@@ -769,6 +769,31 @@ async fn desktop_get_settings(
 /// The whole document crosses the bridge, so the webview's read-modify-write is
 /// one round trip and the file on disk is always a document this build's schema
 /// produced.
+///
+/// # The reply is the input, not the disk
+///
+/// This echoes the document it was **given**, not the merged-and-reloaded state
+/// on disk — nothing here re-reads the file. So a caller does not observe a
+/// bumped `version`, a normalised value, or the unknown sections the merge
+/// preserved until the next [`desktop_get_settings`]. Harmless for appearance,
+/// where the input *is* the value the user chose; #741 and #802 must not build
+/// on the echo reflecting what was written.
+///
+/// # The accepted strings are length-bounded
+///
+/// A compromised webview could otherwise send an arbitrarily long appearance
+/// token that gets allocated and lowercased on the way in. The bound is
+/// [`settings::MAX_APPEARANCE_TOKEN_BYTES`], checked inside `AppearanceMode`'s
+/// deserializer *before* the normalising copy, so it covers this command and a
+/// hand-edited document with one check; an over-length value fails argument
+/// deserialisation with a message naming the limit and carrying no path.
+///
+/// A full strict DTO with `deny_unknown_fields` is deliberately **not** here.
+/// It adds no new privilege class — a compromised main webview already holds
+/// strictly stronger command and terminal surfaces than this one — while the
+/// length bound is the part that removes the unbounded-allocation shape. What
+/// remains outside our reach is the size of the IPC message itself, which the
+/// framework parses before this signature is reached.
 #[tauri::command]
 async fn desktop_set_settings(
     webview: Webview,

@@ -142,12 +142,61 @@ impl Serialize for AppearanceMode {
     }
 }
 
+/// The longest appearance token this build will accept, on either side.
+///
+/// The tokens are `system`, `light` and `dark` — six bytes at most. 64 leaves
+/// room for a mode name a future build invents while making a payload-shaped
+/// value impossible.
+pub const MAX_APPEARANCE_TOKEN_BYTES: usize = 64;
+
 impl<'de> Deserialize<'de> for AppearanceMode {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         // A derived unit-variant `Deserialize` would reject an unknown token,
         // and serde's `#[serde(other)]` is not available on an externally
-        // tagged enum, so the fallback is spelled out here.
-        Ok(Self::from_str_lossy(&String::deserialize(deserializer)?))
+        // tagged enum, so the fallback is spelled out here. A visitor rather
+        // than `String::deserialize` because the length has to be judged on the
+        // borrowed input, **before** anything allocates a normalised copy of it
+        // — see [`AppearanceModeVisitor::visit_str`].
+        deserializer.deserialize_str(AppearanceModeVisitor)
+    }
+}
+
+struct AppearanceModeVisitor;
+
+impl serde::de::Visitor<'_> for AppearanceModeVisitor {
+    type Value = AppearanceMode;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "an appearance mode of at most {MAX_APPEARANCE_TOKEN_BYTES} bytes"
+        )
+    }
+
+    /// Length first, then [`AppearanceMode::from_str_lossy`].
+    ///
+    /// The order is the point. `from_str_lossy` trims and lowercases, which
+    /// allocates a copy of whatever it was handed, so a webview sending a
+    /// megabyte-long mode used to get a megabyte allocated and rewritten before
+    /// anything looked at it. The bound lives here rather than in the Tauri
+    /// command so it covers the command *and* a hand-edited document with one
+    /// check.
+    ///
+    /// Over-length is an **error**, not the unknown-value fallback, and the
+    /// distinction is deliberate: an unrecognised token is a mode this build has
+    /// not heard of and is tolerated by design, while a 4 KB one is a malformed
+    /// document. On the disk path that means the whole document falls back to
+    /// defaults — the ordinary malformed-document behaviour, logged, never a
+    /// failed launch. On the IPC path it fails argument deserialisation with a
+    /// message that names the limit and carries no path and no value.
+    fn visit_str<E: serde::de::Error>(self, raw: &str) -> Result<AppearanceMode, E> {
+        if raw.len() > MAX_APPEARANCE_TOKEN_BYTES {
+            return Err(E::custom(format!(
+                "an appearance mode is at most {MAX_APPEARANCE_TOKEN_BYTES} bytes; got {}",
+                raw.len()
+            )));
+        }
+        Ok(AppearanceMode::from_str_lossy(raw))
     }
 }
 
@@ -1350,6 +1399,65 @@ mod tests {
             std::fs::remove_file(&tmp).unwrap();
         }
         assert_eq!(names.len(), 16, "temp names repeated: {names:?}");
+    }
+
+    /// The bound on an accepted appearance token, on both paths.
+    ///
+    /// A compromised webview could otherwise send an arbitrarily long mode that
+    /// is allocated and lowercased on the way in. The check is in the
+    /// deserializer, before the normalising copy, so the same bound covers the
+    /// `desktop_set_settings` payload and a hand-edited `desktop.toml`.
+    #[test]
+    fn an_over_length_appearance_token_is_refused_on_both_paths() {
+        let over = "x".repeat(MAX_APPEARANCE_TOKEN_BYTES + 1);
+
+        // The IPC shape: an argument that fails deserialisation, with a message
+        // that names the limit and leaks neither a path nor the value.
+        let error = serde_json::from_value::<DesktopSettings>(serde_json::json!({
+            "version": 1,
+            "appearance": { "mode": over },
+        }))
+        .expect_err("an over-length appearance token must be refused");
+        let message = error.to_string();
+        assert!(
+            message.contains(&MAX_APPEARANCE_TOKEN_BYTES.to_string()),
+            "the error should name the limit: {message}"
+        );
+        assert!(
+            !message.contains(&over),
+            "the error must not echo the value: {message}"
+        );
+        assert!(
+            !message.contains('/'),
+            "the error must name no path: {message}"
+        );
+
+        // The disk path: still never fails a load. An over-length token is a
+        // malformed document, not an unknown mode, so the fallback is the whole
+        // document rather than the one field — logged, and not a crash.
+        let dir = tempdir();
+        let path = dir.path().join(SETTINGS_FILE_NAME);
+        std::fs::write(
+            &path,
+            format!("version = 9\n[appearance]\nmode = \"{over}\"\n"),
+        )
+        .unwrap();
+        assert_eq!(load_from(&path), DesktopSettings::default());
+
+        // And exactly at the limit is still the ordinary unknown-value
+        // fallback, which keeps the rest of the document.
+        let at_limit = "x".repeat(MAX_APPEARANCE_TOKEN_BYTES);
+        std::fs::write(
+            &path,
+            format!("version = 9\n[appearance]\nmode = \"{at_limit}\"\n"),
+        )
+        .unwrap();
+        let loaded = load_from(&path);
+        assert_eq!(loaded.appearance.mode, AppearanceMode::System);
+        assert_eq!(
+            loaded.version, 9,
+            "an unknown mode must not cost the document"
+        );
     }
 
     /// The pinned shape of the default document, in the idiom of
