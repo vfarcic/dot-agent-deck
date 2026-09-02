@@ -219,7 +219,7 @@ Worth noting what the rule did to its own precedent. The density paragraph had c
 
 Both rounds also corrected me. A `System · Dark` resolution hint was proposed on the premise that a media-query listener already existed; it does not — `System` follows the OS **entirely in CSS**, by removing the `data-theme` attribute, so no JavaScript ever learns what the OS resolved to. Adding the hint would mean adding a listener, and it would additionally break the existing `getByRole("radio", { name: /Dark/ })` selectors by matching two radios.
 
-Left deliberately untouched: `ConfigurationPanels.tsx`'s three `local-only-notice` strings have the same disease, but they are pre-existing and belong to the projects, prompts and profiles panels rather than to settings. Raised with the user as its own change.
+Left deliberately untouched: `ConfigurationPanels.tsx`'s **four** `local-only-notice` strings have the same disease, but they are pre-existing and belong to the projects, prompts, profiles and workflow panels rather than to settings. Raised with the user as its own change.
 
 ### 2026-09-02 — Review and audit resolved; three residuals recorded rather than fixed
 
