@@ -83,6 +83,19 @@
 //! `shallow_clone` helper that omits the `file://` URL, which makes git ignore
 //! `--depth` and quietly produce a complete repository for every shallow
 //! assertion to pass vacuously against.
+//!
+//! The two `Sandbox` isolation tests added by issue #834 were held to the
+//! same bar, and their subject is the *fixture harness* rather than the code
+//! under test — so the injections are into [`Sandbox`] itself. Four, one at a
+//! time, every one caught: dropping the [`AMBIENT_LOCATION_VARS`] loop, which
+//! reddens the read half (`show-toplevel` reports the ambient `GIT_DIR`'s
+//! repository, not the fixture's); dropping that loop *and* reducing the
+//! re-exec'd child to building its fixture, which isolates the write half
+//! (the victim repository's HEAD moves to a fixture commit); clearing
+//! `GIT_CEILING_DIRECTORIES` instead of setting it; and setting it to the
+//! sandbox root instead of the root's parent, which is the one that pins why
+//! [`Sandbox::ceiling`] returns the parent — the root-listed ceiling escapes
+//! to the outer repository exactly as an absent one does.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -1569,7 +1582,7 @@ mod fake_git {
 mod real_git {
     use super::*;
     use std::fs;
-    use std::process::Command;
+    use std::process::{Command, Output};
     use tempfile::TempDir;
 
     /// `collect` passes `--path-format`, added in git 2.31 (March 2021).
@@ -1622,20 +1635,67 @@ mod real_git {
         );
     }
 
+    /// The environment variables through which git's *location* discovery can
+    /// be steered from outside the process (issue #834) — the location-side
+    /// counterparts of the `GIT_CONFIG_*` pair, and every one of them
+    /// outranks the `current_dir` a fixture invocation passes.
+    ///
+    /// Cleared rather than overridden, because for each of these "unset" *is*
+    /// the default git behaviour — measured: with `GIT_DIR` aimed at another
+    /// repository, `git -C <fixture> log` reports that repository's history,
+    /// and the same command with `GIT_DIR` removed reports the fixture's.
+    ///
+    /// `GIT_CEILING_DIRECTORIES` is deliberately NOT in this list:
+    /// [`Sandbox::git`] *sets* it (see [`Sandbox::ceiling`]) rather than
+    /// clearing it, and `GIT_DEFAULT_HASH`/`GIT_DEFAULT_REF_FORMAT` are not
+    /// either — they steer the *format* of a newly created repository, not
+    /// its location, and are handled alongside the reproducibility claim.
+    const AMBIENT_LOCATION_VARS: &[&str] = &[
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_COMMON_DIR",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_NAMESPACE",
+        // Not in the issue's list, and needed for the same claim: it lets the
+        // upward walk cross a mount point, which is one of the two things
+        // that bound it at all.
+        "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+    ];
+
     /// A throwaway tree of repositories under a `tempfile::tempdir()`.
     ///
-    /// Every *fixture* command runs with the ambient git configuration
-    /// switched off — `GIT_CONFIG_GLOBAL`/`GIT_CONFIG_SYSTEM` pointed at a
-    /// path that does not exist, `HOME` and `XDG_CONFIG_HOME` inside the
-    /// sandbox, an empty template dir so no system hook is installed, and the
-    /// commit identity supplied by environment rather than by config — so the
-    /// repositories are byte-identical on a developer's machine and on a bare
-    /// runner, and nothing here can read or write the checkout these tests are
-    /// running inside.
+    /// Every *fixture* command runs with the ambient git environment switched
+    /// off, in three groups, because the claim below needs all three and used
+    /// to rest on only the first (issue #834):
     ///
-    /// [`collect`] itself is deliberately *not* given that environment: it is
-    /// called exactly the way `main.rs` calls it, so what is under test is the
-    /// production invocation rather than a specially-configured one.
+    /// - **Configuration** — `GIT_CONFIG_GLOBAL`/`GIT_CONFIG_SYSTEM` pointed
+    ///   at a path that does not exist, `HOME` and `XDG_CONFIG_HOME` inside
+    ///   the sandbox, an empty template dir so no system hook is installed,
+    ///   and the commit identity supplied by environment rather than config.
+    /// - **Location** — every variable in [`AMBIENT_LOCATION_VARS`] cleared,
+    ///   plus [`Sandbox::ceiling`] bounding the upward walk at the sandbox
+    ///   root. Without this the `current_dir` each fixture command passes is
+    ///   merely a suggestion: `GIT_DIR` overrides it outright, so an ambient
+    ///   one made these fixtures read *and write* the repository it named.
+    /// - **New-repository format** — `GIT_DEFAULT_HASH` and
+    ///   `GIT_DEFAULT_REF_FORMAT` cleared, which is what the
+    ///   byte-identical claim below actually needs: ambient
+    ///   `GIT_DEFAULT_HASH=sha256` builds SHA-256 fixtures on a developer's
+    ///   machine against SHA-1 on a bare runner (measured, as is
+    ///   `GIT_DEFAULT_REF_FORMAT=reftable`).
+    ///
+    /// So the repositories are byte-identical on a developer's machine and on
+    /// a bare runner, and no fixture command here can read or write any
+    /// repository outside this sandbox — including the checkout these tests
+    /// are running inside.
+    ///
+    /// That last sentence is a claim about [`Sandbox::git`] and the commands
+    /// routed through it. [`collect`] and [`run`] are deliberately *not*
+    /// given that environment: they are called exactly the way `main.rs`
+    /// calls them, so what is under test is the production invocation rather
+    /// than a specially-configured one.
     struct Sandbox {
         /// Kept only to hold the directory open for the test's lifetime.
         _dir: TempDir,
@@ -1649,11 +1709,24 @@ mod real_git {
 
     impl Sandbox {
         fn new() -> Sandbox {
+            Sandbox::place(TempDir::new().expect("tempdir"))
+        }
+
+        /// A sandbox rooted *inside* `parent` rather than in the system temp
+        /// dir — the shape a developer gets when `TMPDIR` points somewhere
+        /// under a checkout. Only
+        /// `sandbox_git_cannot_discover_a_repository_above_its_root` uses it,
+        /// because putting the sandbox inside a repository is the one way to
+        /// observe [`Sandbox::ceiling`] doing its job.
+        fn new_in(parent: &Path) -> Sandbox {
+            Sandbox::place(TempDir::new_in(parent).expect("tempdir inside parent"))
+        }
+
+        fn place(dir: TempDir) -> Sandbox {
             require_git(
                 MIN_GIT,
                 "`git rev-parse --path-format`, which `collect` passes",
             );
-            let dir = TempDir::new().expect("tempdir");
             let root = dir.path().canonicalize().expect("canonicalize tempdir");
             fs::create_dir_all(root.join("home")).expect("mkdir home");
             fs::create_dir_all(root.join("empty-template")).expect("mkdir template");
@@ -1664,14 +1737,50 @@ mod real_git {
             self.root.join(rel)
         }
 
-        /// Runs a fixture git command, and fails the test with git's own
-        /// stderr if it does not succeed — a fixture that half-built itself
-        /// and then produced a green assertion is the same fail-green in
-        /// miniature.
-        fn git(&self, cwd: &Path, args: &[&str]) -> String {
-            let out = Command::new("git")
-                .args(args)
+        /// The upward-discovery ceiling handed to every fixture command: the
+        /// sandbox root's **parent**, not the root itself.
+        ///
+        /// `GIT_CEILING_DIRECTORIES` names the directories git must not
+        /// `chdir` up *into*, and it never excludes an invocation's own cwd —
+        /// so listing the root does NOT bound the walk (measured: with the
+        /// root listed, a `rev-parse` from the root still resolved an
+        /// ancestor repository), while listing the parent stops it exactly at
+        /// the root. Discovery *within* the sandbox is unaffected, since a
+        /// walk that starts below the root finds its repository before it ever
+        /// reaches the ceiling.
+        ///
+        /// Set rather than merely cleared, deliberately. Clearing restores
+        /// git's default unbounded walk, which leaves "no fixture command can
+        /// resolve a repository outside this sandbox" true only *contingently*
+        /// — it would then hold because no current fixture command happens to
+        /// do upward discovery from a non-repository directory (`git init` and
+        /// `git clone` do none), and would break silently the day one does, or
+        /// the day `TMPDIR` points inside a checkout. Bounding it makes the
+        /// claim structural instead.
+        ///
+        /// Canonical, because [`Sandbox::root`] is and git resolves symlinks
+        /// in these entries before comparing them. The list is `:`-separated,
+        /// so a temp path containing a colon would split into two useless
+        /// entries — that weakens this bound without affecting anything else
+        /// above.
+        fn ceiling(&self) -> &Path {
+            // A canonicalised `TempDir` always has a parent, and falling back
+            // to the root only ever weakens the bound.
+            self.root.parent().unwrap_or(&self.root)
+        }
+
+        /// Runs a fixture git command and hands back its raw [`Output`],
+        /// failure included.
+        ///
+        /// Split out of [`Sandbox::git`] so a test can drive an invocation
+        /// that is *expected to fail*: the ceiling's effect is only observable
+        /// on a command that must not find a repository, and the asserting
+        /// wrapper cannot express that.
+        fn try_git(&self, cwd: &Path, args: &[&str]) -> Output {
+            let mut cmd = Command::new("git");
+            cmd.args(args)
                 .current_dir(cwd)
+                // Ambient configuration.
                 .env("HOME", self.at("home"))
                 .env("XDG_CONFIG_HOME", self.at("home/.config"))
                 .env("GIT_CONFIG_GLOBAL", self.at("no-such-gitconfig"))
@@ -1683,8 +1792,24 @@ mod real_git {
                 .env("GIT_AUTHOR_EMAIL", "tests@example.invalid")
                 .env("GIT_COMMITTER_NAME", "linkage-check tests")
                 .env("GIT_COMMITTER_EMAIL", "tests@example.invalid")
-                .output()
-                .unwrap_or_else(|e| panic!("failed to invoke `git {}`: {e}", args.join(" ")));
+                // Ambient new-repository format.
+                .env_remove("GIT_DEFAULT_HASH")
+                .env_remove("GIT_DEFAULT_REF_FORMAT")
+                // Ambient location discovery, which outranks `current_dir`.
+                .env("GIT_CEILING_DIRECTORIES", self.ceiling());
+            for var in AMBIENT_LOCATION_VARS {
+                cmd.env_remove(var);
+            }
+            cmd.output()
+                .unwrap_or_else(|e| panic!("failed to invoke `git {}`: {e}", args.join(" ")))
+        }
+
+        /// Runs a fixture git command, and fails the test with git's own
+        /// stderr if it does not succeed — a fixture that half-built itself
+        /// and then produced a green assertion is the same fail-green in
+        /// miniature.
+        fn git(&self, cwd: &Path, args: &[&str]) -> String {
+            let out = self.try_git(cwd, args);
             assert!(
                 out.status.success(),
                 "fixture command `git {}` failed in {}: {}",
@@ -1769,6 +1894,196 @@ mod real_git {
             );
             wt
         }
+    }
+
+    /// Marker in the child's environment: this process is the re-exec'd half
+    /// of `sandbox_git_ignores_ambient_location_env`.
+    const AMBIENT_CHILD: &str = "DAD_LINKAGE_CHECK_AMBIENT_GIT_CHILD";
+
+    /// That test's own name, used as the child's libtest filter. A rename
+    /// that misses this makes the child match zero tests — which libtest
+    /// exits 0 for, so the parent asserts on `1 passed` rather than on the
+    /// status alone.
+    const AMBIENT_TEST: &str = "sandbox_git_ignores_ambient_location_env";
+
+    /// Scenario: git's location discovery is steerable from the environment —
+    /// `GIT_DIR` and friends outrank the `current_dir` a fixture command
+    /// passes — so with one of them set in the parent process these fixtures
+    /// read and write whatever it names instead of the sandbox (issue #834).
+    /// Re-execs this test binary with every such variable aimed at a victim
+    /// repository, has the child build a sandbox and assert it operated on
+    /// its own fixture, then asserts here that the victim's HEAD and commit
+    /// count came through unchanged.
+    ///
+    /// The re-exec is what keeps this honest: the variables have to be in the
+    /// environment *before* the process starts to reproduce the real
+    /// condition (mid-`rebase --exec`, a pre-commit hook, `bisect run`), and
+    /// setting them in-process would be `unsafe` and would race every other
+    /// test sharing the process under a threaded runner.
+    #[test]
+    fn sandbox_git_ignores_ambient_location_env() {
+        if std::env::var_os(AMBIENT_CHILD).is_some() {
+            ambient_location_child();
+            return;
+        }
+
+        // The victim: a repository this test must not touch, built by its own
+        // sandbox so it is as disposable as everything else here.
+        let host = Sandbox::new();
+        let victim = host.origin();
+        let before = host.git(&victim, &["rev-parse", "HEAD"]);
+
+        let exe = std::env::current_exe().expect("current_exe: this is a test binary");
+        let out = Command::new(&exe)
+            .args([AMBIENT_TEST, "--nocapture", "--test-threads=1"])
+            .env(AMBIENT_CHILD, "1")
+            .env("GIT_DIR", victim.join(".git"))
+            .env("GIT_WORK_TREE", &victim)
+            .env("GIT_COMMON_DIR", victim.join(".git"))
+            .env("GIT_INDEX_FILE", victim.join(".git/index"))
+            .env("GIT_OBJECT_DIRECTORY", victim.join(".git/objects"))
+            .env(
+                "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+                victim.join(".git/objects"),
+            )
+            .env("GIT_NAMESPACE", "escape")
+            .env("GIT_DISCOVERY_ACROSS_FILESYSTEM", "1")
+            .env("GIT_CEILING_DIRECTORIES", &victim)
+            .output()
+            .expect("re-exec this test binary");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+
+        assert!(
+            out.status.success(),
+            "the sandboxed child must ignore every ambient location variable\n\
+             --- child stdout ---\n{stdout}\n--- child stderr ---\n{stderr}"
+        );
+        assert!(
+            stdout.contains("1 passed"),
+            "the child must have run exactly the test named by AMBIENT_TEST \
+             ({AMBIENT_TEST}); zero matches exit 0 too, which is the \
+             fail-green this asserts away\n{stdout}"
+        );
+
+        // The write half. `Sandbox::origin`'s `init`/`commit` sequence in the
+        // child ran with `GIT_DIR` naming this repository: unfixed, it moves
+        // this HEAD to a fixture commit and replaces the tree.
+        assert_eq!(
+            host.git(&victim, &["rev-parse", "HEAD"]),
+            before,
+            "the child's fixture commits reached the victim repository — a \
+             sandbox helper wrote into a repository it did not create (#834)"
+        );
+        assert_eq!(
+            host.git(&victim, &["rev-list", "--count", "HEAD"]),
+            "2",
+            "the victim must still be exactly `Sandbox::origin`'s two commits"
+        );
+    }
+
+    /// The re-exec'd half of the test above, running with every variable in
+    /// [`AMBIENT_LOCATION_VARS`] set in its own environment.
+    fn ambient_location_child() {
+        // Vacuity guard first: if the parent failed to hand these down, every
+        // assertion below passes while proving nothing.
+        for var in AMBIENT_LOCATION_VARS {
+            assert!(
+                std::env::var_os(var).is_some(),
+                "the parent must set {var} in this child, or this test proves \
+                 nothing at all"
+            );
+        }
+        assert!(
+            std::env::var_os("GIT_CEILING_DIRECTORIES").is_some(),
+            "the parent must set GIT_CEILING_DIRECTORIES too — `Sandbox::git` \
+             overrides rather than clears it, so it is not in the list above"
+        );
+
+        let sb = Sandbox::new();
+        let origin = sb.origin();
+
+        // The read half: `Sandbox::origin` asserts nothing about *where* it
+        // built, so ask git which repository the fixture command resolved.
+        assert_eq!(
+            Path::new(sb.git(&origin, &["rev-parse", "--show-toplevel"]).as_str()),
+            origin.as_path(),
+            "a fixture command resolved a repository outside its own sandbox: \
+             git's location discovery is still steerable from the environment"
+        );
+        assert_eq!(
+            sb.git(&origin, &["log", "-1", "--format=%s"]),
+            "second",
+            "HEAD must be this sandbox's own second empty commit"
+        );
+        assert_eq!(
+            sb.git(&origin, &["rev-list", "--count", "HEAD"]),
+            "2",
+            "two commits, built by this sandbox and nothing else"
+        );
+    }
+
+    /// Scenario: places a sandbox *inside* another repository's working tree —
+    /// what a developer gets when `TMPDIR` points under a checkout — and
+    /// asserts a fixture invocation from the sandbox root cannot walk up out
+    /// of it, while one from inside a fixture repository still resolves
+    /// normally.
+    ///
+    /// The control in the middle is the load-bearing part: the same probe
+    /// without the ceiling *does* resolve the outer repository, so the
+    /// assertion cannot pass by the escape being impossible to stage. Without
+    /// it this test would stay green on a machine where the sandbox simply
+    /// has no repository above it, which is every ordinary machine.
+    #[test]
+    fn sandbox_git_cannot_discover_a_repository_above_its_root() {
+        let host = Sandbox::new();
+        let outer = host.origin();
+        let sb = Sandbox::new_in(&outer);
+
+        // Control: an unbounded walk from the sandbox root reaches `outer`.
+        // Everything the real helper neutralises is neutralised here too,
+        // except the ceiling — so an ambient `GIT_DIR` cannot make this
+        // control fail for an unrelated reason.
+        let mut control = Command::new("git");
+        control
+            .args(["rev-parse", "--show-toplevel"])
+            .current_dir(&sb.root)
+            .env_remove("GIT_CEILING_DIRECTORIES");
+        for var in AMBIENT_LOCATION_VARS {
+            control.env_remove(var);
+        }
+        let escaped = control.output().expect("invoke git");
+        assert!(
+            escaped.status.success(),
+            "control: an unbounded walk from the sandbox root must find the \
+             outer repository, or this test stages nothing: {}",
+            String::from_utf8_lossy(&escaped.stderr).trim()
+        );
+        assert_eq!(
+            Path::new(String::from_utf8_lossy(&escaped.stdout).trim()),
+            outer.as_path(),
+            "control: the unbounded walk must land on the outer repository"
+        );
+
+        // The bounded walk stops at the sandbox root instead.
+        let bounded = sb.try_git(&sb.root, &["rev-parse", "--show-toplevel"]);
+        assert!(
+            !bounded.status.success(),
+            "a fixture invocation from the sandbox root resolved a repository \
+             above it: {}",
+            String::from_utf8_lossy(&bounded.stdout).trim()
+        );
+
+        // And the ceiling must not have broken the walk *inside* the sandbox,
+        // which is what a root-listed ceiling would have done.
+        let fixture = sb.origin();
+        let sub = fixture.join("sub");
+        fs::create_dir_all(&sub).expect("mkdir sub");
+        assert_eq!(
+            Path::new(sb.git(&sub, &["rev-parse", "--show-toplevel"]).as_str()),
+            fixture.as_path(),
+            "the ceiling must still allow the upward walk within the sandbox"
+        );
     }
 
     /// **The motivating case (issue #557).** `.git/shallow` lives in the
