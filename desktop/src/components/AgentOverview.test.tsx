@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 /*
   The shipped stylesheet, loaded so the assertions below can read COMPUTED
   declarations rather than only class names. Vitest's `css: true` hands it to
@@ -634,6 +634,98 @@ describe("AgentOverview", () => {
 
     expect(document.querySelector(".overview-uptime")).toHaveTextContent("2h");
     expect(document.querySelector(".overview-activity")?.textContent).toBe("");
+  });
+
+  /**
+   * Scenario: mount the overview with one agent seen 30 seconds ago, then let
+   * five minutes pass with NO new snapshot — no daemon event, no reconnect,
+   * nothing. Both time cells must have moved on their own: `just now` becomes
+   * `5m ago`, and `<1m` becomes `5m` (PRD #745 M12).
+   *
+   * This is the freeze bug. Snapshots are event-driven off the daemon watch
+   * stream and nothing polls, so an agent emitting nothing produced no
+   * re-render at all and both columns stopped. It failed exactly backwards —
+   * any OTHER agent's event repaints everything, so a busy fleet masked it and
+   * the idle case, which is when "quiet for two hours" is the most valuable
+   * thing on screen, is precisely when it stopped updating.
+   */
+  it("keeps the relative times counting while no snapshot arrives", () => {
+    vi.useFakeTimers();
+    try {
+      const start = new Date("2026-09-02T09:00:00.000Z").getTime();
+      vi.setSystemTime(start);
+      renderOverview({
+        snapshot: snapshotWithAgent({ lastActivityMs: start - 30_000, spawnedAtMs: start - 30_000, tab: { kind: "dashboard" } }),
+      });
+
+      expect(document.querySelector(".overview-activity")).toHaveTextContent("just now");
+      expect(document.querySelector(".overview-uptime")).toHaveTextContent("<1m");
+
+      act(() => void vi.advanceTimersByTime(5 * 60_000));
+
+      expect(document.querySelector(".overview-activity")).toHaveTextContent("5m ago");
+      expect(document.querySelector(".overview-uptime")).toHaveTextContent("5m");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  /**
+   * Scenario: mount the overview, let it tick, then leave the screen. The
+   * interval must be gone — a ticker that outlives its component keeps
+   * repainting a tree nobody is looking at, for as long as the app runs.
+   */
+  it("stops ticking when the screen is left", () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-09-02T09:00:00.000Z").getTime());
+      const { unmount } = renderOverview({ snapshot: snapshotWithAgent({ tab: { kind: "dashboard" } }) });
+      expect(vi.getTimerCount()).toBeGreaterThan(0);
+
+      unmount();
+
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  /**
+   * Scenario: mount the overview, hide the document, let 45 minutes pass, then
+   * bring it back. While hidden nothing ticks — a backgrounded window
+   * repainting six times a minute forever is pure waste — so the cell is
+   * knowably stale. Becoming visible re-reads the clock IMMEDIATELY rather than
+   * waiting out an interval, so the first thing the user sees is the true time
+   * rather than the one from before they looked away (PRD #745 M12).
+   */
+  it("pauses while the document is hidden and catches up the moment it comes back", () => {
+    vi.useFakeTimers();
+    const visibility = (state: DocumentVisibilityState) => {
+      Object.defineProperty(document, "visibilityState", { value: state, configurable: true });
+      act(() => void document.dispatchEvent(new Event("visibilitychange")));
+    };
+    try {
+      const start = new Date("2026-09-02T09:00:00.000Z").getTime();
+      vi.setSystemTime(start);
+      renderOverview({ snapshot: snapshotWithAgent({ lastActivityMs: start, tab: { kind: "dashboard" } }) });
+      const ticking = vi.getTimerCount();
+      expect(ticking).toBeGreaterThan(0);
+
+      visibility("hidden");
+      expect(vi.getTimerCount()).toBe(ticking - 1);
+
+      act(() => void vi.advanceTimersByTime(45 * 60_000));
+      // Still the pre-hide reading: nothing ticked, which is the point.
+      expect(document.querySelector(".overview-activity")).toHaveTextContent("just now");
+
+      visibility("visible");
+      expect(document.querySelector(".overview-activity")).toHaveTextContent("45m ago");
+      expect(vi.getTimerCount()).toBe(ticking);
+    } finally {
+      // @ts-expect-error — removing the own property restores the prototype getter.
+      delete document.visibilityState;
+      vi.useRealTimers();
+    }
   });
 
   /**

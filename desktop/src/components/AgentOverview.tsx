@@ -334,6 +334,83 @@ const GROUP_ICON: Record<OverviewGroupKind, typeof Network> = {
  */
 const COLUMNS = ["Status", "Agent", "State", "Last activity", "Uptime", "CLI", "Active tool", "Tools", "Working directory", "Last prompt"];
 
+/**
+ * How often the screen re-reads the clock so its two relative-time columns keep
+ * counting between daemon events (PRD #745 M12).
+ *
+ * **Ten seconds, and the number follows from what the columns print.** Both
+ * `displayActivity` and `displayUptime` render one unit, largest that fits,
+ * floored — so above a minute the smallest change either cell can make is a
+ * whole minute, and below it the label is a fixed `just now` / `<1m`. The only
+ * moment a faster tick buys anything is the crossing INTO the first minute
+ * bucket, and 10s bounds the lag on that crossing to a tenth of the unit being
+ * crossed while costing six repaints a minute of a screen that mounts no
+ * terminal. A one-second tick would be sixty repaints a minute to change a
+ * label on one of them.
+ *
+ * It is a re-render and NOTHING else: no snapshot request, no reconnect, no
+ * daemon call. The screen's whole design property is one RPC plus one already
+ * open event stream (M7), and a polling loop here would quietly reinstate the
+ * per-agent cost that milestone removed.
+ */
+export const OVERVIEW_CLOCK_TICK_MS = 10_000;
+
+/**
+ * The instant the overview's relative cells are measured against, re-read on an
+ * interval so they keep counting while no snapshot arrives.
+ *
+ * This exists because both time columns were FROZEN between daemon events.
+ * Snapshots are event-driven off the daemon watch stream and nothing polls, so
+ * an agent emitting nothing produced no re-render: `Last activity` stayed at
+ * `3m ago` while the truth became `30m ago`, and `Uptime` — a duration, and so
+ * inherently continuous — stopped counting altogether. It failed exactly
+ * backwards, because any OTHER agent's event repaints the whole screen: a busy
+ * fleet masked it, and the idle case, where "quiet for two hours" is the most
+ * valuable thing on the screen, is precisely where it stopped updating.
+ *
+ * One clock for the whole screen rather than one `Date.now()` per row, so every
+ * cell on a repaint is relative to the SAME moment rather than to fifteen
+ * slightly different ones.
+ *
+ * **Paused while the document is hidden, and it catches up on the way back.**
+ * A backgrounded window repainting six times a minute forever is pure waste,
+ * and browsers throttle the timer anyway — but a paused ticker means the cells
+ * are stale by however long the window was away, so becoming visible re-reads
+ * the clock IMMEDIATELY and only then restarts the interval. Waiting a whole
+ * interval before correcting would show a time that is knowably wrong at the
+ * one moment the user is looking straight at it.
+ */
+export function useOverviewClock(intervalMs: number = OVERVIEW_CLOCK_TICK_MS): number {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    let timer: number | undefined;
+    const read = () => setNow(Date.now());
+    const start = () => {
+      if (timer === undefined) timer = window.setInterval(read, intervalMs);
+    };
+    const stop = () => {
+      if (timer === undefined) return;
+      window.clearInterval(timer);
+      timer = undefined;
+    };
+    const onVisibilityChange = () => {
+      if (document.visibilityState === "hidden") {
+        stop();
+        return;
+      }
+      read();
+      start();
+    };
+    if (document.visibilityState !== "hidden") start();
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    return () => {
+      stop();
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+    };
+  }, [intervalMs]);
+  return now;
+}
+
 /** What a reported write lease says on hover, in the daemon's own terms. */
 const WRITE_LEASE_TITLE: Record<"read" | "write" | "none", string> = {
   write: "The daemon holds a live, writable target for this agent — input typed on the deck reaches it.",
@@ -385,6 +462,11 @@ export function AgentOverview({ runtime, onNavigate }: { runtime: DeckRuntimeSta
    * list and the header contradicted it.
    */
   const connected = connection.status === "connected";
+  /*
+    Re-read on a timer so the relative cells keep counting between daemon
+    events. It re-renders and refetches nothing — see `useOverviewClock`.
+  */
+  const now = useOverviewClock();
   const agents = useMemo(() => snapshot.agents.map(toOverviewAgent), [snapshot.agents]);
   const groups = useMemo(() => groupAgents(agents), [agents]);
   const counts = useMemo(() => countByStatus(agents), [agents]);
@@ -509,6 +591,7 @@ export function AgentOverview({ runtime, onNavigate }: { runtime: DeckRuntimeSta
               <DaemonBody
                 agents={agents}
                 groups={groups}
+                now={now}
                 connection={connection}
                 message={daemonMessage}
                 overrideError={overrideError}
@@ -532,9 +615,11 @@ export function AgentOverview({ runtime, onNavigate }: { runtime: DeckRuntimeSta
   );
 }
 
-function DaemonBody({ agents, groups, connection, message, overrideError, onOpenDeck, onReconnect, onConnectAnyway }: {
+function DaemonBody({ agents, groups, now, connection, message, overrideError, onOpenDeck, onReconnect, onConnectAnyway }: {
   agents: OverviewAgent[];
   groups: OverviewGroup[];
+  /** The one instant every relative cell on this screen is measured against. */
+  now: number;
   connection: ConnectionView;
   message?: string;
   overrideError?: string;
@@ -618,13 +703,13 @@ function DaemonBody({ agents, groups, connection, message, overrideError, onOpen
         <span>LAST PROMPT</span>
       </div>
       <div className="overview-groups">
-        {groups.map((group) => <OverviewGroupCard key={group.key} group={group} />)}
+        {groups.map((group) => <OverviewGroupCard key={group.key} group={group} now={now} />)}
       </div>
     </>
   );
 }
 
-function OverviewGroupCard({ group }: { group: OverviewGroup }) {
+function OverviewGroupCard({ group, now }: { group: OverviewGroup; now: number }) {
   const Icon = GROUP_ICON[group.kind];
   const counts = countByStatus(group.agents);
   const titleId = `overview-group-title-${group.key}`;
@@ -683,7 +768,7 @@ function OverviewGroupCard({ group }: { group: OverviewGroup }) {
           </tr>
         </thead>
         <tbody className="overview-rows" role="rowgroup">
-          {group.agents.map((agent) => <OverviewRow key={agentDomKey(agent)} agent={agent} hoistedCwd={hoistedCwd} />)}
+          {group.agents.map((agent) => <OverviewRow key={agentDomKey(agent)} agent={agent} hoistedCwd={hoistedCwd} now={now} />)}
         </tbody>
       </table>
     </article>
@@ -712,7 +797,7 @@ function unnamedGroupLabel(group: OverviewGroup): string {
   return rendersBlank(id) ? `unnamed ${noun}` : `unnamed ${noun} ${id}`;
 }
 
-function OverviewRow({ agent, hoistedCwd }: { agent: OverviewAgent; hoistedCwd?: string }) {
+function OverviewRow({ agent, hoistedCwd, now }: { agent: OverviewAgent; hoistedCwd?: string; now: number }) {
   const orchestration = agent.tab.kind === "orchestration" ? agent.tab : undefined;
   // Only an orchestration's role name says something the other columns do not.
   // Outside one, the daemon derives the role from the agent type, so showing it
@@ -729,9 +814,10 @@ function OverviewRow({ agent, hoistedCwd }: { agent: OverviewAgent; hoistedCwd?:
     `src/untrusted_text.rs`; it is fixed by saying something visible instead.
   */
   const name = displayIdentity(agent.displayName, DISPLAY_LIMITS.name, unnamedAgentLabel(agent));
-  // Read once per render against ONE `Date.now()`, so every row on a repaint is
-  // relative to the same moment rather than to fifteen slightly different ones.
-  const now = Date.now();
+  // ONE instant for the whole screen, ticked by `useOverviewClock` so these two
+  // cells keep counting between daemon events. Passed down rather than read
+  // here so every row on a repaint is relative to the same moment rather than
+  // to fifteen slightly different ones.
   const activity = displayActivity(agent.lastActivityMs, now);
   const uptime = displayUptime(agent.spawnedAtMs, now);
   return (
