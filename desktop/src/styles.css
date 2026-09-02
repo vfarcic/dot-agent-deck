@@ -109,6 +109,223 @@
   --radius: 6px;
 }
 
+/* Dark values (PRD #743 M3), delivered twice because both paths are required:
+   the media query is the OS default and must NOT apply when the user has
+   explicitly chosen Light, and the attribute block is an explicit Dark choice
+   winning on a light OS.
+
+   Every colour token the light block declares is re-declared in both, even
+   where the value is deliberately identical, so this reads as a complete list
+   of decisions rather than as a diff. `xtask/linkage-check`'s desktop-palette
+   guard fails the build if the two blocks drift apart or if a token is added
+   to `:root` without a dark counterpart -- neither is something a test can
+   otherwise see, because nothing renders dark mode in CI. */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    /* Surfaces. The ground is the deepest layer in dark so every card lifts off */
+    /* it; in light the ground sits mid-ladder because cream barely separates from */
+    /* cream. Otherwise the ladder's order is the light one, mirrored: more raised */
+    /* is lighter in both themes. */
+    --canvas: #101514;
+    --paper: #1f2624;
+    --paper-strong: #262e2b;
+    --paper-sunken: #1a201f;
+    --paper-sunken-strong: #161b1a;
+    --skeleton: #39423e;  /* lighter than its card, not darker: a placeholder has to be seen */
+    /* Text. */
+    --ink: #e6ebe8;
+    --ink-soft: #c0c8c4;
+    --muted: #a8b2ad;
+    --faint: #8d9792;  /* lifted until AA clears on every surface it lands on */
+    /* NOT the surface ladder. This is the label ON a filled accent -- the primary */
+    /* button, the switch knob, the checkbox tick -- and in dark those fills are */
+    /* LIGHT, so the label has to go dark. Following --paper-strong here would put */
+    /* a near-white label on a light teal button at 1.9:1. */
+    --on-accent: #0b1614;
+    /* Lines. */
+    --line: #373f3c;
+    --line-strong: #495350;
+    /* --dialog-edge and --shell-edge hold the same value in light and move in */
+    /* OPPOSITE directions here, which is the whole reason they are two tokens. */
+    /* This one rims a floating dialog whose surface just went dark, so it has to */
+    /* get lighter to keep defining the dialog's edge. */
+    --dialog-edge: #8b9490;
+    /* Teal: the primary accent. Text and fills, so it must read as text on a dark */
+    /* surface -- which is what forces --on-accent dark above. */
+    --teal: #4fc3ae;
+    --teal-deep: #79d9c7;  /* the primary button's hover: a step further is brighter in dark */
+    --focus-ring: #5ac9b6;
+    --teal-wash-ink: #a9cec5;
+    --teal-focus: #6aa89b;
+    --teal-rim: #47756b;
+    --teal-edge: #33564f;
+    --teal-soft: #1c332e;
+    --teal-wash: #16241f;
+    /* Green: passed / done. */
+    --green: #5cbb87;
+    --green-rim: #4f8266;
+    --green-rim-soft: #3a5f49;
+    --green-soft: #1a2c21;
+    /* Amber: waiting / caution. */
+    --amber: #e0b44f;
+    --amber-ink: #e4ca8d;
+    --amber-ink-soft: #c1b088;
+    --amber-rim: #7d6430;
+    --amber-edge: #695426;
+    --amber-line: #55441f;
+    --amber-soft: #2b2313;
+    --amber-bright: #241d0e;  /* the subtlest amber ground, as it is in light */
+    /* Red: failed / destructive. */
+    --red: #e28880;
+    --red-ink: #efaba4;
+    --red-rim-strong: #8f4f49;
+    --red-rim: #743e39;
+    --red-soft: #2e1a18;
+    /* Violet: needs a human. */
+    --violet: #ab92ca;
+    --violet-soft: #29223a;
+    /* Live status. Unchanged: these were already picked to read against the dark */
+    /* instrument chrome, and every one of their call sites is on it -- the rail's */
+    /* connection lamp, the composer's caution/error lines, the check rows. */
+    --status-ok: #6db58b;
+    --status-warn: #c69a4e;
+    --status-error: #d0685f;
+    /* Instrument chrome. Near-invariant by decision: PRD #743 keeps the terminals */
+    /* dark in both appearances, so these surfaces were already right. The three */
+    /* nudges are all one thing -- the canvas around them is dark now, so the */
+    /* instrument block has to sit slightly BELOW the cards to stay an inset */
+    /* rather than float on top of them. */
+    --terminal: #141817;  /* never themed. The xterm surface, PRD #743 Open Question 1 */
+    --shell-deep: #14201d;
+    --shell-line-deep: #131816;
+    --shell: #1b2220;  /* nudged down from #222a27: separation from --paper-strong */
+    --shell-line: #242b29;  /* tracks --shell */
+    --shell-raised: #2a3532;  /* tracks --shell, keeping the rail's hover step */
+    --shell-thumb: #46534e;
+    --shell-edge: #4e5754;  /* down, while --dialog-edge goes up: see above */
+    --shell-faint: #82908a;
+    --shell-muted: #9da7a2;
+    --shell-ink-soft: #bac2be;
+    --shell-ink: #d8ded9;
+    --shell-ink-bright: #f4f5f3;
+    --shell-teal-surface: #1d3a30;
+    --shell-teal-edge: #3a6a5f;
+    --shell-teal: #72c3b3;
+    --shell-teal-text: #9fd8c8;
+    --shell-teal-text-strong: #d5f3ea;
+    /* Channel forms. --paper-rgb and --teal-rgb track their own token, as in */
+    /* light. --ink-rgb deliberately does NOT: every one of its nine call sites is */
+    /* a scrim or a drop shadow, and a shadow cast in the new near-white --ink */
+    /* would light the app up instead of darkening it. Black is the most a fixed */
+    /* call-site alpha can darken a dark surface by. */
+    --ink-rgb: 0 0 0;
+    --paper-rgb: 31 38 36;  /* = --paper */
+    --teal-rgb: 79 195 174;  /* = --teal */
+  }
+}
+
+/* An explicit Dark choice, which has to win on a light OS too. */
+:root[data-theme="dark"] {
+  /* Surfaces. The ground is the deepest layer in dark so every card lifts off */
+  /* it; in light the ground sits mid-ladder because cream barely separates from */
+  /* cream. Otherwise the ladder's order is the light one, mirrored: more raised */
+  /* is lighter in both themes. */
+  --canvas: #101514;
+  --paper: #1f2624;
+  --paper-strong: #262e2b;
+  --paper-sunken: #1a201f;
+  --paper-sunken-strong: #161b1a;
+  --skeleton: #39423e;  /* lighter than its card, not darker: a placeholder has to be seen */
+  /* Text. */
+  --ink: #e6ebe8;
+  --ink-soft: #c0c8c4;
+  --muted: #a8b2ad;
+  --faint: #8d9792;  /* lifted until AA clears on every surface it lands on */
+  /* NOT the surface ladder. This is the label ON a filled accent -- the primary */
+  /* button, the switch knob, the checkbox tick -- and in dark those fills are */
+  /* LIGHT, so the label has to go dark. Following --paper-strong here would put */
+  /* a near-white label on a light teal button at 1.9:1. */
+  --on-accent: #0b1614;
+  /* Lines. */
+  --line: #373f3c;
+  --line-strong: #495350;
+  /* --dialog-edge and --shell-edge hold the same value in light and move in */
+  /* OPPOSITE directions here, which is the whole reason they are two tokens. */
+  /* This one rims a floating dialog whose surface just went dark, so it has to */
+  /* get lighter to keep defining the dialog's edge. */
+  --dialog-edge: #8b9490;
+  /* Teal: the primary accent. Text and fills, so it must read as text on a dark */
+  /* surface -- which is what forces --on-accent dark above. */
+  --teal: #4fc3ae;
+  --teal-deep: #79d9c7;  /* the primary button's hover: a step further is brighter in dark */
+  --focus-ring: #5ac9b6;
+  --teal-wash-ink: #a9cec5;
+  --teal-focus: #6aa89b;
+  --teal-rim: #47756b;
+  --teal-edge: #33564f;
+  --teal-soft: #1c332e;
+  --teal-wash: #16241f;
+  /* Green: passed / done. */
+  --green: #5cbb87;
+  --green-rim: #4f8266;
+  --green-rim-soft: #3a5f49;
+  --green-soft: #1a2c21;
+  /* Amber: waiting / caution. */
+  --amber: #e0b44f;
+  --amber-ink: #e4ca8d;
+  --amber-ink-soft: #c1b088;
+  --amber-rim: #7d6430;
+  --amber-edge: #695426;
+  --amber-line: #55441f;
+  --amber-soft: #2b2313;
+  --amber-bright: #241d0e;  /* the subtlest amber ground, as it is in light */
+  /* Red: failed / destructive. */
+  --red: #e28880;
+  --red-ink: #efaba4;
+  --red-rim-strong: #8f4f49;
+  --red-rim: #743e39;
+  --red-soft: #2e1a18;
+  /* Violet: needs a human. */
+  --violet: #ab92ca;
+  --violet-soft: #29223a;
+  /* Live status. Unchanged: these were already picked to read against the dark */
+  /* instrument chrome, and every one of their call sites is on it -- the rail's */
+  /* connection lamp, the composer's caution/error lines, the check rows. */
+  --status-ok: #6db58b;
+  --status-warn: #c69a4e;
+  --status-error: #d0685f;
+  /* Instrument chrome. Near-invariant by decision: PRD #743 keeps the terminals */
+  /* dark in both appearances, so these surfaces were already right. The three */
+  /* nudges are all one thing -- the canvas around them is dark now, so the */
+  /* instrument block has to sit slightly BELOW the cards to stay an inset */
+  /* rather than float on top of them. */
+  --terminal: #141817;  /* never themed. The xterm surface, PRD #743 Open Question 1 */
+  --shell-deep: #14201d;
+  --shell-line-deep: #131816;
+  --shell: #1b2220;  /* nudged down from #222a27: separation from --paper-strong */
+  --shell-line: #242b29;  /* tracks --shell */
+  --shell-raised: #2a3532;  /* tracks --shell, keeping the rail's hover step */
+  --shell-thumb: #46534e;
+  --shell-edge: #4e5754;  /* down, while --dialog-edge goes up: see above */
+  --shell-faint: #82908a;
+  --shell-muted: #9da7a2;
+  --shell-ink-soft: #bac2be;
+  --shell-ink: #d8ded9;
+  --shell-ink-bright: #f4f5f3;
+  --shell-teal-surface: #1d3a30;
+  --shell-teal-edge: #3a6a5f;
+  --shell-teal: #72c3b3;
+  --shell-teal-text: #9fd8c8;
+  --shell-teal-text-strong: #d5f3ea;
+  /* Channel forms. --paper-rgb and --teal-rgb track their own token, as in */
+  /* light. --ink-rgb deliberately does NOT: every one of its nine call sites is */
+  /* a scrim or a drop shadow, and a shadow cast in the new near-white --ink */
+  /* would light the app up instead of darkening it. Black is the most a fixed */
+  /* call-site alpha can darken a dark surface by. */
+  --ink-rgb: 0 0 0;
+  --paper-rgb: 31 38 36;  /* = --paper */
+  --teal-rgb: 79 195 174;  /* = --teal */
+}
 * { box-sizing: border-box; }
 html, body, #root { min-width: 320px; min-height: 100%; margin: 0; }
 body { min-height: 100vh; overflow-x: hidden; }
