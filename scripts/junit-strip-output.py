@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
-"""Rebuild a nextest JUnit report as METADATA ONLY, for safe artifact upload.
+"""Rebuild a nextest JUnit report as METADATA ONLY, so it is safe to share.
 
-Issue #785. `.github/workflows/e2e-live.yml` is the one job in this repository
-that holds an agent credential, and its nextest run writes
-`target/nextest/default/junit.xml` from the cargo process that holds
-`ANTHROPIC_API_KEY`. nextest's JUnit defaults store stdout AND stderr for failed
-and retried tests, so if a test, an agent CLI, an HTTP error body, a panic
-diagnostic or a contributor-authored test emits the key, the raw value lands in
-that file. GitHub's secret masking covers log RENDERING; it does not cover files
-copied out by `actions/upload-artifact`, and on a public repository such an
-artifact is downloadable by any logged-in reader.
+Issue #785. A `cargo test-e2e-live` run writes `target/nextest/default/junit.xml`
+from the cargo process that holds `ANTHROPIC_API_KEY`. nextest's JUnit defaults
+store stdout AND stderr for failed and retried tests, so if a test, an agent CLI,
+an HTTP error body, a panic diagnostic or a contributor-authored test emits the
+key, the raw value lands in that file.
+
+Issue #502 took the credentialed lane out of CI entirely — no test that reaches a
+real agent runs on a runner — so the report this protects is now a LOCAL one, and
+that is a stronger reason to run this rather than a weaker one. A CI artifact at
+least sat behind a GitHub Environment; a local report sits in a working tree and
+is exactly the file a contributor attaches to an issue, pastes into a PR comment
+or hands to another agent when a live test fails. Nothing masks it there. Run
+this over any JUnit report from a credentialed run before it leaves your machine.
 
 So this does not DELETE output from the report. It REBUILDS the document from a
 per-element attribute whitelist, which is a stronger property: the result cannot
@@ -24,11 +28,11 @@ Usage:
     junit-strip-output.py <input.xml> <output.xml>
     junit-strip-output.py --self-test
 
-A MISSING INPUT IS NOT AN ERROR (exit 0, nothing written). The workflow step
-runs under `if: always()`, so it is reached on paths where the tests never ran
-and no report exists; failing there would redden a job for a non-problem. The
-upload step reads only the output path, so writing nothing means nothing is
-uploaded rather than the raw file being uploaded as a fallback.
+A MISSING INPUT IS NOT AN ERROR (exit 0, nothing written). It is routinely
+invoked on a run that never produced a report — the build failed, or the filter
+selected nothing — and failing there would report a problem that is not one.
+Writing nothing, rather than an empty document, is deliberate too: an empty
+report that looks stripped is worse than an obvious absence.
 """
 
 from __future__ import annotations
@@ -82,7 +86,7 @@ ALLOWED: dict[str, frozenset[str]] = {
 
 
 class Stats:
-    """Counts of what was dropped, so the CI log says what happened."""
+    """Counts of what was dropped, so the run says what happened."""
 
     def __init__(self) -> None:
         self.dropped_elements: dict[str, int] = {}
@@ -154,7 +158,7 @@ def strip_file(in_path: str, out_path: str) -> int:
     except FileNotFoundError:
         print(
             f"junit-strip-output: no report at {in_path} — nothing to strip, "
-            "nothing to upload."
+            "nothing to write."
         )
         return 0
 
@@ -168,8 +172,8 @@ def strip_file(in_path: str, out_path: str) -> int:
         )
         return 1
 
-    # Indent for a human reader: the artifact's whole purpose is being read
-    # after a re-run has overwritten the conclusion, and nextest's own report is
+    # Indent for a human reader: the stripped report's whole purpose is being
+    # read after the run that produced it is gone, and nextest's own report is
     # indented. `ET.indent` is stdlib since 3.9.
     ET.indent(root, space="    ")
     ET.ElementTree(root).write(out_path, encoding="utf-8", xml_declaration=True)

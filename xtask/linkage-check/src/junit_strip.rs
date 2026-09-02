@@ -1,7 +1,17 @@
-//! Issue #785: the JUnit report the credentialed `e2e-live` job uploads must be
-//! structurally incapable of carrying test output, and that property is a
-//! RUNTIME one — `scripts/junit-strip-output.py` either drops the
-//! output-bearing elements or it does not, and no compile step can tell.
+//! Issue #785: a JUnit report produced by a run that held an agent credential
+//! must be structurally incapable of carrying test output before it is shared,
+//! and that property is a RUNTIME one — `scripts/junit-strip-output.py` either
+//! drops the output-bearing elements or it does not, and no compile step can
+//! tell.
+//!
+//! **The report this protects is now a LOCAL one.** Issue #502's credentialed CI
+//! lane is gone — no test that reaches a real agent runs in CI any more — so the
+//! only machine that produces a credential-bearing JUnit report is a
+//! developer's. That makes the stripper *more* useful rather than less: a CI
+//! artifact at least sat behind an environment and GitHub's secret masking of
+//! rendered logs, while a local `target/nextest/default/junit.xml` has neither,
+//! and it is the file a contributor attaches to an issue or pastes into a PR
+//! when a live test fails. Run the stripper over it first.
 //!
 //! That is the same shape CLAUDE.md rule 5 records for
 //! `xtask/linkage-check/src/clean_tmp.rs`: a tool whose safety properties are
@@ -10,18 +20,20 @@
 //! the stripper in `cargo test-fast`, where a change that quietly reopens the
 //! sink goes red on the per-task gate.
 //!
-//! Three things are pinned:
+//! Two things are pinned:
 //!
 //! 1. the script's own `--self-test` passes (cheap, and it is what a
 //!    contributor is told to run);
 //! 2. an INDEPENDENT fixture — the exact element shapes nextest 0.9.143 emits
 //!    for a failed-and-retried test, captured from a real report — comes out
 //!    with the placeholder credential gone and the metadata intact. This half
-//!    does not trust the script's self-test;
-//! 3. `.github/workflows/e2e-live.yml` still uploads the STRIPPED path and not
-//!    the raw report, because "simplify the upload back to
-//!    `target/nextest/default/junit.xml`" is the one edit that silently undoes
-//!    all of the above.
+//!    does not trust the script's self-test.
+//!
+//! A third check used to pin the coupling to `.github/workflows/e2e-live.yml`'s
+//! upload step: that the job uploaded the STRIPPED path rather than the raw
+//! report. It went with the workflow. There is no longer any automated consumer
+//! to keep in step — invoking the stripper is now a human step, so the two tests
+//! above are what stands behind it.
 //!
 //! Tests only. The rule lives in the script; this is its gate.
 
@@ -83,9 +95,10 @@ const NEXTEST_FAILURE_REPORT: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 </testsuites>
 "#;
 
-/// The script's own `--self-test` must pass. It is what the workflow comment
-/// and `docs/develop/e2e-lanes.md` both tell a reader to run, so a self-test
-/// that has rotted is worse than none.
+/// The script's own `--self-test` must pass. Since #502 removed the
+/// credentialed workflow, the only places that tell a reader to run it are
+/// prose — `docs/develop/e2e-lanes.md` and the script's own usage block — so a
+/// self-test that has rotted is worse than none.
 #[test]
 fn junit_strip_self_test_passes() {
     if !python_present() {
@@ -169,10 +182,11 @@ fn a_real_failure_report_loses_every_output_surface() {
     }
 }
 
-/// A missing input is a no-op, not an error. The workflow step runs under
-/// `if: always()` and is reached on paths where the tests never produced a
-/// report; failing there would redden a job for a non-problem, and writing a
-/// file anyway would upload something meaningless.
+/// A missing input is a no-op, not an error. The `if: always()` workflow step
+/// this was written for went with the credentialed lane in #502, and the
+/// property outlives it: the caller is now a human pointing the stripper at a
+/// local report, and a run that never produced one should exit clean rather
+/// than error or write a meaningless file.
 #[test]
 fn a_missing_report_is_a_no_op() {
     if !python_present() {
@@ -194,33 +208,6 @@ fn a_missing_report_is_a_no_op() {
     );
     assert!(
         !output.exists(),
-        "a missing input must write nothing, so `if-no-files-found` uploads nothing"
-    );
-}
-
-/// The coupling that undoes everything above if it drifts: the credentialed job
-/// must upload the STRIPPED path, and must not name the raw report in its
-/// `upload-artifact` step.
-#[test]
-fn the_live_workflow_uploads_the_stripped_report() {
-    let workflow = repo_root().join(".github/workflows/e2e-live.yml");
-    let text = std::fs::read_to_string(&workflow)
-        .unwrap_or_else(|e| panic!("could not read {}: {e}", workflow.display()));
-
-    assert!(
-        text.contains("scripts/junit-strip-output.py"),
-        "e2e-live.yml no longer runs the JUnit stripper; the artifact it uploads can then \
-         carry ANTHROPIC_API_KEY (issue #785)"
-    );
-    assert!(
-        text.contains("path: ${{ runner.temp }}/junit-metadata.xml"),
-        "e2e-live.yml's upload step no longer points at the stripped report"
-    );
-    assert!(
-        !text.contains("path: target/nextest/default/junit.xml"),
-        "e2e-live.yml uploads the RAW nextest report again. nextest stores failed and retried \
-         tests' stdout/stderr in it, that file is written by the process holding \
-         ANTHROPIC_API_KEY, and GitHub's secret masking does not cover uploaded artifacts on a \
-         public repository (issue #785). Upload the stripped copy."
+        "a missing input must write nothing rather than an empty report that looks stripped"
     );
 }
