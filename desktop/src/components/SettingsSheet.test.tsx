@@ -2,7 +2,8 @@ import { fireEvent, render, screen, within } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import { DEFAULT_DESKTOP_SETTINGS } from "../lib/bridge";
 import type { SettingsPanelProps, SettingsSection } from "../lib/settingsContract";
-import { SETTINGS_SECTIONS, SettingsSheet } from "./SettingsSheet";
+import { SETTINGS_SECTIONS } from "../lib/settingsRegistry";
+import { SettingsSheet } from "./SettingsSheet";
 
 /**
  * The section column's two states (PRD #803 M3).

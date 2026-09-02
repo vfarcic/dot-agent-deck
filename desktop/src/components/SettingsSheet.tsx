@@ -1,6 +1,11 @@
 /**
- * The settings surface (PRD #803 M3): the sixth overlay, the section registry,
- * and the footer line that answers "where did that go?".
+ * The settings surface (PRD #803 M3): the sixth overlay and the footer line
+ * that answers "where did that go?".
+ *
+ * A pure rendering component. The section registry it renders lives in
+ * `lib/settingsRegistry.ts`, so a feature adding a section never opens this
+ * file — which is what makes the contract in `lib/settingsContract.ts` true
+ * rather than aspirational.
  *
  * A `config-sheet` rather than a screen, matching the four panels in
  * `ConfigurationPanels.tsx`. The app has no navigation model on `main` — one
@@ -21,29 +26,11 @@
  * so the column is provably real rather than asserted in a comment.
  */
 import { useState } from "react";
-import { FileCog, Palette, X } from "lucide-react";
+import { FileCog, X } from "lucide-react";
 import type { DesktopSettingsDto } from "../lib/bridge";
 import type { SettingsSection } from "../lib/settingsContract";
+import { SETTINGS_SECTIONS } from "../lib/settingsRegistry";
 import type { RuntimeMode } from "../types";
-import { AppearancePanel } from "./AppearancePanel";
-
-/**
- * The section registry. Adding a section is one row here and one component.
- *
- * It has exactly one entry, and that is the scope rather than an unfinished
- * state: #741's daemon endpoints and #802's voice backends each add their own
- * when they land. Pre-creating empty sections for them would be this container
- * growing opinions about its contents, which is the specific failure PRD #803
- * exists to prevent — a container with opinions blocks the dependents it was
- * built for.
- *
- * Below two entries the sheet drops the section column and renders the one
- * panel full width — see {@link SettingsSheet}. The registry still drives it,
- * so the column comes back on its own the moment a second row lands here.
- */
-export const SETTINGS_SECTIONS: SettingsSection[] = [
-  { id: "appearance", label: "Appearance", icon: Palette, component: AppearancePanel },
-];
 
 interface SettingsSheetProps {
   open: boolean;
@@ -56,10 +43,11 @@ interface SettingsSheetProps {
   loaded: boolean;
   mode: RuntimeMode;
   /**
-   * The registry to render. Defaults to {@link SETTINGS_SECTIONS}; the app
-   * never passes it. It exists so the two-section layout is testable while the
-   * real registry holds one row — the collapse below is otherwise a claim no
-   * test can reach until #741 or #802 lands.
+   * The registry to render. Defaults to `SETTINGS_SECTIONS` from
+   * `lib/settingsRegistry.ts`; the app never passes it. It exists so the
+   * two-section layout is testable while the real registry holds one row — the
+   * collapse below is otherwise a claim no test can reach until #741 or #802
+   * lands.
    */
   sections?: SettingsSection[];
 }

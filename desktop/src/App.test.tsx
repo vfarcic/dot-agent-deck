@@ -10,7 +10,7 @@ vi.mock("./components/TerminalViewport", () => ({
 }));
 
 import { ControlDeck } from "./App";
-import { SETTINGS_SECTIONS } from "./components/SettingsSheet";
+import { SETTINGS_SECTIONS } from "./lib/settingsRegistry";
 
 /**
  * A settings store with the shape the real bridges have: `getSettings` answers

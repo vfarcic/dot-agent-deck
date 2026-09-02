@@ -5,9 +5,12 @@
  * The whole of it, deliberately. Adding a **setting** is a field on your
  * feature's section struct in `src-tauri/src/settings.rs` plus an edit to your
  * own panel. Adding a **section** is one row in `SETTINGS_SECTIONS`
- * (`components/SettingsSheet.tsx`) and one component implementing
+ * (`lib/settingsRegistry.ts`) and one component implementing
  * {@link SettingsPanelProps}. Neither requires touching the store, the sheet,
- * or anything belonging to another feature.
+ * or anything belonging to another feature — the registry is a module of its
+ * own precisely so that claim holds: while it lived inside the sheet, every
+ * dependent had to edit a #803-owned rendering component to register, and two
+ * of them would have collided on adjacent lines of the same array.
  *
  * There is no generic key/value renderer here, and that is a decision rather
  * than an omission: #741's endpoint list and #802's model manager are not
