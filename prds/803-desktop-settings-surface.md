@@ -201,6 +201,26 @@ Two things #779 adds should be built **on** rather than duplicated once it lands
 
 ## Work Log
 
+### 2026-09-02 — The user reviewed the first panel, and two conventions came out of it
+
+`8be48be` (one setting, one row) and `6eb8200` (the prose cut). Both are container-level rules rather than appearance changes, which is why they are recorded here and not only in #743: **whatever the first panel establishes is what #741 and #802 will copy**, so the first panel is where the design language gets set. Both rules are written into `docs/develop/desktop-gui.md`'s "Adding a setting" section, which is what dependents actually read.
+
+**A setting is one row.** Appearance shipped as three full-width radio cards, each carrying a sentence of hint — **195px of a ~700px panel for one setting**, and 67% of the panel body. The user's objection was that it was tolerable as the only setting and would not scale, and they were right about the cause too: the hints were near-tautological, since *"Always light, whatever this machine is set to"* only restates *Light*. As a segmented control the same setting is **27px**. The rule that went in the docs: label left, control right; pick the control by cardinality (switch for a boolean, segmented for up to about four exclusive short-labelled options, select beyond that); per-option prose is the exception, not the default. The CSS is deliberately generic — `.settings-row` and `.segmented`, not `.appearance-*` — so a dependent inherits the control instead of re-deriving it. Accessibility was preserved rather than rebuilt: still a `fieldset`/`legend`/radio group on one `name`, verified in a real engine that ArrowRight moves focus *and* selection and that `:focus-visible` lands inside the track.
+
+**UI text earns its place by being actionable, not by being true.** The user asked why two strings existed and observed that an app needing long text to explain itself is showing a UX problem. Three deletions followed, and the panel body went **291px → 123px → 61px** across the two commits, with the sheet header 110px → 92px:
+
+- the terminals-stay-dark note, which explained an **engineering constraint** to someone who had not asked, in vocabulary they do not have — nobody outside this repo knows what truecolor SGR is — while the observable fact needed no note at all, since the terminals are visibly dark and nothing looks broken;
+- the sheet's description, whose second sentence put **this PRD's own ownership boundary** in front of a user who wanted dark mode, and whose first sentence restated the word "Settings";
+- the footer's *"readable, editable and deletable without Agent Deck running"*, where the path is actionable and the adjectives are reassurance about a design decision.
+
+Every one of those sentences was **accurate**, which is exactly why each was easy to justify keeping and why this needed to become a rule rather than stay a judgement call. The test in the docs is whether a sentence changes what the reader does next. The stated exception is an error or a consequence the user must act on: the failed-save alert — *"this appearance is applied, but saving it failed, so it will not survive a restart"* — stays untouched.
+
+Worth noting what the rule did to its own precedent. The density paragraph had cited the terminals-stay-dark note as the model of a legitimate *panel-level* note; that note was then deleted for failing the text rule, and `.settings-note` went with it. Rather than invent a replacement, the docs now say plainly that panel-level notes are a narrow exception with **no current instance**, and that anyone who believes they have the first one is adding the class back rather than reusing it. The terminal constraint itself is not lost — it lives in `docs/develop/desktop-gui.md` and in #743's Technical Approach, which is where an engineering rationale belongs.
+
+Both rounds also corrected me. A `System · Dark` resolution hint was proposed on the premise that a media-query listener already existed; it does not — `System` follows the OS **entirely in CSS**, by removing the `data-theme` attribute, so no JavaScript ever learns what the OS resolved to. Adding the hint would mean adding a listener, and it would additionally break the existing `getByRole("radio", { name: /Dark/ })` selectors by matching two radios.
+
+Left deliberately untouched: `ConfigurationPanels.tsx`'s three `local-only-notice` strings have the same disease, but they are pre-existing and belong to the projects, prompts and profiles panels rather than to settings. Raised with the user as its own change.
+
 ### 2026-09-02 — Review and audit resolved; three residuals recorded rather than fixed
 
 Reviewer verdict **ship it**, no blocking bug. Auditor found no critical or high, and recommended holding the persistence seam until its findings 1 and 2 were addressed; both are now addressed. Seven commits, `d08ee61`..`e70ac93`. Tests: **3704** Rust (from 3690) and **62** vitest across 9 files (from 60).
