@@ -21,6 +21,50 @@
 # profile's 240s. So: put every timeout carve-out under `[profile.default]`,
 # and do not add a second profile without also adding the `-P` that selects it.
 
+# Issue #818: `tests/e2e_orchestration_remit.rs`'s seven tests need BOTH a
+# concurrency cap (here) and bounds larger than the harness default (30s, in the
+# file itself). Neither alone is enough, which is the whole reason this comment
+# is long — each half looks like the wrong fix when tested without the other.
+#
+# Measured, four ways:
+#
+#   bounds  concurrency          result
+#   10s     default parallelism  2 FAIL — remit_001, remit_007
+#   30s     default parallelism  2 FAIL — same two
+#   30s     serial (`-j 1`)      7 PASS — each 2-5s
+#   10s     serial (this group)  1 FAIL — remit_001 alone, needing >10s (took 13.5s)
+#   30s     + this group         7 PASS — 18.7s total
+#
+# Read rows 2 and 4 together before touching either half. Row 2 says raising the
+# bound does not help under parallelism, which looks like "the bound is
+# irrelevant"; row 4 refutes that — serialised, with nothing competing,
+# `remit_001` still blew past 10s. So the bound is NECESSARY BUT NOT SUFFICIENT,
+# and removing either half puts lane 1 back to red.
+#
+# This is what turned `e2e-deterministic` red on EVERY branch and on `main` five
+# seconds after #789 merged, after five consecutive green runs.
+#
+# It is CONTAINMENT, not a cure. It does not explain why concurrent decks
+# interfere — both failures land on the same wait, the daemon's
+# ListAgents/live-status join never reporting the injected `Compacting` for
+# `pane 1 (agent_id 1)`, identifiers every test in the file reuses. #818 stays
+# open for the isolation bug; delete this group when that is found, not before.
+#
+# `max-threads = 1` serialises the group against ITSELF only — the rest of the
+# tier still runs at full parallelism alongside it, so the tier's wall clock is
+# unchanged (it is set by one ~260s test, not by these seven).
+#
+# The filter is a REGEX on the test-function prefix Decision 17 mandates, so a
+# new `orchestration_remit_008` joins the group automatically rather than
+# silently running unconstrained — unlike the `test(exact_name)` carve-outs
+# below, whose own comments warn that a rename makes them match nothing.
+[test-groups]
+orchestration-remit = { max-threads = 1 }
+
+[[profile.default.overrides]]
+filter = 'test(/^orchestration_remit_/)'
+test-group = "orchestration-remit"
+
 [profile.default]
 retries = 0
 slow-timeout = { period = "60s", terminate-after = 3 }
