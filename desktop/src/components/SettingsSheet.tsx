@@ -9,6 +9,16 @@
  * PR #779's landing, which introduces the first `DeckView` union; if that turns
  * the rail into real navigation, Settings becomes a view and the panel
  * components move unchanged.
+ *
+ * **The section column appears only once there are at least two sections.** A
+ * 232px list holding one entry beside ~700px of panel reads as unfinished work
+ * rather than as a deliberate scope boundary, and the alternative — a footnote
+ * naming what will land there later — would bake an opinion about the
+ * container's future contents into the container, which is the specific thing
+ * PRD #803 exists to avoid. Collapsing bakes in nothing: the registry still
+ * drives the layout, so the column returns by itself the moment #741 or #802
+ * adds a row. `SettingsSheet.test.tsx` pins both directions with stub sections,
+ * so the column is provably real rather than asserted in a comment.
  */
 import { useState } from "react";
 import { FileCog, Palette, X } from "lucide-react";
@@ -26,6 +36,10 @@ import { AppearancePanel } from "./AppearancePanel";
  * growing opinions about its contents, which is the specific failure PRD #803
  * exists to prevent — a container with opinions blocks the dependents it was
  * built for.
+ *
+ * Below two entries the sheet drops the section column and renders the one
+ * panel full width — see {@link SettingsSheet}. The registry still drives it,
+ * so the column comes back on its own the moment a second row lands here.
  */
 export const SETTINGS_SECTIONS: SettingsSection[] = [
   { id: "appearance", label: "Appearance", icon: Palette, component: AppearancePanel },
@@ -41,14 +55,24 @@ interface SettingsSheetProps {
   path?: string;
   loaded: boolean;
   mode: RuntimeMode;
+  /**
+   * The registry to render. Defaults to {@link SETTINGS_SECTIONS}; the app
+   * never passes it. It exists so the two-section layout is testable while the
+   * real registry holds one row — the collapse below is otherwise a claim no
+   * test can reach until #741 or #802 lands.
+   */
+  sections?: SettingsSection[];
 }
 
-export function SettingsSheet({ open, onClose, settings, onSave, saveError, path, loaded, mode }: SettingsSheetProps) {
-  const [activeId, setActiveId] = useState(SETTINGS_SECTIONS[0]?.id ?? "");
+export function SettingsSheet({ open, onClose, settings, onSave, saveError, path, loaded, mode, sections = SETTINGS_SECTIONS }: SettingsSheetProps) {
+  const [activeId, setActiveId] = useState(sections[0]?.id ?? "");
   if (!open) return null;
 
-  const active = SETTINGS_SECTIONS.find((section) => section.id === activeId) ?? SETTINGS_SECTIONS[0];
+  const active = sections.find((section) => section.id === activeId) ?? sections[0];
   const Panel = active?.component;
+  // One section is a full-width panel with no column to choose from; two or
+  // more is a list beside a panel. See the note at the top of this file.
+  const withColumn = sections.length > 1;
 
   return (
     <div className="sheet-backdrop" role="presentation" onMouseDown={onClose}>
@@ -69,27 +93,29 @@ export function SettingsSheet({ open, onClose, settings, onSave, saveError, path
           <button className="icon-button" aria-label="Close settings" onClick={onClose}><X size={18} /></button>
         </header>
 
-        <div className="settings-layout">
-          <aside className="settings-sections">
-            <nav aria-label="Settings sections">
-              {SETTINGS_SECTIONS.map((section) => {
-                const Icon = section.icon;
-                const selected = section.id === active?.id;
-                return (
-                  <button
-                    key={section.id}
-                    className={selected ? "is-selected" : ""}
-                    aria-current={selected ? "page" : undefined}
-                    data-testid={`settings-section-${section.id}`}
-                    onClick={() => setActiveId(section.id)}
-                  >
-                    <Icon size={15} />
-                    <span>{section.label}</span>
-                  </button>
-                );
-              })}
-            </nav>
-          </aside>
+        <div className={withColumn ? "settings-layout" : "settings-layout is-single"} data-testid="settings-layout">
+          {withColumn && (
+            <aside className="settings-sections">
+              <nav aria-label="Settings sections">
+                {sections.map((section) => {
+                  const Icon = section.icon;
+                  const selected = section.id === active?.id;
+                  return (
+                    <button
+                      key={section.id}
+                      className={selected ? "is-selected" : ""}
+                      aria-current={selected ? "page" : undefined}
+                      data-testid={`settings-section-${section.id}`}
+                      onClick={() => setActiveId(section.id)}
+                    >
+                      <Icon size={15} />
+                      <span>{section.label}</span>
+                    </button>
+                  );
+                })}
+              </nav>
+            </aside>
+          )}
 
           <div className="settings-active" data-testid={active ? `settings-panel-${active.id}` : undefined}>
             {Panel ? <Panel settings={settings} onSave={onSave} saveError={saveError} /> : <div className="configuration-empty">No settings sections are registered.</div>}

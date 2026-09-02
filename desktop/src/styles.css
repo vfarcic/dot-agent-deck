@@ -96,10 +96,18 @@
   --shell-teal-text: #9fd8c8;
   --shell-teal-text-strong: #d5f3ea;
 
-  /* Channel forms of the three tokens that are also used at partial alpha, for
-     the scrims and drop shadows. `rgb(var(--ink-rgb) / .12)` keeps the alpha at
-     the call site so one token serves every depth. */
-  --ink-rgb: 29 37 34;
+  /* Channel forms, for the colours also used at partial alpha:
+     `rgb(var(--scrim-rgb) / .12)` keeps the alpha at the call site so one token
+     serves every depth.
+
+     --paper-rgb and --teal-rgb are channel forms OF the token they are named
+     after and track it in both themes. --scrim-rgb is not one: its role is the
+     nine scrims and drop shadows, and it goes to black in dark rather than
+     following --ink. Its light value equalling --ink is a coincidence, and it is
+     why this token was renamed out of the ink family: the old name invited the
+     next person extending the palette to make it track --ink, which would light
+     the app up in dark mode instead of darkening it. */
+  --scrim-rgb: 29 37 34;
   --paper-rgb: 248 246 240;
   --teal-rgb: 15 113 103;
 
@@ -214,11 +222,11 @@
     --shell-teal-text: #9fd8c8;
     --shell-teal-text-strong: #d5f3ea;
     /* Channel forms. --paper-rgb and --teal-rgb track their own token, as in */
-    /* light. --ink-rgb deliberately does NOT: every one of its nine call sites is */
-    /* a scrim or a drop shadow, and a shadow cast in the new near-white --ink */
-    /* would light the app up instead of darkening it. Black is the most a fixed */
-    /* call-site alpha can darken a dark surface by. */
-    --ink-rgb: 0 0 0;
+    /* light. --scrim-rgb tracks nothing, which is what its name says: every */
+    /* one of its nine call sites is a scrim or a drop shadow, and a shadow cast in */
+    /* the near-white dark --ink would light the app up instead of darkening it. */
+    /* Black is the most a fixed call-site alpha can darken a dark surface by. */
+    --scrim-rgb: 0 0 0;
     --paper-rgb: 31 38 36;  /* = --paper */
     --teal-rgb: 79 195 174;  /* = --teal */
   }
@@ -318,11 +326,11 @@
   --shell-teal-text: #9fd8c8;
   --shell-teal-text-strong: #d5f3ea;
   /* Channel forms. --paper-rgb and --teal-rgb track their own token, as in */
-  /* light. --ink-rgb deliberately does NOT: every one of its nine call sites is */
-  /* a scrim or a drop shadow, and a shadow cast in the new near-white --ink */
-  /* would light the app up instead of darkening it. Black is the most a fixed */
-  /* call-site alpha can darken a dark surface by. */
-  --ink-rgb: 0 0 0;
+  /* light. --scrim-rgb tracks nothing, which is what its name says: every */
+  /* one of its nine call sites is a scrim or a drop shadow, and a shadow cast in */
+  /* the near-white dark --ink would light the app up instead of darkening it. */
+  /* Black is the most a fixed call-site alpha can darken a dark surface by. */
+  --scrim-rgb: 0 0 0;
   --paper-rgb: 31 38 36;  /* = --paper */
   --teal-rgb: 79 195 174;  /* = --teal */
 }
@@ -498,8 +506,8 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .reader-open:hover { color: var(--shell-teal-text-strong); background: var(--shell-teal-surface); }
 /* Outrank the .agent-tabs button span {display:none} tab-label rule. */
 .agent-tabs .reader-open span { display: inline; }
-.reader-overlay { position: fixed; inset: 0; z-index: 80; display: flex; justify-content: center; padding: 3vh 3vw; background: rgb(var(--ink-rgb) / .74); backdrop-filter: blur(2px); }
-.reader-panel { position: relative; width: min(1040px, 100%); display: flex; flex-direction: column; overflow: hidden; border: 1px solid var(--shell-line); border-radius: 12px; background: var(--shell-deep); box-shadow: 0 28px 70px rgb(var(--ink-rgb) / .55); }
+.reader-overlay { position: fixed; inset: 0; z-index: 80; display: flex; justify-content: center; padding: 3vh 3vw; background: rgb(var(--scrim-rgb) / .74); backdrop-filter: blur(2px); }
+.reader-panel { position: relative; width: min(1040px, 100%); display: flex; flex-direction: column; overflow: hidden; border: 1px solid var(--shell-line); border-radius: 12px; background: var(--shell-deep); box-shadow: 0 28px 70px rgb(var(--scrim-rgb) / .55); }
 .reader-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 10px 14px; border-bottom: 1px solid var(--shell-line); background: var(--shell-deep); }
 .reader-title { display: flex; align-items: center; gap: 9px; color: var(--shell-ink); }
 .reader-title strong { margin-right: 8px; font-size: 13px; }
@@ -508,7 +516,7 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .reader-tail.is-live { color: var(--shell-teal); background: var(--shell-teal-surface); }
 .reader-scroll { flex: 1 1 auto; min-height: 0; overflow: auto; overscroll-behavior: contain; padding: 18px 26px 22px; scrollbar-color: var(--shell-thumb) var(--shell-deep); scrollbar-width: thin; }
 .reader-text { margin: 0; white-space: pre-wrap; word-break: break-word; color: var(--shell-ink); font-family: "JetBrains Mono", "SFMono-Regular", Consolas, monospace; font-size: 13.5px; line-height: 1.7; user-select: text; }
-.reader-jump { position: absolute; bottom: 148px; left: 50%; transform: translateX(-50%); display: flex; align-items: center; gap: 6px; padding: 6px 14px; border: 1px solid var(--shell-teal-edge); border-radius: 16px; color: var(--shell-teal-text-strong); background: var(--shell); cursor: pointer; font-size: 10.5px; box-shadow: 0 6px 18px rgb(var(--ink-rgb) / .4); }
+.reader-jump { position: absolute; bottom: 148px; left: 50%; transform: translateX(-50%); display: flex; align-items: center; gap: 6px; padding: 6px 14px; border: 1px solid var(--shell-teal-edge); border-radius: 16px; color: var(--shell-teal-text-strong); background: var(--shell); cursor: pointer; font-size: 10.5px; box-shadow: 0 6px 18px rgb(var(--scrim-rgb) / .4); }
 .reader-jump:hover { background: var(--shell-teal-surface); }
 .reader-panel .agent-composer { border-top: 1px solid var(--shell-line); }
 .terminal-host .xterm { height: 100%; }
@@ -589,8 +597,8 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .empty-deck p { max-width: 390px; margin: 0; font-size: 10px; line-height: 1.5; }
 .empty-deck > div { margin-top: 15px; display: flex; gap: 7px; }
 
-.sheet-backdrop, .dialog-backdrop { position: fixed; z-index: 80; inset: 0; display: flex; justify-content: flex-end; background: rgb(var(--ink-rgb) / .42); }
-.config-sheet { width: min(780px, calc(100vw - 74px)); height: 100%; display: flex; flex-direction: column; border-left: 1px solid var(--line-strong); background: var(--paper); box-shadow: -12px 0 32px rgb(var(--ink-rgb) / .12); }
+.sheet-backdrop, .dialog-backdrop { position: fixed; z-index: 80; inset: 0; display: flex; justify-content: flex-end; background: rgb(var(--scrim-rgb) / .42); }
+.config-sheet { width: min(780px, calc(100vw - 74px)); height: 100%; display: flex; flex-direction: column; border-left: 1px solid var(--line-strong); background: var(--paper); box-shadow: -12px 0 32px rgb(var(--scrim-rgb) / .12); }
 .workflow-sheet { width: min(610px, calc(100vw - 74px)); }
 .projects-sheet { width: min(850px, calc(100vw - 74px)); }
 .sheet-header { min-height: 92px; padding: 18px 20px; display: flex; align-items: flex-start; justify-content: space-between; border-bottom: 1px solid var(--line); }
@@ -674,6 +682,8 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
    same shape as .projects-layout so the surface is one a user of this app
    already recognises. */
 .settings-sheet .settings-layout { min-height: 0; flex: 1; display: grid; grid-template-columns: 232px minmax(0, 1fr); }
+/* One section: no column to choose from, so the panel takes the whole sheet. */
+.settings-sheet .settings-layout.is-single { grid-template-columns: minmax(0, 1fr); }
 .settings-sections { min-height: 0; padding: 11px; display: flex; flex-direction: column; border-right: 1px solid var(--line); background: var(--paper-sunken); }
 .settings-sections nav { min-height: 0; display: grid; align-content: start; gap: 5px; overflow: auto; }
 .settings-sections nav > button { width: 100%; min-height: 38px; padding: 8px 10px; display: grid; grid-template-columns: 18px minmax(0, 1fr); align-items: center; gap: 9px; border: 1px solid transparent; border-radius: 4px; color: var(--muted); background: transparent; cursor: pointer; font-size: 11px; text-align: left; }
@@ -734,7 +744,7 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .project-footer > div { flex-wrap: wrap; justify-content: flex-end; }
 
 .dialog-backdrop { z-index: 100; align-items: flex-start; justify-content: center; padding: 11vh 18px 20px; }
-.command-palette { width: min(550px, 100%); overflow: hidden; border: 1px solid var(--dialog-edge); border-radius: 7px; background: var(--paper-strong); box-shadow: 0 18px 50px rgb(var(--ink-rgb) / .24); }
+.command-palette { width: min(550px, 100%); overflow: hidden; border: 1px solid var(--dialog-edge); border-radius: 7px; background: var(--paper-strong); box-shadow: 0 18px 50px rgb(var(--scrim-rgb) / .24); }
 .command-palette > label { height: 51px; padding: 0 13px; display: flex; align-items: center; gap: 8px; border-bottom: 1px solid var(--line); }
 .command-palette input { min-width: 0; flex: 1; border: 0; outline: 0; background: transparent; font-size: 12px; }
 .command-palette kbd { padding: 3px 5px; border: 1px solid var(--line); border-radius: 3px; color: var(--muted); background: var(--paper-sunken); font-size: 8px; }
@@ -747,7 +757,7 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .command-palette > div > p { padding: 18px; color: var(--muted); text-align: center; font-size: 10px; }
 .command-palette > footer { height: 29px; padding: 0 10px; display: flex; align-items: center; justify-content: space-between; border-top: 1px solid var(--line); color: var(--faint); font-size: 7px; }
 .command-palette > footer span { display: flex; align-items: center; gap: 4px; }
-.shortcut-dialog, .confirm-dialog { width: min(380px, 100%); padding: 15px; border: 1px solid var(--line-strong); border-radius: 7px; background: var(--paper-strong); box-shadow: 0 18px 50px rgb(var(--ink-rgb) / .22); }
+.shortcut-dialog, .confirm-dialog { width: min(380px, 100%); padding: 15px; border: 1px solid var(--line-strong); border-radius: 7px; background: var(--paper-strong); box-shadow: 0 18px 50px rgb(var(--scrim-rgb) / .22); }
 .shortcut-dialog header { padding-bottom: 12px; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid var(--line); }
 .shortcut-dialog header > div { display: flex; align-items: center; gap: 7px; }
 .shortcut-dialog h2 { margin: 0; font-size: 14px; }
@@ -758,7 +768,7 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .confirm-dialog h2 { margin: 0; font-size: 15px; }
 .confirm-dialog p { margin: 7px auto 16px; max-width: 320px; color: var(--muted); font-size: 9.5px; line-height: 1.5; }
 .confirm-dialog > div:last-child { display: flex; justify-content: center; gap: 7px; }
-.toast { max-width: min(470px, calc(100vw - 30px)); min-height: 42px; padding: 8px 9px; position: fixed; z-index: 120; right: 18px; bottom: 16px; display: grid; grid-template-columns: 18px minmax(0, 1fr) 24px; align-items: center; gap: 5px; border: 1px solid var(--amber-rim); border-radius: 5px; color: var(--amber-ink); background: var(--amber-bright); box-shadow: 0 8px 22px rgb(var(--ink-rgb) / .13); font-size: 9px; }
+.toast { max-width: min(470px, calc(100vw - 30px)); min-height: 42px; padding: 8px 9px; position: fixed; z-index: 120; right: 18px; bottom: 16px; display: grid; grid-template-columns: 18px minmax(0, 1fr) 24px; align-items: center; gap: 5px; border: 1px solid var(--amber-rim); border-radius: 5px; color: var(--amber-ink); background: var(--amber-bright); box-shadow: 0 8px 22px rgb(var(--scrim-rgb) / .13); font-size: 9px; }
 .toast button { width: 22px; height: 22px; display: grid; place-items: center; border: 0; background: transparent; cursor: pointer; }
 
 @media (min-width: 1450px) {
@@ -769,7 +779,7 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 
 @media (max-width: 1260px) {
   .control-deck.with-evidence .deck-main { margin-right: 0; }
-  .evidence-drawer { z-index: 55; box-shadow: -10px 0 28px rgb(var(--ink-rgb) / .14); }
+  .evidence-drawer { z-index: 55; box-shadow: -10px 0 28px rgb(var(--scrim-rgb) / .14); }
   .run-instruments .instrument:nth-child(3), .run-instruments .instrument:nth-child(5) { display: none; }
   .topbar { grid-template-columns: minmax(180px, 1fr) auto minmax(230px, auto); }
 }

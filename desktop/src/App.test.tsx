@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createFixtureSnapshot } from "./data/fixture";
 import { WINDOWS_WORKFLOW_BLOCK_REASON } from "./lib/platform";
@@ -359,18 +359,19 @@ describe("ControlDeck", () => {
     unmount();
   });
 
-  it("renders the section registry and shows the active section's panel", () => {
+  it("renders the registry's active section, with no column while there is only one", () => {
     render(<ControlDeck runtime={runtime()} />);
     fireEvent.click(screen.getByTestId("open-settings"));
 
-    // Every registered section gets a nav entry, and the first is active.
-    const nav = screen.getByRole("navigation", { name: "Settings sections" });
-    const entries = within(nav).getAllByRole("button");
-    expect(entries).toHaveLength(SETTINGS_SECTIONS.length);
-    entries.forEach((entry, index) => expect(entry).toHaveTextContent(SETTINGS_SECTIONS[index].label));
-    expect(screen.getByTestId(`settings-section-${SETTINGS_SECTIONS[0].id}`)).toHaveAttribute("aria-current", "page");
+    // The registry drives what is rendered, and today it holds one row, so the
+    // section column is dropped and the panel takes the whole sheet. The
+    // column's own two states are pinned with stub sections in
+    // `components/SettingsSheet.test.tsx`; what matters here is that the real
+    // registry reaches the real sheet.
+    expect(SETTINGS_SECTIONS).toHaveLength(1);
+    expect(screen.getByTestId("settings-layout")).toHaveClass("is-single");
+    expect(screen.queryByRole("navigation", { name: "Settings sections" })).not.toBeInTheDocument();
 
-    // And its panel is the one rendered.
     expect(screen.getByTestId(`settings-panel-${SETTINGS_SECTIONS[0].id}`)).toBeVisible();
     expect(screen.getByRole("group", { name: "Appearance" })).toBeVisible();
   });

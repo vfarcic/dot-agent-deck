@@ -19,7 +19,7 @@
 //! - hex literals — `#rgb`, `#rgba`, `#rrggbb`, `#rrggbbaa`;
 //! - the colour functions `rgb() rgba() hsl() hsla() hwb() lab() lch() oklab()
 //!   oklch() color()`, **unless** the arguments name a token, so the
-//!   `rgb(var(--ink-rgb) / .42)` form the scrims and shadows use is fine;
+//!   `rgb(var(--scrim-rgb) / .42)` form the scrims and shadows use is fine;
 //! - the bare keywords `white` and `black`.
 //!
 //! The functional forms are included deliberately. The brief allowed leaving
@@ -595,7 +595,7 @@ fn report(findings: &[Finding]) -> String {
          \x20  desktop/src/styles.css -- reuse the token that names this role, or add one\n\
          \x20  there (family plus depth, e.g. `--teal-deep`) and reference it as\n\
          \x20  `var(--teal-deep)`. For a colour needed at partial alpha, use the channel\n\
-         \x20  form: `rgb(var(--ink-rgb) / .42)`.\n\
+         \x20  form: `rgb(var(--scrim-rgb) / .42)`.\n\
          \n\
          2. If the colour genuinely must not follow the theme, put\n\
          \x20  `theme-invariant: <why>` in a comment on that line. Give a real reason --\n\
@@ -747,7 +747,7 @@ mod tests {
         dir
     }
 
-    const PALETTE: &str = ":root {\n  --teal: #0f7167;\n  --ink-rgb: 29 37 34;\n}\n";
+    const PALETTE: &str = ":root {\n  --teal: #0f7167;\n  --scrim-rgb: 29 37 34;\n}\n";
 
     #[test]
     fn a_tokenised_tree_passes() {
@@ -755,7 +755,7 @@ mod tests {
             "styles.css",
             &format!(
                 "{PALETTE}\
-                 .a {{ color: var(--teal); background: rgb(var(--ink-rgb) / .42); }}\n\
+                 .a {{ color: var(--teal); background: rgb(var(--scrim-rgb) / .42); }}\n\
                  .b {{ border: 1px solid transparent; white-space: nowrap; }}\n"
             ),
         )]);
@@ -884,7 +884,7 @@ mod tests {
             &format!(
                 "{PALETTE}\
                  .a {{ background: rgba(24, 30, 28, .42); }}\n\
-                 .b {{ background: rgb(var(--ink-rgb) / .42); }}\n\
+                 .b {{ background: rgb(var(--scrim-rgb) / .42); }}\n\
                  .c {{ color: hsl(160 40% 30%); }}\n\
                  .d {{ box-shadow: 0 1px 2px rgb(0 0 0 / .2); }}\n"
             ),
