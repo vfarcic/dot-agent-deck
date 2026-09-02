@@ -532,9 +532,12 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .overview-body { padding: 14px 16px 20px; }
 .daemon-group { border: 1px solid var(--line-strong); border-radius: var(--radius); background: var(--paper); }
 .daemon-group-header { min-height: 50px; padding: 9px 13px; display: flex; align-items: center; gap: 11px; border-bottom: 1px solid var(--line); background: var(--paper-strong); border-radius: var(--radius) var(--radius) 0 0; }
+/* One line, not two: the socket filename that used to sit under the name is
+   gone from the layout and lives on the name's own `title` — it contained the
+   very uid it was meant to keep out of a screenshot and said nothing a reader
+   could act on (PRD #745). */
 .daemon-identity { min-width: 0; display: flex; flex-direction: column; gap: 3px; }
 .daemon-identity strong { font-size: 12px; font-weight: 720; }
-.daemon-identity code { overflow: hidden; color: var(--muted); font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
 .daemon-state { min-width: 0; margin: 0; overflow: hidden; color: var(--faint); font-size: 9.5px; text-overflow: ellipsis; white-space: nowrap; }
 .daemon-pips { margin-left: auto; display: flex; flex-wrap: wrap; gap: 5px; }
 .daemon-group-body { padding: 11px 12px 13px; }
@@ -674,3 +677,8 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .overview-columns-menu label:hover { background: var(--paper-strong); }
 .overview-columns-menu label.is-permanent { color: var(--muted); cursor: default; }
 .overview-columns-menu em { margin-left: auto; color: var(--faint); font-size: 8px; font-style: normal; letter-spacing: .06em; text-transform: uppercase; }
+/* Not a `.button`: the picker lives inside `.top-actions`, whose narrow-window
+   rule hides a `.button`'s label, and a reset whose word disappears is a
+   mystery icon in a menu of words. */
+.overview-columns-reset { margin-top: 6px; padding: 4px 5px; display: flex; align-items: center; gap: 5px; border: 0; border-top: 1px solid var(--line); border-radius: 0 0 3px 3px; background: none; color: var(--muted); font-size: 9.5px; cursor: pointer; }
+.overview-columns-reset:hover { color: var(--ink); background: var(--paper-strong); }

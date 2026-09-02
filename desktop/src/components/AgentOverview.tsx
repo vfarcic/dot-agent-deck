@@ -1,9 +1,9 @@
-import { useEffect, useMemo, useState, type CSSProperties, type ReactNode } from "react";
-import { Blocks, Boxes, Columns3, LayoutList, Layers, Network, RefreshCw, ShieldAlert, Sparkles, SquareTerminal, Wrench } from "lucide-react";
+import { useEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from "react";
+import { Blocks, Boxes, Columns3, LayoutList, Layers, Network, RefreshCw, RotateCcw, ShieldAlert, Sparkles, SquareTerminal, Wrench } from "lucide-react";
 import type { AgentSession, AgentStatus, ConnectionView, DeckRuntimeState, DeckView } from "../types";
 import { modeScopedKey } from "../lib/bridge";
 import { ConfirmDialog, type ConfirmState } from "./ConfirmDialog";
-import { DISPLAY_LIMITS, displayActivity, displayIdentity, displayPath, displayText, displayTitle, displayUptime, domIdentity, rendersBlank, shortDaemonLabel } from "../lib/displayText";
+import { DISPLAY_LIMITS, displayActivity, displayIdentity, displayPath, displayText, displayTitle, displayUptime, domIdentity, rendersBlank } from "../lib/displayText";
 
 /**
  * The honest subset of `AgentSession`: every field a daemon genuinely reports
@@ -632,6 +632,23 @@ export function AgentOverview({ runtime, onNavigate }: { runtime: DeckRuntimeSta
   const socketPath = connection.socketPath;
   const daemonMessage = connection.message ? displayText(connection.message, DISPLAY_LIMITS.message) : undefined;
   /**
+   * Whether the connection message says anything the lamp beside it does not
+   * (PRD #745). A healthy connection's message is literally `Daemon
+   * responding`, which is the lamp restated in words — two renderings of one
+   * bit, and the screen narrating its own state.
+   *
+   * The test is the flag rather than the wording, because the wording is not
+   * the point and a string match would rot. There are exactly two ways to be
+   * `connected`: the ordinary one, where the desktop crate reported no message
+   * at all and the webview synthesised the restatement, and the one where a
+   * build-stamp mismatch was bypassed — which is the case whose caveat issue
+   * #801 requires to stay on screen for the whole session. `buildStampMismatchOnly`
+   * is the same flag Connect anyway is gated on, and the crate sets it on
+   * exactly the branch that puts a message in `error`. So a naive "hide when
+   * connected" is what this deliberately is not.
+   */
+  const messageSaysSomethingNew = !connected || connection.buildStampMismatchOnly === true;
+  /**
    * Issue #801. Since the crate stopped refusing a daemon that names the same
    * release, the ordinary case is two builds from different commits connecting
    * with nothing on screen — which is the point, but it also means the
@@ -639,10 +656,32 @@ export function AgentOverview({ runtime, onNavigate }: { runtime: DeckRuntimeSta
    * available on hover, absent from the layout, and deliberately NOT an alert.
    * A real compatibility break still gets the banner and Connect anyway.
    */
-  const buildStampsTitle = connection.clientBuildVersion && connection.daemonBuildVersion
+  const buildStampsCaveat = connection.clientBuildVersion && connection.daemonBuildVersion
     && connection.clientBuildVersion !== connection.daemonBuildVersion
-    ? displayTitle(`Built from different commits — desktop ${connection.clientBuildVersion}, daemon ${connection.daemonBuildVersion}.`)
+    ? `Built from different commits — desktop ${connection.clientBuildVersion}, daemon ${connection.daemonBuildVersion}.`
     : undefined;
+  /**
+   * Everything hover can say about WHICH daemon this is: its socket path, and
+   * the two build stamps when they differ.
+   *
+   * The socket path used to be on screen, shortened to its last segment — a
+   * label whose stated purpose was keeping a uid or a username out of
+   * screenshots, and which on the default socket reads
+   * `dot-agent-deck-attach-501.sock`, so it leaked the very uid it was meant to
+   * hide and told the reader nothing actionable either way. The path is
+   * genuinely diagnostic, so it stays here, where it costs no layout;
+   * `data-daemon-id` on the section still carries the identity for tests and a
+   * future drill-in.
+   *
+   * The stamps hover moved here with it, and had to: it used to hang off the
+   * connection message, which for a healthy connection no longer renders. On
+   * the daemon's own name it is more discoverable than it was — a reader hovers
+   * a thing they can see.
+   */
+  const daemonFacts = [socketPath, buildStampsCaveat].filter((fact): fact is string => Boolean(fact));
+  // Joined rather than stacked: a sanitised `title` cannot carry a newline —
+  // `displayText` strips category `Cc`, and `\n` is in it.
+  const daemonIdentityTitle = daemonFacts.length ? displayTitle(daemonFacts.join(" · ")) : undefined;
   const [confirm, setConfirm] = useState<ConfirmState>();
   const [overrideError, setOverrideError] = useState<string>();
   /**
@@ -723,20 +762,21 @@ export function AgentOverview({ runtime, onNavigate }: { runtime: DeckRuntimeSta
             <header className="daemon-group-header">
               <span className={`connection-lamp connection-${connection.status}`} aria-hidden="true" />
               <div className="daemon-identity">
-                <strong id="daemon-group-title">Local daemon</strong>
                 {/*
-                  A socket path routinely embeds a uid or a username, so the
-                  header carries a short label and keeps the full path on hover.
-                  `data-daemon-id` above carries the identity, sanitised and
-                  bounded: it is a marker for tests and a future drill-in, not a
-                  key, so nothing depends on it being byte-for-byte raw — and
-                  `daemonId` has no length limit below the protocol frame.
+                  The socket filename is gone from the layout and lives on
+                  hover — see `daemonIdentityTitle`, which is also where the
+                  build stamps disclose themselves.
                 */}
-                <code title={socketPath ? displayTitle(socketPath) : undefined}>
-                  {socketPath ? shortDaemonLabel(socketPath) : "socket path not reported"}
-                </code>
+                <strong id="daemon-group-title" title={daemonIdentityTitle} data-testid="daemon-identity">Local daemon</strong>
               </div>
-              <p className="daemon-state" data-testid="daemon-state" title={buildStampsTitle}>{daemonMessage ?? connection.status}</p>
+              {/*
+                Only when it says something the lamp does not. The element is
+                not deleted — in the disconnected, incompatible and
+                connected-anyway states it carries the only explanation on the
+                header, including the build-mismatch caveat issue #801 requires
+                to survive the whole session.
+              */}
+              {messageSaysSomethingNew && <p className="daemon-state" data-testid="daemon-state">{daemonMessage ?? connection.status}</p>}
               {connected && agents.length > 0 && (
                 <div className="daemon-pips">{counts.map((entry) => (
                   <span className={`status-label status-${entry.status}`} key={entry.status}>{entry.count} {entry.status}</span>
@@ -880,6 +920,7 @@ function DaemonBody({ agents, groups, now, columns, connection, message, overrid
  */
 function OverviewColumnPicker({ columns, onChange }: { columns: OverviewColumnId[]; onChange: (columns: OverviewColumnId[]) => void }) {
   const [open, setOpen] = useState(false);
+  const root = useRef<HTMLDivElement>(null);
   const chosen = new Set(columns);
   const toggle = (column: OverviewColumnId) => {
     const next = new Set(chosen);
@@ -887,9 +928,37 @@ function OverviewColumnPicker({ columns, onChange }: { columns: OverviewColumnId
     else next.add(column);
     onChange(orderedColumns(next));
   };
+  /*
+    Dismiss on a click anywhere else (PRD #745). Three details are the whole
+    thing:
+
+    `pointerdown`, not `click`. A click fires after focus has already moved, so
+    a menu that closes on it closes AFTER whatever was clicked has taken focus
+    — the ordering a user reads as the menu lagging behind them. Pointer-down is
+    the moment the intent is expressed.
+
+    Anything inside the picker's root is ignored, and the TRIGGER lives inside
+    that root. That is what stops the close-then-reopen: were the trigger
+    outside, its pointer-down would close the menu and its click would toggle it
+    straight back open, so the button would appear not to work at all.
+
+    The listener is bound only while the menu is open and removed when it
+    closes, not merely on unmount — `open` is in the dependency list, so React
+    runs the cleanup on the same transition that hides the menu.
+  */
+  useEffect(() => {
+    if (!open) return;
+    const dismiss = (event: Event) => {
+      if (event.target instanceof Node && root.current?.contains(event.target)) return;
+      setOpen(false);
+    };
+    document.addEventListener("pointerdown", dismiss);
+    return () => document.removeEventListener("pointerdown", dismiss);
+  }, [open]);
   return (
     <div
       className="overview-columns-picker"
+      ref={root}
       onKeyDown={(event) => {
         if (event.key !== "Escape") return;
         setOpen(false);
@@ -925,6 +994,21 @@ function OverviewColumnPicker({ columns, onChange }: { columns: OverviewColumnId
               </label>
             );
           })}
+          {/*
+            The way back (PRD #745). Without it, the only route out of a set
+            somebody unticked their way into is remembering which four the
+            screen opened on. It persists through exactly the path every other
+            change does — `onChange` up to the screen, whose effect writes the
+            selection — so there is no second way for a choice to be saved.
+          */}
+          <button
+            type="button"
+            className="overview-columns-reset"
+            data-testid="overview-columns-reset"
+            onClick={() => onChange(orderedColumns(DEFAULT_OVERVIEW_COLUMNS))}
+          >
+            <RotateCcw size={12} /><span>Restore defaults</span>
+          </button>
         </div>
       )}
     </div>
@@ -1122,7 +1206,16 @@ function OverviewRow({ agent, hoistedCwd, now, columns }: { agent: OverviewAgent
         */
         return <td className="overview-uptime" role="cell" key={column} title={uptime && `Spawned by the daemon at: ${uptime.title}`}>{uptime?.label ?? ""}</td>;
       case "cli":
-        return <td className="overview-cli" role="cell" key={column} title={displayText(`Agent type reported by the daemon: ${agent.cli}`, DISPLAY_LIMITS.title)}>{displayText(agent.cli, DISPLAY_LIMITS.name)}</td>;
+        /*
+          The BINARY this agent runs, resolved from the agent registry rather
+          than from the wire identity (PRD #745). It used to print the
+          serialised enum, so Claude Code read `claude_code` and OpenCode read
+          `open_code` — neither of them a name anybody would type — while
+          `codex` happened to be right. The hover is the full value and nothing
+          else: the column header already says what it is, and a sentence
+          restating it would be the screen describing itself.
+        */
+        return <td className="overview-cli" role="cell" key={column} title={displayTitle(agent.cli)}>{displayText(agent.cli, DISPLAY_LIMITS.name)}</td>;
       case "activeTool":
         return (
           <td className="overview-tool" role="cell" key={column}>

@@ -6,6 +6,7 @@ use dot_agent_deck::agent_pty::{
     AgentRecord, TabMembership, clamp_pty_dims, is_valid_cwd, is_valid_display_name,
     is_valid_orchestration_cwd, is_valid_pane_id_env,
 };
+use dot_agent_deck::agent_registry;
 use dot_agent_deck::daemon_protocol::PROTOCOL_VERSION;
 use dot_agent_deck::event::{AgentType, SendResult, Writable};
 use dot_agent_deck::state::SessionStatus;
@@ -78,6 +79,24 @@ pub struct DesktopAgent {
     pub rows: u16,
     pub cols: u16,
     pub agent_type: String,
+    /// The BINARY the registry says this agent type runs — `claude`,
+    /// `opencode`, `pi`, `codex`, `devin` — read straight off
+    /// `AgentSpec::default_command` rather than restated here.
+    ///
+    /// `agent_type` above is the wire IDENTITY and stays snake_case for the
+    /// consumers that key on it; it is not a name anybody types. Rendering it
+    /// showed Claude Code as `claude_code` and OpenCode as `open_code`, with
+    /// `codex` right only by coincidence. Deriving the answer from the registry
+    /// is what stops a second copy of it drifting: adding an agent there gives
+    /// this field its value with nothing to update here.
+    ///
+    /// Absent — never a placeholder, and never invented — for
+    /// [`AgentType::None`] and for a record that reported no type at all.
+    /// `None` is also `#[serde(other)]`, so a FUTURE agent type from a newer
+    /// daemon lands there; this build genuinely does not know what binary that
+    /// is, and says nothing rather than guessing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cli_name: Option<&'static str>,
     pub status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub active_tool: Option<DesktopActiveTool>,
@@ -376,12 +395,19 @@ fn write_lease_name(writable: &Writable) -> &'static str {
 
 pub(crate) fn map_agent(record: AgentRecord) -> DesktopAgent {
     let live = record.live.as_ref();
-    let agent_type = live
+    // Resolved ONCE, so the wire identity and the binary name can never
+    // disagree about which agent this is.
+    let reported_type = live
         .and_then(|snapshot| snapshot.agent_type.as_ref())
-        .or(record.agent_type.as_ref())
+        .or(record.agent_type.as_ref());
+    let agent_type = reported_type
         .map(agent_type_name)
         .unwrap_or("none")
         .to_string();
+    // Off the registry, which is where the deck already keeps the command that
+    // launches each agent — see `cli_name`.
+    let cli_name =
+        reported_type.and_then(|agent_type| agent_registry::spec(agent_type).default_command);
     let status = live
         .map(|snapshot| session_status_name(&snapshot.status))
         .unwrap_or("running")
@@ -412,6 +438,7 @@ pub(crate) fn map_agent(record: AgentRecord) -> DesktopAgent {
         rows: record.rows,
         cols: record.cols,
         agent_type,
+        cli_name,
         status,
         active_tool,
         tool_count,
@@ -665,9 +692,61 @@ mod tests {
         assert_eq!(value["id"], "agent-7");
         assert_eq!(value["paneId"], "pane-7");
         assert_eq!(value["agentType"], "codex");
+        assert_eq!(value["cliName"], "codex");
         assert_eq!(value["status"], "working");
         assert_eq!(value["activeTool"]["name"], "shell");
         assert_eq!(value["tab"]["kind"], "mode");
+    }
+
+    /// PRD #745: the CLI column shows a binary somebody could type, and EVERY
+    /// variant is checked here rather than only the one the fixture happens to
+    /// carry — the enum names had Claude Code reading `claude_code` and
+    /// OpenCode reading `open_code`, with `codex` right only by coincidence.
+    #[test]
+    fn every_agent_type_reports_the_binary_it_runs() {
+        let cli_of = |agent_type: Option<AgentType>| {
+            let mut record = fixture_record();
+            record.agent_type = agent_type;
+            record.live = None;
+            map_agent(record).cli_name
+        };
+        assert_eq!(cli_of(Some(AgentType::ClaudeCode)), Some("claude"));
+        assert_eq!(cli_of(Some(AgentType::OpenCode)), Some("opencode"));
+        assert_eq!(cli_of(Some(AgentType::Pi)), Some("pi"));
+        assert_eq!(cli_of(Some(AgentType::Codex)), Some("codex"));
+        assert_eq!(cli_of(Some(AgentType::Devin)), Some("devin"));
+        // `None` is both "no recognized agent" and the `#[serde(other)]`
+        // landing spot for a type this build has never heard of. Neither has a
+        // binary this build can name, so it reports nothing rather than a word.
+        assert_eq!(cli_of(Some(AgentType::None)), None);
+        assert_eq!(cli_of(None), None);
+    }
+
+    /// The live snapshot's type wins over the record's for the binary name
+    /// exactly as it does for the wire identity — one resolution, so the two
+    /// fields cannot end up naming different agents.
+    #[test]
+    fn the_live_agent_type_decides_the_binary_too() {
+        let mut record = fixture_record();
+        record.agent_type = Some(AgentType::Codex);
+        if let Some(live) = record.live.as_mut() {
+            live.agent_type = Some(AgentType::ClaudeCode);
+        }
+        let mapped = map_agent(record);
+        assert_eq!(mapped.agent_type, "claude_code");
+        assert_eq!(mapped.cli_name, Some("claude"));
+    }
+
+    /// Absence stays OFF the wire, so the webview reads absence rather than an
+    /// empty string it would have to special-case.
+    #[test]
+    fn an_unnameable_cli_is_absent_from_the_serialized_shape() {
+        let mut record = fixture_record();
+        record.agent_type = Some(AgentType::None);
+        record.live = None;
+        let value = serde_json::to_value(map_agent(record)).unwrap();
+        assert_eq!(value["agentType"], "none");
+        assert!(value.get("cliName").is_none());
     }
 
     #[test]

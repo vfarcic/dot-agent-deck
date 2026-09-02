@@ -255,7 +255,7 @@ describe("AgentOverview", () => {
     const coder = screen.getByTestId(`overview-agent-${agentKey({ daemonId: FIXTURE_DAEMON_ID, id: "2" })}`);
     expect(coder).toHaveTextContent("coder");
     expect(coder).toHaveTextContent("running");
-    expect(coder).toHaveTextContent("claude_code");
+    expect(coder).toHaveTextContent("claude");
     expect(coder).toHaveTextContent("edit");
     expect(coder).toHaveTextContent("desktop/src/components/AgentOverview.tsx");
     expect(coder).toHaveTextContent("132");
@@ -263,6 +263,28 @@ describe("AgentOverview", () => {
     // An agent with no active tool says so rather than borrowing a placeholder.
     const docs = screen.getByTestId(`overview-agent-${agentKey({ daemonId: FIXTURE_DAEMON_ID, id: "5" })}`);
     expect(docs).toHaveTextContent("no active tool");
+  });
+
+  /**
+   * Scenario: read the CLI column down the whole fleet. Every cell names a
+   * BINARY somebody could type. It used to render the serialised agent-type
+   * enum, so Claude Code read `claude_code` and OpenCode read `open_code`,
+   * with `codex` right only by coincidence — the name now comes from the agent
+   * registry, which is where the deck already keeps each agent's command
+   * (PRD #745).
+   */
+  it("names the binary each agent runs, never the enum the wire keys it by", () => {
+    const { container } = renderOverview();
+
+    const cells = Array.from(container.querySelectorAll(".overview-cli")).map((cell) => cell.textContent);
+    expect(new Set(cells)).toEqual(new Set(["claude", "opencode", "codex", "pi"]));
+    for (const cell of cells) expect(cell).not.toContain("_");
+
+    // The hover is the full value and nothing else: the column header already
+    // says what it is, and a sentence restating that is the screen describing
+    // itself.
+    const coder = screen.getByTestId(`overview-agent-${agentKey({ daemonId: FIXTURE_DAEMON_ID, id: "2" })}`);
+    expect(coder.querySelector(".overview-cli")).toHaveAttribute("title", "claude");
   });
 
   it("states the working directory most of a group shares and prints only the rows that differ", () => {
@@ -296,15 +318,29 @@ describe("AgentOverview", () => {
     expect(document.body.textContent ?? "").not.toContain("/home/dev");
   });
 
-  it("labels the daemon group without printing its socket path, and keeps the raw path as the key", () => {
+  /**
+   * Scenario: look at the daemon card's header. It names the daemon and shows
+   * no socket filename at all — the shortened label that used to sit there read
+   * `dot-agent-deck-attach-501.sock` on a default socket, so it carried the very
+   * uid it existed to keep out of a screenshot and told the reader nothing they
+   * could act on. The full path is one hover away, and the raw path is still the
+   * identity key (PRD #745).
+   */
+  it("shows no socket filename in the daemon header and keeps the full path on hover", () => {
     const { container } = renderOverview();
 
-    const label = screen.getByTestId("daemon-group").querySelector(".daemon-identity code");
-    expect(label).toHaveTextContent("dot-agent-deck.sock");
-    expect(label).toHaveAttribute("title", FIXTURE_DAEMON_ID);
-    // The identity key is still the raw socket path — the label is display only.
-    expect(screen.getByTestId("daemon-group")).toHaveAttribute("data-daemon-id", FIXTURE_DAEMON_ID);
+    const header = screen.getByTestId("daemon-group");
+    expect(header).toHaveTextContent("Local daemon");
+    // Not shortened, not abbreviated — absent. No segment of the socket path is
+    // on screen, and neither is the uid the old label leaked.
+    expect(container.textContent ?? "").not.toContain(".sock");
     expect(container.textContent ?? "").not.toContain("/tmp/");
+    expect(header.querySelector(".daemon-identity code")).toBeNull();
+
+    // Diagnostic rather than decorative, so hover keeps it in full.
+    expect(screen.getByTestId("daemon-identity")).toHaveAttribute("title", FIXTURE_DAEMON_ID);
+    // The identity key is still the raw socket path.
+    expect(header).toHaveAttribute("data-daemon-id", FIXTURE_DAEMON_ID);
   });
 
   it("strips every control and bidi character out of what it renders and out of its titles", () => {
@@ -596,6 +632,65 @@ describe("AgentOverview", () => {
 
     // The deck is still one click away — the picker never took over the screen.
     expect(screen.getByTestId("overview-open-deck")).toBeVisible();
+  });
+
+  /**
+   * Scenario: open the Columns menu, click a checkbox inside it (the menu
+   * stays), then press the pointer down somewhere else on the screen — the menu
+   * closes. `Escape` used to be the only way out, so a menu opened by accident
+   * had to be dismissed by keyboard (PRD #745).
+   */
+  it("closes the column picker on an outside pointerdown and not on one inside it", () => {
+    renderOverviewWithStoredColumns(undefined);
+    fireEvent.click(screen.getByTestId("overview-columns-toggle"));
+    expect(screen.getByTestId("overview-columns-menu")).toBeVisible();
+
+    // Inside the menu: choosing a column must not dismiss the menu you are
+    // choosing from.
+    fireEvent.pointerDown(screen.getByTestId("overview-column-cli"));
+    fireEvent.click(screen.getByTestId("overview-column-cli"));
+    expect(screen.getByTestId("overview-columns-menu")).toBeVisible();
+    expect(legendLabels()).toContain("CLI");
+
+    fireEvent.pointerDown(screen.getByTestId("overview-refresh"));
+    expect(screen.queryByTestId("overview-columns-menu")).not.toBeInTheDocument();
+    expect(screen.getByTestId("overview-columns-toggle")).toHaveAttribute("aria-expanded", "false");
+  });
+
+  /**
+   * Scenario: with the menu open, click the Columns button again. It closes and
+   * stays closed. The trigger sits INSIDE the dismissal boundary on purpose —
+   * outside it, its own pointer-down would close the menu and its click would
+   * toggle it straight back open, so the button would look broken (PRD #745).
+   */
+  it("closes the picker when its own trigger is clicked, without reopening it", () => {
+    renderOverviewWithStoredColumns(undefined);
+    fireEvent.click(screen.getByTestId("overview-columns-toggle"));
+    expect(screen.getByTestId("overview-columns-menu")).toBeVisible();
+
+    fireEvent.pointerDown(screen.getByTestId("overview-columns-toggle"));
+    fireEvent.click(screen.getByTestId("overview-columns-toggle"));
+    expect(screen.queryByTestId("overview-columns-menu")).not.toBeInTheDocument();
+  });
+
+  /**
+   * Scenario: untick your way down to almost nothing, then click Restore
+   * defaults. The four the screen opens on come back, and they are remembered
+   * exactly as any other change is — without it, the only way back was
+   * remembering which four they were (PRD #745).
+   */
+  it("restores the default columns from the picker and remembers them", () => {
+    renderOverviewWithStoredColumns(JSON.stringify({ columns: ["displayName", "lastUserPrompt", "toolCount"] }));
+    expect(legendLabels()).toEqual(["AGENT", "TOOLS", "LAST PROMPT"]);
+
+    fireEvent.click(screen.getByTestId("overview-columns-toggle"));
+    fireEvent.click(screen.getByTestId("overview-columns-reset"));
+
+    expect(legendLabels()).toEqual(["STATUS", "AGENT", "UPTIME", "WORKING DIRECTORY"]);
+    expect(JSON.parse(window.localStorage.getItem(OVERVIEW_COLUMNS_STORAGE_KEY) ?? "null"))
+      .toEqual({ columns: [...DEFAULT_OVERVIEW_COLUMNS] });
+    // The menu stays open, so the ticks a reader just changed are visible.
+    expect(screen.getByTestId("overview-columns-menu")).toBeVisible();
   });
 
   /**
@@ -1322,10 +1417,41 @@ describe("AgentOverview", () => {
     };
     render(<AgentOverview runtime={runtime({ mode: "live", snapshot })} onNavigate={vi.fn()} />);
 
-    expect(document.querySelector(".daemon-state")).toHaveTextContent("Connected anyway for this session");
+    // The regression guard for #801 against PRD #745's suppression rule: this
+    // is the one case where the status IS `connected` and the message still
+    // matters, so a naive "hide the message when connected" would silently
+    // undo the session-long caveat.
+    expect(screen.getByTestId("daemon-state")).toHaveTextContent("Connected anyway for this session");
     // Connected means the fleet is readable again, so it is listed.
     expect(rows(document.body).length).toBeGreaterThan(0);
     expect(screen.queryByTestId("overview-connect-anyway")).not.toBeInTheDocument();
+  });
+
+  /**
+   * Scenario: a healthy connection. The lamp beside the daemon's name is green
+   * and the line that read `Daemon responding` next to it is gone — two
+   * renderings of one bit, and the screen narrating its own state (PRD #745).
+   */
+  it("says nothing beside the lamp when the daemon is simply responding", () => {
+    renderOverview();
+
+    expect(screen.queryByTestId("daemon-state")).not.toBeInTheDocument();
+    expect(document.body.textContent ?? "").not.toContain("Daemon responding");
+    // The lamp is what says it, and it still does.
+    expect(screen.getByTestId("daemon-group").querySelector(".connection-lamp.connection-connected")).not.toBeNull();
+  });
+
+  /**
+   * Scenario: the two states where the message is the only explanation there
+   * is. It is suppressed for a healthy connection and for nothing else — the
+   * element was never the problem, the restatement was (PRD #745).
+   */
+  it("keeps the connection message in every state that says something the lamp does not", () => {
+    for (const state of ["disconnected", "error"] as const) {
+      const { unmount } = render(<AgentOverview runtime={runtime({ snapshot: createFixtureSnapshot(state) })} onNavigate={vi.fn()} />);
+      expect(screen.getByTestId("daemon-state")).toBeVisible();
+      unmount();
+    }
   });
 
   /**
@@ -1354,13 +1480,17 @@ describe("AgentOverview", () => {
     expect(screen.queryByRole("heading", { name: "Incompatible daemon" })).not.toBeInTheDocument();
     expect(rows(document.body).length).toBeGreaterThan(0);
 
-    const state = screen.getByTestId("daemon-state");
-    expect(state).toHaveTextContent("Daemon responding");
-    expect(state).toHaveAttribute("title", "Built from different commits — desktop 0.39.0-49-ga0165f8, daemon 0.39.0-g1ea0fe7.");
+    // The connection is healthy, so its message says nothing the lamp does not
+    // and no longer takes a line (PRD #745). The stamps are still reachable —
+    // on the daemon's own name, which is a hover and not an alert, and which a
+    // reader can actually find because it is a thing they can see.
+    expect(screen.queryByTestId("daemon-state")).not.toBeInTheDocument();
+    expect(screen.getByTestId("daemon-identity"))
+      .toHaveAttribute("title", `${FIXTURE_DAEMON_ID} · Built from different commits — desktop 0.39.0-49-ga0165f8, daemon 0.39.0-g1ea0fe7.`);
   });
 
-  /** Matching stamps have nothing to disclose, so the hover is absent entirely. */
-  it("leaves the daemon state line untitled when both builds report the same stamp", () => {
+  /** Matching stamps have nothing to disclose, so only the socket path is on hover. */
+  it("discloses nothing but the socket path when both builds report the same stamp", () => {
     const snapshot = createFixtureSnapshot("crowded");
     snapshot.connection = {
       ...snapshot.connection,
@@ -1372,7 +1502,7 @@ describe("AgentOverview", () => {
     };
     render(<AgentOverview runtime={runtime({ mode: "live", snapshot })} onNavigate={vi.fn()} />);
 
-    expect(screen.getByTestId("daemon-state")).not.toHaveAttribute("title");
+    expect(screen.getByTestId("daemon-identity")).toHaveAttribute("title", FIXTURE_DAEMON_ID);
   });
 
   it("reconnects on demand", () => {

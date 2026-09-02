@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { clampText, CLOCK_SKEW_TOLERANCE_MS, DISPLAY_LIMITS, displayActivity, displayIdentity, displayPath, displayText, displayUptime, domIdentity, homeRelative, rendersBlank, sanitizeText, shortDaemonLabel } from "./displayText";
+import { clampText, CLOCK_SKEW_TOLERANCE_MS, DISPLAY_LIMITS, displayActivity, displayIdentity, displayPath, displayText, displayUptime, domIdentity, homeRelative, rendersBlank, sanitizeText } from "./displayText";
 
 /**
  * Every bidi formatting and override codepoint the Rust policy names
@@ -84,19 +84,6 @@ describe("displayPath and displayText", () => {
   it("bounds what it returns however long the input is", () => {
     expect(Array.from(displayText("x".repeat(500), DISPLAY_LIMITS.toolDetail))).toHaveLength(DISPLAY_LIMITS.toolDetail + 1);
     expect(Array.from(displayPath(`/home/dev/${"x".repeat(500)}`))).toHaveLength(DISPLAY_LIMITS.path + 1);
-  });
-});
-
-describe("shortDaemonLabel", () => {
-  it("names the daemon without printing the uid or username in its socket path", () => {
-    expect(shortDaemonLabel("/run/user/1000/dot-agent-deck/daemon.sock")).toBe("daemon.sock");
-    expect(shortDaemonLabel("/tmp/dot-agent-deck.sock")).toBe("dot-agent-deck.sock");
-    expect(shortDaemonLabel("/home/dev/.local/state/dot-agent-deck/deck.sock")).toBe("deck.sock");
-  });
-
-  it("falls back to the whole value when there is no segment to take", () => {
-    expect(shortDaemonLabel("dot-agent-deck.sock")).toBe("dot-agent-deck.sock");
-    expect(shortDaemonLabel("/")).toBe("/");
   });
 });
 

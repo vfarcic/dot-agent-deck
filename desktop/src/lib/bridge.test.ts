@@ -518,6 +518,31 @@ describe("TauriDeckBridge", () => {
   });
 
   /**
+   * PRD #745. `cli` is the BINARY the agent runs, resolved daemon-side from the
+   * agent registry, and never the wire identity beside it: rendering
+   * `agentType` printed `claude_code` and `open_code`, neither of which anybody
+   * types. Where this build cannot name a binary — the daemon reported `none`,
+   * which is also where an agent type from a NEWER daemon lands — the deck's
+   * own generic word stands in rather than an invented one.
+   */
+  it("renders the CLI binary the daemon resolved, and never the agent-type enum", async () => {
+    const { mapDesktopSnapshot } = await import("./bridge");
+    const claude = structuredClone(snapshot);
+    claude.agents[0].agentType = "claude_code";
+    claude.agents[0].cliName = "claude";
+    // Outside an orchestration the deck's role label is derived from the wire
+    // identity, which this leaves untouched.
+    claude.agents[0].tab = { kind: "dashboard" };
+
+    expect(mapDesktopSnapshot(claude).agents[0]?.cli).toBe("claude");
+    expect(mapDesktopSnapshot(claude).agents[0]?.role).toBe("Claude code");
+
+    const unnameable = structuredClone(snapshot);
+    unnameable.agents[0].agentType = "none";
+    expect(mapDesktopSnapshot(unnameable).agents[0]?.cli).toBe("agent");
+  });
+
+  /**
    * The M8 audit's cwd finding. `src/agent_pty.rs` accepts any non-empty,
    * bounded, control-free working directory, so `"Unavailable"` — the deck's
    * own stand-in word — is a directory an agent can genuinely be launched in.

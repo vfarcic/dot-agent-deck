@@ -48,6 +48,19 @@ export interface DesktopAgentDto {
   rows: number;
   cols: number;
   agentType: "claude_code" | "open_code" | "pi" | "codex" | "devin" | "none";
+  /**
+   * The binary the agent registry says this type runs — `claude`, `opencode`,
+   * `pi`, `codex`, `devin` (PRD #745). `agentType` above is the wire IDENTITY
+   * and is not a name anybody types: rendering it showed Claude Code as
+   * `claude_code`, OpenCode as `open_code`, and `codex` correctly only by
+   * coincidence.
+   *
+   * Absent — the key is omitted, never blank — when the daemon reported
+   * `none` or no type at all. `none` is also the landing spot for a type this
+   * build has never heard of, so absence here means "this build cannot name
+   * the binary", and nothing invents one.
+   */
+  cliName?: string;
   status: "running" | "thinking" | "working" | "compacting" | "waiting_for_input" | "idle" | "error" | "unknown";
   activeTool?: { name: string; detail?: string };
   toolCount: number;
@@ -262,7 +275,14 @@ function agentFromDto(agent: DesktopAgentDto, index: number, daemonId: string): 
     paneId: agent.paneId,
     role,
     displayName: agent.displayName || role,
-    cli: agent.agentType || "agent",
+    // The BINARY, not the enum (PRD #745). `agentType` is the wire identity —
+    // `claude_code`, `open_code` — and nobody types either of those. The name
+    // is resolved daemon-side from the agent registry, which is where the deck
+    // already keeps the command each agent launches, so a desktop-side lookup
+    // table cannot drift away from it. `"agent"` is the fallback it always was,
+    // reached now for the case it was written for: a type this build cannot
+    // name a binary for.
+    cli: agent.cliName || "agent",
     model: UNREPORTED,
     status,
     task: taskLine(agent),

@@ -169,20 +169,6 @@ export function displayPath(path: string, max: number = DISPLAY_LIMITS.path): st
 }
 
 /**
- * A short label for a daemon. `AgentSession.daemonId` is the socket path, which
- * routinely embeds a uid or a username (`/run/user/1000/…`), and a group header
- * is not the place for either. The last path segment identifies the daemon
- * among the handful a machine runs; the full socket path stays on hover, and
- * the raw value stays the identity key.
- */
-export function shortDaemonLabel(socketPath: string): string {
-  const clean = sanitizeText(socketPath);
-  const trimmed = clean.replace(/[\\/]+$/, "");
-  const base = trimmed.slice(Math.max(trimmed.lastIndexOf("/"), trimmed.lastIndexOf("\\")) + 1);
-  return clampText(base || clean, DISPLAY_LIMITS.name);
-}
-
-/**
  * Characters that occupy no visual space when rendered: Unicode whitespace, the
  * default-ignorable format characters `UNSAFE_DISPLAY_CHARS` deliberately KEEPS
  * (`U+200B` ZWSP, `U+200C` ZWNJ, `U+200D` ZWJ, `U+2060` WJ, `U+FEFF`), the
