@@ -5,9 +5,33 @@
 # This is the ONLY file that knows how the reel is hosted. Swapping YouTube for
 # another host means rewriting this one script; reel.sh never names a host.
 #
-# It uploads an MP4 to YouTube as UNLISTED via the YouTube Data API v3 and
-# prints the resulting watch URL on stdout. Credentials are read from the
-# environment (sourced from vals/.env.vals.yaml in this repo; never hardcoded):
+# It uploads an MP4 to YouTube as PRIVATE via the YouTube Data API v3 and
+# prints the resulting watch URL on stdout.
+#
+# PRIVATE IS THE DEFAULT ON PURPOSE, and it is a security boundary rather than a
+# preference. A reel clip is only eligible if the run spun up a REAL agent, so
+# every cast it stitches was recorded by a process holding live credentials, and
+# the watch URL goes into the PR body *and* the changelog fragment, which flows
+# into the public release notes. Unlisted means "anyone with the link can watch",
+# so uploading unlisted put a credential-bearing recording on an automated public
+# URL with no human in between. Private means only the channel owner (and
+# accounts they name) can watch it — the owner can always watch their OWN private
+# videos, so an unattended agent still uploads and still hands over a working
+# link; beyond that owner and the accounts they deliberately share it with,
+# nothing is visible until a human flips it. The video id survives a private ->
+# unlisted flip, so the link already in the PR and the changelog starts working
+# with no re-upload.
+#
+# What private does NOT do: the upload has already happened, so the bytes are on
+# Google's servers either way. Private CONTAINS a leak to the owner's own
+# account; it does not undo one.
+#
+# `--privacy` is the explicit escape hatch for asking for another status. The
+# engine (reel.sh --publish, and so the adapter) never passes it, so the
+# automated path cannot produce anything but a private video.
+#
+# Credentials are read from the environment (sourced from vals/.env.vals.yaml in
+# this repo; never hardcoded):
 #
 #   YOUTUBE_CLIENT_ID      OAuth client id
 #   YOUTUBE_CLIENT_SECRET  OAuth client secret
@@ -18,7 +42,7 @@
 # error body THROUGH to stderr and exits non-zero rather than swallowing it.
 #
 # Usage:
-#   upload.sh VIDEO.mp4 [TITLE] [DESCRIPTION]
+#   upload.sh [--privacy private|unlisted|public] VIDEO.mp4 [TITLE] [DESCRIPTION]
 #
 set -euo pipefail
 
@@ -29,11 +53,45 @@ die() {
   exit 1
 }
 
+USAGE="usage: $SCRIPT_NAME [--privacy private|unlisted|public] VIDEO.mp4 [TITLE] [DESCRIPTION]"
+
+# The YouTube privacy status the video is CREATED with. Private unless a caller
+# says otherwise, for the reason in the header — this default is the only thing
+# that keeps an automated upload of a credential-bearing recording off a
+# publicly-reachable URL.
+PRIVACY="private"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --privacy)
+      [[ $# -ge 2 ]] || die "--privacy needs a value (private|unlisted|public)"
+      PRIVACY="$2"
+      shift 2
+      ;;
+    --privacy=*)
+      PRIVACY="${1#--privacy=}"
+      shift
+      ;;
+    --) shift; break ;;
+    -*) die "unknown option: $1 ($USAGE)" ;;
+    *) break ;;
+  esac
+done
+
 VIDEO="${1:-}"
 TITLE="${2:-Demo reel}"
 DESCRIPTION="${3:-}"
 
-[[ -n "$VIDEO" ]] || die "usage: $SCRIPT_NAME VIDEO.mp4 [TITLE] [DESCRIPTION]"
+# Validated against the three statuses the API defines rather than passed
+# through: a typo ("privat", "Private") would otherwise be rejected by the API
+# only AFTER the bytes were sent, or — worse for a future API revision — accepted
+# as something wider than intended.
+case "$PRIVACY" in
+  private | unlisted | public) ;;
+  *) die "invalid --privacy value: $PRIVACY (expected private, unlisted or public)" ;;
+esac
+
+[[ -n "$VIDEO" ]] || die "$USAGE"
 [[ -f "$VIDEO" ]] || die "video file not found: $VIDEO"
 
 for var in YOUTUBE_CLIENT_ID YOUTUBE_CLIENT_SECRET YOUTUBE_REFRESH_TOKEN; do
@@ -95,14 +153,15 @@ new_tmp auth_header_file
 printf 'Authorization: Bearer %s' "$access_token" > "$auth_header_file"
 
 # ---- 2. Start a resumable upload session -------------------------------
-# The metadata sets privacyStatus=unlisted. The initiating POST returns the
+# The metadata sets privacyStatus from $PRIVACY, which is `private` unless the
+# caller explicitly asked for another status. The initiating POST returns the
 # upload URL in the Location response header (captured to a header file) while
 # the response body is captured to a variable — on success the body is empty,
 # on failure --fail-with-body puts the API's error JSON there so it is passed
 # through rather than discarded.
 metadata="$(
-  jq -n --arg title "$TITLE" --arg desc "$DESCRIPTION" \
-    '{snippet: {title: $title, description: $desc}, status: {privacyStatus: "unlisted"}}'
+  jq -n --arg title "$TITLE" --arg desc "$DESCRIPTION" --arg privacy "$PRIVACY" \
+    '{snippet: {title: $title, description: $desc}, status: {privacyStatus: $privacy}}'
 )"
 
 new_tmp header_file

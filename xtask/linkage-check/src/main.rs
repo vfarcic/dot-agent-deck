@@ -85,10 +85,11 @@ mod clean_tmp;
 /// script under `node`.
 #[cfg(test)]
 mod issue_labeler_memory;
-/// Issue #785: `scripts/junit-strip-output.py`, the stripper that makes the
-/// credentialed `e2e-live` job's uploaded JUnit report structurally incapable of
-/// carrying test output. Tests only — the rule lives in the script, and these
-/// drive the real one under `python3`.
+/// Issue #785: `scripts/junit-strip-output.py`, the stripper that makes a JUnit
+/// report from a credential-holding run structurally incapable of carrying test
+/// output before anyone shares it. Since #502 took the credentialed lane out of
+/// CI, the report it protects is a LOCAL one. Tests only — the rule lives in the
+/// script, and these drive the real one under `python3`.
 #[cfg(test)]
 mod junit_strip;
 mod list_tests;

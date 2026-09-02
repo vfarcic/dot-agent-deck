@@ -1,15 +1,15 @@
 ---
 name: demo-reel
-description: Stitch a manifest of terminal recordings into one narrated MP4 (title/description card, then clip, repeated) and optionally upload it unlisted to YouTube. Repo-agnostic engine driven only by a manifest.json; runnable by an agent or directly as reel.sh. Use when asked to build a demo reel / narrated video from a set of asciinema casts, gifs, or mp4 clips.
+description: Stitch a manifest of terminal recordings into one narrated MP4 (title/description card, then clip, repeated) and optionally upload it privately to YouTube. Repo-agnostic engine driven only by a manifest.json; runnable by an agent or directly as reel.sh. Use when asked to build a demo reel / narrated video from a set of asciinema casts, gifs, or mp4 clips.
 ---
 
 # Demo Reel engine
 
-A reusable, repo-agnostic engine that turns an ordered **manifest** of `{title, description, clip}` entries into a single narrated MP4: for each entry it renders a title/description **card**, plays that entry's **clip**, then moves to the next — concatenated in manifest order. With `--publish` it uploads the result **unlisted to YouTube** and prints the URL.
+A reusable, repo-agnostic engine that turns an ordered **manifest** of `{title, description, clip}` entries into a single narrated MP4: for each entry it renders a title/description **card**, plays that entry's **clip**, then moves to the next — concatenated in manifest order. With `--publish` it uploads the result **private to YouTube** and prints the URL.
 
 The engine knows nothing about Rust, tests, PRDs, or any specific repo. Its only input is a `manifest.json`. It is invocable by an agent (via this skill) and directly by a human or CI (`reel.sh manifest.json --out reel.mp4`).
 
-> **Status:** the full engine pipeline is wired. A run validates the manifest and prerequisites, renders a card per entry, stitches `[card, clip, …]` into one uniform MP4 (`reel.sh` → `ffmpeg`), and — with `--publish` and credentials present — uploads it unlisted to YouTube (`upload.sh`) and prints the URL. The stitch path is covered by a re-runnable local smoke (`task reel-smoke`); the live upload is verified by code review plus a documented one-line manual step (see **Verifying the upload path**).
+> **Status:** the full engine pipeline is wired. A run validates the manifest and prerequisites, renders a card per entry, stitches `[card, clip, …]` into one uniform MP4 (`reel.sh` → `ffmpeg`), and — with `--publish` and credentials present — uploads it **private** to YouTube (`upload.sh`) and prints the URL. The stitch path is covered by a re-runnable local smoke (`task reel-smoke`); the live upload is verified by code review plus a documented one-line manual step (see **Verifying the upload path**).
 
 ## Usage
 
@@ -22,14 +22,14 @@ reel.sh MANIFEST [--out OUT.mp4] [--title TITLE] [--publish]
 | `MANIFEST` | Path to a `manifest.json` (see **Manifest contract** below). Required, positional. |
 | `--out OUT.mp4` | Where to write the stitched MP4. Default: `reel.mp4`. |
 | `--title TITLE` | Title for the uploaded video (used only with `--publish`). Default: the basename of `--out` without its extension (e.g. `reel` for `reel.mp4`). The engine is repo-agnostic and has no notion of a PRD, so a descriptive title is the caller's job — the dot-agent-deck adapter composes one and passes it through here. |
-| `--publish` | After stitching, upload the MP4 unlisted to YouTube and print the URL. Requires the YouTube OAuth credentials (see **Prerequisites**). |
+| `--publish` | After stitching, upload the MP4 **private** to YouTube and print the URL. Requires the YouTube OAuth credentials (see **Prerequisites**). |
 | `-h`, `--help` | Print usage and exit. |
 
 Examples:
 
 ```sh
 reel.sh manifest.json --out reel.mp4                                   # stitch only, no upload
-reel.sh manifest.json --out reel.mp4 --publish                         # stitch + upload unlisted (title = "reel")
+reel.sh manifest.json --out reel.mp4 --publish                         # stitch + upload private (title = "reel")
 reel.sh manifest.json --out reel.mp4 --title "My demo reel" --publish  # stitch + upload with an explicit title
 ```
 
@@ -171,6 +171,16 @@ task reel-smoke
 .claude/skills/demo-reel/tests/smoke.sh
 ```
 
+## Privacy — uploads are PRIVATE by default, and that is a security boundary
+
+`upload.sh` creates the video with `privacyStatus: private`, and `reel.sh --publish` passes no privacy flag at all, so **the automated path can only ever produce a private video**. `upload.sh --privacy unlisted|public` is the explicit escape hatch for a hand-run.
+
+Why the default moved off `unlisted`: unlisted means *anyone with the link can watch*, and in this project's flow the link is written into the PR body **and** the changelog fragment, which flows into the public release notes. A reel clip is only eligible if the recorded run spun up a **real agent**, so every cast the reel stitches was written by a process holding live credentials. Uploading unlisted therefore put a credential-bearing recording on a publicly-reachable URL with no human between the two. Private keeps the same automation — the channel owner can always watch their own private videos, so an agent still uploads unattended and the link still goes in the PR — while making the human review a **publication** gate instead of a merge gate: flipping the video to unlisted before a release is a deliberate step somebody takes.
+
+The video id survives a private → unlisted flip, so the link already in the PR and the changelog starts working with no re-upload and no link edit.
+
+**What private does not do.** The upload has already happened; the bytes sit on Google's servers either way. Private *contains* a leak to the owner's own account. It does not undo one. And redaction upstream of this is a blocklist that can only remove values the harness registered — see `docs/develop/e2e-lanes.md` for its known gaps.
+
 ## Verifying the upload path
 
 The live YouTube upload cannot be a routine automated test, so it is verified by code review of `upload.sh` plus a **one-time manual** check: with the three `YOUTUBE_*` credentials exported, run
@@ -179,7 +189,7 @@ The live YouTube upload cannot be a routine automated test, so it is verified by
 .claude/skills/demo-reel/reel.sh some-manifest.json --out reel.mp4 --publish
 ```
 
-and confirm it prints an `https://youtu.be/<id>` URL that opens an **unlisted** video. All hosting lives in `upload.sh` alone, so swapping hosts later does not touch the rest of the engine.
+and confirm it prints an `https://youtu.be/<id>` URL that opens a **private** video — signed in as the channel owner it plays normally and shows a *Private* badge; signed out, or as any account the owner has not deliberately shared it with, it is unavailable. That asymmetry is the point (see **Privacy** below). All hosting lives in `upload.sh` alone, so swapping hosts later does not touch the rest of the engine.
 
 ## Failure behavior
 

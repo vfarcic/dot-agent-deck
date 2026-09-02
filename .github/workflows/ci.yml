@@ -184,12 +184,12 @@ jobs:
       #
       # Until this step existed, e2e code was linted by nothing anywhere and
       # type-checked only by `cargo test-e2e`, which at the time ran in no
-      # workflow at all. Since issue #502 the tier itself DOES run in CI — see
-      # `e2e-deterministic` below and e2e-live.yml — but this step is still
-      # only a type-check and lint: it runs no test and needs no agent or API
-      # key, so naming the e2e features here neither duplicates those jobs nor
-      # gives this one a credential. It just makes the local rule 2 gate
-      # something a contributor cannot forget to run.
+      # workflow at all. Since issue #502 lane 1 DOES run in CI — see
+      # `e2e-deterministic` below — but this step is still only a type-check and
+      # lint: it runs no test and needs no agent or API key, so naming the e2e
+      # features here neither duplicates that job nor gives this one a
+      # credential. It just makes the local rule 2 gate something a contributor
+      # cannot forget to run.
       #
       # Linux only. build-windows/build-macos below stay on bare `cargo clippy`
       # for the reason documented there, reinforced here: the L2 tier is
@@ -214,6 +214,15 @@ jobs:
       # `--features e2e,e2e-live` failed with that E0308. This step is still a
       # type-check and lint only — it runs no test and needs no credential, so
       # naming `e2e-live` here does not put lane 2 into this job.
+      #
+      # THAT FLAG NOW CARRIES THE WHOLE WEIGHT. Lane 2 does not run in CI at
+      # all — no e2e test reaches a real agent there, so no TEST credential is
+      # registered on this repository (the separately credentialed Codex
+      # issue-labeler is out of scope; see the e2e-deterministic job's comment
+      # and docs/develop/issue-labeling.md) — which makes this step the ONLY
+      # thing in CI that compiles those 24 files. Drop `e2e-live` from this
+      # line and they go back to being checked by nothing until a developer
+      # runs them.
       - run: cargo clippy --workspace --all-targets --features e2e,e2e-live -- -D warnings
       - run: cargo build --release
       # `cargo nextest run`, NOT `cargo test` — the same runner as the
@@ -278,16 +287,40 @@ jobs:
   # agent credential; the other 24 open with
   # `#![cfg(all(feature = "e2e", feature = "e2e-live"))]` and compile to empty
   # crates here, so they are never even built into this job. The credentialed
-  # superset is lane 2, in .github/workflows/e2e-live.yml.
+  # superset is lane 2, and lane 2 runs ONLY on a developer's machine — no e2e
+  # test reaches a real agent in CI. `docs/develop/e2e-lanes.md` records why,
+  # and CLAUDE.md rule 5 is the policy.
   #
-  # NO SECRETS, and that is the property the entire lane rests on rather than a
-  # detail: this job declares no `environment:`, no job-level `env:` reading
-  # `secrets.*`, and passes no ANTHROPIC_API_KEY. That is what makes it safe on
-  # a fork PR — where GitHub withholds secrets anyway — and what keeps the
-  # post-merge "pwn request" surface #785 describes off the per-PR path
-  # entirely. If a test here ever fails for want of a credential then the test
-  # is in the wrong lane: re-gate its file into `e2e-live`. DO NOT add a key
-  # here to make it pass.
+  # NO AGENT OR TEST CREDENTIAL REACHES THIS JOB, and that is the property the
+  # lane rests on rather than a detail: no ANTHROPIC_API_KEY, no OPENAI_API_KEY,
+  # no agent CLI credential. It declares no `environment:` and no job-level
+  # `env:` reading `secrets.*`, no other job in `ci.yml` does either, and no
+  # workflow anywhere registers a TEST credential — which is the point, because
+  # a test credential in a public repository's CI is a vulnerability that
+  # running it less often does not remove. If a test here ever fails for want of
+  # a credential then the test is in the wrong lane: re-gate its file into
+  # `e2e-live`. DO NOT add a key here to make it pass.
+  #
+  # That is NOT the same as "no secrets in this job", which this comment used to
+  # claim and which is false. The unqualified `actions/checkout@v7` below
+  # receives the automatic `GITHUB_TOKEN` as its default `token:` input, and
+  # `persist-credentials` defaults to true, so the token is written into
+  # `.git/config` as an auth header for the life of the job — reachable by any
+  # contributor-authored test code this lane runs. What bounds it is SCOPE, not
+  # absence: this workflow's top-level `permissions:` block grants
+  # `contents: read` and `pull-requests: read` and nothing else, and a fork
+  # `pull_request` run gets a read-only token whatever the block says (see
+  # `.claude/skills/verify-pr/SKILL.md`). Setting `persist-credentials: false`
+  # on that checkout would remove even that, and is worth doing as its own
+  # change rather than folded into a prose pass.
+  #
+  # That is deliberately NOT the wider claim "no agent credential reaches this
+  # repository's CI", which is false: the Codex issue-labeler
+  # (`issue-labeler.md`, `issue-labeler.lock.yml`, `issue-labeler-batch.yml`)
+  # passes the repository secret OPENAI_API_KEY into a `codex exec` step and
+  # genuinely reaches a real agent. That is a separate feature with its own
+  # threat model — `docs/develop/issue-labeling.md` — and out of scope for the
+  # e2e lanes. Do not cite it as precedent for putting a test key here.
   #
   # NO AGENT CLI is installed either, and that is deliberate rather than merely
   # unnecessary. `scheduler/cli/002` in tests/e2e_scheduler_cli.rs writes a
@@ -421,8 +454,10 @@ jobs:
   #     crates here;
   #   * the L2 PTY e2e suite is excluded because this job runs `cargo nextest
   #     run` WITHOUT either e2e feature — every one of the 71 `tests/e2e_*.rs`
-  #     files opens with a `feature = "e2e"` cfg (47 bare, 24 also requiring
-  #     `feature = "e2e-live"` since issue #502), so none of them is compiled
+  #     files opens with a `feature = "e2e"` cfg (47 in lane 1 — 44 exactly
+  #     that attribute, three adding a `unix` term — and 24 in lane 2, which
+  #     also require `feature = "e2e-live"` since issue #502, 21 exactly and
+  #     three adding `unix`), so none of them is compiled
   #     here at all rather than compiled-and-emptied. Note this is a DIFFERENT
   #     mechanism from the first bullet even for the six of the 71 that DO
   #     carry a `unix` term (e2e_hook_binary_path, e2e_remote_doctor,

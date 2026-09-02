@@ -153,7 +153,7 @@ Print every included PR with **number, title, author, whether it is the runner's
 
 Then **ask how many to dispatch**, recommending **2–3**. Do not assume "all of them", and do not offer "all" as the recommended option.
 
-Each unit that verifies runs `/verify-pr`, which runs lane 1 of the e2e tier — the 47 deterministic files, spawning real binaries and PTYs for tens of minutes (CLAUDE.md rule 5). It needs no agent credential and spends no tokens since issue #502, but it is still the longest step in a verification by a wide margin. How much of that to spend at once is the user's call, not yours.
+Each unit that verifies runs `/verify-pr`, which since issue #502 **reads** the PR's `e2e-deterministic` CI run rather than reproducing lane 1 locally — so a verification is now dominated by the release build, `test-fast` and the windows cross-check rather than by tens of minutes of PTY time. It still builds its own multi-GB `target/`, and a unit may opt into a local lane-1 run with `--e2e` where CI's is missing. How much of that to spend at once is the user's call, not yours.
 
 **The count is a security decision, not only a cost one.** N units means N concurrent agents, N independent chances for the untrusted-content problem in step 5 to land, and N simultaneous `cargo build` / `nextest` / `xtask` runs over code nobody has read yet. That is what a "just do all of them" answer is really buying.
 
@@ -205,7 +205,7 @@ Re-check `author` rather than trusting the listing: it is what decides the push 
 
 **When the two sources disagree, this GraphQL `author.login` is the authority — not `scan.sh`'s `PR_AUTHOR`.** Both are available in this step and they name the same person in every ordinary case, so say which decides before a weird case makes you guess. `scan.sh` emits `PR_AUTHOR` as free text in a `KEY=value` stream (`scan.sh:51`) four lines after the attacker-controlled `PR_TITLE` (`scan.sh:47`), which makes it the more forgeable of the two by construction, whether or not a title can actually carry a newline today. Use `PR_AUTHOR` for reporting; decide the **permission** from the typed GraphQL field.
 
-**The 100-thread bound applies here too**, and this is where it bites hardest. If `more_threads` is true, page with `-F cursor=<next>` until it is false before trusting `unresolved: 0` — on someone else's PR that zero is the whole exclusion test, and a PR with 130 threads whose unresolved ones are the most recent reads as clear and burns a lane-1 run.
+**The 100-thread bound applies here too**, and this is where it bites hardest. If `more_threads` is true, page with `-F cursor=<next>` until it is false before trusting `unresolved: 0` — on someone else's PR that zero is the whole exclusion test, and a PR with 130 threads whose unresolved ones are the most recent reads as clear and burns a whole verification unit.
 
 Yes, the dispatched agent will run `scan.sh` again as its own Phase 0. That duplication is intentional and nearly free: a handful of read-only API calls, and it is what lets you write a tailored risk note without reading the diff yourself.
 
