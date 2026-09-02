@@ -21,6 +21,14 @@
  * `docs/develop/desktop-gui.md` and `prds/743-desktop-light-dark-appearance.md`.
  * The failed-save alert below stays, because it is a consequence the user has to
  * act on.
+ *
+ * And it is the worked example of that document's heading rule, also by
+ * subtraction: this panel opened with a `.form-heading` carrying an `APPEARANCE`
+ * eyebrow over a `Light and dark` title, above a row whose own legend reads
+ * *Appearance*. That put the word on screen twice and restated the three option
+ * labels in the title, for 70px — more than the 61px the setting itself
+ * occupies. A section heading is chrome for telling sections apart, and there is
+ * one section.
  */
 import { AlertTriangle } from "lucide-react";
 import type { AppearanceMode } from "../lib/bridge";
@@ -36,42 +44,38 @@ export function AppearancePanel({ settings, onSave, saveError }: SettingsPanelPr
   const current = settings.appearance.mode;
 
   return (
-    <>
-      <div className="form-heading">
-        <div><span>APPEARANCE</span><h3>Light and dark</h3></div>
-      </div>
-      <div className="settings-body">
-        {/* A segmented control, not three buttons: still a real radio group, so
-            one `name` buys arrow-key navigation and a single tab stop for free,
-            and the legend names the group for a screen reader without a visible
-            heading having to do that job. The legend is also the row's visible
-            label — see the `float` note on `.settings-row > legend` in
-            `styles.css` for why that works. */}
-        <fieldset className="settings-row">
-          <legend>Appearance</legend>
-          <div className="segmented">
-            {CHOICES.map((choice) => (
-              <label key={choice.value} className={choice.value === current ? "is-selected" : ""}>
-                <input
-                  type="radio"
-                  name="appearance"
-                  value={choice.value}
-                  checked={choice.value === current}
-                  onChange={() => onSave({ ...settings, appearance: { ...settings.appearance, mode: choice.value } })}
-                />
-                <span>{choice.label}</span>
-              </label>
-            ))}
-          </div>
-        </fieldset>
+    <div className="settings-body">
+      {/* A segmented control, not three buttons: still a real radio group, so
+          one `name` buys arrow-key navigation and a single tab stop for free,
+          and the legend names the group for a screen reader without a visible
+          heading having to do that job. The legend is also the row's visible
+          label — see the `float` note on `.settings-row > legend` in
+          `styles.css` for why that works, and it is why deleting the heading
+          above it took no label with it. */}
+      <fieldset className="settings-row">
+        <legend>Appearance</legend>
+        <div className="segmented">
+          {CHOICES.map((choice) => (
+            <label key={choice.value} className={choice.value === current ? "is-selected" : ""}>
+              <input
+                type="radio"
+                name="appearance"
+                value={choice.value}
+                checked={choice.value === current}
+                onChange={() => onSave({ ...settings, appearance: { ...settings.appearance, mode: choice.value } })}
+              />
+              <span>{choice.label}</span>
+            </label>
+          ))}
+        </div>
+      </fieldset>
 
-        {saveError && (
-          <p className="settings-error" role="alert">
-            <AlertTriangle size={13} />
-            <span>This appearance is applied, but saving it failed, so it will not survive a restart. {saveError}</span>
-          </p>
-        )}
-      </div>
-    </>
+      {saveError && (
+        <p className="settings-error" role="alert">
+          <AlertTriangle size={13} />
+          <span>This appearance is applied, but saving it failed, so it will not survive a restart. {saveError}</span>
+        </p>
+      )}
+    </div>
   );
 }

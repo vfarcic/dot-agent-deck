@@ -604,6 +604,14 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .sheet-header { min-height: 92px; padding: 18px 20px; display: flex; align-items: flex-start; justify-content: space-between; border-bottom: 1px solid var(--line); }
 .sheet-header h2 { margin: 3px 0 5px; font-size: 20px; letter-spacing: -.02em; }
 .sheet-header p { margin: 0; color: var(--muted); font-size: 10px; }
+/* A header carrying only its title, on one line with the close button (PRD
+   #803). The 92px above is sized for an eyebrow, a title and a description, and
+   the four `ConfigurationPanels` sheets all carry that stack — so this is a
+   modifier rather than a smaller shared min-height. Measure one of those four
+   before touching either rule. The 13px matches the 61px footer's rhythm rather
+   than the 18px the taller stack needs. */
+.sheet-header.is-title-only { min-height: 0; padding-top: 13px; padding-bottom: 13px; align-items: center; }
+.sheet-header.is-title-only h2 { margin: 0; }
 .icon-button { width: 31px; height: 31px; display: grid; place-items: center; border: 1px solid var(--line); border-radius: 4px; background: transparent; cursor: pointer; }
 .local-only-notice { min-height: 40px; padding: 8px 18px; display: flex; align-items: center; gap: 7px; border-bottom: 1px solid var(--amber-edge); color: var(--amber-ink); background: var(--amber-soft); font-size: 9px; }
 .local-only-notice code { font-size: 8px; }

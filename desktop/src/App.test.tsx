@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createFixtureSnapshot } from "./data/fixture";
 import { WINDOWS_WORKFLOW_BLOCK_REASON } from "./lib/platform";
@@ -374,6 +374,17 @@ describe("ControlDeck", () => {
 
     expect(screen.getByTestId(`settings-panel-${SETTINGS_SECTIONS[0].id}`)).toBeVisible();
     expect(screen.getByRole("group", { name: "Appearance" })).toBeVisible();
+
+    // One row of chrome, then the setting (PRD #803, and the heading rule in
+    // `docs/develop/desktop-gui.md`). The sheet carries exactly one heading —
+    // its own title — and the panel carries none: the row's legend is already
+    // its visible label AND its accessible group name, which is what the
+    // assertion above rides on, so a heading over it was the word "Appearance"
+    // on screen twice. There are no eyebrows left on the surface either.
+    const sheet = screen.getByTestId("settings-panel");
+    expect(within(sheet).getAllByRole("heading").map((h) => h.textContent)).toEqual(["Settings"]);
+    expect(within(screen.getByTestId(`settings-panel-${SETTINGS_SECTIONS[0].id}`)).queryByRole("heading")).not.toBeInTheDocument();
+    expect(sheet.querySelectorAll(".eyebrow, .form-heading")).toHaveLength(0);
   });
 
   it("applies each appearance choice to the document root, and System CLEARS the attribute", async () => {

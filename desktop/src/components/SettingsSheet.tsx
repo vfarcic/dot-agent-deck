@@ -72,11 +72,15 @@ export function SettingsSheet({ open, onClose, settings, onSave, saveError, path
         data-testid="settings-panel"
         onMouseDown={(event) => event.stopPropagation()}
       >
-        <header className="sheet-header">
-          <div>
-            <span className="eyebrow">APPLICATION SETTINGS</span>
-            <h2 id="settings-title">Settings</h2>
-          </div>
+        {/* One line: the title and the close button. The `APPLICATION SETTINGS`
+            eyebrow that used to sit over it was the same word twice, and the
+            description under it went in the round before (see the text rule in
+            `docs/develop/desktop-gui.md`), which left the shared
+            `.sheet-header` reserving 92px for a stack of three to hold one. The
+            modifier is what scopes the override away from the four
+            `ConfigurationPanels` sheets, which all still carry the full stack. */}
+        <header className="sheet-header is-title-only">
+          <h2 id="settings-title">Settings</h2>
           <button className="icon-button" aria-label="Close settings" onClick={onClose}><X size={18} /></button>
         </header>
 
