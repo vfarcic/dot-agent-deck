@@ -691,7 +691,6 @@ export function AgentOverview({ runtime, onNavigate }: { runtime: DeckRuntimeSta
         <header className="topbar">
           <div className="repo-context">
             <div className="repo-line"><LayoutList size={15} /><strong>Agent overview</strong></div>
-            <div className="branch-line"><span title="Every agent this desktop can see, grouped the way the daemon groups them.">every agent this desktop can see · this screen opens no terminal</span></div>
           </div>
           <div className="run-instruments">
             <OverviewInstrument label="AGENTS" testId="overview-count-agents"><OverviewCount known={connected} value={agents.length} /></OverviewInstrument>
@@ -760,14 +759,6 @@ export function AgentOverview({ runtime, onNavigate }: { runtime: DeckRuntimeSta
               />
             </div>
           </section>
-
-          <p className="overview-footnote">
-            This screen reads one snapshot, opens no terminal of its own, and asks the bridge to release the ones the deck left
-            attached — a socket a previous screen opened is torn down as that release lands, not the instant this line renders.
-            Columns are yours to choose and are remembered for next time; the picker lists every column the daemon reports
-            and there is nothing else to add. Model, token, cost, context-window, branch and attempt columns are absent
-            because the daemon does not track them at all — see PRD #745.
-          </p>
         </section>
       </main>
       {confirm && <ConfirmDialog state={confirm} onClose={() => setConfirm(undefined)} />}

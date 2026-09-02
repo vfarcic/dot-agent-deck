@@ -644,7 +644,6 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .overview-note p { max-width: 460px; margin: 0 0 4px; font-size: 10px; line-height: 1.55; }
 .overview-note-hint { color: var(--faint); }
 .overview-note > div { margin-top: 15px; display: flex; gap: 7px; }
-.overview-footnote { max-width: 760px; margin: 11px 2px 0; color: var(--faint); font-size: 9px; line-height: 1.5; }
 
 .count-running { color: var(--teal); }
 .count-waiting { color: var(--amber); }
