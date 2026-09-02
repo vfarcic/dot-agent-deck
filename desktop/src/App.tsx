@@ -35,10 +35,13 @@ import {
 import { AgentTile } from "./components/AgentTile";
 import { HandoffRail } from "./components/HandoffRail";
 import { ProfilesPanel, ProjectsPanel, PromptLibraryPanel, WorkflowPanel } from "./components/ConfigurationPanels";
+import { SettingsSheet } from "./components/SettingsSheet";
 import { useAgentProfiles } from "./hooks/useAgentProfiles";
 import { useDeckRuntime } from "./hooks/useDeckRuntime";
 import { useProjects } from "./hooks/useProjects";
 import { usePromptLibrary } from "./hooks/usePromptLibrary";
+import { useDesktopSettings } from "./hooks/useDesktopSettings";
+import { applyAppearance } from "./lib/appearance";
 import { desktopWorkflowPlatformIssue } from "./lib/platform";
 import type { DeckAction, DeckActionResult, DeckRuntimeState, EvidenceItem, PanelTab, WorkflowLaunchConfig } from "./types";
 import { modeScopedKey } from "./lib/bridge";
@@ -79,12 +82,23 @@ export function ControlDeck({ runtime, workflowPlatformIssue = desktopWorkflowPl
   const [workflowOpen, setWorkflowOpen] = useState(false);
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [helpOpen, setHelpOpen] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
   const [notice, setNotice] = useState<string>();
   const [confirm, setConfirm] = useState<ConfirmState>();
   const { profiles, updateProfile, resetProfiles } = useAgentProfiles(snapshot.profiles);
   const { projects, activeId: activeProjectId, activeProject, setActiveId: setActiveProjectId, addProject, updateProject, removeProject } = useProjects(snapshot.worktree, snapshot.repo);
   const { prompts, addPrompt, updatePrompt, removePrompt } = usePromptLibrary();
   const [profileOrder, setProfileOrder] = useState<string[]>([]);
+  const settings = useDesktopSettings(runtime);
+
+  // PRD #743: applied on LOAD as well as on change. Keeping it in one effect
+  // keyed on the stored value means the panel only has to save — the change
+  // is optimistic in `useDesktopSettings`, so this runs on the click rather
+  // than after the disk write, and there is no restart and no second path
+  // that could disagree with this one.
+  useEffect(() => {
+    applyAppearance(settings.settings.appearance.mode);
+  }, [settings.settings.appearance.mode]);
 
   useEffect(() => {
     if (!selectedAgentId || !snapshot.agents.some((agent) => agent.id === selectedAgentId)) {
@@ -170,7 +184,7 @@ export function ControlDeck({ runtime, workflowPlatformIssue = desktopWorkflowPl
         return;
       }
       if (event.key === "Escape") {
-        setPaletteOpen(false); setHelpOpen(false); setProjectsOpen(false); setProfilesOpen(false); setPromptsOpen(false); setWorkflowOpen(false); setConfirm(undefined);
+        setPaletteOpen(false); setHelpOpen(false); setProjectsOpen(false); setProfilesOpen(false); setPromptsOpen(false); setWorkflowOpen(false); setSettingsOpen(false); setConfirm(undefined);
         return;
       }
       if (editing) return;
@@ -287,6 +301,7 @@ export function ControlDeck({ runtime, workflowPlatformIssue = desktopWorkflowPl
     { label: "Open prompt library", hint: "Reusable launch and message prompts", icon: BookMarked, run: () => setPromptsOpen(true) },
     { label: "Open agent profiles", hint: "Configure models & permissions", icon: Bot, run: () => setProfilesOpen(true) },
     { label: "Edit workflow order", hint: "Enable, skip, or reorder roles", icon: Network, run: () => setWorkflowOpen(true) },
+    { label: "Open settings", hint: "Appearance and other app preferences", icon: Settings2, run: () => setSettingsOpen(true) },
     { label: evidenceOpen ? "Hide evidence drawer" : "Show evidence drawer", hint: "Toggle transition evidence", icon: PanelRight, run: () => setEvidenceOpen((open) => !open) },
     ...snapshot.agents.map((agent, index) => ({ label: `Focus ${agent.role}`, hint: `Shortcut ${index + 1}`, icon: SquareTerminal, run: () => setSelectedAgentId(agent.id) })),
     ...(mode === "fixture" ? [{ label: "Advance fixture", hint: "Move the deterministic loop one node", icon: Zap, run: () => { void perform({ type: "advance_fixture" }); } }] : []),
@@ -298,11 +313,11 @@ export function ControlDeck({ runtime, workflowPlatformIssue = desktopWorkflowPl
         <div className="brand-mark" aria-label="Agent Deck"><span>AD</span><i aria-hidden="true" /></div>
         <nav>
           <RailButton icon={FolderGit2} label="Projects" active={projectsOpen} onClick={() => setProjectsOpen(true)} testId="open-projects" />
-          <RailButton icon={Activity} label="Runs" active={!projectsOpen && !workflowOpen && !profilesOpen && !promptsOpen} onClick={() => { setProjectsOpen(false); setWorkflowOpen(false); setProfilesOpen(false); setPromptsOpen(false); }} />
+          <RailButton icon={Activity} label="Runs" active={!projectsOpen && !workflowOpen && !profilesOpen && !promptsOpen && !settingsOpen} onClick={() => { setProjectsOpen(false); setWorkflowOpen(false); setProfilesOpen(false); setPromptsOpen(false); setSettingsOpen(false); }} />
           <RailButton icon={BookMarked} label="Prompts" active={promptsOpen} onClick={() => setPromptsOpen(true)} testId="open-prompts" />
           <RailButton icon={Network} label="Workflows" active={workflowOpen} onClick={() => setWorkflowOpen(true)} />
           <RailButton icon={Bot} label="Agent Profiles" active={profilesOpen} onClick={() => setProfilesOpen(true)} testId="open-agent-profiles" />
-          <RailButton icon={Settings2} label="Settings" onClick={() => setNotice("Runtime settings will use the same local configuration seam.")} />
+          <RailButton icon={Settings2} label="Settings" active={settingsOpen} onClick={() => setSettingsOpen(true)} testId="open-settings" />
         </nav>
         <div className="rail-bottom">
           <button aria-label="Keyboard shortcuts" title="Keyboard shortcuts" onClick={() => setHelpOpen(true)}><Keyboard size={18} /></button>
@@ -433,6 +448,16 @@ export function ControlDeck({ runtime, workflowPlatformIssue = desktopWorkflowPl
       />
       <ProfilesPanel open={profilesOpen} profiles={profiles} onClose={() => setProfilesOpen(false)} onUpdate={updateProfile} onReset={resetProfiles} onSaved={() => setNotice("Agent profile draft saved locally. Project TOML is unchanged.")} />
       <WorkflowPanel key={activeProject?.id ?? "runtime-workflow"} open={workflowOpen} profiles={profiles} order={profileOrder} mode={mode} defaultName={activeProject?.workflowName ?? "dot-agent-deck"} defaultCwd={activeProject?.cwd || snapshot.worktree} onClose={() => setWorkflowOpen(false)} onToggle={(id) => { const profile = profiles.find((item) => item.id === id); if (profile) updateProfile(id, { enabled: !profile.enabled }); }} onMove={moveStage} onLaunch={requestLaunch} platformIssue={workflowPlatformIssue} prompts={prompts} />
+      <SettingsSheet
+        open={settingsOpen}
+        onClose={() => setSettingsOpen(false)}
+        settings={settings.settings}
+        onSave={settings.save}
+        saveError={settings.saveError}
+        path={settings.path}
+        loaded={settings.loaded}
+        mode={mode}
+      />
       {paletteOpen && <CommandPalette commands={commandItems} onClose={() => setPaletteOpen(false)} />}
       {helpOpen && <ShortcutHelp onClose={() => setHelpOpen(false)} />}
       {confirm && <ConfirmDialog state={confirm} onClose={() => setConfirm(undefined)} />}

@@ -117,6 +117,29 @@ export function normalizeDesktopSettings(value: unknown): DesktopSettingsDto {
   };
 }
 
+/**
+ * The settings document plus where it lives, as `desktop_get_settings` returns
+ * it (PRD #803).
+ *
+ * `path` is absent in the browser preview, which has no filesystem at all —
+ * `FixtureDeckBridge` keeps settings in `localStorage`. The settings surface
+ * says so in as many words rather than printing a plausible-looking path for a
+ * file that does not exist.
+ */
+export interface DesktopSettingsSnapshotDto {
+  settings: DesktopSettingsDto;
+  path?: string;
+}
+
+/** Coerce a `desktop_get_settings` reply into a valid snapshot. */
+export function normalizeDesktopSettingsSnapshot(value: unknown): DesktopSettingsSnapshotDto {
+  const record = typeof value === "object" && value !== null ? value as Record<string, unknown> : {};
+  return {
+    settings: normalizeDesktopSettings(record.settings),
+    path: typeof record.path === "string" && record.path ? record.path : undefined,
+  };
+}
+
 /** Low-volume lifecycle payload emitted as `desktop://terminal-state`. */
 export interface DesktopTerminalStateDto {
   sessionId: string;
@@ -160,8 +183,8 @@ export interface DeckBridge {
   runAction(action: DeckAction): Promise<DeckActionResult>;
   sendTerminalInput(agentId: string, data: string): Promise<void>;
   resizeTerminal(agentId: string, cols: number, rows: number): Promise<void>;
-  /** The desktop app's own settings document (PRD #803). Never rejects. */
-  getSettings(): Promise<DesktopSettingsDto>;
+  /** The desktop app's own settings document, and where it lives (PRD #803). Never rejects. */
+  getSettings(): Promise<DesktopSettingsSnapshotDto>;
   /** Persist the whole document and resolve with what was written. */
   saveSettings(settings: DesktopSettingsDto): Promise<DesktopSettingsDto>;
   dispose(): Promise<void>;
@@ -373,9 +396,11 @@ class FixtureDeckBridge implements DeckBridge {
    * `@tauri-apps/api/core`, so it structurally cannot reach `desktop.toml` — a
    * fixture visit can only ever write the localStorage key above.
    */
-  async getSettings(): Promise<DesktopSettingsDto> {
+  async getSettings(): Promise<DesktopSettingsSnapshotDto> {
     await Promise.resolve();
-    if (this.settings) return structuredClone(this.settings);
+    // No `path`: there is no file. The surface renders the browser-preview
+    // wording instead of naming one that does not exist.
+    if (this.settings) return { settings: structuredClone(this.settings) };
     let stored: unknown;
     try {
       const raw = window.localStorage.getItem(FIXTURE_SETTINGS_KEY);
@@ -384,7 +409,7 @@ class FixtureDeckBridge implements DeckBridge {
       stored = undefined;
     }
     this.settings = normalizeDesktopSettings(stored);
-    return structuredClone(this.settings);
+    return { settings: structuredClone(this.settings) };
   }
 
   async saveSettings(settings: DesktopSettingsDto): Promise<DesktopSettingsDto> {
@@ -657,12 +682,15 @@ export class TauriDeckBridge implements DeckBridge {
    * *save* does propagate — a preference the user set and the app silently
    * dropped is worse than an error they can see.
    */
-  async getSettings(): Promise<DesktopSettingsDto> {
+  async getSettings(): Promise<DesktopSettingsSnapshotDto> {
     const invoke = await this.getInvoke();
     try {
-      return normalizeDesktopSettings(await invoke<DesktopSettingsDto>("desktop_get_settings"));
+      return normalizeDesktopSettingsSnapshot(await invoke<DesktopSettingsSnapshotDto>("desktop_get_settings"));
     } catch {
-      return structuredClone(DEFAULT_DESKTOP_SETTINGS);
+      // Loading never fails Rust-side, so this is an IPC-level failure. The
+      // defaults keep the app usable; the missing path makes the surface say
+      // the location is unavailable rather than invent one.
+      return { settings: structuredClone(DEFAULT_DESKTOP_SETTINGS) };
     }
   }
 

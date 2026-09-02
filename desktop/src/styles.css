@@ -670,6 +670,39 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .workflow-footer { margin-top: auto; }
 
 .project-notice { border-bottom-color: var(--teal-rim); color: var(--teal-wash-ink); background: var(--teal-wash); }
+/* Settings sheet (PRD #803 M3). Section list beside the active panel, in the
+   same shape as .projects-layout so the surface is one a user of this app
+   already recognises. */
+.settings-sheet .settings-layout { min-height: 0; flex: 1; display: grid; grid-template-columns: 232px minmax(0, 1fr); }
+.settings-sections { min-height: 0; padding: 11px; display: flex; flex-direction: column; border-right: 1px solid var(--line); background: var(--paper-sunken); }
+.settings-sections nav { min-height: 0; display: grid; align-content: start; gap: 5px; overflow: auto; }
+.settings-sections nav > button { width: 100%; min-height: 38px; padding: 8px 10px; display: grid; grid-template-columns: 18px minmax(0, 1fr); align-items: center; gap: 9px; border: 1px solid transparent; border-radius: 4px; color: var(--muted); background: transparent; cursor: pointer; font-size: 11px; text-align: left; }
+.settings-sections nav > button:hover { color: var(--ink); border-color: var(--line); background: var(--paper-strong); }
+.settings-sections nav > button.is-selected { color: var(--ink); border-color: var(--line); background: var(--paper-strong); box-shadow: inset 3px 0 0 var(--teal); }
+.settings-active { min-height: 0; display: flex; flex-direction: column; overflow: auto; }
+.settings-body { padding: 17px 18px; display: grid; gap: 15px; }
+.settings-footer { justify-content: flex-start; }
+.settings-footer > span { display: flex; align-items: center; gap: 7px; }
+.settings-footer code { color: var(--muted); font-size: 8px; }
+
+/* The three-way appearance choice (PRD #743 M4). A real radio group: one name
+   gives arrow-key navigation and a single tab stop, and the legend labels it. */
+.appearance-choices { margin: 0; padding: 0; display: grid; gap: 7px; border: 0; }
+.appearance-choices legend { padding: 0 0 8px; color: var(--faint); font-size: 7px; font-weight: 800; letter-spacing: .1em; text-transform: uppercase; }
+.appearance-choices label { padding: 11px 12px; display: grid; grid-template-columns: 15px minmax(0, 1fr); align-items: start; gap: 10px; border: 1px solid var(--line-strong); border-radius: 5px; background: var(--paper-strong); cursor: pointer; }
+.appearance-choices label:hover { border-color: var(--teal-rim); }
+.appearance-choices label.is-selected { border-color: var(--teal-focus); box-shadow: 0 0 0 1px var(--teal-focus); }
+.appearance-choices input { position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+.appearance-mark { width: 15px; height: 15px; margin-top: 1px; display: block; border: 1px solid var(--line-strong); border-radius: 50%; background: var(--paper); }
+.appearance-choices label.is-selected .appearance-mark { border-color: var(--teal); background: var(--teal); box-shadow: inset 0 0 0 3px var(--on-accent); }
+.appearance-choices input:focus-visible + .appearance-mark { outline: 2px solid var(--focus-ring); outline-offset: 2px; }
+.appearance-copy { display: flex; flex-direction: column; gap: 4px; }
+.appearance-copy strong { font-size: 12px; }
+.appearance-copy small { color: var(--muted); font-size: 9px; line-height: 1.45; }
+.settings-note, .settings-error { margin: 0; padding: 9px 11px; display: flex; align-items: flex-start; gap: 7px; border: 1px solid var(--line); border-radius: 4px; color: var(--muted); background: var(--paper-sunken); font-size: 9px; line-height: 1.5; }
+.settings-note svg, .settings-error svg { flex: 0 0 auto; margin-top: 1px; }
+.settings-error { border-color: var(--red-rim); color: var(--red-ink); background: var(--red-soft); }
+
 .projects-layout { min-height: 0; flex: 1; display: grid; grid-template-columns: 260px minmax(0, 1fr); }
 .project-library { min-height: 0; padding: 11px; display: flex; flex-direction: column; border-right: 1px solid var(--line); background: var(--paper-sunken); }
 .add-project { min-height: 36px; display: flex; align-items: center; justify-content: center; gap: 6px; border: 1px dashed var(--teal-rim); border-radius: 4px; color: var(--teal); background: var(--teal-wash); cursor: pointer; font-size: 9px; font-weight: 700; }

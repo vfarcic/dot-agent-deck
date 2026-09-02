@@ -163,6 +163,40 @@ impl Default for DesktopSettings {
     }
 }
 
+/// The document plus where it lives, which is what the settings surface renders.
+///
+/// A separate struct rather than a field on [`DesktopSettings`], because the
+/// path is **not** part of the document: it is where the document is, it is
+/// never written to TOML, and putting it on the struct would put it in the file
+/// and into [`tests::default_document_shape_is_pinned`]'s pinned shape.
+///
+/// # Why this path reaches the webview when error paths deliberately do not
+///
+/// [`SettingsWriteError`] splits itself precisely so a `/home/<user>/…` path
+/// never crosses the bridge, and that is not in tension with this. A path
+/// leaking out of an *error* is incidental detail the user did not ask for; the
+/// location of their own settings file is the answer to "where did that go?",
+/// which PRD #803 makes a visible footer line specifically so it is answerable
+/// without documentation. Same string, opposite intent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DesktopSettingsSnapshot {
+    pub settings: DesktopSettings,
+    /// Absolute, as [`settings_path`] resolved it — including when
+    /// [`SETTINGS_PATH_ENV`] pointed somewhere else, since the footer's job is
+    /// to name the file this process will actually write.
+    pub path: String,
+}
+
+/// [`load_from`] against [`settings_path`], plus that path, for the settings
+/// surface. This is how the app loads its settings.
+pub fn load_snapshot() -> DesktopSettingsSnapshot {
+    let path = settings_path();
+    DesktopSettingsSnapshot {
+        settings: load_from(&path),
+        path: path.display().to_string(),
+    }
+}
+
 /// A settings write failure, split so a filesystem path never reaches the
 /// webview.
 ///
@@ -217,13 +251,12 @@ pub fn settings_path() -> PathBuf {
     }
 }
 
-/// Load the settings document. Never fails — see the module docs.
-pub fn load() -> DesktopSettings {
-    load_from(&settings_path())
-}
-
-/// [`load`] against an explicit path, so tests never depend on process-global
-/// environment state.
+/// Load the settings document from `path`. Never fails — see the module docs.
+///
+/// Every caller passes a path: the app goes through [`load_snapshot`], which
+/// needs the resolved path anyway to show the user where their settings live,
+/// and every test passes one explicitly so none of them depends on
+/// process-global environment state.
 pub fn load_from(path: &Path) -> DesktopSettings {
     match std::fs::read_to_string(path) {
         Ok(contents) => match toml::from_str(&contents) {
@@ -716,6 +749,38 @@ mod tests {
         );
         assert_eq!(overridden, Path::new("/tmp/somewhere/else.toml"));
         assert_eq!(empty_override, default_path);
+    }
+
+    /// The settings surface shows where the document lives, so the snapshot has
+    /// to name the path this process would actually write — including under the
+    /// env override, which is the only way a test or a packaged build ends up
+    /// somewhere other than the config directory.
+    #[test]
+    fn the_snapshot_carries_the_path_the_process_would_write() {
+        let _guard = ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let dir = tempdir();
+        let path = dir.path().join("elsewhere.toml");
+        save_to(&path, &dark()).unwrap();
+
+        // SAFETY: the lock above serialises every test that touches this var.
+        unsafe { std::env::set_var(SETTINGS_PATH_ENV, &path) };
+        let snapshot = load_snapshot();
+        unsafe { std::env::remove_var(SETTINGS_PATH_ENV) };
+
+        assert_eq!(snapshot.settings, dark());
+        assert_eq!(snapshot.path, path.display().to_string());
+
+        // The path rides alongside the document rather than inside it, so the
+        // pinned document shape is untouched by this.
+        let json = serde_json::to_value(&snapshot).unwrap();
+        assert_eq!(json["settings"]["appearance"]["mode"], "dark");
+        assert_eq!(json["path"], path.display().to_string());
+        assert!(
+            json["settings"].get("path").is_none(),
+            "the path must not have leaked into the document: {json}"
+        );
     }
 
     #[test]

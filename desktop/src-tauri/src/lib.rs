@@ -747,7 +747,7 @@ async fn desktop_terminal_detach(
     terminal::detach(&state, &session_id).await
 }
 
-/// Read the desktop app's own settings document (PRD #803).
+/// Read the desktop app's own settings document, and where it lives (PRD #803).
 ///
 /// A standalone command rather than a `DesktopAction`, for the same reason the
 /// terminal commands are: every `DesktopAction` ends in `refresh_and_emit`, so
@@ -757,9 +757,11 @@ async fn desktop_terminal_detach(
 /// nowhere to put it. Settings are client-owned; nothing here touches the
 /// daemon.
 #[tauri::command]
-async fn desktop_get_settings(webview: Webview) -> Result<DesktopSettings, String> {
+async fn desktop_get_settings(
+    webview: Webview,
+) -> Result<settings::DesktopSettingsSnapshot, String> {
     ensure_main_webview(&webview)?;
-    Ok(settings::load())
+    Ok(settings::load_snapshot())
 }
 
 /// Persist the desktop app's settings document and echo back what was written.
