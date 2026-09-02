@@ -76,7 +76,6 @@ export function SettingsSheet({ open, onClose, settings, onSave, saveError, path
           <div>
             <span className="eyebrow">APPLICATION SETTINGS</span>
             <h2 id="settings-title">Settings</h2>
-            <p>Preferences for this installation of Agent Deck, on this machine. Everything else — the project, the agents, the run — comes from the daemon.</p>
           </div>
           <button className="icon-button" aria-label="Close settings" onClick={onClose}><X size={18} /></button>
         </header>
@@ -130,10 +129,10 @@ export function SettingsSheet({ open, onClose, settings, onSave, saveError, path
  */
 function SettingsLocation({ mode, path, loaded }: { mode: RuntimeMode; path?: string; loaded: boolean }) {
   if (mode === "fixture") {
-    return <span data-testid="settings-location">Browser preview — settings are kept in this browser's local storage, not in a file. The desktop app stores them on your machine.</span>;
+    return <span data-testid="settings-location">Browser preview — kept in this browser's local storage, not in a file.</span>;
   }
   if (path) {
-    return <span data-testid="settings-location">Stored in <code>{path}</code> — readable, editable and deletable without Agent Deck running.</span>;
+    return <span data-testid="settings-location">Stored in <code>{path}</code></span>;
   }
   return <span data-testid="settings-location">{loaded ? "Settings file location unavailable." : "Locating the settings file…"}</span>;
 }

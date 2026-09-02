@@ -716,9 +716,8 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .segmented label.is-selected > span { color: var(--teal); background: var(--paper-strong); box-shadow: 0 0 0 1px var(--teal-focus); }
 .segmented input { position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
 .segmented input:focus-visible + span { outline: 2px solid var(--focus-ring); outline-offset: 1px; }
-.settings-note, .settings-error { margin: 0; padding: 9px 11px; display: flex; align-items: flex-start; gap: 7px; border: 1px solid var(--line); border-radius: 4px; color: var(--muted); background: var(--paper-sunken); font-size: 9px; line-height: 1.5; }
-.settings-note svg, .settings-error svg { flex: 0 0 auto; margin-top: 1px; }
-.settings-error { border-color: var(--red-rim); color: var(--red-ink); background: var(--red-soft); }
+.settings-error { margin: 0; padding: 9px 11px; display: flex; align-items: flex-start; gap: 7px; border: 1px solid var(--red-rim); border-radius: 4px; color: var(--red-ink); background: var(--red-soft); font-size: 9px; line-height: 1.5; }
+.settings-error svg { flex: 0 0 auto; margin-top: 1px; }
 
 .projects-layout { min-height: 0; flex: 1; display: grid; grid-template-columns: 260px minmax(0, 1fr); }
 .project-library { min-height: 0; padding: 11px; display: flex; flex-direction: column; border-right: 1px solid var(--line); background: var(--paper-sunken); }

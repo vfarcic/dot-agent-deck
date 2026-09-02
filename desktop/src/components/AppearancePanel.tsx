@@ -13,8 +13,16 @@
  * whatever this machine is set to." restates *Light*). Whatever density this
  * first panel establishes is the one #741 and #802 will copy, so it establishes
  * the tight one.
+ *
+ * It is the worked example of that document's text rule too, by subtraction: it
+ * used to carry a paragraph explaining *why* the agent terminals stay dark in
+ * both appearances. That is an engineering constraint, it is true, and it
+ * changed nothing a reader does next — so it now lives only in
+ * `docs/develop/desktop-gui.md` and `prds/743-desktop-light-dark-appearance.md`.
+ * The failed-save alert below stays, because it is a consequence the user has to
+ * act on.
  */
-import { AlertTriangle, SquareTerminal } from "lucide-react";
+import { AlertTriangle } from "lucide-react";
 import type { AppearanceMode } from "../lib/bridge";
 import type { SettingsPanelProps } from "../lib/settingsContract";
 
@@ -63,18 +71,6 @@ export function AppearancePanel({ settings, onSave, saveError }: SettingsPanelPr
             <span>This appearance is applied, but saving it failed, so it will not survive a restart. {saveError}</span>
           </p>
         )}
-
-        {/* A panel-level note rather than a per-option hint: it is not a
-            consequence of any one choice, and it is the kind of thing a user
-            cannot infer from a label. */}
-        <p className="settings-note">
-          <SquareTerminal size={13} />
-          <span>
-            Agent terminals stay dark in both appearances. Agent CLIs pick colours for a dark
-            terminal — dim greys tuned to read on black, and truecolor output that ignores the
-            palette — so a light pane would be unreadable in a way Agent Deck cannot fix from here.
-          </span>
-        </p>
       </div>
     </>
   );
