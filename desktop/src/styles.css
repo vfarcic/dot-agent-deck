@@ -695,20 +695,27 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .settings-footer > span { display: flex; align-items: center; gap: 7px; }
 .settings-footer code { color: var(--muted); font-size: 8px; }
 
-/* The three-way appearance choice (PRD #743 M4). A real radio group: one name
-   gives arrow-key navigation and a single tab stop, and the legend labels it. */
-.appearance-choices { margin: 0; padding: 0; display: grid; gap: 7px; border: 0; }
-.appearance-choices legend { padding: 0 0 8px; color: var(--faint); font-size: 7px; font-weight: 800; letter-spacing: .1em; text-transform: uppercase; }
-.appearance-choices label { padding: 11px 12px; display: grid; grid-template-columns: 15px minmax(0, 1fr); align-items: start; gap: 10px; border: 1px solid var(--line-strong); border-radius: 5px; background: var(--paper-strong); cursor: pointer; }
-.appearance-choices label:hover { border-color: var(--teal-rim); }
-.appearance-choices label.is-selected { border-color: var(--teal-focus); box-shadow: 0 0 0 1px var(--teal-focus); }
-.appearance-choices input { position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
-.appearance-mark { width: 15px; height: 15px; margin-top: 1px; display: block; border: 1px solid var(--line-strong); border-radius: 50%; background: var(--paper); }
-.appearance-choices label.is-selected .appearance-mark { border-color: var(--teal); background: var(--teal); box-shadow: inset 0 0 0 3px var(--on-accent); }
-.appearance-choices input:focus-visible + .appearance-mark { outline: 2px solid var(--focus-ring); outline-offset: 2px; }
-.appearance-copy { display: flex; flex-direction: column; gap: 4px; }
-.appearance-copy strong { font-size: 12px; }
-.appearance-copy small { color: var(--muted); font-size: 9px; line-height: 1.45; }
+/* One setting, one row: label on the left, control on the right (PRD #803's
+   density rule — docs/develop/desktop-gui.md). The sheet is 780px wide and full
+   height, so vertical space is what every section is competing for.
+
+   `float: left` on the legend is load-bearing, not a leftover. A floated legend
+   stops being the fieldset's *rendered* legend, which is the only way it joins
+   the flex row instead of being laid out above it on a line of its own — and
+   the row has to stay a fieldset so the group keeps its accessible name. */
+.settings-row { margin: 0; padding: 0; display: flex; align-items: center; gap: 14px; border: 0; }
+.settings-row > legend { float: left; margin-right: auto; padding: 0; color: var(--ink); font-size: 11px; }
+
+/* A segmented control: up to about four exclusive options with short labels,
+   joined into one row. Still a real radio group — one name gives arrow-key
+   navigation and a single tab stop, and the row's legend labels it. */
+.segmented { display: flex; padding: 2px; gap: 2px; border: 1px solid var(--line-strong); border-radius: 5px; background: var(--paper-sunken); }
+.segmented label { display: flex; cursor: pointer; }
+.segmented label > span { padding: 5px 13px; border-radius: 3px; color: var(--muted); font-size: 10px; }
+.segmented label:hover > span { color: var(--ink); }
+.segmented label.is-selected > span { color: var(--teal); background: var(--paper-strong); box-shadow: 0 0 0 1px var(--teal-focus); }
+.segmented input { position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+.segmented input:focus-visible + span { outline: 2px solid var(--focus-ring); outline-offset: 1px; }
 .settings-note, .settings-error { margin: 0; padding: 9px 11px; display: flex; align-items: flex-start; gap: 7px; border: 1px solid var(--line); border-radius: 4px; color: var(--muted); background: var(--paper-sunken); font-size: 9px; line-height: 1.5; }
 .settings-note svg, .settings-error svg { flex: 0 0 auto; margin-top: 1px; }
 .settings-error { border-color: var(--red-rim); color: var(--red-ink); background: var(--red-soft); }

@@ -4,15 +4,24 @@
  *
  * It implements `SettingsPanelProps` and nothing else — the sheet does not know
  * this is about themes, and this file does not know how the document is stored.
+ *
+ * It is also the worked example of the density rule in
+ * `docs/develop/desktop-gui.md`: **one setting is one row**, its label on the
+ * left and its control on the right. This was three full-width cards carrying a
+ * sentence of hint each — 195px of a ~700px panel for a single setting, against
+ * 27px as one row — and the hints were close to tautological ("Always light,
+ * whatever this machine is set to." restates *Light*). Whatever density this
+ * first panel establishes is the one #741 and #802 will copy, so it establishes
+ * the tight one.
  */
 import { AlertTriangle, SquareTerminal } from "lucide-react";
 import type { AppearanceMode } from "../lib/bridge";
 import type { SettingsPanelProps } from "../lib/settingsContract";
 
-const CHOICES: { value: AppearanceMode; label: string; hint: string }[] = [
-  { value: "system", label: "System", hint: "Follow this machine's light/dark setting, and keep following it when it changes." },
-  { value: "light", label: "Light", hint: "Always light, whatever this machine is set to." },
-  { value: "dark", label: "Dark", hint: "Always dark, whatever this machine is set to." },
+const CHOICES: { value: AppearanceMode; label: string }[] = [
+  { value: "system", label: "System" },
+  { value: "light", label: "Light" },
+  { value: "dark", label: "Dark" },
 ];
 
 export function AppearancePanel({ settings, onSave, saveError }: SettingsPanelProps) {
@@ -24,24 +33,28 @@ export function AppearancePanel({ settings, onSave, saveError }: SettingsPanelPr
         <div><span>APPEARANCE</span><h3>Light and dark</h3></div>
       </div>
       <div className="settings-body">
-        {/* A real radio group: one `name` gives arrow-key navigation and a
-            single tab stop for free, and the legend names it for a screen
-            reader without a visible heading having to do that job. */}
-        <fieldset className="appearance-choices">
+        {/* A segmented control, not three buttons: still a real radio group, so
+            one `name` buys arrow-key navigation and a single tab stop for free,
+            and the legend names the group for a screen reader without a visible
+            heading having to do that job. The legend is also the row's visible
+            label — see the `float` note on `.settings-row > legend` in
+            `styles.css` for why that works. */}
+        <fieldset className="settings-row">
           <legend>Appearance</legend>
-          {CHOICES.map((choice) => (
-            <label key={choice.value} className={choice.value === current ? "is-selected" : ""}>
-              <input
-                type="radio"
-                name="appearance"
-                value={choice.value}
-                checked={choice.value === current}
-                onChange={() => onSave({ ...settings, appearance: { ...settings.appearance, mode: choice.value } })}
-              />
-              <span className="appearance-mark" aria-hidden="true" />
-              <span className="appearance-copy"><strong>{choice.label}</strong><small>{choice.hint}</small></span>
-            </label>
-          ))}
+          <div className="segmented">
+            {CHOICES.map((choice) => (
+              <label key={choice.value} className={choice.value === current ? "is-selected" : ""}>
+                <input
+                  type="radio"
+                  name="appearance"
+                  value={choice.value}
+                  checked={choice.value === current}
+                  onChange={() => onSave({ ...settings, appearance: { ...settings.appearance, mode: choice.value } })}
+                />
+                <span>{choice.label}</span>
+              </label>
+            ))}
+          </div>
         </fieldset>
 
         {saveError && (
@@ -51,13 +64,15 @@ export function AppearancePanel({ settings, onSave, saveError }: SettingsPanelPr
           </p>
         )}
 
+        {/* A panel-level note rather than a per-option hint: it is not a
+            consequence of any one choice, and it is the kind of thing a user
+            cannot infer from a label. */}
         <p className="settings-note">
           <SquareTerminal size={13} />
           <span>
-            The agent terminals stay dark in both appearances. Agent CLIs pick colours for a dark
+            Agent terminals stay dark in both appearances. Agent CLIs pick colours for a dark
             terminal — dim greys tuned to read on black, and truecolor output that ignores the
-            palette entirely — so a light pane would be unreadable in a way Agent Deck cannot fix
-            from here.
+            palette — so a light pane would be unreadable in a way Agent Deck cannot fix from here.
           </span>
         </p>
       </div>
