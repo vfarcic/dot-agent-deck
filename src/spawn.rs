@@ -2911,15 +2911,38 @@ mod tests {
         agent_id: &str,
         attempt: usize,
     ) -> Vec<u8> {
+        wait_for_drained_lines(registry, agent_id, attempt.saturating_sub(1)).await
+    }
+
+    /// Block until `lines` completed input lines have finished round-tripping,
+    /// i.e. until the buffer holds the `2 * lines` line terminators
+    /// [`completed_lines`] documents — one per line from the echo, one from
+    /// `/bin/cat`'s copy.
+    ///
+    /// This is the same wait as [`wait_for_detached_delivery_attempt`] said in
+    /// the vocabulary of a caller that is counting WRITES rather than delivery
+    /// attempts. A caller needs it before snapshotting a baseline that a later
+    /// assertion compares by EXACT EQUALITY: a `cat` copy still in flight lands
+    /// inside the comparison window and reads as bytes the code under test
+    /// sent, which is issue #850's failure mode one assertion further on from
+    /// the precondition it was filed for.
+    async fn wait_for_drained_lines(
+        registry: &AgentPtyRegistry,
+        agent_id: &str,
+        lines: usize,
+    ) -> Vec<u8> {
         let deadline = Instant::now() + Duration::from_secs(8);
         loop {
             let snapshot = registry.snapshot(agent_id).expect("byte target snapshot");
-            if completed_lines(&snapshot) >= 2 * attempt.saturating_sub(1) {
+            let seen = completed_lines(&snapshot);
+            if seen >= 2 * lines {
                 return snapshot;
             }
             assert!(
                 Instant::now() < deadline,
-                "timed out waiting for attempt {attempt} to land in full; snapshot={:?}",
+                "timed out waiting for {lines} line(s) to finish round-tripping; saw \
+                 {seen} of {} terminators; snapshot={:?}",
+                2 * lines,
                 String::from_utf8_lossy(&snapshot)
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -3114,7 +3137,89 @@ mod tests {
         }
     }
 
-    async fn type_user_bytes(
+    /// The printable runs of `bytes` that are long enough to search the
+    /// target's buffer for.
+    ///
+    /// The line discipline echoes printable input verbatim, so every such run
+    /// must appear in the buffer once the write has physically reached the PTY.
+    /// Control bytes are excluded because their echoed form is not fixed —
+    /// `ECHOCTL` renders `ESC` as `^[` while `/bin/cat`'s copy of the same line
+    /// carries the raw byte — which is also why the runs are searched for
+    /// individually instead of the payload being searched for whole. One-byte
+    /// runs are dropped: a single character is not a landmark.
+    fn printable_runs(bytes: &[u8]) -> Vec<&[u8]> {
+        bytes
+            .split(|byte: &u8| !byte.is_ascii_graphic() && *byte != b' ')
+            .filter(|run| run.len() >= 2)
+            .collect()
+    }
+
+    /// How many times each of `bytes`' landmarks must appear on the target
+    /// before the write has finished producing output.
+    ///
+    /// A run sitting in a line this write COMPLETED lands twice: once from the
+    /// echo, and once from `/bin/cat` copying the finished line straight back —
+    /// the same "exactly TWO line terminators per write" arithmetic
+    /// [`completed_lines`] documents, counted by content instead of by
+    /// terminator. A run left in an unterminated line lands once, because `cat`
+    /// has nothing to copy until a terminator arrives.
+    ///
+    /// Waiting for that second appearance is load-bearing rather than thorough.
+    /// `cat`'s copy is the last byte the write can produce, and several callers
+    /// compare the snapshot taken straight after this write against a later one
+    /// by EXACT EQUALITY (`after_paste_retry == before_paste_retry` and the
+    /// three `UserFrameRetry` comparisons in
+    /// `dispatch_020_payload_guards_are_scoped_to_one_delivery`), so a copy
+    /// still in flight lands between the two snapshots and fails the assertion.
+    fn echo_landmarks(bytes: &[u8]) -> Vec<(&[u8], usize)> {
+        let completed = bytes
+            .iter()
+            .rposition(|byte| *byte == b'\n' || *byte == b'\r')
+            .map_or(0, |index| index + 1);
+        let (finished, pending) = bytes.split_at(completed);
+        printable_runs(finished)
+            .into_iter()
+            .map(|run| (run, 2))
+            .chain(printable_runs(pending).into_iter().map(|run| (run, 1)))
+            .collect()
+    }
+
+    /// Block until `needle` has appeared at least `occurrences` times on the
+    /// target, or fail with the buffer that was actually observed.
+    ///
+    /// Content-keyed for the same reason [`wait_for_detached_payload_echo`] is:
+    /// the caller needs an instant that is provably AFTER a specific write, and
+    /// "the buffer grew" only proves that if nothing else can put a byte there.
+    async fn wait_for_echo_occurrences(
+        registry: &AgentPtyRegistry,
+        agent_id: &str,
+        needle: &[u8],
+        occurrences: usize,
+    ) {
+        let deadline = Instant::now() + Duration::from_secs(8);
+        loop {
+            let snapshot = registry.snapshot(agent_id).expect("byte target snapshot");
+            let seen = snapshot
+                .windows(needle.len())
+                .filter(|window| *window == needle)
+                .count();
+            if seen >= occurrences {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for {:?} to appear {occurrences} time(s) on the \
+                 target; saw {seen}; snapshot={:?}",
+                String::from_utf8_lossy(needle),
+                String::from_utf8_lossy(&snapshot)
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Put raw user-input bytes on the pane's PTY and record them as user
+    /// input. Waits for nothing — the callers below own that half.
+    async fn write_user_bytes(
         registry: &AgentPtyRegistry,
         agent_id: &str,
         pane_id: &str,
@@ -3132,7 +3237,62 @@ mod tests {
         writer.flush().expect("flush detached user input bytes");
         drop(writer);
         registry.note_user_input(pane_id);
-        tokio::time::sleep(Duration::from_millis(75)).await;
+    }
+
+    /// Type user-input bytes, returning only once they are demonstrably on the
+    /// target's PTY — and only once nothing else is still arriving on it.
+    ///
+    /// This used to write and then sleep a fixed 75 ms (issue #850). Nothing
+    /// waited for the bytes to become observable, so every caller's "the draft
+    /// must physically reach the PTY" precondition was a bet on a PTY round trip
+    /// beating that constant — a bet a contended runner loses, and the fast tier
+    /// has no retries, so losing it hard-reds the required `build` job. Both
+    /// waits below are keyed on content and bounded only by a diagnostic
+    /// deadline, so load makes them slower rather than wrong.
+    ///
+    /// `lines_already_written` is the number of input lines the pane has
+    /// completed before this call — one per guarded delivery, which writes a
+    /// payload and a submit CR, plus any earlier draft that carried a
+    /// terminator of its own. Draining them first is not tidiness, and it is
+    /// the half of this fix that is easiest to mistake for it: `/bin/cat` and
+    /// the line discipline's echo are two independent writers into one PTY
+    /// output queue, and the kernel commits echo in batches, so a `cat` copy
+    /// that is still pending can land IN THE MIDDLE of this write's echo.
+    /// Measured, on the plain-Enter case of
+    /// `dispatch_020_payload_guards_are_scoped_to_one_delivery`:
+    ///
+    /// ```text
+    /// "automatic payload before plain Enter\r\n"   <- echo of the earlier line
+    /// "user"                                       <- this write's echo, cut off
+    /// "automatic payload before plain Enter\r\n"   <- cat's copy, interleaved
+    /// " turn completed with plain Enter"           <- the rest of this write
+    /// ```
+    ///
+    /// The scrollback is append-only, so that split is permanent: no amount of
+    /// waiting reassembles the draft, and every `windows(draft.len())` search in
+    /// the callers below — their own preconditions included — fails for good.
+    /// With the pane drained first, `cat` has nothing to copy until this write
+    /// terminates a line, so there is no second writer to interleave.
+    async fn type_user_bytes(
+        registry: &AgentPtyRegistry,
+        agent_id: &str,
+        pane_id: &str,
+        bytes: &[u8],
+        lines_already_written: usize,
+    ) {
+        let landmarks = echo_landmarks(bytes);
+        assert!(
+            !landmarks.is_empty(),
+            "cannot observe this write's own completion: {:?} carries no printable \
+             landmark. Use type_user_frame, which names the pending draft whose \
+             line the write completes.",
+            String::from_utf8_lossy(bytes)
+        );
+        wait_for_drained_lines(registry, agent_id, lines_already_written).await;
+        write_user_bytes(registry, agent_id, pane_id, bytes).await;
+        for (needle, occurrences) in landmarks {
+            wait_for_echo_occurrences(registry, agent_id, needle, occurrences).await;
+        }
     }
 
     async fn type_user_draft(
@@ -3140,8 +3300,44 @@ mod tests {
         agent_id: &str,
         pane_id: &str,
         draft: &str,
+        lines_already_written: usize,
     ) {
-        type_user_bytes(registry, agent_id, pane_id, draft.as_bytes()).await;
+        type_user_bytes(
+            registry,
+            agent_id,
+            pane_id,
+            draft.as_bytes(),
+            lines_already_written,
+        )
+        .await;
+    }
+
+    /// Type a newline control frame — `Ctrl+J` encodes to `\n`, `Alt+Enter` to
+    /// `ESC \r`, plain `Enter` to `\r` — and return once it has finished
+    /// round-tripping.
+    ///
+    /// A bare frame carries no printable byte, so it has no landmark of its own
+    /// for [`type_user_bytes`] to wait on. What it does is COMPLETE the line
+    /// `draft` opened, which makes `/bin/cat` copy that line back, so the second
+    /// appearance of `draft` is this write's last observable effect. Both
+    /// directions of the PTY are FIFO and the echo of a byte is queued before
+    /// `cat` can read the line containing it, so that copy arriving implies the
+    /// frame's own echo — and every earlier byte on this pane — has already
+    /// landed.
+    ///
+    /// This takes no `lines_already_written` because it must only ever follow
+    /// the `type_user_draft` that opened `draft`: that call drained the pane and
+    /// left `cat` with nothing to copy, so no second writer can interleave into
+    /// this frame's echo either.
+    async fn type_user_frame(
+        registry: &AgentPtyRegistry,
+        agent_id: &str,
+        pane_id: &str,
+        frame: &[u8],
+        draft: &str,
+    ) {
+        write_user_bytes(registry, agent_id, pane_id, frame).await;
+        wait_for_echo_occurrences(registry, agent_id, draft.as_bytes(), 2).await;
     }
 
     struct UserFrameRetry {
@@ -3165,8 +3361,11 @@ mod tests {
                 .expect("delivery before user newline control"),
             GuardedSend::Applied
         );
-        type_user_draft(&registry, &agent_id, pane_id, draft).await;
-        type_user_bytes(&registry, &agent_id, pane_id, frame).await;
+        // One guarded delivery precedes the draft: it wrote a payload and a
+        // submit CR, so exactly one input line has to finish round-tripping
+        // before this write can be echoed without `/bin/cat` cutting into it.
+        type_user_draft(&registry, &agent_id, pane_id, draft, 1).await;
+        type_user_frame(&registry, &agent_id, pane_id, frame, draft).await;
         let before = registry
             .snapshot(&agent_id)
             .expect("before newline-control retry snapshot");
@@ -3902,6 +4101,8 @@ mod tests {
             &replacement_agent,
             REPLACEMENT_PANE_ID,
             REPLACEMENT_DRAFT,
+            // Attempt 1's payload and submit CR are the one line in flight.
+            1,
         )
         .await;
         let before_replacement = replacement_registry
@@ -3974,7 +4175,8 @@ mod tests {
             "precondition: attempt 2 must have reached the byte target before the user types"
         );
 
-        type_user_draft(&registry, &agent_id, PANE_ID, USER_DRAFT).await;
+        // Attempt 2's payload and submit CR are the one line in flight.
+        type_user_draft(&registry, &agent_id, PANE_ID, USER_DRAFT, 1).await;
         let before_probe = registry
             .snapshot(&agent_id)
             .expect("pre-probe pane snapshot");
@@ -4098,6 +4300,8 @@ mod tests {
             &same_agent,
             SAME_PANE,
             "user completed an unrelated turn\r",
+            // Delivery A's payload and submit CR are the one line in flight.
+            1,
         )
         .await;
         let before_delivery_b = same_registry
@@ -4134,6 +4338,8 @@ mod tests {
             &replaced_agent,
             REPLACED_PANE,
             "draft that invalidates delivery A",
+            // Delivery A's payload and submit CR are the one line in flight.
+            1,
         )
         .await;
         assert_eq!(
@@ -4149,7 +4355,12 @@ mod tests {
             GuardedSend::Applied,
             "precondition: the different guarded submit must replace the pane-global payload slot"
         );
-        tokio::time::sleep(Duration::from_millis(75)).await;
+        // Deliveries A and B each wrote a payload and a submit CR, so two input
+        // lines are in flight; the draft between them terminated none. Both must
+        // finish round-tripping before the baseline below is taken, because the
+        // assertion at the end of this test compares it against the post-retry
+        // snapshot by exact equality.
+        wait_for_drained_lines(&replaced_registry, &replaced_agent, 2).await;
         let before_delivery_a_retry = replaced_registry
             .snapshot(&replaced_agent)
             .expect("before delivery A retry snapshot");
@@ -4179,7 +4390,15 @@ mod tests {
                 .expect("delivery before bracketed paste"),
             GuardedSend::Applied
         );
-        type_user_draft(&paste_registry, &paste_agent, PASTE_PANE, BRACKETED_DRAFT).await;
+        // The delivery before the paste is the one line in flight.
+        type_user_draft(
+            &paste_registry,
+            &paste_agent,
+            PASTE_PANE,
+            BRACKETED_DRAFT,
+            1,
+        )
+        .await;
         let before_paste_retry = paste_registry
             .snapshot(&paste_agent)
             .expect("before bracketed-paste retry snapshot");
@@ -4299,6 +4518,15 @@ mod tests {
             &overlap_agent,
             OVERLAP_PANE,
             OVERLAP_DRAFT,
+            // BOTH overlapping deliveries wrote a payload and a submit CR, so
+            // two input lines are in flight here. Nothing else waits for them,
+            // and the assertion at the end of this test compares the baseline
+            // taken just below against the post-retry snapshot by exact
+            // equality — so a `/bin/cat` copy still in flight lands inside that
+            // window and reads as bytes the retry sent. Measured: under 4x CPU
+            // oversubscription this case failed 2 runs in 30 without the drain
+            // (issue #850).
+            2,
         )
         .await;
         let before_overlap_retry = overlap_registry
