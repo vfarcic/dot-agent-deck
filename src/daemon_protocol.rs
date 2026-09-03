@@ -13,9 +13,16 @@
 //!   forward-compatible by design (older peer ignores the field, newer peer
 //!   tolerates its absence).
 //!
-//! The handshake itself ([`AttachRequest::Hello`]) is enforced only by the
-//! laptop-side `connect` flow — single-binary in-process call sites already
-//! match versions by construction and don't need the check.
+//! The handshake itself ([`AttachRequest::Hello`]) is enforced by the
+//! **desktop** client, which refuses to connect unless the daemon reports
+//! exactly this [`PROTOCOL_VERSION`] (`desktop/src-tauri/src/daemon_bridge.rs`,
+//! `classify_handshake`) — that check runs before the build-stamp comparison
+//! and its session-scoped bypass cannot reach it. No other client refuses on a
+//! version *difference*: `72527b9` removed the laptop-side `connect`
+//! comparison this note used to name (issue #491 — it compared two constants
+//! that never shared a wire), leaving only a presence floor there, and the
+//! local TUI attach path never had one (issue #405). Single-binary in-process
+//! call sites match versions by construction.
 //!
 //! # Wire format
 //!
@@ -229,7 +236,14 @@ pub const KIND_STREAM_REJECT: u8 = 0x17;
 ///
 /// # Where this constant is enforced
 ///
-/// **No call site refuses on it today, and that is issue #405.** The bump
+/// **Exactly one call site refuses on it: the desktop.**
+/// `classify_handshake` in `desktop/src-tauri/src/daemon_bridge.rs` requires
+/// `server_version == Some(PROTOCOL_VERSION)`, runs that comparison *before*
+/// the build-stamp one, and is not reachable by the stamp check's
+/// session-scoped bypass — so a desktop and a daemon that disagree here never
+/// exchange a second frame. Inside this crate nothing refuses on a version
+/// *difference* — `probe_remote_protocol`'s surviving check is a presence
+/// floor, described two paragraphs down — and that is issue #405. The bump
 /// rationales above were written while
 /// [`crate::connect::probe_remote_protocol`] compared the remote's
 /// `server_version` against the laptop's and hard-failed on a difference, and
@@ -243,20 +257,22 @@ pub const KIND_STREAM_REJECT: u8 = 0x17;
 /// cannot answer `daemon hello` at all — an install floor, not a version
 /// verdict.
 ///
-/// The local same-machine TUI↔daemon pairing is the one place a wire-shape skew
-/// can actually happen (the binary upgraded on disk under a still-running
+/// The local same-machine TUI↔daemon pairing is the place a wire-shape skew
+/// most easily happens (the binary upgraded on disk under a still-running
 /// daemon), and it is guarded by [`crate::build_version_handshake`]'s
 /// `DAD_BUILD_ID` comparison rather than by this constant. Build-id equality is
 /// strictly stronger than protocol equality when it *matches* — same build
 /// implies same protocol — but declining its restart prompt (the right choice
 /// when live agents would die with the daemon) attaches anyway with no version
-/// check of any kind. Issue #405 tracks closing that.
+/// check of any kind. Issue #405 tracks closing that. The desktop↔daemon
+/// pairing skews the same way and is the one that *does* read this constant,
+/// per the paragraph above.
 ///
 /// Keep bumping this on every wire-shape break regardless. The bump is what
 /// makes a skew *nameable* — it is the number the handshake reports, what
 /// `daemon hello` prints, and the input any future compatibility gate will
 /// read; #405 is what will make it *refused*.
-pub const PROTOCOL_VERSION: u32 = 8;
+pub const PROTOCOL_VERSION: u32 = 9;
 
 /// Hard cap on a single frame's payload length. Defends against a malicious
 /// or buggy peer trying to allocate gigabytes off a forged length prefix.
@@ -268,6 +284,66 @@ pub const PROTOCOL_VERSION: u32 = 8;
 /// header without the async reader, and used to allocate straight off the u32.
 /// Both sides now read the one constant — do not re-spell the 16 MiB literal.
 pub(crate) const MAX_FRAME_LEN: usize = 16 * 1024 * 1024;
+
+// ---------------------------------------------------------------------------
+// PRD #819: capability strings, and the project verbs' bounded error codes.
+// ---------------------------------------------------------------------------
+
+/// Capability string for [`AttachRequest::ListProjects`].
+///
+/// The strings are the kebab-case `op` names the request enum already
+/// serializes to, so there is one spelling of each verb rather than two that
+/// can drift.
+pub const CAP_LIST_PROJECTS: &str = "list-projects";
+
+/// Capability string for [`AttachRequest::ResolveProject`].
+pub const CAP_RESOLVE_PROJECT: &str = "resolve-project";
+
+/// Capability string for [`AttachRequest::PrepareWorkflow`].
+pub const CAP_PREPARE_WORKFLOW: &str = "prepare-workflow";
+
+/// The capability set this build advertises on the [`AttachRequest::Hello`]
+/// reply, via [`AttachResponse::with_capabilities`].
+///
+/// **What an entry claims, precisely:** this build's dispatch knows the op and
+/// answers it with a defined [`AttachResponse`], rather than failing the frame
+/// decode with serde's `unknown variant …`. It does **not** claim that a given
+/// call will succeed — a bounded refusal (a rejected path, an over-long task)
+/// is a normal answer to a known verb. Strike a verb from this list if this
+/// build stops accepting it; do not leave a name here that the dispatch no
+/// longer has an arm for.
+pub const DAEMON_CAPABILITIES: &[&str] =
+    &[CAP_LIST_PROJECTS, CAP_RESOLVE_PROJECT, CAP_PREPARE_WORKFLOW];
+
+/// PRD #819 M2: the project verbs' refusal carries a stable machine-readable
+/// code as the first token of [`AttachResponse::error`], followed by `": "` and
+/// a generic human sentence.
+///
+/// The codes exist because the alternative is matching prose, and because the
+/// text after them is deliberately uninformative: an arbitrary caller-selected
+/// path gets a bounded refusal that names no path, no parser source line and no
+/// raw OS error. [`crate::project_config::ProjectConfigError`]'s `Display`
+/// renders the offending TOML line verbatim, so returning it for a pasted path
+/// would disclose file *content*, not merely existence. Detail is reserved for
+/// a path already in the daemon's known set — see the PRD's disclosure split —
+/// and that half arrives with M3.
+pub const PROJECT_ERR_INVALID_PATH: &str = "invalid-path";
+
+/// The `task` on [`AttachRequest::PrepareWorkflow`] exceeded
+/// [`crate::bounded_read::MAX_TASK_BYTES`], or carried a NUL. See
+/// [`PROJECT_ERR_INVALID_PATH`] for the code convention.
+pub const PROJECT_ERR_TASK_REJECTED: &str = "task-rejected";
+
+/// The verb parsed and its arguments were accepted, but this build has no
+/// implementation behind it yet (PRD #819 M2 landed the wire contract; M3 and
+/// M4 land the behaviour).
+///
+/// It is a distinct code rather than a generic failure because the two are not
+/// the same thing to a caller, and it is an error rather than `ok: true` with
+/// an empty payload for the same reason: a client — or a test — cannot tell an
+/// empty answer apart from a real one. A panic was the other option and is
+/// worse; `handle_connection` serves other clients.
+pub const PROJECT_ERR_UNIMPLEMENTED: &str = "unimplemented";
 
 /// Bounded timeout for a single STREAM_OUT/STREAM_END write to a client. If
 /// a client stops draining its socket, the OS send buffer fills and our
@@ -493,9 +569,12 @@ pub enum AttachRequest {
     /// PRD #76 M2.21: protocol-version handshake. Client sends its
     /// [`PROTOCOL_VERSION`]; server replies with its own in
     /// [`AttachResponse::server_version`]. The daemon never rejects on
-    /// `client_version`, and since issue #491 no client rejects on
-    /// `server_version` either — `connect`'s strict comparison was the last
-    /// one, and the local attach path never had one (issue #405). See the
+    /// `client_version`. On the client side, the **desktop** rejects on
+    /// `server_version` — `classify_handshake` in
+    /// `desktop/src-tauri/src/daemon_bridge.rs` requires exact equality and is
+    /// never bypassed. Issue #491 removed `connect`'s comparison and the local
+    /// TUI attach path never had one (issue #405), so the desktop is currently
+    /// the only client that refuses on a version *difference*. See the
     /// enforcement note on [`PROTOCOL_VERSION`].
     ///
     /// PRD #103 M1.2: optional `client_build_version` carries the client's
@@ -541,6 +620,70 @@ pub enum AttachRequest {
     /// warning on any error, which is the same way it treats a down daemon.
     DispatchWorktreeClosePreview {
         pane_ids: Vec<String>,
+    },
+    /// PRD #819 M2: enumerate the projects this daemon knows about. **Read-only.**
+    ///
+    /// A GUI cannot `cd`, and against a remote daemon it cannot browse to find
+    /// out either — so this is the desktop's equivalent of the TUI's selection
+    /// mechanism. The answer is derived from what the daemon already holds
+    /// (its own startup cwd, live agent cwds, orchestration cwds), revalidated
+    /// per candidate; nothing is persisted on either side. The reply rides back
+    /// on [`AttachResponse::projects`].
+    ///
+    /// A struct variant with no fields rather than a unit variant, because the
+    /// enumeration will grow bounds (a cap, a filter) and a unit variant cannot
+    /// gain a `#[serde(default)]` field without moving the wire shape again.
+    ListProjects {},
+    /// PRD #819 M2: resolve one project path. **Read-only.**
+    ///
+    /// One path in, resolved. No directory walk, no children, no parents, and
+    /// no implicit widening — resolving `/a/b` does not make `/a` or `/a/b/c`
+    /// known. This is the primitive the desktop lacks, and it is deliberately
+    /// narrower than a filesystem API: PRD #76's rejected Phase 6 was
+    /// `ListDir` / `ReadFile` / `Stat` and this is not that.
+    ///
+    /// It is **API minimisation, not authorization.** Any peer that reaches
+    /// this socket already has the daemon user's local-exec authority via
+    /// [`AttachRequest::StartAgent`] — see its trust-boundary note. Withholding
+    /// a browse verb limits the blast radius of a compromised or buggy UI and
+    /// keeps least privilege available later; it is not a privilege boundary.
+    ///
+    /// The reply rides back on [`AttachResponse::project`].
+    ResolveProject {
+        /// An absolute path. Either a path this daemon returned from
+        /// [`AttachRequest::ListProjects`], or one a user supplied verbatim —
+        /// never one a client derived from its own environment, because a
+        /// desktop client's filesystem need not be the daemon's.
+        path: String,
+    },
+    /// PRD #819 M2/M4: prepare a workflow launch — resolve, compose the
+    /// coordinator context, and publish it. **The only new verb that writes.**
+    ///
+    /// Preparing the context is an explicit launch phase rather than an
+    /// incidental side effect of resolution: enumerate and resolve stay
+    /// read-only, and there is otherwise no operation at which the daemon-side
+    /// write could happen ([`AttachRequest::StartAgent`] carries no task and no
+    /// config revision, and is issued once per role). A failed preparation
+    /// starts no roles.
+    ///
+    /// The reply rides back on [`AttachResponse::workflow_prepared`].
+    PrepareWorkflow {
+        /// The daemon-canonical path, as returned by
+        /// [`AttachRequest::ListProjects`] or [`AttachRequest::ResolveProject`].
+        /// Not a client-derived path.
+        path: String,
+        orchestration: String,
+        /// The coordinator task. Bounded server-side at
+        /// [`crate::bounded_read::MAX_TASK_BYTES`] before any filesystem work —
+        /// the desktop's own 64 KiB check is a UI affordance and not a bound
+        /// this daemon may rely on.
+        task: String,
+        /// The config revision the client believes it resolved against. Stale
+        /// values are refused, which is what closes the TOCTOU window between
+        /// the picker, the write and the spawn. `#[serde(default)]` so a client
+        /// that has not yet got one can omit the key.
+        #[serde(default)]
+        config_revision: Option<String>,
     },
 }
 
@@ -732,6 +875,47 @@ pub struct AttachResponse {
     /// with is owed to the new REQUEST variant beside it, not to this.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kept_worktree: Option<crate::issue_dispatch_run::KeptWorktree>,
+    /// PRD #819 M2: the answer to [`AttachRequest::ListProjects`]. `None` on
+    /// every other response. Additive + optional, so the field itself is
+    /// forward-compatible in both directions; the `PROTOCOL_VERSION` bump this
+    /// ships with is owed to the three new REQUEST variants beside it, not to
+    /// this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projects: Option<crate::event::ProjectListing>,
+    /// PRD #819 M2: the answer to [`AttachRequest::ResolveProject`]. `None` on
+    /// every other response, and on a refusal. Additive + optional on the same
+    /// basis as [`Self::projects`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<crate::event::ResolvedProject>,
+    /// PRD #819 M2: the answer to [`AttachRequest::PrepareWorkflow`]. `None` on
+    /// every other response, and on a preparation that failed — a failed
+    /// preparation publishes nothing and starts no roles. Additive + optional
+    /// on the same basis as [`Self::projects`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_prepared: Option<crate::event::PreparedWorkflow>,
+    /// PRD #819 M2/M5: explicit capability advertisement on the
+    /// [`AttachRequest::Hello`] reply — the general form of
+    /// [`Self::guarded_send`], which stays exactly as it is and is deliberately
+    /// **not** folded into this list (an older client reads only the boolean,
+    /// and moving it would break that client for no gain).
+    ///
+    /// Each entry is a stable string naming one op this build's dispatch
+    /// accepts and answers; see [`DAEMON_CAPABILITIES`]. Unknown strings are
+    /// ignored by a reader, so the set can grow without a bump.
+    ///
+    /// **Absence means "this daemon does not tell you", which a client must
+    /// treat as "withhold" — never as "proceed".** That is the
+    /// [`Self::guarded_send`] rule generalised, and it is the only safe reading:
+    /// an older daemon omits the field entirely, and it is indistinguishable
+    /// from a newer one that chose to.
+    ///
+    /// It is **compatibility metadata, NOT authentication.** A daemon controls
+    /// its own replies and can therefore claim anything; what this buys is a
+    /// stable answer to "will this op parse over there", in place of
+    /// string-matching serde's `unknown variant …` message — which is not a
+    /// stability contract. Nothing may branch on that error text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capabilities: Option<Vec<String>>,
 }
 
 impl AttachResponse {
@@ -844,6 +1028,15 @@ impl AttachResponse {
     /// build) makes a guarded send FAIL SAFE — see [`Self::guarded_send`].
     pub fn with_guarded_send(mut self) -> Self {
         self.guarded_send = Some(true);
+        self
+    }
+
+    /// PRD #819 M2/M5: advertise [`DAEMON_CAPABILITIES`] on a handshake reply.
+    /// The live daemon's `Hello` handler calls this; the static `daemon hello`
+    /// CLI probe and the plain [`Self::hello`] constructor leave the field
+    /// `None`, which a client reads as "withhold" — see [`Self::capabilities`].
+    pub fn with_capabilities(mut self) -> Self {
+        self.capabilities = Some(DAEMON_CAPABILITIES.iter().map(|c| c.to_string()).collect());
         self
     }
 }
@@ -2229,7 +2422,13 @@ async fn handle_connection(
             // client knows this daemon enforces the identity/idempotency guards
             // and may safely issue an identity-bearing write-and-submit. Its
             // absence (an older daemon) makes the client fail such a send safe.
-            let mut resp = AttachResponse::hello(PROTOCOL_VERSION).with_guarded_send();
+            // PRD #819 M2/M5: advertise the project verbs explicitly, so a
+            // client asks a stable question ("do you know this op?") instead
+            // of string-matching serde's `unknown variant` message. Absence
+            // means withhold — see `AttachResponse::capabilities`.
+            let mut resp = AttachResponse::hello(PROTOCOL_VERSION)
+                .with_guarded_send()
+                .with_capabilities();
             if !omit_running_agents {
                 let summary = RunningAgentsSummary::from_records(&registry.agent_records());
                 resp = resp.with_running_agents(summary);
@@ -2295,8 +2494,115 @@ async fn handle_connection(
             resp.kept_worktree = kept;
             write_resp(&mut stream, &resp).await?
         }
+        // PRD #819 M2. The three project verbs are REACHABLE here — the wire
+        // contract is landed, the boundary validation below is real, and an
+        // accepted request gets a named `unimplemented` refusal rather than a
+        // panic or a hollow `ok: true`. The behaviour arrives with M3
+        // (enumeration and the bounded reader) and M4 (the safe publish).
+        AttachRequest::ListProjects {} => {
+            // Nothing caller-supplied to validate: the enumeration is derived
+            // entirely from state the daemon already holds.
+            let resp = unimplemented_project_verb(CAP_LIST_PROJECTS);
+            write_resp(&mut stream, &resp).await?
+        }
+        AttachRequest::ResolveProject { path } => {
+            let resp = match validate_project_path(&path) {
+                Err(message) => AttachResponse::err(message),
+                Ok(()) => unimplemented_project_verb(CAP_RESOLVE_PROJECT),
+            };
+            write_resp(&mut stream, &resp).await?
+        }
+        // Every field bound, with no `..` rest pattern, so the next field added
+        // to the variant is a compile error at this seam rather than a value
+        // silently dropped — the mistake `map_tab` in the desktop crate records
+        // having made with `orchestration_cwd`.
+        AttachRequest::PrepareWorkflow {
+            path,
+            orchestration: _,
+            task,
+            config_revision: _,
+        } => {
+            let resp = match validate_project_path(&path).and_then(|()| validate_task(&task)) {
+                Err(message) => AttachResponse::err(message),
+                Ok(()) => unimplemented_project_verb(CAP_PREPARE_WORKFLOW),
+            };
+            write_resp(&mut stream, &resp).await?
+        }
     }
     Ok(())
+}
+
+/// PRD #819 M2/A5: the wire-boundary check every caller-supplied project path
+/// passes **before** any filesystem access.
+///
+/// It reuses [`crate::agent_pty::is_valid_orchestration_cwd`] rather than
+/// spelling a second validator, because that predicate is already exactly this
+/// shape — non-empty, at most [`crate::agent_pty::CWD_MAX_LEN`] (4096) bytes,
+/// free of ASCII control characters, and absolute for this platform — and it is
+/// already the rule applied to the `orchestration_cwd` these paths become. A
+/// path that survives here and a path the daemon will later accept as an
+/// orchestration identity are then the same set by construction.
+///
+/// Non-UTF-8 needs no check here and is not lossily converted: the frame is
+/// JSON and `path` is a `String`, so a non-UTF-8 byte sequence fails the frame
+/// decode and never reaches this function. That is a refusal, which is the
+/// intended outcome.
+///
+/// On refusal it returns the message the caller wraps in an
+/// [`AttachResponse::err`], and that message names no path. See
+/// [`PROJECT_ERR_INVALID_PATH`].
+fn validate_project_path(path: &str) -> Result<(), String> {
+    if crate::agent_pty::is_valid_orchestration_cwd(path) {
+        return Ok(());
+    }
+    Err(format!(
+        "{PROJECT_ERR_INVALID_PATH}: project path must be absolute, non-empty, \
+         free of control characters, and at most {} bytes",
+        crate::agent_pty::CWD_MAX_LEN
+    ))
+}
+
+/// PRD #819 M2/A5: the wire-boundary bound on
+/// [`AttachRequest::PrepareWorkflow`]'s caller-supplied `task`, applied before
+/// any filesystem work.
+///
+/// The bound is [`crate::bounded_read::MAX_TASK_BYTES`] — the constant issue
+/// #328 already established and documented for exactly this input class, task
+/// prose destined for an agent's prompt. Reusing it keeps one justified number
+/// rather than inventing a second. The desktop applies its own tighter 64 KiB
+/// check at its UI seam, and that is a client affordance this daemon does not
+/// rely on: the audit's requirement is a server-side bound, and a bound that
+/// only exists in one client is not one.
+///
+/// A NUL is refused alongside the length, because the text is destined for a
+/// markdown file the daemon writes and the desktop already refuses one at its
+/// own seam — so this stays a strict superset of the client's shape check.
+fn validate_task(task: &str) -> Result<(), String> {
+    if task.len() as u64 > crate::bounded_read::MAX_TASK_BYTES {
+        return Err(format!(
+            "{PROJECT_ERR_TASK_REJECTED}: task must be at most {} bytes",
+            crate::bounded_read::MAX_TASK_BYTES
+        ));
+    }
+    if task.contains('\0') {
+        return Err(format!(
+            "{PROJECT_ERR_TASK_REJECTED}: task must contain no NUL"
+        ));
+    }
+    Ok(())
+}
+
+/// PRD #819 M2: the refusal a project verb returns when its arguments were
+/// accepted but this build has no implementation behind it.
+///
+/// Deliberately not `ok: true` with an empty payload (indistinguishable from a
+/// real empty answer) and deliberately not a `todo!()` (a panic in a connection
+/// handler takes down a task that is serving other clients).
+fn unimplemented_project_verb(capability: &str) -> AttachResponse {
+    AttachResponse::err(format!(
+        "{PROJECT_ERR_UNIMPLEMENTED}: this daemon build accepts `{capability}` but does not \
+         implement it yet (PRD #819 M2 landed the wire contract; M3/M4 land the behaviour)"
+    ))
 }
 
 // CodeRabbit Fix C fixup: bound the response write with `CLIENT_WRITE_TIMEOUT`.

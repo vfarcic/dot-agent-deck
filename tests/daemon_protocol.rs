@@ -40,9 +40,10 @@ use tokio::task::JoinHandle;
 
 use dot_agent_deck::agent_pty::{AgentPtyRegistry, AgentRecord};
 use dot_agent_deck::daemon_protocol::{
-    AttachRequest, AttachResponse, KIND_DETACH, KIND_REQ, KIND_RESP, KIND_STREAM_END,
-    KIND_STREAM_IN, KIND_STREAM_OUT, KIND_STREAM_REJECT, RunningAgentsSummary, TabMembership,
-    bind_attach_listener, serve_attach_with_counter, write_resp,
+    AttachRequest, AttachResponse, DAEMON_CAPABILITIES, KIND_DETACH, KIND_REQ, KIND_RESP,
+    KIND_STREAM_END, KIND_STREAM_IN, KIND_STREAM_OUT, KIND_STREAM_REJECT, PROJECT_ERR_INVALID_PATH,
+    PROJECT_ERR_TASK_REJECTED, PROJECT_ERR_UNIMPLEMENTED, PROTOCOL_VERSION, RunningAgentsSummary,
+    TabMembership, bind_attach_listener, serve_attach_with_counter, write_resp,
 };
 use dot_agent_deck::event::{
     AgentEvent, AgentType, EventType, LiveTarget, SendResult, TargetKind, Writable,
@@ -1055,6 +1056,236 @@ async fn malformed_request_returns_err() {
         resp.error
             .as_deref()
             .is_some_and(|e| e.contains("malformed request"))
+    );
+}
+
+/// PRD #819 M2 (recon §5c): a syntactically valid request naming an `op` this
+/// daemon does not know gets a clean structured `ok:false` — not a panic, not
+/// silence, not an abrupt close.
+///
+/// `malformed_request_returns_err` above covers **non-JSON** input, which is a
+/// different failure: it never reaches serde's enum dispatch. This is the case
+/// the whole cross-version degradation story rests on — an older daemon meeting
+/// a verb from a newer client — and it was untested.
+///
+/// The assertion deliberately does NOT pin serde's `unknown variant …` wording.
+/// That text is not a stability contract, and nothing may branch on it; the
+/// contract being pinned here is the SHAPE of the reply, which is why the
+/// `capabilities` field exists.
+#[tokio::test]
+async fn unknown_op_returns_structured_error_not_a_panic() {
+    let server = start_server().await;
+    let resp = issue_json_request(
+        &server,
+        serde_json::json!({ "op": "no-such-verb-from-a-later-build", "path": "/tmp" }),
+    )
+    .await;
+    assert!(!resp.ok, "an unknown op must be refused, not accepted");
+    assert!(
+        resp.error
+            .as_deref()
+            .is_some_and(|e| e.contains("malformed request")),
+        "unknown op must reply with the structured malformed-request error, got {:?}",
+        resp.error
+    );
+
+    // The daemon is still serving: an unknown op ends that request cycle, not
+    // the process. This is the half a panic would fail.
+    let mut s = UnixStream::connect(&server.path).await.unwrap();
+    write_request(&mut s, &AttachRequest::ListAgents).await;
+    let follow_up = read_response(&mut s).await;
+    assert!(
+        follow_up.ok,
+        "daemon must keep serving after an unknown op: {:?}",
+        follow_up.error
+    );
+}
+
+/// PRD #819 M2: the three project verbs are REACHABLE — they parse, dispatch,
+/// and answer with a named `unimplemented` refusal rather than a decode failure.
+/// That is what makes the tester's behaviour tests fail on behaviour instead of
+/// on an `unknown variant` error indistinguishable from a typo.
+#[tokio::test]
+async fn project_verbs_are_reachable_and_report_unimplemented() {
+    let server = start_server().await;
+
+    for (label, request) in [
+        (
+            "list-projects",
+            serde_json::json!({ "op": "list-projects" }),
+        ),
+        (
+            "resolve-project",
+            serde_json::json!({ "op": "resolve-project", "path": "/tmp" }),
+        ),
+        (
+            "prepare-workflow",
+            serde_json::json!({
+                "op": "prepare-workflow",
+                "path": "/tmp",
+                "orchestration": "dispatch",
+                "task": "do the thing",
+            }),
+        ),
+    ] {
+        let resp = issue_json_request(&server, request).await;
+        assert!(!resp.ok, "{label} must not report a hollow success");
+        let error = resp.error.unwrap_or_default();
+        assert!(
+            error.starts_with(PROJECT_ERR_UNIMPLEMENTED),
+            "{label} must refuse with the `{PROJECT_ERR_UNIMPLEMENTED}` code, got {error:?}"
+        );
+        assert!(
+            !error.contains("malformed request"),
+            "{label} must PARSE — a decode failure means the variant is not wired: {error:?}"
+        );
+    }
+}
+
+/// PRD #819 A5: the boundary validation is real now, ahead of the behaviour.
+/// A rejected path never reaches a filesystem, and the refusal names no path —
+/// see the disclosure split in the PRD.
+#[tokio::test]
+async fn project_verbs_reject_a_bad_path_at_the_boundary() {
+    let server = start_server().await;
+
+    let oversized = format!("/{}", "a".repeat(4096));
+    for bad in [
+        "",
+        "relative/path",
+        "/has/a\u{7f}delete",
+        "/has/a\u{1}control",
+        oversized.as_str(),
+    ] {
+        let resp = issue_json_request(
+            &server,
+            serde_json::json!({ "op": "resolve-project", "path": bad }),
+        )
+        .await;
+        assert!(!resp.ok, "resolve-project must refuse {bad:?}");
+        let error = resp.error.unwrap_or_default();
+        assert!(
+            error.starts_with(PROJECT_ERR_INVALID_PATH),
+            "expected `{PROJECT_ERR_INVALID_PATH}` for {bad:?}, got {error:?}"
+        );
+        assert!(
+            !error.contains(bad) || bad.is_empty(),
+            "the refusal must not echo the caller-supplied path: {error:?}"
+        );
+    }
+}
+
+/// PRD #819 A5: `PrepareWorkflow.task` is bounded SERVER-side, at the wire
+/// boundary and before any filesystem work. The desktop's own 64 KiB check is a
+/// UI affordance, not a bound this daemon may rely on.
+#[tokio::test]
+async fn prepare_workflow_bounds_the_task_at_the_boundary() {
+    let server = start_server().await;
+
+    let over = "x".repeat(dot_agent_deck::bounded_read::MAX_TASK_BYTES as usize + 1);
+    let resp = issue_json_request(
+        &server,
+        serde_json::json!({
+            "op": "prepare-workflow",
+            "path": "/tmp",
+            "orchestration": "dispatch",
+            "task": over,
+        }),
+    )
+    .await;
+    assert!(!resp.ok);
+    let error = resp.error.unwrap_or_default();
+    assert!(
+        error.starts_with(PROJECT_ERR_TASK_REJECTED),
+        "expected `{PROJECT_ERR_TASK_REJECTED}`, got {error:?}"
+    );
+
+    // Exactly at the limit is accepted by the bound, so it falls through to the
+    // not-implemented refusal — which is how we know the bound is a bound and
+    // not an off-by-one that rejects legitimate input.
+    let at_limit = "x".repeat(dot_agent_deck::bounded_read::MAX_TASK_BYTES as usize);
+    let resp = issue_json_request(
+        &server,
+        serde_json::json!({
+            "op": "prepare-workflow",
+            "path": "/tmp",
+            "orchestration": "dispatch",
+            "task": at_limit,
+        }),
+    )
+    .await;
+    assert!(!resp.ok);
+    assert!(
+        resp.error
+            .as_deref()
+            .is_some_and(|e| e.starts_with(PROJECT_ERR_UNIMPLEMENTED)),
+        "a task exactly at the limit must pass the bound, got {:?}",
+        resp.error
+    );
+}
+
+/// PRD #819 A5: the path is validated BEFORE the task, so a request that is
+/// wrong in both ways names the path — and, more importantly, an invalid path
+/// is refused whatever the task carries.
+#[tokio::test]
+async fn prepare_workflow_validates_the_path_before_the_task() {
+    let server = start_server().await;
+    let over = "x".repeat(dot_agent_deck::bounded_read::MAX_TASK_BYTES as usize + 1);
+    let resp = issue_json_request(
+        &server,
+        serde_json::json!({
+            "op": "prepare-workflow",
+            "path": "not-absolute",
+            "orchestration": "dispatch",
+            "task": over,
+        }),
+    )
+    .await;
+    assert!(!resp.ok);
+    assert!(
+        resp.error
+            .as_deref()
+            .is_some_and(|e| e.starts_with(PROJECT_ERR_INVALID_PATH)),
+        "path validation runs first, got {:?}",
+        resp.error
+    );
+}
+
+/// PRD #819 M2/M5: the `Hello` reply advertises each project verb explicitly,
+/// and leaves `guarded_send` exactly where PRD #20 put it.
+#[tokio::test]
+async fn hello_advertises_the_project_capabilities() {
+    let server = start_server().await;
+    let mut s = UnixStream::connect(&server.path).await.unwrap();
+    write_request(
+        &mut s,
+        &AttachRequest::Hello {
+            client_version: PROTOCOL_VERSION,
+            client_build_version: None,
+        },
+    )
+    .await;
+    let resp = read_response(&mut s).await;
+    assert!(resp.ok);
+
+    let advertised = resp
+        .capabilities
+        .expect("Hello must advertise capabilities");
+    for expected in DAEMON_CAPABILITIES {
+        assert!(
+            advertised.iter().any(|c| c == expected),
+            "Hello must advertise `{expected}`, got {advertised:?}"
+        );
+    }
+
+    // The PRD #20 boolean is NOT folded into the list: an older client reads
+    // only the boolean, and moving it would break that client for no gain.
+    assert_eq!(resp.guarded_send, Some(true));
+    assert!(
+        !advertised
+            .iter()
+            .any(|c| c == "guarded_send" || c == "guarded-send"),
+        "guarded_send stays its own field: {advertised:?}"
     );
 }
 

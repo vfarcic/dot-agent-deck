@@ -163,7 +163,7 @@ The outermost unit is a **daemon group**, not an agent group, even though there 
 
 ### Last activity
 
-The **Last activity** column is the one thing on the screen that needed a daemon-side change. `last_activity_ms` was added to `SessionSnapshot` as an additive optional field tagged `#[serde(default, skip_serializing_if = "Option::is_none")]`, which `src/daemon_protocol.rs`'s own policy names as an explicit do-not-bump case, so `PROTOCOL_VERSION` stays 8 and older and newer peers interoperate in both directions — a new app against an older daemon simply shows an empty column. It crosses the wire as epoch milliseconds rather than a formatted string, so the relative wording stays the webview's decision, and it carries its unit in its name because a bare integer invites the seconds-versus-milliseconds mistake that turns every reading into fifty-seven years.
+The **Last activity** column is the one thing on the screen that needed a daemon-side change. `last_activity_ms` was added to `SessionSnapshot` as an additive optional field tagged `#[serde(default, skip_serializing_if = "Option::is_none")]`, which `src/daemon_protocol.rs`'s own policy names as an explicit do-not-bump case, so it moved `PROTOCOL_VERSION` by nothing and older and newer peers interoperate in both directions — a new app against an older daemon simply shows an empty column. (The constant has moved since, to 9, for the unrelated request variants PRD #819 added. It was 8 when this column landed and the field is additive either way.) It crosses the wire as epoch milliseconds rather than a formatted string, so the relative wording stays the webview's decision, and it carries its unit in its name because a bare integer invites the seconds-versus-milliseconds mistake that turns every reading into fifty-seven years.
 
 It is on the screen where a duration built from `SessionState.started_at` is not, and the line between them is honesty rather than taste. `started_at` is invented as `Utc::now()` on hydration, so a duration built on it resets under a restarted daemon and silently lies about long-running work. (The screen *does* carry a duration now — see [Uptime](#uptime) — from a source the daemon genuinely holds. The narrow claim here, about `started_at`, still stands; it is only ever that source this section is rejecting.) `last_activity` is a high-water mark of observed event timestamps, advanced only when a newer frame arrives, so an agent quiet for an hour snapshots as quiet for an hour. And the daemon-restart case resolves to **absence** rather than to a lie, for free: the daemon persists no `AppState`, so a restarted daemon has no sessions at all, `AgentRecord.live` is `None`, the field never reaches the wire, and every cell renders empty. A duration had no absent state to fall back to, because `started_at` is always populated with *something*.
 
@@ -175,7 +175,7 @@ One consequence is deliberately left alone: the TUI's reconnect hydration does n
 
 The **Uptime** column is the second daemon-side change, and it is the duration this screen used to refuse. The refusal was aimed at `SessionState.started_at`, and that aim was right but the reason given for it — that `started_at` is invented as `now` on hydration — understated the problem. `started_at` is **event-derived**: a session exists only once a hook event has arrived, so an agent that has never emitted one has no start instant at all, and that is exactly the agent whose uptime a reader most wants.
 
-The source that works is **when the daemon forked the process**. `AgentPtyRegistry::spawn_agent` stamps `RunningAgent.spawned_at` immediately after `spawn()` returns and nothing ever rewrites it; it reaches the wire as `AgentRecord.spawned_at_ms`, an additive optional field on the same do-not-bump basis as `last_activity_ms`, so `PROTOCOL_VERSION` stays 8. It is an **observation rather than an inference** — signal-independent, present for an agent that has never reported anything, and something the daemon definitionally knows. It is also never invented: `spawn_agent` is the only site that writes a value, so a record that arrives any other way (an older daemon's id-only `ListAgents` reply, the synthetic test seam) carries `None` and every consumer renders nothing. There is no `Utc::now()` fallback anywhere on the path.
+The source that works is **when the daemon forked the process**. `AgentPtyRegistry::spawn_agent` stamps `RunningAgent.spawned_at` immediately after `spawn()` returns and nothing ever rewrites it; it reaches the wire as `AgentRecord.spawned_at_ms`, an additive optional field on the same do-not-bump basis as `last_activity_ms`, so it moved `PROTOCOL_VERSION` by nothing. It is an **observation rather than an inference** — signal-independent, present for an agent that has never reported anything, and something the daemon definitionally knows. It is also never invented: `spawn_agent` is the only site that writes a value, so a record that arrives any other way (an older daemon's id-only `ListAgents` reply, the synthetic test seam) carries `None` and every consumer renders nothing. There is no `Utc::now()` fallback anywhere on the path.
 
 **What the number means follows from where it comes from, with no flag needed.** A `clear = true` delegate respawns its worker by removing the old registry record outright and spawning a fresh one, so a restarted worker reports the age of its **current iteration**; a role nobody has restarted — an orchestrator, typically — keeps its original record and reports its **whole lifetime**. And because `agent_records()` filters entries whose child has exited, a spawn instant never outlives the process it describes and ticks up as a phantom uptime.
 
@@ -240,6 +240,108 @@ The daemon remains the single source of truth for agent lifecycle, PTYs, hooks, 
 The window uses a restrictive content-security policy and a minimal Tauri capability set. Bridge commands are scoped to the main webview, connection errors are sanitized before reaching it, terminal input and launch commands are bounded to 64 KiB, dimensions are constrained to `1..=4096`, and terminal sessions use opaque IDs and are detached when the bridge is disposed. A build mismatch is shown as incompatible rather than triggering an automatic daemon restart, and the only way past it is an explicit, confirmed, session-scoped **Connect anyway** that relaxes the stamp comparison alone.
 
 Treat every live terminal as equivalent to its underlying agent CLI: it has the daemon user's filesystem and process permissions, and terminal input can authorize consequential work. The stop control has a confirmation step, but this preview is not a sandbox or an access-control boundary.
+
+## Ownership: where every value comes from
+
+This is PRD [#819](https://github.com/vfarcic/dot-agent-deck/issues/819)'s M1 ownership sweep. It exists so the boundary can be stated as a **checked list** rather than as "everything except settings" — the false-absolute shape `CLAUDE.md` rule 17 exists to stop, and one this PRD's own history has already had to correct twice.
+
+The governing principle it checks against, from #819 and [#803](https://github.com/vfarcic/dot-agent-deck/issues/803): **a client gets everything from the daemon, wherever that daemon runs; the only thing it owns is its own settings plus genuinely presentational state.** Where the daemon does not expose something a client legitimately needs, the daemon is extended — "the client can compute it locally" is not an acceptable answer even when the client is on the same machine.
+
+Every value below is one of three things. **Daemon-sourced**: it comes over the wire. **Client-owned by policy**: it describes this machine, this display or this installation, so the client is the only party that knows it. **Computed locally**: the client derives it — each of those is either fixed by #819 or carries an issue.
+
+### The sweep is mechanical, and here are its sources
+
+The done-condition is that the enumeration is *derived*, not asserted, because the rule-17 trap this sweep exists to close could otherwise recur inside the sweep. Three mechanical sources, each with the command that reproduces it:
+
+1. **Every field of the frontend snapshot DTO** — `DesktopSnapshot` and the types it nests in [`desktop/src-tauri/src/dto.rs`](../../desktop/src-tauri/src/dto.rs), mirrored field-for-field (camelCased) by `DesktopSnapshotDto` in [`desktop/src/lib/bridge.ts`](../../desktop/src/lib/bridge.ts). `grep -n 'pub struct\|pub enum' desktop/src-tauri/src/dto.rs` enumerates the Rust side; `DesktopSnapshotDto` and `DesktopAgentDto` are the TS side. The two agree on every field name and optionality but one, noted in the table.
+2. **Every `localStorage` key** — `grep -rn 'localStorage\|sessionStorage' desktop/src/ | grep -v '\.test\.'`. There are **five**, every one of them written through `modeScopedKey` so a fixture visit cannot write a key live mode reads back.
+3. **Every settings key in an on-disk desktop store** — **there is no such store.** `grep -rn 'desktop.toml' .` is empty across the repository, `desktop/src-tauri/Cargo.toml` declares no `tauri-plugin-store`, and `desktop/package.json` declares no store or window-state plugin. The window's geometry is a static literal in `tauri.conf.json`, not a persisted preference. The desktop persists **nothing** to disk today; `localStorage` is the whole of its state. Recording the absence rather than omitting the source is the point — an empty class read as "nothing to check" is how the next store lands unclassified.
+
+### The snapshot DTO
+
+| value | class | where it comes from |
+| --- | --- | --- |
+| `connection.status` | computed locally | the client's verdict on its own connection (`classify_handshake`). Its own state, legitimately. |
+| `connection.socketPath` | client-owned by policy | the endpoint *this* client dials, from `config::attach_socket_path()`. The TS layer also uses it as the daemon identity ahead of [#742](https://github.com/vfarcic/dot-agent-deck/issues/742). |
+| `connection.error` | mixed | the daemon's own `Hello` rejection when there is one, otherwise the client's transport error. Sanitised locally by `safe_message` (control characters stripped, 2048 chars). |
+| `connection.clientProtocolVersion` | client-owned by policy | this binary's `PROTOCOL_VERSION`. |
+| `connection.serverProtocolVersion` | daemon-sourced | `AttachResponse::server_version`. |
+| `connection.clientBuildVersion` | client-owned by policy | this binary's `DAD_BUILD_ID`. |
+| `connection.daemonBuildVersion` | daemon-sourced | `AttachResponse::build_version`. |
+| `connection.daemonVersion` | daemon-sourced | `AttachResponse::daemon_version`. |
+| `connection.runningAgentCount` | daemon-sourced | `AttachResponse::running_agents.count`. |
+| `connection.buildStampMismatchOnly` | computed locally | the client's compatibility verdict, comparing a daemon-sourced stamp against its own. Always emitted from Rust including as `false`; the TS type marks it optional so a test DTO need not restate the common case. This is the one field where the two declarations differ. |
+| `agents[].id` | daemon-sourced | `AgentRecord.id`. |
+| `agents[].paneId` | daemon-sourced | `AgentRecord.pane_id_env`. |
+| `agents[].displayName` | daemon-sourced | `AgentRecord.display_name`. |
+| `agents[].cwd` | daemon-sourced | `AgentRecord.cwd` — the daemon's own view, which is the point: it diverges from any client's `current_dir()` the moment an agent has `cd`'d. |
+| `agents[].rows` / `agents[].cols` | daemon-sourced | `AgentRecord.rows` / `.cols`. |
+| `agents[].agentType` | daemon-sourced | the live snapshot's type, else `AgentRecord.agent_type`. Falls back to the literal `"none"`, which is honest: it is the value that also catches a type this build has never heard of. |
+| `agents[].cliName` | **computed locally** | looked up in the client's **own** compiled-in `agent_registry` from the daemon-sent `agentType`. On the wrong side of the boundary and tracked by [#856](https://github.com/vfarcic/dot-agent-deck/issues/856). It cannot diverge today because the handshake requires an exact `PROTOCOL_VERSION` match and matching build stamps, so both sides compile the same table — but that is a property of the gate [#801](https://github.com/vfarcic/dot-agent-deck/issues/801) exists to relax, not of the design. **Not** fixed by #819: widening its projection to carry per-agent command metadata runs against the direction that projection deliberately narrows. |
+| `agents[].status` | daemon-sourced | the live snapshot's `SessionStatus`. Falls back to `"running"` when the daemon reported no live session, which is a *reading* of daemon-held state rather than an invention — the record exists because the daemon holds the process — and not a placeholder the user could mistake for a report. |
+| `agents[].activeTool` | daemon-sourced | the live snapshot's `active_tool`. |
+| `agents[].toolCount` | daemon-sourced | the live snapshot's `tool_count`, `0` when there is no snapshot. |
+| `agents[].lastUserPrompt` | daemon-sourced | the live snapshot's `last_user_prompt`. Absent, never blank. |
+| `agents[].writeLease` | daemon-sourced | projected from the live target's `Writable` into read/write/none. Absent when the daemon declared no live target, which is not the same as declaring a non-writable one. |
+| `agents[].lastActivityMs` | daemon-sourced | the live snapshot's `last_activity_ms`, copied through unclamped. The daemon owns the instant; the webview owns the wording and the clock-skew rule. |
+| `agents[].spawnedAtMs` | daemon-sourced | `AgentRecord.spawned_at_ms`, same split. |
+| `agents[].tab` | daemon-sourced | `TabMembership`, every field bound explicitly in `map_tab` rather than through a rest pattern, so the next field added there is a compile error at this seam. |
+| `projectCwd` | **computed locally** | `desktop_project_cwd()` — `option_env!("CARGO_MANIFEST_DIR")`'s grandparent if it holds a `.dot-agent-deck.toml`, else `std::env::current_dir()`. This is the defect #819 exists to remove: a compile-time constant cannot name a runtime machine's project, and against a remote daemon neither leg is even on the right host. **Fixed by #819 M6**, which deletes the function with nothing replacing it. |
+| `protocolVersion` | client-owned by policy | this binary's `PROTOCOL_VERSION`, restated at the top level. |
+| `source` | client-owned by policy | the literal `"daemon"`, distinguishing a live snapshot from the fixture bridge's. |
+
+### Beyond the snapshot
+
+The bridge emits three more DTOs. They are listed because leaving them out would make "every value the desktop presents" the kind of claim this sweep exists to replace.
+
+| value | class | where it comes from |
+| --- | --- | --- |
+| `DesktopActionResult.ok` / `.message` | computed locally | the client's outcome for the action it just issued. |
+| `DesktopActionResult.agentId` / `.agentIds` | daemon-sourced | ids the daemon minted for the agents it just started. |
+| `DesktopActionResult.sendResult` | daemon-sourced | `AttachResponse::send_result`, the daemon's honest delivery outcome (PRD #20). |
+| `DesktopActionResult.snapshot` | — | the table above. |
+| `TerminalAttachResult.sessionId` / `.generation` / `.reused` | client-owned by policy | the desktop's own per-window terminal bookkeeping: an opaque id minted from a process-local counter, for a session that exists only inside this app. |
+| `TerminalAttachResult.agentId`, `TerminalStateEvent.agentId` | daemon-sourced | the agent the session is attached to. |
+| `TerminalStateEvent.state` / `.message` | computed locally | this client's view of its own stream. |
+
+### The four values the deck still invents, and who owns them
+
+`mapDesktopSnapshot` builds the deck's run model on top of the DTO, and four of its fields have no daemon counterpart at all. PRD #745 deleted the branch chip and the attempt readouts outright for exactly this reason — a fabricated `ATT 01` reads as data in a way an explicit "unavailable" does not — and these are what remain.
+
+| value | class | verdict |
+| --- | --- | --- |
+| `repo` | computed locally | the basename of `cwd`, split in the webview. Once `cwd` is daemon-canonical it should read `KnownProject.name` instead of re-splitting, because canonicalising a symlinked path changes its basename and the two derivations would then disagree — PRD #220's bug verbatim. **A requirement on #819 M6**, not a separate issue. |
+| `worktree` / the `cwd` fallback chain | computed locally | four legs: a daemon-reported agent `cwd`, then `projectCwd`, then the *previous snapshot's* `worktree`, then the literal `"No active project"`. Legs two and three are both client-held project state. **Fixed by #819 M6**, which is what makes the header and the panes name the same host. |
+| `spend`, `elapsed` | computed locally | hardcoded `0` and `"—"`. Model, cost, tokens and context window are [#633](https://github.com/vfarcic/dot-agent-deck/issues/633)'s subject — out of #819's scope but not out of the principle: #633's discovery work is choosing how the *daemon* acquires them. |
+| `profiles` | computed locally | `DEFAULT_PROFILES`, overlaid from the `agent-profiles.v1` key below. [#824](https://github.com/vfarcic/dot-agent-deck/issues/824). |
+
+`runId`, `stages`, `health`, `currentNode`, `totalNodes` and `paused` are presentation derived from daemon-sourced agent state, or inert constants in live mode (`paused` is only ever written by the fixture bridge). They are client-owned by policy.
+
+### The five `localStorage` keys
+
+Every one is written through `modeScopedKey`, which suffixes the runtime mode — a fixture visit cannot write a key live mode reads back, which it once could, and which handed a real workflow launch a working directory that never existed.
+
+| key | class | verdict |
+| --- | --- | --- |
+| `dot-agent-deck.desktop.projects.v1` | **computed locally, and the source of truth for the launch cwd** | a list the user types into, with nothing validating it against the daemon's world. **Fixed by #819 M6**: removed, with nothing persisted in its place. Any future convenience must be prefill for a field the daemon still resolves — never an authority. Record the decision on #824. |
+| `dot-agent-deck.desktop.agent-profiles.v1` | computed locally | per-project draft content. [#824](https://github.com/vfarcic/dot-agent-deck/issues/824), which stays open for this one. |
+| `dot-agent-deck.desktop.prompts.v1` | computed locally | the prompt library. #824. |
+| `dot-agent-deck.desktop.workflow-preview.v1` | computed locally | workflow role order. #824. |
+| `dot-agent-deck.desktop.overview-columns.v1` | client-owned by policy | which columns *this display* shows. Genuinely presentational and correctly client-side. |
+
+**#824 says "the four `localStorage` keys" and there are five.** The fifth is `overview-columns.v1`, added by PRD #745 after #824 was filed, and it is the one key on the right side of the boundary — so the discrepancy is a stale count rather than a missed violation. It is recorded here because a count that drifts unremarked is how the next key lands unclassified.
+
+### The whole client-local filesystem surface
+
+The criterion is **"the client resolves no project against a filesystem"**, not "the client touches no filesystem" — the wide version fails on day one and is quotable, so the narrow one is stated with its exceptions enumerated rather than waved at.
+
+The production filesystem surface of `desktop/src-tauri/src/` is four call sites, in two functions. `grep -n 'std::fs' desktop/src-tauri/src/*.rs` finds **none** of them outside `#[cfg(test)]`, because the probes go through `Path::is_file` and `Path::metadata` — which is worth knowing before trusting a `grep` for `fs` to have covered this; `grep -n 'is_file()\|is_dir()\|\.exists()\|metadata(\|read_dir\|canonicalize' desktop/src-tauri/src/*.rs` is the enumeration that works.
+
+1. **Locating the bundled daemon sidecar** for **Replace daemon** — `is_executable_file` (`daemon_bridge.rs`, the `is_file` at `:375` and the `metadata` at `:381`) and the `current_exe` sibling search that calls it, plus the `DOT_AGENT_DECK_BINARY` and `PATH` env lookups beside them. **Legitimate and permanent:** this is the client finding *its own installation*, which no daemon can tell it.
+2. **`desktop_project_cwd()`** — two `is_file` probes for a `.dot-agent-deck.toml` (`dto.rs:478` and `:482`). **This is the defect,** and #819 M6 deletes the function.
+3. **The desktop's own settings** — allowed by the same rule, and today an empty set: there is no on-disk store, per source 3 above. When one arrives it belongs in this table.
+
+One more read is invisible to every grep above because it happens inside the shared root crate: `prepare_orchestrator_prompt`'s `create_dir_all` and `write`, reached from `lib.rs`'s workflow-launch path. It is a **write** rather than a read, it is the other half of the defect, and it moves daemon-side in #819 M4. That it cannot be found by searching this crate is precisely why #819 M7 adds a linkage-check tripwire — and why the tripwire is labelled a tripwire and not a boundary, since the desktop crate path-depends on the root crate and every `pub` item there stays reachable.
 
 ## Models and agent profiles
 
