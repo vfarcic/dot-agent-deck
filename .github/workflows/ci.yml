@@ -137,11 +137,11 @@ jobs:
       run:
         working-directory: desktop
     steps:
-      - uses: actions/checkout@v7
-      - uses: pnpm/action-setup@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
         with:
           version: 11
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
           node-version: 24
           cache: pnpm
@@ -157,13 +157,13 @@ jobs:
     if: needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@v1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
         with:
           toolchain: 1.97.1
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2 # v2
-      - uses: taiki-e/install-action@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: taiki-e/install-action@e67fa11c4b9316fa714ddf0abed07a0c3143b95b # v2
         with:
           tool: cargo-nextest@0.9.143
       # Tauri's Linux build deps, needed because clippy/nextest below run with
@@ -261,7 +261,7 @@ jobs:
       # not of macOS, so all three test jobs carry it.
       - name: Preserve this attempt's test results
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: nextest-linux-attempt-${{ github.run_attempt }}
           path: target/nextest/default/junit.xml
@@ -359,12 +359,12 @@ jobs:
     # to paper over a hang.
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@v1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
         with:
           toolchain: 1.97.1
-      - uses: Swatinem/rust-cache@v2
-      - uses: taiki-e/install-action@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: taiki-e/install-action@e67fa11c4b9316fa714ddf0abed07a0c3143b95b # v2
         with:
           tool: cargo-nextest@0.9.143
       # The same Tauri Linux deps the `build` job installs, for the same reason:
@@ -387,7 +387,7 @@ jobs:
       # real regression.
       - name: Preserve this attempt's test results
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: nextest-e2e-attempt-${{ github.run_attempt }}
           path: target/nextest/default/junit.xml
@@ -421,12 +421,12 @@ jobs:
     if: needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@v1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
         with:
           toolchain: 1.97.1
           targets: x86_64-pc-windows-msvc
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: Type-check the workspace for Windows from Linux
         run: |
           set -euo pipefail
@@ -475,7 +475,7 @@ jobs:
     if: needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true'
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       # Issue #552 — the 35 tracked symlinks (AGENTS.md -> CLAUDE.md, the 33
       # entries under .agents/skills/, docs/img) have to come out of a checkout
       # as LINKS. Where they do not, git writes each one as a plain text file
@@ -512,13 +512,13 @@ jobs:
         run: |
           scripts/check-symlinks.sh --self-test
           scripts/check-symlinks.sh
-      - uses: dtolnay/rust-toolchain@v1
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
         with:
           toolchain: 1.97.1
           targets: x86_64-pc-windows-msvc
           components: clippy
-      - uses: Swatinem/rust-cache@v2
-      - uses: taiki-e/install-action@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: taiki-e/install-action@e67fa11c4b9316fa714ddf0abed07a0c3143b95b # v2
         with:
           tool: cargo-nextest@0.9.143
       - run: cargo build
@@ -549,7 +549,7 @@ jobs:
       # not of macOS, so all three test jobs carry it.
       - name: Preserve this attempt's test results
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: nextest-windows-attempt-${{ github.run_attempt }}
           path: target/nextest/default/junit.xml
@@ -572,13 +572,13 @@ jobs:
     if: needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true'
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@v1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
         with:
           toolchain: 1.97.1
           components: clippy
-      - uses: Swatinem/rust-cache@v2
-      - uses: taiki-e/install-action@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: taiki-e/install-action@e67fa11c4b9316fa714ddf0abed07a0c3143b95b # v2
         with:
           tool: cargo-nextest@0.9.143
       - run: cargo build
@@ -627,7 +627,7 @@ jobs:
       # the test step has no results and must not fail on that.
       - name: Preserve this attempt's test results
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: nextest-macos-attempt-${{ github.run_attempt }}
           path: target/nextest/default/junit.xml
@@ -639,11 +639,11 @@ jobs:
     if: needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@v1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
         with:
           toolchain: 1.97.1
-      - uses: Swatinem/rust-cache@v2 # v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - run: cargo install cargo-audit --locked
       - run: cargo audit
 
@@ -683,7 +683,7 @@ jobs:
     if: needs.changes.outputs.devbox_only != 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       # The Determinate installer rather than cachix/install-nix-action: it is
       # what the cache action below is built to pair with, and it turns on
       # flakes (`nix-command`, `flakes`) without a hand-written extra-conf.
@@ -800,7 +800,7 @@ jobs:
   devbox:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       # Issue #648. Needs nothing but bash and the checkout, so it runs FIRST —
       # a drifted pin is reported in seconds rather than after the Nix store
       # restore.
@@ -829,7 +829,7 @@ jobs:
       # `devbox` job stops the lane that produced #648 from merging itself.
       - name: Toolchain pins in devbox.json and the workflows agree
         run: scripts/check-pin-lockstep.sh
-      - uses: jetify-com/devbox-install-action@v0.15.0
+      - uses: jetify-com/devbox-install-action@8c6a66ed6273138b1915457069de78cb52fe3bd7 # v0.15.0
         with:
           # Caches the whole Nix store keyed on devbox.json. Worth it: the
           # `path:gcloud#google-cloud-sdk` flake pulls nixpkgs-unstable and

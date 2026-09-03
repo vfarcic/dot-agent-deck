@@ -60,7 +60,7 @@ jobs:
             echo "::error::RELEASE_TOKEN is unset or empty. This job pushes the changelog commit to the protected \`main\` branch and needs the admin PAT to bypass the ruleset; GITHUB_TOKEN cannot. Set the RELEASE_TOKEN secret and re-run. See CLAUDE.md rule 8."
             exit 1
           fi
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
           token: ${{ secrets.RELEASE_TOKEN }}
@@ -272,14 +272,14 @@ jobs:
             binary_ext: ""
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@v1
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
         with:
           toolchain: 1.97.1
           targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           key: ${{ matrix.target }}
       - name: Install cross
@@ -418,7 +418,7 @@ jobs:
           BINARY_NAME="dot-agent-deck-${MATRIX_ARTIFACT_SUFFIX}${MATRIX_BINARY_EXT}"
           cp "target/${MATRIX_TARGET}/release/dot-agent-deck${MATRIX_BINARY_EXT}" "$BINARY_NAME"
           echo "BINARY_NAME=$BINARY_NAME" >> "$GITHUB_ENV"
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: dot-agent-deck-${{ matrix.artifact_suffix }}
           path: ${{ env.BINARY_NAME }}
@@ -427,8 +427,8 @@ jobs:
     needs: [prepare, build]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: arduino/setup-task@v3.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: arduino/setup-task@c0bc642852239c2689f73f4ea6459c29405f3c52 # v3.0.0
         with:
           version: 3.x
       # PRD #740: `pattern` is load-bearing, not tidiness. `merge-multiple`
@@ -440,7 +440,7 @@ jobs:
       # `shasum -a 256 dot-agent-deck-*` cannot cope with the space in Tauri's
       # `Agent Deck_<version>_amd64.deb` output name. The desktop job therefore
       # names its artifacts `desktop-bundle-*`, which this pattern excludes.
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           pattern: dot-agent-deck-*
           path: dist
@@ -469,7 +469,7 @@ jobs:
             echo "prerelease=false" >> "$GITHUB_OUTPUT"
           fi
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
         with:
           tag_name: v${{ needs.prepare.outputs.version }}
           name: v${{ needs.prepare.outputs.version }}
@@ -555,12 +555,12 @@ jobs:
             bundles: deb
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@v1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
         with:
           toolchain: 1.97.1
           targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       # The first five are ci.yml's compile set, needed because this job builds
       # `dot-agent-deck-desktop`. The rest are needed only by the bundlers:
       # producing a .deb and an AppImage shells out to them, and ci.yml has
@@ -573,12 +573,12 @@ jobs:
             libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev \
             librsvg2-dev libxdo-dev \
             patchelf fakeroot file desktop-file-utils
-      - uses: pnpm/action-setup@v6
+      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
         with:
           version: 11
       # Node 20 and pnpm 10 match ci.yml's `desktop-web` job rather than the
       # devbox pin, so the floor that is tested is the floor that is shipped.
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
           node-version: 24
           cache: pnpm
@@ -665,7 +665,7 @@ jobs:
             echo "::error::no bundle filename contains ${RELEASE_VERSION}; the version injection did not reach the bundle and these artifacts would be labelled 0.1.0."
             exit 1
           fi
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           # Deliberately NOT `dot-agent-deck-*`: that is the pattern `finalize`
           # selects on, and these must stay out of the CLI release's `dist/`.
@@ -691,7 +691,7 @@ jobs:
     if: ${{ !cancelled() && needs.finalize.result == 'success' && !inputs.skip_desktop }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         # Tolerated deliberately: with a partial matrix now a legitimate state,
         # this step's own failure mode (no artifact matches the pattern at all)
         # is one the guard below reports far better than "Unable to find any
