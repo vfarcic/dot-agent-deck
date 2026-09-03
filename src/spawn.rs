@@ -3154,63 +3154,146 @@ mod tests {
             .collect()
     }
 
-    /// How many times each of `bytes`' landmarks must appear on the target
-    /// before the write has finished producing output.
+    /// `bytes` with terminal escape sequences removed, leaving the text a
+    /// terminal is expected to echo.
     ///
-    /// A run sitting in a line this write COMPLETED lands twice: once from the
-    /// echo, and once from `/bin/cat` copying the finished line straight back —
-    /// the same "exactly TWO line terminators per write" arithmetic
-    /// [`completed_lines`] documents, counted by content instead of by
-    /// terminator. A run left in an unterminated line lands once, because `cat`
-    /// has nothing to copy until a terminator arrives.
+    /// A landmark has to be TEXT, not protocol, and getting that wrong is what
+    /// made the first version of this fix pass `build` and fail `build-windows`
+    /// on the same commit. `ESC[200~` is a real bracketed-paste marker: Unix's
+    /// line discipline knows nothing about it and echoes its printable tail
+    /// (`[200~`) literally, while Windows' ConPTY PARSES it and echoes nothing
+    /// at all. A landmark cut from the raw payload therefore matched on one
+    /// platform and could never match on the other — and the callers' own
+    /// preconditions never looked for it either, only for the draft text.
+    fn echo_text(bytes: &[u8]) -> Vec<u8> {
+        let mut text = Vec::with_capacity(bytes.len());
+        let mut rest = bytes;
+        while let Some((first, tail)) = rest.split_first() {
+            if *first != 0x1b {
+                text.push(*first);
+                rest = tail;
+                continue;
+            }
+            // CSI: `ESC [`, parameter and intermediate bytes, then a final byte
+            // in 0x40..=0x7e. Anything else after ESC is a two-byte sequence.
+            rest = match tail.split_first() {
+                Some((b'[', params)) => params
+                    .iter()
+                    .position(|byte| (0x40..=0x7e).contains(byte))
+                    .map_or(&[][..], |end| &params[end + 1..]),
+                Some((_, after)) => after,
+                None => &[][..],
+            };
+        }
+        text
+    }
+
+    /// The text landmarks a write must leave on the target before it is known
+    /// to have physically reached the PTY.
     ///
-    /// Waiting for that second appearance is load-bearing rather than thorough.
-    /// `cat`'s copy is the last byte the write can produce, and several callers
-    /// compare the snapshot taken straight after this write against a later one
-    /// by EXACT EQUALITY (`after_paste_retry == before_paste_retry` and the
-    /// three `UserFrameRetry` comparisons in
-    /// `dispatch_020_payload_guards_are_scoped_to_one_delivery`), so a copy
-    /// still in flight lands between the two snapshots and fails the assertion.
-    fn echo_landmarks(bytes: &[u8]) -> Vec<(&[u8], usize)> {
-        let completed = bytes
-            .iter()
-            .rposition(|byte| *byte == b'\n' || *byte == b'\r')
-            .map_or(0, |index| index + 1);
-        let (finished, pending) = bytes.split_at(completed);
-        printable_runs(finished)
+    /// Each is waited for at ONE appearance — the echo. Whether the byte target
+    /// also copies the text back depends on the platform, so that half is not
+    /// predicted here; [`wait_for_quiescent_lines`] observes it instead.
+    fn echo_landmarks(bytes: &[u8]) -> Vec<Vec<u8>> {
+        printable_runs(&echo_text(bytes))
             .into_iter()
-            .map(|run| (run, 2))
-            .chain(printable_runs(pending).into_iter().map(|run| (run, 1)))
+            .map(<[u8]>::to_vec)
             .collect()
     }
 
-    /// Block until `needle` has appeared at least `occurrences` times on the
-    /// target, or fail with the buffer that was actually observed.
+    /// Line terminators in `bytes`, each of which MAY complete an input line —
+    /// whether it does is the platform's business, not this fixture's.
+    fn line_terminators(bytes: &[u8]) -> usize {
+        bytes
+            .iter()
+            .filter(|byte| matches!(**byte, b'\n' | b'\r'))
+            .count()
+    }
+
+    /// Block until `needle` is visible on the target, or fail with the buffer
+    /// that was actually observed.
     ///
     /// Content-keyed for the same reason [`wait_for_detached_payload_echo`] is:
     /// the caller needs an instant that is provably AFTER a specific write, and
     /// "the buffer grew" only proves that if nothing else can put a byte there.
-    async fn wait_for_echo_occurrences(
-        registry: &AgentPtyRegistry,
-        agent_id: &str,
-        needle: &[u8],
-        occurrences: usize,
-    ) {
+    async fn wait_for_echo_bytes(registry: &AgentPtyRegistry, agent_id: &str, needle: &[u8]) {
         let deadline = Instant::now() + Duration::from_secs(8);
         loop {
             let snapshot = registry.snapshot(agent_id).expect("byte target snapshot");
-            let seen = snapshot
+            if snapshot
                 .windows(needle.len())
-                .filter(|window| *window == needle)
-                .count();
-            if seen >= occurrences {
+                .any(|window| window == needle)
+            {
                 return;
             }
             assert!(
                 Instant::now() < deadline,
-                "timed out waiting for {:?} to appear {occurrences} time(s) on the \
-                 target; saw {seen}; snapshot={:?}",
+                "timed out waiting for {:?} to reach the target; snapshot={:?}",
                 String::from_utf8_lossy(needle),
+                String::from_utf8_lossy(&snapshot)
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Block until the target has produced at least one byte beyond `floor`.
+    ///
+    /// The weakest landmark in this file, and only usable for a write that has
+    /// no text of its own — a bare newline control frame. It proves anything
+    /// only because [`type_user_frame`]'s caller drained the pane first, so this
+    /// write is the one thing that can still append.
+    ///
+    /// Unix-only, because [`type_user_frame`] is the sole caller and claims a
+    /// bare frame's echo only on the platform where it was measured.
+    #[cfg(unix)]
+    async fn wait_for_growth(registry: &AgentPtyRegistry, agent_id: &str, floor: usize) {
+        let deadline = Instant::now() + Duration::from_secs(8);
+        loop {
+            let snapshot = registry.snapshot(agent_id).expect("byte target snapshot");
+            if snapshot.len() > floor {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for a control frame to be echoed past {floor} byte(s); \
+                 snapshot={:?}",
+                String::from_utf8_lossy(&snapshot)
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Block until the pane is quiescent again after a write: every line
+    /// terminator the platform actually honoured has produced BOTH its echo and
+    /// the byte target's copy of the finished line.
+    ///
+    /// Deliberately OBSERVED rather than predicted, which is what makes it
+    /// portable. [`completed_lines`] counts two terminators per completed line,
+    /// so a pane with nothing in flight always holds an EVEN count; a caller
+    /// that drained the pane before writing therefore only has to wait for the
+    /// count to become even again. That absorbs the platform difference instead
+    /// of encoding it: Unix honours the `\n` inside a bracketed paste and
+    /// produces two more terminators, Windows' ConPTY consumes the paste markers
+    /// and produces none, and both are simply "even".
+    ///
+    /// Two preconditions, both enforced by the callers rather than assumed here.
+    /// The pane must have been drained first, or an earlier copy still in flight
+    /// could make the count even at the wrong moment. And the write must carry
+    /// at most ONE terminator — two would take the count from even straight to
+    /// even and let this return before either copy landed — which is why
+    /// [`type_user_bytes`] and [`type_user_frame`] both assert it.
+    async fn wait_for_quiescent_lines(registry: &AgentPtyRegistry, agent_id: &str, drained: usize) {
+        let deadline = Instant::now() + Duration::from_secs(8);
+        loop {
+            let snapshot = registry.snapshot(agent_id).expect("byte target snapshot");
+            let seen = completed_lines(&snapshot);
+            if seen >= drained && seen.is_multiple_of(2) {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for the pane to go quiescent: saw {seen} terminators, \
+                 wanted an even count of at least {drained}; snapshot={:?}",
                 String::from_utf8_lossy(&snapshot)
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -3252,8 +3335,7 @@ mod tests {
     ///
     /// `lines_already_written` is the number of input lines the pane has
     /// completed before this call — one per guarded delivery, which writes a
-    /// payload and a submit CR, plus any earlier draft that carried a
-    /// terminator of its own. Draining them first is not tidiness, and it is
+    /// payload and a submit CR. Draining them first is not tidiness, and it is
     /// the half of this fix that is easiest to mistake for it: `/bin/cat` and
     /// the line discipline's echo are two independent writers into one PTY
     /// output queue, and the kernel commits echo in batches, so a `cat` copy
@@ -3283,16 +3365,25 @@ mod tests {
         let landmarks = echo_landmarks(bytes);
         assert!(
             !landmarks.is_empty(),
-            "cannot observe this write's own completion: {:?} carries no printable \
-             landmark. Use type_user_frame, which names the pending draft whose \
-             line the write completes.",
+            "cannot observe this write's own completion: {:?} carries no text \
+             landmark. Use type_user_frame, which is written for a payload that \
+             is nothing but a control frame.",
             String::from_utf8_lossy(bytes)
         );
-        wait_for_drained_lines(registry, agent_id, lines_already_written).await;
+        assert!(
+            line_terminators(bytes) <= 1,
+            "wait_for_quiescent_lines cannot bracket a write carrying more than one \
+             line terminator: {:?}",
+            String::from_utf8_lossy(bytes)
+        );
+        let drained = completed_lines(
+            &wait_for_drained_lines(registry, agent_id, lines_already_written).await,
+        );
         write_user_bytes(registry, agent_id, pane_id, bytes).await;
-        for (needle, occurrences) in landmarks {
-            wait_for_echo_occurrences(registry, agent_id, needle, occurrences).await;
+        for needle in &landmarks {
+            wait_for_echo_bytes(registry, agent_id, needle).await;
         }
+        wait_for_quiescent_lines(registry, agent_id, drained).await;
     }
 
     async fn type_user_draft(
@@ -3316,28 +3407,46 @@ mod tests {
     /// `ESC \r`, plain `Enter` to `\r` — and return once it has finished
     /// round-tripping.
     ///
-    /// A bare frame carries no printable byte, so it has no landmark of its own
-    /// for [`type_user_bytes`] to wait on. What it does is COMPLETE the line
-    /// `draft` opened, which makes `/bin/cat` copy that line back, so the second
-    /// appearance of `draft` is this write's last observable effect. Both
-    /// directions of the PTY are FIFO and the echo of a byte is queued before
-    /// `cat` can read the line containing it, so that copy arriving implies the
-    /// frame's own echo — and every earlier byte on this pane — has already
-    /// landed.
+    /// A bare frame carries no text, so it has no landmark of its own for
+    /// [`type_user_bytes`] to wait on — only that the buffer grew, and then that
+    /// the pane went quiescent again. Whether the frame completes the line the
+    /// preceding draft opened, and so whether the byte target copies that line
+    /// back, is the platform's business; [`wait_for_quiescent_lines`] observes
+    /// the answer rather than assuming one.
     ///
     /// This takes no `lines_already_written` because it must only ever follow
-    /// the `type_user_draft` that opened `draft`: that call drained the pane and
-    /// left `cat` with nothing to copy, so no second writer can interleave into
-    /// this frame's echo either.
+    /// the `type_user_draft` that opened the draft it terminates: that call left
+    /// the pane quiescent, so the count it reads is the drained one and this
+    /// write is the only thing that can still append.
     async fn type_user_frame(
         registry: &AgentPtyRegistry,
         agent_id: &str,
         pane_id: &str,
         frame: &[u8],
-        draft: &str,
     ) {
+        assert!(
+            line_terminators(frame) <= 1,
+            "wait_for_quiescent_lines cannot bracket a frame carrying more than one \
+             line terminator: {:?}",
+            String::from_utf8_lossy(frame)
+        );
+        let before = registry
+            .snapshot(agent_id)
+            .expect("pre-frame byte target snapshot");
         write_user_bytes(registry, agent_id, pane_id, frame).await;
-        wait_for_echo_occurrences(registry, agent_id, draft.as_bytes(), 2).await;
+        // Unix's line discipline echoes a bare control frame, measurably: a
+        // submit CR comes back as `\r\n`. Whether ConPTY renders one is NOT
+        // something this fixture has evidence for — the Windows run that caught
+        // the escape-sequence bug above panicked at the paste, before reaching
+        // any frame — so the echo proof is claimed only where it was measured.
+        // Windows keeps the sleep it always had; it was never the platform this
+        // issue was filed about, and `wait_for_quiescent_lines` below is
+        // additive there rather than a replacement.
+        #[cfg(unix)]
+        wait_for_growth(registry, agent_id, before.len()).await;
+        #[cfg(windows)]
+        tokio::time::sleep(Duration::from_millis(75)).await;
+        wait_for_quiescent_lines(registry, agent_id, completed_lines(&before)).await;
     }
 
     struct UserFrameRetry {
@@ -3365,7 +3474,7 @@ mod tests {
         // submit CR, so exactly one input line has to finish round-tripping
         // before this write can be echoed without `/bin/cat` cutting into it.
         type_user_draft(&registry, &agent_id, pane_id, draft, 1).await;
-        type_user_frame(&registry, &agent_id, pane_id, frame, draft).await;
+        type_user_frame(&registry, &agent_id, pane_id, frame).await;
         let before = registry
             .snapshot(&agent_id)
             .expect("before newline-control retry snapshot");
