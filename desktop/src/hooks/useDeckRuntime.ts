@@ -21,13 +21,17 @@ export function useDeckRuntime(): DeckRuntimeState {
         ...fixtureShape,
         runId: "—",
         repo: "No active project",
-        branch: "Unavailable",
+        // PRD #745 M8: no branch and no attempt at all, rather than a
+        // placeholder branch and a zeroed attempt counter. Neither exists
+        // daemon-side, and the seed is what the topbar shows before the first
+        // snapshot arrives.
+        branch: undefined,
         worktree: "No active project",
         elapsed: "—",
         spend: 0,
         currentNode: 0,
         totalNodes: 0,
-        currentAttempt: 0,
+        currentAttempt: undefined,
         stages: [],
         agents: [],
         evidence: [],
@@ -133,6 +137,10 @@ export function useDeckRuntime(): DeckRuntimeState {
 
   const sendTerminalInput = useCallback((agentId: string, data: string) => bridge.sendTerminalInput(agentId, data), [bridge]);
   const resizeTerminal = useCallback((agentId: string, cols: number, rows: number) => bridge.resizeTerminal(agentId, cols, rows), [bridge]);
+  // Stable for the lifetime of the bridge, because the screens declare their
+  // shown set from an effect: an identity that changed every render would fire
+  // that effect every render (PRD #745 M7).
+  const setShownTerminals = useCallback((agentIds: string[]) => bridge.setShownTerminals(agentIds), [bridge]);
 
   return {
     mode,
@@ -143,6 +151,7 @@ export function useDeckRuntime(): DeckRuntimeState {
     runAction,
     sendTerminalInput,
     resizeTerminal,
+    setShownTerminals,
     reconnect,
   };
 }

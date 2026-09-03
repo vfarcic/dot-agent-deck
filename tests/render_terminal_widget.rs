@@ -168,3 +168,61 @@ fn widget_002_area_larger_than_pty_falls_back_to_min_no_panic() {
         inner_dump(&buf, inner)
     );
 }
+
+/// Scenario: Issue #747 — build a vt100 screen at exactly `PTY_RESIZE_DIM_MAX`
+/// (the widest a child PTY can be given) and render it, with
+/// `contract_guaranteed(true)`, into a pane whose inner area is 2 columns WIDER
+/// than that. The invariant-3 `debug_assert!` is live in this debug test build
+/// and must expect the CAPPED inner area, so reaching past the render call at
+/// all is the assertion. The child's full width then lands at the top-left and
+/// the columns past the cap stay blank, because the child has no more columns
+/// to show.
+#[spec("render/widget/003")]
+#[test]
+fn widget_003_over_cap_inner_area_does_not_trip_the_contract_guard() {
+    use dot_agent_deck::agent_pty::PTY_RESIZE_DIM_MAX;
+
+    // Short and very wide: the cap only bites on the column axis here, which
+    // keeps the fixture's cell count (and the buffer below) small.
+    const ROWS: u16 = 4;
+    let mut parser = vt100::Parser::new(ROWS, PTY_RESIZE_DIM_MAX, 0);
+    parser.process(b"\x1b[1;1HCAPPED_ROW_0");
+
+    // Outer area 2 cols wider than the capped screen → inner width
+    // PTY_RESIZE_DIM_MAX + 2, which `resize_panes_to_layout` legitimately
+    // declines to size the PTY to.
+    let area = Rect {
+        x: 0,
+        y: 0,
+        width: PTY_RESIZE_DIM_MAX + 4,
+        height: ROWS + 2,
+    };
+    let inner = inner_of(area);
+    assert!(
+        inner.width > PTY_RESIZE_DIM_MAX,
+        "fixture must draw into an inner area wider than the cap ({} vs {PTY_RESIZE_DIM_MAX})",
+        inner.width
+    );
+
+    let parser = Arc::new(Mutex::new(parser));
+    let widget =
+        TerminalWidget::new(parser, "wide-pane".to_string(), true).contract_guaranteed(true);
+    let mut buf = Buffer::empty(area);
+    // Reaching past this call in a debug build is the assertion: before #747 the
+    // invariant-3 `debug_assert!` compared the parser against the RAW inner area
+    // and would panic here.
+    widget.render(area, &mut buf);
+
+    let top = inner_row(&buf, inner, 0);
+    assert!(
+        top.starts_with("CAPPED_ROW_0"),
+        "the child's capped-width content must still render from the top-left, got {:?}",
+        &top[..top.len().min(40)]
+    );
+    assert_eq!(
+        top.trim_end(),
+        "CAPPED_ROW_0",
+        "columns past the child's capped width must render blank — the child has no \
+         more columns to show, so painting anything there would be invented content"
+    );
+}

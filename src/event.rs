@@ -582,6 +582,31 @@ pub const WRAPPER_INTERFACE_READY_SESSION_START_ORIGIN: &str = "wrapper_interfac
 /// [`WRAPPER_INTERFACE_READY_SESSION_START_ORIGIN`] applies to this value too.
 pub const WRAPPER_INTERFACE_SETTLED_SESSION_START_ORIGIN: &str = "wrapper_interface_settled";
 
+/// `AgentEvent.metadata` key declaring that a `SessionStart` originated from
+/// the user running `/clear`. Claude Code's native `SessionStart` hook
+/// carries a `source` field with one of `"startup"`/`"resume"`/`"compact"`/
+/// `"clear"`; `crate::hook::build_event_typed` forwards only the `"clear"`
+/// case, under this key, mirroring the existing narrow-forwarding pattern
+/// [`SESSION_START_ORIGIN_METADATA_KEY`] already uses — one specific key,
+/// one specific value, only on `SessionStart`, not a general `metadata`
+/// passthrough (issue #243's forged-`SessionStart` audit is why that
+/// distinction matters).
+///
+/// Deliberately distinct from [`SESSION_START_ORIGIN_METADATA_KEY`], which is
+/// an unrelated concern (wrapper-fork boot provenance) — the two must never be
+/// conflated.
+///
+/// Additive on the wire in both directions, same as
+/// [`SESSION_START_ORIGIN_METADATA_KEY`]: an old Claude Code build (or a hook
+/// payload with no `source` field) omits the key and a new daemon reads
+/// `None`; the key rides the existing free-form `metadata` map, so no
+/// [`crate::daemon_protocol::PROTOCOL_VERSION`] bump is needed.
+pub const CLEAR_SESSION_START_METADATA_KEY: &str = "session_start_source";
+
+/// The [`CLEAR_SESSION_START_METADATA_KEY`] value meaning "this `SessionStart`
+/// was caused by the user running `/clear`".
+pub const CLEAR_SESSION_START_METADATA_VALUE: &str = "clear";
+
 /// PRD #20 M1: current schema version of the [`AgentEvent`] JSON wire shape.
 ///
 /// This versions the **payload shape of a single `AgentEvent` record** — the

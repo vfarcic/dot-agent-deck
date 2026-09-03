@@ -2,9 +2,9 @@
 
 ## The gap this closes
 
-`cargo test-fast` and `cargo test-e2e` only ever compile for the host, which on every current dev machine is Linux. CI's `build-windows` job (`.github/workflows/ci.yml`) is therefore the *first* thing that ever compiles the tree for `x86_64-pc-windows-msvc` — so a Windows-only compile break is invisible locally and shows up as a red PR minutes later.
+`cargo test-fast`, `cargo test-e2e` and `cargo test-e2e-live` only ever compile for the host, which on every current dev machine is Linux. CI's `build-windows` job (`.github/workflows/ci.yml`) is therefore the *first* thing that ever compiles the tree for `x86_64-pc-windows-msvc` — so a Windows-only compile break is invisible locally and shows up as a red PR minutes later.
 
-The break is almost always the same shape: a **fast-tier** test file calls a `tests/common/mod.rs` helper that is `#[cfg(unix)]` (because it is built on `std::os::unix::net::UnixStream` or `libc`). The `e2e_*.rs` suites never hit this, because the Windows job runs `cargo nextest run` **without** `--features e2e`, so those targets are not compiled there at all. Fast-tier files are.
+The break is almost always the same shape: a **fast-tier** test file calls a `tests/common/mod.rs` helper that is `#[cfg(unix)]` (because it is built on `std::os::unix::net::UnixStream` or `libc`). The `e2e_*.rs` suites never hit this, because the Windows job runs `cargo nextest run` **without** either e2e feature, so none of the 71 targets is compiled there at all. Issue #502 does not change that: `build-windows` names no e2e feature, so the 24 files that now also require `e2e-live` stay out for the same reason as the other 47. Fast-tier files are.
 
 PRD #126 hit it exactly this way: `tests/idle_worker_detector.rs` called `common::attach_request_on`, and `build-windows` failed with `error[E0425]: cannot find function attach_request_on in module common`.
 

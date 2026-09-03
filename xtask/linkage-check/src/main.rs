@@ -80,6 +80,12 @@
 //! Exits 0 on success, 1 on any failure with a per-finding summary.
 
 mod clean_tmp;
+/// Issue #815: `scripts/devbox-check-gtk.sh`, which asserts that pkg-config
+/// resolves Tauri's GTK stack to Nix's copy rather than the host's. Tests only,
+/// and Linux only — the rule lives in the script, which CI's `devbox` job runs
+/// through `scripts/devbox-smoke.sh`.
+#[cfg(all(test, target_os = "linux"))]
+mod devbox_gtk_origin;
 /// Issue #603: the adaptive issue labeler's post-agent memory validator. Tests
 /// only — the rule lives in the agentic workflow, and these drive the real
 /// script under `node`.
@@ -89,6 +95,13 @@ mod issue_labeler_memory;
 /// only — these drive the real script under `python3`.
 #[cfg(test)]
 mod issue_labeler_policy;
+/// Issue #785: `scripts/junit-strip-output.py`, the stripper that makes a JUnit
+/// report from a credential-holding run structurally incapable of carrying test
+/// output before anyone shares it. Since #502 took the credentialed lane out of
+/// CI, the report it protects is a LOCAL one. Tests only — the rule lives in the
+/// script, and these drive the real one under `python3`.
+#[cfg(test)]
+mod junit_strip;
 mod list_tests;
 /// Issue #648: the toolchain pins duplicated between `devbox.json` and
 /// `.github/workflows/`. Tests only, and Unix only — the rule itself lives in

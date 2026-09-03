@@ -168,10 +168,11 @@ pub const KIND_STREAM_REJECT: u8 = 0x17;
 /// pre-Pi reader has neither the `Pi` variant NOR (before this PRD) a
 /// `#[serde(other)]` catch-all, so `agent_type = "pi"` fails its whole-response
 /// / whole-frame decode — a non-forward-compatible payload-schema change, the
-/// same class as #120's new enum variant. The bump makes the exact-match attach
-/// handshake ([`crate::connect::probe_remote_protocol`]) refuse the
-/// old-reader/new-daemon pairing at connect time (a clean `ProtocolMismatch`)
-/// instead of letting it reach a mid-session deserialize crash. `AgentType`
+/// same class as #120's new enum variant. The bump marks the break so the
+/// old-reader/new-daemon pairing is detectable at handshake time rather than
+/// arriving as a mid-session deserialize crash; when this was written
+/// `crate::connect::probe_remote_protocol` also *refused* on it, which it no
+/// longer does — see the enforcement note below. `AgentType`
 /// now also carries `#[serde(other)]` so THIS build and every future one
 /// degrade an unknown agent type to the neutral `None` placeholder rather than
 /// erroring — future agent-type additions therefore need no further bump — but
@@ -198,9 +199,10 @@ pub const KIND_STREAM_REJECT: u8 = 0x17;
 /// is running" signal), following the exact precedent PRD #201 set for
 /// `AgentType::Pi` above — a pre-#370 reader has neither variant nor a
 /// `#[serde(other)]` catch-all, so a `KIND_EVENT` frame carrying one fails
-/// its whole-frame decode. The bump forces `probe_remote_protocol` to refuse
-/// the old-reader/new-daemon pairing with a clean `ProtocolMismatch` instead
-/// of a mid-session crash. `EventType` now also carries `#[serde(other)]`
+/// its whole-frame decode. The bump marks the old-reader/new-daemon pairing as
+/// skewed at handshake time instead of letting it land as a mid-session crash;
+/// the enforcement note below records where that is acted on today.
+/// `EventType` now also carries `#[serde(other)]`
 /// (mirroring `AgentType`'s retrofit), so future event-type additions need
 /// no further bump.
 ///
@@ -220,10 +222,40 @@ pub const KIND_STREAM_REJECT: u8 = 0x17;
 /// it rather than skipping one message.
 ///
 /// The second is what makes the bump load-bearing rather than bookkeeping. The
-/// constant's job here is to make `probe_remote_protocol` refuse a skewed
-/// `connect` pairing at handshake time instead of letting it surface later as a
-/// dead event stream. The reply's [`AttachResponse::kept_worktree`] field is
-/// additive and would have needed no bump on its own.
+/// constant's job here is to make a skewed pairing *identifiable* at handshake
+/// time instead of letting it surface later as a dead event stream. The reply's
+/// [`AttachResponse::kept_worktree`] field is additive and would have needed no
+/// bump on its own.
+///
+/// # Where this constant is enforced
+///
+/// **No call site refuses on it today, and that is issue #405.** The bump
+/// rationales above were written while
+/// [`crate::connect::probe_remote_protocol`] compared the remote's
+/// `server_version` against the laptop's and hard-failed on a difference, and
+/// each one named that refusal as the payoff.
+///
+/// Issue #491 removed the comparison, because it could not fail for a real
+/// reason: `connect` is an `ssh -t` wrapper that runs the *remote* binary's TUI
+/// against the *remote* daemon, so the laptop's constant was never a party to
+/// that attach conversation and the check could only refuse remotes whose two
+/// ends already agreed by construction. The probe still refuses a remote that
+/// cannot answer `daemon hello` at all — an install floor, not a version
+/// verdict.
+///
+/// The local same-machine TUI↔daemon pairing is the one place a wire-shape skew
+/// can actually happen (the binary upgraded on disk under a still-running
+/// daemon), and it is guarded by [`crate::build_version_handshake`]'s
+/// `DAD_BUILD_ID` comparison rather than by this constant. Build-id equality is
+/// strictly stronger than protocol equality when it *matches* — same build
+/// implies same protocol — but declining its restart prompt (the right choice
+/// when live agents would die with the daemon) attaches anyway with no version
+/// check of any kind. Issue #405 tracks closing that.
+///
+/// Keep bumping this on every wire-shape break regardless. The bump is what
+/// makes a skew *nameable* — it is the number the handshake reports, what
+/// `daemon hello` prints, and the input any future compatibility gate will
+/// read; #405 is what will make it *refused*.
 pub const PROTOCOL_VERSION: u32 = 8;
 
 /// Hard cap on a single frame's payload length. Defends against a malicious
@@ -461,9 +493,10 @@ pub enum AttachRequest {
     /// PRD #76 M2.21: protocol-version handshake. Client sends its
     /// [`PROTOCOL_VERSION`]; server replies with its own in
     /// [`AttachResponse::server_version`]. The daemon never rejects on
-    /// `client_version` — only the client decides whether to fail (the
-    /// `connect` strict path) or continue (call sites that have no version
-    /// dependency).
+    /// `client_version`, and since issue #491 no client rejects on
+    /// `server_version` either — `connect`'s strict comparison was the last
+    /// one, and the local attach path never had one (issue #405). See the
+    /// enforcement note on [`PROTOCOL_VERSION`].
     ///
     /// PRD #103 M1.2: optional `client_build_version` carries the client's
     /// compiled-in `DAD_BUILD_ID`. The daemon logs it but never rejects on
@@ -3713,6 +3746,7 @@ mod tests {
             rows: 0,
             cols: 0,
             live: None,
+            spawned_at_ms: None,
         };
         let json = serde_json::to_string(&rec).unwrap();
         let back: AgentRecord = serde_json::from_str(&json).unwrap();
@@ -3731,6 +3765,7 @@ mod tests {
             rows: 0,
             cols: 0,
             live: None,
+            spawned_at_ms: None,
         };
         let v: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&rec).unwrap()).unwrap();
@@ -3856,6 +3891,7 @@ mod tests {
                 first_prompts: vec!["build the feature".into()],
                 last_user_prompt: Some("build the feature".into()),
                 live_target: None,
+                last_activity_ms: None,
             };
             let json = serde_json::to_string(&snap).expect("SessionSnapshot serializes");
             let back: SessionSnapshot =
@@ -3890,7 +3926,9 @@ mod tests {
                 first_prompts: Vec::new(),
                 last_user_prompt: None,
                 live_target: None,
+                last_activity_ms: None,
             }),
+            spawned_at_ms: None,
         };
         let json = serde_json::to_string(&rec).expect("AgentRecord serializes");
         let back: AgentRecord = serde_json::from_str(&json).expect("AgentRecord deserializes");
@@ -3915,6 +3953,237 @@ mod tests {
             old.live.is_none(),
             "older AgentRecord without a live field must decode as None"
         );
+    }
+
+    /// Scenario: Build a live `SessionState` whose `last_activity` is an hour
+    /// in the past, snapshot it, and assert the wire carries THAT instant as
+    /// epoch milliseconds rather than anything resembling `now` — the honesty
+    /// property that separates `last_activity` from the rejected session
+    /// duration. Then serialize a snapshot with no activity time and confirm
+    /// the key is absent from the JSON entirely, and decode an older peer's
+    /// payload that predates the field and confirm it arrives as `None`
+    /// (additive optional — no `PROTOCOL_VERSION` bump).
+    #[spec("session/live/013")]
+    #[test]
+    fn live_013_last_activity_is_event_derived_and_additive() {
+        use crate::event::AgentType;
+        use crate::state::{SessionSnapshot, SessionState, SessionStatus};
+        use std::collections::VecDeque;
+
+        // (a) POPULATED, and populated from the session's OWN recorded instant.
+        //
+        // This is the check that decided the milestone. `SessionState.started_at`
+        // was rejected as a column because the hydration path invents it as
+        // `now`, so a duration resets under a restarted daemon and silently
+        // lies about long-running work. `last_activity` does not have that
+        // defect: `apply_event` sets it from the observed `AgentEvent.timestamp`
+        // and only ever advances it, so an agent quiet for an hour snapshots as
+        // quiet for an hour. Pinning an hour-old instant is what would fail if
+        // anyone ever "helpfully" stamped this at snapshot time.
+        let quiet_since = chrono::Utc::now() - chrono::Duration::hours(1);
+        let session = SessionState {
+            session_id: "sess-745".into(),
+            agent_type: AgentType::ClaudeCode,
+            cwd: None,
+            status: SessionStatus::Idle,
+            active_tool: None,
+            started_at: quiet_since,
+            last_activity: quiet_since,
+            recent_events: VecDeque::new(),
+            tool_count: 0,
+            last_user_prompt: None,
+            first_prompts: Vec::new(),
+            pane_id: Some("pane-745".into()),
+            agent_id: Some("agent-745".into()),
+            display_name: None,
+            shell_synthetic_working: false,
+        };
+        let snap = session.live_snapshot();
+        assert_eq!(
+            snap.last_activity_ms,
+            Some(quiet_since.timestamp_millis()),
+            "the snapshot must carry the session's own last_activity, not a \
+             timestamp minted when the snapshot was taken"
+        );
+
+        // Round-trips as an exact integer: epoch milliseconds is the wire
+        // representation precisely so there is no format to lose anything to.
+        let json = serde_json::to_string(&snap).expect("SessionSnapshot serializes");
+        let back: SessionSnapshot = serde_json::from_str(&json).expect("deserializes");
+        assert_eq!(back.last_activity_ms, snap.last_activity_ms);
+
+        // (b) OMITTED when absent. `skip_serializing_if` keeps the key off the
+        // wire, so a peer sees absence rather than a null it would have to
+        // special-case — and the overview renders nothing at all for it.
+        let mut absent = snap.clone();
+        absent.last_activity_ms = None;
+        let json = serde_json::to_string(&absent).expect("serializes");
+        let value: serde_json::Value = serde_json::from_str(&json).expect("is JSON");
+        assert!(
+            value.get("last_activity_ms").is_none(),
+            "an absent activity time must have no key at all; got {json}"
+        );
+
+        // (c) FORWARD-COMPATIBLE with an older peer, which is the entire basis
+        // of the do-not-bump decision — proven rather than asserted. An older
+        // daemon's snapshot payload has no `last_activity_ms` key, and it must
+        // decode via `#[serde(default)]` with every other field intact.
+        let legacy = r#"{
+            "status": "Working",
+            "agent_type": "claude_code",
+            "tool_count": 7
+        }"#;
+        let old: SessionSnapshot = serde_json::from_str(legacy)
+            .expect("an older peer's snapshot must decode via #[serde(default)]");
+        assert!(
+            old.last_activity_ms.is_none(),
+            "an older peer reports no activity time, which must read as absent"
+        );
+        assert_eq!(old.status, SessionStatus::Working);
+        assert_eq!(old.tool_count, 7);
+
+        // And the other direction: a NEWER peer's payload carrying the key must
+        // not disturb the fields an older reader does understand.
+        let newer = r#"{
+            "status": "Idle",
+            "tool_count": 0,
+            "last_activity_ms": 1756684800123
+        }"#;
+        let forward: SessionSnapshot =
+            serde_json::from_str(newer).expect("a newer peer's snapshot must decode");
+        assert_eq!(forward.last_activity_ms, Some(1_756_684_800_123));
+    }
+
+    /// Scenario: Spawn a real agent through the registry, read it back out of
+    /// `agent_records()`, and assert the wire carries the instant the daemon
+    /// forked that child — bracketed by two `Utc::now()` readings taken either
+    /// side of the spawn, so a value minted at snapshot time or copied from a
+    /// session would fall outside. Then register an agent the registry did NOT
+    /// spawn and confirm its record reports no spawn time at all and omits the
+    /// key from the JSON entirely, and decode an older peer's `AgentRecord`
+    /// payload that predates the field and confirm it arrives as `None` with
+    /// every other field intact (additive optional — no `PROTOCOL_VERSION`
+    /// bump).
+    #[spec("session/live/014")]
+    #[test]
+    fn live_014_spawn_time_is_observed_and_additive() {
+        use crate::agent_pty::{AgentPtyRegistry, AgentRecord, SpawnOptions};
+        use portable_pty::{CommandBuilder, PtySize, PtySystem};
+
+        // (a) RECORDED, and recorded as an OBSERVATION of our own fork.
+        //
+        // This is the property that made a duration shippable where the PRD had
+        // rejected one. `SessionState.started_at` is event-derived — a session
+        // exists only once a hook event has arrived, and the hydration path
+        // invents it as `Utc::now()` when `pane_started_at` has no entry — so an
+        // agent that has never emitted an event has no start instant at all.
+        // A spawn is something the daemon DID, so it needs no signal and no
+        // inference. Bracketing the spawn is what would fail if anyone ever
+        // "helpfully" stamped this at snapshot time instead.
+        let before = chrono::Utc::now().timestamp_millis();
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let id = registry
+            .spawn_agent(SpawnOptions::default())
+            .expect("spawn should succeed");
+        let after = chrono::Utc::now().timestamp_millis();
+
+        let records = registry.agent_records();
+        let rec = records.iter().find(|r| r.id == id).expect("agent missing");
+        let spawned_at_ms = rec
+            .spawned_at_ms
+            .expect("the daemon forked this child, so it must report when");
+        assert!(
+            (before..=after).contains(&spawned_at_ms),
+            "the spawn instant must lie inside the spawn call itself \
+             ({before} ..= {after}), got {spawned_at_ms}"
+        );
+
+        // And it does not MOVE. The bracket above already rules out a value
+        // minted at snapshot time, but only to the resolution of a millisecond
+        // on a fast machine; reading the same record again a few milliseconds
+        // later settles it outright — a `Utc::now()` anywhere on the read path
+        // reports a different number here, whatever the clock's granularity.
+        std::thread::sleep(Duration::from_millis(5));
+        let again = registry.agent_records();
+        let again = again.iter().find(|r| r.id == id).expect("agent missing");
+        assert_eq!(
+            again.spawned_at_ms,
+            Some(spawned_at_ms),
+            "the spawn instant is recorded once and read back, never recomputed"
+        );
+
+        // Round-trips as an exact integer: epoch milliseconds is the wire
+        // representation precisely so there is no format to lose anything to.
+        let json = serde_json::to_string(rec).expect("AgentRecord serializes");
+        let back: AgentRecord = serde_json::from_str(&json).expect("deserializes");
+        assert_eq!(back.spawned_at_ms, Some(spawned_at_ms));
+        registry.shutdown_all();
+
+        // (b) ABSENT when this registry did not do the spawning, and omitted
+        // from the wire entirely rather than sent as a null. There is no
+        // `Utc::now()` fallback anywhere on this path — an invented value is
+        // exactly the failure the PRD's original duration rejection was about.
+        let adopted = Arc::new(AgentPtyRegistry::new());
+        let pair = portable_pty::NativePtySystem::default()
+            .openpty(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .expect("openpty");
+        let child = pair
+            .slave
+            .spawn_command(CommandBuilder::new("sleep"))
+            .expect("spawn a child the registry did not fork");
+        let adopted_id = adopted.insert_test_agent(child);
+        let adopted_records = adopted.agent_records();
+        let adopted_rec = adopted_records
+            .iter()
+            .find(|r| r.id == adopted_id)
+            .expect("adopted agent missing");
+        assert!(
+            adopted_rec.spawned_at_ms.is_none(),
+            "a child this registry did not fork has no spawn time to report"
+        );
+        let json = serde_json::to_string(adopted_rec).expect("serializes");
+        let value: serde_json::Value = serde_json::from_str(&json).expect("is JSON");
+        assert!(
+            value.get("spawned_at_ms").is_none(),
+            "an absent spawn time must have no key at all; got {json}"
+        );
+        adopted.shutdown_all();
+
+        // (c) FORWARD-COMPATIBLE with an older peer, which is the entire basis
+        // of the do-not-bump decision — proven rather than asserted. An older
+        // daemon's `AgentRecord` has no `spawned_at_ms` key, and it must decode
+        // via `#[serde(default)]` with every other field intact.
+        let legacy = r#"{
+            "id": "3",
+            "pane_id_env": "pane-3",
+            "display_name": "coder"
+        }"#;
+        let old: AgentRecord = serde_json::from_str(legacy)
+            .expect("an older peer's record must decode via #[serde(default)]");
+        assert!(
+            old.spawned_at_ms.is_none(),
+            "an older peer reports no spawn time, which must read as absent"
+        );
+        assert_eq!(old.id, "3");
+        assert_eq!(old.pane_id_env.as_deref(), Some("pane-3"));
+        assert_eq!(old.display_name.as_deref(), Some("coder"));
+
+        // And the other direction: a NEWER peer's payload carrying the key must
+        // not disturb the fields an older reader does understand.
+        let newer = r#"{
+            "id": "4",
+            "pane_id_env": "pane-4",
+            "spawned_at_ms": 1756684800123
+        }"#;
+        let forward: AgentRecord =
+            serde_json::from_str(newer).expect("a newer peer's record must decode");
+        assert_eq!(forward.spawned_at_ms, Some(1_756_684_800_123));
+        assert_eq!(forward.pane_id_env.as_deref(), Some("pane-4"));
     }
 
     /// Scenario: A newer daemon advertises an `AgentRecord` whose `live.status`

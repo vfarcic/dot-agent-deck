@@ -116,6 +116,11 @@
     },
     {
       "matchManagers": ["npm"],
+      "minimumReleaseAge": "3 days",
+      "description": "Do not propose an npm package until it is three days old. pnpm 11 (arrived via #776) enforces a supply-chain policy that REJECTS lockfile entries for packages published within the last 24 hours — its own default, not configured here — so a PR opened hours after publication fails `desktop-web` at `pnpm install --frozen-lockfile` with ERR_PNPM_MINIMUM_RELEASE_AGE_VIOLATION, and one that MERGES leaves `main` red until the package ages out (issue #813). Measured twice in two days: lucide-react 1.38.0 merged via #790 and held `main` red ~16h, and 1.39.0 arrived on #809 at 1h28m old. The failure is time-based and self-healing, which is what makes it corrosive rather than merely annoying — a recurring red check that means nothing trains everyone to ignore red checks, and an unrelated PR opened in that window inherits it (#805 failed at 23h31m, 29 minutes short). Renovate's internalChecksFilter holds the update rather than opening a PR, so nothing is created for CI to reject. THREE days rather than 24 hours on purpose: pnpm evaluates the cutoff at install time, so matching the figure exactly leaves no margin for a PR opened at the boundary, and for the packages this actually affects — an icon set, test tooling, a docs site — three days costs nothing. SCOPED TO npm DELIBERATELY: pnpm's policy governs npm packages only, so cargo, devbox and github-actions lanes keep their current cadence; a global delay would change three lanes to fix a problem in one. NOTE the 24-hour figure is pnpm's default, not a value pinned in this repository — if it changes, or is later configured explicitly, this number has to track it, which is a two-halves-of-one-number problem of the same shape as #648 in a lane scripts/check-pin-lockstep.sh does not cover."
+    },
+    {
+      "matchManagers": ["npm"],
       "matchFileNames": ["site/**"],
       "matchUpdateTypes": ["patch", "minor"],
       "groupName": "Docs site (site/)",

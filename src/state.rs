@@ -665,6 +665,46 @@ pub struct SessionSnapshot {
     /// [`AppState::seed_hydrated_session`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub live_target: Option<LiveTarget>,
+    /// PRD #745 M9: when this session last did anything, as a count of
+    /// milliseconds since the Unix epoch (UTC).
+    ///
+    /// The daemon has maintained [`SessionState::last_activity`] since long
+    /// before this field existed — it is the `ListAgents` join tie-breaker — but
+    /// it never reached a client, so the desktop overview had no answer to "how
+    /// long has this one been quiet". Additive optional
+    /// (`#[serde(default)]` + `skip_serializing_if`), so it is a documented
+    /// do-not-bump case per this module's policy (`crate::daemon_protocol`):
+    /// an older daemon omits the key and a newer one tolerates its absence.
+    ///
+    /// **Epoch milliseconds, not a formatted string.** A single integer has no
+    /// format for two peers to disagree about — no offset suffix, no fractional
+    /// precision to negotiate, no locale — and it is the same unit
+    /// `Date.now()` produces in the webview, so the client's whole computation
+    /// is one subtraction with no date parsing in it. Chrono's own
+    /// `Serialize` for `DateTime<Utc>` would emit RFC 3339 at NANOSECOND
+    /// precision, which every JavaScript consumer silently truncates. And a
+    /// pre-formatted `"3m ago"` would bake the client's presentation — its
+    /// rounding, its vocabulary, its notion of "now" — into the daemon's
+    /// contract; the relative wording stays in the webview.
+    ///
+    /// **It is honest across a restart rather than reset like
+    /// [`SessionState::started_at`], and that is why this field exists at all
+    /// while session duration was rejected.** The value is a high-water mark of
+    /// real, observed `AgentEvent::timestamp`s (see [`AppState::apply_event`]),
+    /// never `Utc::now()` invented for a session that has been idle for hours.
+    /// The daemon persists no `AppState`, so a restarted daemon has no sessions
+    /// at all, `AgentRecord.live` is `None`, and this reads ABSENT — which every
+    /// consumer renders as nothing. Absent beats a timestamp that lies.
+    ///
+    /// The value is PRODUCER-supplied and deliberately unclamped here, because
+    /// the same field is the ordering evidence
+    /// [`AppState::supersedes_generation`] weighs and a clamp would change that
+    /// judgement. A stamp in the future is therefore reachable
+    /// (`a_disowned_generations_far_future_session_cannot_pin_its_pane`), and
+    /// handling it is the RENDER seam's job: the desktop absorbs ordinary clock
+    /// skew and refuses to relativise anything beyond it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_activity_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -732,6 +772,10 @@ impl SessionState {
             // PRD #20 blocker-4: carry the durable live-target so a reconnect
             // restores the card's write-semantics (history-only / view-only).
             live_target: self.live_target(),
+            // PRD #745 M9: always `Some` from a live session — the daemon
+            // always knows when it last saw this one do something. Absence on
+            // the wire means there was no live session to snapshot at all.
+            last_activity_ms: Some(self.last_activity.timestamp_millis()),
         }
     }
 

@@ -1,4 +1,4 @@
-#![cfg(feature = "e2e")]
+#![cfg(all(feature = "e2e", feature = "e2e-live"))]
 
 //! L2 PTY-attached REAL-`pi` live-pane showcases (PRD #201, CLAUDE.md rule 4 +
 //! demo-reel eligibility per PRD #180). These are the Pi feature's "AS A USER
@@ -177,6 +177,14 @@ fn pi_live_001_live_pane_shows_identity_and_status() {
         .with_env("DOT_AGENT_DECK_EXPERIMENTAL", "1")
         // pi authenticates to Anthropic with this (never printed); the deck's
         // daemon and the pi child inherit it.
+        //
+        // Issue #502/#785 made `inherit_pass` forward ANTHROPIC_API_KEY into
+        // every harness-spawned deck, so this override is now belt-and-braces
+        // rather than the only source. Kept deliberately: it states the
+        // dependency at the call site, and without it these tests would take
+        // their credential from a list they do not name and would lose it —
+        // as a PTY timeout, not a compile error — if that list were ever
+        // narrowed.
         .with_env(
             "ANTHROPIC_API_KEY",
             std::env::var("ANTHROPIC_API_KEY").expect("checked non-empty by check_pi_available"),
@@ -482,7 +490,8 @@ fn pi_live_002_native_seeded_orchestration_delegates_live() {
         // Gate ON so the Pi first-class identity renders (features::show_pi_agent).
         .with_env("DOT_AGENT_DECK_EXPERIMENTAL", "1")
         // pi authenticates to Anthropic with this (never printed); the deck's
-        // daemon and the pi child inherit it.
+        // daemon and the pi child inherit it. Belt-and-braces since issue
+        // #502/#785 — see the note on `pi_live_001` above.
         .with_env(
             "ANTHROPIC_API_KEY",
             std::env::var("ANTHROPIC_API_KEY").expect("checked non-empty by check_pi_available"),

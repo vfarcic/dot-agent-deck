@@ -1,4 +1,4 @@
-#![cfg(feature = "e2e")]
+#![cfg(all(feature = "e2e", feature = "e2e-live"))]
 
 //! L2 REAL-`pi` WORKER proof (PRD #201 completeness — pi's second role).
 //!
@@ -256,7 +256,12 @@ async fn chain_smoke_pi_002_worker_receives_delegate_and_signals_work_done_inner
     )
     .expect("stage the bundled pi extension into the worker HOME");
 
-    // CRITICAL (harness caveat): explicitly propagate ANTHROPIC_API_KEY + HOME
+    // CRITICAL (harness caveat), and STILL required after issue #502/#785:
+    // that change forwards ANTHROPIC_API_KEY through `TuiDeckBuilder::launch`'s
+    // `inherit_pass`, and this spawn does not go through it — it builds
+    // `SpawnOptions.env` for an in-process daemon. Do not delete this as a
+    // duplicate of that.
+    // Explicitly propagate ANTHROPIC_API_KEY + HOME
     // (+ pane/socket/PATH) into the pi child. Never print the key. The pi worker
     // runs `dot-agent-deck work-done` from its task-file footer (or the extension's
     // `work_done` tool), so it needs the built binary on PATH and the hook socket

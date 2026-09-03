@@ -1,4 +1,4 @@
-#![cfg(feature = "e2e")]
+#![cfg(all(feature = "e2e", feature = "e2e-live"))]
 
 //! PTY-attached real-Codex native-hook parity coverage for PRD #20 W1.
 

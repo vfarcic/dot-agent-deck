@@ -261,7 +261,7 @@ Diagnosing remote 'desk-vm' at deck@desk-vm.example:22 (read-only)
 
 PASS    HostReachable        ssh connected and authenticated
 PASS    RemoteBinary         the deck answered on the remote
-PASS    ProtocolCompatible   the attach protocol version matches this laptop's
+PASS    ProtocolCompatible   the remote answered the attach handshake
 PASS    RemoteForward        ssh resolved reverse-dynamic SOCKS on 1080
 PASS    DynamicForward       no laptop-side SOCKS listener is configured
 PASS    ExitOnForwardFailure `ExitOnForwardFailure yes` is set, so a tunnel that cannot bind aborts the session loudly

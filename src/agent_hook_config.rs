@@ -21,20 +21,94 @@
 use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 
+/// Which shell will actually EXECUTE the hook command line the deck writes, and
+/// therefore which dialect [`build_command`] quotes for. It is a property of
+/// the **consuming agent**, not of the machine the deck was compiled on (issue
+/// #734).
+///
+/// Spelled per writer rather than defaulted, because the two writers genuinely
+/// differ and a single host-derived answer is wrong for one of them. Deriving
+/// it from `cfg!(windows)` for both is the same category error #734 fixed —
+/// reading the dialect off the compile target instead of off the interpreter —
+/// just one level further down.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HookShell {
+    /// The host's native shell: `cmd.exe` on Windows, a POSIX shell elsewhere.
+    ///
+    /// **Codex.** Its hooks engine
+    /// (`codex-rs/hooks/src/engine/command_runner.rs`, read at 0.149.0) hands
+    /// the whole command string to `%COMSPEC%` else `cmd.exe` with `/C` on
+    /// Windows, and to `$SHELL` else `/bin/sh` with `-lc` otherwise. The deck
+    /// writes no per-entry `shell` override, so that default is what runs every
+    /// deck hook and the interpreter really does follow the host — and
+    /// `codex_home` honours `$CODEX_HOME` on every platform, which is what
+    /// makes the Windows arm reachable rather than theoretical.
+    Native,
+    /// A POSIX shell, whatever the host is.
+    ///
+    /// **Devin.** `devin_hooks_manage::devin_config_dir` returns `None` off
+    /// Unix, so the only machine that can ever read the config this writer
+    /// produces is a Unix one, and its interpreter is POSIX by construction.
+    ///
+    /// The gate that makes that true lives one level up, and
+    /// `devin_hooks_manage::install_to` is reachable *without* passing through
+    /// it — so a host-derived dialect did not stay theoretical either: it gave
+    /// a Windows CI runner double-quoted Devin output and went red, which is
+    /// the correct outcome, since that output contradicts the very claim
+    /// ("byte-identical on every platform Devin can run on") that justified
+    /// leaving the Devin path alone in the first place. Asking for POSIX here
+    /// makes the claim true at the call site instead of borrowing it from a
+    /// caller.
+    Posix,
+}
+
 /// Build the deck's hook command for `binary_path`, robustly quoting the
 /// executable path so a path containing whitespace or shell metacharacters still
 /// produces a valid command that the agent parses to the intended argv. A "safe"
 /// path (only path-typical characters) is emitted verbatim so the common case
-/// stays human-readable and stable; anything else is single-quoted with embedded
-/// single quotes escaped.
+/// stays human-readable and stable; anything else is quoted in `shell`'s
+/// dialect — single quotes for a POSIX shell, double quotes for `cmd.exe`.
 ///
 /// `suffix` is the caller's `HOOK_COMMAND_SUFFIX` — the fixed
 /// `hook --agent <agent>` signature that also identifies the resulting command
 /// as deck-owned on the way back in, so the two must stay the same string.
-pub(crate) fn build_command(binary_path: &str, suffix: &str) -> String {
+///
+/// **The quoting follows the interpreter, not the compile target** (issue
+/// #734); [`HookShell`] records which writer names which interpreter, and why.
+/// Before #734 it was POSIX on every platform, so a Windows Codex user
+/// (reachable only via `$CODEX_HOME` — see `codex_hooks_manage::codex_home`)
+/// got `'C:\…\dot-agent-deck.exe' hook --agent codex` written into
+/// `hooks.json`, which `cmd.exe` cannot run: it reads `'` as an ordinary
+/// character and looks for a file whose name literally starts with one.
+pub(crate) fn build_command(binary_path: &str, suffix: &str, shell: HookShell) -> String {
+    build_command_for(binary_path, suffix, shell, cfg!(windows))
+}
+
+/// [`build_command`] with the host as a parameter.
+///
+/// The split exists for testability and nothing else: production passes
+/// `cfg!(windows)`, a compile-time constant, so the branch costs nothing at
+/// runtime — but a `#[cfg]` here would leave the Windows spelling of these
+/// command lines asserted by nothing on any machine this project is developed
+/// or CI-tested on except `build-windows`, which type-checks the arm without
+/// ever running it. That is exactly how #734 shipped.
+///
+/// It is also what lets [`HookShell::Posix`]'s host-independence be *asserted*
+/// from Linux rather than trusted, which matters because that property was
+/// wrong once already and only a Windows runner noticed.
+fn build_command_for(
+    binary_path: &str,
+    suffix: &str,
+    shell: HookShell,
+    windows_host: bool,
+) -> String {
+    let windows_dialect = match shell {
+        HookShell::Native => windows_host,
+        HookShell::Posix => false,
+    };
     format!(
         "{} {suffix}",
-        crate::platform::paths::shell_quote_if_needed(binary_path)
+        crate::platform::paths::native_shell_command_word(binary_path, windows_dialect)
     )
 }
 
@@ -228,12 +302,129 @@ mod tests {
     #[test]
     fn build_command_appends_the_agent_suffix_and_quotes_only_when_needed() {
         assert_eq!(
-            build_command("/abs/dot-agent-deck", "hook --agent codex"),
+            build_command_for(
+                "/abs/dot-agent-deck",
+                "hook --agent codex",
+                HookShell::Native,
+                false
+            ),
             "/abs/dot-agent-deck hook --agent codex"
         );
         assert_eq!(
-            build_command("/with space/dot-agent-deck", "hook --agent devin"),
+            build_command_for(
+                "/with space/dot-agent-deck",
+                "hook --agent devin",
+                HookShell::Posix,
+                false
+            ),
             "'/with space/dot-agent-deck' hook --agent devin"
+        );
+    }
+
+    /// Issue #734. The command written into a Windows Codex user's `hooks.json`
+    /// must be one `cmd.exe` can run — Codex hands the whole string to
+    /// `%COMSPEC%`/`cmd.exe /C` there. The pre-fix output single-quoted the
+    /// path, which `cmd.exe` does not implement as quoting at all: it looked
+    /// for a file whose name literally began with `'`, so every deck hook
+    /// silently failed.
+    ///
+    /// Driven through `build_command_for`'s parameter rather than `cfg!`, so
+    /// this runs on the Linux box the project is developed on. The one link it
+    /// does not cover is `build_command`'s own `cfg!(windows)`, which is a
+    /// constant.
+    #[test]
+    fn build_command_for_a_windows_host_is_runnable_by_cmd_exe() {
+        let path = r"C:\Users\somebody\AppData\Local\dot-agent-deck.exe";
+        let command = build_command_for(path, "hook --agent codex", HookShell::Native, true);
+        assert_eq!(
+            command,
+            format!(r"{path} hook --agent codex"),
+            "an ordinary Windows path is emitted verbatim — the safe set has `\\`"
+        );
+        assert!(
+            !command.starts_with('\''),
+            "#734's defect: a single-quoted Windows path is not runnable by cmd.exe; \
+             got {command}"
+        );
+
+        let spaced = r"C:\Program Files\dot-agent-deck\dot-agent-deck.exe";
+        assert_eq!(
+            build_command_for(spaced, "hook --agent codex", HookShell::Native, true),
+            format!(r#""{spaced}" hook --agent codex"#),
+            "a spaced Windows path is double-quoted, the form cmd.exe understands"
+        );
+    }
+
+    /// The suffix is what both installers use to recognise their own rules
+    /// (`command_is_deck_owned` is an `ends_with` on it), so it must survive
+    /// the dialect change untouched — that is what makes the repair automatic
+    /// for a user who already has a POSIX-quoted rule on disk: the next install
+    /// still identifies it, strips it, and writes the runnable spelling.
+    #[test]
+    fn build_command_ends_with_the_ownership_suffix_in_either_dialect() {
+        for windows_host in [true, false] {
+            for shell in [HookShell::Native, HookShell::Posix] {
+                for path in [
+                    "/home/somebody/bin/dot-agent-deck",
+                    r"C:\Program Files\deck\dot-agent-deck.exe",
+                    "/with space/dot-agent-deck",
+                ] {
+                    for suffix in ["hook --agent codex", "hook --agent devin"] {
+                        let command = build_command_for(path, suffix, shell, windows_host);
+                        assert!(
+                            command.ends_with(suffix),
+                            "quoting must never disturb the ownership suffix; got {command}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The regression `build-windows` caught on PR #782, pinned from Linux.
+    ///
+    /// Devin's writer must not take its dialect from the host: `install_to` is
+    /// reachable without the `devin_config_dir()` gate that confines Devin to
+    /// Unix, so a host-derived choice quoted Devin's command for `cmd.exe` on a
+    /// Windows runner — contradicting #734's own "byte-identical on every
+    /// platform Devin can run on", which is what justified leaving that writer
+    /// alone. Asserted as an equality across BOTH hosts rather than against one
+    /// spelling, so it states the invariant (the host is not an input) instead
+    /// of a snapshot of today's POSIX quoter.
+    #[test]
+    fn a_posix_writer_ignores_the_host_dialect() {
+        for path in [
+            "/home/somebody/bin/dot-agent-deck",
+            "/Applications/My Deck/dot-agent-deck",
+            r"C:\Program Files\deck\dot-agent-deck.exe",
+        ] {
+            assert_eq!(
+                build_command_for(path, "hook --agent devin", HookShell::Posix, true),
+                build_command_for(path, "hook --agent devin", HookShell::Posix, false),
+                "a POSIX writer's output must not depend on the host; {path} differed"
+            );
+        }
+
+        assert_eq!(
+            build_command_for(
+                "/Applications/My Deck/dot-agent-deck",
+                "hook --agent devin",
+                HookShell::Posix,
+                true
+            ),
+            "'/Applications/My Deck/dot-agent-deck' hook --agent devin",
+            "on a Windows host a POSIX writer still single-quotes"
+        );
+
+        // And the enum is not inert: the SAME path on the SAME host takes the
+        // other dialect for a writer whose interpreter really does follow the
+        // host. Without this, a `HookShell` that always returned POSIX would
+        // satisfy everything above.
+        let spaced = r"C:\Program Files\deck\dot-agent-deck.exe";
+        assert_ne!(
+            build_command_for(spaced, "hook --agent codex", HookShell::Native, true),
+            build_command_for(spaced, "hook --agent codex", HookShell::Posix, true),
+            "Native and Posix must differ on a Windows host, or the choice is doing nothing"
         );
     }
 

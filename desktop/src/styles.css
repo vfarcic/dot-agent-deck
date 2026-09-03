@@ -527,3 +527,158 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .handoff-edge time { margin-left: auto; color: var(--faint); font-size: 9.5px; }
 .handoff-reason { width: 100%; margin: 1px 0 0; color: var(--red); font-size: 10.5px; }
 .handoff-task { width: 100%; margin: 1px 0 0; color: var(--muted); font-size: 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* ---- Agent overview: the fleet at a glance, with no terminals (PRD #745) ---- */
+.overview-body { padding: 14px 16px 20px; }
+.daemon-group { border: 1px solid var(--line-strong); border-radius: var(--radius); background: var(--paper); }
+.daemon-group-header { min-height: 50px; padding: 9px 13px; display: flex; align-items: center; gap: 11px; border-bottom: 1px solid var(--line); background: var(--paper-strong); border-radius: var(--radius) var(--radius) 0 0; }
+/* One line, not two: the socket filename that used to sit under the name is
+   gone from the layout and lives on the name's own `title` — it contained the
+   very uid it was meant to keep out of a screenshot and said nothing a reader
+   could act on (PRD #745). */
+.daemon-identity { min-width: 0; display: flex; flex-direction: column; gap: 3px; }
+.daemon-identity strong { font-size: 12px; font-weight: 720; }
+.daemon-state { min-width: 0; margin: 0; overflow: hidden; color: var(--faint); font-size: 9.5px; text-overflow: ellipsis; white-space: nowrap; }
+.daemon-pips { margin-left: auto; display: flex; flex-wrap: wrap; gap: 5px; }
+.daemon-group-body { padding: 11px 12px 13px; }
+
+.overview-legend { padding: 0 12px 6px; }
+.overview-legend span { color: var(--faint); font-size: 6.5px; font-weight: 800; letter-spacing: .12em; }
+.overview-groups { display: flex; flex-direction: column; gap: 9px; }
+
+.overview-group { overflow: hidden; border: 1px solid var(--line); border-radius: 5px; background: var(--paper-strong); }
+.overview-group[data-group-kind="orchestration"] { border-left: 3px solid var(--teal); }
+.overview-group[data-group-kind="mode"] { border-left: 3px solid var(--violet); }
+.overview-group[data-group-kind="standalone"] { border-left: 3px solid var(--line-strong); }
+.overview-group-header { min-height: 40px; padding: 7px 11px; display: flex; align-items: center; gap: 9px; border-bottom: 1px solid var(--line); background: #f6f4ee; color: var(--muted); }
+.overview-group-identity { min-width: 0; display: flex; flex-direction: column; gap: 1px; }
+.overview-group-identity h3 { margin: 0; overflow: hidden; color: var(--ink); font-size: 12px; font-weight: 700; text-overflow: ellipsis; white-space: nowrap; }
+.overview-group-subtitle { color: var(--faint); font-size: 9px; }
+.overview-group-cwd { min-width: 0; overflow: hidden; color: var(--faint); font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
+.overview-group-count { margin-left: auto; color: var(--faint); font-family: "JetBrains Mono", monospace; font-size: 9px; white-space: nowrap; }
+.overview-group-pips { display: flex; flex-wrap: wrap; gap: 4px; }
+
+/* The rows are a real `<table>` so every cell has a `<th scope="col">`, and the
+   grid layout below is what keeps the columns aligned across group cards. Note
+   that `display: grid` on table elements strips their implicit ARIA semantics
+   in browsers, which is why AgentOverview.tsx restates role="table"/"row"/
+   "columnheader"/"cell" explicitly rather than relying on the element names. */
+.overview-table { width: 100%; display: block; border-collapse: collapse; }
+.overview-rows { display: block; margin: 0; padding: 0; }
+/* The per-group header row: present for a screen reader, invisible on screen,
+   because one visible legend for the whole fleet is the design. `clip-path`
+   rather than `display: none`, which would take it out of the a11y tree too. */
+.overview-sr-only { position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0; overflow: hidden; clip-path: inset(50%); white-space: nowrap; border: 0; }
+/* ONE scroll region for the legend and every group card together, never one
+   per card (PRD #745 M12). All the cards share a single grid template, which is
+   what makes the fleet read as one table across card boundaries; scrolling them
+   individually would let two cards sit at different horizontal offsets and the
+   columns would stop lining up — exactly when the chosen set is wide enough to
+   overflow, which is exactly when a reader depends on that alignment.
+
+   `min-width: min-content` on the track is what produces a scrollbar at all.
+   Every flexible column's track is `minmax(<px>, <n>fr)` rather than
+   `minmax(0, <n>fr)`, so the grid's min-content width is the SUM OF THOSE
+   MINIMUMS — a fixed, content-independent number — instead of either zero
+   (tracks crushed to nothing, no overflow, no scrollbar) or the width of the
+   longest prompt on screen (a `max-content` track, which one 64 KiB prompt
+   would blow to an unusable width). */
+.overview-table-region { overflow-x: auto; }
+.overview-table-track { min-width: min-content; }
+/* One grid template shared by the legend and every row, published once by
+   `AgentOverview` as a custom property on the track above and inherited from
+   there. It is GENERATED from the columns the operator chose, so there is no
+   index-sensitivity left anywhere: adding a column is one entry in
+   `COLUMN_FIELDS`, not a renumbering of `nth-child` rules in two media queries
+   (which is what this was until M12, and what made column four a five-rule
+   edit). */
+.overview-legend, .overview-row { display: grid; grid-template-columns: var(--overview-grid); align-items: center; gap: 10px; }
+.overview-row > td { min-width: 0; padding: 0; }
+.overview-row { min-height: 34px; padding: 5px 11px; border-top: 1px solid #eae7de; }
+.overview-row:first-child { border-top: 0; }
+.overview-row:hover { background: #f7f5ef; }
+.overview-row[data-status="failed"] { background: rgba(161, 62, 56, .05); }
+/* The status cell carries BOTH the mark and the word, because they render the
+   same field and two columns for one datum is what the column picker made
+   absurd (PRD #745 M12). The mark needs to be a block for its 8px box to apply
+   now that it is not a grid item in its own right. */
+.overview-state { min-width: 0; display: flex; align-items: center; gap: 6px; }
+.overview-row .agent-state-mark { display: block; margin: 0; }
+.overview-agent-name { min-width: 0; display: flex; align-items: baseline; gap: 6px; }
+.overview-agent-name strong { overflow: hidden; font-size: 11px; font-weight: 680; text-overflow: ellipsis; white-space: nowrap; }
+.overview-role-index { flex: 0 0 auto; color: var(--faint); font-family: "JetBrains Mono", monospace; font-size: 9px; font-style: normal; }
+.overview-role-name { overflow: hidden; color: var(--faint); font-size: 9px; font-style: normal; text-overflow: ellipsis; white-space: nowrap; }
+/* Scoped to the overview on purpose: `.coordinator-badge` is also used by
+   AgentTile and has never had a rule, so an unscoped selector here would
+   restyle the deck — which PRD #745 iteration 1 must not do. Giving the
+   deck's badge a style is a separate change. */
+.overview-row .coordinator-badge { flex: 0 0 auto; padding: 1px 4px; border-radius: 2px; color: var(--teal); background: var(--teal-soft); font-size: 7px; font-weight: 800; letter-spacing: .08em; }
+.overview-row .status-label { flex: 0 0 auto; display: inline-block; }
+.overview-cli, .overview-cwd, .overview-tool-count { overflow: hidden; color: var(--muted); font-family: "JetBrains Mono", monospace; font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
+/* Last activity: a fixed track (58px, declared with the column in
+   `OVERVIEW_COLUMNS` since M12 moved the templates into TypeScript), so "just
+   now" and "2760d ago" occupy the same width and the column reads as one
+   scannable strip rather than a ragged one. Muted, because it qualifies the
+   state beside it rather than competing with it, and nowrap so no value can
+   push a row taller than its neighbours. */
+.overview-activity { overflow: hidden; color: var(--faint); font-family: "JetBrains Mono", monospace; font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
+/* Uptime: the same treatment as Last activity beside it, on a narrower fixed
+   track — its labels carry no `ago`, so `<1m` through `2760d` fit in 48px (also
+   declared in `OVERVIEW_COLUMNS`). The two read as one strip because they
+   answer one question between them. */
+.overview-uptime { overflow: hidden; color: var(--faint); font-family: "JetBrains Mono", monospace; font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
+.overview-tool-count { justify-self: end; color: var(--faint); }
+.overview-tool { min-width: 0; display: flex; align-items: center; gap: 5px; color: var(--muted); }
+.overview-tool strong { flex: 0 0 auto; font-family: "JetBrains Mono", monospace; font-size: 9.5px; font-weight: 650; }
+.overview-tool em { overflow: hidden; color: var(--faint); font-family: "JetBrains Mono", monospace; font-size: 9px; font-style: normal; text-overflow: ellipsis; white-space: nowrap; }
+.overview-tool-idle { color: #a7ada9; font-size: 9px; font-style: italic; }
+/* The last user prompt: one line, always, whatever the daemon sent. `min-width:
+   0` plus the nowrap/ellipsis trio is what keeps a 64 KiB prompt from widening
+   its grid track or pushing its row taller than its neighbours — the render
+   seam's character clamp bounds the DOM, this bounds the layout. */
+.overview-prompt { min-width: 0; overflow: hidden; color: var(--muted); font-size: 9.5px; text-overflow: ellipsis; white-space: nowrap; }
+/* The daemon-reported write lease, next to the agent's name. Muted and small:
+   it is a qualifier on the row, not a status. */
+.overview-lease { flex: 0 0 auto; padding: 1px 4px; border-radius: 2px; color: var(--faint); background: rgba(0, 0, 0, .04); font-family: "JetBrains Mono", monospace; font-size: 7px; font-weight: 800; letter-spacing: .08em; text-transform: uppercase; }
+.overview-lease.lease-read, .overview-lease.lease-none { color: var(--amber); background: rgba(176, 122, 42, .1); }
+
+.overview-note { min-height: 260px; padding: 30px; display: flex; flex-direction: column; align-items: center; justify-content: center; border: 1px dashed var(--line-strong); border-radius: var(--radius); color: var(--muted); background: rgba(248, 246, 240, .55); text-align: center; }
+.overview-note h3 { margin: 11px 0 5px; color: var(--ink); font-size: 14px; }
+.overview-note p { max-width: 460px; margin: 0 0 4px; font-size: 10px; line-height: 1.55; }
+.overview-note-hint { color: var(--faint); }
+.overview-note > div { margin-top: 15px; display: flex; gap: 7px; }
+
+.count-running { color: var(--teal); }
+.count-waiting { color: var(--amber); }
+.count-failed { color: var(--red); }
+/* An unreadable fleet is not an empty one: the em dash says so and stays muted. */
+.overview-screen .count-unknown { color: var(--faint); }
+
+/* NO COLUMN IS HIDDEN BY VIEWPORT (PRD #745 M12). Two media queries used to
+   drop uptime, CLI and the working directory below 1180px and the active tool,
+   tool count and prompt below 680px, by `nth-child` index. Once the operator
+   picks the columns, hiding one by window width fights them: they asked for it
+   and the screen silently disagreed, with nothing on screen saying so. The
+   narrow case is now a horizontal scroll of the whole table region, which is
+   what `.overview-table-region` above is for. What survives here is padding and
+   the decorative status pips, none of which is a column. */
+@media (max-width: 680px) {
+  .overview-body { padding: 8px; }
+  .daemon-group-body { padding: 8px; }
+  .daemon-pips, .overview-group-pips { display: none; }
+}
+
+/* The column picker, in the top bar so choosing columns never leaves the
+   overview (PRD #745 M12). */
+.overview-columns-picker { position: relative; }
+.overview-columns-menu { position: absolute; top: calc(100% + 6px); right: 0; z-index: 30; min-width: 196px; padding: 8px; display: flex; flex-direction: column; gap: 1px; border: 1px solid var(--line-strong); border-radius: var(--radius); background: var(--paper); box-shadow: 0 10px 26px rgba(0, 0, 0, .13); }
+.overview-columns-menu p { margin: 0 0 6px; color: var(--faint); font-size: 9px; line-height: 1.45; }
+.overview-columns-menu label { display: flex; align-items: center; gap: 6px; padding: 3px 4px; border-radius: 3px; color: var(--ink); font-size: 10px; cursor: pointer; }
+.overview-columns-menu label:hover { background: var(--paper-strong); }
+.overview-columns-menu label.is-permanent { color: var(--muted); cursor: default; }
+.overview-columns-menu em { margin-left: auto; color: var(--faint); font-size: 8px; font-style: normal; letter-spacing: .06em; text-transform: uppercase; }
+/* Not a `.button`: the picker lives inside `.top-actions`, whose narrow-window
+   rule hides a `.button`'s label, and a reset whose word disappears is a
+   mystery icon in a menu of words. */
+.overview-columns-reset { margin-top: 6px; padding: 4px 5px; display: flex; align-items: center; gap: 5px; border: 0; border-top: 1px solid var(--line); border-radius: 0 0 3px 3px; background: none; color: var(--muted); font-size: 9.5px; cursor: pointer; }
+.overview-columns-reset:hover { color: var(--ink); background: var(--paper-strong); }
