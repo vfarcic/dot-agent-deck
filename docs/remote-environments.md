@@ -112,6 +112,8 @@ A long-lived `connect` session survives the laptop sleeping or the network dropp
 
 Reconnection is **bounded**, so a genuinely-gone remote surfaces an error instead of looping forever: `connect` retries up to four times after the initial drop, with a short backoff between attempts. If the host is still unreachable when the budget is exhausted, `connect` prints a clear "giving up" message, restores your local terminal to a sane state (a session interrupted mid-stream may otherwise leave the terminal in raw mode), and exits.
 
+The same budget covers the **first** connect, not only reconnects. A probe that cannot reach the host prints `'<name>' not reachable yet — retrying…` to stderr and tries again after a backoff, up to the same five attempts — so a link that needs a moment to wake (a cold VM, a VPN still coming up, a laptop whose Wi-Fi has just associated) connects on its own instead of failing and leaving you to run the command a second time. It does not make a first-attempt failure impossible: when the host really is unreachable, the retries are spent and you get the [Host unreachable](#host-unreachable) error below.
+
 Only a **dropped transport** triggers a reconnect. A clean quit or detach (exit 0), a `Ctrl-C` (exit 130), or a remote-side crash all end the session immediately — `connect` never reconnects into an intentional exit or a crashing TUI, and `last_connected` is recorded only on a clean exit, not on intermediate reconnects.
 
 The keepalive interval/count and retry budget are sensible fixed defaults today; exposing them as configuration is a future improvement.
@@ -147,16 +149,18 @@ This is the same shared handshake described under [Installation › Upgrading](i
 
 ## Failure modes
 
-Before exec'ing `ssh -t`, `connect` runs a short version probe (`<install_path> --version` over ssh) so it can classify reachability failures up front and give you an actionable message instead of dropping a half-broken TUI on you. A version *difference* between the remote binary and the laptop client is **not** a failure — it never blocks the connect. An un-upgraded older remote connects normally, and when your laptop happens to be newer you get an optional one-step upgrade offer (see [Version skew and the upgrade nudge](#version-skew-and-the-upgrade-nudge)).
+Before exec'ing `ssh -t`, `connect` runs a short version probe (`<install_path> --version` over ssh) so it can classify reachability failures up front and give you an actionable message instead of dropping a half-broken TUI on you. While a probe is in flight the terminal shows what it is waiting on — `Connecting to 'my-vm'… checking the remote deck`, then `…waiting for the handshake` — and the line is erased before the session takes over the screen. It is drawn only when you are at a terminal: piped or redirected, `connect` writes nothing extra. A version *difference* between the remote binary and the laptop client is **not** a failure — it never blocks the connect. An un-upgraded older remote connects normally, and when your laptop happens to be newer you get an optional one-step upgrade offer (see [Version skew and the upgrade nudge](#version-skew-and-the-upgrade-nudge)).
 
 ### Host unreachable
 
-Symptom: ssh itself failed — refused the connection, timed out, mismatched a host key, or rejected your key. Auth failures fold into this class because the recovery hint is the same.
+Symptom: ssh itself failed — refused the connection, timed out, mismatched a host key, or rejected your key. Auth failures fold into this class because the recovery hint is the same. This is the message you get once the retries described under [Surviving sleep/wake](#surviving-sleepwake) are spent, so a `not reachable yet — retrying…` line or two above it is normal and means the deck kept trying.
 
 ```
 Could not reach remote 'my-vm': <ssh stderr verbatim>
 Check your ssh config (`~/.ssh/config`), the host is up, and the network path is open.
 ```
+
+A missing or unrecognisable remote binary, a rejected handshake, or a forward that could not bind are **not** in this class and are never retried — they fail on the first attempt, because trying four more times cannot fix any of them and would only make an actionable error slow to arrive. An untrusted host key or a rejected key *is* in this class, so those are retried before the message arrives; run `dot-agent-deck remote add` or a plain `ssh <host>` once to settle a first-time host key rather than waiting the retries out.
 
 What to check:
 
