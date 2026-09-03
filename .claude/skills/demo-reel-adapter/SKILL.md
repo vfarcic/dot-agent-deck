@@ -1,6 +1,6 @@
 ---
 name: demo-reel-adapter
-description: dot-agent-deck-specific adapter that builds a demo-reel manifest.json from this repo's per-test recordings — selects the e2e #[spec] tests added/changed on the branch (diff vs main) that are explicitly marked reel-eligible (` [reel]` in tests/CATALOG.md), lifts each test's title/description from its test.md, orders by catalog id, points each entry at its full-stream.cast, and invokes the repo-agnostic demo-reel engine. Clean-skips when no eligible e2e tests changed. Use when asked to build the PRD demo reel for this repo.
+description: dot-agent-deck-specific adapter that builds a demo-reel manifest.json from this repo's per-test recordings — selects the e2e #[spec] tests added/changed on the branch (diff vs main) that are explicitly marked reel-eligible (` [reel]` in tests/CATALOG.md), lifts each test's title/description from its test.md, orders by catalog id, points each entry at its full-stream.cast, refuses any cast whose provenance sidecar does not record a passing run at the current commit, and invokes the repo-agnostic demo-reel engine. Clean-skips when no eligible e2e tests changed. Use when asked to build the PRD demo reel for this repo.
 ---
 
 # Demo Reel adapter (dot-agent-deck)
@@ -26,7 +26,7 @@ Everything dot-agent-deck-specific (which tests, where their title/description l
 | `build.sh [reel] [--out OUT.mp4] [--publish] [--manifest PATH] [--title TITLE]` | Full pipeline: **select** → **assemble** → invoke the engine, forwarding `--out`/`--publish` plus a composed `--title`. Clean-skips (no manifest, no engine, exit 0) when no e2e tests changed — and just as cleanly, but with a **different message naming the tests**, when e2e tests *did* change and none is `[reel]`-marked (see **Which clean skip you got**). `--manifest` sets where `manifest.json` is written (default `manifest.json` in CWD). `--title` overrides the composed title verbatim (see **Title composition**). |
 | `build.sh title [--title TITLE]` | Print the title the `reel` pipeline would pass to the engine on the current branch — the composed title, or `--title` verbatim. Dry-run: no selection, no manifest, no engine, no upload. |
 | `build.sh select` | Print the in-scope recording-dir IDs, one per line (the git-diff half — concern **a**). |
-| `build.sh assemble [ID...] [--manifest PATH]` | Build `manifest.json` from an explicit list of recording-dir IDs (the pure half — concern **b**; no git, no network). Excludes cast-less IDs **and** IDs whose catalog entry lacks the ` [reel]` marker, orders by catalog id, clean-skips an empty/all-ineligible list — naming any ID it dropped for a missing marker. |
+| `build.sh assemble [ID...] [--manifest PATH]` | Build `manifest.json` from an explicit list of recording-dir IDs (concern **b**; no network, and one `git rev-parse HEAD` unless `REEL_ADAPTER_EXPECT_COMMIT` is set). Excludes cast-less IDs, IDs whose catalog entry lacks the ` [reel]` marker, **and** IDs whose recording fails the [cast-provenance gate](#cast-provenance-issue-808), orders by catalog id, clean-skips a list where nothing survives — naming what each gate dropped, separately. |
 
 Run the full `reel` pipeline from the repo root so the default relative paths (`.dot-agent-deck/recordings`, `tests/CATALOG.md`) resolve. The engine resolves `clip` paths relative to its own CWD, so it is invoked from the same directory.
 
@@ -142,7 +142,50 @@ Pick the grid for what the scenario needs to show, then keep the ratio near 4:1.
   authoritative order); an id absent from the catalog sorts last.
 - **Clean skip:** if no ID resolves to a reel-eligible e2e clip it writes **no** manifest and exits 0, printing either the plain `skipped: no e2e tests changed on this branch` or, when an ID was dropped for a missing marker, the eligibility message that names it (see **Which clean skip you got**).
 
-Splitting selection (a) from assembly (b) is deliberate: (b) is fully deterministic and fixture-testable without git or the network, which is what most of the acceptance test below exercises.
+Splitting selection (a) from assembly (b) is deliberate: (b) is deterministic and fixture-testable, and it has exactly one impure edge — resolving the commit the provenance gate checks against, which `REEL_ADAPTER_EXPECT_COMMIT` overrides and which is resolved *lazily*, so a list that reaches no provenance check touches no git at all. That is what most of the acceptance test below exercises.
+
+## Cast provenance (issue #808)
+
+The three selection gates are a `test -f` plus two **static facts about the test** — is it branch-scoped, is its catalog line marked — so none of them says anything about the **artifact**. A `full-stream.cast` an older revision left on disk satisfies every one of them, which means the adapter could stitch a clip from an unknown revision into a video whose URL goes into the PR body *and* the changelog fragment, and from there into the public release notes.
+
+PR #805 fixed the cheap half: the harness now discards the previous run's artifacts at launch (before it spawns anything) and on `skip_unless!`'s runtime-skip path, and a deletion that fails for any reason other than `NotFound` panics instead of warning. `tests/harness_isolation.rs` carries all three guards. That closes every route that **reaches** one of those call sites — and **two routes do not**:
+
+1. A **filtered** run — the normal way anyone works, and what CLAUDE.md rule 5 asks for — never selects the test at all, so nothing on the discard path executes and an unselected test's older cast is untouched.
+2. `skip_unless!` evaluates its **preflight expression before** `_skip_if_err` is entered: `skip_unless!(check_claude_available())` calls the check first and only then hands the `Result` over, so a kill or an abort inside a `check_*_available` — or inside an importer it calls, which is where the credential work happens — lands before the skip-path discard.
+
+Provenance covers both at once, which is why the answer was not a third discard. The harness writes a `provenance.json` sidecar beside each dump, and `assemble` checks it.
+
+### What is refused, and what is only reported
+
+| Field | Adapter behaviour |
+| --- | --- |
+| sidecar **absent**, unparseable, unknown `schema`, or missing a required field | **REFUSED.** Covers a cast written before the sidecar existed and a dump that died before writing it — the sidecar is written **last** for exactly that reason. |
+| `outcome` other than `passed` | **REFUSED.** `Drop` dumps on panic, so a failure diagnostic is the commonest artifact on disk; it is not a clip. |
+| `commit` not the revision the reel is being built at | **REFUSED.** This is the field that closes both residual routes: a cast an older revision left behind names that older revision. |
+| `run_id` | Reported; **differing ids across clips WARN**, never refuse. A reel legitimately assembles clips from several filtered runs at one commit. |
+| `dirty` | Reported loudly; never refuses. Recording from a dirty tree is the ordinary dogfood case. |
+| `build_id`, `recorded_at_unix`, `redaction_version` | Reported. `recorded_at_unix` is never thresholded: a clip recorded at this commit is publishable however old it is, and any age limit would be an arbitrary number that refuses correct clips. |
+
+The gate is **per-clip**: one stale sidecar drops one clip and the rest of the reel is still built, with the omission named where the manifest is announced. Dropping a whole reel over one stale clip would only teach people to bypass the gate.
+
+### What this proves — and what it does not
+
+A selected clip was written by a harness **built from this commit**, by a run that **was not unwinding a panic**. Stated no wider than that, because each of these is outside it:
+
+- It does **not** prove the clip came from the **latest** run. A passing clip recorded at this commit by an earlier run is accepted, and correctly so — the code that produced it is the code under test. Provenance establishes revision and outcome, not recency.
+- Under `dirty` even the revision narrows: one commit then covers more than one working state, so `commit` stops identifying the code. That is why the dirty flag is reported rather than swallowed.
+- `outcome: passed` means **the harness was not unwinding a panic when the deck was dropped** — not that nextest reported the test as passed. A test that panics after its deck is already dropped is not observed; a test killed outright reaches no `Drop`, writes no sidecar at all, and is covered by the launch-time discard instead.
+- It says **nothing about whether the cast's content is redacted.** The harness redaction is a best-effort blocklist with two reproduced gaps ([#810](https://github.com/vfarcic/dot-agent-deck/issues/810)). Provenance and redaction do not cover for each other, and a passing test lowers the probability of a credential-bearing dump without changing the boundary — successful terminal output can carry a credential too.
+- It is **not a signature.** The sidecar sits in the same gitignored directory as the cast, so whoever can write one can write the other. It establishes which revision and which outcome produced an artifact the harness itself wrote.
+- Watching the finished reel before flipping it public remains defence in depth, and is **not** a reliable secret scanner.
+
+### Where it is enforced
+
+At **assembly only**, and that is sufficient rather than a shortcut: every route to a manifest runs `assemble` — the `reel` pipeline and the standalone `build.sh assemble <id...>` that an injected id list would use. `select` deliberately does not check it: "in scope" is a statement about the test, provenance is a statement about the artifact, so `build.sh select` stays a pure scope query with no git-HEAD dependency of its own and there is exactly one place the publish decision is made. (The ` [reel]` marker is duplicated across both halves for a different reason — so its near-miss diagnostic fires during selection too — not because assembly's copy is insufficient.)
+
+The harness end of the contract is `write_provenance` in `tests/common/mod.rs`, with `RECORDING_PROVENANCE_SCHEMA` and `RECORDING_REDACTION_VERSION` next to it. The two ends are in different languages and neither compiles the other, so `tests/harness_isolation.rs` asserts in the fast tier that every field the adapter reads is one the harness writes and that both agree on the schema number — drift would otherwise refuse every clip silently until somebody next tried to publish.
+
+**If the reel refuses everything, re-record rather than reaching for the override.** `DOT_AGENT_DECK_RECORD=1 cargo test-e2e-live <filter>` at the current commit is the fix for a stale cast; `REEL_ADAPTER_EXPECT_COMMIT` exists for the acceptance test and for a deliberate manual assertion, not as a way past a refusal.
 
 ## Which clean skip you got
 
@@ -152,8 +195,11 @@ Both skips are identical in behaviour — no manifest, no engine, **exit 0** —
 | --- | --- | --- |
 | `skipped: no e2e tests changed on this branch` | Nothing was in scope at all — no changed e2e test with a cast. | Nothing. A reel was never possible on this branch. (If you expected one, check that the e2e suite ran with `DOT_AGENT_DECK_RECORD=1` so the casts exist.) |
 | `skipped: N e2e test(s) …, but none is reel-eligible — no [reel] marker in tests/CATALOG.md for: <ids>` | e2e tests **did** change and have casts; they were dropped by the opt-in marker gate alone. | Read the named ids. Usually **nothing** — an unmarked test is unmarked on purpose. Add the marker only if that test genuinely spins up a **real agent** and shows the feature as a user runs it; a stand-in stays unmarked. |
+| `skipped: N e2e test(s) …, but none has a recording whose provenance checks out` | The tests changed and **are** marked, but every one of their recordings failed the [cast-provenance gate](#cast-provenance-issue-808) — most often a cast an earlier revision left on disk that no filtered run since has overwritten. | **Re-record** at this commit: `DOT_AGENT_DECK_RECORD=1 cargo test-e2e-live <filter>`. Each id's own verdict — absent sidecar, wrong commit, non-passing run — is on stderr above the skip. A ` [reel]` marker will not fix it, and neither will the diff. |
 
-A hand-written id list can trip **both** gates at once — one id with no cast, another with a cast but no marker — and then the second message carries an extra parenthetical naming the cast-less ids separately, because "none is reel-eligible" is not the reason those were dropped and adding a marker to them would change nothing. Only the standalone `build.sh assemble <id...>` reaches this: the `reel` pipeline's `select` half drops cast-less dirs before `assemble` ever sees them, so its skips always have a single cause.
+The three wordings are deliberately distinct because the three causes call for opposite responses, and the provenance one is a third unrelated reason rather than a variant of the marker: blaming the marker for a stale cast would send a reader to add a tag that changes nothing, which is the same misattribution issue #735 was about.
+
+A hand-written id list can trip **more than one** gate at once — one id with no cast, another with a cast but no marker — and then the second message carries an extra parenthetical naming the cast-less ids separately, because "none is reel-eligible" is not the reason those were dropped and adding a marker to them would change nothing. Only the standalone `build.sh assemble <id...>` reaches this: the `reel` pipeline's `select` half drops cast-less dirs before `assemble` ever sees them, so its skips always have a single cause.
 
 The second message names the ids because that is what makes it actionable, and because the older generic wording pointed at the wrong gate: a reader who saw "no e2e tests changed" on a branch that *had* changed e2e tests would go debugging the git-diff selection, which was working correctly. The inverse hazard is worth naming too — a message claiming nothing changed invites someone to reach for a ` [reel]` marker to make a reel appear, when the absent marker was the deliberate, correct answer.
 
@@ -167,6 +213,9 @@ All paths default to this repo's layout and are overridable (the test uses this 
 | `REEL_ADAPTER_CATALOG` | `tests/CATALOG.md` |
 | `REEL_ADAPTER_MAIN_REF` | `origin/main` |
 | `REEL_ADAPTER_ENGINE` | `<skill>/../demo-reel/reel.sh` |
+| `REEL_ADAPTER_EXPECT_COMMIT` | `git rev-parse HEAD`, resolved lazily |
+
+`REEL_ADAPTER_EXPECT_COMMIT` is the commit each recording's provenance must name. Setting it is an **operator assertion**, in the same class as `clean-e2e-tmp --ignore-liveness`: it is what keeps the acceptance test offline and deterministic, and pointing it at the wrong revision defeats the commit gate. It cannot loosen anything by accident, though — a wrong value refuses every clip rather than admitting a stale one. With it unset and `git rev-parse HEAD` unable to answer, `assemble` **dies** rather than publishing unchecked.
 
 ## Acceptance test
 
@@ -185,9 +234,16 @@ A **re-runnable, pure-shell** test (no `agg`/`ffmpeg`, no git, no network — so
    source skips with that eligibility message (never `no e2e tests changed` —
    the issue #735 defect) and still writes no manifest and invokes no engine,
    while a branch that changed a **marked** test's source selects, assembles and
-   invokes the engine (a stub) with no near-miss reported.
+   invokes the engine (a stub) with no near-miss reported;
+4. the **cast-provenance** gate refuses a clip whose sidecar is absent, corrupt,
+   of an unknown schema, missing a required field, recorded at a different
+   commit, or recorded from a non-passing run — while a valid sidecar publishes,
+   one stale sidecar drops **one** clip rather than the reel, a dirty-tree or
+   multi-run reel publishes **with a warning** rather than a refusal, and an
+   adapter that cannot resolve any commit to check against **dies** instead of
+   publishing unchecked.
 
-Sections 1–2 are pure shell. Section 3 exercises the selection half, which exists to run `git diff`, so it shells out to **git** — building every repository inside its own `mktemp -d` with the ambient git configuration switched off, so it can neither read nor write the checkout it runs in, and with no network and no sleep (the same discipline CLAUDE.md rule 5 sets for the `xtask` real-git tests). It **skips**, without failing, where `git` is unavailable.
+Section 4's cases mutate **copies** of the fixture tree, editing one provenance field at a time, so the difference between "publishes" and "refused" is visible in the test body rather than buried across a fixture dir per refusal. Sections 1, 2 and 4 are pure shell (a `cp` and a `jq`), apart from two provenance cases that deliberately unset `REEL_ADAPTER_EXPECT_COMMIT` to prove the git-HEAD default is live and that it fails closed. Section 3 exercises the selection half, which exists to run `git diff`, so it shells out to **git** — building every repository inside its own `mktemp -d` with the ambient git configuration switched off, so it can neither read nor write the checkout it runs in, and with no network and no sleep (the same discipline CLAUDE.md rule 5 sets for the `xtask` real-git tests). It **skips**, without failing, where `git` is unavailable.
 
 ```sh
 task reel-adapter-test

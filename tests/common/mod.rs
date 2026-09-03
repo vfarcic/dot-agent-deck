@@ -1839,6 +1839,15 @@ impl Drop for TuiDeck {
         // opt-in for capturing successful runs).
         let panicking = std::thread::panicking();
         let should_dump = panicking || self.record_on_success;
+        // Issue #808: the outcome the provenance sidecar records. See
+        // [`RecordingOutcome`] for what this observation is and is not — it is
+        // "the harness was not unwinding a panic when the deck was dropped",
+        // which is narrower than "nextest reported this test as passed".
+        let outcome = if panicking {
+            RecordingOutcome::Failed
+        } else {
+            RecordingOutcome::Passed
+        };
 
         // Stop the reader, then kill the child. Order matters: if we
         // kill first the reader sees EOF mid-buffer and the cast loses
@@ -1879,7 +1888,7 @@ impl Drop for TuiDeck {
             // a re-run simply replaces the previous artifacts.
             let recordings_dir =
                 workspace_recordings_root().join(sanitize_test_name(&self.test_name));
-            if let Err(e) = self.dump_recordings(&recordings_dir) {
+            if let Err(e) = self.dump_recordings(&recordings_dir, outcome) {
                 eprintln!("[tui-harness] failed to write recordings to {recordings_dir:?}: {e}");
             }
             // PRD #77 Decision 30 / M4: regenerate the paired `.md`
@@ -1976,7 +1985,7 @@ impl TuiDeck {
         values
     }
 
-    fn dump_recordings(&self, dir: &Path) -> std::io::Result<()> {
+    fn dump_recordings(&self, dir: &Path, outcome: RecordingOutcome) -> std::io::Result<()> {
         std::fs::create_dir_all(dir)?;
         let redactions = self.artifact_redactions();
 
@@ -2010,7 +2019,101 @@ impl TuiDeck {
             let redacted = redact_known_credentials_bytes(&bytes, &redactions);
             atomic_write(&dir.join("fixture.toml"), &redacted)?;
         }
+
+        // provenance.json — issue #808. Written LAST on purpose: the adapter
+        // refuses a cast whose sidecar is absent, so a dump that dies partway
+        // (a full disk, a `?` on any write above) leaves a cast that cannot be
+        // published rather than one that can. `provenance.json` is FIRST in
+        // [`RECORDING_ARTIFACTS`] for the mirror-image reason, so the
+        // launch-time discard removes the vouching sidecar before the artifact
+        // it vouches for.
+        self.write_provenance(dir, outcome, &redactions)?;
         Ok(())
+    }
+
+    /// Write the `provenance.json` sidecar the demo-reel adapter checks before
+    /// it will publish a cast (issue #808).
+    ///
+    /// # What each field is FOR, and what it does not establish
+    ///
+    /// The adapter refuses a cast on three of these — an absent sidecar, an
+    /// `outcome` other than `passed`, and a `commit` that is not the revision
+    /// the reel is being built at. The rest are recorded for the audit trail and
+    /// reported by the adapter, and gate nothing. Both halves are deliberate:
+    ///
+    /// * `schema` — lets the adapter refuse a sidecar shape it does not
+    ///   understand instead of misreading it. Bump it when a field's meaning
+    ///   changes, and teach `build.sh` the new value in the same commit.
+    /// * `outcome` — `passed` means **the harness was not unwinding a panic when
+    ///   `TuiDeck` was dropped**, which is narrower than "nextest reported this
+    ///   test as passed". A test that panics after its deck has already been
+    ///   dropped, or that is killed outright (no `Drop`, so no dump at all),
+    ///   is not observed here. What it does cover is the common case by far: the
+    ///   dump that fires *because* the test panicked, which is a failure
+    ///   diagnostic and not a clip.
+    /// * `commit` — the short sha the binary under test was BUILT from, parsed
+    ///   out of the compile-time `DAD_BUILD_ID` rather than read from the tree
+    ///   at dump time. That choice matters: a tree-time `git rev-parse HEAD`
+    ///   would name the revision the run was *launched* against, which a stale
+    ///   binary makes a lie, and there would then be two commit facts that can
+    ///   disagree. One fact, sourced from the artifact's own producer.
+    /// * `dirty` — `DAD_BUILD_ID`'s `-dirty` suffix. Recorded because it bounds
+    ///   what `commit` proves: with a dirty tree, two different working states
+    ///   share one commit, so the adapter reports it loudly and refuses nothing.
+    /// * `build_id` — the whole `DAD_BUILD_ID` string, so the audit trail keeps
+    ///   the version segment and the `-unknown` sentinel that `commit` drops.
+    /// * `run_id` — `NEXTEST_RUN_ID`, which is one value for a whole nextest
+    ///   run, so clips recorded together share it. It gates nothing: a reel
+    ///   legitimately assembles clips from several filtered runs at one commit,
+    ///   so the adapter reports the ids and warns when they differ rather than
+    ///   refusing. `unknown` when the recording was not made under nextest.
+    /// * `redaction_version` — bump [`RECORDING_REDACTION_VERSION`] whenever the
+    ///   recording redaction changes materially. It gates nothing today because
+    ///   `commit` already pins the redaction implementation to the one at that
+    ///   revision; it is here for the case `commit` cannot pin, which is a
+    ///   `dirty` tree, and so that a future adapter can enforce a floor over
+    ///   casts kept across revisions.
+    /// * `recorded_at_unix` — epoch seconds. Reported, never thresholded: a
+    ///   clip recorded at this commit is publishable however old it is, and any
+    ///   age limit would be an arbitrary number that refuses correct clips.
+    ///
+    /// **This is not a defence against a local author.** Every field is written
+    /// into a gitignored directory by this process, so whoever can write the
+    /// cast can write the sidecar that vouches for it. It establishes which
+    /// revision and which outcome produced an artifact that the harness itself
+    /// wrote; it is not a signature.
+    fn write_provenance(
+        &self,
+        dir: &Path,
+        outcome: RecordingOutcome,
+        redactions: &[String],
+    ) -> std::io::Result<()> {
+        let (commit, dirty) = recording_build_commit(env!("DAD_BUILD_ID"));
+        let recorded_at_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let provenance = serde_json::json!({
+            "schema": RECORDING_PROVENANCE_SCHEMA,
+            "test": self.test_name,
+            "outcome": outcome.as_str(),
+            "commit": commit.unwrap_or(""),
+            "dirty": dirty,
+            "build_id": env!("DAD_BUILD_ID"),
+            "run_id": std::env::var("NEXTEST_RUN_ID").unwrap_or_else(|_| "unknown".to_string()),
+            "redaction_version": RECORDING_REDACTION_VERSION,
+            "recorded_at_unix": recorded_at_unix,
+        });
+        let mut bytes = serde_json::to_vec_pretty(&provenance)?;
+        bytes.push(b'\n');
+        // No field here carries process output, so there is nothing a
+        // credential could have reached — but every other artifact in this dump
+        // goes through the redactor, and an exception is how the next field
+        // added here would quietly become the one that does not. If a value ever
+        // did match, the sidecar is corrupted and the adapter refuses the clip,
+        // which is the safe direction.
+        let bytes = redact_known_credentials_bytes(&bytes, redactions);
+        atomic_write(&dir.join("provenance.json"), &bytes)
     }
 
     fn encode_asciinema_cast(&self, redactions: &[String]) -> String {
@@ -3340,12 +3443,107 @@ pub fn current_test_recordings_dir() -> PathBuf {
 /// deliberately absent: it is regenerated from the test source rather than
 /// captured from a run, so it carries no credential and no run identity, and a
 /// developer browsing it should not have it deleted under them.
-const RECORDING_ARTIFACTS: [&str; 4] = [
+///
+/// `provenance.json` is FIRST, and the order is load-bearing in the deletion
+/// direction (issue #808): it is the file the demo-reel adapter checks before it
+/// will publish the cast, so removing it before the cast means a discard that
+/// panics partway has already made whatever survives unpublishable. The dump
+/// writes it LAST for the mirror-image reason.
+const RECORDING_ARTIFACTS: [&str; 5] = [
+    "provenance.json",
     "final-grid.txt",
     "final-grid.svg",
     "full-stream.cast",
     "fixture.toml",
 ];
+
+/// Schema version of the `provenance.json` sidecar (issue #808).
+///
+/// `.claude/skills/demo-reel-adapter/build.sh` refuses a sidecar whose `schema`
+/// is not the value it knows, so bumping this without teaching the adapter the
+/// new value stops the reel from selecting anything — loudly, and in the
+/// fail-closed direction. `tests/harness_isolation.rs` asserts the two agree.
+const RECORDING_PROVENANCE_SCHEMA: u32 = 1;
+
+/// Version of the recording redaction implementation, recorded in
+/// `provenance.json` so a published clip carries which redaction produced it.
+///
+/// **Bump it whenever the redaction of the persisted artifacts changes
+/// materially** — a new matcher, a new registered-value source, a change to what
+/// counts as a hit. It gates nothing today: `commit` already pins the redaction
+/// implementation to the one at that revision, which is the stronger statement.
+/// It earns its place in the two spots `commit` cannot reach — a `dirty` tree,
+/// where one commit covers more than one working state, and any future adapter
+/// that enforces a floor over casts kept across revisions.
+///
+/// Version 1 is the matcher issue #502/#785 landed, with the two reproduced gaps
+/// [#810](https://github.com/vfarcic/dot-agent-deck/issues/810) tracks: a
+/// registered value starting inside an earlier match, and a decoy continuation
+/// that suppresses a real one. #810's rewrite must bump this.
+const RECORDING_REDACTION_VERSION: u32 = 1;
+
+/// What the `provenance.json` `outcome` field records.
+///
+/// **The observation is narrower than the names suggest, and the doc says so
+/// because the field is a publish gate.** `Passed` means `std::thread::panicking()`
+/// was false when `TuiDeck` was dropped — not that nextest reported the test as
+/// passed. Three shapes it does not see: a test that panics after its deck has
+/// already been dropped; a test killed outright, which reaches no `Drop` and so
+/// writes no sidecar at all (the launch-time discard is what covers that route);
+/// and a test whose assertions were vacuous. What it does cover is the common
+/// case by far — the dump that fires *because* the test panicked, which is a
+/// failure diagnostic and never a clip.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum RecordingOutcome {
+    Passed,
+    Failed,
+}
+
+impl RecordingOutcome {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Passed => "passed",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+/// The commit the binary under test was built from and whether its tree was
+/// dirty, parsed out of a `DAD_BUILD_ID` (issue #808).
+///
+/// `build.rs` composes that value as `<version>-g<short-sha>[-dirty]`, or
+/// `<version>-unknown` when git metadata was unavailable, or an operator's
+/// injected `DAD_BUILD_ID` verbatim. The sha is read from the LAST `-g` because
+/// the version segment can legally contain one: a SemVer prerelease such as
+/// `0.25.0-gamma.1` would otherwise be mined for a sha. It is accepted only when
+/// what follows is at least git's minimum abbreviation of hex digits, so the
+/// `-unknown` sentinel and an arbitrary injected id both yield `None` — and the
+/// adapter refuses a sidecar whose `commit` is empty, which is the fail-closed
+/// direction: a binary that cannot say which commit it came from cannot support
+/// a provenance claim.
+///
+/// The `-dirty` suffix is reported separately rather than folded into the sha,
+/// because it is what bounds the sha's meaning: two different working states
+/// share one commit, so `commit` alone stops identifying the code.
+#[allow(dead_code)] // exercised from `tests/harness_isolation.rs`
+pub fn recording_build_commit(build_id: &str) -> (Option<&str>, bool) {
+    let (head, dirty) = match build_id.strip_suffix("-dirty") {
+        Some(head) => (head, true),
+        None => (build_id, false),
+    };
+    let commit = head.rsplit_once("-g").map(|(_, sha)| sha).filter(|sha| {
+        sha.len() >= MIN_BUILD_COMMIT_LEN && sha.chars().all(|c| c.is_ascii_hexdigit())
+    });
+    (commit, dirty)
+}
+
+/// Shortest sha [`recording_build_commit`] will accept as identifying a commit.
+///
+/// Git's auto-abbreviation floor is 7, so this rejects nothing a normal
+/// `git rev-parse --short HEAD` produces while refusing a `core.abbrev` low
+/// enough that a prefix match would be weak evidence rather than proof. The
+/// adapter applies the same floor to the value it compares against.
+const MIN_BUILD_COMMIT_LEN: usize = 7;
 
 /// Delete the artifacts a PREVIOUS run of `test_name` left in its recordings
 /// directory, before this run can produce any of its own.
