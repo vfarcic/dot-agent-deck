@@ -4733,6 +4733,34 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Platform coverage:** mac+linux.
 
 
+### Daemon-side project resolution (PRD #819)
+
+#### project/resolve
+
+##### project/resolve/001 — `ListProjects` offers only candidates that currently resolve: a live agent's bare working directory is not a project.
+- **Layer:** L2 lane 1 (headless `daemon serve` driven over the attach socket; no PTY, no TUI surface — the verb has no rendered surface of its own yet, and the desktop's launcher is the first client).
+- **Agent:** none (two `sh -c 'sleep 600'` stand-ins registered through `AttachRequest::StartAgent`, one per seeded working directory, so the daemon holds the `AgentRecord.cwd` enumeration seed PRD #819 draws on).
+- **Asserts:** with one agent whose cwd holds a `.dot-agent-deck.toml` and one whose cwd holds nothing, the reply's `projects` offers the real project's **canonical** path and does NOT offer the bare directory; when `primary` is present it nominates one of the offered projects. Seed origin is not proof — an agent cwd or a scheduler `working_dir` need not be a project at all, and offering one would break Decision 2's own boundary (projects, not the filesystem).
+- **Does not assert:** the deterministic precedence that picks `primary` among survivors; the daemon's own startup cwd as a seed (present but not pinned, since the test process's cwd is the repository and that is not a property of the verb); `KnownProject.name` (`project/launch/002` owns the basename-after-canonicalisation claim); the wire shape of the projection or the `#[serde(default)]` additivity of the four new `AttachResponse` fields (`tests/project_projection.rs`); path/task boundary refusal before any filesystem access (`tests/daemon_protocol.rs`).
+- **Platform coverage:** mac+linux (the file is `#![cfg(all(feature = "e2e", unix))]` — `DaemonProc` binds Unix-domain sockets).
+
+#### project/launch
+
+##### project/launch/001 — `PrepareWorkflow` publishes the coordinator context where the agent will read it and names it in the reply; a failed preparation publishes nothing and starts no roles.
+- **Layer:** L2 lane 1 (headless `daemon serve` driven over the attach socket).
+- **Agent:** none (the project fixture's roles are `cat`; the verb resolves, composes and publishes, and per PRD #819 Open Question 5 spawning stays a later `StartAgent` sequence, so no role is started by either half).
+- **Asserts:** against a project defining `loop` (a `planner` start role with a `prompt_template` and a `builder` role with a `description`), the reply is `ok` and its `context_path` names `<project>/.dot-agent-deck/orchestrator-context.md`; that file already exists when the reply arrives (the publish precedes the success, not the other way round) and contains the configured prompt template, `**builder**: …`, `## Delegation protocol`, `## Your task` and the task text; the reply's `roles` carry `planner`/`start` and `builder`/not-start. Then a second preparation naming an orchestration the project does not define is refused with a code that is NOT `unimplemented`, carries no `PreparedWorkflow`, writes no context file under that project, and leaves the daemon holding zero panes. This re-establishes daemon-side the only end-to-end check that the context has the right CONTENT, which `desktop/src-tauri/src/lib.rs`'s `workflow_launch_prepares_canonical_context_in_config_order` provides today and loses when the write moves.
+- **Does not assert:** the file's mode bits, atomicity, or the symlink-safety of the publish (M4's six publish cases own those); the `token`'s issuance or staleness policy; role ORDER in the reply (`order_workflow_roles` derives ordering from the config client-side); the exact error code of the missing-orchestration refusal, only that it is not the not-implemented one; the full byte content of the context — assertions name the missing needle rather than dumping a file the PRD declines to assume is public.
+- **Platform coverage:** mac+linux (`#![cfg(all(feature = "e2e", unix))]`).
+
+##### project/launch/002 — The canonical path `ResolveProject` returns is the string the launch uses, basename included (the PRD #220 regression guard).
+- **Layer:** L2 lane 1 (headless `daemon serve` driven over the attach socket; a real symlink on disk, which is why the file carries the `unix` cfg term).
+- **Agent:** none.
+- **Asserts:** with a real project at `<root>/code/canonical-project` and a symlink `<root>/current` pointing at it, resolving through the SYMLINKED spelling answers with the canonical path; the project's orchestration — deliberately written with no `name`, so `load_project_config` derives it from the loaded directory's basename — is named `canonical-project` and never `current`; and a `PrepareWorkflow` issued against the path the resolve returned reports a `context_path` under that same canonical directory. Canonicalising changes a path's basename, so getting the canonical form only partway through the flow makes the listing say one name while the spawn says another — `src/dispatch.rs`'s documented bug verbatim.
+- **Does not assert:** that a workflow deliberately spelled through a symlink keeps its aliased behaviour (the PRD records that as an accepted trade, not a property); whether the daemon refuses a symlinked `.dot-agent-deck.toml` or a symlinked `.dot-agent-deck` destination (M3/M4 hardening); non-UTF-8 paths, which fail the JSON frame decode before reaching the verb.
+- **Platform coverage:** mac+linux (`#![cfg(all(feature = "e2e", unix))]`).
+
+
 ### Experimental feature flag (PRD #139)
 
 #### features/gating
