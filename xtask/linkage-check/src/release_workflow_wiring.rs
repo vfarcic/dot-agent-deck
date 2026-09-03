@@ -408,17 +408,19 @@ fn gh_calls_in_checkoutless_jobs_name_their_repository() {
     // Non-vacuity. A guard that passes because it matched nothing is not a
     // guard, and this one is one `gh`-token predicate away from matching
     // nothing. `desktop-publish` is the only job in the file that reaches the
-    // API through the CLI, and it does so three times; counted regardless of
-    // whether the job checks out, so this stays live under either remedy above.
-    let publish_calls = gh_invocations(job(&all, "desktop-publish")).len();
+    // API through the CLI, and it does so on three separate lines; counted
+    // regardless of whether the job checks out, so this stays live under either
+    // remedy above.
+    let publish_lines = gh_invocations(job(&all, "desktop-publish")).len();
     assert!(
-        publish_calls >= 3,
-        "expected to still see the three `gh` calls in `desktop-publish` that \
-         issue #852 was about, found {publish_calls}. This is a lower bound, \
-         not a pin on the step layout: if a call was deliberately removed, \
-         lower it in the same commit. If all three are still there, the `gh` \
-         token match above has stopped seeing them -- perhaps a call is now \
-         split across a line continuation -- and the loop it feeds has become \
-         a no-op that passes on nothing."
+        publish_lines >= 3,
+        "expected `desktop-publish` to still hold the three `gh` invocation \
+         LINES that issue #852 was about, matched {publish_lines}. Lines, not \
+         calls -- two invocations sharing a line would count once -- and a \
+         lower bound rather than a pin on the step layout: if a call was \
+         deliberately removed, lower it in the same commit. If all three are \
+         still there, the `gh` token match above has stopped seeing them -- \
+         perhaps a call is now split across a line continuation -- and the loop \
+         it feeds has become a no-op that passes on nothing."
     );
 }
