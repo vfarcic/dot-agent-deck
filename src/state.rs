@@ -5907,25 +5907,48 @@ impl AppState {
         }
     }
 
-    /// Issue #770: every live orchestration-role registration this daemon is
-    /// holding, newest state of the in-memory maps, sorted for a stable report.
+    /// Issue #770: the orchestration-role registrations this daemon is holding
+    /// whose pane still has a LIVE agent, sorted for a stable report.
     ///
-    /// These maps have no persistence path of any kind, so this set is exactly
-    /// what a daemon restart destroys. `daemon stop` reads it over `ListAgents`
-    /// and refuses without `--force` when it is non-empty — see
+    /// The maps themselves have no persistence path of any kind, so what a
+    /// daemon restart destroys is all of them. `daemon stop` reads this over
+    /// `ListAgents` and refuses without `--force` when it is non-empty — see
     /// [`crate::daemon_stop::run_daemon_stop`].
     ///
-    /// It is deliberately NOT derived from the agent registry's
-    /// `TabMembership`, which carries the same information for panes that still
-    /// have a live agent record. The role maps are the state whose loss causes
-    /// the bug, and they outlive the agent record (nothing but a pane CLOSE
-    /// calls [`Self::unregister_pane`]), so reading the registry instead would
-    /// under-report exactly the case worth refusing: a role whose agent has
-    /// detached from the pane it was born under and will survive the restart.
-    pub fn live_orchestration_roles(&self) -> Vec<OrchestrationRoleRecord> {
+    /// # Why this is filtered by the registry, and what that gives up
+    ///
+    /// A role's map entry outlives its agent: nothing but a pane CLOSE calls
+    /// [`Self::unregister_pane`] (the `StopAgent` handler, the TUI's close
+    /// paths, and `spawn`'s partial-orchestration rollback), so a role agent
+    /// that simply EXITS leaves its entry behind indefinitely. Reporting those
+    /// as live made `daemon stop` and `daemon restart` refuse for the rest of
+    /// the daemon's life over a pane that is already a corpse, with `--force`
+    /// as the only way out — a wedge on an ordinary lifecycle command, and the
+    /// exact opposite of the "make recycling the daemon safe" this is for
+    /// (Greptile review of PR #844).
+    ///
+    /// The filter is honest about its own limit rather than pretending to a
+    /// completeness it cannot have. What it gives up is the role whose agent
+    /// has already detached past the daemon's view — the record reaped, the
+    /// process still running — which is indistinguishable from a dead pane
+    /// from in here, because both answer `has_live_pane == false`. That case
+    /// is what issue #770's SECOND half exists for: the orphan marker on the
+    /// card ([`Self::is_orphaned_orchestration_pane`]) names it after the fact,
+    /// where this guard cannot name it in advance.
+    ///
+    /// Note what the filter does NOT cost. A pane with a live agent already
+    /// trips the older managed-agent guard beside this one, so this set is a
+    /// subset of what `daemon stop` refuses on either way; what it adds is
+    /// WHICH orchestration is at stake and that losing it is permanent, which
+    /// is the whole thing the operator was never told.
+    pub fn live_orchestration_roles(
+        &self,
+        registry: &AgentPtyRegistry,
+    ) -> Vec<OrchestrationRoleRecord> {
         let mut roles: Vec<OrchestrationRoleRecord> = self
             .pane_role_map
             .iter()
+            .filter(|(pane_id, _)| registry.has_live_pane(pane_id))
             .map(|(pane_id, role)| OrchestrationRoleRecord {
                 pane_id: pane_id.clone(),
                 role: role.clone(),

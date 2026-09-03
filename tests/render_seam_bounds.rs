@@ -55,6 +55,7 @@ fn fixture_session() -> SessionState {
         agent_id: Some("1".to_string()),
         display_name: None,
         shell_synthetic_working: false,
+        orchestration_orphaned: false,
     }
 }
 

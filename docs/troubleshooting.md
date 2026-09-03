@@ -179,7 +179,7 @@ Restoring the maps from disk is deliberately *not* the fix: a restart kills the 
 
 An affected card is marked **`orphaned`** in its title and carries a `Orphaned — delegation unavailable` row, so the state is visible on the dashboard instead of waiting for the next delegate to expose it.
 
-And `daemon stop` refuses while any orchestration role is live, listing the panes and roles at stake:
+And `daemon stop` refuses while any orchestration role still has a live agent under it, listing the panes and roles at stake:
 
 ```text
 daemon holds 2 live orchestration role(s):

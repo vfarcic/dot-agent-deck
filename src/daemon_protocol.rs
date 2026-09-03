@@ -1537,12 +1537,12 @@ async fn handle_connection(
                         .map(|s| s.live_snapshot());
                 }
             }
-            // Issue #770: report the in-memory orchestration role registrations
-            // alongside the agents, so `daemon stop` can refuse to destroy
+            // Issue #770: report the orchestration role registrations whose pane
+            // still has a live agent, so `daemon stop` can refuse to destroy
             // them. Read under its own short guard rather than inside the join
             // loop above — it is one snapshot of the whole map, not a per-record
             // lookup.
-            let orchestration_roles = state.read().await.live_orchestration_roles();
+            let orchestration_roles = state.read().await.live_orchestration_roles(&registry);
             let mut resp = AttachResponse::agent_records(records);
             resp.orchestration_roles = Some(orchestration_roles);
             write_resp(&mut stream, &resp).await?;
@@ -4022,6 +4022,7 @@ mod tests {
             agent_id: Some("agent-745".into()),
             display_name: None,
             shell_synthetic_working: false,
+            orchestration_orphaned: false,
         };
         let snap = session.live_snapshot();
         assert_eq!(

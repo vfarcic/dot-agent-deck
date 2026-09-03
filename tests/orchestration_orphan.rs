@@ -42,9 +42,10 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use chrono::Utc;
-use dot_agent_deck::agent_pty::AgentPtyRegistry;
+use dot_agent_deck::agent_pty::{AgentPtyRegistry, DOT_AGENT_DECK_PANE_ID, SpawnOptions};
 use dot_agent_deck::daemon_client::issue_command;
 use dot_agent_deck::daemon_protocol::{
     AttachRequest, bind_attach_listener, serve_attach_with_counter,
@@ -69,6 +70,9 @@ static HARNESS_BIND_LOCK: Mutex<()> = Mutex::new(());
 /// (`sched-dispatch-issue-318-319-17-r0`).
 const ORCHESTRATOR_PANE: &str = "sched-issue-work-17-r0";
 const WORKER_PANE: &str = "sched-issue-work-17-r1";
+/// A role pane whose agent has EXITED without the pane being closed — the
+/// state that leaves a role-map entry behind with nothing running under it.
+const DEPARTED_PANE: &str = "sched-issue-work-17-r2";
 
 /// One hook event as an agent's own hook script would post it: a mid-session
 /// `ToolStart`, which is what an orphaned pane keeps emitting for hours.
@@ -281,11 +285,12 @@ fn orphan_002_card_says_orphaned_and_delegation_unavailable() {
     );
 }
 
-/// Scenario: Serve a real attach socket over an `AppState` holding two live
-/// orchestration roles, ask it for `list-agents`, then run the real
+/// Scenario: Serve a real attach socket over an `AppState` holding two
+/// orchestration roles whose panes have live stand-in agents, plus a THIRD
+/// whose agent has exited, then ask for `list-agents` and run the real
 /// `daemon stop` flow against that socket with no `--force`. The reply must
-/// report both roles and the stop must refuse, naming them and saying the loss
-/// is permanent.
+/// report the two live roles and not the dead one, and the stop must refuse,
+/// naming them and saying the loss is permanent.
 #[spec("orchestration/orphan/003")]
 #[test]
 fn orphan_003_daemon_stop_refuses_while_orchestration_roles_are_live() {
@@ -295,6 +300,32 @@ fn orphan_003_daemon_stop_refuses_while_orchestration_roles_are_live() {
 }
 
 async fn orphan_003_inner() {
+    let registry = Arc::new(AgentPtyRegistry::new());
+    // Two live role panes, and a third whose agent exits immediately. The
+    // third is the Greptile-review case: nothing but a pane CLOSE calls
+    // `unregister_pane`, so a role agent that simply exits leaves its map
+    // entry behind — and reporting THAT as live wedged `daemon stop` for the
+    // rest of the daemon's life, with `--force` as the only way out.
+    for pane in [ORCHESTRATOR_PANE, WORKER_PANE] {
+        registry
+            .spawn_agent(SpawnOptions {
+                command: Some("sleep 30"),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane.to_string())],
+                ..SpawnOptions::default()
+            })
+            .expect("stand-in role agent should spawn");
+    }
+    registry
+        .spawn_agent(SpawnOptions {
+            command: Some("true"),
+            env: vec![(
+                DOT_AGENT_DECK_PANE_ID.to_string(),
+                DEPARTED_PANE.to_string(),
+            )],
+            ..SpawnOptions::default()
+        })
+        .expect("stand-in departed agent should spawn");
+
     let mut state = AppState::default();
     let identity = OrchestrationIdentity::Instance {
         id: "inst-1".to_string(),
@@ -311,12 +342,30 @@ async fn orphan_003_inner() {
         WORKER_PANE,
         "coder",
         false,
+        identity.clone(),
+        Some("/home/dev/issue-work"),
+    );
+    state.register_orchestration_role(
+        DEPARTED_PANE,
+        "reviewer",
+        false,
         identity,
         Some("/home/dev/issue-work"),
     );
     let shared = Arc::new(tokio::sync::RwLock::new(state));
 
-    let server = start_server(shared).await;
+    // The registry marks an agent exited from its own reaper, so the `true`
+    // stand-in's departure is observable but not synchronous with the spawn.
+    let departed_gone = wait_until(Duration::from_secs(10), || {
+        !registry.has_live_pane(DEPARTED_PANE)
+    })
+    .await;
+    assert!(
+        departed_gone,
+        "the `true` stand-in must exit so the registry stops claiming its pane"
+    );
+
+    let server = start_server(registry.clone(), shared).await;
 
     // The wire half: the roles must actually reach a client. Nothing else in
     // the response changes, so an older client reading only `agents` is
@@ -346,7 +395,9 @@ async fn orphan_003_inner() {
             ),
             (WORKER_PANE.to_string(), "coder".to_string(), false),
         ],
-        "both roles must be reported, orchestrator flagged, order stable"
+        "the two LIVE roles must be reported, orchestrator flagged, order \
+         stable — and the role whose agent exited must NOT appear, or an \
+         ordinary `daemon stop` would be refused forever over a dead pane"
     );
 
     // The policy half, driven through the real `daemon stop` entry point so the
@@ -366,7 +417,7 @@ async fn orphan_003_inner() {
     assert_eq!(
         roles.len(),
         2,
-        "the refusal must carry both roles: {roles:?}"
+        "the refusal must carry both live roles and neither the dead one: {roles:?}"
     );
     let msg = dot_agent_deck::daemon_stop::format_live_orchestrations_refusal(&roles);
     assert!(
@@ -379,18 +430,37 @@ struct Server {
     _dir: TempDir,
     path: PathBuf,
     handle: JoinHandle<()>,
+    registry: Arc<AgentPtyRegistry>,
 }
 
 impl Drop for Server {
     fn drop(&mut self) {
         self.handle.abort();
+        // The stand-in role agents are real child processes; reap them rather
+        // than leaving a `sleep 30` behind for the harness to trip over.
+        self.registry.shutdown_all();
     }
+}
+
+/// Poll `cond` until it holds or `budget` elapses.
+async fn wait_until(budget: Duration, mut cond: impl FnMut() -> bool) -> bool {
+    let deadline = std::time::Instant::now() + budget;
+    while std::time::Instant::now() < deadline {
+        if cond() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    cond()
 }
 
 /// Serve the production `ListAgents` handler over a real attach socket, backed
 /// by the caller's `AppState` — the same shape `tests/rehydration.rs` uses, and
 /// the only way to exercise the handler's own read of the role maps.
-async fn start_server(state: dot_agent_deck::state::SharedState) -> Server {
+async fn start_server(
+    registry: Arc<AgentPtyRegistry>,
+    state: dot_agent_deck::state::SharedState,
+) -> Server {
     let (dir, path, listener) = {
         let _g = HARNESS_BIND_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let dir = test_temp::tempdir().unwrap();
@@ -398,16 +468,16 @@ async fn start_server(state: dot_agent_deck::state::SharedState) -> Server {
         let listener = bind_attach_listener(&path).expect("bind attach listener");
         (dir, path, listener)
     };
-    let registry = Arc::new(AgentPtyRegistry::new());
     let (event_tx, _rx) = tokio::sync::broadcast::channel(16);
     let client_count = Arc::new(AtomicUsize::new(0));
     let scheduler = Arc::new(dot_agent_deck::scheduler::Scheduler::with_stderr_notifier());
     let reuse = dot_agent_deck::spawn::new_reuse_registry();
     let worktrees = dot_agent_deck::issue_dispatch_run::new_worktree_registry();
+    let registry_for_task = registry.clone();
     let handle = tokio::spawn(async move {
         let _ = serve_attach_with_counter(
             listener,
-            registry,
+            registry_for_task,
             event_tx,
             client_count,
             state,
@@ -422,5 +492,6 @@ async fn start_server(state: dot_agent_deck::state::SharedState) -> Server {
         _dir: dir,
         path,
         handle,
+        registry,
     }
 }
