@@ -345,20 +345,23 @@ fn validate_structure(root: &Value) -> io::Result<()> {
 /// comments Devin allows but `serde_json` cannot parse) is backed up to
 /// `config.json.bak` and reported as an error so the caller never overwrites it;
 /// unreadable content propagates its own error.
+///
+/// The copy aside goes through
+/// [`agent_hook_config::backup_malformed`](crate::agent_hook_config::backup_malformed),
+/// which publishes it rather than `std::fs::write`ing it — that followed a
+/// symlink planted at the predictable `.bak` name (#731).
 fn read_config(path: &Path) -> io::Result<Value> {
     match std::fs::read(path) {
         Ok(bytes) => match serde_json::from_slice::<Value>(&bytes) {
             Ok(value) => Ok(value),
             Err(parse_err) => {
-                let backup = path.with_extension("json.bak");
-                let _ = std::fs::write(&backup, &bytes);
+                let backup = crate::agent_hook_config::backup_malformed(path, &bytes);
                 Err(io::Error::new(
                     ErrorKind::InvalidData,
                     format!(
                         "existing Devin config.json is not valid JSON — Devin allows \
-                         comments, which cannot be edited in place (preserved at {}): \
-                         {parse_err}",
-                        backup.display()
+                         comments, which cannot be edited in place ({}): {parse_err}",
+                        crate::agent_hook_config::preserved_phrase(backup.as_deref())
                     ),
                 ))
             }
@@ -668,6 +671,48 @@ mod tests {
         );
         let backup = dir.path().join("config.json.bak");
         assert_eq!(std::fs::read_to_string(backup).unwrap(), jsonc);
+    }
+
+    /// The same preservation must never be made THROUGH a symlink planted at
+    /// the predictable `config.json.bak` path.
+    ///
+    /// `std::fs::write` follows a symlink, so a writer able to add an entry to
+    /// `~/.config/devin` could point that name at any file it could write and
+    /// have the deck fill it with the malformed config's bytes (#731's second
+    /// half). The victim here stands for that file.
+    #[cfg(unix)]
+    #[test]
+    fn a_malformed_config_backup_does_not_follow_a_symlink_planted_at_the_backup_path() {
+        let dir = crate::test_temp::tempdir().expect("config tempdir");
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, b"victim bytes").expect("seed victim");
+
+        let jsonc = "{\n  // a comment serde_json cannot parse\n}\n";
+        std::fs::write(config_path(dir.path()), jsonc).expect("seed config.json");
+        let backup = dir.path().join("config.json.bak");
+        std::os::unix::fs::symlink(&victim, &backup).expect("plant symlink");
+
+        let err = install_to(dir.path(), "/abs/dot-agent-deck")
+            .expect_err("a config we cannot parse must not be rewritten");
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
+
+        assert_eq!(
+            std::fs::read(&victim).expect("read victim"),
+            b"victim bytes",
+            "the backup was written through the planted symlink and overwrote the victim"
+        );
+        assert!(
+            !std::fs::symlink_metadata(&backup)
+                .expect("stat backup")
+                .file_type()
+                .is_symlink(),
+            "the backup must be a real file, not the planted symlink"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&backup).expect("read backup"),
+            jsonc,
+            "the user's bytes must still be preserved beside the original"
+        );
     }
 
     /// A structurally-incompatible shape errors WITHOUT touching the file.

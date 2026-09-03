@@ -17,6 +17,11 @@
 //! once; this one draws an unpredictable name instead (#731). Folding them
 //! together would push a rewrite onto an adapter that has not been reviewed for
 //! it, so it stays where it is.
+//!
+//! It does share [`backup_malformed`], though, and all three adapters do — that
+//! one is new rather than a rewrite of anything, and the alternative was a
+//! fourth hand-rolled copy of the write whose triplicated version is what #731
+//! is about.
 
 use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
@@ -190,6 +195,72 @@ pub(crate) fn write_atomic(dir: &Path, dest: &Path, bytes: &[u8]) -> io::Result<
         return Err(e);
     }
     Ok(())
+}
+
+/// Preserve `bytes` — the content of a config file that would not parse — beside
+/// the original as `<file name>.bak`, and report where they went.
+///
+/// Best-effort by contract: every caller is on its way to returning an
+/// `InvalidData` error with the user's file left untouched, so a failed copy must
+/// not replace that error with its own. The return is a path rather than a `()`
+/// so [`preserved_phrase`] can turn it into the clause the caller's message
+/// shows, and no message names a backup that was never made — the
+/// `let _ = std::fs::write(…)` this replaces could not express that difference.
+///
+/// # The copy is never written THROUGH a symlink (#731)
+///
+/// All three adapters spelled this as `std::fs::write` at this same, fully
+/// predictable path. That opens with `O_TRUNC` and **follows a symlink**, so a
+/// writer able to add an entry to the agent's config directory — `~/.claude`,
+/// `~/.codex`, `~/.config/devin` — could plant `<name>.bak` pointing at any file
+/// it could write and have the deck truncate that file and fill it with the
+/// malformed config's bytes. It is [`write_atomic`]'s own defect one door along:
+/// the config directory's other name the deck writes without creating it first.
+///
+/// Publishing through [`write_atomic`] closes it, because `rename(2)` does not
+/// follow a symlink at its destination either — it replaces the link itself, so
+/// the planted target is never opened. Replacing rather than refusing is the
+/// right branch *here*, unlike `hooks_manage::refuse_symlinked_destination`
+/// which guards the real config file: a `.bak` is the deck's own scratch name
+/// that nobody stows in a dotfiles checkout, and refusing would discard the very
+/// bytes this exists to keep.
+///
+/// It carries [`write_atomic`]'s mode rule along with its safety: the backup
+/// lands at its own current mode, or 0600 when it is new, rather than
+/// `File::create`'s `0666 & !umask` — so a copy of a 0600 config holding an
+/// org id or an auth reference is no longer published 0644 beside it (#360,
+/// #382).
+///
+/// # The name
+///
+/// `.bak` is APPENDED to the whole file name. Two of the three adapters spelled
+/// this `path.with_extension("json.bak")`, which *replaces* the extension —
+/// identical for every path they actually pass (`settings.json`, `hooks.json`,
+/// `config.json` all become `<name>.json.bak` either way) and different only for
+/// a destination not named `*.json`, where appending is the answer that keeps
+/// the original name legible.
+pub(crate) fn backup_malformed(dest: &Path, bytes: &[u8]) -> Option<PathBuf> {
+    let mut name = dest.file_name()?.to_os_string();
+    name.push(".bak");
+    // `dest`'s OWN directory, which is what keeps the publish's `rename` on one
+    // filesystem — the same requirement `write_atomic` states for `dir`.
+    let dir = match dest.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    let backup = dir.join(name);
+    write_atomic(dir, &backup, bytes).ok().map(|()| backup)
+}
+
+/// Spell where [`backup_malformed`]'s bytes went, for the caller's error message.
+///
+/// One phrasing shared by all three adapters, so the sentence a user reads names
+/// a file that exists.
+pub(crate) fn preserved_phrase(backup: Option<&Path>) -> String {
+    match backup {
+        Some(path) => format!("preserved at {}", path.display()),
+        None => "not preserved: the copy aside failed".to_string(),
+    }
 }
 
 /// How many temp names [`create_temp`] draws before giving up. Each attempt
@@ -645,5 +716,121 @@ mod tests {
                 "unexpected temp name shape: {name}"
             );
         }
+    }
+
+    /// The backup half of #731, on the shared helper.
+    ///
+    /// `<name>.bak` is as predictable as the old temp name was, and the
+    /// `std::fs::write` all three adapters used follows a symlink — so a writer
+    /// able to add an entry to the agent's config directory could point that
+    /// name at any file it could write and have the deck fill it with the
+    /// malformed config's bytes. The publish must replace the link instead.
+    #[cfg(unix)]
+    #[test]
+    fn backup_malformed_does_not_follow_a_symlink_planted_at_the_backup_path() {
+        let dir = crate::test_temp::tempdir().expect("backup tempdir");
+        let dest = dir.path().join("config.json");
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, b"victim bytes").expect("seed victim");
+
+        let planted = dir.path().join("config.json.bak");
+        std::os::unix::fs::symlink(&victim, &planted).expect("plant symlink");
+
+        let backup = backup_malformed(&dest, b"{ not json").expect("the bytes must be preserved");
+
+        assert_eq!(
+            std::fs::read(&victim).expect("read victim"),
+            b"victim bytes",
+            "the copy followed the planted symlink and overwrote the victim"
+        );
+        assert_eq!(backup, planted, "the backup keeps its conventional name");
+        assert!(
+            !std::fs::symlink_metadata(&backup)
+                .expect("stat backup")
+                .file_type()
+                .is_symlink(),
+            "the backup must be a real file, not the planted symlink"
+        );
+        assert_eq!(std::fs::read(&backup).expect("read backup"), b"{ not json");
+    }
+
+    /// The plain path, and the control for the test above: with nothing planted
+    /// the bytes land at `<name>.bak`, a later copy replaces that same file
+    /// rather than accumulating beside it, and no temp is left behind.
+    ///
+    /// Replacing matters more than it looks: `hooks_manage::auto_install` runs on
+    /// every deck start, so a config that stays malformed reaches this on every
+    /// launch. A collision-safe *new* name each time — the issue's other
+    /// sanctioned shape — would grow one file per launch in the user's config
+    /// directory.
+    #[test]
+    fn backup_malformed_replaces_a_previous_backup_without_accumulating() {
+        let dir = crate::test_temp::tempdir().expect("backup tempdir");
+        let dest = dir.path().join("settings.json");
+        std::fs::write(&dest, b"first malformed").expect("seed destination");
+
+        let first = backup_malformed(&dest, b"first malformed").expect("first backup");
+        assert_eq!(first, dir.path().join("settings.json.bak"));
+
+        let second = backup_malformed(&dest, b"second malformed").expect("second backup");
+        assert_eq!(second, first, "the backup name is stable across copies");
+        assert_eq!(
+            std::fs::read(&second).expect("read backup"),
+            b"second malformed"
+        );
+
+        let mut names: Vec<_> = std::fs::read_dir(dir.path())
+            .expect("list dir")
+            .map(|e| e.expect("dir entry").file_name())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec![
+                std::ffi::OsString::from("settings.json"),
+                std::ffi::OsString::from("settings.json.bak")
+            ],
+            "the copy left a stray temp or a second backup behind"
+        );
+    }
+
+    /// A backup is a byte-for-byte copy of the config, so it must not be readable
+    /// by accounts the config was not. `std::fs::write` created it at
+    /// `0666 & !umask` — 0644 typically — beside a Devin config that ships 0600
+    /// and holds `devin.org_id` (#360, #382).
+    #[cfg(unix)]
+    #[test]
+    fn backup_malformed_creates_an_owner_only_file() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = crate::test_temp::tempdir().expect("backup tempdir");
+        let dest = dir.path().join("config.json");
+        let backup = backup_malformed(&dest, b"{ not json").expect("backup");
+
+        assert_eq!(
+            std::fs::metadata(&backup)
+                .expect("stat backup")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600,
+            "a fresh backup must be owner-only"
+        );
+    }
+
+    /// The message a user reads must not name a file that was never written.
+    /// The `let _ = std::fs::write(…)` this replaced always claimed one.
+    #[test]
+    fn preserved_phrase_names_a_backup_only_when_there_is_one() {
+        assert_eq!(
+            preserved_phrase(Some(Path::new("/agent/config/hooks.json.bak"))),
+            "preserved at /agent/config/hooks.json.bak"
+        );
+        let none = preserved_phrase(None);
+        assert!(
+            !none.contains(".bak"),
+            "a failed copy must not name a backup path: {none}"
+        );
+        assert!(none.contains("not preserved"), "{none}");
     }
 }
