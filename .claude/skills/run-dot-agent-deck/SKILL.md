@@ -139,7 +139,7 @@ cargo fmt --check
 cargo clippy --workspace --all-targets --features e2e,e2e-live -- -D warnings
 ```
 
-Every flag is load-bearing and CLAUDE.md rule 2 is the authority. `--all-targets --features e2e` per issue #407 and `e2e-live` per issue #502: without them the 71 `tests/e2e_*.rs` files compile to empty crates (all of them without `e2e`, the 24 credentialed ones without `e2e-live`), so clippy reports clean over code it never saw. `--workspace` per issue #436, or the `xtask/*` members are linted by nothing.
+Every flag is load-bearing and CLAUDE.md rule 2 is the authority. `--all-targets --features e2e` per issue #407 and `e2e-live` per issue #502: without them the 71 `tests/e2e_*.rs` files compile to empty crates (all of them without `e2e`, the 24 real-agent ones without `e2e-live`), so clippy reports clean over code it never saw. `e2e-live` matters most of the four — it is the only thing in CI that type-checks those 24, because no test that reaches a real agent runs on a runner. `--workspace` per issue #436, or the `xtask/*` members are linted by no gate.
 
 ## Gotchas
 

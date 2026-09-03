@@ -46,6 +46,19 @@
   # node (`undefined symbol: uv_tcp_keepalive_ex`), and pointing it at a Nix
   # tree would take precedence over every DT_RUNPATH in the shell for the same
   # class of reason.
+  #
+  # HOW THIS OUTPUT REACHES pkg-config AT USE TIME (corrected by issue #815)
+  #
+  # Through the devbox `packages` entry alone. Because `pkg-config@0.29.2` is
+  # also pinned, what lands on PATH is Nix's pkg-config WRAPPER, and the
+  # wrapper's setup hook adds this output's `lib/pkgconfig` to a role-mangled
+  # variable (`PKG_CONFIG_PATH_FOR_TARGET` on Linux). The wrapper then re-execs
+  # the real binary with `PKG_CONFIG_PATH` REPLACED by that variable, so a
+  # `PKG_CONFIG_PATH` set by the caller — including the one in devbox.json's
+  # `env` block — is discarded and never consulted. That block is a fallback for
+  # a non-wrapper pkg-config, not the mechanism; #815 was diagnosed twice over
+  # as an `env`-block bug before that was measured. Do not add a shared library
+  # or an `LD_LIBRARY_PATH` here on the strength of an empty `PKG_CONFIG_PATH`.
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";

@@ -52,7 +52,7 @@
       # (the same one release.yml uses) and pins the version here. The
       # dot-ai-tag-release skill bumps this line as part of cutting a tag, and
       # release.yml refuses to release when it disagrees with the tag.
-      version = "0.39.0";
+      version = "0.39.1";
 
       # `<version>-g<short-sha>`, the same shape build.rs composes out of git
       # metadata (build_version_resolve.rs:180-196).

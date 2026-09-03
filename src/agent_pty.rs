@@ -1882,6 +1882,30 @@ pub struct RunningAgent {
     /// Lets a test prove the NATIVE delivery path ran rather than the safety
     /// net (the whole point of dissolving the keystroke-injection workaround).
     pub seed_delivered_native: bool,
+    /// PRD #745 M11: the wall-clock instant at which **this registry forked
+    /// this child**, or `None` when the registry did not fork it.
+    ///
+    /// It is an OBSERVATION, not an inference. [`AgentPtyRegistry::spawn_agent`]
+    /// stamps it immediately after `spawn(opts)` returns — the first moment the
+    /// process exists — and nothing ever rewrites it. It is the only site that
+    /// writes `Some`; every other way a record comes into being leaves it
+    /// `None`, which is why the absent case needs no guard anyone has to
+    /// remember.
+    ///
+    /// **`DateTime<Utc>`, not `Instant`.** A monotonic instant is meaningless in
+    /// another process, so it cannot cross the wire at all; the value is
+    /// serialized as epoch milliseconds on [`AgentRecord::spawned_at_ms`], the
+    /// unit `Date.now()` speaks.
+    ///
+    /// **A respawn does not carry it over, and that is the feature.** A
+    /// `clear = true` delegate removes this record outright and
+    /// [`AgentPtyRegistry::spawn_agent`] mints a fresh one
+    /// (see [`AgentPtyRegistry::respawn_agent_for_pane_declared`]), so a
+    /// restarted worker reports the age of its CURRENT iteration while a role
+    /// nobody has restarted — an orchestrator, typically — reports its whole
+    /// lifetime. No "which duration is this?" flag is needed, because the two
+    /// answers come from two different records.
+    pub spawned_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 impl RunningAgent {
@@ -2063,6 +2087,40 @@ pub struct AgentRecord {
     /// no `PROTOCOL_VERSION` bump is needed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub live: Option<crate::state::SessionSnapshot>,
+    /// PRD #745 M11: when the daemon spawned this agent's process, as a count
+    /// of milliseconds since the Unix epoch (UTC). Copied from
+    /// [`RunningAgent::spawned_at`].
+    ///
+    /// **Spawn time, not [`crate::state::SessionState::started_at`], and the
+    /// difference is the point.** `started_at` is EVENT-derived: a session only
+    /// exists once a hook event has arrived, so an agent that has never emitted
+    /// one has no start instant at all — which is exactly the agent whose
+    /// uptime a reader most wants — and the hydration path invents it as
+    /// `Utc::now()` when `pane_started_at` has no entry
+    /// (`AppState::insert_placeholder_session`). A spawn is something the
+    /// daemon DID, so it is signal-independent and needs no inference.
+    ///
+    /// **Never invented.** `None` means the daemon cannot vouch for a spawn:
+    /// a record minted from an older daemon's id-only `ListAgents` reply
+    /// (`daemon_client::list_agents`), a peer predating this field, or the
+    /// synthetic test seam. Every consumer renders nothing for it — no dash, no
+    /// placeholder — which is the same disposition
+    /// [`crate::state::SessionSnapshot::last_activity_ms`] takes and the reason
+    /// a duration is shippable here where one built on `started_at` was not.
+    ///
+    /// **Epoch milliseconds for the same four reasons M9 recorded**, and the
+    /// unit is in the NAME because a seconds/milliseconds slip is a ×1000
+    /// error: an integer has no format for two peers to disagree about, it is
+    /// what `Date.now()` speaks, chrono's own `DateTime<Utc>` serialization
+    /// emits RFC 3339 at nanosecond precision no JavaScript consumer can
+    /// represent, and a pre-formatted `"3h"` would bake the client's rounding
+    /// and vocabulary into the daemon's contract.
+    ///
+    /// Additive optional, so no `PROTOCOL_VERSION` bump — the do-not-bump case
+    /// this module's own policy names (`crate::daemon_protocol`), the same
+    /// basis `live` and `last_activity_ms` were added on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spawned_at_ms: Option<i64>,
 }
 
 /// Skip-predicate for `AgentRecord::rows` / `AgentRecord::cols`
@@ -5039,6 +5097,12 @@ impl AgentPtyRegistry {
         // would otherwise drop the `AgentPty` without killing the child
         // (`AgentPty` has no `Drop`).
         let guard = PtyGuard::new(spawn(opts)?);
+        // PRD #745 M11: the child exists as of the line above, so this is the
+        // instant to record — before the lock acquisition below, which can
+        // block behind any other registry operation. An OBSERVATION of when the
+        // daemon forked this process, never derived from an event and never
+        // recomputed; see [`RunningAgent::spawned_at`].
+        let spawned_at = chrono::Utc::now();
         let mut inner = self.inner.lock().unwrap();
         // Issue #454: hand ownership over from the reservation to `agents`
         // WITHOUT releasing the lock in between — every early return below has
@@ -5208,6 +5272,9 @@ impl AgentPtyRegistry {
             // pulls it on `session_start`.
             pending_seed: None,
             seed_delivered_native: false,
+            // PRD #745 M11: the ONLY site that records a spawn instant, because
+            // it is the only site that performs a spawn.
+            spawned_at: Some(spawned_at),
         };
 
         // Use the id we pre-allocated above (before spawn) and injected
@@ -6099,6 +6166,11 @@ impl AgentPtyRegistry {
             // seed via `set_pending_seed` right after this returns.
             pending_seed: _,
             seed_delivered_native: _,
+            // PRD #745 M11: deliberately dropped rather than carried over. The
+            // fresh child is a fresh spawn, and `spawn_agent` stamps it — which
+            // is what makes a restarted worker report its CURRENT iteration
+            // while an unrestarted role reports its whole lifetime.
+            spawned_at: _,
         } = removed;
 
         // Drop this reference to the writer Arc; the slave half closes
@@ -6612,6 +6684,8 @@ impl AgentPtyRegistry {
             rows: agent.pty_rows,
             cols: agent.pty_cols,
             live: None,
+            // PRD #745 M11: absent unless THIS registry forked the child.
+            spawned_at_ms: agent.spawned_at.map(|at| at.timestamp_millis()),
         })
     }
 
@@ -6903,6 +6977,11 @@ impl AgentPtyRegistry {
                 // `ListAgents` handler joins `AppState.sessions` in and
                 // overrides this when a matching live session exists.
                 live: None,
+                // PRD #745 M11: absent unless THIS registry forked the child.
+                // Every record this method yields is a LIVE one — the `exited`
+                // filter above is what keeps a spawn instant from outliving the
+                // process it describes and ticking up as a phantom uptime.
+                spawned_at_ms: agent.spawned_at.map(|at| at.timestamp_millis()),
             })
             .collect();
         records.sort_by_key(|r| r.id.parse::<u64>().unwrap_or(0));
@@ -7158,6 +7237,12 @@ impl AgentPtyRegistry {
                 pane_handed_over: false,
                 pending_seed: None,
                 seed_delivered_native: false,
+                // PRD #745 M11: this registry did not fork this child — the
+                // caller did, and handed it over. There is no spawn of ours to
+                // report, so the honest value is absence rather than the
+                // `Utc::now()` that would make the synthetic agent look like it
+                // had just been started by us.
+                spawned_at: None,
             },
         );
         id
@@ -10490,6 +10575,7 @@ mod spawn_tests {
             rows: 120,
             cols: 40,
             live: None,
+            spawned_at_ms: None,
         };
         let json = serde_json::to_string(&rec).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -10751,6 +10837,7 @@ mod spawn_tests {
             rows: 0,
             cols: 0,
             live: None,
+            spawned_at_ms: None,
         };
         let json = serde_json::to_string(&rec).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();

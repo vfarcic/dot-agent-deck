@@ -355,6 +355,10 @@ impl DaemonClient {
                 // Legacy `agents`-only daemon shape carries no live session
                 // state; the TUI falls back to a bare placeholder.
                 live: None,
+                // PRD #745 M11: and no spawn instant either — this daemon
+                // predates the field, so it reported no spawn time and none may
+                // be invented for it. Absence renders as nothing.
+                spawned_at_ms: None,
             })
             .collect())
     }
@@ -1206,6 +1210,7 @@ mod tests {
             rows: 0,
             cols: 0,
             live: None,
+            spawned_at_ms: None,
         };
         sanitize_record_tab_membership(&mut rec);
         assert!(rec.tab_membership.is_none(), "invalid name must be cleared");
@@ -1229,6 +1234,7 @@ mod tests {
             rows: 0,
             cols: 0,
             live: None,
+            spawned_at_ms: None,
         };
         sanitize_record_tab_membership(&mut ok);
         assert_eq!(

@@ -330,6 +330,7 @@ async fn handle_connection(
                         rows: 24,
                         cols: 80,
                         live: None,
+                        spawned_at_ms: None,
                     }]
                 })
                 .unwrap_or_default();

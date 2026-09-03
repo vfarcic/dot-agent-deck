@@ -44,6 +44,45 @@ use spec::spec;
 
 const DELIVERED_POINTER: &str = "Read .dot-agent-deck/orchestrator-context.md";
 
+/// Ceiling on "the daemon has applied the injected event to its own state".
+///
+/// Issue #818. This was a bare 10s at both call sites, merely restating the
+/// harness-wide `WAIT_TIMEOUT` default (`tests/common/mod.rs`). That is
+/// ample locally — `orchestration_remit_001` completes in ~2.2s — and too tight
+/// on a GitHub runner, where lane 1 runs the whole 8000-test tier in parallel
+/// and `e2e-deterministic` went red on every branch and on `main` within
+/// seconds of this file landing. The wait itself was never the problem: it is a
+/// bounded `common::wait_until` poll, exactly what Decision 21 asks for.
+///
+/// 30s rather than a larger round number because the work being waited on is
+/// one socket write plus one state application — if that genuinely needs longer,
+/// something IS wrong and the test should say so rather than wait it out.
+/// Existing e2e tests already bound slower waits at 15s, 20s, 30s, 60s and 75s,
+/// so this needs no new mechanism.
+///
+/// THIS BOUND ALONE DOES NOT FIX #818, and raising it further will not either.
+/// At 30s under default parallelism these tests still failed; they pass only
+/// with the `orchestration-remit` `max-threads = 1` test group in
+/// `.config/nextest.toml` as well. The bound is still load-bearing — serialised
+/// by that group but left at 10s, `orchestration_remit_001` alone still blew
+/// past it (13.5s) — so the two halves must move together. That file's comment
+/// carries the four-way measurement.
+const STATE_APPLIED_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Ceiling on "the fixture's prompt log shows the remit pointer N times".
+///
+/// Issue #818, same cause as [`STATE_APPLIED_TIMEOUT`] and raised for the same
+/// reason: `orchestration_remit_001` was observed failing at BOTH bounds on a
+/// runner — at the state wait in one run and at the first delivery wait in
+/// another — so raising only one of them just moves the flake.
+///
+/// Applies to the POSITIVE waits only, the ones asserting a delivery *did*
+/// happen. The deliberate short bounds elsewhere in this file
+/// (`Duration::from_millis(900)`, always under `assert!(!…)`) assert a delivery
+/// did NOT happen; raising those would invert what the test proves while making
+/// it slower. Leave them alone.
+const DELIVERY_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Drive the new-pane dialog to open the (single) orchestration in the
 /// `remit-reassert-orchestration` fixture. With no `[[modes]]` defined the
 /// Mode chip row is `[No mode] [Orch: remit-reassert] [schedule]`, so ONE
@@ -234,7 +273,7 @@ fn inject_compacting(
     common::write_hook_line(deck.hook_socket_path(), &line)
         .expect("inject synthetic Compacting AgentEvent over hook socket");
 
-    let applied = common::wait_until(Duration::from_secs(10), || {
+    let applied = common::wait_until(STATE_APPLIED_TIMEOUT, || {
         common::agent_records_on(socket).into_iter().any(|r| {
             r.pane_id_env.as_deref() == Some(pane_id)
                 && r.live.as_ref().map(|s| &s.status)
@@ -244,9 +283,11 @@ fn inject_compacting(
     assert!(
         applied,
         "the daemon's own ListAgents/live-status join never reported Compacting \
-         for pane {pane_id} (agent_id {agent_id}) within 10s — the hook socket write \
-         was accepted, but AppState::apply_event may have rejected it or applied it \
-         to the wrong session.",
+         for pane {pane_id} (agent_id {agent_id}) within {STATE_APPLIED_TIMEOUT:?}. \
+         The hook socket write was accepted. On a loaded CI runner suspect the \
+         bound before the code (issue #818); if this reproduces locally, where the \
+         whole test takes ~2s, then AppState::apply_event really is rejecting the \
+         event or applying it to the wrong session.",
     );
 }
 
@@ -313,7 +354,7 @@ fn inject_clear_session_start(
     common::write_hook_line(deck.hook_socket_path(), &line)
         .expect("inject synthetic clear-originated SessionStart AgentEvent over hook socket");
 
-    let applied = common::wait_until(Duration::from_secs(10), || {
+    let applied = common::wait_until(STATE_APPLIED_TIMEOUT, || {
         common::agent_records_on(socket).into_iter().any(|r| {
             r.pane_id_env.as_deref() == Some(pane_id)
                 && r.live.as_ref().map(|s| &s.status)
@@ -323,9 +364,11 @@ fn inject_clear_session_start(
     assert!(
         applied,
         "the daemon's own ListAgents/live-status join never reported Idle for pane \
-         {pane_id} (agent_id {agent_id}) within 10s after injecting a synthetic \
-         clear-originated SessionStart — the hook socket write was accepted, but \
-         AppState::apply_event may have rejected it or applied it to the wrong session.",
+         {pane_id} (agent_id {agent_id}) within {STATE_APPLIED_TIMEOUT:?} after \
+         injecting a synthetic clear-originated SessionStart. The hook socket write \
+         was accepted. On a loaded CI runner suspect the bound before the code \
+         (issue #818); if this reproduces locally then AppState::apply_event really \
+         is rejecting the event or applying it to the wrong session.",
     );
 }
 
@@ -357,11 +400,11 @@ fn open_and_confirm_initial_delivery(
 
     let log = deck.workdir().join("orchestrator-prompt.log");
     let initial_delivered =
-        common::wait_for_file_substr_count(&log, DELIVERED_POINTER, 1, Duration::from_secs(10));
+        common::wait_for_file_substr_count(&log, DELIVERED_POINTER, 1, DELIVERY_TIMEOUT);
     assert!(
         initial_delivered,
         "precondition failed: the spawn-time orchestrator prompt never reached the \
-         start role's pane within 10s\nFinal grid:\n{}",
+         start role's pane within {DELIVERY_TIMEOUT:?}\nFinal grid:\n{}",
         deck.snapshot_grid()
     );
 
@@ -389,12 +432,12 @@ fn orchestration_remit_001_start_role_compaction_reasserts_remit() {
     );
 
     let reasserted =
-        common::wait_for_file_substr_count(&log, DELIVERED_POINTER, 2, Duration::from_secs(10));
+        common::wait_for_file_substr_count(&log, DELIVERED_POINTER, 2, DELIVERY_TIMEOUT);
     assert!(
         reasserted,
         "a Compacting event on the orchestrator start-role pane must re-deliver the \
          `{DELIVERED_POINTER}` remit pointer a second time; the log only shows it \
-         once within 10s.\nFinal grid:\n{}",
+         once within {DELIVERY_TIMEOUT:?}.\nFinal grid:\n{}",
         deck.snapshot_grid()
     );
 }
@@ -447,7 +490,7 @@ fn orchestration_remit_002_non_start_role_compaction_reasserts_nothing() {
         &format!("{orch_agent_id}-remit002-orch-session"),
     );
     let reasserted_on_start_role =
-        common::wait_for_file_substr_count(&log, DELIVERED_POINTER, 2, Duration::from_secs(10));
+        common::wait_for_file_substr_count(&log, DELIVERED_POINTER, 2, DELIVERY_TIMEOUT);
     assert!(
         reasserted_on_start_role,
         "control failed: a Compacting event on the orchestrator START role must still \
@@ -515,7 +558,7 @@ fn orchestration_remit_003_reassertion_waits_for_confirmed_delivery() {
     std::fs::write(deck.workdir().join("go-live-again"), "")
         .expect("trigger the fixture script's return-to-live phase");
     let delivered_once_live =
-        common::wait_for_file_substr_count(&log, DELIVERED_POINTER, 2, Duration::from_secs(10));
+        common::wait_for_file_substr_count(&log, DELIVERED_POINTER, 2, DELIVERY_TIMEOUT);
 
     assert!(
         feedback,
@@ -558,12 +601,12 @@ fn orchestration_remit_004_start_role_clear_reasserts_remit() {
     );
 
     let reasserted =
-        common::wait_for_file_substr_count(&log, DELIVERED_POINTER, 2, Duration::from_secs(10));
+        common::wait_for_file_substr_count(&log, DELIVERED_POINTER, 2, DELIVERY_TIMEOUT);
     assert!(
         reasserted,
         "a `/clear`-originated SessionStart event on the orchestrator start-role pane \
          must re-deliver the `{DELIVERED_POINTER}` remit pointer a second time; the \
-         log only shows it once within 10s.\nFinal grid:\n{}",
+         log only shows it once within {DELIVERY_TIMEOUT:?}.\nFinal grid:\n{}",
         deck.snapshot_grid()
     );
 
@@ -636,7 +679,7 @@ fn orchestration_remit_005_non_start_role_clear_reasserts_nothing() {
         AgentType::ClaudeCode,
     );
     let reasserted_on_start_role =
-        common::wait_for_file_substr_count(&log, DELIVERED_POINTER, 2, Duration::from_secs(10));
+        common::wait_for_file_substr_count(&log, DELIVERED_POINTER, 2, DELIVERY_TIMEOUT);
     assert!(
         reasserted_on_start_role,
         "control failed: a `/clear`-originated SessionStart event on the orchestrator \
@@ -746,18 +789,14 @@ fn orchestration_remit_007_compaction_reassertion_preserves_a_dispatched_task() 
         &format!("{agent_id}-remit007-session"),
     );
 
-    let reasserted_with_task = common::wait_for_file_substr_count(
-        &log,
-        CARRY_OUT_TASK_POINTER,
-        1,
-        Duration::from_secs(10),
-    );
+    let reasserted_with_task =
+        common::wait_for_file_substr_count(&log, CARRY_OUT_TASK_POINTER, 1, DELIVERY_TIMEOUT);
     assert!(
         reasserted_with_task,
         "a compaction re-assertion on a start role whose context file carries a `## Your \
          task` section must re-deliver the TASK-CARRYING pointer (containing \
          `{CARRY_OUT_TASK_POINTER}`), not the no-task \"wait for instructions\" variant; \
-         the log never shows it within 10s.\nFinal grid:\n{}",
+         the log never shows it within {DELIVERY_TIMEOUT:?}.\nFinal grid:\n{}",
         deck.snapshot_grid()
     );
 

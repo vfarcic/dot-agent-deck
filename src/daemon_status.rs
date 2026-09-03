@@ -233,6 +233,7 @@ mod tests {
             rows: 0,
             cols: 0,
             live,
+            spawned_at_ms: None,
         }
     }
 
@@ -245,6 +246,7 @@ mod tests {
             first_prompts: Vec::new(),
             last_user_prompt: None,
             live_target: None,
+            last_activity_ms: None,
         }
     }
 

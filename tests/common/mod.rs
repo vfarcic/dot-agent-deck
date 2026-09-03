@@ -553,6 +553,11 @@ impl TuiDeck {
 
     fn try_launch_inner(builder: TuiDeckBuilder, fixture_name: &str) -> Result<Self, String> {
         let test_name = current_test_name();
+        // PR #805 audit blocker 3, and it comes before every side effect on
+        // purpose: from here on the run can be killed at any instant, and
+        // whatever it does not overwrite is what a later reel build picks up.
+        // See [`discard_previous_recording`].
+        discard_previous_recording(&test_name);
 
         // M2.1 auditor S1 + M3.1 auditor S4: create the per-test
         // tempdir with mode 0o700 atomically. `harness_tempdir()`
@@ -646,15 +651,32 @@ impl TuiDeck {
         let mut recording_redactions = Vec::new();
         for kind in &builder.credential_imports {
             match kind {
+                // Issue #502/#785, PR #805 audit blocker 2: the Claude importer
+                // now returns redactions like the other three. It used to
+                // return none, on the ground that the credential set is "never
+                // rendered" — a convention, not a structural property, and the
+                // route most reel clips take. The run's credential source is
+                // recorded in `CLAUDE_OAUTH_SEEDED` for
+                // `seed_claude_project_trust` below rather than threaded
+                // through every builder field.
                 CredentialImport::ClaudeCode => {
-                    import_claude_credentials(&home).map_err(|e| e.to_string())?;
+                    recording_redactions
+                        .extend(import_claude_credentials(&home).map_err(|e| e.to_string())?);
                 }
                 CredentialImport::OpenCode => {
                     recording_redactions
                         .extend(import_opencode_credentials(&home).map_err(|e| e.to_string())?);
                 }
+                // Issue #502/#785 audit S2: the Codex importer now returns
+                // redactions like the OpenCode and Devin ones. It used to
+                // return none at all — and since a key-only host provisions
+                // `~/.codex/auth.json` FROM the raw OPENAI_API_KEY, and this
+                // importer copies those bytes into every isolated Codex HOME,
+                // anything that rendered codex's auth state put the raw key
+                // into `final-grid.*` and `full-stream.cast` unredacted.
                 CredentialImport::Codex => {
-                    import_codex_credentials(&home).map_err(|e| e.to_string())?;
+                    recording_redactions
+                        .extend(import_codex_credentials(&home).map_err(|e| e.to_string())?);
                 }
                 CredentialImport::Devin => {
                     recording_redactions
@@ -674,19 +696,35 @@ impl TuiDeck {
         //     prompt renders exactly that (see `seed_claude_project_trust`), so
         //     any run where the approval seeding is wrong or has not happened
         //     yet paints a derivative of the secret straight into the recording
-        //     — and from there into nextest's captured output, which lane 2
-        //     lifts into the job log with `--success-output=final`. GitHub masks
-        //     a registered secret's exact value in a rendered log; a substring
-        //     of it is not covered.
+        //     — and from there into nextest's captured output, which
+        //     `--success-output=final` prints. Both sinks are LOCAL, because
+        //     lane 2 runs on a developer's machine and nowhere in CI: what is
+        //     at stake is that developer's terminal and scrollback, the `.cast`
+        //     the demo reel publishes, and whatever they paste onward. Nothing
+        //     downstream masks anything — and a log-masking layer covers a
+        //     registered secret's exact value, never a 20-character derivative
+        //     of it, which is why this suffix is registered in its own right.
         //
         // Registered unconditionally rather than only on a claude import: the
-        // key reaches the deck either way, and a redaction for a string that
-        // never appears costs one failed substring search per artifact.
+        // key reaches the deck either way. A value that never appears is not
+        // free — this used to say it costs one failed substring search, and the
+        // matcher can instead drive repeated bounded continuation scans
+        // wherever the value shares a prefix with rendered bytes. Realistic
+        // artifacts stay in the hundreds of milliseconds; the adversarial shape
+        // measured in `docs/develop/e2e-lanes.md` is ~25 s for 1.6 MB, and
+        // #810 carries the indexed rewrite and the fail-closed cost budget.
         if let Some(key) = anthropic_api_key() {
             recording_redactions.extend(api_key_recording_redactions(&key));
         }
-        recording_redactions.sort_by_key(|value| std::cmp::Reverse(value.len()));
-        recording_redactions.dedup();
+        normalise_redactions(&mut recording_redactions);
+        // Audit S1: the same set the recordings redact also has to redact the
+        // DIAGNOSTICS, because a credential rendered into the grid reaches
+        // nextest's captured output through a panic long before it reaches a
+        // `.cast`. Each importer registers its own values too, so this is
+        // belt-and-braces for the deck-launched route rather than the only
+        // registration — but it is the one that also covers the ambient key on
+        // a deck whose test imports no credentials at all.
+        register_diagnostic_redactions(recording_redactions.clone());
 
         // Pre-trust folders for a daemon-spawned interactive `claude` so it
         // clears its first-run onboarding + per-folder trust gates without a
@@ -707,7 +745,14 @@ impl TuiDeck {
             }
         }
         if !claude_trust_paths.is_empty() {
-            seed_claude_project_trust(&home, &claude_trust_paths).map_err(|e| e.to_string())?;
+            // PR #805 audit P2: the `~/.claude.json` this writes carries the
+            // host `oauthAccount`, and its identity fields are redacted out of
+            // the recordings as well as the diagnostics — see
+            // [`claude_identity_redactions`].
+            recording_redactions.extend(
+                seed_claude_project_trust(&home, &claude_trust_paths).map_err(|e| e.to_string())?,
+            );
+            normalise_redactions(&mut recording_redactions);
         }
 
         // Write the saved-session file the deck auto-restores on startup
@@ -858,10 +903,8 @@ impl TuiDeck {
         // exactly this reason — so no other provider variable would be used by
         // anything the deck spawns, and each one added is another secret in the
         // recorded PTY's environment for no gain.
-        let inherit_pass = ["PATH", ANTHROPIC_API_KEY_ENV];
-
         let mut final_env: HashMap<String, String> = HashMap::new();
-        for k in inherit_pass {
+        for k in INHERIT_PASS {
             if let Ok(v) = std::env::var(k) {
                 final_env.insert(k.into(), v);
             }
@@ -1193,6 +1236,9 @@ impl TuiDeck {
     /// stack owns). Escape bytes survive the decode unharmed — `ESC` is 0x1b,
     /// valid UTF-8 — so a needle like `"\x1b[>1u"` matches literally.
     pub fn stream_text(&self) -> String {
+        // Same invariant as `snapshot_grid`: raw for assertions, but not
+        // obtainable before the diagnostic redaction is in place.
+        install_credential_redaction();
         String::from_utf8_lossy(&self.byte_history.lock().unwrap()).into_owned()
     }
 
@@ -1534,6 +1580,12 @@ impl TuiDeck {
     /// internally and by tests that want to assert on full-screen
     /// state.
     pub fn snapshot_grid(&self) -> String {
+        // Issue #502/#785 audit S1. Deliberately NOT a redaction of the return
+        // value — assertions must keep matching on real content. This is the
+        // invariant that makes the output-seam redaction sound: no test can
+        // hold a grid without the redacting panic hook already being installed,
+        // whatever route it took to get here.
+        install_credential_redaction();
         self.parser.lock().unwrap().screen().contents()
     }
 
@@ -1876,8 +1928,57 @@ fn regenerate_paired_doc(test_name: &str) {
 }
 
 impl TuiDeck {
+    /// The values the persisted artifacts are redacted against: this deck's own
+    /// set UNION the process-global diagnostic store.
+    ///
+    /// The union exists because the two sets drifted, and the drift was silent
+    /// in the direction that matters. `recording_redactions` is assembled once,
+    /// during `try_launch_inner`, so anything registered AFTER the launch — and
+    /// `seed_claude_trust_in_home` is called after the launch by nine live tests,
+    /// deliberately, because the trusted directory is only known then — reached
+    /// the panic seam and never the `.cast`. That is backwards: the `.cast` is
+    /// the artifact the demo reel publishes. Every value in the global store is
+    /// a credential or identity value some harness path registered, and the
+    /// per-deck set is already a subset of it in practice.
+    ///
+    /// **Enlarging the set is NOT monotonic, and this comment used to claim it
+    /// was.** "The union can only add redactions" is false under the first of
+    /// the two matcher gaps tracked in
+    /// [#810](https://github.com/vfarcic/dot-agent-deck/issues/810). Put a
+    /// value whose start lies INSIDE an earlier value in the per-deck set, and
+    /// only that earlier value in the global store: with the deck value alone
+    /// the scan reaches its start and redacts it, but once the union adds the
+    /// earlier value the greedy scan matches that one first, resumes at the end
+    /// of its first fragment, steps over the deck value's interior start, and
+    /// leaves the deck value's tail in the artifact. So adding a pattern can
+    /// REMOVE a redaction until the matcher is replaced — #810 now carries
+    /// monotonicity (adding a pattern must never remove a redaction) as a
+    /// required property of the rewrite. Nextest's process-per-test model
+    /// bounds the blast radius to one test, since no other test's store can
+    /// reach this artifact, but it does not bound two credential or identity
+    /// paths interacting INSIDE the same test — which, with nine live tests
+    /// registering identity after launch, is exactly the shape this union
+    /// creates. It is kept anyway: the alternative is the silent drift it was
+    /// added to close, where a post-launch registration reached the panic seam
+    /// and never the `.cast`.
+    ///
+    /// The cost is not one failed substring search per artifact either. A value
+    /// that never appears can still drive repeated bounded continuation scans
+    /// wherever it shares a prefix with rendered bytes, and the union enlarges
+    /// the set that can do so; `docs/develop/e2e-lanes.md` records the measured
+    /// adversarial case (~25 s for 1.6 MB of repeated shared prefixes) against
+    /// ~162 ms for a realistic 2.1 MB artifact. #810's indexed rewrite and
+    /// fail-closed budget carry that too.
+    fn artifact_redactions(&self) -> Vec<String> {
+        let mut values = self.recording_redactions.clone();
+        values.extend(lock_diagnostic_redactions().iter().cloned());
+        normalise_redactions(&mut values);
+        values
+    }
+
     fn dump_recordings(&self, dir: &Path) -> std::io::Result<()> {
         std::fs::create_dir_all(dir)?;
+        let redactions = self.artifact_redactions();
 
         // M4.3: atomic writes for every artifact in the per-test
         // dir. Two `cargo test-e2e` runs on the same checkout (or one
@@ -1888,7 +1989,7 @@ impl TuiDeck {
         // half-written.
 
         // final-grid.txt
-        let grid = redact_known_credentials_text(&self.snapshot_grid(), &self.recording_redactions);
+        let grid = redact_known_credentials_text(&self.snapshot_grid(), &redactions);
         atomic_write(&dir.join("final-grid.txt"), grid.as_bytes())?;
 
         // final-grid.svg — minimal monospace render. Not pixel-perfect,
@@ -1898,7 +1999,7 @@ impl TuiDeck {
 
         // full-stream.cast — asciinema v2 format (header + one JSON
         // array per event). Inline encoder, ~20 lines.
-        let cast = self.encode_asciinema_cast();
+        let cast = self.encode_asciinema_cast(&redactions);
         atomic_write(&dir.join("full-stream.cast"), cast.as_bytes())?;
 
         // fixture.toml — copy of the deck's .dot-agent-deck.toml so a
@@ -1906,13 +2007,13 @@ impl TuiDeck {
         let fixture_src = self.fixture_path.join(".dot-agent-deck.toml");
         if fixture_src.exists() {
             let bytes = std::fs::read(&fixture_src)?;
-            let redacted = redact_known_credentials_bytes(&bytes, &self.recording_redactions);
+            let redacted = redact_known_credentials_bytes(&bytes, &redactions);
             atomic_write(&dir.join("fixture.toml"), &redacted)?;
         }
         Ok(())
     }
 
-    fn encode_asciinema_cast(&self) -> String {
+    fn encode_asciinema_cast(&self, redactions: &[String]) -> String {
         let mut s = String::new();
         // Header — minimum required fields for asciinema v2.
         let header = serde_json::json!({
@@ -1926,7 +2027,7 @@ impl TuiDeck {
         s.push_str(&header.to_string());
         s.push('\n');
         let events = self.cast_events.lock().unwrap();
-        let redacted_events = redact_cast_events(&events, &self.recording_redactions);
+        let redacted_events = redact_cast_events(&events, redactions);
         for (ev, redacted) in events.iter().zip(redacted_events) {
             // Lossy UTF-8 decoding is what asciinema players expect:
             // raw bytes that are valid UTF-8 round-trip, invalid bytes
@@ -1942,9 +2043,381 @@ impl TuiDeck {
 
 const RECORDING_CREDENTIAL_REDACTION: &[u8] = b"[REDACTED-CREDENTIAL]";
 
-/// Locate non-overlapping credential occurrences, preferring the longest value
-/// at a shared start. Matching bytes before JSON/asciinema encoding also catches
-/// secrets that contain characters the artifact format would escape.
+// ---------------------------------------------------------------------------
+// Matching a credential a TERMINAL WRAPPED (issue #502/#785 blocker A)
+// ---------------------------------------------------------------------------
+//
+// Byte-exact matching is not enough, and the arithmetic says so precisely. An
+// Anthropic API key is 108 characters. The harness renders at 120 columns. An
+// `ANTHROPIC_API_KEY=` line therefore starts the value at column 19 and breaks
+// it 102 / 6 — and the key's last-20 response id, the derivative Claude Code's
+// approval prompt paints and the one GitHub's masking never covers, is itself
+// split 14 / 6. Neither registered pattern matches either piece, while the whole
+// value is sitting there in two adjacent rows for anyone to concatenate.
+//
+// It is not the grid alone. The same value is split the same way in
+// `full-stream.cast`, one layer lower: what separates two rows there is the
+// deck's own cursor-position escape, not a newline. And it is not always as
+// tidy as one newline in between — a deck grid has a pane border and usually a
+// neighbouring column, so the bytes between two fragments of one wrapped value
+// are arbitrary rendered content, not padding.
+//
+// So the matcher bridges GAPS. Every hop has to cross a row transition and then
+// reproduce `MIN_WRAP_FRAGMENT` more bytes of the value exactly; the bytes in
+// between are left in place, because they are the newline, the border and the
+// neighbouring column that make the artifact readable at all.
+//
+// AND THEN IT READS THEM ANYWAY. Left in place is a statement about the OUTPUT,
+// not about what the scan looked at, and conflating the two is what issue #785
+// had to be reopened for. A gap is arbitrary rendered content, so on a real
+// grid it holds whatever else was on screen — including the other registered
+// value, because the key and the response id Claude Code's approval prompt
+// paints are always registered together and the id is a suffix of the key. The
+// scan therefore resumes at the end of a match's FIRST fragment, never past the
+// last, and every alternate place a hop could have resumed is redacted along
+// with the one it took. `credential_redaction_ranges` and `fragment_candidates`
+// carry the measured cases.
+//
+// WHY THIS IS NOT A SUBSEQUENCE SEARCH, which is the failure mode a naive
+// version of this has: "match, skip anything, match again" finds almost any
+// string in almost any text. The two constants below are what keep it honest —
+// a minimum of eight exact bytes per hop, and a hard ceiling on how far one hop
+// may look. A contiguous occurrence still produces exactly one range, so this is
+// a strict superset of the byte-exact matcher it replaces.
+//
+// WHAT THIS DOES NOT CLAIM, AND IT IS MORE THAN THE FLOOR. Start with the
+// framing, because every doc that described this as "the last thing between a
+// key and a published video" was overstating it: **this is a BLOCKLIST and it is
+// best-effort.** It can only remove values something registered, and the scan
+// that finds them is greedy left-to-right with a single committed continuation
+// chain. It has been point-fixed four times (contiguous-only matching; skipping
+// the bytes a fragmented match preserved; redacting only the first place a hop
+// could resume; keeping one match per position by length) and PR #805's second
+// security audit reproduced TWO more leaks in the code as it stands, with
+// fabricated values:
+//
+//   1. A registered value that STARTS INSIDE an earlier match survives. The scan
+//      resumes at the smallest first-fragment end among the matches at a
+//      position, which still skips every offset inside that fragment — so
+//      `first-value-ABCDEFGH` and `ABCDEFGH-second-value-tail`, scanned over
+//      their concatenation, leave `[REDACTED-CREDENTIAL]-second-value-tail`.
+//   2. A DECOY continuation suppresses a real one and then nothing is redacted
+//      at all. `credential_fragments_at` follows `candidates.first()` and returns
+//      `None` if that path dead-ends, so a value whose genuine continuation
+//      appears after a decoy is left entirely in place.
+//
+// Both are issue #810, which carries the design: a bounded
+// dynamic-programming/NFA search over deduplicated continuation states emitting
+// ranges only from COMPLETE paths, exact occurrences from an overlap-preserving
+// multi-pattern scan, and a cost budget that fails closed by replacing the whole
+// artifact rather than writing unscanned bytes. Do not add a fifth point fix
+// here: each of the four closed a real leak and each was followed by another of
+// the same ordering-dependent shape. What actually stands between a credential
+// and a public URL is the demo reel's private-by-default upload plus the owner's
+// review before flipping it — see `docs/develop/demo-reel.md`.
+//
+// WHAT IT DOES GUARANTEE, verified rather than argued. Every range constructed
+// here reproduces registered credential bytes exactly — the first is a common
+// prefix, chained ranges are common prefixes of the remaining credential,
+// alternates are exact candidate runs — and `merge_redaction_ranges` merges only
+// strict overlaps and never fills gaps. So it OVER-redacts rather than
+// mis-redacts: it can obscure a coincidental fragment of a panic, it cannot
+// replace arbitrary bytes it did not match. And it removes the realistic
+// geometries a terminal produces, which is what it was built for.
+//
+// THE FLOOR, which is the narrower claim this paragraph used to be about.
+// `MIN_WRAP_FRAGMENT` is a floor on evidence, so a run of credential bytes
+// SHORTER than it can survive: the six-byte remainder of a 102 / 6 break stays
+// in the artifact when a coincidence elsewhere on the row took the chain. Six
+// bytes is below the bar this matcher states for evidence everywhere else, which
+// is the reason the floor is where it is rather than an exception to it. In the
+// other direction the floor over-redacts, and `collect_credential_values` widens
+// that surface by registering every auth-document string of 16 characters or
+// more even when its field name is not sensitive — see the note on
+// `MIN_WRAP_FRAGMENT` below.
+//
+// COST has an adversarial tail, and it is part of #810 too: a realistic 2.1 MB
+// artifact holding one rendered credential document scans in ~162 ms, while
+// 1.6 MB of repeated shared prefixes takes ~25 SECONDS, because each occurrence
+// of a shared eight-byte prefix can trigger two full `MAX_WRAP_GAP` candidate
+// scans whether or not a range is kept — and `.cast` history is not
+// size-bounded.
+
+/// The shortest run of credential bytes a wrapped match accepts as a fragment,
+/// other than the final one.
+///
+/// This is the whole safety bound. A false positive would need eight
+/// consecutive bytes of a real credential to appear by chance AND then chain
+/// into the rest of it across a row transition, which is not something that
+/// happens to base64-shaped secrets.
+///
+/// The final fragment is exempt because the tail is exactly what wrapping
+/// leaves short — the 102 / 6 break above. By the time the matcher is looking at
+/// those six bytes it has already reproduced 102, so the coincidence argument is
+/// already spent.
+///
+/// "Base64-shaped secrets" is the honest scope of that argument, and the
+/// registered population is wider than that. [`collect_credential_values`]
+/// registers every auth-document string of 16 characters or more, sensitive
+/// field name or not, so human-readable values — a URL, an account label, a
+/// model name — are registered too, and those genuinely can share an eight-byte
+/// prefix with unrelated rendered text. Kept at eight deliberately: the cost of
+/// the false positive is bounded and diagnostic-only, because the matcher
+/// replaces the matching runs and leaves the layout between them, so the damage
+/// is an obscured fragment of a panic rather than a destroyed one — whereas the
+/// cost of raising the floor is a missed 102 / 6 tail, which is the leak this
+/// whole seam exists to stop. Narrowing what `collect_credential_values`
+/// registers would be the fix if this ever bites; it is deliberately not made
+/// here for AUTH documents, because a registered value that stops being
+/// registered stops being redacted, and that trade wants a measurement rather
+/// than a guess. It IS narrowed for `~/.claude/settings.json`, and that is not
+/// an exception to the reasoning but the same reasoning with a different input:
+/// a configuration document is mostly long strings that are not secrets
+/// (`permissions.allow` rules, a model id, a `statusLine` command), so there the
+/// floor buys nothing and charges a scan pass per string plus the readability of
+/// every grid. See [`CredentialScope`].
+const MIN_WRAP_FRAGMENT: usize = 8;
+
+/// The longest run of bytes one hop will bridge, and therefore the bound on how
+/// far this scan can wander.
+///
+/// One hop is "the rest of this row, plus the next row up to where the value
+/// resumes" — at most two rows. Four kibibytes covers two rows of a 500-column
+/// terminal even when every cell is a three-byte box-drawing character, and one
+/// frame's worth of the deck's escape traffic in a `.cast`. It is a bound rather
+/// than a measurement: the point is that the scan cannot go quadratic on a
+/// multi-megabyte stream.
+const MAX_WRAP_GAP: usize = 4096;
+
+/// Bytes that mean "the writer moved to another row" — the only thing that
+/// licenses bridging a gap at all.
+///
+/// `\n` is the grid case. `vt100::Screen::contents()` joins rows with it EXCEPT
+/// for a row the terminal itself auto-wrapped, which it deliberately leaves
+/// unbroken — and that exception is why this is needed rather than why it is
+/// not. ratatui never lets a terminal auto-wrap; it positions the cursor per
+/// row. Measured both ways at 120 columns: an auto-wrapped render leaves a
+/// 108-character key contiguous, and the same content painted row by row, the
+/// way the deck paints it, splits it 102 / 6.
+///
+/// `0x1b` is that same event one layer down, in `full-stream.cast`, where the
+/// row change is a cursor-position CSI.
+fn is_row_transition(byte: u8) -> bool {
+    matches!(byte, b'\n' | b'\r' | 0x1b)
+}
+
+/// How many leading bytes of `wanted` `data[cursor..]` reproduces.
+fn common_prefix_len(data: &[u8], cursor: usize, wanted: &[u8]) -> usize {
+    let limit = data.len().saturating_sub(cursor).min(wanted.len());
+    (0..limit)
+        .take_while(|index| data[cursor + index] == wanted[*index])
+        .count()
+}
+
+/// Every place after a row transition, within [`MAX_WRAP_GAP`], where
+/// `remaining` resumes — as `(position, run length)`, ascending.
+///
+/// The chain still follows the FIRST one and never backtracks. The rest are why
+/// this returns a list instead of a position, and the reason is a property of
+/// the registered set rather than a hypothetical: a registered value can be a
+/// SUFFIX of another registered value. An Anthropic key and the 20-character
+/// response id Claude Code's approval prompt paints are exactly that pair, and
+/// [`api_key_recording_redactions`] always registers them together — so the run
+/// that resumes the key on the next row ALSO occurs, a few characters earlier,
+/// inside a response id rendered on that row. Following the first candidate is
+/// then following the coincidence, and the real continuation is left sitting
+/// there. It is a whole 16 characters of key material when the value wraps
+/// 92 / 16 inside a pane.
+///
+/// Whichever one the chain follows, both are runs that reproduce credential
+/// bytes exactly, so both are redacted. There is no way to tell them apart and
+/// no need to.
+///
+/// A candidate is recorded only when it reproduces a FULL
+/// [`MIN_WRAP_FRAGMENT`]. A shorter tail is exempt for the CHAIN — the 102 / 6
+/// break's six-byte remainder, whose coincidence argument was already spent on
+/// the 102 bytes before it — but it is not evidence on its own, and redacting
+/// every place a six- or one-byte tail happens to occur would be over-redaction
+/// with nothing behind it. So a short tail stops at the one candidate the chain
+/// takes, exactly as before.
+///
+/// Cost is unchanged in the bound and only in the bound: one pass over at most
+/// [`MAX_WRAP_GAP`] positions comparing at most [`MIN_WRAP_FRAGMENT`] bytes at
+/// each. That was already what a gap containing no candidate cost; it is now
+/// what every hop with a full-length tail costs. Still linear in the input for
+/// a fixed credential set, still no backtracking, still no growth in the number
+/// of hops.
+fn fragment_candidates(data: &[u8], gap_start: usize, remaining: &[u8]) -> Vec<(usize, usize)> {
+    let need = &remaining[..remaining.len().min(MIN_WRAP_FRAGMENT)];
+    let alternates_are_evidence = need.len() == MIN_WRAP_FRAGMENT;
+    let limit = data.len().min(gap_start.saturating_add(MAX_WRAP_GAP));
+    let mut found = Vec::new();
+    let mut crossed_a_row = false;
+    for index in gap_start..limit {
+        if is_row_transition(data[index]) {
+            crossed_a_row = true;
+        } else if crossed_a_row && common_prefix_len(data, index, need) == need.len() {
+            found.push((index, common_prefix_len(data, index, remaining)));
+            if !alternates_are_evidence {
+                break;
+            }
+        }
+    }
+    found
+}
+
+/// One occurrence of one credential, as the ranges that carry it.
+struct CredentialMatch {
+    /// Every range that carries credential bytes: the chained fragments, plus
+    /// every alternate candidate [`fragment_candidates`] found in a bridged
+    /// gap. The chain's own fragments ascend; the alternates do not interleave
+    /// with them in order, which is why [`credential_redaction_ranges`] sorts
+    /// and coalesces before returning.
+    ranges: Vec<(usize, usize)>,
+    /// End of the FIRST fragment — where the outer scan resumes, so that every
+    /// byte this match PRESERVED is still examined for another credential.
+    first_fragment_end: usize,
+}
+
+/// Match `credential` starting at `start`, allowing a TUI to have painted it
+/// across several rows, and return the byte ranges that carry it.
+///
+/// A contiguous occurrence comes back as exactly one range, which is what makes
+/// this a strict superset of byte-exact matching.
+///
+/// **KNOWN LEAK (issue #810): the chain commits to `candidates.first()` and
+/// returns `None` if that path dead-ends.** Every candidate is recorded, but one
+/// candidate still decides whether any result exists at all, so a decoy
+/// continuation suppresses a valid later one and the value is left entirely
+/// unredacted. Reproduced by PR #805's second audit with fabricated values.
+/// Collecting candidates is not the same as searching exhaustively; the fix is
+/// the all-match search in #810, not a different choice of candidate here.
+fn credential_fragments_at(
+    data: &[u8],
+    start: usize,
+    credential: &[u8],
+) -> Option<CredentialMatch> {
+    let mut consumed = common_prefix_len(data, start, credential);
+    if consumed == 0 {
+        return None;
+    }
+    // Cheap rejection BEFORE anything is allocated: on a large stream this is
+    // reached once per occurrence of the credential's first byte.
+    if consumed < credential.len() && consumed < MIN_WRAP_FRAGMENT {
+        return None;
+    }
+    let mut cursor = start + consumed;
+    let first_fragment_end = cursor;
+    let mut ranges = vec![(start, cursor)];
+    while consumed < credential.len() {
+        let candidates = fragment_candidates(data, cursor, &credential[consumed..]);
+        // Never zero-length: a candidate reproduces at least one byte, so this
+        // loop always advances.
+        let (resume, run) = *candidates.first()?;
+        consumed += run;
+        cursor = resume + run;
+        if consumed < credential.len() && run < MIN_WRAP_FRAGMENT {
+            return None;
+        }
+        ranges.push((resume, cursor));
+        // The chain took the first candidate; the others reproduce the same
+        // credential bytes and are redacted too — see `fragment_candidates`.
+        ranges.extend(candidates[1..].iter().map(|(at, run)| (*at, at + run)));
+    }
+    Some(CredentialMatch {
+        ranges,
+        first_fragment_end,
+    })
+}
+
+/// Sort and coalesce, so the ranges come back ascending and non-overlapping —
+/// what both consumers rely on.
+///
+/// Overlaps are ordinary now rather than a defect: the same bytes can be
+/// claimed both by a fragmented match's alternate candidate and by the
+/// registered value that candidate sits inside. Strictly overlapping ranges
+/// coalesce; two that merely TOUCH are left as two, which is what a scan that
+/// found two adjacent credentials always produced.
+fn merge_redaction_ranges(mut ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
+    ranges.sort_unstable();
+    let mut merged: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
+    for (start, end) in ranges {
+        match merged.last_mut() {
+            Some(last) if start < last.1 => last.1 = last.1.max(end),
+            _ => merged.push((start, end)),
+        }
+    }
+    merged
+}
+
+/// Locate the byte ranges to replace, taking EVERY value that matches at a
+/// shared start rather than one of them. Matching bytes before JSON/asciinema
+/// encoding also catches secrets that contain characters the artifact format
+/// would escape.
+///
+/// One credential can contribute SEVERAL ranges — see the block above. The bytes
+/// between them are deliberately left in the artifact: in a grid they are the
+/// newline, the pane border and the neighbouring column, and in a `.cast` they
+/// are the escape sequences that keep it replayable.
+///
+/// LEFT IN THE ARTIFACT IS NOT LEFT UNREAD. That distinction is the whole of
+/// issue #785's second round. The first version of this scan jumped `offset` to
+/// the END of a fragmented match, so every byte it had preserved was skipped —
+/// and those bytes are arbitrary rendered content, which on a real grid
+/// includes the OTHER registered value. Measured with the pair the live lane
+/// actually registers: a 108-character key wrapped 102 / 6 with its
+/// 20-character response id painted on the next row ahead of the continuation
+/// left 14 characters of that id intact, and the whole derivative was
+/// reconstructable. So the scan resumes at the end of the FIRST fragment and
+/// reads the gap like any other bytes.
+///
+/// NOR IS A MATCH ALLOWED TO SHADOW ANOTHER AT THE SAME START, which is the
+/// third round and was found by the Claude-document fixture PR #805's audit
+/// blocker 2 asked for. This used to keep `max_by_key(pattern length)` — one
+/// match per position, "the longest value at a shared start". Two registered
+/// values of the SAME length that share [`MIN_WRAP_FRAGMENT`] leading bytes then
+/// decide it by tie-break, and a real credential document has exactly that pair:
+/// `~/.claude/.credentials.json` holds an `accessToken` beginning `sk-ant-oat01-`
+/// beside a `refreshToken` beginning `sk-ant-ort01-`, so both match the first
+/// eight bytes of either. The tie-break took the refresh token, whose chain then
+/// bridged forward to its own real occurrence two rows down; that match's first
+/// fragment was the eight coincidental bytes, so `offset` advanced eight bytes
+/// and the access token's remaining 120 characters were never looked at again.
+/// Measured with the fabricated pair: 120 of 128 characters survived into
+/// `final-grid.txt` while the artifact showed a redaction placeholder at exactly
+/// the right place.
+///
+/// So every match at a position contributes its ranges, and `offset` resumes at
+/// the SMALLEST first-fragment end among them — the same "read the preserved
+/// bytes" rule, applied across values instead of within one. Every range any
+/// match produces reproduces registered credential bytes exactly (see
+/// [`credential_fragments_at`]), so adding all of them can only over-redact,
+/// never mis-redact, and the ranges merge afterwards.
+///
+/// Cost is unchanged, and measured rather than argued: the scan already
+/// evaluated every pattern at every position and merely discarded all but one
+/// result, so keeping them costs a `min` per match. Measured back to back on the
+/// same build, old implementation against new, with the fabricated 128-byte
+/// `accessToken`/`refreshToken` pair registered: a realistic 2.1 MB stream
+/// holding ONE rendered credential document, 183 ms before and **162 ms** after
+/// (and 3 ranges before against **4** after — the old scan missed one on a
+/// realistic artifact, not only on a fixture built to provoke it); a stream
+/// packed with that document every 140 bytes, 3.59 s before and 3.61 s after;
+/// the adversarial shape of eight-byte prefixes that never chain, 25.33 s before
+/// and 25.30 s after. Those last two are far slower than the same shapes cost
+/// with the key/response-id pair (10.6 ms and 895 ms per ~2 MB) and that is the
+/// PAIR, not this change: two 128-byte values sharing an eight-byte prefix means
+/// every occurrence of that prefix pays a full `MAX_WRAP_GAP` candidate sweep
+/// twice. A real artifact renders the document once or twice, which is the
+/// realistic row.
+///
+/// **KNOWN LEAK (issue #810): the outer scan skips every offset INSIDE a match's
+/// first fragment.** Resuming at the smallest `first_fragment_end` is what keeps
+/// the bytes a match preserved readable to the scan, but a registered value that
+/// begins inside that fragment and extends past it is still never looked for —
+/// reproduced by PR #805's second audit with `first-value-ABCDEFGH` and
+/// `ABCDEFGH-second-value-tail`. At minimum the scan must examine every byte
+/// offset; the design that does it without the cost is #810.
 fn credential_redaction_ranges(data: &[u8], credentials: &[String]) -> Vec<(usize, usize)> {
     let patterns: Vec<&[u8]> = credentials
         .iter()
@@ -1954,18 +2427,20 @@ fn credential_redaction_ranges(data: &[u8], credentials: &[String]) -> Vec<(usiz
     let mut ranges = Vec::new();
     let mut offset = 0;
     while offset < data.len() {
-        let matched = patterns
-            .iter()
-            .filter(|pattern| data[offset..].starts_with(pattern))
-            .max_by_key(|pattern| pattern.len());
-        if let Some(pattern) = matched {
-            ranges.push((offset, offset + pattern.len()));
-            offset += pattern.len();
-        } else {
-            offset += 1;
+        let mut resume = None;
+        for pattern in &patterns {
+            if let Some(found) = credential_fragments_at(data, offset, pattern) {
+                ranges.extend(found.ranges);
+                resume = Some(resume.map_or(found.first_fragment_end, |at: usize| {
+                    at.min(found.first_fragment_end)
+                }));
+            }
         }
+        // `.max()` rather than a bare assignment so a degenerate match can never
+        // fail to advance the scan; no match at all advances by one byte.
+        offset = resume.map_or(offset + 1, |at| at.max(offset + 1));
     }
-    ranges
+    merge_redaction_ranges(ranges)
 }
 
 fn redact_known_credentials_bytes(data: &[u8], credentials: &[String]) -> Vec<u8> {
@@ -2035,6 +2510,212 @@ fn redact_cast_events(events: &[CastEvent], credentials: &[String]) -> Vec<Vec<u
         event_start = event_end;
     }
     projected
+}
+
+// ---------------------------------------------------------------------------
+// Diagnostic credential redaction (issue #502/#785 — audit finding S1)
+// ---------------------------------------------------------------------------
+//
+// The redaction above covers every PERSISTED recording — `final-grid.txt`, its
+// SVG, `fixture.toml` and the cross-event `full-stream.cast`. It does not cover
+// the other place a rendered credential goes: CAPTURED TEST OUTPUT.
+//
+// That is not a theoretical second sink, it is the SAME sink reached by the
+// same failure. `seed_claude_api_key_response` exists because an interactive
+// Claude Code with a key in its environment stops on an approval prompt that
+// renders the key's last 20 characters. If that seeding is absent, stale, or
+// incompatible with a future Claude Code version, the prompt paints the suffix
+// onto the grid — AND the agent then sits on the prompt forever, so the test
+// dies at a PTY wait whose panic interpolates that same grid. The leak path and
+// the panic path are one path. nextest renders that panic to the live console
+// (which `--success-output=final` and failure output both surface) and stores it
+// in the raw JUnit report — the first landing in the developer's own terminal
+// scrollback, the second a file on that same machine, because lane 2 runs on no
+// runner. So there is no masking layer downstream of either, and the one that
+// exists where logs are rendered covers a registered secret's exact value,
+// never a 20-character substring of it.
+//
+// WHY A PROCESS-GLOBAL PANIC HOOK rather than redaction on the accessors.
+//
+//   * The messages are built by the TESTS, in dozens of files, as
+//     `assert!(cond, "…{grid}")` over a grid they already hold. No change to
+//     `snapshot_grid()` reaches them, and redacting AT THE SOURCE would break
+//     every assertion that legitimately matches on real content.
+//   * The in-process worker paths have no `TuiDeck` at all, so no per-deck
+//     redaction object can reach them BY CONSTRUCTION. `e2e_pi_orchestrator.rs`,
+//     `e2e_delegate_work_done_chain.rs` and `e2e_codex_worker.rs` drive an
+//     in-process daemon and read pane bytes straight off
+//     `daemon.registry.snapshot(&agent_id)`, then interpolate those into
+//     `assert!` messages. Those are exactly the paths `seed_claude_worker_home`
+//     serves, and they are the ones the audit singled out as having no
+//     redaction of any kind. A process-global store reaches them for free.
+//
+// So: raw snapshots stay raw for assertions, and the redaction happens at the
+// OUTPUT SEAM — the one place every panic message in the process passes
+// through on its way to stderr.
+//
+// IT REPLACES THE PREVIOUS HOOK RATHER THAN CHAINING TO IT, and that is the
+// only correct choice: the hook it replaces is std's default, whose entire job
+// is to print the UNREDACTED payload. Chaining would defeat the seam. Two
+// consequences follow. First, the default hook honours libtest's output
+// capture and this one does not — it writes to stderr unconditionally — so a
+// panic message is no longer grouped under `---- <test> stdout ----`. That
+// costs nothing here because every alias in `.cargo/config.toml` runs nextest,
+// which is process-per-test and captures the process's stderr (verified: the
+// message lands in nextest's `stderr ───` section and in the raw JUnit report,
+// redacted, with thread, `file:line` and message shape intact). Second, a test
+// that installs its own hook AFTER this one would silently un-install the seam;
+// none does, and `no_test_installs_a_competing_panic_hook` below keeps it that
+// way. Spawned threads need no special handling — `set_hook` is process-global.
+//
+// WHAT THIS DOES NOT COVER, stated plainly. A test that writes terminal content
+// to stdout with `println!` bypasses the hook entirely. None does — and
+// `no_test_prints_terminal_content_outside_the_redacting_panic_seam` in the unit
+// tests below is a standing guard that keeps it that way, naming
+// [`redact_credentials_for_output`] as the remedy for the day one legitimately
+// needs to. It cannot cover a credential the harness never learns about: only
+// values registered here are redacted, which is why every importer registers
+// what it copied.
+//
+// A value the vt100 grid WRAPPED across a row boundary USED to be outside it
+// too, on the reasoning that two substrings are not one. That was measured
+// wrong for the case that matters and is fixed: at 120 columns an
+// `ANTHROPIC_API_KEY=` line breaks a 108-character key 102 / 6 and its response
+// id 14 / 6, so the whole credential was reconstructable out of a panic grid
+// while neither registered pattern matched. `credential_redaction_ranges` now
+// bridges row transitions — see the block above it — and the same change covers
+// `final-grid.txt`, its SVG and `full-stream.cast`, because all three go through
+// that one function.
+
+/// Every credential value this test PROCESS could render, in the exact form it
+/// would be rendered in. Process-global because the sinks it protects are
+/// (see above), and `OnceLock` rather than a `lazy_static` dependency.
+static DIAGNOSTIC_REDACTIONS: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+
+fn diagnostic_redaction_store() -> &'static Mutex<Vec<String>> {
+    DIAGNOSTIC_REDACTIONS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Poison-tolerant lock. A poisoned mutex here means some thread panicked while
+/// holding it; the contents are still a valid list of strings, and refusing to
+/// redact because of it is the one outcome that must never happen.
+fn lock_diagnostic_redactions() -> std::sync::MutexGuard<'static, Vec<String>> {
+    diagnostic_redaction_store()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Longest first, because [`credential_redaction_ranges`] prefers the longest
+/// value at a shared start, then de-duplicated. The secondary sort by value is
+/// what makes `dedup` exact: `dedup` only removes ADJACENT equals, so sorting
+/// by length alone leaves two copies of the same string unmerged whenever a
+/// different value of the same length sorts between them.
+fn normalise_redactions(values: &mut Vec<String>) {
+    values.retain(|value| !value.is_empty());
+    values.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+    values.dedup();
+}
+
+/// Install the redacting panic hook and register everything the AMBIENT
+/// ENVIRONMENT already carries. Idempotent, cheap (an atomic load once
+/// installed) and safe to call from anywhere — which is the point: it is called
+/// from every harness entry that can either obtain terminal content or handle a
+/// credential, so "a grid exists in this process" implies "the hook is
+/// installed".
+pub fn install_credential_redaction() {
+    static INSTALLED: std::sync::Once = std::sync::Once::new();
+    INSTALLED.call_once(|| {
+        // Collected BEFORE the lock is taken: nothing that can panic may run
+        // inside the critical section, or a panic there would deadlock against
+        // the very hook being installed.
+        let mut ambient = Vec::new();
+        if let Some(key) = anthropic_api_key() {
+            ambient.extend(api_key_recording_redactions(&key));
+        }
+        if let Some(key) = openai_api_key() {
+            ambient.push(key);
+        }
+        {
+            let mut store = lock_diagnostic_redactions();
+            store.append(&mut ambient);
+            normalise_redactions(&mut store);
+        }
+        std::panic::set_hook(Box::new(|info| {
+            let payload = panic_payload_text(info.payload());
+            let location = info
+                .location()
+                .map(ToString::to_string)
+                .unwrap_or_else(|| "<unknown location>".to_string());
+            let thread = std::thread::current()
+                .name()
+                .unwrap_or("<unnamed>")
+                .to_string();
+            let mut rendered = format_redacted_panic(&thread, &location, &payload);
+            // Same shape the default hook produces, so a failure still reads
+            // the way a contributor expects. A backtrace carries symbol names
+            // rather than data, but it is redacted too — free, and one less
+            // path to reason about.
+            let backtrace = std::backtrace::Backtrace::capture();
+            if backtrace.status() == std::backtrace::BacktraceStatus::Captured {
+                rendered.push_str("\nstack backtrace:\n");
+                rendered.push_str(&redact_credentials_for_output(&backtrace.to_string()));
+            } else {
+                rendered.push_str(
+                    "\nnote: run with `RUST_BACKTRACE=1` environment variable to display a \
+                     backtrace",
+                );
+            }
+            eprintln!("{rendered}");
+        }));
+    });
+}
+
+/// Register credential values discovered at RUNTIME — the ones read out of an
+/// imported auth document rather than out of the environment. Every importer
+/// calls this with what it copied, so the coverage does not depend on the
+/// caller being a `TuiDeck`.
+pub fn register_diagnostic_redactions<I: IntoIterator<Item = String>>(values: I) {
+    install_credential_redaction();
+    // Drained outside the lock for the deadlock reason on the installer: the
+    // iterator is caller-supplied and may run arbitrary code.
+    let mut incoming: Vec<String> = values.into_iter().filter(|v| !v.is_empty()).collect();
+    if incoming.is_empty() {
+        return;
+    }
+    let mut store = lock_diagnostic_redactions();
+    store.append(&mut incoming);
+    normalise_redactions(&mut store);
+}
+
+/// Redact every registered credential out of text bound for stdout, stderr or a
+/// panic message. Public so the one legitimate future `println!` of terminal
+/// content has a correct way to exist; the guard test names it.
+pub fn redact_credentials_for_output(text: &str) -> String {
+    let values = lock_diagnostic_redactions().clone();
+    if values.is_empty() {
+        return text.to_string();
+    }
+    redact_known_credentials_text(text, &values)
+}
+
+/// The payload of a panic as a string, matching what the default hook renders.
+fn panic_payload_text(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "Box<dyn Any>".to_string()
+    }
+}
+
+/// The first line(s) of the hook's output, split out as a pure function so the
+/// redaction of a panic message is unit-testable without panicking.
+fn format_redacted_panic(thread: &str, location: &str, payload: &str) -> String {
+    format!(
+        "thread '{thread}' panicked at {location}:\n{}",
+        redact_credentials_for_output(payload)
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -2646,6 +3327,106 @@ fn workspace_recordings_root() -> PathBuf {
         .join("recordings")
 }
 
+/// The recordings directory for the test running on this thread — the exact
+/// path [`TuiDeck::dump_recordings`] writes into and
+/// [`discard_previous_recording`] clears.
+#[allow(dead_code)]
+pub fn current_test_recordings_dir() -> PathBuf {
+    workspace_recordings_root().join(sanitize_test_name(&current_test_name()))
+}
+
+/// Every artifact [`TuiDeck::dump_recordings`] writes, as one list, so the dump
+/// and the discard below cannot drift apart. The paired `test.md` is
+/// deliberately absent: it is regenerated from the test source rather than
+/// captured from a run, so it carries no credential and no run identity, and a
+/// developer browsing it should not have it deleted under them.
+const RECORDING_ARTIFACTS: [&str; 4] = [
+    "final-grid.txt",
+    "final-grid.svg",
+    "full-stream.cast",
+    "fixture.toml",
+];
+
+/// Delete the artifacts a PREVIOUS run of `test_name` left in its recordings
+/// directory, before this run can produce any of its own.
+///
+/// # Why this exists (PR #805 audit blocker 3)
+///
+/// `TuiDeck` keeps its cast in memory and writes artifacts only from `Drop`, and
+/// only when the test panicked or `DOT_AGENT_DECK_RECORD` is set. Nothing used
+/// to remove the previous run's files at launch, so every route that ends a run
+/// without reaching `Drop` — a `SIGKILL`, a nextest timeout, a Ctrl-C, a
+/// runtime skip before launch, a re-recording that failed — left the OLD
+/// `full-stream.cast` sitting there. `.claude/skills/demo-reel-adapter` then
+/// selects a cast on **path existence** plus branch scope and a `[reel]` marker;
+/// it records no run identity, no commit, no timestamp and no proof that the
+/// test passed, and the engine performs no redaction of its own. So a cast
+/// written by a revision that predates the redaction fixes could survive an
+/// interrupted current run and still be stitched into a video and uploaded to
+/// YouTube with its link in the PR body and the public release notes. (The
+/// upload is PRIVATE by default now, so widening it beyond the channel owner
+/// and the accounts they deliberately share it with is a human step — that
+/// reduces the blast radius, it does not make a stale cast correct.)
+///
+/// Clearing at launch kills that at the source: after this call the artifact
+/// either belongs to the current run or does not exist. **It is the cheap half,
+/// and it does not close the case.** The other half — the adapter verifying
+/// provenance (run identity, commit, and that the cast came from a test that
+/// actually PASSED in the current run) rather than trusting `test -f` — is issue
+/// #808 and is deliberately not built here. TWO residual routes still leave a
+/// stale artifact in place, and both want provenance rather than another
+/// discard:
+///
+///   1. A **filtered** run never selects the test at all, so nothing on this
+///      path executes and an unselected test's older cast is untouched.
+///   2. The **preflight expression** of `skip_unless!` is evaluated before
+///      `_skip_if_err` is entered — `skip_unless!(check_claude_available())`
+///      calls the check first and only then hands the `Result` over — so a kill
+///      or an abort inside a `check_*_available`, or inside an importer it calls,
+///      happens BEFORE the skip-path discard runs.
+///
+/// A third route — a deletion that FAILS — used to be a way for a stale artifact
+/// to survive this function itself, and is closed by the panic below.
+///
+/// **It fails CLOSED.** A `NotFound` is the ordinary case and says nothing; any
+/// OTHER error means a stale artifact may have SURVIVED, which is the exact
+/// failure this function exists to prevent, so it PANICS and the test fails.
+///
+/// That reverses the original stance, which warned to stderr and continued on
+/// the ground that "a harness that refuses to start over an unwritable
+/// gitignored directory would be worse than one that says so". PR #805's second
+/// security audit named that a fail-open and it was right. A warning only helps
+/// if somebody reads it; the run that printed it continues to completion, gets
+/// reported as PASSED, and the artifact it could not remove still satisfies the
+/// adapter's `test -f` — so the stale cast is published exactly as if nothing had
+/// been attempted. Failing to remove a stale credential-bearing artifact is
+/// precisely the case where continuing is wrong. The cost is a harness that
+/// refuses to start over an unwritable `.dot-agent-deck/recordings/<test>/`,
+/// which is a trivially fixable state and, unlike the warning, never a silent
+/// one.
+fn discard_previous_recording(test_name: &str) {
+    // The panic below is the failure mode of this function, so it has to reach
+    // the redacting output seam like every other harness panic. Cheap (a
+    // `Once`), and this is the earliest thing `try_launch_inner` does.
+    install_credential_redaction();
+    let dir = workspace_recordings_root().join(sanitize_test_name(test_name));
+    for name in RECORDING_ARTIFACTS {
+        let path = dir.join(name);
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => panic!(
+                "could not discard the previous recording at {}: {error} — refusing \
+                 to run, because a STALE artifact that survives this run still \
+                 satisfies the demo-reel adapter's existence check and can be \
+                 published. Delete it (or fix the directory's permissions) and \
+                 re-run",
+                path.display()
+            ),
+        }
+    }
+}
+
 /// Atomic file write: stage `bytes` in a sibling tempfile under
 /// `dst.parent()` and then `persist(dst)` so the rename is atomic on
 /// Unix (same filesystem). Concurrent writers see either the
@@ -2739,19 +3520,26 @@ fn render_grid_to_svg(grid: &str, cols: u16, rows: u16) -> String {
 /// working). The file check therefore falls back to a Keychain probe instead
 /// of reporting "not found". Without that fallback EVERY real-agent test in
 /// this suite silently self-skips on macOS and reports PASS — and that is
-/// exactly the tier CLAUDE.md rule 5 exception (a) says must be run locally
-/// BECAUSE CI has no credentials to run it, so both sides would be green while
-/// proving nothing.
+/// exactly the tier CLAUDE.md rule 5 now calls lane 2: the one that runs on a
+/// developer's machine and in no CI job, BECAUSE CI has no credentials to run
+/// it, so both sides would be green while proving nothing. (Rule 5 carries no
+/// lettered exceptions any more; this used to cite an "exception (a)" the rule
+/// no longer contains.)
 ///
 /// Issue #502/#785: there is now a THIRD path — a non-empty
 /// `ANTHROPIC_API_KEY`, consulted last, after both credential stores have come
-/// up empty. That is what lets lane 2 run the claude-gated tests on a GitHub
-/// runner from a scopable, revocable, spend-cappable key instead of the owner's
-/// account session. See the comment on that branch, and note it is coupled to
+/// up empty. That is what lets a developer run the claude-gated tests LOCALLY
+/// from a key alone — on a host that has never run `claude login`, or whose
+/// credential set has expired — instead of needing an account session in one of
+/// the two credential stores. It buys nothing in CI and is not there for CI:
+/// lane 2 runs on a developer's machine and NOWHERE on a runner, and this
+/// repository registers no test credential (CLAUDE.md rule 5). See the comment
+/// on that branch, and note it is coupled to
 /// [`seed_claude_project_trust`]: an interactive agent authenticated by key
 /// also needs the API-key approval recorded in `~/.claude.json`, or it stops on
 /// a prompt that defaults to "No".
 pub fn check_claude_available() -> Result<(), String> {
+    install_credential_redaction();
     if !cli_invocable("claude") {
         return Err("Claude Code CLI not installed (could not invoke `claude --version`)".into());
     }
@@ -2784,15 +3572,45 @@ pub fn check_claude_available() -> Result<(), String> {
             // the two are coupled: widening this check without it just moves
             // the failure later.
             //
-            // This is what lets lane 2 run the 22 claude-gated tests on a
-            // GitHub runner under #785 decision 1 — a scopable, spend-cappable,
+            // This is what lets a developer run the 22 claude-gated tests
+            // LOCALLY from a key alone — a scopable, spend-cappable,
             // independently revocable API key rather than the owner's account
-            // session. The key is only tested for presence here; it is never
-            // printed, and no probe request is made (same trade as the file
-            // path: a live round trip would spend tokens on every e2e run, so
-            // a revoked key remains an accepted false-positive that fails
-            // loudly later).
-            if anthropic_api_key().is_some() {
+            // session. #785 decision 1 originally wrote it for a credentialed
+            // CI lane; #502 removed that lane, so the only host this branch
+            // now serves is a key-only developer machine. The key reaching an
+            // agent is therefore always the developer's own.
+            //
+            // The key is only tested for presence here; it is never printed,
+            // and no probe request is made (same trade as the file path: a live
+            // round trip would spend tokens on every e2e run, so a revoked key
+            // remains an accepted false-positive that fails loudly later).
+            if let Some(key) = anthropic_api_key() {
+                // Issue #502/#785 audit follow-up: one case where a present key
+                // is NOT an authorisation. If the host `~/.claude.json` already
+                // records this exact key as REJECTED, that is a developer who
+                // answered "No" to this key on this machine, and OAuth being
+                // unusable does not turn that "No" into a "Yes". Approving it
+                // anyway inside the isolated HOME would run their tests on
+                // metered billing against an explicit refusal — and since the
+                // key reaches the agent through `inherit_pass` now, it really
+                // would authenticate.
+                //
+                // `require_real_e2e()` is the override, and it is the right
+                // one: setting it IS a statement that this run must reach a
+                // real agent, so it is the caller asking rather than the
+                // harness deciding. Without it, this is a clean skip that NAMES
+                // the reason instead of a silent bill or a PTY wait that times
+                // out on a prompt whose recorded answer is "No".
+                if host_claude_api_key_rejected(&key) && !require_real_e2e() {
+                    return Err(format!(
+                        "this machine's ~/.claude.json records {ANTHROPIC_API_KEY_ENV} as \
+                         REJECTED for Claude Code's API-key approval, and no usable OAuth \
+                         credential set is available, so the only credential left is one you \
+                         explicitly declined. Approve it (answer \"Yes\" once in an \
+                         interactive `claude`), log in with `claude login`, or set \
+                         {REQUIRE_REAL_E2E_ENV}=1 to override the refusal for this run"
+                    ));
+                }
                 return Ok(());
             }
             Err(format!(
@@ -2804,17 +3622,19 @@ pub fn check_claude_available() -> Result<(), String> {
 }
 
 /// Issue #502/#785: the environment variable Claude Code, OpenCode and `pi` all
-/// read an Anthropic API key from, and the only agent credential lane 2 holds in
-/// CI. Named here so the harness, the gates and the redaction agree on one
-/// spelling.
+/// read an Anthropic API key from, and the credential a key-only host runs
+/// lane 2 from. It is NOT a CI credential and must not be made one on the
+/// strength of this constant existing: lane 2 reaches no runner and this
+/// repository registers no test secret (CLAUDE.md rule 5), so every value this
+/// name ever holds here is a developer's own. Named so the harness, the gates
+/// and the redaction agree on one spelling.
 pub const ANTHROPIC_API_KEY_ENV: &str = "ANTHROPIC_API_KEY";
 
 /// The ambient Anthropic API key, or `None` when it is unset, empty or
 /// whitespace-only.
 ///
 /// Presence is decided on the TRIMMED value — the same rule all three
-/// `check_pi_available` copies apply, and the same rule `e2e-live.yml`'s guard
-/// step applies with `${VAR//[[:space:]]/}` — but the value comes back
+/// `check_pi_available` copies apply — but the value comes back
 /// VERBATIM, because verbatim is what a spawned agent receives and therefore
 /// what it derives [`claude_api_key_response_id`] from.
 ///
@@ -2823,6 +3643,33 @@ pub const ANTHROPIC_API_KEY_ENV: &str = "ANTHROPIC_API_KEY";
 /// printed, never formatted into an error and never written to an artifact.
 fn anthropic_api_key() -> Option<String> {
     std::env::var(ANTHROPIC_API_KEY_ENV)
+        .ok()
+        .filter(|key| !key.trim().is_empty())
+}
+
+/// Issue #502/#785: the OpenAI key a key-only host derives `~/.codex/auth.json`
+/// from. Nothing in the harness authenticates from it directly — codex reads
+/// the FILE, never the variable (measured: `codex exec` with the variable
+/// ambient and an empty `CODEX_HOME` answers 401) — so this exists only so a
+/// value that IS ambient on a developer's machine is registered for redaction
+/// alongside the copy the auth document carries.
+pub const OPENAI_API_KEY_ENV: &str = "OPENAI_API_KEY";
+
+/// The HOST variables that cross `launch_with_fixture`'s `env_clear` into every
+/// deck — and therefore into every daemon it lazy-spawns and every agent those
+/// daemons spawn.
+///
+/// Module-level and named so it can be asserted on: `ANTHROPIC_API_KEY` is here
+/// because a live test's credential has to reach the process that needs it, and
+/// the deck lazy-spawns the daemon that spawns the agent. The reasoning for each
+/// entry is at the use site.
+const INHERIT_PASS: [&str; 2] = ["PATH", ANTHROPIC_API_KEY_ENV];
+
+/// The ambient OpenAI API key, or `None` when unset, empty or whitespace-only.
+/// Same trim rule and same secret discipline as [`anthropic_api_key`]: returned
+/// only to be registered for redaction, never printed or written anywhere.
+fn openai_api_key() -> Option<String> {
+    std::env::var(OPENAI_API_KEY_ENV)
         .ok()
         .filter(|key| !key.trim().is_empty())
 }
@@ -2863,6 +3710,23 @@ fn api_key_recording_redactions(key: &str) -> Vec<String> {
     vec![key.to_string(), claude_api_key_response_id(key)]
 }
 
+/// Whether the host `~/.claude.json` records this exact key under
+/// `customApiKeyResponses.rejected` — a developer who once answered "No" to
+/// Claude Code's API-key approval prompt for this credential.
+///
+/// Reads the same file [`seed_claude_project_trust`] copies, so the gate and
+/// the seeding agree on what the host said. A missing, unreadable, unparsable
+/// or non-object file means "no stored answer", which is the ordinary state and
+/// not a refusal. Never returns or logs the key or its derivative.
+fn host_claude_api_key_rejected(key: &str) -> bool {
+    let id = claude_api_key_response_id(key);
+    std::fs::read_to_string(host_home().join(".claude.json"))
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .filter(|cfg| cfg.is_object())
+        .is_some_and(|cfg| response_list_contains(&cfg, "rejected", &id))
+}
+
 /// Whether the HOST carries an OAuth credential set the gate accepts — the file
 /// first, then the macOS Keychain. Exactly the pair [`check_claude_available`]
 /// consulted before the API key became a third path, so "was this run
@@ -2875,8 +3739,47 @@ fn api_key_recording_redactions(key: &str) -> Vec<String> {
 /// false. If the two ever disagree, an agent gets an OAuth file it cannot use,
 /// or an approved key it did not need — and the second of those silently moves
 /// a developer's local run off their subscription and onto metered API billing.
+///
+/// The two no longer arrive at that answer independently: the import RECORDS
+/// what it seeded in [`CLAUDE_OAUTH_SEEDED`] and the seeding reads it back
+/// through [`claude_run_is_oauth_backed`], so a credential rotation landing
+/// between them cannot make them disagree. This function is still the source of
+/// the answer — it is now consulted once instead of twice.
 fn host_claude_oauth_usable() -> bool {
     check_claude_credentials_file().is_ok() || claude_keychain_credentials_present()
+}
+
+/// What [`import_claude_credentials`] ACTUALLY seeded, the first time it ran in
+/// this process: `true` if it wrote a credential set into a test HOME, `false`
+/// if it deliberately wrote none because an API key authorises the run.
+///
+/// Issue #785 audit, the non-blocking TOCTOU. The import and
+/// [`seed_claude_project_trust`] used to derive that answer INDEPENDENTLY, each
+/// re-reading the host's credential stores. A rotation landing between the two
+/// reads makes them disagree, and the disagreement is not symmetric: an agent
+/// handed an OAuth file it cannot use merely fails, while an approved key it did
+/// not need silently moves a developer's run off their subscription and onto
+/// metered API billing. Recording the decision makes the invariant structural —
+/// one answer per process, produced by the code that acted on it, rather than
+/// two reads that are equal only if nothing changed in between.
+///
+/// A fresh key-only host never reaches the failing interleaving — there is no
+/// credential set for a rotation to land in — which is why this was not a
+/// blocker; a developer machine mid-`claude login` is. (This used to name a
+/// "fresh key-only CI runner". Since #502 there is no such host: lane 2 runs
+/// in no CI job.)
+static CLAUDE_OAUTH_SEEDED: OnceLock<bool> = OnceLock::new();
+
+/// The seeding's view of "was this run authorised by OAuth?" — the import's own
+/// answer when this process has one, otherwise a fresh read.
+///
+/// The fallback is not a hole. It is reached only when no import has run in this
+/// process, and with no import there is no second decision to disagree with.
+fn claude_run_is_oauth_backed() -> bool {
+    CLAUDE_OAUTH_SEEDED
+        .get()
+        .copied()
+        .unwrap_or_else(host_claude_oauth_usable)
 }
 
 /// The file half of [`check_claude_available`]: `~/.claude/.credentials.json`
@@ -3012,8 +3915,11 @@ fn claude_keychain_credentials_present() -> bool {
 }
 
 /// Non-macOS hosts keep the file-only behaviour unchanged: Linux Claude Code
-/// still writes `~/.claude/.credentials.json`, and CI — which has no
-/// credentials either way — must keep skipping.
+/// still writes `~/.claude/.credentials.json`, so there is no second store to
+/// probe and [`check_claude_available`] falls back to the file — or, since
+/// #502/#785, to an ambient `ANTHROPIC_API_KEY`. No CI claim belongs here:
+/// lane 2 runs on a developer's machine and in no CI job, so there is no CI
+/// skip for this arm to preserve.
 #[cfg(not(target_os = "macos"))]
 fn claude_keychain_credentials_present() -> bool {
     false
@@ -3145,6 +4051,7 @@ pub fn claude_oauth_usable(oauth: &serde_json::Value, now_ms: i64) -> Result<(),
 /// which is the outcome this whole family of checks exists to prevent. For any
 /// other provider the gate is unchanged and still wants an `auth.json`.
 pub fn check_opencode_available() -> Result<(), String> {
+    install_credential_redaction();
     if !cli_invocable("opencode") {
         return Err("OpenCode CLI not installed (could not invoke `opencode --version`)".into());
     }
@@ -3311,6 +4218,7 @@ pub fn opencode_test_model() -> &'static str {
 /// so expired credentials, 401 responses, and unreachable accounts skip cleanly
 /// before the PTY scenario starts.
 pub fn check_codex_available() -> Result<(), String> {
+    install_credential_redaction();
     if !cli_invocable("codex") {
         return Err("Codex CLI not installed (could not invoke `codex --version`)".into());
     }
@@ -3401,6 +4309,7 @@ pub fn check_codex_available() -> Result<(), String> {
 /// whether to spend more. `devin auth status` reaches the account without
 /// inference and distinguishes a logged-out host from a logged-in one.
 pub fn check_devin_available() -> Result<(), String> {
+    install_credential_redaction();
     if !cli_invocable("devin") {
         return Err("Devin CLI not installed (could not invoke `devin --version`)".into());
     }
@@ -3496,6 +4405,7 @@ pub fn import_devin_credentials(test_home: &Path) -> std::io::Result<Vec<String>
         &dst_config_dir.join("config.json"),
         serde_json::to_string_pretty(&root)?.as_bytes(),
     )?;
+    register_diagnostic_redactions(redactions.clone());
     Ok(redactions)
 }
 
@@ -3554,23 +4464,45 @@ pub fn require_real_e2e() -> bool {
 /// package's unit tests, and several of those print their own `SKIP: ` lines
 /// when a tool they drive is absent — `xtask/linkage-check/src/junit_strip.rs`,
 /// `pin_lockstep.rs`, `verify_pr_stream.rs`, `issue_labeler_memory.rs`,
-/// `clean_tmp.rs` and `src/ui.rs`. The credentialed lane-2 workflow
-/// (`.github/workflows/e2e-live.yml`) counts runtime skips into its run summary
-/// to answer "did any API-key-backed test actually run?", and a marker-less
-/// count folds every one of those unrelated skips into that number.
+/// `clean_tmp.rs` and `src/ui.rs`. Anyone counting runtime skips to answer "did
+/// any real-agent test actually run?" — the grep in `docs/develop/e2e-lanes.md`
+/// is the canonical one — folds every one of those unrelated skips into the
+/// number without the marker.
 ///
 /// The marker narrows the population; it does not AUTHENTICATE it. Any selected
 /// test can print any line, and this function takes an arbitrary `String`, so
-/// nothing downstream may treat a matching line as trustworthy metadata — which
-/// is why that workflow reports a count and nothing else, leaving the reasons in
-/// the masked job log. `.claude/skills/verify-pr/checks.sh` deliberately keeps
+/// nothing downstream may treat a matching line as trustworthy metadata.
+/// `.claude/skills/verify-pr/checks.sh` deliberately keeps
 /// the broader marker-less pattern, because it runs against whatever branch is
 /// checked out, including ones predating this marker.
 #[doc(hidden)]
 pub fn _skip_if_err(result: Result<(), String>) -> bool {
+    // Issue #502/#785 audit S1. The narrowest choke point that covers every
+    // runtime credential preflight: `skip_unless!` is what wraps each
+    // `check_*_available` call, so a test that gates on a credential passes
+    // through here whatever else it shares with the harness — for most of them,
+    // as the first statement in the test body — and for some it is the ONLY
+    // thing they share with the harness at all.
+    // `e2e_pi_worker.rs` is the case that made this necessary — it defines its
+    // own file-local `check_pi_available`, never calls a `common::check_*` or an
+    // importer, drives an IN-PROCESS daemon (so no `TuiDeckBuilder::launch`),
+    // forwards `ANTHROPIC_API_KEY` to a real pi worker by hand, and then reads
+    // `registry.snapshot()` straight into `assert!` messages. Every other
+    // installation site would have missed it.
+    //
+    // It also covers the panic below: `reason` is caller-supplied text, and the
+    // require-real assertion interpolates it.
+    install_credential_redaction();
     match result {
         Ok(()) => false,
         Err(reason) => {
+            // PR #805 audit blocker 3: a runtime skip is one of the routes that
+            // used to leave the previous run's `full-stream.cast` in place while
+            // nextest reported the test as PASSED — the worst shape of the
+            // problem, because "it passed" and "it recorded nothing" look
+            // identical. Discarded before the require-real assertion so the
+            // stale artifact goes whichever way that assertion falls.
+            discard_previous_recording(&current_test_name());
             assert!(
                 !require_real_e2e(),
                 "{REQUIRE_REAL_E2E_ENV} is set, so this real-agent test must RUN, not skip: \
@@ -3617,7 +4549,56 @@ fn host_home() -> PathBuf {
 /// in place would invoke the developer's real hook commands inside
 /// the test). M3.1 auditor S2 + S3: write the destination with mode
 /// 0o600 atomically; refuse source files that are symlinks.
-fn import_claude_credentials(test_home: &Path) -> std::io::Result<()> {
+///
+/// # Returns the credential values the recording must redact (issue #502/#785)
+///
+/// Same contract as [`import_codex_credentials`], [`import_opencode_credentials`]
+/// and [`import_devin_credentials`], and it is the last of the four to get one.
+/// This importer used to register NOTHING from the documents it copies, on the
+/// stated ground that "the Claude credential set itself is never rendered (it is
+/// a file the agent reads)". The security audit of PR #805 named that as a
+/// blocker and it was right: never-rendered is a CONVENTION, not a structural
+/// property. An agent command, a contributor-authored test, an auth diagnostic
+/// or an accidental `cat` of the file paints the document onto the terminal, and
+/// the Codex importer's own rationale already treats exactly that ("a test
+/// dumping the file") as a sink. The same reasoning applies here, and the stakes
+/// are higher rather than lower: reel-eligible tests deliberately drive real
+/// agents and publish their terminal capture to a YouTube URL linked from the
+/// public release notes, and most of them take the ordinary OAuth-backed Claude
+/// route — precisely the one that had no registration. (That upload is private by
+/// default since PR #805, so a human flip stands between such a video and a
+/// third party; this registration is what keeps the credential out of the bytes
+/// in the first place, and the two are not substitutes.)
+///
+/// Both copied documents go through [`collect_credential_values`], at DIFFERENT
+/// widths (see [`CredentialScope`]): the OAuth credential set is an auth
+/// document and gets the same 16-byte floor the other three importers use, while
+/// the hook-stripped `settings.json` — which the M4.6 review already flagged as
+/// carrying "the same tokens / sensitive config that motivate the 0o600 mode on
+/// credentials.json" — is a CONFIGURATION document and gets the sensitive-key
+/// rule only, because a real one is mostly long strings that are not secrets. The values are registered for DIAGNOSTIC redaction here as
+/// well as returned, so the routes with no `TuiDeck` — [`seed_claude_worker_home`],
+/// and through it `e2e_pi_orchestrator.rs` and `e2e_delegate_work_done_chain.rs`
+/// — are covered without having to remember to, and so the panic seam and the
+/// raw JUnit report inherit it alongside `full-stream.cast` and `final-grid.*`.
+///
+/// Deliberately NOT registered by THIS importer: the `~/.claude.json` that
+/// [`seed_claude_project_trust`] writes. It carries the host `oauthAccount`,
+/// which is account IDENTITY (a uuid, an email, an organisation name) and not a
+/// credential, and `collect_credential_values`' 16-byte floor would sweep the
+/// whole file up — trading credential coverage for the readability of every grid
+/// a developer reads. The one credential derivative it does hold, the API key's
+/// 20-character approval suffix, is registered by
+/// [`api_key_recording_redactions`] whenever a key is present. Its identity
+/// fields are registered separately and by NAME, where they are written — see
+/// [`claude_identity_redactions`] (PR #805 audit P2).
+fn import_claude_credentials(test_home: &Path) -> std::io::Result<Vec<String>> {
+    // The ambient API key this import defers to is rendered through the
+    // approval prompt's 20-character suffix, and the documents copied below are
+    // registered at the point they are read. Installing here registers every
+    // derivative before any agent authorised by that key can start.
+    install_credential_redaction();
+    let mut redactions = Vec::new();
     let src_root = host_home().join(".claude");
     let dst_root = test_home.join(".claude");
     std::fs::create_dir_all(&dst_root)?;
@@ -3649,8 +4630,10 @@ fn import_claude_credentials(test_home: &Path) -> std::io::Result<()> {
     // is `try_launch_with_fixture(…).unwrap_or_else(|e| panic!(…))`, so an
     // `Err` here is a PANIC rather than a skip. Widening the gate without
     // widening this converts 22 silent skips into 22 hard panics on any host
-    // that has a key and no credential set — which is precisely the state a CI
-    // runner is in. The two changes are one change.
+    // that has a key and no credential set — which since #502 is a developer
+    // machine that has never run `claude login`, or whose credential set has
+    // expired, and never a CI runner: no test credential is registered on this
+    // repository and lane 2 runs in no CI job. The two changes are one change.
     //
     // So: when NEITHER store is usable but a key is present, the correct
     // credential set to seed is NO credential set. Claude Code then
@@ -3685,7 +4668,22 @@ fn import_claude_credentials(test_home: &Path) -> std::io::Result<()> {
             None => return Err(file_err),
         },
     };
+    // Recorded BEFORE the rest of the import, and returned below, so the
+    // approval decision in `seed_claude_project_trust` is taken from what was
+    // actually written rather than from a second read of the host — see
+    // [`CLAUDE_OAUTH_SEEDED`].
+    let seeded_oauth = creds_bytes.is_some();
+    let _ = CLAUDE_OAUTH_SEEDED.set(seeded_oauth);
     if let Some(bytes) = creds_bytes {
+        // Registered from the bytes actually WRITTEN, not from a second read of
+        // the host — the Keychain fallback and the API-key branch mean the
+        // document that lands in the test HOME is not always the file this
+        // function started from.
+        redactions.extend(claude_recording_redactions(
+            &bytes,
+            "~/.claude/.credentials.json",
+            CredentialScope::AuthDocument,
+        )?);
         write_credential_file_atomic_0o600(&dst_root.join(".credentials.json"), &bytes)?;
     }
 
@@ -3704,6 +4702,14 @@ fn import_claude_credentials(test_home: &Path) -> std::io::Result<()> {
         require_regular_file_no_symlink(&src_settings, "~/.claude/settings.json")?;
         let raw = std::fs::read_to_string(&src_settings)?;
         let dst_text = strip_hooks_from_claude_settings(&raw)?;
+        // The sanitised text, not the host's JSONC: `strip_hooks_from_claude_settings`
+        // has already parsed and re-serialised it, so this parse cannot fail and
+        // the registered values are the ones the test HOME will hold.
+        redactions.extend(claude_recording_redactions(
+            dst_text.as_bytes(),
+            "~/.claude/settings.json",
+            CredentialScope::ConfigDocument,
+        )?);
         write_credential_file_atomic_0o600(&dst_root.join("settings.json"), dst_text.as_bytes())?;
     }
 
@@ -3725,7 +4731,58 @@ fn import_claude_credentials(test_home: &Path) -> std::io::Result<()> {
         require_regular_dir_no_symlink(&src_plugins, "~/.claude/plugins")?;
         copy_dir_recursively(&src_plugins, &dst_root.join("plugins"))?;
     }
-    Ok(())
+    normalise_redactions(&mut redactions);
+    register_diagnostic_redactions(redactions.clone());
+    // `seeded_oauth` is not returned any more — it never had a reader, because
+    // both call sites always discarded it and `seed_claude_project_trust` takes
+    // the answer from [`CLAUDE_OAUTH_SEEDED`], which is set above.
+    Ok(redactions)
+}
+
+/// The credential values inside a Claude Code document a recording must redact.
+/// Same helper as [`codex_recording_redactions`] and
+/// [`opencode_recording_redactions`], with `scope` deciding how wide the sweep
+/// is — and the two documents this importer copies need different widths, which
+/// is the whole reason [`CredentialScope`] exists:
+///
+///   * `~/.claude/.credentials.json` is an AUTH document, so it gets the same
+///     treatment as codex's and OpenCode's: the OAuth `accessToken` /
+///     `refreshToken` match on their key names, and the 16-byte floor sweeps up
+///     anything token-shaped under a name this code does not know — which
+///     matters here because the shape of that file is Claude Code's to change.
+///   * `~/.claude/settings.json` is a CONFIGURATION document and gets the
+///     sensitive-key-name rule with no floor. A real one carries dozens of long
+///     strings that are not secrets, and registering them would cost a scan pass
+///     per string over every artifact *and* redact `permissions.allow` rules and
+///     model ids out of the grids a developer reads.
+///
+/// An unparsable document is a hard refusal rather than "no redactions", the
+/// same stance the other two take: a credential file we cannot read is a
+/// credential file we cannot redact, and that is precisely the sink. The one
+/// branch that can reach it is the deliberate "copy what we have and let it fail
+/// loudly rather than silently importing nothing" fallback, and a run that takes
+/// that branch has no usable credential from any source — so it was going to
+/// fail either way, and failing at the import names the cause instead of dying
+/// in a PTY wait. An expired-but-well-formed document, which is what "unusable"
+/// almost always means, parses fine and is registered. (The `settings.json` call
+/// cannot reach the refusal at all: `strip_hooks_from_claude_settings` has
+/// already parsed and re-serialised that text, and fails closed itself if the
+/// host's file is malformed.)
+fn claude_recording_redactions(
+    bytes: &[u8],
+    redacted_display: &str,
+    scope: CredentialScope,
+) -> std::io::Result<Vec<String>> {
+    let document: serde_json::Value = serde_json::from_slice(bytes).map_err(|error| {
+        std::io::Error::other(format!(
+            "refusing to import {redacted_display}: not valid JSON, so its \
+             credential values cannot be registered for redaction: {error}"
+        ))
+    })?;
+    let mut values = Vec::new();
+    collect_credential_values(&document, None, scope, false, &mut values);
+    normalise_redactions(&mut values);
+    Ok(values)
 }
 
 /// Whether to copy the host's `~/.claude/plugins` into each seeded HOME.
@@ -3769,28 +4826,67 @@ fn import_claude_plugins_enabled() -> bool {
 /// confusing timeout. [`claude_api_key_response_id`] is what the answer is
 /// recorded under, so the answer can be pre-seeded without a round trip.
 ///
-/// WHICH answer is seeded is decided by [`host_claude_oauth_usable`], and the
-/// asymmetry is the point:
+/// WHICH answer is seeded is decided by [`host_claude_oauth_usable`], and one
+/// rule governs both branches: **the harness never silently moves a run onto
+/// metered API billing.** It may move a run OFF it, and it may move a run onto
+/// it when something explicit authorises that. It may not do so on its own.
 ///
 ///   * **OAuth usable** (a developer's machine): record the key as REJECTED, so
-///     the prompt is silent and the agent keeps authenticating from the
-///     imported credential set exactly as it did before this change. Approving
-///     it here would quietly move a local run off the developer's subscription
-///     and onto metered API billing.
-///   * **OAuth unusable** (a CI runner): record it as APPROVED, and drop any
-///     inherited `rejected` entry for it — the host config is copied wholesale,
-///     so a developer who once answered "No" to this very key would otherwise
-///     export that refusal to a runner where the key is the ONLY way in.
+///     the prompt is silent and the agent authenticates from the imported
+///     credential set. This now overrides an inherited `approved` entry as
+///     well, which the first version of this code deliberately preserved as
+///     "the developer's own answer". MEASURED on claude 2.1.252, and the
+///     measurement is why it changed: with a usable `~/.claude/.credentials.json`
+///     present, the ambient key exported, and that key listed under `approved`,
+///     the interactive header reads `Haiku 4.5 · API Usage Billing` and Claude
+///     Code additionally warns "Both claude.ai and ANTHROPIC_API_KEY set · auth
+///     may not work as expected". With the key `rejected` instead — everything
+///     else identical — it reads `Haiku 4.5 · Claude Team`. So an approved key
+///     WINS over a usable OAuth file, and that host approval was recorded for
+///     the developer's own interactive sessions at a time when `inherit_pass`
+///     was PATH-only and the key never reached a test agent at all. Honouring
+///     it here would newly bill a developer for a test run they did not ask to
+///     pay for; overriding it costs them nothing, since the OAuth set the
+///     harness just imported is what runs instead.
+///   * **OAuth unusable** (a key-only developer host — since #502 the only
+///     shape that reaches this, because lane 2 runs on no runner): record it
+///     as APPROVED — the key is the only way in — UNLESS the host config
+///     already records a REJECTION for this exact key and nothing authorises
+///     overriding it. That carve-out replaced an unconditional
+///     approve-and-drop-the-refusal, whose stated justification (a runner would
+///     otherwise inherit a developer's refusal) does not survive checking:
+///     `ubuntu-latest` starts with a FRESH HOME and nothing copies a developer's
+///     `~/.claude.json` onto it, so the removal was a no-op in CI and took
+///     effect only on a local key-only host — the one place the stored "No" is a
+///     real, deliberate human decision. Ambient key presence is not consent
+///     either; this repository's dev environment loads API keys automatically.
+///     [`REQUIRE_REAL_E2E_ENV`] is the authorisation, and it is exactly the
+///     right one: setting it IS a statement that this run must reach a real
+///     agent, so a caller who wants the override asks for it, while a developer
+///     who answered "No" gets a clean preflight skip from
+///     [`check_claude_available`] naming the reason instead of a silent bill.
 ///
 /// A response the host already recorded for a key that is not the ambient one
-/// is left untouched, and so is an existing response for the ambient key on an
-/// OAuth host: that is the developer's own answer, and it already says "No".
-fn seed_claude_project_trust(test_home: &Path, trust_paths: &[String]) -> std::io::Result<()> {
+/// is left untouched in every branch.
+fn seed_claude_project_trust(
+    test_home: &Path,
+    trust_paths: &[String],
+) -> std::io::Result<Vec<String>> {
+    install_credential_redaction();
     let host_cfg_path = host_home().join(".claude.json");
     let mut cfg: serde_json::Value = std::fs::read_to_string(&host_cfg_path)
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_else(|| serde_json::json!({ "hasCompletedOnboarding": true }));
+    // A host `~/.claude.json` that is valid JSON but not an OBJECT — `[]`,
+    // `"x"`, `null` — parses fine and then PANICS on the `cfg["projects"] = …`
+    // below, because indexing a non-object `Value` with a string key panics on
+    // assignment. Pre-existing (it predates the API-key work) and cheap, so it
+    // is closed here rather than left as a follow-up: treated exactly like an
+    // unparsable file, which is the same amount of host state either carries.
+    if !cfg.is_object() {
+        cfg = serde_json::json!({ "hasCompletedOnboarding": true });
+    }
     if !cfg["projects"].is_object() {
         cfg["projects"] = serde_json::json!({});
     }
@@ -3802,33 +4898,136 @@ fn seed_claude_project_trust(test_home: &Path, trust_paths: &[String]) -> std::i
         });
     }
     if let Some(key) = anthropic_api_key() {
-        seed_claude_api_key_response(&mut cfg, &key, host_claude_oauth_usable());
+        seed_claude_api_key_response(
+            &mut cfg,
+            &key,
+            claude_run_is_oauth_backed(),
+            require_real_e2e(),
+        );
     }
     let bytes = serde_json::to_vec(&cfg)
         .map_err(|e| std::io::Error::other(format!("serialize .claude.json: {e}")))?;
-    write_credential_file_atomic_0o600(&test_home.join(".claude.json"), &bytes)
+    write_credential_file_atomic_0o600(&test_home.join(".claude.json"), &bytes)?;
+    // Registered from `cfg` — the document actually written — rather than from a
+    // second read of the host, the same rule the credential importers follow.
+    let identity = claude_identity_redactions(&cfg);
+    register_diagnostic_redactions(identity.clone());
+    Ok(identity)
+}
+
+/// Field names inside `oauthAccount` whose values IDENTIFY the developer rather
+/// than authenticate them. Matched case-insensitively as substrings of the key,
+/// which on a real `~/.claude.json` selects `accountUuid`, `organizationUuid`,
+/// `emailAddress`, `displayName`, `fullName` and `organizationName`, and leaves
+/// the descriptive neighbours alone (`billingType`, `seatTier`,
+/// `organizationRole`, `organizationRateLimitTier`, the trial flags and the
+/// timestamps) — those are not identity and registering a value like `admin` or
+/// `max` would replace those bytes wherever they occurred in an artifact.
+const CLAUDE_IDENTITY_KEY_FRAGMENTS: [&str; 3] = ["uuid", "email", "name"];
+
+/// The IDENTITY values inside the `~/.claude.json` this harness writes, for
+/// redaction out of the artifacts (PR #805 audit P2).
+///
+/// The classification is unchanged and the audit agreed with it: an account
+/// uuid, an email address and an organisation name are identity, not
+/// authentication material — nothing in that file authorises an API call, and
+/// the one credential DERIVATIVE it carries (the key's 20-character approval
+/// suffix) is registered by [`api_key_recording_redactions`] instead. What
+/// changed is the consequence. This document is copied into every isolated HOME
+/// of every real-agent test, an interactive `claude` renders the account line
+/// into the pane, and that pane is what `full-stream.cast` captures and the demo
+/// reel publishes. Private-by-default upload drops that exposure a long way (see
+/// `docs/develop/demo-reel.md`), but "a human has to flip it before strangers can
+/// watch" is not a reason to leave a developer's email in the artifact when the
+/// alternative is a handful of field names.
+///
+/// Deliberately NOT the [`CredentialScope::AuthDocument`] treatment. That would
+/// register every string of 16 bytes or more in the file — which here is mostly
+/// timestamps, tiers, trial flags and, at the top level, the whole `projects` map
+/// of paths this run just trusted — and would cost the readability of every grid
+/// a developer reads, which is the trade the original decision correctly refused.
+/// This is the targeted third option: the identity fields by name, at the top
+/// level of `oauthAccount` only.
+///
+/// The [`MIN_WRAP_FRAGMENT`] floor is the one guard: a value shorter than eight
+/// bytes cannot be told apart from ordinary rendered text — that is exactly what
+/// the floor means everywhere else in this seam — so registering a three-letter
+/// display name would gouge those letters out of every artifact that happens to
+/// contain them. No account uuid or email is that short; a display name can be,
+/// and is then left alone rather than allowed to wreck the artifacts, with the
+/// uuid and email still covering the account.
+///
+/// **Two gaps, both accepted rather than unnoticed.** The floor above leaves a
+/// short display, full or organisation name visible. And the rule is keyed to
+/// the schema as MEASURED: a future identity field named `handle`, `login`,
+/// `subject` or `userId` contains none of the three fragments and would be
+/// registered by nothing, silently, with no test failing — the substrings are a
+/// snapshot of one vendor's JSON, not a definition of identity. Both are PII
+/// exposure rather than credential exposure, which is why they are recorded
+/// here instead of blocking; reassess them against the schema rather than
+/// against the matcher, because `oauthAccount` is a trusted location that
+/// supplies far stronger identity context than an arbitrary rendered string
+/// does.
+fn claude_identity_redactions(cfg: &serde_json::Value) -> Vec<String> {
+    let Some(account) = cfg.get("oauthAccount").and_then(|v| v.as_object()) else {
+        return Vec::new();
+    };
+    let mut values: Vec<String> = Vec::new();
+    for (key, value) in account {
+        let Some(text) = value.as_str() else { continue };
+        let lowered = key.to_ascii_lowercase();
+        let identifying = CLAUDE_IDENTITY_KEY_FRAGMENTS
+            .iter()
+            .any(|fragment| lowered.contains(fragment));
+        if identifying && text.len() >= MIN_WRAP_FRAGMENT {
+            values.push(text.to_string());
+        }
+    }
+    normalise_redactions(&mut values);
+    values
 }
 
 /// Pre-answer Claude Code's "Detected a custom API key in your environment"
 /// prompt inside a `~/.claude.json` document. Split out as a pure mutation of
 /// the parsed config so the branch table above is covered by unit tests instead
-/// of by argument, and so `oauth_usable` is an explicit input rather than an
-/// ambient read.
+/// of by argument, and so both policy inputs are explicit rather than ambient
+/// reads: `oauth_usable` from [`host_claude_oauth_usable`] and
+/// `may_override_rejection` from [`require_real_e2e`].
 ///
-/// Only ever handles [`claude_api_key_response_id`] — the 20-character
-/// derivative — never the key itself, which does not appear in this file.
-fn seed_claude_api_key_response(cfg: &mut serde_json::Value, key: &str, oauth_usable: bool) {
+/// Only ever handles [`claude_api_key_response_id`] — the key's last 20
+/// characters — and only when that derivative is STRICTLY SHORTER than the key,
+/// which is what makes "the key itself does not appear in this file" true
+/// rather than nearly true. For an input of 20 characters or fewer the id IS
+/// the whole value, so seeding it would write the credential into
+/// `~/.claude.json` verbatim; that input is refused here instead. No real
+/// Anthropic key is anywhere near that short (this repository's is 108
+/// characters), so the refusal costs nothing on a real credential and removes
+/// a false claim on a fabricated one — which is the defect class this branch
+/// exists to close.
+fn seed_claude_api_key_response(
+    cfg: &mut serde_json::Value,
+    key: &str,
+    oauth_usable: bool,
+    may_override_rejection: bool,
+) {
     let id = claude_api_key_response_id(key);
+    if id.chars().count() >= key.chars().count() {
+        return;
+    }
     if !cfg["customApiKeyResponses"].is_object() {
         cfg["customApiKeyResponses"] = serde_json::json!({});
     }
     if oauth_usable {
-        // The imported credential set is authoritative. Answer "No" for the
-        // ambient key ONLY if the host has not already answered — an existing
-        // `approved` entry is a deliberate developer choice and stays.
-        if !response_list_contains(cfg, "approved", &id) {
-            set_response_membership(cfg, "rejected", &id, true);
-        }
+        // The imported credential set is authoritative, and an approved key
+        // beats it (measured — see the doc block above), so the approval has to
+        // go rather than merely not be added.
+        set_response_membership(cfg, "approved", &id, false);
+        set_response_membership(cfg, "rejected", &id, true);
+    } else if response_list_contains(cfg, "rejected", &id) && !may_override_rejection {
+        // A deliberate local "No" with nothing authorising an override. Left
+        // exactly as the host recorded it; `check_claude_available` refuses the
+        // run for the same reason, so this is the honest state of the file
+        // rather than a config the agent will then stall on.
     } else {
         set_response_membership(cfg, "approved", &id, true);
         set_response_membership(cfg, "rejected", &id, false);
@@ -3867,7 +5066,11 @@ fn set_response_membership(cfg: &mut serde_json::Value, field: &str, id: &str, w
 /// has to beat the spawn, not the launch.
 #[allow(dead_code)]
 pub fn seed_claude_trust_in_home(home: &Path, trust_paths: &[String]) -> std::io::Result<()> {
-    seed_claude_project_trust(home, trust_paths)
+    // The identity values are registered process-globally by the callee, and
+    // `TuiDeck::dump_recordings` reads that store too (see
+    // [`TuiDeck::artifact_redactions`]), so a post-launch caller's recordings are
+    // covered without threading a value back through nine call sites.
+    seed_claude_project_trust(home, trust_paths).map(|_| ())
 }
 
 /// Seed a HOME for a Claude Code worker the test spawns ITSELF, outside the
@@ -3887,8 +5090,23 @@ pub fn seed_claude_trust_in_home(home: &Path, trust_paths: &[String]) -> std::io
 /// would have stalled on the prompt even if the copy had been made optional.
 #[allow(dead_code)]
 pub fn seed_claude_worker_home(home: &Path, trust_paths: &[String]) -> std::io::Result<()> {
+    // Issue #502/#785 audit S1: these callers have no `TuiDeck`, so they have no
+    // `recording_redactions` object and never will. They read pane bytes off
+    // `daemon.registry.snapshot()` and interpolate them into `assert!`
+    // messages, which is the same sink a deck-launched test reaches through a
+    // harness timeout. The process-global store is what covers both.
+    install_credential_redaction();
+    // The returned values are discarded rather than ignored: this route has no
+    // `TuiDeck` and so no recording to redact, and the importer registers what
+    // it copied for DIAGNOSTIC redaction itself (PR #805 audit blocker 2), which
+    // is the only redaction these callers get.
     import_claude_credentials(home)?;
-    seed_claude_project_trust(home, trust_paths)
+    // Same order as the builder's, so both routes record and then read one
+    // decision rather than two (see [`CLAUDE_OAUTH_SEEDED`]). The identity
+    // values it returns are discarded for the same reason the importer's are:
+    // this route has no `TuiDeck` and no recording, and the callee registered
+    // them for the diagnostic sink itself.
+    seed_claude_project_trust(home, trust_paths).map(|_| ())
 }
 
 /// Strip the top-level `hooks` key from a Claude Code settings.json.
@@ -4140,16 +5358,100 @@ fn write_credential_file_atomic_0o600(dst: &Path, bytes: &[u8]) -> std::io::Resu
     Ok(())
 }
 
-fn collect_credential_values(value: &serde_json::Value, key: Option<&str>, out: &mut Vec<String>) {
+/// How widely [`collect_credential_values`] sweeps a document.
+///
+/// The distinction exists because the four importers do not all copy the same
+/// KIND of file (issue #502/#785, PR #805 audit blocker 2). An auth document is
+/// credential material end to end; a configuration document is mostly not.
+#[derive(Clone, Copy)]
+enum CredentialScope {
+    /// Every string of 16 bytes or more, sensitive key name or not. Right for an
+    /// AUTH document — `~/.codex/auth.json`, OpenCode's `auth.json`, Devin's,
+    /// `~/.claude/.credentials.json` — where the floor is what sweeps up
+    /// whatever token-shaped field a future release adds under a name this code
+    /// does not know. It over-redacts on purpose; the reasoning is in the
+    /// `MIN_WRAP_FRAGMENT` note above.
+    AuthDocument,
+    /// Strings under a sensitive KEY NAME with no length floor at all, PLUS
+    /// every string of 16 bytes or more anywhere below an `env` object.
+    /// Right for a CONFIGURATION document — `~/.claude/settings.json` — where a
+    /// document-wide floor would be actively harmful: a real one carries dozens
+    /// of long strings that are not secrets (`permissions.allow` rules, a model
+    /// id, a `statusLine` command), and registering those costs a full scan pass
+    /// over every artifact for each one AND redacts them out of the grids a
+    /// developer reads.
+    ///
+    /// **The `env` map is the exception, and PR #805's second audit was right to
+    /// call the key-name rule alone a leak there.** Claude Code copies
+    /// `settings.json` into the isolated HOME and exports everything under `env`
+    /// into the agent's environment, and the names in that map are ARBITRARY —
+    /// the recursion keeps only the innermost key, so a variable is judged purely
+    /// on what the developer happened to call it. `ANTHROPIC_AUTH_TOKEN` matches
+    /// the sensitive-name list; `DATABASE_URL`, `HTTP_PROXY`, `NPM_CONFIG__AUTH`,
+    /// `COOKIE`, `CREDENTIAL` and `PAT` do not, and a database or proxy URL
+    /// carrying user-info is a complete password-bearing credential rather than
+    /// hypothetical configuration syntax. So inside `env` the policy flips to the
+    /// auth-document one: the variable's NAME stops being evidence and the value
+    /// gets the same 16-byte floor, because an `env` entry is exactly the shape
+    /// of thing that holds a credential under a name this code cannot predict.
+    ///
+    /// The floor is what keeps that from being a disaster: `NO_COLOR=1`,
+    /// `RUST_LOG=debug` and `TERM=xterm` would otherwise be registered, and
+    /// registering a two-byte value replaces those bytes wherever they occur in
+    /// every artifact. Sixteen is the same bound the auth documents use.
+    ///
+    /// **It is a trade, not a completeness boundary, and this comment used to
+    /// deny the residual by claiming no credential worth protecting is shorter
+    /// than sixteen bytes.** A short password under an ordinary provider
+    /// variable — the audit's counterexample is `REDISCLI_AUTH` — matches no
+    /// sensitive-name rule, and a value below sixteen bytes then falls under
+    /// the floor too, so it is registered by nothing and redacted from nothing.
+    /// The floor stays anyway, because removing it gouges `NO_COLOR`-sized
+    /// values out of every artifact a developer reads, which is a certain harm
+    /// against a narrow one; the residual is real and is covered by the
+    /// blocklist framing in
+    /// `docs/develop/e2e-lanes.md` rather than argued away. The way out, if it
+    /// is ever worth taking, is to widen the high-confidence name fragments or
+    /// to treat short values exact-only when the surrounding context is strong
+    /// — not to drop the floor globally.
+    ///
+    /// Not depth-anchored to the top-level `env` on purpose — a nested `env`
+    /// map is env material too, and being wrong in the over-registering
+    /// direction is the safe one here.
+    ConfigDocument,
+}
+
+/// The length at which a string is treated as credential-shaped on its own, with
+/// no sensitive name to vouch for it: [`CredentialScope::AuthDocument`]
+/// everywhere, and [`CredentialScope::ConfigDocument`] inside an `env` map.
+/// See the `MIN_WRAP_FRAGMENT` note for why over-registering is the safe
+/// direction and the floor is what bounds the cost of it.
+const MIN_UNNAMED_CREDENTIAL: usize = 16;
+
+/// `in_env` says whether this value sits anywhere below a key named `env`. It is
+/// the ancestry the plain `key` parameter throws away: the recursion replaces the
+/// parent context with each child key, so by the time an `env` entry's string is
+/// examined, "it was under `env`" is not recoverable from `key` alone — and for a
+/// map of arbitrarily-named environment variables that is the only thing that
+/// distinguishes a credential from a setting. Set once on the way down and never
+/// cleared, so it survives arrays and nested objects.
+fn collect_credential_values(
+    value: &serde_json::Value,
+    key: Option<&str>,
+    scope: CredentialScope,
+    in_env: bool,
+    out: &mut Vec<String>,
+) {
     match value {
         serde_json::Value::Object(map) => {
             for (child_key, child) in map {
-                collect_credential_values(child, Some(child_key), out);
+                let child_in_env = in_env || child_key.eq_ignore_ascii_case("env");
+                collect_credential_values(child, Some(child_key), scope, child_in_env, out);
             }
         }
         serde_json::Value::Array(values) => {
             for child in values {
-                collect_credential_values(child, key, out);
+                collect_credential_values(child, key, scope, in_env, out);
             }
         }
         serde_json::Value::String(value) => {
@@ -4163,7 +5465,14 @@ fn collect_credential_values(value: &serde_json::Value, key: Option<&str>, out: 
                 || key.contains("authorization")
                 || key.contains("api_key")
                 || key.contains("apikey");
-            if !value.is_empty() && (sensitive_key || value.len() >= 16) {
+            let long_enough = match scope {
+                CredentialScope::AuthDocument => value.len() >= MIN_UNNAMED_CREDENTIAL,
+                // Not "no floor anywhere" any more: inside `env` the variable
+                // name is not evidence of anything, so the value is judged the
+                // way an auth document's is. See [`CredentialScope`].
+                CredentialScope::ConfigDocument => in_env && value.len() >= MIN_UNNAMED_CREDENTIAL,
+            };
+            if !value.is_empty() && (sensitive_key || long_enough) {
                 out.push(value.clone());
             }
         }
@@ -4181,9 +5490,14 @@ fn opencode_recording_redactions(
         ))
     })?;
     let mut values = Vec::new();
-    collect_credential_values(&auth, None, &mut values);
-    values.sort_by_key(|value| std::cmp::Reverse(value.len()));
-    values.dedup();
+    collect_credential_values(
+        &auth,
+        None,
+        CredentialScope::AuthDocument,
+        false,
+        &mut values,
+    );
+    normalise_redactions(&mut values);
     Ok(values)
 }
 
@@ -4268,8 +5582,8 @@ fn import_opencode_credentials_from(
     }
     write_minimal_opencode_config(test_home)?;
 
-    recording_redactions.sort_by_key(|value| std::cmp::Reverse(value.len()));
-    recording_redactions.dedup();
+    normalise_redactions(&mut recording_redactions);
+    register_diagnostic_redactions(recording_redactions.clone());
     Ok(recording_redactions)
 }
 
@@ -4287,9 +5601,9 @@ fn import_opencode_credentials(test_home: &Path) -> std::io::Result<Vec<String>>
         // `import_claude_credentials`: this runs inside the `launch_with_fixture`
         // path that panics on `Err`, so `check_opencode_available` accepting an
         // env key without this would turn two clean skips into two panics on a
-        // runner. There is no auth file to copy and that is the AUTHORISED
-        // state, not a failure — the isolated config is still written, so the
-        // host's plugins and MCP commands stay out either way.
+        // key-only host. There is no auth file to copy and that is the
+        // AUTHORISED state, not a failure — the isolated config is still
+        // written, so the host's plugins and MCP commands stay out either way.
         Err(err) if err.kind() == std::io::ErrorKind::NotFound && opencode_env_key_authorises() => {
             write_minimal_opencode_config(test_home)?;
             Ok(Vec::new())
@@ -4305,13 +5619,36 @@ fn import_opencode_credentials(test_home: &Path) -> std::io::Result<Vec<String>>
 /// Issue #243: also seeds `version.json` — see [`codex_update_notice_dismissal`]
 /// for why an isolated HOME without it can wedge a real-agent Codex test in a
 /// way that looks like a delivery failure.
-pub fn import_codex_credentials(test_home: &Path) -> std::io::Result<()> {
+///
+/// # Returns the credential values the recording must redact (issue #502/#785)
+///
+/// It used to return nothing, which was survivable while `~/.codex/auth.json`
+/// was only ever a developer's own ChatGPT session. It stopped being survivable
+/// once that file could be PRODUCED from the raw `OPENAI_API_KEY` on a key-only
+/// host:
+/// this function copies those bytes verbatim into every isolated Codex HOME, so
+/// anything that renders codex's auth state — codex itself, an API error body,
+/// a test dumping the file — puts the raw key into `final-grid.*` and
+/// `full-stream.cast`. Same treatment as the OpenCode and Devin importers,
+/// through the same `collect_credential_values` policy, and registered for
+/// DIAGNOSTIC redaction here as well so an in-process caller with no `TuiDeck`
+/// (`e2e_codex_worker.rs`) is covered without having to remember to.
+///
+/// An unparsable auth document is a hard refusal rather than "no redactions",
+/// mirroring `opencode_recording_redactions`: a credential file we cannot read
+/// is a credential file we cannot redact, and that is precisely the sink. It is
+/// also not a state a working host reaches — `check_codex_available` ends in a
+/// live model probe against this very file, so a host that got here has one
+/// codex itself just authenticated from.
+pub fn import_codex_credentials(test_home: &Path) -> std::io::Result<Vec<String>> {
     let src = host_home().join(".codex").join("auth.json");
     let bytes = read_credential_file_no_symlink(
         &src,
         "Codex credentials not found at ~/.codex/auth.json — log in with `codex login`",
         "~/.codex/auth.json",
     )?;
+    let redactions = codex_recording_redactions(&bytes, "~/.codex/auth.json")?;
+    register_diagnostic_redactions(redactions.clone());
     let dst = test_home.join(".codex");
     std::fs::create_dir_all(&dst)?;
     write_credential_file_atomic_0o600(&dst.join("auth.json"), &bytes)?;
@@ -4346,7 +5683,34 @@ pub fn import_codex_credentials(test_home: &Path) -> std::io::Result<()> {
     // `last_checked_at` timestamp and whatever version the developer happens to
     // be on, neither of which a test wants to inherit.
     let _ = std::fs::write(dst.join("version.json"), codex_update_notice_dismissal());
-    Ok(())
+    Ok(redactions)
+}
+
+/// The credential values inside a Codex `auth.json` that a recording must
+/// redact. Same policy and same helper as [`opencode_recording_redactions`] —
+/// `OPENAI_API_KEY` matches on its key name, the OAuth `id_token` /
+/// `access_token` / `refresh_token` members match on theirs, and the 16-byte
+/// floor sweeps up anything token-shaped a future codex release adds under a
+/// name this list does not know.
+fn codex_recording_redactions(
+    bytes: &[u8],
+    redacted_display: &str,
+) -> std::io::Result<Vec<String>> {
+    let auth: serde_json::Value = serde_json::from_slice(bytes).map_err(|error| {
+        std::io::Error::other(format!(
+            "refusing to import {redacted_display}: auth file is not valid JSON: {error}"
+        ))
+    })?;
+    let mut values = Vec::new();
+    collect_credential_values(
+        &auth,
+        None,
+        CredentialScope::AuthDocument,
+        false,
+        &mut values,
+    );
+    normalise_redactions(&mut values);
+    Ok(values)
 }
 
 /// The `version.json` body that suppresses codex-cli's update notice in an
@@ -10127,10 +11491,11 @@ mod harness_unit_tests {
     /// Scenario: Register an API key for recording redaction and then render
     /// both the key and the 20-character suffix Claude Code's approval prompt
     /// paints on the terminal into a grid. Neither survives into the artifact.
-    /// The suffix half is the one that matters: GitHub masks a registered
-    /// secret's exact value in a rendered log, never a derivative of it, and the
-    /// prompt renders exactly this derivative whenever the approval seeding is
-    /// missing or wrong.
+    /// The suffix half is the one that matters: a derivative is what no
+    /// masking layer covers even where one exists, these artifacts are local
+    /// files with no such layer downstream at all, and the prompt renders
+    /// exactly this derivative whenever the approval seeding is missing or
+    /// wrong.
     #[test]
     fn the_api_key_and_its_rendered_suffix_are_both_redacted_from_recordings() {
         let key = "sk-ant-api03-not-a-real-key-DEADBEEFCAFEBABE0123";
@@ -10156,26 +11521,1568 @@ mod harness_unit_tests {
         );
     }
 
-    /// Scenario: Seed Claude Code's API-key approval into a config on a host
-    /// whose OAuth credential set is UNUSABLE — a CI runner. The key is
-    /// approved, and a `rejected` entry inherited from the host config is
-    /// dropped, because the host copy is taken wholesale and a developer who
-    /// once answered "No" to this key would otherwise export that refusal to a
-    /// runner where the key is the only way in.
+    // -----------------------------------------------------------------------
+    // PR #805 audit blocker 2 — the imported CLAUDE documents are registered
+    // -----------------------------------------------------------------------
+
+    /// A FABRICATED Claude Code OAuth credential document, of the real
+    /// `claudeAiOauth` shape. Never a real credential: every token body is
+    /// deterministic pseudo-random filler carrying `FAKE`, generated so that no
+    /// eight-character window of it occurs twice, which is what lets
+    /// [`assert_no_fragment_survives`] treat any surviving window as evidence
+    /// rather than as a coincidence.
+    ///
+    /// The tokens are 128 characters on purpose. At a four-space indent the
+    /// value starts at column 21 of a 120-column grid, so a 128-character token
+    /// breaks 100 / 28 — the wrapped shape blocker A was about, reached here
+    /// through a `cat` of the imported file rather than through an env dump.
+    const FABRICATED_CLAUDE_CREDENTIALS: &str = concat!(
+        "{\n",
+        "  \"claudeAiOauth\": {\n",
+        "    \"accessToken\": \"sk-ant-oat01-FAKE-C3J27XDCG2LmlZGEONYlgCtjfIZ4SOcMz9CPVNPkNa1Hedcm4pMbXDuCL1mHoOsFaQfDPrAJ71fTquWoGsbeKXgzg2sye9b2Rann76dEyTzAeK\",\n",
+        "    \"refreshToken\": \"sk-ant-ort01-FAKE-96ipbNClShVP4wY4for9duMl7JRU7BT4dK4bLqtAml2hLH8UX98KdSuNvql9zt5X399PGjr0rQSlBdvI5cA7qGsH4AzQ76ltKxzLbtKMJIHBWR\",\n",
+        "    \"expiresAt\": 1799999999000,\n",
+        "    \"scopes\": [\"user:inference\", \"user:profile\"],\n",
+        "    \"subscriptionType\": \"max\"\n",
+        "  }\n",
+        "}\n",
+    );
+
+    /// The `accessToken` of [`FABRICATED_CLAUDE_CREDENTIALS`], as a value the
+    /// assertions can name.
+    const FABRICATED_CLAUDE_ACCESS_TOKEN: &str = "sk-ant-oat01-FAKE-C3J27XDCG2LmlZGEONYlgCtjfIZ4SOcMz9CPVNPkNa1Hedcm4pMbXDuCL1mHoOsFaQfDPrAJ71fTquWoGsbeKXgzg2sye9b2Rann76dEyTzAeK";
+
+    /// Its `refreshToken`.
+    const FABRICATED_CLAUDE_REFRESH_TOKEN: &str = "sk-ant-ort01-FAKE-96ipbNClShVP4wY4for9duMl7JRU7BT4dK4bLqtAml2hLH8UX98KdSuNvql9zt5X399PGjr0rQSlBdvI5cA7qGsH4AzQ76ltKxzLbtKMJIHBWR";
+
+    /// A FABRICATED hook-stripped `settings.json`, the second document the
+    /// Claude import copies into the isolated HOME. The M4.6 review already
+    /// noted that this file "can carry the same tokens / sensitive config that
+    /// motivate the 0o600 mode on credentials.json"; this is that shape, plus the
+    /// long-but-innocuous entries a real one is mostly made of — a
+    /// `permissions.allow` rule and a model id — which the
+    /// [`CredentialScope::ConfigDocument`] width must leave alone.
+    const FABRICATED_CLAUDE_SETTINGS: &str = concat!(
+        "{\n",
+        "  \"apiKeyHelper\": \"/opt/fake-secrets/print-key.sh\",\n",
+        "  \"model\": \"claude-haiku-4-5-20251001\",\n",
+        "  \"permissions\": { \"allow\": [\"Bash(cargo nextest run:*)\"] },\n",
+        "  \"env\": {\n",
+        "    \"ANTHROPIC_AUTH_TOKEN\": \"sk-ant-atk01-FAKE-KkOo01rEP45I6HlP5N8Gu9RHECs8ROetAtHF5dVM3VRB02r7uJWRph3du4sn5eVxhPuXpGruawHQtJ\",\n",
+        "    \"DATABASE_URL\": \"postgres://svc:FAKE-Xy7Qm2Vb9Lr4Ts8Wn3Hd@db.invalid:5432/app\",\n",
+        "    \"NO_COLOR\": \"1\"\n",
+        "  }\n",
+        "}\n",
+    );
+
+    /// The auth token inside [`FABRICATED_CLAUDE_SETTINGS`].
+    const FABRICATED_CLAUDE_SETTINGS_TOKEN: &str = "sk-ant-atk01-FAKE-KkOo01rEP45I6HlP5N8Gu9RHECs8ROetAtHF5dVM3VRB02r7uJWRph3du4sn5eVxhPuXpGruawHQtJ";
+
+    /// A credential-bearing `env` entry under a name the sensitive-key list does
+    /// NOT match — PR #805 audit P1. A `postgres://user:password@host/db` is a
+    /// complete password-bearing credential and `DATABASE_URL` looks like
+    /// ordinary configuration, which is exactly the combination the key-name rule
+    /// used to copy into the isolated HOME unregistered.
+    const FABRICATED_CLAUDE_SETTINGS_DATABASE_URL: &str =
+        "postgres://svc:FAKE-Xy7Qm2Vb9Lr4Ts8Wn3Hd@db.invalid:5432/app";
+
+    /// Scenario: Point `HOME` at a fabricated host home holding a
+    /// `~/.claude/.credentials.json` and a `~/.claude/settings.json`, run the
+    /// REAL `import_claude_credentials` against a fresh isolated HOME, and then:
+    /// assert it returned every credential value in those documents, assert the
+    /// bytes it actually wrote into the isolated HOME still hold them, assert it
+    /// self-registered them process-globally, and finally render the written
+    /// bytes onto a real 120-column vt100 grid the way a `cat` of the imported
+    /// file inside a pane would and push that grid through every sink the harness
+    /// persists or prints — `final-grid.txt`, the SVG rendered from it,
+    /// `full-stream.cast`, and the panic message the diagnostic seam renders. No
+    /// eight-character fragment of any token survives into any of them.
+    ///
+    /// This is PR #805's audit blocker 2 stated as a test. The Claude importer
+    /// was the one of four that registered NOTHING from the documents it copies,
+    /// on the ground that the credential set is "never rendered". That is a
+    /// convention rather than a structural property — an agent command, a
+    /// contributor-authored test, an auth diagnostic or an accidental file dump
+    /// paints it onto the terminal — and it is the route most reel clips take,
+    /// which is the route whose `.cast` the demo reel publishes.
+    ///
+    /// **It drives the importer because the first version of it did not, and the
+    /// second PR #805 audit caught that.** It called `claude_recording_redactions`
+    /// directly, so deleting either importer call site, or the importer's
+    /// `register_diagnostic_redactions`, left it green while claiming to be the
+    /// regression test for exactly those lines — the third vacuous guard in this
+    /// work. Every assertion above the render is now anchored on the importer's
+    /// own return value, the files it wrote, or the global store it registered
+    /// into, and each of those three sites was broken in turn and watched to fail.
     #[test]
-    fn a_key_authorised_run_approves_the_key_and_drops_an_inherited_refusal() {
+    fn a_rendered_imported_claude_credential_document_survives_into_no_sink() {
+        // A fabricated HOST home, so the importer's `host_home()` reads these
+        // documents rather than the developer's. Both API keys are cleared: with
+        // one set, `import_claude_credentials` takes its key-authorises branch
+        // and `install_credential_redaction` seeds the global store with an
+        // ambient value, either of which would make the assertions below depend
+        // on the machine.
+        // SAFETY: single-threaded test body, and nextest gives each test its own
+        // process, so nothing else in this process observes the change.
+        unsafe {
+            std::env::remove_var(ANTHROPIC_API_KEY_ENV);
+            std::env::remove_var("OPENAI_API_KEY");
+        }
+        let source_home = harness_tempdir().expect("fabricated host home");
+        let source_claude = source_home.path().join(".claude");
+        std::fs::create_dir_all(&source_claude).expect("create the fabricated ~/.claude");
+        std::fs::write(
+            source_claude.join(".credentials.json"),
+            FABRICATED_CLAUDE_CREDENTIALS,
+        )
+        .expect("write the fabricated credential document");
+        std::fs::write(
+            source_claude.join("settings.json"),
+            FABRICATED_CLAUDE_SETTINGS,
+        )
+        .expect("write the fabricated settings document");
+        let restore_home = std::env::var_os("HOME");
+        // SAFETY: as above.
+        unsafe { std::env::set_var("HOME", source_home.path()) };
+
+        let test_home = harness_tempdir().expect("isolated test HOME");
+        let imported = import_claude_credentials(test_home.path());
+        // SAFETY: as above. Restored before the assertions so a failure does not
+        // leave the process pointing at the fixture.
+        unsafe {
+            match &restore_home {
+                Some(value) => std::env::set_var("HOME", value),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+        let redactions = imported.expect("the fabricated documents import cleanly");
+
+        // The bytes the importer actually WROTE, which is what an agent reads and
+        // what a `cat` in a pane paints. Read back rather than assumed: the
+        // credential set is copied verbatim while the settings are re-serialised
+        // from the parsed document, so only one of the two is byte-identical to
+        // its source.
+        let written_credentials =
+            std::fs::read_to_string(test_home.path().join(".claude").join(".credentials.json"))
+                .expect("the importer wrote the credential document into the isolated HOME");
+        let written_settings =
+            std::fs::read_to_string(test_home.path().join(".claude").join("settings.json"))
+                .expect("the importer wrote the settings document into the isolated HOME");
+
+        // Non-vacuity of the REGISTRATION, anchored on the importer's own return
+        // value: deleting either `claude_recording_redactions` call in
+        // `import_claude_credentials` fails here. Each value is checked to be in
+        // the isolated HOME too, so "registered" and "present on disk" cannot
+        // drift apart.
+        for (what, value, written) in [
+            (
+                "accessToken",
+                FABRICATED_CLAUDE_ACCESS_TOKEN,
+                &written_credentials,
+            ),
+            (
+                "refreshToken",
+                FABRICATED_CLAUDE_REFRESH_TOKEN,
+                &written_credentials,
+            ),
+            (
+                "settings.json's ANTHROPIC_AUTH_TOKEN",
+                FABRICATED_CLAUDE_SETTINGS_TOKEN,
+                &written_settings,
+            ),
+            (
+                "settings.json's DATABASE_URL",
+                FABRICATED_CLAUDE_SETTINGS_DATABASE_URL,
+                &written_settings,
+            ),
+        ] {
+            assert!(
+                written.contains(value),
+                "{what} is not in the document the importer wrote into the \
+                 isolated HOME, so this fixture proves nothing:\n{written}"
+            );
+            assert!(
+                redactions.iter().any(|r| r == value),
+                "{what} was not returned by import_claude_credentials, so it is \
+                 copied into the isolated HOME unredactable: {redactions:?}"
+            );
+        }
+
+        // Non-vacuity of the SELF-REGISTRATION: `redact_credentials_for_output`
+        // reads the process-global store and nothing else, so this is green only
+        // because the importer called `register_diagnostic_redactions` itself.
+        // Deleting that call fails here. It is the route the tests with no
+        // `TuiDeck` depend on entirely.
+        let globally = redact_credentials_for_output(&format!(
+            "accessToken={FABRICATED_CLAUDE_ACCESS_TOKEN} \
+             refreshToken={FABRICATED_CLAUDE_REFRESH_TOKEN} \
+             ANTHROPIC_AUTH_TOKEN={FABRICATED_CLAUDE_SETTINGS_TOKEN} \
+             DATABASE_URL={FABRICATED_CLAUDE_SETTINGS_DATABASE_URL}"
+        ));
+        for (what, value) in [
+            ("accessToken", FABRICATED_CLAUDE_ACCESS_TOKEN),
+            ("refreshToken", FABRICATED_CLAUDE_REFRESH_TOKEN),
+            (
+                "settings.json's ANTHROPIC_AUTH_TOKEN",
+                FABRICATED_CLAUDE_SETTINGS_TOKEN,
+            ),
+            (
+                "settings.json's DATABASE_URL",
+                FABRICATED_CLAUDE_SETTINGS_DATABASE_URL,
+            ),
+        ] {
+            assert!(
+                !globally.contains(value),
+                "{what} was not self-registered by the importer, so every route \
+                 with no `TuiDeck` renders it raw: {globally}"
+            );
+        }
+
+        // And the configuration document's long NON-secrets are left alone, or
+        // a developer's `permissions.allow` rules and model id disappear out of
+        // every grid they read and each one costs a scan pass over every
+        // artifact. This is what `CredentialScope::ConfigDocument` buys. `1` is
+        // the `env` floor's half of the same trade: registering a two-byte
+        // environment value would replace those bytes everywhere they occur.
+        for innocuous in [
+            "Bash(cargo nextest run:*)",
+            "claude-haiku-4-5-20251001",
+            "1",
+        ] {
+            assert!(
+                !redactions.iter().any(|r| r == innocuous),
+                "`{innocuous}` is not a credential and must not be registered \
+                 from a CONFIGURATION document: {redactions:?}"
+            );
+        }
+
+        // Both written documents painted into one grid, row by row the way
+        // ratatui paints, so a value too long for the width breaks across rows
+        // exactly as it does in a real pane.
+        let dump = format!(
+            "$ cat ~/.claude/.credentials.json\n{written_credentials}\n\
+             $ cat ~/.claude/settings.json\n{written_settings}\n"
+        );
+        let rows: Vec<String> = dump
+            .lines()
+            .flat_map(|line| wrap_to_width(line, GRID_COLS as usize))
+            .collect();
+        let grid = render_like_ratatui(GRID_COLS, &rows);
+
+        // Non-vacuity of the SHAPE: the tokens really are split across rows, so
+        // a byte-exact matcher would not have caught them and this exercises the
+        // wrapped path rather than the contiguous one.
+        for (what, value) in [
+            ("accessToken", FABRICATED_CLAUDE_ACCESS_TOKEN),
+            ("refreshToken", FABRICATED_CLAUDE_REFRESH_TOKEN),
+            (
+                "settings.json's ANTHROPIC_AUTH_TOKEN",
+                FABRICATED_CLAUDE_SETTINGS_TOKEN,
+            ),
+        ] {
+            assert!(
+                !grid.contains(value),
+                "{what} is contiguous in the raw grid, so this test is not \
+                 reproducing the wrapped shape:\n{grid}"
+            );
+        }
+
+        // Sink 1 and 2 — `final-grid.txt` and the SVG rendered from it.
+        let redacted = redact_known_credentials_text(&grid, &redactions);
+        let svg = render_grid_to_svg(&redacted, GRID_COLS, u16::try_from(rows.len()).unwrap());
+        for (what, value) in [
+            ("accessToken", FABRICATED_CLAUDE_ACCESS_TOKEN),
+            ("refreshToken", FABRICATED_CLAUDE_REFRESH_TOKEN),
+            (
+                "settings.json's ANTHROPIC_AUTH_TOKEN",
+                FABRICATED_CLAUDE_SETTINGS_TOKEN,
+            ),
+            (
+                "settings.json's DATABASE_URL",
+                FABRICATED_CLAUDE_SETTINGS_DATABASE_URL,
+            ),
+        ] {
+            assert_no_fragment_survives(&redacted, value, &format!("final-grid.txt / {what}"));
+            assert_no_fragment_survives(&svg, value, &format!("final-grid.svg / {what}"));
+        }
+        assert!(redacted.contains("[REDACTED-CREDENTIAL]"));
+        assert!(
+            redacted.contains("\"claudeAiOauth\"") && redacted.contains("\"apiKeyHelper\""),
+            "redaction ate the surrounding render, so the artifact is no longer \
+             diagnostic:\n{redacted}"
+        );
+
+        // Sink 3 — `full-stream.cast`, one layer below the grid, where the row
+        // change is the deck's own cursor-position escape rather than a newline.
+        let events = vec![
+            CastEvent {
+                offset_secs: 0.1,
+                data: format!(
+                    "\x1b[1;1H    \"accessToken\": \"{}",
+                    &FABRICATED_CLAUDE_ACCESS_TOKEN[..100]
+                )
+                .into_bytes(),
+            },
+            CastEvent {
+                offset_secs: 0.2,
+                data: format!(
+                    "\x1b[2;1H{}\",\x1b[K",
+                    &FABRICATED_CLAUDE_ACCESS_TOKEN[100..]
+                )
+                .into_bytes(),
+            },
+        ];
+        let joined: Vec<u8> = redact_cast_events(&events, &redactions)
+            .into_iter()
+            .flatten()
+            .collect();
+        let cast = String::from_utf8_lossy(&joined).into_owned();
+        assert_no_fragment_survives(&cast, FABRICATED_CLAUDE_ACCESS_TOKEN, "full-stream.cast");
+        assert!(
+            cast.contains("\x1b[2;1H"),
+            "the escape that separates the rows must survive, or the cast stops \
+             replaying:\n{cast:?}"
+        );
+
+        // Sink 4 — the diagnostic seam, which is what carries a grid into
+        // nextest's captured output, the raw JUnit report and whatever a
+        // developer pastes. Nothing registers anything here: the store already
+        // holds these values because `import_claude_credentials` registered them
+        // itself, which the global-store assertion above proves.
+        let panic_text = format_redacted_panic(
+            "deck",
+            "tests/common/mod.rs:1:1",
+            &format!("did not see \"ready\" within 30s.\nFinal grid:\n{grid}"),
+        );
+        for (what, value) in [
+            ("accessToken", FABRICATED_CLAUDE_ACCESS_TOKEN),
+            ("refreshToken", FABRICATED_CLAUDE_REFRESH_TOKEN),
+            (
+                "settings.json's ANTHROPIC_AUTH_TOKEN",
+                FABRICATED_CLAUDE_SETTINGS_TOKEN,
+            ),
+            (
+                "settings.json's DATABASE_URL",
+                FABRICATED_CLAUDE_SETTINGS_DATABASE_URL,
+            ),
+        ] {
+            assert_no_fragment_survives(&panic_text, value, &format!("the panic seam / {what}"));
+        }
+        assert!(
+            panic_text.contains("did not see \"ready\" within 30s."),
+            "the panic kept none of its diagnostic shape:\n{panic_text}"
+        );
+    }
+
+    /// Scenario: Hand the Claude redaction collector a document that is not
+    /// valid JSON. It refuses the import by name rather than returning "no
+    /// redactions", the same stance `codex_recording_redactions` and
+    /// `opencode_recording_redactions` take.
+    ///
+    /// A credential file we cannot read is a credential file we cannot redact,
+    /// and that is precisely the sink. The only branch that reaches this is the
+    /// deliberate "copy what we have and let it fail loudly" fallback, and a run
+    /// there has no usable credential from any source — so failing at the import
+    /// names the cause instead of dying in a PTY wait.
+    #[test]
+    fn an_unparsable_claude_credential_document_is_refused_not_silently_unredacted() {
+        let error = claude_recording_redactions(
+            b"NOT-A-JSON-DOCUMENT",
+            "~/.claude/.credentials.json",
+            CredentialScope::AuthDocument,
+        )
+        .expect_err("an unparsable credential document must be refused");
+        let message = error.to_string();
+        assert!(
+            message.contains("~/.claude/.credentials.json")
+                && message.contains("cannot be registered for redaction"),
+            "the refusal must name the file and the reason: {message}"
+        );
+        assert!(
+            !message.contains("NOT-A-JSON-DOCUMENT"),
+            "the refusal must not quote the document body back: {message}"
+        );
+    }
+
+    /// Scenario: Hand the credential collector a `settings.json` whose `env` map
+    /// carries credentials under ordinary variable names — a `DATABASE_URL` with
+    /// user-info, an authenticated `HTTP_PROXY`, a `COOKIE`, a `PAT` — plus the
+    /// short settings a real one is full of. Every credential-length value under
+    /// `env` is registered whatever it is called, the two-byte ones are not, and
+    /// a long string OUTSIDE `env` under a non-sensitive name still is not.
+    ///
+    /// PR #805 audit P1. The recursion keeps only the innermost key, so an `env`
+    /// entry used to be judged purely on what the developer named it:
+    /// `ANTHROPIC_AUTH_TOKEN` matched the sensitive-name list and everything else
+    /// was copied into the isolated HOME unregistered. A
+    /// `postgres://user:password@host/db` is a complete credential.
+    #[test]
+    fn a_credential_under_an_ordinary_env_variable_name_is_registered() {
+        let settings = serde_json::json!({
+            "model": "claude-haiku-4-5-20251001",
+            "permissions": { "allow": ["Bash(cargo nextest run:*)"] },
+            "statusLine": { "command": "printf '%s' \"$PWD\" | sed 's|/home/dev||'" },
+            "env": {
+                "DATABASE_URL": "postgres://svc:FAKE-Xy7Qm2Vb9Lr4@db.invalid:5432/app",
+                "HTTP_PROXY": "http://dev:FAKE-Pw9Kt3Zc7Qm@proxy.invalid:3128",
+                "NPM_CONFIG__AUTH": "FAKE-bnBtLXRva2VuLXZhbHVlLWhlcmU=",
+                "COOKIE": "session=FAKE-9d41c0b2e7f84a1c6b3d",
+                "PAT": "FAKE-ghp-4KqR7wZ2mN8xT1vB6yH3jL5s",
+                "NO_COLOR": "1",
+                "TERM": "xterm",
+            },
+        });
+        let mut values = Vec::new();
+        collect_credential_values(
+            &settings,
+            None,
+            CredentialScope::ConfigDocument,
+            false,
+            &mut values,
+        );
+
+        for (what, value) in [
+            (
+                "DATABASE_URL",
+                "postgres://svc:FAKE-Xy7Qm2Vb9Lr4@db.invalid:5432/app",
+            ),
+            (
+                "HTTP_PROXY",
+                "http://dev:FAKE-Pw9Kt3Zc7Qm@proxy.invalid:3128",
+            ),
+            ("NPM_CONFIG__AUTH", "FAKE-bnBtLXRva2VuLXZhbHVlLWhlcmU="),
+            ("COOKIE", "session=FAKE-9d41c0b2e7f84a1c6b3d"),
+            ("PAT", "FAKE-ghp-4KqR7wZ2mN8xT1vB6yH3jL5s"),
+        ] {
+            assert!(
+                values.iter().any(|v| v == value),
+                "an `env` entry named {what} holds a credential and was not \
+                 registered, so it is copied into the isolated HOME and rendered \
+                 raw: {values:?}"
+            );
+        }
+
+        // The floor, which is what keeps this from wrecking every artifact: a
+        // registered two-byte value would replace those bytes wherever they
+        // occur.
+        for short in ["1", "xterm"] {
+            assert!(
+                !values.iter().any(|v| v == short),
+                "`{short}` is a setting, not a credential, and registering it \
+                 would gouge those bytes out of every artifact: {values:?}"
+            );
+        }
+
+        // And OUTSIDE `env` the sensitive-key rule still governs, or a real
+        // settings.json's long non-secrets disappear out of every grid.
+        for innocuous in [
+            "claude-haiku-4-5-20251001",
+            "Bash(cargo nextest run:*)",
+            "printf '%s' \"$PWD\" | sed 's|/home/dev||'",
+        ] {
+            assert!(
+                !values.iter().any(|v| v == innocuous),
+                "`{innocuous}` is not under `env` and not under a sensitive key, \
+                 so a CONFIGURATION document must leave it alone: {values:?}"
+            );
+        }
+    }
+
+    /// Scenario: Point `HOME` at a fabricated host home whose `~/.claude.json`
+    /// carries an `oauthAccount`, run the real `seed_claude_project_trust`
+    /// against a fresh isolated HOME, and check the three things that matter: the
+    /// identity fields it copied come back for the recordings to redact, they are
+    /// registered process-globally for the diagnostics, and the descriptive
+    /// neighbours (`organizationRole`, `seatTier`) and a too-short display name
+    /// are left alone.
+    ///
+    /// PR #805 audit P2. The classification stands — a uuid, an email and an
+    /// organisation name identify rather than authenticate — but this file is
+    /// copied into every real-agent test's HOME, an interactive `claude` paints
+    /// the account line into the pane, and that pane is what the demo reel
+    /// publishes. Three field names is cheaper than accepting that.
+    #[test]
+    fn the_seeded_claude_json_registers_its_account_identity_fields() {
+        // SAFETY: single-threaded test body in its own nextest process.
+        unsafe {
+            std::env::remove_var(ANTHROPIC_API_KEY_ENV);
+            std::env::remove_var("OPENAI_API_KEY");
+        }
+        let uuid = "6f1c9e02-FAKE-4b77-9d31-2a8e5c40b913";
+        let email = "fabricated.developer@example.invalid";
+        let organisation = "Fabricated Example Organisation";
+        let source_home = harness_tempdir().expect("fabricated host home");
+        std::fs::write(
+            source_home.path().join(".claude.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "hasCompletedOnboarding": true,
+                "oauthAccount": {
+                    "accountUuid": uuid,
+                    "emailAddress": email,
+                    "organizationName": organisation,
+                    "organizationRole": "admin",
+                    "seatTier": "max",
+                    "displayName": "Ab",
+                },
+            }))
+            .expect("serialize the fabricated ~/.claude.json"),
+        )
+        .expect("write the fabricated ~/.claude.json");
+        let restore_home = std::env::var_os("HOME");
+        // SAFETY: as above.
+        unsafe { std::env::set_var("HOME", source_home.path()) };
+
+        let test_home = harness_tempdir().expect("isolated test HOME");
+        let seeded = seed_claude_project_trust(
+            test_home.path(),
+            &[test_home.path().to_string_lossy().into_owned()],
+        );
+        // SAFETY: as above.
+        unsafe {
+            match &restore_home {
+                Some(value) => std::env::set_var("HOME", value),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+        let identity = seeded.expect("the fabricated ~/.claude.json seeds cleanly");
+
+        let written = std::fs::read_to_string(test_home.path().join(".claude.json"))
+            .expect("the seeding wrote a ~/.claude.json into the isolated HOME");
+        for (what, value) in [
+            ("accountUuid", uuid),
+            ("emailAddress", email),
+            ("organizationName", organisation),
+        ] {
+            assert!(
+                written.contains(value),
+                "{what} is not in the document the seeding wrote, so this fixture \
+                 proves nothing:\n{written}"
+            );
+            assert!(
+                identity.iter().any(|v| v == value),
+                "{what} was not returned for redaction, so it reaches the cast \
+                 the demo reel publishes: {identity:?}"
+            );
+        }
+
+        // Self-registration, for the routes with no `TuiDeck` and for a caller
+        // that seeds AFTER the launch (`seed_claude_trust_in_home`).
+        let globally =
+            redact_credentials_for_output(&format!("account {uuid} <{email}> at {organisation}"));
+        for (what, value) in [
+            ("accountUuid", uuid),
+            ("emailAddress", email),
+            ("organizationName", organisation),
+        ] {
+            assert!(
+                !globally.contains(value),
+                "{what} was not registered process-globally: {globally}"
+            );
+        }
+
+        // Descriptive neighbours are not identity, and registering one would
+        // replace `admin` or `max` wherever they occurred. `Ab` is the floor:
+        // below eight bytes a value cannot be told apart from ordinary rendered
+        // text, which is what `MIN_WRAP_FRAGMENT` means everywhere else here.
+        for left_alone in ["admin", "max", "Ab"] {
+            assert!(
+                !identity.iter().any(|v| v == left_alone),
+                "`{left_alone}` must not be registered — it is not identity, or \
+                 it is too short to tell apart from rendered text: {identity:?}"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #502/#785 blocker A — a credential the TERMINAL WRAPPED
+    // -----------------------------------------------------------------------
+
+    /// A fake Anthropic key of the REAL length — 108 characters — because the
+    /// length is the whole point: it is what makes the value wrap at 120
+    /// columns, and a shorter stand-in would render on one row and prove
+    /// nothing.
+    ///
+    /// The body is deterministic pseudo-random rather than a repeated
+    /// character so that no eight-character window of it occurs twice, which is
+    /// what lets [`assert_no_fragment_survives`] treat any surviving window as
+    /// evidence rather than as a coincidence. Never a real key.
+    const WRAPPING_FAKE_KEY: &str = "sk-ant-api03-FAKE-at88unjrP0OqBDXjbB87XI4kBCwkHjpvXQJBVsvFVWYuS6kfhXAxGYQJntl73YD1xRekgbsGPDiVfdPg7RMSHYKnu8";
+
+    /// The width the harness renders at, and the width the arithmetic in
+    /// `credential_redaction_ranges`' comment is stated for.
+    const GRID_COLS: u16 = 120;
+
+    /// Paint `rows` into a REAL vt100 screen the way ratatui paints — one
+    /// explicit cursor move per row, never relying on the terminal's own
+    /// auto-wrap — and return exactly what [`TuiDeck::snapshot_grid`] returns.
+    ///
+    /// That distinction is load-bearing, not pedantry. `vt100` suppresses the
+    /// row separator for a row the TERMINAL wrapped itself, so a test that
+    /// wrote a long line and let the terminal wrap it would get the value back
+    /// CONTIGUOUS from `contents()`, pass against the byte-exact matcher, and
+    /// prove nothing at all. ratatui positions the cursor per row, so the deck's
+    /// grid always takes the separator path — measured both ways before this
+    /// test was written.
+    fn render_like_ratatui(cols: u16, rows: &[String]) -> String {
+        let height = u16::try_from(rows.len().max(1)).expect("test grid height");
+        let mut parser = vt100::Parser::new(height, cols, 0);
+        for (index, row) in rows.iter().enumerate() {
+            parser.process(format!("\x1b[{};1H{row}", index + 1).as_bytes());
+        }
+        parser.screen().contents()
+    }
+
+    /// Split `text` into rows of at most `width` CHARACTERS, the way a terminal
+    /// breaks a line that does not fit.
+    fn wrap_to_width(text: &str, width: usize) -> Vec<String> {
+        text.chars()
+            .collect::<Vec<char>>()
+            .chunks(width)
+            .map(|chunk| chunk.iter().collect())
+            .collect()
+    }
+
+    /// Every [`MIN_WRAP_FRAGMENT`]-character window of `secret` must be gone
+    /// from `text`.
+    ///
+    /// Stronger than `!text.contains(secret)` on purpose: the failure this
+    /// guards is precisely that the value survives in PIECES, so asserting on
+    /// the whole value is the assertion that already passed vacuously while the
+    /// credential sat on screen in two rows. The window is the matcher's own
+    /// minimum fragment, so anything at least this long is something the
+    /// matcher was supposed to have caught.
+    fn assert_no_fragment_survives(text: &str, secret: &str, what: &str) {
+        for window in secret.as_bytes().windows(MIN_WRAP_FRAGMENT) {
+            let fragment = std::str::from_utf8(window).expect("the fixtures are ASCII");
+            assert!(
+                !text.contains(fragment),
+                "{what}: a fragment of {MIN_WRAP_FRAGMENT} credential characters survived \
+                 redaction, so the wrapped value is still reconstructable from this text:\n{text}"
+            );
+        }
+    }
+
+    /// Scenario: Render `ANTHROPIC_API_KEY=<108-character key>` into a real
+    /// 120-column vt100 screen painted row by row, the way the deck paints, so
+    /// the key breaks 102 / 6 and its 20-character response id breaks 14 / 6.
+    /// Confirm the raw grid really is split that way — neither registered
+    /// pattern occurs in it — and then confirm that no eight-character piece of
+    /// the key survives redaction into `final-grid.txt`, into the SVG rendered
+    /// from it, or into a panic message.
+    ///
+    /// This is issue #785 blocker A stated as a test. The whole credential was
+    /// reconstructable out of a panic grid while both registered patterns
+    /// matched nothing, and a panic grid goes two places: nextest's live console
+    /// output, which lands in the developer's own terminal scrollback, and the
+    /// raw JUnit report, which is a file on that same machine. Since #502 lane 2
+    /// runs on no runner, so neither passes through a masking layer, and the
+    /// masking that does exist where logs are rendered covers a registered
+    /// secret's exact value rather than reassembling line-wrapped fragments of
+    /// it.
+    #[test]
+    fn a_credential_wrapped_across_grid_rows_is_redacted_from_every_sink() {
+        let key = WRAPPING_FAKE_KEY;
+        assert_eq!(key.chars().count(), 108, "the fixture must be key-length");
+        let id = claude_api_key_response_id(key);
+        let redactions = api_key_recording_redactions(key);
+
+        let rows = wrap_to_width(&format!("ANTHROPIC_API_KEY={key}"), GRID_COLS as usize);
+        let grid = render_like_ratatui(GRID_COLS, &rows);
+
+        // Non-vacuity, and the arithmetic itself: 120 columns less an
+        // 18-character label leaves 102 of the key on the first row and 6 on
+        // the second, which splits the response id 14 / 6.
+        assert_eq!(rows.len(), 2, "the fixture must occupy exactly two rows");
+        assert!(
+            grid.contains(&key[..102]) && grid.contains(&key[102..]),
+            "the render did not break the key 102 / 6, so this test is not \
+             reproducing the reported shape:\n{grid}"
+        );
+        assert!(
+            !grid.contains(key) && !grid.contains(&id),
+            "the raw grid still carries a contiguous credential, so byte-exact \
+             matching would already have caught it and this proves nothing:\n{grid}"
+        );
+
+        // The recording sink — `final-grid.txt` and the SVG rendered from it.
+        let redacted = redact_known_credentials_text(&grid, &redactions);
+        assert_no_fragment_survives(&redacted, key, "final-grid.txt");
+        assert!(redacted.contains("[REDACTED-CREDENTIAL]"));
+        let svg = render_grid_to_svg(&redacted, GRID_COLS, u16::try_from(rows.len()).unwrap());
+        assert_no_fragment_survives(&svg, key, "final-grid.svg");
+
+        // The diagnostic sink — the panic message the seam renders.
+        register_diagnostic_redactions(redactions.clone());
+        let panic_text = format_redacted_panic(
+            "deck",
+            "tests/common/mod.rs:1:1",
+            &format!("did not see \"ready\" within 30s.\nFinal grid:\n{grid}"),
+        );
+        assert_no_fragment_survives(&panic_text, key, "the panic seam");
+        assert!(
+            panic_text.contains("did not see \"ready\" within 30s."),
+            "the panic kept none of its diagnostic shape:\n{panic_text}"
+        );
+    }
+
+    /// Scenario: The same 108-character key, but rendered the way the deck
+    /// actually renders — a sidebar column, a pane border, the value wrapped
+    /// inside the pane — so the bytes between two fragments of the credential
+    /// are somebody else's rendered content rather than a bare newline. It is
+    /// still redacted.
+    ///
+    /// This is why the matcher bridges ARBITRARY bytes after a row transition
+    /// instead of a whitelist of frame characters. A whitelist would cover a
+    /// full-width dump and quietly miss the layout the deck spends most of its
+    /// time in, which is the one a panicking test screenshots.
+    #[test]
+    fn a_credential_wrapped_inside_a_bordered_pane_is_redacted_too() {
+        let key = WRAPPING_FAKE_KEY;
+        let redactions = api_key_recording_redactions(key);
+
+        // 8-column sidebar + border + 110-column pane + border = 120.
+        const INNER: usize = 110;
+        let sidebar = ["worker-1", "worker-2", "orch    "];
+        let pane = wrap_to_width(&format!("ANTHROPIC_API_KEY={key}"), INNER);
+        assert_eq!(pane.len(), 2, "the value must wrap inside the pane");
+        let rows: Vec<String> = pane
+            .iter()
+            .enumerate()
+            .map(|(index, content)| {
+                format!("{:<8}\u{2502}{content:<INNER$}\u{2502}", sidebar[index])
+            })
+            .collect();
+        let grid = render_like_ratatui(GRID_COLS, &rows);
+
+        assert!(
+            !grid.contains(key),
+            "the raw grid still carries the key contiguously:\n{grid}"
+        );
+        assert!(
+            grid.lines()
+                .nth(1)
+                .is_some_and(|row| row.starts_with("worker-2")),
+            "the second row must OPEN with the sidebar, so the bytes between the \
+             two fragments of the credential are somebody else's rendered content \
+             rather than padding — otherwise this test is not about the gap it \
+             claims to be about:\n{grid}"
+        );
+
+        let redacted = redact_known_credentials_text(&grid, &redactions);
+        assert_no_fragment_survives(&redacted, key, "a bordered pane's grid");
+        assert!(redacted.contains("[REDACTED-CREDENTIAL]"));
+        // The layout survives: the redaction replaces the credential runs and
+        // leaves the border, the sidebar and the row separator in place.
+        assert!(
+            redacted.contains("worker-1") && redacted.contains("worker-2"),
+            "redaction ate the surrounding render:\n{redacted}"
+        );
+    }
+
+    /// Scenario: A value split across two `.cast` events by the deck's own
+    /// cursor-position escape — the same wrap, one layer below the grid — is
+    /// redacted out of `full-stream.cast`.
+    ///
+    /// `redact_cast_events` already concatenated the stream before matching, so
+    /// a value split across two PTY READS was covered. A value the deck itself
+    /// painted onto two rows was not: what sits between the fragments there is
+    /// an escape sequence, which is why [`is_row_transition`] counts `0x1b`.
+    #[test]
+    fn a_credential_painted_onto_two_cast_rows_is_redacted() {
+        let key = WRAPPING_FAKE_KEY;
+        let events = vec![
+            CastEvent {
+                offset_secs: 0.1,
+                data: format!("\x1b[1;1HANTHROPIC_API_KEY={}", &key[..102]).into_bytes(),
+            },
+            CastEvent {
+                offset_secs: 0.2,
+                data: format!("\x1b[2;1H{} \x1b[K", &key[102..]).into_bytes(),
+            },
+        ];
+        let joined: Vec<u8> = redact_cast_events(&events, &api_key_recording_redactions(key))
+            .into_iter()
+            .flatten()
+            .collect();
+        let text = String::from_utf8_lossy(&joined).into_owned();
+        assert_no_fragment_survives(&text, key, "full-stream.cast");
+        assert!(text.contains("[REDACTED-CREDENTIAL]"));
+        assert!(
+            text.contains("\x1b[2;1H"),
+            "the escape that separates the rows must survive, or the cast stops \
+             replaying:\n{text:?}"
+        );
+    }
+
+    /// Scenario: Ask the matcher to bridge a gap it must NOT bridge. Two
+    /// unrelated four-character runs that happen to concatenate into a
+    /// registered value are left alone, because every hop has to reproduce at
+    /// least [`MIN_WRAP_FRAGMENT`] bytes.
+    ///
+    /// The bound is what stops "match, skip, match again" from degenerating
+    /// into a subsequence search, and a subsequence search over a terminal grid
+    /// would redact arbitrary unrelated text.
+    #[test]
+    fn gap_bridging_does_not_degenerate_into_a_subsequence_search() {
+        let credential = "abcdefghijklmnop".to_string();
+        let registered = std::slice::from_ref(&credential);
+        // Every fragment here is four bytes, half the minimum.
+        let text = "abcd|xxxx\nefgh|xxxx\nijkl|xxxx\nmnop";
+        assert_eq!(
+            redact_known_credentials_text(text, registered),
+            text,
+            "four-byte fragments were chained into a match"
+        );
+        // The same value split at the minimum IS matched, so the bound is a
+        // threshold rather than a refusal to bridge at all.
+        let wrapped = "abcdefgh|pane\nijklmnop";
+        let redacted = redact_known_credentials_text(wrapped, registered);
+        assert!(
+            !redacted.contains("abcdefgh") && !redacted.contains("ijklmnop"),
+            "{redacted}"
+        );
+        assert!(
+            redacted.contains("|pane\n"),
+            "the bytes between the fragments must be preserved: {redacted}"
+        );
+    }
+
+    /// Scenario: The 108-character key wrapped 102 / 6 the way the deck paints
+    /// it, with its OWN registered 20-character response id painted on the next
+    /// row AHEAD of the key's six-character continuation. Then the same
+    /// interleaving inside a bordered pane, where the width breaks the key
+    /// 92 / 16 so the continuation is long enough to be evidence on its own.
+    /// Neither registered value may survive either grid.
+    ///
+    /// This is the hole the first version of this matcher left. The two values
+    /// are ALWAYS registered together (`api_key_recording_redactions`), and the
+    /// response id is a suffix of the key — so the run that resumes the key on
+    /// the next row also occurs inside the response id, a few characters
+    /// earlier. The matcher chained through that earlier occurrence, then
+    /// advanced past the whole match, and the bytes it had preserved in between
+    /// — which held the rest of the response id — were never scanned again. The
+    /// derivative stayed reconstructable while every contiguous assertion
+    /// passed.
+    ///
+    /// The 92 / 16 half is the one that needs the alternate candidates: there
+    /// the run the chain consumed inside the response id is sixteen characters,
+    /// so the REAL continuation left behind is sixteen characters of key
+    /// material, well over [`MIN_WRAP_FRAGMENT`].
+    #[test]
+    fn two_registered_values_interleaved_across_rows_are_both_redacted() {
+        let key = WRAPPING_FAKE_KEY;
+        let redactions = api_key_recording_redactions(key);
+        let id = claude_api_key_response_id(key);
+
+        // The response id is a suffix of the key, which is exactly why the
+        // key's continuation also occurs inside it. Pinned, because if that
+        // ever stopped holding this test would still pass and prove nothing.
+        assert!(key.ends_with(&id) && id.chars().count() == 20);
+
+        for (label, label_width, continuation_at) in [
+            ("a full-width grid", GRID_COLS as usize, 102usize),
+            ("a bordered pane", 110, 92),
+        ] {
+            let head = &key[..continuation_at];
+            let tail = &key[continuation_at..];
+            let rows = wrap_to_width(&format!("ANTHROPIC_API_KEY={key}"), label_width);
+            assert_eq!(rows.len(), 2, "{label}: the fixture must occupy two rows");
+            assert_eq!(rows[1], tail, "{label}: the break is not where claimed");
+
+            // Row two carries the approval prompt's response id first and the
+            // wrapped value's continuation second, separated by a pane border —
+            // the interleaving the matcher has to survive.
+            let grid = render_like_ratatui(
+                GRID_COLS,
+                &[
+                    rows[0].clone(),
+                    format!("use this key? ...{id} \u{2502}{tail}"),
+                ],
+            );
+
+            // Non-vacuity: the key really is broken, and the response id really
+            // is present whole, so it is a value the matcher is obliged to find
+            // rather than one this test smuggled past it.
+            assert!(
+                !grid.contains(key) && grid.contains(head) && grid.contains(&id),
+                "{label}: the fixture does not carry the reported shape:\n{grid}"
+            );
+
+            let redacted = redact_known_credentials_text(&grid, &redactions);
+            assert_no_fragment_survives(&redacted, key, label);
+            assert_no_fragment_survives(&redacted, &id, label);
+            // And the layout between the fragments is still there — the point
+            // of fragment-aware matching is that a panic stays readable.
+            assert!(
+                redacted.contains("use this key? ") && redacted.contains('\u{2502}'),
+                "{label}: redaction ate the surrounding render:\n{redacted}"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #502 — the credential reaches the agent that needs it
+    // -----------------------------------------------------------------------
+
+    /// Scenario: The Anthropic API key is on the list of variables that cross
+    /// the harness's `env_clear`, so a deck — and the daemon it `setsid`s away
+    /// and the agents that daemon spawns — inherits it.
+    ///
+    /// Pinned rather than reviewed because the failure is silent and in the
+    /// direction that erases coverage: without it, `check_claude_available`'s
+    /// API-key path passes a gate the spawned agent then cannot satisfy, so a
+    /// key-authenticated lane-2 run stalls in a PTY wait instead of saying what
+    /// is missing.
+    #[test]
+    fn the_credential_crosses_the_harness_env_clear() {
+        assert!(
+            INHERIT_PASS.contains(&ANTHROPIC_API_KEY_ENV),
+            "the credential a key-authorised lane-2 run depends on no longer \
+             reaches a deck-spawned agent: {INHERIT_PASS:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #502/#785 audit S1 — the DIAGNOSTIC redaction seam
+    // -----------------------------------------------------------------------
+
+    /// Marker the child half below puts in its panic message so the parent can
+    /// tell "the child panicked where it was supposed to" apart from "the child
+    /// died on the way there".
+    #[cfg(unix)]
+    const PANIC_SEAM_MARKER: &str = "harness-panic-seam-reached";
+    /// Set by the parent on the child it spawns. Without it the child half is a
+    /// no-op, so the test is inert under `--run-ignored all`, under a plain
+    /// `cargo test`, and anywhere else it is selected on its own.
+    #[cfg(unix)]
+    const PANIC_SEAM_CHILD_ENV: &str = "DAD_TEST_PANIC_SEAM_CHILD";
+    /// Deliberately fake, and deliberately the REAL length of an Anthropic key
+    /// so the child below can render both shapes that reach a panic message: the
+    /// approval prompt's contiguous 20-character response id, and the same key
+    /// broken across two 120-column rows. Never a real key: proving the seam
+    /// must not require writing a live credential into any captured output,
+    /// even a passing one.
+    #[cfg(unix)]
+    const PANIC_SEAM_FAKE_KEY: &str = WRAPPING_FAKE_KEY;
+
+    /// Scenario: Formatting a panic message that carries a registered
+    /// credential redacts it, while leaving the rest of the message — the
+    /// thread, the location, the surrounding diagnostic text — intact, because
+    /// a redacted panic still has to be readable enough to debug from.
+    #[test]
+    fn a_panic_message_is_redacted_without_losing_its_diagnostic_shape() {
+        let key = "sk-ant-api03-not-a-real-key-DEADBEEFCAFEBABE0123";
+        let suffix = claude_api_key_response_id(key);
+        register_diagnostic_redactions(api_key_recording_redactions(key));
+
+        let rendered = format_redacted_panic(
+            "deck",
+            "tests/common/mod.rs:1:1",
+            &format!(
+                "did not see \"ready\" within 30s.\nFinal grid:\n  \
+                 ANTHROPIC_API_KEY: sk-ant-...{suffix}\n  Do you want to use this API key?\n"
+            ),
+        );
+        assert!(
+            !rendered.contains(&suffix) && !rendered.contains(key),
+            "a registered credential survived the panic seam: {rendered}"
+        );
+        assert!(rendered.contains("[REDACTED-CREDENTIAL]"), "{rendered}");
+        assert!(rendered.contains("thread 'deck' panicked at tests/common/mod.rs:1:1"));
+        assert!(rendered.contains("did not see \"ready\" within 30s."));
+        assert!(rendered.contains("Do you want to use this API key?"));
+    }
+
+    /// Scenario: The child half of
+    /// [`the_panic_seam_redacts_a_key_this_process_read_from_the_environment`].
+    /// Runs only when the parent marks it, seeds a Claude worker HOME through
+    /// the REAL entry point (`seed_claude_worker_home` — the in-process-daemon
+    /// route that has no `TuiDeck` and so no recording redactions at all),
+    /// renders the approval prompt's key suffix into a grid, and dies at a PTY
+    /// wait the way a real one does.
+    ///
+    /// Nothing here registers a redaction by hand. That is the point: what is
+    /// under test is the WIRING — that a real harness entry point reads the key
+    /// out of the environment and installs the seam before any diagnostic can
+    /// carry it.
+    ///
+    /// UNIX-ONLY, and the reason is the entry point rather than the seam.
+    /// `seed_claude_worker_home` imports the host's Claude credentials, so it
+    /// resolves `host_home()` from `HOME` — which Windows does not set, making
+    /// this a hard panic there before the test reaches what it is testing.
+    /// Measured on `build-windows` for PR #805: 11 binaries failed on `HOME is
+    /// set on the host`. Gating rather than teaching `host_home()` about
+    /// `USERPROFILE`, because the L2 tier is Unix-only in practice (CLAUDE.md
+    /// rule 2, which is where that is recorded — rule 5 does not say it) and
+    /// inventing a Windows credential path to satisfy a
+    /// test would be a fiction. The seam ITSELF is platform-independent and
+    /// stays covered everywhere by
+    /// `a_panic_message_is_redacted_without_losing_its_diagnostic_shape` and by
+    /// the four wrapped-credential tests above, none of which touch `HOME`.
+    #[cfg(unix)]
+    #[test]
+    fn a_rendered_credential_reaches_a_panic_message_only_redacted() {
+        if std::env::var_os(PANIC_SEAM_CHILD_ENV).is_none() {
+            return;
+        }
+        let home = race_safe_tempdir();
+        let work = home.path().join("work");
+        std::fs::create_dir_all(&work).expect("child work dir");
+        seed_claude_worker_home(home.path(), &[work.to_string_lossy().into_owned()])
+            .expect("seed the isolated worker HOME");
+
+        let key = std::env::var(ANTHROPIC_API_KEY_ENV).expect("the parent set a key");
+        // A REAL 120-column vt100 render, painted row by row the way ratatui
+        // paints, carrying both shapes: the approval prompt's contiguous
+        // response id, and an `ANTHROPIC_API_KEY=` line that the width breaks
+        // 102 / 6 (issue #785 blocker A). Neither may reach captured output.
+        let mut rows = vec![
+            "Detected a custom API key in your environment".to_string(),
+            format!(
+                "  ANTHROPIC_API_KEY: sk-ant-...{}",
+                claude_api_key_response_id(&key)
+            ),
+            "  Do you want to use this API key?".to_string(),
+            "   Yes".to_string(),
+            " > No (recommended)".to_string(),
+        ];
+        rows.extend(wrap_to_width(
+            &format!("ANTHROPIC_API_KEY={key}"),
+            GRID_COLS as usize,
+        ));
+        let grid = render_like_ratatui(GRID_COLS, &rows);
+        panic!("did not see \"ready\" within 30s. {PANIC_SEAM_MARKER}\nFinal grid:\n{grid}");
+    }
+
+    /// Scenario: Re-run this binary against the child above with a FAKE
+    /// `ANTHROPIC_API_KEY` in its environment, and read its captured output.
+    /// The rendered key suffix — the exact derivative Claude Code's approval
+    /// prompt paints, and the one GitHub's secret masking does not cover — must
+    /// not appear anywhere in what nextest would capture.
+    ///
+    /// A fresh process is what makes this a test of the wiring rather than of
+    /// the redactor: the environment read, the hook installation and the panic
+    /// all happen in a process that started with nothing registered.
+    ///
+    /// Gated with its child for one further reason beyond the child's own: with
+    /// only the child gated, the `--exact` filter here would match no test on
+    /// Windows and this half would fail on its own non-vacuity assertion,
+    /// reporting "the child never reached its panic" for a child that was never
+    /// compiled.
+    #[cfg(unix)]
+    #[test]
+    fn the_panic_seam_redacts_a_key_this_process_read_from_the_environment() {
+        // This test's OWN assertion messages interpolate the child's captured
+        // output, so install the seam here too. The child cannot carry the real
+        // ambient key (the fake one is forced into its environment below), so
+        // this is belt-and-braces rather than the load-bearing part — but a
+        // diagnostic that renders another process's output is exactly the shape
+        // this seam exists for, and it should not be the one place that opts
+        // out.
+        install_credential_redaction();
+        let exe = std::env::current_exe().expect("current exe");
+        // libtest test names omit the crate segment `module_path!()` carries.
+        let module = module_path!()
+            .split_once("::")
+            .map(|(_, rest)| rest)
+            .unwrap_or_else(|| module_path!());
+        let child_test =
+            format!("{module}::a_rendered_credential_reaches_a_panic_message_only_redacted");
+        let out = std::process::Command::new(&exe)
+            .arg(&child_test)
+            .args(["--exact", "--test-threads=1", "--nocapture"])
+            .env(PANIC_SEAM_CHILD_ENV, "1")
+            .env(ANTHROPIC_API_KEY_ENV, PANIC_SEAM_FAKE_KEY)
+            .env("RUST_BACKTRACE", "0")
+            .output()
+            .expect("re-run this test binary");
+        let captured = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            captured.contains(PANIC_SEAM_MARKER),
+            "the child never reached its panic, so this proves nothing — did \
+             `{child_test}` match no tests, or did the HOME seeding fail?\n{captured}"
+        );
+        assert!(
+            !out.status.success(),
+            "the child was supposed to die on its panic: {}\n{captured}",
+            out.status
+        );
+        let suffix = claude_api_key_response_id(PANIC_SEAM_FAKE_KEY);
+        assert!(
+            !captured.contains(suffix.as_str()),
+            "the approval prompt's key suffix reached captured test output \
+             unredacted — this is the sink the whole seam exists for\n{captured}"
+        );
+        assert!(
+            !captured.contains(PANIC_SEAM_FAKE_KEY),
+            "the key itself reached captured test output\n{captured}"
+        );
+        // Issue #785 blocker A: the child's grid also carries the key BROKEN
+        // 102 / 6 across two 120-column rows, and neither of the two assertions
+        // above can see that — they look for contiguous values. This one is the
+        // one that fails if the wrapped half regresses. nextest writes exactly
+        // these bytes into the raw JUnit report's captured-output element, so
+        // this covers that sink and the run log with one assertion.
+        assert_no_fragment_survives(
+            &captured,
+            PANIC_SEAM_FAKE_KEY,
+            "the child's captured output",
+        );
+        // Non-vacuity, and specifically that the WRAPPED half was exercised:
+        // one marker for the prompt's contiguous response id, and one per row
+        // of the broken key.
+        let markers = captured.matches("[REDACTED-CREDENTIAL]").count();
+        assert!(
+            markers >= 3,
+            "expected at least three redactions — the prompt's response id plus \
+             one per row of the wrapped key — but found {markers}, so the grid \
+             never carried what this test is about and the assertions above \
+             passed vacuously\n{captured}"
+        );
+    }
+
+    /// The accessors that hand a caller raw terminal content. `registry.snapshot`
+    /// is the in-process-daemon route (`e2e_pi_orchestrator.rs`,
+    /// `e2e_delegate_work_done_chain.rs`, `e2e_codex_worker.rs`); the other two
+    /// are `TuiDeck`'s.
+    const TERMINAL_CONTENT_ACCESSORS: [&str; 3] =
+        ["snapshot_grid", "stream_text", "registry.snapshot"];
+
+    /// Whether `haystack` mentions `ident` as a whole identifier — not inside
+    /// `grid_lines`, and not as the method in `sock.as_os_str().len()`, which is
+    /// why a leading `.` disqualifies a hit as firmly as a letter does.
+    fn mentions_ident(haystack: &str, ident: &str) -> bool {
+        let mut from = 0;
+        while let Some(found) = haystack[from..].find(ident) {
+            let start = from + found;
+            from = start + ident.len();
+            let before = |c: char| !c.is_alphanumeric() && c != '_' && c != '.';
+            let after = |c: char| !c.is_alphanumeric() && c != '_';
+            if haystack[..start].chars().next_back().is_none_or(before)
+                && haystack[from..].chars().next().is_none_or(after)
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// The parts of a macro argument that carry CODE rather than prose: every
+    /// `{…}` placeholder, plus everything outside the string literals.
+    ///
+    /// Matching a binding name against the whole argument reads the format
+    /// string's English too, and `"… seen live on grid = {saw_sentinel_grid}"`
+    /// in `e2e_pi_live.rs` is then reported for the word "grid" in a sentence.
+    /// Splitting the argument first is what keeps the binding arm precise enough
+    /// to be worth having. `{{` is skipped because it is an escaped brace, and a
+    /// `\'"\'` char literal inside a print argument would confuse the string
+    /// tracking — neither occurs in this suite.
+    fn interpolated_regions(arg: &str) -> Vec<&str> {
+        let bytes = arg.as_bytes();
+        let mut regions = Vec::new();
+        let (mut index, mut in_string, mut escaped, mut outside_start) = (0usize, false, false, 0);
+        while index < bytes.len() {
+            let byte = bytes[index];
+            if in_string {
+                if escaped {
+                    escaped = false;
+                } else if byte == b'\\' {
+                    escaped = true;
+                } else if byte == b'"' {
+                    in_string = false;
+                    outside_start = index + 1;
+                } else if byte == b'{' {
+                    if bytes.get(index + 1) == Some(&b'{') {
+                        index += 2;
+                        continue;
+                    }
+                    if let Some(close) = arg[index + 1..].find('}') {
+                        regions.push(&arg[index + 1..index + 1 + close]);
+                        index += 1 + close;
+                    }
+                }
+            } else if byte == b'"' {
+                regions.push(&arg[outside_start..index]);
+                in_string = true;
+            }
+            index += 1;
+        }
+        regions.push(&arg[outside_start.min(arg.len())..]);
+        regions
+    }
+
+    /// The local bindings in `src` whose initialiser reads terminal content —
+    /// `let grid = deck.snapshot_grid();` and its variants.
+    ///
+    /// Without this the scan below sees only what is written INSIDE the macro
+    /// call, and `let grid = deck.snapshot_grid(); eprintln!("{grid}");` walks
+    /// straight past it. Binding first is not a contrived way to write it; it
+    /// is how every wait helper in this harness already holds a grid before
+    /// interpolating it, so the gap sat exactly where the real code lives.
+    ///
+    /// Names are collected per FILE rather than per function, which can only
+    /// over-report — and the remedy for a false positive is the same wrap the
+    /// true positive needs, so over-reporting costs nothing but a rename.
+    fn terminal_content_bindings(src: &str) -> Vec<String> {
+        let mut bound: Vec<String> = Vec::new();
+        let mut from = 0;
+        while let Some(found) = src[from..].find("let ") {
+            let start = from + found;
+            from = start + "let ".len();
+            // A `let` that starts a word, not the tail of an identifier.
+            if src[..start]
+                .chars()
+                .next_back()
+                .is_some_and(|c| c.is_alphanumeric() || c == '_')
+            {
+                continue;
+            }
+            let mut rest = src[from..].trim_start();
+            if let Some(stripped) = rest.strip_prefix("mut ") {
+                rest = stripped.trim_start();
+            }
+            let name: String = rest
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+            // Destructuring patterns and `let else` are deliberately skipped:
+            // neither binds a single name this scan could then look for.
+            if name.is_empty() || name == "else" {
+                continue;
+            }
+            let Some(end) = rest[name.len()..].find(';') else {
+                continue;
+            };
+            let initialiser = &rest[name.len()..name.len() + end];
+            if initialiser.contains("redact_credentials_for_output") {
+                continue;
+            }
+            // A LENGTH is not content. `let len = registry.snapshot(id).map(|s|
+            // s.len()).unwrap_or(0)` mentions an accessor and holds a number,
+            // and tainting `len` file-wide reports every unrelated `{}` that
+            // interpolates one. The cost of the shortcut is a binding that both
+            // reduces to a scalar and keeps the content — none exists here, and
+            // the accessor arm still covers an accessor written in the macro.
+            if initialiser.contains(".len()") || initialiser.contains(".count()") {
+                continue;
+            }
+            if TERMINAL_CONTENT_ACCESSORS
+                .iter()
+                .any(|accessor| initialiser.contains(accessor))
+            {
+                bound.push(name);
+            }
+        }
+        bound.sort();
+        bound.dedup();
+        bound
+    }
+
+    /// Scenario: Scan every test source for a `print!`/`println!`/`eprint!`/
+    /// `eprintln!` that renders terminal content — either by calling an
+    /// accessor inside the macro, or by interpolating a local the file bound
+    /// from one. The redacting panic hook covers panics and assertion failures
+    /// — every diagnostic this suite actually produces — but it cannot cover a
+    /// direct write to stdout, so this keeps the invariant it relies on true as
+    /// the suite grows.
+    ///
+    /// The remedy is named in the failure message rather than left to be
+    /// guessed: wrap the argument in `common::redact_credentials_for_output`,
+    /// which is exactly what the seam does for a panic.
+    #[test]
+    fn no_test_prints_terminal_content_outside_the_redacting_panic_seam() {
+        /// The balanced `(…)` of a macro invocation starting at `open`, skipping
+        /// parentheses inside string and character literals.
+        fn macro_arg(src: &str, open: usize) -> &str {
+            let bytes = src.as_bytes();
+            let (mut depth, mut in_str, mut escaped, mut i) = (0usize, false, false, open);
+            while i < bytes.len() {
+                let c = bytes[i];
+                if in_str {
+                    if escaped {
+                        escaped = false;
+                    } else if c == b'\\' {
+                        escaped = true;
+                    } else if c == b'"' {
+                        in_str = false;
+                    }
+                } else {
+                    match c {
+                        b'"' => in_str = true,
+                        // `'('` / `'\''` — a char literal, not a lifetime.
+                        b'\'' if bytes.get(i + 2) == Some(&b'\'') => i += 2,
+                        b'\'' if bytes.get(i + 3) == Some(&b'\'') && bytes[i + 1] == b'\\' => {
+                            i += 3
+                        }
+                        b'(' => depth += 1,
+                        b')' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                return &src[open..=i];
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                i += 1;
+            }
+            &src[open..]
+        }
+
+        let tests_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests");
+        let mut sources: Vec<PathBuf> = std::fs::read_dir(&tests_dir)
+            .expect("read tests/")
+            .filter_map(|entry| {
+                let path = entry.ok()?.path();
+                (path.extension()? == "rs").then_some(path)
+            })
+            .collect();
+        sources.push(tests_dir.join("common").join("mod.rs"));
+        sources.sort();
+        assert!(
+            sources.len() > 50,
+            "only found {} test sources under {} — the scan is not reaching the suite",
+            sources.len(),
+            tests_dir.display()
+        );
+
+        let mut offenders = Vec::new();
+        for path in &sources {
+            let src = std::fs::read_to_string(path).expect("read a test source");
+            let bindings = terminal_content_bindings(&src);
+            for name in ["println!", "eprintln!", "print!", "eprint!"] {
+                let mut from = 0;
+                while let Some(found) = src[from..].find(name) {
+                    let start = from + found;
+                    from = start + name.len();
+                    // `eprintln!` CONTAINS `println!`, so the needle has to
+                    // start at a macro boundary rather than mid-identifier, or
+                    // one `eprintln!` is reported twice under two names.
+                    if src[..start]
+                        .chars()
+                        .next_back()
+                        .is_some_and(|c| c.is_alphanumeric() || c == '_')
+                    {
+                        continue;
+                    }
+                    // A macro named inside a LINE COMMENT executes nothing, and
+                    // the doc comment on `terminal_content_bindings` above spells
+                    // out the exact pattern this scan looks for — so without this
+                    // the scanner reports its own documentation. Line comments
+                    // only: a block comment would need real lexing, and none in
+                    // this suite contains a print macro.
+                    let line_start = src[..start].rfind('\n').map_or(0, |at| at + 1);
+                    if src[line_start..start].contains("//") {
+                        continue;
+                    }
+                    // Only the invocation whose `(` follows the macro name.
+                    let Some(open) = src[from..]
+                        .find('(')
+                        .filter(|offset| src[from..from + offset].chars().all(char::is_whitespace))
+                    else {
+                        continue;
+                    };
+                    let arg = macro_arg(&src, from + open);
+                    if arg.contains("redact_credentials_for_output") {
+                        continue;
+                    }
+                    let rendered = TERMINAL_CONTENT_ACCESSORS
+                        .iter()
+                        .find(|accessor| arg.contains(**accessor))
+                        .map(|accessor| (*accessor).to_string())
+                        .or_else(|| {
+                            let regions = interpolated_regions(arg);
+                            bindings
+                                .iter()
+                                .find(|binding| {
+                                    regions.iter().any(|region| mentions_ident(region, binding))
+                                })
+                                .map(|binding| format!("`{binding}`, bound from terminal content"))
+                        });
+                    if let Some(what) = rendered {
+                        let line = src[..start].matches('\n').count() + 1;
+                        offenders
+                            .push(format!("{}:{line} — {name} renders {what}", path.display()));
+                    }
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "terminal content is being written straight to captured test output, where the \
+             redacting panic hook cannot reach it. A rendered API key suffix there lands in \
+             nextest's run log and the raw JUnit report (issue #502/#785 audit S1). Wrap the \
+             argument in `common::redact_credentials_for_output`:\n  {}",
+            offenders.join("\n  ")
+        );
+    }
+
+    /// Scenario: Scan every test source for a competing panic-hook
+    /// installation. The redacting seam is a process-global hook, so a test that
+    /// installs its own after it — even a `|_| {}` one to silence an expected
+    /// panic — silently removes the redaction for the rest of that binary's
+    /// run. The invariant is enforced here rather than left as a comment.
+    ///
+    /// The needles are assembled with `concat!` so this scanner does not match
+    /// its own source, which is also why neither appears spelled out anywhere
+    /// in this function.
+    ///
+    /// They match the CALL rather than a `panic::`-qualified path, because an
+    /// IMPORTED symbol installs a hook just as thoroughly as a qualified one and
+    /// a path-shaped needle never saw it — `use std::panic::set_hook;` followed
+    /// by a bare call was invisible to the predecessor of this scan. Matching on
+    /// the trailing `(` is what keeps a prose mention of the function in a
+    /// comment from being reported, and it is also why
+    /// `registry.set_hook_socket(…)` in `tests/daemon_protocol.rs` is correctly
+    /// ignored. The `use` arm is separate because an import has no call
+    /// parentheses to match on.
+    ///
+    /// `src/` is deliberately not scanned: those hooks (`src/ui.rs`'s terminal
+    /// restore, and two in-crate unit tests) live in the deck BINARY or in the
+    /// lib's own test target, neither of which shares a process with this
+    /// harness.
+    #[test]
+    fn no_test_installs_a_competing_panic_hook() {
+        let calls = [concat!("set_", "hook("), concat!("take_", "hook(")];
+        let imported = |line: &str| {
+            line.trim_start().starts_with("use ")
+                && (line.contains(concat!("set_", "hook"))
+                    || line.contains(concat!("take_", "hook")))
+        };
+        let tests_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests");
+        let mut sources: Vec<PathBuf> = std::fs::read_dir(&tests_dir)
+            .expect("read tests/")
+            .filter_map(|entry| {
+                let path = entry.ok()?.path();
+                (path.extension()? == "rs").then_some(path)
+            })
+            .collect();
+        sources.push(tests_dir.join("common").join("mod.rs"));
+        sources.sort();
+        assert!(sources.len() > 50, "the scan is not reaching the suite");
+
+        let mut offenders = Vec::new();
+        let mut seam_installations = 0;
+        for path in &sources {
+            let src = std::fs::read_to_string(path).expect("read a test source");
+            for (line_no, line) in src.lines().enumerate() {
+                if !calls.iter().any(|needle| line.contains(needle)) && !imported(line) {
+                    continue;
+                }
+                // The seam's own installation is the one legitimate site.
+                if path.ends_with("common/mod.rs") && line.contains("Box::new(|info|") {
+                    seam_installations += 1;
+                    continue;
+                }
+                offenders.push(format!(
+                    "{}:{} — {}",
+                    path.display(),
+                    line_no + 1,
+                    line.trim()
+                ));
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "a panic hook installed here replaces the credential-redacting seam for the rest \
+             of this test binary's run, and a rendered API key would then reach nextest's \
+             captured output and the raw JUnit report unredacted (issue #502/#785 audit S1). \
+             The seam is a `Once`, so it cannot reinstall itself afterwards — rework the test \
+             instead:\n  {}",
+            offenders.join("\n  ")
+        );
+        // Non-vacuity: if the seam's own installation stopped matching, this
+        // scan would be looking for something that no longer exists.
+        assert_eq!(
+            seam_installations, 1,
+            "expected to find exactly the seam's own hook installation; the scanner has drifted \
+             away from what it is meant to be guarding"
+        );
+    }
+
+    /// Scenario: The approval decision reads the credential source the IMPORT
+    /// recorded, and that record cannot be revised once set — so one process
+    /// has one answer however the host changes underneath it.
+    ///
+    /// Issue #785's non-blocking TOCTOU. The import and the seeding used to
+    /// re-derive the answer independently; a rotation landing between the two
+    /// reads made them disagree, and one direction of that disagreement moves a
+    /// developer's run off their subscription and onto metered billing.
+    #[test]
+    fn the_seeding_reads_the_credential_source_the_import_recorded() {
+        // Order-independent: whichever value this process settled on first is
+        // the one both halves must keep seeing.
+        let recorded = *CLAUDE_OAUTH_SEEDED.get_or_init(|| false);
+        assert_eq!(claude_run_is_oauth_backed(), recorded);
+        assert!(
+            CLAUDE_OAUTH_SEEDED.set(!recorded).is_err(),
+            "the recorded credential source must not be revisable"
+        );
+        assert_eq!(claude_run_is_oauth_backed(), recorded);
+    }
+
+    /// Scenario: Seed Claude Code's API-key approval into a config on a host
+    /// whose OAuth credential set is UNUSABLE and that records NO answer for
+    /// this key — a key-only host with a fresh HOME, which since #502 means a
+    /// developer machine that has never run `claude login` rather than a
+    /// runner. The key is approved, because it is the only way in and there is
+    /// no stored decision to respect.
+    #[test]
+    fn a_key_authorised_run_approves_a_key_the_host_never_answered_for() {
+        let key = "sk-ant-api03-not-a-real-key-DEADBEEFCAFEBABE0123";
+        let id = claude_api_key_response_id(key);
+        let mut cfg = serde_json::json!({ "hasCompletedOnboarding": true });
+        seed_claude_api_key_response(&mut cfg, key, false, false);
+        assert!(response_list_contains(&cfg, "approved", &id));
+        assert!(!response_list_contains(&cfg, "rejected", &id));
+    }
+
+    /// Scenario: The host recorded a REJECTION for this exact key and OAuth is
+    /// unusable — a key-only developer machine where the "No" is a real human
+    /// decision. Nothing authorises overriding it, so the refusal stands and
+    /// the key is NOT approved. `check_claude_available` refuses the run for
+    /// the same reason, so the developer gets a named skip rather than a
+    /// silent bill.
+    ///
+    /// The predecessor of this test asserted the opposite, on the justification
+    /// that a runner would otherwise inherit a developer's refusal. That does
+    /// not hold: `ubuntu-latest` starts with a fresh HOME and nothing copies
+    /// `~/.claude.json` onto it, so the removal was a no-op in CI and took
+    /// effect only here — the one place it overrode a human.
+    #[test]
+    fn a_stored_local_refusal_is_respected_when_nothing_authorises_an_override() {
         let key = "sk-ant-api03-not-a-real-key-DEADBEEFCAFEBABE0123";
         let id = claude_api_key_response_id(key);
         let mut cfg = serde_json::json!({
             "hasCompletedOnboarding": true,
             "customApiKeyResponses": { "approved": [], "rejected": [id.clone()] },
         });
-        seed_claude_api_key_response(&mut cfg, key, false);
+        seed_claude_api_key_response(&mut cfg, key, false, false);
+        assert!(!response_list_contains(&cfg, "approved", &id));
+        assert!(response_list_contains(&cfg, "rejected", &id));
+    }
+
+    /// Scenario: The same stored refusal, but the run carries the explicit
+    /// require-real authorisation. The refusal is overridden and the key
+    /// approved — the override is something a caller asked for rather than
+    /// something the harness did on its own.
+    #[test]
+    fn an_authorised_run_overrides_a_stored_refusal() {
+        let key = "sk-ant-api03-not-a-real-key-DEADBEEFCAFEBABE0123";
+        let id = claude_api_key_response_id(key);
+        let mut cfg = serde_json::json!({
+            "customApiKeyResponses": { "approved": [], "rejected": [id.clone()] },
+        });
+        seed_claude_api_key_response(&mut cfg, key, false, true);
         assert!(response_list_contains(&cfg, "approved", &id));
         assert!(!response_list_contains(&cfg, "rejected", &id));
     }
 
-    /// Scenario: Seed the same answer on a host whose OAuth credential set IS
+    /// Scenario: Seed the answer on a host whose OAuth credential set IS
     /// usable — a developer's machine. The key is REJECTED rather than
     /// approved, so the imported credential set stays authoritative and the run
     /// does not quietly move off the developer's subscription onto metered API
@@ -10187,25 +13094,86 @@ mod harness_unit_tests {
         let key = "sk-ant-api03-not-a-real-key-DEADBEEFCAFEBABE0123";
         let id = claude_api_key_response_id(key);
         let mut cfg = serde_json::json!({ "hasCompletedOnboarding": true });
-        seed_claude_api_key_response(&mut cfg, key, true);
+        seed_claude_api_key_response(&mut cfg, key, true, false);
         assert!(response_list_contains(&cfg, "rejected", &id));
         assert!(!response_list_contains(&cfg, "approved", &id));
     }
 
     /// Scenario: The host config already approves this key and the host also has
-    /// a usable OAuth credential set. That approval is the developer's own
-    /// deliberate answer, so the seeding leaves it alone rather than overriding
-    /// it with a refusal.
+    /// a usable OAuth credential set. The approval is REVOKED inside the
+    /// isolated test HOME, because an approved key beats a usable OAuth file.
+    ///
+    /// Measured on claude 2.1.252 with a real credential set (the reviewer's
+    /// note A): OAuth file present + key exported + key approved renders
+    /// `Haiku 4.5 · API Usage Billing`, and the identical HOME with the key
+    /// rejected renders `Haiku 4.5 · Claude Team`. The host approval was
+    /// recorded for the developer's own interactive sessions, at a time when
+    /// the key never reached a test agent at all; honouring it here would newly
+    /// bill them for a test run, while overriding it costs them nothing.
     #[test]
-    fn a_deliberate_host_approval_survives_the_oauth_branch() {
+    fn an_oauth_host_revokes_an_inherited_approval_rather_than_paying_for_it() {
         let key = "sk-ant-api03-not-a-real-key-DEADBEEFCAFEBABE0123";
         let id = claude_api_key_response_id(key);
         let mut cfg = serde_json::json!({
             "customApiKeyResponses": { "approved": [id.clone()], "rejected": [] },
         });
-        seed_claude_api_key_response(&mut cfg, key, true);
+        seed_claude_api_key_response(&mut cfg, key, true, false);
+        assert!(!response_list_contains(&cfg, "approved", &id));
+        assert!(response_list_contains(&cfg, "rejected", &id));
+    }
+
+    /// Scenario: Seed an API key of 20 characters or fewer, where the "last 20
+    /// characters" derivative IS the whole key. Nothing is written at all — not
+    /// the key, not a response block — so the claim that the raw key never
+    /// appears in `~/.claude.json` stays true for every input rather than only
+    /// for realistic ones.
+    ///
+    /// Each fixture asserts its own length, because the boundary is the whole
+    /// point: an earlier draft of this test used a "twenty-character" fixture
+    /// that was actually 21, which passed for the wrong reason (the id was a
+    /// strict suffix, so the full string genuinely was absent) and exercised
+    /// the refusal not at all.
+    #[test]
+    fn a_key_shorter_than_its_own_response_id_is_never_written_into_the_config() {
+        // 12, 20, and 20 counted in CHARACTERS rather than bytes — the id is
+        // built from `chars()`, so a multibyte value at the boundary has to
+        // land on the same side of it.
+        for key in [
+            "sk-ant-short",
+            "exactly-twenty-chars",
+            "sk-\u{e9}\u{e9}-twenty-charsXY",
+        ] {
+            assert!(
+                key.chars().count() <= 20,
+                "fixture {key:?} is {} characters, so it does not exercise the refusal",
+                key.chars().count()
+            );
+            let mut cfg = serde_json::json!({ "hasCompletedOnboarding": true });
+            seed_claude_api_key_response(&mut cfg, key, false, true);
+            let rendered = cfg.to_string();
+            assert!(
+                !rendered.contains(key),
+                "the key itself was written into the config: {rendered}"
+            );
+            assert!(
+                cfg.get("customApiKeyResponses").is_none(),
+                "a response block was built for a key that must not be recorded \
+                 at all: {rendered}"
+            );
+        }
+        // The boundary in the other direction: 21 characters has a strict
+        // 20-character suffix, so it IS seeded.
+        let key = "twenty-one-characters";
+        assert_eq!(key.chars().count(), 21);
+        let mut cfg = serde_json::json!({});
+        seed_claude_api_key_response(&mut cfg, key, false, true);
+        let id = claude_api_key_response_id(key);
+        assert_eq!(id.chars().count(), 20);
         assert!(response_list_contains(&cfg, "approved", &id));
-        assert!(!response_list_contains(&cfg, "rejected", &id));
+        assert!(
+            !cfg.to_string().contains(key),
+            "the whole key reached the config even though its id is a strict suffix"
+        );
     }
 
     /// Scenario: Seed into a host config whose `customApiKeyResponses` is
@@ -10222,7 +13190,7 @@ mod harness_unit_tests {
             serde_json::json!({ "customApiKeyResponses": { "approved": "not-a-list" } }),
         ] {
             let mut cfg = hostile;
-            seed_claude_api_key_response(&mut cfg, key, false);
+            seed_claude_api_key_response(&mut cfg, key, false, false);
             assert!(
                 response_list_contains(&cfg, "approved", &id),
                 "the approval was lost: {cfg}"
@@ -10232,8 +13200,8 @@ mod harness_unit_tests {
 
     /// Scenario: Ask whether an ambient API key is usable. Unset, empty and
     /// whitespace-only all mean absent — the same rule the three
-    /// `check_pi_available` copies apply and the same rule `e2e-live.yml`'s
-    /// guard step applies — while a real value comes back VERBATIM, because
+    /// `check_pi_available` copies apply — while a real value comes back
+    /// VERBATIM, because
     /// verbatim is what the spawned agent receives.
     #[test]
     fn an_empty_or_whitespace_only_api_key_counts_as_absent() {

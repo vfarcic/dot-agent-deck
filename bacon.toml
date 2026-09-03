@@ -10,9 +10,13 @@ default_job = "test-fast"
 # above. The other two are the e2e tier's lanes: `test-e2e` is lane 1, the 47
 # `tests/e2e_*.rs` files needing no agent credential, and `test-e2e-live` is the
 # SUPERSET — all 71, so it needs a working agent credential. Since issue #502
-# neither is a pre-PR obligation; CI runs lane 1 on every PR and lane 2
-# per-merge on `main`. In a watch loop you almost always want one of these with
-# a filter appended (`bacon test-e2e -- lifecycle_001`), which is rule 6.
+# neither is a pre-PR obligation: CI runs lane 1 on every PR, and lane 2 runs
+# nowhere but on a developer's machine, because no test that reaches a real
+# agent runs in CI. So those 24 files are exercised only when a person runs
+# them — a `bacon test-e2e-live` filtered to what you are touching, or the
+# `cargo test-e2e-live` alias this job mirrors — and by nothing else. In a watch
+# loop you almost always want one of these with a filter appended
+# (`bacon test-e2e -- lifecycle_001`), which is rule 6.
 [jobs.test-fast]
 command = ["cargo", "nextest", "run", "--workspace"]
 need_stdout = true

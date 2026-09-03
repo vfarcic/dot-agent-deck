@@ -4,7 +4,7 @@
 #
 # Turns a manifest of {title, description, clip} entries into a single
 # narrated MP4 (title/description card, then the clip, repeated in order),
-# and optionally uploads it unlisted to YouTube. The engine knows nothing
+# and optionally uploads it PRIVATE to YouTube. The engine knows nothing
 # about Rust, tests, PRDs, or any specific repo — its only input is a
 # manifest.json. See SKILL.md for the full contract.
 #
@@ -18,6 +18,13 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # All hosting lives in this one script (see Uploader decision); reel.sh never
 # names a host. Only invoked when --publish is requested with credentials set.
+#
+# It uploads PRIVATE, and the engine deliberately passes no privacy flag: the
+# automated path — the adapter, and so anything an agent runs unattended — can
+# therefore only ever produce a private video. Asking for another status is a
+# hand-run `upload.sh --privacy ...`, or (the normal route) a human flipping the
+# finished video in the YouTube UI, which keeps the same video id and so the same
+# link. See upload.sh's header for why that boundary is where it is.
 UPLOAD_SCRIPT="$SCRIPT_DIR/upload.sh"
 
 # Re-times each .cast clip BEFORE agg renders it: rewrites event timestamps so
@@ -180,7 +187,7 @@ Usage: $SCRIPT_NAME MANIFEST [--out OUT.mp4] [--title TITLE] [--publish]
 
 Stitch a manifest of {title, description, clip} entries into one narrated MP4
 (title/description card, then clip, repeated in order). With --publish, upload
-the result unlisted to YouTube and print the URL.
+the result PRIVATE to YouTube and print the URL.
 
 Arguments:
   MANIFEST        Path to a manifest.json: a non-empty JSON array of objects,
@@ -192,7 +199,9 @@ Options:
   --title TITLE   Title for the uploaded video (only used with --publish).
                   Default: the basename of --out without its extension
                   (e.g. "reel" for reel.mp4).
-  --publish       Upload the MP4 unlisted to YouTube and print the URL.
+  --publish       Upload the MP4 PRIVATE to YouTube and print the URL, so
+                  only the channel owner, and any account they deliberately
+                  share it with, can watch it until a human flips it.
                   Requires ${CRED_VARS[*]} in the environment.
   -h, --help      Show this help and exit.
 
@@ -709,6 +718,6 @@ if [[ "$PUBLISH" -eq 1 ]]; then
     reel_desc="$(jq -r 'map("• " + .title) | join("\n")' "$MANIFEST")"
     url="$("$UPLOAD_SCRIPT" "$OUT" "$reel_title" "$reel_desc")"
     echo "$url"
-    note "published unlisted: $url"
+    note "published PRIVATE (only the channel owner, and any account they deliberately share it with, can watch it; flipping it to unlisted keeps this link): $url"
   fi
 fi

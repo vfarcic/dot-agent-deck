@@ -209,6 +209,7 @@ async fn handle_connection(
                 rows,
                 cols,
                 live: None,
+                spawned_at_ms: None,
             });
             write_resp(&mut stream, &AttachResponse::with_id(id))
                 .await
@@ -287,6 +288,7 @@ fn mode_record(fixture: &str, mode: &str, agent_id: &str, pane_id: &str) -> Agen
         rows: 24,
         cols: 80,
         live: None,
+        spawned_at_ms: None,
     }
 }
 

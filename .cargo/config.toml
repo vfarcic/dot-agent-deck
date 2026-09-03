@@ -31,10 +31,17 @@ test-e2e = "nextest run --workspace --features e2e"
 # files open with `#![cfg(all(feature = "e2e", feature = "e2e-live"))]`, so
 # `e2e-live` without `e2e` compiles every e2e file to an empty crate.
 #
-# So the three lanes are: `test-fast` (fast tier), `test-e2e` (lane 1 — needs
-# no agent credentials, safe to run on every PR with no secrets present) and
-# `test-e2e-live` (lane 1 + lane 2 — needs a working agent credential;
-# credential handling is issue #785).
+# So the three commands are: `test-fast` (fast tier, the per-task gate),
+# `test-e2e` (lane 1 — needs no agent credentials, which is why CI runs it on
+# every PR) and `test-e2e-live` (lane 1 + lane 2 — needs a working agent
+# credential, and runs ONLY on a developer's machine; credential handling is
+# issue #785). Lane 2 is deliberately not in CI: a credential in a public
+# repository's CI is a vulnerability whose existence running it less often does
+# not reduce, and the line the `e2e-live` feature draws is "reaches a real
+# agent", not "reads a key" — on a developer box the agent CLIs are already
+# authenticated, so a test that spawns `claude` spends a credential without
+# ever touching an environment variable. CLAUDE.md rule 5 is the policy;
+# `docs/develop/e2e-lanes.md` is the operational page.
 #
 # `--workspace` for the same reason as the two aliases above (issue #489):
 # without it cargo selects the root package alone and every test in

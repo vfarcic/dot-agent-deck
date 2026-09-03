@@ -1,6 +1,6 @@
 ---
 name: verify-pr
-description: Deeply verify a pull request written by someone else and end with an explicit merge recommendation. Safety-scans the diff, checks the PR out into its own worktree, runs every automated gate including lane 1 of the e2e tier, reviews the code against this repo's rules, and reports a verdict. Use when asked to review, verify, audit, or decide whether to merge a PR from a contributor, from Renovate, or from another agent.
+description: Deeply verify a pull request written by someone else and end with an explicit merge recommendation. Safety-scans the diff, checks the PR out into its own worktree, runs every automated gate, reads the PR's own e2e CI run, reviews the code against this repo's rules, and reports a verdict. Use when asked to review, verify, audit, or decide whether to merge a PR from a contributor, from Renovate, or from another agent.
 user-invocable: true
 ---
 
@@ -88,7 +88,11 @@ Re-running on a PR that has been pushed to since: `setup.sh <n> --force`.
 
 **The safety bar here is higher than Phase 0's.** Phase 0 asks "is it safe to check this out on my machine?" Approving asks "is it safe to execute this in CI, where repository secrets live?" Two things follow:
 
-- **A `pull_request` run executes the contributor's workflow files, so read them before approving.** The run checks out the PR *merge ref*, and the workflow definitions come from that ref too — a fork's edit to `.github/**` **is live in the run you are approving**. What makes a fork run safe is not the definitions' origin: it is that GitHub withholds every secret except `GITHUB_TOKEN` from a fork `pull_request` and reduces that token to read-only. (This repo's own `e2e-live.yml` depends on exactly that property — it is how a credentialed workflow can be exercised on a PR before it reaches the default branch. `docs/develop/e2e-lanes.md` has the detail.) So a malicious workflow edit is both a blocking finding **and** an approval blocker: it runs on the runner the moment you approve.
+- **A `pull_request` run executes the contributor's workflow files, so read them before approving.** The run checks out the PR *merge ref*, and the workflow definitions come from that ref too — a fork's edit to `.github/**` **is live in the run you are approving**. What makes a fork run safe is not the definitions' origin: it is that GitHub withholds every secret except `GITHUB_TOKEN` from a fork `pull_request` and reduces that token to read-only.
+
+  **On a same-repository branch that property does not apply, and this repository DOES hold an agent credential.** The repository secret `OPENAI_API_KEY` exists for the Codex issue-labeler (`.github/workflows/issue-labeler.md` and its generated lock file, plus the manually-dispatchable `issue-labeler-batch.yml`), which puts that key on a runner and reaches a real agent; its firewall keeps the raw variables out of the agent container and proxies the call, which limits model visibility but not runner presence. So a same-repo branch that adds a step reading `${{ secrets.OPENAI_API_KEY }}` gets it. What is true, and is the narrow claim worth carrying, is that **no *test* credential is registered here and no e2e test reaches a real agent in CI** (rule 5, and line 138 below). Do not read that as "nothing here holds a secret worth a pre-merge run" — that absolute was in this file and it was false, which is the worst place for it to be, since this is the section that tells a maintainer whether approving CI execution is safe. Re-check the live secret list rather than assuming either way.
+
+  So a malicious workflow edit is both a blocking finding **and** an approval blocker: it runs on the runner the moment you approve.
 
   **`pull_request_target` and `workflow_run` are the opposite shape, and both remain an immediate stop.** *Those* events do run from the default branch's definition, and they do receive secrets and a writable token — so a PR that adds one is inert in the run you are approving and arms the moment it merges. That base-branch-definition model is what this section used to attribute to `pull_request`; it is the wrong model for the trigger actually in use, and believing it is how a reviewer talks themselves out of reading a contributor's workflow diff.
 - What the fork *also* controls is code CI executes: `build.rs`, `.cargo/config.toml`, proc-macro crates, `xtask/**`, `scripts/**`, `devbox.json`, and — easy to forget — **test code**, because CI runs `cargo nextest run`.
@@ -124,13 +128,26 @@ bash .claude/skills/verify-pr/checks.sh --dir ../dot-agent-deck-pr-<n>
 
 **Run this in the background** (`run_in_background: true`) — the suite runs far longer than a foreground tool call allows. It appends a row to `<worktree>/target/verify-pr/summary.tsv` as each step finishes and writes `DONE` at the end, so poll those instead of blocking. Logs land per step under `target/verify-pr/logs/`.
 
-Steps, cheapest first: `fmt`, `clippy` (both rule 2 — note clippy carries **both** e2e features, so it type-checks lane 2's files even though nothing here runs them), `build --release`, `test-fast` (rule 5's fast tier), `linkage-check` (rule 7), `windows-cross`, `audit`, then `e2e` (rule 5's **lane 1** — the 47 deterministic files, `--features e2e`). It does not stop at the first failure — a review needs the whole picture. If the build fails, the test steps are marked `BLOCKED` rather than burning minutes restating it.
+Steps, cheapest first: `fmt`, `clippy` (both rule 2 — note clippy carries **both** e2e features, so it type-checks lane 2's files — the only step in this skill that compiles them, and CI-side the only thing that does, since no test reaching a real agent runs in any CI job), `build --release`, `test-fast` (rule 5's fast tier), `linkage-check` (rule 7), `windows-cross`, `audit`. It does not stop at the first failure — a review needs the whole picture. If the build fails, the test steps are marked `BLOCKED` rather than burning minutes restating it.
 
-Tell the user **before** starting the run that the `e2e` step spawns real binaries and PTYs and takes tens of minutes. It needs **no** agent credential: since issue #502 this skill runs lane 1 only, and lane 1's 47 files are exactly the ones that need none. `env.txt` still records which agent CLIs were found, because a stray `claude` on PATH changes what a couple of lane-1 tests do. Run inside `devbox shell` if `cargo-nextest` is missing.
+**Lane 1 is CI's job, so READ its run rather than reproducing it.** The `e2e` step is **off by default** since issue #502: `ci.yml`'s `e2e-deterministic` job runs `cargo test-e2e` on every PR, so the signal already exists on the PR you are reviewing. Get it, and put it in the report as a row like any other gate:
 
-**This skill does not run lane 2, and that is a deliberate gap you must state in the report.** The 24 credentialed files are exercised by `.github/workflows/e2e-live.yml`, not here — running them locally would need the reviewer's own agent credentials and spend real tokens on the flakiest tests in the repo. If the PR under review touches real-agent paths (spawn, hooks, delegate, the adapters), apply the `run-live-e2e` label to it and read that workflow's run instead; [`docs/develop/e2e-lanes.md`](../../../docs/develop/e2e-lanes.md) covers how, and why a green lane-2 run can still mean almost nothing. **Labelling is a credentialed act, so it belongs after Phase 1b's checklist, not before it.** For a same-repository branch, approving that run's `live-e2e` environment means approving arbitrary branch code — including the workflow files, per Phase 1b — to execute with the Anthropic key. For a fork, GitHub withholds the secret regardless, so lane 2 genuinely cannot run there and the job fails fast saying so; read that red as "UNVERIFIED", not as a defect in the PR. Where the label was not applied, say plainly that lane 2 is UNVERIFIED for this PR rather than letting a green lane-1 row stand in for it.
+```bash
+gh pr checks <n>                          # is e2e-deterministic green, red, or still running?
+gh run view <run-id> --log-failed         # what actually failed
+```
 
-**The `e2e-real-coverage` row matters more than the `e2e` row.** A test that cannot run prints `SKIP: <reason>` and *returns normally*, so nextest counts it as **passed** — a green run that proved nothing. In lane 1 a skip means a missing local tool or an unmet host precondition rather than an absent credential, which makes it more interesting rather than less: CI's `e2e-deterministic` job is supposed to run every one of these for real. `checks.sh` passes `--success-output=final` specifically to make those lines visible, counts them, and writes them to `e2e-skips.txt`. If any skipped test covers the surface this PR changes, rerun it with the skip-to-failure switch:
+Reproducing it locally costs tens of minutes of PTY time for a result that is **less** trustworthy than CI's — this worktree sits at a long `../dot-agent-deck-pr-<n>` path with a cold `target/`, and Phase 5 below records a case where that difference alone reddened a test and got misreported as a defect on `main`. Pass `--e2e` to `checks.sh` when CI's run is genuinely missing (cancelled, never triggered, a fork whose workflows never ran) or when you want one test under a `--filter`; then tell the user first that it spawns real binaries and PTYs and takes tens of minutes, and run inside `devbox shell` if `cargo-nextest` is missing. `env.txt` records which agent CLIs were found either way, because a stray `claude` on PATH changes what a couple of lane-1 tests do.
+
+**This skill does not run lane 2 by default, and no CI job runs it at all — state that gap in the report.** Only a person running `cargo test-e2e-live` (or `bacon test-e2e-live`) executes those files, and this skill does not do it for you. The 24 real-agent files run in no CI job: no e2e test reaches a real agent on a runner, and no test credential is registered on this repository (CLAUDE.md rule 5 has the decision, its two reasons, and the scope note about the separately credentialed Codex issue-labeler; [`docs/develop/e2e-lanes.md`](../../../docs/develop/e2e-lanes.md) has the operational detail). So there is no label to apply and no workflow run to read. If the PR under review touches real-agent paths (spawn, hooks, delegate, the adapters), either run the covering tests yourself with your own credentials —
+
+```bash
+cd ../dot-agent-deck-pr-<n> && cargo test-e2e-live <test-filter>
+```
+
+— or say plainly in the report that lane 2 is **UNVERIFIED** for this PR and name the surface it leaves uncovered. Never let a green lane-1 row, or a green CI run, stand in for it.
+
+**When you do run the `e2e` step, the `e2e-real-coverage` row matters more than the `e2e` row.** A test that cannot run prints `SKIP: <reason>` and *returns normally*, so nextest counts it as **passed** — a green run that proved nothing. In lane 1 a skip means a missing local tool or an unmet host precondition rather than an absent credential, which makes it more interesting rather than less: CI's `e2e-deterministic` job is supposed to run every one of these for real. `checks.sh` passes `--success-output=final` specifically to make those lines visible, counts them, and writes them to `e2e-skips.txt`. If any skipped test covers the surface this PR changes, rerun it with the skip-to-failure switch:
 
 ```bash
 cd ../dot-agent-deck-pr-<n> && DOT_AGENT_DECK_REQUIRE_REAL_E2E=1 cargo nextest run --features e2e <test-filter>
@@ -179,7 +196,7 @@ git -C ../dot-agent-deck-pr-<n>-base reset --hard origin/main
 
 Do **not** hand-roll a worktree under the scratchpad to get a second baseline. A cargo `target/` is multi-GB and the scratchpad is typically a tmpfs, so the build dies at link time with a misleading `linking with 'cc' failed`, and the space it does consume comes out of the RAM the compile needs (CLAUDE.md rule 14). Every worktree belongs at a disk-backed `../<repo>-<suffix>` sibling.
 
-**Flakes.** The e2e tier is flaky-tolerant by design — which is why rule 5 makes lane 2 advisory and per-merge rather than a per-PR gate — and timing-sensitive tests here have failed on one platform and passed on two others in the same run. Per rule 6, rerun the single failing test in isolation first:
+**Flakes.** The e2e tier is flaky-tolerant by design — which is why rule 5 keeps lane 1 advisory rather than required, and why lane 2 is not a gate anywhere — and timing-sensitive tests here have failed on one platform and passed on two others in the same run. Per rule 6, rerun the single failing test in isolation first:
 
 ```bash
 cd ../dot-agent-deck-pr-<n> && cargo nextest run --features e2e <test-name>
@@ -220,7 +237,10 @@ Template:
 ## CI
 <per-job conclusions from `gh pr checks`, or "held for approval — released in Phase 1b" /
 "not approved, see blocking findings". Name the jobs the local run cannot replace:
-build-macos, build-windows, security (cargo audit).>
+build-macos, build-windows, security (cargo audit), and e2e-deterministic — lane 1
+is CI's job now, so quote its conclusion here rather than a local `e2e` row.
+State lane 2 explicitly: run by you with your own credentials (name the tests), or
+UNVERIFIED. Nothing in CI covers it.>
 
 ## Blocking findings
 <file:line, what breaks, and the inputs/state that trigger it. "None" if none.>

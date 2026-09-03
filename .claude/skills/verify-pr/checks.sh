@@ -4,14 +4,23 @@
 # without stopping at the first failure — a review needs the whole picture, not
 # the first thing that broke.
 #
-# Usage: checks.sh [--dir <worktree>] [--no-e2e] [--only <a,b,c>] [--filter <expr>]
+# Usage: checks.sh [--dir <worktree>] [--e2e] [--no-e2e] [--only <a,b,c>] [--filter <expr>]
 #
 #   --dir     worktree to run in (default: current directory)
-#   --no-e2e  skip lane 1 of the e2e tier (CLAUDE.md rule 5). Lane 1 needs no
-#             credentials, but it still spawns real binaries and PTYs, so it
-#             costs minutes
+#   --e2e     ALSO run lane 1 of the e2e tier locally. OFF BY DEFAULT since
+#             issue #502: lane 1 runs in CI on every PR (the `e2e-deterministic`
+#             job), so the reviewer's job is to READ that run, not to spend tens
+#             of minutes of PTY time reproducing it on a machine whose result is
+#             less trustworthy — a worktree at a long `../dot-agent-deck-pr-<n>`
+#             path is not the environment CI runs in, and Phase 5 of the skill
+#             records a case where that difference alone reddened a test.
+#             Pass this when CI's run is missing, cancelled, or you need it
+#             under a `--filter`
+#   --no-e2e  explicit form of the default; accepted so an existing invocation
+#             keeps working
 #   --only    comma-separated subset of: fmt,clippy,build,test-fast,
-#             linkage-check,windows-cross,audit,e2e
+#             linkage-check,windows-cross,audit,e2e (naming `e2e` here implies
+#             --e2e)
 #   --filter  test-name filter passed to the test steps, for rule 6's
 #             rerun-one-test loop (e.g. --filter lifecycle_001)
 #
@@ -35,7 +44,8 @@ if ! . "$stream_lib"; then
 fi
 
 dir="."
-run_e2e=true
+run_e2e=false
+e2e_explicit=false
 only=""
 filter=""
 
@@ -45,8 +55,14 @@ while [ $# -gt 0 ]; do
       dir="${2:-}"
       shift 2
       ;;
+    --e2e)
+      run_e2e=true
+      e2e_explicit=true
+      shift
+      ;;
     --no-e2e)
       run_e2e=false
+      e2e_explicit=true
       shift
       ;;
     --only)
@@ -64,6 +80,13 @@ while [ $# -gt 0 ]; do
       ;;
   esac
 done
+
+# Naming `e2e` in --only is an explicit request for it, so it implies --e2e.
+# Without this, `--only e2e` would run nothing at all, which is the least useful
+# possible reading of the flag. An explicit --no-e2e still wins.
+if [ -n "$only" ] && [ "$e2e_explicit" != true ]; then
+  case ",${only}," in *",e2e,"*) run_e2e=true ;; esac
+fi
 
 if [ ! -d "$dir" ]; then
   emit ERROR true
@@ -171,13 +194,16 @@ wanted fmt && { run_step fmt "cargo fmt --check" || true; } || skip fmt "not in 
 # touching only `xtask/*` — linkage-check, the docs generator, the `spec`
 # macro — was reviewed against a lint that never read a line of it.
 #
-# `e2e-live` (issue #502) is the same hole reopened for the 24 credentialed
-# files, which now open with
+# `e2e-live` (issue #502) is the same hole reopened for the 24 real-agent
+# files, which open with
 # `#![cfg(all(feature = "e2e", feature = "e2e-live"))]` and are empty crates
-# under `--features e2e` alone. This gate is where a reviewer catches a break
-# in them: the e2e step below runs LANE 1 only, so without this second feature
-# a PR touching a real-agent test would be reviewed against no compilation of
-# it at all.
+# under `--features e2e` alone. This gate is where a reviewer catches a break in
+# them, and CI-side it is the only compilation of those 24 there is: they run
+# in no CI job — no test that reaches a real agent does — and the e2e step below
+# runs lane 1 only even when it is turned on. Locally a developer can still
+# compile them with `cargo test-e2e-live` or `bacon clippy`; this gate is what
+# makes that unnecessary for a reviewer. Without this second feature a PR
+# touching a real-agent test is reviewed against no compilation of it at all.
 #
 # This is a type-check and lint, so naming `e2e-live` costs no credential and
 # runs no live test. build-windows/build-macos still run bare `cargo clippy`
@@ -249,21 +275,27 @@ else
   skip audit "not in --only"
 fi
 
-# --- e2e lane 1: the deterministic tier that exercises the product -------
+# --- e2e lane 1: OPT-IN, because CI already runs it on this PR ------------
 #
-# LANE 1 ONLY (issue #502, CLAUDE.md rule 5). This step runs `--features e2e`,
-# i.e. the 47 `tests/e2e_*.rs` files that need no agent credential. The other
-# 24 need one and are lane 2, which runs from `.github/workflows/e2e-live.yml`
-# — per-merge on `main`, on `workflow_dispatch`, and on a PR when the
-# `run-live-e2e` label is applied. This skill deliberately does NOT run lane 2:
-# a reviewer's machine would need its own agent credentials, the run costs real
-# tokens, and those tests are the flakiest signal in the repo. If the PR under
-# review touches real-agent paths, label it `run-live-e2e` and read that
-# workflow's run rather than running it here — docs/develop/e2e-lanes.md has
-# the how, including why a GREEN lane-2 run can still mean almost nothing.
+# OFF BY DEFAULT since issue #502 (CLAUDE.md rule 5). Lane 1 — the 47
+# `tests/e2e_*.rs` files that reach no real agent, `--features e2e` — runs in CI
+# on every PR as the `e2e-deterministic` job, so the reviewer's job is to READ
+# that run: `gh pr checks <n>` for its conclusion, `gh run view <id> --log-failed`
+# for a failure. Reproducing it here costs tens of minutes of PTY time for a
+# result that is LESS trustworthy than CI's, because this worktree sits at a long
+# `../dot-agent-deck-pr-<n>` path with a cold target/ — Phase 5 of SKILL.md
+# records a case where that difference alone reddened a test and got misreported
+# as a defect on `main`.
+#
+# Pass --e2e when CI's run is missing, cancelled, or you want it under a
+# --filter. Lane 2 — the 24 files that reach a real agent — is NEVER run here
+# and runs nowhere in CI either: it needs the reviewer's own agent credentials
+# and spends real tokens on the flakiest signal in the repo. Say so in the
+# report rather than letting a green lane-1 row stand in for it.
+# docs/develop/e2e-lanes.md has the reasoning.
 
 if [ "$run_e2e" != true ]; then
-  skip e2e "--no-e2e was passed — SAY SO in the report; do not present the run as complete"
+  skip e2e "not run locally — READ THE PR's e2e-deterministic CI run instead (gh pr checks <n>); pass --e2e to run it here"
 elif ! wanted e2e; then
   skip e2e "not in --only"
 elif [ "$build_ok" != true ]; then
@@ -302,17 +334,17 @@ else
     # nothing and only then exits 1, so `|| echo 0` produces "0\n0" and the
     # numeric test below dies with "integer expression expected".
     #
-    # DELIBERATELY MARKER-LESS, and this is the one place the pattern does NOT
-    # match e2e-live.yml byte for byte. Since #502/#785 `_skip_if_err` in
-    # tests/common/mod.rs prints `SKIP: [e2e] <reason>`, and that workflow's
-    # summary requires the `[e2e]` marker so its count is not polluted by the
-    # xtask and unit-test `SKIP:` lines a `--workspace` run also selects. This
-    # script keeps the broader pattern for two reasons: it runs against whatever
-    # branch a contributor's PR is on, including branches that predate the
-    # marker, where requiring it would silently report 0 and re-open #452/#490;
-    # and its output is a local file for the human running /verify-pr, not a
-    # public job summary, so over-counting here costs a second of reading rather
-    # than a wrong answer on a trusted surface. The consequence to know when
+    # DELIBERATELY MARKER-LESS. Since #502/#785 `_skip_if_err` in
+    # tests/common/mod.rs prints `SKIP: [e2e] <reason>`, and the narrower
+    # `SKIP: \[e2e\] ` pattern docs/develop/e2e-lanes.md recommends keeps a count
+    # from being polluted by the xtask and unit-test `SKIP:` lines a
+    # `--workspace` run also selects. This script keeps the broader pattern for
+    # two reasons: it runs against whatever branch a contributor's PR is on,
+    # including branches that predate the marker, where requiring it would
+    # silently report 0 and re-open #452/#490; and its output is a local file for
+    # the human running /verify-pr, so over-counting here costs a second of
+    # reading rather than a wrong answer on a trusted surface. The consequence to
+    # know when
     # reading the row below: on a workspace missing `bash`, `jq`, `node` or
     # `python3` this count includes those tools' own skips.
     skips=$(grep -cE '^[[:space:]]*SKIP: ' "$e2e_log" 2>/dev/null || true)
