@@ -1082,9 +1082,33 @@ async fn run_idle_monitor(
 async fn ingest_event(
     state: &SharedState,
     event_tx: &broadcast::Sender<BroadcastMsg>,
-    event: AgentEvent,
+    registry: &AgentPtyRegistry,
+    mut event: AgentEvent,
 ) {
+    // Issue #770: half of the orphan verdict, asked of the registry BEFORE the
+    // `AppState` write lock is taken. Sequencing, not style: `has_live_pane`
+    // takes the registry's own mutex, and every other path in the daemon that
+    // holds both takes the registry first (`spawn` registers a role only after
+    // `spawn_agent` has returned and released it). Asking here keeps that order
+    // rather than introducing the one nesting that would reverse it.
+    let daemon_owns_pane = event
+        .pane_id
+        .as_deref()
+        .is_some_and(|pane_id| registry.has_live_pane(pane_id));
     let mut state = state.write().await;
+    // The other half, plus the stamp: is this an orchestration role pane whose
+    // role registration a daemon restart destroyed while its agent survived?
+    // The verdict is the daemon's alone — any inbound value is dropped first,
+    // because `metadata` rides an unauthenticated same-uid socket and a
+    // producer must not be able to paint its own card (see
+    // `ORCHESTRATION_ORPHANED_METADATA_KEY`).
+    //
+    // Stamped HERE, before the fan-out, so it reaches attached TUIs even when
+    // the daemon's own `apply_event` declines the event — which is precisely
+    // what happens for an orphan: admission control asks the registry, the
+    // registry has never heard of the pane, and a non-`SessionStart` frame is
+    // dropped. The card that needs the badge is an attached TUI's.
+    state.stamp_orchestration_orphan(&mut event, daemon_owns_pane);
     let _ = event_tx.send(BroadcastMsg::Event(event.clone()));
     state.apply_event(event);
 }
@@ -1694,7 +1718,7 @@ async fn run_shell_activity_monitor_with<S, F>(
             // One ordered ingestion step (broadcast + apply under a single
             // write-lock hold), exactly as the hook loop below does it — see
             // `ingest_event` for the interleaving this closes.
-            ingest_event(&state, &event_tx, event).await;
+            ingest_event(&state, &event_tx, &pty_registry, event).await;
         }
     }
 }
@@ -2039,7 +2063,7 @@ async fn run_hook_loop(
                             // different connection, so doing it first only
                             // means a client that reacts to the event by
                             // listing agents sees the fresher answer.
-                            ingest_event(&state, &event_tx, event).await;
+                            ingest_event(&state, &event_tx, &pty_registry, event).await;
                         } else {
                             warn!("Malformed event: {line}");
                         }

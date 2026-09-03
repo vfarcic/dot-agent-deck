@@ -157,6 +157,42 @@ See [Installation › Recycling the local daemon](installation.md#recycling-the-
 
 On every launch, the TUI performs a build-version handshake with the daemon. When the binary versions differ, the resolution depends only on whether managed agents are running. With **no agents running**, the older daemon is restarted **silently** — there is nothing to lose. With **agents running** and an interactive terminal, the TUI prompts you: the prompt **names the live agents** and warns that restarting stops them, then offers a single-keystroke choice — press **S** to restart onto the new version, or any other key to **keep the current daemon** and stay attached to it with your agents intact. Keeping the current daemon is what leaves you on the older shape. When the TUI is not attached to a terminal (CI, pipes) and agents are running, it prints the recovery hint to stderr and exits non-zero instead of prompting.
 
+## An orchestration stops being able to delegate: "the daemon holds no orchestration role for pane …"
+
+An orchestrator that has been delegating happily suddenly cannot. Its `dot-agent-deck delegate` fails with:
+
+```text
+delegate from pane sched-issue-work-17-r0 failed: the daemon holds no
+orchestration role for pane sched-issue-work-17-r0, so this delegate was
+routed nowhere. Only a pane spawned as part of an orchestration can delegate.
+```
+
+Nothing else looks wrong. The pane is still running, the agent is still working, and the card is still updating — which is what makes this expensive: the failure surfaces only at the moment someone delegates, which for an orchestrator can be hours into a run.
+
+### Why this happens
+
+The daemon holds each orchestration's role registrations **in memory only**. There is no file, no snapshot, and nothing that survives the process. If the daemon restarts — `daemon stop`, a build-version restart, a crash — those registrations are gone. An agent that has detached from the PTY it was born under keeps running regardless, so it outlives the daemon that knew about it, reconnects its hooks to the new one (which accepts them), and is simply never able to delegate again.
+
+Restoring the maps from disk is deliberately *not* the fix: a restart kills the PTYs the daemon owned, so most panes in such a file would be genuinely dead, and a restored entry pointing at a dead pane turns an honest refusal into a delegate that silently routes into a void.
+
+### What you will see now
+
+An affected card is marked **`orphaned`** in its title and carries a `Orphaned — delegation unavailable` row, so the state is visible on the dashboard instead of waiting for the next delegate to expose it.
+
+And `daemon stop` refuses while any orchestration role is live, listing the panes and roles at stake:
+
+```text
+daemon holds 2 live orchestration role(s):
+  sched-issue-work-17-r0 orchestrator (orchestrator) [issue-work]
+  sched-issue-work-17-r1 coder [issue-work]
+stopping the daemon deletes these registrations for good — they are held in memory only, so any agent that survives the restart keeps running but can never delegate again
+pass --force to stop anyway
+```
+
+### Fix
+
+There is no in-place recovery for a pane that is already orphaned — re-dispatch the orchestration. To avoid it, let an orchestration finish before recycling the daemon, and treat `daemon stop --force` while roles are live as a decision to abandon that run.
+
 ## A pane says "disconnected" and ignores what you type
 
 A pane whose title ends in `— disconnected` is no longer connected to an agent. Its last output stays on screen so you can read what happened, but the pane cannot accept input again — typing into it reports that it is disconnected rather than sending anything. Close the pane and start a new one; there is nothing to recover in place.

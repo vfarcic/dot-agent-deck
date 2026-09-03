@@ -744,6 +744,19 @@ pub struct SessionState {
     /// synthetic (see the bottom of `apply_event`), so a real event always
     /// wins the "what set this status" question.
     pub shell_synthetic_working: bool,
+    /// Issue #770: this session's pane is an ORPHANED orchestration role pane —
+    /// the daemon holds no orchestration role for it, so
+    /// `dot-agent-deck delegate` from it is refused and no worker can be
+    /// dispatched, however healthy the rest of the card looks.
+    ///
+    /// Set from the daemon's own marker on the event
+    /// ([`crate::event::ORCHESTRATION_ORPHANED_METADATA_KEY`]) — never derived
+    /// locally, because only the daemon holds the role map the answer comes
+    /// from. STICKY once set: a pane whose role registration is gone cannot get
+    /// it back (a re-dispatch mints a new pane id and therefore a new card), so
+    /// there is no un-orphaning edge to watch for and clearing on the next
+    /// unmarked event would just make the badge flicker.
+    pub orchestration_orphaned: bool,
 }
 
 impl SessionState {
@@ -857,6 +870,37 @@ impl OrchestrationIdentity {
             OrchestrationIdentity::NameCwd { name, .. } => name,
         }
     }
+}
+
+/// Issue #770: one live orchestration-role registration the daemon is holding
+/// in memory, as reported on the `ListAgents` reply so `daemon stop` can refuse
+/// to destroy it.
+///
+/// This is a snapshot of [`AppState::pane_role_map`] +
+/// [`AppState::orchestrator_pane_ids`] + [`AppState::pane_orchestration_map`],
+/// which live in memory ONLY. Stopping the daemon deletes them, and an agent
+/// that survives the restart is then permanently unable to delegate — the
+/// daemon that comes up next holds no role for its pane, so
+/// [`AppState::handle_delegate`] refuses, while its hook events keep being
+/// accepted and the pane keeps looking healthy. That asymmetry is what makes
+/// the loss expensive to diagnose and worth refusing by default.
+///
+/// Additive and optional on the wire (see
+/// [`crate::daemon_protocol::AttachResponse::orchestration_roles`]): a daemon
+/// predating it omits the field and a new client falls back to the
+/// managed-agent guard alone, which is exactly today's behaviour.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct OrchestrationRoleRecord {
+    /// The pane the role is registered against — the value that agent sees as
+    /// `DOT_AGENT_DECK_PANE_ID` and sends on every delegate.
+    pub pane_id: String,
+    /// The role name (`orchestrator`, `coder`, …) as registered.
+    pub role: String,
+    /// The orchestration's config name, for grouping the refusal message.
+    pub orchestration: String,
+    /// `true` for the start role — the only one that may delegate, and so the
+    /// one whose loss is immediately fatal to the run.
+    pub is_orchestrator: bool,
 }
 
 /// Issue #454: who this process actually owns, asked of the component that
@@ -5745,6 +5789,7 @@ impl AppState {
                 agent_id,
                 display_name: None,
                 shell_synthetic_working: false,
+                orchestration_orphaned: false,
             },
         );
         session_id
@@ -5859,6 +5904,103 @@ impl AppState {
         }
         if is_start_role {
             self.orchestrator_pane_ids.insert(pane_id.to_string());
+        }
+    }
+
+    /// Issue #770: every live orchestration-role registration this daemon is
+    /// holding, newest state of the in-memory maps, sorted for a stable report.
+    ///
+    /// These maps have no persistence path of any kind, so this set is exactly
+    /// what a daemon restart destroys. `daemon stop` reads it over `ListAgents`
+    /// and refuses without `--force` when it is non-empty — see
+    /// [`crate::daemon_stop::run_daemon_stop`].
+    ///
+    /// It is deliberately NOT derived from the agent registry's
+    /// `TabMembership`, which carries the same information for panes that still
+    /// have a live agent record. The role maps are the state whose loss causes
+    /// the bug, and they outlive the agent record (nothing but a pane CLOSE
+    /// calls [`Self::unregister_pane`]), so reading the registry instead would
+    /// under-report exactly the case worth refusing: a role whose agent has
+    /// detached from the pane it was born under and will survive the restart.
+    pub fn live_orchestration_roles(&self) -> Vec<OrchestrationRoleRecord> {
+        let mut roles: Vec<OrchestrationRoleRecord> = self
+            .pane_role_map
+            .iter()
+            .map(|(pane_id, role)| OrchestrationRoleRecord {
+                pane_id: pane_id.clone(),
+                role: role.clone(),
+                orchestration: self
+                    .pane_orchestration_map
+                    .get(pane_id)
+                    .map(|id| id.name().to_string())
+                    .unwrap_or_default(),
+                is_orchestrator: self.orchestrator_pane_ids.contains(pane_id),
+            })
+            .collect();
+        // `pane_role_map` is a `HashMap`, so iteration order varies run to run.
+        // The refusal message lists these to a human; sort so the same daemon
+        // state always prints the same list.
+        roles.sort_by(|a, b| {
+            a.orchestration
+                .cmp(&b.orchestration)
+                .then_with(|| a.pane_id.cmp(&b.pane_id))
+        });
+        roles
+    }
+
+    /// Issue #770: is this hook event coming from an orchestration ROLE pane
+    /// that this daemon holds no role registration for — i.e. an ORPHAN?
+    ///
+    /// The orphan is created by a daemon restart. The role maps are in-memory
+    /// only, so the new daemon has none; an agent that detached from the PTY it
+    /// was born under (`ppid=1`) survives untouched and keeps posting hooks to
+    /// the new daemon, which accepts them. Its `dot-agent-deck delegate`,
+    /// however, is refused by [`Self::handle_delegate`] for the rest of the
+    /// run. Nothing else about the pane looks wrong, which is why the failure
+    /// was measured surfacing hours later, at the first delegate.
+    ///
+    /// Three conditions, all required:
+    ///
+    /// - `daemon_owns_pane` is `false`. This is what makes the SPAWN RACE
+    ///   unreachable: [`crate::spawn::spawn`] registers each role synchronously
+    ///   as its spawn lands, so a fast agent can emit its first hook in the
+    ///   window between the child starting and the registration completing —
+    ///   and in that window the registry DOES claim the pane, while after a
+    ///   restart it does not. Without this term that race would paint a healthy
+    ///   pane orphaned.
+    /// - the pane id has the daemon's own role shape
+    ///   ([`crate::spawn::is_orchestration_role_pane_id`]). A `Ctrl+n`
+    ///   orchestration's panes are numbered by the TUI and carry no such
+    ///   marker, so they are not classified here either way.
+    /// - no [`Self::pane_role_map`] entry — the condition
+    ///   [`Self::handle_delegate`] itself refuses on, asked of the same map.
+    pub fn is_orphaned_orchestration_pane(&self, pane_id: &str, daemon_owns_pane: bool) -> bool {
+        !daemon_owns_pane
+            && crate::spawn::is_orchestration_role_pane_id(pane_id)
+            && !self.pane_role_map.contains_key(pane_id)
+    }
+
+    /// Issue #770: decide, and stamp, whether `event` came from an ORPHANED
+    /// orchestration role pane (see [`Self::is_orphaned_orchestration_pane`]).
+    ///
+    /// The daemon calls this on every inbound hook event, before the fan-out.
+    /// It is **daemon-authoritative**: any inbound value under
+    /// [`crate::event::ORCHESTRATION_ORPHANED_METADATA_KEY`] is REMOVED first,
+    /// unconditionally, so a producer on the unauthenticated same-uid hook
+    /// socket can neither badge a healthy card nor — the direction that
+    /// actually matters — suppress the badge on its own by supplying a value
+    /// this function would otherwise have left alone.
+    pub fn stamp_orchestration_orphan(&self, event: &mut AgentEvent, daemon_owns_pane: bool) {
+        event
+            .metadata
+            .remove(crate::event::ORCHESTRATION_ORPHANED_METADATA_KEY);
+        if let Some(pane_id) = event.pane_id.as_deref()
+            && self.is_orphaned_orchestration_pane(pane_id, daemon_owns_pane)
+        {
+            event.metadata.insert(
+                crate::event::ORCHESTRATION_ORPHANED_METADATA_KEY.to_string(),
+                crate::event::ORCHESTRATION_ORPHANED_METADATA_VALUE.to_string(),
+            );
         }
     }
 
@@ -7191,6 +7333,7 @@ impl AppState {
                 // redundant duplicate of that block).
                 display_name: None,
                 shell_synthetic_working: false,
+                orchestration_orphaned: false,
             });
 
         // PRD #127 finding #2, reworked for PRD #284 sub-problem (d): seed the
@@ -7402,6 +7545,14 @@ impl AppState {
         // the silent-break `#[serde(other)]` exists to prevent.
         if !matches!(event.event_type, EventType::ShellBusy | EventType::Unknown) {
             session.shell_synthetic_working = false;
+        }
+
+        // Issue #770: carry the daemon's orphaned-role verdict onto the card.
+        // One-way: the marker only ever ARRIVES (see the field's doc comment for
+        // why there is no un-orphaning edge), and an unmarked event from an
+        // older daemon must not clear a verdict a newer one already reported.
+        if event.is_orchestration_orphaned() {
+            session.orchestration_orphaned = true;
         }
 
         // PRD #20 blocker-2: keep the live-target durable across the bounded
@@ -10499,6 +10650,7 @@ mod tests {
                 agent_id: Some("some-other-agent".to_string()),
                 display_name: None,
                 shell_synthetic_working: false,
+                orchestration_orphaned: false,
             },
         );
 

@@ -3101,6 +3101,29 @@ without depending on the config struct API.
 - **Does not assert:** live delegate/work-done routing across the reattach (that is `orchestration/route/001` and the `src/state.rs` routing unit tests); PTY attach or scrollback replay of the rebuilt panes; the same-cwd spawn warning (`orchestration/guard/001`); the on-disk snapshot restore branch.
 - **Platform coverage:** linux+mac (the suite is `#![cfg(unix)]` — the mock attach servers bind Unix-domain sockets; Windows port tracked by #164).
 
+#### orchestration/orphan
+
+##### orchestration/orphan/001 — The daemon MARKS hook events from an orchestration role pane it holds no role for, and that mark reaches the card (issue #770).
+- **Layer:** L1 (in-process `AppState`, no socket and no PTY). Drives the production seam `daemon::ingest_event` calls — `AppState::stamp_orchestration_orphan`, which composes `spawn::is_orchestration_role_pane_id` with the same `pane_role_map` lookup `handle_delegate` refuses on — then the real `apply_event`.
+- **Agent:** none (a synthesized mid-session `ToolStart`, which is what an orphaned pane keeps emitting for hours).
+- **Asserts:** a role-shaped pane id with no `pane_role_map` entry and no registry claim is marked; a pane the registry still claims (the spawn race, where registration has not landed yet) is NOT; a registered role is NOT; a TUI-numbered pane id is NOT; a FORGED inbound mark is stripped before the daemon decides, so the unauthenticated hook socket cannot badge a healthy card; and `apply_event` carries the mark onto `SessionState.orchestration_orphaned`, where a later unmarked event does not clear it.
+- **Does not assert:** the delegate refusal itself (`orchestration/delegate/*` and the `src/state.rs` routing unit tests own that); the daemon's own admission control, which drops a non-`SessionStart` frame for a pane it never spawned — the mark is stamped BEFORE the fan-out precisely because the card that needs it is an attached TUI's; anything about re-registering the lost role, which issue #770 defers.
+- **Platform coverage:** linux+mac (the file is `#![cfg(unix)]` for the attach socket `orchestration/orphan/003` binds).
+
+##### orchestration/orphan/002 — An orphaned pane's dashboard card says so: an `orphaned` title marker and a `delegation unavailable` row (issue #770).
+- **Layer:** L1 (ratatui `TestBackend` via `render_card_to_buffer`).
+- **Agent:** none.
+- **Asserts:** a card whose session is flagged orphaned renders the title marker and the body row naming delegation as the thing that is unavailable; an otherwise-identical card that is not flagged renders neither. The two fixtures differ in exactly one field, so nothing else can account for the difference.
+- **Does not assert:** colour or styling of the marker; card geometry at other densities (`dashboard/pane/*` owns layout); how the flag got set (`orchestration/orphan/001`).
+- **Platform coverage:** linux+mac (file-level `#![cfg(unix)]`; the render path itself is portable).
+
+##### orchestration/orphan/003 — `daemon stop` reports live orchestration roles over `list-agents` and REFUSES to stop while any exist (issue #770).
+- **Layer:** L1/synthetic (real attach socket served by the production `serve_attach_with_counter` over a caller-owned `AppState`, driven through the real `daemon_stop::run_daemon_stop`).
+- **Agent:** none (two role registrations, no spawned process).
+- **Asserts:** the `ListAgents` reply carries both roles with the orchestrator flagged and a stable order; `run_daemon_stop(.., force = false)` returns `LiveOrchestrations` carrying both, and the rendered refusal names the panes and says the loss is permanent rather than a termination. The refusal is also what stops the flow before `terminate_daemon_graceful`, whose target pid is the test process itself — so a regression here is a SIGTERM, not a quiet assertion failure.
+- **Does not assert:** the `--force` override or the both-guards-apply ordering, which are covered without a socket by `daemon_stop::tests::stop_refusal_covers_the_force_matrix` — driving `--force` here would terminate the test runner; the pre-existing managed-agent guard; SIGTERM/SIGKILL escalation (`lifecycle/stop/003`).
+- **Platform coverage:** linux+mac (`#![cfg(unix)]` — the attach socket is Unix-domain and pid discovery reads `SO_PEERCRED`; Windows port tracked by #164).
+
 ### Session restore
 
 #### session/restore
