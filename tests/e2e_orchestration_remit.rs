@@ -114,6 +114,45 @@ const DELIVERY_SETTLE_QUIET_WINDOW: Duration = Duration::from_millis(1500);
 /// fork on a loaded machine, not an IPC round trip.
 const DELIVERY_SETTLE_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// The most [`DELIVERED_POINTER`] lines ONE logical delivery can legitimately
+/// leave in the log, and therefore the ceiling [`settled_pointer_count`]
+/// refuses to settle above.
+///
+/// Three, from `src/prompt_delivery.rs`: `MAX_PAYLOAD_SUBMISSIONS` is 2 — the
+/// write itself plus the one bounded REPLACEMENT payload — and issue #666's
+/// `AgentStartRearm` allows ONE further payload write on positive evidence the
+/// payload was destroyed, which that module documents as a hard cap of three.
+/// Every attempt past that falls back to a submit-only probe, which writes a
+/// bare CR the fixture logs as an empty line rather than as a pointer, so it
+/// cannot inflate this count.
+///
+/// Greptile P2 on PR #837, first half. A settled count with no ceiling accepts
+/// whatever it happens to observe, so a caller that meant "one more delivery"
+/// silently accepts five. Bounding it does NOT on its own pin exactly-once —
+/// a count cannot separate one delivery that retried from two that did not,
+/// which is what [`ContextRewriteWatcher`] exists for.
+const MAX_POINTER_LINES_PER_DELIVERY: usize = 3;
+
+/// The minimum gap [`ContextRewriteWatcher`] requires between two observed
+/// modification times before it counts them as two SEPARATE rewrites.
+///
+/// `prepare_orchestrator_prompt` writes the context file with
+/// `std::fs::write`, which truncates and then writes, so ONE logical rewrite
+/// can bump the mtime twice microseconds apart. Two genuine re-arms cannot be
+/// anywhere near that close: the second cannot start until the first
+/// delivery has actually written its payload (`PromptDelivery::attempts > 0`,
+/// `src/ui.rs`), which puts a whole readiness gate and PTY write between them.
+/// Measured against the deliberate double-fire mutation used to verify this
+/// detector: **~680ms** apart, across three runs (679ms, 688ms, 688ms).
+const CONTEXT_REWRITE_DEBOUNCE: Duration = Duration::from_millis(8);
+
+/// Ceiling on how long [`ContextRewriteWatcher`]'s sampling thread stays
+/// alive. Comfortably above the sum of every bound the watched region can
+/// spend ([`REASSERTION_DELIVERY_TIMEOUT`] + [`DELIVERY_SETTLE_TIMEOUT`] +
+/// the 900ms hold), because a watcher that times out early would silently
+/// UNDER-count. [`ContextRewriteWatcher::stop`] asserts it did not.
+const CONTEXT_WATCH_MAX: Duration = Duration::from_secs(180);
+
 /// Block until the daemon's own `ListAgents`/live-status join reports `pred`
 /// for `pane_id`'s live session, or `timeout` elapses; returns whether it
 /// did.
@@ -165,8 +204,19 @@ fn wait_for_applied(
 /// it measures — one more pointer line than the spawn-time delivery left
 /// behind, whatever that delivery cost — instead of asserting a literal that
 /// silently encodes "and the retry did not fire".
+///
+/// `ceiling` is the largest count this call will accept as settled, and it is
+/// the answer to Greptile P2's first half on PR #837: without it a caller
+/// takes whatever count happens to hold still and hands it on as the baseline
+/// for a check that then measures from a figure it never inspected. Every
+/// caller knows how many deliveries are legitimately behind the count it is
+/// settling — one — so every caller can name
+/// [`MAX_POINTER_LINES_PER_DELIVERY`] more than it started from. A count that
+/// blows past that is a defect regardless of what happens next, and saying so
+/// here reports it against the delivery that caused it rather than as a
+/// confusing off-by-N in the assertion behind it.
 #[cfg(unix)]
-fn settled_pointer_count(deck: &TuiDeck, log: &std::path::Path) -> usize {
+fn settled_pointer_count(deck: &TuiDeck, log: &std::path::Path, ceiling: usize) -> usize {
     let last = std::cell::Cell::new(usize::MAX);
     let stable_since = std::cell::Cell::new(std::time::Instant::now());
     let settled = common::wait_until(DELIVERY_SETTLE_TIMEOUT, || {
@@ -187,7 +237,106 @@ fn settled_pointer_count(deck: &TuiDeck, log: &std::path::Path) -> usize {
         last.get(),
         deck.snapshot_grid()
     );
-    last.get()
+    let settled_count = last.get();
+    assert!(
+        settled_count <= ceiling,
+        "the delivery log settled at {settled_count} `{DELIVERED_POINTER}` line(s), above \
+         the {ceiling} one logical delivery can account for \
+         ({MAX_POINTER_LINES_PER_DELIVERY} payload writes at most — \
+         `MAX_PAYLOAD_SUBMISSIONS` plus issue #666's one evidence-based rearm, \
+         `src/prompt_delivery.rs`). More than one delivery therefore ran, so this count \
+         cannot serve as a baseline for anything.\nFinal grid:\n{}",
+        deck.snapshot_grid()
+    );
+    settled_count
+}
+
+/// Count how many times the orchestrator context file is REWRITTEN between
+/// [`ContextRewriteWatcher::start`] and [`ContextRewriteWatcher::stop`] — the
+/// exactly-once detector `orchestration_remit_004` needs and that no pointer
+/// count can provide.
+///
+/// Greptile P2 on PR #837. Counting pointer lines cannot tell ONE re-assertion
+/// whose delivery earned its replacement payload write (`baseline + 2` lines,
+/// designed behaviour, `MAX_PAYLOAD_SUBMISSIONS` in `src/prompt_delivery.rs`)
+/// from a genuine DOUBLE FIRE whose two deliveries were each confirmed first
+/// time (`baseline + 2` lines, the regression). Both land inside
+/// [`DELIVERY_SETTLE_QUIET_WINDOW`], so a settled baseline absorbs the second
+/// one and the "stays put" check behind it then measures from a baseline that
+/// already contains the defect.
+///
+/// The context FILE separates them, because the two writes have different
+/// authors. A re-arm calls `reassert_orchestrator_prompt` (`src/ui.rs`), which
+/// goes through `prepare_orchestrator_prompt` (`src/orchestrator_context.rs`)
+/// and `std::fs::write`s the whole file. A payload retry re-sends the
+/// ALREADY-PREPARED prompt string and never touches the file at all. So the
+/// number of rewrites IS the number of logical re-assertions, whatever the
+/// pointer count did.
+///
+/// **Why a background sampler rather than reading the file at each step.** The
+/// first version of this check stamped a sentinel comment into the file,
+/// waited for the re-assertion's log line, and re-stamped. That misses,
+/// measured: against a deliberate double-fire mutation it caught only 3 of 5
+/// runs, because the SECOND re-arm fires one frame after the first payload
+/// write — i.e. at essentially the same moment as the log line the test is
+/// waiting on, and usually before the test can react to it. Sampling from
+/// before the trigger removes the reaction entirely: there is no moment the
+/// test has to be quick enough to catch.
+#[cfg(unix)]
+struct ContextRewriteWatcher {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    handle: std::thread::JoinHandle<(usize, bool)>,
+}
+
+#[cfg(unix)]
+impl ContextRewriteWatcher {
+    fn start(context_path: &std::path::Path) -> Self {
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let path = context_path.to_path_buf();
+        let thread_stop = std::sync::Arc::clone(&stop);
+        let handle = std::thread::spawn(move || {
+            let mtime = |p: &std::path::Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+            let last = std::cell::Cell::new(mtime(&path));
+            // Start the debounce already elapsed, so the FIRST rewrite always
+            // counts however soon after `start` it arrives.
+            let last_counted =
+                std::cell::Cell::new(std::time::Instant::now() - CONTEXT_REWRITE_DEBOUNCE);
+            let rewrites = std::cell::Cell::new(0usize);
+            // The pacing comes from `common::wait_until` — the harness's own
+            // bounded poll — rather than from a sleep in this file. That is
+            // Decision 21 (no sleeps in an e2e test body), and the cadence is
+            // right on the measurement rather than by luck: `wait_until` polls
+            // every 50ms (`tests/common/mod.rs`) against a ~680ms gap between
+            // two genuine re-arms, so ~13x margin.
+            let stopped_cleanly = common::wait_until(CONTEXT_WATCH_MAX, || {
+                let now = mtime(&path);
+                if now.is_some() && now != last.get() {
+                    last.set(now);
+                    if last_counted.get().elapsed() >= CONTEXT_REWRITE_DEBOUNCE {
+                        rewrites.set(rewrites.get() + 1);
+                        last_counted.set(std::time::Instant::now());
+                    }
+                }
+                thread_stop.load(std::sync::atomic::Ordering::Relaxed)
+            });
+            (rewrites.get(), stopped_cleanly)
+        });
+        Self { stop, handle }
+    }
+
+    fn stop(self) -> usize {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let (rewrites, stopped_cleanly) =
+            self.handle.join().expect("context rewrite watcher thread");
+        assert!(
+            stopped_cleanly,
+            "the context-rewrite watcher hit its own {CONTEXT_WATCH_MAX:?} ceiling before the \
+             test asked it to stop, so it stopped sampling early and its count of \
+             {rewrites} rewrite(s) is a floor rather than a total — do not read an \
+             exactly-once verdict off it."
+        );
+        rewrites
+    }
 }
 
 /// Drive the new-pane dialog to open the (single) orchestration in the
@@ -437,6 +586,88 @@ fn inject_compacting(
 /// real production constants `build_event_typed` (`src/hook.rs`) forwards
 /// `ClaudeCodeHookInput.source == "clear"` into.
 ///
+/// Drive `pane_id`'s live session onto a UNIQUELY-NAMED active tool and block
+/// until the daemon has applied it — the primer that makes
+/// [`inject_clear_session_start`]'s own barrier a genuine transition rather
+/// than a predicate that may already be true.
+///
+/// Greptile P1 on PR #837. `SessionStatus::Idle` is what
+/// `AppState::apply_event`'s `EventType::SessionStart` arm sets, and it is
+/// also the resting value of a session that has done nothing in particular —
+/// so "wait for Idle" is not a barrier on the injected event, it is a barrier
+/// on a VALUE the injected event happens to produce. Anything else that
+/// reaches that value first satisfies it, and every assertion behind it (the
+/// 900ms negative checks in `_005`/`_006` most of all) then runs against state
+/// the injection has not reached. That is TRIVIALITY, not impatience: no wider
+/// bound rescues a predicate that was already true, which is the same shape of
+/// mistake as the bounds #818 first proposed for the status clobber.
+///
+/// Measured on this branch before the primer existed, instrumenting all three
+/// call sites: the start-role pane read `Thinking` (the spawn confirmation's
+/// own footprint) and the `_005` worker pane had NO live session at all, so
+/// `wait_for_applied`'s `is_some_and` was false and every wait did in fact
+/// barrier. So the finding is LATENT rather than currently firing — the
+/// predicate is sound today only because of what the fixture happens to leave
+/// on those panes, and this makes it sound by construction instead.
+///
+/// `EventType::ToolStart` is the primer because it is the only arm that writes
+/// a value THIS CALL CHOOSES into the snapshot — `active_tool.name`
+/// (`src/state.rs`) — so its own barrier cannot be satisfied by anything the
+/// pane was already doing. It is inert for the feature under test: the two
+/// re-assertion triggers are a `Compacting` status and a `/clear`-shaped
+/// `SessionStart` (`should_reassert_orchestrator_remit` /
+/// `orchestrator_remit_pane_latest_clear_session_start`, `src/ui.rs`), and the
+/// `Working` this sets is neither. It carries the caller's own `agent_type` so
+/// it cannot change the session's recorded one relative to the injection that
+/// follows — `apply_event` fixes a session's `agent_type` from its first
+/// non-`None` event and never changes it afterwards.
+#[cfg(unix)]
+fn prime_active_tool(
+    deck: &TuiDeck,
+    socket: &std::path::Path,
+    pane_id: &str,
+    agent_id: &str,
+    session_id: &str,
+    agent_type: &AgentType,
+    tool_marker: &str,
+) {
+    let event = AgentEvent {
+        session_id: session_id.to_string(),
+        agent_type: agent_type.clone(),
+        event_type: EventType::ToolStart,
+        tool_name: Some(tool_marker.to_string()),
+        tool_detail: None,
+        cwd: None,
+        timestamp: chrono::Utc::now(),
+        user_prompt: None,
+        metadata: std::collections::HashMap::new(),
+        pane_id: Some(pane_id.to_string()),
+        agent_id: Some(agent_id.to_string()),
+        agent_version: None,
+        schema_version: None,
+        live_target: None,
+    };
+    let line = serde_json::to_string(&event).expect("serialize synthetic ToolStart AgentEvent");
+    common::write_hook_line(deck.hook_socket_path(), &line)
+        .expect("inject synthetic ToolStart AgentEvent over hook socket");
+
+    let primed = wait_for_applied(socket, pane_id, INJECTED_EVENT_APPLIED_TIMEOUT, |s| {
+        s.active_tool
+            .as_ref()
+            .is_some_and(|t| t.name == tool_marker)
+    });
+    assert!(
+        primed,
+        "the daemon's own ListAgents/live-status join never reported the priming tool \
+         `{tool_marker}` for pane {pane_id} (agent_id {agent_id}) within \
+         {INJECTED_EVENT_APPLIED_TIMEOUT:?}. The tool name is unique to this call, so \
+         nothing else can produce it: either AppState::apply_event rejected the event \
+         (admission control — is this pane owned?) or it applied it to a different \
+         session.\nFinal grid:\n{}",
+        deck.snapshot_grid()
+    );
+}
+
 /// `agent_type` is a caller-supplied parameter, not a hardcoded value: the
 /// re-assertion feature's `/clear` trigger is Claude Code only, so
 /// `orchestration_remit_004`/`_005` pass [`AgentType::ClaudeCode`] to
@@ -459,7 +690,7 @@ fn inject_clear_session_start(
     );
     let event = AgentEvent {
         session_id: session_id.to_string(),
-        agent_type,
+        agent_type: agent_type.clone(),
         event_type: EventType::SessionStart,
         tool_name: None,
         tool_detail: None,
@@ -475,20 +706,53 @@ fn inject_clear_session_start(
     };
     let line = serde_json::to_string(&event)
         .expect("serialize synthetic clear-originated SessionStart AgentEvent");
+
+    // See [`prime_active_tool`]. The barrier below cannot be a wait for
+    // `SessionStatus::Idle`: that is a VALUE this event produces, not a
+    // footprint of this event, and it is also where a quiet pane already sits.
+    let tool_marker = format!("remit-clear-primer-{session_id}");
+    prime_active_tool(
+        deck,
+        socket,
+        pane_id,
+        agent_id,
+        session_id,
+        &agent_type,
+        &tool_marker,
+    );
+
     common::write_hook_line(deck.hook_socket_path(), &line)
         .expect("inject synthetic clear-originated SessionStart AgentEvent over hook socket");
 
+    // `active_tool` CLEARED, not `status == Idle`, and the difference is two
+    // separate things.
+    //
+    // Non-triviality: the primer above established `Some(tool_marker)` and had
+    // its own applied barrier, so this predicate was demonstrably false a
+    // moment ago. Nothing in this fixture emits a second tool event.
+    //
+    // Latching: `Idle` is TRANSIENT here. On a pane whose re-assertion this
+    // event triggers, the delivery's own `thinking` confirmation overwrites
+    // `Idle` within roughly one `wait_until` poll interval (50ms,
+    // `tests/common/mod.rs`), so a `status == Idle` wait can miss the window
+    // entirely and time out on a correct system — trading a predicate that
+    // passes too easily for one that fails at random. `active_tool` stays
+    // `None` once cleared, and the only events that clear it here are this
+    // `SessionStart` or a `Thinking` that is causally DOWNSTREAM of it
+    // (`src/state.rs`), so either way this becoming true means the injection
+    // was applied.
     let applied = wait_for_applied(socket, pane_id, INJECTED_EVENT_APPLIED_TIMEOUT, |s| {
-        s.status == dot_agent_deck::state::SessionStatus::Idle
+        s.active_tool.is_none()
     });
     assert!(
         applied,
-        "the daemon's own ListAgents/live-status join never reported Idle for pane \
-         {pane_id} (agent_id {agent_id}) within {INJECTED_EVENT_APPLIED_TIMEOUT:?} after \
-         injecting a synthetic clear-originated SessionStart. Same two candidate causes, \
-         and same order to check them in, as [`inject_compacting`]'s twin above — a \
-         later `EventType::Thinking` on this pane overwrites `Idle` just as \
-         unconditionally as it overwrites `Compacting`.",
+        "the daemon's own ListAgents/live-status join still reported the priming tool \
+         `{tool_marker}` for pane {pane_id} (agent_id {agent_id}) \
+         {INJECTED_EVENT_APPLIED_TIMEOUT:?} after injecting a synthetic \
+         clear-originated SessionStart, so that SessionStart was never applied. \
+         `EventType::SessionStart` clears `active_tool` unconditionally \
+         (`src/state.rs`), so the candidate causes are that AppState::apply_event \
+         rejected the write or applied it to the wrong session.",
     );
 }
 
@@ -581,8 +845,10 @@ fn open_and_confirm_initial_delivery(
     // The settled baseline (see [`settled_pointer_count`]). Taken here, after
     // the confirmation barrier above, so it accounts for the one replacement
     // payload write an unconfirmed spawn-time delivery earns under load —
-    // which every caller would otherwise mistake for a re-assertion.
-    let baseline = settled_pointer_count(deck, &log);
+    // which every caller would otherwise mistake for a re-assertion. The
+    // ceiling counts from ZERO because exactly one delivery — the spawn-time
+    // seed — has run by this point.
+    let baseline = settled_pointer_count(deck, &log, MAX_POINTER_LINES_PER_DELIVERY);
 
     (socket, pane_id, agent_id, log, baseline)
 }
@@ -803,13 +1069,29 @@ fn orchestration_remit_003_reassertion_waits_for_confirmed_delivery() {
 /// `CLEAR_SESSION_START_METADATA_VALUE`). The pointer must reach the pane's
 /// stdin a second time — the orchestrator's remit re-asserting itself on
 /// `/clear`, exactly as it already re-asserts on compaction, via the same
-/// reused delivery machinery.
+/// reused delivery machinery. It must then re-assert EXACTLY once: a sentinel
+/// comment is stamped into `.dot-agent-deck/orchestrator-context.md` before
+/// the trigger, the re-assertion's own rewrite of that file must destroy it
+/// (proving the sentinel detects a re-arm at all), and a freshly stamped one
+/// must then survive the settle-and-hold window that follows.
 #[spec("orchestration/remit/004")]
 #[test]
 #[cfg(unix)]
 fn orchestration_remit_004_start_role_clear_reasserts_remit() {
     let deck = TuiDeck::launch_with_fixture("remit-reassert-orchestration");
     let (socket, pane_id, agent_id, log, baseline) = open_and_confirm_initial_delivery(&deck);
+
+    // Arm the exactly-once detector BEFORE the trigger (see
+    // [`ContextRewriteWatcher`]). It has to be running already: the second
+    // re-arm of a double-fire regression lands one frame after the first
+    // payload write, so any detector that only starts looking once the test
+    // has OBSERVED that write is racing something it loses more often than it
+    // wins.
+    let context_path = deck
+        .workdir()
+        .join(".dot-agent-deck")
+        .join("orchestrator-context.md");
+    let rewrites = ContextRewriteWatcher::start(&context_path);
 
     inject_clear_session_start(
         &deck,
@@ -848,7 +1130,8 @@ fn orchestration_remit_004_start_role_clear_reasserts_remit() {
     // unsettled figure would read that designed retry as a second
     // re-assertion. Under a 64-way CPU load this reddened here specifically,
     // on the literal "must not reach a third line".
-    let settled_after_reassertion = settled_pointer_count(&deck, &log);
+    let settled_after_reassertion =
+        settled_pointer_count(&deck, &log, baseline + MAX_POINTER_LINES_PER_DELIVERY);
     let repeated_beyond_one_reassertion = common::wait_for_file_substr_count(
         &log,
         DELIVERED_POINTER,
@@ -861,6 +1144,36 @@ fn orchestration_remit_004_start_role_clear_reasserts_remit() {
          pointer more than once; the log rose past its settled \
          {settled_after_reassertion} `{DELIVERED_POINTER}` lines within a bounded wait \
          after the re-assertion.\nFinal grid:\n{}",
+        deck.snapshot_grid()
+    );
+
+    // The half the pointer count cannot do (Greptile P2 on PR #837). Settling
+    // absorbs everything written inside its quiet window, and a count cannot
+    // separate ONE delivery that earned its replacement payload write from TWO
+    // deliveries that were each confirmed first time — both read as
+    // `baseline + 2`, so the check above would take a genuine double fire as
+    // its baseline and then confirm the count stayed put at it. Rewrites of
+    // the context file are not a count of deliveries, they are a count of
+    // RE-ARMS: only `reassert_orchestrator_prompt` writes that file and a
+    // payload retry never does.
+    //
+    // Stopped here rather than earlier so the window covers everything above —
+    // the delivery, its settle, and the hold.
+    let rewrites = rewrites.stop();
+    assert_eq!(
+        rewrites,
+        1,
+        "a single `/clear`-originated SessionStart event must trigger exactly ONE \
+         logical re-assertion, but {} was rewritten {rewrites} time(s) while this test \
+         watched it. 0 means no re-arm ran at all and the delivery above came from \
+         somewhere else, so this detector is blind — check it before anything else. 2 \
+         or more is a double fire: only `reassert_orchestrator_prompt` (`src/ui.rs` -> \
+         `src/orchestrator_context.rs`) writes that file, so a second write IS a second \
+         re-arm, and the edge detection on `orchestration_remit_clear_reasserted_at` is \
+         what to look at. The pointer count cannot see this at all — two confirmed \
+         deliveries and one retried delivery leave the same number of lines.\n\
+         Final grid:\n{}",
+        context_path.display(),
         deck.snapshot_grid()
     );
 }
