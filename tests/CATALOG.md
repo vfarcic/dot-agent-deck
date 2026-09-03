@@ -2168,6 +2168,15 @@ note).
 - **Does not assert:** the geometry arithmetic itself (covered by `orchestration/layout/008`); the PTY dims the same layout drives (covered by `orchestration/layout/010`); the live rendered grid and the key that produces it (covered by the PTY-attached `tabs/orchestration/011`).
 - **Platform coverage:** mac+linux+windows.
 
+#### render/seam-bound
+
+##### render/seam-bound/001 — An exported `*_to_buffer` render seam with two caller-controlled axes bounds its dimensions instead of allocating them; the four one-row seams deliberately do not (issue #748).
+- **Layer:** L1 (in-process `TestBackend` through the exported seams themselves; no PTY, no subprocess).
+- **Agent:** none (one synthetic `SessionState` fixture shared by the card seams; the command-banner seam renders an inert pane).
+- **Asserts:** twelve exported two-axis seams — covering both shared helpers (`draw_to_buffer`, `render_overlay_to_buffer`) and seven of the eight seams that build their own `TestBackend` — return a buffer whose `area` is the requested size when it is in range, and `RENDER_SEAM_DIM_MAX` (1024) once the request exceeds it: on the width axis alone at `u16::MAX`, on the height axis alone at `u16::MAX`, on both axes at `RENDER_SEAM_DIM_MAX + 1`, and finally on both axes at `u16::MAX` — the ~4.3-billion-cell request that is an OOM/abort without the bound. The eighth, `render_dashboard_cards_to_buffer`, is asserted separately because its height is derived from the card count rather than passed. A third test pins the OTHER side of the scope: `render_button_bar_to_buffer`, `render_filter_bar_to_buffer`, `render_rename_bar_to_buffer` and `render_tab_bar_to_buffer` pass a literal `1` as their height, so at `u16::MAX` columns they return that width verbatim — 65,535 cells is not an allocation concern and a cap there would truncate a legitimately wide bar, so the exclusion is asserted rather than left as prose.
+- **Does not assert:** what the seams *draw* at the cap (every other `render/*` and `dashboard/*` entry pins content at real terminal sizes); the orchestration frame's own bound and degenerate-input guard, which are inline and predate this (`render/layout/006`); behaviour at degenerate 1x1-style sizes, which is a totality question rather than an allocation one; the daemon-side PTY sibling `PTY_RESIZE_DIM_MAX` (`render/widget/003`, `resize/layout/002`).
+- **Platform coverage:** mac+linux+windows.
+
 ### Keybindings (PRD #40)
 
 Keybindings resolve **client-side**: the config file lives on the machine
@@ -3291,6 +3300,20 @@ These entries cover PRD #162: on TUI reconnect the daemon's `ListAgents` must at
 - **Does not assert:** active-tool restoration (`session/live/006` covers a `Working` snapshot with a tool); real LLM behavior; scheduler/dispatch spawning (`scheduler/spawn/007`).
 - **Platform coverage:** mac+linux.
 
+##### session/live/013 — `SessionSnapshot.last_activity_ms` reports the session's own recorded instant and is additive in both directions (PRD #745 M9).
+- **Layer:** pure-data (serde round-trip plus one `SessionState::live_snapshot` call; no daemon/TUI harness; runs in the fast tier).
+- **Agent:** none.
+- **Asserts:** a `SessionState` whose `last_activity` is an hour old snapshots as that hour-old instant in epoch milliseconds, not as a timestamp minted at snapshot time (the honesty property that separated `last_activity` from the rejected session duration, whose `started_at` IS invented on hydration); the integer round-trips exactly; an absent activity time has no key in the JSON at all rather than a null; an older peer's snapshot payload lacking the key decodes via `#[serde(default)]` to `None` with every other field intact; and a newer peer's payload carrying the key decodes without disturbing the fields an older reader understands — which is the proof behind the do-not-bump decision (`PROTOCOL_VERSION` stays 8).
+- **Does not assert:** the desktop DTO projection or the webview's relative-time wording and clock-skew rule (both covered by the desktop crate's `dto.rs` tests and `AgentOverview.test.tsx`); the `ListAgents` join that carries the snapshot (`session/live/002`, `session/live/003`); the TUI-side seeding of the field, which `seed_hydrated_session` deliberately does not overlay.
+- **Platform coverage:** mac+linux+windows.
+
+##### session/live/014 — `AgentRecord.spawned_at_ms` reports when the daemon forked the child, is absent when it did not, and is additive in both directions (PRD #745 M11).
+- **Layer:** mixed pure-data / real-PTY (one real `AgentPtyRegistry::spawn_agent` plus serde round-trips; no daemon socket, no TUI harness; runs in the fast tier).
+- **Agent:** none (the spawned pane is the default shell; no LLM).
+- **Asserts:** an agent spawned through the registry reports a spawn instant that lies inside the spawn call itself, bracketed by `Utc::now()` either side, so a value minted at snapshot time or copied from a session would fail; the integer round-trips exactly; an agent the registry did NOT fork reports no spawn time and has no key in the JSON at all rather than a null; an older peer's `AgentRecord` payload lacking the key decodes via `#[serde(default)]` to `None` with every other field intact; and a newer peer's payload carrying the key decodes without disturbing the fields an older reader understands — which is the proof behind the do-not-bump decision (`PROTOCOL_VERSION` stays 8).
+- **Does not assert:** that a respawn mints a fresh instant (structural — `respawn_agent_for_pane_declared` removes the record and `spawn_agent` is the only writer, and the registry's respawn behaviour is covered by `orchestration/delegate/*`); the desktop DTO projection or the webview's uptime wording and clock-skew rule (the desktop crate's `dto.rs` tests and `AgentOverview.test.tsx`); the `ListAgents` handler (`session/live/002`, `session/live/003`).
+- **Platform coverage:** mac+linux+windows.
+
 ### Session save (snapshot freshness, PRD #89 Phase 1)
 
 These entries cover PRD #89 Phase 1: the saved-session snapshot must be kept continuously fresh — written on meaningful TUI state changes and on detach — not only at clean teardown/quit.
@@ -3428,6 +3451,13 @@ This entry covers PRD #89 Phase 2b M2b.2: the saved-pane schema gains an `Option
 - **Agent:** none.
 - **Asserts:** `ForwardAgent` and the aggregate are `WARN`, and the process exits exactly 0, pinning WARN as advisory rather than incomplete or broken.
 - **Does not assert:** exact agent-forwarding advisory prose or any real ssh-agent interaction.
+- **Platform coverage:** mac+linux (Unix-only `sh` + `PATH` executable seam).
+
+##### remote/doctor/012 — A remote reporting a different attach protocol version is not a fault (issue #491).
+- **Layer:** L2 (real-binary subprocess spawn; the synthetic `ssh` answers `daemon hello` with a `server_version` one below and one above this binary's own).
+- **Agent:** none.
+- **Asserts:** `ProtocolCompatible` is `PASS` and the run exits 0 in **both** skew directions, and no report quotes a laptop-side protocol version at the user. Pins the removal of the laptop↔remote comparison: `connect` ssh's in and runs the *remote* binary's TUI against the *remote* daemon, so those two constants never share a wire and a difference between them was never evidence of a fault.
+- **Does not assert:** anything about a remote that cannot answer `daemon hello` at all — that floor is kept and is unit-covered by `connect::tests::unanswerable_handshake_stays_fatal_without_naming_versions`.
 - **Platform coverage:** mac+linux (Unix-only `sh` + `PATH` executable seam).
 
 ### Fresh-start escape hatch (PRD #89 Phase 4)

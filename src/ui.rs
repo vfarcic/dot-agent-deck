@@ -18179,6 +18179,8 @@ pub fn render_help_overlay_with_bindings_to_buffer(
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
+    let (width, height) = clamp_render_seam_dims(width, height);
+
     let backend = TestBackend::new(width, height);
     let mut terminal = Terminal::new(backend).expect("TestBackend should construct");
     terminal
@@ -18216,6 +18218,8 @@ pub fn render_hints_bar_for_mode_to_buffer(
 ) -> ratatui::buffer::Buffer {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+
+    let (width, height) = clamp_render_seam_dims(width, height);
 
     let backend = TestBackend::new(width, height);
     let mut terminal = Terminal::new(backend).expect("TestBackend should construct");
@@ -20021,6 +20025,8 @@ where
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
+    let (width, height) = clamp_render_seam_dims(width, height);
+
     let backend = TestBackend::new(width, height);
     let mut terminal = Terminal::new(backend).expect("TestBackend should construct");
     terminal
@@ -20042,12 +20048,10 @@ pub fn render_stats_bar_to_buffer(
     height: u16,
 ) -> ratatui::buffer::Buffer {
     draw_to_buffer(width, height, |frame| {
-        let area = Rect {
-            x: 0,
-            y: 0,
-            width,
-            height,
-        };
+        // `frame.area()` rather than a Rect rebuilt from `width`/`height`: those
+        // are the caller's raw arguments, and `draw_to_buffer` bounds them
+        // (issue #748), so the frame is the only thing that knows the real size.
+        let area = frame.area();
         render_stats_bar(frame, stats, area, active_mode_name);
     })
 }
@@ -20077,12 +20081,8 @@ pub fn render_experimental_footer_to_buffer(
     height: u16,
 ) -> ratatui::buffer::Buffer {
     draw_to_buffer(width, height, |frame| {
-        let area = Rect {
-            x: 0,
-            y: 0,
-            width,
-            height,
-        };
+        // `frame.area()` for the same reason as `render_stats_bar_to_buffer`.
+        let area = frame.area();
         render_experimental_footer(frame, features, area);
     })
 }
@@ -20275,6 +20275,8 @@ pub fn render_card_with_declared_agent_to_buffer(
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
+    let (width, height) = clamp_render_seam_dims(width, height);
+
     let backend = TestBackend::new(width, height);
     let mut terminal = Terminal::new(backend).expect("TestBackend should construct");
     let display_name_owned = display_name.map(str::to_string);
@@ -20327,6 +20329,10 @@ pub fn render_dashboard_cards_to_buffer(
 
     let card_height = density.rendered_height();
     let height = card_height.saturating_mul(cards.len() as u16).max(1);
+    // `height` is derived rather than passed, but `cards.len()` is still the
+    // caller's, so it needs the same bound as `width`. Cards past the cap get a
+    // zero-height rect from `Layout::vertical` below and draw nothing.
+    let (width, height) = clamp_render_seam_dims(width, height);
 
     let backend = TestBackend::new(width, height);
     let mut terminal = Terminal::new(backend).expect("TestBackend should construct");
@@ -20409,6 +20415,8 @@ pub fn render_card_grid_to_buffer(
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
+    let (width, height) = clamp_render_seam_dims(width, height);
+
     let mut ui = UiState::new(DashboardConfig::default(), KeybindingConfig::default());
     ui.selected_index = selected;
     ui.scroll_offset = scroll_offset;
@@ -20455,13 +20463,29 @@ pub fn render_card_grid_to_buffer(
     (terminal.backend().buffer().clone(), probe)
 }
 
-/// Largest frame dimension [`render_orchestration_frame_to_buffer`] will render.
+/// Largest dimension an exported `*_to_buffer` render seam with TWO
+/// caller-controlled axes will render.
 ///
-/// The seam is `#[doc(hidden)] pub`, which hides it from the docs but does not
-/// stop anyone calling it, and its `TestBackend` allocates one cell per
-/// `width * height`. 1024 x 1024 is ~1M cells — comfortably above any real
-/// terminal and comfortably below the ~4.3 BILLION that `u16::MAX` on both axes
-/// would ask for.
+/// Those seams are library API: `src/lib.rs` is `pub mod ui;`, half of them
+/// carry no `#[doc(hidden)]` at all, and `#[doc(hidden)]` hides an item from
+/// rustdoc rather than making it unreachable — so their dimensions come from a
+/// caller this crate does not control. Each one's `TestBackend` allocates one
+/// cell per `width * height`, so `u16::MAX` on both axes asks for ~4.3 BILLION
+/// cells: an OOM/abort, not an error a caller can handle. 1024 x 1024 is ~1M
+/// cells — comfortably above any real terminal and comfortably below that.
+/// Apply it with [`clamp_render_seam_dims`] (issue #748).
+///
+/// **The two-axis qualifier is load-bearing, not hedging.** Four exported seams
+/// are deliberately NOT bounded by this, because they pass a literal `1` as the
+/// height: [`render_button_bar_to_buffer`], [`render_filter_bar_to_buffer`],
+/// [`render_rename_bar_to_buffer`] and [`render_tab_bar_to_buffer`] each render
+/// a single row, so their worst case is `u16::MAX * 1` = 65,535 cells (~2 MB) —
+/// not an allocation concern, and capping it would silently truncate a
+/// legitimately wide bar. Issue #748 measured that and scoped them out; the
+/// `seam_bound_001_one_row_seams_are_deliberately_unbounded` test pins the
+/// exclusion so it stays a decision rather than an oversight. So do not write
+/// "every exported seam is bounded" — write this. If a fifth one-row seam ever
+/// gains a caller-controlled height, it joins the list above instead.
 #[doc(hidden)]
 pub const RENDER_SEAM_DIM_MAX: u16 = 1024;
 
@@ -20471,6 +20495,34 @@ pub const RENDER_SEAM_DIM_MAX: u16 = 1024;
 /// configure.
 #[doc(hidden)]
 pub const RENDER_SEAM_ROLES_MAX: usize = 64;
+
+/// Bound a render seam's caller-given dimensions to [`RENDER_SEAM_DIM_MAX`].
+///
+/// Call this BEFORE the seam's `TestBackend` is built and shadow both bindings,
+/// so every `Rect` the seam derives afterwards describes the buffer that
+/// actually exists rather than the one that was asked for.
+///
+/// **Why clamp rather than return an error** (issue #748): every real caller is
+/// asking for a terminal-sized frame and no real terminal is anywhere near the
+/// cap, so a `Result` on two dozen exported seams would be friction at every
+/// call site in exchange for bounding a case none of them reach. It is not a
+/// *silent* clamp either — the returned `Buffer`'s own `area` is the clamped
+/// size, so the bound is observable in the value the seam already hands back.
+///
+/// **Why one shared rule** — issue #747 is about the damage done when one side
+/// of a resize clamps and another does not, so this function is the single place
+/// the cap is applied, and the daemon-side sibling
+/// [`crate::agent_pty::PTY_RESIZE_DIM_MAX`] clamps the same way. Of the 25
+/// exported two-axis seams, 24 route through here; the 25th,
+/// [`render_orchestration_frame_to_buffer`], applies `RENDER_SEAM_DIM_MAX`
+/// inline because it pairs it with a role-count bound and a degenerate-input
+/// guard.
+fn clamp_render_seam_dims(width: u16, height: u16) -> (u16, u16) {
+    (
+        width.min(RENDER_SEAM_DIM_MAX),
+        height.min(RENDER_SEAM_DIM_MAX),
+    )
+}
 
 /// PRD #313 M5 — L1 seam for a WHOLE orchestration tab: the real
 /// `compute_frame_layout` → `resize_panes_to_layout` → [`render_frame`]
@@ -20706,6 +20758,8 @@ pub fn render_button_bar_with_bindings_to_buffer(
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
+    let (width, height) = clamp_render_seam_dims(width, height);
+
     let backend = TestBackend::new(width, height);
     let mut terminal = Terminal::new(backend).expect("TestBackend should construct");
     // Seam renders the full global+context bar (including the always-on
@@ -20749,6 +20803,8 @@ pub fn render_button_bar_for_mode_to_buffer(
 ) -> ratatui::buffer::Buffer {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+
+    let (width, height) = clamp_render_seam_dims(width, height);
 
     let backend = TestBackend::new(width, height);
     let mut terminal = Terminal::new(backend).expect("TestBackend should construct");
@@ -20869,6 +20925,8 @@ pub fn render_command_banner_pane_to_buffer(
 ) -> ratatui::buffer::Buffer {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+
+    let (width, height) = clamp_render_seam_dims(width, height);
 
     const PANE_ID: &str = "1";
     // `render_terminal_panes` resolves the focused pane as
@@ -22058,6 +22116,8 @@ fn render_overlay_to_buffer(
 ) -> ratatui::buffer::Buffer {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+
+    let (width, height) = clamp_render_seam_dims(width, height);
 
     let backend = TestBackend::new(width, height);
     let mut terminal = Terminal::new(backend).expect("TestBackend should construct");

@@ -245,6 +245,18 @@ impl DoctorFixture {
     }
 
     fn run(&self, name: &str, scenario: &str) -> (Output, String) {
+        self.run_with_protocol(name, scenario, PROTOCOL_VERSION)
+    }
+
+    /// Same run, with the protocol version the stub remote reports made
+    /// explicit. Issue #491: the doctor must no longer key any verdict on how
+    /// that number compares to this binary's own.
+    fn run_with_protocol(
+        &self,
+        name: &str,
+        scenario: &str,
+        remote_protocol: u32,
+    ) -> (Output, String) {
         let mut path_entries = vec![self.bindir.clone()];
         if let Some(path) = std::env::var_os("PATH") {
             path_entries.extend(std::env::split_paths(&path));
@@ -270,7 +282,7 @@ impl DoctorFixture {
         cmd.env("SSH_STUB_LOG", &self.argv_log);
         cmd.env("SSH_STUB_SCENARIO", scenario);
         cmd.env("SSH_STUB_VERSION", env!("DAD_VERSION"));
-        cmd.env("SSH_STUB_PROTOCOL", PROTOCOL_VERSION.to_string());
+        cmd.env("SSH_STUB_PROTOCOL", remote_protocol.to_string());
         cmd.stdin(Stdio::null());
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
@@ -683,4 +695,31 @@ fn remote_doctor_011_warn_only_report_exits_zero() {
     assert_verdict(&text, "ForwardAgent", "WARN");
     assert_overall(&text, "WARN");
     assert_exit_code(&output, 0, &text);
+}
+
+/// Scenario: An otherwise healthy remote whose `daemon hello` reports an attach
+/// protocol version far from this binary's own. `ProtocolCompatible` passes and
+/// the run exits 0, because the remote's TUI and daemon are one install and the
+/// laptop is only ssh plus a terminal — the two constants never share a wire.
+#[spec("remote/doctor/012")]
+#[test]
+fn remote_doctor_012_differing_remote_protocol_is_not_a_fault() {
+    let fixture = DoctorFixture::new();
+
+    // Both directions, since the removed comparison had a distinct arm and a
+    // distinct (equally spurious) remedy for each: "upgrade the remote" below,
+    // "upgrade your laptop binary" above.
+    for remote_protocol in [PROTOCOL_VERSION.saturating_sub(1), PROTOCOL_VERSION + 1] {
+        let (output, text) = fixture.run_with_protocol("prod", "healthy", remote_protocol);
+
+        assert_verdict(&text, "ProtocolCompatible", "PASS");
+        assert_exit_code(&output, 0, &text);
+        assert_complete_report(&text);
+        assert!(
+            !normalized(&text).contains(&normalized("laptop speaks")),
+            "no laptop-side protocol version may be quoted at the user \
+             (issue #491), but the report for remote protocol \
+             {remote_protocol} says:\n{text}"
+        );
+    }
 }

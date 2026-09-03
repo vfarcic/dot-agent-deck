@@ -6,8 +6,9 @@ use dot_agent_deck::agent_pty::{
     AgentRecord, TabMembership, clamp_pty_dims, is_valid_cwd, is_valid_display_name,
     is_valid_orchestration_cwd, is_valid_pane_id_env,
 };
+use dot_agent_deck::agent_registry;
 use dot_agent_deck::daemon_protocol::PROTOCOL_VERSION;
-use dot_agent_deck::event::{AgentType, SendResult};
+use dot_agent_deck::event::{AgentType, SendResult, Writable};
 use dot_agent_deck::state::SessionStatus;
 use serde::{Deserialize, Serialize};
 use tauri::ipc::JavaScriptChannelId;
@@ -45,6 +46,16 @@ pub struct DesktopConnection {
     pub daemon_version: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub running_agent_count: Option<usize>,
+    /// True when the ONLY thing that failed the handshake is the git-describe
+    /// build stamp — the protocol version agreed on both sides — so the webview
+    /// may offer Connect anyway (issue #801).
+    ///
+    /// Always emitted, including as `false`, because the webview branches on it
+    /// to decide whether an override exists: an absent field and an incompatible
+    /// wire must not look the same. A protocol mismatch never sets it, which is
+    /// what keeps the wire check unoverridable from the UI as well as from the
+    /// bypass itself.
+    pub build_stamp_mismatch_only: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
@@ -68,10 +79,90 @@ pub struct DesktopAgent {
     pub rows: u16,
     pub cols: u16,
     pub agent_type: String,
+    /// The BINARY the registry says this agent type runs — `claude`,
+    /// `opencode`, `pi`, `codex`, `devin` — read straight off
+    /// `AgentSpec::default_command` rather than restated here.
+    ///
+    /// `agent_type` above is the wire IDENTITY and stays snake_case for the
+    /// consumers that key on it; it is not a name anybody types. Rendering it
+    /// showed Claude Code as `claude_code` and OpenCode as `open_code`, with
+    /// `codex` right only by coincidence. Deriving the answer from the registry
+    /// is what stops a second copy of it drifting: adding an agent there gives
+    /// this field its value with nothing to update here.
+    ///
+    /// Absent — never a placeholder, and never invented — for
+    /// [`AgentType::None`] and for a record that reported no type at all.
+    /// `None` is also `#[serde(other)]`, so a FUTURE agent type from a newer
+    /// daemon lands there; this build genuinely does not know what binary that
+    /// is, and says nothing rather than guessing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cli_name: Option<&'static str>,
     pub status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub active_tool: Option<DesktopActiveTool>,
     pub tool_count: u32,
+    /// The daemon's `SessionSnapshot.last_user_prompt` (PRD #745 M8) — the most
+    /// recent prompt the operator sent this agent, and the honest answer to
+    /// "what was this one asked to do".
+    ///
+    /// Absent, never a placeholder: an agent that has emitted no prompt event,
+    /// a record with no `live` snapshot, and an older daemon all yield `None`,
+    /// and `skip_serializing_if` keeps the key off the wire so the webview sees
+    /// absence rather than an empty string it would have to special-case. The
+    /// value is already control-stripped and byte-bounded by
+    /// `daemon_client::sanitize_record_tab_membership`; the webview bounds and
+    /// sanitises its own DISPLAY copy again at the render seam, because that
+    /// scrub covers category `Cc` only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_user_prompt: Option<String>,
+    /// Whether the daemon can deliver input to this agent right now, projected
+    /// from `SessionSnapshot.live_target.writable` (PRD #745 M8). Replaces the
+    /// webview's hardcoded `"unknown"`.
+    ///
+    /// Only the `writable` half is surfaced: the deck's model speaks
+    /// read/write/none, and `TargetKind` (pty / tmux / sdk / process) is a
+    /// daemon-side implementation detail no desktop surface consumes. Absent
+    /// when the daemon declared no live target at all — which the TUI reads as
+    /// the legacy live default, so the desktop must NOT read absence as
+    /// "read-only".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub write_lease: Option<&'static str>,
+    /// When the daemon last saw this agent do anything, as epoch milliseconds
+    /// (`SessionSnapshot.last_activity_ms`, PRD #745 M9). Copied through
+    /// unchanged: the daemon owns the instant, the webview owns the wording.
+    ///
+    /// Absent when the record carries no `live` snapshot — a daemon that
+    /// restarted has no sessions, so it reports no activity times rather than
+    /// resetting them all to "just now" — and absent from an older daemon that
+    /// predates the field. Absence renders as nothing, never a placeholder.
+    ///
+    /// NOT clamped here. The daemon's value is producer-supplied and can land
+    /// in the future, and the only seam that can decide what to do about that
+    /// is the one that owns the OTHER clock: the webview compares it against
+    /// its own `Date.now()`, absorbs ordinary skew, and refuses to relativise
+    /// anything beyond it. Clamping here against the desktop process's clock
+    /// would silently move a value the daemon reported, using a third clock
+    /// that is not the one the comparison is made on.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_activity_ms: Option<i64>,
+    /// When the daemon spawned this agent's process, as epoch milliseconds
+    /// (`AgentRecord.spawned_at_ms`, PRD #745 M11). Copied through unchanged,
+    /// same split as `last_activity_ms`: the daemon owns the instant, the
+    /// webview owns the wording.
+    ///
+    /// It comes off the REGISTRY record rather than the live session, which is
+    /// what makes it answer a question `last_activity_ms` cannot: a session
+    /// exists only once a hook event has arrived, so an agent that has never
+    /// emitted one still reports a spawn time. Absent when the daemon did not
+    /// spawn the process it is describing (an id-only reply from an older
+    /// daemon) or predates the field — and absent means the column renders
+    /// nothing, never a placeholder.
+    ///
+    /// NOT clamped here, for the reason spelled out on `last_activity_ms`: the
+    /// desktop process holds a third clock, and the seam that owns the one the
+    /// comparison is actually made against is the webview.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spawned_at_ms: Option<i64>,
     pub tab: DesktopTab,
 }
 
@@ -99,6 +190,15 @@ pub enum DesktopTab {
         role_index: usize,
         role_name: String,
         is_start_role: bool,
+        /// The orchestration TAB's own working directory
+        /// (`TabMembership::orchestration_cwd`), shared by every role pane in
+        /// the tab and distinct from each pane's own `cwd` — an orchestrator
+        /// and its workers may sit in different per-pane directories while
+        /// belonging to one orchestration (PRD #745 M8). The overview states it
+        /// once in the group header, which is what turns the per-row column
+        /// into a differences column. `None` when the daemon reported none.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         display_title: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -147,6 +247,12 @@ pub enum DesktopAction {
         force: bool,
     },
     RestartDaemon,
+    /// Relax the build-stamp comparison for the rest of this app session and
+    /// hand back a freshly classified snapshot (issue #801). Carries no
+    /// payload: it is an assertion by the user, not a parameter, and it can
+    /// only ever relax the stamp check — the protocol check runs first and is
+    /// never bypassed.
+    AllowBuildMismatch,
     RenameAgent {
         agent_id: String,
         #[serde(alias = "name")]
@@ -242,6 +348,12 @@ fn session_status_name(status: &SessionStatus) -> &'static str {
     }
 }
 
+/// The orchestration arm deliberately binds EVERY field rather than ending in a
+/// `..` rest pattern. The rest pattern is what silently swallowed
+/// `orchestration_cwd` for as long as this function has existed (PRD #745 M8):
+/// the daemon sent it, the desktop parsed it, and nothing here copied it out.
+/// Binding them all makes the next field added to `TabMembership` a compile
+/// error at this seam instead of another quietly dropped column.
 fn map_tab(tab: Option<&TabMembership>) -> DesktopTab {
     match tab {
         None => DesktopTab::Dashboard,
@@ -251,28 +363,51 @@ fn map_tab(tab: Option<&TabMembership>) -> DesktopTab {
             role_index,
             role_name,
             is_start_role,
+            orchestration_cwd,
             display_title,
             orchestration_id,
-            ..
         }) => DesktopTab::Orchestration {
             name: name.clone(),
             role_index: *role_index,
             role_name: role_name.clone(),
             is_start_role: *is_start_role,
+            cwd: orchestration_cwd.clone(),
             display_title: display_title.clone(),
             orchestration_id: orchestration_id.clone(),
         },
     }
 }
 
+/// The webview's read/write/none vocabulary for a daemon `LiveTarget`.
+///
+/// Only [`Writable`] is consulted — it is the half that answers "can the deck
+/// type into this pane right now". `Writable::None` is also serde's
+/// forward-compat catch-all, so a `writable` value a future daemon invents
+/// lands on the SAFE, non-writable answer rather than being dressed up as a
+/// live target.
+fn write_lease_name(writable: &Writable) -> &'static str {
+    match writable {
+        Writable::Live => "write",
+        Writable::HistoryOnly => "read",
+        Writable::None => "none",
+    }
+}
+
 pub(crate) fn map_agent(record: AgentRecord) -> DesktopAgent {
     let live = record.live.as_ref();
-    let agent_type = live
+    // Resolved ONCE, so the wire identity and the binary name can never
+    // disagree about which agent this is.
+    let reported_type = live
         .and_then(|snapshot| snapshot.agent_type.as_ref())
-        .or(record.agent_type.as_ref())
+        .or(record.agent_type.as_ref());
+    let agent_type = reported_type
         .map(agent_type_name)
         .unwrap_or("none")
         .to_string();
+    // Off the registry, which is where the deck already keeps the command that
+    // launches each agent — see `cli_name`.
+    let cli_name =
+        reported_type.and_then(|agent_type| agent_registry::spec(agent_type).default_command);
     let status = live
         .map(|snapshot| session_status_name(&snapshot.status))
         .unwrap_or("running")
@@ -284,6 +419,15 @@ pub(crate) fn map_agent(record: AgentRecord) -> DesktopAgent {
             detail: tool.detail.clone(),
         });
     let tool_count = live.map(|snapshot| snapshot.tool_count).unwrap_or(0);
+    let last_user_prompt = live.and_then(|snapshot| snapshot.last_user_prompt.clone());
+    let write_lease = live
+        .and_then(|snapshot| snapshot.live_target.as_ref())
+        .map(|target| write_lease_name(&target.writable));
+    let last_activity_ms = live.and_then(|snapshot| snapshot.last_activity_ms);
+    // PRD #745 M11: off the RECORD, not the live snapshot — the daemon knows
+    // when it spawned a process whether or not that process has ever emitted an
+    // event.
+    let spawned_at_ms = record.spawned_at_ms;
     let tab = map_tab(record.tab_membership.as_ref());
 
     DesktopAgent {
@@ -294,9 +438,14 @@ pub(crate) fn map_agent(record: AgentRecord) -> DesktopAgent {
         rows: record.rows,
         cols: record.cols,
         agent_type,
+        cli_name,
         status,
         active_tool,
         tool_count,
+        last_user_prompt,
+        write_lease,
+        last_activity_ms,
+        spawned_at_ms,
         tab,
     }
 }
@@ -347,6 +496,7 @@ pub(crate) fn disconnected_snapshot(error: impl AsRef<str>) -> DesktopSnapshot {
             daemon_build_version: None,
             daemon_version: None,
             running_agent_count: None,
+            build_stamp_mismatch_only: false,
         },
         agents: Vec::new(),
         project_cwd: desktop_project_cwd(),
@@ -504,6 +654,7 @@ pub(crate) fn ensure_desktop_workflow_platform_supported(target_os: &str) -> Res
 mod tests {
     use super::*;
     use dot_agent_deck::agent_pty::PTY_RESIZE_DIM_MAX;
+    use dot_agent_deck::event::{LiveTarget, TargetKind};
     use dot_agent_deck::state::{ActiveTool, SessionSnapshot};
 
     fn fixture_record() -> AgentRecord {
@@ -529,7 +680,9 @@ mod tests {
                 first_prompts: Vec::new(),
                 last_user_prompt: None,
                 live_target: None,
+                last_activity_ms: None,
             }),
+            spawned_at_ms: None,
         }
     }
 
@@ -539,9 +692,61 @@ mod tests {
         assert_eq!(value["id"], "agent-7");
         assert_eq!(value["paneId"], "pane-7");
         assert_eq!(value["agentType"], "codex");
+        assert_eq!(value["cliName"], "codex");
         assert_eq!(value["status"], "working");
         assert_eq!(value["activeTool"]["name"], "shell");
         assert_eq!(value["tab"]["kind"], "mode");
+    }
+
+    /// PRD #745: the CLI column shows a binary somebody could type, and EVERY
+    /// variant is checked here rather than only the one the fixture happens to
+    /// carry — the enum names had Claude Code reading `claude_code` and
+    /// OpenCode reading `open_code`, with `codex` right only by coincidence.
+    #[test]
+    fn every_agent_type_reports_the_binary_it_runs() {
+        let cli_of = |agent_type: Option<AgentType>| {
+            let mut record = fixture_record();
+            record.agent_type = agent_type;
+            record.live = None;
+            map_agent(record).cli_name
+        };
+        assert_eq!(cli_of(Some(AgentType::ClaudeCode)), Some("claude"));
+        assert_eq!(cli_of(Some(AgentType::OpenCode)), Some("opencode"));
+        assert_eq!(cli_of(Some(AgentType::Pi)), Some("pi"));
+        assert_eq!(cli_of(Some(AgentType::Codex)), Some("codex"));
+        assert_eq!(cli_of(Some(AgentType::Devin)), Some("devin"));
+        // `None` is both "no recognized agent" and the `#[serde(other)]`
+        // landing spot for a type this build has never heard of. Neither has a
+        // binary this build can name, so it reports nothing rather than a word.
+        assert_eq!(cli_of(Some(AgentType::None)), None);
+        assert_eq!(cli_of(None), None);
+    }
+
+    /// The live snapshot's type wins over the record's for the binary name
+    /// exactly as it does for the wire identity — one resolution, so the two
+    /// fields cannot end up naming different agents.
+    #[test]
+    fn the_live_agent_type_decides_the_binary_too() {
+        let mut record = fixture_record();
+        record.agent_type = Some(AgentType::Codex);
+        if let Some(live) = record.live.as_mut() {
+            live.agent_type = Some(AgentType::ClaudeCode);
+        }
+        let mapped = map_agent(record);
+        assert_eq!(mapped.agent_type, "claude_code");
+        assert_eq!(mapped.cli_name, Some("claude"));
+    }
+
+    /// Absence stays OFF the wire, so the webview reads absence rather than an
+    /// empty string it would have to special-case.
+    #[test]
+    fn an_unnameable_cli_is_absent_from_the_serialized_shape() {
+        let mut record = fixture_record();
+        record.agent_type = Some(AgentType::None);
+        record.live = None;
+        let value = serde_json::to_value(map_agent(record)).unwrap();
+        assert_eq!(value["agentType"], "none");
+        assert!(value.get("cliName").is_none());
     }
 
     #[test]
@@ -552,6 +757,164 @@ mod tests {
         assert_eq!(mapped.status, "running");
         assert_eq!(mapped.tool_count, 0);
         assert!(mapped.active_tool.is_none());
+        // PRD #745 M8: no live snapshot means no prompt and no lease to report.
+        // Absent, not blank — the webview must be able to tell "nothing to say"
+        // from "the daemon said the empty string".
+        assert!(mapped.last_user_prompt.is_none());
+        assert!(mapped.write_lease.is_none());
+        // PRD #745 M9: nor an activity time. This is the case a RESTARTED
+        // daemon produces for every agent — it persists no `AppState`, so it
+        // has no sessions to snapshot — and it is exactly why this field could
+        // be shipped where session duration could not: the honest answer to
+        // "when did this last do something" after a restart is "I do not
+        // know", and absence says that.
+        assert!(mapped.last_activity_ms.is_none());
+        // PRD #745 M11: the spawn time is INDEPENDENT of `live`, so removing
+        // the snapshot must not be what makes it absent — this fixture is
+        // absent because the record itself reports no spawn (see
+        // `agent_mapping_surfaces_the_spawn_instant_unchanged` for the present
+        // case, which keeps `live` untouched).
+        assert!(mapped.spawned_at_ms.is_none());
+    }
+
+    /// PRD #745 M8: the two `SessionSnapshot` fields the desktop's own DTO used
+    /// to drop even though the daemon sends them and the desktop parses them.
+    #[test]
+    fn agent_mapping_surfaces_the_last_prompt_and_the_write_lease() {
+        let mut record = fixture_record();
+        let live = record.live.as_mut().unwrap();
+        live.last_user_prompt = Some("ship the overview".into());
+        live.live_target = Some(LiveTarget {
+            kind: TargetKind::Pty,
+            writable: Writable::Live,
+        });
+
+        let value = serde_json::to_value(map_agent(record)).unwrap();
+        assert_eq!(value["lastUserPrompt"], "ship the overview");
+        assert_eq!(value["writeLease"], "write");
+    }
+
+    /// PRD #745 M9: the daemon's `last_activity_ms` reaches the webview as the
+    /// same integer, under `lastActivityMs`, with no reformatting and no clamp.
+    ///
+    /// Pinned on the SERIALIZED value because a `serde_json` number is where a
+    /// silent unit change would show up — seconds instead of milliseconds
+    /// divides it by a thousand and every relative time on the overview becomes
+    /// fifty-seven years, which is why the field carries its unit in its name.
+    #[test]
+    fn agent_mapping_surfaces_the_last_activity_instant_unchanged() {
+        let mut record = fixture_record();
+        record.live.as_mut().unwrap().last_activity_ms = Some(1_756_684_800_123);
+
+        let value = serde_json::to_value(map_agent(record)).unwrap();
+        assert_eq!(value["lastActivityMs"], 1_756_684_800_123i64);
+    }
+
+    /// The value is NOT clamped or validated here, deliberately: the daemon's
+    /// `last_activity` is producer-supplied and can land in the future, and the
+    /// only seam that can judge that is the one holding the other clock. A
+    /// far-future instant therefore crosses this boundary intact, and the
+    /// webview is what refuses to relativise it.
+    #[test]
+    fn a_future_last_activity_crosses_the_dto_boundary_intact() {
+        let far_future = 4_102_444_800_000i64; // 2100-01-01T00:00:00Z
+        let mut record = fixture_record();
+        record.live.as_mut().unwrap().last_activity_ms = Some(far_future);
+
+        let value = serde_json::to_value(map_agent(record)).unwrap();
+        assert_eq!(value["lastActivityMs"], far_future);
+    }
+
+    /// PRD #745 M11: the daemon's `spawned_at_ms` reaches the webview as the
+    /// same integer, under `spawnedAtMs`, with no reformatting and no clamp —
+    /// and it comes off the RECORD, so it survives a record carrying no live
+    /// session at all.
+    ///
+    /// That last half is the whole reason spawn time beats
+    /// `SessionState.started_at`: a session exists only once a hook event has
+    /// arrived, so an agent that has never emitted one has no start instant —
+    /// and it is exactly the agent whose uptime a reader most wants. Pinned on
+    /// the SERIALIZED value for the same reason M9's is: a seconds/milliseconds
+    /// slip is a ×1000 error, which is why the unit is in the name.
+    #[test]
+    fn agent_mapping_surfaces_the_spawn_instant_unchanged() {
+        let mut record = fixture_record();
+        record.spawned_at_ms = Some(1_756_684_800_123);
+
+        let value = serde_json::to_value(map_agent(record.clone())).unwrap();
+        assert_eq!(value["spawnedAtMs"], 1_756_684_800_123i64);
+
+        // No live snapshot, same answer: the daemon knows when it forked a
+        // process whether or not that process has ever reported anything.
+        record.live = None;
+        let value = serde_json::to_value(map_agent(record)).unwrap();
+        assert_eq!(value["spawnedAtMs"], 1_756_684_800_123i64);
+        assert!(value.get("lastActivityMs").is_none());
+    }
+
+    /// The absent case for both, pinned in the SERIALIZED shape: the keys are
+    /// missing from the JSON the webview receives rather than present and null,
+    /// so `agent.lastUserPrompt` is `undefined` there and absence survives the
+    /// boundary.
+    #[test]
+    fn absent_prompt_and_lease_are_omitted_from_the_frontend_shape() {
+        let value = serde_json::to_value(map_agent(fixture_record())).unwrap();
+        assert!(value.get("lastUserPrompt").is_none());
+        assert!(value.get("writeLease").is_none());
+        // PRD #745 M9, same rule: no key at all, so `agent.lastActivityMs` is
+        // `undefined` in the webview and the column renders nothing.
+        assert!(value.get("lastActivityMs").is_none());
+        // PRD #745 M11, same rule again: a daemon that did not spawn the agent
+        // — or one predating the field — sends no key, and the uptime column
+        // renders nothing rather than a fabricated age.
+        assert!(value.get("spawnedAtMs").is_none());
+    }
+
+    /// Only `Writable` decides the lease, and its `#[serde(other)]` catch-all
+    /// means an unknown future value arrives as `None` — so the non-writable
+    /// answer is what a daemon this build does not understand produces.
+    #[test]
+    fn write_lease_projects_every_writable_value() {
+        let lease = |writable| {
+            let mut record = fixture_record();
+            record.live.as_mut().unwrap().live_target = Some(LiveTarget {
+                kind: TargetKind::Tmux,
+                writable,
+            });
+            map_agent(record).write_lease
+        };
+        assert_eq!(lease(Writable::Live), Some("write"));
+        assert_eq!(lease(Writable::HistoryOnly), Some("read"));
+        assert_eq!(lease(Writable::None), Some("none"));
+    }
+
+    /// PRD #745 M8: the orchestration tab's own cwd, which the `..` rest
+    /// pattern in `map_tab` used to swallow.
+    #[test]
+    fn orchestration_tab_carries_the_orchestration_cwd() {
+        let tab = |orchestration_cwd| {
+            serde_json::to_value(map_tab(Some(&TabMembership::Orchestration {
+                name: "dot-agent-deck".into(),
+                role_index: 1,
+                role_name: "coder".into(),
+                is_start_role: false,
+                orchestration_cwd,
+                display_title: Some("PRD #745".into()),
+                orchestration_id: Some("orc-745".into()),
+            })))
+            .unwrap()
+        };
+
+        let reported = tab(Some("/home/dev/code/dot-agent-deck".into()));
+        assert_eq!(reported["kind"], "orchestration");
+        assert_eq!(reported["cwd"], "/home/dev/code/dot-agent-deck");
+        assert_eq!(reported["roleName"], "coder");
+        assert_eq!(reported["orchestrationId"], "orc-745");
+
+        // Absent stays absent: an orchestration whose cwd the daemon did not
+        // report has no key at all, so the group header states nothing rather
+        // than a placeholder.
+        assert!(tab(None).get("cwd").is_none());
     }
 
     #[test]
@@ -612,6 +975,15 @@ mod tests {
     }
 
     #[test]
+    fn allow_build_mismatch_action_carries_no_payload() {
+        let action: DesktopAction = serde_json::from_value(serde_json::json!({
+            "type": "allow_build_mismatch"
+        }))
+        .unwrap();
+        assert!(matches!(action, DesktopAction::AllowBuildMismatch));
+    }
+
+    #[test]
     fn disconnected_snapshot_is_fixture_safe_and_sanitized() {
         let snapshot = disconnected_snapshot("offline\u{1b}[31m");
         assert_eq!(snapshot.connection.status, ConnectionStatus::Disconnected);
@@ -620,6 +992,10 @@ mod tests {
         let value = serde_json::to_value(snapshot).unwrap();
         assert_eq!(value["connection"]["status"], "disconnected");
         assert_eq!(value["source"], "daemon");
+        // No daemon answered, so there is no stamp-only mismatch to override —
+        // and the field is PRESENT rather than absent, because the webview
+        // branches on it (issue #801).
+        assert_eq!(value["connection"]["buildStampMismatchOnly"], false);
     }
 
     #[test]

@@ -58,6 +58,25 @@ const DELIVERED_POINTER: &str = "Read .dot-agent-deck/orchestrator-context.md";
 /// too small for the machine rather than racing anything.
 const SPAWN_DELIVERY_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// How long a RE-ASSERTION's delivery has to reach the start role's pane —
+/// the positive `wait_for_file_substr_count` bounds, the ones asserting a
+/// delivery *did* happen.
+///
+/// Carried forward from issue #818's containment round, which raised every
+/// positive wait in this file from a bare 10s (a restatement of the
+/// harness-wide `WAIT_TIMEOUT`, `tests/common/mod.rs`) to 30s after
+/// `orchestration_remit_001` was observed on a runner failing at BOTH this
+/// bound and [`SPAWN_DELIVERY_TIMEOUT`] in different runs. That bound is kept
+/// rather than reverted: this measures a real PTY write plus the fixture's
+/// own read, so a loaded runner genuinely can be slow here, and widening a
+/// POSITIVE wait costs only failure latency.
+///
+/// The deliberate short bounds elsewhere in this file
+/// (`Duration::from_millis(900)`, always under `assert!(!...)`) assert a
+/// delivery did NOT happen; raising those would invert what the test proves
+/// while making it slower. Leave them alone.
+const REASSERTION_DELIVERY_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// How long the fixture's delivery confirmation has to reach the daemon's
 /// APPLIED state. Paid on the fixture's `python3` fork, so it is a process
 /// start under whatever load the tier is carrying, not an IPC round trip.
@@ -70,6 +89,17 @@ const CONFIRMATION_APPLIED_TIMEOUT: Duration = Duration::from_secs(30);
 /// nothing else is competing for the status by then, so a timeout here is
 /// evidence of a real defect rather than of a slow runner, and widening it
 /// would only delay that report.
+///
+/// This is the ONE bound issue #818's containment round raised (to 30s, as
+/// `STATE_APPLIED_TIMEOUT`) that this file does not carry forward, so read it
+/// as a deliberate resolution rather than a lost merge. The containment was
+/// measured against code where a still-in-flight confirmation could overwrite
+/// the injected status permanently — a failure no budget recovers from, which
+/// is why 30s failed there too. The barriers below remove that competitor, and
+/// the branch's own `e2e-deterministic` run was green at 10s under full runner
+/// parallelism. Every POSITIVE delivery wait in this file does keep the
+/// widened bound ([`REASSERTION_DELIVERY_TIMEOUT`]), because those measure
+/// real work rather than a single apply.
 const INJECTED_EVENT_APPLIED_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How long the delivery log's pointer count must hold steady before this
@@ -581,13 +611,14 @@ fn orchestration_remit_001_start_role_compaction_reasserts_remit() {
         &log,
         DELIVERED_POINTER,
         baseline + 1,
-        Duration::from_secs(10),
+        REASSERTION_DELIVERY_TIMEOUT,
     );
     assert!(
         reasserted,
         "a Compacting event on the orchestrator start-role pane must re-deliver the \
          `{DELIVERED_POINTER}` remit pointer once more; the log never rose past the \
-         {baseline} line(s) the spawn-time delivery settled at, within 10s.\n\
+         {baseline} line(s) the spawn-time delivery settled at, within \
+         {REASSERTION_DELIVERY_TIMEOUT:?}.\n\
          Final grid:\n{}",
         deck.snapshot_grid()
     );
@@ -649,7 +680,7 @@ fn orchestration_remit_002_non_start_role_compaction_reasserts_nothing() {
         &log,
         DELIVERED_POINTER,
         baseline + 1,
-        Duration::from_secs(10),
+        REASSERTION_DELIVERY_TIMEOUT,
     );
     assert!(
         reasserted_on_start_role,
@@ -745,7 +776,7 @@ fn orchestration_remit_003_reassertion_waits_for_confirmed_delivery() {
         &log,
         DELIVERED_POINTER,
         baseline + 1,
-        Duration::from_secs(10),
+        REASSERTION_DELIVERY_TIMEOUT,
     );
 
     assert!(
@@ -793,14 +824,14 @@ fn orchestration_remit_004_start_role_clear_reasserts_remit() {
         &log,
         DELIVERED_POINTER,
         baseline + 1,
-        Duration::from_secs(10),
+        REASSERTION_DELIVERY_TIMEOUT,
     );
     assert!(
         reasserted,
         "a `/clear`-originated SessionStart event on the orchestrator start-role pane \
          must re-deliver the `{DELIVERED_POINTER}` remit pointer once more; the log \
          never rose past the {baseline} line(s) the spawn-time delivery settled at, \
-         within 10s.\nFinal grid:\n{}",
+         within {REASSERTION_DELIVERY_TIMEOUT:?}.\nFinal grid:\n{}",
         deck.snapshot_grid()
     );
 
@@ -895,7 +926,7 @@ fn orchestration_remit_005_non_start_role_clear_reasserts_nothing() {
         &log,
         DELIVERED_POINTER,
         baseline + 1,
-        Duration::from_secs(10),
+        REASSERTION_DELIVERY_TIMEOUT,
     );
     assert!(
         reasserted_on_start_role,
@@ -1019,14 +1050,14 @@ fn orchestration_remit_007_compaction_reassertion_preserves_a_dispatched_task() 
         &log,
         CARRY_OUT_TASK_POINTER,
         1,
-        Duration::from_secs(10),
+        REASSERTION_DELIVERY_TIMEOUT,
     );
     assert!(
         reasserted_with_task,
         "a compaction re-assertion on a start role whose context file carries a `## Your \
          task` section must re-deliver the TASK-CARRYING pointer (containing \
          `{CARRY_OUT_TASK_POINTER}`), not the no-task \"wait for instructions\" variant; \
-         the log never shows it within 10s.\nFinal grid:\n{}",
+         the log never shows it within {REASSERTION_DELIVERY_TIMEOUT:?}.\nFinal grid:\n{}",
         deck.snapshot_grid()
     );
 
