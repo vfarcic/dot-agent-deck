@@ -207,6 +207,14 @@ fn publish(dir: &Path, dest: &Path, bytes: &[u8], mode: PublishMode) -> io::Resu
 
     let (mut file, tmp) = create_temp(dir, name)?;
 
+    // Windows has no mode bits to set, so the policy is read by nobody there and
+    // `-D warnings` fails on the unused parameter. `build-windows` is the only
+    // gate that compiles this arm, and it caught exactly that on PR #855 — the
+    // divergence CLAUDE.md rule 2 warns about, since the four-flag clippy run a
+    // contributor makes locally never builds this configuration.
+    #[cfg(not(unix))]
+    let _ = mode;
+
     // Everything after the create is fallible with a temp file already on disk,
     // so it runs in one closure and shares a single cleanup path. The previous
     // shape leaked the temp file whenever `write_all` or `sync_all` failed — it
