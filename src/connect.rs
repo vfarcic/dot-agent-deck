@@ -1525,7 +1525,25 @@ pub fn run_connect<R: BufRead, W: Write>(
                 source,
             }
         })?;
-        session_established = true;
+        if !session_established {
+            session_established = true;
+            // Greptile P1 on PR #859: the probe retries that got this FIRST
+            // session up and the reconnects PRD #148 promises after it drops
+            // are two separate budgets, and `attempt` was carrying both. A
+            // connect whose probe finally succeeded on attempt 5 dropped
+            // straight into the exhausted branch and got ZERO reconnects —
+            // the "up to four automatic reconnects after a transport drop"
+            // spent on getting connected in the first place.
+            //
+            // Reset ONCE, at the boundary between the two, so the session that
+            // just started is attempt 1 of the reconnect budget. It stays
+            // bounded: the reset is gated on `!session_established`, so a
+            // session that keeps flapping still gets `MAX_CONNECT_ATTEMPTS`
+            // spawns in total rather than a fresh budget per reconnect. On the
+            // ordinary path — probe succeeds first time — `attempt` is already
+            // 1 and this changes nothing.
+            attempt = 1;
+        }
 
         // Stage 3: route on the exit code. Reconnect ONLY on ssh's
         // transport-failure code (255); any other code is terminal.
@@ -2404,6 +2422,51 @@ mod tests {
         assert!(
             reloaded.remotes[0].last_connected.is_some(),
             "a clean exit after a retried initial connect still records the session"
+        );
+    }
+
+    #[test]
+    fn initial_probe_retries_do_not_eat_the_reconnect_budget() {
+        // Greptile P1 on PR #859, and a defect the first cut of issue #858
+        // introduced: the probe retries that get the FIRST session up and the
+        // post-drop reconnects PRD #148 promises are two separate budgets, and
+        // folding the initial probe into the shared counter silently spent one
+        // on the other. A connect whose probe finally succeeded on attempt 5
+        // got ZERO reconnects — the session dropped and `on_transport_failure`
+        // gave up immediately, which is precisely the "up to four automatic
+        // reconnects after a transport drop" that documentation promises.
+        //
+        // Trace with probes [f, f, f, f, t] (then reachable forever) and
+        // spawns [255, 255, 0] — the sharpest case, where the initial connect
+        // consumes the entire budget before a session exists:
+        //   attempts 1-4: --version → HostUnreachable → backoff x4
+        //   attempt 5:    probe ok → spawn #1 → 255   → counter resets here
+        //   then:         spawn #2 → 255 → backoff, spawn #3 → 0 → Ok(0)
+        // So: 3 spawns, 6 backoffs, exit 0. Before the fix: 1 spawn, 4
+        // backoffs, and Ok(255) from an immediate give-up.
+        let entry = test_entry("prod");
+        let (_dir, path) = registry_with(&entry);
+        let executor =
+            ScriptedProbeExecutor::new(TEST_LOCAL_VERSION, vec![false, false, false, false, true]);
+        let spawner = ScriptedSpawner::new(vec![255, 255, 0]);
+        let backoff = RecordingBackoff::new();
+
+        let code = run_connect_no_nudge(&entry, &executor, &spawner, &backoff, &path)
+            .expect("run_connect");
+
+        assert_eq!(
+            code, 0,
+            "the reconnect after the drop must still happen and reach a clean exit"
+        );
+        assert_eq!(
+            spawner.spawn_count(),
+            3,
+            "the session that came up on the last probe attempt still gets its reconnects"
+        );
+        assert_eq!(
+            backoff.count(),
+            6,
+            "four probe backoffs plus two reconnect backoffs — the two budgets are separate"
         );
     }
 
