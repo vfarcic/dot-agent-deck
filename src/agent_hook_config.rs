@@ -165,6 +165,41 @@ fn build_command_for(
 /// publish lands is still the destination's own, applied by `fchmod`, which no
 /// umask filters.
 pub(crate) fn write_atomic(dir: &Path, dest: &Path, bytes: &[u8]) -> io::Result<()> {
+    publish(dir, dest, bytes, PublishMode::Destination)
+}
+
+/// Which mode a [`publish`] lands.
+///
+/// Named rather than implied because the answer genuinely differs between the
+/// two things this module writes, and the wrong one is a confidentiality bug in
+/// either direction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PublishMode {
+    /// The destination's OWN current mode, or owner-only when it is new — the
+    /// rule #360 and #382 exist to hold, so an install never widens a config the
+    /// user kept private and never narrows one they deliberately opened.
+    ///
+    /// The stat behind this FOLLOWS a symlink, which is correct here: a config
+    /// legitimately symlinked into a dotfiles checkout should be published at
+    /// the mode of the file that actually holds it. What makes that safe is the
+    /// caller — `hooks_manage::write_settings` refuses a symlinked destination
+    /// outright, and the other adapters write a path the agent owns.
+    Destination,
+    /// Owner-only, whatever is at the destination.
+    ///
+    /// For a file whose name is the deck's own scratch convention, where there
+    /// is no user intent at the destination to preserve and a pre-existing entry
+    /// is far more likely to be a plant than a preference. Greptile's P1 on PR
+    /// #855: [`backup_malformed`] used [`PublishMode::Destination`], so a
+    /// symlink planted at `<name>.bak` pointing at a world-readable file got to
+    /// CHOOSE the mode a copy of the user's config was published with — the
+    /// `rename` correctly refused to follow the link for the write, and then the
+    /// mode was taken from what it pointed at anyway.
+    OwnerOnly,
+}
+
+/// [`write_atomic`] with the landed mode spelled by the caller.
+fn publish(dir: &Path, dest: &Path, bytes: &[u8], mode: PublishMode) -> io::Result<()> {
     let name = dest
         .file_name()
         .and_then(|n| n.to_str())
@@ -180,10 +215,16 @@ pub(crate) fn write_atomic(dir: &Path, dest: &Path, bytes: &[u8]) -> io::Result<
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
-            let mode = std::fs::metadata(dest)
-                .map(|meta| meta.permissions().mode() & 0o777)
-                .unwrap_or(0o600);
-            file.set_permissions(std::fs::Permissions::from_mode(mode))?;
+            // Set explicitly in BOTH arms rather than leaning on
+            // `create_temp_excl`'s `mode(0o600)`, which an unusual umask can
+            // narrow further; `fchmod` is filtered by no umask.
+            let landed = match mode {
+                PublishMode::Destination => std::fs::metadata(dest)
+                    .map(|meta| meta.permissions().mode() & 0o777)
+                    .unwrap_or(0o600),
+                PublishMode::OwnerOnly => 0o600,
+            };
+            file.set_permissions(std::fs::Permissions::from_mode(landed))?;
         }
         file.write_all(bytes)?;
         file.sync_all()
@@ -225,11 +266,21 @@ pub(crate) fn write_atomic(dir: &Path, dest: &Path, bytes: &[u8]) -> io::Result<
 /// that nobody stows in a dotfiles checkout, and refusing would discard the very
 /// bytes this exists to keep.
 ///
-/// It carries [`write_atomic`]'s mode rule along with its safety: the backup
-/// lands at its own current mode, or 0600 when it is new, rather than
-/// `File::create`'s `0666 & !umask` — so a copy of a 0600 config holding an
-/// org id or an auth reference is no longer published 0644 beside it (#360,
-/// #382).
+/// # Permissions
+///
+/// The backup lands **owner-only, always** ([`PublishMode::OwnerOnly`]) — not at
+/// the destination's own mode, which is what every other write here uses. It is
+/// a byte-for-byte copy of a config that may hold an org id or an auth
+/// reference, so 0600 is the right answer on its merits; `std::fs::write` left
+/// it at `0666 & !umask`, typically 0644, beside a Devin config that ships 0600
+/// (#360, #382).
+///
+/// Taking the destination's mode here would ALSO hand the mode back to a
+/// planted symlink, which is Greptile's P1 on PR #855 and the reason this arm
+/// exists: `rename` does not follow the link for the write, but the stat that
+/// chose the mode did, so a link pointing at a world-readable file published the
+/// user's config bytes 0666. Not following a symlink and then adopting its
+/// target's permissions is worse than either half sounds.
 ///
 /// # The name
 ///
@@ -249,7 +300,9 @@ pub(crate) fn backup_malformed(dest: &Path, bytes: &[u8]) -> Option<PathBuf> {
         _ => Path::new("."),
     };
     let backup = dir.join(name);
-    write_atomic(dir, &backup, bytes).ok().map(|()| backup)
+    publish(dir, &backup, bytes, PublishMode::OwnerOnly)
+        .ok()
+        .map(|()| backup)
 }
 
 /// Spell where [`backup_malformed`]'s bytes went, for the caller's error message.
@@ -791,6 +844,49 @@ mod tests {
                 std::ffi::OsString::from("settings.json.bak")
             ],
             "the copy left a stray temp or a second backup behind"
+        );
+    }
+
+    /// A planted symlink must not get to CHOOSE the backup's mode either.
+    ///
+    /// Greptile's P1 on PR #855, and a real second mouth of the same trap: the
+    /// publish is safe because `rename` replaces the link rather than following
+    /// it, but the mode it lands came from `std::fs::metadata(dest)` — `stat(2)`,
+    /// which DOES follow — so a link pointing at a world-readable file published
+    /// the user's config bytes 0666. Not following a symlink for the write and
+    /// then taking the symlink target's permissions for it is worse than either
+    /// half sounds.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_backup_path_cannot_choose_the_backups_mode() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = crate::test_temp::tempdir().expect("backup tempdir");
+        let dest = dir.path().join("config.json");
+
+        // The attacker's target, deliberately wide open.
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, b"victim bytes").expect("seed victim");
+        std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o666))
+            .expect("widen victim");
+        std::os::unix::fs::symlink(&victim, dir.path().join("config.json.bak"))
+            .expect("plant symlink");
+
+        let backup = backup_malformed(&dest, b"{ not json").expect("backup");
+
+        assert_eq!(
+            std::fs::metadata(&backup)
+                .expect("stat backup")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600,
+            "the planted link's target supplied the published backup's mode"
+        );
+        assert_eq!(
+            std::fs::read(&victim).expect("read victim"),
+            b"victim bytes",
+            "the victim must still be untouched"
         );
     }
 
