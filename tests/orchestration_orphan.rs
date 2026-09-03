@@ -426,6 +426,120 @@ async fn orphan_003_inner() {
     );
 }
 
+/// Scenario: Register ONE orchestration role whose stand-in agent exits on its
+/// own and never close its pane, then serve a real attach socket and ask for
+/// `list-agents`. The role-map entry must still be there while the reply
+/// reports no live roles and no agents, so the policy `daemon stop` applies to
+/// that reply is "proceed" rather than a refusal over a pane that is a corpse.
+#[spec("orchestration/orphan/004")]
+#[test]
+fn orphan_004_a_role_whose_agent_exited_on_its_own_does_not_block_daemon_stop() {
+    child_lifetime_bound::arm();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(orphan_004_inner());
+}
+
+async fn orphan_004_inner() {
+    // The Greptile P1 case in isolation: ONE role, its agent gone, its pane
+    // never closed, and nothing else in the daemon. `orphan/003` proves the
+    // dead role is dropped from a report that still has live roles in it; this
+    // proves the empty report that follows is not itself a refusal — which is
+    // the half an operator actually feels, because the pre-fix behaviour wedged
+    // `daemon stop` and `daemon restart` for the life of the daemon with
+    // `--force` as the only way out.
+    let registry = Arc::new(AgentPtyRegistry::new());
+    registry
+        .spawn_agent(SpawnOptions {
+            command: Some("true"),
+            env: vec![(
+                DOT_AGENT_DECK_PANE_ID.to_string(),
+                DEPARTED_PANE.to_string(),
+            )],
+            ..SpawnOptions::default()
+        })
+        .expect("stand-in departed agent should spawn");
+
+    let mut state = AppState::default();
+    state.register_orchestration_role(
+        DEPARTED_PANE,
+        "reviewer",
+        false,
+        OrchestrationIdentity::Instance {
+            id: "inst-1".to_string(),
+            name: "issue-work".to_string(),
+        },
+        Some("/home/dev/issue-work"),
+    );
+
+    // Nothing here calls `unregister_pane`, and nothing on the PTY-EOF path
+    // does either — its only callers are the `StopAgent` handler, the TUI's
+    // close paths and `spawn`'s partial-orchestration rollback. So the agent
+    // dying is observable ONLY through the registry: `pump_reader` sets the
+    // per-agent `exited` flag when the PTY read loop ends, which is what makes
+    // `has_live_pane` go false for a child that was never explicitly closed.
+    let departed_gone = wait_until(Duration::from_secs(10), || {
+        !registry.has_live_pane(DEPARTED_PANE)
+    })
+    .await;
+    assert!(
+        departed_gone,
+        "the `true` stand-in must exit on its own, with no pane close, so the \
+         registry stops claiming its pane"
+    );
+    assert!(
+        state.pane_role_map.contains_key(DEPARTED_PANE),
+        "the role-map entry must OUTLIVE its agent — if it were cleaned up here \
+         this test would pass for the wrong reason, and the filter under review \
+         would be doing nothing"
+    );
+    assert!(
+        state.live_orchestration_roles(&registry).is_empty(),
+        "a role whose agent has exited must not be reported as live"
+    );
+
+    let shared = Arc::new(tokio::sync::RwLock::new(state));
+    let server = start_server(registry.clone(), shared).await;
+    let stream = IpcStream::connect(&server.path).await.expect("connect");
+    let (mut rd, mut wr) = stream.into_split();
+    let resp = issue_command(&mut rd, &mut wr, &AttachRequest::ListAgents)
+        .await
+        .expect("list-agents");
+    drop(rd);
+    drop(wr);
+    assert!(resp.ok, "list-agents failed: {:?}", resp.error);
+    assert_eq!(
+        resp.orchestration_roles.as_deref(),
+        Some(&[][..]),
+        "a daemon holding only a DEAD role must answer `Some(vec![])` — it holds \
+         no live roles — and not `None`, which `daemon stop` reads as \"this \
+         daemon cannot answer\""
+    );
+
+    // The policy over the real reply, derived exactly as `run_daemon_stop`
+    // derives it. Deliberately NOT through `run_daemon_stop` itself: with no
+    // refusal to stop it, that call reaches `terminate_daemon_graceful`, whose
+    // target pid is this test process (see `orphan/003`'s note). Asserting the
+    // decision instead of the SIGTERM is the whole reason `stop_refusal` is a
+    // separate pure function.
+    let agent_ids: Vec<String> = resp
+        .agent_records
+        .map(|rs| rs.into_iter().map(|r| r.id).collect::<Vec<_>>())
+        .or(resp.agents)
+        .unwrap_or_default();
+    assert!(
+        agent_ids.is_empty(),
+        "the exited stand-in must be gone from `agent_records` too, or the \
+         PRE-EXISTING managed-agent guard would refuse the stop and this would \
+         prove nothing about the new one: {agent_ids:?}"
+    );
+    let roles = resp.orchestration_roles.unwrap_or_default();
+    assert!(
+        dot_agent_deck::daemon_stop::stop_refusal(&roles, &agent_ids, false).is_none(),
+        "with only a dead role left, an ordinary `daemon stop` must PROCEED — \
+         refusing here is the wedge the Greptile P1 named"
+    );
+}
+
 struct Server {
     _dir: TempDir,
     path: PathBuf,

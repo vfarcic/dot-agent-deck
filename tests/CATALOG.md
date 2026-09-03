@@ -3124,6 +3124,13 @@ without depending on the config struct API.
 - **Does not assert:** the `--force` override or the both-guards-apply ordering, which are covered without a socket by `daemon_stop::tests::stop_refusal_covers_the_force_matrix` — driving `--force` here would terminate the test runner; the pre-existing managed-agent guard; SIGTERM/SIGKILL escalation (`lifecycle/stop/003`).
 - **Platform coverage:** linux+mac (`#![cfg(unix)]` — the attach socket is Unix-domain and pid discovery reads `SO_PEERCRED`; Windows port tracked by #164).
 
+##### orchestration/orphan/004 — A role whose agent exited ON ITS OWN, with the pane never closed, does NOT block `daemon stop` (issue #770, Greptile P1 on PR #844).
+- **Layer:** L1/synthetic (a real stand-in child under `AgentPtyRegistry`, plus a real attach socket served by the production `serve_attach_with_counter`).
+- **Agent:** none (a `true` stand-in that exits immediately, standing in for a role process that ends without its pane being closed).
+- **Asserts:** the `pane_role_map` entry OUTLIVES its agent — nothing on the PTY-EOF path calls `unregister_pane`, whose only callers are the `StopAgent` handler, the TUI's close paths and `spawn`'s rollback — while `live_orchestration_roles` omits it, the real `ListAgents` reply carries `Some(vec![])` (holds no live roles) rather than `None` (cannot answer), `agent_records` is empty so the pre-existing managed-agent guard cannot account for the result, and `stop_refusal` over that exact reply returns `None`: the stop PROCEEDS. Pre-fix this refused for the life of the daemon over a dead pane, with `--force` as the only escape.
+- **Does not assert:** the refusal itself (`orchestration/orphan/003`); the `--force` matrix and the both-guards ordering (`daemon_stop::tests::stop_refusal_covers_the_force_matrix`). The decision is asserted over the real reply rather than by calling `run_daemon_stop`, because with nothing to refuse that call reaches `terminate_daemon_graceful`, whose target pid is the test process itself.
+- **Platform coverage:** linux+mac (`#![cfg(unix)]` — the attach socket is Unix-domain; Windows port tracked by #164).
+
 ### Session restore
 
 #### session/restore
