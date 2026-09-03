@@ -42,8 +42,9 @@ use dot_agent_deck::agent_pty::{AgentPtyRegistry, AgentRecord};
 use dot_agent_deck::daemon_protocol::{
     AttachRequest, AttachResponse, DAEMON_CAPABILITIES, KIND_DETACH, KIND_REQ, KIND_RESP,
     KIND_STREAM_END, KIND_STREAM_IN, KIND_STREAM_OUT, KIND_STREAM_REJECT, PROJECT_ERR_INVALID_PATH,
-    PROJECT_ERR_TASK_REJECTED, PROJECT_ERR_UNIMPLEMENTED, PROTOCOL_VERSION, RunningAgentsSummary,
-    TabMembership, bind_attach_listener, serve_attach_with_counter, write_resp,
+    PROJECT_ERR_TASK_REJECTED, PROJECT_ERR_UNIMPLEMENTED, PROJECT_ERR_UNRESOLVED, PROTOCOL_VERSION,
+    RunningAgentsSummary, TabMembership, bind_attach_listener, serve_attach_with_counter,
+    write_resp,
 };
 use dot_agent_deck::event::{
     AgentEvent, AgentType, EventType, LiveTarget, SendResult, TargetKind, Writable,
@@ -1101,45 +1102,86 @@ async fn unknown_op_returns_structured_error_not_a_panic() {
     );
 }
 
-/// PRD #819 M2: the three project verbs are REACHABLE — they parse, dispatch,
-/// and answer with a named `unimplemented` refusal rather than a decode failure.
-/// That is what makes the tester's behaviour tests fail on behaviour instead of
-/// on an `unknown variant` error indistinguishable from a typo.
+/// PRD #819 M2: every project verb is REACHABLE — it parses and dispatches
+/// rather than failing the decode. That is what makes the behaviour tests fail
+/// on behaviour instead of on an `unknown variant` error indistinguishable from
+/// a typo.
+///
+/// M3 landed the behaviour behind two of the three, so what each verb answers
+/// now differs and this test pins both halves: `prepare-workflow` is the one
+/// still reporting `unimplemented` (M4 lands its safe publish), while
+/// `list-projects` and `resolve-project` answer for real — the first with a
+/// listing, the second with a bounded refusal for a directory that is not a
+/// project. Neither may report `unimplemented` any more, which is what would
+/// otherwise let the implementation be quietly reverted.
 #[tokio::test]
-async fn project_verbs_are_reachable_and_report_unimplemented() {
+async fn project_verbs_are_reachable_and_only_prepare_workflow_is_unimplemented() {
     let server = start_server().await;
 
-    for (label, request) in [
-        (
-            "list-projects",
-            serde_json::json!({ "op": "list-projects" }),
-        ),
-        (
-            "resolve-project",
-            serde_json::json!({ "op": "resolve-project", "path": "/tmp" }),
-        ),
-        (
-            "prepare-workflow",
-            serde_json::json!({
-                "op": "prepare-workflow",
-                "path": "/tmp",
-                "orchestration": "dispatch",
-                "task": "do the thing",
-            }),
-        ),
-    ] {
-        let resp = issue_json_request(&server, request).await;
-        assert!(!resp.ok, "{label} must not report a hollow success");
-        let error = resp.error.unwrap_or_default();
-        assert!(
-            error.starts_with(PROJECT_ERR_UNIMPLEMENTED),
-            "{label} must refuse with the `{PROJECT_ERR_UNIMPLEMENTED}` code, got {error:?}"
-        );
-        assert!(
-            !error.contains("malformed request"),
-            "{label} must PARSE — a decode failure means the variant is not wired: {error:?}"
-        );
-    }
+    let resp = issue_json_request(
+        &server,
+        serde_json::json!({
+            "op": "prepare-workflow",
+            "path": "/tmp",
+            "orchestration": "dispatch",
+            "task": "do the thing",
+        }),
+    )
+    .await;
+    assert!(
+        !resp.ok,
+        "prepare-workflow must not report a hollow success"
+    );
+    let error = resp.error.unwrap_or_default();
+    assert!(
+        error.starts_with(PROJECT_ERR_UNIMPLEMENTED),
+        "prepare-workflow must still refuse with the `{PROJECT_ERR_UNIMPLEMENTED}` code, got {error:?}"
+    );
+    assert!(
+        !error.contains("malformed request"),
+        "prepare-workflow must PARSE — a decode failure means the variant is not wired: {error:?}"
+    );
+
+    // `list-projects` derives its answer from state this server holds, and this
+    // one holds nothing — so the honest answer is an EMPTY listing with
+    // `ok: true`, not a refusal. "This daemon knows nothing live" is a state the
+    // client renders, not a failure it reports.
+    let resp = issue_json_request(&server, serde_json::json!({ "op": "list-projects" })).await;
+    assert!(
+        resp.ok,
+        "list-projects must answer from what the daemon holds, got {:?}",
+        resp.error
+    );
+    let listing = resp
+        .projects
+        .expect("a successful list-projects must carry a ProjectListing");
+    assert!(
+        listing.projects.is_empty() && listing.primary.is_none(),
+        "a server holding nothing live must offer nothing: {listing:?}"
+    );
+
+    // `/tmp` exists and is a directory, so this exercises the resolve path
+    // proper rather than a boundary refusal: no `.dot-agent-deck.toml` there
+    // means a bounded `unresolved`, and never `unimplemented`.
+    let resp = issue_json_request(
+        &server,
+        serde_json::json!({ "op": "resolve-project", "path": "/tmp" }),
+    )
+    .await;
+    assert!(!resp.ok, "/tmp is not a project, so resolve must refuse it");
+    assert!(
+        resp.project.is_none(),
+        "a refusal carries no ResolvedProject"
+    );
+    let error = resp.error.unwrap_or_default();
+    assert!(
+        error.starts_with(PROJECT_ERR_UNRESOLVED),
+        "expected the bounded `{PROJECT_ERR_UNRESOLVED}` code, got {error:?}"
+    );
+    assert!(
+        !error.contains("/tmp"),
+        "an arbitrary path must not be echoed back: {error:?}"
+    );
 }
 
 /// PRD #819 A5: the boundary validation is real now, ahead of the behaviour.

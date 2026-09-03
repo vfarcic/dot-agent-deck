@@ -345,6 +345,34 @@ pub const PROJECT_ERR_TASK_REJECTED: &str = "task-rejected";
 /// worse; `handle_connection` serves other clients.
 pub const PROJECT_ERR_UNIMPLEMENTED: &str = "unimplemented";
 
+/// PRD #819 M3: the ONE code carried by every refusal that comes from
+/// *resolving* a path against a filesystem.
+///
+/// It is deliberately a single code for every cause — no such directory, no
+/// config there, a config that is a FIFO, a config that does not parse — because
+/// the property this verb delivers is that **the wire response does not directly
+/// distinguish** those cases for an arbitrary caller-supplied path. A code per
+/// cause would hand that distinction back on a plate.
+///
+/// It is not the only code these verbs can return, and the difference matters:
+/// a path that fails [`validate_project_path`]'s string check answers with
+/// [`PROJECT_ERR_INVALID_PATH`] instead, before any filesystem is touched. That
+/// refusal is about the caller's own request being malformed rather than about
+/// what is on disk, so it discloses nothing this one is protecting.
+///
+/// Read the claim narrowly, and do not widen it in a comment later:
+/// canonicalisation, traversal, `open(2)` and TOML parsing do observably
+/// different amounts of work, so **no timing property is claimed** and the
+/// concurrency bound in [`crate::project_resolve`] protects availability rather
+/// than constant time. What is claimed is about the response bytes alone.
+///
+/// The text after the code splits by trust: a path the daemon already knows
+/// carries the detailed diagnostic (`crate::project_resolve::known_path_refusal`),
+/// and every other path carries one fixed generic sentence
+/// (`crate::project_resolve::generic_refusal`) that names no path, no parser
+/// source line and no raw OS error.
+pub const PROJECT_ERR_UNRESOLVED: &str = "unresolved";
+
 /// Bounded timeout for a single STREAM_OUT/STREAM_END write to a client. If
 /// a client stops draining its socket, the OS send buffer fills and our
 /// `write_all` blocks forever — which would also block lag detection (we
@@ -2494,24 +2522,80 @@ async fn handle_connection(
             resp.kept_worktree = kept;
             write_resp(&mut stream, &resp).await?
         }
-        // PRD #819 M2. The three project verbs are REACHABLE here — the wire
-        // contract is landed, the boundary validation below is real, and an
-        // accepted request gets a named `unimplemented` refusal rather than a
-        // panic or a hollow `ok: true`. The behaviour arrives with M3
-        // (enumeration and the bounded reader) and M4 (the safe publish).
+        // PRD #819 M3. `ListProjects` answers from what the daemon already
+        // holds — no new persistence, no filesystem browsing — and every
+        // candidate is revalidated through the bounded reader before it is
+        // offered, because an agent cwd or a scheduler `working_dir` need not be
+        // a project at all.
         AttachRequest::ListProjects {} => {
             // Nothing caller-supplied to validate: the enumeration is derived
             // entirely from state the daemon already holds.
-            let resp = unimplemented_project_verb(CAP_LIST_PROJECTS);
-            write_resp(&mut stream, &resp).await?
-        }
-        AttachRequest::ResolveProject { path } => {
-            let resp = match validate_project_path(&path) {
-                Err(message) => AttachResponse::err(message),
-                Ok(()) => unimplemented_project_verb(CAP_RESOLVE_PROJECT),
+            let candidates = project_candidates(&registry, &state, &scheduler).await;
+            let resp = match crate::project_resolve::run_bounded(move || {
+                crate::project_resolve::resolve_candidates(&candidates)
+            })
+            .await
+            {
+                Ok(listing) => {
+                    // `ok` even when the listing is empty: "this daemon knows
+                    // nothing live" is an answer, not a failure, and it is the
+                    // state the client renders its paste-a-path surface for.
+                    let mut resp = AttachResponse::ok();
+                    resp.projects = Some(listing);
+                    resp
+                }
+                Err(e) => {
+                    warn!(reason = %e, "list-projects could not complete");
+                    AttachResponse::err(format!(
+                        "{PROJECT_ERR_UNRESOLVED}: {}",
+                        crate::project_resolve::ProjectResolveError::Internal.detail()
+                    ))
+                }
             };
             write_resp(&mut stream, &resp).await?
         }
+        // PRD #819 M3. Resolve-only: one explicit path in, resolved through the
+        // same bounded reader the enumeration uses. No directory walk, no
+        // children, no parents, and resolving `/a/b` does not make `/a` or
+        // `/a/b/c` known. The refusal's disclosure splits by trust — see
+        // [`PROJECT_ERR_UNRESOLVED`].
+        AttachRequest::ResolveProject { path } => {
+            let resp = match validate_project_path(&path) {
+                Err(message) => AttachResponse::err(message),
+                Ok(()) => {
+                    // The seed set is what decides whether this path gets the
+                    // detailed diagnostic. Gathered here, on the async side,
+                    // because it is pure in-memory state; the canonicalisation
+                    // it is compared against happens inside the blocking half.
+                    let seeds = project_candidates(&registry, &state, &scheduler).await;
+                    match crate::project_resolve::run_bounded(move || {
+                        crate::project_resolve::resolve_for_wire(&path, &seeds)
+                    })
+                    .await
+                    {
+                        Ok(Ok(project)) => {
+                            let mut resp = AttachResponse::ok();
+                            resp.project = Some(project);
+                            resp
+                        }
+                        Ok(Err(refusal)) => AttachResponse::err(refusal),
+                        Err(e) => {
+                            warn!(reason = %e, "resolve-project could not complete");
+                            AttachResponse::err(format!(
+                                "{PROJECT_ERR_UNRESOLVED}: {}",
+                                crate::project_resolve::ProjectResolveError::Internal.detail()
+                            ))
+                        }
+                    }
+                }
+            };
+            write_resp(&mut stream, &resp).await?
+        }
+        // PRD #819 M4 still owns this one: the coordinator-context publish has
+        // to be atomic, owner-only and symlink-safe before the verb can report
+        // success, so the arm keeps answering `unimplemented` rather than
+        // publishing unsafely in the meantime.
+        //
         // Every field bound, with no `..` rest pattern, so the next field added
         // to the variant is a compile error at this seam rather than a value
         // silently dropped — the mistake `map_tab` in the desktop crate records
@@ -2530,6 +2614,59 @@ async fn handle_connection(
         }
     }
     Ok(())
+}
+
+/// PRD #819 M3: the daemon's enumeration seeds, gathered from state it already
+/// holds.
+///
+/// Four sources, and **all four are candidates rather than projects** — an
+/// ordinary agent cwd or a scheduled task's working directory need not hold a
+/// `.dot-agent-deck.toml` at all, so
+/// [`crate::project_resolve::resolve_candidates`] revalidates every one before
+/// it is offered:
+///
+/// 1. the daemon's own startup cwd, captured once in
+///    [`crate::daemon::run_daemon_with`];
+/// 2. `AgentRecord.cwd` for every live agent;
+/// 3. `TabMembership::Orchestration::orchestration_cwd` for every orchestration
+///    role;
+/// 4. every registered schedule's `working_dir`.
+///
+/// This function touches **no filesystem**, which is why it runs on the async
+/// side: it reads two in-memory registries and the daemon's `AppState`. The
+/// `live` join is the same one [`AttachRequest::ListAgents`] performs, and it is
+/// here for one reason — `AgentRecord.live` is what carries
+/// [`crate::state::SessionSnapshot::last_activity_ms`], the real timestamp the
+/// primary nomination prefers over `spawned_at_ms`.
+async fn project_candidates(
+    registry: &Arc<AgentPtyRegistry>,
+    state: &SharedState,
+    scheduler: &Arc<crate::scheduler::Scheduler>,
+) -> Vec<crate::project_resolve::ProjectCandidate> {
+    let mut records = registry.agent_records();
+    {
+        let guard = state.read().await;
+        for record in &mut records {
+            record.live = guard
+                .sessions
+                .values()
+                .filter(|s| {
+                    s.agent_id.as_deref() == Some(record.id.as_str())
+                        && s.pane_id == record.pane_id_env
+                })
+                .max_by(|a, b| {
+                    a.last_activity
+                        .cmp(&b.last_activity)
+                        .then_with(|| a.session_id.cmp(&b.session_id))
+                })
+                .map(|s| s.live_snapshot());
+        }
+    }
+    crate::project_resolve::collect_candidates(
+        crate::project_resolve::daemon_startup_cwd().as_deref(),
+        &records,
+        &scheduler.registered_working_dirs(),
+    )
 }
 
 /// PRD #819 M2/A5: the wire-boundary check every caller-supplied project path
@@ -2598,10 +2735,14 @@ fn validate_task(task: &str) -> Result<(), String> {
 /// Deliberately not `ok: true` with an empty payload (indistinguishable from a
 /// real empty answer) and deliberately not a `todo!()` (a panic in a connection
 /// handler takes down a task that is serving other clients).
+///
+/// M3 landed the behaviour behind `list-projects` and `resolve-project`, so
+/// [`AttachRequest::PrepareWorkflow`] is the one verb still answering this;
+/// M4 lands the safe publish behind it.
 fn unimplemented_project_verb(capability: &str) -> AttachResponse {
     AttachResponse::err(format!(
         "{PROJECT_ERR_UNIMPLEMENTED}: this daemon build accepts `{capability}` but does not \
-         implement it yet (PRD #819 M2 landed the wire contract; M3/M4 land the behaviour)"
+         implement it yet (PRD #819 M2 landed the wire contract; M4 lands the safe publish)"
     ))
 }
 
