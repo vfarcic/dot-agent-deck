@@ -234,11 +234,11 @@ pub(crate) fn write_atomic(dir: &Path, dest: &Path, bytes: &[u8]) -> io::Result<
 /// # The name
 ///
 /// `.bak` is APPENDED to the whole file name. Two of the three adapters spelled
-/// this `path.with_extension("json.bak")`, which *replaces* the extension —
-/// identical for every path they actually pass (`settings.json`, `hooks.json`,
-/// `config.json` all become `<name>.json.bak` either way) and different only for
-/// a destination not named `*.json`, where appending is the answer that keeps
-/// the original name legible.
+/// this `path.with_extension("json.bak")`, which *replaces* the extension
+/// instead — the same answer for every path they actually pass, since
+/// `settings.json`, `hooks.json` and `config.json` each reach
+/// `<that name>.bak` either way, and a different one only for a destination not
+/// named `*.json`, where appending is what keeps the original name legible.
 pub(crate) fn backup_malformed(dest: &Path, bytes: &[u8]) -> Option<PathBuf> {
     let mut name = dest.file_name()?.to_os_string();
     name.push(".bak");
