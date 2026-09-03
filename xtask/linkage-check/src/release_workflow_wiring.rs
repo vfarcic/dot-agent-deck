@@ -302,3 +302,123 @@ fn one_platforms_bundler_failure_does_not_cancel_the_other() {
          timeout on Linux cancels an otherwise-good macOS dmg."
     );
 }
+
+/// Does this job block carry an `actions/checkout` step?
+///
+/// Comment lines are dropped first: the steps this predicate feeds carry prose
+/// *about* the absence of a checkout, and a match on that prose would report
+/// the property as satisfied by the very comment explaining it is not.
+fn checks_out(block: &str) -> bool {
+    block
+        .lines()
+        .filter(|l| !l.trim_start().starts_with('#'))
+        .any(|l| l.contains("uses: actions/checkout"))
+}
+
+/// The lines of a job block that invoke the `gh` CLI.
+///
+/// Matched on a `gh` *token* -- the two characters preceded by something that
+/// cannot continue an identifier, and followed by whitespace -- and not on the
+/// bare substring, which is everywhere in ordinary English (`through`, `high`,
+/// `right`) and in this file's own `github.token` / `GH_TOKEN` bindings.
+/// Comment lines are dropped for the same reason: a sweep that drowns in noise
+/// gets abandoned, which buys as much as not sweeping.
+///
+/// `/` and `.` are deliberately NOT in that set, so a path-qualified
+/// `/usr/bin/gh release upload` is matched too. Erring toward over-matching is
+/// the safe direction here: a false positive asks for a `--repo` that does no
+/// harm, while a miss is the silent broken release this exists to prevent.
+///
+/// Deliberately line-oriented, so it sees `$(gh release view …)` and
+/// `… | gh release edit …` as invocations. It cannot see one split across a
+/// backslash continuation; nothing in `release.yml` writes one, and the
+/// non-vacuity assertion below is what notices if that changes.
+fn gh_invocations(block: &str) -> Vec<&str> {
+    block
+        .lines()
+        .filter(|l| !l.trim_start().starts_with('#'))
+        .filter(|l| {
+            l.match_indices("gh").any(|(i, _)| {
+                let boundary_before = l[..i]
+                    .chars()
+                    .next_back()
+                    .is_none_or(|c| !(c.is_alphanumeric() || "_-".contains(c)));
+                let arguments_after = l[i + 2..].chars().next().is_some_and(char::is_whitespace);
+                boundary_before && arguments_after
+            })
+        })
+        .collect()
+}
+
+/// Issue #852: `desktop-publish` is the one job in this file with no
+/// `actions/checkout` -- it downloads artifacts and calls the API, so it needs
+/// no source tree -- and none of its three `gh` calls passed `--repo`. `gh`
+/// then falls back to inspecting git for its target repository, finds none, and
+/// dies with `failed to run git: fatal: not a git repository`. Every release
+/// that reached the job failed inside it, so on every tag carrying these jobs
+/// the desktop alpha bundles were built correctly and then never attached, and
+/// the release-body note the two later calls append was never appended either.
+///
+/// Asserted over every `gh` call in every checkout-less job rather than over
+/// the three lines that were wrong, and that generality is the point: the
+/// steps run under the default `bash -e`, so the first failure aborts the job
+/// and the other two calls were *latent*. A check pinned to the call named in
+/// the failure log would have been satisfied by a fix that merely relocated the
+/// failure to the next call. Stated as a property it also covers the next job
+/// added without a checkout, which is how this one arrived.
+///
+/// Either remedy satisfies it, matching the two the issue offers: a `--repo` on
+/// each call, or a checkout for the job. This does not pin which.
+///
+/// **Scoped to `release.yml`**, which is this module's file and the workflow
+/// that never runs on a pull request -- so a static assertion is the only thing
+/// that can catch this at all. It is *not* a claim about the other workflows,
+/// and does not generalise to them as written: `ci.yml`'s `changes` job reaches
+/// the API as `gh api repos/$REPO/…`, carrying its repository in the request
+/// path rather than in a flag, and the `*.lock.yml` files are generated.
+#[test]
+fn gh_calls_in_checkoutless_jobs_name_their_repository() {
+    let all = jobs(&workflow());
+
+    for (name, block) in &all {
+        if checks_out(block) {
+            continue;
+        }
+        for call in gh_invocations(block) {
+            assert!(
+                call.contains("--repo"),
+                "`{name}` has no `actions/checkout` step, so its workspace \
+                 holds no git repository for `gh` to infer a target from -- and \
+                 this call names none either:\n\n    {}\n\n\
+                 It will fail with `failed to run git: fatal: not a git \
+                 repository`. That is issue #852: from PRD #740 onward every \
+                 release built the desktop bundles and then failed to attach \
+                 them, because all three `gh` calls in `desktop-publish` were \
+                 missing this flag. Fix it either way -- add `--repo \"$REPO\"` \
+                 with `REPO: ${{{{ github.repository }}}}` in the step's \
+                 `env:`, or give the job a SHA-pinned `actions/checkout` -- but \
+                 fix it here, because `release.yml` fires only on a tag and \
+                 nothing in CI will tell you. By the time this is observable a \
+                 release has already gone out without its assets.",
+                call.trim()
+            );
+        }
+    }
+
+    // Non-vacuity. A guard that passes because it matched nothing is not a
+    // guard, and this one is one `gh`-token predicate away from matching
+    // nothing. `desktop-publish` is the only job in the file that reaches the
+    // API through the CLI, and it does so three times; counted regardless of
+    // whether the job checks out, so this stays live under either remedy above.
+    let publish_calls = gh_invocations(job(&all, "desktop-publish")).len();
+    assert!(
+        publish_calls >= 3,
+        "expected to still see the three `gh` calls in `desktop-publish` that \
+         issue #852 was about, found {publish_calls}. This is a lower bound, \
+         not a pin on the step layout: if a call was deliberately removed, \
+         lower it in the same commit. If all three are still there, the `gh` \
+         token match above has stopped seeing them -- perhaps a call is now \
+         split across a line continuation -- and the loop it feeds has become \
+         a no-op that passes on nothing."
+    );
+}
