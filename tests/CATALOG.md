@@ -3131,6 +3131,13 @@ without depending on the config struct API.
 - **Does not assert:** the refusal itself (`orchestration/orphan/003`); the `--force` matrix and the both-guards ordering (`daemon_stop::tests::stop_refusal_covers_the_force_matrix`). The decision is asserted over the real reply rather than by calling `run_daemon_stop`, because with nothing to refuse that call reaches `terminate_daemon_graceful`, whose target pid is the test process itself.
 - **Platform coverage:** linux+mac (`#![cfg(unix)]` — the attach socket is Unix-domain; Windows port tracked by #164).
 
+##### orchestration/orphan/005 — The orphaned-role badge reaches a REAL terminal, and a forged one does not (issue #770).
+- **Layer:** L2 (real-binary PTY + vt100; synthetic `SessionStart` hooks written to the deck's own hook socket).
+- **Agent:** none (two synthesized Claude Code `SessionStart` events — no credential, no spawned agent). Not demo-reel-eligible: a stand-in PTY test, deliberately unmarked.
+- **Asserts:** a hook event from a plain pane id that FORGES `orchestration_orphaned` in its metadata renders no marker at all — pinning the daemon-authoritative strip through the unauthenticated same-uid socket, which is the only place that threat exists; then a hook from a role-shaped pane id the daemon holds no role for makes the `orphaned` title marker and the `Orphaned — delegation unavailable` row appear on the rendered grid, and exactly ONE card carries that row, so the genuine badge did not leak onto the forged card. Ordered clean-then-badged so both assertions are real transitions rather than vacuous matches.
+- **Does not assert:** the stamping decision matrix (`orchestration/orphan/001` owns the spawn-race, registered-role and TUI-pane-id arms at the seam); card geometry or styling (`orchestration/orphan/002`, `dashboard/pane/*`); the `daemon stop` refusal (`orchestration/orphan/003`, `orchestration/orphan/004`); re-registering the lost role, which issue #770 defers.
+- **Platform coverage:** linux+mac (`#![cfg(feature = "e2e")]`; the L2 PTY harness is Unix-only).
+
 ### Session restore
 
 #### session/restore
