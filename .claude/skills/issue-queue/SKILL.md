@@ -28,7 +28,7 @@ It **never implements a fix, and never diagnoses beyond what selection requires*
 
 If you see that, stop. Selection still works and is worth reporting, but nothing can be dispatched from here; say so rather than falling back to doing the work yourself.
 
-## Step 0 — Fetch, and never trust the working tree
+## Step 0 — Fetch, verify against `origin/main`, and bring the base up to date
 
 **Run `git fetch origin` before verifying anything, and verify against `origin/main`, not the checkout.**
 
@@ -45,9 +45,44 @@ So verify claims with `git grep` against the remote ref:
 git grep -n "fn shell_foreground_busy_snapshot" origin/main -- src/agent_pty.rs
 ```
 
-Do **not** `git pull` to fix this. The runner may have local work, and this skill has no business moving their branch.
+### Then bring the checkout up to date, because every unit is cut from it
 
-**That rule is about verification, which is all this step governs.** Verifying against `origin/main` needs no pull, so refusing one here costs nothing at all. The *base each dispatched worktree is cut from* is a different problem that verifying harder does not touch, and it is what step 5b is for — same constraint, different answer: surface the staleness, hand the decision to the runner, and still never pull on your own.
+**`dispatch` has no base or branch option.** It runs `git worktree add <dir> -b agent/dispatch-<name>` **in the caller's own working directory and with no start-point** — `ctx.working_dir` in `src/dispatch.rs` feeding `create_worktree` in `src/issue_dispatch_run.rs` — and git resolves an absent start-point to **`HEAD`**. So whatever `HEAD` is at dispatch time is the base every unit in this batch inherits, and no flag anywhere overrides it. The fetch above fixes what you *verify against* and does nothing whatever about what the units are *built on*.
+
+**So bring the base up to date when it is safe to, rather than reporting it stale.** The fetch has already happened, so reading the state costs nothing. Two of the three are new; the third is the same distance read as above, wanted this time for its *left* number as well:
+
+```bash
+git rev-parse --abbrev-ref HEAD                        # the branch every unit is cut from
+git status --porcelain --untracked-files=no            # ANY output means tracked changes
+git rev-list --left-right --count HEAD...origin/main   # "0  6" is 0 ahead, 6 behind
+```
+
+**When `HEAD` is `main`, that status output is empty, and the ahead count is `0`, fast-forward it and say you did.** No prompt, no question — an up-to-date base is the default here, and the runner is told what happened rather than asked to authorise it:
+
+```bash
+git merge --ff-only origin/main
+```
+
+**This reverses the rule that used to stand here, so read why before restoring it.** The old paragraph refused to pull, because *the runner may have local work, and this skill has no business moving their branch*. That hazard is real, and it is kept — it is precisely what the three preconditions test for. What was wrong was the scope: the rule declined every case because it distinguished none of them, and distinguishing them is three commands that cost nothing after a fetch you were already doing. Together those preconditions are the statement **there is no local work here to move** — no uncommitted tracked change, no commit that is not already on the remote, and the branch is the one the remote's is. A fast-forward under them rewrites nothing, discards nothing, creates no merge commit, and is undone exactly by `git reset --hard <the sha you printed before moving>`.
+
+**What declining costs, measured on 2026-08-30.** Two units were dispatched from a local `main` at `820ba40`, six commits behind `origin/main` at `83d9bf3`. One of those six was `daf94f0`, the commit that introduces `desktop/` in the first place — and both units had been dispatched to work on the desktop app. They were cut from a tree with no `desktop/` directory at all, so they could not have done anything; both were stopped and re-dispatched after a pull, with not one original commit between them. **A unit cannot discover this about itself.** It sees a valid checkout, finds the code its issue names missing, and reasonably concludes that the *issue* is stale rather than that its base is.
+
+**`git merge --ff-only origin/main`, never `git pull`, and the difference is not stylistic.** The fetch above already put the ref in the repository, so the merge is purely local: no second network round trip, and nothing for a `pull.rebase` setting to reinterpret into a rebase of the runner's branch. It is also the second of two independent guards — the preconditions decide and `--ff-only` enforces, so if the two ever disagree the merge fails loudly instead of writing a merge commit onto `main`.
+
+**When the base cannot be brought up to date, do not touch the checkout.** Three of the four cases below are precondition failures — the case the old rule was written for, unchanged — and the fourth is the merge itself refusing. Say which one it was, in these terms:
+
+- **Tracked changes present** — name the files. They are invisible to the units either way: a unit's copy is made from the last commit ([`docs/dispatcher-mode.md`](../../../docs/dispatcher-mode.md)), so uncommitted work never reaches one. Committing or stashing is therefore the same fix in both directions, and it is the runner's to make rather than yours. **Untracked files are deliberately not a blocker** — `--untracked-files=no` is load-bearing above. A fast-forward that would clobber one fails cleanly by itself, and counting them as dirtiness would refuse on nearly every real checkout, reinstating "never update" by another route.
+- **`HEAD` is not `main`** — every unit is cut from *that* branch and carries its unmerged work into every PR the batch produces. Name the branch and its distance from `origin/main`. This is the sharper failure of the three, because nothing about it looks wrong: a feature branch dispatches exactly as smoothly as `main` does.
+- **`HEAD` is ahead of `origin/main`** — there is nothing to fast-forward *to*, and the commits that put it ahead are inherited by every unit's branch and turn up in every unit's PR. Report the count; pushing or moving is the runner's call.
+- **The merge command itself fails despite every precondition passing** — a fast-forward that would clobber a file `origin/main` newly tracks is the concrete case. Treat that failure exactly like the three above: report the git error and do not proceed to dispatch. **Decide on the exit status, never on the output** — git prints `Updating <old>..<new>` *after* `Aborting`, so a refusal ends in a line that reads exactly like a successful fast-forward. `--ff-only` never partially applies, so the checkout is unchanged and there is nothing to undo.
+
+**Do not stop the queue over a refusal.** Nothing in selection depends on the checkout — verifying against `origin/main` is exactly what makes that true — so carry the refusal forward and put it in front of the runner at the same moment you ask how many to dispatch (step 5), where they are already weighing what the batch costs. Three answers are legitimate and all three are the runner's: dispatch anyway onto the older base, clear the blocker and dispatch after it, or defer the batch. Take their answer rather than picking one, and never clear the blocker on their behalf — committing, stashing or switching branch is precisely the local work this step refuses to touch.
+
+**Resolve it before the first dispatch, never between two.** If the runner clears the blocker, re-read `HEAD` and dispatch. Updating mid-batch splits one batch across two bases, and the units already started keep the old one.
+
+**Then report the base as a distance from `origin/main`, not as a branch name** (step 9). "cut from `main`" reads identically whether `main` is level with the remote or six commits behind it, which is exactly how the 2026-08-30 batch looked fine right up until the units did not.
+
+**If a later step in this file also checks the base, this one supersedes the deciding half of it.** Issue #674 added such a step, written when surfacing was the policy; keep what it says about `dispatch` naming the base in its own success line, since that is a record written *after* the worktree exists and step 9 quotes it, and drop its instruction to surface and ask, which is what this step replaces.
 
 ## Step 1 — Resolve identity at runtime
 
@@ -187,36 +222,9 @@ Show what was excluded and why — in-flight exclusions especially, since that i
 
 **If nothing survives, stop there.** After PRD exclusion, in-flight elimination and duplicate clustering the candidate list can legitimately be empty. Report the counts at each stage and what they removed, and do not go on to ask how many to dispatch — there is nothing to dispatch, and asking implies otherwise.
 
-Otherwise **ask how many to dispatch, recommending 2–3.** Do not assume "all", and do not offer "all" as the recommendation. Each unit runs the full gate chain including `cargo test-e2e`, the most expensive gate in the repo (CLAUDE.md rule 5), and CLAUDE.md rule 14 records how concurrent multi-GB `target/` trees surface as a misleading `linking with 'cc' failed` or a `SIGKILL` on `rustc`. An agent hitting either will blame its issue rather than the batch size.
+Otherwise **ask how many to dispatch, recommending 2–3.** Do not assume "all", and do not offer "all" as the recommendation. Each unit builds its own multi-GB `target/` tree and runs the full gate chain, and CLAUDE.md rule 14 records how concurrent trees surface as a misleading `linking with 'cc' failed` or a `SIGKILL` on `rustc`. An agent hitting either will blame its issue rather than the batch size. This got cheaper on 2026-08-31 but not free: issue #502 removed the per-PR `cargo test-e2e` obligation — the tier's lane 1 now runs in CI instead, so N units no longer mean N copies of it competing on one box, which is the contention #415 measured — but `cargo clippy --workspace --all-targets --features e2e,e2e-live` and `cargo test-fast` still compile and run in every unit.
 
 Ask **which** issues too, unless the runner already named them. Relative value is theirs to judge; a security issue and a 2 Hz polling inefficiency are not interchangeable just because both are small.
-
-## Step 5b — Check the base the units will be cut from
-
-**`dispatch` has no base or branch option.** `create_worktree` runs `git worktree add <dir> -b agent/dispatch-<name>` with no start-point (`src/issue_dispatch_run.rs`), and git resolves that to **`HEAD`** — so whatever `HEAD` is at dispatch time is the base every unit in this batch inherits, and no flag anywhere overrides it. The freshness of the runner's checkout is the only lever that exists.
-
-Read both halves of it. Step 0's fetch has already happened, so this costs nothing:
-
-```bash
-git rev-parse --abbrev-ref HEAD                        # the branch every unit inherits
-git rev-list --left-right --count HEAD...origin/main   # "0  6" means 6 behind
-```
-
-**Show the runner what you found and ask what they want to do about it. Never `git pull` on your own.** Step 0's reason holds here unchanged — the runner may have local work, and this skill has no business moving their branch — which is precisely *why* this is a question rather than a fix. What differs from step 0 is only the consequence: a stale checkout mis-answers a `grep`, and step 0 routes around that by verifying against `origin/main`; a stale checkout is *baked into* every worktree, and nothing downstream can route around it.
-
-Measured on the 2026-08-24 batch that motivated this step: local `main` sat at `f3752e1`, **six** commits behind `origin/main` at `c701932`, and all three units were cut there. One of those six, `a2a5953`, rewrote 58 lines of `src/state.rs` inside `AppState::apply_event` — the same function #670 was dispatched to fix — moving the metadata ingest line that issue names from 5671 to **5707**. Selection was still sound, because step 0 had every claim verified against `origin/main`; what was wrong was the ground all three units then stood on, and each had to discover and fix that for itself.
-
-**`HEAD` is not necessarily `main`, and that is the sharper failure.** Dispatch from a pane sitting on a feature branch and every unit is cut from *that branch*, carrying its unmerged work into three PRs — silently, since nothing `dispatch` prints names the base. Verified rather than inferred from git's documentation: `git worktree add <dir> -b probe` with `HEAD` on a feature branch put `probe` at the feature commit, not at `main`. This is where `dispatch` differs from `/worktree-prd`, whose `create.sh` passes the default branch as an explicit start-point — `dispatch` passes none, so there is nothing for the base to be stale *relative to* except wherever the runner happens to be standing.
-
-Three answers are legitimate and all three are the runner's to pick:
-
-- **Dispatch anyway** — reasonable when the gap is small, or touches nothing this batch does. Say which it was in step 9's report rather than leaving it implicit.
-- **The runner updates first**, after which you **re-read `HEAD`** and dispatch. Resolve this before the *first* dispatch, never between two: a mid-batch update splits one batch across two bases, and the units already started keep the old one.
-- **Drop or defer the units the gap actually touches.** `git diff --name-only HEAD..origin/main` names the files that moved; a unit whose issue targets one of them is the one worth deferring.
-
-**Say what you found even when the answer is "nothing".** A checkout already level with `origin/main` is worth one line, because the runner cannot tell "checked, current" apart from "never checked".
-
-**`dispatch` names the base itself, and that does not replace this step.** Since issue #674 its success line ends `…, cut from main at c701932`, which step 9 quotes — but that is a record written *after* the worktree exists. This step runs before, and it is the only thing that can still change the answer.
 
 ## Step 6 — Claim, then name
 
@@ -328,7 +336,7 @@ The human gates in steps 5 and 6 do not cover this, and it is worth being precis
 - **The goal in one or two sentences**, and the expected end state.
 - **Any duplicate to close** and any coupled issue included in the unit.
 - **The non-obvious constraint**, where the issue records one, inside the fence. These are the most load-bearing sentences in the task, because they are what an agent reading only the code would get wrong — e.g. #429's "a timed-out sample must yield `None`, never `Some(false)`", or #448's "`DelegationRetirement::Nothing` is not a reliable proxy for never-delegated".
-- **The gates, from CLAUDE.md**: `cargo fmt --check` and `cargo clippy --workspace --all-targets --features e2e -- -D warnings` before every commit, `cargo test-fast` per task, `cargo test-e2e` before the PR.
+- **The gates, from CLAUDE.md**: `cargo fmt --check` and `cargo clippy --workspace --all-targets --features e2e,e2e-live -- -D warnings` before every commit, and `cargo test-fast` per task. There is **no** full-tier obligation before the PR — say so explicitly in the task, because an agent that has read an older PRD will otherwise run `cargo test-e2e` for tens of minutes on its own initiative. What rule 5 *does* require is the **tests covering what the unit touched**, found via `tests/CATALOG.md`, the `#[spec]` annotations or `cargo xtask list-tests`, and **named in the report** — including a credentialed `cargo test-e2e-live <filter>` where the issue touches a real-agent path, since lane 2 runs on no runner anywhere. Lane 1 in full is CI's job (the `e2e-deterministic` job, every PR): tell the unit to read that run, not to reproduce it. Locally, rule 6 still applies — rerun a failing e2e test alone with a filter, then its module.
 - **A changelog fragment** via the `dot-ai-changelog-fragment` skill.
 - **CLAUDE.md rule 12** where the change touches the daemon, protocol, orchestration or hooks: the unit must answer the `PROTOCOL_VERSION`-vs-`.breaking.md` question explicitly rather than silently.
 - **Rule 4** where the change is user-visible: which test tier it needs.
@@ -350,5 +358,5 @@ Give the runner, per unit: issue number, worktree path as `dispatch` reported it
 
 - **Nothing reports back to this pane.** `dispatch` is fire-and-forget with no return edge. Point at the worktree paths and the units' own tabs; never say results will arrive here.
 - **Anything you excluded, and why** — especially in-flight collisions, duplicates, and any candidate abandoned at step 6 or 8 over an assignee collision or a refused dispatch.
-- **The base every unit was cut from.** `dispatch` names it in its own success line (`…, cut from main at c701932`), so **quote what it reported** rather than recomputing it, and pair it with the distance and the runner's answer from step 5b. Report it when the base was already current, too: nothing else distinguishes a base that was checked from one that was never looked at. **A success line carrying no `cut from` clause means the probe failed, not that the base is fine** — it is deliberately best-effort so a failed probe cannot fail a dispatch that already succeeded. Say the base is unreported rather than dropping the line.
-- **Anything you could not verify**, including a stale local checkout you chose not to move, and any list you could not confirm was untruncated.
+- **The base every unit was cut from, as a distance from `origin/main`** — the sha, plus `0 behind` after step 0 fast-forwarded it or `N behind` when step 0 declined to move it, measured at the moment the batch was dispatched rather than now. Report it when the base was already current too: nothing else distinguishes a base that was checked from one nobody looked at, and a bare branch name distinguishes neither. Where `dispatch`'s own success line names the base (`…, cut from main at c701932`), quote that rather than recomputing it — and read a missing clause as an older build or a failed probe, never as a base that is fine.
+- **Anything you could not verify**, including a checkout step 0 declined to move and which precondition stopped it, and any list you could not confirm was untruncated.

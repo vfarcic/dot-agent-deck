@@ -1,4 +1,4 @@
-#![cfg(feature = "e2e")]
+#![cfg(all(feature = "e2e", feature = "e2e-live"))]
 
 //! L2 real-agent chain test for #187 / PR #188.
 //!
@@ -66,43 +66,16 @@ const PINNED_CLAUDE_MODEL: &str = "claude-haiku-4-5-20251001";
 /// never appears; a fresh tempdir cwd would otherwise trip it and swallow
 /// the injected delegate prompt. The returned TempDir must be kept alive
 /// for the worker's lifetime.
+///
+/// Issue #502/#785: this used to be hand-rolled here, opening with an
+/// unconditional `fs::copy` of the host's `~/.claude/.credentials.json` that
+/// panicked outright on a host authorised by an `ANTHROPIC_API_KEY` instead.
+/// It now defers to the harness's own pair, which also pre-answers Claude
+/// Code's API-key approval prompt — see `common::seed_claude_worker_home`.
 fn prepare_claude_home(worker_cwd: &str) -> TempDir {
-    let host_home = std::env::var("HOME").expect("HOME is set");
     let home = common::race_safe_tempdir();
-
-    // Carry the host credentials so the worker authenticates as the host
-    // user (mirrors the harness's `with_imported_claude_credentials`).
-    std::fs::create_dir_all(home.path().join(".claude")).expect("mk .claude");
-    std::fs::copy(
-        Path::new(&host_home)
-            .join(".claude")
-            .join(".credentials.json"),
-        home.path().join(".claude").join(".credentials.json"),
-    )
-    .expect("copy claude credentials");
-
-    // Start from the host's global config (preserves oauthAccount +
-    // hasCompletedOnboarding so the worker skips the global onboarding
-    // flow), then add this cwd as a trusted project.
-    let host_cfg_path = Path::new(&host_home).join(".claude.json");
-    let mut cfg: serde_json::Value = std::fs::read_to_string(&host_cfg_path)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_else(|| serde_json::json!({ "hasCompletedOnboarding": true }));
-    if !cfg["projects"].is_object() {
-        cfg["projects"] = serde_json::json!({});
-    }
-    cfg["projects"][worker_cwd] = serde_json::json!({
-        "hasTrustDialogAccepted": true,
-        "hasCompletedProjectOnboarding": true,
-        "projectOnboardingSeenCount": 1,
-    });
-    std::fs::write(
-        home.path().join(".claude.json"),
-        serde_json::to_string(&cfg).expect("serialize .claude.json"),
-    )
-    .expect("write isolated .claude.json");
-
+    common::seed_claude_worker_home(home.path(), &[worker_cwd.to_string()])
+        .expect("seed the isolated Claude worker HOME");
     home
 }
 

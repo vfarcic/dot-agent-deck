@@ -604,35 +604,41 @@ pub fn classify(inputs: &DoctorInputs) -> Vec<CheckResult> {
         ),
     });
 
-    // FAIL, not an advisory. A protocol-version mismatch is fatal in
-    // `connect.rs` today: it is part of the connect floor (PRD #161 D3),
-    // unaffected by M1.2's removal of the build-id comparison, and
-    // `run_connect`'s probe returns `Err` on it. A remote you literally cannot
-    // attach to must not be diagnosed `Overall: WARN`, exit 0, "clear" — that
-    // is precisely the "reports fine when it is not" failure this command
-    // exists to prevent. Issue #491 argues the comparison guards nothing (the
-    // remote's TUI and daemon are one install, and the laptop is only ssh plus
-    // a terminal); that argument is still worth putting in front of the user,
-    // so it stays in the fix text — but it is an open proposal, not landed
-    // behaviour, and it must not downgrade the verdict below what `connect`
-    // actually enforces.
+    // What this check measures changed with issue #491, and the verdicts did
+    // not. `connect` no longer compares the remote's protocol version against
+    // the laptop's — the two constants never share a wire, since `connect`
+    // ssh's in and runs the remote's own TUI against the remote's own daemon —
+    // so a version *difference* is no longer observable here and no longer
+    // fatal anywhere. What `probe_remote_protocol` still reports, and what
+    // `run_connect` still refuses on, is a remote that cannot answer
+    // `daemon hello` at all: too old for the subcommand, or a broken install.
+    // That remains genuinely unattachable, so FAIL stays FAIL — a remote you
+    // literally cannot attach to must not be diagnosed `Overall: WARN`,
+    // exit 0, "clear", which is precisely the "reports fine when it is not"
+    // failure this command exists to prevent.
+    //
+    // `CheckId::ProtocolCompatible` keeps its name deliberately. The identity
+    // is part of the report's scriptable output contract (pinned by
+    // `tests/e2e_remote_doctor.rs`), it still reads true — can the remote speak
+    // our handshake at all — and renaming it would break anyone grepping the
+    // report for zero diagnostic gain. Only the prose moved.
     checks.push(match inputs.protocol_compatible {
         Some(true) => CheckResult::new(
             CheckId::ProtocolCompatible,
             Verdict::Pass,
-            "the attach protocol version matches this laptop's",
+            "the remote answered the attach handshake",
             "",
         ),
         Some(false) => CheckResult::new(
             CheckId::ProtocolCompatible,
             Verdict::Fail,
-            "the attach protocol version differs from this laptop's, so attaching is refused",
-            "Run `dot-agent-deck remote upgrade <name>` (or upgrade this laptop's binary if the remote is the newer one) — `dot-agent-deck connect <name>` refuses a version skew outright, so this is not advisory. Worth knowing: the remote's TUI and daemon come from one install, so the difference may not reflect a real fault, and issue #491 proposes dropping the comparison. Until it lands, this is what stops you attaching.",
+            "the remote did not answer the attach handshake, so attaching is refused",
+            "Run `dot-agent-deck remote upgrade <name>` to reinstall — `dot-agent-deck connect <name>` refuses a remote whose `daemon hello` it cannot get an answer from, so this is not advisory. Either the installed binary predates the handshake or the install is broken. A version *difference* is not what this reports: since issue #491 the remote's protocol version is never compared against this laptop's, because the remote's TUI and daemon are one install and the laptop is only ssh plus a terminal.",
         ),
         None => CheckResult::new(
             CheckId::ProtocolCompatible,
             Verdict::Unknown,
-            "the attach protocol handshake did not complete",
+            "the attach handshake did not complete",
             "The handshake rides the same session, so it cannot answer until whatever else this report flagged is resolved.",
         ),
     });
@@ -1619,7 +1625,7 @@ fn observe(executor: &dyn SshExecutor, target: &SshTarget, name: &str) -> Observ
         inputs.protocol_compatible =
             match probe_remote_protocol(executor, target, name, REMOTE_INSTALL_PATH) {
                 Ok(_) => Some(true),
-                Err(RemoteConnectError::ProtocolMismatch { .. }) => Some(false),
+                Err(RemoteConnectError::RemoteHandshakeUnsupported { .. }) => Some(false),
                 Err(_) => None,
             };
     }
@@ -2948,11 +2954,12 @@ remoteforward 1080 [socks]:0
         assert_ne!(overall_verdict(&results), Verdict::Pass);
     }
 
-    /// Scenario: The remote speaks a different attach protocol version. That is
-    /// fatal to `connect`, so the doctor reports FAIL — a remote you cannot
-    /// attach to must never read as an all-clear diagnosis.
+    /// Scenario: The remote cannot answer `daemon hello` at all — too old for
+    /// the subcommand, or a broken install. That is fatal to `connect`, so the
+    /// doctor reports FAIL — a remote you cannot attach to must never read as
+    /// an all-clear diagnosis.
     #[test]
-    fn classify_protocol_mismatch_is_fatal_not_advisory() {
+    fn classify_unanswered_handshake_is_fatal_not_advisory() {
         let mut inputs = healthy_inputs();
         inputs.protocol_compatible = Some(false);
         let results = classify(&inputs);
@@ -2961,15 +2968,20 @@ remoteforward 1080 [socks]:0
         assert_eq!(
             result.verdict,
             Verdict::Fail,
-            "`connect` refuses a protocol skew outright (src/connect.rs, PRD #161 D3), so the \
-             doctor must not downgrade it below what connect enforces: {result:#?}"
+            "`connect` refuses a remote whose handshake it cannot get an answer from \
+             (src/connect.rs `RemoteHandshakeUnsupported`), so the doctor must not downgrade \
+             it below what connect enforces: {result:#?}"
         );
         assert_eq!(overall_verdict(&results), Verdict::Fail);
         assert_eq!(overall_verdict(&results).exit_code(), 1);
-        // The issue #491 nuance is still useful context; it just must not set
-        // the verdict.
-        assert!(result.fix.contains("491"), "{result:#?}");
         assert!(result.fix.contains("remote upgrade"), "{result:#?}");
+        // Issue #491: a version *difference* is no longer what this reports,
+        // and the fix text must not send the user chasing one.
+        assert!(
+            !result.headline.contains("version differs"),
+            "the headline must not claim a version comparison the code no longer makes: \
+             {result:#?}"
+        );
     }
 
     /// Scenario: Map each aggregate verdict to its exit code. A failed check

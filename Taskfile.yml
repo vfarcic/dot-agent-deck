@@ -105,7 +105,7 @@ tasks:
       - .claude/skills/demo-reel/tests/smoke.sh
 
   reel-adapter-test:
-    desc: Assert the demo-reel adapter builds manifest.json in catalog order, excludes L1 (cast-less) tests, and clean-skips an empty list (pure shell; no agg/ffmpeg/git/network; CI-safe)
+    desc: Assert the demo-reel adapter builds manifest.json in catalog order, excludes L1 (cast-less) and unmarked tests, and clean-skips with the right reason for each cause (no agg/ffmpeg, no network; the reel-path cases use git in a throwaway repo; CI-safe)
     cmds:
       - .claude/skills/demo-reel-adapter/tests/adapter_test.sh
 

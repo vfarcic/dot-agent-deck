@@ -162,6 +162,43 @@ pub fn arm_seed_fallback(
 /// terminal size while still keeping downstream allocations bounded.
 pub const PTY_RESIZE_DIM_MAX: u16 = 4096;
 
+/// Process-wide one-shot guard so the daemon logs a single line the first time
+/// it has to clamp a resize request, rather than one per frame for the whole
+/// life of a very wide terminal. See [`AgentPtyRegistry::resize`].
+static OVERSIZED_RESIZE_LOGGED: AtomicBool = AtomicBool::new(false);
+
+/// Normalize a requested PTY geometry to what the child process will actually
+/// be given: each axis clamped to [`PTY_RESIZE_DIM_MAX`].
+///
+/// **Issue #747 — this is the one place the cap is spelled.** The cap used to
+/// live only at the far end of the resize path ([`AgentPtyRegistry::resize`]),
+/// which clamped silently and returned `Ok`. The client applied no bound at
+/// all, so on a terminal wider than the cap it would parse and render the
+/// agent's output at (say) 4198 columns while the child had been told to wrap
+/// at 4096 — a pane full of rewrapped, misaligned content, with nothing logged
+/// and no error anywhere. Every participant in a resize now normalizes through
+/// this function, so "the width the client parses at" and "the width the child
+/// was given" are the same number by construction:
+///
+/// 1. `FrameLayout::pane_target_dims` (`src/ui.rs`) — the layout-derived target
+///    `resize_panes_to_layout` drives every pane from.
+/// 2. `EmbeddedPaneController::resize_pane_pty` (`src/embedded_pane.rs`) — the
+///    local vt100 parser, and the `(rows, cols)` put on the pane's resize watch
+///    channel and forwarded to the daemon as `AttachRequest::Resize`.
+/// 3. `TerminalWidget::render` (`src/terminal_widget.rs`) — the PRD #84
+///    invariant-3 guard, which compares the parser against the *capped* inner
+///    area so an over-cap pane is not reported as a contract violation.
+/// 4. [`AgentPtyRegistry::resize`] below — still the enforcing boundary, since
+///    a same-uid attach-socket peer is under no obligation to pre-clamp.
+///
+/// A pane whose drawn area exceeds the cap therefore renders the child's full
+/// 4096 columns through `TerminalWidget`'s `min(area, screen)` path and leaves
+/// the remaining columns blank. That is the honest outcome: the child has no
+/// more columns to show.
+pub fn clamp_pty_dims(rows: u16, cols: u16) -> (u16, u16) {
+    (rows.min(PTY_RESIZE_DIM_MAX), cols.min(PTY_RESIZE_DIM_MAX))
+}
+
 /// Maximum byte length the daemon will *retain* for a caller-supplied
 /// `DOT_AGENT_DECK_PANE_ID` value (and the TUI will *reuse* on rehydration).
 /// The agent's child process still receives whatever the caller sent — we
@@ -927,8 +964,9 @@ pub fn spawn(opts: SpawnOptions<'_>) -> Result<AgentPty, AgentPtyError> {
             opts.rows, opts.cols
         )));
     }
-    let rows = opts.rows.min(PTY_RESIZE_DIM_MAX);
-    let cols = opts.cols.min(PTY_RESIZE_DIM_MAX);
+    // Issue #747: through the shared helper, so this stays a mirror of
+    // `resize` by construction rather than by two copies staying in step.
+    let (rows, cols) = clamp_pty_dims(opts.rows, opts.cols);
 
     let pty_system = NativePtySystem::default();
 
@@ -1844,6 +1882,30 @@ pub struct RunningAgent {
     /// Lets a test prove the NATIVE delivery path ran rather than the safety
     /// net (the whole point of dissolving the keystroke-injection workaround).
     pub seed_delivered_native: bool,
+    /// PRD #745 M11: the wall-clock instant at which **this registry forked
+    /// this child**, or `None` when the registry did not fork it.
+    ///
+    /// It is an OBSERVATION, not an inference. [`AgentPtyRegistry::spawn_agent`]
+    /// stamps it immediately after `spawn(opts)` returns — the first moment the
+    /// process exists — and nothing ever rewrites it. It is the only site that
+    /// writes `Some`; every other way a record comes into being leaves it
+    /// `None`, which is why the absent case needs no guard anyone has to
+    /// remember.
+    ///
+    /// **`DateTime<Utc>`, not `Instant`.** A monotonic instant is meaningless in
+    /// another process, so it cannot cross the wire at all; the value is
+    /// serialized as epoch milliseconds on [`AgentRecord::spawned_at_ms`], the
+    /// unit `Date.now()` speaks.
+    ///
+    /// **A respawn does not carry it over, and that is the feature.** A
+    /// `clear = true` delegate removes this record outright and
+    /// [`AgentPtyRegistry::spawn_agent`] mints a fresh one
+    /// (see [`AgentPtyRegistry::respawn_agent_for_pane_declared`]), so a
+    /// restarted worker reports the age of its CURRENT iteration while a role
+    /// nobody has restarted — an orchestrator, typically — reports its whole
+    /// lifetime. No "which duration is this?" flag is needed, because the two
+    /// answers come from two different records.
+    pub spawned_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 impl RunningAgent {
@@ -2025,6 +2087,40 @@ pub struct AgentRecord {
     /// no `PROTOCOL_VERSION` bump is needed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub live: Option<crate::state::SessionSnapshot>,
+    /// PRD #745 M11: when the daemon spawned this agent's process, as a count
+    /// of milliseconds since the Unix epoch (UTC). Copied from
+    /// [`RunningAgent::spawned_at`].
+    ///
+    /// **Spawn time, not [`crate::state::SessionState::started_at`], and the
+    /// difference is the point.** `started_at` is EVENT-derived: a session only
+    /// exists once a hook event has arrived, so an agent that has never emitted
+    /// one has no start instant at all — which is exactly the agent whose
+    /// uptime a reader most wants — and the hydration path invents it as
+    /// `Utc::now()` when `pane_started_at` has no entry
+    /// (`AppState::insert_placeholder_session`). A spawn is something the
+    /// daemon DID, so it is signal-independent and needs no inference.
+    ///
+    /// **Never invented.** `None` means the daemon cannot vouch for a spawn:
+    /// a record minted from an older daemon's id-only `ListAgents` reply
+    /// (`daemon_client::list_agents`), a peer predating this field, or the
+    /// synthetic test seam. Every consumer renders nothing for it — no dash, no
+    /// placeholder — which is the same disposition
+    /// [`crate::state::SessionSnapshot::last_activity_ms`] takes and the reason
+    /// a duration is shippable here where one built on `started_at` was not.
+    ///
+    /// **Epoch milliseconds for the same four reasons M9 recorded**, and the
+    /// unit is in the NAME because a seconds/milliseconds slip is a ×1000
+    /// error: an integer has no format for two peers to disagree about, it is
+    /// what `Date.now()` speaks, chrono's own `DateTime<Utc>` serialization
+    /// emits RFC 3339 at nanosecond precision no JavaScript consumer can
+    /// represent, and a pre-formatted `"3h"` would bake the client's rounding
+    /// and vocabulary into the daemon's contract.
+    ///
+    /// Additive optional, so no `PROTOCOL_VERSION` bump — the do-not-bump case
+    /// this module's own policy names (`crate::daemon_protocol`), the same
+    /// basis `live` and `last_activity_ms` were added on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spawned_at_ms: Option<i64>,
 }
 
 /// Skip-predicate for `AgentRecord::rows` / `AgentRecord::cols`
@@ -5001,6 +5097,12 @@ impl AgentPtyRegistry {
         // would otherwise drop the `AgentPty` without killing the child
         // (`AgentPty` has no `Drop`).
         let guard = PtyGuard::new(spawn(opts)?);
+        // PRD #745 M11: the child exists as of the line above, so this is the
+        // instant to record — before the lock acquisition below, which can
+        // block behind any other registry operation. An OBSERVATION of when the
+        // daemon forked this process, never derived from an event and never
+        // recomputed; see [`RunningAgent::spawned_at`].
+        let spawned_at = chrono::Utc::now();
         let mut inner = self.inner.lock().unwrap();
         // Issue #454: hand ownership over from the reservation to `agents`
         // WITHOUT releasing the lock in between — every early return below has
@@ -5170,6 +5272,9 @@ impl AgentPtyRegistry {
             // pulls it on `session_start`.
             pending_seed: None,
             seed_delivered_native: false,
+            // PRD #745 M11: the ONLY site that records a spawn instant, because
+            // it is the only site that performs a spawn.
+            spawned_at: Some(spawned_at),
         };
 
         // Use the id we pre-allocated above (before spawn) and injected
@@ -6061,6 +6166,11 @@ impl AgentPtyRegistry {
             // seed via `set_pending_seed` right after this returns.
             pending_seed: _,
             seed_delivered_native: _,
+            // PRD #745 M11: deliberately dropped rather than carried over. The
+            // fresh child is a fresh spawn, and `spawn_agent` stamps it — which
+            // is what makes a restarted worker report its CURRENT iteration
+            // while an unrestarted role reports its whole lifetime.
+            spawned_at: _,
         } = removed;
 
         // Drop this reference to the writer Arc; the slave half closes
@@ -6373,16 +6483,38 @@ impl AgentPtyRegistry {
     /// shape (`PtySize { rows, cols, pixel_width: 0, pixel_height: 0 }`).
     /// Zero rows or cols are rejected up front so a buggy caller can't
     /// quietly produce a 0×0 PTY (which would deadlock any agent that
-    /// reads `TIOCGWINSZ`). Non-zero values are silently clamped down to
+    /// reads `TIOCGWINSZ`). Non-zero values are clamped down to
     /// [`PTY_RESIZE_DIM_MAX`] — see the constant docs for the rationale.
+    ///
+    /// Issue #747: the clamp is no longer *silent*. It stays a clamp rather
+    /// than a rejection — refusing would leave a wide terminal's pane stuck at
+    /// its previous geometry, which is worse than a pane narrower than the
+    /// screen — but it now emits one `warn!` per process. Our own TUI
+    /// pre-clamps through [`clamp_pty_dims`], so after #747 this line firing
+    /// means some *other* peer on the attach socket sent an over-cap request,
+    /// which is precisely the case the cap exists for and worth seeing.
     pub fn resize(&self, id: &str, rows: u16, cols: u16) -> Result<(), AgentPtyError> {
         if rows == 0 || cols == 0 {
             return Err(AgentPtyError::Resize(format!(
                 "rows and cols must be > 0 (got {rows}x{cols})"
             )));
         }
-        let rows = rows.min(PTY_RESIZE_DIM_MAX);
-        let cols = cols.min(PTY_RESIZE_DIM_MAX);
+        let (requested_rows, requested_cols) = (rows, cols);
+        let (rows, cols) = clamp_pty_dims(rows, cols);
+        if (rows, cols) != (requested_rows, requested_cols)
+            && !OVERSIZED_RESIZE_LOGGED.swap(true, Ordering::Relaxed)
+        {
+            tracing::warn!(
+                agent_id = %id,
+                requested_rows,
+                requested_cols,
+                applied_rows = rows,
+                applied_cols = cols,
+                max = PTY_RESIZE_DIM_MAX,
+                "resize request exceeded PTY_RESIZE_DIM_MAX and was clamped; the child PTY \
+                 is narrower/shorter than the caller asked for (logged once per process)"
+            );
+        }
         let mut inner = self.inner.lock().unwrap();
         let agent = inner
             .agents
@@ -6552,6 +6684,8 @@ impl AgentPtyRegistry {
             rows: agent.pty_rows,
             cols: agent.pty_cols,
             live: None,
+            // PRD #745 M11: absent unless THIS registry forked the child.
+            spawned_at_ms: agent.spawned_at.map(|at| at.timestamp_millis()),
         })
     }
 
@@ -6843,6 +6977,11 @@ impl AgentPtyRegistry {
                 // `ListAgents` handler joins `AppState.sessions` in and
                 // overrides this when a matching live session exists.
                 live: None,
+                // PRD #745 M11: absent unless THIS registry forked the child.
+                // Every record this method yields is a LIVE one — the `exited`
+                // filter above is what keeps a spawn instant from outliving the
+                // process it describes and ticking up as a phantom uptime.
+                spawned_at_ms: agent.spawned_at.map(|at| at.timestamp_millis()),
             })
             .collect();
         records.sort_by_key(|r| r.id.parse::<u64>().unwrap_or(0));
@@ -7098,6 +7237,12 @@ impl AgentPtyRegistry {
                 pane_handed_over: false,
                 pending_seed: None,
                 seed_delivered_native: false,
+                // PRD #745 M11: this registry did not fork this child — the
+                // caller did, and handed it over. There is no spawn of ours to
+                // report, so the honest value is absence rather than the
+                // `Utc::now()` that would make the synthetic agent look like it
+                // had just been started by us.
+                spawned_at: None,
             },
         );
         id
@@ -10430,6 +10575,7 @@ mod spawn_tests {
             rows: 120,
             cols: 40,
             live: None,
+            spawned_at_ms: None,
         };
         let json = serde_json::to_string(&rec).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -10691,6 +10837,7 @@ mod spawn_tests {
             rows: 0,
             cols: 0,
             live: None,
+            spawned_at_ms: None,
         };
         let json = serde_json::to_string(&rec).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();

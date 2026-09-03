@@ -357,7 +357,13 @@ pub(crate) enum PaneLayout {
 /// Describes which panes to render and how to lay them out, based on the active tab.
 enum ActiveTabView {
     /// Dashboard tab: show all panes except those managed by mode tabs.
-    Dashboard { exclude_pane_ids: Vec<String> },
+    Dashboard {
+        exclude_pane_ids: Vec<String>,
+        /// PRD #313: mirrors `Tab::Dashboard::zoomed`. Travels on the snapshot
+        /// for the same reason the orchestration one does — `compute_frame_layout`
+        /// stays a pure function of its inputs.
+        zoomed: bool,
+    },
     /// Mode tab: agent pane on left (50%), side panes stacked on right (50%).
     Mode {
         mode_name: String,
@@ -378,6 +384,13 @@ enum ActiveTabView {
         /// the render snapshot, which is what keeps the layout pass a pure
         /// function of its inputs.
         split_narrow: bool,
+        /// PRD #313: mirrors `Tab::Orchestration::zoomed` — whether this tab's
+        /// focused role pane takes the whole frame with the sidebar and the
+        /// non-focused panes not drawn. Travels on the snapshot for the same
+        /// reason `split_narrow` does: `compute_frame_layout` stays a pure
+        /// function of its inputs. Unlike the split there is no global behind
+        /// it — zoom is per-tab, so this field IS the value the tab holds.
+        zoomed: bool,
     },
 }
 
@@ -1878,6 +1891,100 @@ pub fn should_inject_spawn_time_prompt(
     }
 }
 
+/// Pure policy: does this `SessionStatus` observation for an orchestrator
+/// start-role pane warrant re-asserting the remit pointer? `Compacting` is
+/// the only status the daemon ever derives from `EventType::Compacting`
+/// (`AppState::apply_event`), so gating on the status here is equivalent to
+/// gating on the event type without the render loop needing its own copy of
+/// the raw event stream. Every other status — including the terminal `Error`
+/// and the forward-compat `Unknown` — must leave the remit alone.
+fn should_reassert_orchestrator_remit(status: &SessionStatus) -> bool {
+    matches!(status, SessionStatus::Compacting)
+}
+
+/// Pure policy: is the orchestrator start-role pane currently `Compacting`,
+/// looked up in an order-independent way? Mirrors the `.any()` pattern
+/// `deliver_orchestrator_prompt`'s own readiness check uses for this exact
+/// pane (`src/ui.rs`, the `agent_ready` computation) rather than `.find()`
+/// over a `HashMap`, whose iteration order is unspecified.
+/// `AppState::apply_event` (`src/state.rs`) documents that two sessions can
+/// legitimately co-reside on one `pane_id` — a placeholder (`agent_type:
+/// AgentType::None`) alongside the tagged real session — so this also
+/// excludes placeholders, the same filter every sibling call site applies,
+/// rather than letting a stale co-resident session mask or spoof the real
+/// agent's status.
+fn orchestrator_remit_pane_is_compacting<'a>(
+    mut sessions: impl Iterator<Item = &'a SessionState>,
+    start_pane_id: &str,
+) -> bool {
+    sessions.any(|s| {
+        s.pane_id.as_deref() == Some(start_pane_id)
+            && s.agent_type != AgentType::None
+            && should_reassert_orchestrator_remit(&s.status)
+    })
+}
+
+/// Pure policy: the timestamp of the most recent clear-originated
+/// `SessionStart` recorded against the orchestrator start-role pane's own
+/// (non-placeholder) session, if one is still present in its retained
+/// `recent_events` window. Order-independent lookup and same-pane-placeholder
+/// exclusion mirror `orchestrator_remit_pane_is_compacting` above, but this
+/// returns an event IDENTITY (its own timestamp) rather than a boolean level:
+/// a `SessionStart` is a point-in-time event, not a persisted status the way
+/// `Compacting` is, so there is no level to poll here — the daemon's
+/// `EventType::SessionStart` arm unconditionally sets `session.status =
+/// SessionStatus::Idle` regardless of cause, so `status` alone can't
+/// distinguish "just cleared" from any other route to `Idle`. The caller
+/// edge-detects by comparing this timestamp against the last one it already
+/// reacted to (`UiState::orchestration_remit_clear_reasserted_at`), exactly
+/// the way `orchestration_remit_compacting`'s membership check edge-detects
+/// the boolean level above.
+///
+/// Scoped to Claude Code only: the check is on the EVENT's own `agent_type`,
+/// not the session's — a session's `agent_type` is set once from its first
+/// non-`None` event and never changes afterward (`AppState::apply_event`),
+/// while each `AgentEvent` retained in `recent_events` carries whatever
+/// `agent_type` its own producer stamped it with — that per-event identity is
+/// what must be Claude Code for a `/clear` on it to count.
+fn orchestrator_remit_pane_latest_clear_session_start<'a>(
+    sessions: impl Iterator<Item = &'a SessionState>,
+    start_pane_id: &str,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    sessions
+        .filter(|s| s.pane_id.as_deref() == Some(start_pane_id) && s.agent_type != AgentType::None)
+        .filter_map(|s| {
+            s.recent_events.iter().rev().find_map(|e| {
+                (e.event_type == EventType::SessionStart
+                    && e.agent_type == AgentType::ClaudeCode
+                    && e.metadata
+                        .get(crate::event::CLEAR_SESSION_START_METADATA_KEY)
+                        .map(String::as_str)
+                        == Some(crate::event::CLEAR_SESSION_START_METADATA_VALUE))
+                .then_some(e.timestamp)
+            })
+        })
+        .max()
+}
+
+/// Pure policy: the start role's displayed status after a (re-)delivered
+/// remit prompt. At spawn this slot is always `Waiting`, so the transition to
+/// `Working` is unconditional there; on a compaction or `/clear`
+/// re-assertion it may already hold a TERMINAL status set by something else
+/// entirely — `Done`, or `Failed` (the warm-reattach hydration path's "role
+/// died" marker, `TabManager::open_orchestration_tab_with_existing_role_panes`)
+/// — and a re-assertion re-arming the same gate has no business overwriting
+/// either.
+fn next_start_role_status_after_delivery(
+    current: OrchestrationRoleStatus,
+) -> OrchestrationRoleStatus {
+    match current {
+        OrchestrationRoleStatus::Done | OrchestrationRoleStatus::Failed => current,
+        OrchestrationRoleStatus::Waiting | OrchestrationRoleStatus::Working => {
+            OrchestrationRoleStatus::Working
+        }
+    }
+}
+
 /// Returns how long the human-typing dispatch should sleep before forwarding
 /// `bytes` to the pane, to ensure an Enter keystroke arrives as a standalone
 /// event rather than fused to recent typing. Returns `Duration::ZERO` unless
@@ -2082,6 +2189,14 @@ pub fn send_retry_delay(attempts: u32) -> std::time::Duration {
     let shift = attempts.saturating_sub(1).min(6);
     std::time::Duration::from_millis(BASE_MS.saturating_mul(1u64 << shift)).min(CAP)
 }
+
+/// The minimum interval between successive `prepare_orchestrator_prompt`
+/// attempts for the SAME unreacted `/clear` edge
+/// (`UiState::orchestration_remit_clear_retry_at`). Only needs to be large
+/// enough to turn a ~62 Hz render-loop hot spin into an occasional retry —
+/// this is not meant to add real user-visible latency to the re-arm, just to
+/// bound a persistent-failure retry rate.
+const CLEAR_REASSERT_RETRY_FLOOR: std::time::Duration = std::time::Duration::from_millis(250);
 
 struct UiState {
     mode: UiMode,
@@ -2344,8 +2459,90 @@ struct UiState {
     stop_confirm_agent_count: usize,
     /// Orchestration tab IDs whose start-role prompt has already been injected.
     orchestration_prompted: HashSet<TabId>,
-    /// Tracks when orchestration tabs were created (for delayed prompt injection).
-    orchestration_created_at: HashMap<TabId, std::time::Instant>,
+    /// Orchestration tab IDs whose start-role pane is currently (as of the
+    /// last frame checked) observed `Compacting`. Edge-triggers the remit
+    /// re-assertion — present means "already re-armed for this compaction
+    /// streak", so the render loop, which runs at ~62 Hz and may see the
+    /// same `Compacting` status for many consecutive frames, fires the
+    /// re-arm exactly once per streak rather than once per frame. Removed
+    /// the moment the status is next observed as anything else, which
+    /// re-arms detection for a possible later compaction.
+    orchestration_remit_compacting: HashSet<TabId>,
+    /// For each orchestration tab, the timestamp of the most recent
+    /// clear-originated `SessionStart` the remit re-arm loop has already
+    /// reacted to on the start-role pane, if any. A `SessionStart` is a
+    /// point-in-time event, not a persisted status like `Compacting`, so
+    /// there is no boolean level to track here the way
+    /// `orchestration_remit_compacting` does — this instead records the
+    /// IDENTITY of the last reacted-to event
+    /// (`orchestrator_remit_pane_latest_clear_session_start`'s return
+    /// value) so the render loop, running at ~62 Hz, fires the re-arm
+    /// exactly once per observed `/clear`, not once per frame the same
+    /// event remains within `SessionState::recent_events`'s retained
+    /// window. A missing entry means "never reacted for this tab"; an
+    /// entry is only ever inserted, never removed — mirrors
+    /// `orchestration_prompt_anchor_at`'s `TabId`-keyed, append-only shape.
+    orchestration_remit_clear_reasserted_at: HashMap<TabId, chrono::DateTime<chrono::Utc>>,
+    /// The wall-clock moment the `/clear` re-arm loop FIRST evaluated this
+    /// tab — set once, lazily, the first time the loop sees a given
+    /// `TabId`, and never advanced afterward. Guards against a
+    /// `latest_clear` that predates this tab's own lifetime: not reachable
+    /// today (reconnect hydration seeds empty `recent_events`, and
+    /// `SessionSnapshot` carries no event history), but forecloses the risk
+    /// pre-emptively for if `SessionSnapshot` ever grows one. Deliberately
+    /// its OWN field rather than reusing `orchestration_prompt_anchor_at`:
+    /// that one is re-anchored to NOW on every successful re-arm
+    /// (compaction or clear), so using it here would let a later compaction
+    /// re-arm's reset retroactively make an earlier, still-pending `/clear`
+    /// look "stale" and wrongly discard it — this field is append-only and
+    /// never moves once set, so it can't be shifted forward by an unrelated
+    /// re-arm.
+    orchestration_remit_clear_tab_anchor_at: HashMap<TabId, chrono::DateTime<chrono::Utc>>,
+    /// The last `Instant` the `/clear` re-arm loop attempted
+    /// `prepare_orchestrator_prompt` for a `latest_clear` edge it has not
+    /// yet reacted to. Deliberately separate from
+    /// `orchestration_remit_clear_reasserted_at` (which only ever records a
+    /// SUCCESSFUL reaction, or a permanent exclusion) — this one exists
+    /// purely to bound the RATE of a persistently failing attempt
+    /// (deleted/unmounted cwd, read-only fs, disk full), which would
+    /// otherwise retry `create_dir_all` + `fs::write` on the render thread
+    /// every frame (~62 Hz) for as long as the triggering event stays
+    /// inside the pane's `recent_events` window. The "don't silently drop
+    /// it forever" property is preserved — this floors the RATE of
+    /// retrying, not the DURATION, so a transient failure still recovers
+    /// once the floor next elapses. Removed once the edge is reacted to
+    /// (success or permanent exclusion), so a later `/clear` isn't
+    /// gratuitously throttled by a stale entry — but that cleanup only
+    /// runs while `latest_clear` is still `Some`. If the triggering event
+    /// ages out of `recent_events` (or is filtered by the tab anchor)
+    /// while a retry entry is outstanding, `latest_clear` goes `None`, the
+    /// whole gate stops running for that tab, and the entry is simply left
+    /// behind. Harmless: the next edge's floor check compares against that
+    /// long-past `Instant` and passes immediately, so the stale entry never
+    /// throttles anything — it just isn't removed.
+    orchestration_remit_clear_retry_at: HashMap<TabId, std::time::Instant>,
+    /// Originally "when the orchestration tab was created", used only to
+    /// seed `deliver_orchestrator_prompt`'s deadline/timeout checks. The
+    /// remit re-assertion re-anchors this to the re-arm moment, so it now
+    /// means "when the current prompt DELIVERY ATTEMPT started" — both of
+    /// its readers (`AUTOMATIC_PROMPT_DEADLINE`, the 10s `SessionStart`
+    /// fallback) are already scoped to one attempt, so re-anchoring on
+    /// every re-arm is correct for both; there is no third reader that
+    /// wants a true creation timestamp. Renamed from
+    /// `orchestration_created_at` so the name doesn't lie to the next
+    /// consumer that wants tab age.
+    orchestration_prompt_anchor_at: HashMap<TabId, std::time::Instant>,
+    /// Orchestration tab IDs whose start-role prompt was permanently
+    /// abandoned — a timed-out `AUTOMATIC_PROMPT_DEADLINE` or a terminal
+    /// `SendResult` (`abandon_orchestrator_prompt`). Once a tab is in this
+    /// set the remit re-arm gate below must never fire for it again: an
+    /// abandoned delivery has no in-flight attempt to protect (so
+    /// `orchestrator_prompt.is_none()` alone can't tell "delivered" and
+    /// "gave up" apart), and re-arming it would turn the deadline this set
+    /// exists to make permanent into an unbounded retry loop. Never
+    /// removed — bounded the same way as `orchestration_prompted` and its
+    /// siblings: `TabId` is a monotonic, never-reused `u32`.
+    orchestration_remit_abandoned: HashSet<TabId>,
     /// PRD #128 Direction B-1 — tracks the moment SessionStart was first
     /// observed for each orchestration tab's start-role pane. The role
     /// prompt is held until `SPAWN_TIME_READINESS_BUFFER` has elapsed
@@ -2535,7 +2732,12 @@ impl UiState {
             stop_confirm_selected: 0,
             stop_confirm_agent_count: 0,
             orchestration_prompted: HashSet::new(),
-            orchestration_created_at: HashMap::new(),
+            orchestration_remit_compacting: HashSet::new(),
+            orchestration_remit_clear_reasserted_at: HashMap::new(),
+            orchestration_remit_clear_tab_anchor_at: HashMap::new(),
+            orchestration_remit_clear_retry_at: HashMap::new(),
+            orchestration_prompt_anchor_at: HashMap::new(),
+            orchestration_remit_abandoned: HashSet::new(),
             orchestration_ready_since: HashMap::new(),
             pending_dispatches: Vec::new(),
             pending_seed_prompts: Vec::new(),
@@ -2672,6 +2874,48 @@ pub(crate) fn orchestration_split_percents(narrow: bool) -> (u16, u16) {
         )
     } else {
         (ORCHESTRATION_LEFT_PERCENT, ORCHESTRATION_PANES_PERCENT)
+    }
+}
+
+/// PRD #313: resolve an orchestration tab's sidebar/pane-column percentages for
+/// its full view state — the split AND whether it is zoomed.
+///
+/// Zoom is a third arrangement rather than a wider split, so it answers `(0,
+/// 100)`: the sidebar gets no width at all and the pane column takes the whole
+/// frame. It wins over `narrow`, and clearing it delegates straight back to
+/// [`orchestration_split_percents`], which is what makes the toggle restore
+/// exactly the split that was in force rather than snapping to the 34/66
+/// default.
+///
+/// Wrapping rather than widening [`orchestration_split_percents`] keeps PRD
+/// #336's function and every one of its callers untouched, while extending its
+/// single-source-of-truth discipline to zoom: the layout pass and the per-frame
+/// PTY sizing both reach the width through here, so they cannot disagree about
+/// how wide a zoomed role pane is.
+pub(crate) fn orchestration_layout_percents(narrow: bool, zoomed: bool) -> (u16, u16) {
+    if zoomed {
+        (0, 100)
+    } else {
+        orchestration_split_percents(narrow)
+    }
+}
+
+/// PRD #313: the Dashboard's sidebar/pane-column split for a tab's zoom state —
+/// `(0, 100)` when zoomed, the fixed 33/67 default otherwise.
+///
+/// The Dashboard is the same shape as an orchestration tab (card sidebar on the
+/// left, a stack of agent panes on the right; the two even share
+/// `right_column_pane_dims`), so zoom is worth exactly what it is worth there
+/// and the resolver is the mirror of [`orchestration_layout_percents`]. It stays
+/// a separate function rather than a shared one with a percentage parameter
+/// because the unzoomed halves genuinely differ — 33/67 here, and a
+/// `Ctrl+l`-toggled 34/66-or-25/75 there — and collapsing them would put a
+/// caller in the position of passing the constants back in.
+pub(crate) fn dashboard_layout_percents(zoomed: bool) -> (u16, u16) {
+    if zoomed {
+        (0, 100)
+    } else {
+        (DASHBOARD_LEFT_PERCENT, DASHBOARD_PANES_PERCENT)
     }
 }
 
@@ -2918,7 +3162,7 @@ fn filter_sessions<'a>(state: &'a AppState, ui: &UiState) -> Vec<(&'a String, &'
 // path needs the same composition, and two copies is what left a
 // daemon-started orchestration without its delegation protocol. Imported below
 // so this module's call site and tests are unchanged.
-use crate::orchestrator_context::prepare_orchestrator_prompt;
+use crate::orchestrator_context::{prepare_orchestrator_prompt, reassert_orchestrator_prompt};
 // ---------------------------------------------------------------------------
 // PRD #76 M2.12: hydration partition
 // ---------------------------------------------------------------------------
@@ -4459,6 +4703,15 @@ fn seed_result_is_terminal(result: SendResult, already_written: bool) -> bool {
 /// its prompt (so the render-loop gate stops re-entering), drop its retry/
 /// delivery/ready-since state, and surface `msg`. Used on the deadline and on a
 /// terminal send outcome.
+///
+/// Inserting `tab_id` into `orchestration_remit_abandoned` here is
+/// load-bearing — it's what makes an abandoned delivery PERMANENTLY
+/// ineligible for the remit re-arm gate in the main render loop, rather than
+/// one `AUTOMATIC_PROMPT_DEADLINE` window away from firing again on the next
+/// compaction or `/clear`. Do not remove this insert as a "symmetry
+/// cleanup": once a tab id is in this set it is meant to stay there for the
+/// tab's whole lifetime, by design — that permanence is what bounds the
+/// retry chain.
 fn abandon_orchestrator_prompt(
     ui: &mut UiState,
     tab_id: TabId,
@@ -4471,6 +4724,7 @@ fn abandon_orchestrator_prompt(
     ui.send_retry_backoff.remove(start_pane_id);
     ui.prompt_delivery.remove(start_pane_id);
     ui.orchestration_ready_since.remove(&tab_id);
+    ui.orchestration_remit_abandoned.insert(tab_id);
     ui.status_message = Some((msg, now));
 }
 
@@ -4493,7 +4747,8 @@ fn finalize_orchestrator_prompt(
     orchestrator_prompt: &mut Option<String>,
 ) {
     *orchestrator_prompt = None;
-    role_statuses[start_role_index] = OrchestrationRoleStatus::Working;
+    role_statuses[start_role_index] =
+        next_start_role_status_after_delivery(role_statuses[start_role_index]);
     ui.orchestration_prompted.insert(tab_id);
     ui.send_retry_backoff.remove(start_pane_id);
     ui.prompt_delivery.remove(start_pane_id);
@@ -4590,7 +4845,7 @@ fn deliver_orchestrator_prompt(
     // The old block had no orchestrator deadline at all, so a permanent
     // non-delivery retried one RPC every ~2s forever.
     if ui
-        .orchestration_created_at
+        .orchestration_prompt_anchor_at
         .get(&tab_id)
         .is_some_and(|t| now.duration_since(*t) > AUTOMATIC_PROMPT_DEADLINE)
     {
@@ -4649,7 +4904,7 @@ fn deliver_orchestrator_prompt(
     });
     let timeout_ready = !agent_ready
         && ui
-            .orchestration_created_at
+            .orchestration_prompt_anchor_at
             .get(&tab_id)
             .is_some_and(|t| now.duration_since(*t) > std::time::Duration::from_secs(10));
     if agent_ready {
@@ -5229,6 +5484,13 @@ pub enum Action {
     /// opened later — but the chord is only claimed on an orchestration tab:
     /// on any other tab it reaches the PTY as ordinary input.
     ToggleOrchestrationSplit,
+    /// PRD #313: zoom the focused role pane to the whole frame, hiding the
+    /// sidebar and the non-focused panes (`z`). PER-TAB, unlike the split
+    /// above: one press changes the active orchestration tab and nothing else.
+    /// Only ever reaches the handler from an orchestration tab in command mode
+    /// — [`scope_zoom`] un-resolves it everywhere else, which is what keeps a
+    /// plain `z` typeable at an agent.
+    ToggleZoom,
     /// PRD #80: leave `PaneInput` and return to Normal (command) mode on the
     /// current tab (Ctrl+D).
     DetachToNormal,
@@ -7000,6 +7262,7 @@ pub fn sync_and_derive_selection(
     match tab {
         Tab::Dashboard {
             selected_session_id,
+            ..
         } => {
             if let Some(fid) = focused_pane_id
                 && let Some((sid, _)) = filtered.iter().find(|(_, pid)| *pid == Some(fid))
@@ -7376,6 +7639,7 @@ fn switch_tab_with_focus(
         // remembered pane → feed `restored_focus` → pre-seed the baseline.
         if let Tab::Dashboard {
             selected_session_id,
+            ..
         } = tab_manager.active_tab()
             && let Some(sid) = selected_session_id
             && let Some(session) = snapshot.sessions.get(sid)
@@ -8375,6 +8639,14 @@ pub fn global_action(kb: &KeybindingConfig, key: &KeyEvent) -> Option<Action> {
     if kb.matches(KbAction::ToggleOrchestrationSplit, key) {
         return Some(Action::ToggleOrchestrationSplit);
     }
+    // PRD #313. Same shape as the split above and for the same reason: a pure
+    // chord→action mapping here, narrowed to (orchestration tab, command mode)
+    // by `scope_zoom` at the one dispatch site that has tab context. The
+    // narrowing matters more for this binding than for any other, because the
+    // default is an ordinary letter.
+    if kb.matches(KbAction::ToggleZoom, key) {
+        return Some(Action::ToggleZoom);
+    }
     if kb.matches(KbAction::NewPane, key) {
         return Some(Action::NewPane);
     }
@@ -8476,16 +8748,24 @@ fn scope_command_entry_lock(
 /// means "no global command and nothing to forward", i.e. the key belongs to
 /// that mode's own handler.
 ///
-/// The `ToggleOrchestrationLock` pass below applies [`scope_command_entry_lock`]'s
-/// MODE term only, with `is_orchestration_tab: true`. Mode is this helper's
-/// whole subject and is knowable here, so leaving it out would make the helper
-/// over-report `Ctrl+E` as claimed in `PaneInput` — the exact thing the scoping
-/// exists to stop. Tab kind is not knowable here and is applied at the live
-/// call site, so this helper answers for the most permissive tab.
+/// The `ToggleOrchestrationLock` and `ToggleZoom` passes below apply
+/// [`scope_command_entry_lock`]'s and [`scope_zoom`]'s MODE term only, with
+/// `is_orchestration_tab: true`. Mode is this helper's whole subject and is
+/// knowable here, so leaving it out would make the helper over-report `Ctrl+E`
+/// (and, worse, a plain `z`) as claimed in `PaneInput` — the exact thing the
+/// scoping exists to stop. Tab kind is not knowable here and is applied at the
+/// live call site, so this helper answers for the most permissive tab.
 pub fn key_action_for_mode(kb: &KeybindingConfig, mode: UiMode, key: &KeyEvent) -> Option<Action> {
-    if let Some(action) =
-        scope_command_entry_lock(global_action_for_mode(kb, mode, key), true, mode)
-    {
+    let resolved = global_action_for_mode(kb, mode, key);
+    let resolved = scope_command_entry_lock(resolved, true, mode);
+    // PRD #313: the same MODE-only pass for the zoom toggle, with
+    // `is_orchestration_tab: true`. Leaving it out would make this helper report
+    // a plain `z` as claimed in `PaneInput`, when the live loop un-resolves it
+    // there and forwards the byte to the agent — the exact over-report the
+    // `ToggleOrchestrationLock` line above exists to avoid, and a louder one,
+    // since this binding is an ordinary character.
+    let resolved = scope_zoom(resolved, true, mode);
+    if let Some(action) = resolved {
         return Some(action);
     }
     if mode == UiMode::PaneInput {
@@ -8534,6 +8814,36 @@ fn scope_orchestration_split(
         {
             None
         }
+        other => other,
+    }
+}
+
+/// PRD #313: the same narrowing as [`scope_orchestration_split`], for the zoom
+/// toggle — `Action::ToggleZoom` resolves only on a tab that HAS a card
+/// sidebar to reclaim (Dashboard or Orchestration), and only in command mode.
+///
+/// - **Mode (the `UiMode`)** — this is what keeps `Ctrl+Z` job control. The
+///   binding is `Ctrl+z`, and in a pane that byte is `0x1a`, the tty's SUSP
+///   character: unscoped, the deck would eat every agent's suspend/resume.
+///   `global_action_for_mode` runs ahead of every per-mode handler, so the
+///   keystroke would never reach the PTY. Un-resolving it here is what lets it
+///   fall through to `ForwardToPane([0x1a])`, exactly as `Ctrl+l` stays
+///   readline's clear-screen and `Ctrl+w` stays word-delete while you type.
+/// - **Tab type** — a Mode tab is two pane regions (agent left, side panes
+///   right), not sidebar-plus-panes, so "hide the sidebar and take the frame"
+///   has no meaning there and claiming the chord would be pure loss. The
+///   Dashboard and an Orchestration tab ARE the same shape — both are a card
+///   sidebar beside a stack of agent panes, and they even share
+///   `right_column_pane_dims` — so both zoom.
+///
+/// Returning `None` un-resolves it so the key falls through to whichever
+/// handler owns the mode — the `PaneInput` PTY forwarding, or a text field's
+/// own insert. Every other action passes through untouched. Kept a standalone
+/// pure function for the same reason its siblings are: it is then unit-testable
+/// without a PTY (`orchestration/layout/007`).
+fn scope_zoom(action: Option<Action>, tab_has_card_sidebar: bool, mode: UiMode) -> Option<Action> {
+    match action {
+        Some(Action::ToggleZoom) if !tab_has_card_sidebar || mode != UiMode::Normal => None,
         other => other,
     }
 }
@@ -9101,6 +9411,39 @@ fn dispatch_action(
                     Some((format!("Split: {split_name}"), std::time::Instant::now()));
             }
         }
+        // `Ctrl+z`: zoom the active tab's focused pane (PRD #313). PER-TAB,
+        // which is the deliberate contrast with the split above: this writes the
+        // ACTIVE tab's own flag and touches no other tab, so a tab the user
+        // never zoomed never loses its sidebar — and the Dashboard's flag and an
+        // orchestration tab's are separate values for the same reason.
+        //
+        // Both card-shaped tab kinds are handled, because they are the same
+        // shape: a card sidebar on the left and a stack of agent panes on the
+        // right, differing only in the percentage (33/67 vs a `Ctrl+l`-toggled
+        // 34/66-or-25/75) and in which panes they scope to. A Mode tab is
+        // deliberately absent — it is two pane regions rather than
+        // sidebar-plus-panes, so "hide the sidebar" has no meaning there; see
+        // the follow-up issue referenced in the PRD.
+        //
+        // The `match` arm has the same job the split's `matches!` guard does —
+        // unreachable on a Mode tab (`scope_zoom` un-resolves the key there),
+        // but a no-op rather than a surprise if that ever changes.
+        Action::ToggleZoom => {
+            let flag = match tab_manager.active_tab_mut() {
+                Tab::Orchestration { zoomed, .. } | Tab::Dashboard { zoomed, .. } => Some(zoomed),
+                Tab::Mode { .. } => None,
+            };
+            if let Some(zoomed) = flag {
+                *zoomed = !*zoomed;
+                let zoom_name = if *zoomed { "on" } else { "off" };
+                // Mirroring `ToggleOrchestrationSplit`: flip the flag and let
+                // the next frame pick it up. `compute_frame_layout` reads it off
+                // the render snapshot and the pre-draw `resize_panes_to_layout`
+                // pass reflows the panes' PTYs from the same rects — no resize is
+                // pushed from here.
+                ui.status_message = Some((format!("Zoom: {zoom_name}"), std::time::Instant::now()));
+            }
+        }
         // Ctrl+d: TOGGLE between command mode and the focused pane, staying on
         // the current tab.
         //
@@ -9389,6 +9732,7 @@ fn dispatch_action(
                 ui.selected_index = Some(idx);
                 if let Tab::Dashboard {
                     selected_session_id,
+                    ..
                 } = tab_manager.active_tab_mut()
                 {
                     *selected_session_id = Some(filtered[idx].0.clone());
@@ -9903,7 +10247,7 @@ fn dispatch_action(
 
                             // Record creation time for delayed prompt injection fallback.
                             if let Tab::Orchestration { id, .. } = tab_manager.active_tab() {
-                                ui.orchestration_created_at
+                                ui.orchestration_prompt_anchor_at
                                     .insert(*id, std::time::Instant::now());
                             }
 
@@ -11070,6 +11414,16 @@ fn handle_key_event(
         // so narrow it here — otherwise `Ctrl+l` is claimed everywhere and
         // never reaches a pane's PTY. See `scope_orchestration_split`.
         action = scope_orchestration_split(action, is_orchestration_tab, ui.mode);
+        // PRD #313: and the zoom toggle, on nearly the same terms — but a
+        // WIDER tab predicate, because the Dashboard is the same card-sidebar
+        // shape as an orchestration tab and zoom is worth the same there. See
+        // `scope_zoom`; the mode half is what keeps `Ctrl+Z` reaching a pane as
+        // `0x1a` job control.
+        let tab_has_card_sidebar = matches!(
+            tab_manager.active_tab(),
+            Tab::Orchestration { .. } | Tab::Dashboard { .. }
+        );
+        action = scope_zoom(action, tab_has_card_sidebar, ui.mode);
     }
 
     // PRD #341 M5: command-mode focused-pane scrolling (`scroll_pane_up` /
@@ -11926,7 +12280,7 @@ pub fn run_tui(
                                 // gate's 10s timeout fallback works for agents
                                 // that never signal `SessionStart`.
                                 if let Tab::Orchestration { id, .. } = tab_manager.active_tab() {
-                                    ui.orchestration_created_at
+                                    ui.orchestration_prompt_anchor_at
                                         .insert(*id, std::time::Instant::now());
                                 }
                                 // PRD #20 R20-003 (finding #5): capture the start
@@ -12564,8 +12918,9 @@ pub fn run_tui(
         let has_pane_control = pane.is_available();
         let pane_layout = ui.pane_layout;
         let tab_view = match tab_manager.active_tab() {
-            Tab::Dashboard { .. } => ActiveTabView::Dashboard {
+            Tab::Dashboard { zoomed, .. } => ActiveTabView::Dashboard {
                 exclude_pane_ids: tab_manager.all_managed_pane_ids(),
+                zoomed: *zoomed,
             },
             Tab::Mode {
                 name,
@@ -12582,6 +12937,7 @@ pub fn run_tui(
             Tab::Orchestration {
                 role_pane_ids,
                 split_narrow,
+                zoomed,
                 ..
             } => ActiveTabView::Orchestration {
                 role_pane_ids: role_pane_ids.clone(),
@@ -12590,6 +12946,9 @@ pub fn run_tui(
                 // orchestration tab holds the same (global) value — see
                 // `TabManager::toggle_orchestration_split`.
                 split_narrow: *split_narrow,
+                // PRD #313: same road for zoom, minus the global — this tab's
+                // own value is the source of truth.
+                zoomed: *zoomed,
             },
         };
         // Focus follows the lock. While the command-entry lock is engaged the
@@ -12824,6 +13183,298 @@ pub fn run_tui(
         // handling) lives in `deliver_orchestrator_prompt`, which takes an
         // injected `now` so it is unit-testable with a controlled clock.
         let orch_now = std::time::Instant::now();
+
+        // The orchestrator's remit is delivered once at spawn and never
+        // re-asserted, so role adherence decays across a long, compacted
+        // session — worst exactly when the roles matter most. On the frame
+        // the START ROLE's own pane is FIRST observed `Compacting` (an
+        // edge, not a level — see `orchestration_remit_compacting`'s doc
+        // comment, since this loop runs every frame at ~62 Hz and the
+        // status can stay `Compacting` for many consecutive frames), re-arm
+        // exactly the gate the spawn-time seed uses: put the pointer text
+        // back into `orchestrator_prompt` and drop the tab from
+        // `orchestration_prompted` so the delivery loop directly below
+        // re-enters `deliver_orchestrator_prompt` — reusing its readiness
+        // gating and `SendResult`-based delivery confirmation UNCHANGED,
+        // never a second delivery path. Scoped to the start role only: only
+        // `role_pane_ids[start_role_index]` is ever consulted, so a
+        // non-start role's compaction is invisible here.
+        for tab in tab_manager.tabs_mut() {
+            if let Tab::Orchestration {
+                id,
+                role_pane_ids,
+                start_role_index,
+                orchestrator_prompt,
+                config,
+                cwd,
+                ..
+            } = tab
+            {
+                let start_pane_id = role_pane_ids[*start_role_index].clone();
+                // Order-independent lookup — see
+                // `orchestrator_remit_pane_is_compacting`'s doc comment for
+                // why `.find()` over `snapshot.sessions.values()` was wrong.
+                let is_compacting = orchestrator_remit_pane_is_compacting(
+                    snapshot.sessions.values(),
+                    &start_pane_id,
+                );
+
+                if is_compacting {
+                    // Eligibility no longer requires
+                    // `orchestration_prompted.contains(id)`. That condition
+                    // is true only after THIS loop's own delivery path has
+                    // completed a delivery, which a warm-daemon reattach
+                    // (`TabManager::open_orchestration_tab_with_existing_role_panes`,
+                    // `orchestrator_prompt: None` from construction — never
+                    // replay on reconnect) never reaches — so the re-arm
+                    // gate could never pass for the exact long-lived,
+                    // detach/reattach sessions this feature is meant to
+                    // target.
+                    //
+                    // `orchestrator_prompt.is_none()` alone is NOT
+                    // equivalent to "no delivery attempt is in-flight right
+                    // now" under the capability-based confirmation model
+                    // (`src/prompt_delivery.rs`): a write that has LANDED
+                    // (bytes reached the PTY) leaves `orchestrator_prompt`
+                    // `Some` until the agent independently reports having
+                    // submitted it — which, for a producer that never
+                    // reports back (or simply hasn't yet), never happens,
+                    // permanently blocking this gate. A landed-but-unconfirmed
+                    // write must be as eligible for re-arm as no delivery
+                    // ever having started: a compaction is new information
+                    // and an argument for reasserting MORE, not less. Only a
+                    // delivery still probing readiness/backoff BEFORE its
+                    // first write is genuinely in-flight and must keep
+                    // blocking re-arm. `PromptDelivery::attempts > 0` is that
+                    // "a write has landed" witness — see its own doc
+                    // comment: it is set only inside the `Applied`/`Queued`
+                    // arm, so it is zero for exactly the still-probing case
+                    // and nonzero the moment a write lands.
+                    let no_delivery_pending = orchestrator_prompt.is_none()
+                        || ui
+                            .prompt_delivery
+                            .get(start_pane_id.as_str())
+                            .is_some_and(|d| d.attempts > 0);
+
+                    // Pi start roles are excluded on purpose (not by
+                    // accident of `orchestration_prompted` never being set
+                    // for them either): a Pi role's prompt is delivered
+                    // NATIVELY, daemon-side — this gate's mechanism is
+                    // TUI-owned PTY keystroke injection via
+                    // `write_and_submit_to_pane_with_identity`, which is the
+                    // wrong delivery path for a role the TUI deliberately
+                    // never PTY-injects into at spawn either. A native
+                    // re-assertion mechanism for Pi is out of scope here.
+                    let start_role_is_pi = config
+                        .roles
+                        .get(*start_role_index)
+                        .map(|r| AgentType::from_command(Some(&r.command)) == Some(AgentType::Pi))
+                        .unwrap_or(false);
+
+                    if !ui.orchestration_remit_compacting.contains(id)
+                        && no_delivery_pending
+                        && !ui.orchestration_remit_abandoned.contains(id)
+                        && !start_role_is_pi
+                        // Re-run the spawn-time write-then-point pair
+                        // instead of injecting the bare pointer constant, so
+                        // a re-assertion (a) verifies the context file
+                        // exists before claiming delivery, and (b) refreshes
+                        // it from the tab's own `cwd`/`config` rather than
+                        // trusting a file some other process may have
+                        // pruned or a relative path the agent will resolve
+                        // from wherever it has since `cd`'d to.
+                        //
+                        // `reassert_orchestrator_prompt`, not
+                        // `prepare_orchestrator_prompt(config, cwd, None)`
+                        // directly: the latter unconditionally wipes any `##
+                        // Your task` section already on disk, which for a
+                        // `dispatch --task` orchestration (`src/spawn.rs`)
+                        // deleted an in-progress task on every compaction and
+                        // told the orchestrator to wait rather than continue.
+                        // The former reads that section back off the existing
+                        // file first and carries it forward, falling back to
+                        // today's no-task behavior when there is none.
+                        && let Some(prompt) = reassert_orchestrator_prompt(config, cwd)
+                    {
+                        // This re-arm may be SUPERSEDING a still-open cycle
+                        // that already landed a write and is only waiting on
+                        // confirmation — possibly holding a spent
+                        // payload-submission budget, a captured delivery
+                        // identity, or a scheduled backoff for it. None of
+                        // that belongs to the NEW cycle this re-arm starts,
+                        // so clear it explicitly rather than let it leak in:
+                        // an inherited `attempts` count would make the new
+                        // cycle's own first write compute as attempt 2+ and
+                        // fall straight to a submit-only probe instead of
+                        // actually retyping the pointer. This is
+                        // deliberately a fresh cycle, not a retry of the old
+                        // one.
+                        ui.send_retry_backoff.remove(start_pane_id.as_str());
+                        ui.prompt_delivery.remove(start_pane_id.as_str());
+                        ui.orchestration_ready_since.remove(id);
+
+                        *orchestrator_prompt = Some(prompt);
+                        ui.orchestration_prompted.remove(id);
+                        // Re-anchor the delivery deadline to NOW:
+                        // `deliver_orchestrator_prompt` abandons once
+                        // `AUTOMATIC_PROMPT_DEADLINE` has elapsed since this
+                        // timestamp, and reusing the tab's original creation
+                        // time would abandon a re-assertion on sight in any
+                        // orchestration old enough to actually need one.
+                        ui.orchestration_prompt_anchor_at.insert(*id, orch_now);
+                    }
+                    ui.orchestration_remit_compacting.insert(*id);
+                } else {
+                    ui.orchestration_remit_compacting.remove(id);
+                }
+            }
+        }
+
+        // A second, INDEPENDENT re-arm trigger — a `/clear`-shaped
+        // `SessionStart` on the start role's own pane. Kept as its own loop
+        // and its own edge-detection state
+        // (`orchestration_remit_clear_reasserted_at`), deliberately not
+        // merged into the `Compacting` loop above: `Compacting` is a
+        // persisted STATUS the daemon holds until something else changes it,
+        // so membership in `orchestration_remit_compacting` is a genuine
+        // level to poll; a `/clear`-originated `SessionStart` is a
+        // POINT-IN-TIME event — `AppState::apply_event`'s `SessionStart` arm
+        // unconditionally sets `status = SessionStatus::Idle` regardless of
+        // cause, so there is no status value here to gate on the way
+        // `should_reassert_orchestrator_remit` does above. Reuses the exact
+        // same reset-and-redeliver sequence and eligibility rules as the
+        // compaction path (no_delivery_pending / Pi exclusion /
+        // `orchestration_remit_abandoned`) so both triggers feed the SAME
+        // `deliver_orchestrator_prompt` machinery below, unchanged — a second
+        // trigger, not a second delivery path.
+        // Wall-clock "now", captured once per frame like `orch_now` just
+        // above but on the `chrono` axis: this seeds
+        // `orchestration_remit_clear_tab_anchor_at` the first frame a given
+        // `TabId` is seen, and is compared directly against `latest_clear`
+        // (both `chrono::DateTime<Utc>`) below.
+        let clear_guard_now = Utc::now();
+        for tab in tab_manager.tabs_mut() {
+            if let Tab::Orchestration {
+                id,
+                role_pane_ids,
+                start_role_index,
+                orchestrator_prompt,
+                config,
+                cwd,
+                ..
+            } = tab
+            {
+                let start_pane_id = role_pane_ids[*start_role_index].clone();
+                let latest_clear = orchestrator_remit_pane_latest_clear_session_start(
+                    snapshot.sessions.values(),
+                    &start_pane_id,
+                );
+
+                // A `latest_clear` older than this tab's own anchor moment
+                // cannot legitimately belong to it — `TabId` is fresh on
+                // every rebuild, so an event that predates the anchor can
+                // only have reached `recent_events` via daemon-side history
+                // the tab itself never produced (not reachable today:
+                // reconnect hydration seeds empty `recent_events`, and
+                // `SessionSnapshot` carries no event history — this
+                // forecloses the risk pre-emptively for if that ever
+                // changes, per the never-replay-on-reconnect design). The
+                // anchor is seeded lazily HERE, on first observation, rather
+                // than reusing `orchestration_prompt_anchor_at` — that
+                // field is re-anchored to NOW on every successful re-arm
+                // (compaction or clear), so a later compaction re-arm's
+                // reset would retroactively make an earlier, still-pending
+                // `/clear` look "stale" and wrongly discard it.
+                let tab_anchor = *ui
+                    .orchestration_remit_clear_tab_anchor_at
+                    .entry(*id)
+                    .or_insert(clear_guard_now);
+                let latest_clear = latest_clear.filter(|latest_clear| *latest_clear >= tab_anchor);
+
+                if let Some(latest_clear) = latest_clear
+                    && ui.orchestration_remit_clear_reasserted_at.get(id) != Some(&latest_clear)
+                {
+                    // Same landed-vs-still-probing distinction the
+                    // compaction path documents above: a write that has
+                    // LANDED (`PromptDelivery::attempts > 0`) is eligible
+                    // for re-arm; only a delivery still probing
+                    // readiness/backoff before its first write keeps
+                    // blocking it.
+                    let no_delivery_pending = orchestrator_prompt.is_none()
+                        || ui
+                            .prompt_delivery
+                            .get(start_pane_id.as_str())
+                            .is_some_and(|d| d.attempts > 0);
+
+                    // Pi start roles are excluded on purpose, same reason as
+                    // the compaction path: a Pi role's prompt is delivered
+                    // NATIVELY, daemon-side — this gate's TUI-owned PTY
+                    // keystroke injection is the wrong delivery path for it.
+                    let start_role_is_pi = config
+                        .roles
+                        .get(*start_role_index)
+                        .map(|r| AgentType::from_command(Some(&r.command)) == Some(AgentType::Pi))
+                        .unwrap_or(false);
+
+                    // Permanently excluded tabs are marked SEEN regardless of
+                    // outcome this frame — neither condition can ever
+                    // change, so there is nothing to gain by re-evaluating
+                    // them on every subsequent frame this same event
+                    // remains the latest one.
+                    let permanently_excluded =
+                        ui.orchestration_remit_abandoned.contains(id) || start_role_is_pi;
+
+                    // A persistently failing `prepare_orchestrator_prompt`
+                    // (deleted/unmounted cwd, read-only fs, disk full) must
+                    // not be retried every frame at the render loop's ~62 Hz
+                    // rate — bound the RATE, not the duration, of the
+                    // retry. `retry_floor_ok` gates the attempt itself, so a
+                    // throttled frame never touches the filesystem at all.
+                    let retry_floor_ok =
+                        ui.orchestration_remit_clear_retry_at
+                            .get(id)
+                            .is_none_or(|last| {
+                                orch_now.saturating_duration_since(*last)
+                                    >= CLEAR_REASSERT_RETRY_FLOOR
+                            });
+
+                    if no_delivery_pending && !permanently_excluded && retry_floor_ok {
+                        ui.orchestration_remit_clear_retry_at.insert(*id, orch_now);
+                        // See the compaction re-arm's identical comment above:
+                        // `reassert_orchestrator_prompt` reads any existing
+                        // `## Your task` section back off disk before
+                        // rewriting, so a dispatched orchestration's task
+                        // survives a `/clear` re-assertion instead of being
+                        // silently replaced with the no-task pointer.
+                        if let Some(prompt) = reassert_orchestrator_prompt(config, cwd) {
+                            ui.send_retry_backoff.remove(start_pane_id.as_str());
+                            ui.prompt_delivery.remove(start_pane_id.as_str());
+                            ui.orchestration_ready_since.remove(id);
+
+                            *orchestrator_prompt = Some(prompt);
+                            ui.orchestration_prompted.remove(id);
+                            ui.orchestration_prompt_anchor_at.insert(*id, orch_now);
+                            ui.orchestration_remit_clear_reasserted_at
+                                .insert(*id, latest_clear);
+                            ui.orchestration_remit_clear_retry_at.remove(id);
+                        }
+                    } else if permanently_excluded {
+                        ui.orchestration_remit_clear_reasserted_at
+                            .insert(*id, latest_clear);
+                        ui.orchestration_remit_clear_retry_at.remove(id);
+                    }
+                    // Else: blocked only by a TRANSIENT condition this frame
+                    // (a delivery still probing readiness/backoff before its
+                    // first write, `prepare_orchestrator_prompt` failing to
+                    // read the context file, or the retry floor above not
+                    // having elapsed yet) — deliberately left unmarked, so a
+                    // later frame retries against the SAME `latest_clear`
+                    // event rather than silently dropping the re-assertion
+                    // the way marking it seen here would.
+                }
+            }
+        }
+
         for tab in tab_manager.tabs_mut() {
             if let Tab::Orchestration {
                 id,
@@ -14150,6 +14801,47 @@ enum FrameContent {
     },
 }
 
+/// Process-wide one-shot guard for the [`clamp_pane_target_dims`] notice: a
+/// terminal wider than the cap stays wide, so without this the line would be
+/// emitted once per pane per frame forever.
+static PANE_TARGET_CLAMPED_LOGGED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Issue #747 — bound a layout-derived PTY target to the geometry the daemon
+/// will actually apply to the child ([`crate::agent_pty::PTY_RESIZE_DIM_MAX`]).
+///
+/// `pane_target_dims` is the single source `resize_panes_to_layout` drives
+/// every pane from, so clamping HERE is what makes all four participants in a
+/// resize agree: the layout target, the local vt100 parser, the
+/// `AttachRequest::Resize` on the wire, and the child PTY. Clamping only
+/// further downstream would also break `resize_panes_to_layout`'s
+/// "commit only a real delta" check, which compares this target against the
+/// pane's current parser size — an unclamped target could never equal a
+/// clamped parser, so a very wide terminal would re-send a resize every frame.
+///
+/// The clamp is deliberately **not** a refusal: a terminal wider than the cap
+/// gets a pane that fills 4096 of its columns (the rest rendered blank by
+/// `TerminalWidget`'s `min(area, screen)` fallback), which is strictly better
+/// than a pane frozen at its previous geometry. It is also no longer silent —
+/// one `warn!` per process says why the pane stops short of the screen edge.
+fn clamp_pane_target_dims(rows: u16, cols: u16) -> (u16, u16) {
+    let clamped = crate::agent_pty::clamp_pty_dims(rows, cols);
+    if clamped != (rows, cols)
+        && !PANE_TARGET_CLAMPED_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed)
+    {
+        tracing::warn!(
+            target_rows = rows,
+            target_cols = cols,
+            applied_rows = clamped.0,
+            applied_cols = clamped.1,
+            max = crate::agent_pty::PTY_RESIZE_DIM_MAX,
+            "pane is larger than the maximum PTY geometry: the agent runs at the capped size \
+             and the remaining rows/columns of the pane render blank (logged once per process)"
+        );
+    }
+    clamped
+}
+
 impl FrameLayout {
     /// PRD #84 M4 — every local terminal pane's target PTY size `(rows, cols)`
     /// keyed by pane id, derived from its layout rect: the bordered
@@ -14168,8 +14860,12 @@ impl FrameLayout {
     /// actually expanded this frame). `Tiled` is untouched: a zero-height
     /// `Tiled` rect is a genuine "no room" case, not an undrawn pane.
     fn pane_target_dims(&self) -> Vec<(&str, u16, u16)> {
-        // Inner area of a bordered pane = outer minus 1 cell on each side.
-        let dims = |rect: Rect| (rect.height.saturating_sub(2), rect.width.saturating_sub(2));
+        // Inner area of a bordered pane = outer minus 1 cell on each side,
+        // then bounded by what the daemon will actually give the child
+        // (issue #747 — see `clamp_pane_target_dims`).
+        let dims = |rect: Rect| {
+            clamp_pane_target_dims(rect.height.saturating_sub(2), rect.width.saturating_sub(2))
+        };
         let mut out = Vec::new();
         match &self.content {
             FrameContent::Cards {
@@ -14273,18 +14969,29 @@ fn compute_frame_layout(
                 side_pane_rects,
             }
         }
-        ActiveTabView::Dashboard { exclude_pane_ids } => {
+        ActiveTabView::Dashboard {
+            exclude_pane_ids,
+            zoomed,
+        } => {
             let pane_ids: Vec<String> = all_pane_ids
                 .iter()
                 .filter(|&id| !exclude_pane_ids.contains(id))
                 .cloned()
                 .collect();
-            let (dashboard_area, panes_area) = split_cards_area(
-                main_area,
-                &pane_ids,
-                DASHBOARD_LEFT_PERCENT,
-                DASHBOARD_PANES_PERCENT,
-            );
+            // PRD #313: the Dashboard zooms on exactly the same terms as an
+            // orchestration tab — zero-width sidebar, full-frame pane column,
+            // and an effective `Stacked` layout so the non-focused panes are not
+            // drawn whatever `Ctrl+t` is set to. Both halves are resolved here,
+            // once, and carried in `FrameContent::Cards`; see the Orchestration
+            // arm below for why that matters (PRD #84 invariant 1).
+            let (left_percent, panes_percent) = dashboard_layout_percents(*zoomed);
+            let pane_layout = if *zoomed {
+                PaneLayout::Stacked
+            } else {
+                pane_layout
+            };
+            let (dashboard_area, panes_area) =
+                split_cards_area(main_area, &pane_ids, left_percent, panes_percent);
             let pane_rects = cards_pane_rects(panes_area, &pane_ids, pane_layout, focused_pane_id);
             FrameContent::Cards {
                 dashboard_area,
@@ -14297,6 +15004,7 @@ fn compute_frame_layout(
         ActiveTabView::Orchestration {
             role_pane_ids,
             split_narrow,
+            zoomed,
             ..
         } => {
             let pane_ids: Vec<String> = all_pane_ids
@@ -14307,7 +15015,39 @@ fn compute_frame_layout(
             // PRD #336: resolve this tab's toggled split rather than the fixed
             // constants, so `Ctrl+l` reflows both the rendered columns and (via
             // `resize_panes_to_layout`) the role panes' PTYs on the next frame.
-            let (left_percent, panes_percent) = orchestration_split_percents(*split_narrow);
+            // PRD #313: and `z` on top of it — a zoomed tab resolves to a
+            // zero-width sidebar and a full-frame pane column, which is the ONE
+            // place zoom touches geometry. The role panes' PTYs follow from the
+            // same rects through `pane_target_dims`, so the agent reflows to the
+            // new width with no spawn-site or resize-site plumbing of its own.
+            let (left_percent, panes_percent) =
+                orchestration_layout_percents(*split_narrow, *zoomed);
+            // PRD #313 M1 — the EFFECTIVE pane layout for this frame. Zoom's
+            // promise is "the focused agent gets the frame and everything else
+            // gets out of the way", and the second half of that is false under
+            // `Tiled`: the sidebar resolves away above, and then every role pane
+            // still takes an equal full-width slice of the column, so zoom reads
+            // as "make all the panes wider". Resolving the layout to `Stacked`
+            // for the duration of the frame reuses PRD #311's existing
+            // "only the focused pane is drawn, the rest reserve zero rows"
+            // machinery, so zoom needs no drawing rule of its own.
+            //
+            // It is EFFECTIVE, not stored: `ui.pane_layout` is the user's
+            // `Ctrl+t` choice and stays whatever they set it to, so unzooming
+            // restores Tiled exactly (`orchestration/layout/011` asserts both
+            // halves). And it is resolved ONCE, here, then carried in
+            // `FrameContent::Cards` — `render_frame` reads it back out rather
+            // than re-deriving it, which is what stops the geometry pass and the
+            // render pass from disagreeing about what layout this frame is in
+            // (PRD #84 invariant 1). It is also why the undrawn panes are sized
+            // "as if focused" by `pane_target_dims` (PRD #311 M2) instead of
+            // keeping a stale pre-zoom Tiled slice they would never reflow out
+            // of — the case `orchestration/layout/010` exists to pin.
+            let pane_layout = if *zoomed {
+                PaneLayout::Stacked
+            } else {
+                pane_layout
+            };
             let (dashboard_area, panes_area) =
                 split_cards_area(main_area, &pane_ids, left_percent, panes_percent);
             let pane_rects = cards_pane_rects(panes_area, &pane_ids, pane_layout, focused_pane_id);
@@ -14785,6 +15525,18 @@ fn render_frame(
         ActiveTabView::Mode { mode_name, .. } => Some(mode_name.as_str()),
     };
 
+    // PRD #313: is this frame's tab zoomed? Resolved once here and threaded into
+    // every `render_terminal_panes` call below, so the three Cards paths (no
+    // sessions / all filtered out / the normal grid) cannot disagree about
+    // whether the focused pane wears the indicator. Both card-shaped tabs can be
+    // zoomed — a Mode tab cannot; the geometry each implies was already resolved
+    // by `compute_frame_layout`, so all this decides is the border title.
+    let zoomed = matches!(
+        tab_view,
+        ActiveTabView::Orchestration { zoomed: true, .. }
+            | ActiveTabView::Dashboard { zoomed: true, .. }
+    );
+
     // PRD #341 M3: reconcile the banner against the mode this frame is about to
     // draw, then read its decay state ONCE and thread that one value into every
     // pane-rendering path below. Doing it here — rather than at each
@@ -14864,6 +15616,20 @@ fn render_frame(
     // be unit-tested without a live daemon.
     let pane_status: HashMap<&str, SessionStatus> = build_pane_status(state);
 
+    // PRD #313 M1 + PRD #84 invariant 1 — the EFFECTIVE pane layout for this
+    // frame, read back out of the layout pass rather than re-derived here. A
+    // zoomed orchestration tab resolves to `Stacked` for the duration of the
+    // frame (see the Orchestration arm of `compute_frame_layout`), and reading
+    // the value the geometry actually used is what makes "the rects were split
+    // one way and the panes drawn another" unrepresentable — there is exactly
+    // one `if zoomed` in the layout, and no second one here. The `pane_layout`
+    // argument is the deck's STORED toggle (`ui.pane_layout`); a Mode tab
+    // carries no pane layout of its own and returns below before this is read.
+    let pane_layout = match &layout.content {
+        FrameContent::Cards { pane_layout, .. } => *pane_layout,
+        FrameContent::Mode { .. } => pane_layout,
+    };
+
     // Branch on the content the layout pass resolved. Mode tabs render and
     // return here; dashboard / orchestration fall through to the card grid.
     let (dashboard_area, panes_area, pane_ids, pane_rects) = match &layout.content {
@@ -14917,19 +15683,32 @@ fn render_frame(
 
     // Orchestration tabs use the same dashboard card rendering as the main dashboard.
 
+    // PRD #313 M1: a zoomed orchestration tab resolves the sidebar to `0`
+    // percent, so `split_cards_area` hands back a dashboard rect of width 0 —
+    // a surface with nowhere to paint. Skip laying it out and drawing into it.
+    //
+    // Not for the wasted work: `render_card_grid` also WRITES `ui.columns`, the
+    // field left/right card navigation reads, and a hidden surface quietly
+    // rewriting shared UI state is a trap for whoever touches that field next.
+    // It happens to be harmless today only because `max_columns_for_width(0)`
+    // and `grid_columns(0)` both floor at 1.
+    let draw_sidebar = dashboard_area.width > 0;
+
     if state.sessions.is_empty() {
-        let vertical = Layout::vertical([
-            Constraint::Fill(1),
-            Constraint::Length(1),
-            Constraint::Fill(1),
-        ])
-        .split(dashboard_area);
-        let msg = Paragraph::new(format!(
-            "No active sessions. Press {MOD_KEY}+n to create a pane."
-        ))
-        .style(text_primary())
-        .centered();
-        frame.render_widget(msg, vertical[1]);
+        if draw_sidebar {
+            let vertical = Layout::vertical([
+                Constraint::Fill(1),
+                Constraint::Length(1),
+                Constraint::Fill(1),
+            ])
+            .split(dashboard_area);
+            let msg = Paragraph::new(format!(
+                "No active sessions. Press {MOD_KEY}+n to create a pane."
+            ))
+            .style(text_primary())
+            .centered();
+            frame.render_widget(msg, vertical[1]);
+        }
         let ctx_buttons = dashboard_context_buttons(&ui.keybindings, !filtered.is_empty());
         render_bottom_bar(frame, ui, hints_area, has_pane_control, &ctx_buttons);
 
@@ -14948,6 +15727,7 @@ fn render_frame(
                 banner_visibility,
                 Some(&pane_outer_rects),
                 now,
+                zoomed,
             );
         }
 
@@ -14963,34 +15743,36 @@ fn render_frame(
     let showing = sessions.len();
 
     if sessions.is_empty() {
-        // All filtered out. Nothing is drawn, so nothing can be hidden — no
-        // overflow indicator on this title.
-        let title = Paragraph::new(deck_title_line(showing, total_sessions, ""));
-        let vertical = Layout::vertical([
-            Constraint::Length(1),
-            Constraint::Fill(1),
-            Constraint::Length(1),
-        ])
-        .split(dashboard_area);
-        frame.render_widget(title, vertical[0]);
+        if draw_sidebar {
+            // All filtered out. Nothing is drawn, so nothing can be hidden — no
+            // overflow indicator on this title.
+            let title = Paragraph::new(deck_title_line(showing, total_sessions, ""));
+            let vertical = Layout::vertical([
+                Constraint::Length(1),
+                Constraint::Fill(1),
+                Constraint::Length(1),
+            ])
+            .split(dashboard_area);
+            frame.render_widget(title, vertical[0]);
 
-        let msg = Paragraph::new("No sessions match filter.")
-            .style(text_primary())
-            .centered();
-        let inner = Layout::vertical([
-            Constraint::Fill(1),
-            Constraint::Length(1),
-            Constraint::Fill(1),
-        ])
-        .split(vertical[1]);
-        frame.render_widget(msg, inner[1]);
+            let msg = Paragraph::new("No sessions match filter.")
+                .style(text_primary())
+                .centered();
+            let inner = Layout::vertical([
+                Constraint::Fill(1),
+                Constraint::Length(1),
+                Constraint::Fill(1),
+            ])
+            .split(vertical[1]);
+            frame.render_widget(msg, inner[1]);
 
-        render_stats_bar(
-            frame,
-            &state.aggregate_stats(),
-            vertical[2],
-            active_mode_name,
-        );
+            render_stats_bar(
+                frame,
+                &state.aggregate_stats(),
+                vertical[2],
+                active_mode_name,
+            );
+        }
         let ctx_buttons = dashboard_context_buttons(&ui.keybindings, !filtered.is_empty());
         render_bottom_bar(frame, ui, hints_area, has_pane_control, &ctx_buttons);
         // Still render live terminal panes even when filter matches zero sessions.
@@ -15009,27 +15791,30 @@ fn render_frame(
                 banner_visibility,
                 Some(&pane_outer_rects),
                 now,
+                zoomed,
             );
         }
         render_overlays(frame, ui, active_mode_name);
         return;
     }
 
-    let stats_area = render_card_grid(
-        frame,
-        dashboard_area,
-        ui,
-        &sessions,
-        &session_ids,
-        total_sessions,
-        tick,
-    );
-    render_stats_bar(
-        frame,
-        &state.aggregate_stats(),
-        stats_area,
-        active_mode_name,
-    );
+    if draw_sidebar {
+        let stats_area = render_card_grid(
+            frame,
+            dashboard_area,
+            ui,
+            &sessions,
+            &session_ids,
+            total_sessions,
+            tick,
+        );
+        render_stats_bar(
+            frame,
+            &state.aggregate_stats(),
+            stats_area,
+            active_mode_name,
+        );
+    }
 
     // Full-width hints bar
     let ctx_buttons = dashboard_context_buttons(&ui.keybindings, !filtered.is_empty());
@@ -15051,6 +15836,7 @@ fn render_frame(
             banner_visibility,
             Some(&pane_outer_rects),
             now,
+            zoomed,
         );
     }
 
@@ -15735,6 +16521,15 @@ fn render_terminal_panes(
     // Injected by L1 notice-lifecycle coverage; live frames pass the same `now`
     // used for every other transient render state in that frame.
     now: std::time::Instant,
+    // PRD #313 M3: is the tab being drawn zoomed? The ONLY thing this changes is
+    // the border title of the pane the layout expanded, which gains the
+    // `ZOOM_TITLE_MARKER` (see `zoom_marked_id` below). Geometry is not decided
+    // here — `compute_frame_layout` already handed this call the rects, and
+    // already resolved a zoomed frame to an effective `Stacked` — so a zoomed
+    // frame differs from an unzoomed one by a marker on one border title and
+    // nothing else. Every caller that cannot be on a zoomed orchestration tab
+    // passes `false`.
+    zoomed: bool,
 ) -> Option<Rect> {
     let ctrl = embedded?;
     if pane_ids.is_empty() {
@@ -15767,6 +16562,27 @@ fn render_terminal_panes(
             None => base,
         }
     };
+
+    // PRD #313 M3: which pane wears the zoom indicator — the one a zoom leaves
+    // on screen, so nobody concludes their other agents disappeared.
+    //
+    // Keyed to the pane the GEOMETRY expanded, not to focus equality. Those are
+    // the same pane in the happy path, but `stacked_expanded_index` falls back
+    // to pane 0 when nothing in the stack is focused, so keying on
+    // `focused_id == Some(id)` would let a full-frame pane render with no
+    // marker the moment focus is `None` — the exact "you forgot you were
+    // zoomed" hazard M3 exists to close, arrived at by the two answers
+    // disagreeing. Asking the same helper the split asked makes "the visible
+    // pane carries `[Z]`" structural rather than contingent. A zoomed frame is
+    // always effectively `Stacked` (PRD #313 M1 resolves it in
+    // `compute_frame_layout`), which is what makes this the right question to
+    // ask under either toggle.
+    let zoom_marked_id: Option<&str> = if zoomed {
+        stacked_expanded_index(pane_ids, focused_id.as_deref()).map(|i| pane_ids[i].as_str())
+    } else {
+        None
+    };
+    let is_zoom_marked = |id: &str| zoom_marked_id == Some(id);
 
     // Track the focused pane's rect and screen for hardware cursor positioning.
     let mut focused_pane_rect: Option<Rect> = None;
@@ -15810,7 +16626,8 @@ fn render_terminal_panes(
                     // `resize_panes_to_layout` this frame, so attest the contract.
                     let mut widget = TerminalWidget::new(Arc::clone(&screen), title, focused)
                         .contract_guaranteed(true)
-                        .with_input_active(input_active);
+                        .with_input_active(input_active)
+                        .with_zoom_marker(is_zoom_marked(pane_id.as_str()));
                     // PRD #155 (M3): supply the pane's status so a non-focused
                     // pane renders its status-colored border via the palette (the
                     // focus override stays inside TerminalWidget). Panes without a
@@ -15844,7 +16661,8 @@ fn render_terminal_panes(
                     // by `resize_panes_to_layout` this frame — attest it.
                     let mut widget = TerminalWidget::new(Arc::clone(&screen), title, is_focused)
                         .contract_guaranteed(true)
-                        .with_input_active(input_active);
+                        .with_input_active(input_active)
+                        .with_zoom_marker(is_zoom_marked(pane_id.as_str()));
                     // PRD #155 (M3): same status threading as the Tiled arm.
                     if let Some(status) = pane_status.get(pane_id.as_str()) {
                         widget = widget.with_status(status.clone());
@@ -16041,6 +16859,9 @@ fn render_mode_tab(
             // scope); the agent pane is a single Stacked pane filling agent_area.
             None,
             now,
+            // PRD #313: zoom is an orchestration-tab view state; a mode tab
+            // has no sidebar to reclaim and can never be zoomed.
+            false,
         );
         if rect.is_some() {
             ui.focused_pane_rect = rect;
@@ -16065,6 +16886,7 @@ fn render_mode_tab(
             // split as the `side_pane_rects` above; out of the Cards finding's scope.
             None,
             now,
+            false,
         );
         // Use side pane rect when a side pane is visually focused, or as fallback.
         if side_visual_focus.is_some() || ui.focused_pane_rect.is_none() {
@@ -17357,6 +18179,8 @@ pub fn render_help_overlay_with_bindings_to_buffer(
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
+    let (width, height) = clamp_render_seam_dims(width, height);
+
     let backend = TestBackend::new(width, height);
     let mut terminal = Terminal::new(backend).expect("TestBackend should construct");
     terminal
@@ -17394,6 +18218,8 @@ pub fn render_hints_bar_for_mode_to_buffer(
 ) -> ratatui::buffer::Buffer {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+
+    let (width, height) = clamp_render_seam_dims(width, height);
 
     let backend = TestBackend::new(width, height);
     let mut terminal = Terminal::new(backend).expect("TestBackend should construct");
@@ -17487,6 +18313,10 @@ fn render_help_overlay(
             &n(KbAction::ToggleOrchestrationSplit),
             "Toggle orch tab split ratio",
         ),
+        // PRD #313: same scope as the split above (command mode, orchestration
+        // tab), so it sits in the same place. The description names the tab
+        // scope and stays inside the ~30 columns this field renders.
+        help_key_line(&n(KbAction::ToggleZoom), "Zoom focused pane"),
         help_key_line(&n(KbAction::Filter), "Filter sessions"),
         help_key_line(&n(KbAction::ClearFilter), "Clear filter"),
         help_key_line(&n(KbAction::Rename), "Rename session"),
@@ -19195,6 +20025,8 @@ where
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
+    let (width, height) = clamp_render_seam_dims(width, height);
+
     let backend = TestBackend::new(width, height);
     let mut terminal = Terminal::new(backend).expect("TestBackend should construct");
     terminal
@@ -19216,12 +20048,10 @@ pub fn render_stats_bar_to_buffer(
     height: u16,
 ) -> ratatui::buffer::Buffer {
     draw_to_buffer(width, height, |frame| {
-        let area = Rect {
-            x: 0,
-            y: 0,
-            width,
-            height,
-        };
+        // `frame.area()` rather than a Rect rebuilt from `width`/`height`: those
+        // are the caller's raw arguments, and `draw_to_buffer` bounds them
+        // (issue #748), so the frame is the only thing that knows the real size.
+        let area = frame.area();
         render_stats_bar(frame, stats, area, active_mode_name);
     })
 }
@@ -19251,12 +20081,8 @@ pub fn render_experimental_footer_to_buffer(
     height: u16,
 ) -> ratatui::buffer::Buffer {
     draw_to_buffer(width, height, |frame| {
-        let area = Rect {
-            x: 0,
-            y: 0,
-            width,
-            height,
-        };
+        // `frame.area()` for the same reason as `render_stats_bar_to_buffer`.
+        let area = frame.area();
         render_experimental_footer(frame, features, area);
     })
 }
@@ -19449,6 +20275,8 @@ pub fn render_card_with_declared_agent_to_buffer(
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
+    let (width, height) = clamp_render_seam_dims(width, height);
+
     let backend = TestBackend::new(width, height);
     let mut terminal = Terminal::new(backend).expect("TestBackend should construct");
     let display_name_owned = display_name.map(str::to_string);
@@ -19501,6 +20329,10 @@ pub fn render_dashboard_cards_to_buffer(
 
     let card_height = density.rendered_height();
     let height = card_height.saturating_mul(cards.len() as u16).max(1);
+    // `height` is derived rather than passed, but `cards.len()` is still the
+    // caller's, so it needs the same bound as `width`. Cards past the cap get a
+    // zero-height rect from `Layout::vertical` below and draw nothing.
+    let (width, height) = clamp_render_seam_dims(width, height);
 
     let backend = TestBackend::new(width, height);
     let mut terminal = Terminal::new(backend).expect("TestBackend should construct");
@@ -19583,6 +20415,8 @@ pub fn render_card_grid_to_buffer(
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
+    let (width, height) = clamp_render_seam_dims(width, height);
+
     let mut ui = UiState::new(DashboardConfig::default(), KeybindingConfig::default());
     ui.selected_index = selected;
     ui.scroll_offset = scroll_offset;
@@ -19629,6 +20463,257 @@ pub fn render_card_grid_to_buffer(
     (terminal.backend().buffer().clone(), probe)
 }
 
+/// Largest dimension an exported `*_to_buffer` render seam with TWO
+/// caller-controlled axes will render.
+///
+/// Those seams are library API: `src/lib.rs` is `pub mod ui;`, half of them
+/// carry no `#[doc(hidden)]` at all, and `#[doc(hidden)]` hides an item from
+/// rustdoc rather than making it unreachable — so their dimensions come from a
+/// caller this crate does not control. Each one's `TestBackend` allocates one
+/// cell per `width * height`, so `u16::MAX` on both axes asks for ~4.3 BILLION
+/// cells: an OOM/abort, not an error a caller can handle. 1024 x 1024 is ~1M
+/// cells — comfortably above any real terminal and comfortably below that.
+/// Apply it with [`clamp_render_seam_dims`] (issue #748).
+///
+/// **The two-axis qualifier is load-bearing, not hedging.** Four exported seams
+/// are deliberately NOT bounded by this, because they pass a literal `1` as the
+/// height: [`render_button_bar_to_buffer`], [`render_filter_bar_to_buffer`],
+/// [`render_rename_bar_to_buffer`] and [`render_tab_bar_to_buffer`] each render
+/// a single row, so their worst case is `u16::MAX * 1` = 65,535 cells (~2 MB) —
+/// not an allocation concern, and capping it would silently truncate a
+/// legitimately wide bar. Issue #748 measured that and scoped them out; the
+/// `seam_bound_001_one_row_seams_are_deliberately_unbounded` test pins the
+/// exclusion so it stays a decision rather than an oversight. So do not write
+/// "every exported seam is bounded" — write this. If a fifth one-row seam ever
+/// gains a caller-controlled height, it joins the list above instead.
+#[doc(hidden)]
+pub const RENDER_SEAM_DIM_MAX: u16 = 1024;
+
+/// Largest role count [`render_orchestration_frame_to_buffer`] will render, for
+/// the same reason as [`RENDER_SEAM_DIM_MAX`]: every role allocates an inert
+/// vt100 parser and a session. Far above any orchestration tab a person would
+/// configure.
+#[doc(hidden)]
+pub const RENDER_SEAM_ROLES_MAX: usize = 64;
+
+/// Bound a render seam's caller-given dimensions to [`RENDER_SEAM_DIM_MAX`].
+///
+/// Call this BEFORE the seam's `TestBackend` is built and shadow both bindings,
+/// so every `Rect` the seam derives afterwards describes the buffer that
+/// actually exists rather than the one that was asked for.
+///
+/// **Why clamp rather than return an error** (issue #748): every real caller is
+/// asking for a terminal-sized frame and no real terminal is anywhere near the
+/// cap, so a `Result` on two dozen exported seams would be friction at every
+/// call site in exchange for bounding a case none of them reach. It is not a
+/// *silent* clamp either — the returned `Buffer`'s own `area` is the clamped
+/// size, so the bound is observable in the value the seam already hands back.
+///
+/// **Why one shared rule** — issue #747 is about the damage done when one side
+/// of a resize clamps and another does not, so this function is the single place
+/// the cap is applied, and the daemon-side sibling
+/// [`crate::agent_pty::PTY_RESIZE_DIM_MAX`] clamps the same way. Of the 25
+/// exported two-axis seams, 24 route through here; the 25th,
+/// [`render_orchestration_frame_to_buffer`], applies `RENDER_SEAM_DIM_MAX`
+/// inline because it pairs it with a role-count bound and a degenerate-input
+/// guard.
+fn clamp_render_seam_dims(width: u16, height: u16) -> (u16, u16) {
+    (
+        width.min(RENDER_SEAM_DIM_MAX),
+        height.min(RENDER_SEAM_DIM_MAX),
+    )
+}
+
+/// PRD #313 M5 — L1 seam for a WHOLE orchestration tab: the real
+/// `compute_frame_layout` → `resize_panes_to_layout` → [`render_frame`]
+/// sequence the main loop runs, driven into a `TestBackend` and handed back as
+/// a `Buffer`.
+///
+/// It exists because zoom is the first orchestration change whose whole point
+/// is what is *no longer on screen*, and that cannot be asserted from the
+/// geometry alone: "the sidebar is gone" and "the focused pane kept its border"
+/// are questions about painted cells. Every other `*_to_buffer` export renders
+/// one bar, card, grid or modal — this is the first that renders a frame — so
+/// an integration test (which cannot reach the module-private
+/// `compute_frame_layout` / `ActiveTabView` / `render_frame`) had no way to ask.
+///
+/// `role_names` are the roles in tab order, each used as BOTH its sidebar card's
+/// display name and its pane's border title (which is what makes the rendered
+/// frame legible to a role-keyed scan such as `common::role_pane_left_edge`).
+/// `focused_role_index` selects the focused — and, under `PaneLayout::Stacked`,
+/// the only drawn — role pane. `split_narrow` and `zoomed` are the tab's view
+/// state, resolved through the same [`orchestration_layout_percents`] the live
+/// tab uses.
+///
+/// The panes are inert by construction (`for_render_seam_with_focused_pane` /
+/// `add_scroll_seam_pane`): no daemon, no I/O task, nothing on a socket. Their
+/// vt100 screens are empty and are sized by the real `resize_panes_to_layout`
+/// pass before the draw, exactly as a live frame does, so the PRD #84
+/// invariant-3 contract holds here rather than being waived.
+///
+/// `#[doc(hidden)]`: `pub` because an integration test cannot enable a crate
+/// feature on demand, not because it is API. `#[doc(hidden)]` hides it from the
+/// docs; it is not a compile barrier, so the function is TOTAL over its
+/// arguments and bounded in what it allocates — see [`RENDER_SEAM_DIM_MAX`] and
+/// the degenerate-input guard at the top of the body. That is hardening of a
+/// test seam rather than the closing of an exploitable hole; it is here because
+/// the fix is cheap and a panicking `pub fn` is a bad thing to leave in a
+/// library.
+#[doc(hidden)]
+pub fn render_orchestration_frame_to_buffer(
+    role_names: &[&str],
+    focused_role_index: usize,
+    split_narrow: bool,
+    zoomed: bool,
+    width: u16,
+    height: u16,
+) -> ratatui::buffer::Buffer {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    // Bound the allocation BEFORE anything is allocated. `TestBackend::new`
+    // allocates exactly `width * height` cells, so `u16::MAX` on both axes asks
+    // for 4,294,836,225 of them — an OOM/abort, not an error a caller can
+    // handle. Clamping is right rather than erroring because every real caller
+    // is asking for a terminal-sized frame and no real terminal is anywhere
+    // near the cap.
+    let width = width.min(RENDER_SEAM_DIM_MAX);
+    let height = height.min(RENDER_SEAM_DIM_MAX);
+    // Degenerate inputs get a defined answer instead of a panic: a blank buffer
+    // of the clamped size. With no roles there is no orchestration tab to draw
+    // (the body below indexes `role_names[focused_role_index]`), and with a zero
+    // dimension there is nowhere to draw it — `render_tab_strip` writes `(0, 0)`
+    // into a zero-height buffer and panics inside ratatui.
+    if role_names.is_empty() || width == 0 || height == 0 {
+        return ratatui::buffer::Buffer::empty(Rect {
+            x: 0,
+            y: 0,
+            width,
+            height,
+        });
+    }
+    // Each role costs a session, two map entries and an inert vt100 parser, so
+    // cap the count for the same reason as the dimensions. Truncating (rather
+    // than erroring) keeps the seam pleasant to call; the focused index is
+    // re-clamped against the truncated list so it stays in range.
+    let role_names = &role_names[..role_names.len().min(RENDER_SEAM_ROLES_MAX)];
+    let focused_role_index = focused_role_index.min(role_names.len() - 1);
+
+    // Numeric pane ids so `filter_sessions`' pane-id sort reproduces role order
+    // and the rendered card column is deterministic.
+    let pane_ids: Vec<String> = (0..role_names.len()).map(|i| i.to_string()).collect();
+
+    // One inert pane per role, the focused one focused. The seed geometry is a
+    // placeholder — `resize_panes_to_layout` below sizes every pane to its real
+    // layout rect before anything is drawn.
+    let ctrl = EmbeddedPaneController::for_render_seam_with_focused_pane(
+        &pane_ids[focused_role_index],
+        24,
+        80,
+        b"",
+    );
+    // Held for the life of the render: dropping a pane's child-input receiver
+    // closes its channel, which is a state the seam has no reason to pose.
+    let _child_inputs: Vec<_> = pane_ids
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i != focused_role_index)
+        .map(|(_, id)| ctrl.add_scroll_seam_pane(id, 24, 80, b""))
+        .collect();
+
+    let mut ui = UiState::new(DashboardConfig::default(), KeybindingConfig::default());
+    let mut state = AppState::default();
+    // Two hours back rather than "now": the card's bottom border renders
+    // `format_elapsed`, so a fresh timestamp reads `0s` for only ONE second
+    // before it becomes `1s`. At two hours the string is `2h` for a full minute,
+    // which is the difference between a snapshot that is deterministic in
+    // practice and one that is deterministic on a loaded machine too.
+    let last_activity = Utc::now() - chrono::Duration::hours(2);
+    for (i, role) in role_names.iter().enumerate() {
+        let session_id = format!("seam-role-{i}");
+        state.sessions.insert(
+            session_id.clone(),
+            SessionState {
+                session_id: session_id.clone(),
+                agent_type: AgentType::ClaudeCode,
+                cwd: None,
+                status: SessionStatus::Idle,
+                active_tool: None,
+                started_at: last_activity,
+                last_activity,
+                recent_events: std::collections::VecDeque::new(),
+                tool_count: 0,
+                last_user_prompt: None,
+                first_prompts: Vec::new(),
+                pane_id: Some(pane_ids[i].clone()),
+                agent_id: None,
+                display_name: None,
+                shell_synthetic_working: false,
+            },
+        );
+        // Two different maps: the sidebar card reads `display_names` (keyed by
+        // session id), the pane border reads `pane_display_names` (keyed by pane
+        // id). A role has to be in both to be findable in either half of the
+        // frame.
+        ui.display_names.insert(session_id, (*role).to_string());
+        ui.pane_display_names
+            .insert(pane_ids[i].clone(), (*role).to_string());
+    }
+
+    let tab_view = ActiveTabView::Orchestration {
+        role_pane_ids: pane_ids.clone(),
+        split_narrow,
+        zoomed,
+    };
+    let tab_bar = TabBarInfo {
+        show: true,
+        labels: vec!["orchestration".into()],
+        active_index: 0,
+        orchestration_statuses: vec![Some(vec![])],
+    };
+    let frame_area = Rect {
+        x: 0,
+        y: 0,
+        width,
+        height,
+    };
+    // The same order the main loop uses: measure the bottom bar, lay the frame
+    // out once, size every PTY from that layout, then draw from it.
+    let bar_rows = bottom_bar_rows(&ui, width, height, &tab_view);
+    let layout = compute_frame_layout(
+        frame_area,
+        &tab_view,
+        &tab_bar,
+        &pane_ids,
+        PaneLayout::Stacked,
+        Some(pane_ids[focused_role_index].as_str()),
+        bar_rows,
+    );
+    resize_panes_to_layout(&layout, &ctrl);
+
+    let filtered = filter_sessions(&state, &ui);
+    let backend = TestBackend::new(width, height);
+    let mut terminal = Terminal::new(backend).expect("TestBackend should construct");
+    terminal
+        .draw(|frame| {
+            render_frame(
+                frame,
+                &state,
+                &mut ui,
+                &filtered,
+                0,
+                true,
+                &ctrl,
+                PaneLayout::Stacked,
+                &tab_view,
+                &tab_bar,
+                &layout,
+            );
+        })
+        .expect("TestBackend draw should succeed");
+    terminal.backend().buffer().clone()
+}
+
 /// PRD #80 M2: render the persistent global button bar into a one-row
 /// `Buffer` for L1 tests, mirroring [`render_card_to_buffer`]. Drives the
 /// production bottom-bar renderer (`render_bottom_bar`) through a
@@ -19673,6 +20758,8 @@ pub fn render_button_bar_with_bindings_to_buffer(
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
+    let (width, height) = clamp_render_seam_dims(width, height);
+
     let backend = TestBackend::new(width, height);
     let mut terminal = Terminal::new(backend).expect("TestBackend should construct");
     // Seam renders the full global+context bar (including the always-on
@@ -19716,6 +20803,8 @@ pub fn render_button_bar_for_mode_to_buffer(
 ) -> ratatui::buffer::Buffer {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+
+    let (width, height) = clamp_render_seam_dims(width, height);
 
     let backend = TestBackend::new(width, height);
     let mut terminal = Terminal::new(backend).expect("TestBackend should construct");
@@ -19795,6 +20884,8 @@ pub fn render_focused_pane_cursor_for_mode_to_position(
                 CommandBannerVisibility::Hidden,
                 None,
                 std::time::Instant::now(),
+                // PRD #313: unzoomed — this seam renders the pane column only.
+                false,
             );
         })
         .expect("TestBackend draw should succeed");
@@ -19835,6 +20926,8 @@ pub fn render_command_banner_pane_to_buffer(
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
+    let (width, height) = clamp_render_seam_dims(width, height);
+
     const PANE_ID: &str = "1";
     // `render_terminal_panes` resolves the focused pane as
     // `visual_focus_id.or_else(|| ctrl.focused_pane_id())`, and the seam's
@@ -19872,6 +20965,7 @@ pub fn render_command_banner_pane_to_buffer(
                 visibility,
                 None,
                 std::time::Instant::now(),
+                false,
             );
         })
         .expect("TestBackend draw should succeed");
@@ -20087,6 +21181,7 @@ fn render_sized_scroll_seam_pane_to_buffer(
                 banner,
                 Some(&pane_rects),
                 now,
+                false,
             );
         })
         .expect("TestBackend draw should succeed");
@@ -20429,6 +21524,7 @@ fn observe_scroll_notice_pane_affinity(
                 CommandBannerVisibility::Hidden,
                 None,
                 now,
+                false,
             );
         })
         .expect("TestBackend draw should succeed");
@@ -21021,6 +22117,8 @@ fn render_overlay_to_buffer(
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
+    let (width, height) = clamp_render_seam_dims(width, height);
+
     let backend = TestBackend::new(width, height);
     let mut terminal = Terminal::new(backend).expect("TestBackend should construct");
     terminal
@@ -21567,6 +22665,7 @@ mod tests {
         let frame_area = Rect::new(0, 0, 100, 40);
         let tab_view = ActiveTabView::Dashboard {
             exclude_pane_ids: vec![],
+            zoomed: false,
         };
         let tab_bar = TabBarInfo {
             show: true,
@@ -21717,6 +22816,7 @@ mod tests {
         let tab_view = ActiveTabView::Orchestration {
             role_pane_ids: pane_ids.clone(),
             split_narrow: false,
+            zoomed: false,
         };
         let tab_bar = TabBarInfo {
             show: true,
@@ -21791,14 +22891,21 @@ mod tests {
     }
 
     /// Build the orchestration render snapshot for `role_pane_ids` at a given
-    /// split state, then return `compute_frame_layout`'s resolved
-    /// `(sidebar_width, pane_column_width)`. PRD #336: the split now travels on
-    /// `ActiveTabView::Orchestration`, so a test can pin the geometry for a
-    /// given toggle state with no shared state to set up or reset.
-    fn orch_split_widths(frame_area: Rect, role_pane_ids: &[String], narrow: bool) -> (u16, u16) {
+    /// view state, then return `compute_frame_layout`'s resolved
+    /// `(sidebar_width, pane_column_width)`. PRD #336: the split travels on
+    /// `ActiveTabView::Orchestration`, and PRD #313 adds `zoomed` alongside it —
+    /// so a test can pin the geometry for any view state with no shared state to
+    /// set up or reset.
+    fn orch_split_widths(
+        frame_area: Rect,
+        role_pane_ids: &[String],
+        narrow: bool,
+        zoomed: bool,
+    ) -> (u16, u16) {
         let tab_view = ActiveTabView::Orchestration {
             role_pane_ids: role_pane_ids.to_vec(),
             split_narrow: narrow,
+            zoomed,
         };
         let tab_bar = TabBarInfo {
             show: true,
@@ -21858,14 +22965,14 @@ mod tests {
 
         // Untoggled: today's fixed default, 34% sidebar / 66% pane column.
         assert_eq!(
-            orch_split_widths(frame_area, &role_pane_ids, false),
+            orch_split_widths(frame_area, &role_pane_ids, false, false),
             (34, 66),
             "an untoggled orchestration tab must use the 34/66 default split"
         );
 
         // Toggled: the sidebar narrows and the pane column widens.
         assert_eq!(
-            orch_split_widths(frame_area, &role_pane_ids, true),
+            orch_split_widths(frame_area, &role_pane_ids, true, false),
             (25, 75),
             "a toggled orchestration tab must use the narrower-sidebar 25/75 split"
         );
@@ -22279,6 +23386,1050 @@ mod tests {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // PRD #313 — zoom the focused agent pane. A per-tab, presentation-only view
+    // state: the focused role pane takes the whole frame, the sidebar and the
+    // non-focused panes are not drawn, and the focused pane KEEPS its border so
+    // the title/focus/status channel (PRD #155 M3, commit `9345a74`) survives —
+    // which is also where the `[Z]` indicator lives.
+    // -----------------------------------------------------------------------
+
+    /// Scenario: PRD #313 — press `Ctrl+Z` in command mode on a tab that has a
+    /// card sidebar (Dashboard or Orchestration) and the deck must resolve
+    /// `Action::ToggleZoom`; press it while typing at a pane and the deck must
+    /// NOT claim it, so the byte still reaches the agent as `0x1a` job control.
+    /// Resolves a simulated `Ctrl+Z` `KeyEvent` through `key_action_for_mode`,
+    /// drives `scope_zoom` across every tab/mode pair, and confirms the
+    /// `PaneInput` path still forwards `0x1a` to the PTY.
+    #[spec("orchestration/layout/007")]
+    #[test]
+    fn orchestration_layout_007_scope_zoom_claims_ctrl_z_only_on_a_card_sidebar_tab() {
+        // The default binding resolves to the zoom toggle SPECIFICALLY — not
+        // merely to "some action", which would still pass if the ACTIONS entry
+        // were wired to the wrong variant. (`Action` derives no `PartialEq`,
+        // hence `matches!` rather than `assert_eq!`.)
+        let kb = KeybindingConfig::default();
+        let ctrl_z = KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL);
+        let resolved = key_action_for_mode(&kb, UiMode::Normal, &ctrl_z);
+        assert!(
+            matches!(resolved, Some(Action::ToggleZoom)),
+            "default `Ctrl+z` must resolve to Action::ToggleZoom, got {resolved:?}"
+        );
+
+        // A PLAIN `z` must NOT resolve — it is an ordinary character and belongs
+        // to whatever the user is typing into. This is the inverse of the
+        // assertion this test carried before the binding moved, and it is the
+        // half that would break if someone "restored" the old default without
+        // also restoring its scoping.
+        let plain_z = KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE);
+        for mode in [UiMode::Normal, UiMode::PaneInput] {
+            assert!(
+                !matches!(
+                    key_action_for_mode(&kb, mode, &plain_z),
+                    Some(Action::ToggleZoom)
+                ),
+                "a plain `z` must not resolve to the zoom toggle ({mode:?})"
+            );
+        }
+
+        let zoom = || Some(Action::ToggleZoom);
+
+        // Card-sidebar tab + command mode resolves. PRD #313 covers BOTH card
+        // shapes: the Dashboard is a 33/67 card sidebar beside a pane stack and
+        // an orchestration tab is a 34/66 one, so the predicate is "does this
+        // tab have a sidebar to reclaim", not "is it an orchestration tab".
+        assert!(
+            matches!(
+                scope_zoom(zoom(), true, UiMode::Normal),
+                Some(Action::ToggleZoom)
+            ),
+            "a card-sidebar tab in command mode must claim the zoom toggle"
+        );
+
+        // No card sidebar (a Mode tab), any mode -> un-resolved, so `Ctrl+Z`
+        // reaches the PTY.
+        for mode in [UiMode::Normal, UiMode::PaneInput] {
+            assert!(
+                scope_zoom(zoom(), false, mode).is_none(),
+                "on a tab with no card sidebar the zoom toggle must be \
+                 un-resolved so `Ctrl+Z` reaches the focused pane's PTY ({mode:?})"
+            );
+        }
+
+        // Right tab, wrong mode -> un-resolved. This is the half that keeps
+        // JOB CONTROL working: `Ctrl+Z` in a pane is `0x1a`, the tty's SUSP
+        // character, so an unscoped binding would eat suspend/resume in every
+        // agent's shell. Same narrowing `Ctrl+l` uses to stay readline's
+        // clear-screen (`orchestration/layout/005`).
+        for mode in [
+            UiMode::PaneInput,
+            UiMode::Filter,
+            UiMode::Rename,
+            UiMode::Help,
+            UiMode::NewPaneForm,
+        ] {
+            assert!(
+                scope_zoom(zoom(), true, mode).is_none(),
+                "the zoom toggle must be command-mode only; {mode:?} must \
+                 un-resolve it so the keystroke is not swallowed"
+            );
+        }
+
+        // And the payoff, end to end: in `PaneInput` the chord still reaches the
+        // PTY as `0x1a` rather than being swallowed by the zoom binding. This is
+        // what made `Ctrl+Z` affordable at all — the PRD's Open Question 1 framed
+        // the choice as "Ctrl+Z globally OR a plain `z`", but scoping is a
+        // property of the ACTION, not the key, so command-mode-only `Ctrl+Z`
+        // costs no job control.
+        assert!(
+            matches!(
+                key_action_for_mode(&kb, UiMode::PaneInput, &ctrl_z),
+                Some(Action::ForwardToPane(ref bytes)) if bytes.as_slice() == [0x1a]
+            ),
+            "Ctrl+Z in PaneInput must still forward `0x1a` to the pane's PTY"
+        );
+
+        // Unrelated actions pass through untouched for every tab/mode pair —
+        // the guard must be surgical, not a general-purpose filter.
+        for is_orch in [false, true] {
+            for mode in [UiMode::Normal, UiMode::PaneInput] {
+                assert!(
+                    matches!(
+                        scope_zoom(Some(Action::ToggleLayout), is_orch, mode),
+                        Some(Action::ToggleLayout)
+                    ),
+                    "ToggleLayout must survive (is_orch={is_orch}, {mode:?})"
+                );
+                assert!(
+                    matches!(
+                        scope_zoom(Some(Action::ToggleOrchestrationSplit), is_orch, mode),
+                        Some(Action::ToggleOrchestrationSplit)
+                    ),
+                    "ToggleOrchestrationSplit must survive (is_orch={is_orch}, {mode:?})"
+                );
+                assert!(
+                    scope_zoom(None, is_orch, mode).is_none(),
+                    "None stays None (is_orch={is_orch}, {mode:?})"
+                );
+            }
+        }
+    }
+
+    /// Same shape as [`orch_split_widths`], for a Dashboard tab: drive the real
+    /// `compute_frame_layout` and report `(sidebar_width, pane_column_width)`.
+    fn dashboard_zoom_widths(frame_area: Rect, pane_ids: &[String], zoomed: bool) -> (u16, u16) {
+        let tab_view = ActiveTabView::Dashboard {
+            exclude_pane_ids: Vec::new(),
+            zoomed,
+        };
+        let tab_bar = TabBarInfo {
+            show: true,
+            labels: vec!["Dashboard".into()],
+            active_index: 0,
+            orchestration_statuses: vec![],
+        };
+        let layout = compute_frame_layout(
+            frame_area,
+            &tab_view,
+            &tab_bar,
+            pane_ids,
+            PaneLayout::Tiled,
+            None,
+            1,
+        );
+        let FrameContent::Cards {
+            dashboard_area,
+            panes_area,
+            pane_rects,
+            ..
+        } = layout.content
+        else {
+            panic!("Dashboard tab must produce FrameContent::Cards");
+        };
+        assert_eq!(
+            pane_rects.len(),
+            pane_ids.len(),
+            "every pane must get a rect, drawn or not"
+        );
+        (
+            dashboard_area.width,
+            panes_area.expect("panes => a right column").width,
+        )
+    }
+
+    /// Scenario: PRD #313 — the Dashboard zooms on the same terms as an
+    /// orchestration tab, because it is the same shape: a card sidebar beside a
+    /// stack of agent panes. Drive `compute_frame_layout` for a Dashboard tab
+    /// with two panes, unzoomed and zoomed, and assert the sidebar goes from the
+    /// 33/67 default to zero width with the pane column taking the whole frame,
+    /// that only the focused pane is drawn while zoomed even under `Tiled`, and
+    /// that unzooming restores 33/67 exactly.
+    #[spec("orchestration/layout/012")]
+    #[test]
+    fn orchestration_layout_012_the_dashboard_zooms_like_an_orchestration_tab() {
+        let frame_area = Rect::new(0, 0, 100, 40);
+        let pane_ids = vec!["p0".to_string(), "p1".to_string()];
+
+        // Unzoomed: the Dashboard's own fixed split, which is 33/67 rather than
+        // orchestration's 34/66 — asserted as the real constants, so this test
+        // fails if zoom is wired to the wrong resolver.
+        assert_eq!(
+            dashboard_zoom_widths(frame_area, &pane_ids, false),
+            (33, 67),
+            "an unzoomed Dashboard must use the 33/67 split"
+        );
+
+        // Zoomed: no sidebar, pane column takes the whole frame.
+        assert_eq!(
+            dashboard_zoom_widths(frame_area, &pane_ids, true),
+            (0, 100),
+            "a zoomed Dashboard must give the sidebar zero width and the pane \
+             column the whole 100-col frame"
+        );
+
+        // Reversible, exactly: unzooming restores 33/67 rather than leaving the
+        // tab on some third geometry.
+        assert_eq!(
+            dashboard_zoom_widths(frame_area, &pane_ids, false),
+            (33, 67),
+            "unzooming the Dashboard must restore the 33/67 split exactly"
+        );
+
+        // And the second half of M1 — "other panes are not drawn" — holds here
+        // too, under `Tiled`, via the same effective-Stacked resolution the
+        // Orchestration arm uses (`orchestration/layout/011` is its sibling).
+        let tab_view = ActiveTabView::Dashboard {
+            exclude_pane_ids: Vec::new(),
+            zoomed: true,
+        };
+        let tab_bar = TabBarInfo {
+            show: true,
+            labels: vec!["Dashboard".into()],
+            active_index: 0,
+            orchestration_statuses: vec![],
+        };
+        let layout = compute_frame_layout(
+            frame_area,
+            &tab_view,
+            &tab_bar,
+            &pane_ids,
+            PaneLayout::Tiled,
+            Some("p0"),
+            1,
+        );
+        let FrameContent::Cards {
+            panes_area,
+            pane_rects,
+            ..
+        } = layout.content
+        else {
+            panic!("Dashboard tab must produce FrameContent::Cards");
+        };
+        let rect = |id: &str| {
+            pane_rects
+                .iter()
+                .find(|(pid, _)| pid == id)
+                .map(|(_, r)| *r)
+                .unwrap_or_else(|| panic!("{id} must still be present in pane_rects"))
+        };
+        assert_eq!(
+            rect("p0"),
+            panes_area.expect("panes => a right column"),
+            "zoomed, the focused Dashboard pane must be the whole pane column \
+             whatever the Stacked/Tiled toggle says"
+        );
+        assert_eq!(
+            rect("p1").height,
+            0,
+            "zoomed, a non-focused Dashboard pane must reserve zero rows \
+             (PRD #311 M2's convention) rather than take a tiled slice"
+        );
+    }
+
+    /// Scenario: PRD #313 M1 — an orchestration tab's frame geometry must be the
+    /// 34/66 default unzoomed, the narrower 25/75 split when `split_narrow`, and
+    /// a ZERO-width sidebar with the pane column spanning the whole frame when
+    /// `zoomed`. Zoom wins over the narrow split in both states, and clearing
+    /// `zoomed` returns the frame to exactly whichever split was in force — the
+    /// PRD's "the same key restores the previous view exactly". Drives
+    /// `compute_frame_layout`, the single per-frame layout pass that both
+    /// `render_frame` and the pre-draw PTY-resize pass read.
+    #[spec("orchestration/layout/008")]
+    #[test]
+    fn orchestration_layout_008_zoom_gives_the_pane_column_the_whole_frame() {
+        let frame_area = Rect::new(0, 0, 100, 40);
+        let role_pane_ids = vec!["r0".to_string(), "r1".to_string()];
+        let widths = |narrow: bool, zoomed: bool| {
+            orch_split_widths(frame_area, &role_pane_ids, narrow, zoomed)
+        };
+
+        // Unzoomed: the two split states PRD #336 already established.
+        assert_eq!(
+            widths(false, false),
+            (34, 66),
+            "an unzoomed orchestration tab must use the 34/66 default split"
+        );
+        assert_eq!(
+            widths(true, false),
+            (25, 75),
+            "an unzoomed, narrowed orchestration tab must use the 25/75 split"
+        );
+
+        // Zoomed, from BOTH split states: no sidebar at all, and the pane
+        // column spans the full frame width. Asserting both is what makes this
+        // fail against a plausible-but-wrong implementation that merely widened
+        // the pane column another notch instead of reclaiming the whole frame.
+        for narrow in [false, true] {
+            let before = widths(narrow, false);
+            assert_eq!(
+                widths(narrow, true),
+                (0, 100),
+                "a zoomed orchestration tab must give the sidebar zero width and \
+                 the pane column the whole 100-col frame, regardless of the \
+                 split underneath it (split_narrow={narrow})"
+            );
+            // Zoom is a REVERSIBLE view state, not a third split: unzooming
+            // must restore exactly the split that was in force, not snap back
+            // to the 34/66 default.
+            assert_eq!(
+                widths(narrow, false),
+                before,
+                "unzooming must restore exactly the split that was in force \
+                 (split_narrow={narrow}), not reset to the default"
+            );
+        }
+    }
+
+    /// Scenario: PRD #313 Open Question 4, decided — zoom is PER-TAB, the
+    /// deliberate opposite of PRD #336's global split (`orchestration/layout/004`,
+    /// where a tab opened later ADOPTS the current global value). Open
+    /// orchestration tab A, zoom it with the real `Action::ToggleZoom` dispatch,
+    /// then open tab B and confirm B comes up unzoomed while A stays zoomed;
+    /// toggling from B must leave A alone in both directions. Dispatching on the
+    /// Dashboard must be a no-op, and a `1`-`9` role jump on a zoomed tab must
+    /// leave it zoomed with the newly focused pane now filling the frame
+    /// (Open Question 3, decided: zoom FOLLOWS focus).
+    #[spec("orchestration/layout/009")]
+    #[test]
+    fn orchestration_layout_009_zoom_is_per_tab_and_follows_focus() {
+        let tmp = tempdir().expect("tempdir");
+        let pc = Arc::new(CapturingPaneController::new());
+        let mut tm = TabManager::new(pc.clone());
+        let mut ui = default_ui();
+        let state: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
+        let frame_area = Rect::new(0, 0, 100, 40);
+
+        // Two sessions backing tab A's role panes. `CapturingPaneController`
+        // mints ids in creation order, so tab A (opened first) owns `pane-0`
+        // (orchestrator) and `pane-1` (worker) — what the `Action::FocusCard(1)`
+        // role jump below has to land on.
+        let mut snapshot = AppState::default();
+        for (sid, pid) in [("sess-a0", "pane-0"), ("sess-a1", "pane-1")] {
+            let mut sess = make_session(SessionStatus::Idle);
+            sess.session_id = sid.to_string();
+            sess.pane_id = Some(pid.to_string());
+            snapshot.sessions.insert(sid.to_string(), sess);
+        }
+        let session_ids = ["sess-a0".to_string(), "sess-a1".to_string()];
+        let filtered: Vec<(&String, &SessionState)> = session_ids
+            .iter()
+            .map(|id| (id, snapshot.sessions.get(id).expect("seeded session")))
+            .collect();
+
+        let cfg = |name: &str| OrchestrationConfig {
+            default: false,
+            name: name.to_string(),
+            roles: vec![
+                OrchestrationRoleConfig {
+                    agent: None,
+                    name: "orchestrator".to_string(),
+                    command: "cat".to_string(),
+                    start: true,
+                    description: None,
+                    prompt_template: None,
+                    clear: false,
+                },
+                OrchestrationRoleConfig {
+                    agent: None,
+                    name: "worker".to_string(),
+                    command: "cat".to_string(),
+                    start: false,
+                    description: None,
+                    prompt_template: None,
+                    clear: false,
+                },
+            ],
+        };
+
+        let zoomed_of = |tm: &TabManager, idx: usize| match &tm.tabs()[idx] {
+            Tab::Orchestration { zoomed, .. } => *zoomed,
+            _ => panic!("tab {idx} should be an orchestration tab"),
+        };
+
+        // Tab A, opened alone, starts unzoomed.
+        tm.open_orchestration_tab(
+            &cfg("tab-a"),
+            tmp.path().to_str().expect("utf-8 tmp path"),
+            None,
+            None,
+            (24, 80),
+        )
+        .expect("open orchestration tab A");
+        assert!(!zoomed_of(&tm, 1), "tab A must open unzoomed");
+
+        dispatch_action(
+            Action::ToggleZoom,
+            &mut ui,
+            pc.as_ref(),
+            &state,
+            &mut tm,
+            &snapshot,
+            &filtered,
+            None,
+            frame_area,
+        );
+        assert!(zoomed_of(&tm, 1), "tab A must be zoomed after one toggle");
+
+        // Tab B, opened while A is zoomed, must come up UNZOOMED. This is the
+        // explicit contrast with `orchestration/layout/004`, where a later tab
+        // adopts the current GLOBAL split: a tab the user never zoomed must not
+        // lose its sidebar behind their back.
+        tm.open_orchestration_tab(
+            &cfg("tab-b"),
+            tmp.path().to_str().expect("utf-8 tmp path"),
+            None,
+            None,
+            (24, 80),
+        )
+        .expect("open orchestration tab B");
+        assert!(
+            !zoomed_of(&tm, 2),
+            "a tab opened while another tab is zoomed must start UNZOOMED — \
+             zoom is per-tab, unlike the GLOBAL split of orchestration/layout/004"
+        );
+        assert!(zoomed_of(&tm, 1), "opening tab B must not disturb tab A");
+
+        // B is now active. Toggling from B must move B and ONLY B.
+        dispatch_action(
+            Action::ToggleZoom,
+            &mut ui,
+            pc.as_ref(),
+            &state,
+            &mut tm,
+            &snapshot,
+            &filtered,
+            None,
+            frame_area,
+        );
+        assert!(zoomed_of(&tm, 2), "toggling from tab B must zoom tab B");
+        assert!(
+            zoomed_of(&tm, 1),
+            "toggling from tab B must NOT change tab A — zoom is per-tab"
+        );
+        dispatch_action(
+            Action::ToggleZoom,
+            &mut ui,
+            pc.as_ref(),
+            &state,
+            &mut tm,
+            &snapshot,
+            &filtered,
+            None,
+            frame_area,
+        );
+        assert!(!zoomed_of(&tm, 2), "tab B must round-trip to unzoomed");
+        assert!(
+            zoomed_of(&tm, 1),
+            "unzooming tab B must NOT change tab A either — the independence \
+             has to hold in both directions"
+        );
+
+        // On the Dashboard the action must do nothing at all, and must not
+        // reach into an orchestration tab's state.
+        tm.switch_to(0);
+        dispatch_action(
+            Action::ToggleZoom,
+            &mut ui,
+            pc.as_ref(),
+            &state,
+            &mut tm,
+            &snapshot,
+            &filtered,
+            None,
+            frame_area,
+        );
+        assert!(
+            matches!(tm.active_tab(), Tab::Dashboard { .. }),
+            "dispatch must not disturb the Dashboard tab"
+        );
+        assert!(
+            zoomed_of(&tm, 1) && !zoomed_of(&tm, 2),
+            "a ToggleZoom dispatched on the Dashboard must not mutate any \
+             orchestration tab's zoom state"
+        );
+
+        // Open Question 3, decided: zoom FOLLOWS focus. A `1`-`9` role jump on
+        // the zoomed tab A is a deliberate "go work with that agent" action, so
+        // it must keep the tab zoomed rather than dropping back to the split.
+        tm.switch_to(1);
+        dispatch_action(
+            Action::FocusCard(1),
+            &mut ui,
+            pc.as_ref(),
+            &state,
+            &mut tm,
+            &snapshot,
+            &filtered,
+            None,
+            frame_area,
+        );
+        assert_eq!(
+            ui.selected_index,
+            Some(1),
+            "the role jump must land on role 2 (index 1)"
+        );
+        assert_eq!(
+            ui.mode,
+            UiMode::PaneInput,
+            "a successful role jump enters PaneInput on the newly focused pane"
+        );
+        assert!(
+            zoomed_of(&tm, 1),
+            "jumping to another role while zoomed must KEEP the tab zoomed — \
+             zoom follows focus (PRD #313 Open Question 3)"
+        );
+
+        // The render side of the same claim: with role 2 now the focused pane,
+        // the zoomed geometry must hand THAT pane the whole frame. Zoom is not
+        // pinned to whichever role happened to be focused when it was toggled.
+        let role_pane_ids = match &tm.tabs()[1] {
+            Tab::Orchestration { role_pane_ids, .. } => role_pane_ids.clone(),
+            _ => panic!("tab 1 should be an orchestration tab"),
+        };
+        tm.record_focus(&role_pane_ids[1]);
+        let tab_bar = TabBarInfo {
+            show: true,
+            labels: vec!["tab-a".into(), "tab-b".into()],
+            active_index: 0,
+            orchestration_statuses: vec![Some(vec![]), Some(vec![])],
+        };
+        let layout = compute_frame_layout(
+            frame_area,
+            &ActiveTabView::Orchestration {
+                role_pane_ids: role_pane_ids.clone(),
+                split_narrow: false,
+                zoomed: true,
+            },
+            &tab_bar,
+            &role_pane_ids,
+            PaneLayout::Stacked,
+            Some(role_pane_ids[1].as_str()),
+            1,
+        );
+        let FrameContent::Cards { pane_rects, .. } = &layout.content else {
+            panic!("Orchestration tab must produce FrameContent::Cards");
+        };
+        let focused_rect = pane_rects
+            .iter()
+            .find(|(id, _)| id == &role_pane_ids[1])
+            .map(|(_, r)| *r)
+            .expect("the focused role must have a rect");
+        assert_eq!(
+            (focused_rect.x, focused_rect.width),
+            (0, 100),
+            "while zoomed, the NEWLY focused role's pane must span the whole \
+             frame width from column 0: {focused_rect:?}"
+        );
+    }
+
+    /// Scenario: PRD #313 — zooming must resize the agent's PTY, not just the
+    /// drawn rect. The per-frame `resize_panes_to_layout` sweep sizes every role
+    /// pane from `FrameLayout::pane_target_dims`, so this asserts those dims
+    /// directly: on a 100-wide frame an unzoomed orchestration role pane targets
+    /// 64 inner columns (the 66% column less its border) and a narrowed one 73,
+    /// while a ZOOMED one must target 98 (the whole frame less its border) —
+    /// including the non-focused Stacked role, which is sized "as if focused" so
+    /// it does not reflow twice on the way back.
+    #[spec("orchestration/layout/010")]
+    #[test]
+    fn orchestration_layout_010_pane_target_dims_follow_zoom() {
+        // 100-wide frame: 66% -> 64 inner cols, 75% -> 73, zoomed (100%) -> 98.
+        let frame_area = Rect::new(0, 0, 100, 40);
+        let role_pane_ids = vec!["r0".to_string(), "r1".to_string()];
+        let tab_bar = TabBarInfo {
+            show: true,
+            labels: vec!["zoom-tab".into()],
+            active_index: 0,
+            orchestration_statuses: vec![Some(vec![])],
+        };
+        let dims = |narrow: bool, zoomed: bool| -> Vec<(String, u16, u16)> {
+            let tab_view = ActiveTabView::Orchestration {
+                role_pane_ids: role_pane_ids.clone(),
+                split_narrow: narrow,
+                zoomed,
+            };
+            let layout = compute_frame_layout(
+                frame_area,
+                &tab_view,
+                &tab_bar,
+                &role_pane_ids,
+                PaneLayout::Stacked,
+                Some("r0"),
+                1,
+            );
+            layout
+                .pane_target_dims()
+                .into_iter()
+                .map(|(id, rows, cols)| (id.to_string(), rows, cols))
+                .collect()
+        };
+
+        let cols_of =
+            |v: &[(String, u16, u16)]| -> Vec<u16> { v.iter().map(|(_, _, c)| *c).collect() };
+
+        let unzoomed = dims(false, false);
+        assert_eq!(
+            cols_of(&unzoomed),
+            vec![64, 64],
+            "unzoomed: every role pane's PTY targets the 66%-width column \
+             (64 inner cols on a 100-wide frame)"
+        );
+        assert_eq!(
+            cols_of(&dims(true, false)),
+            vec![73, 73],
+            "narrowed: every role pane's PTY targets the 75%-width column \
+             (73 inner cols), matching orchestration/layout/006"
+        );
+
+        for narrow in [false, true] {
+            let zoomed = dims(narrow, true);
+            assert_eq!(
+                cols_of(&zoomed),
+                vec![98, 98],
+                "zoomed (split_narrow={narrow}): every role pane's PTY must \
+                 target the FULL-width column (98 inner cols on a 100-wide \
+                 frame), not the 66%/75% one — this is the seam \
+                 `resize_panes_to_layout` reads, so an agent that does not get \
+                 these dims never reflows"
+            );
+            // Zoom reclaims WIDTH only: the tab strip and the bottom bar stay,
+            // so the row budget is untouched. Pins the PRD's scope discipline —
+            // zoom gets the toggle and the indicator, and nothing else.
+            let rows: Vec<u16> = zoomed.iter().map(|(_, r, _)| *r).collect();
+            assert_eq!(
+                rows,
+                unzoomed.iter().map(|(_, r, _)| *r).collect::<Vec<_>>(),
+                "zooming must not change the pane row budget — it hides the \
+                 sidebar and the non-focused panes, nothing else"
+            );
+        }
+    }
+
+    /// Scenario: Issue #747 — lay out an orchestration tab on a terminal far
+    /// wider than `PTY_RESIZE_DIM_MAX` (4200 cols zoomed, 6400 cols unzoomed),
+    /// run the real per-frame `resize_panes_to_layout` sweep over inert panes,
+    /// then read each pane's local vt100 parser back. The daemon clamps every
+    /// axis of a resize request to the cap before it reaches the child PTY, so
+    /// the client's parser must land on that SAME capped geometry — otherwise
+    /// the pane parses the agent's output at one width while the child wraps it
+    /// at another and the content renders rewrapped. The control is the same
+    /// sweep at an ordinary 4200-col unzoomed width, whose 2770-col target is
+    /// under the cap and must therefore be left exactly alone.
+    #[spec("resize/layout/002")]
+    #[test]
+    fn resize_layout_002_over_cap_pane_targets_the_geometry_the_child_gets() {
+        use crate::agent_pty::PTY_RESIZE_DIM_MAX;
+
+        let role_pane_ids = vec!["r0".to_string(), "r1".to_string()];
+        let tab_bar = TabBarInfo {
+            show: true,
+            labels: vec!["wide-tab".into()],
+            active_index: 0,
+            orchestration_statuses: vec![Some(vec![])],
+        };
+
+        // Drive the production chain the main loop runs: one layout pass, then
+        // the PTY-sizing sweep over it. Returns, per pane, the dims the layout
+        // asked for and the geometry the local parser actually ended up at.
+        let sweep = |width: u16, zoomed: bool| -> Vec<(u16, u16, u16, u16)> {
+            let ctrl = EmbeddedPaneController::for_render_seam_with_focused_pane("r0", 24, 80, b"");
+            // Held for the life of the sweep: dropping a pane's child-input
+            // receiver closes its channel, a state this seam has no reason to pose.
+            let _child_inputs: Vec<_> = role_pane_ids
+                .iter()
+                .skip(1)
+                .map(|id| ctrl.add_scroll_seam_pane(id, 24, 80, b""))
+                .collect();
+
+            let tab_view = ActiveTabView::Orchestration {
+                role_pane_ids: role_pane_ids.clone(),
+                split_narrow: false,
+                zoomed,
+            };
+            let layout = compute_frame_layout(
+                Rect::new(0, 0, width, 40),
+                &tab_view,
+                &tab_bar,
+                &role_pane_ids,
+                PaneLayout::Stacked,
+                Some("r0"),
+                1,
+            );
+            let targets: Vec<(String, u16, u16)> = layout
+                .pane_target_dims()
+                .into_iter()
+                .map(|(id, rows, cols)| (id.to_string(), rows, cols))
+                .collect();
+            resize_panes_to_layout(&layout, &ctrl);
+            targets
+                .into_iter()
+                .map(|(id, rows, cols)| {
+                    let (parser_rows, parser_cols) = ctrl
+                        .get_screen(&id)
+                        .expect("every laid-out pane must be registered on the seam controller")
+                        .lock()
+                        .expect("the seam parser lock must stay healthy")
+                        .screen()
+                        .size();
+                    (rows, cols, parser_rows, parser_cols)
+                })
+                .collect()
+        };
+
+        // What `AgentPtyRegistry::resize` will actually hand the child, spelled
+        // out here rather than borrowed from the production helper so the test
+        // restates the daemon's rule instead of echoing it.
+        let child_geometry =
+            |rows: u16, cols: u16| (rows.min(PTY_RESIZE_DIM_MAX), cols.min(PTY_RESIZE_DIM_MAX));
+
+        // --- Control: 4200 cols unzoomed. The 66% column is 2770 inner cols,
+        // comfortably under the cap, so nothing may be clamped here. ---
+        for (target_rows, target_cols, parser_rows, parser_cols) in sweep(4200, false) {
+            assert_eq!(
+                (target_rows, target_cols),
+                (36, 2770),
+                "control: an under-cap pane must target its full inner rect"
+            );
+            assert_eq!(
+                (parser_rows, parser_cols),
+                (36, 2770),
+                "control: an under-cap pane's parser must be left at its full \
+                 inner rect — the cap may not narrow an ordinary pane"
+            );
+        }
+
+        // --- Zoomed at 4200 cols: the pane column is the whole frame, so the
+        // inner width is 4198 — over the cap, which is the PRD #313 threshold. ---
+        // --- Unzoomed at 6400 cols: the 66% column is 4222 inner cols — over
+        // the cap too, which is the pre-existing, layout-independent threshold. ---
+        for (width, zoomed, raw_cols) in [(4200u16, true, 4198u16), (6400, false, 4222)] {
+            assert!(
+                raw_cols > PTY_RESIZE_DIM_MAX,
+                "fixture must actually exceed the cap ({raw_cols} vs {PTY_RESIZE_DIM_MAX})"
+            );
+            for (target_rows, target_cols, parser_rows, parser_cols) in sweep(width, zoomed) {
+                assert_eq!(
+                    (target_rows, target_cols),
+                    child_geometry(36, raw_cols),
+                    "at {width} cols (zoomed={zoomed}) the layout's PTY target must \
+                     already be the capped geometry — it is the single source \
+                     `resize_panes_to_layout` drives every pane from, so an \
+                     over-cap value here reaches the wire and the local parser \
+                     while the child gets something narrower"
+                );
+                assert_eq!(
+                    (parser_rows, parser_cols),
+                    child_geometry(36, raw_cols),
+                    "at {width} cols (zoomed={zoomed}) the local vt100 parser must \
+                     sit at the SAME geometry the daemon hands the child \
+                     ({PTY_RESIZE_DIM_MAX} cols max); parsing the agent's output \
+                     at {parser_cols} cols while the child wraps it at \
+                     {PTY_RESIZE_DIM_MAX} is issue #747's rewrapped pane"
+                );
+            }
+        }
+
+        // --- The resize PRIMITIVE, not just the layout that drives it. The
+        // layout sweep above is the only production caller today, but
+        // `resize_pane_pty` is a `pub` method whose two halves must not be able
+        // to disagree: whatever it hands `set_size` is also what it puts on the
+        // watch channel bound for `AttachRequest::Resize`. Bounding only the
+        // layout would leave the divergence one new call site away. ---
+        // One over-cap axis at a time, each paired with a small one: a parser
+        // that is over-cap on BOTH axes is 16.7M cells, which is real time and
+        // real memory to buy no extra coverage of a per-axis `min`.
+        let ctrl = EmbeddedPaneController::for_render_seam_with_focused_pane("wide", 24, 80, b"");
+        let _tall_input = ctrl.add_scroll_seam_pane("tall", 24, 80, b"");
+        for (pane_id, req, want) in [
+            (
+                "wide",
+                (24, PTY_RESIZE_DIM_MAX + 200),
+                (24, PTY_RESIZE_DIM_MAX),
+            ),
+            (
+                "tall",
+                (PTY_RESIZE_DIM_MAX + 1, 80),
+                (PTY_RESIZE_DIM_MAX, 80),
+            ),
+        ] {
+            ctrl.resize_pane_pty(pane_id, req.0, req.1)
+                .expect("resizing a registered seam pane must succeed");
+            let got = ctrl
+                .get_screen(pane_id)
+                .expect("the seam controller must register its panes")
+                .lock()
+                .expect("the seam parser lock must stay healthy")
+                .screen()
+                .size();
+            assert_eq!(
+                got, want,
+                "resize_pane_pty({}x{}) must clamp before touching the parser, so the \
+                 parser can never be told a geometry the daemon would narrow behind it",
+                req.0, req.1
+            );
+        }
+    }
+
+    /// Scenario: PRD #313 M1 under the Tiled pane layout — tile an orchestration
+    /// tab with the real `Action::ToggleLayout` dispatch, then zoom it with
+    /// `Action::ToggleZoom` and assert only the FOCUSED role pane gets a drawn
+    /// rect, the other two collapsing to zero height (PRD #311 M2's convention),
+    /// while the same tab unzoomed still tiles all three. The deck's stored
+    /// `PaneLayout::Tiled` must survive the zoom untouched, so unzooming restores
+    /// the user's tiled view exactly rather than dropping them into Stacked.
+    #[spec("orchestration/layout/011")]
+    #[test]
+    fn orchestration_layout_011_zoom_draws_only_the_focused_pane_under_tiled() {
+        let tmp = tempdir().expect("tempdir");
+        let pc = Arc::new(CapturingPaneController::new());
+        let mut tm = TabManager::new(pc.clone());
+        let mut ui = default_ui();
+        let state: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
+        let frame_area = Rect::new(0, 0, 100, 40);
+
+        // THREE roles, deliberately: with two panes "only the focused one is
+        // drawn" and "the other one happens to be empty" are the same
+        // observation, and a Tiled frame that dropped just one slot would still
+        // pass. With three, the claim has to hold for every non-focused pane.
+        let mut snapshot = AppState::default();
+        for (sid, pid) in [
+            ("sess-0", "pane-0"),
+            ("sess-1", "pane-1"),
+            ("sess-2", "pane-2"),
+        ] {
+            let mut sess = make_session(SessionStatus::Idle);
+            sess.session_id = sid.to_string();
+            sess.pane_id = Some(pid.to_string());
+            snapshot.sessions.insert(sid.to_string(), sess);
+        }
+        let session_ids = [
+            "sess-0".to_string(),
+            "sess-1".to_string(),
+            "sess-2".to_string(),
+        ];
+        let filtered: Vec<(&String, &SessionState)> = session_ids
+            .iter()
+            .map(|id| (id, snapshot.sessions.get(id).expect("seeded session")))
+            .collect();
+
+        let role = |name: &str, start: bool| OrchestrationRoleConfig {
+            agent: None,
+            name: name.to_string(),
+            command: "cat".to_string(),
+            start,
+            description: None,
+            prompt_template: None,
+            clear: false,
+        };
+        tm.open_orchestration_tab(
+            &OrchestrationConfig {
+                default: false,
+                name: "tiled-zoom".to_string(),
+                roles: vec![
+                    role("orchestrator", true),
+                    role("worker", false),
+                    role("reviewer", false),
+                ],
+            },
+            tmp.path().to_str().expect("utf-8 tmp path"),
+            None,
+            None,
+            (24, 80),
+        )
+        .expect("open orchestration tab");
+
+        let role_pane_ids = match &tm.tabs()[1] {
+            Tab::Orchestration { role_pane_ids, .. } => role_pane_ids.clone(),
+            _ => panic!("tab 1 should be an orchestration tab"),
+        };
+        assert_eq!(role_pane_ids.len(), 3, "the tab must own three role panes");
+        let zoomed_of = |tm: &TabManager| match &tm.tabs()[1] {
+            Tab::Orchestration { zoomed, .. } => *zoomed,
+            _ => panic!("tab 1 should be an orchestration tab"),
+        };
+
+        // `Ctrl+t` — the user's own layout choice, made through the real
+        // dispatch rather than by poking `ui.pane_layout`.
+        assert_eq!(
+            ui.pane_layout,
+            PaneLayout::Stacked,
+            "the deck starts in the default Stacked layout"
+        );
+        dispatch_action(
+            Action::ToggleLayout,
+            &mut ui,
+            pc.as_ref(),
+            &state,
+            &mut tm,
+            &snapshot,
+            &filtered,
+            None,
+            frame_area,
+        );
+        assert_eq!(
+            ui.pane_layout,
+            PaneLayout::Tiled,
+            "ToggleLayout must put the deck in Tiled"
+        );
+
+        // `z` on top of it.
+        dispatch_action(
+            Action::ToggleZoom,
+            &mut ui,
+            pc.as_ref(),
+            &state,
+            &mut tm,
+            &snapshot,
+            &filtered,
+            None,
+            frame_area,
+        );
+        assert!(zoomed_of(&tm), "the tab must be zoomed after one toggle");
+
+        // The half a plausible-but-wrong implementation fails: zoom must NOT
+        // flip the stored layout to Stacked and flip it back on unzoom. The
+        // toggle the user set is theirs; zoom overrides the frame, not the
+        // preference, and that is what makes PRD #313's "the same key restores
+        // the previous view exactly" true for a tiled deck.
+        assert_eq!(
+            ui.pane_layout,
+            PaneLayout::Tiled,
+            "zooming must leave the deck's stored pane layout at Tiled — zoom \
+             overrides the frame for as long as it is on, it does not rewrite \
+             the user's Ctrl+t choice"
+        );
+
+        // Geometry, resolved through the same seam the render loop reads: the
+        // stored `ui.pane_layout` goes in, and the effective layout comes out.
+        let tab_bar = TabBarInfo {
+            show: true,
+            labels: vec!["tiled-zoom".into()],
+            active_index: 0,
+            orchestration_statuses: vec![Some(vec![])],
+        };
+        let rects = |zoomed: bool| -> (Rect, Vec<(String, Rect)>) {
+            let layout = compute_frame_layout(
+                frame_area,
+                &ActiveTabView::Orchestration {
+                    role_pane_ids: role_pane_ids.clone(),
+                    split_narrow: false,
+                    zoomed,
+                },
+                &tab_bar,
+                &role_pane_ids,
+                ui.pane_layout,
+                Some(role_pane_ids[0].as_str()),
+                1,
+            );
+            let FrameContent::Cards {
+                panes_area,
+                pane_rects,
+                ..
+            } = layout.content
+            else {
+                panic!("Orchestration tab must produce FrameContent::Cards");
+            };
+            (
+                panes_area.expect("role panes => a right pane column"),
+                pane_rects,
+            )
+        };
+        let height_of = |pane_rects: &[(String, Rect)], id: &str| -> u16 {
+            pane_rects
+                .iter()
+                .find(|(pid, _)| pid.as_str() == id)
+                .map(|(_, r)| r.height)
+                .unwrap_or_else(|| {
+                    panic!("role pane {id} must keep a rect in the layout: {pane_rects:?}")
+                })
+        };
+
+        // (1) Zoomed + Tiled: only the focused pane is drawn. PRD #313 M1 says
+        // "sidebar and other panes are not drawn", and under Tiled today the
+        // second half is false — every role keeps a full-width slice of the
+        // frame, so zoom reads as "make all the panes wider" instead of
+        // "get everything else out of the way".
+        let (panes_area, zoomed_rects) = rects(true);
+        assert_eq!(
+            zoomed_rects
+                .iter()
+                .find(|(id, _)| id == &role_pane_ids[0])
+                .map(|(_, r)| *r),
+            Some(panes_area),
+            "zoomed, the FOCUSED role pane must be the whole pane column \
+             (which orchestration/layout/008 pins to the whole frame), whatever \
+             the Stacked/Tiled toggle says: {zoomed_rects:?}"
+        );
+        for id in &role_pane_ids[1..] {
+            assert_eq!(
+                height_of(&zoomed_rects, id.as_str()),
+                0,
+                "zoomed, the non-focused role pane {id} must not be drawn — \
+                 zero reserved height, the same convention PRD #311 M2 gives \
+                 Stacked and orchestration/layout/002 pins: {zoomed_rects:?}"
+            );
+        }
+
+        // (2) The same tab UNZOOMED is still tiled: every role pane keeps a
+        // drawn slice. Zoom overrode the frame; it did not quietly restack the
+        // deck underneath.
+        let (unzoomed_area, unzoomed_rects) = rects(false);
+        for id in &role_pane_ids {
+            assert!(
+                height_of(&unzoomed_rects, id.as_str()) > 0,
+                "unzoomed, every role pane must still be drawn under Tiled — \
+                 {id} got zero height: {unzoomed_rects:?}"
+            );
+        }
+        assert_eq!(
+            unzoomed_rects.iter().map(|(_, r)| r.height).sum::<u16>(),
+            unzoomed_area.height,
+            "unzoomed, the three tiled panes must divide the pane column \
+             between them: {unzoomed_rects:?}"
+        );
+
+        // (3) Unzooming leaves the user exactly where they were: tab unzoomed,
+        // layout still Tiled, nothing to undo by hand.
+        dispatch_action(
+            Action::ToggleZoom,
+            &mut ui,
+            pc.as_ref(),
+            &state,
+            &mut tm,
+            &snapshot,
+            &filtered,
+            None,
+            frame_area,
+        );
+        assert!(!zoomed_of(&tm), "the tab must round-trip to unzoomed");
+        assert_eq!(
+            ui.pane_layout,
+            PaneLayout::Tiled,
+            "unzooming must leave the deck in Tiled — the layout the user chose \
+             before they ever pressed z"
+        );
+    }
+
     // PRD #144 — `modal_rect` is the shared content-driven modal sizer: clamp the
     // desired content dims into `[min, 90% of terminal]`, never exceeding the
     // terminal bounds, and center the result. Pure data, so a plain unit test.
@@ -22374,6 +24525,7 @@ mod tests {
         let ui = UiState::default();
         let tab_view = ActiveTabView::Dashboard {
             exclude_pane_ids: Vec::new(),
+            zoomed: false,
         };
         // 8 cols is narrower than any single full button label, so every button
         // wraps onto its own row — the uncapped count (9) exceeds each of these
@@ -23954,6 +26106,7 @@ mod tests {
                 // (one layout pass per frame); compute it from the same inputs.
                 let tab_view = ActiveTabView::Dashboard {
                     exclude_pane_ids: vec![],
+                    zoomed: false,
                 };
                 let tab_bar = TabBarInfo {
                     show: false,
@@ -24044,6 +26197,7 @@ mod tests {
                 // (one layout pass per frame); compute it from the same inputs.
                 let tab_view = ActiveTabView::Dashboard {
                     exclude_pane_ids: vec![],
+                    zoomed: false,
                 };
                 let tab_bar = TabBarInfo {
                     show: false,
@@ -24184,6 +26338,7 @@ mod tests {
                 // (one layout pass per frame); compute it from the same inputs.
                 let tab_view = ActiveTabView::Dashboard {
                     exclude_pane_ids: vec![],
+                    zoomed: false,
                 };
                 let tab_bar = TabBarInfo {
                     show: false,
@@ -24545,6 +26700,7 @@ mod tests {
                 // (one layout pass per frame); compute it from the same inputs.
                 let tab_view = ActiveTabView::Dashboard {
                     exclude_pane_ids: vec![],
+                    zoomed: false,
                 };
                 let tab_bar = TabBarInfo {
                     show: false,
@@ -24638,6 +26794,7 @@ mod tests {
                 // (one layout pass per frame); compute it from the same inputs.
                 let tab_view = ActiveTabView::Dashboard {
                     exclude_pane_ids: vec![],
+                    zoomed: false,
                 };
                 let tab_bar = TabBarInfo {
                     show: false,
@@ -24706,6 +26863,7 @@ mod tests {
                 // (one layout pass per frame); compute it from the same inputs.
                 let tab_view = ActiveTabView::Dashboard {
                     exclude_pane_ids: vec![],
+                    zoomed: false,
                 };
                 let tab_bar = TabBarInfo {
                     show: false,
@@ -26271,6 +28429,7 @@ mod tests {
         ui.selected_index = Some(1);
         if let Tab::Dashboard {
             selected_session_id,
+            ..
         } = tab_manager.active_tab_mut()
         {
             *selected_session_id = Some("s1".to_string());
@@ -26407,6 +28566,7 @@ mod tests {
         ui.selected_index = Some(1);
         if let Tab::Dashboard {
             selected_session_id,
+            ..
         } = tab_manager.active_tab_mut()
         {
             *selected_session_id = Some("s1".to_string());
@@ -26583,6 +28743,7 @@ mod tests {
         ui.selected_index = None; // inactive
         let mut tab = Tab::Dashboard {
             selected_session_id: None,
+            zoomed: false,
         };
         reconcile_dashboard_selection(&mut ui, &mut tab, Some("p1"), &filtered);
         assert_eq!(
@@ -26596,6 +28757,7 @@ mod tests {
         ui2.selected_index = None;
         let mut tab2 = Tab::Dashboard {
             selected_session_id: None,
+            zoomed: false,
         };
         reconcile_dashboard_selection(&mut ui2, &mut tab2, None, &filtered);
         assert_eq!(
@@ -26731,6 +28893,7 @@ mod tests {
         ui.selected_index = Some(1);
         if let Tab::Dashboard {
             selected_session_id,
+            ..
         } = tab_manager.active_tab_mut()
         {
             *selected_session_id = Some("s1".to_string());
@@ -27082,6 +29245,7 @@ mod tests {
             ui.selected_index = Some(1);
             if let Tab::Dashboard {
                 selected_session_id,
+                ..
             } = tab_manager.active_tab_mut()
             {
                 *selected_session_id = Some("s1".to_string());
@@ -27196,6 +29360,7 @@ mod tests {
         ui.selected_index = Some(1);
         if let Tab::Dashboard {
             selected_session_id,
+            ..
         } = tab_manager.active_tab_mut()
         {
             *selected_session_id = Some("agent-sess".to_string());
@@ -27246,6 +29411,7 @@ mod tests {
         ui.selected_index = None; // inactive
         let mut tab = Tab::Dashboard {
             selected_session_id: None,
+            zoomed: false,
         };
         let filtered: [(&str, Option<&str>); 3] =
             [("s0", Some("p0")), ("s1", Some("p1")), ("s2", Some("p2"))];
@@ -28755,6 +30921,335 @@ mod tests {
         let ready_since = now - SPAWN_TIME_READINESS_BUFFER;
         // `>=` boundary: exactly at the buffer should fire.
         assert!(should_inject_spawn_time_prompt(Some(ready_since), now));
+    }
+
+    // Orchestrator remit re-assertion trigger policy. Pure-data: only a
+    // Compacting status observation for the start-role pane should trigger
+    // re-assertion; every other status (including the terminal Error and the
+    // forward-compat Unknown catch-all) must not.
+    #[test]
+    fn remit_reassert_fires_only_for_compacting_status() {
+        assert!(should_reassert_orchestrator_remit(
+            &SessionStatus::Compacting
+        ));
+        assert!(!should_reassert_orchestrator_remit(
+            &SessionStatus::Thinking
+        ));
+        assert!(!should_reassert_orchestrator_remit(&SessionStatus::Working));
+        assert!(!should_reassert_orchestrator_remit(
+            &SessionStatus::WaitingForInput
+        ));
+        assert!(!should_reassert_orchestrator_remit(&SessionStatus::Idle));
+        assert!(!should_reassert_orchestrator_remit(&SessionStatus::Error));
+        assert!(!should_reassert_orchestrator_remit(&SessionStatus::Unknown));
+    }
+
+    // Pure policy: `orchestrator_remit_pane_is_compacting` must find the
+    // REAL, tagged session on the start-role pane and ignore (a) a
+    // co-resident placeholder on the SAME pane and (b) a Compacting session
+    // on a DIFFERENT pane. `AppState::apply_event` (`src/state.rs`)
+    // documents that two sessions can legitimately co-reside on one
+    // `pane_id`, so this pins the `.any()` lookup against exactly the
+    // divergence an order-dependent `.find()` would be exposed to.
+    #[test]
+    fn remit_pane_compacting_ignores_placeholder_and_other_panes() {
+        let mut sessions: HashMap<String, SessionState> = HashMap::new();
+
+        // Co-resident placeholder on the target pane, reporting Compacting —
+        // must not count; `agent_type: None` means no real agent produced it.
+        sessions.insert(
+            "placeholder".to_string(),
+            SessionState {
+                pane_id: Some("orch-pane".to_string()),
+                agent_type: AgentType::None,
+                ..make_session(SessionStatus::Compacting)
+            },
+        );
+        assert!(
+            !orchestrator_remit_pane_is_compacting(sessions.values(), "orch-pane"),
+            "a placeholder session (agent_type: None) must not count as compacting"
+        );
+
+        // A real, tagged session Compacting on a DIFFERENT pane must not
+        // count for "orch-pane" either.
+        sessions.insert(
+            "other-pane-session".to_string(),
+            SessionState {
+                pane_id: Some("other-pane".to_string()),
+                agent_type: AgentType::Codex,
+                ..make_session(SessionStatus::Compacting)
+            },
+        );
+        assert!(
+            !orchestrator_remit_pane_is_compacting(sessions.values(), "orch-pane"),
+            "a Compacting session on a different pane must not count"
+        );
+
+        // The REAL, tagged session co-resident on "orch-pane" alongside the
+        // placeholder, reporting Compacting, must count — order-independence
+        // (`.any()`, not `.find()`) is what makes this reliable regardless of
+        // which of the two entries the map happens to iterate first.
+        sessions.insert(
+            "orch-pane-real".to_string(),
+            SessionState {
+                pane_id: Some("orch-pane".to_string()),
+                agent_type: AgentType::Codex,
+                ..make_session(SessionStatus::Compacting)
+            },
+        );
+        assert!(
+            orchestrator_remit_pane_is_compacting(sessions.values(), "orch-pane"),
+            "the real tagged session on the target pane must count even with \
+             a co-resident placeholder present"
+        );
+    }
+
+    // Pure policy: `orchestrator_remit_pane_latest_clear_session_start` must
+    // find only a genuinely qualifying `/clear`-originated `SessionStart` on
+    // the REAL, tagged session on the start-role pane, ignoring (a) a
+    // co-resident placeholder, (b) a matching event on a DIFFERENT pane, (c)
+    // a non-`SessionStart` event carrying the clear metadata, (d) a
+    // `SessionStart` event with absent or wrong clear metadata, and (e) a
+    // fully metadata-qualifying `SessionStart` with a non-`ClaudeCode`
+    // agent_type — then must return the LATEST qualifying timestamp when more
+    // than one co-resident session on the pane carries one,
+    // order-independently. Direct template:
+    // `remit_pane_compacting_ignores_placeholder_and_other_panes` above.
+    #[test]
+    fn remit_pane_latest_clear_session_start_filters_and_picks_latest() {
+        fn clear_event(timestamp: chrono::DateTime<Utc>) -> AgentEvent {
+            let mut metadata = HashMap::new();
+            metadata.insert(
+                crate::event::CLEAR_SESSION_START_METADATA_KEY.to_string(),
+                crate::event::CLEAR_SESSION_START_METADATA_VALUE.to_string(),
+            );
+            AgentEvent {
+                session_id: "s".to_string(),
+                agent_type: AgentType::ClaudeCode,
+                event_type: EventType::SessionStart,
+                tool_name: None,
+                tool_detail: None,
+                cwd: None,
+                timestamp,
+                user_prompt: None,
+                metadata,
+                pane_id: None,
+                agent_id: None,
+                agent_version: None,
+                schema_version: None,
+                live_target: None,
+            }
+        }
+
+        let mut sessions: HashMap<String, SessionState> = HashMap::new();
+        let base = Utc::now();
+
+        assert_eq!(
+            orchestrator_remit_pane_latest_clear_session_start(sessions.values(), "orch-pane"),
+            None,
+            "no sessions at all on the pane must yield None"
+        );
+
+        // Co-resident placeholder on the target pane, carrying a qualifying
+        // clear event — must not count; `agent_type: None` means no real
+        // agent produced it.
+        let mut placeholder_events = std::collections::VecDeque::new();
+        placeholder_events.push_back(clear_event(base));
+        sessions.insert(
+            "placeholder".to_string(),
+            SessionState {
+                pane_id: Some("orch-pane".to_string()),
+                agent_type: AgentType::None,
+                recent_events: placeholder_events,
+                ..make_session(SessionStatus::Idle)
+            },
+        );
+        assert_eq!(
+            orchestrator_remit_pane_latest_clear_session_start(sessions.values(), "orch-pane"),
+            None,
+            "a placeholder session (agent_type: None) must not count"
+        );
+
+        // A real, tagged session on a DIFFERENT pane carrying a qualifying
+        // clear event must not count for "orch-pane" either.
+        let mut other_pane_events = std::collections::VecDeque::new();
+        other_pane_events.push_back(clear_event(base));
+        sessions.insert(
+            "other-pane-session".to_string(),
+            SessionState {
+                pane_id: Some("other-pane".to_string()),
+                agent_type: AgentType::Codex,
+                recent_events: other_pane_events,
+                ..make_session(SessionStatus::Idle)
+            },
+        );
+        assert_eq!(
+            orchestrator_remit_pane_latest_clear_session_start(sessions.values(), "orch-pane"),
+            None,
+            "a qualifying event on a different pane must not count"
+        );
+
+        // The real, tagged session on "orch-pane" itself, but its only event
+        // carries the clear metadata on the WRONG event type (Compacting,
+        // not SessionStart) — must not count.
+        let mut wrong_type_event = clear_event(base);
+        wrong_type_event.event_type = EventType::Compacting;
+        let mut real_events = std::collections::VecDeque::new();
+        real_events.push_back(wrong_type_event);
+        sessions.insert(
+            "orch-pane-real".to_string(),
+            SessionState {
+                pane_id: Some("orch-pane".to_string()),
+                agent_type: AgentType::Codex,
+                recent_events: real_events.clone(),
+                ..make_session(SessionStatus::Idle)
+            },
+        );
+        assert_eq!(
+            orchestrator_remit_pane_latest_clear_session_start(sessions.values(), "orch-pane"),
+            None,
+            "a non-SessionStart event carrying the clear metadata must not count"
+        );
+
+        // Same pane/session, a genuine SessionStart but with NO metadata at
+        // all — must not count. `agent_type: ClaudeCode` here (not `Codex`)
+        // isolates the metadata predicate on its own: the
+        // `agent_type == AgentType::ClaudeCode` gate is satisfied, so this
+        // case would still fail even if that gate were deleted, proving it's
+        // the metadata check doing the work.
+        real_events.clear();
+        real_events.push_back(AgentEvent {
+            session_id: "s".to_string(),
+            agent_type: AgentType::ClaudeCode,
+            event_type: EventType::SessionStart,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp: base,
+            user_prompt: None,
+            metadata: HashMap::new(),
+            pane_id: None,
+            agent_id: None,
+            agent_version: None,
+            schema_version: None,
+            live_target: None,
+        });
+        sessions.get_mut("orch-pane-real").unwrap().recent_events = real_events.clone();
+        assert_eq!(
+            orchestrator_remit_pane_latest_clear_session_start(sessions.values(), "orch-pane"),
+            None,
+            "a SessionStart event with no clear metadata must not count"
+        );
+
+        // Same pane/session, a genuine SessionStart but with the WRONG clear
+        // metadata value — must not count. `agent_type: ClaudeCode` again,
+        // for the same isolation reason as the no-metadata case above.
+        let mut wrong_value_metadata = HashMap::new();
+        wrong_value_metadata.insert(
+            crate::event::CLEAR_SESSION_START_METADATA_KEY.to_string(),
+            "not-clear".to_string(),
+        );
+        real_events.clear();
+        real_events.push_back(AgentEvent {
+            session_id: "s".to_string(),
+            agent_type: AgentType::ClaudeCode,
+            event_type: EventType::SessionStart,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp: base,
+            user_prompt: None,
+            metadata: wrong_value_metadata,
+            pane_id: None,
+            agent_id: None,
+            agent_version: None,
+            schema_version: None,
+            live_target: None,
+        });
+        sessions.get_mut("orch-pane-real").unwrap().recent_events = real_events.clone();
+        assert_eq!(
+            orchestrator_remit_pane_latest_clear_session_start(sessions.values(), "orch-pane"),
+            None,
+            "a SessionStart event with the wrong clear metadata value must not count"
+        );
+
+        // Same pane/session, fully metadata-qualifying (SessionStart, correct
+        // key/value) but with a non-ClaudeCode agent_type — must not count.
+        // This isolates the `agent_type == AgentType::ClaudeCode` gate on its
+        // own, which neither case above does: both of those already fail on
+        // the metadata predicate first, so deleting the agent_type gate
+        // would break no case without this one.
+        let mut non_claude_code_event = clear_event(base);
+        non_claude_code_event.agent_type = AgentType::Codex;
+        real_events.clear();
+        real_events.push_back(non_claude_code_event);
+        sessions.get_mut("orch-pane-real").unwrap().recent_events = real_events.clone();
+        assert_eq!(
+            orchestrator_remit_pane_latest_clear_session_start(sessions.values(), "orch-pane"),
+            None,
+            "a fully metadata-qualifying SessionStart with a non-ClaudeCode agent_type must \
+             not count"
+        );
+
+        // Now give the real, tagged session a genuinely qualifying clear
+        // event — must count, and its timestamp must be returned.
+        real_events.clear();
+        real_events.push_back(clear_event(base));
+        sessions.get_mut("orch-pane-real").unwrap().recent_events = real_events.clone();
+        assert_eq!(
+            orchestrator_remit_pane_latest_clear_session_start(sessions.values(), "orch-pane"),
+            Some(base),
+            "a genuinely qualifying clear-originated SessionStart on the real, tagged \
+             session must count"
+        );
+
+        // A SECOND real, tagged session co-resident on the same pane
+        // (`AppState::apply_event` documents this co-residence is legitimate,
+        // mirroring `remit_pane_compacting_ignores_placeholder_and_other_panes`
+        // above), with a LATER qualifying clear event, must win via `.max()`
+        // — order-independently, regardless of HashMap iteration order.
+        let later = base + Duration::seconds(30);
+        let mut second_events = std::collections::VecDeque::new();
+        second_events.push_back(clear_event(later));
+        sessions.insert(
+            "orch-pane-real-2".to_string(),
+            SessionState {
+                pane_id: Some("orch-pane".to_string()),
+                agent_type: AgentType::ClaudeCode,
+                recent_events: second_events,
+                ..make_session(SessionStatus::Idle)
+            },
+        );
+        assert_eq!(
+            orchestrator_remit_pane_latest_clear_session_start(sessions.values(), "orch-pane"),
+            Some(later),
+            "the LATEST qualifying clear-originated SessionStart across co-resident \
+             sessions on the pane must win, regardless of HashMap iteration order"
+        );
+    }
+
+    // A (re-)delivered remit prompt sets the start role's displayed status to
+    // `Working` from `Waiting`/`Working`, but must never clobber a TERMINAL
+    // status (`Done`, or `Failed` — the warm-reattach hydration path's "role
+    // died" marker) a re-assertion has no business overwriting.
+    #[test]
+    fn next_start_role_status_preserves_terminal_statuses() {
+        assert_eq!(
+            next_start_role_status_after_delivery(OrchestrationRoleStatus::Waiting),
+            OrchestrationRoleStatus::Working
+        );
+        assert_eq!(
+            next_start_role_status_after_delivery(OrchestrationRoleStatus::Working),
+            OrchestrationRoleStatus::Working
+        );
+        assert_eq!(
+            next_start_role_status_after_delivery(OrchestrationRoleStatus::Done),
+            OrchestrationRoleStatus::Done
+        );
+        assert_eq!(
+            next_start_role_status_after_delivery(OrchestrationRoleStatus::Failed),
+            OrchestrationRoleStatus::Failed
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -32547,7 +35042,7 @@ mod tests {
                 _ => unreachable!(),
             };
             let mut ui = default_ui();
-            ui.orchestration_created_at.insert(tab_id, now);
+            ui.orchestration_prompt_anchor_at.insert(tab_id, now);
             ui.orchestration_ready_since.insert(
                 tab_id,
                 now.checked_sub(SPAWN_TIME_READINESS_BUFFER + std::time::Duration::from_millis(1))
@@ -33367,7 +35862,7 @@ mod tests {
         let tab_id: TabId = 30030;
         let mut held_role_ui = default_ui();
         held_role_ui
-            .orchestration_created_at
+            .orchestration_prompt_anchor_at
             .insert(tab_id, started);
         held_role_ui.orchestration_ready_since.insert(
             tab_id,
@@ -33500,7 +35995,7 @@ mod tests {
         let burst_tab_id: TabId = 30031;
         let mut burst_role_ui = default_ui();
         burst_role_ui
-            .orchestration_created_at
+            .orchestration_prompt_anchor_at
             .insert(burst_tab_id, burst_started);
         burst_role_ui.orchestration_ready_since.insert(
             burst_tab_id,
@@ -33622,7 +36117,7 @@ mod tests {
         let lost_tab_id: TabId = 30032;
         let mut lost_role_ui = default_ui();
         lost_role_ui
-            .orchestration_created_at
+            .orchestration_prompt_anchor_at
             .insert(lost_tab_id, lost_started);
         lost_role_ui.orchestration_ready_since.insert(
             lost_tab_id,
@@ -33868,7 +36363,7 @@ mod tests {
         let created = std::time::Instant::now();
         let tab_id: TabId = 25;
         let mut ui = default_ui();
-        ui.orchestration_created_at.insert(tab_id, created);
+        ui.orchestration_prompt_anchor_at.insert(tab_id, created);
         ui.orchestration_ready_since.insert(
             tab_id,
             created
@@ -34752,7 +37247,7 @@ mod tests {
         let mut ui = default_ui();
         let tab_id: TabId = 7;
         let created = std::time::Instant::now();
-        ui.orchestration_created_at.insert(tab_id, created);
+        ui.orchestration_prompt_anchor_at.insert(tab_id, created);
         let now_past_deadline = created
             .checked_add(AUTOMATIC_PROMPT_DEADLINE + std::time::Duration::from_secs(1))
             .expect("future instant");
@@ -34792,7 +37287,7 @@ mod tests {
         ));
         let mut ui2 = default_ui();
         let tab2: TabId = 8;
-        ui2.orchestration_created_at
+        ui2.orchestration_prompt_anchor_at
             .insert(tab2, std::time::Instant::now());
         ui2.orchestration_ready_since.insert(
             tab2,

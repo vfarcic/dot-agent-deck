@@ -1,4 +1,4 @@
-#![cfg(feature = "e2e")]
+#![cfg(all(feature = "e2e", feature = "e2e-live"))]
 
 //! L2 PTY-attached REAL-agent proof for PRD #225 M5: a `clear = true` delegate
 //! to a **Codex** worker delivers the prompt and the worker acts on it.

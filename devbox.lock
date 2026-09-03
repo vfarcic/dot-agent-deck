@@ -343,116 +343,116 @@
         }
       }
     },
-    "ffmpeg@8.1.2": {
-      "last_modified": "2026-08-01T16:34:20Z",
-      "resolved": "github:NixOS/nixpkgs/a5cbcfe954791221bfffe2307f7d1a1bf61a871e#ffmpeg",
+    "ffmpeg@9.0.1": {
+      "last_modified": "2026-08-27T07:16:00Z",
+      "resolved": "github:NixOS/nixpkgs/c27cdad491a991b11ed731760aa2ef8db0cb0410#ffmpeg",
       "source": "devbox-search",
-      "version": "8.1.2",
+      "version": "9.0.1",
       "systems": {
         "aarch64-darwin": {
           "outputs": [
             {
               "name": "bin",
-              "path": "/nix/store/7v8zx62rpcnr0qz2fj51nz72g65g5dar-ffmpeg-8.1.2-bin",
+              "path": "/nix/store/s1dqvjdraaa3bh9fq8y1wcnw1bg7mzg9-ffmpeg-9.0.1-bin",
               "default": true
             },
             {
               "name": "man",
-              "path": "/nix/store/33ygdwc2i0dbbj8s00f8m0dxpy4wzfap-ffmpeg-8.1.2-man",
+              "path": "/nix/store/wka94k55yy79zcxbq9d6lcmvvl5ddra3-ffmpeg-9.0.1-man",
               "default": true
             },
             {
-              "name": "lib",
-              "path": "/nix/store/hskqcn39d6vlycl5ajw58qbglg5p1rrf-ffmpeg-8.1.2-lib"
-            },
-            {
-              "name": "out",
-              "path": "/nix/store/lwdywcg4mzg8v19k21l2gnfbgrmm7k18-ffmpeg-8.1.2"
-            },
-            {
-              "name": "data",
-              "path": "/nix/store/41kngjbnj1vr17ga30yam1vajdwg0592-ffmpeg-8.1.2-data"
-            },
-            {
               "name": "dev",
-              "path": "/nix/store/b3i7r4bfi760xx94swr1c0c8as291say-ffmpeg-8.1.2-dev"
+              "path": "/nix/store/g8219yvnsdbsjajgn7a4jzff7da54sxs-ffmpeg-9.0.1-dev"
             },
             {
               "name": "doc",
-              "path": "/nix/store/6w3fb9dazdn7k6izgm4jbiv0npsjygwq-ffmpeg-8.1.2-doc"
+              "path": "/nix/store/c0xb95gjmdymb0sv50x464pxkb4y7nrw-ffmpeg-9.0.1-doc"
+            },
+            {
+              "name": "lib",
+              "path": "/nix/store/1mg05n22qj6cjqd5ngbwxp1xil9s0x11-ffmpeg-9.0.1-lib"
+            },
+            {
+              "name": "out",
+              "path": "/nix/store/mcjs93zl32h3fksdln0xhss6n1d6m085-ffmpeg-9.0.1"
+            },
+            {
+              "name": "data",
+              "path": "/nix/store/6xws3jf7dx7gj6k8ms04yfm785hf9psb-ffmpeg-9.0.1-data"
             }
           ],
-          "store_path": "/nix/store/7v8zx62rpcnr0qz2fj51nz72g65g5dar-ffmpeg-8.1.2-bin"
+          "store_path": "/nix/store/s1dqvjdraaa3bh9fq8y1wcnw1bg7mzg9-ffmpeg-9.0.1-bin"
         },
         "aarch64-linux": {
           "outputs": [
             {
               "name": "bin",
-              "path": "/nix/store/8mx60n2lphp5b08qqbmydjgd2c54ban8-ffmpeg-8.1.2-bin",
+              "path": "/nix/store/n8jyaq5r4k746j3nwymn4wf7x6k7r2zs-ffmpeg-9.0.1-bin",
               "default": true
             },
             {
               "name": "man",
-              "path": "/nix/store/b4mznk890ck7cipmypg5brf7kwbzjz39-ffmpeg-8.1.2-man",
+              "path": "/nix/store/nf10jhnk679d1my6g9k2gypl5v09v3ap-ffmpeg-9.0.1-man",
               "default": true
             },
             {
-              "name": "data",
-              "path": "/nix/store/nzk0w5azlci8x66jq55iww3jkncp49gx-ffmpeg-8.1.2-data"
-            },
-            {
-              "name": "dev",
-              "path": "/nix/store/z1a9sna6xi1lq03rn0swycfvy7rlwdq5-ffmpeg-8.1.2-dev"
-            },
-            {
               "name": "doc",
-              "path": "/nix/store/s1gwwvycqbh3a4awfcmzr3w0ik5p45a3-ffmpeg-8.1.2-doc"
+              "path": "/nix/store/47531s4l6imqz2mxnwp8xpgv26ys8rj6-ffmpeg-9.0.1-doc"
             },
             {
               "name": "lib",
-              "path": "/nix/store/79d16bdq454ynvn8c1d90wh7fk1h6bvc-ffmpeg-8.1.2-lib"
+              "path": "/nix/store/42fsinrl4xmb44cp2i7q7y6l1h56js7s-ffmpeg-9.0.1-lib"
             },
             {
               "name": "out",
-              "path": "/nix/store/9xbvb84wh7h52iqgfw3jy8b1mlnp5lnw-ffmpeg-8.1.2"
+              "path": "/nix/store/v0k2r8i217li6xsy3sdbwikk0hg1mxkz-ffmpeg-9.0.1"
+            },
+            {
+              "name": "data",
+              "path": "/nix/store/cr9rhy77vk12prycdaj7xnlk01czp4ca-ffmpeg-9.0.1-data"
+            },
+            {
+              "name": "dev",
+              "path": "/nix/store/h00zc1vfvbyl7pl1hbfr57ss9cixzhgv-ffmpeg-9.0.1-dev"
             }
           ],
-          "store_path": "/nix/store/8mx60n2lphp5b08qqbmydjgd2c54ban8-ffmpeg-8.1.2-bin"
+          "store_path": "/nix/store/n8jyaq5r4k746j3nwymn4wf7x6k7r2zs-ffmpeg-9.0.1-bin"
         },
         "x86_64-linux": {
           "outputs": [
             {
               "name": "bin",
-              "path": "/nix/store/dxkxkr8jdqzcxy37ja3d6561v5hj86fd-ffmpeg-8.1.2-bin",
+              "path": "/nix/store/a2qfg58bz9c68lqgr4id8g2vvqdagman-ffmpeg-9.0.1-bin",
               "default": true
             },
             {
               "name": "man",
-              "path": "/nix/store/hznb91mwz5qcrzkgq7nr12l754hqdr5i-ffmpeg-8.1.2-man",
+              "path": "/nix/store/l03z4qnhp6h76icam2p8vzqxnw55vyrb-ffmpeg-9.0.1-man",
               "default": true
             },
             {
-              "name": "dev",
-              "path": "/nix/store/9cfbhvpkxd14blsx852kyq5a5qk64cvn-ffmpeg-8.1.2-dev"
-            },
-            {
-              "name": "doc",
-              "path": "/nix/store/sgch43g2fj5dma1kbhlm61dk01jw3fav-ffmpeg-8.1.2-doc"
-            },
-            {
               "name": "lib",
-              "path": "/nix/store/bv6srla8j47n8dxbb9fyzhs74xi0qq4x-ffmpeg-8.1.2-lib"
+              "path": "/nix/store/vw6jkg2ilvhhdab70a6hg0pmjw91sf8a-ffmpeg-9.0.1-lib"
             },
             {
               "name": "out",
-              "path": "/nix/store/8g4d1a44fa330lqqq0zhmdbj0kq50cca-ffmpeg-8.1.2"
+              "path": "/nix/store/z1madanw8x9gbcxqvv2xwliim63wfh7x-ffmpeg-9.0.1"
             },
             {
               "name": "data",
-              "path": "/nix/store/6x4f9ip0bfs2vd1ilcvmpzaxp48a1p00-ffmpeg-8.1.2-data"
+              "path": "/nix/store/da5vcmxzp2g5hns8nnb5920fkpn34j1j-ffmpeg-9.0.1-data"
+            },
+            {
+              "name": "dev",
+              "path": "/nix/store/iwiw531gwyp19rcn270jgmngxqa23gvy-ffmpeg-9.0.1-dev"
+            },
+            {
+              "name": "doc",
+              "path": "/nix/store/4h9c6pnl523z9raz2pnnk66ybapfvy60-ffmpeg-9.0.1-doc"
             }
           ],
-          "store_path": "/nix/store/dxkxkr8jdqzcxy37ja3d6561v5hj86fd-ffmpeg-8.1.2-bin"
+          "store_path": "/nix/store/a2qfg58bz9c68lqgr4id8g2vvqdagman-ffmpeg-9.0.1-bin"
         }
       }
     },
@@ -764,41 +764,125 @@
         }
       }
     },
-    "pnpm_10@10.34.5": {
-      "last_modified": "2026-08-12T11:28:58Z",
-      "resolved": "github:NixOS/nixpkgs/044bfe75bfe4c7bbe043dc17b5e42ea823b84a09#pnpm_10",
+    "pkg-config@0.29.2": {
+      "last_modified": "2025-11-23T21:50:36Z",
+      "resolved": "github:NixOS/nixpkgs/ee09932cedcef15aaf476f9343d1dea2cb77e261#pkg-config",
       "source": "devbox-search",
-      "version": "10.34.5",
+      "version": "0.29.2",
       "systems": {
         "aarch64-darwin": {
           "outputs": [
             {
               "name": "out",
-              "path": "/nix/store/q26chpyzfsy66m5r2jfxbyz6p2h8dcsn-pnpm-10.34.5",
+              "path": "/nix/store/hygaaqwk9ylklp0ybwppqhw75nz8ya41-pkg-config-wrapper-0.29.2",
               "default": true
+            },
+            {
+              "name": "man",
+              "path": "/nix/store/9px0sji43x3r2w4zxl3j3idwsql7lwxx-pkg-config-wrapper-0.29.2-man",
+              "default": true
+            },
+            {
+              "name": "doc",
+              "path": "/nix/store/hqk44ra6qxw7iixardl6c3hdgb9kq6ns-pkg-config-wrapper-0.29.2-doc"
             }
           ],
-          "store_path": "/nix/store/q26chpyzfsy66m5r2jfxbyz6p2h8dcsn-pnpm-10.34.5"
+          "store_path": "/nix/store/hygaaqwk9ylklp0ybwppqhw75nz8ya41-pkg-config-wrapper-0.29.2"
         },
         "aarch64-linux": {
           "outputs": [
             {
               "name": "out",
-              "path": "/nix/store/1dq1asc1m26pam3bb3clzghjcrscbyma-pnpm-10.34.5",
+              "path": "/nix/store/lbiigi8qbp7mzf1lpr7p982l1kyf01ql-pkg-config-wrapper-0.29.2",
               "default": true
+            },
+            {
+              "name": "man",
+              "path": "/nix/store/10060k24qggqyzlwdsfmni9y32zxcg0j-pkg-config-wrapper-0.29.2-man",
+              "default": true
+            },
+            {
+              "name": "doc",
+              "path": "/nix/store/0y4v51ndpyvkj09hwlfqkz0c3h17zfmc-pkg-config-wrapper-0.29.2-doc"
             }
           ],
-          "store_path": "/nix/store/1dq1asc1m26pam3bb3clzghjcrscbyma-pnpm-10.34.5"
+          "store_path": "/nix/store/lbiigi8qbp7mzf1lpr7p982l1kyf01ql-pkg-config-wrapper-0.29.2"
+        },
+        "x86_64-darwin": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/vknadizq0q5kffvx6y4379p9gdry9zq3-pkg-config-wrapper-0.29.2",
+              "default": true
+            },
+            {
+              "name": "man",
+              "path": "/nix/store/1nyspra675q22gfhf7hn2nmfpi6rgim5-pkg-config-wrapper-0.29.2-man",
+              "default": true
+            },
+            {
+              "name": "doc",
+              "path": "/nix/store/7lq1axxwrafwljs06n88bzyz9w523rkc-pkg-config-wrapper-0.29.2-doc"
+            }
+          ],
+          "store_path": "/nix/store/vknadizq0q5kffvx6y4379p9gdry9zq3-pkg-config-wrapper-0.29.2"
         },
         "x86_64-linux": {
           "outputs": [
             {
               "name": "out",
-              "path": "/nix/store/cc9jkig6j6ww7agsnqlb69d20j34lc4c-pnpm-10.34.5",
+              "path": "/nix/store/8vdiwpbh0g4avsd6x5v4s0di32vcl3dp-pkg-config-wrapper-0.29.2",
+              "default": true
+            },
+            {
+              "name": "man",
+              "path": "/nix/store/j9xfpnrygg3v37svc5pfin9q5bm49r94-pkg-config-wrapper-0.29.2-man",
+              "default": true
+            },
+            {
+              "name": "doc",
+              "path": "/nix/store/x3bypxdxaq20kykybhkf21x4jczsiy8y-pkg-config-wrapper-0.29.2-doc"
+            }
+          ],
+          "store_path": "/nix/store/8vdiwpbh0g4avsd6x5v4s0di32vcl3dp-pkg-config-wrapper-0.29.2"
+        }
+      }
+    },
+    "pnpm@11.22.0": {
+      "last_modified": "2026-08-27T07:16:00Z",
+      "resolved": "github:NixOS/nixpkgs/c27cdad491a991b11ed731760aa2ef8db0cb0410#pnpm",
+      "source": "devbox-search",
+      "version": "11.22.0",
+      "systems": {
+        "aarch64-darwin": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/z0rlx5672gdlfb3830irk026yfwz8kyp-pnpm-11.22.0",
               "default": true
             }
           ],
-          "store_path": "/nix/store/cc9jkig6j6ww7agsnqlb69d20j34lc4c-pnpm-10.34.5"
+          "store_path": "/nix/store/z0rlx5672gdlfb3830irk026yfwz8kyp-pnpm-11.22.0"
+        },
+        "aarch64-linux": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/ym3qz78cr56fcc28v3d6paxnjs9v5gqw-pnpm-11.22.0",
+              "default": true
+            }
+          ],
+          "store_path": "/nix/store/ym3qz78cr56fcc28v3d6paxnjs9v5gqw-pnpm-11.22.0"
+        },
+        "x86_64-linux": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/33x60qag0i4ri26wvvkp4lb3hhqw6fsc-pnpm-11.22.0",
+              "default": true
+            }
+          ],
+          "store_path": "/nix/store/33x60qag0i4ri26wvvkp4lb3hhqw6fsc-pnpm-11.22.0"
         }
       }
     },

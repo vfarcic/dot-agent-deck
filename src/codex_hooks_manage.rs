@@ -80,6 +80,13 @@ use serde_json::{Value, json};
 /// (finding #14).
 const HOOK_COMMAND_SUFFIX: &str = "hook --agent codex";
 
+/// The interpreter every Codex hook command is quoted for. Unlike Devin's,
+/// this one genuinely follows the host: Codex's hooks engine runs the command
+/// through `%COMSPEC%`/`cmd.exe /C` on Windows and `$SHELL`/`/bin/sh -lc`
+/// elsewhere, and `codex_home` honours `$CODEX_HOME` on every platform, so the
+/// Windows arm is reachable. See `agent_hook_config::HookShell`.
+const HOOK_SHELL: crate::agent_hook_config::HookShell = crate::agent_hook_config::HookShell::Native;
+
 /// Serializes the read-modify-write of `hooks.json` across concurrent in-process
 /// Codex spawns (two panes launching `codex` at once). Combined with the atomic
 /// temp-file+rename publish, this closes the concurrent-clobber / partial-write
@@ -262,7 +269,8 @@ pub fn install_to(codex_home: &Path, binary_path: &str) -> std::io::Result<()> {
 
     validate_structure(&root)?;
 
-    let command = crate::agent_hook_config::build_command(binary_path, HOOK_COMMAND_SUFFIX);
+    let command =
+        crate::agent_hook_config::build_command(binary_path, HOOK_COMMAND_SUFFIX, HOOK_SHELL);
     install_impl(&mut root, &command);
     let contents = serde_json::to_string_pretty(&root)?;
     crate::agent_hook_config::write_atomic(codex_home, &path, contents.as_bytes())
@@ -886,6 +894,25 @@ pub fn auto_install_and_trust_at_startup() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Codex's hook commands are quoted for the HOST's shell — the half of #734
+    /// that is a real behaviour change, and the half no test on a POSIX box can
+    /// observe through the emitted string.
+    ///
+    /// Paired with `devin_hooks_manage`'s opposite assertion, this is what keeps
+    /// the two writers from being collapsed into one answer: on Linux both
+    /// spellings emit identical bytes, so setting this to `Posix` would revert
+    /// #734 for the only writer that can reach Windows while every other test in
+    /// the workspace stayed green.
+    #[test]
+    fn hook_commands_are_quoted_for_the_shell_codex_will_use() {
+        assert_eq!(
+            HOOK_SHELL,
+            crate::agent_hook_config::HookShell::Native,
+            "Codex runs its hooks through the host's own shell, so the quoting \
+             must follow the host"
+        );
+    }
 
     #[test]
     fn install_writes_command_hooks_for_every_event() {

@@ -1,4 +1,4 @@
-#![cfg(feature = "e2e")]
+#![cfg(all(feature = "e2e", feature = "e2e-live"))]
 
 //! PTY-attached Codex wrapper coverage for PRD #20 M7. The synthetic case pins
 //! deterministic plumbing; the real case runs a cheap Codex model against a

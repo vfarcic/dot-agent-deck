@@ -402,9 +402,11 @@ pub fn parser_init_dims(rows: u16, cols: u16) -> (u16, u16) {
 ///
 /// This guards *construction* only, which is the whole of the contract. A
 /// parser's geometry can still move afterwards through `screen_mut().set_size`
-/// in [`EmbeddedPaneController::resize_pane_pty`], which does not clamp — its
-/// one caller, `ui.rs`'s `resize_panes_to_layout`, skips a zero axis instead —
-/// and feeding stays separately guarded by [`guarded_parser_feed`].
+/// in [`EmbeddedPaneController::resize_pane_pty`], which since issue #747
+/// clamps the UPPER bound to [`PTY_RESIZE_DIM_MAX`] (matching the daemon) but
+/// still relies on its one caller, `ui.rs`'s `resize_panes_to_layout`, to skip
+/// a zero axis rather than rejecting one itself — and feeding stays separately
+/// guarded by [`guarded_parser_feed`].
 fn new_pane_parser(rows: u16, cols: u16) -> vt100::Parser {
     let (rows, cols) = parser_init_dims(rows, cols);
     vt100::Parser::new(rows, cols, PANE_SCROLLBACK_LINES)
@@ -834,7 +836,20 @@ impl EmbeddedPaneController {
     /// with a bounded timeout. Intermediate values during rapid layout
     /// churn are dropped on the floor — only the latest size reaches the
     /// wire, with at most one in-flight daemon connection per pane.
+    ///
+    /// Issue #747: the request is normalized through
+    /// [`agent_pty::clamp_pty_dims`] FIRST, so the parser and the wire carry
+    /// the geometry the daemon will actually apply to the child rather than
+    /// one the daemon would quietly narrow. Both sides of this function must
+    /// use the same clamped pair — resizing the parser to 4198 columns while
+    /// the child is told 4096 is exactly the divergence #747 is about. The
+    /// production caller (`ui.rs`'s `resize_panes_to_layout`) already clamps
+    /// its layout target through the same helper, which is what keeps its
+    /// "only commit a real delta" check honest: comparing an unclamped target
+    /// against a clamped parser would never match and would re-send a resize
+    /// on every frame.
     pub fn resize_pane_pty(&self, pane_id: &str, rows: u16, cols: u16) -> Result<(), PaneError> {
+        let (rows, cols) = agent_pty::clamp_pty_dims(rows, cols);
         let panes = self.panes.lock().unwrap();
         let pane = panes
             .get(pane_id)

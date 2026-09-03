@@ -61,8 +61,10 @@ The widget assumes the upstream contract holds — the PTY screen is already the
 
 If the contract is violated, the failure is **loud**, not silently wrong:
 
-- **Debug builds:** `debug_assert!` that PTY `(rows, cols)` equals inner-area `(height, width)`.
+- **Debug builds:** `debug_assert!` that PTY `(rows, cols)` equals inner-area `(height, width)`, each axis capped at `PTY_RESIZE_DIM_MAX`.
 - **Release builds:** log once on mismatch and fall back to `min` rather than panicking — behavior at least as good as today, never a crash.
+
+**The `PTY_RESIZE_DIM_MAX` cap is part of invariant 3's expectation, not an exception to it** (issue #747). A child PTY cannot be made larger than that cap — the daemon refuses on principle, since a same-uid peer on the attach socket could otherwise drive an agent to an absurd geometry — so on a terminal wider than the cap `resize_panes_to_layout` deliberately sizes the pane to the cap and the drawn area is legitimately larger. The pane then renders the child's full 4096 columns through the `min(area, screen)` fallback and leaves the rest blank, which is the honest outcome: the child has no more columns to show. `crate::agent_pty::clamp_pty_dims` is the single place that spells the cap, and invariant 2's `pane_target_dims` applies it so the layout target, the local vt100 parser, the `AttachRequest::Resize` on the wire and the child PTY all carry the same number. Clamping only at the far end — as the code did before #747 — left the parser rendering at one width while the child wrapped at another, silently.
 
 **Enforced by:**
 

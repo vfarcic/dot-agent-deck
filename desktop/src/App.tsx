@@ -1,4 +1,4 @@
-import { useEffect, useState, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import {
   Activity,
   AlertTriangle,
@@ -17,6 +17,7 @@ import {
   HelpCircle,
   History,
   Keyboard,
+  LayoutList,
   Network,
   PanelRight,
   Pause,
@@ -32,7 +33,9 @@ import {
   X,
   Zap,
 } from "lucide-react";
+import { AgentOverview } from "./components/AgentOverview";
 import { AgentTile } from "./components/AgentTile";
+import { ConfirmDialog, type ConfirmState } from "./components/ConfirmDialog";
 import { HandoffRail } from "./components/HandoffRail";
 import { ProfilesPanel, ProjectsPanel, PromptLibraryPanel, WorkflowPanel } from "./components/ConfigurationPanels";
 import { useAgentProfiles } from "./hooks/useAgentProfiles";
@@ -40,7 +43,7 @@ import { useDeckRuntime } from "./hooks/useDeckRuntime";
 import { useProjects } from "./hooks/useProjects";
 import { usePromptLibrary } from "./hooks/usePromptLibrary";
 import { desktopWorkflowPlatformIssue } from "./lib/platform";
-import type { DeckAction, DeckActionResult, DeckRuntimeState, EvidenceItem, PanelTab, WorkflowLaunchConfig } from "./types";
+import type { DeckAction, DeckActionResult, DeckRuntimeState, DeckView, EvidenceItem, PanelTab, WorkflowLaunchConfig } from "./types";
 import { modeScopedKey } from "./lib/bridge";
 
 const WORKFLOW_STORAGE_KEY = modeScopedKey("dot-agent-deck.desktop.workflow-preview.v1");
@@ -52,20 +55,29 @@ function evidenceOpenOnFirstLoad(): boolean {
   return window.innerWidth >= 1260;
 }
 
-interface ConfirmState {
-  title: string;
-  body: string;
-  label: string;
-  busyLabel: string;
-  action: () => Promise<void>;
-}
-
 export default function App() {
-  return <ControlDeck runtime={useDeckRuntime()} />;
+  return <DeckShell runtime={useDeckRuntime()} />;
 }
 
-export function ControlDeck({ runtime, workflowPlatformIssue = desktopWorkflowPlatformIssue() }: { runtime: DeckRuntimeState; workflowPlatformIssue?: string }) {
-  const { snapshot, mode } = runtime;
+/**
+ * Owns which top-level surface is mounted. The overview renders *instead of*
+ * the deck, so the state belongs above `ControlDeck` rather than as one more
+ * boolean inside it — none of the deck's own `useState` booleans is a view, and
+ * five of the rail's six buttons are overlay toggles over an always-mounted
+ * deck. `DeckView` is a discriminated union from the start so PRD #745
+ * iteration 3's group and single-agent views arrive as added variants.
+ *
+ * The deck stays the default: launching the app lands exactly where it does
+ * today.
+ */
+export function DeckShell({ runtime, workflowPlatformIssue, initialView = { kind: "deck" } }: { runtime: DeckRuntimeState; workflowPlatformIssue?: string; initialView?: DeckView }) {
+  const [view, setView] = useState<DeckView>(initialView);
+  if (view.kind === "overview") return <AgentOverview runtime={runtime} onNavigate={setView} />;
+  return <ControlDeck runtime={runtime} workflowPlatformIssue={workflowPlatformIssue} onNavigate={setView} />;
+}
+
+export function ControlDeck({ runtime, workflowPlatformIssue = desktopWorkflowPlatformIssue(), onNavigate }: { runtime: DeckRuntimeState; workflowPlatformIssue?: string; onNavigate?: (view: DeckView) => void }) {
+  const { snapshot, mode, setShownTerminals } = runtime;
   const [selectedAgentId, setSelectedAgentId] = useState("");
   const [tabs, setTabs] = useState<Record<string, PanelTab>>({});
   const [selectedEvidenceId, setSelectedEvidenceId] = useState("");
@@ -128,6 +140,45 @@ export function ControlDeck({ runtime, workflowPlatformIssue = desktopWorkflowPl
       // Keep the workflow preview usable when storage is unavailable.
     }
   }, [profileOrder]);
+
+  /**
+   * Every tile currently rendering a terminal (PRD #745 M7). `AgentTile` mounts
+   * a terminal whenever its tab is `"terminal"`, which is also the default, so
+   * the derivation has to repeat that `?? "terminal"` fallback exactly.
+   */
+  const shownTerminals = snapshot.agents
+    .filter((agent) => (tabs[agent.id] ?? "terminal") === "terminal")
+    .map((agent) => agent.id);
+
+  /**
+   * The same ids joined into one dependency so the effect below fires when the
+   * SET changes rather than on every render. It is a dependency KEY and nothing
+   * else — never split back apart. Agent ids are raw daemon identities, not
+   * display strings, so an id containing a newline would come back out of a
+   * `split` as two shown agents: two attach paths from one tile, and one
+   * invalid identity turned into several valid-looking ones behind
+   * `validate_agent_id`, which rejects control characters only when it is
+   * handed the id whole.
+   */
+  const shownTerminalKey = shownTerminals.join("\n");
+  /**
+   * The array the effect actually passes on, held in a ref because the effect
+   * must key on the joined string (stable across renders that change nothing)
+   * while carrying the ids themselves (a fresh array every render).
+   */
+  const shownTerminalsRef = useRef(shownTerminals);
+  shownTerminalsRef.current = shownTerminals;
+
+  /**
+   * ONE call per render commit carrying ALL the shown ids, never one call per
+   * tile: `setShownTerminals` is declarative, so nine tiles declaring
+   * themselves one at a time would leave eight of the nine in the warm set and
+   * evict five of them. Deleting this effect does not fail a bridge test — it
+   * silently leaves the deck with no attached terminals at all.
+   */
+  useEffect(() => {
+    void setShownTerminals(shownTerminalsRef.current);
+  }, [setShownTerminals, shownTerminalKey]);
 
   const orderedStages = snapshot.stages;
   const selectedAgent = snapshot.agents.find((agent) => agent.id === selectedAgentId);
@@ -237,6 +288,39 @@ export function ControlDeck({ runtime, workflowPlatformIssue = desktopWorkflowPl
     });
   };
 
+  /**
+   * Issue #801. Offered ONLY when the desktop crate says the mismatch is
+   * stamp-only — the wire protocol agreed on both sides and the git-describe
+   * stamps did not. A genuine protocol mismatch never sets that flag, so this
+   * button never appears for one, and the crate would refuse it anyway: the
+   * protocol check runs first and the allowance cannot reach it.
+   *
+   * Unlike Replace daemon this is offered whatever the live-agent count, which
+   * is the entire point — replacement is correctly refused while agents are
+   * live, and that left an upgraded app with nine running agents no way in at
+   * all.
+   */
+  const requestConnectAnyway = () => {
+    if (!snapshot.connection.buildStampMismatchOnly) return;
+    setConfirm({
+      title: "Connect to a differently-built daemon?",
+      body: "The wire protocol matched on both sides, so this daemon and this app agree on the shape of everything they exchange. They were built from different commits, and a stamp difference can still mean divergent behaviour behind an identical wire — a field whose meaning changed while its shape did not. Agent Deck will connect and keep the mismatch on screen for the rest of this session; nothing is remembered after you quit the app.",
+      label: "Connect anyway",
+      busyLabel: "Connecting…",
+      action: async () => {
+        try {
+          await runtime.runAction({ type: "allow_build_mismatch" });
+          // The allowance is read by the NEXT handshake, so the reconnect is
+          // what actually connects; the crate caches no verdict.
+          await runtime.reconnect();
+          setNotice("Connected to the differently-built daemon. The mismatch stays in the connection banner for this session.");
+        } catch (cause) {
+          setNotice(cause instanceof Error ? cause.message : String(cause));
+        }
+      },
+    });
+  };
+
   const requestStartDaemon = () => {
     setConfirm({
       title: "Start the local daemon?",
@@ -299,6 +383,8 @@ export function ControlDeck({ runtime, workflowPlatformIssue = desktopWorkflowPl
         <nav>
           <RailButton icon={FolderGit2} label="Projects" active={projectsOpen} onClick={() => setProjectsOpen(true)} testId="open-projects" />
           <RailButton icon={Activity} label="Runs" active={!projectsOpen && !workflowOpen && !profilesOpen && !promptsOpen} onClick={() => { setProjectsOpen(false); setWorkflowOpen(false); setProfilesOpen(false); setPromptsOpen(false); }} />
+          {/* The one rail button that is a real view rather than an overlay toggle. */}
+          <RailButton icon={LayoutList} label="Overview" onClick={() => onNavigate?.({ kind: "overview" })} testId="open-overview" />
           <RailButton icon={BookMarked} label="Prompts" active={promptsOpen} onClick={() => setPromptsOpen(true)} testId="open-prompts" />
           <RailButton icon={Network} label="Workflows" active={workflowOpen} onClick={() => setWorkflowOpen(true)} />
           <RailButton icon={Bot} label="Agent Profiles" active={profilesOpen} onClick={() => setProfilesOpen(true)} testId="open-agent-profiles" />
@@ -314,12 +400,19 @@ export function ControlDeck({ runtime, workflowPlatformIssue = desktopWorkflowPl
         <header className="topbar">
           <div className="repo-context">
             <div className="repo-line"><FolderGit2 size={15} /><strong>{activeProject?.name || snapshot.repo}</strong><ChevronRight size={13} /><span>{snapshot.runId}</span></div>
-            <div className="branch-line"><GitBranch size={12} /><span>{snapshot.branch}</span><i /> <span title={activeProject?.cwd || snapshot.worktree}>{activeProject?.cwd || snapshot.worktree}</span></div>
+            {/*
+              PRD #745 M8: the branch chip appears only when there IS a branch.
+              Nothing daemon-side tracks one, so live mode reports none and the
+              line carries the working directory alone rather than printing the
+              literal "Unavailable" where a branch name belongs.
+            */}
+            <div className="branch-line">{snapshot.branch && <><GitBranch size={12} /><span>{snapshot.branch}</span><i /> </>}<span title={activeProject?.cwd || snapshot.worktree}>{activeProject?.cwd || snapshot.worktree}</span></div>
           </div>
           <div className="run-instruments">
             <Instrument label="HEALTH" testId="run-health"><span className={`health-value health-${snapshot.health}`}><i />{snapshot.health}</span></Instrument>
             <Instrument label="NODE"><strong>{String(snapshot.currentNode).padStart(2, "0")}<em>/{String(snapshot.totalNodes).padStart(2, "0")}</em></strong></Instrument>
-            <Instrument label="ATTEMPT"><strong>{String(snapshot.currentAttempt).padStart(2, "0")}</strong></Instrument>
+            {/* Em dash, this deck's established "not known": no daemon tracks an attempt count (PRD #745 M8). */}
+            <Instrument label="ATTEMPT"><strong>{snapshot.currentAttempt === undefined ? "—" : String(snapshot.currentAttempt).padStart(2, "0")}</strong></Instrument>
             <Instrument label="ELAPSED"><strong>{snapshot.elapsed}</strong></Instrument>
             <Instrument label="SPEND"><strong>{mode === "fixture" ? `$${snapshot.spend.toFixed(2)}` : "—"}</strong></Instrument>
           </div>
@@ -351,11 +444,19 @@ export function ControlDeck({ runtime, workflowPlatformIssue = desktopWorkflowPl
           </div>
         )}
 
-        {snapshot.connection.status !== "connected" && (
+        {/*
+          The banner also stays up while CONNECTED with a build-stamp caveat
+          (issue #801). Accepting the mismatch is not the same as it going away:
+          the desktop crate deliberately keeps it in the connection message on
+          the bypass path, and a banner keyed on `status` alone threw that away
+          at the exact moment it started to matter — the session where the two
+          builds actually differ.
+        */}
+        {(snapshot.connection.status !== "connected" || snapshot.connection.buildStampMismatchOnly) && (
           <div className={`connection-banner connection-${snapshot.connection.status}`} role="alert">
             {snapshot.connection.status === "loading" ? <RefreshCw className="spin" size={16} /> : <ShieldAlert size={16} />}
-            <div><strong>{snapshot.connection.status === "loading" ? "Establishing control channel" : snapshot.connection.status === "error" ? "Desktop bridge error" : "Daemon disconnected"}</strong><span>{snapshot.connection.message}</span></div>
-            {snapshot.connection.status !== "loading" && <div className="connection-actions">{mode === "live" && snapshot.connection.status === "disconnected" && <button className="button primary compact" data-testid="start-daemon" onClick={requestStartDaemon}><Play size={13} /> Start daemon</button>}{mode === "live" && snapshot.connection.daemonDetected && snapshot.connection.status === "error" && snapshot.connection.runningAgentCount === 0 && <button className="button primary compact" data-testid="replace-daemon" onClick={requestRestartDaemon}><RefreshCw size={13} /> Replace daemon</button>}<button className="button secondary compact" onClick={() => void runtime.reconnect()}><RefreshCw size={13} /> Reconnect</button></div>}
+            <div><strong>{snapshot.connection.status === "loading" ? "Establishing control channel" : snapshot.connection.status === "connected" ? "Connected to a differently-built daemon" : snapshot.connection.status === "error" ? "Desktop bridge error" : "Daemon disconnected"}</strong><span>{snapshot.connection.message}</span></div>
+            {snapshot.connection.status !== "loading" && <div className="connection-actions">{mode === "live" && snapshot.connection.status === "disconnected" && <button className="button primary compact" data-testid="start-daemon" onClick={requestStartDaemon}><Play size={13} /> Start daemon</button>}{mode === "live" && snapshot.connection.daemonDetected && snapshot.connection.status === "error" && snapshot.connection.runningAgentCount === 0 && <button className="button primary compact" data-testid="replace-daemon" onClick={requestRestartDaemon}><RefreshCw size={13} /> Replace daemon</button>}{mode === "live" && snapshot.connection.status === "error" && snapshot.connection.buildStampMismatchOnly && <button className="button primary compact" data-testid="connect-anyway" onClick={requestConnectAnyway}><ShieldAlert size={13} /> Connect anyway</button>}<button className="button secondary compact" onClick={() => void runtime.reconnect()}><RefreshCw size={13} /> Reconnect</button></div>}
           </div>
         )}
 
@@ -365,7 +466,7 @@ export function ControlDeck({ runtime, workflowPlatformIssue = desktopWorkflowPl
             {orderedStages.length ? orderedStages.map((stage, index) => (
               <div className={`workflow-node node-${stage.status} ${stage.enabled ? "" : "is-disabled"}`} key={stage.id} data-testid={`workflow-node-${stage.id}`}>
                 <div className="node-glyph">{stage.status === "passed" ? <Check size={14} /> : stage.status === "failed" ? <X size={14} /> : <span>{String(index + 1).padStart(2, "0")}</span>}</div>
-                <div><strong>{stage.label}</strong><small>{stage.enabled ? `${stage.status} · att ${stage.attempt}` : "skipped"}</small></div>
+                <div><strong>{stage.label}</strong><small>{stage.enabled ? (stage.attempt === undefined ? stage.status : `${stage.status} · att ${stage.attempt}`) : "skipped"}</small></div>
                 {index < orderedStages.length - 1 && <i className="workflow-link" aria-hidden="true" />}
               </div>
             )) : <div className="workflow-empty">No workflow nodes reported. Open <button onClick={() => setWorkflowOpen(true)}>Edit loop</button> to inspect configuration.</div>}
@@ -494,9 +595,4 @@ function CommandPalette({ commands, onClose }: { commands: { label: string; hint
 function ShortcutHelp({ onClose }: { onClose: () => void }) {
   const shortcuts = [["⌘ K", "Command menu"], ["1 — 4", "Focus agent"], ["J / K", "Move through evidence"], ["?", "Shortcut guide"], ["ESC", "Close overlay"]];
   return <div className="dialog-backdrop" role="presentation" onMouseDown={onClose}><section className="shortcut-dialog" role="dialog" aria-modal="true" aria-labelledby="shortcut-title" onMouseDown={(event) => event.stopPropagation()}><header><div><HelpCircle size={18} /><h2 id="shortcut-title">Control keys</h2></div><button aria-label="Close shortcut guide" onClick={onClose}><X size={16} /></button></header>{shortcuts.map(([keys, label]) => <div key={keys}><span>{label}</span><kbd>{keys}</kbd></div>)}</section></div>;
-}
-
-function ConfirmDialog({ state, onClose }: { state: ConfirmState; onClose: () => void }) {
-  const [busy, setBusy] = useState(false);
-  return <div className="dialog-backdrop" role="presentation" onMouseDown={onClose}><section className="confirm-dialog" role="alertdialog" aria-modal="true" aria-labelledby="confirm-title" onMouseDown={(event) => event.stopPropagation()}><div className="danger-icon"><CircleStop size={20} /></div><h2 id="confirm-title">{state.title}</h2><p>{state.body}</p><div><button className="button secondary" onClick={onClose}>Cancel</button><button className="button danger" disabled={busy} onClick={() => { setBusy(true); void state.action().finally(onClose); }}>{busy ? state.busyLabel : state.label}</button></div></section></div>;
 }

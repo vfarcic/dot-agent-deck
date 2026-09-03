@@ -7,8 +7,11 @@
 //! 1. **lookup / picker** — `lookup_remote` / `pick_remote` resolve the
 //!    registry entry. Kubernetes entries are rejected (planned in PRD #81).
 //! 2. **version probe** — one short `ssh <target> dot-agent-deck --version`
-//!    classifies host-unreachable, missing-binary, and version-mismatch
-//!    outcomes before we hand the terminal over.
+//!    classifies host-unreachable and missing-binary outcomes before we hand
+//!    the terminal over, and returns the remote's version for the upgrade
+//!    nudge. A `daemon hello` handshake follows, as proof the installed binary
+//!    runs; neither probe compares a version against the laptop's own
+//!    (issue #491 — see [`probe_remote_protocol`]).
 //! 3. **exec** — `ssh -t -- <target> env DOT_AGENT_DECK_VIA_DAEMON=1 <install_path>`
 //!    runs the deck TUI on the remote with stdio inherited from the user.
 //!    The TUI's M2.8 external-daemon mode lazy-spawns the persistent
@@ -26,7 +29,7 @@ use std::time::Duration;
 
 use thiserror::Error;
 
-use crate::daemon_protocol::{AttachResponse, PROTOCOL_VERSION};
+use crate::daemon_protocol::AttachResponse;
 use crate::remote::{
     RemoteConfigError, RemoteEntry, RemotesFile, SshError, SshExecutor, SshTarget,
 };
@@ -157,22 +160,24 @@ pub enum RemoteConnectError {
         #[source]
         source: std::io::Error,
     },
-    /// PRD #76 M2.21: the laptop and the remote speak incompatible
-    /// attach-protocol versions. A protocol-version mismatch is fatal: the
-    /// wire format isn't backward-compatible and live updates would silently
-    /// fail. This is part of the connect *floor* (PRD #161 D3 — "remote too
-    /// old to handshake" stays) and is unaffected by the M1.2 removal of the
-    /// laptop↔remote version/build *comparison*. `remote`
-    /// is `None` when the remote binary is too old to know about the
-    /// handshake at all (pre-M2.21 — no `daemon hello` subcommand).
-    #[error("Remote '{name}' speaks attach protocol v{remote_str}; laptop speaks v{local}. {upgrade_hint}",
-            remote_str = remote.map(|v| v.to_string()).unwrap_or_else(|| "?".to_string()))]
-    ProtocolMismatch {
-        name: String,
-        remote: Option<u32>,
-        local: u32,
-        upgrade_hint: String,
-    },
+    /// PRD #76 M2.21, narrowed by issue #491: the remote never answered the
+    /// `daemon hello` handshake, so we cannot confirm a working deck binary is
+    /// installed there — the subcommand is missing (pre-M2.21), the install is
+    /// broken, or something else answered in its place. Fatal, because
+    /// `connect` is about to hand the user's terminal to that binary: a remote
+    /// that cannot answer a one-line handshake has no business receiving it.
+    ///
+    /// This is the "remote too old to handshake" *floor* (PRD #161 D3) with the
+    /// version *comparison* removed. It deliberately carries no version
+    /// numbers: the laptop's compiled-in `PROTOCOL_VERSION` is never a party to
+    /// any wire conversation in this flow (`connect` ssh's in and runs the
+    /// *remote* binary's TUI, which attaches to the *remote* daemon), so
+    /// quoting it at the user described a comparison that measured nothing.
+    /// [`probe_remote_protocol`] carries the full reasoning.
+    #[error(
+        "Remote '{name}' did not answer the `daemon hello` handshake, so its `dot-agent-deck` is too old or the install is broken. Run `dot-agent-deck remote upgrade {name}` to reinstall."
+    )]
+    RemoteHandshakeUnsupported { name: String },
     /// PRD #76 M2.21: the remote daemon answered the handshake but flagged
     /// `ok: false` in its response. The wire format isn't skewed (a legacy
     /// remote wouldn't reach this branch), so the right user action is to
@@ -513,40 +518,67 @@ pub fn probe_remote_version(
 /// in one buffer's worth of reads.
 const PROBE_PROTOCOL_STDOUT_CAP: usize = 64 * 1024;
 
-/// PRD #76 M2.21: run the protocol-version handshake over ssh and decide
-/// whether the wire format is compatible.
+/// PRD #76 M2.21: run the `daemon hello` handshake over ssh and confirm the
+/// remote has a working deck binary to hand the terminal to.
 ///
 /// The remote runs `<install_path> daemon hello`, which prints a JSON
 /// `AttachResponse` carrying `server_version` (the remote binary's
-/// compiled-in [`PROTOCOL_VERSION`]). The protocol version is a property of
-/// the binary, not of a running daemon, so the static print is equivalent to
-/// a Hello round-trip against a running daemon — and avoids spawning the
-/// daemon just to answer a version probe.
+/// compiled-in `PROTOCOL_VERSION`). The probe reads that reply as *proof of
+/// life* — a real deck binary ran there and answered — and, since issue #491,
+/// does not compare the number against the laptop's own.
 ///
-/// Failure modes:
+/// `daemon hello` is a static print rather than a round-trip against a running
+/// daemon, which is why the probe costs one ssh command and never spawns
+/// anything on the remote: the values it reports are properties of the binary
+/// on disk, so a live daemon would have nothing to add.
+///
+/// # Why there is no version comparison (issue #491)
+///
+/// `connect` is `ssh -t -- <target> env DOT_AGENT_DECK_VIA_DAEMON=1
+/// <install_path>` (see [`build_connect_command`], which requests no port or
+/// socket forwarding). That runs the *remote* binary's TUI on the remote's
+/// pty, and that TUI attaches to the *remote* daemon over a socket resolved by
+/// [`crate::config::attach_socket_path`] — a function that takes no host and
+/// can only name a path on the machine it runs on. The laptop opens no attach
+/// connection at all in this flow; it blocks on ssh until the session ends.
+///
+/// So both ends of the attach conversation are the same install on the same
+/// machine and agree on `PROTOCOL_VERSION` by construction, and the laptop's
+/// constant was never a party to it. Comparing the two constants refused
+/// internally-consistent, fully working remotes, and its recommended recovery
+/// (`remote upgrade`) swaps the remote binary under the user's live agents —
+/// after which the remote's *own* build-id handshake prompts to restart the
+/// daemon serving them. The "your remote is older" axis belongs to
+/// [`maybe_nudge_upgrade`] instead: newer-only, TTY-only, default-N, and it
+/// names the running-agent count as the restart cost. That nudge runs three
+/// stages later and was unreachable whenever the protocol digits happened to
+/// differ, because the fatal fired first.
+///
+/// # Failure modes
+///
+/// All of them mean "the remote could not answer"; none is about skew.
 ///
 /// - Remote answered with `{"ok":false,...}` →
 ///   [`RemoteConnectError::RemoteHandshakeError`]. The wire shape is
 ///   compatible; the daemon is signaling an error. User's recovery is to
 ///   investigate the remote, not to upgrade.
-/// - Remote prints a `server_version` that differs from the laptop's
-///   [`PROTOCOL_VERSION`] →
-///   [`RemoteConnectError::ProtocolMismatch`] with `upgrade_hint` naming
-///   which side is older.
 /// - Remote exits non-zero (e.g. pre-M2.21 binary that doesn't recognize
-///   `daemon hello`) → `ProtocolMismatch { remote: None, .. }`.
-/// - Remote exits 0 but stdout doesn't parse as a JSON response with a
-///   `server_version` field → same treatment as "remote too old".
+///   `daemon hello`) → [`RemoteConnectError::RemoteHandshakeUnsupported`].
+/// - Remote exits 0 but stdout doesn't parse as a JSON `AttachResponse`, or
+///   parses without a `server_version` at all → same variant: something ran
+///   there, but nothing we can identify as a deck.
 ///
-/// PRD #161 M1.2 (D3): the `server_version == PROTOCOL_VERSION` arm no longer
-/// compares the finer-grained `build_version`. That laptop↔remote build-id
-/// comparison guarded nothing (the laptop is only ssh + a terminal), so a
-/// matched-protocol remote is accepted regardless of build id and an
-/// un-upgraded remote connects normally. The structural `PROTOCOL_VERSION`
-/// floor ("remote too old to handshake") stays. On success the probe returns
-/// the remote's `running_agents` count (when the reply carries one) so the
-/// upgrade nudge can state the restart cost; the static `daemon hello` CLI
-/// has no registry to enumerate, so that is `None` today.
+/// PRD #161 M1.2 (D3) had already removed the finer-grained `build_version`
+/// comparison on identical reasoning — "that laptop↔remote build-id comparison
+/// guarded nothing (the laptop is only ssh + a terminal)" — while keeping the
+/// protocol digits as a "structural floor". Issue #491 is that same sentence
+/// applied to the half it spared. What survives as the floor is the *presence*
+/// of an answer, not its value.
+///
+/// On success the probe returns the remote's `running_agents` count (when the
+/// reply carries one) so the upgrade nudge can state the restart cost; the
+/// static `daemon hello` CLI has no registry to enumerate, so that is `None`
+/// today.
 ///
 /// Transport failures (`SshError`) fold into `HostUnreachable` via the same
 /// `map_probe_ssh_error` the binary-version probe uses — the user's
@@ -593,21 +625,15 @@ pub fn probe_remote_protocol(
                 // unexpected runtime failure on the remote (broken install,
                 // dependency missing, etc.) which the user resolves the same
                 // way: re-run `remote upgrade`.
-                return Err(RemoteConnectError::ProtocolMismatch {
+                return Err(RemoteConnectError::RemoteHandshakeUnsupported {
                     name: name.to_string(),
-                    remote: None,
-                    local: PROTOCOL_VERSION,
-                    upgrade_hint: format!("Run `dot-agent-deck remote upgrade {name}`"),
                 });
             }
             let resp: AttachResponse = match serde_json::from_str(output.stdout.trim()) {
                 Ok(r) => r,
                 Err(_) => {
-                    return Err(RemoteConnectError::ProtocolMismatch {
+                    return Err(RemoteConnectError::RemoteHandshakeUnsupported {
                         name: name.to_string(),
-                        remote: None,
-                        local: PROTOCOL_VERSION,
-                        upgrade_hint: format!("Run `dot-agent-deck remote upgrade {name}`"),
                     });
                 }
             };
@@ -623,32 +649,23 @@ pub fn probe_remote_protocol(
                 });
             }
             match resp.server_version {
-                Some(v) if v == PROTOCOL_VERSION => {
-                    // PRD #161 M1.2: the wire format is compatible. No
-                    // build-id comparison (deleted with the laptop↔remote
-                    // probe). Surface the running-agent count when the reply
-                    // carries one so the upgrade nudge can state the restart
-                    // cost; the static `daemon hello` CLI omits it (`None`).
-                    Ok(resp.running_agents.map(|s| s.count))
-                }
-                Some(v) => {
-                    let upgrade_hint = if v < PROTOCOL_VERSION {
-                        format!("Run `dot-agent-deck remote upgrade {name}`")
-                    } else {
-                        "Upgrade your laptop binary".to_string()
-                    };
-                    Err(RemoteConnectError::ProtocolMismatch {
-                        name: name.to_string(),
-                        remote: Some(v),
-                        local: PROTOCOL_VERSION,
-                        upgrade_hint,
-                    })
-                }
-                None => Err(RemoteConnectError::ProtocolMismatch {
+                // Issue #491: presence, not equality. A parseable reply
+                // carrying a version field is a live deck binary answering;
+                // *which* version it reports cannot matter here, because the
+                // laptop's constant never joins the attach conversation (see
+                // the doc comment above). Surface the running-agent count when
+                // the reply carries one so the upgrade nudge can state the
+                // restart cost; the static `daemon hello` CLI omits it
+                // (`None`).
+                Some(_) => Ok(resp.running_agents.map(|s| s.count)),
+                // Kept as a floor, deliberately not as a version verdict: a
+                // reply with no `server_version` at all is not an older deck
+                // disagreeing with us, it is something we cannot identify as a
+                // deck. `AttachResponse::hello` always sets the field, so this
+                // is a stub, a hand-rolled reply, or a pre-M2.21 shape — none
+                // of which should be handed a terminal.
+                None => Err(RemoteConnectError::RemoteHandshakeUnsupported {
                     name: name.to_string(),
-                    remote: None,
-                    local: PROTOCOL_VERSION,
-                    upgrade_hint: format!("Run `dot-agent-deck remote upgrade {name}`"),
                 }),
             }
         }
@@ -1263,14 +1280,16 @@ pub fn run_connect<R: BufRead, W: Write>(
                 Err(e) => return Err(e),
             };
 
-        // Stage 1b: protocol-version handshake — the structural floor ("remote
-        // too old to handshake" stays; the build-id comparison was removed with
-        // the laptop probe, see PRD #161 M1.2). Returns the remote's
-        // running-agent count when the reply carries one, so the nudge can
-        // state the restart cost. Same reachability-vs-fatal split as the
-        // version probe: a transient transport failure on a reconnect retries,
-        // but a protocol incompatibility stays fatal so we never re-spawn into
-        // an incompatible remote.
+        // Stage 1b: `daemon hello` handshake — the structural floor ("remote
+        // too old to handshake" stays; the build-id comparison went with the
+        // laptop probe in PRD #161 M1.2, and the version comparison with issue
+        // #491). It answers "does a deck binary actually run there", not "do we
+        // agree on a version", and returns the remote's running-agent count
+        // when the reply carries one so the nudge can state the restart cost.
+        // Same reachability-vs-fatal split as the version probe: a transient
+        // transport failure on a reconnect retries, but an unanswerable
+        // handshake stays fatal so we never hand the terminal to a remote whose
+        // install we could not confirm.
         let agent_count = match probe_remote_protocol(executor, &target, &entry.name, install_path)
         {
             Ok(count) => count,
@@ -1639,6 +1658,7 @@ mod tests {
 
     // ----- PRD #148: auto-reconnect state machine -----
 
+    use crate::daemon_protocol::PROTOCOL_VERSION;
     use crate::remote::SshOutput;
     use std::cell::Cell;
 
@@ -1669,10 +1689,10 @@ mod tests {
         fn run(&self, _target: &SshTarget, command: &str) -> Result<SshOutput, SshError> {
             self.runs.set(self.runs.get() + 1);
             if command.contains("daemon hello") {
-                // `hello()` carries server_version == PROTOCOL_VERSION and
-                // build_version == local_build_id(), which is exactly what
-                // probe_remote_protocol compares against in-process — so the
-                // handshake matches without any env juggling.
+                // `hello()` carries a `server_version`, which since issue
+                // #491 is all `probe_remote_protocol` asks of the reply — its
+                // presence, not its value. Using the in-process constant keeps
+                // this fixture reading as "an ordinary matched remote".
                 let body = serde_json::to_string(&AttachResponse::hello(PROTOCOL_VERSION))
                     .expect("serialize hello");
                 Ok(SshOutput {
@@ -1854,24 +1874,41 @@ mod tests {
     /// than the laptop) end-to-end through `run_connect`.
     struct VersionExecutor {
         remote_version: String,
+        /// Raw `daemon hello` stdout. Overridable so a test can drive a remote
+        /// whose `server_version` differs from the laptop's, or omits it
+        /// entirely — the two cases issue #491 separates.
+        hello: String,
     }
 
     impl VersionExecutor {
         fn new(remote_version: &str) -> Self {
             Self {
                 remote_version: remote_version.to_string(),
+                hello: hello_body(Some(PROTOCOL_VERSION)),
             }
+        }
+
+        fn with_hello(mut self, body: String) -> Self {
+            self.hello = body;
+            self
+        }
+    }
+
+    /// `daemon hello` stdout carrying `server_version` (or omitting it, which
+    /// is the wire shape for `None` — `skip_serializing_if`).
+    fn hello_body(server_version: Option<u32>) -> String {
+        match server_version {
+            Some(v) => serde_json::to_string(&AttachResponse::hello(v)).expect("serialize hello"),
+            None => r#"{"ok":true}"#.to_string(),
         }
     }
 
     impl SshExecutor for VersionExecutor {
         fn run(&self, _target: &SshTarget, command: &str) -> Result<SshOutput, SshError> {
             if command.contains("daemon hello") {
-                let body = serde_json::to_string(&AttachResponse::hello(PROTOCOL_VERSION))
-                    .expect("serialize hello");
                 Ok(SshOutput {
                     status: 0,
-                    stdout: body,
+                    stdout: self.hello.clone(),
                     stderr: String::new(),
                 })
             } else if command.contains("--version") {
@@ -2178,6 +2215,159 @@ mod tests {
         assert!(
             upgrader.calls().is_empty(),
             "no upgrade forced on a non-TTY connect to an older remote"
+        );
+    }
+
+    // ----- issue #491: no laptop<->remote PROTOCOL_VERSION comparison --------
+
+    /// A remote whose `daemon hello` reports a different `server_version`
+    /// connects normally, and — the laptop being the newer of the two by
+    /// `--version` — reaches the upgrade nudge instead of dying before it.
+    ///
+    /// This is the case issue #491 unblocks. The deleted comparison fired on
+    /// the protocol digits and returned `Err` from stage 1b, three stages
+    /// before `maybe_nudge_upgrade` could run, so the *soft* nudge that owns
+    /// the "your remote is older" axis was unreachable for exactly the remotes
+    /// it was written for. Both constants are real, but they never share a
+    /// wire: `connect` ssh's in and runs the remote's own TUI against the
+    /// remote's own daemon.
+    #[test]
+    fn differing_remote_protocol_connects_and_reaches_the_nudge() {
+        let entry = test_entry("prod");
+        let (_dir, path) = registry_with(&entry);
+        // Older remote on an older protocol — the pairing the old check killed.
+        let executor = VersionExecutor::new("0.31.0")
+            .with_hello(hello_body(Some(PROTOCOL_VERSION.saturating_sub(1))));
+        let spawner = ScriptedSpawner::new(vec![0]);
+        let backoff = RecordingBackoff::new();
+        let upgrader = RecordingUpgrader::new();
+        // On a TTY, declining the nudge: proves the nudge was REACHED (it
+        // wrote its prompt) and that declining still connects.
+        let mut input: &[u8] = b"n\n";
+        let mut output: Vec<u8> = Vec::new();
+
+        let code = run_connect(
+            &entry,
+            &executor,
+            &spawner,
+            &backoff,
+            &upgrader,
+            &path,
+            "0.31.1", // laptop strictly newer -> the nudge is offered
+            REMOTE_INSTALL_PATH,
+            &mut input,
+            &mut output,
+            true, // TTY
+        )
+        .expect("a differing protocol version must not block connect");
+
+        assert_eq!(code, 0, "connects and exits cleanly");
+        assert_eq!(spawner.spawn_count(), 1, "the terminal was handed over");
+        let prompt = String::from_utf8(output).unwrap();
+        assert!(
+            prompt.contains("Upgrade and connect? [y/N]"),
+            "the soft nudge must be reached, not pre-empted by a fatal: {prompt}"
+        );
+        assert!(
+            upgrader.calls().is_empty(),
+            "'n' declines -> no upgrade, and no forced one either"
+        );
+    }
+
+    /// The reverse direction is spurious in the same way: a remote on a NEWER
+    /// protocol than the laptop used to die with "Upgrade your laptop binary",
+    /// which asked the user to change the one machine that is not part of the
+    /// conversation. It connects normally now, and the nudge stays silent
+    /// because it never suggests a downgrade.
+    #[test]
+    fn newer_remote_protocol_connects_without_touching_the_laptop() {
+        let entry = test_entry("prod");
+        let (_dir, path) = registry_with(&entry);
+        let executor =
+            VersionExecutor::new("0.32.0").with_hello(hello_body(Some(PROTOCOL_VERSION + 1)));
+        let spawner = ScriptedSpawner::new(vec![0]);
+        let backoff = RecordingBackoff::new();
+        let upgrader = RecordingUpgrader::new();
+        let mut input: &[u8] = b"";
+        let mut output: Vec<u8> = Vec::new();
+
+        let code = run_connect(
+            &entry,
+            &executor,
+            &spawner,
+            &backoff,
+            &upgrader,
+            &path,
+            "0.31.1", // laptop OLDER than the remote
+            REMOTE_INSTALL_PATH,
+            &mut input,
+            &mut output,
+            true,
+        )
+        .expect("a newer remote protocol must not block connect");
+
+        assert_eq!(code, 0);
+        assert_eq!(spawner.spawn_count(), 1);
+        assert!(
+            output.is_empty(),
+            "never nudge an older laptop toward the remote's version: {}",
+            String::from_utf8_lossy(&output)
+        );
+        assert!(upgrader.calls().is_empty());
+    }
+
+    /// The floor that issue #491 deliberately KEEPS: a reply with no
+    /// `server_version` at all is not an older deck disagreeing about a
+    /// number, it is something we cannot identify as a deck. `connect` is
+    /// about to hand over the user's terminal, so that stays fatal — and the
+    /// message names the install rather than quoting a version comparison the
+    /// code no longer makes.
+    #[test]
+    fn unanswerable_handshake_stays_fatal_without_naming_versions() {
+        let entry = test_entry("prod");
+        let (_dir, path) = registry_with(&entry);
+        let executor = VersionExecutor::new("0.31.0").with_hello(hello_body(None));
+        let spawner = ScriptedSpawner::new(vec![0]);
+        let backoff = RecordingBackoff::new();
+        let upgrader = RecordingUpgrader::new();
+        let mut input: &[u8] = b"";
+        let mut output: Vec<u8> = Vec::new();
+
+        let err = run_connect(
+            &entry,
+            &executor,
+            &spawner,
+            &backoff,
+            &upgrader,
+            &path,
+            "0.31.1",
+            REMOTE_INSTALL_PATH,
+            &mut input,
+            &mut output,
+            false,
+        )
+        .expect_err("a reply we cannot identify as a deck must stay fatal");
+
+        assert!(
+            matches!(
+                err,
+                RemoteConnectError::RemoteHandshakeUnsupported { ref name } if name == "prod"
+            ),
+            "unexpected error: {err:?}"
+        );
+        assert_eq!(
+            spawner.spawn_count(),
+            0,
+            "the terminal is never handed to an install we could not confirm"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("remote upgrade prod"),
+            "the message must name the recovery: {msg}"
+        );
+        assert!(
+            !msg.contains("laptop speaks"),
+            "no laptop-side version may be quoted at the user (issue #491): {msg}"
         );
     }
 

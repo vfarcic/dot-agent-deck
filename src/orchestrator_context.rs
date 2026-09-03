@@ -214,6 +214,51 @@ pub fn prepare_orchestrator_prompt(
     })
 }
 
+/// The exact separator `prepare_orchestrator_prompt` writes ahead of a task —
+/// matched here rather than duplicated as a shared constant, since this is
+/// the only other reader.
+const TASK_SECTION_MARKER: &str = "\n## Your task\n\n";
+
+/// Read an existing orchestrator context file's own `## Your task` section
+/// back off disk, if any. `None` covers every case where there is nothing to
+/// carry forward: the file does not exist yet, cannot be read, or was written
+/// with no task (the interactive `Ctrl+n` path, which never carries one).
+///
+/// Exists so a re-assertion (compaction or `/clear`) can re-supply the SAME
+/// task `prepare_orchestrator_prompt` would otherwise silently drop — see
+/// [`reassert_orchestrator_prompt`].
+fn read_back_task(cwd: &str) -> Option<String> {
+    let file_path = std::path::Path::new(cwd)
+        .join(".dot-agent-deck")
+        .join("orchestrator-context.md");
+    let content = std::fs::read_to_string(file_path).ok()?;
+    let after = content.split_once(TASK_SECTION_MARKER)?.1;
+    let task = after.trim();
+    (!task.is_empty()).then(|| task.to_string())
+}
+
+/// Re-run `prepare_orchestrator_prompt` for a re-assertion (compaction or
+/// `/clear`), preserving whatever task the existing context file already
+/// carries instead of silently discarding it.
+///
+/// Before this, both re-arm sites in `src/ui.rs` called
+/// `prepare_orchestrator_prompt(config, cwd, None)` directly — correct for the
+/// interactive `Ctrl+n` orchestrator, which never has a task, but wrong for a
+/// `dispatch --task` or per-issue orchestration (`src/spawn.rs`): a
+/// compaction or `/clear` on one of those rewrote the file with no `## Your
+/// task` section at all and delivered the no-task "wait for instructions"
+/// pointer over a task that was actively in progress, deleting it from disk
+/// and telling the orchestrator to stop rather than continue.
+///
+/// Reading the task back off the file the daemon itself just wrote is
+/// non-destructive and needs no new tab state — `Tab::Orchestration` does not
+/// need to start carrying the task alongside `config`/`cwd` for this to work,
+/// because the file already has it.
+pub fn reassert_orchestrator_prompt(config: &OrchestrationConfig, cwd: &str) -> Option<String> {
+    let task = read_back_task(cwd);
+    prepare_orchestrator_prompt(config, cwd, task.as_deref())
+}
+
 // ---------------------------------------------------------------------------
 // M6: Skill file auto-deployment
 // ---------------------------------------------------------------------------
@@ -340,6 +385,76 @@ mod tests {
                     .unwrap();
             assert!(!written.contains("## Your task"));
         }
+    }
+
+    /// Regression for the maintainer review on the fork's upstream PR #789
+    /// "Required 1": both `src/ui.rs` re-arm sites used to call
+    /// `prepare_orchestrator_prompt(config, cwd, None)` directly, which wiped
+    /// a dispatched task's `## Your task` section on every compaction/`/clear`
+    /// re-assertion and told the orchestrator to wait rather than continue.
+    /// `reassert_orchestrator_prompt` must read that section back and carry
+    /// it forward instead.
+    #[test]
+    fn reassert_preserves_an_existing_dispatched_task() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path().to_string_lossy().to_string();
+
+        // Simulate the spawn-time write a `dispatch --task` orchestration
+        // (`src/spawn.rs`) leaves on disk.
+        prepare_orchestrator_prompt(&config(), &cwd, Some("Verify PR #232 and report."))
+            .expect("spawn-time write");
+
+        let line = reassert_orchestrator_prompt(&config(), &cwd).expect("re-assertion written");
+        assert!(
+            line.contains("carry out that task"),
+            "a re-assertion that found an existing task must still direct action, got {line:?}"
+        );
+        assert!(
+            !line.contains("wait for instructions"),
+            "must not tell a dispatched orchestrator to wait: {line:?}"
+        );
+
+        let written =
+            std::fs::read_to_string(tmp.path().join(".dot-agent-deck/orchestrator-context.md"))
+                .expect("context file on disk");
+        assert!(
+            written.contains("Verify PR #232 and report."),
+            "the task must survive the re-assertion rewrite:\n{written}"
+        );
+    }
+
+    /// The interactive `Ctrl+n` orchestrator never has a task, so a
+    /// re-assertion on it must reproduce today's no-task behavior exactly —
+    /// `reassert_orchestrator_prompt` must not invent one.
+    #[test]
+    fn reassert_with_no_prior_task_reproduces_no_task_behavior() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path().to_string_lossy().to_string();
+
+        prepare_orchestrator_prompt(&config(), &cwd, None).expect("spawn-time write");
+
+        let line = reassert_orchestrator_prompt(&config(), &cwd).expect("re-assertion written");
+        assert!(line.contains("wait for instructions"), "got {line:?}");
+
+        let written =
+            std::fs::read_to_string(tmp.path().join(".dot-agent-deck/orchestrator-context.md"))
+                .unwrap();
+        assert!(!written.contains("## Your task"));
+    }
+
+    /// With no context file on disk at all (a re-assertion racing ahead of any
+    /// spawn-time write, or a pruned file), `reassert_orchestrator_prompt`
+    /// must fall back to the ordinary no-task write rather than failing —
+    /// `read_back_task` returns `None` and `prepare_orchestrator_prompt`
+    /// creates the file fresh, matching `prepare_orchestrator_prompt`'s own
+    /// `None` behavior.
+    #[test]
+    fn reassert_with_no_existing_file_falls_back_to_no_task() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path().to_string_lossy().to_string();
+
+        let line = reassert_orchestrator_prompt(&config(), &cwd).expect("written from scratch");
+        assert!(line.contains("wait for instructions"), "got {line:?}");
     }
 
     /// Scenario: Build the orchestrator context and check that its `delegate`

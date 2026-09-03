@@ -19,7 +19,9 @@
 #       `build.sh assemble [ID...] [--manifest PATH]`
 #
 #   reel (default) — run (a), then (b), then invoke the engine forwarding
-#       --out/--publish. Clean-skips when nothing is in scope.
+#       --out/--publish. Clean-skips when nothing is in scope, naming WHICH of
+#       the two causes it hit: nothing changed, or things changed but carry no
+#       ` [reel]` marker (issue #735 — the two call for opposite responses).
 #
 # Selection rule (file-level granularity, robustness over cleverness):
 #   A recording dir `<RECORDINGS_DIR>/<id>/` is IN SCOPE iff
@@ -66,14 +68,84 @@ ENGINE="${REEL_ADAPTER_ENGINE:-$SCRIPT_DIR/../demo-reel/reel.sh}"
 
 SKIP_MSG="skipped: no e2e tests changed on this branch"
 
+# Where `select_ids` records the ids it dropped for a MISSING ` [reel]` marker —
+# the near-misses that cleared every other gate (they have a cast, and their
+# source changed on this branch), so they are exactly what a reader would
+# otherwise go hunting for. A FILE rather than a variable because `reel` reads
+# `select_ids` through a process substitution, which runs it in a subshell whose
+# variables never make it back. Empty (the default, and what `build.sh select`
+# uses) means "record nothing".
+INELIGIBLE_LOG=""
+
 die() { echo "demo-reel-adapter: $*" >&2; exit 1; }
+
+# The clean-skip line. BOTH skip paths write no manifest, invoke no engine and
+# exit 0 — only the WORDING differs, and it must, because the two causes call for
+# opposite responses (issue #735):
+#   * nothing in scope at all      -> a reel was never possible; nothing to do.
+#   * in scope but not [reel]-marked -> a deliberate opt-out is in force, and the
+#     reader may want to know WHICH tests and whether the marker is rightly
+#     absent. Naming the ids is what makes that case actionable; the old generic
+#     wording sent readers to debug the diff gate, which was working fine.
+# Composed in ONE place, called from both paths, so the two messages cannot drift
+# back into saying the same wrong thing.
+#
+# Exclusions arrive as TWO buckets separated by a literal `--`, because a list can
+# lose ids to either gate and the composed reason has to survive BOTH firing at
+# once (PR #778 review). An id is never `--` itself — ids are single recording-dir
+# names, and `assemble` rejects `/` and `..` before this is ever called.
+#   usage: skip_message <scope-phrase> [cast-less-id...] -- [unmarked-id...]
+skip_message() {
+  local scope="$1"; shift
+  # Declared one per line: macOS ships /bin/bash 3.2.57 and this file already
+  # carries one bash-3.2 scar (issue #593's `mapfile`), so array declarations
+  # stay in the single-target form the rest of the script uses.
+  local cast_less=()
+  local unmarked=()
+  local past_sep="" arg
+  for arg in "$@"; do
+    if [[ -z "$past_sep" && "$arg" == "--" ]]; then past_sep=1; continue; fi
+    if [[ -n "$past_sep" ]]; then unmarked+=("$arg"); else cast_less+=("$arg"); fi
+  done
+
+  # Nothing was dropped for a missing marker, so the scope gate really is the
+  # whole story. A cast-less-ONLY list lands here deliberately: "no e2e tests
+  # changed" is literally true of a list that contains no e2e test (a dir with no
+  # cast is an L1 render test, not a clip candidate), and each such id has already
+  # had its own naming diagnostic on stderr mid-loop.
+  if [[ ${#unmarked[@]} -eq 0 ]]; then
+    printf '%s\n' "$SKIP_MSG"
+    return 0
+  fi
+
+  printf '%s\n' "skipped: ${#unmarked[@]} e2e test(s) $scope, but none is reel-eligible — no [reel] marker in $CATALOG_FILE for: $(join_ids "${unmarked[@]}")"
+  # The marker is not the whole reason when the same list ALSO lost ids before
+  # they ever reached the marker gate: saying only "none is reel-eligible" would
+  # scope that verdict over the cast-less ones too and send a reader to add a
+  # marker that would change nothing. This PR exists because a skip named the
+  # wrong reason — so name both when both apply.
+  if [[ ${#cast_less[@]} -gt 0 ]]; then
+    printf '%s\n' "  (a further ${#cast_less[@]} id(s) in the same list were dropped EARLIER, for an unrelated reason — no full-stream.cast, so not an e2e clip at all and no [reel] marker would help: $(join_ids "${cast_less[@]}"))"
+  fi
+  printf '%s\n' "  ([reel] is OPT-IN and its absence is usually the right answer: a clip exists so a human can watch REAL behavior, so only a test that genuinely spins up a real agent is marked — a stand-in (cat, scripted echo, recorder stubs, synthesized hook events) stays unmarked and never becomes a clip. See CLAUDE.md rule 4.)"
+}
+
+# Render an id list for a human: "a, b, c". Used for both of skip_message's
+# buckets, so the two read identically.
+join_ids() {
+  local out="" id
+  for id in "$@"; do out="${out:+$out, }$id"; done
+  printf '%s' "$out"
+}
 
 usage() {
   cat <<EOF
 Usage:
   build.sh [reel] [--out OUT.mp4] [--publish] [--manifest PATH] [--title TITLE]
       Select in-scope e2e tests, build a manifest, and invoke the engine.
-      Clean-skips (no manifest, no engine, exit 0) when no e2e tests changed.
+      Clean-skips (no manifest, no engine, exit 0) when no e2e tests changed —
+      or, when e2e tests DID change but none carries the [reel] marker, skips
+      just as cleanly while naming those tests instead.
       Composes a descriptive video title ('<repo> · PRD #<prd> · PR #<pr> —
       <desc>') and forwards it to the engine; --title TITLE overrides that
       composition verbatim (for manual/dogfood runs).
@@ -87,7 +159,10 @@ Usage:
       Build manifest.json from the given recording-dir IDs (pure: no git, no
       network). Excludes any ID without a full-stream.cast, or whose catalog id
       lacks the trailing [reel] eligibility marker; orders by catalog id.
-      Clean-skips when no ID resolves to a reel-eligible e2e clip.
+      Clean-skips when no ID resolves to a reel-eligible e2e clip, naming any ID
+      dropped for a missing [reel] marker — and, when the list also lost IDs for
+      having no cast, naming those separately rather than blaming the marker for
+      the whole skip.
 
 Environment overrides:
   REEL_ADAPTER_RECORDINGS_DIR  (default: .dot-agent-deck/recordings)
@@ -192,6 +267,16 @@ catalog_reel_eligible() {
 assemble() {
   local manifest="$1"; shift
   local rows id md cast title catid desc ord obj title_dec desc_dec
+  # Ids dropped for a missing ` [reel]` marker, so the clean-skip below can name
+  # the real reason instead of blaming the diff (issue #735) — and, separately,
+  # the ids dropped for having no cast at all. BOTH buckets are tracked because a
+  # hand-written id list can populate both at once, and a skip that named only
+  # the marker bucket would scope "none is reel-eligible" over cast-less ids too
+  # (PR #778 review). `reel` never mixes them — `select_ids` filters cast-less
+  # dirs out before `assemble` is called — but the standalone
+  # `build.sh assemble <id...>` subcommand takes raw ids with no such filtering.
+  local ineligible=()
+  local cast_less=()
   rows="$(mktemp)"
   # The rows scratch file is removed on the normal exit paths below, but a
   # validation `die` can abort mid-loop — so also clean it up on any exit
@@ -210,6 +295,7 @@ assemble() {
     md="$RECORDINGS_DIR/$id/test.md"
     if [[ ! -f "$cast" ]]; then
       echo "demo-reel-adapter: excluding '$id' (no full-stream.cast — not an e2e clip)" >&2
+      cast_less+=("$id")
       continue
     fi
     [[ -f "$md" ]] || die "missing test.md for '$id': $md"
@@ -223,6 +309,7 @@ assemble() {
     # id list can't smuggle an unmarked test past selection's own marker check.
     if ! catalog_reel_eligible "$catid"; then
       echo "demo-reel-adapter: excluding '$id' (catalog id '$catid' has no [reel] marker — not reel-eligible)" >&2
+      ineligible+=("$id")
       continue
     fi
     desc="$(extract_description "$md")"
@@ -236,7 +323,8 @@ assemble() {
 
   if [[ ! -s "$rows" ]]; then
     rm -f "$rows"
-    echo "$SKIP_MSG"
+    skip_message "in the given list" \
+      ${cast_less[@]+"${cast_less[@]}"} -- ${ineligible[@]+"${ineligible[@]}"}
     return 0
   fi
 
@@ -255,7 +343,7 @@ assemble() {
 # Concern (a): print the in-scope recording-dir IDs (one per line).
 # --------------------------------------------------------------------------
 select_ids() {
-  local changed base md id src
+  local changed base md id src catid
   # The default ref is `origin/main`, so refresh the remote-tracking ref first —
   # a local `main` can lag the true remote tip and over-select tests already
   # merged upstream. Best-effort: offline / no remote just falls back to whatever
@@ -273,17 +361,32 @@ select_ids() {
   base="$(git merge-base "$MAIN_REF" HEAD 2>/dev/null || true)"
   changed="$(git diff --name-only "$base" -- '*.rs' 2>/dev/null | sed -E 's#.*/##' | sort -u || true)"
   [[ -d "$RECORDINGS_DIR" ]] || return 0
+  # The three gates are ANDed, so evaluation ORDER cannot change WHICH ids are
+  # selected — but it does change which ones the marker gate gets to talk about,
+  # so the marker is checked LAST (issue #735). Checked first, it fires for every
+  # unmarked recording dir on disk (dozens), which is noise; checked last it
+  # fires only for a test that WOULD have been selected — cast on disk, source
+  # changed on this branch, marker absent. Those are the near-misses worth
+  # naming, and the ones `INELIGIBLE_LOG` hands to the caller so a clean skip can
+  # state its real reason instead of blaming the diff.
   for md in "$RECORDINGS_DIR"/*/test.md; do
     [[ -f "$md" ]] || continue
     id="$(basename "$(dirname "$md")")"
     [[ -f "$RECORDINGS_DIR/$id/full-stream.cast" ]] || continue   # (1) e2e proxy
-    catalog_reel_eligible "$(extract_catalog_id "$(extract_title "$md")")" \
-      || continue                                                 # (2) [reel] marker
     src="$(extract_source_basename "$md")"
     [[ -n "$src" ]] || continue
-    if printf '%s\n' "$changed" | grep -Fxq "$src"; then          # (3) changed vs main
-      printf '%s\n' "$id"
+    printf '%s\n' "$changed" | grep -Fxq "$src" || continue       # (3) changed vs main
+    catid="$(extract_catalog_id "$(extract_title "$md")")"
+    if ! catalog_reel_eligible "$catid"; then                     # (2) [reel] marker
+      # Same diagnostic assemble() emits, so the marker gate explains itself
+      # wherever it fires rather than only at assembly.
+      echo "demo-reel-adapter: excluding '$id' (catalog id '$catid' has no [reel] marker — not reel-eligible)" >&2
+      if [[ -n "$INELIGIBLE_LOG" ]]; then
+        printf '%s\n' "$id" >> "$INELIGIBLE_LOG"
+      fi
+      continue
     fi
+    printf '%s\n' "$id"
   done
 }
 
@@ -374,6 +477,13 @@ case "$cmd" in
     ;;
 
   reel)
+    # Give select_ids somewhere to record the ids it drops for a missing [reel]
+    # marker, so an empty selection can say WHICH of the two causes it hit
+    # (issue #735). Read and removed immediately below rather than left to the
+    # trap: this path ends in `exec`, which replaces the process without running
+    # EXIT traps, so the trap only covers a `die`/interrupt before that point.
+    INELIGIBLE_LOG="$(mktemp)"
+    trap 'rm -f "${INELIGIBLE_LOG:-}"' EXIT INT TERM
     # A read loop rather than `mapfile -t scope`, which is bash 4: macOS ships
     # /bin/bash 3.2.57, where `mapfile` is not a builtin at all and this died
     # with `mapfile: command not found` (exit 127) before selecting anything
@@ -384,8 +494,19 @@ case "$cmd" in
     while IFS= read -r id; do
       scope+=("$id")
     done < <(select_ids)
+    ineligible=()
+    while IFS= read -r id; do
+      ineligible+=("$id")
+    done < "$INELIGIBLE_LOG"
+    rm -f "$INELIGIBLE_LOG"
     if [[ ${#scope[@]} -eq 0 ]]; then
-      echo "$SKIP_MSG"
+      # Still a CLEAN skip — no manifest, no engine, exit 0. Only the wording
+      # changes: an empty `ineligible` means nothing was in scope at all, a
+      # non-empty one means tests changed but are deliberately not reel-eligible.
+      # The cast-less bucket is EMPTY here and always will be: `select_ids`'s gate
+      # (1) drops cast-less dirs itself, so this path never sees one. The `--`
+      # still leads, so both call sites pass the same two-bucket shape.
+      skip_message "changed on this branch" -- ${ineligible[@]+"${ineligible[@]}"}
       exit 0
     fi
     rm -f "$manifest"

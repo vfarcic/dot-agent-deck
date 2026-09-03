@@ -78,6 +78,13 @@ pub enum Tab {
         /// selection to the wrong card. `UiState.selected_index` is
         /// derived from this each frame.
         selected_session_id: Option<String>,
+        /// PRD #313: whether this tab's focused pane takes the whole frame,
+        /// with the card sidebar and the non-focused panes not drawn. Ephemeral
+        /// and per-tab, exactly like [`Tab::Orchestration::zoomed`] — the two
+        /// are deliberately separate values rather than one global, so zooming
+        /// the Dashboard does not silently zoom an orchestration tab you were
+        /// supervising, or the reverse.
+        zoomed: bool,
     },
     Mode {
         id: TabId,
@@ -152,6 +159,25 @@ pub enum Tab {
         /// Deliberately not persisted across launches — a fresh process starts
         /// at the 34/66 default (PRD #336 keeps persistence out of scope).
         split_narrow: bool,
+        /// PRD #313: whether this tab's focused role pane is zoomed to the
+        /// whole frame, with the sidebar and the non-focused panes not drawn.
+        /// `false` = the normal supervisory view.
+        ///
+        /// Unlike [`Self::Orchestration::split_narrow`] this is **per-tab and
+        /// is itself the source of truth** — there is deliberately no
+        /// `TabManager`-level global mirroring it. tmux zooms a *window*, not a
+        /// session, and the two states answer different questions: the split is
+        /// a standing reading preference, while zoom says "I have stopped
+        /// supervising and am working in *this* agent". A tab the user never
+        /// zoomed must not silently lose its sidebar, which a global would do —
+        /// and keeping it per-tab means no cross-tab broadcast loop like
+        /// [`TabManager::toggle_orchestration_split`]'s is needed at all.
+        ///
+        /// Ephemeral in the same way, and more so: not persisted across
+        /// launches *and* not written to the saved session, so a detach/reattach
+        /// always returns the full supervisory view. It is pure presentation —
+        /// nothing about it reaches the daemon.
+        zoomed: bool,
     },
 }
 
@@ -188,6 +214,9 @@ impl TabManager {
         Self {
             tabs: vec![Tab::Dashboard {
                 selected_session_id: None,
+                // PRD #313: a fresh deck is never zoomed; zoom is ephemeral and
+                // is not restored from a saved session.
+                zoomed: false,
             }],
             active_index: 0,
             next_id: 1,
@@ -954,6 +983,9 @@ impl TabManager {
             all_clear_pending: false,
             // PRD #336: adopt the current GLOBAL split, not the 34/66 default.
             split_narrow: self.orchestration_split_narrow,
+            // PRD #313: zoom is PER-TAB, so a newly opened tab always starts
+            // unzoomed regardless of what any other tab is doing.
+            zoomed: false,
         });
 
         let index = self.tabs.len() - 1;
@@ -1097,6 +1129,9 @@ impl TabManager {
             // across launches, so a restore during startup lands on the 34/66
             // default; a restore mid-session picks up whatever is in effect.
             split_narrow: self.orchestration_split_narrow,
+            // PRD #313: zoom is ephemeral view state and is never persisted, so
+            // a hydrated/restored tab comes back with the full supervisory view.
+            zoomed: false,
         });
 
         let index = self.tabs.len() - 1;
@@ -1642,6 +1677,7 @@ mod tests {
         // Stamp a distinct remembered id onto each tab variant.
         if let Tab::Dashboard {
             selected_session_id,
+            ..
         } = &mut tm.tabs[0]
         {
             *selected_session_id = Some("sess-dashboard".to_string());
@@ -1668,7 +1704,7 @@ mod tests {
 
         assert!(matches!(
             &tm.tabs[0],
-            Tab::Dashboard { selected_session_id: Some(s) } if s == "sess-dashboard"
+            Tab::Dashboard { selected_session_id: Some(s), .. } if s == "sess-dashboard"
         ));
         assert!(matches!(
             &tm.tabs[mode_idx],
@@ -1743,6 +1779,7 @@ mod tests {
 
         let mut dash = Tab::Dashboard {
             selected_session_id: Some("s2".to_string()),
+            zoomed: false,
         };
         // No focused pane: index derives purely from the remembered id.
         let idx = crate::ui::sync_and_derive_selection(&mut dash, None, filtered, None);
@@ -1753,7 +1790,7 @@ mod tests {
         assert_eq!(idx, Some(2));
         assert!(matches!(
             &dash,
-            Tab::Dashboard { selected_session_id: Some(s) } if s == "s3"
+            Tab::Dashboard { selected_session_id: Some(s), .. } if s == "s3"
         ));
 
         // Gating: running the sync while a Mode tab is active returns
@@ -1772,7 +1809,7 @@ mod tests {
         assert_eq!(idx, None);
         assert!(matches!(
             &dash,
-            Tab::Dashboard { selected_session_id: Some(s) } if s == "s3"
+            Tab::Dashboard { selected_session_id: Some(s), .. } if s == "s3"
         ));
     }
 
@@ -1790,13 +1827,15 @@ mod tests {
         let filtered: &[(&str, Option<&str>)] = &[("s1", Some("p1")), ("s2", Some("p2"))];
         let mut dash = Tab::Dashboard {
             selected_session_id: Some("gone".to_string()),
+            zoomed: false,
         };
         let idx = crate::ui::sync_and_derive_selection(&mut dash, None, filtered, None);
         assert_eq!(idx, Some(0));
         assert!(matches!(
             &dash,
             Tab::Dashboard {
-                selected_session_id: None
+                selected_session_id: None,
+                ..
             }
         ));
 
@@ -1818,6 +1857,7 @@ mod tests {
             had_waiting_pane: false,
             all_clear_pending: false,
             split_narrow: false,
+            zoomed: false,
         };
         let idx = crate::ui::sync_and_derive_selection(&mut orch, None, filtered, None);
         assert_eq!(idx, Some(0));
@@ -1850,6 +1890,7 @@ mod tests {
             had_waiting_pane: false,
             all_clear_pending: false,
             split_narrow: false,
+            zoomed: false,
         };
         assert_eq!(
             crate::ui::sync_and_derive_selection(&mut dup_tab, None, dup, Some(1)),

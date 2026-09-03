@@ -1,0 +1,34 @@
+---
+source: tests/render_layout.rs
+expression: unzoomed
+---
+ orchestration                                                                                      
+ dot-agent-deck — 2 session(s)    ┏orchestrator━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+┏ ▸ 1 ClaudeCode · orche… ● Idle ┓┃                                                                ┃
+┃Dir:  —                         ┃┃                                                                ┃
+┃                                ┃┃                                                                ┃
+┃                                ┃┃                                                                ┃
+┃                                ┃┃                                                                ┃
+┃                                ┃┃                                                                ┃
+┃                                ┃┃                                                                ┃
+┃                                ┃┃                                                                ┃
+┃                                ┃┃                                                                ┃
+┗━━━━━━━━━━━━ Last: 2h  Tools: 0 ┛┃                                                                ┃
+┌ 2 ClaudeCode · worker ─ ● Idle ┐┃                                                                ┃
+│Dir:  —                         │┃                                                                ┃
+│                                │┃                                                                ┃
+│                                │┃                                                                ┃
+│                                │┃                                                                ┃
+│                                │┃                         Ctrl+D to type                         ┃
+│                                │┃                                                                ┃
+│                                │┃                                                                ┃
+│                                │┃                                                                ┃
+└──────────── Last: 2h  Tools: 0 ┘┃                                                                ┃
+                                  ┃                                                                ┃
+                                  ┃                                                                ┃
+                                  ┃                                                                ┃
+                                  ┃                                                                ┃
+                                  ┃                                                                ┃
+ 2 active  │  2 idle  │  0 tools  ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
+ COMMAND  [Back to Pane Ctrl+D] [New Pane Ctrl+N] [Close Ctrl+W] [Toggle Layout Ctrl+T] [Help ?]    
+[Quit Ctrl+C] [Filter /] [Rename r] [Generate g] [Scheduled Tasks s]
