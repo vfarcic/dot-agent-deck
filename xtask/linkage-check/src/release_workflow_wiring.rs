@@ -114,7 +114,7 @@ fn finalize_does_not_wait_on_the_desktop_jobs() {
     let all = jobs(&workflow());
     let finalize = needs(job(&all, "finalize"));
 
-    for forbidden in ["desktop-bundle", "desktop-publish"] {
+    for forbidden in ["desktop-bundle", "desktop-publish", "attest"] {
         assert!(
             !finalize.iter().any(|n| n == forbidden),
             "`finalize` lists `{forbidden}` in needs: {finalize:?}.\n\
@@ -300,6 +300,103 @@ fn one_platforms_bundler_failure_does_not_cancel_the_other() {
         bundle.contains("fail-fast: false"),
         "`desktop-bundle` must set `fail-fast: false`, or an AppImage fetch \
          timeout on Linux cancels an otherwise-good macOS dmg."
+    );
+}
+
+/// PRD #757 takes the free half of artifact trust: every published asset gets
+/// SLSA build provenance from `actions/attest-build-provenance`, signed with a
+/// short-lived Sigstore certificate obtained through the job's OIDC token. It
+/// is the only half that reaches Linux at all, since `dpkg -i` verifies no
+/// package signature.
+///
+/// Two properties of the job matter and neither is visible in review:
+///
+/// It must stay **off the critical path**, like `desktop-bundle` before it. An
+/// attestation-service blip must turn the run red and leave the CLI release
+/// complete, which is only true while `finalize` does not wait on it. That half
+/// is covered by [`finalize_does_not_wait_on_the_desktop_jobs`], extended here
+/// to name `attest` too.
+///
+/// And it must **not be gated on the desktop matrix succeeding**. `needs:` on a
+/// matrix job resolves to the aggregate, so `needs: desktop-publish` alone would
+/// skip attestation of the CLI binaries whenever a bundler leg failed --
+/// exactly the defect Greptile's P1 on #768 found in `desktop-publish` itself.
+/// The gate is on the release object existing.
+#[test]
+fn attestation_is_off_the_critical_path_and_not_hostage_to_the_desktop_matrix() {
+    let all = jobs(&workflow());
+    let attest = job(&all, "attest");
+
+    let finalize = needs(job(&all, "finalize"));
+    assert!(
+        !finalize.iter().any(|n| n == "attest"),
+        "`finalize` lists `attest` in needs: {finalize:?}. Attestation calls an \
+         external service from inside the release path; putting it ahead of the \
+         job that creates the Release means a service blip delays or blocks an \
+         ordinary tag. Same topology rule as the desktop jobs -- PRD #740 \
+         Decision 4, PRD #757."
+    );
+
+    let gate = attest
+        .lines()
+        .map(code_before_comment)
+        .find(|l| l.trim_start().starts_with("if:"))
+        .unwrap_or_else(|| panic!("`attest` has no `if:` gate:\n{attest}"));
+    assert!(
+        gate.contains("needs.finalize.result == 'success'"),
+        "`attest` must gate on the release object existing, got `{}`. Gating on \
+         `desktop-publish` succeeding instead would discard the CLI binaries' \
+         attestations every time a bundler leg failed, because `needs:` on a \
+         matrix job resolves to the AGGREGATE result. That is the defect \
+         Greptile's P1 on #768 found one job over.",
+        gate.trim()
+    );
+}
+
+/// The whole security argument for attestation is that it needs no secret: the
+/// signing certificate is short-lived and comes from Sigstore via the job's
+/// OIDC token, so there is no private key in this repository to leak, rotate,
+/// or have revoked. PRD #757 Decision 5 is what the alternative would have
+/// cost.
+///
+/// That argument is a property of the job's `permissions:` block, and the
+/// natural future edit -- someone adds a credential here to sign something as
+/// well -- is a one-line change that reads as a convenience. So the block is
+/// pinned: exactly the three scopes attestation needs, and nothing that could
+/// carry or reach a signing key.
+#[test]
+fn the_attest_job_holds_no_credential_and_needs_none() {
+    let all = jobs(&workflow());
+    let attest = job(&all, "attest");
+    let code: String = attest
+        .lines()
+        .map(code_before_comment)
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    for required in ["id-token: write", "attestations: write"] {
+        assert!(
+            code.contains(required),
+            "`attest` must declare `{required}`. Job-level permissions REPLACE \
+             the workflow-level set, so omitting one does not fall back to a \
+             default -- the OIDC token or the attestation write is simply \
+             absent and the action fails at the end of a release."
+        );
+    }
+    assert!(
+        !code.contains("contents: write"),
+        "`attest` must not take `contents: write`. It downloads artifacts and \
+         calls the attestation API; nothing in it writes to the repository, and \
+         a job-level permissions block is the one place that scope can be \
+         narrowed from the workflow-level default."
+    );
+    assert!(
+        !code.contains("secrets."),
+        "`attest` references a secret. The entire argument for provenance over \
+         code signing (PRD #757 Decisions 2 and 5) is that it needs no \
+         credential -- the certificate is short-lived and comes from Sigstore \
+         through `id-token`. A secret here means something else is going on, \
+         and it should be reviewed rather than inherited."
     );
 }
 

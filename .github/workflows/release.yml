@@ -777,9 +777,98 @@ jobs:
             printf -- "- Open **System Settings > Privacy & Security**, find the message naming Agent Deck, and choose **Open Anyway**. Control-clicking the app to bypass this no longer works on macOS Sequoia and later, which is why this route is listed first.\n"
             printf -- "- Or clear the quarantine flag from a terminal:\n\n"
             printf "  \`\`\`sh\n  xattr -dr com.apple.quarantine \"/Applications/Agent Deck.app\"\n  \`\`\`\n\n"
-            printf "**Linux** (\`.deb\`) -- nothing blocks this install and nothing warns you: \`dpkg -i\` does not verify package signatures. Checking the SHA-256 against \`checksums-desktop-alpha.txt\` is the only verification available, so do it.\n\n"
-            printf "Signing and notarization are tracked in https://github.com/vfarcic/dot-agent-deck/issues/757.\n"
+            printf "**Linux** (\`.deb\`) -- nothing blocks this install and nothing warns you: \`dpkg -i\` does not verify package signatures, so the checks below are the only ones anybody makes.\n\n"
+            printf "**Verifying what you downloaded.** Every asset on this release carries [build provenance](https://docs.github.com/en/actions/security-for-github-actions/using-artifact-attestations), which is a stronger claim than a checksum: it says this exact file was produced by this repository's release workflow, from a named commit, rather than merely that it matches a number printed on the same page that served it.\n\n"
+            printf "\`\`\`sh\ngh attestation verify <the-file-you-downloaded> --repo vfarcic/dot-agent-deck\n\`\`\`\n\n"
+            printf "Signing and notarization -- which is what would stop macOS warning you in the first place -- are tracked in https://github.com/vfarcic/dot-agent-deck/issues/757.\n"
           } | gh release edit "v$RELEASE_VERSION" --repo "$REPO" --notes-file -
+
+  # PRD #757: verifiable build provenance for every published asset.
+  #
+  # This is the free half of artifact trust, and it is the ONLY half that
+  # reaches Linux. OS-level signing does nothing for the `.deb`: dpkg ships
+  # with `no-debsig`, so `dpkg -i` verifies no package signature and issues no
+  # warning, which means a signed .deb is a signature nothing looks at. What
+  # every platform can use is provenance -- proof that a given file was built
+  # by this workflow, from this commit, in this repository.
+  #
+  # NO SIGNING SECRET IS INVOLVED, and that is the point rather than a
+  # convenience. `actions/attest-build-provenance` obtains a short-lived
+  # Sigstore certificate through the job's OIDC token (`id-token: write`), so
+  # there is no private key in this repository, nothing to rotate, and nothing
+  # a leak could expose. It is free on public repositories on every current
+  # GitHub plan. Contrast Decision 5 of PRD #757, which is what holding an
+  # Apple Developer ID key here would have cost.
+  #
+  # What this does NOT do, stated so nobody reads it as more than it is: it
+  # does not remove the macOS Gatekeeper dialog, which needs Apple's own chain,
+  # and it does not remove Windows SmartScreen. Verification is opt-in -- a
+  # user runs `gh attestation verify`; no OS checks this on their behalf.
+  #
+  # Off the critical path by the same reasoning as `desktop-bundle`: `finalize`
+  # does not list this job in `needs:`, so an attestation-service blip turns
+  # the run red and leaves the release complete.
+  attest:
+    needs: [prepare, finalize, desktop-publish]
+    # Gated on the RELEASE existing rather than on `desktop-publish` having
+    # succeeded -- `needs` resolves to the aggregate, so requiring the desktop
+    # leg would throw away the CLI attestations whenever a bundler failed.
+    # Same trap Greptile's P1 on #768 found in `desktop-publish`; same fix.
+    if: ${{ !cancelled() && needs.finalize.result == 'success' }}
+    runs-on: ubuntu-latest
+    # Job-level permissions REPLACE the workflow-level set, which is what is
+    # wanted here: this job gets the two scopes attestation needs and drops the
+    # `contents: write` / `packages: write` it has no use for.
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: dot-agent-deck-*
+          path: dist
+          merge-multiple: true
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        # Tolerated for the same reason `desktop-publish` tolerates it: a
+        # partial or wholly failed desktop matrix is a legitimate state, and the
+        # CLI assets must still be attested when it happens.
+        continue-on-error: true
+        with:
+          pattern: desktop-bundle-*
+          path: dist-desktop
+          merge-multiple: true
+      - name: Collect the subjects to attest
+        id: subjects
+        # Built as an explicit list rather than handed to the action as a glob,
+        # because a glob that matches nothing is an error there -- and
+        # `dist-desktop/` legitimately holds nothing when both bundler legs
+        # failed. Expanding here lets that case attest the CLI assets and move
+        # on. Filenames are `dot-agent-deck-*` and carry no spaces; the rename
+        # step in `desktop-bundle` is what guarantees that for the bundles,
+        # whose Tauri output name ("Agent Deck_<version>_amd64.deb") does.
+        run: |
+          set -eu
+          cli=$(find dist -maxdepth 1 -type f -name 'dot-agent-deck-*' | sort)
+          if [ -z "$cli" ]; then
+            echo "::error::no CLI artifacts to attest, but finalize succeeded. Something changed the artifact names or the download pattern."
+            exit 1
+          fi
+          desktop=$(find dist-desktop -maxdepth 1 -type f -name 'dot-agent-deck-desktop-alpha-*' 2>/dev/null | sort || true)
+          if [ -z "$desktop" ]; then
+            echo "::warning::no desktop bundles to attest; that platform's leg failed. Attesting the CLI assets."
+          fi
+          {
+            echo "paths<<SUBJECTS_EOF"
+            echo "$cli"
+            [ -n "$desktop" ] && echo "$desktop"
+            echo "SUBJECTS_EOF"
+          } >> "$GITHUB_OUTPUT"
+          printf 'attesting:\n%s\n' "$cli"
+          [ -n "$desktop" ] && printf '%s\n' "$desktop" || true
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: ${{ steps.subjects.outputs.paths }}
 
   docs:
     needs: [prepare, finalize]

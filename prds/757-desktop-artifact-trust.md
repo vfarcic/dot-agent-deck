@@ -1,6 +1,6 @@
 # PRD #757: Make the published desktop artifacts trusted
 
-**Status**: In progress — **decided: free options only** (maintainer, 2026-09-04). No Apple Developer Program membership, no Windows certificate, no signing secret in this repository. That decision has a hard consequence worth stating in the first line rather than burying: **the macOS warning stays**, because there is no free way to remove it (Decision 2). What the free ceiling does buy is landed or scoped — M2's release-note correction has shipped, M1's measurement is the one open piece of free work, and Decisions 4-6 are kept as the record of what a later reversal would cost rather than as work.
+**Status**: In progress — **decided: free options only** (maintainer, 2026-09-04). No Apple Developer Program membership, no Windows certificate, no signing secret in this repository. That decision has a hard consequence worth stating in the first line rather than burying: **the macOS warning stays**, because there is no free way to remove it (Decision 2). What the free ceiling *does* buy is landed: M2's release-note correction, and **build provenance on every published asset, on all three platforms, with no credential of any kind** (Decision 12) — which is also the only trust mechanism that reaches the Linux `.deb`, where a package signature is inert. M1's measurement is the one open piece of free work; Decisions 4-6 are kept as the record of what a later reversal would cost rather than as work.
 **Priority**: Medium
 **Created**: 2026-09-04
 **Issue**: [#757](https://github.com/vfarcic/dot-agent-deck/issues/757)
@@ -23,6 +23,8 @@ The other two platforms are in genuinely different states, and treating them as 
 
 Split the work by what it costs, because the cost is the decision and everything else follows from it.
 
+**Free, shipped, and the piece that covers every platform:** build provenance for every published asset — the `.dmg`, the `.deb` and the four CLI binaries — generated from the job's OIDC token with no private key anywhere in this repository, and verified by a user with one `gh attestation verify` command (Decision 12). It does not remove any OS warning, and it is the only trust mechanism that reaches Linux at all, where `dpkg -i` checks no package signature.
+
 **Free, and shipped:** stop the release note lying. It gave macOS users one route that macOS Sequoia had removed the alternative to, and told `.deb` users their OS would warn them, which is false. Landed with a static assertion holding both properties.
 
 **Free, and the one piece of work left:** measure, on a Mac, whether ad-hoc signing changes the macOS failure mode from *damaged, Move to Trash* to *unverified, Open Anyway* — and whether the daemon sidecar survives `codesign --verify --deep --strict`, which is a no-cost proxy for an open upstream Tauri bug. Neither needs a certificate, an account, or a secret (Decision 3).
@@ -37,16 +39,19 @@ The topology PRD #740 chose is untouched throughout: `desktop-bundle` still hang
 
 ### In Scope
 
+- **Done:** SLSA build provenance for every release asset via a new `attest` job — free, no secret, all three platforms (Decision 12), with the verification command in the release note.
 - **Done:** correcting the release-body note — the macOS half gains the System Settings route it was missing, and the Linux half stops claiming an OS warning that does not exist (Decision 3), with a static assertion holding both.
 - **Open:** measuring, on a real Mac, whether ad-hoc signing changes the macOS failure mode, and whether the daemon sidecar survives `codesign --verify --deep --strict` — the second being a no-cost proxy for an open upstream Tauri bug (Decision 3, M1).
 - **Open, conditional on that measurement:** ad-hoc-signing the bundle in `desktop-bundle`, if and only if M1 shows it improves the first-launch dialog.
+- Static assertions holding the above: the note's two properties, and the `attest` job's topology and its credential-free permission set (Decision 11).
 - A written, costed statement of what the paid path *would* be (Decisions 4 and 5) and of the Windows options (Decision 6), so that a later reversal is a build rather than a re-think and the free-beats-paid finding is not lost.
 
 ### Out of Scope
 
 - **Acquiring, generating or configuring any certificate, and adding any secret to this repository.** That is the maintainer's decision and this PRD does not pre-empt it.
 - **Windows Authenticode, and the Microsoft Store submission.** There is no Windows artifact to sign (Decision 6). The facts are recorded; the engineering is not scoped.
-- **Linux `.deb` signing.** The default install path verifies nothing (Decision 7).
+- **Linux `.deb` signing, and a signed apt repository.** The default install path verifies no package signature (Decision 7); provenance covers what a user can actually check (Decision 12). A repository is a distribution channel and a separate project.
+- **Surfacing provenance to CLI users in the release body.** The assets are attested; the instructions currently live only in the desktop section this PRD owns. Decision 12 records it as the one known gap.
 - **A Homebrew cask for the GUI.** #740 put it out of scope; Homebrew's 2026-09-01 policy now makes it *depend* on this PRD's paid path rather than substitute for it. If the $99 is spent, a cask becomes possible and is worth its own issue.
 - **Tauri's auto-updater.** Its signature is a Tauri-specific **minisign** keypair over the update payload, unrelated to Developer ID and unrelated to Authenticode — it shares only the word "signing". It also needs an update endpoint, a channel policy and a rollback story. #740 deferred it and this PRD leaves it deferred (Decision 8).
 - **Graduating the GUI out of alpha** (Decision 9), and **a published install page** — [#765](https://github.com/vfarcic/dot-agent-deck/issues/765) owns that, and this PRD is one of the three things it names as making it due.
@@ -54,7 +59,7 @@ The topology PRD #740 chose is untouched throughout: `desktop-bundle` still hang
 
 ## Technical Approach
 
-### Decision 1 — macOS is the whole of the engineering scope, because it is the only platform with both an artifact and a trust gate
+### Decision 1 — macOS is the whole of the *OS-trust* scope, because it is the only platform with both an artifact and a trust gate
 
 Three platforms, three genuinely different states, and the difference is not a matter of degree:
 
@@ -64,7 +69,9 @@ Three platforms, three genuinely different states, and the difference is not a m
 | Windows | **none** | n/a | n/a — nothing to sign (Decision 6) |
 | Linux x86_64 | `…-linux-amd64.deb`, since v0.39.3 | No | No — the default install path checks none (Decision 7) |
 
-That table is the whole scoping argument. The issue's own estimate — "roughly a week of engineering; a calendar window several times that, driven almost entirely by Windows" — assumed three platforms of work. One of them has no artifact and one has no gate, so the engineering is one platform's worth and the calendar is Apple's enrollment time rather than Microsoft's verification time.
+That table scopes the *OS-trust* question, and only that one. It is not the whole of this PRD's engineering: Decision 12 adds build provenance, which is free, needs no credential, and applies to every asset on every platform — including the Linux `.deb`, where the table's "a signature would not help" is true and easy to misread as "nothing would".
+
+As a scoping argument for OS trust it holds. The issue's own estimate — "roughly a week of engineering; a calendar window several times that, driven almost entirely by Windows" — assumed three platforms of work. One of them has no artifact and one has no gate, so the engineering is one platform's worth and the calendar is Apple's enrollment time rather than Microsoft's verification time.
 
 Worth recording because it explains why this problem appeared only now: **the CLI has never needed a signature, and that is a property of how it is delivered rather than of the binary.** `com.apple.quarantine` is set by the *downloader*, so a binary fetched by `brew install` of a formula, or by `curl`, carries no quarantine attribute and faces no Gatekeeper first-launch check. The moment a `.app` started shipping through a browser download, that free ride ended.
 
@@ -96,7 +103,7 @@ Two things fall out of that table and both contradict the issue. First, **EV no 
 
 And if a direct download is wanted alongside the Store, there is a second free route: **[SignPath Foundation](https://signpath.org/) provides free code signing to qualifying open-source projects**, HSM-backed, and Microsoft's own documentation names it. This project's MIT license with no commercial dual-licensing satisfies the license criterion; the other conditions are real and worth reading before assuming eligibility — verifiable builds from the project's own source, MFA across the team, an Authors/Reviewers/Approvers split, manual approval of each release, and a published *code signing policy* page. It signs Windows Authenticode only, so it is not an answer for macOS.
 
-**Linux: free already, and already adequate** — see Decision 7.
+**Linux: free, and better served by provenance than by a signature.** OS-level package signing is inert there (Decision 7), but that is an argument against signing the `.deb`, not an argument that Linux users get nothing. Decision 12 is the free mechanism that actually reaches them — and reaches macOS and Windows too.
 
 **Decided, 2026-09-04: free options only.** The maintainer's answer to the $99 question was to take the free ceiling on every platform. What that costs is worth writing in the decision rather than leaving to be discovered: **on macOS the security dialog stays on first launch, for every user, on every release, until this is revisited.** The free work below makes that dialog more honest and possibly less alarming; nothing free makes it go away. Decisions 4 and 5 stay in this document as the record of what a reversal would build and what it would risk, not as scheduled work.
 
@@ -197,13 +204,15 @@ The repository is nonetheless **already advertising an executable it does not bu
 
 **Recommendation: procure nothing for Windows.** Not because it is expensive, but because the best available outcome there is free, and because it buys a warning with a name in it for an artifact that does not exist on a platform whose blocker is #741 rather than trust. The counter-argument worth taking seriously is the calendar — Artifact Signing's identity validation runs to 20 business days — and it does not apply to either free route, which is the main practical consequence of this decision.
 
-### Decision 7 — Linux is out of scope because the default install path checks no package signature
+### Decision 7 — the `.deb` stays unsigned, because the default install path checks no package signature
+
+*Linux is not out of scope — Decision 12 is its answer, and it is a better one than a signature would have been. What is out of scope is signing the package itself, for the reason below.*
 
 The `.deb` is unsigned and this PRD leaves it unsigned, and the reason is not effort. Debian's package tooling **disables per-package signature verification by default** — `dpkg` supports it, and `/etc/dpkg/dpkg.cfg` ships with `no-debsig`, so `dpkg -i` on a downloaded `.deb` checks nothing unless the user has changed that default. Signing the artifact with `dpkg-sig` or `debsigs` therefore produces a signature that the installation path this project actually ships against will not look at.
 
 The trust mechanism that *is* real on Linux is a **signed apt repository**, verified by `apt` against a key in the machine's trusted set. That is a distribution channel, not an artifact property: it means hosting a repository, publishing a key, and committing to keeping both alive. Legitimate future work, and not this — it belongs with whatever decides how Linux users are meant to *get* the app, which is closer to #765's territory.
 
-What a direct download can honestly offer is integrity, and it already does: `checksums-desktop-alpha.txt` ships alongside the bundles. **Deliberately not proposed here:** GPG-signing that checksums file. It is cheap, and would let a user who already trusts a published maintainer key verify provenance rather than just integrity — but it needs a published key whose distribution is its own trust problem, nobody has asked, and adding a second signing key to reason about while arguing about the first is a poor trade. Recorded so it is a decision rather than an omission.
+What a direct download can honestly offer is integrity, and it already does: `checksums-desktop-alpha.txt` ships alongside the bundles. **GPG-signing that checksums file was considered and is not needed.** It would let a user who already trusts a published maintainer key verify provenance rather than just integrity — but it needs a published key whose distribution is its own trust problem, and Decision 12 delivers the same property with **no key at all**: the certificate is short-lived, issued to the workflow's own identity, and logged publicly. A GPG key would be strictly more to protect for strictly less. Recorded so it is a decision rather than an omission.
 
 ### Decision 8 — no experimental flag, no protocol change, and the updater stays out
 
@@ -239,7 +248,27 @@ Three new assertions land with the paid path, and the third earns its place:
 
 All three must run through the module's existing `code_before_comment` helper, whose docstring already records why: the `desktop-publish` steps carry prose *about* `--repo` and about having no checkout, so a comment can satisfy a naive predicate by talking about the thing. The secret-name assertion has that hazard in its worst direction — a comment in `desktop-bundle` explaining why it holds no credential would, grepped naively, read as `desktop-bundle` holding one, and the guard would fire on the correct state.
 
-The free path needs one assertion of its own, and it is the cheapest guard in the PRD: **the note's macOS half offers the System Settings route as well as the command**, so a later edit cannot quietly reduce it back to a single terminal instruction.
+The free path needs three assertions of its own. **The note's macOS half offers the System Settings route as well as the command**, so a later edit cannot quietly reduce it back to a single terminal instruction, and it addresses the `.deb` on its own terms — scoped to the note *step* rather than the job, because over a whole job block a substring can be satisfied by something that is not the note. And Decision 12's `attest` job gets two: that **`finalize` does not wait on it** and that it gates on the release existing rather than on the desktop matrix, and that it **holds no credential and needs none** — exactly `id-token: write` and `attestations: write`, no `contents: write`, and no `secrets.` reference at all. That last one is the same shape of guard as the signing-secret assertion above, pointed at the opposite property: the whole argument for provenance over code signing is that no key is involved, and the natural future edit that breaks it is a one-line convenience.
+
+### Decision 12 — build provenance is the free trust mechanism that reaches all three platforms, and it is what reaches Linux where a package signature does not
+
+Decisions 3 through 7 are organised by platform, and that framing has a blind spot: it asks *"what does each OS check?"* and concludes that Linux checks nothing, so Linux gets nothing. The better question is *"what can a user check?"*, and there the answer is the same on every platform and costs nothing. (A signed apt repository would reach Linux users too — Decision 7 says why that is a distribution-channel project rather than an artifact property, and it is not free of hosting or of a key.)
+
+**Every published asset now carries SLSA build provenance**, generated by `actions/attest-build-provenance` in a new `attest` job. A user verifies with one command:
+
+```sh
+gh attestation verify <the-file-you-downloaded> --repo vfarcic/dot-agent-deck
+```
+
+**This is a stronger claim than the checksums file, and the difference is not academic.** `checksums.txt` says a file matches a number printed on the same page that served the file — it detects corruption, and an attacker who can replace the asset can replace the line. An attestation says *this exact digest was produced by this repository's release workflow, from this commit*, signed by a certificate bound to that workflow identity and recorded in a public transparency log. The checksums files stay, because they are useful without a `gh` install; the attestation is what makes provenance checkable.
+
+**No secret is involved, and that is the point rather than a convenience.** The signing certificate is short-lived and obtained through the job's OIDC token (`id-token: write`), so there is no private key in this repository — nothing to rotate, nothing a leak could expose, and none of Decision 5's threat model to argue about. It is free on public repositories on every current GitHub plan; private and internal repositories need GitHub Enterprise Cloud, which is worth knowing only because it is the one condition attached.
+
+**What it does not do, stated flatly, because "signed" is the word everyone reaches for.** It does not remove the macOS Gatekeeper dialog: Gatekeeper checks Apple's chain and knows nothing about Sigstore. It does not remove SmartScreen. It is not checked by any operating system, package manager or installer on the user's behalf — verification is opt-in and requires the `gh` CLI. Provenance and OS trust are different problems with different mechanisms, and this solves exactly one of them.
+
+**Off the critical path, by the same rule as everything else here.** `attest` hangs off `finalize` and `finalize` does not list it in `needs:`, so an attestation-service blip turns the run red and leaves the CLI release complete. It is gated on `needs.finalize.result == 'success'` rather than on the desktop matrix, because `needs:` on a matrix job resolves to the aggregate and gating on `desktop-publish` would discard the *CLI* binaries' attestations every time a bundler leg failed — the exact defect Greptile's P1 found in `desktop-publish` on #768, one job over. The desktop download step tolerates failure and the subject list is built in shell rather than handed to the action as a glob, because a glob matching nothing is an error there and an empty `dist-desktop/` is a legitimate state.
+
+**One gap, recorded rather than quietly left.** The release body's provenance instructions live in the desktop note, which is the section this PRD owns. The CLI assets are attested too, but a CLI user reading the release page is not told so. Surfacing it for them means adding a fixed section to the body `prepare` assembles from the changelog — a small change to a different job, worth doing and deliberately not smuggled in here.
 
 ### Test plan
 
@@ -247,6 +276,10 @@ Release and packaging work again, so CLAUDE.md rule 4's TUI-harness requirement 
 
 | Item | Catalog ID | Tier | Scenario | Action |
 |---|---|---|---|---|
+| `attest` is off the critical path and not hostage to the desktop matrix | n/a — `xtask/linkage-check` module | fast-tier static | Asserts `finalize` does not list `attest` in `needs:`, and that `attest` gates on `needs.finalize.result == 'success'` rather than on `desktop-publish`. Mutation-tested both ways. | create |
+| `attest` holds no credential and needs none | n/a | fast-tier static | Asserts the job declares exactly `id-token: write` and `attestations: write`, carries no `contents: write`, and references no `secrets.`. Mutation-tested by adding `contents: write` and by removing `id-token`. | create |
+| The workflow still parses, with valid permission scopes | n/a | manual, pre-commit | `actionlint` over `release.yml` — clean, and confirmed to validate the `attestations` scope by rejecting a bogus value for it. A syntax or scope error here breaks **every** release and no PR check would catch it, since `release.yml` fires only on a tag. | create |
+| Provenance actually verifies on a published asset | n/a | manual (first tag) | After the next release: `gh attestation verify <asset> --repo vfarcic/dot-agent-deck` on a downloaded `.dmg`, `.deb` and CLI binary. Nothing before a real tag proves the job runs. | create |
 | The note offers a no-terminal route and does not claim an OS warning for the `.deb` | n/a — `xtask/linkage-check` module | fast-tier static | Asserts the note step's code lines mention the System Settings route, and that the "your OS will warn you" clause is not applied to the Linux asset. | create |
 | Ad-hoc signing changes the macOS failure mode | n/a | manual (M1) | Download v0.39.3's `.dmg` on a Mac that has never seen this source, record the exact dialog; ad-hoc-sign a locally built bundle, quarantine it by hand, and record the dialog again. Settles Decision 3's hypothesis. | create |
 | The signature structure survives the sidecar | n/a | manual (M1) | Ad-hoc-sign the real bundle (`APPLE_SIGNING_IDENTITY="-"`), then `codesign --verify --deep --strict --verbose=4` the nested sidecar and the outer bundle. Targets tauri#11992's failure class; needs no credential. | create |
@@ -264,17 +297,21 @@ The honest limit is the same one #740 recorded and it has not improved: no test 
 
 **The free position, which is the one being taken:**
 
+- Every asset on a release — the `.dmg`, the `.deb` and the four CLI binaries — carries build provenance a user can verify with `gh attestation verify <file> --repo vfarcic/dot-agent-deck`. **Met in code; provable only by a real tag.**
+- That provenance costs no credential: the `attest` job holds `id-token: write` and `attestations: write`, no `contents: write`, and references no secret. **Met, and asserted.**
+- Linux users get a verification that something actually checks, rather than a package signature that `dpkg -i` ignores. **Met.**
 - The release note offers a macOS route that does not require a terminal, and no longer tells `.deb` users their OS will warn them. **Met.**
 - Neither property can silently regress: a static assertion in `xtask/linkage-check` fails the build if the note offers the terminal command as its only macOS route, or stops addressing the `.deb` on its own terms. **Met.**
 - The macOS failure mode is *measured* rather than assumed, and ad-hoc signing is applied if and only if the measurement supports it — so a user meets *"Apple could not verify…"* with an *Open Anyway* route rather than *"damaged — Move to Trash"*. **Open (M1).**
 - Whether tauri#11992's failure class reaches this app is known, for free, rather than being a surprise waiting for whoever revisits the paid path. **Open (M1).**
 - The Linux `.deb` and the CLI assets are unaffected in how they are produced, named and checksummed. **Met.**
-- A bundling failure still leaves the CLI release complete and on schedule and turns the run red — PRD #740's topology is untouched, and its assertions still pass. **Met.**
+- A bundling **or attestation** failure still leaves the CLI release complete and on schedule and turns the run red — PRD #740's topology is untouched, its assertions still pass, and `finalize` waits on none of the three new jobs. **Met, and asserted.**
 
 **What the free position explicitly does not achieve**, stated as a criterion because leaving it implicit is how a trade quietly becomes a belief:
 
-- macOS users **do** meet a security dialog on first launch. Every user, every release, until the $99 decision is revisited.
+- macOS users **do** meet a security dialog on first launch. Every user, every release, until the $99 decision is revisited. Provenance does not touch this: Gatekeeper checks Apple's chain and knows nothing about Sigstore.
 - No Windows user is helped, because there is no Windows artifact to help them with.
+- Provenance is **opt-in and requires the `gh` CLI**. No operating system, package manager or installer checks it on a user's behalf, so its practical reach is whoever chooses to run one command.
 
 **The acceptance test a reversal would have to pass**, preserved rather than deleted: a user downloads the `.dmg` on a clean Mac, drags the app to `/Applications`, and launches it **offline** with no dialog beyond the ordinary "downloaded from the internet" confirmation; `xcrun stapler validate` succeeds and `spctl` reports a Notarized Developer ID; and no signing credential is named anywhere in `release.yml` outside `desktop-sign`.
 
@@ -284,6 +321,7 @@ The free-options decision of Decision 2 settles M3 and takes M4 and M6 off the b
 
 - [ ] **M1 — Measure, on a Mac, for free.** Two questions, one session, no credential and no money: does ad-hoc signing turn *"damaged"* into *"unverified, Open Anyway"* (Decision 3's hypothesis), and does `codesign --verify --deep --strict` survive the daemon sidecar (tauri#11992's failure class)? **The only open piece of free work, and the only thing that can still improve a macOS user's first launch.** Needs Apple hardware, which is available; needs nothing else.
 - [x] **M2 — Ship the free note work.** *(Landed in PR [#879](https://github.com/vfarcic/dot-agent-deck/pull/879).)* The note corrections of Decision 3 and their static assertion `the_alpha_note_does_not_leave_a_user_with_only_a_terminal_command`, mutation-tested both ways. **Ad-hoc signing is deliberately not part of this milestone** — it belongs to M1's result, and shipping it on a hypothesis is the thing this repository's discipline exists to prevent.
+- [x] **M2a — Ship build provenance.** *(Landed in PR [#879](https://github.com/vfarcic/dot-agent-deck/pull/879).)* The `attest` job of Decision 12, its two static assertions, and the verification command in the release note. Free, no credential, all three platforms, and the only trust mechanism that reaches the Linux `.deb`. **Proof requires a real tag** — nothing in this repository can execute `release.yml`, so the first tagged release is where this is genuinely tested, exactly as PRD #740's M6 was.
 - [x] **M3 — The $99 decision.** *Answered 2026-09-04: **no**.* Free options only, on every platform. Decision 2 records that this is a spend-or-accept-the-warning choice rather than a build-or-buy one, so the answer carries a permanent consequence: the macOS dialog stays.
 - [ ] ~~**M4 — `desktop-sign`, wired and guarded.**~~ **Not being built.** Reopens only if M3 is revisited. The design is Decision 4 and the assertions are Decision 11; both are written down so a reversal is a build rather than a re-think.
 - [ ] **M5 — Docs.** Scoped down by M3 to what actually landed: `docs/develop/desktop-gui.md`'s **Release bundles** section now records both guarded properties of the note and points here. A `docs/develop/desktop-signing.md` is **not** written, because there is no signing to document — writing a certificate-lifecycle page for a certificate nobody holds is the kind of documentation that rots unread. User-facing install instructions stay with [#765](https://github.com/vfarcic/dot-agent-deck/issues/765). Remaining: fold M1's measured answer in once it exists.
@@ -308,6 +346,8 @@ The decision to take the free ceiling removes most of this list — a certificat
 - **tauri#11992 — notarization fails with `externalBin`.** Open upstream, no workaround reported, and this app's sidecar is not optional. Dormant while nothing is notarized, and the first thing a reversal would trip over. M1 answers the cheap half of it for free either way, which is why M1 is still worth running.
 - **Gatekeeper's behaviour is a moving target, and the free position depends entirely on its details.** Sequoia removed the Control-click override; Homebrew's cask policy changed on 2026-09-01; Decision 3's whole hypothesis is about which dialog appears. A position built on "the warning is survivable" needs re-checking at each major macOS release in a way that a notarized artifact would not.
 - **Homebrew is now closed to this project's GUI.** Casks must be codesigned and notarized. Not a regression caused here, but a door that the free decision keeps shut — worth knowing before anyone proposes a cask as the install story.
+- **Nothing has executed the `attest` job, and nothing in this repository can.** `release.yml` fires only on a tag. `actionlint` says the file parses and its permission scopes are valid, the wiring assertions say the topology is right, and neither of those is the same as the job having run. The first tagged release is the test, and the containment is that a failure there turns the run red and leaves the release complete.
+- **Provenance is easy to over-read.** "Signed" is the word people reach for, and an attestation is not an OS-trusted signature: Gatekeeper and SmartScreen ignore it, and verification needs the `gh` CLI. Decision 12 states this explicitly, and the release note says what the check proves rather than implying the warnings are gone. The risk is a future summary quietly upgrading it.
 - **Scope creep toward Windows.** Every Windows question that arises belongs to #164 or #741 first and to a signing decision second. Decision 6 records the facts and the ranking so they do not have to be rediscovered.
 
 ## Open Questions
@@ -356,3 +396,23 @@ Decisions 4 and 5 — the split-job topology and the threat model — are kept s
 **One free thing is still open and is worth running.** M1 needs a Mac and one session: whether ad-hoc signing (`APPLE_SIGNING_IDENTITY="-"`, no account, no money) converts *"damaged — Move to Trash"* into *"Apple could not verify…"* with an *Open Anyway* route, and whether the daemon sidecar survives `codesign --verify --deep --strict`. The first is the last free improvement available to a macOS user's first launch; the second retires tauri#11992's failure class for free whether or not the paid path is ever taken. It stays a **hypothesis** in this document until it is measured — shipping the config change on the strength of the mechanism alone is precisely what this repository's discipline exists to prevent.
 
 **Review round (Greptile on PR #879).** One P2, valid and fixed here: the PRD still read "Not started" while the same PR landed M2. The status line, the milestones and the success criteria now record what shipped and what did not. Greptile's file overview separately noted that the new assertion's substring checks were scoped to the whole `desktop-publish` job rather than to the note step — also right, and also fixed: the guard now extracts the note step and asserts against that, so an unrelated step mentioning `dpkg` can no longer satisfy it.
+
+### 2026-09-04 — Linux included, and the free option that had been missed
+
+The maintainer corrected the goal: *"I made a mistake by mentioning only mac and Windows. Linux releases should be included as well."*
+
+The literal half of that was already satisfied — `dot-agent-deck-desktop-alpha-linux-amd64.deb` has been on the release since v0.39.3, alongside two Linux CLI binaries, so Linux is in fact the **best**-covered platform for artifacts and the only one with both a CLI and a GUI download. But the correction exposed a real gap in this document's reasoning, and it was a framing error rather than a missing fact.
+
+**Decisions 3 through 7 were organised by asking "what does each OS check?", and that question has a blind spot.** It correctly concluded that nothing checks a `.deb` signature and then let that stand as "Linux gets nothing", which is a different claim and a false one. Asking instead *"what can a user check?"* produces an answer that is the same on every platform, costs nothing, and had been left out: **build provenance**.
+
+Hence Decision 12 and the `attest` job. `actions/attest-build-provenance` obtains a short-lived Sigstore certificate through the job's OIDC token, so there is **no private key in this repository** — none of Decision 5's threat model applies, there is nothing to rotate, and nothing a leak could expose. It is free on public repositories on every current GitHub plan. Every asset is covered: the `.dmg`, the `.deb` and the four CLI binaries, verified with `gh attestation verify <file> --repo vfarcic/dot-agent-deck`.
+
+It also retires the GPG-signed-checksums option Decision 7 had been holding open: provenance delivers the same property with no key to publish, protect or distribute, which is strictly less to get wrong.
+
+**What it is not, because "signed" is the word everyone will reach for.** It does not remove the macOS Gatekeeper dialog — Gatekeeper checks Apple's chain and knows nothing about Sigstore — and it does not remove SmartScreen. No OS, package manager or installer checks it on a user's behalf; verification is opt-in and needs the `gh` CLI. Decision 12 says this in its own words, and the release note describes what the check proves rather than implying the warnings are gone.
+
+**Two claims elsewhere in this document became false and were narrowed, per CLAUDE.md rule 17.** Decision 1's heading said macOS "is the whole of the engineering scope", which stopped being true the moment a cross-platform job landed; it now scopes the *OS-trust* question only, and says so where the table could otherwise be read as "nothing would help Linux". And Decision 12's own heading initially claimed provenance was "the only" mechanism reaching Linux — a signed apt repository would too, so it now says it is what reaches Linux *where a package signature does not*.
+
+**On testing a workflow nothing can execute.** `release.yml` fires only on a tag, so a syntax error or an invalid permission scope in it would break every future release with no PR check to catch it — a materially worse failure than the runtime kind, which the topology contains. `actionlint` was run over the file (clean) and confirmed to actually validate the new scopes by rejecting a bogus value for `attestations`. The two new wiring assertions were mutation-tested four ways: making `finalize` wait on `attest`, gating `attest` on the desktop matrix, granting it `contents: write`, and dropping `id-token`. Each reddens exactly the intended test. None of that proves the job runs; the first tagged release is where that is learned, and the containment is that `finalize` does not wait on it.
+
+**One gap left deliberately.** The provenance instructions live in the desktop note, which is the section this PRD owns. The CLI assets are attested too, but a CLI user reading the release page is not told so — surfacing it means a fixed section in the body `prepare` assembles from the changelog, a small change to a different job that is recorded in Decision 12 rather than smuggled in here.
