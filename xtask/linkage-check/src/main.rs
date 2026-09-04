@@ -91,6 +91,10 @@ mod devbox_gtk_origin;
 /// script under `node`.
 #[cfg(test)]
 mod issue_labeler_memory;
+/// The same workflow's `Extract label policy for the agent` setup step. Tests
+/// only — these drive the real script under `python3`.
+#[cfg(test)]
+mod issue_labeler_policy;
 /// Issue #785: `scripts/junit-strip-output.py`, the stripper that makes a JUnit
 /// report from a credential-holding run structurally incapable of carrying test
 /// output before anyone shares it. Since #502 took the credentialed lane out of
