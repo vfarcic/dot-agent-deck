@@ -114,7 +114,7 @@ jq -r --arg me "$ME" '.[]
   | "\(.number)\t[\([.labels[].name]|join(","))]\t\(.title)"' "$ISSUES"
 ```
 
-Keep the full JSON, don't just print from it. **Steps 3b, 4 and 5 all need issue bodies**, and re-fetching them one at a time is both slower and a second chance to get the filter wrong. `body` is in the `--json` list above for exactly that reason.
+Keep the full JSON, don't just print from it. **Steps 3b, 4, 4b and 5 all need issue bodies**, and re-fetching them one at a time is both slower and a second chance to get the filter wrong. `body` is in the `--json` list above for exactly that reason.
 
 Three notes on the filters:
 
@@ -210,9 +210,66 @@ Titles are not enough on their own: #493 (`shell_foreground_busy_snapshot`) and 
 
 Prefer picks whose file sets are **disjoint from the other units in the same batch**. When two candidates are equally good, the tiebreak is which one shares fewer files with what is already dispatched.
 
+## Step 4b — Spot-check the premise, and mark the row rather than dropping it
+
+Step 3 asks whether someone is **already working** the candidate. Nothing so far asks whether the candidate is **still true**. An issue that was implemented and never closed presents itself as available work indefinitely, and before this step no step asked the question — step 5's one-line scope read might happen to surface it, but nothing required anyone to look.
+
+**The cost is the same wasted unit that step 3 exists to prevent, arrived at from the other direction** — not "someone else is doing this" but "this is already done". The near-miss: #236 was selected for dispatch and presented as *"a live data-loss bug"*, quoting its own present-tense problem statement, when `RemovalPolicy::KeepIfDirty` and `worktree list|reclaim` had both shipped weeks earlier. It was caught only because the runner happened to ask what a phrase in it meant. A backlog pass on 2026-08-26 found **seven** such issues out of roughly 180 open, without looking for them: #304, #370, #195, #194, #236, #242 and #358. Six have since been closed; the rate is what matters, not the six.
+
+**This step produces a note on a row. It never removes one, and it never closes anything.** A heuristic that hides real work fails invisibly, which is worse than the state it replaces — the runner cannot correct a row they were never shown. Adjudicating a stale issue is also not selection's job: a `looks stale` row goes to the runner as a question.
+
+### Read the claim first; the greps only supply evidence
+
+**Do this by reading, on the shortlist only.** Run it on the handful of candidates that survived steps 3 and 4, not on the full list — it is a reading task, and its value comes from the reading.
+
+For each candidate, state the **central claim** in one line from the body already fetched in step 2 — the thing that would have to be true for the work to be worth doing. Then find its **anchor**: most issues here cite one. A symbol in backticks, a `src/*.rs` path, a version string, a CLI verb, a config key. #242's anchor is `0.28.1`; #304's is `blocking_overlay`; #358's is a `/tmp` path and a file mode.
+
+Check the anchor against **`origin/main`**, never the checkout — step 0's reason applies with full force here, and inverts this step's answer when ignored:
+
+```bash
+git grep -n 'blocking_overlay' origin/main -- src/
+git ls-tree --name-only origin/main -- src/foo.rs
+git grep -n '^crossterm' origin/main -- Cargo.toml
+```
+
+Then classify the row into exactly one of three outcomes, and **report all three** in step 5:
+
+- **`premise holds`** — the anchor is where the issue says it is, and the described behaviour is still there.
+- **`premise looks stale — verify`** — the evidence points at work that already landed. Say what the evidence was, in the row, so the runner can judge it in one line.
+- **`premise not mechanically checkable`** — no anchor, or an anchor a grep cannot settle. **This is an ordinary outcome, not a failure.** Design questions, policy decisions and flake reports frequently have no mechanical anchor at all, and a row marked this way is exactly as dispatchable as one marked `premise holds`.
+
+### What these greps do NOT decide, measured on this backlog
+
+**Symbol absence is not evidence of staleness, and on this repo it is mostly evidence of nothing.** Extracting every backticked `[a-z][a-z0-9_]{5,}` identifier from the 215 open issues on 2026-09-04 and testing it against `origin/main` flagged **65 of them — 30% of the backlog**. In a twelve-row sample, none indicated a stale premise; they fell into **seven** kinds of thing that merely looks like a symbol:
+
+| Flagged "missing symbol" | What it actually was |
+|---|---|
+| `check_gemini_available` (#211), `check_aider_available` (#212), `is_ready`/`is_stable` (#234), `ssh_args` (#97) | a function or field the issue **proposes creating** — absent because the work is undone |
+| `dac0ad0` (#143), `e22cd1e` (#233), `b00f2c0` (#240) | a git SHA |
+| `c_ispeed`, `c_line` (#248) | fields of a **dependency crate's** `termios`, absent from this tree as identifiers of their own |
+| `workflow_call`, `workflow_dispatch` (#324) | GitHub Actions YAML keys, outside the searched paths |
+| `wontfix` (#239) | a label name |
+| `ffmpeg` (#246) | an external binary |
+| `spawn_006` (#245) | a test id that is absent as a whole token but is the **prefix** of two real test functions — the `sigterm_001` trap below, live |
+
+The dominant category is the first: **absence usually means "proposed", not "stale"** — which is the exact inversion that makes a naive symbol sweep worse than no sweep. A separate heuristic premise-check over this backlog on the same day produced **24 flags with 23 false positives** for this reason. Its one true positive was #483, where the cited `ensure_claim_label` survives only in the prose of `prds/421-issue-triage-labels-and-dispatch-claims.md` and not in `src/` — which is also a reminder that *where* you search decides the answer as much as *what* you search for.
+
+**File-path absence is quiet but not clean.** The same sweep found only **two** of 215 issues citing a `src|tests|xtask/*.rs` path absent from `origin/main` — and **both were wrong**: #248's `src/unix/mod.rs` is inside the `libc` crate and #293's `src/win/psuedocon.rs` is inside `portable-pty`. Before reporting a missing path, check the citation's sentence for whose tree it names.
+
+**A later merged PR naming the issue is far too common to flag on.** 119 of the 215 open issues — **55%** — are named by a PR merged after they were filed. Narrowing to a resolving verb (`fixes`, `closes`, `implements`, `supersedes`) within 90 characters of the reference still flags **47 — 22%** — and the sample is dominated by references that say the opposite on reading: *"recorded as #864, **not shipped**"*, *"filed not fixed"*. Useful as something to read when a row is already suspect; not a trigger on its own.
+
+**Two further traps, both of which have produced a confident wrong answer here:**
+
+- **A grep that matches the *fix* looks like a grep that matches the *bug*.** #358's audit had to separate "credentials absent from `/tmp`" — which the issue itself had already observed and correctly distrusted as luck — from "the containing directory is now owner-only", which was the actual fix. **Absence of a symptom is not evidence of a fix.**
+- **Word-boundary and pattern mistakes invert the answer in both directions, and they catch careful people.** A `grep -w sigterm_001` reported a test as deleted when it exists as the prefix of a longer name, and a `grep -icE 'trust'` counted 49 hits that were all the framing mechanism rather than the claim. The sweep quoted above walked into the same trap while being written: `c_line` is absent from this tree as a token, but a substring search finds it inside the unrelated `cmd_c_line` in `src/platform/paths.rs`, so the two searches disagree about whether it is present. Anchor patterns at the boundary you actually mean, and read a sample of the hits before believing the count.
+
+**So the reliable signal here is a reading, and the commands above only make it fast.** When the evidence is ambiguous — and it usually is — mark the row **`premise not mechanically checkable`**. That bucket exists for evidence that cannot settle the claim, and a row carrying it is exactly as dispatchable as one marked `premise holds`, so nothing is lost by using it.
+
+**Do not reach for `premise holds` to express doubt.** It asserts the claim was checked and still stands, step 5 prints it as a confirmation, and no later step re-checks it — so a row that quietly upgrades *"could not tell"* to *"verified"* is the same unverified-claim defect this step exists to catch, reintroduced by the step itself. A row wrongly marked unclear costs a glance; a row wrongly marked verified costs the work, and a row wrongly dropped costs it silently.
+
 ## Step 5 — Show the queue, then ask how many
 
-Print the candidates with **number, labels, title, a one-line scope read, and any duplicate or coupling note**. The scope read comes from the body fetched in step 2:
+Print the candidates with **number, labels, title, a one-line scope read, step 4b's premise mark, and any duplicate or coupling note**. Print the premise mark on every row, including `premise holds` — a mark that appears only when something is wrong is indistinguishable from a step that was skipped. The scope read comes from the body fetched in step 2:
 
 ```bash
 jq -r '.[] | select(.number==<n>) | .body' "$ISSUES"
