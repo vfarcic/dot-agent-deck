@@ -341,7 +341,36 @@ The production filesystem surface of `desktop/src-tauri/src/` is four call sites
 2. **`desktop_project_cwd()`** — two `is_file` probes for a `.dot-agent-deck.toml` (`dto.rs:478` and `:482`). **This is the defect,** and #819 M6 deletes the function.
 3. **The desktop's own settings** — allowed by the same rule, and today an empty set: there is no on-disk store, per source 3 above. When one arrives it belongs in this table.
 
-One more read is invisible to every grep above because it happens inside the shared root crate: `prepare_orchestrator_prompt`'s `create_dir_all` and `write`, reached from `lib.rs`'s workflow-launch path. It is a **write** rather than a read, it is the other half of the defect, and it moves daemon-side in #819 M4. That it cannot be found by searching this crate is precisely why #819 M7 adds a linkage-check tripwire — and why the tripwire is labelled a tripwire and not a boundary, since the desktop crate path-depends on the root crate and every `pub` item there stays reachable.
+One more read is invisible to every grep above because it happens inside the shared root crate: `prepare_orchestrator_prompt`'s `create_dir_all` and `write`, reached from `lib.rs`'s workflow-launch path. It is a **write** rather than a read, it is the other half of the defect, and it moves daemon-side in #819 M4. That it cannot be found by searching this crate is precisely why #819 M7 adds the linkage-check tripwire described [below](#the-tripwire-on-that-invariant-and-what-it-cannot-do) — and why the tripwire is labelled a tripwire and not a boundary, since the desktop crate path-depends on the root crate and every `pub` item there stays reachable.
+
+### The tripwire on that invariant, and what it cannot do
+
+PRD #819 M7 adds **check 12** to `cargo xtask linkage-check` ([`xtask/linkage-check/src/desktop_project_boundary.rs`](../../xtask/linkage-check/src/desktop_project_boundary.rs)), over the production sources of `desktop/src-tauri/src/`.
+
+**It is a regression tripwire. It is not enforcement, and it is not a security boundary.** The PRD's first draft called it enforcement and the security audit was right to object, so the framing is stated here rather than left to be inferred. `desktop/src-tauri/Cargo.toml` carries `dot-agent-deck = { path = "../.." }`, so every `pub` item in the root crate stays callable from the desktop crate whatever this rule says — which is exactly how `load_project_config` was reachable from `lib.rs` in the first place. The rule can notice the shapes that read like a client-side project resolution; it cannot make one unreachable.
+
+What it catches, by parsing Rust rather than matching substrings — a substring scan drowns in comments and string literals, and a sweep that produces noise gets switched off:
+
+| finding | what trips it |
+| --- | --- |
+| `root-module` | a `use` or qualified path naming a root-crate module that is not on the rule's positive allowlist. The allowlist is the **boundary as a positive statement** — the modules the production desktop may reach across — so a fifth forbidden name does not need adding to a blacklist to be caught. |
+| `forbidden-symbol` | `project_config`, `orchestrator_context`, `load_project_config` or `prepare_orchestrator_prompt` as a path segment anywhere, including through an alias (`use … as pc` still spells `project_config` in its path), a grouped or multi-line import, or a fully qualified call with no import at all. |
+| `project-state-literal` | a string literal carrying `.dot-agent-deck.toml` or `orchestrator-context.md`, including inside a `format!` — the desktop's project prose lives almost entirely in macro arguments, which syn leaves as opaque tokens, so the rule walks those token streams too. |
+| `cwd-fallback` | `std::env::current_dir`, the guess `desktop_project_cwd()` fell back to. On a remote daemon that guess resolves against the wrong filesystem and is silently wrong, which is the defect #819 exists to remove. |
+
+`#[cfg(test)]` items are out of scope — the desktop crate's test modules legitimately build project fixtures, and a rule that failed on them would be worked around rather than obeyed. `#[cfg(not(test))]` is production and *is* scanned.
+
+**The residual, named rather than implied.** A source rule is bypassable, unintentionally as easily as deliberately:
+
+- **a root-crate wrapper with an innocuous name** — a new `pub fn` in an already-allowlisted module whose body calls `load_project_config`. Nothing in the desktop's source says so, so nothing in this rule can see it. This is the likeliest accidental bypass and it is pinned by a test (`a_root_crate_wrapper_with_an_innocuous_name_is_not_caught`) that asserts the rule does **not** catch it, so the gap stays visible instead of being rediscovered;
+- **a macro that generates a forbidden path** out of tokens that are not one — syn does not expand macros;
+- **an already-imported module gaining a new method** that reads project state;
+- **a trait method** brought in by an allowlisted `use`;
+- anything reached through `std::fs` by a path the rule has no literal for.
+
+Only removing the desktop's dependency on the full root crate gives compiler-enforced reachability, and that is [#176](https://github.com/vfarcic/dot-agent-deck/issues/176) M1.1 — out of scope for #819 and one more reason to do it.
+
+**The rule ships before the milestone that satisfies it.** M6 (the desktop launch flow) is what deletes `desktop_project_cwd()` and moves the launch onto the daemon's `prepare-workflow` verb, so today's tree still violates check 12 in two files. Those violations are enumerated one by one in the rule's `PENDING_M6` allowlist rather than the rule being weakened to let them through — a weakened rule catches nothing new either. An allowlist entry that matches **no** finding is itself a failure, so when M6 removes the last client-side project read this check goes red until the entries that excused it are deleted with it.
 
 ## Models and agent profiles
 
