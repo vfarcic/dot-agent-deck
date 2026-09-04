@@ -4,9 +4,13 @@
 //! what a project-aware client does against a daemon that does not advertise
 //! the project verbs.
 //!
-//! The subject under test is the real client helper —
-//! `DaemonClient::require_capability` over `DaemonCapabilities`
-//! (`src/daemon_client.rs`) — driven across a REAL Unix socket. The fast-tier
+//! The subject under test is the real production call site: PRD #819 M6's
+//! `DaemonClient::list_projects` / `resolve_project` / `prepare_workflow`
+//! (`src/daemon_client.rs`), each of which opens with
+//! `self.require_capability(…).await?` before it connects — driven across a
+//! REAL Unix socket. Nothing here supplies its own guarded caller: the
+//! sequence under measurement is the one a desktop or TUI caller runs
+//! verbatim. The fast-tier
 //! unit tests beside that type already pin its pure reading of a reply. What
 //! they cannot pin is the property this file exists for: that a withheld verb
 //! is one the **wire never carries**. The peer here records the `op` of every
@@ -52,14 +56,13 @@ use std::thread::JoinHandle;
 
 use dot_agent_deck::daemon_client::{ClientError, DaemonClient};
 use dot_agent_deck::daemon_protocol::{
-    AttachRequest, AttachResponse, CAP_LIST_PROJECTS, DAEMON_CAPABILITIES, KIND_REQ,
-    PROTOCOL_VERSION, read_frame, write_resp,
+    AttachResponse, CAP_LIST_PROJECTS, CAP_PREPARE_WORKFLOW, CAP_RESOLVE_PROJECT,
+    DAEMON_CAPABILITIES, KIND_REQ, PROTOCOL_VERSION, read_frame, write_resp,
 };
 use dot_agent_deck::event::{KnownProject, ProjectListing};
 use spec::spec;
 use tempfile::TempDir;
 use tokio::net::{UnixListener, UnixStream};
-use tokio::runtime::Runtime;
 
 /// The `op` strings the three project verbs serialize to. Read from the
 /// capability constants rather than re-spelled, because PRD #819 makes the
@@ -70,6 +73,12 @@ const PROJECT_VERB_OPS: &[&str] = DAEMON_CAPABILITIES;
 /// The single project this scripted daemon knows, when it knows any. Named so
 /// the positive half can tell a real reply from a default-constructed one.
 const ADVERTISED_PROJECT_NAME: &str = "capability-negotiation-fixture";
+
+/// The path the two write/resolve verbs are asked about. It is never opened:
+/// against the silent daemon both calls withhold before connecting, and the
+/// advertising daemon only answers `list-projects`, so nothing here touches a
+/// filesystem.
+const FIXTURE_PROJECT_PATH: &str = "/scripted/capability-negotiation";
 
 /// Whether the scripted daemon's `Hello` reply carries `capabilities`.
 #[derive(Clone, Copy)]
@@ -202,7 +211,7 @@ async fn handle_connection(
             let mut resp = AttachResponse::ok();
             resp.projects = Some(ProjectListing {
                 projects: vec![KnownProject {
-                    path: "/scripted/capability-negotiation".to_string(),
+                    path: FIXTURE_PROJECT_PATH.to_string(),
                     name: ADVERTISED_PROJECT_NAME.to_string(),
                 }],
                 primary: None,
@@ -225,33 +234,14 @@ async fn handle_connection(
         .expect("reply to scripted daemon request");
 }
 
-/// A project-aware call site, in the shape PRD #819 M5 prescribes: consult the
-/// capability captured at the handshake FIRST, and open the socket only if the
-/// verb was advertised.
-///
-/// It lives here rather than in `src/` because the PRD's *Capability
-/// negotiation* section puts the TUI's five `ui.rs` sites out of scope, so this
-/// build has no production caller of `require_capability` yet to point the test
-/// at. Both halves below drive this one function, which is what makes the
-/// positive half load-bearing: a helper that withheld unconditionally would
-/// fail it.
-fn guarded_list_projects(
-    runtime: &Runtime,
-    client: &DaemonClient,
-    socket: &Path,
-) -> Result<AttachResponse, ClientError> {
-    runtime.block_on(client.require_capability(CAP_LIST_PROJECTS))?;
-    common::attach_request_on(socket, &AttachRequest::ListProjects {}).map_err(ClientError::Io)
-}
-
 /// Scenario: Stand up a synthetic daemon on a real attach socket whose `Hello`
-/// omits `capabilities` — an older daemon, exactly — and point a real
-/// `DaemonClient` at it through a call site that asks before it sends; every
-/// project verb must be withheld, and the daemon's own request log must show
-/// nothing but the one handshake, proving the verb never reached the wire and
-/// its refusal text was never read. Then repeat against a second synthetic
-/// daemon that DOES advertise: the same call site proceeds, `list-projects`
-/// appears in that daemon's log, and the reply comes back.
+/// omits `capabilities` — an older daemon, exactly — and call the real
+/// `DaemonClient::list_projects` / `resolve_project` / `prepare_workflow`
+/// against it; all three must be withheld, and the daemon's own request log
+/// must show nothing but the one handshake, proving no verb reached the wire
+/// and its refusal text was never read. Then repeat against a second synthetic
+/// daemon that DOES advertise: the same `list_projects` proceeds, the op
+/// appears in that daemon's log, and the scripted listing comes back.
 #[spec("lifecycle/handshake/008")]
 #[test]
 fn handshake_008_absent_capabilities_withhold_project_verbs_before_the_wire() {
@@ -292,17 +282,41 @@ fn handshake_008_absent_capabilities_withhold_project_verbs_before_the_wire() {
         );
     }
 
-    let withheld = guarded_list_projects(&runtime, &client, silent.path())
-        .expect_err("the call site must not reach the socket");
+    // The production verbs themselves, each one the whole method a real caller
+    // invokes — `require_capability` then `connect()`. Nothing between the test
+    // and the code under measurement.
+    let withheld = runtime
+        .block_on(client.list_projects())
+        .expect_err("`DaemonClient::list_projects` must not reach the socket");
     assert!(
         withheld.to_string().contains(CAP_LIST_PROJECTS),
-        "the call site propagates the capability decline verbatim: {withheld}"
+        "`list_projects` propagates the capability decline verbatim: {withheld}"
+    );
+    let withheld = runtime
+        .block_on(client.resolve_project(FIXTURE_PROJECT_PATH))
+        .expect_err("`DaemonClient::resolve_project` must not reach the socket");
+    assert!(
+        withheld.to_string().contains(CAP_RESOLVE_PROJECT),
+        "`resolve_project` propagates the capability decline verbatim: {withheld}"
+    );
+    let withheld = runtime
+        .block_on(client.prepare_workflow(
+            FIXTURE_PROJECT_PATH,
+            "orchestration",
+            "task",
+            Some("revision"),
+        ))
+        .expect_err("`DaemonClient::prepare_workflow` must not reach the socket");
+    assert!(
+        withheld.to_string().contains(CAP_PREPARE_WORKFLOW),
+        "`prepare_workflow` propagates the capability decline verbatim: {withheld}"
     );
 
     // THE ASSERTION THIS FILE EXISTS FOR. Not "the verb was refused" — "the
     // verb was never sent". The daemon logged every op it was asked to answer,
-    // and one handshake is the whole of it: three capability questions cost a
-    // single `Hello` (the set is captured once), and no project verb followed.
+    // and one handshake is the whole of it: three capability questions and all
+    // three production verbs cost a single `Hello` between them (the set is
+    // captured once), and no project verb followed it.
     let silent_log = silent.requests();
     assert_eq!(
         silent_log,
@@ -317,10 +331,20 @@ fn handshake_008_absent_capabilities_withhold_project_verbs_before_the_wire() {
         );
     }
 
-    // ---- Half 2: the same call site against a daemon that DOES advertise. -
-    // Without this, a client that withheld unconditionally would pass.
+    // ---- Half 2: the same production verb against a daemon that DOES
+    // advertise. Without this, a client that withheld unconditionally would
+    // pass.
     let advertising = ScriptedDaemon::spawn(CapabilityScript::Advertising);
+    // A SEPARATE client, so the silent daemon's captured "advertises nothing"
+    // cannot carry into this half. Two guards make that so and the assertion
+    // below pins the outer one: `DaemonClient::new` starts with an empty cache,
+    // and the snapshot is keyed by endpoint besides, so even a shared handle
+    // would re-handshake against this second socket path.
     let client = DaemonClient::new(advertising.path().to_path_buf());
+    assert!(
+        client.cached_capabilities().is_none(),
+        "the positive half must handshake this daemon itself, not inherit the silent one's answer"
+    );
 
     for capability in DAEMON_CAPABILITIES {
         runtime
@@ -328,12 +352,14 @@ fn handshake_008_absent_capabilities_withhold_project_verbs_before_the_wire() {
             .unwrap_or_else(|e| panic!("`{capability}` was advertised and must be permitted: {e}"));
     }
 
-    let reply = guarded_list_projects(&runtime, &client, advertising.path())
-        .expect("an advertised verb must proceed to the socket");
-    assert!(reply.ok, "the scripted daemon answered the verb: {reply:?}");
-    let listing = reply
-        .projects
-        .expect("an advertised `list-projects` comes back with a listing");
+    // `list_projects` returns the listing only on an `ok:true` reply carrying
+    // one — it turns `ok:false` into `ClientError::Server` and a missing
+    // listing into `ClientError::Malformed` — so reaching this binding is the
+    // "the daemon answered the verb" assertion, not merely the "it was sent"
+    // one.
+    let listing = runtime
+        .block_on(client.list_projects())
+        .expect("an advertised verb must proceed to the socket and come back");
     assert_eq!(
         listing
             .projects
