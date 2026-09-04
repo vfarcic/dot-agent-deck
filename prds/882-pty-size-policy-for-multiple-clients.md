@@ -111,7 +111,11 @@ So a single TUI showing three agent panes holds four or more connections before 
 
 **The number that does exist per agent is `AgentPtyRegistry::receiver_count(id)`** (`src/agent_pty.rs`), which forwards to `broadcast::Sender::receiver_count()` — the live `AttachStream` subscribers for that one agent. It is already load-bearing elsewhere in the registry. That is a genuine per-agent viewer count, and it is the right input to "is more than one client watching *this* agent". A count is still not a set of geometries.
 
-**No client identity exists on the attach protocol** — `grep -rn "client_id" src/` returns nothing, and no request carries one. But identity is **derivable today with zero protocol bytes**, and this is the finding that most changes the price of options 1 and 2: `src/platform/peercred/` already wraps peer-PID discovery for all three platforms — `getsockopt(SO_PEERCRED)` on Linux, `LOCAL_PEERPID` on macOS, `GetNamedPipeClientProcessId` on Windows — and the Windows backend explicitly implements and documents the **server-end** direction ("`Server` | the connected client | `GetNamedPipeClientProcessId`"). Every connection from one client process therefore shares a PID, including the short-lived `Resize` connections, so the daemon can attribute a resize to a client and prune a departed one without a wire change.
+**No client identity exists on the attach protocol** — `grep -rn "client_id" src/` returns nothing, and no request carries one. But identity is **derivable today with zero protocol bytes**, and this is the finding that most changes the price of options 1 and 2: `src/platform/peercred/` already wraps peer-PID discovery for all three platforms — `getsockopt(SO_PEERCRED)` on Linux, `LOCAL_PEERPID` on macOS, `GetNamedPipeClientProcessId` on Windows — and the Windows backend explicitly implements and documents the **server-end** direction ("`Server` | the connected client | `GetNamedPipeClientProcessId`"). Every connection from one client process therefore shares a PID, including the short-lived `Resize` connections, so the daemon can attribute a resize to a *client* without a wire change.
+
+**But a PID identifies a client, not a viewer, and the geometry map needs the viewer** (raised by Greptile on PR #884; the first draft of this section presented PID plus stream teardown as sufficient, and it is not). Two things break a PID-keyed map. A `Resize` arrives on its **own** short-lived connection, so the PID says which process asked and nothing about which of that process's views it asked for; and one process can hold more than one `AttachStream` for the same agent — two desktop tiles showing it, or a tile plus the Reader overlay — at which point two different tile geometries collapse onto one key and the later one silently wins. The prune is wrong in the same way: the first of those streams to end would delete an entry the other still needs.
+
+So the honest division of labour is **peer PID for grouping, a per-attach key for geometry**. Getting a per-attach key means the size travels on the long-lived connection — the additive `AttachStream { id, rows, cols }` fields, `#[serde(default)]`, no bump — or the `Resize` carries a token the attach handed out. Peer PID keeps its value for the questions it can actually answer: telling one client's connections from another's, and noticing that a whole client is gone. Anything option 1 does with per-viewer geometry rests on the per-attach key, not on the PID.
 
 Three caveats belong with that, because the mechanism is coded rather than exercised in this direction:
 
@@ -177,9 +181,9 @@ Four reasons, in the order they carry weight:
 
 **What #883 builds under each answer**, so the handoff is unambiguous:
 
-- **Option 1** — the client stops asserting geometry and starts requesting it; the daemon keys a per-agent geometry map by peer PID, applies the smallest, prunes on `AttachStream` end, and echoes the applied size on the `Resize` response; the TUI's invariant-3 expectation and delta check move to the applied size; the desktop sets its xterm grid from the applied size instead of from `fit()`.
+- **Option 1** — the client stops asserting geometry and starts requesting it; the daemon keys a per-agent geometry map **per attach** (the size riding on `AttachStream`, or a token the attach hands out — *not* by peer PID, see Q3), applies the smallest, prunes when that attach ends, and echoes the applied size on the `Resize` response; the TUI's invariant-3 expectation and delta check move to the applied size; the desktop sets its xterm grid from the applied size instead of from `fit()`.
 - **Option 2** — the client keeps asserting, conditional on a viewer count it must be told; the daemon declines a resize while more than one viewer is attached and echoes the size it kept; something re-evaluates on the last detach.
-- **Option 3** — #883 close to as already scoped: compare against `AgentRecord.rows/cols` rather than the local parser, re-assert on attach/focus, accept the ring clear, and move the desktop's grid authority off `fit()` onto the daemon's applied size (the one item the original scope did not carry — see the correction above). Then document both newly-normal behaviours: a pane that shows part of its agent's screen, and an empty replay for a client attaching after a size change.
+- **Option 3** — #883 close to as already scoped: stop comparing the target against the local parser, re-assert **on client activity rather than on attach** (see [The trigger](#the-trigger-which-the-policy-name-does-not-settle) — attach-only would self-correct almost never), accept the ring clear, and move the desktop's grid authority off `fit()` onto the daemon's applied size (the one item the original scope did not carry — see the correction above). Then document both newly-normal behaviours: a pane that shows part of its agent's screen, and an empty replay for a client attaching after a size change.
 
 ## Scope
 
@@ -246,7 +250,7 @@ The recommendation above is deliberately left standing as written rather than re
 - **A ring clear per agent per attention switch.** #104's reasoning about resize being occasional no longer describes this path. What is lost is the replay for a client attaching *afterwards*, not an attached client's live scrollback — and because the desktop attaches per shown tile, "scroll a tile back into view after working in the TUI" is the routine way a user meets it.
 - **The size stays arbitrary in the sense that matters least**: it is whoever acted last, but it is now *chosen, documented and self-correcting on the next switch*, where today it is emergent and sticky until someone resizes a terminal by hand. That is the improvement being bought.
 
-**What it buys:** no protocol change, no `PROTOCOL_VERSION` question, no `.breaking.md` fragment, no rendering-contract amendment, no per-viewer geometry accounting and no dependence on the server-end `peer_pid` direction that has no production caller yet. #883 ships as already scoped.
+**What it buys:** no protocol change, no `PROTOCOL_VERSION` question, no `.breaking.md` fragment, no rendering-contract amendment, no per-viewer geometry accounting and no dependence on the server-end `peer_pid` direction that has no production caller yet. #883 ships **close to** as already scoped — two items its original scope did not carry are the desktop's grid authority (the correction in the options section) and the resize trigger ([The trigger](#the-trigger-which-the-policy-name-does-not-settle) below).
 
 **Rule 12 is therefore answered "no" for this work**: the wire shape and the meaning of `AttachRequest::Resize` are both unchanged, and the existing `AgentRecord.rows`/`cols` suffice. The cross-version manual test is not required by this decision. If #883 finds it needs the applied-dims echo on the `Resize` response after all, that is an additive optional field on `AttachResponse` — still no bump, and Q2 above has the precedent.
 
@@ -254,7 +258,29 @@ The recommendation above is deliberately left standing as written rather than re
 
 **If this decision is ever reversed, the argument to beat is the direction asymmetry**, not the cost: every single-size policy makes some client render a grid that is not its viewport, and this one puts the loss where content becomes unreachable rather than where space goes unused.
 
+### The trigger, which the policy name does not settle
+
+Raised by Greptile on PR #884, and it is a real gap rather than a wording quibble: "latest-**attach** wins" and "the client that most recently became active" are different events, and #883's scoped fix says "re-assert on attach/focus" while this PRD's cost model assumes a resize per attention switch. Those cannot both be right, because **neither client re-asserts on focus today, and for the TUI "focus" barely exists**: it is a terminal program with no notion of its window being frontmost, and it stays attached the whole time the desktop is being used. Attach-only would therefore self-correct almost never — the TUI does not re-attach when you switch back to it.
+
+**The trigger is client activity, and tmux's own wording is the authority for it**: `window-size latest` uses "the size of the client that had the most recent **activity**". Read that way the policy is *most-recent-activity wins*, and both clients can detect activity locally with no new information — a keystroke delivered into a pane, a pane-focus change, a tile becoming shown. That also makes the re-assert unconditional rather than a comparison, which sidesteps the awkward fact established in Q2 that the TUI has no steady-state poll and so cannot compare against the daemon's dims on demand.
+
+**One sub-decision is left for #883, stated so it is chosen rather than defaulted: what a *passive* client renders while the other one is driving.** Re-asserting on activity fixes the client you are using, and leaves the one you are only watching parsing at its own geometry while the PTY sits at the other's — mis-parsed until your next interaction with it. Two ways out, and they differ in cost rather than in kind:
+
+- **Accept the transient.** No protocol change at all. The residual is a window between the other client winning and your next activity in this one — much shorter than today's "sticky until you resize your terminal by hand", which is the bug being fixed.
+- **Take the applied-dims echo** on the `Resize` response (additive optional field, no bump — Q2 has the precedent) plus a refresh trigger, so a passive client can re-parse at the daemon's geometry without asserting anything. Strictly better, and the point at which "no protocol change" becomes "one additive field".
+
+Recommendation: start with the first, because it is the policy as chosen and it is measurable in use; add the echo if watching an idle pane while driving the other client proves to be a real workflow. Either way **the trigger itself is activity, not attach** — that is the part #883 should not re-derive.
+
 ## Work Log
+
+### 2026-09-04 — Greptile review round: four findings, three of them real gaps
+
+Greptile raised four P2 findings on PR #884. All four were valid at review time; three needed changes to this document and one had already been fixed in a follow-up commit Greptile could not have seen (it reviews once, when a PR opens — `greptile.json` sets `triggerOnUpdates: false`).
+
+- **The resize trigger was ambiguous, and this was the substantive one.** "Latest-**attach** wins" and "the client that most recently became active" are different events, and this PRD's cost model assumed the second while #883's scope said the first. Attach-only would self-correct almost never, because the TUI stays attached the whole time the desktop is in use and has no notion of window focus at all. Resolved by naming **activity** as the trigger, on tmux's own authority — `window-size latest` uses "the size of the client that had the most recent activity" — and by recording the one sub-decision that falls out of it (what a passive client renders while the other drives) as an explicit fork for #883 with both costs, rather than leaving it to be defaulted. New subsection under Decision taken.
+- **Peer PID identifies a client, not a viewer.** The option-1 sketch keyed the per-agent geometry map by peer PID and pruned on stream teardown, which does not hold: a `Resize` arrives on its own connection so the PID cannot say *which* view it is for, one process can hold two attaches for the same agent (two tiles, or a tile plus the Reader overlay), and the first stream to end would delete an entry the other still needs. Corrected in Q3 to "peer PID for grouping, a per-attach key for geometry", and the option-1 handoff updated. This is option-1 material and not the chosen path, but the record is explicitly kept for a future revisit, so a wrong sketch there is a trap rather than a curiosity.
+- **The Work Log's closing line contradicted the decision.** Struck through and marked superseded rather than deleted — the entry was accurate when written and a Work Log is a record of what was true then.
+- **"Option 3 needs no rendering work" — already corrected** in `13c69ad`, before the review was read. Greptile reviewed `e3d955b`.
 
 ### 2026-09-04 — Decision taken: option 3, latest-attach wins
 
@@ -280,4 +306,4 @@ tmux precedent read from `man tmux` on tmux 3.6 rather than recalled, including 
 
 `cargo test-fast` — 2401 tests, all passed.
 
-**Outstanding: the policy decision itself.** #883 stays blocked until it is recorded here.
+~~**Outstanding: the policy decision itself.** #883 stays blocked until it is recorded here.~~ — **superseded the same day** by the entry above: option 3 was chosen and #883 is unblocked. Left struck through rather than deleted, since a Work Log is a record of what was true when written.
