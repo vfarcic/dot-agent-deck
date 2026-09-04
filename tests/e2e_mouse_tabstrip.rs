@@ -4,7 +4,7 @@
 //!
 //! Spawns the real `dot-agent-deck` binary inside an isolated PTY, opens a
 //! second tab (a Mode tab) so the tab strip renders, then drives the mouse
-//! via SGR reports through the `TuiDeck::click` / `find_in_grid` helpers:
+//! via SGR reports through the `TuiDeck::click` / `wait_for_in_grid` helpers:
 //!   - mouse/tabstrip/001 — clicking a non-active tab header switches to it
 //!     (same outcome as Tab / Ctrl+PageDown).
 //!   - mouse/tabstrip/002 (click→close half) — clicking a Mode tab's `[×]`
@@ -37,9 +37,7 @@ fn open_mode_tab(deck: &TuiDeck, right_presses: usize, selected_mode: &str) {
     deck.wait_for_string(selected_mode); // selection reflected in the title
     // Submit via the [Submit] button (deterministic — a mode pane still shows
     // the Command field, so an Enter-count would be fragile).
-    let (scol, srow) = deck
-        .find_in_grid("[Submit]")
-        .expect("new-pane form should render a [Submit] button");
+    let (scol, srow) = deck.wait_for_in_grid("[Submit]");
     deck.click(scol, srow);
     deck.wait_for_string("Dashboard"); // tab strip appears only with ≥2 tabs
 }
@@ -86,9 +84,7 @@ fn tabstrip_002_click_close_glyph_closes_tab() {
     open_second_tab(&deck);
 
     // Click the Mode tab's close affordance.
-    let (col, row) = deck
-        .find_in_grid("×")
-        .expect("Mode tab header should render a [×] close affordance");
+    let (col, row) = deck.wait_for_in_grid("×");
     deck.click(col, row);
 
     // The glyph is a request, not a one-click teardown: the tab and its close
@@ -116,10 +112,8 @@ fn tabstrip_003_inactive_close_binds_target_and_modal_suppresses_navigation() {
     open_mode_tab(&deck, 2, "beta mode");
     deck.wait_for_string("BETA_TAB_SENTINEL");
 
-    // `find_in_grid` returns the first ×: alpha's, while beta remains active.
-    let (col, row) = deck
-        .find_in_grid("×")
-        .expect("two Mode tabs must render close affordances");
+    // `wait_for_in_grid` returns the first ×: alpha's, while beta remains active.
+    let (col, row) = deck.wait_for_in_grid("×");
     deck.click(col, row);
     deck.wait_for_string("Close this tab and all its panes?");
     assert!(deck.snapshot_grid().contains("BETA_TAB_SENTINEL"));

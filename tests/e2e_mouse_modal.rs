@@ -5,7 +5,7 @@
 //! Spawns the real `dot-agent-deck` binary inside an isolated PTY, opens
 //! each modal that can be triggered synthetically, clicks one of its
 //! buttons, and asserts the outcome equals the corresponding keystroke.
-//! Buttons are located by their bracketed label via `find_in_grid`.
+//! Buttons are located by their bracketed label via `wait_for_in_grid`.
 //! Decision 6: gated behind the `e2e` feature so `cargo test-fast` never
 //! compiles it.
 //!
@@ -43,9 +43,7 @@ fn send_session_start(deck: &TuiDeck, session_id: &str, pane_id: &str, cwd: &str
 
 /// Click the button whose bracketed label is `needle` (e.g. `[Cancel]`).
 fn click_button(deck: &TuiDeck, needle: &str) {
-    let (col, row) = deck
-        .find_in_grid(needle)
-        .unwrap_or_else(|| panic!("modal should render a clickable {needle} button"));
+    let (col, row) = deck.wait_for_in_grid(needle);
     deck.click(col, row);
 }
 

@@ -39,9 +39,7 @@ fn mode_006_watch_pane_streams_output_before_the_command_exits() {
     deck.wait_for_string("Mode:");
     deck.send_bytes(b"\x1b[C");
     deck.wait_for_string("stream mode");
-    let (scol, srow) = deck
-        .find_in_grid("[Submit]")
-        .expect("new-pane form should render a [Submit] button");
+    let (scol, srow) = deck.wait_for_in_grid("[Submit]");
     deck.click(scol, srow);
     deck.wait_for_string("Dashboard"); // tab strip appears only with >=2 tabs
 

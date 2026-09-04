@@ -4,7 +4,7 @@
 //!
 //! Spawns the real `dot-agent-deck` binary inside an isolated PTY, opens the
 //! new-pane form (Ctrl+N → Select Directory → Space-to-confirm), and drives
-//! the mouse via SGR reports through `TuiDeck::click` / `find_in_grid` /
+//! the mouse via SGR reports through `TuiDeck::click` / `wait_for_in_grid` /
 //! `send_bytes`. Each interaction is asserted to equal the corresponding
 //! keystroke. Decision 6: gated behind the `e2e` feature so `cargo test-fast`
 //! never compiles it.
@@ -31,9 +31,7 @@ fn open_form(deck: &TuiDeck) {
 
 /// Click the button/affordance whose label text is `needle`.
 fn click_target(deck: &TuiDeck, needle: &str) {
-    let (col, row) = deck
-        .find_in_grid(needle)
-        .unwrap_or_else(|| panic!("expected a clickable {needle} affordance in the form"));
+    let (col, row) = deck.wait_for_in_grid(needle);
     deck.click(col, row);
 }
 
@@ -48,9 +46,7 @@ fn form_001_click_field_moves_focus() {
     let deck = TuiDeck::launch_with_fixture("form");
     open_form(&deck);
 
-    let (col, row) = deck
-        .find_in_grid("Name:")
-        .expect("form should render a Name field");
+    let (col, row) = deck.wait_for_in_grid("Name:");
     deck.click(col, row);
 
     deck.send_bytes(b"nm777");
