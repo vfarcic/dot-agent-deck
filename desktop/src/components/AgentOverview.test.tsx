@@ -65,6 +65,11 @@ function runtime(overrides: Partial<DeckRuntimeState> = {}): DeckRuntimeState {
     resizeTerminal: vi.fn(async () => undefined),
     setShownTerminals: vi.fn(async () => undefined),
     reconnect: vi.fn(async () => undefined),
+    // PRD #819 M6: the runtime's project surface. The overview does not use it,
+    // but `DeckRuntimeState` is one shape and a fake that omits a member of it
+    // stops type-checking — which is the point of it being on the interface.
+    listProjects: vi.fn(async () => ({ projects: [] })),
+    resolveProject: vi.fn(async () => { throw new Error("unresolved: the overview resolves no project"); }),
     // PRD #803 made the settings pair part of the runtime contract, and the
     // DeckShell cases below mount the whole app, so the hook calls these. The
     // overview itself reads no setting; these only have to resolve.

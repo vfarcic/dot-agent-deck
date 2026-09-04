@@ -464,6 +464,13 @@ pub async fn run_daemon(socket_path: &Path, state: SharedState) -> Result<(), Da
 /// is spawned alongside the hook-ingestion loop and aborted when this
 /// function returns.
 pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), DaemonError> {
+    // PRD #819 M3: capture this daemon's own working directory ONCE, here, at
+    // startup — the first of the four seeds its project enumeration draws on.
+    // A process's cwd is not guaranteed stable, so reading it lazily at request
+    // time would make the answer depend on when it was asked. It is only a
+    // seed: a daemon started by systemd/launchd with `cwd=/` contributes
+    // nothing, and every candidate is revalidated before it is offered.
+    crate::project_resolve::capture_daemon_startup_cwd();
     // PRD #93 M1.3 / round-2 auditor BLOCKER: race protection for the
     // probe-remove-bind sequence.
     //

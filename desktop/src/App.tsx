@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import {
   Activity,
   AlertTriangle,
@@ -41,7 +41,7 @@ import { ProfilesPanel, ProjectsPanel, PromptLibraryPanel, WorkflowPanel } from 
 import { SettingsSheet } from "./components/SettingsSheet";
 import { useAgentProfiles } from "./hooks/useAgentProfiles";
 import { useDeckRuntime } from "./hooks/useDeckRuntime";
-import { useProjects } from "./hooks/useProjects";
+import { useDaemonProjects } from "./hooks/useDaemonProjects";
 import { usePromptLibrary } from "./hooks/usePromptLibrary";
 import { useDesktopSettings } from "./hooks/useDesktopSettings";
 import { applyAppearance } from "./lib/appearance";
@@ -50,6 +50,46 @@ import type { DeckAction, DeckActionResult, DeckRuntimeState, DeckView, Evidence
 import { modeScopedKey } from "./lib/bridge";
 
 const WORKFLOW_STORAGE_KEY = modeScopedKey("dot-agent-deck.desktop.workflow-preview.v1");
+/**
+ * The daemon's stable refusal codes this screen recognises, matched as CODES
+ * rather than as prose. Each is the first token of `AttachResponse.error`,
+ * followed by `": "` — and the sentence after it is deliberately uninformative
+ * for a path the daemon does not already know, so this screen must not depend
+ * on how much it said.
+ *
+ * `unresolved` (`daemon_protocol::PROJECT_ERR_UNRESOLVED`): the path did not
+ * resolve. `stale-revision` (`PROJECT_ERR_STALE_REVISION`): it did, but against
+ * different config bytes than the picker read — the TOCTOU gate M4 added, whose
+ * remedy is to resolve again.
+ *
+ * The last three are token-time refusals, all of which mean "nothing was
+ * started" and two of which arrive from the PRD #819 audit fix:
+ *
+ * - `stale-token` (`PROJECT_ERR_STALE_TOKEN`): the preparation is unknown to
+ *   this daemon or has aged out of its TTL.
+ * - `stale-preparation` (`PROJECT_ERR_STALE_PREPARATION`): the preparation was
+ *   ours and live, but the project, its config or the published context moved
+ *   under it — most ordinarily because a second launch in the same project
+ *   replaced the context at its fixed path. The remedy is a real one the user
+ *   can take: prepare again, which is what re-resolving and re-launching does.
+ * - `unsupported-platform` (`PROJECT_ERR_UNSUPPORTED_PLATFORM`): the daemon
+ *   will not publish a coordinator context on its platform, because the
+ *   owner-only guarantee the publish documents is Unix-only. No amount of
+ *   retrying helps, so this one says so instead of inviting one.
+ *
+ * `preparation-mismatch` (`PROJECT_ERR_PREPARATION_MISMATCH`, PRD #819 Greptile
+ * P1(a)) is deliberately NOT in that list and falls through to the generic
+ * notice carrying the daemon's own sentence. It means this app submitted a
+ * project, workflow or role other than the one the daemon prepared, which is a
+ * defect in this client rather than a state the user can be walked out of —
+ * re-preparing and sending the same thing again earns the same refusal, so
+ * offering that as a remedy would be a lie. Nothing was started either way.
+ */
+const PROJECT_UNRESOLVED_CODE = "unresolved: ";
+const PROJECT_STALE_REVISION_CODE = "stale-revision: ";
+const PROJECT_STALE_TOKEN_CODE = "stale-token: ";
+const PROJECT_STALE_PREPARATION_CODE = "stale-preparation: ";
+const PROJECT_UNSUPPORTED_PLATFORM_CODE = "unsupported-platform: ";
 const DESKTOP_EVIDENCE_QUERY = "(min-width: 1260px)";
 
 function evidenceOpenOnFirstLoad(): boolean {
@@ -86,7 +126,6 @@ export function ControlDeck({ runtime, workflowPlatformIssue = desktopWorkflowPl
   const [selectedEvidenceId, setSelectedEvidenceId] = useState("");
   const [evidenceOpen, setEvidenceOpen] = useState(evidenceOpenOnFirstLoad);
   const [projectsOpen, setProjectsOpen] = useState(false);
-  const [selectedProjectId, setSelectedProjectId] = useState("");
   const [profilesOpen, setProfilesOpen] = useState(false);
   const [promptsOpen, setPromptsOpen] = useState(false);
   const [selectedPromptId, setSelectedPromptId] = useState("");
@@ -98,7 +137,48 @@ export function ControlDeck({ runtime, workflowPlatformIssue = desktopWorkflowPl
   const [notice, setNotice] = useState<string>();
   const [confirm, setConfirm] = useState<ConfirmState>();
   const { profiles, updateProfile, resetProfiles } = useAgentProfiles(snapshot.profiles);
-  const { projects, activeId: activeProjectId, activeProject, setActiveId: setActiveProjectId, addProject, updateProject, removeProject } = useProjects(snapshot.worktree, snapshot.repo);
+  /*
+   * PRD #819 M6: the projects come from the daemon and nothing is remembered.
+   * `useProjects` used to seed a `localStorage` list from the desktop's own
+   * guess at a working directory and treat it as the source of truth for the
+   * launch cwd — which, against a remote daemon, named a directory on the wrong
+   * machine and did not error.
+   *
+   * The listing is re-fetched when the connection changes and when the agent
+   * set moves, because enumeration is derived from LIVE state: a project stops
+   * being known the moment its last agent exits.
+   *
+   * PRD #819 Greptile P2(c): the key used to be `status:agentCount`, and a count
+   * does not determine the answer. The daemon derives its project list from its
+   * startup cwd, every live agent's `cwd`, every orchestration role's
+   * `orchestration_cwd` and every registered schedule's working directory — so
+   * replacing an agent with one in another project keeps the count identical and
+   * changes the list. The key below carries the seeds this client can actually
+   * observe, deduplicated and sorted so it is a set rather than an ordering, and
+   * keeps the agent count as well: the key is then a strict superset of the old
+   * one, and cannot re-list less often than it did.
+   *
+   * Two seeds are deliberately absent, and neither is observable from here: the
+   * daemon's own startup cwd, which is fixed for that daemon's life and so is
+   * covered by the connection status; and registered schedule directories, which
+   * reach no desktop surface at all. A schedule registered while the app is open
+   * is therefore picked up by the picker's own refresh rather than automatically
+   * — which is why that button exists.
+   */
+  const projectsRevision = useMemo(() => {
+    const seeds = snapshot.agents.flatMap((agent) => [agent.cwd, agent.tab.kind === "orchestration" ? agent.tab.cwd : undefined]);
+    const distinct = [...new Set(seeds.filter((cwd): cwd is string => Boolean(cwd)))].sort();
+    // NUL as the separator: `is_valid_cwd` refuses it, so no directory can spell
+    // one and no two different seed sets can collapse onto the same key.
+    return [snapshot.connection.status, String(snapshot.agents.length), ...distinct].join("\u0000");
+  }, [snapshot.agents, snapshot.connection.status]);
+  const projectState = useDaemonProjects({
+    listProjects: runtime.listProjects,
+    resolveProject: runtime.resolveProject,
+    revision: projectsRevision,
+    enabled: mode === "live" && snapshot.connection.status === "connected",
+  });
+  const activeProject = projectState.selected;
   const { prompts, addPrompt, updatePrompt, removePrompt } = usePromptLibrary();
   const [profileOrder, setProfileOrder] = useState<string[]>([]);
   const settings = useDesktopSettings(runtime);
@@ -123,12 +203,6 @@ export function ControlDeck({ runtime, workflowPlatformIssue = desktopWorkflowPl
       setSelectedEvidenceId(snapshot.evidence[0]?.id ?? "");
     }
   }, [selectedEvidenceId, snapshot.evidence]);
-
-  useEffect(() => {
-    if (!selectedProjectId || !projects.some((project) => project.id === selectedProjectId)) {
-      setSelectedProjectId(activeProjectId || projects[0]?.id || "");
-    }
-  }, [activeProjectId, projects, selectedProjectId]);
 
   useEffect(() => {
     if (!selectedPromptId || !prompts.some((prompt) => prompt.id === selectedPromptId)) {
@@ -361,19 +435,78 @@ export function ControlDeck({ runtime, workflowPlatformIssue = desktopWorkflowPl
       ? ` Among generated commands, ${config.generatedFullAccessCount} role${config.generatedFullAccessCount === 1 ? " runs" : "s run"} unrestricted — Claude Code with bypassPermissions, or Codex with no sandbox — so ${config.generatedFullAccessCount === 1 ? "it acts" : "they act"} without asking.`
       : "";
     setConfirm({
-      title: `Launch ${config.name}?`,
-      body: `This starts ${config.roles.length} live CLI agents in ${config.cwd} and sends your task prompt to the coordinator. ${commandCopy}${accessCopy} This launch does not rewrite project TOML.`,
+      title: `Launch ${config.displayName}?`,
+      body: `This starts ${config.roles.length} live CLI agents in ${config.displayPath} and sends your task prompt to the coordinator. ${commandCopy}${accessCopy} This launch does not rewrite project TOML.`,
       label: "Launch live loop",
       busyLabel: "Launching…",
       action: async () => {
         try {
-          const { customCommandCount: _customCommandCount, generatedFullAccessCount: _generatedFullAccessCount, ...launch } = config;
+          // The display twins come off with the two counts: they exist for the
+          // dialog and the notice, and the daemon gets the identities alone
+          // (PRD #819 audit fix).
+          const { customCommandCount: _customCommandCount, generatedFullAccessCount: _generatedFullAccessCount, displayName: _displayName, displayPath: _displayPath, ...launch } = config;
           await runtime.runAction({ type: "start_workflow", ...launch });
           setWorkflowOpen(false);
           await runtime.reconnect();
-          setNotice(`${config.name} launched with ${config.roles.length} configured roles.`);
+          setNotice(`${config.displayName} launched with ${config.roles.length} configured roles.`);
         } catch (cause) {
-          setNotice(cause instanceof Error ? cause.message : String(cause));
+          const message = cause instanceof Error ? cause.message : String(cause);
+          /*
+           * PRD #819 M6, state 2. The daemon re-resolves on launch, and
+           * enumeration is derived from live state — so a project can stop
+           * being known between the moment it was drawn and the moment Launch
+           * is pressed, when its last agent exits. That is an ORDINARY outcome,
+           * so it is presented the way the empty state is: the picker reopens
+           * saying the project is no longer known, rather than a red failure
+           * naming a refusal code.
+           */
+          if (message.includes(PROJECT_UNRESOLVED_CODE)) {
+            projectState.clearSelection();
+            void projectState.refresh();
+            setWorkflowOpen(false);
+            setProjectsOpen(true);
+            setNotice("That project is no longer one this daemon knows — nothing is running there any more. Choose another, or paste its path again.");
+            return;
+          }
+          /*
+           * The other ordinary refusal: the project is fine and its config
+           * changed under the picker. The remedy the daemon's own sentence
+           * names is "resolve again", so do exactly that rather than leaving
+           * the user a dead end, and say what happened.
+           */
+          if (message.includes(PROJECT_STALE_REVISION_CODE) && activeProject) {
+            void projectState.select(activeProject.path);
+            setNotice("This project's .dot-agent-deck.toml changed since the workflows were listed, so nothing was started. It has been re-read — check the workflow and launch again.");
+            return;
+          }
+          /*
+           * The two token-time refusals. Both mean the daemon started nothing,
+           * and both have the same remedy — prepare again — so both re-resolve
+           * the project to pick up its current revision and say what happened
+           * in the words that are true of each. `stale-preparation` is the one
+           * an ordinary second launch in the same project produces, because the
+           * coordinator context lives at a path fixed per project and the later
+           * preparation is the one that survives.
+           */
+          if ((message.includes(PROJECT_STALE_PREPARATION_CODE) || message.includes(PROJECT_STALE_TOKEN_CODE)) && activeProject) {
+            void projectState.select(activeProject.path);
+            setNotice(message.includes(PROJECT_STALE_PREPARATION_CODE)
+              ? "This launch's prepared coordinator context no longer matches what the daemon approved — another launch in this project replaced it, or the project moved. Nothing was started. The project has been re-read; launch again to prepare a fresh one."
+              : "The daemon no longer holds this launch's preparation — it expired, or the daemon was replaced. Nothing was started. The project has been re-read; launch again to prepare a fresh one.");
+            return;
+          }
+          /*
+           * Not retryable, and the only one of these that is not: the daemon's
+           * platform cannot give the published context an owner-only guarantee,
+           * so it withholds the verb rather than publishing without one. Its own
+           * sentence already names what to do instead, so pass it through.
+           */
+          if (message.includes(PROJECT_UNSUPPORTED_PLATFORM_CODE)) {
+            setWorkflowOpen(false);
+            setNotice(message);
+            return;
+          }
+          setNotice(message);
         }
       },
     });
@@ -414,14 +547,25 @@ export function ControlDeck({ runtime, workflowPlatformIssue = desktopWorkflowPl
       <main className="deck-main">
         <header className="topbar">
           <div className="repo-context">
-            <div className="repo-line"><FolderGit2 size={15} /><strong>{activeProject?.name || snapshot.repo}</strong><ChevronRight size={13} /><span>{snapshot.runId}</span></div>
+            <div className="repo-line"><FolderGit2 size={15} /><strong>{activeProject?.displayName || snapshot.repo}</strong><ChevronRight size={13} /><span>{snapshot.runId}</span></div>
             {/*
               PRD #745 M8: the branch chip appears only when there IS a branch.
               Nothing daemon-side tracks one, so live mode reports none and the
               line carries the working directory alone rather than printing the
               literal "Unavailable" where a branch name belongs.
             */}
-            <div className="branch-line">{snapshot.branch && <><GitBranch size={12} /><span>{snapshot.branch}</span><i /> </>}<span title={activeProject?.cwd || snapshot.worktree}>{activeProject?.cwd || snapshot.worktree}</span></div>
+            {/*
+              `activeProject.displayPath` is the escaped twin of the DAEMON's
+              canonical spelling of the project chosen for the next launch;
+              `snapshot.worktree` is the daemon-reported cwd of a running agent.
+              Both come from the daemon — the third tier this line used to fall
+              back to was the desktop's own guess, and it is gone (PRD #819 M6).
+
+              The DISPLAY half, not `path`. This line is a text node and a
+              `title` attribute, so it gets the escaped copy; `path` is reserved
+              for what goes back to the daemon (PRD #819 audit fix).
+            */}
+            <div className="branch-line">{snapshot.branch && <><GitBranch size={12} /><span>{snapshot.branch}</span><i /> </>}<span title={activeProject?.displayPath || snapshot.worktree}>{activeProject?.displayPath || snapshot.worktree}</span></div>
           </div>
           <div className="run-instruments">
             <Instrument label="HEALTH" testId="run-health"><span className={`health-value health-${snapshot.health}`}><i />{snapshot.health}</span></Instrument>
@@ -526,15 +670,8 @@ export function ControlDeck({ runtime, workflowPlatformIssue = desktopWorkflowPl
 
       <ProjectsPanel
         open={projectsOpen}
-        projects={projects}
-        activeId={activeProjectId}
-        selectedId={selectedProjectId}
-        onSelect={setSelectedProjectId}
+        state={projectState}
         onClose={() => setProjectsOpen(false)}
-        onAdd={() => setSelectedProjectId(addProject())}
-        onUpdate={updateProject}
-        onRemove={(id) => { removeProject(id); setNotice("Project entry removed. The repository folder was not changed."); }}
-        onActivate={(id) => { setActiveProjectId(id); setNotice("Active project updated. Open Workflows when you are ready to launch its agents."); }}
         onConfigureWorkflow={() => { setProjectsOpen(false); setWorkflowOpen(true); }}
       />
       <PromptLibraryPanel
@@ -548,7 +685,7 @@ export function ControlDeck({ runtime, workflowPlatformIssue = desktopWorkflowPl
         onRemove={(id) => { removePrompt(id); setNotice("Prompt removed from this device's library."); }}
       />
       <ProfilesPanel open={profilesOpen} profiles={profiles} onClose={() => setProfilesOpen(false)} onUpdate={updateProfile} onReset={resetProfiles} onSaved={() => setNotice("Agent profile draft saved locally. Project TOML is unchanged.")} />
-      <WorkflowPanel key={activeProject?.id ?? "runtime-workflow"} open={workflowOpen} profiles={profiles} order={profileOrder} mode={mode} defaultName={activeProject?.workflowName ?? "dot-agent-deck"} defaultCwd={activeProject?.cwd || snapshot.worktree} onClose={() => setWorkflowOpen(false)} onToggle={(id) => { const profile = profiles.find((item) => item.id === id); if (profile) updateProfile(id, { enabled: !profile.enabled }); }} onMove={moveStage} onLaunch={requestLaunch} platformIssue={workflowPlatformIssue} prompts={prompts} />
+      <WorkflowPanel key={activeProject?.path ?? "runtime-workflow"} open={workflowOpen} profiles={profiles} order={profileOrder} mode={mode} project={activeProject} onChooseProject={() => { setWorkflowOpen(false); setProjectsOpen(true); }} onClose={() => setWorkflowOpen(false)} onToggle={(id) => { const profile = profiles.find((item) => item.id === id); if (profile) updateProfile(id, { enabled: !profile.enabled }); }} onMove={moveStage} onLaunch={requestLaunch} platformIssue={workflowPlatformIssue} prompts={prompts} />
       <SettingsSheet
         open={settingsOpen}
         onClose={() => setSettingsOpen(false)}

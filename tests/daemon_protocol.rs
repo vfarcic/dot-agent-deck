@@ -40,8 +40,12 @@ use tokio::task::JoinHandle;
 
 use dot_agent_deck::agent_pty::{AgentPtyRegistry, AgentRecord};
 use dot_agent_deck::daemon_protocol::{
-    AttachRequest, AttachResponse, KIND_DETACH, KIND_REQ, KIND_RESP, KIND_STREAM_END,
-    KIND_STREAM_IN, KIND_STREAM_OUT, KIND_STREAM_REJECT, RunningAgentsSummary, TabMembership,
+    AttachRequest, AttachResponse, DAEMON_CAPABILITIES, KIND_DETACH, KIND_REQ, KIND_RESP,
+    KIND_STREAM_END, KIND_STREAM_IN, KIND_STREAM_OUT, KIND_STREAM_REJECT, PROJECT_ERR_INVALID_PATH,
+    PROJECT_ERR_NO_ORCHESTRATION, PROJECT_ERR_PREPARATION_MISMATCH, PROJECT_ERR_PUBLISH_FAILED,
+    PROJECT_ERR_STALE_PREPARATION, PROJECT_ERR_STALE_REVISION, PROJECT_ERR_STALE_TOKEN,
+    PROJECT_ERR_TASK_REJECTED, PROJECT_ERR_UNIMPLEMENTED, PROJECT_ERR_UNRESOLVED,
+    PROJECT_ERR_WRONG_START_VERB, PROTOCOL_VERSION, RunningAgentsSummary, TabMembership,
     bind_attach_listener, serve_attach_with_counter, write_resp,
 };
 use dot_agent_deck::event::{
@@ -1055,6 +1059,1225 @@ async fn malformed_request_returns_err() {
         resp.error
             .as_deref()
             .is_some_and(|e| e.contains("malformed request"))
+    );
+}
+
+/// PRD #819 M2 (recon §5c): a syntactically valid request naming an `op` this
+/// daemon does not know gets a clean structured `ok:false` — not a panic, not
+/// silence, not an abrupt close.
+///
+/// `malformed_request_returns_err` above covers **non-JSON** input, which is a
+/// different failure: it never reaches serde's enum dispatch. This is the case
+/// the whole cross-version degradation story rests on — an older daemon meeting
+/// a verb from a newer client — and it was untested.
+///
+/// The assertion deliberately does NOT pin serde's `unknown variant …` wording.
+/// That text is not a stability contract, and nothing may branch on it; the
+/// contract being pinned here is the SHAPE of the reply, which is why the
+/// `capabilities` field exists.
+#[tokio::test]
+async fn unknown_op_returns_structured_error_not_a_panic() {
+    let server = start_server().await;
+    let resp = issue_json_request(
+        &server,
+        serde_json::json!({ "op": "no-such-verb-from-a-later-build", "path": "/tmp" }),
+    )
+    .await;
+    assert!(!resp.ok, "an unknown op must be refused, not accepted");
+    assert!(
+        resp.error
+            .as_deref()
+            .is_some_and(|e| e.contains("malformed request")),
+        "unknown op must reply with the structured malformed-request error, got {:?}",
+        resp.error
+    );
+
+    // The daemon is still serving: an unknown op ends that request cycle, not
+    // the process. This is the half a panic would fail.
+    let mut s = UnixStream::connect(&server.path).await.unwrap();
+    write_request(&mut s, &AttachRequest::ListAgents).await;
+    let follow_up = read_response(&mut s).await;
+    assert!(
+        follow_up.ok,
+        "daemon must keep serving after an unknown op: {:?}",
+        follow_up.error
+    );
+}
+
+/// PRD #819 M2: every project verb is REACHABLE — it parses and dispatches
+/// rather than failing the decode. That is what makes the behaviour tests fail
+/// on behaviour instead of on an `unknown variant` error indistinguishable from
+/// a typo.
+///
+/// M3 landed the behaviour behind two of the three and **M4 landed the third**,
+/// so this test now pins the same claim for all of them: every verb answers for
+/// real, and none may report `unimplemented` any more — which is what would
+/// otherwise let an implementation be quietly reverted and read as a stub.
+///
+/// `/tmp` exists and is a directory but holds no `.dot-agent-deck.toml`, so both
+/// `resolve-project` and `prepare-workflow` reach the resolver proper and refuse
+/// with the bounded `unresolved` code rather than at a boundary check. That is
+/// the interesting refusal: it proves the verb did filesystem work.
+#[tokio::test]
+async fn project_verbs_are_reachable_and_none_report_unimplemented() {
+    let server = start_server().await;
+
+    let resp = issue_json_request(
+        &server,
+        serde_json::json!({
+            "op": "prepare-workflow",
+            "path": "/tmp",
+            "orchestration": "dispatch",
+            "task": "do the thing",
+        }),
+    )
+    .await;
+    assert!(
+        !resp.ok,
+        "prepare-workflow must not report a hollow success"
+    );
+    assert!(
+        resp.workflow_prepared.is_none(),
+        "a refusal carries no PreparedWorkflow"
+    );
+    let error = resp.error.unwrap_or_default();
+    assert!(
+        !error.starts_with(PROJECT_ERR_UNIMPLEMENTED),
+        "M4 landed the safe publish, so prepare-workflow must never answer \
+         `{PROJECT_ERR_UNIMPLEMENTED}` again: {error:?}"
+    );
+    assert!(
+        error.starts_with(PROJECT_ERR_UNRESOLVED),
+        "/tmp is not a project, so prepare-workflow must refuse it with the bounded \
+         `{PROJECT_ERR_UNRESOLVED}` code, got {error:?}"
+    );
+    assert!(
+        !error.contains("/tmp"),
+        "an arbitrary path must not be echoed back: {error:?}"
+    );
+    assert!(
+        !error.contains("malformed request"),
+        "prepare-workflow must PARSE — a decode failure means the variant is not wired: {error:?}"
+    );
+
+    // `list-projects` derives its answer from state this server holds, and this
+    // one holds nothing — so the honest answer is an EMPTY listing with
+    // `ok: true`, not a refusal. "This daemon knows nothing live" is a state the
+    // client renders, not a failure it reports.
+    let resp = issue_json_request(&server, serde_json::json!({ "op": "list-projects" })).await;
+    assert!(
+        resp.ok,
+        "list-projects must answer from what the daemon holds, got {:?}",
+        resp.error
+    );
+    let listing = resp
+        .projects
+        .expect("a successful list-projects must carry a ProjectListing");
+    assert!(
+        listing.projects.is_empty() && listing.primary.is_none(),
+        "a server holding nothing live must offer nothing: {listing:?}"
+    );
+
+    // `/tmp` exists and is a directory, so this exercises the resolve path
+    // proper rather than a boundary refusal: no `.dot-agent-deck.toml` there
+    // means a bounded `unresolved`, and never `unimplemented`.
+    let resp = issue_json_request(
+        &server,
+        serde_json::json!({ "op": "resolve-project", "path": "/tmp" }),
+    )
+    .await;
+    assert!(!resp.ok, "/tmp is not a project, so resolve must refuse it");
+    assert!(
+        resp.project.is_none(),
+        "a refusal carries no ResolvedProject"
+    );
+    let error = resp.error.unwrap_or_default();
+    assert!(
+        error.starts_with(PROJECT_ERR_UNRESOLVED),
+        "expected the bounded `{PROJECT_ERR_UNRESOLVED}` code, got {error:?}"
+    );
+    assert!(
+        !error.contains("/tmp"),
+        "an arbitrary path must not be echoed back: {error:?}"
+    );
+}
+
+/// PRD #819 A5: the boundary validation is real now, ahead of the behaviour.
+/// A rejected path never reaches a filesystem, and the refusal names no path —
+/// see the disclosure split in the PRD.
+#[tokio::test]
+async fn project_verbs_reject_a_bad_path_at_the_boundary() {
+    let server = start_server().await;
+
+    let oversized = format!("/{}", "a".repeat(4096));
+    for bad in [
+        "",
+        "relative/path",
+        "/has/a\u{7f}delete",
+        "/has/a\u{1}control",
+        oversized.as_str(),
+    ] {
+        let resp = issue_json_request(
+            &server,
+            serde_json::json!({ "op": "resolve-project", "path": bad }),
+        )
+        .await;
+        assert!(!resp.ok, "resolve-project must refuse {bad:?}");
+        let error = resp.error.unwrap_or_default();
+        assert!(
+            error.starts_with(PROJECT_ERR_INVALID_PATH),
+            "expected `{PROJECT_ERR_INVALID_PATH}` for {bad:?}, got {error:?}"
+        );
+        assert!(
+            !error.contains(bad) || bad.is_empty(),
+            "the refusal must not echo the caller-supplied path: {error:?}"
+        );
+    }
+}
+
+/// PRD #819 A5: `PrepareWorkflow.task` is bounded SERVER-side, at the wire
+/// boundary and before any filesystem work. The desktop's own 64 KiB check is a
+/// UI affordance, not a bound this daemon may rely on.
+#[tokio::test]
+async fn prepare_workflow_bounds_the_task_at_the_boundary() {
+    let server = start_server().await;
+
+    let over = "x".repeat(dot_agent_deck::bounded_read::MAX_TASK_BYTES as usize + 1);
+    let resp = issue_json_request(
+        &server,
+        serde_json::json!({
+            "op": "prepare-workflow",
+            "path": "/tmp",
+            "orchestration": "dispatch",
+            "task": over,
+        }),
+    )
+    .await;
+    assert!(!resp.ok);
+    let error = resp.error.unwrap_or_default();
+    assert!(
+        error.starts_with(PROJECT_ERR_TASK_REJECTED),
+        "expected `{PROJECT_ERR_TASK_REJECTED}`, got {error:?}"
+    );
+
+    // Exactly at the limit is accepted by the bound, so it falls through to the
+    // resolver and refuses on `/tmp` not being a project — which is how we know
+    // the bound is a bound and not an off-by-one that rejects legitimate input.
+    // (Before M4 the fall-through landed on `unimplemented`; the claim being
+    // pinned is unchanged — the task got PAST the length check.)
+    let at_limit = "x".repeat(dot_agent_deck::bounded_read::MAX_TASK_BYTES as usize);
+    let resp = issue_json_request(
+        &server,
+        serde_json::json!({
+            "op": "prepare-workflow",
+            "path": "/tmp",
+            "orchestration": "dispatch",
+            "task": at_limit,
+        }),
+    )
+    .await;
+    assert!(!resp.ok);
+    assert!(
+        resp.error
+            .as_deref()
+            .is_some_and(|e| e.starts_with(PROJECT_ERR_UNRESOLVED)),
+        "a task exactly at the limit must pass the bound and reach the resolver, got {:?}",
+        resp.error
+    );
+}
+
+/// PRD #819 A5: the path is validated BEFORE the task, so a request that is
+/// wrong in both ways names the path — and, more importantly, an invalid path
+/// is refused whatever the task carries.
+#[tokio::test]
+async fn prepare_workflow_validates_the_path_before_the_task() {
+    let server = start_server().await;
+    let over = "x".repeat(dot_agent_deck::bounded_read::MAX_TASK_BYTES as usize + 1);
+    let resp = issue_json_request(
+        &server,
+        serde_json::json!({
+            "op": "prepare-workflow",
+            "path": "not-absolute",
+            "orchestration": "dispatch",
+            "task": over,
+        }),
+    )
+    .await;
+    assert!(!resp.ok);
+    assert!(
+        resp.error
+            .as_deref()
+            .is_some_and(|e| e.starts_with(PROJECT_ERR_INVALID_PATH)),
+        "path validation runs first, got {:?}",
+        resp.error
+    );
+}
+
+/// A minimal real project, minted inside the per-test scratch root.
+///
+/// Returns the CANONICAL directory: the harness temp base can itself sit behind
+/// a symlink, and PRD #819's whole point is that one canonical spelling carries
+/// end to end — so a test that compared against the raw spelling would fail for
+/// a reason that has nothing to do with the verb.
+fn mint_project(toml: &str) -> (TempDir, PathBuf) {
+    let dir = test_temp::tempdir().expect("mint the project sandbox");
+    std::fs::write(dir.path().join(".dot-agent-deck.toml"), toml).expect("seed the project config");
+    let canonical = std::fs::canonicalize(dir.path()).expect("canonicalize the project sandbox");
+    (dir, canonical)
+}
+
+const LAUNCHABLE_PROJECT: &str = r#"
+[[orchestrations]]
+name = "loop"
+
+[[orchestrations.roles]]
+name = "planner"
+command = "cat"
+start = true
+prompt_template = "Coordinate through the configured team."
+
+[[orchestrations.roles]]
+name = "builder"
+command = "cat"
+description = "Implements the requested change"
+"#;
+
+/// PRD #819 M4: `ResolveProject` hands back a revision derived from the config
+/// bytes, `PrepareWorkflow` echoes it, and a revision that no longer matches the
+/// file on disk is refused — **before** anything is published.
+///
+/// The ordering is the assertion that matters. A stale revision that were
+/// checked after the write would still report an error while having already
+/// replaced the coordinator context, which is the TOCTOU this field exists to
+/// close rather than to describe.
+#[tokio::test]
+async fn prepare_workflow_refuses_a_stale_config_revision_before_publishing() {
+    let server = start_server().await;
+    let (_dir, project) = mint_project(LAUNCHABLE_PROJECT);
+    let context = project
+        .join(".dot-agent-deck")
+        .join("orchestrator-context.md");
+
+    let resp = issue_json_request(
+        &server,
+        serde_json::json!({ "op": "resolve-project", "path": project.to_str().unwrap() }),
+    )
+    .await;
+    assert!(resp.ok, "resolve must succeed: {:?}", resp.error);
+    let resolved = resp.project.expect("a ResolvedProject");
+    let revision = resolved
+        .config_revision
+        .expect("PRD #819 M4: a resolve carries the revision the launch echoes back");
+
+    // The config changes underneath the client. Nothing tells it; that is the
+    // window.
+    std::fs::write(
+        project.join(".dot-agent-deck.toml"),
+        LAUNCHABLE_PROJECT.replace("Implements the requested change", "Something else entirely"),
+    )
+    .expect("rewrite the project config");
+
+    let resp = issue_json_request(
+        &server,
+        serde_json::json!({
+            "op": "prepare-workflow",
+            "path": project.to_str().unwrap(),
+            "orchestration": "loop",
+            "task": "Launch against a snapshot that no longer exists.",
+            "config_revision": revision,
+        }),
+    )
+    .await;
+    assert!(!resp.ok, "a stale revision must be refused");
+    assert!(
+        resp.workflow_prepared.is_none(),
+        "a refused preparation carries no PreparedWorkflow"
+    );
+    let error = resp.error.unwrap_or_default();
+    assert!(
+        error.starts_with(PROJECT_ERR_STALE_REVISION),
+        "expected the stable `{PROJECT_ERR_STALE_REVISION}` code, got {error:?}"
+    );
+    assert!(
+        !context.exists(),
+        "the revision check must run BEFORE the publish, but {} was written",
+        context.display()
+    );
+
+    // An ABSENT revision means "I have no expectation", not "any revision" — the
+    // client that has not resolved yet must still be able to launch, which is
+    // what keeps the field additive rather than a new requirement.
+    let resp = issue_json_request(
+        &server,
+        serde_json::json!({
+            "op": "prepare-workflow",
+            "path": project.to_str().unwrap(),
+            "orchestration": "loop",
+            "task": "Launch with no revision expectation.",
+        }),
+    )
+    .await;
+    assert!(
+        resp.ok,
+        "a preparation that names no revision must still succeed: {:?}",
+        resp.error
+    );
+    assert!(context.is_file(), "and it must publish the context");
+}
+
+/// PRD #819 M4: a preparation that fails publishes nothing and starts nothing.
+///
+/// The e2e (`project/launch/001`) pins the same claim through a real
+/// `daemon serve`; this is the fast-tier half, and it is here because "starts no
+/// roles" is a property of the ORDERING — every step that can fail runs before
+/// the publish, and the verb spawns nothing at all — which is cheapest to
+/// regress and cheapest to catch.
+#[tokio::test]
+async fn a_failed_preparation_publishes_nothing_and_starts_no_roles() {
+    let server = start_server().await;
+    let (_dir, project) = mint_project(LAUNCHABLE_PROJECT);
+    let context = project
+        .join(".dot-agent-deck")
+        .join("orchestrator-context.md");
+
+    assert!(
+        server.registry.agent_records().is_empty(),
+        "precondition: no panes before the preparation"
+    );
+
+    let resp = issue_json_request(
+        &server,
+        serde_json::json!({
+            "op": "prepare-workflow",
+            "path": project.to_str().unwrap(),
+            "orchestration": "no-such-orchestration",
+            "task": "This preparation must fail.",
+        }),
+    )
+    .await;
+    assert!(!resp.ok, "an unknown orchestration must be refused");
+    let error = resp.error.unwrap_or_default();
+    assert!(
+        error.starts_with(PROJECT_ERR_NO_ORCHESTRATION),
+        "expected `{PROJECT_ERR_NO_ORCHESTRATION}`, got {error:?}"
+    );
+    assert!(
+        !error.contains("loop"),
+        "the refusal must not enumerate the orchestrations the config declares: {error:?}"
+    );
+    assert!(
+        !context.exists(),
+        "a failed preparation must publish nothing, but {} was written",
+        context.display()
+    );
+    assert!(
+        server.registry.agent_records().is_empty(),
+        "a failed preparation must start no roles"
+    );
+}
+
+/// PRD #819 M4: the publish's symlink refusal is reachable **through the verb**,
+/// not only through a direct call to the publish function.
+///
+/// `tests/context_publish.rs` pins the publish primitive's six hardening cases
+/// in isolation. This one pins that the daemon actually routes through it: a
+/// project whose `.dot-agent-deck` is a symlink refuses the launch with the
+/// stable `publish-failed` code, writes nothing through the link, and starts
+/// nothing.
+#[tokio::test]
+async fn prepare_workflow_refuses_a_symlinked_context_directory() {
+    let server = start_server().await;
+    let (_dir, project) = mint_project(LAUNCHABLE_PROJECT);
+
+    // The link target sits outside the project, which is the shape that matters:
+    // a publish that followed it would write the coordinator context — task,
+    // prompt template, role descriptions — somewhere the operator never named.
+    let elsewhere = test_temp::tempdir().expect("mint the link target");
+    let elsewhere = std::fs::canonicalize(elsewhere.path()).expect("canonicalize the link target");
+    std::os::unix::fs::symlink(&elsewhere, project.join(".dot-agent-deck"))
+        .expect("symlink .dot-agent-deck out of the project");
+
+    let resp = issue_json_request(
+        &server,
+        serde_json::json!({
+            "op": "prepare-workflow",
+            "path": project.to_str().unwrap(),
+            "orchestration": "loop",
+            "task": "This must not be written through a symlink.",
+        }),
+    )
+    .await;
+    assert!(!resp.ok, "a symlinked .dot-agent-deck must be refused");
+    assert!(resp.workflow_prepared.is_none());
+    let error = resp.error.unwrap_or_default();
+    assert!(
+        error.starts_with(PROJECT_ERR_PUBLISH_FAILED),
+        "expected `{PROJECT_ERR_PUBLISH_FAILED}`, got {error:?}"
+    );
+    assert!(
+        !elsewhere.join("orchestrator-context.md").exists(),
+        "nothing may be written through the link, but {} exists",
+        elsewhere.join("orchestrator-context.md").display()
+    );
+    assert!(
+        server.registry.agent_records().is_empty(),
+        "a failed preparation must start no roles"
+    );
+}
+
+/// The wire as a daemon that PREDATES `start-prepared-agent` sees it:
+/// [`AttachRequest`] without that variant.
+///
+/// Deserializing a request into this enum is what such a daemon's
+/// `handle_connection` literally does with the frame, so its verdict is the
+/// older daemon's answer rather than a description of one. Only the two ops the
+/// tests below need are declared — serde's `unknown variant` verdict does not
+/// depend on how many siblings an enum has, and every other variant would be
+/// dead weight that drifts.
+#[derive(Debug, serde::Deserialize)]
+#[serde(tag = "op", rename_all = "kebab-case")]
+#[allow(dead_code)]
+enum PreVerbAttachRequest {
+    ListAgents,
+    /// Serde ignores unknown keys, which is the whole point: an older daemon
+    /// decoded a `start-agent` carrying a `prep_token` and dropped the token on
+    /// the floor. Two fields are enough to show that happening.
+    StartAgent {
+        #[serde(default)]
+        command: Option<String>,
+        #[serde(default)]
+        cwd: Option<String>,
+    },
+}
+
+/// The orchestration membership a prepared start submits: the workflow name, the
+/// role, and whether that role is the orchestration's start role.
+///
+/// A real launch always sends one (`desktop/src-tauri/src/lib.rs`'s
+/// `workflow_start_options`), and since PRD #819's Greptile P1(a) fix the daemon
+/// compares it against the token's binding — so a payload carrying `None` here
+/// can no longer produce a spawn. The cases below that pass `None` are the ones
+/// refused before the identity check is reached: an unknown token, and a payload
+/// whose `op` is rewritten so it never decodes as a prepared start at all.
+type PreparedMembership<'a> = (&'a str, &'a str, bool);
+
+/// The membership `LAUNCHABLE_PROJECT`'s start role has.
+const LAUNCHABLE_START_ROLE: PreparedMembership<'static> = ("loop", "planner", true);
+
+/// A prepared start, as a JSON object, ready to have its `op` rewritten.
+fn prepared_start_payload(
+    token: &str,
+    cwd: Option<&str>,
+    membership: Option<PreparedMembership<'_>>,
+) -> serde_json::Map<String, serde_json::Value> {
+    let request = AttachRequest::StartPreparedAgent {
+        prep_token: token.to_string(),
+        command: Some("/bin/sh".into()),
+        cwd: cwd.map(str::to_string),
+        rows: 24,
+        cols: 80,
+        env: vec![],
+        display_name: None,
+        tab_membership: membership.map(|(name, role_name, is_start_role)| {
+            TabMembership::Orchestration {
+                name: name.to_string(),
+                role_index: 0,
+                role_name: role_name.to_string(),
+                is_start_role,
+                orchestration_cwd: cwd.map(str::to_string),
+                display_title: None,
+                orchestration_id: None,
+            }
+        }),
+        agent_type: None,
+        seed: None,
+    };
+    match serde_json::to_value(&request).expect("a prepared start serializes") {
+        serde_json::Value::Object(fields) => fields,
+        other => panic!("a prepared start must serialize to a JSON object, got {other}"),
+    }
+}
+
+/// PRD #819 audit follow-up: the preparation token rides on a **distinct op**,
+/// and a daemon that does not know that op refuses the whole request without
+/// spawning.
+///
+/// This is the claim the verb exists for, so it is asserted in the three parts
+/// it decomposes into rather than gestured at:
+///
+/// 1. the request really is a new `op` with the token as a top-level field, and
+///    a daemon predating it fails the decode — modelled by
+///    [`PreVerbAttachRequest`], which is that daemon's `AttachRequest`;
+/// 2. the shape it REPLACED does not fail there. The same token on the stable
+///    `start-agent` op decodes cleanly against the older enum, which is the
+///    fail-open in one line: the request was accepted, the unknown key dropped,
+///    and the role started with no preparation enforcement at all. **This build
+///    refuses that shape** rather than serving it;
+/// 3. an op this build cannot decode takes `handle_connection`'s structured
+///    malformed-request path — `ok: false`, nothing spawned, daemon still
+///    serving — which is the path an older daemon takes for the real verb.
+///
+/// Without the fix, part 1 is unwritable (there is no variant) and part 2 is the
+/// SHIPPING behaviour rather than a refusal.
+#[tokio::test]
+async fn a_prepared_start_is_a_distinct_op_an_older_daemon_refuses_closed() {
+    let server = start_server().await;
+    let token = "prep-0000000000000000000000000000000";
+    let payload = prepared_start_payload(token, None, None);
+
+    // ---- 1. A new op, carrying the token as a required top-level field.
+    assert_eq!(
+        payload.get("op").and_then(serde_json::Value::as_str),
+        Some("start-prepared-agent"),
+        "the prepared start must be its own op, not a decorated `start-agent`"
+    );
+    assert_eq!(
+        payload
+            .get("prep_token")
+            .and_then(serde_json::Value::as_str),
+        Some(token),
+        "the token must be a field of the variant, not an extra key a peer can drop"
+    );
+    let older =
+        serde_json::from_value::<PreVerbAttachRequest>(serde_json::Value::Object(payload.clone()))
+            .expect_err("a daemon predating the verb must fail the decode, not accept it");
+    assert!(
+        older.to_string().contains("unknown variant"),
+        "the older daemon's refusal is serde's unknown-variant error, got {older}"
+    );
+
+    // The token is REQUIRED, so a caller that omits it is refused by this build
+    // too — an optional field here would be the same silent downgrade one hop in.
+    let mut tokenless = payload.clone();
+    tokenless.remove("prep_token");
+    let resp = issue_json_request(&server, serde_json::Value::Object(tokenless)).await;
+    assert!(
+        !resp.ok,
+        "a prepared start with no token must not be served: {resp:?}"
+    );
+    assert!(
+        resp.error
+            .as_deref()
+            .is_some_and(|e| e.contains("malformed request")),
+        "a missing required token fails the decode, got {:?}",
+        resp.error
+    );
+
+    // ---- 2. The shape this replaced, and why it had to be replaced.
+    let mut on_start_agent = payload.clone();
+    on_start_agent.insert("op".into(), "start-agent".into());
+    serde_json::from_value::<PreVerbAttachRequest>(serde_json::Value::Object(
+        on_start_agent.clone(),
+    ))
+    .expect(
+        "an older daemon ACCEPTS a token spelled on `start-agent` and drops the key — that is \
+         the fail-open the verb removes, and it must be shown rather than asserted",
+    );
+    let resp = issue_json_request(&server, serde_json::Value::Object(on_start_agent)).await;
+    assert!(
+        !resp.ok,
+        "this build must refuse a token on `start-agent` rather than spawn unenforced"
+    );
+    assert!(resp.id.is_none(), "a refused start-agent starts nothing");
+    let error = resp.error.unwrap_or_default();
+    assert!(
+        error.starts_with(PROJECT_ERR_WRONG_START_VERB),
+        "expected `{PROJECT_ERR_WRONG_START_VERB}`, got {error:?}"
+    );
+
+    // ---- 3. The path an older daemon takes for the real verb.
+    let mut later_build = payload;
+    later_build.insert(
+        "op".into(),
+        "start-prepared-agent-from-a-later-build".into(),
+    );
+    let resp = issue_json_request(&server, serde_json::Value::Object(later_build)).await;
+    assert!(!resp.ok, "an unknown op must be refused, not accepted");
+    assert!(
+        resp.error
+            .as_deref()
+            .is_some_and(|e| e.contains("malformed request")),
+        "an unknown op replies with the structured malformed-request error, got {:?}",
+        resp.error
+    );
+    assert!(
+        server.registry.agent_records().is_empty(),
+        "not one of the refusals above may have spawned anything"
+    );
+
+    // The daemon is still serving all of them, which is the half a panic fails.
+    let mut s = UnixStream::connect(&server.path).await.unwrap();
+    write_request(&mut s, &AttachRequest::ListAgents).await;
+    assert!(
+        read_response(&mut s).await.ok,
+        "the daemon must keep serving after refusing a prepared start"
+    );
+}
+
+/// PRD #819 audit follow-up: plain `start-agent` is byte-for-byte unchanged for
+/// every caller that has one — and refuses the one thing it must not silently
+/// accept.
+///
+/// The unchanged half is the one that would break the world quietly: the TUI,
+/// the desktop, dispatch and every existing test call `start-agent` without a
+/// token, and a verb that started failing on them would take all of them down.
+///
+/// The refusing half exists because removing the token FIELD is not the same as
+/// removing the token PATH. Serde drops unknown keys on the base variant, so a
+/// caller aiming at the wrong verb would otherwise be served an unenforced spawn
+/// and told it succeeded — which is the fail-open the new verb removes,
+/// reintroduced by silence.
+#[tokio::test]
+async fn start_agent_is_unchanged_without_a_token_and_refuses_one_spelled_on_it() {
+    let server = start_server().await;
+
+    // The request shape every existing caller sends.
+    let resp = issue_json_request(
+        &server,
+        serde_json::json!({ "op": "start-agent", "command": "/bin/sh", "rows": 24, "cols": 80 }),
+    )
+    .await;
+    assert!(
+        resp.ok && resp.id.is_some(),
+        "start-agent with no token must behave exactly as before: {:?}",
+        resp.error
+    );
+    let spawned = server.registry.agent_records().len();
+
+    // A JSON `null` is the same as absent and must stay on the unchanged path:
+    // it names no preparation, so there is no wrong verb to send anyone to.
+    let resp = issue_json_request(
+        &server,
+        serde_json::json!({
+            "op": "start-agent",
+            "command": "/bin/sh",
+            "rows": 24,
+            "cols": 80,
+            "prep_token": serde_json::Value::Null,
+        }),
+    )
+    .await;
+    assert!(
+        resp.ok && resp.id.is_some(),
+        "a null prep_token is an absent one: {:?}",
+        resp.error
+    );
+
+    // Present, in any shape at all: refused. The wrongly typed case is here
+    // because presence is the question — a caller that malformed its token still
+    // meant to present one, and must not be downgraded into the token-less path.
+    for token in [
+        serde_json::json!("prep-0000000000000000000000000000000"),
+        serde_json::json!(7),
+    ] {
+        let spawned_before = server.registry.agent_records().len();
+        let resp = issue_json_request(
+            &server,
+            serde_json::json!({
+                "op": "start-agent",
+                "command": "/bin/sh",
+                "rows": 24,
+                "cols": 80,
+                "prep_token": token,
+            }),
+        )
+        .await;
+        assert!(
+            !resp.ok,
+            "a token on `start-agent` must be refused: {token}"
+        );
+        assert!(resp.id.is_none(), "a refused start-agent starts nothing");
+        let error = resp.error.unwrap_or_default();
+        assert!(
+            error.starts_with(PROJECT_ERR_WRONG_START_VERB),
+            "expected `{PROJECT_ERR_WRONG_START_VERB}` for {token}, got {error:?}"
+        );
+        assert!(
+            error.contains("start-prepared-agent"),
+            "the refusal must name the verb that DOES enforce a token: {error:?}"
+        );
+        assert_eq!(
+            server.registry.agent_records().len(),
+            spawned_before,
+            "a refused start-agent must not have spawned a pane"
+        );
+    }
+    assert_eq!(
+        server.registry.agent_records().len(),
+        spawned + 1,
+        "only the two token-less starts may have spawned"
+    );
+}
+
+/// PRD #819 audit follow-up: the prepared verb still runs every check the token
+/// carried — an unknown or aged-out token is `stale-token`, and a live one
+/// spawns.
+///
+/// The accepting half is what stops the refusing half from passing against a
+/// daemon that simply refuses every prepared start, which is the shape a
+/// mis-wired new verb would have.
+#[tokio::test]
+async fn a_prepared_start_refuses_an_unknown_token_and_spawns_on_a_live_one() {
+    let server = start_server().await;
+    let (_dir, project) = mint_project(LAUNCHABLE_PROJECT);
+
+    let resp = issue_json_request(
+        &server,
+        serde_json::Value::Object(prepared_start_payload(
+            "prep-0000000000000000000000000000000",
+            None,
+            None,
+        )),
+    )
+    .await;
+    assert!(!resp.ok, "an unknown prep token must be refused");
+    assert!(resp.id.is_none(), "a refused prepared start starts nothing");
+    let error = resp.error.unwrap_or_default();
+    assert!(
+        error.starts_with(PROJECT_ERR_STALE_TOKEN),
+        "expected `{PROJECT_ERR_STALE_TOKEN}`, got {error:?}"
+    );
+    assert!(
+        server.registry.agent_records().is_empty(),
+        "a refused prepared start must not have spawned a pane"
+    );
+
+    let resp = issue_json_request(
+        &server,
+        serde_json::json!({
+            "op": "prepare-workflow",
+            "path": project.to_str().unwrap(),
+            "orchestration": "loop",
+            "task": "Mint a token to spawn with.",
+        }),
+    )
+    .await;
+    assert!(resp.ok, "the preparation must succeed: {:?}", resp.error);
+    let prepared = resp.workflow_prepared.expect("a PreparedWorkflow");
+
+    let resp = issue_json_request(
+        &server,
+        serde_json::Value::Object(prepared_start_payload(
+            &prepared.token,
+            Some(&prepared.path),
+            Some(LAUNCHABLE_START_ROLE),
+        )),
+    )
+    .await;
+    assert!(
+        resp.ok && resp.id.is_some(),
+        "a freshly issued prep token must spawn through the prepared verb: {:?}",
+        resp.error
+    );
+}
+
+/// PRD #819's audit fix, now through the prepared verb: two preparations in one
+/// project, and the **first** token's spawn is refused while the second's is
+/// accepted.
+///
+/// `tests/prep_binding.rs` proves the checker across all five staleness causes
+/// and this proves the **wiring** — that the prepared-start arm resolves a
+/// presented token to its binding, runs `revalidate_preparation`, and answers
+/// `stale-preparation` without spawning anything. The two together are the
+/// finding: before the binding existed, a spawn validated only that the token
+/// was young, so this request succeeded and launched a coordinator pointed at a
+/// file holding the *other* preparation's brief. One wiring test rather than
+/// five, because the arm calls the one checker those five cases exercise; a
+/// second copy of them here would pin the test author's idea of the checker.
+///
+/// The distinction from `stale-token` is asserted, not assumed: this token is one
+/// this daemon issued and is seconds old, so a refusal carrying the wrong code
+/// would say the token was unknown — which would send an operator looking for a
+/// client bug instead of a replaced artifact.
+#[tokio::test]
+async fn a_prepared_start_refuses_a_token_whose_prepared_context_was_replaced() {
+    let server = start_server().await;
+    let (_dir, project) = mint_project(LAUNCHABLE_PROJECT);
+
+    let prepare = |task: &'static str| {
+        let server = &server;
+        let path = project.to_str().unwrap().to_string();
+        async move {
+            let resp = issue_json_request(
+                server,
+                serde_json::json!({
+                    "op": "prepare-workflow",
+                    "path": path,
+                    "orchestration": "loop",
+                    "task": task,
+                }),
+            )
+            .await;
+            assert!(resp.ok, "the preparation must succeed: {:?}", resp.error);
+            resp.workflow_prepared.expect("a PreparedWorkflow")
+        }
+    };
+
+    let first = prepare("Task A: the first client's brief.").await;
+    let second = prepare("Task B: the second client's brief.").await;
+    assert_ne!(first.token, second.token);
+    assert_eq!(
+        first.context_path, second.context_path,
+        "both preparations name the same fixed path, which is the shape of the defect"
+    );
+
+    let resp = issue_json_request(
+        &server,
+        serde_json::Value::Object(prepared_start_payload(
+            &first.token,
+            Some(&first.path),
+            Some(LAUNCHABLE_START_ROLE),
+        )),
+    )
+    .await;
+    assert!(
+        !resp.ok,
+        "a token whose artifact was replaced must be refused"
+    );
+    assert!(resp.id.is_none(), "a refused prepared start starts nothing");
+    let error = resp.error.unwrap_or_default();
+    assert!(
+        error.starts_with(PROJECT_ERR_STALE_PREPARATION),
+        "expected `{PROJECT_ERR_STALE_PREPARATION}`, got {error:?}"
+    );
+    assert!(
+        !error.starts_with(PROJECT_ERR_STALE_TOKEN),
+        "the token IS live; reporting it as unknown would misdirect the diagnosis"
+    );
+    assert!(
+        server.registry.agent_records().is_empty(),
+        "a refused prepared start must not have spawned a pane"
+    );
+
+    // The second preparation's token still spawns, which is what stops the
+    // assertions above from passing against a daemon that refuses every token.
+    let resp = issue_json_request(
+        &server,
+        serde_json::Value::Object(prepared_start_payload(
+            &second.token,
+            Some(&second.path),
+            Some(LAUNCHABLE_START_ROLE),
+        )),
+    )
+    .await;
+    assert!(
+        resp.ok && resp.id.is_some(),
+        "the preparation whose artifact is on disk must still spawn: {:?}",
+        resp.error
+    );
+
+    // And again with the same token, because a real launch presents it once per
+    // ROLE: a re-validation that consumed the record, or that a spawn's own side
+    // effects invalidated, would refuse every role after the first and take the
+    // whole feature down rather than fail visibly here.
+    let resp = issue_json_request(
+        &server,
+        serde_json::Value::Object(prepared_start_payload(
+            &second.token,
+            Some(&second.path),
+            Some(LAUNCHABLE_START_ROLE),
+        )),
+    )
+    .await;
+    assert!(
+        resp.ok && resp.id.is_some(),
+        "the same token must spawn a second role: {:?}",
+        resp.error
+    );
+}
+
+/// PRD #819, Greptile P1(a) over the wire: a token prepared for project X,
+/// presented with spawn fields naming project Y, is refused with **nothing
+/// spawned** — and it is refused as a MISMATCH rather than as staleness.
+///
+/// `tests/prep_binding.rs` proves the comparison across all six of its causes
+/// and this proves the **wiring** — that the `start-prepared-agent` arm lifts the
+/// submitted `cwd` and `tab_membership` out of the request it is about to spawn
+/// and hands them to `verify_prepared_start` before the registry is touched. One
+/// wiring test rather than six, for the reason the sibling
+/// `a_prepared_start_refuses_a_token_whose_prepared_context_was_replaced` gives.
+///
+/// **Both preparations are live and untouched, which is the point.** The two
+/// projects are separate directories, so X's published context is still exactly
+/// what X approved: every staleness check passes and the only thing wrong is
+/// that this request is not the one X's token approved. Before this fix that is
+/// not a refusal at all — the daemon re-validated X and spawned in Y — so the
+/// test cannot pass against the previous code by any route.
+///
+/// The code is asserted, not just the refusal: `stale-preparation` would say the
+/// artifact moved and send an operator hunting a race with another launch, when
+/// what actually happened is a client sending back something other than what it
+/// was handed.
+///
+/// The positive control at the end is what stops all of this from passing
+/// against a daemon that has simply started refusing every prepared start.
+#[tokio::test]
+async fn a_prepared_start_refuses_spawn_fields_from_another_project() {
+    let server = start_server().await;
+    let (_dir_x, project_x) = mint_project(LAUNCHABLE_PROJECT);
+    let (_dir_y, project_y) = mint_project(LAUNCHABLE_PROJECT);
+
+    let prepare = |path: String, task: &'static str| {
+        let server = &server;
+        async move {
+            let resp = issue_json_request(
+                server,
+                serde_json::json!({
+                    "op": "prepare-workflow",
+                    "path": path,
+                    "orchestration": "loop",
+                    "task": task,
+                }),
+            )
+            .await;
+            assert!(resp.ok, "the preparation must succeed: {:?}", resp.error);
+            resp.workflow_prepared.expect("a PreparedWorkflow")
+        }
+    };
+
+    let x = prepare(
+        project_x.to_str().unwrap().to_string(),
+        "Project X's brief.",
+    )
+    .await;
+    let y = prepare(
+        project_y.to_str().unwrap().to_string(),
+        "Project Y's brief.",
+    )
+    .await;
+    assert_ne!(
+        x.context_path, y.context_path,
+        "two projects must publish to two paths, or this would be the staleness case"
+    );
+
+    // X's token, Y's spawn fields.
+    let resp = issue_json_request(
+        &server,
+        serde_json::Value::Object(prepared_start_payload(
+            &x.token,
+            Some(&y.path),
+            Some(LAUNCHABLE_START_ROLE),
+        )),
+    )
+    .await;
+    assert!(
+        !resp.ok,
+        "a token prepared for one project must not start another"
+    );
+    assert!(resp.id.is_none(), "a refused prepared start starts nothing");
+    let error = resp.error.unwrap_or_default();
+    assert!(
+        error.starts_with(PROJECT_ERR_PREPARATION_MISMATCH),
+        "expected `{PROJECT_ERR_PREPARATION_MISMATCH}`, got {error:?}"
+    );
+    assert!(
+        !error.starts_with(PROJECT_ERR_STALE_PREPARATION)
+            && !error.starts_with(PROJECT_ERR_STALE_TOKEN),
+        "nothing went stale — reporting it as staleness sends an operator after a race \
+         that did not happen: {error:?}"
+    );
+    assert!(
+        server.registry.agent_records().is_empty(),
+        "a refused prepared start must not have spawned a pane"
+    );
+
+    // Same token, right project, wrong workflow — the path check alone would let
+    // this through.
+    let resp = issue_json_request(
+        &server,
+        serde_json::Value::Object(prepared_start_payload(
+            &x.token,
+            Some(&x.path),
+            Some(("some-other-loop", "planner", true)),
+        )),
+    )
+    .await;
+    assert!(!resp.ok, "a token must not start another orchestration");
+    assert!(
+        resp.error
+            .unwrap_or_default()
+            .starts_with(PROJECT_ERR_PREPARATION_MISMATCH)
+    );
+    assert!(server.registry.agent_records().is_empty());
+
+    // Same token, right project and workflow, a role the orchestration does not
+    // declare.
+    let resp = issue_json_request(
+        &server,
+        serde_json::Value::Object(prepared_start_payload(
+            &x.token,
+            Some(&x.path),
+            Some(("loop", "not-a-declared-role", true)),
+        )),
+    )
+    .await;
+    assert!(!resp.ok, "a token must not start an undeclared role");
+    assert!(
+        resp.error
+            .unwrap_or_default()
+            .starts_with(PROJECT_ERR_PREPARATION_MISMATCH)
+    );
+    assert!(server.registry.agent_records().is_empty());
+
+    // The positive control: each token still starts its OWN launch, every
+    // declared role of it, so "refuses" above is not trivially true.
+    for (prepared, role) in [
+        (&x, LAUNCHABLE_START_ROLE),
+        (&x, ("loop", "builder", false)),
+        (&y, LAUNCHABLE_START_ROLE),
+    ] {
+        let resp = issue_json_request(
+            &server,
+            serde_json::Value::Object(prepared_start_payload(
+                &prepared.token,
+                Some(&prepared.path),
+                Some(role),
+            )),
+        )
+        .await;
+        assert!(
+            resp.ok && resp.id.is_some(),
+            "the launch a preparation approved must still spawn ({role:?}): {:?}",
+            resp.error
+        );
+    }
+}
+
+/// PRD #819 audit follow-up: the CLIENT routes a presented token onto the
+/// prepared verb, so the daemon-side refusal above is the one a real launch
+/// meets rather than a property only a hand-built payload can reach.
+///
+/// **The op is asserted through the answer, not by reading the frame**, and that
+/// works because the two arms now give different codes for the same input. A
+/// token this daemon never issued is `stale-token` on `start-prepared-agent` and
+/// `wrong-start-verb` on `start-agent`, so the refusal names which op the client
+/// chose. That is a stronger check than inspecting the request would be: it
+/// reads what the daemon actually dispatched.
+///
+/// Verified by reverting `start_agent_with_prep_token` to the shape it replaced
+/// — serializing `StartAgent` and inserting a `prep_token` key — which turns the
+/// first refusal into `wrong-start-verb` and fails this test.
+#[tokio::test]
+async fn the_client_routes_a_presented_token_onto_the_prepared_verb() {
+    use dot_agent_deck::daemon_client::{DaemonClient, StartAgentOptions};
+
+    let server = start_server().await;
+    let (_dir, project) = mint_project(LAUNCHABLE_PROJECT);
+    let client = DaemonClient::new(server.path.clone());
+
+    let refusal = client
+        .start_agent_with_prep_token(
+            StartAgentOptions {
+                command: Some("/bin/sh".into()),
+                ..StartAgentOptions::default()
+            },
+            Some("prep-0000000000000000000000000000000"),
+        )
+        .await
+        .expect_err("a token this daemon never issued must not spawn")
+        .to_string();
+    assert!(
+        refusal.contains(PROJECT_ERR_STALE_TOKEN),
+        "expected the prepared verb's own refusal `{PROJECT_ERR_STALE_TOKEN}`, got {refusal:?}"
+    );
+    assert!(
+        !refusal.contains(PROJECT_ERR_WRONG_START_VERB),
+        "the client sent `start-agent` with the token as an extra key — the fail-open shape the \
+         verb replaced: {refusal:?}"
+    );
+    assert!(
+        server.registry.agent_records().is_empty(),
+        "a refused prepared start must not have spawned a pane"
+    );
+
+    // The positive half, so the assertions above cannot pass against a client
+    // that refuses to send anything at all: a real preparation's token spawns
+    // through the same method, capability gate included.
+    let prepared = client
+        .prepare_workflow(
+            project.to_str().expect("utf-8 project path"),
+            "loop",
+            "Mint a token to spawn with.",
+            None,
+        )
+        .await
+        .expect("the preparation must succeed");
+    let id = client
+        .start_agent_with_prep_token(
+            StartAgentOptions {
+                command: Some("/bin/sh".into()),
+                cwd: Some(prepared.path.clone()),
+                // Since PRD #819's Greptile P1(a) fix a prepared start also has
+                // to submit the identity its token approved, which is what a
+                // real launch sends.
+                tab_membership: Some(TabMembership::Orchestration {
+                    name: "loop".into(),
+                    role_index: 0,
+                    role_name: "planner".into(),
+                    is_start_role: true,
+                    orchestration_cwd: Some(prepared.path.clone()),
+                    display_title: None,
+                    orchestration_id: None,
+                }),
+                ..StartAgentOptions::default()
+            },
+            Some(&prepared.token),
+        )
+        .await
+        .expect("a live preparation's token must spawn through the prepared verb");
+    assert!(!id.is_empty(), "a spawn reports the registry id it created");
+
+    // And `None` stays on plain `start-agent`, which is the path the TUI, the
+    // desktop and dispatch all take: it must neither gain a capability gate nor
+    // meet the wrong-verb refusal.
+    let id = client
+        .start_agent_with_prep_token(
+            StartAgentOptions {
+                command: Some("/bin/sh".into()),
+                ..StartAgentOptions::default()
+            },
+            None,
+        )
+        .await
+        .expect("a token-less start is byte-for-byte the ordinary `start-agent`");
+    assert!(!id.is_empty());
+}
+
+/// PRD #819 M2/M5: the `Hello` reply advertises each project verb explicitly,
+/// and leaves `guarded_send` exactly where PRD #20 put it.
+#[tokio::test]
+async fn hello_advertises_the_project_capabilities() {
+    let server = start_server().await;
+    let mut s = UnixStream::connect(&server.path).await.unwrap();
+    write_request(
+        &mut s,
+        &AttachRequest::Hello {
+            client_version: PROTOCOL_VERSION,
+            client_build_version: None,
+        },
+    )
+    .await;
+    let resp = read_response(&mut s).await;
+    assert!(resp.ok);
+
+    let advertised = resp
+        .capabilities
+        .expect("Hello must advertise capabilities");
+    for expected in DAEMON_CAPABILITIES {
+        assert!(
+            advertised.iter().any(|c| c == expected),
+            "Hello must advertise `{expected}`, got {advertised:?}"
+        );
+    }
+
+    // The PRD #20 boolean is NOT folded into the list: an older client reads
+    // only the boolean, and moving it would break that client for no gain.
+    assert_eq!(resp.guarded_send, Some(true));
+    assert!(
+        !advertised
+            .iter()
+            .any(|c| c == "guarded_send" || c == "guarded-send"),
+        "guarded_send stays its own field: {advertised:?}"
     );
 }
 

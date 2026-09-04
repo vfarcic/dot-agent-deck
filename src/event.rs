@@ -1020,6 +1020,171 @@ pub struct ListedOrchestration {
     pub default: bool,
 }
 
+// ---------------------------------------------------------------------------
+// PRD #819: the project projection carried by the attach socket's three
+// project verbs.
+// ---------------------------------------------------------------------------
+
+/// PRD #819 M2: the daemon's reply to [`crate::daemon_protocol::AttachRequest::ListProjects`].
+///
+/// Owned and purpose-built rather than a serialization of
+/// [`crate::project_config::ProjectConfig`], for the same reason
+/// [`ListTargetsResponse`] is: none of the config types derives `Serialize`,
+/// `ProjectConfig` deserializes through `#[serde(try_from = "RawProjectConfig")]`
+/// so a derive would emit a shape that does not round-trip (`extends` flattened,
+/// defaults materialised), and `DefaultOrchestration<'a>` carries a lifetime and
+/// cannot be serialized at all. That asymmetry is deliberate; this is the
+/// projection PRD #220 already established as the way across it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectListing {
+    #[serde(default)]
+    pub projects: Vec<KnownProject>,
+    /// The project most recently active on this daemon, if any.
+    ///
+    /// A FACT derived from live state — an agent cwd, an orchestration cwd —
+    /// and not a configured preference. Nothing persists it and no client sets
+    /// it, so it changes as the daemon's own world changes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primary: Option<String>,
+}
+
+/// One project in a [`ProjectListing`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KnownProject {
+    /// Daemon-canonical absolute path. **This is the identity.** A client sends
+    /// this string back verbatim; it never derives a path from its own
+    /// environment, because a desktop client's filesystem need not be the
+    /// daemon's.
+    pub path: String,
+    /// Display name. The directory basename today — which is why the canonical
+    /// spelling has to be the one that propagates: canonicalising a symlinked
+    /// path changes its basename, and an empty orchestration name is derived
+    /// from that basename (PRD #220's bug, `crate::dispatch`).
+    pub name: String,
+}
+
+/// PRD #819 M2: the daemon's reply to [`crate::daemon_protocol::AttachRequest::ResolveProject`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResolvedProject {
+    /// The daemon-canonical path this resolved to, which may differ from the
+    /// spelling the caller sent (an alias or a symlink resolves elsewhere).
+    /// This is the string a later `PrepareWorkflow` and `StartAgent` must use.
+    pub path: String,
+    #[serde(default)]
+    pub orchestrations: Vec<ProjectOrchestration>,
+    /// PRD #819 M4: an opaque identifier for the exact config bytes this
+    /// resolution was computed from.
+    ///
+    /// The client echoes it back on
+    /// [`crate::daemon_protocol::AttachRequest::PrepareWorkflow`], and a
+    /// mismatch is refused — which is what closes the window between the
+    /// picker's resolve and the launch's write. Derived from the config
+    /// **content** as read (see
+    /// [`crate::project_resolve::config_revision`]), never from mtime or size:
+    /// those collide, and a `git checkout` or a `cp -p` perturbs them without a
+    /// real change.
+    ///
+    /// Additive on a response type: `#[serde(default)]` plus
+    /// `skip_serializing_if`, so an older daemon's reply omits the key and
+    /// decodes to `None`, and an older client ignores it. No further
+    /// `PROTOCOL_VERSION` move — that is the exemption
+    /// [`crate::daemon_protocol::PROTOCOL_VERSION`]'s own policy grants
+    /// response fields.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_revision: Option<String>,
+}
+
+/// One orchestration in a [`ResolvedProject`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectOrchestration {
+    pub name: String,
+    /// Carried for picker pre-selection, not because a current call site reads
+    /// it. Same shape and same `#[serde(default)]` treatment as
+    /// [`ListedOrchestration::default`].
+    #[serde(default)]
+    pub default: bool,
+    #[serde(default)]
+    pub roles: Vec<ProjectRole>,
+}
+
+/// One role of a [`ProjectOrchestration`].
+///
+/// `name` and `start` are the complete set the desktop reads
+/// (`order_workflow_roles` in `desktop/src-tauri/src/lib.rs`). The rest of
+/// `OrchestrationRoleConfig` — `command`, `description`, `prompt_template`,
+/// `agent`, `clear` — is consumed only inside
+/// [`crate::orchestrator_context::prepare_orchestrator_prompt`], which moves
+/// daemon-side in PRD #819 M4, so none of it ever crosses the wire. That is a
+/// security property as well as a size one: command strings and prompt
+/// templates stay daemon-side. Do not widen this struct to carry them back.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectRole {
+    pub name: String,
+    #[serde(default)]
+    pub start: bool,
+}
+
+/// PRD #819 M2: the daemon's reply to [`crate::daemon_protocol::AttachRequest::PrepareWorkflow`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PreparedWorkflow {
+    /// Where the coordinator context was published, daemon-side.
+    pub context_path: String,
+    /// PRD #819 M6: the daemon-**canonical** project directory this preparation
+    /// resolved to — the same string [`ResolvedProject::path`] carries, restated
+    /// here so a spawn does not have to trust that the caller sent the canonical
+    /// spelling in the first place.
+    ///
+    /// This is the string every following `StartAgent.cwd` and
+    /// `orchestration_cwd` must use. Canonicalising a symlinked path changes its
+    /// basename and an empty orchestration name is derived from that basename,
+    /// so a launch that prepares under one spelling and spawns under another
+    /// reproduces PRD #220's bug verbatim (`crate::dispatch`). Answering with the
+    /// canonical path makes "the listing and the spawn agree" a property of the
+    /// reply rather than of the caller's discipline.
+    ///
+    /// Additive with `#[serde(default)]`, like [`Self::prompt`]: an older
+    /// daemon's reply decodes it as the empty string, which a caller must read as
+    /// "not reported" rather than as a working directory.
+    #[serde(default)]
+    pub path: String,
+    /// Short-lived preparation token. Spawning stays a later sequence of
+    /// per-role calls (PRD #819 Open Question 5, settled in favour of the
+    /// smaller change), so the atomicity the launch verb promises has to be
+    /// policed across that gap: the sequence presents this token and stale use
+    /// is refused.
+    ///
+    /// M4 landed issuance ([`crate::prep_token::issue`]) and checking. The audit
+    /// follow-up moved the presentation onto its own verb,
+    /// [`crate::daemon_protocol::AttachRequest::StartPreparedAgent`], where the
+    /// token is a **required** field — an older daemon then refuses the whole
+    /// request as an unknown variant instead of ignoring an additive key and
+    /// spawning unenforced. **Read [`crate::prep_token`]'s module doc before
+    /// treating it as anything more than a staleness check** — it is not an
+    /// authorization token, and the attach socket is not a privilege boundary.
+    pub token: String,
+    #[serde(default)]
+    pub roles: Vec<ProjectRole>,
+    /// PRD #819 M6: the one-liner to inject into the coordinator's PTY, as
+    /// composed by
+    /// [`crate::orchestrator_context::prepare_orchestrator_context`].
+    ///
+    /// It is here because the client that spawns the roles has to deliver it and
+    /// **may not compose it itself**: the line names
+    /// `.dot-agent-deck/orchestrator-context.md`, which is project-state
+    /// knowledge this PRD moves daemon-side, and it varies with whether the
+    /// preparation carried a task. A client that built its own copy would be
+    /// holding a second, driftable spelling of a file only the daemon wrote.
+    ///
+    /// Additive on a response type, exactly like
+    /// [`ResolvedProject::config_revision`]: `#[serde(default)]`, so an older
+    /// daemon's reply decodes it as the empty string and a caller that finds it
+    /// empty has nothing to deliver. That is the exemption
+    /// [`crate::daemon_protocol::PROTOCOL_VERSION`]'s own policy grants response
+    /// fields, so it moves no version.
+    #[serde(default)]
+    pub prompt: String,
+}
+
 /// The daemon's reply to a [`DaemonMessage::Delegate`], one JSON line back on
 /// the hook-socket connection (the [`GetSeedResponse`] / [`ListTargetsResponse`]
 /// pattern).

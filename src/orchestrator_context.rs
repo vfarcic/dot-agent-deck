@@ -171,8 +171,70 @@ pub fn build_orchestrator_context(config: &OrchestrationConfig) -> String {
     content
 }
 
-/// Write the orchestrator context to a file and return a one-liner to inject.
-/// Multi-line prompts don't submit in Claude Code via PTY, so we use a file reference.
+/// Fold the caller's own task, if any, into the composed context.
+///
+/// Split out from [`prepare_orchestrator_prompt`] in PRD #819 M4 so that
+/// composing and *publishing* are two steps rather than one: the daemon needs
+/// the composed bytes before they reach a filesystem, both to bound them
+/// ([`MAX_CONTEXT_BYTES`]) and to hand them to
+/// [`publish_orchestrator_context`]. The composition itself is unchanged — same
+/// sections, same separator, same trimming rule — because this is the ONE
+/// composer the desktop, the TUI and the daemon all share, and forking it is
+/// what produced the parity gap PRD #222 closed.
+///
+/// `task` is expected already trimmed and non-empty when `Some`; callers go
+/// through [`prepare_orchestrator_context`], which applies that rule once.
+pub fn compose_orchestrator_context(config: &OrchestrationConfig, task: Option<&str>) -> String {
+    let mut content = build_orchestrator_context(config);
+    if let Some(task) = task {
+        content.push_str(TASK_SECTION_MARKER);
+        content.push_str(task);
+        content.push('\n');
+    }
+    content
+}
+
+/// The one-liner injected into the coordinator's PTY, pointing at the file.
+///
+/// With a task, the closing instruction must NOT be "wait for instructions" —
+/// the instruction is already in the file, and telling the orchestrator to wait
+/// is what would leave a dispatched unit idle forever.
+fn orchestrator_prompt_line(has_task: bool) -> String {
+    if has_task {
+        "Read .dot-agent-deck/orchestrator-context.md for your role, the available agents, the \
+         delegation protocol, and your task under `## Your task`. Then carry out that task, \
+         delegating to the agents listed there."
+            .to_string()
+    } else {
+        "Read .dot-agent-deck/orchestrator-context.md for your role, available agents, and \
+         delegation protocol. Acknowledge your role and wait for instructions."
+            .to_string()
+    }
+}
+
+/// What a successful [`prepare_orchestrator_context`] produced.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedContext {
+    /// The file the coordinator will read — the path the daemon reports back on
+    /// [`crate::event::PreparedWorkflow::context_path`].
+    pub context_path: std::path::PathBuf,
+    /// The one-liner to inject into the coordinator's PTY.
+    pub prompt: String,
+    /// The exact bytes published, so a caller that has to *bind* this
+    /// preparation can digest what it approved rather than re-reading the file
+    /// and digesting whatever is there by then. PRD #819's audit fix — see
+    /// [`crate::prep_token::PrepBinding::context_digest`].
+    pub content: String,
+    /// The published file's inode identity, captured from the open temp-file
+    /// handle **before** the publishing `rename(2)`, which is the same inode the
+    /// destination then names. A later publish installs a different one, so this
+    /// value is what makes "still the artifact this preparation published"
+    /// checkable ([`crate::prep_token::PrepBinding::context_identity`]).
+    pub context_identity: Option<crate::prep_token::InodeIdentity>,
+}
+
+/// Compose the orchestrator context and publish it, reporting **why** on
+/// failure.
 ///
 /// `task` is the caller's own instruction, if any — a PRD #220 `dispatch --task`
 /// or a PRD #120 per-issue prompt. It is folded INTO the context file rather than
@@ -183,40 +245,54 @@ pub fn build_orchestrator_context(config: &OrchestrationConfig) -> String {
 ///
 /// `None` reproduces the pre-#222 output byte-for-byte, which is what keeps the
 /// interactive `Ctrl+n` path unchanged.
+///
+/// **Blocking.** Every async caller goes through
+/// [`crate::project_resolve::run_bounded`].
+pub fn prepare_orchestrator_context(
+    config: &OrchestrationConfig,
+    cwd: &std::path::Path,
+    task: Option<&str>,
+) -> Result<PreparedContext, ContextPublishError> {
+    let task = task.map(str::trim).filter(|t| !t.is_empty());
+    let content = compose_orchestrator_context(config, task);
+    let published = publish_orchestrator_context(cwd, &content)?;
+    Ok(PreparedContext {
+        context_path: published.path,
+        prompt: orchestrator_prompt_line(task.is_some()),
+        context_identity: published.identity,
+        content,
+    })
+}
+
+/// Write the orchestrator context to a file and return a one-liner to inject.
+/// Multi-line prompts don't submit in Claude Code via PTY, so we use a file reference.
+///
+/// The `Option` return is kept for the three pre-existing callers — the
+/// interactive `Ctrl+n` path (`crate::ui`), the daemon spawn path
+/// (`crate::spawn`) and the desktop's launch flow — each of which already has a
+/// degraded behaviour for "no context file" and no way to act on a cause. The
+/// cause is no longer *lost*, though: it is logged here, and a caller that needs
+/// it calls [`prepare_orchestrator_context`] instead. PRD #819's daemon verb is
+/// that caller.
 pub fn prepare_orchestrator_prompt(
     config: &OrchestrationConfig,
     cwd: &str,
     task: Option<&str>,
 ) -> Option<String> {
-    let dir = std::path::Path::new(cwd).join(".dot-agent-deck");
-    std::fs::create_dir_all(&dir).ok()?;
-    let file_path = dir.join("orchestrator-context.md");
-    let mut content = build_orchestrator_context(config);
-    let task = task.map(str::trim).filter(|t| !t.is_empty());
-    if let Some(task) = task {
-        content.push_str("\n## Your task\n\n");
-        content.push_str(task);
-        content.push('\n');
+    match prepare_orchestrator_context(config, std::path::Path::new(cwd), task) {
+        Ok(prepared) => Some(prepared.prompt),
+        Err(e) => {
+            tracing::warn!(reason = %e, "could not publish the coordinator context");
+            None
+        }
     }
-    std::fs::write(&file_path, &content).ok()?;
-    // With a task, the closing instruction must NOT be "wait for instructions" —
-    // the instruction is already in the file, and telling the orchestrator to wait
-    // is what would leave a dispatched unit idle forever.
-    Some(if task.is_some() {
-        "Read .dot-agent-deck/orchestrator-context.md for your role, the available agents, the \
-         delegation protocol, and your task under `## Your task`. Then carry out that task, \
-         delegating to the agents listed there."
-            .to_string()
-    } else {
-        "Read .dot-agent-deck/orchestrator-context.md for your role, available agents, and \
-         delegation protocol. Acknowledge your role and wait for instructions."
-            .to_string()
-    })
 }
 
-/// The exact separator `prepare_orchestrator_prompt` writes ahead of a task —
-/// matched here rather than duplicated as a shared constant, since this is
-/// the only other reader.
+/// The exact separator [`compose_orchestrator_context`] writes ahead of a task.
+///
+/// One constant now written by the composer and read by [`read_back_task`],
+/// rather than a literal in one place matched by a constant in the other — the
+/// arrangement before PRD #819 M4 split the composer out.
 const TASK_SECTION_MARKER: &str = "\n## Your task\n\n";
 
 /// Read an existing orchestrator context file's own `## Your task` section
@@ -229,8 +305,8 @@ const TASK_SECTION_MARKER: &str = "\n## Your task\n\n";
 /// [`reassert_orchestrator_prompt`].
 fn read_back_task(cwd: &str) -> Option<String> {
     let file_path = std::path::Path::new(cwd)
-        .join(".dot-agent-deck")
-        .join("orchestrator-context.md");
+        .join(CONTEXT_DIR_NAME)
+        .join(CONTEXT_FILE_NAME);
     let content = std::fs::read_to_string(file_path).ok()?;
     let after = content.split_once(TASK_SECTION_MARKER)?.1;
     let task = after.trim();
@@ -257,6 +333,552 @@ fn read_back_task(cwd: &str) -> Option<String> {
 pub fn reassert_orchestrator_prompt(config: &OrchestrationConfig, cwd: &str) -> Option<String> {
     let task = read_back_task(cwd);
     prepare_orchestrator_prompt(config, cwd, task.as_deref())
+}
+
+// ---------------------------------------------------------------------------
+// PRD #819 M4: the publish
+//
+// After M4 the DAEMON creates a directory and writes a file at a location
+// derived from a client-supplied path, on an endpoint #741 will later make
+// reachable off-box. The write primitive this replaced — `create_dir_all` plus
+// `std::fs::write` — was fine for a path this process chose and is not fine for
+// that: it followed a destination symlink, truncated in place, was not atomic,
+// swallowed its cause behind an `Option`, and created the file under the
+// ambient umask.
+//
+// Joining a fixed suffix does block a lexical `..` escape, and the daemon
+// canonicalises the project root before it gets here — but canonicalisation
+// removes the symlinks present at that MOMENT and protects neither the child
+// directory nor the destination. Those are what the code below is about.
+// ---------------------------------------------------------------------------
+
+/// The per-project directory the coordinator context is published in.
+pub const CONTEXT_DIR_NAME: &str = ".dot-agent-deck";
+
+/// The file inside it. Matched by `read_back_task` and by every agent-facing
+/// instruction `build_orchestrator_context` emits.
+pub const CONTEXT_FILE_NAME: &str = "orchestrator-context.md";
+
+/// Upper bound on a composed coordinator context this process will write.
+///
+/// **4 MiB.** The task is already bounded at the wire boundary
+/// ([`crate::bounded_read::MAX_TASK_BYTES`], 1 MiB) but the *composed* output is
+/// task + template + role names + descriptions, and everything after the task
+/// comes out of a config file — bounded at
+/// [`crate::project_resolve::MAX_PROJECT_CONFIG_BYTES`] (1 MiB) for a
+/// caller-selected path, and bounded by nothing at all on the interactive
+/// `Ctrl+n` path, which loads through `project_config::load_project_config`.
+/// So the two input bounds imply a ~2 MiB ceiling for the daemon verb, and 4 MiB
+/// is twice that: no legitimate maximal input can be refused, and the write is
+/// still capped at a quarter of the protocol's own `MAX_FRAME_LEN`.
+///
+/// Refused rather than truncated, for [`crate::bounded_read::read_capped`]'s
+/// reason: a silently shortened coordinator context is a wrong brief that looks
+/// like a right one, and the agent acting on it has no way to tell.
+///
+/// **Be honest about which caller this actually stops.** For the daemon verb it
+/// is a backstop rather than the operative gate — the two input bounds already
+/// imply a smaller ceiling, so a request that passes them cannot reach this one.
+/// It becomes load-bearing in two cases: the in-process paths, which compose
+/// from a config read by the *unbounded* loader, and any later widening of
+/// either input bound. A bound whose only justification is "the callers happen
+/// to be smaller today" is a bound that disappears the first time one of them
+/// grows, which is why it is checked here — at the write — rather than inferred
+/// at the boundary.
+pub const MAX_CONTEXT_BYTES: usize = 4 * 1024 * 1024;
+
+/// What a successful [`publish_orchestrator_context`] left on disk.
+///
+/// It replaced a bare `PathBuf` return in PRD #819's audit fix: a caller that
+/// has to *bind* the artifact it just published needs the file's identity as
+/// well as its name, and a path alone cannot be re-checked later — the name
+/// stays the same across a republish while the inode does not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublishedContext {
+    /// The destination the bytes reached.
+    pub path: std::path::PathBuf,
+    /// The published file's inode identity, or `None` where the platform has
+    /// none. See [`crate::prep_token::InodeIdentity`].
+    pub identity: Option<crate::prep_token::InodeIdentity>,
+}
+
+/// Why a coordinator context was not published.
+///
+/// Replaces the `Option` the old publish returned. The caller needs to know
+/// *why* — the daemon has to answer a client, and the daemon log needs the
+/// detail — and "it did not work" is not an answer either can act on.
+///
+/// Two renderings, deliberately: [`Display`](std::fmt::Display) is the
+/// daemon-local diagnostic, and [`ContextPublishError::client_sentence`] is what
+/// may cross the wire. Neither names a path today; the split exists so the
+/// daemon-local one can grow an OS error string without that decision leaking
+/// onto the wire by default.
+#[derive(Debug)]
+pub enum ContextPublishError {
+    /// The composed context exceeds [`MAX_CONTEXT_BYTES`].
+    ContextTooLarge(usize),
+    /// The final `.dot-agent-deck` component is a symlink. Refused; see
+    /// [`open_context_dir`].
+    ContextDirIsSymlink,
+    /// An existing `.dot-agent-deck` grants **write** to group or other, so
+    /// publishing into it cannot deliver the owner-only promise. Refused; see
+    /// [`refuse_a_writable_context_dir`]. The `u32` is the offending mode's
+    /// permission bits, for the daemon-local diagnostic only.
+    ContextDirGroupOrWorldWritable(u32),
+    /// `.dot-agent-deck` could not be created or opened as a directory — it is a
+    /// regular file, the project directory does not exist, or the permissions
+    /// forbid it.
+    ContextDirUnusable(std::io::Error),
+    /// The `.dot-agent-deck` component was replaced between the moment it was
+    /// opened and the moment the temp file was created inside it. See
+    /// [`publish_orchestrator_context`] for what this detects and what it does
+    /// not prevent.
+    ContextDirReplaced,
+    /// The owner-only temp file could not be created.
+    TempCreate(std::io::Error),
+    /// The bytes could not be written to the temp file.
+    TempWrite(std::io::Error),
+    /// The rename that publishes the temp file over the destination failed.
+    Publish(std::io::Error),
+}
+
+impl ContextPublishError {
+    /// The **daemon-local** diagnostic. Safe to log; carries the OS error.
+    pub fn detail(&self) -> String {
+        match self {
+            Self::ContextTooLarge(n) => format!(
+                "the composed coordinator context is {n} bytes; at most {MAX_CONTEXT_BYTES} can \
+                 be published"
+            ),
+            Self::ContextDirIsSymlink => format!(
+                "{CONTEXT_DIR_NAME} is a symlink; the coordinator context must be published into \
+                 a real directory in the project itself"
+            ),
+            Self::ContextDirGroupOrWorldWritable(mode) => format!(
+                "{CONTEXT_DIR_NAME} is mode {mode:04o}, which grants write to group or other; \
+                 another local account could replace the coordinator context's directory entry \
+                 after it is published, so publishing is refused — `chmod go-w` the directory"
+            ),
+            Self::ContextDirUnusable(e) => {
+                format!("{CONTEXT_DIR_NAME} could not be created or opened as a directory: {e}")
+            }
+            Self::ContextDirReplaced => format!(
+                "{CONTEXT_DIR_NAME} was replaced while the coordinator context was being written"
+            ),
+            Self::TempCreate(e) => format!("could not create the temporary context file: {e}"),
+            Self::TempWrite(e) => format!("could not write the temporary context file: {e}"),
+            Self::Publish(e) => format!("could not publish the coordinator context: {e}"),
+        }
+    }
+
+    /// The sentence that may cross the wire.
+    ///
+    /// It names no path and carries no raw OS error, which is the same rule
+    /// [`crate::project_resolve::generic_refusal`] follows. It is deliberately
+    /// **not** the single uniform sentence that one is, though, and the reason
+    /// is that the two protect different things: a resolve refusal must not
+    /// distinguish "no such directory" from "no config there" for an arbitrary
+    /// pasted path, whereas every case here is reached only *after* that path
+    /// has already resolved as a project — so the caller has already learned the
+    /// directory exists and holds a config, and naming the shape of the
+    /// obstruction discloses nothing further while being the only way the
+    /// operator can fix it.
+    pub fn client_sentence(&self) -> &'static str {
+        match self {
+            Self::ContextTooLarge(_) => {
+                "the composed coordinator context exceeds this daemon's size limit"
+            }
+            Self::ContextDirIsSymlink => {
+                "the project's `.dot-agent-deck` directory is a symlink, which is refused"
+            }
+            Self::ContextDirGroupOrWorldWritable(_) => {
+                "the project's `.dot-agent-deck` directory is writable by group or other, which \
+                 is refused; remove those write bits and retry"
+            }
+            Self::ContextDirUnusable(_) => {
+                "the project's `.dot-agent-deck` directory could not be created"
+            }
+            Self::ContextDirReplaced => {
+                "the project's `.dot-agent-deck` directory changed while the context was being \
+                 written"
+            }
+            Self::TempCreate(_) | Self::TempWrite(_) | Self::Publish(_) => {
+                "the coordinator context could not be written"
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for ContextPublishError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.detail())
+    }
+}
+
+/// What [`open_context_dir`] hands back so the publish can prove, after the
+/// fact, that it wrote into the directory it checked.
+///
+/// A real open handle on Unix; a marker on other platforms, where a directory
+/// cannot be opened as a `File` without platform-specific flags and the
+/// symlink check is a separate lookup anyway.
+#[cfg(unix)]
+type ContextDirGuard = std::fs::File;
+#[cfg(not(unix))]
+#[derive(Debug)]
+struct ContextDirGuard;
+
+/// Create `<project>/.dot-agent-deck` **owner-only** if it is not there.
+///
+/// `DirBuilder::mode(0o700)` rather than a `chmod` afterwards: the mode is
+/// applied by `mkdir(2)` itself, so there is no window in which the directory
+/// exists group- or world-readable. A permissive umask cannot widen it either —
+/// a umask only *removes* bits, so the result is `0o700 & !umask`, which is
+/// owner-only or narrower whatever the caller's umask is.
+///
+/// **A directory that already exists is left exactly as it is** — this function
+/// re-permissions nothing. Publishing is not the operation that gets to
+/// re-permission a directory the operator created, and every `.dot-agent-deck`
+/// in every existing checkout predates this rule. So the owner-only claim here
+/// is about directories this function *creates*, and no wider.
+///
+/// **What an existing directory is nonetheless required to satisfy** lives one
+/// step later, in [`refuse_a_writable_context_dir`]: the publish refuses outright
+/// when the existing directory grants write to group or other. That split is
+/// deliberate — accepting an unsafe directory and accepting it *silently* are
+/// different failures, and only the second was PRD #819's audit finding.
+///
+/// Non-recursive on purpose: the project directory is the caller's to establish
+/// (the daemon verb canonicalises it first, which proves it exists), and
+/// `create_dir_all` would silently invent an entire chain for a typo.
+fn create_context_dir(dir: &std::path::Path) -> Result<(), ContextPublishError> {
+    // The only mutation is the `.mode()` call below, which is Unix-only, so on a
+    // platform without `DirBuilderExt` the binding is genuinely never mutated and
+    // `unused_mut` fires. Allowed there rather than restructured: dropping the
+    // `mut` would take the owner-only-at-creation mode with it, and that is PRD
+    // #819's audit fix, not a lint's business.
+    #[cfg_attr(not(unix), allow(unused_mut))]
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        builder.mode(0o700);
+    }
+    match builder.create(dir) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(e) => Err(ContextPublishError::ContextDirUnusable(e)),
+    }
+}
+
+/// Open `.dot-agent-deck`, refusing a symlinked final component.
+///
+/// On Unix the open carries `O_NOFOLLOW | O_DIRECTORY`, following
+/// [`crate::project_resolve::read_config_file`]'s precedent: the refusal is a
+/// property of the `open(2)` itself rather than of a check-then-open pair, and
+/// `O_DIRECTORY` additionally refuses a `.dot-agent-deck` that is a regular
+/// file. The handle is kept so the publish can compare it against the path
+/// afterwards.
+///
+/// **On a platform without those flags the guarantee is narrower**, and is
+/// stated rather than papered over: the check is a separate `symlink_metadata`
+/// lookup from the write, so a component swapped between the two is not caught,
+/// no mode bits are applied at all (the Windows protected-DACL equivalent is
+/// not implemented), and [`refuse_a_writable_context_dir`] has nothing to
+/// inspect.
+///
+/// **The premise that used to excuse that was false, and PRD #819's audit was
+/// right to catch it.** This doc claimed the daemon is Unix-only, citing
+/// `bind_attach_listener` as a Unix-domain socket. It is not: `bind_attach_listener`
+/// returns a `crate::platform::ipc::IpcListener`, which is a **Windows named
+/// pipe** on Windows, with its own protected security descriptor — an active
+/// listener, not a stub. `#![cfg(unix)]` on the L2 tier bounds what is *tested*,
+/// which is not the same claim.
+///
+/// So the gap is closed at the boundary instead of being argued away:
+/// [`crate::daemon_protocol::AttachRequest::PrepareWorkflow`] — the one verb
+/// that lets a **peer** name the directory this publish writes into — is refused
+/// on non-Unix with [`crate::daemon_protocol::PROJECT_ERR_UNSUPPORTED_PLATFORM`],
+/// and `crate::daemon_protocol::DAEMON_CAPABILITIES` does not advertise it
+/// there. The narrower guarantee below therefore covers only the in-process TUI
+/// and spawn publishes, where the project directory comes from this process's
+/// own config. Implementing the DACL half with
+/// `crate::platform::fsperm::create_owner_only_dir` /
+/// `set_file_owner_only` remains available and would let the verb be enabled on
+/// Windows; it is deliberately not done here, because Windows desktop is out of
+/// PRD #819's scope and a refusal is a true statement where a half-built DACL
+/// would be a false one.
+fn open_context_dir(dir: &std::path::Path) -> Result<ContextDirGuard, ContextPublishError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
+            .open(dir)
+            .map_err(|e| {
+                // Consulting the path here cannot reintroduce a TOCTOU the open
+                // handle exists to avoid: the open has ALREADY failed, so
+                // nothing is written on this branch either way, and the only
+                // thing a race can change is the wording of an error returned
+                // regardless. Same recovery, for the same reason, as
+                // `project_resolve::read_config_file`.
+                if std::fs::symlink_metadata(dir).is_ok_and(|m| m.file_type().is_symlink()) {
+                    ContextPublishError::ContextDirIsSymlink
+                } else {
+                    ContextPublishError::ContextDirUnusable(e)
+                }
+            })
+    }
+    #[cfg(not(unix))]
+    {
+        if std::fs::symlink_metadata(dir).is_ok_and(|m| m.file_type().is_symlink()) {
+            return Err(ContextPublishError::ContextDirIsSymlink);
+        }
+        if !std::fs::metadata(dir).is_ok_and(|m| m.is_dir()) {
+            return Err(ContextPublishError::ContextDirUnusable(
+                std::io::Error::other(format!("{CONTEXT_DIR_NAME} is not a directory")),
+            ));
+        }
+        Ok(ContextDirGuard)
+    }
+}
+
+/// Whether the directory `guard` was opened on is still the one at `dir`.
+///
+/// Compares device + inode from the **open handle's** `fstat` against a
+/// `symlink_metadata` of the path. This **detects** a `.dot-agent-deck`
+/// swapped between [`open_context_dir`] and the temp-file create; it does not
+/// **prevent** one. Preventing it needs `openat(2)` from the held descriptor,
+/// which `std` does not expose and which is not worth hand-rolling here: the
+/// swap requires write permission on the project directory, and anyone holding
+/// that can rewrite `.dot-agent-deck.toml` — whose `command` strings the daemon
+/// executes — which is strictly more authority than redirecting one markdown
+/// file. The check is cheap, so it is here; the claim is exactly that.
+#[cfg(unix)]
+fn context_dir_unchanged(guard: &ContextDirGuard, dir: &std::path::Path) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    match (guard.metadata(), std::fs::symlink_metadata(dir)) {
+        (Ok(open), Ok(now)) => open.dev() == now.dev() && open.ino() == now.ino(),
+        _ => false,
+    }
+}
+
+#[cfg(not(unix))]
+fn context_dir_unchanged(_guard: &ContextDirGuard, _dir: &std::path::Path) -> bool {
+    // No handle to compare against; see `open_context_dir`'s narrower guarantee.
+    true
+}
+
+/// Refuse to publish into a `.dot-agent-deck` that grants **write** to group or
+/// other.
+///
+/// **This is PRD #819's audit finding, and the argument that used to excuse it
+/// does not transfer.** [`create_context_dir`] applies `0o700` only to a
+/// directory it creates and leaves an existing one alone, which was pinned as
+/// deliberate on the reasoning that whoever can write the *parent* already
+/// controls `.dot-agent-deck.toml` — whose `command` strings this daemon
+/// executes — so nothing is gained by policing the child. That argument is
+/// sound about the parent and says nothing about the child: a `.dot-agent-deck`
+/// can be group-writable while the project root is not, and a **file's** mode
+/// does not protect its **directory entry**. So another local account with write
+/// on that directory can rename or replace an `orchestrator-context.md`
+/// published at `0o600`, and the next coordinator reads attacker-controlled
+/// instructions.
+///
+/// Refusing rather than re-permissioning is the deliberate half. `chmod`-ing a
+/// directory the operator created is a side effect a publish has no business
+/// having, it would race the very attacker it is aimed at
+/// (`crate::platform::fsperm`'s own `ensure_owner_only_dir` documents that
+/// residual window), and it would hide the misconfiguration instead of naming
+/// it. The error sentence says which mode and what to run.
+///
+/// **Write bits only, and that is the whole check.** Group/other *read* and
+/// *execute* are tolerated: `0o755` is what a `.dot-agent-deck` looks like in an
+/// ordinary checkout under a default umask, refusing those would refuse nearly
+/// every existing project, and reading a directory is not what lets someone
+/// replace an entry in it. The published file is `0o600` regardless, so its
+/// contents are not exposed by a readable directory.
+///
+/// **Ownership is deliberately not checked**, having been considered: an
+/// existing directory owned by another account either denies this process the
+/// temp-file create outright — the OS refuses, and the publish fails with
+/// `TempCreate` — or this process is `root`, for whom no mode or owner check
+/// means anything at all. Adding one would buy nothing and would newly refuse
+/// `sudo`-in-a-user-checkout, which works today. The claim this function makes
+/// is therefore exactly: *no group- or world-writable directory is published
+/// into*, and nothing wider.
+///
+/// The mode comes from an `fstat` on the handle [`open_context_dir`] already
+/// holds, not from a second path lookup, so there is no check-then-open pair to
+/// race and no chance of inspecting a different directory than the one written
+/// to.
+#[cfg(unix)]
+fn refuse_a_writable_context_dir(guard: &ContextDirGuard) -> Result<(), ContextPublishError> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let mode = guard
+        .metadata()
+        .map_err(ContextPublishError::ContextDirUnusable)?
+        .permissions()
+        .mode()
+        & 0o7777;
+    if mode & 0o022 != 0 {
+        return Err(ContextPublishError::ContextDirGroupOrWorldWritable(mode));
+    }
+    Ok(())
+}
+
+/// The non-Unix arm, and it is a **no-op rather than an equivalent**.
+///
+/// There is no mode model to inspect here; the analogue is a protected DACL, and
+/// this module implements none (see [`open_context_dir`]). Rather than let that
+/// gap sit behind a claim it does not support, the daemon verb that would expose
+/// this write to a peer is refused outright on non-Unix — see
+/// [`crate::daemon_protocol::PROJECT_ERR_UNSUPPORTED_PLATFORM`]. What still
+/// reaches this line on such a platform is the in-process TUI publish, whose
+/// project directory comes from this process's own config rather than from
+/// another party.
+#[cfg(not(unix))]
+fn refuse_a_writable_context_dir(_guard: &ContextDirGuard) -> Result<(), ContextPublishError> {
+    Ok(())
+}
+
+/// A temp-file name unique within one directory, for one publish.
+///
+/// Process id plus a monotonically increasing counter: two publishes in one
+/// process cannot collide, and two processes cannot either. It is only ever
+/// half of the guarantee — the create is `create_new`, so a collision fails
+/// loudly rather than clobbering — and it is hidden and suffixed so it can never
+/// be mistaken for a coordinator context by [`read_back_task`], which reads
+/// exactly [`CONTEXT_FILE_NAME`].
+fn temp_context_file_name() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    format!(
+        ".{CONTEXT_FILE_NAME}.{}.{}.tmp",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+/// Publish `content` at `<project_dir>/.dot-agent-deck/orchestrator-context.md`,
+/// atomically and owner-only, and answer with the path written.
+///
+/// Five properties, each of which the `create_dir_all` + `std::fs::write` pair
+/// it replaced lacked:
+///
+/// * **Bounded.** The composed context is checked against
+///   [`MAX_CONTEXT_BYTES`] before a filesystem is touched, and refused rather
+///   than truncated.
+/// * **The directory component is not a symlink.** [`open_context_dir`] refuses
+///   one at the `open(2)`, and [`context_dir_unchanged`] then detects a swap
+///   afterwards.
+/// * **Owner-only from creation, never by a later `chmod`.** The directory is
+///   created `0o700` by `mkdir(2)` and the file `0o600` by `open(2)`, so there
+///   is no window in which either exists wider than that. A permissive umask
+///   only removes bits and a permissive parent directory grants nothing here,
+///   because neither is consulted for the new inode's mode. An **existing**
+///   directory is not re-permissioned — and, since PRD #819's audit, is
+///   *refused* when it grants group or other write, because a `0o600` file's
+///   directory entry is only as safe as the directory holding it
+///   ([`refuse_a_writable_context_dir`]). All of this is the **Unix** arm; the
+///   non-Unix arm applies no mode or DACL at all, which is why the daemon verb
+///   is refused there rather than claiming otherwise (see
+///   [`open_context_dir`]).
+/// * **Atomic with respect to a reader.** The bytes go to a `create_new`
+///   temp file in the SAME directory and reach the destination by `rename(2)`,
+///   so a concurrent reader sees either the previous context or the new one and
+///   never a prefix of the new one. This is atomicity, **not durability**: no
+///   `fsync` is issued, so a machine that loses power immediately afterwards may
+///   come back to either version. Publishing a coordinator context is
+///   worth-redoing work, not a ledger.
+/// * **A destination symlink is replaced, not followed.** `rename(2)` operates
+///   on the directory entry, so a `orchestrator-context.md` that is a symlink to
+///   `/etc/passwd` is *unlinked* and replaced by the new regular file; nothing is
+///   written through it. This is the one property that comes free from choosing
+///   rename over write, and it is the reason the choice is not merely about
+///   atomicity.
+///
+/// A failure leaves the previous context — if any — exactly as it was, and
+/// removes the temp file. That, not the absence of a partially written
+/// destination alone, is what "a partial write must never be observable as a
+/// coordinator context" means.
+///
+/// **Blocking.** Async callers go through [`crate::project_resolve::run_bounded`].
+pub fn publish_orchestrator_context(
+    project_dir: &std::path::Path,
+    content: &str,
+) -> Result<PublishedContext, ContextPublishError> {
+    if content.len() > MAX_CONTEXT_BYTES {
+        return Err(ContextPublishError::ContextTooLarge(content.len()));
+    }
+
+    let dir = project_dir.join(CONTEXT_DIR_NAME);
+    create_context_dir(&dir)?;
+    let guard = open_context_dir(&dir)?;
+    // Before anything is created inside it: an existing directory that group or
+    // other can write is refused outright, because a 0600 file's directory entry
+    // is only as protected as the directory holding it.
+    refuse_a_writable_context_dir(&guard)?;
+
+    let final_path = dir.join(CONTEXT_FILE_NAME);
+    let temp_path = dir.join(temp_context_file_name());
+
+    let outcome = (|| {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            // The mode is an argument to `open(2)`, so the file is 0600 from the
+            // instant it exists. `O_NOFOLLOW` costs nothing next to
+            // `create_new` and states the intent at the same seam the directory
+            // open states it.
+            options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+        }
+        let mut file = options
+            .open(&temp_path)
+            .map_err(ContextPublishError::TempCreate)?;
+
+        if !context_dir_unchanged(&guard, &dir) {
+            return Err(ContextPublishError::ContextDirReplaced);
+        }
+
+        use std::io::Write as _;
+        file.write_all(content.as_bytes())
+            .map_err(ContextPublishError::TempWrite)?;
+        file.flush().map_err(ContextPublishError::TempWrite)?;
+        // The identity is taken from the OPEN HANDLE, before the rename. That is
+        // not a convenience: `rename(2)` moves this inode onto the destination
+        // name, so the handle's `(dev, ino)` IS the published file's, whereas a
+        // `stat` of the destination afterwards would report whichever inode
+        // happens to be there — including a *later* publish's, which is exactly
+        // the interleaving this value exists to detect.
+        let identity = file
+            .metadata()
+            .ok()
+            .as_ref()
+            .and_then(crate::prep_token::inode_identity);
+        drop(file);
+
+        std::fs::rename(&temp_path, &final_path).map_err(ContextPublishError::Publish)?;
+        Ok(identity)
+    })();
+
+    match outcome {
+        Ok(identity) => Ok(PublishedContext {
+            path: final_path,
+            identity,
+        }),
+        Err(e) => {
+            // Best effort, and deliberately not reported: the publish already
+            // failed for a reason the caller is about to be told, and a leftover
+            // temp file is not that reason. `TempCreate` is the one case where
+            // there is nothing to remove, and removing a path that is not there
+            // is a no-op.
+            let _ = std::fs::remove_file(&temp_path);
+            Err(e)
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

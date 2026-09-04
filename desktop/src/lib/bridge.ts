@@ -6,6 +6,8 @@ import type { HandoffEdge,
   AgentSession,
   AgentStatus,
   AgentTab,
+  DaemonProjectListing,
+  DaemonResolvedProject,
   DeckAction,
   DeckActionResult,
   DeckSnapshot,
@@ -35,7 +37,15 @@ export interface DesktopSnapshotDto {
     buildStampMismatchOnly?: boolean;
   };
   agents: DesktopAgentDto[];
-  projectCwd?: string;
+  /*
+   * PRD #819 M6: no `projectCwd`. The desktop crate's `desktop_project_cwd()`
+   * guessed one from its own compile-time manifest directory and then from the
+   * app process's `current_dir()` — an answer about the WRONG machine whenever
+   * the daemon is not this one, and silently so. The fallback below therefore
+   * loses its third tier; the daemon-reported agent `cwd` it already preferred
+   * stays, and the project a launch runs in comes from `desktop_list_projects`
+   * / `desktop_resolve_project` instead.
+   */
   protocolVersion: number;
   source: "daemon";
 }
@@ -225,7 +235,7 @@ export type DesktopRunActionDto =
   | { type: "attach_terminal"; agentId: string; onOutput: import("@tauri-apps/api/core").Channel<ArrayBuffer> }
   | { type: "detach_terminal"; sessionId: string }
   | { type: "submit_text"; agentId: string; text: string }
-  | { type: "start_workflow"; name: string; cwd: string; taskPrompt: string; roles: { role: string; command: string; start: boolean }[]; rows?: number; cols?: number }
+  | { type: "start_workflow"; name: string; cwd: string; taskPrompt: string; roles: { role: string; command: string; start: boolean }[]; rows?: number; cols?: number; configRevision?: string }
   | { type: "stop_daemon"; force?: boolean }
   | { type: "restart_daemon" }
   | { type: "allow_build_mismatch" };
@@ -265,6 +275,23 @@ export interface DeckBridge {
    * commit with every shown id.
    */
   setShownTerminals(agentIds: string[]): Promise<void>;
+  /**
+   * The projects the connected daemon knows about (PRD #819 M6). Enumerated
+   * from what the daemon already holds — its startup cwd, live agent cwds,
+   * orchestration cwds, scheduled working dirs — with every candidate
+   * revalidated, and nothing persisted on either side.
+   *
+   * An empty list is a normal answer. So is a list that shrinks between two
+   * calls: enumeration is derived from LIVE state, so a project stops being
+   * enumerable the moment its last agent exits.
+   */
+  listProjects(): Promise<DaemonProjectListing>;
+  /**
+   * Resolve one path the user pasted or the daemon listed. The reply's `path`
+   * is the daemon's canonical spelling and replaces whatever was sent — see
+   * `DaemonResolvedProject`.
+   */
+  resolveProject(path: string): Promise<DaemonResolvedProject>;
   dispose(): Promise<void>;
 }
 
@@ -433,8 +460,10 @@ export function mapDesktopSnapshot(dto: DesktopSnapshotDto, previous?: DeckSnaps
   // ahead of #742).
   const daemonId = dto.connection.socketPath;
   const agents = dto.agents.map((agent, index) => agentFromDto(agent, index, daemonId));
+  // Three tiers since PRD #819 M6, not four. The daemon-reported agent cwd
+  // leads, as it always did; the removed tier was the desktop's own guess at a
+  // project directory, which is the read this PRD moved daemon-side.
   const cwd = agents.find((agent) => agent.cwd)?.cwd
-    ?? dto.projectCwd
     ?? (previous?.worktree?.startsWith("/") ? previous.worktree : undefined)
     ?? "No active project";
   const repo = cwd.split("/").filter(Boolean).at(-1) ?? cwd;
@@ -608,6 +637,28 @@ class FixtureDeckBridge implements DeckBridge {
    */
   async setShownTerminals(): Promise<void> {
     await Promise.resolve();
+  }
+
+  /**
+   * The fixture owns no daemon, so it answers the way a daemon with nothing
+   * live does: an empty listing and no primary. That is the FIRST-RUN state
+   * PRD #819 M6 asks the picker to render — a paste-a-path field and a sentence
+   * saying so — and having the deterministic preview show it means the state is
+   * reachable without a daemon at all.
+   */
+  async listProjects(): Promise<DaemonProjectListing> {
+    await Promise.resolve();
+    return { projects: [] };
+  }
+
+  /**
+   * And it cannot resolve one either. Inventing a plausible project here would
+   * be the fixture teaching the same lesson `desktop_project_cwd()` did: that a
+   * client may answer a question only the daemon can.
+   */
+  async resolveProject(): Promise<DaemonResolvedProject> {
+    await Promise.resolve();
+    throw new Error("The deterministic preview has no daemon, so it can resolve no project. Run against a live daemon to choose one.");
   }
 
   async dispose(): Promise<void> {
@@ -1150,6 +1201,16 @@ export class TauriDeckBridge implements DeckBridge {
         if (this.pendingResizes.has(agentId)) this.scheduleResize(agentId);
       }
     }
+  }
+
+  async listProjects(): Promise<DaemonProjectListing> {
+    const invoke = await this.getInvoke();
+    return invoke<DaemonProjectListing>("desktop_list_projects");
+  }
+
+  async resolveProject(path: string): Promise<DaemonResolvedProject> {
+    const invoke = await this.getInvoke();
+    return invoke<DaemonResolvedProject>("desktop_resolve_project", { path });
   }
 
   async dispose(): Promise<void> {

@@ -422,6 +422,33 @@ impl Scheduler {
         names
     }
 
+    /// PRD #819 M3: the `working_dir` of every currently-registered task,
+    /// deduplicated and sorted.
+    ///
+    /// One of the four seeds the daemon's project enumeration draws on, and the
+    /// one whose source outlives the daemon process — a schedule is reloaded
+    /// from `schedules.toml` on the next start, while live agents and the
+    /// orchestrations built out of them are gone. Every value here is a
+    /// **candidate**, not a project: a scheduled task's working directory need
+    /// not hold a `.dot-agent-deck.toml` at all, so `crate::project_resolve`
+    /// revalidates each one before it is offered.
+    ///
+    /// Empty strings are dropped rather than returned: `Scheduler::register`
+    /// builds its `FireFields` from a cron expression alone, so a task
+    /// registered through that path (tests, and the schedule-only harnesses)
+    /// carries no working directory.
+    pub fn registered_working_dirs(&self) -> Vec<String> {
+        let tasks = self.tasks.lock().expect("scheduler task map poisoned");
+        let mut dirs: Vec<String> = tasks
+            .values()
+            .map(|t| t.fire_fields.working_dir.clone())
+            .filter(|d| !d.is_empty())
+            .collect();
+        dirs.sort();
+        dirs.dedup();
+        dirs
+    }
+
     /// Surface a batch of config load/parse errors through the notifier. Used
     /// by the daemon's startup load and `ReloadSchedules` handler so a
     /// malformed entry is reported (never silently swallowed) without the

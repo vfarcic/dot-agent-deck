@@ -13,9 +13,16 @@
 //!   forward-compatible by design (older peer ignores the field, newer peer
 //!   tolerates its absence).
 //!
-//! The handshake itself ([`AttachRequest::Hello`]) is enforced only by the
-//! laptop-side `connect` flow — single-binary in-process call sites already
-//! match versions by construction and don't need the check.
+//! The handshake itself ([`AttachRequest::Hello`]) is enforced by the
+//! **desktop** client, which refuses to connect unless the daemon reports
+//! exactly this [`PROTOCOL_VERSION`] (`desktop/src-tauri/src/daemon_bridge.rs`,
+//! `classify_handshake`) — that check runs before the build-stamp comparison
+//! and its session-scoped bypass cannot reach it. No other client refuses on a
+//! version *difference*: `72527b9` removed the laptop-side `connect`
+//! comparison this note used to name (issue #491 — it compared two constants
+//! that never shared a wire), leaving only a presence floor there, and the
+//! local TUI attach path never had one (issue #405). Single-binary in-process
+//! call sites match versions by construction.
 //!
 //! # Wire format
 //!
@@ -227,9 +234,35 @@ pub const KIND_STREAM_REJECT: u8 = 0x17;
 /// [`AttachResponse::kept_worktree`] field is additive and would have needed no
 /// bump on its own.
 ///
+/// PRD #819 bumped 8 → 9, and **one bump covers every request variant that PRD
+/// added**: [`AttachRequest::ListProjects`], [`AttachRequest::ResolveProject`],
+/// [`AttachRequest::PrepareWorkflow`] and
+/// [`AttachRequest::StartPreparedAgent`]. They are on the bump list for the
+/// ordinary reason — an older daemon fails the frame decode on a variant it does
+/// not have — and the last of them arrived after the first three, during the
+/// same unreleased cycle, which is exactly when a variant is free. The
+/// [`AttachResponse::capabilities`] field that goes with them is additive and
+/// optional and would have needed no bump of its own; it is what lets a client
+/// tell "speaks 9" from "answers this verb" once there is more than one build at
+/// 9.
+///
+/// **Do not read that as licence to keep adding variants at 9.** It holds only
+/// while 9 is unreleased: the moment a build carrying it ships, another variant
+/// is another break for every user, and this repo's bump policy makes that
+/// another minor release (`docs/develop/versioning.md`). The deadline is the
+/// whole reason `StartPreparedAgent` was taken now rather than left as the
+/// recorded next step it started as.
+///
 /// # Where this constant is enforced
 ///
-/// **No call site refuses on it today, and that is issue #405.** The bump
+/// **Exactly one call site refuses on it: the desktop.**
+/// `classify_handshake` in `desktop/src-tauri/src/daemon_bridge.rs` requires
+/// `server_version == Some(PROTOCOL_VERSION)`, runs that comparison *before*
+/// the build-stamp one, and is not reachable by the stamp check's
+/// session-scoped bypass — so a desktop and a daemon that disagree here never
+/// exchange a second frame. Inside this crate nothing refuses on a version
+/// *difference* — `probe_remote_protocol`'s surviving check is a presence
+/// floor, described two paragraphs down — and that is issue #405. The bump
 /// rationales above were written while
 /// [`crate::connect::probe_remote_protocol`] compared the remote's
 /// `server_version` against the laptop's and hard-failed on a difference, and
@@ -243,20 +276,22 @@ pub const KIND_STREAM_REJECT: u8 = 0x17;
 /// cannot answer `daemon hello` at all — an install floor, not a version
 /// verdict.
 ///
-/// The local same-machine TUI↔daemon pairing is the one place a wire-shape skew
-/// can actually happen (the binary upgraded on disk under a still-running
+/// The local same-machine TUI↔daemon pairing is the place a wire-shape skew
+/// most easily happens (the binary upgraded on disk under a still-running
 /// daemon), and it is guarded by [`crate::build_version_handshake`]'s
 /// `DAD_BUILD_ID` comparison rather than by this constant. Build-id equality is
 /// strictly stronger than protocol equality when it *matches* — same build
 /// implies same protocol — but declining its restart prompt (the right choice
 /// when live agents would die with the daemon) attaches anyway with no version
-/// check of any kind. Issue #405 tracks closing that.
+/// check of any kind. Issue #405 tracks closing that. The desktop↔daemon
+/// pairing skews the same way and is the one that *does* read this constant,
+/// per the paragraph above.
 ///
 /// Keep bumping this on every wire-shape break regardless. The bump is what
 /// makes a skew *nameable* — it is the number the handshake reports, what
 /// `daemon hello` prints, and the input any future compatibility gate will
 /// read; #405 is what will make it *refused*.
-pub const PROTOCOL_VERSION: u32 = 8;
+pub const PROTOCOL_VERSION: u32 = 9;
 
 /// Hard cap on a single frame's payload length. Defends against a malicious
 /// or buggy peer trying to allocate gigabytes off a forged length prefix.
@@ -268,6 +303,259 @@ pub const PROTOCOL_VERSION: u32 = 8;
 /// header without the async reader, and used to allocate straight off the u32.
 /// Both sides now read the one constant — do not re-spell the 16 MiB literal.
 pub(crate) const MAX_FRAME_LEN: usize = 16 * 1024 * 1024;
+
+// ---------------------------------------------------------------------------
+// PRD #819: capability strings, and the project verbs' bounded error codes.
+// ---------------------------------------------------------------------------
+
+/// Capability string for [`AttachRequest::ListProjects`].
+///
+/// The strings are the kebab-case `op` names the request enum already
+/// serializes to, so there is one spelling of each verb rather than two that
+/// can drift.
+pub const CAP_LIST_PROJECTS: &str = "list-projects";
+
+/// Capability string for [`AttachRequest::ResolveProject`].
+pub const CAP_RESOLVE_PROJECT: &str = "resolve-project";
+
+/// Capability string for [`AttachRequest::PrepareWorkflow`].
+pub const CAP_PREPARE_WORKFLOW: &str = "prepare-workflow";
+
+/// Capability string for [`AttachRequest::StartPreparedAgent`].
+///
+/// Withheld wherever [`CAP_PREPARE_WORKFLOW`] is withheld, and the two are only
+/// useful together: a build that cannot prepare a workflow can never have issued
+/// a token, so a prepared start on it has nothing to present.
+pub const CAP_START_PREPARED_AGENT: &str = "start-prepared-agent";
+
+/// The capability set this build advertises on the [`AttachRequest::Hello`]
+/// reply, via [`AttachResponse::with_capabilities`].
+///
+/// **What an entry claims, precisely:** this build's dispatch knows the op and
+/// answers it with a defined [`AttachResponse`], rather than failing the frame
+/// decode with serde's `unknown variant …`. It does **not** claim that a given
+/// call will succeed — a bounded refusal (a rejected path, an over-long task)
+/// is a normal answer to a known verb. Strike a verb from this list if this
+/// build stops accepting it; do not leave a name here that the dispatch no
+/// longer has an arm for.
+///
+/// **[`CAP_PREPARE_WORKFLOW`] and [`CAP_START_PREPARED_AGENT`] are Unix-only**,
+/// which is the one place that distinction bites. A non-Unix build refuses both
+/// verbs *unconditionally* with [`PROJECT_ERR_UNSUPPORTED_PLATFORM`] — the
+/// publish cannot deliver the owner-only guarantee there, so no preparation can
+/// exist and nothing can be started against one — and that is not a bounded
+/// refusal of a particular request but the verb being unavailable, which is
+/// exactly the "this build stops accepting it" case above. Advertising either
+/// anyway would reduce the list to "the frame decodes", and the whole point of
+/// PRD #819's capability helper is that a client withholds rather than enables
+/// on absence. The two travel together deliberately: they are one feature split
+/// across two round trips, and a build offering the second without the first
+/// would be advertising a verb that can only ever answer
+/// [`PROJECT_ERR_STALE_TOKEN`].
+#[cfg(unix)]
+pub const DAEMON_CAPABILITIES: &[&str] = &[
+    CAP_LIST_PROJECTS,
+    CAP_RESOLVE_PROJECT,
+    CAP_PREPARE_WORKFLOW,
+    CAP_START_PREPARED_AGENT,
+];
+#[cfg(not(unix))]
+pub const DAEMON_CAPABILITIES: &[&str] = &[CAP_LIST_PROJECTS, CAP_RESOLVE_PROJECT];
+
+/// PRD #819 M2: the project verbs' refusal carries a stable machine-readable
+/// code as the first token of [`AttachResponse::error`], followed by `": "` and
+/// a generic human sentence.
+///
+/// The codes exist because the alternative is matching prose, and because the
+/// text after them is deliberately uninformative: an arbitrary caller-selected
+/// path gets a bounded refusal that names no path, no parser source line and no
+/// raw OS error. [`crate::project_config::ProjectConfigError`]'s `Display`
+/// renders the offending TOML line verbatim, so returning it for a pasted path
+/// would disclose file *content*, not merely existence. Detail is reserved for
+/// a path already in the daemon's known set — see the PRD's disclosure split —
+/// and that half arrives with M3.
+pub const PROJECT_ERR_INVALID_PATH: &str = "invalid-path";
+
+/// The `task` on [`AttachRequest::PrepareWorkflow`] exceeded
+/// [`crate::bounded_read::MAX_TASK_BYTES`], or carried a NUL. See
+/// [`PROJECT_ERR_INVALID_PATH`] for the code convention.
+pub const PROJECT_ERR_TASK_REJECTED: &str = "task-rejected";
+
+/// The verb parsed and its arguments were accepted, but this build has no
+/// implementation behind it yet (PRD #819 M2 landed the wire contract; M3 and
+/// M4 land the behaviour).
+///
+/// It is a distinct code rather than a generic failure because the two are not
+/// the same thing to a caller, and it is an error rather than `ok: true` with
+/// an empty payload for the same reason: a client — or a test — cannot tell an
+/// empty answer apart from a real one. A panic was the other option and is
+/// worse; `handle_connection` serves other clients.
+///
+/// **No arm of this build's dispatch returns it any more.** M3 landed
+/// `list-projects` and `resolve-project`, M4 landed `prepare-workflow`, and the
+/// helper that produced this refusal went with the last of them. The constant
+/// stays because it is the thing the behaviour tests assert an answer is *not*:
+/// a refusal that comes from resolving a project and a refusal that comes from
+/// there being no implementation are indistinguishable to a caller that cannot
+/// name the difference, and that is exactly how an implementation gets quietly
+/// reverted. Keep it, and give it back to any verb this file grows a stub for.
+pub const PROJECT_ERR_UNIMPLEMENTED: &str = "unimplemented";
+
+/// PRD #819 M4: the caller's [`AttachRequest::PrepareWorkflow::config_revision`]
+/// does not match the config the daemon just read.
+///
+/// The client resolved against one snapshot and is asking to launch against
+/// another. Refusing is what closes the TOCTOU window between the picker, the
+/// write and the spawn; the remedy is to resolve again, which is what the
+/// sentence says.
+pub const PROJECT_ERR_STALE_REVISION: &str = "stale-revision";
+
+/// PRD #819 M4: the project resolved, but defines no role-bearing orchestration
+/// under the requested name.
+///
+/// A separate code from [`PROJECT_ERR_UNRESOLVED`] because it is a different
+/// fact and a different remedy — the project is fine and the *name* is wrong —
+/// and because it is only reachable once the path has already resolved, so it
+/// discloses nothing that refusal was protecting. The sentence still names no
+/// available orchestration: that is config content for a path the caller may
+/// merely have pasted.
+pub const PROJECT_ERR_NO_ORCHESTRATION: &str = "no-such-orchestration";
+
+/// PRD #819 M4: the project and the orchestration resolved, but the coordinator
+/// context could not be published.
+///
+/// See [`crate::orchestrator_context::ContextPublishError::client_sentence`] for
+/// what the text after it is allowed to say and why it is allowed to be more
+/// specific than [`crate::project_resolve::generic_refusal`].
+pub const PROJECT_ERR_PUBLISH_FAILED: &str = "publish-failed";
+
+/// PRD #819 M4: an [`AttachRequest::StartPreparedAgent`] presented a `prep_token`
+/// this daemon did not issue, or issued longer ago than
+/// [`crate::prep_token::PREP_TOKEN_TTL`].
+///
+/// One code for both, because they are one answer: the token does not identify
+/// a live preparation. Read [`crate::prep_token`]'s module doc before treating
+/// this as an authorization failure — it is not one. There is no "absent token"
+/// case to except any more: the token is a required field of the verb, and a
+/// request without one does not decode.
+pub const PROJECT_ERR_STALE_TOKEN: &str = "stale-token";
+
+/// PRD #819 audit fix: an [`AttachRequest::StartPreparedAgent`] presented a
+/// `prep_token` this daemon **did** issue and which has **not** expired, but the
+/// state that preparation approved has moved — see
+/// [`crate::project_resolve::revalidate_preparation`] for the five checks.
+///
+/// A distinct code from [`PROJECT_ERR_STALE_TOKEN`] because it is a distinct
+/// fact: the token is live and the *world* changed, rather than the token being
+/// unknown or aged out. The remedy is the same (prepare again), which is why the
+/// sentence after each code reads alike, but a client or a test that cannot tell
+/// "I presented garbage" from "another launch replaced my artifact" cannot
+/// diagnose either.
+///
+/// One code for all five checks, and the sentence names none of them. Read
+/// [`crate::prep_token`]'s module doc before treating this as an authorization
+/// failure — it is a staleness and integrity refusal.
+pub const PROJECT_ERR_STALE_PREPARATION: &str = "stale-preparation";
+
+/// PRD #819 Greptile P1(a): an [`AttachRequest::StartPreparedAgent`] presented a
+/// token this daemon issued, which has **not** expired and whose approved state
+/// is still intact — but the request being made is not the one that preparation
+/// approved.
+///
+/// **This is a different fact from [`PROJECT_ERR_STALE_PREPARATION`], and until
+/// this code existed nothing checked it at all.** The audit fix made the record
+/// carry what a preparation approved and made the spawn re-validate it against
+/// the filesystem; what it did not do is compare the *submitted* spawn fields
+/// against that record. So a caller could present a token prepared for project X
+/// while submitting the `cwd`, orchestration and role of project Y, and the
+/// daemon validated X and started Y. Making the code look validated is what made
+/// that easy to miss.
+///
+/// `stale-preparation` means "your preparation was ours and live, but the world
+/// moved"; this means "your request does not match your preparation". Those send
+/// an operator in different directions — one is a race with another launch and
+/// is fixed by preparing again, the other is a client that is not sending back
+/// what it was handed and preparing again will not help — which is the same
+/// reasoning that already separates [`PROJECT_ERR_STALE_TOKEN`] from
+/// [`PROJECT_ERR_STALE_PREPARATION`].
+///
+/// See [`crate::project_resolve::verify_prepared_start`] for exactly which
+/// fields are bound and, just as load-bearing, which are deliberately not — the
+/// `command` is not, because per-launch command override is an existing,
+/// documented feature.
+pub const PROJECT_ERR_PREPARATION_MISMATCH: &str = "preparation-mismatch";
+
+/// PRD #819 audit follow-up: an [`AttachRequest::StartAgent`] payload carried a
+/// `prep_token` key, which that verb does not enforce.
+///
+/// The remedy is the verb, not the value: send
+/// [`AttachRequest::StartPreparedAgent`]. It is a refusal rather than a shrug
+/// because the alternative is the exact failure this code's sibling verb exists
+/// to remove — serde drops unknown keys on `StartAgent`, so ignoring the token
+/// would start the role *unenforced* and report success, and the caller would
+/// have no way to tell that from a preparation that was honoured.
+///
+/// No production caller reaches it: the TUI, the desktop and dispatch all spawn
+/// without a token, and the one client method that presents one
+/// ([`crate::daemon_client::DaemonClient::start_agent_with_prep_token`]) sends
+/// the prepared verb. The wire tests build the payload deliberately, which is
+/// the point of the code existing.
+pub const PROJECT_ERR_WRONG_START_VERB: &str = "wrong-start-verb";
+
+/// PRD #819 audit fix: [`AttachRequest::PrepareWorkflow`] is refused on this
+/// platform because the publish cannot deliver the owner-only guarantee it
+/// documents.
+///
+/// **The premise this replaces was false.** The publish's mode bits,
+/// `O_NOFOLLOW | O_DIRECTORY` open and group/other-write refusal are all Unix
+/// (`crate::orchestrator_context::open_context_dir`), and the module excused
+/// that by asserting the daemon is Unix-only. It is not — [`bind_attach_listener`]
+/// returns a `crate::platform::ipc::IpcListener`, which on Windows is an active
+/// **named pipe** listener. So a Windows daemon really can be asked to create a
+/// directory and write a file at a path a *peer* named, with no protected DACL
+/// applied and with path lookups rather than a reparse-safe handle.
+///
+/// Two honest options existed: implement the DACL half with the helpers in
+/// `crate::platform::fsperm` (they exist —
+/// `create_owner_only_dir` / `set_file_owner_only` / `ensure_owner_only_dir`),
+/// or refuse the verb where the guarantee cannot be provided and narrow the
+/// documentation to match. The second was taken: Windows desktop is out of PRD
+/// #819's scope, so refusing there is consistent with what shipped, it is far
+/// smaller than a correct DACL implementation, and it turns a false claim into a
+/// true one. Enabling the verb on Windows later means building the DACL path
+/// **and** deleting this code — not deleting this code alone.
+///
+/// The verb is also struck from [`DAEMON_CAPABILITIES`] on such a platform, so a
+/// client learns at the handshake rather than at launch time.
+pub const PROJECT_ERR_UNSUPPORTED_PLATFORM: &str = "unsupported-platform";
+
+/// PRD #819 M3: the ONE code carried by every refusal that comes from
+/// *resolving* a path against a filesystem.
+///
+/// It is deliberately a single code for every cause — no such directory, no
+/// config there, a config that is a FIFO, a config that does not parse — because
+/// the property this verb delivers is that **the wire response does not directly
+/// distinguish** those cases for an arbitrary caller-supplied path. A code per
+/// cause would hand that distinction back on a plate.
+///
+/// It is not the only code these verbs can return, and the difference matters:
+/// a path that fails [`validate_project_path`]'s string check answers with
+/// [`PROJECT_ERR_INVALID_PATH`] instead, before any filesystem is touched. That
+/// refusal is about the caller's own request being malformed rather than about
+/// what is on disk, so it discloses nothing this one is protecting.
+///
+/// Read the claim narrowly, and do not widen it in a comment later:
+/// canonicalisation, traversal, `open(2)` and TOML parsing do observably
+/// different amounts of work, so **no timing property is claimed** and the
+/// concurrency bound in [`crate::project_resolve`] protects availability rather
+/// than constant time. What is claimed is about the response bytes alone.
+///
+/// The text after the code splits by trust: a path the daemon already knows
+/// carries the detailed diagnostic (`crate::project_resolve::known_path_refusal`),
+/// and every other path carries one fixed generic sentence
+/// (`crate::project_resolve::generic_refusal`) that names no path, no parser
+/// source line and no raw OS error.
+pub const PROJECT_ERR_UNRESOLVED: &str = "unresolved";
 
 /// Bounded timeout for a single STREAM_OUT/STREAM_END write to a client. If
 /// a client stops draining its socket, the OS send buffer fills and our
@@ -493,9 +781,12 @@ pub enum AttachRequest {
     /// PRD #76 M2.21: protocol-version handshake. Client sends its
     /// [`PROTOCOL_VERSION`]; server replies with its own in
     /// [`AttachResponse::server_version`]. The daemon never rejects on
-    /// `client_version`, and since issue #491 no client rejects on
-    /// `server_version` either — `connect`'s strict comparison was the last
-    /// one, and the local attach path never had one (issue #405). See the
+    /// `client_version`. On the client side, the **desktop** rejects on
+    /// `server_version` — `classify_handshake` in
+    /// `desktop/src-tauri/src/daemon_bridge.rs` requires exact equality and is
+    /// never bypassed. Issue #491 removed `connect`'s comparison and the local
+    /// TUI attach path never had one (issue #405), so the desktop is currently
+    /// the only client that refuses on a version *difference*. See the
     /// enforcement note on [`PROTOCOL_VERSION`].
     ///
     /// PRD #103 M1.2: optional `client_build_version` carries the client's
@@ -541,6 +832,146 @@ pub enum AttachRequest {
     /// warning on any error, which is the same way it treats a down daemon.
     DispatchWorktreeClosePreview {
         pane_ids: Vec<String>,
+    },
+    /// PRD #819 M2: enumerate the projects this daemon knows about. **Read-only.**
+    ///
+    /// A GUI cannot `cd`, and against a remote daemon it cannot browse to find
+    /// out either — so this is the desktop's equivalent of the TUI's selection
+    /// mechanism. The answer is derived from what the daemon already holds
+    /// (its own startup cwd, live agent cwds, orchestration cwds), revalidated
+    /// per candidate; nothing is persisted on either side. The reply rides back
+    /// on [`AttachResponse::projects`].
+    ///
+    /// A struct variant with no fields rather than a unit variant, because the
+    /// enumeration will grow bounds (a cap, a filter) and a unit variant cannot
+    /// gain a `#[serde(default)]` field without moving the wire shape again.
+    ListProjects {},
+    /// PRD #819 M2: resolve one project path. **Read-only.**
+    ///
+    /// One path in, resolved. No directory walk, no children, no parents, and
+    /// no implicit widening — resolving `/a/b` does not make `/a` or `/a/b/c`
+    /// known. This is the primitive the desktop lacks, and it is deliberately
+    /// narrower than a filesystem API: PRD #76's rejected Phase 6 was
+    /// `ListDir` / `ReadFile` / `Stat` and this is not that.
+    ///
+    /// It is **API minimisation, not authorization.** Any peer that reaches
+    /// this socket already has the daemon user's local-exec authority via
+    /// [`AttachRequest::StartAgent`] — see its trust-boundary note. Withholding
+    /// a browse verb limits the blast radius of a compromised or buggy UI and
+    /// keeps least privilege available later; it is not a privilege boundary.
+    ///
+    /// The reply rides back on [`AttachResponse::project`].
+    ResolveProject {
+        /// An absolute path. Either a path this daemon returned from
+        /// [`AttachRequest::ListProjects`], or one a user supplied verbatim —
+        /// never one a client derived from its own environment, because a
+        /// desktop client's filesystem need not be the daemon's.
+        path: String,
+    },
+    /// PRD #819 M2/M4: prepare a workflow launch — resolve, compose the
+    /// coordinator context, and publish it. **The only new verb that writes.**
+    ///
+    /// Preparing the context is an explicit launch phase rather than an
+    /// incidental side effect of resolution: enumerate and resolve stay
+    /// read-only, and there is otherwise no operation at which the daemon-side
+    /// write could happen ([`AttachRequest::StartAgent`] carries no task and no
+    /// config revision, and is issued once per role). A failed preparation
+    /// starts no roles.
+    ///
+    /// The reply rides back on [`AttachResponse::workflow_prepared`].
+    PrepareWorkflow {
+        /// The daemon-canonical path, as returned by
+        /// [`AttachRequest::ListProjects`] or [`AttachRequest::ResolveProject`].
+        /// Not a client-derived path.
+        path: String,
+        orchestration: String,
+        /// The coordinator task. Bounded server-side at
+        /// [`crate::bounded_read::MAX_TASK_BYTES`] before any filesystem work —
+        /// the desktop's own 64 KiB check is a UI affordance and not a bound
+        /// this daemon may rely on.
+        task: String,
+        /// The config revision the client believes it resolved against, as
+        /// [`crate::event::ResolvedProject::config_revision`] handed it back.
+        /// Stale values are refused with [`PROJECT_ERR_STALE_REVISION`], which
+        /// is what closes the TOCTOU window between the picker, the write and
+        /// the spawn.
+        ///
+        /// `#[serde(default)]`, and **absent means "no expectation" rather than
+        /// "any revision"** — a client that has not resolved yet must still be
+        /// able to launch, which is what keeps the field additive. It is not a
+        /// degrade-to-unauthorized of the #608 kind: there is no authorization
+        /// here to degrade from, only a staleness check the caller can decline
+        /// to make.
+        #[serde(default)]
+        config_revision: Option<String>,
+    },
+    /// PRD #819 audit follow-up: start ONE role of a workflow this daemon
+    /// prepared. [`AttachRequest::StartAgent`] plus a **required** `prep_token`.
+    ///
+    /// # Why a verb and not a field
+    ///
+    /// The token used to ride on `StartAgent` as an additive JSON key, and that
+    /// shape **fails open on the wire**. `StartAgent` is a stable op every
+    /// daemon back to PRD #76 accepts; an older one decodes the base variant,
+    /// ignores the unknown key and starts the role with no preparation
+    /// enforcement at all. Nothing on this protocol could catch that from the
+    /// client side either: `DaemonClient::connect` is a bare socket connect,
+    /// `issue_json_command` writes one request frame, and [`handle_connection`]
+    /// decodes exactly one `KIND_REQ` per connection — so a role-start
+    /// connection exchanges no [`AttachRequest::Hello`] and re-checks no
+    /// [`PROTOCOL_VERSION`]. Verifying the peer on a *previous* connection
+    /// narrows the window to the gap between two `connect()` calls; it cannot
+    /// shut it.
+    ///
+    /// A distinct `op` removes the timing argument entirely. A daemon that does
+    /// not know this variant fails the frame decode and answers the structured
+    /// `malformed request: unknown variant …` refusal from [`handle_connection`]
+    /// — `ok: false`, nothing spawned, on the very connection the spawn would
+    /// have used. **The launch fails closed with no window at all.**
+    ///
+    /// # What it does NOT change
+    ///
+    /// This is not an authorization boundary and the token is not an
+    /// authorization token — read [`crate::prep_token`]'s module doc. Any peer
+    /// on this socket already holds the daemon user's local-exec authority
+    /// through `StartAgent`, which takes arbitrary `command`, `cwd` and `env`; a
+    /// peer that wants to spawn something arbitrary calls that and is not
+    /// slowed down here. What the verb protects is a *coordinator* against
+    /// launching on a preparation some other launch replaced — a staleness and
+    /// integrity property, and the same one the token always carried.
+    ///
+    /// The fields after `prep_token` are `StartAgent`'s, spelled out rather than
+    /// nested so the wire shape of a role start is one flat object either way.
+    /// Every one carries the same `serde` attribute it does there, so the two
+    /// cannot drift in their defaults.
+    StartPreparedAgent {
+        /// The token [`AttachRequest::PrepareWorkflow`] handed back
+        /// ([`crate::event::PreparedWorkflow::token`]).
+        ///
+        /// **Required, and that is the entire point.** A `#[serde(default)]`
+        /// here would let a client omit it and be served anyway, which is the
+        /// silent downgrade the verb exists to remove; an absent or wrongly
+        /// typed value fails the decode and takes the same structured
+        /// malformed-request path an older daemon takes.
+        prep_token: String,
+        #[serde(default)]
+        command: Option<String>,
+        #[serde(default)]
+        cwd: Option<String>,
+        #[serde(default = "default_rows")]
+        rows: u16,
+        #[serde(default = "default_cols")]
+        cols: u16,
+        #[serde(default)]
+        env: Vec<(String, String)>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        display_name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tab_membership: Option<TabMembership>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_type: Option<AgentType>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        seed: Option<String>,
     },
 }
 
@@ -596,6 +1027,40 @@ struct WriteAndSubmitExtras {
     /// failure never double-submits (R20-004).
     #[serde(default)]
     delivery_id: Option<String>,
+}
+
+/// PRD #819 audit follow-up: the detector that keeps the *removed* token-on-
+/// `StartAgent` path from coming back as a silent one.
+///
+/// M4 landed the preparation token as an additive `prep_token` key alongside
+/// [`AttachRequest::StartAgent`], re-parsed from the same payload the way
+/// [`WriteAndSubmitExtras`] still is. That shape fails open against an older
+/// peer — see [`AttachRequest::StartPreparedAgent`], which replaced it — and it
+/// never shipped: `PROTOCOL_VERSION` was already 9 and unreleased when it was
+/// removed, so no deployed daemon or client ever spoke it.
+///
+/// Removing the field would have made `start-agent` *ignore* a `prep_token`,
+/// because serde drops unknown keys on the base variant — turning a caller
+/// aiming at the wrong verb into an unenforced spawn, which is precisely the
+/// failure being removed. So the re-parse stays, purely to notice the key and
+/// refuse: a token belongs on `start-prepared-agent`, and this verb says so
+/// rather than starting the role.
+///
+/// The field is `serde_json::Value` rather than `String` on purpose. Presence is
+/// the whole question — a wrongly typed token is still a caller reaching for the
+/// prepared path — and `Option<Value>` accepts any JSON, so this parse cannot
+/// fail on a payload that already decoded as `StartAgent` and there is no
+/// malformed branch to get wrong. JSON `null` deserializes to `None`, which is
+/// the same as absent and is the right reading of it.
+///
+/// **An absent key still changes nothing.** The TUI, the desktop, dispatch and
+/// every existing test call `start-agent` without one, and none of them may
+/// break.
+#[derive(Debug, Default, Deserialize)]
+struct StartAgentExtras {
+    /// Present iff the caller put a `prep_token` key on a plain `start-agent`.
+    #[serde(default)]
+    prep_token: Option<serde_json::Value>,
 }
 
 /// PRD #161 M1.1: a snapshot of the agents the daemon is currently managing,
@@ -732,6 +1197,47 @@ pub struct AttachResponse {
     /// with is owed to the new REQUEST variant beside it, not to this.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kept_worktree: Option<crate::issue_dispatch_run::KeptWorktree>,
+    /// PRD #819 M2: the answer to [`AttachRequest::ListProjects`]. `None` on
+    /// every other response. Additive + optional, so the field itself is
+    /// forward-compatible in both directions; the `PROTOCOL_VERSION` bump this
+    /// ships with is owed to the three new REQUEST variants beside it, not to
+    /// this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projects: Option<crate::event::ProjectListing>,
+    /// PRD #819 M2: the answer to [`AttachRequest::ResolveProject`]. `None` on
+    /// every other response, and on a refusal. Additive + optional on the same
+    /// basis as [`Self::projects`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<crate::event::ResolvedProject>,
+    /// PRD #819 M2: the answer to [`AttachRequest::PrepareWorkflow`]. `None` on
+    /// every other response, and on a preparation that failed — a failed
+    /// preparation publishes nothing and starts no roles. Additive + optional
+    /// on the same basis as [`Self::projects`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_prepared: Option<crate::event::PreparedWorkflow>,
+    /// PRD #819 M2/M5: explicit capability advertisement on the
+    /// [`AttachRequest::Hello`] reply — the general form of
+    /// [`Self::guarded_send`], which stays exactly as it is and is deliberately
+    /// **not** folded into this list (an older client reads only the boolean,
+    /// and moving it would break that client for no gain).
+    ///
+    /// Each entry is a stable string naming one op this build's dispatch
+    /// accepts and answers; see [`DAEMON_CAPABILITIES`]. Unknown strings are
+    /// ignored by a reader, so the set can grow without a bump.
+    ///
+    /// **Absence means "this daemon does not tell you", which a client must
+    /// treat as "withhold" — never as "proceed".** That is the
+    /// [`Self::guarded_send`] rule generalised, and it is the only safe reading:
+    /// an older daemon omits the field entirely, and it is indistinguishable
+    /// from a newer one that chose to.
+    ///
+    /// It is **compatibility metadata, NOT authentication.** A daemon controls
+    /// its own replies and can therefore claim anything; what this buys is a
+    /// stable answer to "will this op parse over there", in place of
+    /// string-matching serde's `unknown variant …` message — which is not a
+    /// stability contract. Nothing may branch on that error text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capabilities: Option<Vec<String>>,
     /// Issue #770: the orchestration ROLE registrations the daemon is holding
     /// in memory, populated on the [`AttachRequest::ListAgents`] reply.
     ///
@@ -861,6 +1367,15 @@ impl AttachResponse {
     /// build) makes a guarded send FAIL SAFE — see [`Self::guarded_send`].
     pub fn with_guarded_send(mut self) -> Self {
         self.guarded_send = Some(true);
+        self
+    }
+
+    /// PRD #819 M2/M5: advertise [`DAEMON_CAPABILITIES`] on a handshake reply.
+    /// The live daemon's `Hello` handler calls this; the static `daemon hello`
+    /// CLI probe and the plain [`Self::hello`] constructor leave the field
+    /// `None`, which a client reads as "withhold" — see [`Self::capabilities`].
+    pub fn with_capabilities(mut self) -> Self {
+        self.capabilities = Some(DAEMON_CAPABILITIES.iter().map(|c| c.to_string()).collect());
         self
     }
 }
@@ -1499,6 +2014,60 @@ async fn handle_connection(
         }
     };
 
+    // PRD #819 audit follow-up: `StartPreparedAgent` is `StartAgent` plus a
+    // REQUIRED token, so it is normalised into the base shape and an explicit
+    // token here. Everything downstream is then ONE spawn arm — the prepared and
+    // unprepared starts cannot drift apart in what they register, what they
+    // seed, or what they clean up, which is the failure mode a second copy of
+    // that 200-line arm would have.
+    //
+    // Note what this normalisation does NOT do: it does not put the token back
+    // on the wire's `start-agent`. The `op` a peer sent has already decided
+    // whether this connection is a prepared start, which is the whole property
+    // the verb buys — a daemon that lacks the variant never reaches this line.
+    let (req, prepared_token) = match req {
+        AttachRequest::StartPreparedAgent {
+            prep_token,
+            command,
+            cwd,
+            rows,
+            cols,
+            env,
+            display_name,
+            tab_membership,
+            agent_type,
+            seed,
+        } => {
+            // Refused where `PrepareWorkflow` is refused, and for its reason
+            // rather than a reason of its own: no preparation can exist on this
+            // platform, so nothing can be started against one. Saying so beats
+            // the `stale-token` this would otherwise produce — that answer is
+            // true but sends an operator looking for a client bug — and it keeps
+            // `DAEMON_CAPABILITIES`'s promise honest, since the verb is withheld
+            // there and a withheld verb this build still answered would make the
+            // advertised set mean less than it says.
+            if let Err(message) = refuse_prepared_start_where_unsupported() {
+                write_resp(&mut stream, &AttachResponse::err(message)).await?;
+                return Ok(());
+            }
+            (
+                AttachRequest::StartAgent {
+                    command,
+                    cwd,
+                    rows,
+                    cols,
+                    env,
+                    display_name,
+                    tab_membership,
+                    agent_type,
+                    seed,
+                },
+                Some(prep_token),
+            )
+        }
+        other => (other, None),
+    };
+
     match req {
         AttachRequest::ListAgents => {
             let mut records = registry.agent_records();
@@ -1590,6 +2159,128 @@ async fn handle_connection(
                 )
                 .await?;
                 return Ok(());
+            }
+
+            // PRD #819 audit follow-up: a token reaches this arm ONLY by having
+            // arrived on `start-prepared-agent`, which the normalisation above
+            // turned into the base shape plus `prepared_token`. A plain
+            // `start-agent` that spells a `prep_token` key is a caller aiming at
+            // the wrong verb, and it is refused rather than served: serde drops
+            // unknown keys on the base variant, so serving it would start the
+            // role UNENFORCED and report success — the fail-open the verb exists
+            // to remove, reintroduced by silence. See `StartAgentExtras`.
+            //
+            // `Option<serde_json::Value>` accepts any JSON, and this payload has
+            // already decoded as `StartAgent`, so the re-parse cannot fail; the
+            // `Err` arm is refused anyway rather than defaulted, because the one
+            // thing that must never happen here is a token being downgraded into
+            // an absent one.
+            if prepared_token.is_none() {
+                let carries_token = match serde_json::from_slice::<StartAgentExtras>(&frame.1) {
+                    Ok(extras) => extras.prep_token.is_some(),
+                    Err(_) => true,
+                };
+                if carries_token {
+                    write_resp(
+                        &mut stream,
+                        &AttachResponse::err(format!(
+                            "{PROJECT_ERR_WRONG_START_VERB}: a preparation token does not belong \
+                             on `start-agent`, which enforces none; send `start-prepared-agent` \
+                             instead. Nothing was started."
+                        )),
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            }
+            // PRD #819 audit fix: "the token exists and is young" was the WHOLE
+            // check here, and it binds nothing. The record now carries the state
+            // its preparation approved, so a presented token is resolved to that
+            // record and the record is re-validated against the filesystem
+            // before anything spawns.
+            //
+            // PRD #819 Greptile P1(a): re-validating the record was only half of
+            // it. The record was checked against the FILESYSTEM and never against
+            // the REQUEST, so a caller could present a token prepared for project
+            // X while submitting the `cwd`, orchestration and role of project Y —
+            // and the daemon validated X and started Y. The submitted identity is
+            // now matched against the binding too
+            // (`project_resolve::verify_prepared_start`), which is where the list
+            // of what is bound and what deliberately is not (the `command`, so
+            // per-launch overrides keep working) lives.
+            //
+            // Three refusals, deliberately distinct, because they send an
+            // operator in three directions: the token is not ours or has aged out
+            // (`stale-token`); it is ours and live but the world moved under it
+            // (`stale-preparation`); or it is ours, live and intact and this is
+            // not the launch it approved (`preparation-mismatch`).
+            if let Some(token) = prepared_token.as_deref() {
+                let Some(binding) = crate::prep_token::binding(token) else {
+                    write_resp(
+                        &mut stream,
+                        &AttachResponse::err(format!(
+                            "{PROJECT_ERR_STALE_TOKEN}: that preparation is unknown or has \
+                             expired; prepare the workflow again"
+                        )),
+                    )
+                    .await?;
+                    return Ok(());
+                };
+                // The submitted identity, lifted out of the request as it stands
+                // rather than re-derived from the token — comparing the token to
+                // itself is what the previous round did.
+                let request = crate::project_resolve::PreparedStartRequest {
+                    cwd: cwd.clone(),
+                    membership: tab_membership.as_ref().and_then(|tm| match tm {
+                        TabMembership::Orchestration {
+                            name,
+                            role_name,
+                            is_start_role,
+                            orchestration_cwd,
+                            ..
+                        } => Some(crate::project_resolve::PreparedStartMembership {
+                            orchestration: name.clone(),
+                            orchestration_cwd: orchestration_cwd.clone(),
+                            role: role_name.clone(),
+                            is_start_role: *is_start_role,
+                        }),
+                        TabMembership::Mode { .. } => None,
+                    }),
+                };
+                // Filesystem work, so it goes through the same bounded blocking
+                // pool every other project verb uses — one call, one permit, and
+                // never from inside a task that already holds one.
+                let outcome = crate::project_resolve::run_bounded(move || {
+                    crate::project_resolve::verify_prepared_start(&binding, &request)
+                })
+                .await;
+                let refusal = match outcome {
+                    Ok(Ok(())) => None,
+                    Ok(Err(refusal)) => {
+                        // The cause is named here and nowhere else: the wire gets
+                        // one sentence per category, so the daemon log is the
+                        // only place an operator can learn which check fired.
+                        warn!(
+                            reason = %refusal,
+                            "start-prepared-agent refused: the preparation does not cover this start"
+                        );
+                        Some(refusal.wire_refusal())
+                    }
+                    Err(e) => {
+                        // The pool could not run the check. Refusing is the only
+                        // safe answer: "we could not verify" is not "it is
+                        // fine", and the caller's remedy — prepare again — is
+                        // the same either way. It is reported as a STALENESS
+                        // refusal rather than a mismatch, because an unrun check
+                        // has found no disagreement — it has found nothing.
+                        warn!(reason = %e, "start-prepared-agent refused: the preparation could not be re-validated");
+                        Some(crate::project_resolve::stale_preparation_refusal())
+                    }
+                };
+                if let Some(refusal) = refusal {
+                    write_resp(&mut stream, &AttachResponse::err(refusal)).await?;
+                    return Ok(());
+                }
             }
 
             // PRD #93 round-5: capture the bits we need to populate the
@@ -2254,7 +2945,13 @@ async fn handle_connection(
             // client knows this daemon enforces the identity/idempotency guards
             // and may safely issue an identity-bearing write-and-submit. Its
             // absence (an older daemon) makes the client fail such a send safe.
-            let mut resp = AttachResponse::hello(PROTOCOL_VERSION).with_guarded_send();
+            // PRD #819 M2/M5: advertise the project verbs explicitly, so a
+            // client asks a stable question ("do you know this op?") instead
+            // of string-matching serde's `unknown variant` message. Absence
+            // means withhold — see `AttachResponse::capabilities`.
+            let mut resp = AttachResponse::hello(PROTOCOL_VERSION)
+                .with_guarded_send()
+                .with_capabilities();
             if !omit_running_agents {
                 let summary = RunningAgentsSummary::from_records(&registry.agent_records());
                 resp = resp.with_running_agents(summary);
@@ -2320,6 +3017,323 @@ async fn handle_connection(
             resp.kept_worktree = kept;
             write_resp(&mut stream, &resp).await?
         }
+        // PRD #819 M3. `ListProjects` answers from what the daemon already
+        // holds — no new persistence, no filesystem browsing — and every
+        // candidate is revalidated through the bounded reader before it is
+        // offered, because an agent cwd or a scheduler `working_dir` need not be
+        // a project at all.
+        AttachRequest::ListProjects {} => {
+            // Nothing caller-supplied to validate: the enumeration is derived
+            // entirely from state the daemon already holds.
+            let candidates = project_candidates(&registry, &state, &scheduler).await;
+            let resp = match crate::project_resolve::run_bounded(move || {
+                crate::project_resolve::resolve_candidates(&candidates)
+            })
+            .await
+            {
+                Ok(listing) => {
+                    // `ok` even when the listing is empty: "this daemon knows
+                    // nothing live" is an answer, not a failure, and it is the
+                    // state the client renders its paste-a-path surface for.
+                    let mut resp = AttachResponse::ok();
+                    resp.projects = Some(listing);
+                    resp
+                }
+                Err(e) => {
+                    warn!(reason = %e, "list-projects could not complete");
+                    AttachResponse::err(format!(
+                        "{PROJECT_ERR_UNRESOLVED}: {}",
+                        crate::project_resolve::ProjectResolveError::Internal.detail()
+                    ))
+                }
+            };
+            write_resp(&mut stream, &resp).await?
+        }
+        // PRD #819 M3. Resolve-only: one explicit path in, resolved through the
+        // same bounded reader the enumeration uses. No directory walk, no
+        // children, no parents, and resolving `/a/b` does not make `/a` or
+        // `/a/b/c` known. The refusal's disclosure splits by trust — see
+        // [`PROJECT_ERR_UNRESOLVED`].
+        AttachRequest::ResolveProject { path } => {
+            let resp = match validate_project_path(&path) {
+                Err(message) => AttachResponse::err(message),
+                Ok(()) => {
+                    // The seed set is what decides whether this path gets the
+                    // detailed diagnostic. Gathered here, on the async side,
+                    // because it is pure in-memory state; the canonicalisation
+                    // it is compared against happens inside the blocking half.
+                    let seeds = project_candidates(&registry, &state, &scheduler).await;
+                    match crate::project_resolve::run_bounded(move || {
+                        crate::project_resolve::resolve_for_wire(&path, &seeds)
+                    })
+                    .await
+                    {
+                        Ok(Ok(project)) => {
+                            let mut resp = AttachResponse::ok();
+                            resp.project = Some(project);
+                            resp
+                        }
+                        Ok(Err(refusal)) => AttachResponse::err(refusal),
+                        Err(e) => {
+                            warn!(reason = %e, "resolve-project could not complete");
+                            AttachResponse::err(format!(
+                                "{PROJECT_ERR_UNRESOLVED}: {}",
+                                crate::project_resolve::ProjectResolveError::Internal.detail()
+                            ))
+                        }
+                    }
+                }
+            };
+            write_resp(&mut stream, &resp).await?
+        }
+        // PRD #819 M4: the only project verb that writes. Resolve one validated
+        // config snapshot, check the revision the client believes it resolved
+        // against, find the orchestration, compose the coordinator context and
+        // publish it — then report success. Nothing is started here, and a
+        // failure at any step returns before the publish, which is what makes
+        // "a failed preparation starts no roles" a property of the ordering
+        // rather than of a cleanup path.
+        //
+        // Every field bound, with no `..` rest pattern, so the next field added
+        // to the variant is a compile error at this seam rather than a value
+        // silently dropped — the mistake `map_tab` in the desktop crate records
+        // having made with `orchestration_cwd`.
+        AttachRequest::PrepareWorkflow {
+            path,
+            orchestration,
+            task,
+            config_revision,
+        } => {
+            let resp = match refuse_prepare_where_unsupported()
+                .and_then(|()| validate_project_path(&path))
+                .and_then(|()| validate_task(&task))
+            {
+                Err(message) => AttachResponse::err(message),
+                Ok(()) => {
+                    // Same seed set, same reason, as the resolve arm: it is pure
+                    // in-memory state and it is what decides whether a refusal
+                    // carries the detailed diagnostic.
+                    let seeds = project_candidates(&registry, &state, &scheduler).await;
+                    // One `run_bounded` call, so the whole resolve → read →
+                    // compose → publish sequence runs on ONE blocking thread
+                    // under ONE permit. Splitting it would mean acquiring a
+                    // second permit from inside work that already holds one,
+                    // which is the shape that deadlocks a bounded pool.
+                    match crate::project_resolve::run_bounded(move || {
+                        crate::project_resolve::prepare_workflow_for_wire(
+                            &path,
+                            &orchestration,
+                            &task,
+                            config_revision.as_deref(),
+                            &seeds,
+                        )
+                    })
+                    .await
+                    {
+                        Ok(Ok(prepared)) => {
+                            let mut resp = AttachResponse::ok();
+                            resp.workflow_prepared = Some(prepared);
+                            resp
+                        }
+                        Ok(Err(refusal)) => AttachResponse::err(refusal),
+                        Err(e) => {
+                            warn!(reason = %e, "prepare-workflow could not complete");
+                            AttachResponse::err(format!(
+                                "{PROJECT_ERR_UNRESOLVED}: {}",
+                                crate::project_resolve::ProjectResolveError::Internal.detail()
+                            ))
+                        }
+                    }
+                }
+            };
+            write_resp(&mut stream, &resp).await?
+        }
+        // Unreachable by construction: the normalisation above this `match`
+        // rewrote every `StartPreparedAgent` into the `StartAgent` shape plus an
+        // explicit token, and nothing between the two can mint one. It is an arm
+        // rather than an `unreachable!()` because `handle_connection` serves
+        // other clients and a panic would take one connection's bug out on all
+        // of them — the same reasoning `PROJECT_ERR_UNIMPLEMENTED` records. If
+        // this text is ever observed, the normalisation was edited and the spawn
+        // path it feeds is what to read.
+        AttachRequest::StartPreparedAgent { .. } => {
+            warn!("start-prepared-agent reached the dispatch un-normalised — refusing the spawn");
+            write_resp(
+                &mut stream,
+                &AttachResponse::err(
+                    "start-prepared-agent: internal error — the prepared start was not \
+                     normalised; nothing was started",
+                ),
+            )
+            .await?
+        }
+    }
+    Ok(())
+}
+
+/// PRD #819 M3: the daemon's enumeration seeds, gathered from state it already
+/// holds.
+///
+/// Four sources, and **all four are candidates rather than projects** — an
+/// ordinary agent cwd or a scheduled task's working directory need not hold a
+/// `.dot-agent-deck.toml` at all, so
+/// [`crate::project_resolve::resolve_candidates`] revalidates every one before
+/// it is offered:
+///
+/// 1. the daemon's own startup cwd, captured once in
+///    [`crate::daemon::run_daemon_with`];
+/// 2. `AgentRecord.cwd` for every live agent;
+/// 3. `TabMembership::Orchestration::orchestration_cwd` for every orchestration
+///    role;
+/// 4. every registered schedule's `working_dir`.
+///
+/// This function touches **no filesystem**, which is why it runs on the async
+/// side: it reads two in-memory registries and the daemon's `AppState`. The
+/// `live` join is the same one [`AttachRequest::ListAgents`] performs, and it is
+/// here for one reason — `AgentRecord.live` is what carries
+/// [`crate::state::SessionSnapshot::last_activity_ms`], the real timestamp the
+/// primary nomination prefers over `spawned_at_ms`.
+async fn project_candidates(
+    registry: &Arc<AgentPtyRegistry>,
+    state: &SharedState,
+    scheduler: &Arc<crate::scheduler::Scheduler>,
+) -> Vec<crate::project_resolve::ProjectCandidate> {
+    let mut records = registry.agent_records();
+    {
+        let guard = state.read().await;
+        for record in &mut records {
+            record.live = guard
+                .sessions
+                .values()
+                .filter(|s| {
+                    s.agent_id.as_deref() == Some(record.id.as_str())
+                        && s.pane_id == record.pane_id_env
+                })
+                .max_by(|a, b| {
+                    a.last_activity
+                        .cmp(&b.last_activity)
+                        .then_with(|| a.session_id.cmp(&b.session_id))
+                })
+                .map(|s| s.live_snapshot());
+        }
+    }
+    crate::project_resolve::collect_candidates(
+        crate::project_resolve::daemon_startup_cwd().as_deref(),
+        &records,
+        &scheduler.registered_working_dirs(),
+    )
+}
+
+/// PRD #819 M2/A5: the wire-boundary check every caller-supplied project path
+/// passes **before** any filesystem access.
+///
+/// It reuses [`crate::agent_pty::is_valid_orchestration_cwd`] rather than
+/// spelling a second validator, because that predicate is already exactly this
+/// shape — non-empty, at most [`crate::agent_pty::CWD_MAX_LEN`] (4096) bytes,
+/// free of ASCII control characters, and absolute for this platform — and it is
+/// already the rule applied to the `orchestration_cwd` these paths become. A
+/// path that survives here and a path the daemon will later accept as an
+/// orchestration identity are then the same set by construction.
+///
+/// Non-UTF-8 needs no check here and is not lossily converted: the frame is
+/// JSON and `path` is a `String`, so a non-UTF-8 byte sequence fails the frame
+/// decode and never reaches this function. That is a refusal, which is the
+/// intended outcome.
+///
+/// On refusal it returns the message the caller wraps in an
+/// [`AttachResponse::err`], and that message names no path. See
+/// [`PROJECT_ERR_INVALID_PATH`].
+/// PRD #819 audit fix: refuse [`AttachRequest::PrepareWorkflow`] outright where
+/// the publish cannot deliver its owner-only, reparse-safe guarantee.
+///
+/// **First, before the path and the task are even validated.** The refusal is a
+/// property of the build rather than of the request, so it must not depend on
+/// the request being well-formed — and reporting "invalid path" on a platform
+/// where no path would have worked sends the operator after the wrong thing.
+///
+/// See [`PROJECT_ERR_UNSUPPORTED_PLATFORM`] for why this is a refusal rather
+/// than a Windows DACL implementation, and note that the verb is also absent
+/// from [`DAEMON_CAPABILITIES`] there, so a client that negotiates never reaches
+/// this line.
+fn refuse_prepare_where_unsupported() -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        Err(format!(
+            "{PROJECT_ERR_UNSUPPORTED_PLATFORM}: this daemon cannot publish a coordinator context \
+             with owner-only permissions on this platform, so preparing a workflow is refused; \
+             launch the orchestration from a daemon running on Unix"
+        ))
+    }
+}
+
+/// PRD #819 audit follow-up: the same refusal for
+/// [`AttachRequest::StartPreparedAgent`], for the same reason one hop earlier.
+///
+/// Not a property of the request: [`refuse_prepare_where_unsupported`] refuses
+/// every preparation on such a build, and the `PrepareWorkflow` arm is the only
+/// production path to [`crate::prep_token::issue`] — so this daemon can never
+/// have issued a token, and every prepared start on it is answering for a
+/// preparation that could not have happened. `PROJECT_ERR_STALE_TOKEN` would also be true of that and is
+/// the wrong sentence — it sends an operator after an expiry or a client bug
+/// instead of after the platform. The verb is withheld from
+/// [`DAEMON_CAPABILITIES`] there too, so a client that negotiates never reaches
+/// this line.
+fn refuse_prepared_start_where_unsupported() -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        Err(format!(
+            "{PROJECT_ERR_UNSUPPORTED_PLATFORM}: this daemon cannot prepare a workflow on this \
+             platform, so it holds no preparation to start a role against; launch the \
+             orchestration from a daemon running on Unix"
+        ))
+    }
+}
+
+fn validate_project_path(path: &str) -> Result<(), String> {
+    if crate::agent_pty::is_valid_orchestration_cwd(path) {
+        return Ok(());
+    }
+    Err(format!(
+        "{PROJECT_ERR_INVALID_PATH}: project path must be absolute, non-empty, \
+         free of control characters, and at most {} bytes",
+        crate::agent_pty::CWD_MAX_LEN
+    ))
+}
+
+/// PRD #819 M2/A5: the wire-boundary bound on
+/// [`AttachRequest::PrepareWorkflow`]'s caller-supplied `task`, applied before
+/// any filesystem work.
+///
+/// The bound is [`crate::bounded_read::MAX_TASK_BYTES`] — the constant issue
+/// #328 already established and documented for exactly this input class, task
+/// prose destined for an agent's prompt. Reusing it keeps one justified number
+/// rather than inventing a second. The desktop applies its own tighter 64 KiB
+/// check at its UI seam, and that is a client affordance this daemon does not
+/// rely on: the audit's requirement is a server-side bound, and a bound that
+/// only exists in one client is not one.
+///
+/// A NUL is refused alongside the length, because the text is destined for a
+/// markdown file the daemon writes and the desktop already refuses one at its
+/// own seam — so this stays a strict superset of the client's shape check.
+fn validate_task(task: &str) -> Result<(), String> {
+    if task.len() as u64 > crate::bounded_read::MAX_TASK_BYTES {
+        return Err(format!(
+            "{PROJECT_ERR_TASK_REJECTED}: task must be at most {} bytes",
+            crate::bounded_read::MAX_TASK_BYTES
+        ));
+    }
+    if task.contains('\0') {
+        return Err(format!(
+            "{PROJECT_ERR_TASK_REJECTED}: task must contain no NUL"
+        ));
     }
     Ok(())
 }
@@ -2769,6 +3783,46 @@ async fn handle_attach_stream(
 mod tests {
     use super::*;
     use spec::spec;
+
+    /// PRD #819 audit fix: `PrepareWorkflow` is available exactly where the
+    /// publish can deliver its owner-only guarantee, and the capability list
+    /// says the same thing the dispatch does.
+    ///
+    /// **Both halves are asserted against `cfg!(unix)` rather than against a
+    /// hardcoded expectation**, which is what makes this one test rather than
+    /// two that cannot both run. It pins the property that matters — the gate
+    /// and the advertisement agree — so a later change that refuses the verb
+    /// while still advertising it, or advertises it while still refusing it,
+    /// fails here on whichever platform it is built for. What it deliberately
+    /// does **not** do is prove the Windows refusal *text*; only a Windows build
+    /// can execute that arm, and `cargo clippy --all-targets` for a Windows
+    /// target type-checks it.
+    #[test]
+    fn prepare_workflow_is_offered_exactly_where_it_is_supported() {
+        let gate = refuse_prepare_where_unsupported();
+        let advertised = DAEMON_CAPABILITIES.contains(&CAP_PREPARE_WORKFLOW);
+        assert_eq!(
+            gate.is_ok(),
+            advertised,
+            "the dispatch gate and the advertised capability set must agree; gate = {gate:?}, \
+             advertised = {advertised}"
+        );
+        assert_eq!(
+            advertised,
+            cfg!(unix),
+            "the verb is Unix-only because the publish's mode bits and its \
+             `O_NOFOLLOW | O_DIRECTORY` open are"
+        );
+        // The read-only verbs are unaffected — the refusal is about the write.
+        assert!(DAEMON_CAPABILITIES.contains(&CAP_LIST_PROJECTS));
+        assert!(DAEMON_CAPABILITIES.contains(&CAP_RESOLVE_PROJECT));
+        if let Err(message) = gate {
+            assert!(
+                message.starts_with(PROJECT_ERR_UNSUPPORTED_PLATFORM),
+                "the refusal must carry the stable code, got {message:?}"
+            );
+        }
+    }
 
     /// Issue #454, the root cause pinned at its own seam: a `StartAgent` for an
     /// ORDINARY dashboard pane — no `tab_membership`, so none of the

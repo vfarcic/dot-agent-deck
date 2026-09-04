@@ -22,6 +22,13 @@ toml = "1.0"
 tokio = { version = "1", features = ["sync", "time"] }
 
 [dev-dependencies]
+# The `#[tokio::test]` attribute needs `macros` + `rt`, and the scripted-socket
+# handshake tests in `daemon_bridge.rs` need `net`. All three have always been
+# reachable here through feature unification with the root crate — which is a
+# property of what ANOTHER crate happens to enable, not a declaration this crate
+# makes. Declaring them means a change over there cannot silently take this
+# crate's tests out.
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread"] }
 # PRD #803: every settings test drives an explicit path inside a temp dir so
 # none of them can touch the developer's real ~/.config/dot-agent-deck.
 tempfile = "3"
@@ -30,4 +37,3 @@ tempfile = "3"
 # way to build one to prove it. Tests only — nothing under `src/` uses libc.
 [target.'cfg(unix)'.dev-dependencies]
 libc = "0.2"
-

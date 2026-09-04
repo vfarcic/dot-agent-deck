@@ -58,12 +58,84 @@ export interface ConnectionView {
   daemonBuildVersion?: string;
 }
 
-export interface DeckProject {
-  id: string;
+/**
+ * One project the DAEMON knows about (PRD #819 M6).
+ *
+ * It replaced `DeckProject`, which was a locally-invented record — a minted id,
+ * a free-typed `cwd`, a workflow name, notes — persisted under
+ * `dot-agent-deck.desktop.projects.v1` and used as the source of truth for the
+ * launch working directory. Nothing validated it against the daemon's world, so
+ * against a remote daemon it named a directory on the wrong machine.
+ *
+ * There is no id, because the daemon-canonical `path` IS the identity, and no
+ * editable fields, because nothing here is stored: a project is a property of
+ * the launch being assembled and dies with it.
+ */
+export interface DaemonProject {
+  /**
+   * Daemon-canonical absolute path, byte for byte. Sent back verbatim; never
+   * re-spelled, and never rendered — render `displayPath` instead.
+   *
+   * PRD #819 audit fix (P2, finding 1): the desktop crate used to escape and
+   * truncate this value and keep the result as the only copy, so a valid
+   * canonical path carrying a control character, or longer than 2048
+   * characters, was submitted as a *different* path. Identity and display are
+   * now two fields.
+   */
+  path: string;
+  /** `path`, escaped and bounded for rendering. Never sent anywhere. */
+  displayPath: string;
+  /** The daemon's basename for this project, escaped for rendering. */
+  displayName: string;
+}
+
+export interface DaemonProjectListing {
+  projects: DaemonProject[];
+  /**
+   * The project most recently active on this daemon — a fact derived from live
+   * state, not a remembered preference. Absent when the daemon has nothing
+   * live, which is the empty state rather than an error.
+   */
+  primary?: string;
+}
+
+export interface DaemonOrchestrationRole {
+  /** Identity: matched by name at the launch, and it becomes the pane's label. */
   name: string;
-  cwd: string;
-  workflowName: string;
-  notes: string;
+  /** `name`, escaped for rendering. */
+  displayName: string;
+  start: boolean;
+}
+
+export interface DaemonOrchestration {
+  /** Identity: this exact string goes back as the launch's workflow name. */
+  name: string;
+  /** `name`, escaped for rendering. */
+  displayName: string;
+  default: boolean;
+  roles: DaemonOrchestrationRole[];
+}
+
+/**
+ * One resolved project: the canonical path, and the workflows that project
+ * offers. The order is `daemon → project → workflow` and it is not
+ * rearrangeable — the workflow list comes out of the project's own config, so
+ * there is nothing to offer before a project is chosen.
+ */
+export interface DaemonResolvedProject {
+  /** Identity: the canonical spelling the launch must use, byte for byte. */
+  path: string;
+  /** `path`, escaped and bounded for rendering. Never sent anywhere. */
+  displayPath: string;
+  /** The canonical path's basename, escaped for rendering. */
+  displayName: string;
+  orchestrations: DaemonOrchestration[];
+  /**
+   * The revision these orchestrations were read from, echoed back on the launch
+   * so a config edited in between is refused rather than silently launched
+   * against.
+   */
+  configRevision?: string;
 }
 
 export interface DeckPrompt {
@@ -399,7 +471,7 @@ export type DeckAction =
   | { type: "stop_daemon"; force?: boolean }
   | { type: "restart_daemon" }
   | { type: "allow_build_mismatch" }
-  | { type: "start_workflow"; name: string; cwd: string; taskPrompt: string; roles: WorkflowLaunchRole[]; rows: number; cols: number }
+  | { type: "start_workflow"; name: string; cwd: string; taskPrompt: string; roles: WorkflowLaunchRole[]; rows: number; cols: number; configRevision?: string }
   | { type: "retry_stage"; stageId: string }
   | { type: "stop_agent"; agentId: string }
   | { type: "rename_agent"; agentId: string; displayName: string }
@@ -459,14 +531,38 @@ export interface WorkflowLaunchRole {
 }
 
 export interface WorkflowLaunchConfig {
+  /** The daemon's own spelling of the orchestration name, submitted verbatim. */
   name: string;
+  /**
+   * The daemon-canonical project path, straight off the resolved selection.
+   * PRD #819 M6: never typed into this form and never derived from the app's
+   * own environment — the only two sources are a path the daemon listed and a
+   * path the user pasted into the project picker, which the daemon then
+   * resolved and re-spelled.
+   */
   cwd: string;
+  /**
+   * The escaped twins of `name` and `cwd`, for the confirmation dialog and the
+   * result notice (PRD #819 audit fix). Carried on the config so the screen
+   * that renders them does no lookup of its own; both are destructured off
+   * before the action is dispatched, the way `customCommandCount` already is,
+   * so neither reaches the daemon.
+   *
+   * The builder falls back to the identity if it somehow has no orchestration
+   * to take a label from, which cannot happen while the launch button is
+   * enabled — `canLaunch` requires one — and is a worse-label fallback rather
+   * than a blank one if it ever does.
+   */
+  displayName: string;
+  displayPath: string;
   taskPrompt: string;
   roles: WorkflowLaunchRole[];
   rows: number;
   cols: number;
   customCommandCount: number;
   generatedFullAccessCount: number;
+  /** The revision the selection resolved against, if the daemon reported one. */
+  configRevision?: string;
 }
 
 export interface TerminalChunk {
@@ -507,6 +603,18 @@ export interface DeckRuntimeState {
    */
   setShownTerminals: (agentIds: string[]) => Promise<void>;
   reconnect: () => Promise<void>;
+  /**
+   * PRD #819 M6: the projects the connected daemon knows about. There is no
+   * client-side list to fall back to — an unreachable daemon means no projects
+   * to offer, which is an honest answer and not a reason to guess one.
+   */
+  listProjects: () => Promise<DaemonProjectListing>;
+  /**
+   * Resolve ONE path — one the daemon listed, or one the user pasted. The reply
+   * carries the daemon's canonical spelling, which is the string every later
+   * request uses.
+   */
+  resolveProject: (path: string) => Promise<DaemonResolvedProject>;
   /** The desktop app's own settings, and where they live (PRD #803). */
   getSettings: () => Promise<import("./lib/bridge").DesktopSettingsSnapshotDto>;
   /** Persist the whole document; resolves to what was written. */

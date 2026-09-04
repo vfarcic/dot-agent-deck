@@ -254,16 +254,82 @@ describe("TauriDeckBridge", () => {
     await bridge.dispose();
   });
 
-  it("uses the desktop project cwd when no daemon agents are active", async () => {
+  /**
+   * PRD #819 M6 rewrote this test where its premise was destroyed rather than
+   * deleting the assertion. It used to set `projectCwd` — the desktop crate's
+   * own guess at a project directory, from its compile-time manifest dir and
+   * then from the app process's `current_dir()` — and assert the header adopted
+   * it. That tier is gone: on a remote daemon it named a directory on the wrong
+   * machine, and nothing said so.
+   *
+   * What survives is the shape of the fallback. With agents, the daemon's
+   * reported cwd leads, exactly as before. With none, the last known daemon cwd
+   * carries; with neither, the header says so rather than inventing a path.
+   */
+  it("falls back through daemon-sourced cwds only, and says so when there are none", async () => {
     const { mapDesktopSnapshot } = await import("./bridge");
     const empty = structuredClone(snapshot);
     empty.agents = [];
-    empty.projectCwd = "/Users/prabhusriramulu/dev/active/dot-agent-deck-gui";
 
+    // Nothing from the daemon at all: an honest absence, not a guessed path.
     expect(mapDesktopSnapshot(empty)).toMatchObject({
-      repo: "dot-agent-deck-gui",
-      worktree: "/Users/prabhusriramulu/dev/active/dot-agent-deck-gui",
+      repo: "No active project",
+      worktree: "No active project",
     });
+
+    // A previous snapshot's daemon-reported cwd still carries, so the header
+    // does not blink to "No active project" when the last agent exits.
+    const previous = mapDesktopSnapshot(structuredClone(snapshot));
+    expect(previous.worktree).toBe(snapshot.agents[0].cwd);
+    expect(mapDesktopSnapshot(empty, previous)).toMatchObject({
+      worktree: snapshot.agents[0].cwd,
+    });
+
+    // And a snapshot carrying the removed key is not a way back in: it is not
+    // part of the DTO any more, so nothing reads it.
+    const withRemovedKey = { ...empty, projectCwd: "/Users/someone/dev/gui" } as typeof empty;
+    expect(mapDesktopSnapshot(withRemovedKey).worktree).toBe("No active project");
+  });
+
+  /**
+   * PRD #819 M6: the two project verbs go straight to the daemon through their
+   * own Tauri commands, with the path passed through verbatim. There is no
+   * client-side list behind them and no local fallback when the daemon does not
+   * answer — a fallback is exactly what would reinstate the
+   * silently-wrong-filesystem behaviour on the least tested path.
+   */
+  it("asks the daemon for its projects and resolves a path verbatim", async () => {
+    const { TauriDeckBridge } = await import("./bridge");
+    const bridge = new TauriDeckBridge();
+
+    invoke.mockResolvedValueOnce({ projects: [{ path: "/home/dev/code/deck", name: "deck" }], primary: "/home/dev/code/deck" });
+    const listed = await bridge.listProjects();
+    expect(invoke).toHaveBeenCalledWith("desktop_list_projects");
+    expect(listed.projects[0].path).toBe("/home/dev/code/deck");
+
+    invoke.mockResolvedValueOnce({ path: "/home/dev/code/deck", name: "deck", orchestrations: [], configRevision: "rev-1" });
+    const resolved = await bridge.resolveProject("/home/dev/current");
+    expect(invoke).toHaveBeenCalledWith("desktop_resolve_project", { path: "/home/dev/current" });
+    // The daemon's spelling replaces the one that was sent.
+    expect(resolved.path).toBe("/home/dev/code/deck");
+
+    invoke.mockRejectedValueOnce(new Error("unresolved: that path is not a project this daemon can offer"));
+    await expect(bridge.resolveProject("/nope")).rejects.toThrow("unresolved");
+    await bridge.dispose();
+  });
+
+  /**
+   * The fixture bridge owns no daemon, so it answers the way a daemon with
+   * nothing live does and refuses to resolve. Inventing a plausible project
+   * here would be the preview teaching the very lesson `desktop_project_cwd()`
+   * did: that a client may answer a question only the daemon can.
+   */
+  it("has the fixture bridge report no projects and resolve none", async () => {
+    const { createDeckBridge } = await import("./bridge");
+    const bridge = createDeckBridge("fixture");
+    expect(await bridge.listProjects()).toEqual({ projects: [] });
+    await expect(bridge.resolveProject("/anything")).rejects.toThrow("no daemon");
+    await bridge.dispose();
   });
 
   it("sends stop_daemon through the live bridge", async () => {
