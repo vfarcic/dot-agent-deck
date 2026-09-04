@@ -54,6 +54,12 @@ const MAX_LIFETIME_VAR: &str = "DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS";
 /// a value that can never be confused with a parsed cap.
 const UNSET_MARKER: &str = "<unset>";
 
+/// The per-spawn tag `agent_pty::spawn` and `wrap` export beside the cap, which
+/// is how a reaper finds a descendant that has left the process group it was
+/// armed on (issue #861). Named here rather than imported so this file states
+/// the wire name it depends on, like [`MAX_LIFETIME_VAR`] above.
+const LIFETIME_TAG_VAR: &str = "DOT_AGENT_DECK_TEST_LIFETIME_TAG";
+
 /// The largest cap a child may **inherit**, mirroring
 /// `child_lifetime_bound::CHILD_MAX_LIFETIME_SECS`. Keeping an ambient value
 /// down here is a deletion-safety measure rather than a preference: every cap
@@ -184,6 +190,84 @@ fn in_process_registry_spawn_arms_the_wrapped_child_lifetime_bound() {
          nominally entitled to write there — `clean-e2e-tmp`'s dead-owner floor \
          bounds the caps `tests/` WRITES, not one a shell exports \
          (issue #668)."
+    );
+}
+
+/// Scenario: Spawn a stand-in named `claude` — a `NativeHooks` agent, so
+/// `wrap_launch_command` leaves it bare — through a bare in-process
+/// `AgentPtyRegistry`, with the stand-in recording its own
+/// `DOT_AGENT_DECK_TEST_LIFETIME_TAG` to a file before it blocks. Assert it
+/// carries a non-empty tag, so the reaper armed for that pane has something to
+/// find its `setsid`'d descendants by.
+///
+/// Issue #861, and the agent this is named for is the point. The orphan measured
+/// there was a Claude Code Bash-tool shell, and Claude Code is **not** wrapped:
+/// only `IntegrationStrategy::Wrapper` agents are (Codex), so `wrap`'s reaper
+/// and `wrap`'s tag injection are both absent from that pane's spawn. The tag
+/// therefore has to come from `agent_pty::spawn`, which every launch path
+/// funnels through, and this is the test that says so — the test above covers
+/// the wrapped path and would stay green if the unwrapped one lost its tag
+/// entirely.
+///
+/// Deliberately an environment assertion rather than a timing one, for the same
+/// reason as the test above: it costs milliseconds, it cannot flake, and reading
+/// a child's environment is literally how #861 was diagnosed.
+#[test]
+fn an_unwrapped_agent_spawn_carries_a_lifetime_tag() {
+    common::init_test_env();
+
+    let fixture = common::harness_tempdir().expect("create lifetime-tag fixture");
+    let bin_dir = fixture.path().join("bin");
+    std::fs::create_dir_all(&bin_dir).expect("create synthetic Claude bin dir");
+    let record = fixture.path().join("tag.txt");
+    write_executable(
+        &bin_dir.join("claude"),
+        // `${VAR-<unset>}` (not `:-`) so an empty value reports as empty rather
+        // than silently reading as absent — an empty tag would build a needle
+        // that matches every process on the box, which is the one outcome worse
+        // than none.
+        &format!(
+            "#!/bin/sh\nprintf '%s\\n' \"${{{LIFETIME_TAG_VAR}-{UNSET_MARKER}}}\" > \"$TAG_RECORD\"\nexec cat\n"
+        ),
+    );
+
+    let cwd = fixture.path().to_string_lossy().into_owned();
+    let registry = Arc::new(AgentPtyRegistry::new());
+    let agent_id = registry
+        .spawn_agent(SpawnOptions {
+            command: Some("claude"),
+            cwd: Some(&cwd),
+            env: vec![
+                ("PATH".to_string(), path_with_built_deck(&bin_dir)),
+                ("TAG_RECORD".to_string(), record.display().to_string()),
+                (
+                    "DOT_AGENT_DECK_SOCKET".to_string(),
+                    UNREACHABLE_HOOK_SOCKET.to_string(),
+                ),
+            ],
+            ..SpawnOptions::default()
+        })
+        .expect("spawn unwrapped Claude stand-in through the in-process registry");
+
+    let recorded = common::wait_until(Duration::from_secs(20), || record.is_file())
+        .then(|| std::fs::read_to_string(&record).unwrap_or_default())
+        .map(|s| s.trim().to_string());
+
+    // Tear the registry down before asserting, so a failure cannot also leak the
+    // very orphan this file is about.
+    registry.shutdown_all();
+
+    let recorded = recorded.unwrap_or_else(|| {
+        panic!("the unwrapped Claude stand-in (agent {agent_id}) never recorded its environment")
+    });
+    assert!(
+        recorded != UNSET_MARKER && !recorded.is_empty(),
+        "an unwrapped agent spawned through the in-process registry carries \
+         {LIFETIME_TAG_VAR}={recorded:?}, so the reaper armed for its pane has \
+         no way to find a descendant that `setsid`s out of the pane's process \
+         group — which is exactly the orphan issue #861 measured, on exactly \
+         this agent. `wrap` cannot cover this: Claude Code is `NativeHooks` and \
+         is spawned bare."
     );
 }
 
@@ -362,5 +446,233 @@ fn a_term_resistant_wrapped_child_is_still_bounded_by_the_cap() {
          deleted (issues #657, #668). It does NOT hold its e2e temp root \
          against `clean-e2e-tmp`: that tool keys on the TEST process's pid in \
          the root's name, not on this child."
+    );
+}
+
+/// What the wrapped child does after launching its escapee: keep running, or
+/// exit at once and leave the escapee at `ppid = 1`.
+///
+/// Both are real and they take different paths through the reaper. `Persist`
+/// leaves the child's process group alive at the deadline, so the reaper reaches
+/// its `killpg` — and the escapee still has to be found some other way.
+/// `ExitAtOnce` is the shape the #861 orphan was actually in: the group is gone
+/// long before the deadline, which is precisely when a reaper that keys only on
+/// that group has nothing left to watch and stops watching.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy)]
+enum OuterFate {
+    Persist,
+    ExitAtOnce,
+}
+
+/// Drive a probe whose wrapped child `setsid`s a grandchild into its **own
+/// session**, then SIGKILL the wrapper and report whether that *escapee* was
+/// still alive at the end of `budget`.
+///
+/// The shape is the one measured on the orphan in issue #861, and it is not
+/// hypothetical: Claude Code's Bash tool detaches every shell it runs into a
+/// fresh session — measured live on this box, `pgid == sid == its own pid`
+/// against the `claude` process's own session — which `src/agent_pty.rs`
+/// already names at its close path as "the `setsid`'d sub-shells Claude Code
+/// creates internally". `setsid(1)` stands in for that here so the probe needs
+/// no real agent and no credential.
+///
+/// `cap` is passed to the wrapper's environment verbatim; `None` removes the
+/// variable, which is the control showing the cap is what does the work.
+///
+/// `None` is returned when the host cannot build the shape at all (no
+/// `setsid(1)` on `PATH`), so the caller reports a skip rather than asserting on
+/// a probe it never ran.
+#[cfg(target_os = "linux")]
+fn setsid_escapee_survives(cap: Option<&str>, fate: OuterFate, budget: Duration) -> Option<bool> {
+    if !Command::new("setsid")
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+    {
+        return None;
+    }
+
+    let fixture = common::harness_tempdir().expect("create setsid-escapee fixture");
+    let escapee_pid_path = fixture.path().join("escapee.pid");
+
+    // `setsid` is `exec`'d rather than forked here — the wrapped shell is a
+    // process-group leader but the `setsid` it runs is not, so `setsid(1)` has
+    // no leader conflict to fork around and replaces its own image. That makes
+    // the BACKGROUNDING load-bearing: run in the foreground the wrapped shell
+    // would simply `wait` on it and never reach the rest of the script.
+    // Descriptors go to `/dev/null` so the escapee holds no copy of the inner
+    // PTY slave, and therefore cannot suppress the very hangup this file's
+    // other probe relies on.
+    let escapee = "setsid /bin/sh -c 'trap \"\" TERM; trap \"\" HUP; \
+         printf \"%s\\n\" \"$$\" > \"$ESCAPEE_PID_FILE\"; \
+         while :; do sleep 1; done' </dev/null >/dev/null 2>&1 &";
+    let script = match fate {
+        // Ignored dispositions survive `exec`, and this shell reads nothing, so
+        // no hangup can reach it — only a signal can end it, which keeps the
+        // child's group alive right up to the deadline.
+        OuterFate::Persist => {
+            format!("{escapee} trap '' TERM; trap '' HUP; while :; do sleep 1; done")
+        }
+        OuterFate::ExitAtOnce => format!("{escapee} exit 0"),
+    };
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"));
+    command
+        .args(["wrap", "--agent", "codex", "--", "/bin/sh", "-c", &script])
+        .env("ESCAPEE_PID_FILE", &escapee_pid_path)
+        .env("DOT_AGENT_DECK_SOCKET", UNREACHABLE_HOOK_SOCKET)
+        .env_remove("DOT_AGENT_DECK_EXIT_WHEN_ORPHANED")
+        .env_remove("DOT_AGENT_DECK_PANE_ID")
+        .env_remove("DOT_AGENT_DECK_AGENT_ID")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    match cap {
+        Some(secs) => command.env(MAX_LIFETIME_VAR, secs),
+        None => command.env_remove(MAX_LIFETIME_VAR),
+    };
+
+    let read_pid = |path: &std::path::Path| -> Option<libc::pid_t> {
+        std::fs::read_to_string(path)
+            .ok()
+            .and_then(|contents| contents.trim().parse().ok())
+    };
+
+    let mut wrapper = command.spawn().expect("spawn setsid-escapee probe");
+    let recorded = common::wait_until(Duration::from_secs(10), || {
+        read_pid(&escapee_pid_path).is_some()
+    });
+    if !recorded {
+        let _ = wrapper.kill();
+        let _ = wrapper.wait();
+        panic!("the probe never recorded its escapee's pid");
+    }
+    let escapee_pid = read_pid(&escapee_pid_path).expect("escapee pid recorded");
+
+    // A precondition on the SHAPE, so a probe that quietly failed to escape
+    // cannot make the assertion below pass for the wrong reason: an escapee
+    // still inside the wrapped child's process group is reached by the
+    // pre-existing `killpg` and proves nothing about #861.
+    assert_eq!(
+        session_id_of(escapee_pid),
+        Some(escapee_pid),
+        "the escapee must lead a session of its own, or it never left the \
+         wrapped child's process group and this probe is not the #861 shape"
+    );
+
+    // SIGKILL, not SIGTERM: the wrapper gets no chance to reap, so the only
+    // thing that can still end the escapee is a bound that outlives it. Safe on
+    // an `ExitAtOnce` run too — an unreaped child of this process is a zombie,
+    // which `kill` still accepts.
+    let wrapper_pid = wrapper.id() as libc::pid_t;
+    // SAFETY: the wrapper pid came from this test's live `Child`; ending it
+    // uncleanly is the behavior under test.
+    assert_eq!(
+        unsafe { libc::kill(wrapper_pid, libc::SIGKILL) },
+        0,
+        "deliver SIGKILL to wrapper pid {wrapper_pid}"
+    );
+    let _ = wrapper.wait();
+
+    let gone = common::wait_until(budget, || !common::process_running(escapee_pid));
+
+    // Never leak this test's own probe, whatever the outcome above — otherwise a
+    // regression in the code under test would itself mint the orphan #861 is
+    // about.
+    if common::process_running(escapee_pid) {
+        // SAFETY: best-effort cleanup of a pid this test created. Same
+        // check-then-act residual as every other site here: between
+        // `process_running` and the signal the pid could be reaped and
+        // reissued, so this is bounded same-UID exposure, not an impossibility.
+        unsafe {
+            libc::kill(-escapee_pid, libc::SIGKILL);
+            libc::kill(escapee_pid, libc::SIGKILL);
+        }
+    }
+    Some(!gone)
+}
+
+/// `getsid(2)` for another pid, or `None` when the pid is already gone.
+#[cfg(target_os = "linux")]
+fn session_id_of(pid: libc::pid_t) -> Option<libc::pid_t> {
+    // SAFETY: `getsid` takes a pid and returns a pid or -1; it reads no memory
+    // of ours.
+    let sid = unsafe { libc::getsid(pid) };
+    (sid > 0).then_some(sid)
+}
+
+/// Scenario: Run a wrapped child that `setsid`s a grandchild into its own
+/// session — the shape Claude Code's Bash tool really has — then SIGKILL the
+/// wrapper so no reap loop runs. With no lifetime cap in the environment the
+/// escapee must still be alive after the budget; with a one-second cap it must
+/// be gone inside it, whether the wrapped child kept running or exited the
+/// moment it had launched the escapee.
+///
+/// Issue #861. The child-group reaper #661 forks holds
+/// `killpg(child_pid, …)`, and a `killpg` cannot reach a process that has left
+/// the group — so before this test the escapee outlived its cap without limit.
+/// Measured in the wild: pid 2043710 carrying
+/// `DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS=300` in its own environment,
+/// `PPID 1`, alive **4 days 01:23** — about 1170x its cap — with its owning
+/// test process dead and its temp root already deleted from under it.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_setsid_escapee_is_still_bounded_by_the_cap() {
+    // Control: nothing armed, so nothing can end it. 5 s for the same reason
+    // the group-resident control uses it — it has to exceed the armed halves'
+    // own deadline below (1 s cap + one 250 ms poll + the 1.5 s
+    // `WRAP_TERMINATE_GRACE` ≈ 2.75 s), or an escapee that merely happened to
+    // die on schedule would look like one nothing could end.
+    let Some(survived) =
+        setsid_escapee_survives(None, OuterFate::ExitAtOnce, Duration::from_secs(5))
+    else {
+        eprintln!(
+            "SKIP: the #861 escapee probe needs `setsid(1)` on PATH to put a \
+             grandchild in its own session"
+        );
+        return;
+    };
+    assert!(
+        survived,
+        "precondition failed: a TERM/HUP-ignoring `setsid` escapee that reads \
+         nothing died with no lifetime cap armed, so the assertions below would \
+         pass for a reason other than the cap"
+    );
+    // Armed: 1 s cap + one 250 ms backstop poll + WRAP_TERMINATE_GRACE (1.5 s).
+    // 30 s is loose headroom for a loaded host, not an expected duration.
+    //
+    // Both fates are run before anything is asserted, deliberately: they fail
+    // for *different* reasons — `ExitAtOnce` needs the reaper to stop treating
+    // group death as "nothing left to bound", and `Persist` needs the sweep at
+    // the deadline itself — so a loop that panicked on the first one would leave
+    // the second's assertion never observed failing, which is no evidence at
+    // all.
+    let outcomes = [
+        ("wrapped child exited at once", OuterFate::ExitAtOnce),
+        ("wrapped child kept running", OuterFate::Persist),
+    ]
+    .map(|(label, fate)| {
+        (
+            label,
+            setsid_escapee_survives(Some("1"), fate, Duration::from_secs(30)),
+        )
+    });
+    let stranded: Vec<&str> = outcomes
+        .iter()
+        .filter(|(_, outcome)| *outcome != Some(false))
+        .map(|(label, _)| *label)
+        .collect();
+    assert!(
+        stranded.is_empty(),
+        "a SIGKILL'd wrapper stranded a descendant that had `setsid`'d out of \
+         the wrapped child's process group, with the lifetime cap armed, in \
+         these cases: {stranded:?}. `killpg` cannot reach it and every ancestor \
+         that could have is dead, so nothing enforces the cap it still carries \
+         in its own environment — the orphan that ran for four days in issue \
+         #861."
     );
 }

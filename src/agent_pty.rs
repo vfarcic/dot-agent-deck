@@ -1105,6 +1105,34 @@ pub fn spawn(opts: SpawnOptions<'_>) -> Result<AgentPty, AgentPtyError> {
         cmd.env(k, v);
     }
 
+    // Issue #861: mint this pane's lifetime tag and export it, so a descendant
+    // that later `setsid`s out of the pane's process group can still be found
+    // and bounded by the cap it inherits. Applied AFTER `opts.env` so a caller
+    // cannot accidentally shadow it, and `None` in production —
+    // `for_child` returns nothing unless
+    // `DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS` names a cap, which the harness
+    // sets and nothing else does.
+    //
+    // This seam rather than `wrap`'s, because `wrap` covers only
+    // Wrapper-strategy agents: Codex is wrapped, Claude Code is `NativeHooks`
+    // and is spawned bare, and the orphan in #861 was a Claude Code Bash-tool
+    // shell. Every launch path that reaches a real child funnels through here
+    // (see the `wrap_launch_command` note above), so one call covers wrapped and
+    // unwrapped agents, the daemon's panes, the TUI's, and a test's in-process
+    // registry alike.
+    //
+    // Deliberately NOT routed through `opts.env`, which is what `spawn_env`
+    // captures and `respawn_agent_for_pane` replays: a persisted tag would come
+    // back on a respawn naming a reaper that died with the previous generation.
+    // Applied straight to `cmd` instead, so every generation mints its own.
+    let lifetime_tag = crate::lifetime_tag::LifetimeTag::for_child();
+    if let Some(tag) = &lifetime_tag {
+        cmd.env(
+            crate::lifetime_tag::DOT_AGENT_DECK_TEST_LIFETIME_TAG,
+            tag.value(),
+        );
+    }
+
     let child = pair
         .slave
         .spawn_command(cmd)
@@ -1118,7 +1146,8 @@ pub fn spawn(opts: SpawnOptions<'_>) -> Result<AgentPty, AgentPtyError> {
     // job joined later would not contain the descendants the child had already
     // spawned. Infallible by contract — a Windows job quirk degrades teardown to a
     // single-process kill (logged) instead of failing an otherwise-healthy spawn.
-    let process_group = crate::platform::proc::AgentProcessGroup::adopt(child.process_id());
+    let child_pid = child.process_id();
+    let process_group = crate::platform::proc::AgentProcessGroup::adopt(child_pid);
 
     // Wrap the freshly-spawned child in an RAII guard *before* any fallible
     // step below: a failure in `take_writer` / `try_clone_reader` (or a
@@ -1128,6 +1157,26 @@ pub fn spawn(opts: SpawnOptions<'_>) -> Result<AgentPty, AgentPtyError> {
 
     // Drop the slave — we interact through the master side only.
     drop(pair.slave);
+
+    // Issue #861: a reaper that outlives this process, holding the same deadline
+    // for this pane's group and for anything that carried the tag out of it. A
+    // no-op when no tag was minted — production, and any platform without
+    // `fork`.
+    //
+    // Placed here for the same reason `wrap` places its own call after the same
+    // drop: the fork's short-lived intermediate inherits this process's whole fd
+    // table, and a copy of the PTY slave in it — however briefly — is a
+    // reference on a terminal whose hangup is what ends the child on its own.
+    // Still ahead of the fallible `take_writer` / `try_clone_reader` steps below,
+    // so a spawn that fails halfway leaves the child bounded rather than loose.
+    //
+    // `ChildGuard` covers that same halfway failure by killing the child
+    // outright, and this is deliberately not a substitute for it: the guard runs
+    // only while THIS process lives, which is the assumption #861 is about.
+    #[cfg(unix)]
+    if let Some(pid) = child_pid {
+        crate::wrap::arm_child_group_backstop(pid as libc::pid_t, lifetime_tag);
+    }
 
     let writer = pair
         .master
