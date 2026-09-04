@@ -161,6 +161,22 @@ It is also a resource decision with a misleading failure mode. Each verifying un
 
 A smaller batch is also what makes step 4's risk note worth writing properly. Three tailored tasks beat eight generic ones.
 
+## Step 2b — Establish the shape, by asking
+
+A unit starts either as **one agent** or as a **multi-role orchestration**. Which one the runner wants is theirs to choose — **ask, never infer.**
+
+```bash
+dot-agent-deck dispatch --list-targets
+```
+
+Run that **once** — it is a read-only daemon round-trip and its answer describes the repo, not the PR — then show the runner the output and **ask the shape once per PR**, as a single prompt carrying one line per PR: the number, and what step 2 already said that unit would most likely do — verify, address feedback, or both. That is the scope the answer follows from. **Pass the matching flag explicitly on every dispatch** (`--single` or `--orchestration '<name>'`). With neither, the shape falls back to whatever the repo's config implies, which is the guess this step exists to avoid.
+
+**`--single` is usually the right answer here, and that is exactly what made hardcoding it invisible.** [`docs/dispatcher-mode.md`](../../../docs/dispatcher-mode.md) uses this skill's own workload as its example of the single-agent case — *"verify these three PRs" → usually one agent each* — and `/verify-pr` is written as one agent walking its phases in order. But "usually right" is not "the runner's call", and the two come apart on the case step 4 calls the common one: a PR that has never been verified *and* carries a pile of unresolved threads is two jobs, and #480 — this skill's own PR — was exactly that. This skill's dispatch template read `--single` unconditionally until issue #674, which is a default that is right most of the time and a guess the rest of it, stored where nobody would think to reconsider it.
+
+**One answer can still cover the whole batch — as the runner's answer, not as your assumption.** When they say "single for all of them", take it and stop asking. Asking per PR costs one extra line in one prompt; not asking costs a unit started in a shape nobody chose.
+
+**Both the query and the dispatch need a deck pane.** `dot-agent-deck dispatch` reads `DOT_AGENT_DECK_PANE_ID` and exits `FAILURE` without it, and that check runs **before** the `--list-targets` branch (`src/main.rs`, the `Commands::Dispatch` arm), so outside a managed pane both fail with `Error: DOT_AGENT_DECK_PANE_ID environment variable not set.` If you see that, nothing can be dispatched from here — report the queue and say so, rather than falling back to doing the reviews yourself. If instead the error is `the daemon did not answer list-targets`, there is no daemon or the build is older: **take that to the runner rather than picking a shape**, since a failed query is not a reason to start guessing.
+
 ## Step 3 — Re-check state immediately before each dispatch
 
 Re-query each PR **right before dispatching that PR**, not once up front for the whole batch. PRs move while a queue is being worked: in the session this skill came from, one PR had been closed at listing time and was reopened later, and two others were merged between listing and review. #390's six unresolved threads cleared in the space of an afternoon.
@@ -254,8 +270,10 @@ Live claim → **skip, and name the unit** so the user can go to its tab. No cla
 One dispatch per PR, and **the task goes in a file — never inline**:
 
 ```bash
-dot-agent-deck dispatch <name> --single --task-file '.dot-agent-deck/<task-slug>.md'
+dot-agent-deck dispatch <name> (--single | --orchestration '<orchestration>') --task-file '.dot-agent-deck/<task-slug>.md'
 ```
+
+**The shape flag is whatever the runner chose for _this_ PR in step 2b — never a default carried in this template.** It read `--single` unconditionally until issue #674, in a skill that had no shape step to be overridden by: a template is the one place an answer belonging to the runner cannot be stored, because it is followed rather than reconsidered.
 
 **`--task-file` is the default here, not an escape hatch, and this is a safety rule rather than an ergonomic one.** The product's own delegation protocol says exactly that, compiled into the binary and handed to every orchestrator it spawns (`src/orchestrator_context.rs:81-117`): `--task "…"` is a fallback that is safe *only* when the whole task is **a single line of plain text with no backticks, no `$`, no `"`, no `\` and no `!`**. The template below is a multi-paragraph block, so it fails that allowlist on shape alone — before anyone looks at what it contains.
 
