@@ -65,7 +65,7 @@ The ordering is the claim worth pinning, and `create_worktree_warms_the_environm
 
 For the first three the roles then race exactly as they did before the warm-up existed, which is the status quo rather than a new failure mode. Failing closed here would turn a devbox problem into a dispatch problem for the users who have no devbox at all — devbox is optional for this project.
 
-Three details are load-bearing:
+Four details are load-bearing:
 
 - **The timeout path is the one case that is honestly worse than doing nothing.** If the bound expires, the roles start while devbox is still materializing — the original race, now with the warm-up itself as one more contender in it. Raised by Greptile on PR #881 and accepted rather than argued away. It is bounded, not removed, because both alternatives are worse: waiting forever wedges the dispatch, and killing the child abandons a half-written `.devbox`, which *is* the `compact json for hashing` failure. What the design does instead is make expiry mean *stuck* rather than *slow*.
 - **The bound is ten minutes, and it is a deadlock guard rather than a latency budget.** Waiting is very nearly free in the case that matters: while devbox materializes, every role launching through `devbox run` would be blocked on the same work anyway, so the wait is moved rather than added — and moved somewhere serial, which is the point. Expiring early is not free, per the bullet above. The measured 5.2s is for an already-populated nix store; a first-ever closure fetch is a download nothing here has measured, so ten minutes is not derived from a number — it is simply far enough out that reaching it means something is stuck.
