@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import {
   Activity,
   AlertTriangle,
@@ -76,6 +76,14 @@ const WORKFLOW_STORAGE_KEY = modeScopedKey("dot-agent-deck.desktop.workflow-prev
  *   will not publish a coordinator context on its platform, because the
  *   owner-only guarantee the publish documents is Unix-only. No amount of
  *   retrying helps, so this one says so instead of inviting one.
+ *
+ * `preparation-mismatch` (`PROJECT_ERR_PREPARATION_MISMATCH`, PRD #819 Greptile
+ * P1(a)) is deliberately NOT in that list and falls through to the generic
+ * notice carrying the daemon's own sentence. It means this app submitted a
+ * project, workflow or role other than the one the daemon prepared, which is a
+ * defect in this client rather than a state the user can be walked out of —
+ * re-preparing and sending the same thing again earns the same refusal, so
+ * offering that as a remedy would be a lie. Nothing was started either way.
  */
 const PROJECT_UNRESOLVED_CODE = "unresolved: ";
 const PROJECT_STALE_REVISION_CODE = "stale-revision: ";
@@ -139,11 +147,35 @@ export function ControlDeck({ runtime, workflowPlatformIssue = desktopWorkflowPl
    * The listing is re-fetched when the connection changes and when the agent
    * set moves, because enumeration is derived from LIVE state: a project stops
    * being known the moment its last agent exits.
+   *
+   * PRD #819 Greptile P2(c): the key used to be `status:agentCount`, and a count
+   * does not determine the answer. The daemon derives its project list from its
+   * startup cwd, every live agent's `cwd`, every orchestration role's
+   * `orchestration_cwd` and every registered schedule's working directory — so
+   * replacing an agent with one in another project keeps the count identical and
+   * changes the list. The key below carries the seeds this client can actually
+   * observe, deduplicated and sorted so it is a set rather than an ordering, and
+   * keeps the agent count as well: the key is then a strict superset of the old
+   * one, and cannot re-list less often than it did.
+   *
+   * Two seeds are deliberately absent, and neither is observable from here: the
+   * daemon's own startup cwd, which is fixed for that daemon's life and so is
+   * covered by the connection status; and registered schedule directories, which
+   * reach no desktop surface at all. A schedule registered while the app is open
+   * is therefore picked up by the picker's own refresh rather than automatically
+   * — which is why that button exists.
    */
+  const projectsRevision = useMemo(() => {
+    const seeds = snapshot.agents.flatMap((agent) => [agent.cwd, agent.tab.kind === "orchestration" ? agent.tab.cwd : undefined]);
+    const distinct = [...new Set(seeds.filter((cwd): cwd is string => Boolean(cwd)))].sort();
+    // NUL as the separator: `is_valid_cwd` refuses it, so no directory can spell
+    // one and no two different seed sets can collapse onto the same key.
+    return [snapshot.connection.status, String(snapshot.agents.length), ...distinct].join("\u0000");
+  }, [snapshot.agents, snapshot.connection.status]);
   const projectState = useDaemonProjects({
     listProjects: runtime.listProjects,
     resolveProject: runtime.resolveProject,
-    revision: `${snapshot.connection.status}:${snapshot.agents.length}`,
+    revision: projectsRevision,
     enabled: mode === "live" && snapshot.connection.status === "connected",
   });
   const activeProject = projectState.selected;

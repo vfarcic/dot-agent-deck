@@ -58,7 +58,8 @@ use std::path::{Path, PathBuf};
 use dot_agent_deck::orchestrator_context::{CONTEXT_DIR_NAME, CONTEXT_FILE_NAME};
 use dot_agent_deck::prep_token::PrepBinding;
 use dot_agent_deck::project_resolve::{
-    PreparationStale, prepare_workflow_for_wire, revalidate_preparation,
+    PreparationMismatch, PreparationStale, PreparedStartMembership, PreparedStartRefusal,
+    PreparedStartRequest, prepare_workflow_for_wire, revalidate_preparation, verify_prepared_start,
 };
 
 // Issue #322 / linkage-check rule 8: the self-contained scratch-dir resolver,
@@ -434,4 +435,285 @@ fn the_binding_records_the_state_the_preparation_approved() {
         dot_agent_deck::project_resolve::context_digest(&on_disk),
         binding.context_digest
     );
+}
+
+// ---------------------------------------------------------------------------
+// PRD #819, Greptile P1(a): matching the REQUEST against the binding
+// ---------------------------------------------------------------------------
+//
+// Everything above proves that the binding still describes what it approved.
+// **Nothing above compares it to what is being asked for**, and for one round
+// nothing anywhere did: `revalidate_preparation` checked the record against the
+// filesystem and the spawn then used the SUBMITTED `cwd`, `command`, `env` and
+// `tab_membership`. So a caller could present a token prepared for project X
+// while submitting spawn fields for project Y, and the daemon validated X and
+// started Y.
+//
+// The shape of that miss is worth keeping: the audit fix made the code *look*
+// validated, which is exactly what made the second half easy to overlook. These
+// cases drive `verify_prepared_start` — the function the daemon's
+// `start-prepared-agent` arm actually calls — and each names the specific
+// `PreparationMismatch` so a passing assertion shows *which* comparison fired
+// rather than only that something refused.
+
+/// The request a launch of `LAUNCHABLE_PROJECT`'s start role legitimately makes.
+fn matching_request(project: &Path) -> PreparedStartRequest {
+    let cwd = project.to_str().expect("utf-8 project path").to_string();
+    PreparedStartRequest {
+        cwd: Some(cwd.clone()),
+        membership: Some(PreparedStartMembership {
+            orchestration: "loop".into(),
+            orchestration_cwd: Some(cwd),
+            role: "planner".into(),
+            is_start_role: true,
+        }),
+    }
+}
+
+fn expect_mismatch(
+    binding: &PrepBinding,
+    request: &PreparedStartRequest,
+    expected: PreparationMismatch,
+) {
+    match verify_prepared_start(binding, request) {
+        Ok(()) => panic!("expected {expected:?}, but the prepared start was accepted"),
+        Err(PreparedStartRefusal::Stale(stale)) => panic!(
+            "expected the mismatch {expected:?}, got the staleness refusal {stale:?} ({}) — \
+             the request comparison must run before, and separately from, the filesystem checks",
+            stale.detail()
+        ),
+        Err(PreparedStartRefusal::Mismatch(actual)) => assert_eq!(
+            actual,
+            expected,
+            "expected {expected:?}, got {actual:?} ({})",
+            actual.detail()
+        ),
+    }
+}
+
+/// **The finding itself.** A token prepared for project X, presented with spawn
+/// fields naming project Y, is refused — and the refusal says the request does
+/// not match the preparation rather than that the preparation went stale, which
+/// are different facts with different remedies.
+///
+/// Both projects are real and both preparations are live, so neither token has
+/// aged out and neither artifact has been replaced: every staleness check passes
+/// and the ONLY thing wrong is that this request is not the one this token
+/// approved. Against the code before this fix the refusal does not happen at all
+/// — `revalidate_preparation` returns `Ok` for X's binding and the daemon spawns
+/// in Y.
+#[test]
+fn a_token_prepared_for_one_project_cannot_start_another() {
+    let (_guard_x, project_x) = project();
+    let (_guard_y, project_y) = project();
+    let (_token_x, binding_x) = prepare(&project_x, "Project X's brief.");
+    let (_token_y, binding_y) = prepare(&project_y, "Project Y's brief.");
+
+    // Both preparations are intact, which is what makes this a mismatch rather
+    // than a staleness case.
+    revalidate_preparation(&binding_x).expect("X's preparation is untouched");
+    revalidate_preparation(&binding_y).expect("Y's preparation is untouched");
+
+    expect_mismatch(
+        &binding_x,
+        &matching_request(&project_y),
+        PreparationMismatch::ProjectDiffers,
+    );
+
+    // The positive control, so "refuses" is not trivially true: X's own request
+    // still starts, and so does Y's under Y's token.
+    verify_prepared_start(&binding_x, &matching_request(&project_x))
+        .expect("the request the preparation approved must still be accepted");
+    verify_prepared_start(&binding_y, &matching_request(&project_y))
+        .expect("the request the preparation approved must still be accepted");
+}
+
+/// A request that sends no working directory at all is not a neutral one: it
+/// asks the daemon to spawn in its own cwd, which is not the prepared project.
+#[test]
+fn a_prepared_start_without_a_working_directory_is_refused() {
+    let (_guard, project) = project();
+    let (_token, binding) = prepare(&project, "A brief.");
+
+    let mut request = matching_request(&project);
+    request.cwd = None;
+    expect_mismatch(&binding, &request, PreparationMismatch::ProjectDiffers);
+}
+
+/// A preparation approves an **orchestration launch**, so a start that presents
+/// its token and declares no orchestration membership is not that launch.
+#[test]
+fn a_prepared_start_with_no_orchestration_membership_is_refused() {
+    let (_guard, project) = project();
+    let (_token, binding) = prepare(&project, "A brief.");
+
+    let mut request = matching_request(&project);
+    request.membership = None;
+    expect_mismatch(&binding, &request, PreparationMismatch::NoOrchestration);
+}
+
+/// Same project, different workflow. The path check alone would let this
+/// through, which is why the orchestration is bound separately from it.
+#[test]
+fn a_prepared_start_naming_another_orchestration_is_refused() {
+    let (_guard, project) = project();
+    let (_token, binding) = prepare(&project, "A brief.");
+
+    let mut request = matching_request(&project);
+    if let Some(membership) = request.membership.as_mut() {
+        membership.orchestration = "some-other-loop".into();
+    }
+    expect_mismatch(
+        &binding,
+        &request,
+        PreparationMismatch::OrchestrationDiffers,
+    );
+}
+
+/// The membership carries a **second** copy of the project identity —
+/// `orchestration_cwd`, which is what keys `pane_orchestration_map` — so it is
+/// checked against the same prepared directory the `cwd` is.
+#[test]
+fn a_prepared_start_whose_orchestration_cwd_disagrees_is_refused() {
+    let (_guard_other, other) = project();
+    let (_guard, project) = project();
+    let (_token, binding) = prepare(&project, "A brief.");
+
+    let mut request = matching_request(&project);
+    if let Some(membership) = request.membership.as_mut() {
+        membership.orchestration_cwd = Some(other.to_str().expect("utf-8").to_string());
+    }
+    expect_mismatch(
+        &binding,
+        &request,
+        PreparationMismatch::OrchestrationCwdDiffers,
+    );
+
+    // Absent is not the same as wrong: a membership that declares no
+    // orchestration cwd claims nothing, and older clients omit the field.
+    let mut request = matching_request(&project);
+    if let Some(membership) = request.membership.as_mut() {
+        membership.orchestration_cwd = None;
+    }
+    verify_prepared_start(&binding, &request)
+        .expect("an absent orchestration cwd asserts nothing and must not refuse");
+}
+
+/// The role has to be one the approved orchestration declares, and the role list
+/// comes from the config read the staleness checks just passed rather than from
+/// a second read of whatever is on disk now.
+#[test]
+fn a_prepared_start_naming_an_undeclared_role_is_refused() {
+    let (_guard, project) = project();
+    let (_token, binding) = prepare(&project, "A brief.");
+
+    let mut request = matching_request(&project);
+    if let Some(membership) = request.membership.as_mut() {
+        membership.role = "a-role-this-orchestration-does-not-have".into();
+    }
+    expect_mismatch(&binding, &request, PreparationMismatch::RoleNotDeclared);
+
+    // `builder` IS declared, so the refusal above is about the name rather than
+    // about the check refusing every non-start role.
+    let mut request = matching_request(&project);
+    if let Some(membership) = request.membership.as_mut() {
+        membership.role = "builder".into();
+        membership.is_start_role = false;
+    }
+    verify_prepared_start(&binding, &request)
+        .expect("every declared role of the approved orchestration must still start");
+}
+
+/// The start marker is the orchestration's to declare, and it is what puts a
+/// pane in `orchestrator_pane_ids` — so a request that marks the wrong role as
+/// the start role would make delegations come from somewhere the config never
+/// said.
+#[test]
+fn a_prepared_start_with_the_wrong_start_marker_is_refused() {
+    let (_guard, project) = project();
+    let (_token, binding) = prepare(&project, "A brief.");
+
+    // `planner` is the start role; claiming it is not.
+    let mut request = matching_request(&project);
+    if let Some(membership) = request.membership.as_mut() {
+        membership.is_start_role = false;
+    }
+    expect_mismatch(&binding, &request, PreparationMismatch::StartMarkerDiffers);
+
+    // `builder` is not the start role; claiming it is.
+    let mut request = matching_request(&project);
+    if let Some(membership) = request.membership.as_mut() {
+        membership.role = "builder".into();
+        membership.is_start_role = true;
+    }
+    expect_mismatch(&binding, &request, PreparationMismatch::StartMarkerDiffers);
+}
+
+/// **What is deliberately NOT bound, and this test is the reason to keep it that
+/// way.** Per-launch command override is an existing, documented feature —
+/// `docs/develop/desktop-gui.md`: "The submitted command overrides the matching
+/// project role for that launch only" — and it is how the desktop's agent
+/// profiles reach a launch at all.
+///
+/// The request type therefore carries no command at all, which is what makes
+/// "the command is not bound" a property of the seam rather than of an omitted
+/// comparison someone could add back. This asserts the shape of the type, which
+/// is the only place the property can be observed: a struct with no such field
+/// cannot be compared against one.
+#[test]
+fn the_submitted_command_is_not_part_of_what_a_prepared_start_binds() {
+    let (_guard, project) = project();
+    let (_token, binding) = prepare(&project, "A brief.");
+
+    // The config's `planner` command is `cat`; a launch that overrides it — as
+    // every desktop profile launch does — presents the same identity and is
+    // accepted, because identity is what is bound and content is not.
+    verify_prepared_start(&binding, &matching_request(&project))
+        .expect("a launch that overrides the role command must still start");
+
+    // And the whole request is the two identity halves, so there is nowhere for
+    // a command to be compared even if someone wanted to.
+    let request = matching_request(&project);
+    assert_eq!(
+        request,
+        PreparedStartRequest {
+            cwd: request.cwd.clone(),
+            membership: request.membership.clone(),
+        },
+        "PreparedStartRequest is the submitted IDENTITY and nothing else"
+    );
+}
+
+/// Ordering: the identity comparisons run first, so a request that does not
+/// match its own token is refused with the code that is true of it even when the
+/// preparation has ALSO gone stale.
+///
+/// This matters for diagnosis rather than for safety — both answers refuse — but
+/// "your artifact was replaced" and "you are not asking for what you prepared"
+/// send an operator in different directions, which is the same reasoning that
+/// separates `stale-token` from `stale-preparation`.
+#[test]
+fn a_mismatched_request_is_named_as_one_even_when_the_preparation_is_also_stale() {
+    let (_guard_other, other) = project();
+    let (_guard, project) = project();
+    let (_token, binding) = prepare(&project, "The first brief.");
+    // A second preparation replaces the context at its fixed path, so the first
+    // binding is now stale as well.
+    let (_token2, _binding2) = prepare(&project, "The second brief.");
+    expect_stale(&binding, PreparationStale::ContextReplaced);
+
+    expect_mismatch(
+        &binding,
+        &matching_request(&other),
+        PreparationMismatch::ProjectDiffers,
+    );
+
+    // And a MATCHING request against that same stale binding still reports the
+    // staleness, so the ordering above is not swallowing it.
+    match verify_prepared_start(&binding, &matching_request(&project)) {
+        Err(PreparedStartRefusal::Stale(PreparationStale::ContextReplaced)) => {}
+        other => panic!(
+            "a matching request against a stale binding must report the staleness, got {other:?}"
+        ),
+    }
 }

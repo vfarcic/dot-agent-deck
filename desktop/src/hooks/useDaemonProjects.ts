@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import type { DaemonProject, DaemonResolvedProject } from "../types";
 
 /**
@@ -95,11 +95,33 @@ export function useDaemonProjects({ listProjects, resolveProject, revision, enab
   const [resolving, setResolving] = useState(false);
   const [resolveError, setResolveError] = useState<string>();
   const [vanished, setVanished] = useState(false);
+  /*
+   * PRD #819 Greptile P2(d): NOTHING ORDERS TWO IN-FLIGHT RPCs. Both of these
+   * are `async` and neither had a guard, so an older reply landing after a newer
+   * one overwrote the newer one — a listing could go back to offering a project
+   * that has since disappeared, and a selection could snap back to the project
+   * the user clicked before the one they are looking at.
+   *
+   * A monotonic generation per operation, captured before the await and re-read
+   * after it: a reply that is no longer the newest is dropped, including its
+   * error and its loading state. Refs rather than state, deliberately — the
+   * counter must be readable by a closure that is already running, and a state
+   * update would give that closure the value it captured on render.
+   *
+   * This interacts with P2(c): a refresh key that tracks the daemon's actual
+   * seeds re-lists more often than `status:agentCount` did, so fixing that one
+   * and not this one would have made the race MORE likely rather than less.
+   */
+  const listingGeneration = useRef(0);
+  const selectionGeneration = useRef(0);
 
   const refresh = useCallback(async () => {
+    const generation = ++listingGeneration.current;
     if (!enabled) {
       // Not an error state: there is no daemon to ask, so there are no projects
-      // to offer, and nothing local may stand in for the answer.
+      // to offer, and nothing local may stand in for the answer. The generation
+      // was still bumped, so an in-flight listing from before the disconnect
+      // cannot land on top of this.
       setProjects([]);
       setPrimary(undefined);
       setListing("idle");
@@ -109,11 +131,13 @@ export function useDaemonProjects({ listProjects, resolveProject, revision, enab
     setListing((current) => (current === "idle" ? "loading" : current));
     try {
       const listed = await listProjects();
+      if (listingGeneration.current !== generation) return;
       setProjects(listed.projects);
       setPrimary(listed.primary);
       setListingError(undefined);
       setListing(listed.projects.length ? "ready" : "empty");
     } catch (cause) {
+      if (listingGeneration.current !== generation) return;
       setProjects([]);
       setPrimary(undefined);
       setListingError(cause instanceof Error ? cause.message : String(cause));
@@ -134,14 +158,23 @@ export function useDaemonProjects({ listProjects, resolveProject, revision, enab
    * launch sends is the daemon's own and not the one that was clicked.
    */
   const select = useCallback(async (path: string) => {
+    const generation = ++selectionGeneration.current;
     setResolving(true);
     setResolveError(undefined);
     try {
       const resolved = await resolveProject(path);
+      // Superseded: a later `select` is the one whose answer the user is waiting
+      // for. Returning `false` is honest — this call did not become the
+      // selection. The one caller that reads the boolean is `submitPasted`,
+      // which clears the pasted-path field on a `true`; leaving that field
+      // populated for a click the user has already moved on from is the right
+      // outcome, since the path it holds is not what is selected.
+      if (selectionGeneration.current !== generation) return false;
       setSelected(resolved);
       setVanished(false);
       return true;
     } catch (cause) {
+      if (selectionGeneration.current !== generation) return false;
       const message = cause instanceof Error ? cause.message : String(cause);
       setSelected(undefined);
       // "Was listed and now will not resolve" is the leaves-the-set case, not a
@@ -156,7 +189,9 @@ export function useDaemonProjects({ listProjects, resolveProject, revision, enab
       if (wasListed) void refresh();
       return false;
     } finally {
-      setResolving(false);
+      // Only the newest attempt owns the spinner: an older one clearing it would
+      // report the newest as finished while it is still in flight.
+      if (selectionGeneration.current === generation) setResolving(false);
     }
   }, [projects, refresh, resolveProject]);
 

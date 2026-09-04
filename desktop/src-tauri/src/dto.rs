@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::path::Path;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -523,11 +524,23 @@ pub(crate) fn map_resolved_project(project: ResolvedProject) -> DesktopResolvedP
     // It is split off the VERBATIM path and scrubbed afterwards, not off the
     // scrubbed one: truncating first can cut the basename off entirely, so the
     // order of those two steps is the difference between a shortened label and
-    // the wrong label.
-    let basename = project
-        .path
-        .rsplit('/')
-        .find(|segment| !segment.is_empty())
+    // the wrong label. The path itself is untouched by any of this — it is the
+    // protocol identity and goes back to the daemon byte for byte.
+    //
+    // PRD #819 Greptile P2(e): PLATFORM-AWARE, and it used to split on `/`
+    // alone. Project resolution is not refused on Windows — only
+    // `PrepareWorkflow` is, with `unsupported-platform`, because only its
+    // publish carries an owner-only guarantee it cannot deliver there. So a
+    // Windows client lists and resolves, and a canonical Windows path
+    // (`\\?\C:\Users\dev\project`) contains no `/` at all: the whole path
+    // fell through to the `unwrap_or` and the picker labelled the project with
+    // it. `Path::file_name` is the platform's own answer — under the Windows
+    // target it separates on `\` as well as `/` and understands the `\\?\`
+    // verbatim prefix, while on Unix it keeps a backslash as an ordinary
+    // filename byte, which is exactly what a Unix filename containing one means.
+    let basename = Path::new(project.path.as_str())
+        .file_name()
+        .and_then(|name| name.to_str())
         .unwrap_or(project.path.as_str());
     DesktopResolvedProject {
         display_path: display_only(&project.path),
@@ -1334,6 +1347,82 @@ mod tests {
             mapped.display_name, "api",
             "the basename is split off the VERBATIM path and scrubbed afterwards"
         );
+    }
+
+    /// Scenario: the daemon resolves a project on **Windows**, where a canonical
+    /// path is `\\?\C:\Users\dev\project` and contains no `/` at all. The picker
+    /// must label it `project`, not with the whole path.
+    ///
+    /// PRD #819 Greptile P2(e). The basename used to be `path.rsplit('/')`, and
+    /// project resolution is NOT refused on Windows — only `PrepareWorkflow` is,
+    /// with `unsupported-platform`, because only its publish carries an
+    /// owner-only guarantee it cannot deliver there. So a Windows client lists
+    /// and resolves, every segment fell out of the `/` split, and the whole path
+    /// was shown where a directory name belongs. `Path::file_name` is the
+    /// platform's own answer, verbatim prefix included.
+    ///
+    /// `#[cfg(windows)]` because the claim is about the Windows target's path
+    /// parser: asserting it from a Unix run would report a wider result than was
+    /// measured. Its sibling below pins the Unix half of the same change.
+    #[cfg(windows)]
+    #[test]
+    fn a_windows_canonical_path_is_labelled_with_its_directory_name() {
+        for (path, expected) in [
+            (r"\\?\C:\Users\dev\project", "project"),
+            (r"C:\Users\dev\project", "project"),
+            (r"C:\Users\dev\project\", "project"),
+            // A mixed separator is still a separator to the Windows parser.
+            (r"C:\Users\dev/project", "project"),
+        ] {
+            let mapped = map_resolved_project(ResolvedProject {
+                path: path.to_string(),
+                orchestrations: Vec::new(),
+                config_revision: None,
+            });
+            assert_eq!(
+                mapped.display_name, expected,
+                "{path:?} names the directory {expected:?}"
+            );
+            assert_eq!(mapped.path, path, "the identity must be carried verbatim");
+        }
+    }
+
+    /// Scenario: the daemon resolves a Unix project whose directory name
+    /// contains a backslash — a perfectly ordinary Unix filename, since only `/`
+    /// and NUL are excluded. The label must be that name, backslash included.
+    ///
+    /// This is the guard on P2(e)'s fix rather than the regression test for it:
+    /// the tempting way to "support Windows" is to split on `/` and `\` on every
+    /// platform, which would cut this name in half and label the project
+    /// `ird`. `Path::file_name` is per-target, so it treats the backslash as a
+    /// separator only where the platform does.
+    #[cfg(unix)]
+    #[test]
+    fn a_unix_directory_name_containing_a_backslash_survives_whole() {
+        let mapped = map_resolved_project(ResolvedProject {
+            path: r"/srv/projects/we\ird".to_string(),
+            orchestrations: Vec::new(),
+            config_revision: None,
+        });
+        assert_eq!(mapped.display_name, r"we\ird");
+        assert_eq!(mapped.path, r"/srv/projects/we\ird");
+    }
+
+    /// Scenario: the shapes the basename derivation has to survive on any
+    /// platform — a trailing separator, and a root that names no directory at
+    /// all. The root falls back to the whole path, which is what it did before
+    /// and is the only honest label available for it.
+    #[test]
+    fn a_trailing_separator_and_a_rootless_path_still_produce_a_label() {
+        for (path, expected) in [("/srv/projects/api/", "api"), ("/", "/")] {
+            let mapped = map_resolved_project(ResolvedProject {
+                path: path.to_string(),
+                orchestrations: Vec::new(),
+                config_revision: None,
+            });
+            assert_eq!(mapped.display_name, expected, "{path:?}");
+            assert_eq!(mapped.path, path, "the identity must be carried verbatim");
+        }
     }
 
     /// Scenario: a canonical path longer than `safe_message`'s 2048-character

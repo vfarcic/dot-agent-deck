@@ -457,6 +457,34 @@ pub const PROJECT_ERR_STALE_TOKEN: &str = "stale-token";
 /// failure — it is a staleness and integrity refusal.
 pub const PROJECT_ERR_STALE_PREPARATION: &str = "stale-preparation";
 
+/// PRD #819 Greptile P1(a): an [`AttachRequest::StartPreparedAgent`] presented a
+/// token this daemon issued, which has **not** expired and whose approved state
+/// is still intact — but the request being made is not the one that preparation
+/// approved.
+///
+/// **This is a different fact from [`PROJECT_ERR_STALE_PREPARATION`], and until
+/// this code existed nothing checked it at all.** The audit fix made the record
+/// carry what a preparation approved and made the spawn re-validate it against
+/// the filesystem; what it did not do is compare the *submitted* spawn fields
+/// against that record. So a caller could present a token prepared for project X
+/// while submitting the `cwd`, orchestration and role of project Y, and the
+/// daemon validated X and started Y. Making the code look validated is what made
+/// that easy to miss.
+///
+/// `stale-preparation` means "your preparation was ours and live, but the world
+/// moved"; this means "your request does not match your preparation". Those send
+/// an operator in different directions — one is a race with another launch and
+/// is fixed by preparing again, the other is a client that is not sending back
+/// what it was handed and preparing again will not help — which is the same
+/// reasoning that already separates [`PROJECT_ERR_STALE_TOKEN`] from
+/// [`PROJECT_ERR_STALE_PREPARATION`].
+///
+/// See [`crate::project_resolve::verify_prepared_start`] for exactly which
+/// fields are bound and, just as load-bearing, which are deliberately not — the
+/// `command` is not, because per-launch command override is an existing,
+/// documented feature.
+pub const PROJECT_ERR_PREPARATION_MISMATCH: &str = "preparation-mismatch";
+
 /// PRD #819 audit follow-up: an [`AttachRequest::StartAgent`] payload carried a
 /// `prep_token` key, which that verb does not enforce.
 ///
@@ -2169,9 +2197,23 @@ async fn handle_connection(
             // check here, and it binds nothing. The record now carries the state
             // its preparation approved, so a presented token is resolved to that
             // record and the record is re-validated against the filesystem
-            // before anything spawns. Two refusals, deliberately distinct: the
-            // token is not ours or has aged out (`stale-token`), or it is ours
-            // and live but the world moved under it (`stale-preparation`).
+            // before anything spawns.
+            //
+            // PRD #819 Greptile P1(a): re-validating the record was only half of
+            // it. The record was checked against the FILESYSTEM and never against
+            // the REQUEST, so a caller could present a token prepared for project
+            // X while submitting the `cwd`, orchestration and role of project Y —
+            // and the daemon validated X and started Y. The submitted identity is
+            // now matched against the binding too
+            // (`project_resolve::verify_prepared_start`), which is where the list
+            // of what is bound and what deliberately is not (the `command`, so
+            // per-launch overrides keep working) lives.
+            //
+            // Three refusals, deliberately distinct, because they send an
+            // operator in three directions: the token is not ours or has aged out
+            // (`stale-token`); it is ours and live but the world moved under it
+            // (`stale-preparation`); or it is ours, live and intact and this is
+            // not the launch it approved (`preparation-mismatch`).
             if let Some(token) = prepared_token.as_deref() {
                 let Some(binding) = crate::prep_token::binding(token) else {
                     write_resp(
@@ -2184,40 +2226,59 @@ async fn handle_connection(
                     .await?;
                     return Ok(());
                 };
+                // The submitted identity, lifted out of the request as it stands
+                // rather than re-derived from the token — comparing the token to
+                // itself is what the previous round did.
+                let request = crate::project_resolve::PreparedStartRequest {
+                    cwd: cwd.clone(),
+                    membership: tab_membership.as_ref().and_then(|tm| match tm {
+                        TabMembership::Orchestration {
+                            name,
+                            role_name,
+                            is_start_role,
+                            orchestration_cwd,
+                            ..
+                        } => Some(crate::project_resolve::PreparedStartMembership {
+                            orchestration: name.clone(),
+                            orchestration_cwd: orchestration_cwd.clone(),
+                            role: role_name.clone(),
+                            is_start_role: *is_start_role,
+                        }),
+                        TabMembership::Mode { .. } => None,
+                    }),
+                };
                 // Filesystem work, so it goes through the same bounded blocking
                 // pool every other project verb uses — one call, one permit, and
                 // never from inside a task that already holds one.
                 let outcome = crate::project_resolve::run_bounded(move || {
-                    crate::project_resolve::revalidate_preparation(&binding)
+                    crate::project_resolve::verify_prepared_start(&binding, &request)
                 })
                 .await;
-                let stale = match outcome {
-                    Ok(Ok(())) => false,
-                    Ok(Err(stale)) => {
+                let refusal = match outcome {
+                    Ok(Ok(())) => None,
+                    Ok(Err(refusal)) => {
                         // The cause is named here and nowhere else: the wire gets
-                        // one sentence for all of them, so the daemon log is the
+                        // one sentence per category, so the daemon log is the
                         // only place an operator can learn which check fired.
                         warn!(
-                            reason = %stale,
-                            "start-agent refused: the preparation no longer describes what it approved"
+                            reason = %refusal,
+                            "start-prepared-agent refused: the preparation does not cover this start"
                         );
-                        true
+                        Some(refusal.wire_refusal())
                     }
                     Err(e) => {
                         // The pool could not run the check. Refusing is the only
                         // safe answer: "we could not verify" is not "it is
                         // fine", and the caller's remedy — prepare again — is
-                        // the same either way.
-                        warn!(reason = %e, "start-agent refused: the preparation could not be re-validated");
-                        true
+                        // the same either way. It is reported as a STALENESS
+                        // refusal rather than a mismatch, because an unrun check
+                        // has found no disagreement — it has found nothing.
+                        warn!(reason = %e, "start-prepared-agent refused: the preparation could not be re-validated");
+                        Some(crate::project_resolve::stale_preparation_refusal())
                     }
                 };
-                if stale {
-                    write_resp(
-                        &mut stream,
-                        &AttachResponse::err(crate::project_resolve::stale_preparation_refusal()),
-                    )
-                    .await?;
+                if let Some(refusal) = refusal {
+                    write_resp(&mut stream, &AttachResponse::err(refusal)).await?;
                     return Ok(());
                 }
             }

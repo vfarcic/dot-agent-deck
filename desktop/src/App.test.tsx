@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createFixtureSnapshot } from "./data/fixture";
 import { WINDOWS_WORKFLOW_BLOCK_REASON } from "./lib/platform";
 import { DEFAULT_DESKTOP_SETTINGS, type DesktopSettingsDto } from "./lib/bridge";
-import type { DaemonOrchestration, DaemonProject, DaemonResolvedProject, DeckRuntimeState } from "./types";
+import type { AgentSession, DaemonOrchestration, DaemonProject, DaemonResolvedProject, DeckRuntimeState } from "./types";
 
 vi.mock("./components/TerminalViewport", () => ({
   TerminalViewport: ({ agentId }: { agentId: string }) => <pre data-testid={`terminal-${agentId}`}>terminal</pre>,
@@ -105,6 +105,26 @@ function liveWithProject(overrides: Partial<DeckRuntimeState> = {}): DeckRuntime
     )),
     ...overrides,
   });
+}
+
+/**
+ * PRD #819 Greptile P2(c): a live, connected snapshot carrying exactly the
+ * agents a test names, so the daemon's enumeration SEEDS — each pane's `cwd` and
+ * each orchestration tab's own `cwd` — are what the test moves. The `"empty"`
+ * fixture is the connected-with-no-agents one, so the agent list below is the
+ * whole fleet rather than an addition to a fixture's.
+ */
+function liveSnapshot(agents: AgentSession[]) {
+  return { ...createFixtureSnapshot("empty"), agents };
+}
+
+/**
+ * One pane in `cwd`, built off a real fixture agent so every field the deck
+ * renders is populated and only the seed differs.
+ */
+function agentIn(id: string, cwd: string): AgentSession {
+  const template = createFixtureSnapshot("connected").agents[0];
+  return { ...template, id, paneId: `pane-${id}`, cwd, tab: { kind: "dashboard" } };
 }
 
 /** Pick the one project the fake daemon offers, and wait for it to resolve. */
@@ -561,6 +581,121 @@ describe("ControlDeck", () => {
     expect(screen.getByTestId("workflow-role-mismatch")).toHaveTextContent("Not in this workflow: reviewer");
     expect(screen.getByTestId("launch-live-loop")).toBeDisabled();
     expect(live.runAction).not.toHaveBeenCalled();
+  });
+
+  /**
+   * PRD #819, Greptile P1(b): THE START ROLE IS THE ORCHESTRATION'S TO DECLARE.
+   *
+   * This screen assumed the role named `orchestrator` always starts, so an
+   * orchestration that marks any other role as its start role was offered as a
+   * ready-to-launch button and then refused three layers down —
+   * `order_workflow_roles` compares every submitted start marker against the
+   * daemon's projection, and since the P1(a) fix the daemon refuses the spawn
+   * itself with `preparation-mismatch`.
+   *
+   * The projection has carried `start` per role all along (`event::ProjectRole`)
+   * precisely so a client need not guess. Here the daemon says `coder` starts
+   * and `orchestrator` does not, and the launch has to say the same. The START
+   * badge is asserted alongside the submitted markers because they are two
+   * readings of one fact: a screen that submitted the right marker while
+   * labelling the wrong row would be lying about which agent is the coordinator.
+   */
+  it("submits the start marker the orchestration declares rather than assuming `orchestrator`", async () => {
+    const live = liveWithProject({
+      resolveProject: vi.fn(async () => daemonResolvedProject(
+        "/home/dev/code/deck",
+        "deck",
+        [daemonOrchestration("dot-agent-deck", true, WORKFLOW_ROLES, "coder")],
+        "revision-1",
+      )),
+    });
+    render(<ControlDeck runtime={live} />);
+    await chooseTheOnlyProject();
+
+    const startBadges = [...document.querySelectorAll(".start-role")];
+    expect(startBadges).toHaveLength(1);
+    expect(startBadges[0].parentElement?.textContent).toContain("Coder");
+
+    fireEvent.change(screen.getByLabelText("Task prompt"), { target: { value: "Build it." } });
+    expect(screen.getByTestId("launch-live-loop")).toBeEnabled();
+    fireEvent.click(screen.getByTestId("launch-live-loop"));
+    fireEvent.click(screen.getAllByRole("button", { name: "Launch live loop" }).at(-1)!);
+
+    await waitFor(() => {
+      const launch = vi.mocked(live.runAction).mock.calls[0]?.[0];
+      if (launch?.type !== "start_workflow") throw new Error("expected workflow launch");
+      expect(launch.roles.find((role) => role.role === "coder")?.start).toBe(true);
+      expect(launch.roles.find((role) => role.role === "orchestrator")?.start).toBe(false);
+      expect(launch.roles.filter((role) => role.start)).toHaveLength(1);
+    });
+  });
+
+  /**
+   * PRD #819, Greptile P1(b), the other half: an orchestration that marks NO
+   * role as its start role cannot be launched from this app at all —
+   * `validate_desktop_coordinator` has nothing to make the coordinator out of.
+   * Refuse it here, naming the workflow, rather than enabling a button whose
+   * only outcome is a bridge error after the confirmation dialog.
+   */
+  it("refuses an orchestration that declares no start role, before the launch button", async () => {
+    const live = liveWithProject({
+      resolveProject: vi.fn(async () => daemonResolvedProject(
+        "/home/dev/code/deck",
+        "deck",
+        // No role matches, so every projected `start` is false — which is what a
+        // config with no `start = true` anywhere produces.
+        [daemonOrchestration("dot-agent-deck", true, WORKFLOW_ROLES, "nobody")],
+        "revision-1",
+      )),
+    });
+    render(<ControlDeck runtime={live} />);
+    await chooseTheOnlyProject();
+    fireEvent.change(screen.getByLabelText("Task prompt"), { target: { value: "Build it." } });
+
+    expect(screen.getByTestId("workflow-no-start-role")).toHaveTextContent("marks no role as its start role");
+    expect(document.querySelectorAll(".start-role")).toHaveLength(0);
+    expect(screen.getByTestId("launch-live-loop")).toBeDisabled();
+    fireEvent.click(screen.getByTestId("launch-live-loop"));
+    expect(live.runAction).not.toHaveBeenCalled();
+  });
+
+  /**
+   * PRD #819, Greptile P2(c): the automatic re-list has to be keyed on what
+   * actually determines the daemon's answer.
+   *
+   * It was keyed on `${connection.status}:${agents.length}`, and a count does
+   * not determine the project list: the daemon enumerates from its startup cwd,
+   * every live agent's `cwd`, every orchestration role's `orchestration_cwd` and
+   * every registered schedule's working directory. So replacing an agent with
+   * one in a different project — or moving an orchestration tab — left the key
+   * identical and the picker kept offering a project nothing runs in any more.
+   *
+   * The third rerender is the control that makes the first two mean something:
+   * a new snapshot object carrying the SAME seeds must not re-list, or this test
+   * would pass against a key that simply changes on every render.
+   */
+  it("re-lists projects when the daemon's seeds move without the agent count changing", async () => {
+    const listProjects = vi.fn(async () => ({ projects: [daemonProject("/home/dev/code/deck", "deck")] }));
+    const base = liveWithProject({ listProjects, snapshot: liveSnapshot([agentIn("1", "/home/dev/code/deck")]) });
+    const { rerender } = render(<ControlDeck runtime={base} />);
+    await waitFor(() => expect(listProjects.mock.calls.length).toBeGreaterThan(0));
+
+    // One agent out, one agent in, in another project. Same count.
+    const afterFirst = listProjects.mock.calls.length;
+    rerender(<ControlDeck runtime={{ ...base, snapshot: liveSnapshot([agentIn("2", "/home/dev/code/other")]) }} />);
+    await waitFor(() => expect(listProjects.mock.calls.length).toBeGreaterThan(afterFirst));
+
+    // Same per-pane cwds, a different ORCHESTRATION cwd — the strongest of the
+    // daemon's seeds, since an orchestration cwd is a project by construction.
+    const afterSecond = listProjects.mock.calls.length;
+    rerender(<ControlDeck runtime={{ ...base, snapshot: liveSnapshot([{ ...agentIn("2", "/home/dev/code/other"), tab: { kind: "orchestration", name: "loop", roleIndex: 0, roleName: "planner", isStartRole: true, cwd: "/home/dev/code/third" } }]) }} />);
+    await waitFor(() => expect(listProjects.mock.calls.length).toBeGreaterThan(afterSecond));
+
+    // The control: a fresh snapshot naming the same seeds is not a change.
+    const afterThird = listProjects.mock.calls.length;
+    rerender(<ControlDeck runtime={{ ...base, snapshot: liveSnapshot([{ ...agentIn("2", "/home/dev/code/other"), tab: { kind: "orchestration", name: "loop", roleIndex: 0, roleName: "planner", isStartRole: true, cwd: "/home/dev/code/third" } }]) }} />);
+    await new Promise((settle) => setTimeout(settle, 0));
+    expect(listProjects.mock.calls.length).toBe(afterThird);
   });
 
   it("explains and disables live workflow launch on Windows before confirmation", () => {

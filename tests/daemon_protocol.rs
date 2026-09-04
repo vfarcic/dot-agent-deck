@@ -42,11 +42,11 @@ use dot_agent_deck::agent_pty::{AgentPtyRegistry, AgentRecord};
 use dot_agent_deck::daemon_protocol::{
     AttachRequest, AttachResponse, DAEMON_CAPABILITIES, KIND_DETACH, KIND_REQ, KIND_RESP,
     KIND_STREAM_END, KIND_STREAM_IN, KIND_STREAM_OUT, KIND_STREAM_REJECT, PROJECT_ERR_INVALID_PATH,
-    PROJECT_ERR_NO_ORCHESTRATION, PROJECT_ERR_PUBLISH_FAILED, PROJECT_ERR_STALE_PREPARATION,
-    PROJECT_ERR_STALE_REVISION, PROJECT_ERR_STALE_TOKEN, PROJECT_ERR_TASK_REJECTED,
-    PROJECT_ERR_UNIMPLEMENTED, PROJECT_ERR_UNRESOLVED, PROJECT_ERR_WRONG_START_VERB,
-    PROTOCOL_VERSION, RunningAgentsSummary, TabMembership, bind_attach_listener,
-    serve_attach_with_counter, write_resp,
+    PROJECT_ERR_NO_ORCHESTRATION, PROJECT_ERR_PREPARATION_MISMATCH, PROJECT_ERR_PUBLISH_FAILED,
+    PROJECT_ERR_STALE_PREPARATION, PROJECT_ERR_STALE_REVISION, PROJECT_ERR_STALE_TOKEN,
+    PROJECT_ERR_TASK_REJECTED, PROJECT_ERR_UNIMPLEMENTED, PROJECT_ERR_UNRESOLVED,
+    PROJECT_ERR_WRONG_START_VERB, PROTOCOL_VERSION, RunningAgentsSummary, TabMembership,
+    bind_attach_listener, serve_attach_with_counter, write_resp,
 };
 use dot_agent_deck::event::{
     AgentEvent, AgentType, EventType, LiveTarget, SendResult, TargetKind, Writable,
@@ -1550,10 +1550,25 @@ enum PreVerbAttachRequest {
     },
 }
 
+/// The orchestration membership a prepared start submits: the workflow name, the
+/// role, and whether that role is the orchestration's start role.
+///
+/// A real launch always sends one (`desktop/src-tauri/src/lib.rs`'s
+/// `workflow_start_options`), and since PRD #819's Greptile P1(a) fix the daemon
+/// compares it against the token's binding — so a payload carrying `None` here
+/// can no longer produce a spawn. The cases below that pass `None` are the ones
+/// refused before the identity check is reached: an unknown token, and a payload
+/// whose `op` is rewritten so it never decodes as a prepared start at all.
+type PreparedMembership<'a> = (&'a str, &'a str, bool);
+
+/// The membership `LAUNCHABLE_PROJECT`'s start role has.
+const LAUNCHABLE_START_ROLE: PreparedMembership<'static> = ("loop", "planner", true);
+
 /// A prepared start, as a JSON object, ready to have its `op` rewritten.
 fn prepared_start_payload(
     token: &str,
     cwd: Option<&str>,
+    membership: Option<PreparedMembership<'_>>,
 ) -> serde_json::Map<String, serde_json::Value> {
     let request = AttachRequest::StartPreparedAgent {
         prep_token: token.to_string(),
@@ -1563,7 +1578,17 @@ fn prepared_start_payload(
         cols: 80,
         env: vec![],
         display_name: None,
-        tab_membership: None,
+        tab_membership: membership.map(|(name, role_name, is_start_role)| {
+            TabMembership::Orchestration {
+                name: name.to_string(),
+                role_index: 0,
+                role_name: role_name.to_string(),
+                is_start_role,
+                orchestration_cwd: cwd.map(str::to_string),
+                display_title: None,
+                orchestration_id: None,
+            }
+        }),
         agent_type: None,
         seed: None,
     };
@@ -1598,7 +1623,7 @@ fn prepared_start_payload(
 async fn a_prepared_start_is_a_distinct_op_an_older_daemon_refuses_closed() {
     let server = start_server().await;
     let token = "prep-0000000000000000000000000000000";
-    let payload = prepared_start_payload(token, None);
+    let payload = prepared_start_payload(token, None, None);
 
     // ---- 1. A new op, carrying the token as a required top-level field.
     assert_eq!(
@@ -1801,6 +1826,7 @@ async fn a_prepared_start_refuses_an_unknown_token_and_spawns_on_a_live_one() {
         serde_json::Value::Object(prepared_start_payload(
             "prep-0000000000000000000000000000000",
             None,
+            None,
         )),
     )
     .await;
@@ -1834,6 +1860,7 @@ async fn a_prepared_start_refuses_an_unknown_token_and_spawns_on_a_live_one() {
         serde_json::Value::Object(prepared_start_payload(
             &prepared.token,
             Some(&prepared.path),
+            Some(LAUNCHABLE_START_ROLE),
         )),
     )
     .await;
@@ -1896,7 +1923,11 @@ async fn a_prepared_start_refuses_a_token_whose_prepared_context_was_replaced() 
 
     let resp = issue_json_request(
         &server,
-        serde_json::Value::Object(prepared_start_payload(&first.token, Some(&first.path))),
+        serde_json::Value::Object(prepared_start_payload(
+            &first.token,
+            Some(&first.path),
+            Some(LAUNCHABLE_START_ROLE),
+        )),
     )
     .await;
     assert!(
@@ -1922,7 +1953,11 @@ async fn a_prepared_start_refuses_a_token_whose_prepared_context_was_replaced() 
     // assertions above from passing against a daemon that refuses every token.
     let resp = issue_json_request(
         &server,
-        serde_json::Value::Object(prepared_start_payload(&second.token, Some(&second.path))),
+        serde_json::Value::Object(prepared_start_payload(
+            &second.token,
+            Some(&second.path),
+            Some(LAUNCHABLE_START_ROLE),
+        )),
     )
     .await;
     assert!(
@@ -1937,7 +1972,11 @@ async fn a_prepared_start_refuses_a_token_whose_prepared_context_was_replaced() 
     // whole feature down rather than fail visibly here.
     let resp = issue_json_request(
         &server,
-        serde_json::Value::Object(prepared_start_payload(&second.token, Some(&second.path))),
+        serde_json::Value::Object(prepared_start_payload(
+            &second.token,
+            Some(&second.path),
+            Some(LAUNCHABLE_START_ROLE),
+        )),
     )
     .await;
     assert!(
@@ -1945,6 +1984,163 @@ async fn a_prepared_start_refuses_a_token_whose_prepared_context_was_replaced() 
         "the same token must spawn a second role: {:?}",
         resp.error
     );
+}
+
+/// PRD #819, Greptile P1(a) over the wire: a token prepared for project X,
+/// presented with spawn fields naming project Y, is refused with **nothing
+/// spawned** — and it is refused as a MISMATCH rather than as staleness.
+///
+/// `tests/prep_binding.rs` proves the comparison across all six of its causes
+/// and this proves the **wiring** — that the `start-prepared-agent` arm lifts the
+/// submitted `cwd` and `tab_membership` out of the request it is about to spawn
+/// and hands them to `verify_prepared_start` before the registry is touched. One
+/// wiring test rather than six, for the reason the sibling
+/// `a_prepared_start_refuses_a_token_whose_prepared_context_was_replaced` gives.
+///
+/// **Both preparations are live and untouched, which is the point.** The two
+/// projects are separate directories, so X's published context is still exactly
+/// what X approved: every staleness check passes and the only thing wrong is
+/// that this request is not the one X's token approved. Before this fix that is
+/// not a refusal at all — the daemon re-validated X and spawned in Y — so the
+/// test cannot pass against the previous code by any route.
+///
+/// The code is asserted, not just the refusal: `stale-preparation` would say the
+/// artifact moved and send an operator hunting a race with another launch, when
+/// what actually happened is a client sending back something other than what it
+/// was handed.
+///
+/// The positive control at the end is what stops all of this from passing
+/// against a daemon that has simply started refusing every prepared start.
+#[tokio::test]
+async fn a_prepared_start_refuses_spawn_fields_from_another_project() {
+    let server = start_server().await;
+    let (_dir_x, project_x) = mint_project(LAUNCHABLE_PROJECT);
+    let (_dir_y, project_y) = mint_project(LAUNCHABLE_PROJECT);
+
+    let prepare = |path: String, task: &'static str| {
+        let server = &server;
+        async move {
+            let resp = issue_json_request(
+                server,
+                serde_json::json!({
+                    "op": "prepare-workflow",
+                    "path": path,
+                    "orchestration": "loop",
+                    "task": task,
+                }),
+            )
+            .await;
+            assert!(resp.ok, "the preparation must succeed: {:?}", resp.error);
+            resp.workflow_prepared.expect("a PreparedWorkflow")
+        }
+    };
+
+    let x = prepare(
+        project_x.to_str().unwrap().to_string(),
+        "Project X's brief.",
+    )
+    .await;
+    let y = prepare(
+        project_y.to_str().unwrap().to_string(),
+        "Project Y's brief.",
+    )
+    .await;
+    assert_ne!(
+        x.context_path, y.context_path,
+        "two projects must publish to two paths, or this would be the staleness case"
+    );
+
+    // X's token, Y's spawn fields.
+    let resp = issue_json_request(
+        &server,
+        serde_json::Value::Object(prepared_start_payload(
+            &x.token,
+            Some(&y.path),
+            Some(LAUNCHABLE_START_ROLE),
+        )),
+    )
+    .await;
+    assert!(
+        !resp.ok,
+        "a token prepared for one project must not start another"
+    );
+    assert!(resp.id.is_none(), "a refused prepared start starts nothing");
+    let error = resp.error.unwrap_or_default();
+    assert!(
+        error.starts_with(PROJECT_ERR_PREPARATION_MISMATCH),
+        "expected `{PROJECT_ERR_PREPARATION_MISMATCH}`, got {error:?}"
+    );
+    assert!(
+        !error.starts_with(PROJECT_ERR_STALE_PREPARATION)
+            && !error.starts_with(PROJECT_ERR_STALE_TOKEN),
+        "nothing went stale — reporting it as staleness sends an operator after a race \
+         that did not happen: {error:?}"
+    );
+    assert!(
+        server.registry.agent_records().is_empty(),
+        "a refused prepared start must not have spawned a pane"
+    );
+
+    // Same token, right project, wrong workflow — the path check alone would let
+    // this through.
+    let resp = issue_json_request(
+        &server,
+        serde_json::Value::Object(prepared_start_payload(
+            &x.token,
+            Some(&x.path),
+            Some(("some-other-loop", "planner", true)),
+        )),
+    )
+    .await;
+    assert!(!resp.ok, "a token must not start another orchestration");
+    assert!(
+        resp.error
+            .unwrap_or_default()
+            .starts_with(PROJECT_ERR_PREPARATION_MISMATCH)
+    );
+    assert!(server.registry.agent_records().is_empty());
+
+    // Same token, right project and workflow, a role the orchestration does not
+    // declare.
+    let resp = issue_json_request(
+        &server,
+        serde_json::Value::Object(prepared_start_payload(
+            &x.token,
+            Some(&x.path),
+            Some(("loop", "not-a-declared-role", true)),
+        )),
+    )
+    .await;
+    assert!(!resp.ok, "a token must not start an undeclared role");
+    assert!(
+        resp.error
+            .unwrap_or_default()
+            .starts_with(PROJECT_ERR_PREPARATION_MISMATCH)
+    );
+    assert!(server.registry.agent_records().is_empty());
+
+    // The positive control: each token still starts its OWN launch, every
+    // declared role of it, so "refuses" above is not trivially true.
+    for (prepared, role) in [
+        (&x, LAUNCHABLE_START_ROLE),
+        (&x, ("loop", "builder", false)),
+        (&y, LAUNCHABLE_START_ROLE),
+    ] {
+        let resp = issue_json_request(
+            &server,
+            serde_json::Value::Object(prepared_start_payload(
+                &prepared.token,
+                Some(&prepared.path),
+                Some(role),
+            )),
+        )
+        .await;
+        assert!(
+            resp.ok && resp.id.is_some(),
+            "the launch a preparation approved must still spawn ({role:?}): {:?}",
+            resp.error
+        );
+    }
 }
 
 /// PRD #819 audit follow-up: the CLIENT routes a presented token onto the
@@ -2011,6 +2207,18 @@ async fn the_client_routes_a_presented_token_onto_the_prepared_verb() {
             StartAgentOptions {
                 command: Some("/bin/sh".into()),
                 cwd: Some(prepared.path.clone()),
+                // Since PRD #819's Greptile P1(a) fix a prepared start also has
+                // to submit the identity its token approved, which is what a
+                // real launch sends.
+                tab_membership: Some(TabMembership::Orchestration {
+                    name: "loop".into(),
+                    role_index: 0,
+                    role_name: "planner".into(),
+                    is_start_role: true,
+                    orchestration_cwd: Some(prepared.path.clone()),
+                    display_title: None,
+                    orchestration_id: None,
+                }),
                 ..StartAgentOptions::default()
             },
             Some(&prepared.token),

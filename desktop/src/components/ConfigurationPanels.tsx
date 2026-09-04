@@ -392,7 +392,24 @@ export function WorkflowPanel({ open, profiles, order, mode, project, onChoosePr
   const enabled = ordered.filter((profile) => profile.enabled);
   const resolved = enabled.map((profile) => ({ profile, resolution: resolveProfileCommand(profile) }));
   const invalidCommands = resolved.filter(({ resolution }) => resolution.issue);
-  const roles = resolved.map(({ profile, resolution }) => ({ role: profile.roleId, command: resolution.command, start: profile.roleId === "orchestrator" }));
+  /*
+   * PRD #819 Greptile P1(b): the START ROLE IS THE ORCHESTRATION'S TO DECLARE,
+   * and this screen used to assume it was always the one called `orchestrator`.
+   * A project can mark any role as the start role, so an orchestration whose
+   * start role is named anything else looked ready to launch here and was then
+   * refused three layers down — `order_workflow_roles` compares every submitted
+   * start marker against the daemon's projection, and since the audit fix the
+   * daemon refuses the spawn itself with `preparation-mismatch`.
+   *
+   * The data to get this right has been on the wire all along: `ProjectRole`
+   * carries `start` per role precisely so a client need not guess. So the
+   * markers submitted below are the projected ones, keyed by role NAME (the
+   * identity, not the escaped twin), and an orchestration that declares no start
+   * role at all is refused UP FRONT with a reason rather than offered as a
+   * button that cannot work.
+   */
+  const startRoleNames = new Set((orchestration?.roles ?? []).filter((role) => role.start).map((role) => role.name));
+  const roles = resolved.map(({ profile, resolution }) => ({ role: profile.roleId, command: resolution.command, start: startRoleNames.has(profile.roleId) }));
   // The required set is now the ORCHESTRATION's own role list, straight off the
   // daemon's projection, rather than a sentence naming six roles this app
   // happened to ship defaults for. The daemon refuses a mismatch either way;
@@ -403,7 +420,21 @@ export function WorkflowPanel({ open, profiles, order, mode, project, onChoosePr
   const requiredRoleLabels = orchestration?.roles.map((role) => role.displayName) ?? [];
   const missingRoles = requiredRoles.filter((role) => !roles.some((candidate) => candidate.role === role));
   const extraRoles = roles.filter((role) => !requiredRoles.includes(role.role)).map((role) => role.role);
-  const allRequiredRolesEnabled = Boolean(orchestration) && !missingRoles.length && !extraRoles.length && enabled.some((profile) => profile.roleId === "orchestrator");
+  /*
+   * An orchestration that marks no role as its start role cannot be launched
+   * from this app at all: `validate_desktop_coordinator` has nothing to make the
+   * coordinator out of and refuses. Say so here, where the user can see which
+   * workflow it is, rather than letting it arrive as a bridge error after the
+   * confirmation dialog.
+   *
+   * The trailing `roles.some` is a separate condition rather than a second
+   * banner: it holds whenever the required and enabled sets agree, so the
+   * missing/extra banner is already explaining any case it could catch.
+   */
+  const startRoleIssue = orchestration && !startRoleNames.size
+    ? `${orchestration.displayName} marks no role as its start role, so there is no coordinator to launch. Mark one of its roles \`start = true\` in the project's .dot-agent-deck.toml.`
+    : undefined;
+  const allRequiredRolesEnabled = Boolean(orchestration) && !missingRoles.length && !extraRoles.length && !startRoleIssue && roles.some((role) => role.start);
   const canLaunch = mode === "live" && !platformIssue && Boolean(project) && name.trim().length > 0 && cwd.startsWith("/") && taskPrompt.trim().length > 0 && allRequiredRolesEnabled && invalidCommands.length === 0;
   const customCommandCount = resolved.filter(({ resolution }) => resolution.source === "custom").length;
   const generatedFullAccessCount = resolved.filter(({ profile, resolution }) => resolution.source === "generated" && profile.permissionMode === "full-access").length;
@@ -454,6 +485,7 @@ export function WorkflowPanel({ open, profiles, order, mode, project, onChoosePr
             {!taskPrompt.trim() && <small><AlertTriangle size={12} /> Add the task you want the coordinator to run.</small>}
             {platformIssue && <small data-testid="workflow-platform-issue"><AlertTriangle size={12} /> {platformIssue}</small>}
             {orchestration && (missingRoles.length > 0 || extraRoles.length > 0) && <small data-testid="workflow-role-mismatch"><AlertTriangle size={12} /> {orchestration.displayName} defines {requiredRoleLabels.join(", ") || "no roles"}.{missingRoles.length ? ` Enable a profile for: ${missingRoles.join(", ")}.` : ""}{extraRoles.length ? ` Not in this workflow: ${extraRoles.join(", ")}.` : ""}</small>}
+            {startRoleIssue && <small data-testid="workflow-no-start-role"><AlertTriangle size={12} /> {startRoleIssue}</small>}
             {invalidCommands.length > 0 && <small><AlertTriangle size={12} /> Fix the launch command for: {invalidCommands.map(({ profile }) => profile.role).join(", ")}.</small>}
           </div>
         )}
@@ -462,7 +494,7 @@ export function WorkflowPanel({ open, profiles, order, mode, project, onChoosePr
             <div className={`workflow-editor-row ${profile.enabled ? "" : "is-disabled"}`} key={profile.id}>
               <GripVertical size={16} aria-hidden="true" />
               <span className="workflow-order">{String(index + 1).padStart(2, "0")}</span>
-              <div><strong>{profile.role}{profile.enabled && profile.roleId === "orchestrator" ? <em className="start-role">START</em> : null}{profile.commandMode === "custom" ? <em className="custom-command-badge">CUSTOM CMD</em> : null}</strong><small><code>{profile.roleId}</code> · {profile.commandMode === "custom" ? "exact shell command · permissions unmanaged" : `${profile.cli} · ${profile.model}`}</small></div>
+              <div><strong>{profile.role}{profile.enabled && startRoleNames.has(profile.roleId) ? <em className="start-role">START</em> : null}{profile.commandMode === "custom" ? <em className="custom-command-badge">CUSTOM CMD</em> : null}</strong><small><code>{profile.roleId}</code> · {profile.commandMode === "custom" ? "exact shell command · permissions unmanaged" : `${profile.cli} · ${profile.model}`}</small></div>
               <label className="compact-check"><input type="checkbox" checked={profile.enabled} onChange={() => onToggle(profile.id)} /><span>{profile.enabled ? <Check size={12} /> : null}</span><em>{profile.enabled ? "Enabled" : "Skipped"}</em></label>
               <div className="order-buttons">
                 <button aria-label={`Move ${profile.role} up`} disabled={index === 0} onClick={() => onMove(profile.id, -1)}><ArrowUp size={14} /></button>

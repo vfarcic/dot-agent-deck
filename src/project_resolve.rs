@@ -1173,8 +1173,16 @@ pub fn prepare_workflow_for_wire(
 /// Re-validate a preparation at spawn time: is the artifact this token was
 /// issued for still the artifact a launch would run against?
 ///
-/// **This is the spawn-side half of PRD #819's audit fix, and the half that
-/// makes the token mean anything.** The original design recorded only
+/// **This is one half of the spawn-side gate, and callers want the other one.**
+/// [`verify_prepared_start`] is what the daemon's `start-prepared-agent` arm
+/// calls: it runs these checks *and* matches the submitted request against the
+/// binding, which is the half Greptile's P1(a) found missing. This function
+/// stays public and exercised directly by `tests/prep_binding.rs`, which isolates
+/// each staleness cause; nothing in `src/` calls it alone, and a new caller that
+/// wants it alone is almost certainly re-opening P1(a).
+///
+/// **These checks are PRD #819's audit fix, and without them the token means
+/// nothing at all.** The original design recorded only
 /// `(token, issued_at)`, so nothing here was possible: two clients preparing in
 /// the same project overwrite one fixed file, both tokens stay inside the TTL,
 /// and the earlier launch spawns a coordinator pointed at a path now holding the
@@ -1203,7 +1211,8 @@ pub fn prepare_workflow_for_wire(
 /// with no token at all.
 ///
 /// **Every failure is one refusal with one sentence on the wire**
-/// ([`stale_preparation_refusal`]), and the specific cause stays daemon-local.
+/// ([`stale_preparation_refusal`] — a different sentence from the one a
+/// [`PreparationMismatch`] gets), and the specific cause stays daemon-local.
 /// That is the same disposition the resolve verb's refusals take, and for a
 /// sharper reason here: the caller can already learn all five facts by resolving
 /// the project again, so the uniform sentence costs it nothing, while
@@ -1224,6 +1233,21 @@ pub fn prepare_workflow_for_wire(
 pub fn revalidate_preparation(
     binding: &crate::prep_token::PrepBinding,
 ) -> Result<(), PreparationStale> {
+    revalidate_approved_roles(binding).map(|_| ())
+}
+
+/// [`revalidate_preparation`], plus the role identities the approved
+/// orchestration declares — the list [`verify_prepared_start`] checks a
+/// submitted role against.
+///
+/// It is one function rather than two because the role list has to come from the
+/// **same read** the staleness checks passed: re-reading the config to answer
+/// "does this orchestration declare that role" would answer it about a config
+/// that could already have moved, which is the shape of defect this whole seam
+/// exists to close.
+fn revalidate_approved_roles(
+    binding: &crate::prep_token::PrepBinding,
+) -> Result<Vec<ApprovedRole>, PreparationStale> {
     let dir = canonicalize_project_dir(&binding.project_dir)
         .map_err(|_| PreparationStale::ProjectUnresolved)?;
     if dir != binding.project_dir {
@@ -1245,17 +1269,27 @@ pub fn revalidate_preparation(
     // Cheap, and not a tautology given the revision matched: `config_revision`
     // is a change hint rather than a commitment, so this asks the config itself
     // the question the hint only stands in for.
-    if !config
+    let Some(orch) = config
         .orchestrations
         .iter()
         .filter(|o| !o.roles.is_empty())
-        .any(|o| {
+        .find(|o| {
             crate::project_config::resolve_orchestration_name(&o.name, &dir)
                 == binding.orchestration
         })
-    {
+    else {
         return Err(PreparationStale::OrchestrationGone);
-    }
+    };
+    // Captured before the context checks so the returned list is the one the
+    // orchestration lookup just matched, rather than a second lookup's.
+    let approved_roles: Vec<ApprovedRole> = orch
+        .roles
+        .iter()
+        .map(|role| ApprovedRole {
+            name: role.name.clone(),
+            start: role.start,
+        })
+        .collect();
 
     let (content, context_identity) = read_published_context(&binding.context_path)?;
     if context_identity != binding.context_identity {
@@ -1264,7 +1298,16 @@ pub fn revalidate_preparation(
     if context_digest(&content) != binding.context_digest {
         return Err(PreparationStale::ContextRewritten);
     }
-    Ok(())
+    Ok(approved_roles)
+}
+
+/// One role of the orchestration a preparation approved, as the config declares
+/// it: the exact name a spawn must send back, and whether that role is the one
+/// the orchestration starts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ApprovedRole {
+    name: String,
+    start: bool,
 }
 
 /// Why a preparation no longer describes what it approved.
@@ -1335,6 +1378,246 @@ impl std::fmt::Display for PreparationStale {
     }
 }
 
+/// What a prepared start is actually asking for, in the terms
+/// [`crate::prep_token::PrepBinding`] records.
+///
+/// The daemon builds one of these from the request it is about to spawn, so the
+/// comparison in [`verify_prepared_start`] runs on the submitted fields rather
+/// than on anything re-derived from the token.
+///
+/// **Owned**, deliberately: the daemon runs the comparison on the same bounded
+/// blocking pool the rest of the project verbs use, so the request has to cross
+/// a `'static` boundary. Borrowing here would push a lifetime through that
+/// closure for no benefit — this is built once per prepared start.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PreparedStartRequest {
+    /// `StartAgent.cwd` exactly as submitted, and `None` when the request sent
+    /// none — which is not a neutral value here but a request to spawn in the
+    /// daemon's own working directory, and therefore not the prepared project.
+    pub cwd: Option<String>,
+    /// The orchestration membership the request declares, and `None` for a
+    /// request that declares none at all (a dashboard pane, or a
+    /// [`crate::agent_pty::TabMembership::Mode`] tab).
+    pub membership: Option<PreparedStartMembership>,
+}
+
+/// The orchestration identity a prepared start submits, lifted out of
+/// [`crate::agent_pty::TabMembership::Orchestration`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedStartMembership {
+    /// `TabMembership::Orchestration::name`.
+    pub orchestration: String,
+    /// `TabMembership::Orchestration::orchestration_cwd`, when the membership
+    /// declared one. It is a **second** spelling of the project identity inside
+    /// the same request, so it is checked when present and skipped when absent —
+    /// absence claims nothing.
+    pub orchestration_cwd: Option<String>,
+    /// `TabMembership::Orchestration::role_name`.
+    pub role: String,
+    /// `TabMembership::Orchestration::is_start_role`, which is what puts the
+    /// pane in `orchestrator_pane_ids` and therefore decides where delegations
+    /// come from.
+    pub is_start_role: bool,
+}
+
+/// Why a prepared start is not the launch its token approved.
+///
+/// Same two-rendering split [`PreparationStale`] takes, and for the same reason:
+/// [`Self::detail`] is the daemon-local diagnostic that names the specific
+/// check, and every variant answers the wire with
+/// [`preparation_mismatch_refusal`]'s one sentence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreparationMismatch {
+    /// The submitted `cwd` is absent, or is not the directory the preparation
+    /// resolved. This is the finding's own case: a token prepared for project X
+    /// presented with spawn fields naming project Y.
+    ProjectDiffers,
+    /// The request declares no orchestration membership. A preparation approves
+    /// an orchestration launch, so a start that claims to be one of its roles
+    /// and does not say which orchestration is not that launch.
+    NoOrchestration,
+    /// The membership names an orchestration other than the prepared one.
+    OrchestrationDiffers,
+    /// The membership's own copy of the project directory disagrees with the
+    /// prepared one.
+    OrchestrationCwdDiffers,
+    /// The submitted role is not one the approved orchestration declares.
+    RoleNotDeclared,
+    /// The role is declared, but the request's start marker is not the one the
+    /// config gives it — so the launch would register the wrong pane as the
+    /// orchestration's start role.
+    StartMarkerDiffers,
+}
+
+impl PreparationMismatch {
+    /// The **daemon-local** diagnostic. Safe to log; reaches no client.
+    pub fn detail(&self) -> &'static str {
+        match self {
+            Self::ProjectDiffers => {
+                "the submitted working directory is not the project this preparation approved"
+            }
+            Self::NoOrchestration => {
+                "the submitted request declares no orchestration membership to match against"
+            }
+            Self::OrchestrationDiffers => {
+                "the submitted orchestration is not the one this preparation approved"
+            }
+            Self::OrchestrationCwdDiffers => {
+                "the submitted orchestration directory is not the project this preparation approved"
+            }
+            Self::RoleNotDeclared => {
+                "the submitted role is not declared by the approved orchestration"
+            }
+            Self::StartMarkerDiffers => {
+                "the submitted start marker is not the one the approved orchestration declares"
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for PreparationMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.detail())
+    }
+}
+
+/// Why a prepared start was refused: the world moved, or the request is not the
+/// one that was approved.
+///
+/// Two categories rather than one code, because they send an operator in
+/// different directions — see [`crate::daemon_protocol::PROJECT_ERR_PREPARATION_MISMATCH`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreparedStartRefusal {
+    /// The preparation no longer describes what it approved
+    /// ([`revalidate_preparation`]).
+    Stale(PreparationStale),
+    /// The preparation is intact and the request is a different one
+    /// ([`verify_prepared_start`]).
+    Mismatch(PreparationMismatch),
+}
+
+impl PreparedStartRefusal {
+    /// The **daemon-local** diagnostic, naming the specific check that fired.
+    pub fn detail(&self) -> &'static str {
+        match self {
+            Self::Stale(stale) => stale.detail(),
+            Self::Mismatch(mismatch) => mismatch.detail(),
+        }
+    }
+
+    /// The sentence that goes back on the wire — one per category, naming
+    /// neither the check that fired nor any value from the binding.
+    pub fn wire_refusal(&self) -> String {
+        match self {
+            Self::Stale(_) => stale_preparation_refusal(),
+            Self::Mismatch(_) => preparation_mismatch_refusal(),
+        }
+    }
+}
+
+impl std::fmt::Display for PreparedStartRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.detail())
+    }
+}
+
+/// The whole spawn-side gate on a prepared start: the preparation still
+/// describes what it approved, **and** the request being made is that launch.
+///
+/// **The second half is what Greptile's P1(a) found missing, and the shape of
+/// the miss is worth keeping.** The audit fix made
+/// [`crate::prep_token::PrepBinding`] record what a preparation approved and
+/// made [`revalidate_preparation`] re-check that record against the filesystem.
+/// Both halves were correct and neither compared the record to the *submitted*
+/// spawn fields — so a caller could present a token prepared for project X while
+/// submitting the `cwd`, the orchestration and the role of project Y, and the
+/// daemon validated X and started Y. The first fix made the code **look**
+/// validated, which is precisely what made the second easy to miss.
+///
+/// # What is bound
+///
+/// * the submitted `cwd` is the daemon's own canonical spelling of the prepared
+///   project directory. Compared as the string this daemon minted and handed
+///   back on [`crate::event::PreparedWorkflow::path`] — **not** re-canonicalised,
+///   because re-resolving here would ask the filesystem the question again and
+///   accept any other spelling that happens to land on the same directory, which
+///   is the class of drift PRD #220 is about;
+/// * the membership's orchestration is the prepared one, and its
+///   `orchestration_cwd` — a second copy of the project identity in the same
+///   request — agrees with the prepared directory when it is present;
+/// * the role is one the approved orchestration actually declares, with the
+///   start marker that orchestration gives it. The role list comes from the
+///   config read the staleness checks just passed, so it describes the config
+///   this preparation approved rather than whatever is on disk by the time a
+///   second read would run.
+///
+/// # What is deliberately NOT bound
+///
+/// **The `command`.** Per-launch command override is an existing, documented
+/// feature — `docs/develop/desktop-gui.md`: "The submitted command overrides the
+/// matching project role for that launch only" — and it is how the desktop's
+/// agent profiles reach a launch at all. Requiring the submitted command to
+/// match the config's role command would break every profile, so what is bound
+/// here is **identity** (project, orchestration, role) and not **content**.
+/// Binding the command would also buy nothing this socket protects: a peer that
+/// wants to run an arbitrary command calls `StartAgent` and presents no token.
+///
+/// Nor are `rows`, `cols`, `display_name`, `env`, `agent_type`, `seed`,
+/// `role_index`, `display_title` or `orchestration_id`: each is either
+/// presentation, per-launch shape, or an identity the client mints for itself,
+/// and none of them names the project or the workflow this token approved.
+///
+/// **This is still not an authorization check.** It stops a request from
+/// consuming a preparation that was made for something else; it stops nothing a
+/// peer able to call `StartAgent` could not do with no token at all. Read
+/// [`crate::prep_token`]'s module doc before reading a refusal here as a denied
+/// privilege.
+///
+/// **Ordering.** The identity comparisons run first and touch no filesystem, so
+/// a request that does not match its own token is refused without a single
+/// syscall — and, more importantly, is refused with the code that is *true* of
+/// it rather than with whatever the staleness checks happened to say.
+///
+/// **Blocking** — the caller goes through [`run_bounded`].
+pub fn verify_prepared_start(
+    binding: &crate::prep_token::PrepBinding,
+    request: &PreparedStartRequest,
+) -> Result<(), PreparedStartRefusal> {
+    use PreparedStartRefusal::{Mismatch, Stale};
+
+    // The prepared directory as the daemon spelled it. `canonicalize_project_dir`
+    // refuses a non-UTF-8 path, so a binding minted by `prepare_workflow_for_wire`
+    // always has one; a `None` here could only come from a hand-built binding and
+    // is treated as "nothing the caller could have matched".
+    let approved_dir = binding.project_dir.to_str();
+    if approved_dir.is_none() || request.cwd.as_deref() != approved_dir {
+        return Err(Mismatch(PreparationMismatch::ProjectDiffers));
+    }
+    let Some(membership) = request.membership.as_ref() else {
+        return Err(Mismatch(PreparationMismatch::NoOrchestration));
+    };
+    if membership.orchestration != binding.orchestration {
+        return Err(Mismatch(PreparationMismatch::OrchestrationDiffers));
+    }
+    if let Some(orchestration_cwd) = membership.orchestration_cwd.as_deref()
+        && Some(orchestration_cwd) != approved_dir
+    {
+        return Err(Mismatch(PreparationMismatch::OrchestrationCwdDiffers));
+    }
+
+    let approved_roles = revalidate_approved_roles(binding).map_err(Stale)?;
+    let Some(role) = approved_roles
+        .iter()
+        .find(|role| role.name == membership.role)
+    else {
+        return Err(Mismatch(PreparationMismatch::RoleNotDeclared));
+    };
+    if role.start != membership.is_start_role {
+        return Err(Mismatch(PreparationMismatch::StartMarkerDiffers));
+    }
+    Ok(())
+}
+
 /// Read the coordinator context back for [`revalidate_preparation`], under the
 /// same bounds and the same symlink discipline [`read_config_file`] applies.
 ///
@@ -1385,6 +1668,28 @@ pub fn stale_preparation_refusal() -> String {
         "{}: that preparation no longer matches the project it was made against; prepare the \
          workflow again",
         crate::daemon_protocol::PROJECT_ERR_STALE_PREPARATION
+    )
+}
+
+/// The refusal a prepared start whose request does not match its preparation
+/// gets.
+///
+/// One fixed sentence for all six checks, for the reason
+/// [`verify_prepared_start`]'s doc gives — and it names no value from the
+/// binding, because "the project you prepared for is actually /x/y" is a fact
+/// about another party's launch rather than about this request. The caller
+/// already holds everything it needs: the preparation handed it the canonical
+/// path, the orchestration and the role list.
+///
+/// **The remedy is deliberately not "prepare again".** That is
+/// [`stale_preparation_refusal`]'s remedy and it is the wrong one here: nothing
+/// about the world moved, so a fresh preparation presented the same way is
+/// refused the same way.
+pub fn preparation_mismatch_refusal() -> String {
+    format!(
+        "{}: that request is not the launch this preparation approved; send the project, \
+         orchestration and role the preparation returned",
+        crate::daemon_protocol::PROJECT_ERR_PREPARATION_MISMATCH
     )
 }
 
