@@ -1058,11 +1058,27 @@ async fn run_idle_monitor(
                     // timer declines. Hand arming back to the monitor rather
                     // than dying silently — otherwise nothing ever arms
                     // another timer and the daemon never exits, however long
-                    // it stays idle afterwards. Guarded by the generation: an
-                    // unmoved generation means THIS is still the live timer
-                    // and no re-arm has happened, so clearing the flag cannot
-                    // cancel a newer timer's arming.
-                    if gen_check.load(Ordering::SeqCst) == my_gen {
+                    // it stays idle afterwards.
+                    //
+                    // Claiming the decline is ONE atomic step, not a re-read
+                    // of the generation followed by a store. Arming bumps the
+                    // generation, so a successful compare-exchange proves no
+                    // replacement timer was armed between this timer's
+                    // deadline and this instant — and by bumping the
+                    // generation itself it retires this timer's own claim in
+                    // the same operation. A plain `load() == my_gen` guard
+                    // (Greptile P1 on PR #865) leaves a window: a timer
+                    // descheduled between the load and the store can clear a
+                    // REPLACEMENT timer's `armed` flag, and the monitor's next
+                    // busy reading would then skip its generation bump —
+                    // that branch only fires when `armed` — leaving the
+                    // replacement live across a busy period that should have
+                    // invalidated it, so it could fire on a window the daemon
+                    // did not stay idle through.
+                    if gen_check
+                        .compare_exchange(my_gen, my_gen + 1, Ordering::SeqCst, Ordering::SeqCst)
+                        .is_ok()
+                    {
                         debug!(
                             threshold_secs = dur.as_secs(),
                             "daemon idle timer declined (gate busy at the deadline); re-arming"
