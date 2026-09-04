@@ -133,6 +133,79 @@ export interface DesktopActionResultDto {
   message?: string;
 }
 
+/**
+ * The desktop app's own settings document, exactly as `desktop_get_settings`
+ * returns it and `desktop_set_settings` accepts it (PRD #803).
+ *
+ * The Rust struct in `src-tauri/src/settings.rs` is the source of truth and its
+ * serialised shape is pinned by `default_document_shape_is_pinned`. Every key
+ * is a single word, so the TOML on disk and the JSON on this wire agree byte
+ * for byte.
+ */
+export interface DesktopSettingsDto {
+  version: number;
+  appearance: { mode: AppearanceMode };
+}
+
+/** How the app picks its light/dark palette. What it does is PRD #743's. */
+export type AppearanceMode = "system" | "light" | "dark";
+
+const APPEARANCE_MODES: readonly AppearanceMode[] = ["system", "light", "dark"];
+
+/** Mirrors `DesktopSettings::default()`; used when nothing is stored yet. */
+export const DEFAULT_DESKTOP_SETTINGS: DesktopSettingsDto = { version: 1, appearance: { mode: "system" } };
+
+/**
+ * The fixture bridge's settings key.
+ *
+ * Deliberately NOT run through `modeScopedKey`: a theme choice is global, and
+ * PRD #803 says so. There is no live-mode counterpart to collide with — the
+ * live bridge keeps settings in `desktop.toml` and never reads localStorage —
+ * so the key exists only so a `pnpm dev` + `?fixture=1` preview survives a
+ * reload.
+ */
+export const FIXTURE_SETTINGS_KEY = "dot-agent-deck.desktop-settings";
+
+/**
+ * Coerce anything read back from storage into a valid document. An unknown
+ * appearance value falls back to the default rather than propagating, matching
+ * `AppearanceMode::from_str_lossy` on the Rust side.
+ */
+export function normalizeDesktopSettings(value: unknown): DesktopSettingsDto {
+  const record = typeof value === "object" && value !== null ? value as Record<string, unknown> : {};
+  const appearance = typeof record.appearance === "object" && record.appearance !== null
+    ? record.appearance as Record<string, unknown>
+    : {};
+  const mode = APPEARANCE_MODES.find((candidate) => candidate === appearance.mode) ?? DEFAULT_DESKTOP_SETTINGS.appearance.mode;
+  return {
+    version: typeof record.version === "number" && Number.isFinite(record.version) ? record.version : DEFAULT_DESKTOP_SETTINGS.version,
+    appearance: { mode },
+  };
+}
+
+/**
+ * The settings document plus where it lives, as `desktop_get_settings` returns
+ * it (PRD #803).
+ *
+ * `path` is absent in the browser preview, which has no filesystem at all —
+ * `FixtureDeckBridge` keeps settings in `localStorage`. The settings surface
+ * says so in as many words rather than printing a plausible-looking path for a
+ * file that does not exist.
+ */
+export interface DesktopSettingsSnapshotDto {
+  settings: DesktopSettingsDto;
+  path?: string;
+}
+
+/** Coerce a `desktop_get_settings` reply into a valid snapshot. */
+export function normalizeDesktopSettingsSnapshot(value: unknown): DesktopSettingsSnapshotDto {
+  const record = typeof value === "object" && value !== null ? value as Record<string, unknown> : {};
+  return {
+    settings: normalizeDesktopSettings(record.settings),
+    path: typeof record.path === "string" && record.path ? record.path : undefined,
+  };
+}
+
 /** Low-volume lifecycle payload emitted as `desktop://terminal-state`. */
 export interface DesktopTerminalStateDto {
   sessionId: string;
@@ -177,6 +250,10 @@ export interface DeckBridge {
   runAction(action: DeckAction): Promise<DeckActionResult>;
   sendTerminalInput(agentId: string, data: string): Promise<void>;
   resizeTerminal(agentId: string, cols: number, rows: number): Promise<void>;
+  /** The desktop app's own settings document, and where it lives (PRD #803). Never rejects. */
+  getSettings(): Promise<DesktopSettingsSnapshotDto>;
+  /** Persist the whole document and resolve with what was written. */
+  saveSettings(settings: DesktopSettingsDto): Promise<DesktopSettingsDto>;
   /**
    * States the WHOLE set of agents whose terminal is on screen right now
    * (PRD #745 M7). Attach follows this and nothing else — not `connect()`, not
@@ -420,6 +497,7 @@ class FixtureDeckBridge implements DeckBridge {
   private snapshotListeners = new Set<SnapshotListener>();
   private terminalListeners = new Set<TerminalListener>();
   private fixtureStep = 0;
+  private settings?: DesktopSettingsDto;
 
   constructor() {
     const requestedState = new URLSearchParams(window.location.search).get("state");
@@ -489,6 +567,38 @@ class FixtureDeckBridge implements DeckBridge {
 
   async resizeTerminal(): Promise<void> {
     await Promise.resolve();
+  }
+
+  /**
+   * Settings for the browser preview. This class never imports
+   * `@tauri-apps/api/core`, so it structurally cannot reach `desktop.toml` — a
+   * fixture visit can only ever write the localStorage key above.
+   */
+  async getSettings(): Promise<DesktopSettingsSnapshotDto> {
+    await Promise.resolve();
+    // No `path`: there is no file. The surface renders the browser-preview
+    // wording instead of naming one that does not exist.
+    if (this.settings) return { settings: structuredClone(this.settings) };
+    let stored: unknown;
+    try {
+      const raw = window.localStorage.getItem(FIXTURE_SETTINGS_KEY);
+      stored = raw ? JSON.parse(raw) : undefined;
+    } catch {
+      stored = undefined;
+    }
+    this.settings = normalizeDesktopSettings(stored);
+    return { settings: structuredClone(this.settings) };
+  }
+
+  async saveSettings(settings: DesktopSettingsDto): Promise<DesktopSettingsDto> {
+    await Promise.resolve();
+    this.settings = normalizeDesktopSettings(settings);
+    try {
+      window.localStorage.setItem(FIXTURE_SETTINGS_KEY, JSON.stringify(this.settings));
+    } catch {
+      // A preview whose storage is unavailable still behaves for this session.
+    }
+    return structuredClone(this.settings);
   }
 
   /**
@@ -970,6 +1080,34 @@ export class TauriDeckBridge implements DeckBridge {
       return { ok: true };
     }
     throw new Error("This orchestration control is available in the fixture preview but is not yet exposed by the live daemon.");
+  }
+
+  /**
+   * Settings live in `desktop.toml`, read and written by the Rust core — never
+   * in localStorage, which is invisible to the user, uneditable outside the
+   * app, cleared by a webview data reset, and the wrong place for anything
+   * #802 later wants to reference.
+   *
+   * Loading never fails on the Rust side, so a rejection here can only be an
+   * IPC-level failure; the defaults keep the app usable either way. A failed
+   * *save* does propagate — a preference the user set and the app silently
+   * dropped is worse than an error they can see.
+   */
+  async getSettings(): Promise<DesktopSettingsSnapshotDto> {
+    const invoke = await this.getInvoke();
+    try {
+      return normalizeDesktopSettingsSnapshot(await invoke<DesktopSettingsSnapshotDto>("desktop_get_settings"));
+    } catch {
+      // Loading never fails Rust-side, so this is an IPC-level failure. The
+      // defaults keep the app usable; the missing path makes the surface say
+      // the location is unavailable rather than invent one.
+      return { settings: structuredClone(DEFAULT_DESKTOP_SETTINGS) };
+    }
+  }
+
+  async saveSettings(settings: DesktopSettingsDto): Promise<DesktopSettingsDto> {
+    const invoke = await this.getInvoke();
+    return normalizeDesktopSettings(await invoke<DesktopSettingsDto>("desktop_set_settings", { settings }));
   }
 
   async sendTerminalInput(agentId: string, data: string): Promise<void> {

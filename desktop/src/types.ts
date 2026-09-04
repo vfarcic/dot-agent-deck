@@ -507,4 +507,8 @@ export interface DeckRuntimeState {
    */
   setShownTerminals: (agentIds: string[]) => Promise<void>;
   reconnect: () => Promise<void>;
+  /** The desktop app's own settings, and where they live (PRD #803). */
+  getSettings: () => Promise<import("./lib/bridge").DesktopSettingsSnapshotDto>;
+  /** Persist the whole document; resolves to what was written. */
+  saveSettings: (settings: import("./lib/bridge").DesktopSettingsDto) => Promise<import("./lib/bridge").DesktopSettingsDto>;
 }

@@ -16,5 +16,18 @@ dot-agent-deck = { path = "../.." }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tauri = { version = "2", features = [] }
+# PRD #803: the desktop app's own settings document is TOML, a sibling of
+# the TUI's config.toml. Same version pin as the root package.
+toml = "1.0"
 tokio = { version = "1", features = ["sync", "time"] }
+
+[dev-dependencies]
+# PRD #803: every settings test drives an explicit path inside a temp dir so
+# none of them can touch the developer's real ~/.config/dot-agent-deck.
+tempfile = "3"
+
+# PRD #803: the settings-path guard rejects a FIFO, and `mkfifo(3)` is the only
+# way to build one to prove it. Tests only — nothing under `src/` uses libc.
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2"
 

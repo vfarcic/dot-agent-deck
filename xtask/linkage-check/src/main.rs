@@ -80,6 +80,12 @@
 //! Exits 0 on success, 1 on any failure with a per-finding summary.
 
 mod clean_tmp;
+/// PRD #743: no hard-coded colour under `desktop/src` outside the `:root`
+/// palette, so the desktop app's light/dark appearance cannot rot by attrition.
+/// Tests only — the rule and its scanner both live in the module, and nothing
+/// renders dark mode in CI, so this is the only thing that sees the decay.
+#[cfg(test)]
+mod desktop_palette;
 /// Issue #815: `scripts/devbox-check-gtk.sh`, which asserts that pkg-config
 /// resolves Tauri's GTK stack to Nix's copy rather than the host's. Tests only,
 /// and Linux only — the rule lives in the script, which CI's `devbox` job runs
