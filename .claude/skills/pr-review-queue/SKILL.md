@@ -327,8 +327,10 @@ The check is cheap and the answer is a reading, not a grep:
 ```bash
 gh pr view <n> --json closingIssuesReferences,files \
   -q '"CLOSES: "+([.closingIssuesReferences[].number]|map(tostring)|join(","))+"\nFILES: "+([.files[].path]|join(" "))'
-gh issue view <N> --json title,body -q .title
+gh issue view <N> --json title,body -q '.title, "", .body'
 ```
+
+**Read the body, not only the title.** Multi-part scope lives in the body: #818's several families are invisible from its title, and "does this diff finish it?" cannot be answered against a title alone — which is the exact case this check exists for.
 
 **A reference that over-reaches is a finding to raise, not something to silently fix** — on someone else's PR the unit must never push, and on the runner's own the narrowing is a body edit the runner should see. Say which issues the diff genuinely finishes and which it only advances.
 

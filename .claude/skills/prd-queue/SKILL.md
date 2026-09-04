@@ -152,7 +152,7 @@ A missing document is **not** a defect to fix here and **not** grounds for silen
 
 Step 3 asks whether the candidate has a **document**. Step 4 will ask whether someone is **already working** it. Neither asks whether the document is **still true**. A PRD that was implemented and never closed presents itself as available work indefinitely, and before this step no step asked the question — step 5's scope read might happen to surface it, but nothing required anyone to look.
 
-**Run this on the rows that survived step 3, and skip any that step 4 then eliminates as in flight** — it is a reading task, and its value comes from the reading rather than from covering every row.
+**Steps 3b and 4 are independent, and may be run in either order.** Where the candidate list is long, run step 4 first and premise-check only what survives it — there is no reason to read a document for a PRD already in flight. This sits at 3b because a document's *existence* and its *truth* are the same question asked twice, not because it has to run before the in-flight check.
 
 **Step 0 already contains the correct warning, and that is exactly the problem:** *"a PRD is exactly the kind of long-lived document most likely to describe work that has since partly landed."* That is advice about **which ref to verify against**, not a step that gates a candidate. This step is where it becomes actionable.
 
@@ -198,7 +198,9 @@ The remaining sampled flags were a git SHA (`dac0ad0`, `e22cd1e`), fields of a d
 - **A grep that matches the *fix* looks like a grep that matches the *bug*.** #358's audit had to separate "credentials absent from `/tmp`" — which the issue itself had already observed and correctly distrusted as luck — from "the containing directory is now owner-only", which was the actual fix. **Absence of a symptom is not evidence of a fix.**
 - **Word-boundary and pattern mistakes invert the answer in both directions, and they catch careful people.** A `grep -w sigterm_001` reported a test as deleted when it exists as the prefix of a longer name, and a `grep -icE 'trust'` counted 49 hits that were all the framing mechanism rather than the claim. The sweep quoted above walked into the same trap while being written: `c_line` is absent from this tree as a token, but a substring search finds it inside the unrelated `cmd_c_line` in `src/platform/paths.rs`, so the two searches disagree about whether it is present. Anchor patterns at the boundary you actually mean, and read a sample of the hits before believing the count.
 
-**So the reliable signal here is a reading, and the commands above only make it fast.** When the evidence is ambiguous — and it usually is — mark the row `premise holds` and let the unit find out. A row wrongly marked stale costs a question; a row wrongly dropped costs the work.
+**So the reliable signal here is a reading, and the commands above only make it fast.** When the evidence is ambiguous — and it usually is — mark the row **`premise not mechanically checkable`**. That bucket exists for evidence that cannot settle the claim, and a row carrying it is exactly as dispatchable as one marked `premise holds`, so nothing is lost by using it.
+
+**Do not reach for `premise holds` to express doubt.** It asserts the claim was checked and still stands, step 5 prints it as a confirmation, and no later step re-checks it — so a row that quietly upgrades *"could not tell"* to *"verified"* is the same unverified-claim defect this step exists to catch, reintroduced by the step itself. A row wrongly marked unclear costs a glance; a row wrongly marked verified costs the work, and a row wrongly dropped costs it silently.
 
 ## Step 4 — Eliminate what is already in flight
 
