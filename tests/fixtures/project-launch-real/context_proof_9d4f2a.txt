@@ -1,0 +1,5 @@
+Fixture sentinel for `project/launch/003`.
+
+This file exists only so that a real coordinator agent, following the task the
+daemon wrote into `.dot-agent-deck/orchestrator-context.md`, has a uniquely
+named filename to report back. Nothing reads its contents.

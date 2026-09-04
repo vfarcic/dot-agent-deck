@@ -1,0 +1,34 @@
+# Fixture for `project/launch/003` — the lane-2 real-agent half of the PRD #819
+# project-verb coverage.
+#
+# The three lane-1 tests in `tests/e2e_project_verbs.rs` prove what the daemon
+# RETURNS and where it WRITES. None of them proves the only thing the change is
+# actually for: that a real coordinator agent reads what the daemon wrote. That
+# needs a genuine interactive Claude Code pane, so this orchestration declares
+# one — no `-p`, no `cat` stand-in.
+#
+# ONE role, deliberately. `build_orchestrator_context` lists only NON-start
+# roles under `## Available agents`, so a solo coordinator gets an empty list
+# and has nobody to delegate to — which keeps the run to a single cheap Haiku
+# turn and keeps the proof on "did it read the file", not on a delegation chain
+# (`orchestration/route/001` and `scheduler/dispatch/013` own that).
+#
+# `--allowedTools Bash Read` is the role's own `command`, not a harness flag:
+# `Read` so the coordinator can open the daemon-published context without
+# stopping at a permission prompt, `Bash` so it can genuinely run `ls -a`.
+#
+# NOTE: `command` never crosses the wire — `crate::event::ProjectRole` carries
+# only `name` and `start`, deliberately, so command strings and prompt templates
+# stay daemon-side. The spawning client therefore supplies the command itself on
+# `StartAgent`, and the test keeps this string and its own `COORDINATOR_COMMAND`
+# in lockstep. What the daemon reads from HERE is `name`, `start`,
+# `prompt_template` and `description` — the fields the coordinator context is
+# composed from.
+[[orchestrations]]
+name = "context-handoff"
+
+[[orchestrations.roles]]
+name = "coordinator"
+command = "claude --model claude-haiku-4-5-20251001 --allowedTools Bash Read"
+start = true
+prompt_template = "You are the coordinator for this project. Everything you need is in this file."
