@@ -3656,7 +3656,13 @@ fn resolve_expired_wait(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum PromptWatch {
     /// The agent reported submitting the expected prompt — the delivery is real.
-    Confirmed,
+    ///
+    /// Issue #685: carries WHICH of the matcher's three shapes said so, purely
+    /// so the delivery log can tell a clean single-copy turn apart from one that
+    /// carries the prompt twice. Every shape is equally confirmed and the caller
+    /// treats them identically apart from the line it logs — see
+    /// [`crate::prompt_delivery::ConfirmedSubmission`].
+    Confirmed(crate::prompt_delivery::ConfirmedSubmission),
     /// Issue #424 D5: the agent reported submitting our prompt as REPEATED
     /// COPIES run together with no separator
     /// ([`crate::prompt_delivery::prompt_submission_accumulated`]) — a payload
@@ -3831,8 +3837,14 @@ pub(crate) async fn wait_for_prompt_submission(
                     agent_start = Some((std::time::Instant::now(), event.agent_type.clone()));
                 }
                 if let Some(reported) = event.user_prompt.as_deref() {
-                    if crate::prompt_delivery::prompt_submission_matches(expected, reported) {
-                        return PromptWatch::Confirmed;
+                    // Issue #685: the same accept set as
+                    // `prompt_submission_matches`, reporting which shape matched
+                    // so the caller's log line can distinguish a duplicated turn
+                    // from a clean one. No delivery decision reads it.
+                    if let Some(confirmation) =
+                        crate::prompt_delivery::classify_prompt_submission(expected, reported)
+                    {
+                        return PromptWatch::Confirmed(confirmation);
                     }
                     // Issue #424 D5: asked only after the matcher has said no,
                     // and it terminates rather than confirms. See

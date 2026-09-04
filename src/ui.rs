@@ -30,11 +30,11 @@ use crate::palette;
 use crate::pane::{AgentSpawnOptions, PaneController, PaneError, RenameOutcome};
 use crate::project_config::{ModeConfig, OrchestrationConfig, load_project_config};
 use crate::prompt_delivery::{
-    AUTOMATIC_PROMPT_DEADLINE, AgentStartRearm, ConfirmationCapability, attempt_delivery_id,
-    attempt_writes_payload, log_prompt_abandoned, log_prompt_accumulated, log_prompt_confirmed,
-    log_prompt_probe_submitted, log_prompt_stopped, log_prompt_unconfirmable,
-    log_prompt_unconfirmed, log_prompt_written, mint_delivery_id, pane_confirmation_capability,
-    prompt_submission_accumulated, prompt_submission_matches, submission_is_after_watermark,
+    AUTOMATIC_PROMPT_DEADLINE, AgentStartRearm, ConfirmationCapability, ConfirmedSubmission,
+    attempt_delivery_id, attempt_writes_payload, classify_prompt_submission, log_prompt_abandoned,
+    log_prompt_accumulated, log_prompt_confirmed, log_prompt_probe_submitted, log_prompt_stopped,
+    log_prompt_unconfirmable, log_prompt_unconfirmed, log_prompt_written, mint_delivery_id,
+    pane_confirmation_capability, prompt_submission_accumulated, submission_is_after_watermark,
     unconfirmed_retry_delay,
 };
 use crate::state::{AppState, DashboardStats, SessionState, SessionStatus, SharedState};
@@ -3744,12 +3744,13 @@ fn process_pending_seed_prompts(
             }
             bind_delivery_generation(delivery, snapshot, &sp.pane_id);
             match prompt_submission_evidence(snapshot, &sp.pane_id, &sp.prompt, delivery) {
-                Some(SubmissionEvidence::Confirmed) => {
+                Some(SubmissionEvidence::Confirmed(confirmation)) => {
                     log_prompt_confirmed(
                         "seed",
                         &sp.pane_id,
                         &delivery.delivery_id,
                         delivery.attempts,
+                        confirmation,
                     );
                     backoff.remove(&sp.pane_id);
                     deliveries.remove(&sp.pane_id);
@@ -4130,9 +4131,10 @@ fn capture_prompt_delivery(ui: &mut UiState, pane_id: &str, pane: &dyn PaneContr
 ///   and re-created #424's silent loss in a shape no log would explain;
 /// * the TEXT — an unrelated prompt the human typed into the target pane is not
 ///   our prompt arriving, and comparison goes through
-///   [`prompt_submission_matches`] so a seed longer than `USER_PROMPT_MAX_LEN`
-///   still matches its truncated report, and a CR-swallowed newline-separated
-///   doubled submission counts as delivered rather than leaving the retry armed;
+///   [`crate::prompt_delivery::prompt_submission_matches`] so a seed longer than
+///   `USER_PROMPT_MAX_LEN` still matches its truncated report, and a
+///   CR-swallowed newline-separated doubled submission counts as delivered
+///   rather than leaving the retry armed;
 /// * the WATERMARK — an event already in the pane's journal when we wrote is
 ///   pre-existing history. `attempts == 0` (nothing written yet) can never
 ///   confirm.
@@ -4154,7 +4156,8 @@ fn prompt_submission_evidence(
     if delivery.attempts == 0 {
         return None;
     }
-    let mut evidence = None;
+    let mut confirmed: Option<ConfirmedSubmission> = None;
+    let mut accumulated = false;
     for session in snapshot
         .sessions
         .values()
@@ -4180,17 +4183,31 @@ fn prompt_submission_evidence(
             let Some(reported) = event.user_prompt.as_deref() else {
                 continue;
             };
-            if prompt_submission_matches(expected, reported) {
-                // A clean confirmation anywhere in the journal wins outright:
+            if let Some(shape) = classify_prompt_submission(expected, reported) {
+                // A confirmation anywhere in the journal wins outright:
                 // accumulation elsewhere does not make a real delivery dirty.
-                return Some(SubmissionEvidence::Confirmed);
+                //
+                // Issue #685: the scan no longer RETURNS on the first
+                // confirmation, so which SHAPE gets logged cannot depend on
+                // `sessions`' hash order when a journal holds more than one.
+                // The evidence returned is unchanged — any confirmation still
+                // beats any accumulation, and the most notable shape wins only
+                // among confirmations. See `ConfirmedSubmission::more_notable`.
+                confirmed = Some(match confirmed {
+                    Some(existing) => existing.more_notable(shape),
+                    None => shape,
+                });
+                continue;
             }
             if prompt_submission_accumulated(expected, reported) {
-                evidence = Some(SubmissionEvidence::Accumulated);
+                accumulated = true;
             }
         }
     }
-    evidence
+    if let Some(shape) = confirmed {
+        return Some(SubmissionEvidence::Confirmed(shape));
+    }
+    accumulated.then_some(SubmissionEvidence::Accumulated)
 }
 
 /// Issue #424 D5: what a pane's journal says about a written prompt, once
@@ -4201,9 +4218,14 @@ fn prompt_submission_evidence(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SubmissionEvidence {
     /// The agent reported submitting our prompt — verbatim, truncated, or as
-    /// newline-separated copies ([`prompt_submission_matches`]). The delivery is
+    /// newline-separated copies
+    /// ([`crate::prompt_delivery::prompt_submission_matches`]). The delivery is
     /// real.
-    Confirmed,
+    ///
+    /// Issue #685: carries WHICH of those three shapes it was, so the delivery
+    /// log can tell a clean single-copy turn apart from one carrying the prompt
+    /// twice. Observability only — all three finalize the delivery identically.
+    Confirmed(ConfirmedSubmission),
     /// The agent reported our prompt submitted as repeated copies run together
     /// with no separator ([`prompt_submission_accumulated`]). A payload had been
     /// sitting in the input box and a later write appended to it, so what the
@@ -4817,9 +4839,13 @@ fn deliver_orchestrator_prompt(
         });
         if let Some(evidence) = evidence {
             match evidence {
-                SubmissionEvidence::Confirmed => {
-                    log_prompt_confirmed("orchestrator", &start_pane_id, &delivery_id, attempts)
-                }
+                SubmissionEvidence::Confirmed(confirmation) => log_prompt_confirmed(
+                    "orchestrator",
+                    &start_pane_id,
+                    &delivery_id,
+                    attempts,
+                    confirmation,
+                ),
                 // Issue #424 D5: the role prompt came back doubled with no
                 // separator. The orchestrator HAS submitted it, so the role is
                 // genuinely working and finalizing is honest; what must stop is
@@ -35379,14 +35405,14 @@ mod tests {
         );
 
         let repeated = "bounded repetition";
-        assert!(prompt_submission_matches(
+        assert!(crate::prompt_delivery::prompt_submission_matches(
             repeated,
             &std::iter::repeat_n(repeated, 16)
                 .collect::<Vec<_>>()
                 .join("\n")
         ));
         assert!(
-            !prompt_submission_matches(
+            !crate::prompt_delivery::prompt_submission_matches(
                 repeated,
                 &std::iter::repeat_n(repeated, 17)
                     .collect::<Vec<_>>()
@@ -35394,7 +35420,7 @@ mod tests {
             ),
             "the recovery shape is deliberately bounded to 16 copies"
         );
-        assert!(!prompt_submission_matches(
+        assert!(!crate::prompt_delivery::prompt_submission_matches(
             repeated,
             &format!("{repeated}\nsomething else")
         ));
