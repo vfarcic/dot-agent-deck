@@ -79,6 +79,14 @@
 //!
 //! Exits 0 on success, 1 on any failure with a per-finding summary.
 
+/// Issue #863: `scripts/build-gate.sh` and `scripts/link-gate.sh`, the
+/// machine-wide bound on concurrent linking that `.cargo/config.toml` routes
+/// the Linux target's links through. Tests only, and Unix only — the rule
+/// lives in the scripts, and their whole value is runtime behaviour, so a
+/// compile-time gate proves nothing about them (the same reason `clean_tmp`'s
+/// deletion-safety properties are tested here rather than trusted).
+#[cfg(all(test, unix))]
+mod build_gate;
 mod clean_tmp;
 /// PRD #743: no hard-coded colour under `desktop/src` outside the `:root`
 /// palette, so the desktop app's light/dark appearance cannot rot by attrition.
