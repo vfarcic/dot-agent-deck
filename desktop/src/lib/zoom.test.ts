@@ -41,6 +41,24 @@ describe("clampZoom", () => {
     expect(clampZoom(2.9)).toBe(3);
   });
 
+  /**
+   * A value exactly between two rungs resolves to the LOWER one, because the
+   * nearest-rung search uses a strict `<` over an ascending ladder so the first
+   * candidate wins a tie.
+   *
+   * Pinned because `ZoomLevel::snap` in `desktop/src-tauri/src/settings.rs` is a
+   * second implementation of this, and a tie is the one input where the two
+   * could differ while both looked correct — `<=` on either side would resolve
+   * upward. Disagreement means the app launches at one level (Rust snapped the
+   * document) while the Settings row reads another (this snapped it), which is
+   * the specific failure the duplicated-ladder comments warn about.
+   */
+  it("resolves an exact tie downward, as the Rust copy does", () => {
+    expect(clampZoom(1.05)).toBe(1.0);
+    expect(clampZoom(0.825)).toBe(0.75);
+    expect(clampZoom(2.25)).toBe(2.0);
+  });
+
   it("saturates rather than failing outside the ladder", () => {
     expect(clampZoom(0.01)).toBe(0.75);
     expect(clampZoom(99)).toBe(3);

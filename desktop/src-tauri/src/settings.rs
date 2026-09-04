@@ -1067,6 +1067,23 @@ mod tests {
         }
     }
 
+    /// A value exactly between two rungs resolves to the LOWER one, because the
+    /// search uses a strict `<` over an ascending ladder so the first candidate
+    /// wins a tie.
+    ///
+    /// Pinned because `clampZoom` in `desktop/src/lib/zoom.ts` is a second
+    /// implementation of this, and a tie is the one input where the two could
+    /// differ while both looked correct — `<=` on either side would resolve
+    /// upward. Disagreement means the app launches at the level this snapped
+    /// while the Settings row reads the level that one snapped, which is exactly
+    /// what the duplicated-ladder comment on [`ZOOM_LEVELS`] warns about.
+    #[test]
+    fn an_exact_tie_resolves_downward_as_the_frontend_copy_does() {
+        assert_eq!(ZoomLevel::snap(1.05).as_f64(), 1.0);
+        assert_eq!(ZoomLevel::snap(0.825).as_f64(), 0.75);
+        assert_eq!(ZoomLevel::snap(2.25).as_f64(), 2.0);
+    }
+
     #[test]
     fn an_off_ladder_zoom_level_snaps_to_the_nearest_rung() {
         assert_eq!(ZoomLevel::snap(1.3).as_f64(), 1.25);
