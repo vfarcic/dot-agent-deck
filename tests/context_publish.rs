@@ -33,7 +33,7 @@
 // proven.
 #![cfg(unix)]
 
-use std::os::unix::fs::PermissionsExt as _;
+use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 
 use dot_agent_deck::orchestrator_context::{
@@ -113,6 +113,22 @@ fn a_symlinked_context_directory_is_refused_and_nothing_is_written_through_it() 
     );
 }
 
+/// Create `.dot-agent-deck` the way the publish itself does — **explicitly**
+/// owner-only, not under the ambient umask.
+///
+/// This is not tidiness. `mkdir` under a umask of `002` — the default on hosts
+/// that give each user a private group, including the box this was written on —
+/// produces `0o775`, which the publish now **refuses**
+/// (`a_group_or_world_writable_context_directory_is_refused`). A test whose
+/// subject is symlinks must not depend on the CI host's umask to reach its
+/// assertion, so it says the mode it means.
+fn create_context_dir_owner_only(project: &Path) {
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(context_dir(project))
+        .expect("create .dot-agent-deck owner-only");
+}
+
 /// Case 2. A destination that is a symlink is **replaced**, not followed.
 ///
 /// `rename(2)` acts on the directory entry, so the link is unlinked and a real
@@ -126,7 +142,7 @@ fn a_destination_symlink_is_replaced_rather_than_followed() {
     let target = target_root.join("precious.txt");
     std::fs::write(&target, "do not clobber me").expect("seed the link target");
 
-    std::fs::create_dir(context_dir(&project)).expect("create .dot-agent-deck");
+    create_context_dir_owner_only(&project);
     std::os::unix::fs::symlink(&target, context_file(&project)).expect("symlink the destination");
 
     publish_orchestrator_context(&project, "the new context").expect("publish must succeed");
@@ -356,14 +372,27 @@ fn a_context_directory_that_is_a_regular_file_is_refused() {
     );
 }
 
-/// An existing `.dot-agent-deck` keeps whatever mode the operator gave it.
+/// An existing `.dot-agent-deck` that is **acceptable** keeps whatever mode the
+/// operator gave it.
 ///
 /// The owner-only claim is about directories this code **creates**, and stating
 /// it wider than that would be false: every `.dot-agent-deck` in every existing
 /// checkout predates the rule, and publishing is not the operation that gets to
-/// re-permission a directory somebody else made.
+/// re-permission a directory somebody else made. `0o755` is what one looks like
+/// under a default umask, and group/other *read* and *execute* are not what let
+/// another account replace a directory entry — so this stays the accepted case
+/// and the publish leaves it alone.
+///
+/// **What changed with PRD #819's audit is the boundary, not this side of it.**
+/// The old version of this test pinned "an existing directory is accepted
+/// whatever its mode", and its stated reasoning — whoever can write the parent
+/// already controls `.dot-agent-deck.toml` — is true of the parent and does not
+/// transfer to the child: a `.dot-agent-deck` can be group-writable while the
+/// project root is not. So group/other **write** is now refused, which is
+/// `a_group_or_world_writable_context_directory_is_refused`'s half of the pair.
+/// Keeping both halves is the point; either alone reads as the whole rule.
 #[test]
-fn an_existing_context_directory_keeps_its_mode() {
+fn an_existing_acceptable_context_directory_keeps_its_mode() {
     let (_guard, project) = project();
     std::fs::create_dir(context_dir(&project)).expect("create .dot-agent-deck");
     std::fs::set_permissions(
@@ -384,4 +413,99 @@ fn an_existing_context_directory_keeps_its_mode() {
         0o600,
         "the FILE is still created owner-only, whatever the directory's mode"
     );
+}
+
+/// An existing `.dot-agent-deck` that group or other can **write** is refused,
+/// and nothing is published into it.
+///
+/// PRD #819's audit finding. A file's mode does not protect its **directory
+/// entry**: another local account with write on that directory can rename or
+/// replace an `orchestrator-context.md` published at `0o600`, and the next
+/// coordinator then reads attacker-controlled instructions. The daemon creates
+/// this directory `0o700` when it creates it at all, so the exposure is entirely
+/// about directories that already exist — which the publish used to accept
+/// without inspecting.
+///
+/// Refusing rather than re-permissioning is deliberate: `chmod`-ing a directory
+/// the operator created is a side effect a publish has no business having, it
+/// races the very attacker it aims at, and it hides the misconfiguration instead
+/// of naming it. Both write bits are covered, because `0o770` (group only) is
+/// the shape a shared-group checkout actually has, and it is every bit as
+/// exposed as `0o777`.
+///
+/// **`0o775` is not an exotic mode, and the cost of refusing it is real.** It is
+/// exactly what `mkdir` produces under a umask of `002`, which is the default on
+/// hosts that give each user a private group — so a `.dot-agent-deck` left by
+/// anything other than this publish (a `git` checkout, an operator's `mkdir`, or
+/// this deck's own pre-M4 `create_dir_all`) is likely to carry it, and the
+/// remedy is `chmod go-w .dot-agent-deck`. The check cannot distinguish a
+/// private group from a shared one — group membership is not derivable from the
+/// mode, and NSS makes it unreliable to look up — so it fails closed, which is
+/// the same disposition OpenSSH's `StrictModes` takes for the same reason. That
+/// trade is recorded here rather than discovered by whoever hits it.
+///
+/// Running as root would not defeat this one — the check reads the mode rather
+/// than attempting a write — so unlike
+/// `a_failed_publish_leaves_the_previous_context_intact_and_no_residue` it needs
+/// no root guard.
+#[test]
+fn a_group_or_world_writable_context_directory_is_refused() {
+    for mode in [0o775, 0o777, 0o707, 0o770] {
+        let (_guard, project) = project();
+        std::fs::create_dir(context_dir(&project)).expect("create .dot-agent-deck");
+        std::fs::set_permissions(context_dir(&project), std::fs::Permissions::from_mode(mode))
+            .expect("hand it out to group/other");
+
+        let err =
+            match publish_orchestrator_context(&project, "into a directory anyone can rewrite") {
+                Ok(published) => {
+                    panic!(
+                        "mode {mode:04o} must be refused, but the publish produced {published:?}"
+                    )
+                }
+                Err(e) => e,
+            };
+        let ContextPublishError::ContextDirGroupOrWorldWritable(reported) = err else {
+            panic!("mode {mode:04o}: expected ContextDirGroupOrWorldWritable, got {err:?}");
+        };
+        assert_eq!(reported, mode, "the diagnostic names the offending mode");
+
+        assert!(
+            !context_file(&project).exists(),
+            "mode {mode:04o}: nothing may be published into a directory that fails the check"
+        );
+        assert!(
+            residue(&project).is_empty(),
+            "mode {mode:04o}: and no temp file may be left behind either: {:?}",
+            residue(&project)
+        );
+        assert_eq!(
+            mode_of(&context_dir(&project)),
+            mode,
+            "mode {mode:04o}: the directory is refused, not silently re-permissioned"
+        );
+    }
+}
+
+/// A directory the publish **creates** is owner-only and therefore always passes
+/// the check above — including under a permissive umask, which can only remove
+/// bits.
+///
+/// Without this, `a_group_or_world_writable_context_directory_is_refused` would
+/// be consistent with a publish that refused every directory it had just made.
+#[test]
+fn a_freshly_created_context_directory_satisfies_the_check_it_imposes() {
+    let (_guard, project) = project();
+    // SAFETY: `umask(2)` swaps a per-process value; nextest runs one process per
+    // test, so nothing else here observes it. Same reasoning as
+    // `creation_is_owner_only_under_a_permissive_umask_and_a_permissive_parent`.
+    let previous = unsafe { libc::umask(0) };
+    let published = publish_orchestrator_context(&project, "first publish in a fresh project");
+    unsafe {
+        libc::umask(previous);
+    }
+    published.expect("a directory this publish creates must satisfy its own check");
+
+    assert_eq!(mode_of(&context_dir(&project)), 0o700);
+    assert_eq!(mode_of(&context_file(&project)), 0o600);
 }

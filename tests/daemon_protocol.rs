@@ -42,10 +42,10 @@ use dot_agent_deck::agent_pty::{AgentPtyRegistry, AgentRecord};
 use dot_agent_deck::daemon_protocol::{
     AttachRequest, AttachResponse, DAEMON_CAPABILITIES, KIND_DETACH, KIND_REQ, KIND_RESP,
     KIND_STREAM_END, KIND_STREAM_IN, KIND_STREAM_OUT, KIND_STREAM_REJECT, PROJECT_ERR_INVALID_PATH,
-    PROJECT_ERR_NO_ORCHESTRATION, PROJECT_ERR_PUBLISH_FAILED, PROJECT_ERR_STALE_REVISION,
-    PROJECT_ERR_STALE_TOKEN, PROJECT_ERR_TASK_REJECTED, PROJECT_ERR_UNIMPLEMENTED,
-    PROJECT_ERR_UNRESOLVED, PROTOCOL_VERSION, RunningAgentsSummary, TabMembership,
-    bind_attach_listener, serve_attach_with_counter, write_resp,
+    PROJECT_ERR_NO_ORCHESTRATION, PROJECT_ERR_PUBLISH_FAILED, PROJECT_ERR_STALE_PREPARATION,
+    PROJECT_ERR_STALE_REVISION, PROJECT_ERR_STALE_TOKEN, PROJECT_ERR_TASK_REJECTED,
+    PROJECT_ERR_UNIMPLEMENTED, PROJECT_ERR_UNRESOLVED, PROTOCOL_VERSION, RunningAgentsSummary,
+    TabMembership, bind_attach_listener, serve_attach_with_counter, write_resp,
 };
 use dot_agent_deck::event::{
     AgentEvent, AgentType, EventType, LiveTarget, SendResult, TargetKind, Writable,
@@ -1604,6 +1604,129 @@ async fn start_agent_ignores_an_absent_prep_token_and_refuses_an_unknown_one() {
     assert!(
         resp.ok && resp.id.is_some(),
         "a freshly issued prep token must be accepted: {:?}",
+        resp.error
+    );
+}
+
+/// PRD #819's audit fix, end to end over the wire: two preparations in one
+/// project, and the **first** token's spawn is refused while the second's is
+/// accepted.
+///
+/// `tests/prep_binding.rs` proves the checker; this proves the **wiring** — that
+/// the `start-agent` arm resolves a presented token to its binding, runs the
+/// re-validation, and answers `stale-preparation` without spawning anything. The
+/// two together are the finding: before the fix, `start-agent` validated only
+/// that the token existed and was young, so this request succeeded and launched
+/// a coordinator pointed at a file holding the *other* preparation's brief.
+///
+/// The distinction from `stale-token` is asserted, not assumed: this token is one
+/// this daemon issued and is seconds old, so a refusal carrying the wrong code
+/// would say the token was unknown — which would send an operator looking for a
+/// client bug instead of a replaced artifact.
+#[tokio::test]
+async fn start_agent_refuses_a_token_whose_prepared_context_was_replaced() {
+    let server = start_server().await;
+    let (_dir, project) = mint_project(LAUNCHABLE_PROJECT);
+
+    let prepare = |task: &'static str| {
+        let server = &server;
+        let path = project.to_str().unwrap().to_string();
+        async move {
+            let resp = issue_json_request(
+                server,
+                serde_json::json!({
+                    "op": "prepare-workflow",
+                    "path": path,
+                    "orchestration": "loop",
+                    "task": task,
+                }),
+            )
+            .await;
+            assert!(resp.ok, "the preparation must succeed: {:?}", resp.error);
+            resp.workflow_prepared.expect("a PreparedWorkflow")
+        }
+    };
+
+    let first = prepare("Task A: the first client's brief.").await;
+    let second = prepare("Task B: the second client's brief.").await;
+    assert_ne!(first.token, second.token);
+    assert_eq!(
+        first.context_path, second.context_path,
+        "both preparations name the same fixed path, which is the shape of the defect"
+    );
+
+    let spawned = server.registry.agent_records().len();
+    let resp = issue_json_request(
+        &server,
+        serde_json::json!({
+            "op": "start-agent",
+            "command": "/bin/sh",
+            "cwd": first.path,
+            "rows": 24,
+            "cols": 80,
+            "prep_token": first.token,
+        }),
+    )
+    .await;
+    assert!(
+        !resp.ok,
+        "a token whose artifact was replaced must be refused"
+    );
+    assert!(resp.id.is_none(), "a refused start-agent starts nothing");
+    let error = resp.error.unwrap_or_default();
+    assert!(
+        error.starts_with(PROJECT_ERR_STALE_PREPARATION),
+        "expected `{PROJECT_ERR_STALE_PREPARATION}`, got {error:?}"
+    );
+    assert!(
+        !error.starts_with(PROJECT_ERR_STALE_TOKEN),
+        "the token IS live; reporting it as unknown would misdirect the diagnosis"
+    );
+    assert_eq!(
+        server.registry.agent_records().len(),
+        spawned,
+        "a refused start-agent must not have spawned a pane"
+    );
+
+    // The second preparation's token still spawns, which is what stops the
+    // assertions above from passing against a daemon that refuses every token.
+    let resp = issue_json_request(
+        &server,
+        serde_json::json!({
+            "op": "start-agent",
+            "command": "/bin/sh",
+            "cwd": second.path,
+            "rows": 24,
+            "cols": 80,
+            "prep_token": second.token,
+        }),
+    )
+    .await;
+    assert!(
+        resp.ok && resp.id.is_some(),
+        "the preparation whose artifact is on disk must still spawn: {:?}",
+        resp.error
+    );
+
+    // And again with the same token, because a real launch presents it once per
+    // ROLE: a re-validation that consumed the record, or that a spawn's own side
+    // effects invalidated, would refuse every role after the first and take the
+    // whole feature down rather than fail visibly here.
+    let resp = issue_json_request(
+        &server,
+        serde_json::json!({
+            "op": "start-agent",
+            "command": "/bin/sh",
+            "cwd": second.path,
+            "rows": 24,
+            "cols": 80,
+            "prep_token": second.token,
+        }),
+    )
+    .await;
+    assert!(
+        resp.ok && resp.id.is_some(),
+        "the same token must spawn a second role: {:?}",
         resp.error
     );
 }

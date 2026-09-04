@@ -220,6 +220,17 @@ pub struct PreparedContext {
     pub context_path: std::path::PathBuf,
     /// The one-liner to inject into the coordinator's PTY.
     pub prompt: String,
+    /// The exact bytes published, so a caller that has to *bind* this
+    /// preparation can digest what it approved rather than re-reading the file
+    /// and digesting whatever is there by then. PRD #819's audit fix — see
+    /// [`crate::prep_token::PrepBinding::context_digest`].
+    pub content: String,
+    /// The published file's inode identity, captured from the open temp-file
+    /// handle **before** the publishing `rename(2)`, which is the same inode the
+    /// destination then names. A later publish installs a different one, so this
+    /// value is what makes "still the artifact this preparation published"
+    /// checkable ([`crate::prep_token::PrepBinding::context_identity`]).
+    pub context_identity: Option<crate::prep_token::InodeIdentity>,
 }
 
 /// Compose the orchestrator context and publish it, reporting **why** on
@@ -244,10 +255,12 @@ pub fn prepare_orchestrator_context(
 ) -> Result<PreparedContext, ContextPublishError> {
     let task = task.map(str::trim).filter(|t| !t.is_empty());
     let content = compose_orchestrator_context(config, task);
-    let context_path = publish_orchestrator_context(cwd, &content)?;
+    let published = publish_orchestrator_context(cwd, &content)?;
     Ok(PreparedContext {
-        context_path,
+        context_path: published.path,
         prompt: orchestrator_prompt_line(task.is_some()),
+        context_identity: published.identity,
+        content,
     })
 }
 
@@ -374,6 +387,21 @@ pub const CONTEXT_FILE_NAME: &str = "orchestrator-context.md";
 /// at the boundary.
 pub const MAX_CONTEXT_BYTES: usize = 4 * 1024 * 1024;
 
+/// What a successful [`publish_orchestrator_context`] left on disk.
+///
+/// It replaced a bare `PathBuf` return in PRD #819's audit fix: a caller that
+/// has to *bind* the artifact it just published needs the file's identity as
+/// well as its name, and a path alone cannot be re-checked later — the name
+/// stays the same across a republish while the inode does not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublishedContext {
+    /// The destination the bytes reached.
+    pub path: std::path::PathBuf,
+    /// The published file's inode identity, or `None` where the platform has
+    /// none. See [`crate::prep_token::InodeIdentity`].
+    pub identity: Option<crate::prep_token::InodeIdentity>,
+}
+
 /// Why a coordinator context was not published.
 ///
 /// Replaces the `Option` the old publish returned. The caller needs to know
@@ -392,6 +420,11 @@ pub enum ContextPublishError {
     /// The final `.dot-agent-deck` component is a symlink. Refused; see
     /// [`open_context_dir`].
     ContextDirIsSymlink,
+    /// An existing `.dot-agent-deck` grants **write** to group or other, so
+    /// publishing into it cannot deliver the owner-only promise. Refused; see
+    /// [`refuse_a_writable_context_dir`]. The `u32` is the offending mode's
+    /// permission bits, for the daemon-local diagnostic only.
+    ContextDirGroupOrWorldWritable(u32),
     /// `.dot-agent-deck` could not be created or opened as a directory — it is a
     /// regular file, the project directory does not exist, or the permissions
     /// forbid it.
@@ -420,6 +453,11 @@ impl ContextPublishError {
             Self::ContextDirIsSymlink => format!(
                 "{CONTEXT_DIR_NAME} is a symlink; the coordinator context must be published into \
                  a real directory in the project itself"
+            ),
+            Self::ContextDirGroupOrWorldWritable(mode) => format!(
+                "{CONTEXT_DIR_NAME} is mode {mode:04o}, which grants write to group or other; \
+                 another local account could replace the coordinator context's directory entry \
+                 after it is published, so publishing is refused — `chmod go-w` the directory"
             ),
             Self::ContextDirUnusable(e) => {
                 format!("{CONTEXT_DIR_NAME} could not be created or opened as a directory: {e}")
@@ -452,6 +490,10 @@ impl ContextPublishError {
             }
             Self::ContextDirIsSymlink => {
                 "the project's `.dot-agent-deck` directory is a symlink, which is refused"
+            }
+            Self::ContextDirGroupOrWorldWritable(_) => {
+                "the project's `.dot-agent-deck` directory is writable by group or other, which \
+                 is refused; remove those write bits and retry"
             }
             Self::ContextDirUnusable(_) => {
                 "the project's `.dot-agent-deck` directory could not be created"
@@ -493,11 +535,17 @@ struct ContextDirGuard;
 /// a umask only *removes* bits, so the result is `0o700 & !umask`, which is
 /// owner-only or narrower whatever the caller's umask is.
 ///
-/// **A directory that already exists is left exactly as it is.** Publishing is
-/// not the operation that gets to re-permission a directory the operator
-/// created, and every `.dot-agent-deck` in every existing checkout predates
-/// this rule. So the owner-only claim is about directories this function
-/// *creates*, and no wider.
+/// **A directory that already exists is left exactly as it is** — this function
+/// re-permissions nothing. Publishing is not the operation that gets to
+/// re-permission a directory the operator created, and every `.dot-agent-deck`
+/// in every existing checkout predates this rule. So the owner-only claim here
+/// is about directories this function *creates*, and no wider.
+///
+/// **What an existing directory is nonetheless required to satisfy** lives one
+/// step later, in [`refuse_a_writable_context_dir`]: the publish refuses outright
+/// when the existing directory grants write to group or other. That split is
+/// deliberate — accepting an unsafe directory and accepting it *silently* are
+/// different failures, and only the second was PRD #819's audit finding.
 ///
 /// Non-recursive on purpose: the project directory is the caller's to establish
 /// (the daemon verb canonicalises it first, which proves it exists), and
@@ -528,10 +576,31 @@ fn create_context_dir(dir: &std::path::Path) -> Result<(), ContextPublishError> 
 /// **On a platform without those flags the guarantee is narrower**, and is
 /// stated rather than papered over: the check is a separate `symlink_metadata`
 /// lookup from the write, so a component swapped between the two is not caught,
-/// and no mode bits are applied at all (the Windows protected-DACL equivalent
-/// is not implemented). PRD #819's threat model is a daemon reachable off-box,
-/// and that daemon is Unix-only today — `bind_attach_listener` is a
-/// Unix-domain socket and the whole L2 tier is `#![cfg(unix)]`.
+/// no mode bits are applied at all (the Windows protected-DACL equivalent is
+/// not implemented), and [`refuse_a_writable_context_dir`] has nothing to
+/// inspect.
+///
+/// **The premise that used to excuse that was false, and PRD #819's audit was
+/// right to catch it.** This doc claimed the daemon is Unix-only, citing
+/// `bind_attach_listener` as a Unix-domain socket. It is not: `bind_attach_listener`
+/// returns a `crate::platform::ipc::IpcListener`, which is a **Windows named
+/// pipe** on Windows, with its own protected security descriptor — an active
+/// listener, not a stub. `#![cfg(unix)]` on the L2 tier bounds what is *tested*,
+/// which is not the same claim.
+///
+/// So the gap is closed at the boundary instead of being argued away:
+/// [`crate::daemon_protocol::AttachRequest::PrepareWorkflow`] — the one verb
+/// that lets a **peer** name the directory this publish writes into — is refused
+/// on non-Unix with [`crate::daemon_protocol::PROJECT_ERR_UNSUPPORTED_PLATFORM`],
+/// and `crate::daemon_protocol::DAEMON_CAPABILITIES` does not advertise it
+/// there. The narrower guarantee below therefore covers only the in-process TUI
+/// and spawn publishes, where the project directory comes from this process's
+/// own config. Implementing the DACL half with
+/// `crate::platform::fsperm::create_owner_only_dir` /
+/// `set_file_owner_only` remains available and would let the verb be enabled on
+/// Windows; it is deliberately not done here, because Windows desktop is out of
+/// PRD #819's scope and a refusal is a true statement where a half-built DACL
+/// would be a false one.
 fn open_context_dir(dir: &std::path::Path) -> Result<ContextDirGuard, ContextPublishError> {
     #[cfg(unix)]
     {
@@ -594,6 +663,79 @@ fn context_dir_unchanged(_guard: &ContextDirGuard, _dir: &std::path::Path) -> bo
     true
 }
 
+/// Refuse to publish into a `.dot-agent-deck` that grants **write** to group or
+/// other.
+///
+/// **This is PRD #819's audit finding, and the argument that used to excuse it
+/// does not transfer.** [`create_context_dir`] applies `0o700` only to a
+/// directory it creates and leaves an existing one alone, which was pinned as
+/// deliberate on the reasoning that whoever can write the *parent* already
+/// controls `.dot-agent-deck.toml` — whose `command` strings this daemon
+/// executes — so nothing is gained by policing the child. That argument is
+/// sound about the parent and says nothing about the child: a `.dot-agent-deck`
+/// can be group-writable while the project root is not, and a **file's** mode
+/// does not protect its **directory entry**. So another local account with write
+/// on that directory can rename or replace an `orchestrator-context.md`
+/// published at `0o600`, and the next coordinator reads attacker-controlled
+/// instructions.
+///
+/// Refusing rather than re-permissioning is the deliberate half. `chmod`-ing a
+/// directory the operator created is a side effect a publish has no business
+/// having, it would race the very attacker it is aimed at
+/// (`crate::platform::fsperm`'s own `ensure_owner_only_dir` documents that
+/// residual window), and it would hide the misconfiguration instead of naming
+/// it. The error sentence says which mode and what to run.
+///
+/// **Write bits only, and that is the whole check.** Group/other *read* and
+/// *execute* are tolerated: `0o755` is what a `.dot-agent-deck` looks like in an
+/// ordinary checkout under a default umask, refusing those would refuse nearly
+/// every existing project, and reading a directory is not what lets someone
+/// replace an entry in it. The published file is `0o600` regardless, so its
+/// contents are not exposed by a readable directory.
+///
+/// **Ownership is deliberately not checked**, having been considered: an
+/// existing directory owned by another account either denies this process the
+/// temp-file create outright — the OS refuses, and the publish fails with
+/// `TempCreate` — or this process is `root`, for whom no mode or owner check
+/// means anything at all. Adding one would buy nothing and would newly refuse
+/// `sudo`-in-a-user-checkout, which works today. The claim this function makes
+/// is therefore exactly: *no group- or world-writable directory is published
+/// into*, and nothing wider.
+///
+/// The mode comes from an `fstat` on the handle [`open_context_dir`] already
+/// holds, not from a second path lookup, so there is no check-then-open pair to
+/// race and no chance of inspecting a different directory than the one written
+/// to.
+#[cfg(unix)]
+fn refuse_a_writable_context_dir(guard: &ContextDirGuard) -> Result<(), ContextPublishError> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let mode = guard
+        .metadata()
+        .map_err(ContextPublishError::ContextDirUnusable)?
+        .permissions()
+        .mode()
+        & 0o7777;
+    if mode & 0o022 != 0 {
+        return Err(ContextPublishError::ContextDirGroupOrWorldWritable(mode));
+    }
+    Ok(())
+}
+
+/// The non-Unix arm, and it is a **no-op rather than an equivalent**.
+///
+/// There is no mode model to inspect here; the analogue is a protected DACL, and
+/// this module implements none (see [`open_context_dir`]). Rather than let that
+/// gap sit behind a claim it does not support, the daemon verb that would expose
+/// this write to a peer is refused outright on non-Unix — see
+/// [`crate::daemon_protocol::PROJECT_ERR_UNSUPPORTED_PLATFORM`]. What still
+/// reaches this line on such a platform is the in-process TUI publish, whose
+/// project directory comes from this process's own config rather than from
+/// another party.
+#[cfg(not(unix))]
+fn refuse_a_writable_context_dir(_guard: &ContextDirGuard) -> Result<(), ContextPublishError> {
+    Ok(())
+}
+
 /// A temp-file name unique within one directory, for one publish.
 ///
 /// Process id plus a monotonically increasing counter: two publishes in one
@@ -628,7 +770,14 @@ fn temp_context_file_name() -> String {
 ///   created `0o700` by `mkdir(2)` and the file `0o600` by `open(2)`, so there
 ///   is no window in which either exists wider than that. A permissive umask
 ///   only removes bits and a permissive parent directory grants nothing here,
-///   because neither is consulted for the new inode's mode.
+///   because neither is consulted for the new inode's mode. An **existing**
+///   directory is not re-permissioned — and, since PRD #819's audit, is
+///   *refused* when it grants group or other write, because a `0o600` file's
+///   directory entry is only as safe as the directory holding it
+///   ([`refuse_a_writable_context_dir`]). All of this is the **Unix** arm; the
+///   non-Unix arm applies no mode or DACL at all, which is why the daemon verb
+///   is refused there rather than claiming otherwise (see
+///   [`open_context_dir`]).
 /// * **Atomic with respect to a reader.** The bytes go to a `create_new`
 ///   temp file in the SAME directory and reach the destination by `rename(2)`,
 ///   so a concurrent reader sees either the previous context or the new one and
@@ -652,7 +801,7 @@ fn temp_context_file_name() -> String {
 pub fn publish_orchestrator_context(
     project_dir: &std::path::Path,
     content: &str,
-) -> Result<std::path::PathBuf, ContextPublishError> {
+) -> Result<PublishedContext, ContextPublishError> {
     if content.len() > MAX_CONTEXT_BYTES {
         return Err(ContextPublishError::ContextTooLarge(content.len()));
     }
@@ -660,6 +809,10 @@ pub fn publish_orchestrator_context(
     let dir = project_dir.join(CONTEXT_DIR_NAME);
     create_context_dir(&dir)?;
     let guard = open_context_dir(&dir)?;
+    // Before anything is created inside it: an existing directory that group or
+    // other can write is refused outright, because a 0600 file's directory entry
+    // is only as protected as the directory holding it.
+    refuse_a_writable_context_dir(&guard)?;
 
     let final_path = dir.join(CONTEXT_FILE_NAME);
     let temp_path = dir.join(temp_context_file_name());
@@ -688,13 +841,28 @@ pub fn publish_orchestrator_context(
         file.write_all(content.as_bytes())
             .map_err(ContextPublishError::TempWrite)?;
         file.flush().map_err(ContextPublishError::TempWrite)?;
+        // The identity is taken from the OPEN HANDLE, before the rename. That is
+        // not a convenience: `rename(2)` moves this inode onto the destination
+        // name, so the handle's `(dev, ino)` IS the published file's, whereas a
+        // `stat` of the destination afterwards would report whichever inode
+        // happens to be there — including a *later* publish's, which is exactly
+        // the interleaving this value exists to detect.
+        let identity = file
+            .metadata()
+            .ok()
+            .as_ref()
+            .and_then(crate::prep_token::inode_identity);
         drop(file);
 
-        std::fs::rename(&temp_path, &final_path).map_err(ContextPublishError::Publish)
+        std::fs::rename(&temp_path, &final_path).map_err(ContextPublishError::Publish)?;
+        Ok(identity)
     })();
 
     match outcome {
-        Ok(()) => Ok(final_path),
+        Ok(identity) => Ok(PublishedContext {
+            path: final_path,
+            identity,
+        }),
         Err(e) => {
             // Best effort, and deliberately not reported: the publish already
             // failed for a reason the caller is about to be told, and a leftover

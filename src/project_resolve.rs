@@ -429,12 +429,45 @@ pub fn read_config_file(path: &Path) -> Result<String, ProjectResolveError> {
 /// `.dot-agent-deck.toml` already controls the `command` strings this daemon
 /// executes, which is strictly more than defeating a staleness check.
 pub fn config_revision(contents: &str) -> String {
+    format!("fnv1a128-{}", fnv1a128_hex(contents.as_bytes()))
+}
+
+/// An opaque digest of the coordinator-context bytes one preparation published.
+///
+/// The launch-verb counterpart of [`config_revision`], carried on
+/// [`crate::prep_token::PrepBinding::context_digest`] so a spawn can prove it is
+/// launching against the artifact its own preparation wrote rather than against
+/// whatever later landed at the same fixed path. Same construction, and a
+/// **different prefix** for the reason `config_revision`'s own doc gives: two
+/// derivations that mean different things must not be silently comparable.
+///
+/// **What it detects, precisely:** that the published bytes changed. Like
+/// [`config_revision`] it is FNV-1a and is a change *hint*, not a commitment —
+/// it does not withstand a deliberately crafted collision, and it is not
+/// authorization for anything (see [`crate::prep_token`]'s module doc). On Unix
+/// it is also not the only check: the published file's inode identity is
+/// compared alongside it, and `rename(2)` installs a fresh inode on every
+/// publish, so a republish is caught structurally whatever its bytes hash to.
+/// The digest is what covers the case the inode misses — an in-place rewrite of
+/// the same inode, which is what a shell `>` redirect or another tool's
+/// `fs::write` does.
+pub fn context_digest(content: &str) -> String {
+    format!("ctx-fnv1a128-{}", fnv1a128_hex(content.as_bytes()))
+}
+
+/// FNV-1a, 128-bit, rendered as 32 lowercase hex digits.
+///
+/// One implementation shared by [`config_revision`] and [`context_digest`], so
+/// the two cannot drift into hashing the same bytes differently. The choice of
+/// FNV-1a over [`std::hash::DefaultHasher`] is argued at `config_revision`;
+/// callers add their own scheme prefix.
+fn fnv1a128_hex(bytes: &[u8]) -> String {
     let mut hash: u128 = 0x6c62_272e_07bb_0142_62b8_2175_6295_c58d;
-    for byte in contents.as_bytes() {
+    for byte in bytes {
         hash ^= u128::from(*byte);
         hash = hash.wrapping_mul(0x0000_0000_0100_0000_0000_0000_0000_013b);
     }
-    format!("fnv1a128-{hash:032x}")
+    format!("{hash:032x}")
 }
 
 /// Read and parse `<dir>/.dot-agent-deck.toml` under every bound this module
@@ -893,9 +926,24 @@ pub fn resolve_for_wire(path: &str, seeds: &[ProjectCandidate]) -> Result<Resolv
 ///
 /// The ordering is the point, and it is what makes "a failed preparation starts
 /// no roles" true rather than aspirational: every step that can fail runs
-/// before anything observable is created, the publish is the last thing that
-/// happens, and this function starts nothing. Roles are started by a later
-/// `StartAgent` sequence that never runs if this returns `Err`.
+/// before anything observable is created, the publish is the last step with a
+/// side effect outside this process, and this function starts nothing. Roles are
+/// started by a later `StartAgent` sequence that never runs if this returns
+/// `Err`. (The token minted after the publish is an in-memory record, so it
+/// cannot exist for a preparation that failed.)
+///
+/// **What the returned token binds, and why that is not a detail.** PRD #819's
+/// original design had this issue a token recording only its issuance time, and
+/// the audit of the finished branch showed that binds nothing usable: the
+/// coordinator context is published at a path fixed per project, so a second
+/// preparation in the same project replaces the first's artifact while the
+/// first's token is still inside its TTL. The record now carries the canonical
+/// directory and its inode identity, the config revision, the orchestration and
+/// the published bytes' digest and inode ([`crate::prep_token::PrepBinding`]),
+/// and every spawn presenting the token re-checks all of it
+/// ([`revalidate_preparation`]). The **second** preparation is the one whose
+/// artifact is on disk and whose token validates; the first is refused at its
+/// spawn rather than launched against the wrong brief.
 ///
 /// **One canonical string, carried end to end.** `path` is canonicalised once,
 /// here, and the same `PathBuf` is what the config is read from, what the
@@ -993,6 +1041,16 @@ pub fn prepare_workflow_for_wire(
         split(&err, Some(dir.as_path()))
     })?;
 
+    // The project directory's own identity, read BEFORE the publish so it
+    // describes the directory this preparation actually resolved and wrote into.
+    // A `None` here is not a soft failure: it means the platform has no inode
+    // identity, and the verb that reaches this code is refused on such a
+    // platform (`crate::daemon_protocol::PROJECT_ERR_UNSUPPORTED_PLATFORM`).
+    let project_identity = std::fs::symlink_metadata(&dir)
+        .ok()
+        .as_ref()
+        .and_then(crate::prep_token::inode_identity);
+
     // --- compose and publish. Last, and the only step with a side effect.
     let prepared = crate::orchestrator_context::prepare_orchestrator_context(
         orch,
@@ -1004,13 +1062,34 @@ pub fn prepare_workflow_for_wire(
         publish_refusal(&err)
     })?;
 
+    // --- bind the record to what was just approved.
+    //
+    // PRD #819's audit finding: a token that records only its issuance time
+    // binds nothing, so a launch can present a live token and spawn against an
+    // artifact some *other* preparation published at the same fixed path. The
+    // record therefore carries the canonical directory and its inode identity,
+    // the config revision resolved against, the orchestration, and the exact
+    // published bytes' digest and inode — and every spawn presenting the token
+    // re-validates all of it (`revalidate_preparation`). It remains a staleness
+    // and integrity mechanism and is not an authorization token; see
+    // `crate::prep_token`'s module doc.
+    let token = crate::prep_token::issue(crate::prep_token::PrepBinding {
+        project_dir: dir.clone(),
+        project_identity,
+        config_revision: revision,
+        orchestration: crate::project_config::resolve_orchestration_name(&orch.name, &dir),
+        context_path: prepared.context_path.clone(),
+        context_identity: prepared.context_identity,
+        context_digest: context_digest(&prepared.content),
+    });
+
     Ok(crate::event::PreparedWorkflow {
         context_path: prepared.context_path.to_string_lossy().into_owned(),
         // The canonical directory this preparation actually resolved to, so the
         // spawn does not have to trust the caller's spelling — see
         // `PreparedWorkflow::path`.
         path: dir.to_string_lossy().into_owned(),
-        token: crate::prep_token::issue(),
+        token,
         roles,
         // The composer already built the pointer line and until PRD #819 M6 it
         // was dropped on the floor here. The client spawning the roles is the
@@ -1018,6 +1097,224 @@ pub fn prepare_workflow_for_wire(
         // `PreparedWorkflow::prompt`.
         prompt: prepared.prompt,
     })
+}
+
+/// Re-validate a preparation at spawn time: is the artifact this token was
+/// issued for still the artifact a launch would run against?
+///
+/// **This is the spawn-side half of PRD #819's audit fix, and the half that
+/// makes the token mean anything.** The original design recorded only
+/// `(token, issued_at)`, so nothing here was possible: two clients preparing in
+/// the same project overwrite one fixed file, both tokens stay inside the TTL,
+/// and the earlier launch spawns a coordinator pointed at a path now holding the
+/// later client's brief. The record now carries what it approved
+/// ([`crate::prep_token::PrepBinding`]) and this function re-checks every part
+/// of it:
+///
+/// 1. the canonical project directory still resolves, and still canonicalises to
+///    the same string — a project replaced by a symlink elsewhere is caught;
+/// 2. that directory is the same **inode** — a delete-and-recreate under the same
+///    name is caught, which a path comparison alone cannot see;
+/// 3. the config still reads and its [`config_revision`] is unchanged;
+/// 4. the orchestration is still defined, with roles, under the prepared name;
+/// 5. the published coordinator context is the same **inode** and the same
+///    **bytes** — which is what catches the interleaving above, since a second
+///    publish `rename(2)`s a fresh inode over the destination.
+///
+/// **It is the conjunction that carries the claim, not any single check**, and
+/// two of them are individually defeasible: an inode number is reusable
+/// ([`crate::prep_token::InodeIdentity`]) and [`config_revision`] is an FNV-1a
+/// change hint rather than a commitment. What survives is narrow and sufficient:
+/// for all five to agree, the config bytes, the published bytes and both inode
+/// identities have to coincide, which means the artifact on disk is
+/// byte-identical to the one this preparation approved. No stronger property is
+/// claimed here, and none is needed — a peer able to reach this socket can spawn
+/// with no token at all.
+///
+/// **Every failure is one refusal with one sentence on the wire**
+/// ([`stale_preparation_refusal`]), and the specific cause stays daemon-local.
+/// That is the same disposition the resolve verb's refusals take, and for a
+/// sharper reason here: the caller can already learn all five facts by resolving
+/// the project again, so the uniform sentence costs it nothing, while
+/// enumerating which check failed would turn a staleness answer into a
+/// description of another party's launch. The split is a typed
+/// [`PreparationStale`] rather than a pre-rendered string, exactly as
+/// [`crate::orchestrator_context::ContextPublishError`] splits its two
+/// renderings — so the log and the tests can name the cause without the wire
+/// gaining the ability to.
+///
+/// **It is not an authorization check and does not become one.** A peer that
+/// wants to start a process calls `StartAgent` with no token at all; refusing a
+/// stale one stops a *mistake* — a launch consuming state it did not publish —
+/// and nothing more. Read [`crate::prep_token`]'s module doc before treating a
+/// refusal here as a denied privilege.
+///
+/// **Blocking** — the caller goes through [`run_bounded`].
+pub fn revalidate_preparation(
+    binding: &crate::prep_token::PrepBinding,
+) -> Result<(), PreparationStale> {
+    let dir = canonicalize_project_dir(&binding.project_dir)
+        .map_err(|_| PreparationStale::ProjectUnresolved)?;
+    if dir != binding.project_dir {
+        return Err(PreparationStale::ProjectMoved);
+    }
+    let identity = std::fs::symlink_metadata(&dir)
+        .ok()
+        .as_ref()
+        .and_then(crate::prep_token::inode_identity);
+    if identity != binding.project_identity {
+        return Err(PreparationStale::ProjectReplaced);
+    }
+
+    let (config, revision) =
+        read_project_config_with_revision(&dir).map_err(|_| PreparationStale::ConfigUnreadable)?;
+    if revision != binding.config_revision {
+        return Err(PreparationStale::ConfigChanged);
+    }
+    // Cheap, and not a tautology given the revision matched: `config_revision`
+    // is a change hint rather than a commitment, so this asks the config itself
+    // the question the hint only stands in for.
+    if !config
+        .orchestrations
+        .iter()
+        .filter(|o| !o.roles.is_empty())
+        .any(|o| {
+            crate::project_config::resolve_orchestration_name(&o.name, &dir)
+                == binding.orchestration
+        })
+    {
+        return Err(PreparationStale::OrchestrationGone);
+    }
+
+    let (content, context_identity) = read_published_context(&binding.context_path)?;
+    if context_identity != binding.context_identity {
+        return Err(PreparationStale::ContextReplaced);
+    }
+    if context_digest(&content) != binding.context_digest {
+        return Err(PreparationStale::ContextRewritten);
+    }
+    Ok(())
+}
+
+/// Why a preparation no longer describes what it approved.
+///
+/// Two renderings, for [`crate::orchestrator_context::ContextPublishError`]'s
+/// reason: [`Self::detail`] is the daemon-local diagnostic and names the
+/// specific check, and the wire gets [`stale_preparation_refusal`]'s one
+/// sentence for **every** variant. Nothing here reaches a client, and the enum
+/// exists so the log and the tests can tell the five checks apart — a test that
+/// can only observe "refused" cannot show that the check it is exercising is the
+/// one that fired.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreparationStale {
+    /// The canonical project directory no longer resolves at all.
+    ProjectUnresolved,
+    /// It resolves, but now canonicalises somewhere else — the path became a
+    /// symlink, or a parent component did.
+    ProjectMoved,
+    /// Same path, different inode: deleted and recreated under the same name.
+    ProjectReplaced,
+    /// The project config no longer reads.
+    ConfigUnreadable,
+    /// The config's [`config_revision`] moved after the preparation.
+    ConfigChanged,
+    /// The prepared orchestration is no longer defined with roles.
+    OrchestrationGone,
+    /// The published coordinator context could not be read back.
+    ContextUnreadable,
+    /// Something other than a regular file now sits at the published path.
+    ContextNotRegularFile,
+    /// What sits there is larger than this daemon publishes.
+    ContextTooLarge,
+    /// Same path, different inode — which is what a second publish's
+    /// `rename(2)` produces, and therefore the interleaving case PRD #819's
+    /// audit found.
+    ContextReplaced,
+    /// Same inode, different bytes — an in-place rewrite, which a `>` redirect
+    /// or another tool's `fs::write` performs.
+    ContextRewritten,
+}
+
+impl PreparationStale {
+    /// The **daemon-local** diagnostic. Safe to log; reaches no client.
+    pub fn detail(&self) -> &'static str {
+        match self {
+            Self::ProjectUnresolved => "the prepared project directory no longer resolves",
+            Self::ProjectMoved => "the prepared project directory now canonicalises elsewhere",
+            Self::ProjectReplaced => "the prepared project directory has been replaced",
+            Self::ConfigUnreadable => "the prepared project's config no longer reads",
+            Self::ConfigChanged => "the project config changed after the preparation",
+            Self::OrchestrationGone => "the prepared orchestration is no longer defined with roles",
+            Self::ContextUnreadable => "the published coordinator context could not be read back",
+            Self::ContextNotRegularFile => {
+                "the published coordinator context is no longer a regular file"
+            }
+            Self::ContextTooLarge => {
+                "the published coordinator context is larger than this daemon publishes"
+            }
+            Self::ContextReplaced => "the published coordinator context has been replaced",
+            Self::ContextRewritten => "the published coordinator context has been rewritten",
+        }
+    }
+}
+
+impl std::fmt::Display for PreparationStale {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.detail())
+    }
+}
+
+/// Read the coordinator context back for [`revalidate_preparation`], under the
+/// same bounds and the same symlink discipline [`read_config_file`] applies.
+///
+/// `O_NOFOLLOW` because the destination is a name another party may have turned
+/// into a link, and the regular-file check because a FIFO substituted for it
+/// would otherwise stall this blocking thread. The cap is
+/// [`crate::orchestrator_context::MAX_CONTEXT_BYTES`] — the same bound the
+/// publish enforces, so a file this daemon wrote always fits and anything larger
+/// is by definition not one.
+fn read_published_context(
+    path: &Path,
+) -> Result<(String, Option<crate::prep_token::InodeIdentity>), PreparationStale> {
+    let max = crate::orchestrator_context::MAX_CONTEXT_BYTES as u64;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = options
+        .open(path)
+        .map_err(|_| PreparationStale::ContextUnreadable)?;
+    let metadata = file
+        .metadata()
+        .map_err(|_| PreparationStale::ContextUnreadable)?;
+    if !metadata.is_file() {
+        return Err(PreparationStale::ContextNotRegularFile);
+    }
+    if metadata.len() > max {
+        return Err(PreparationStale::ContextTooLarge);
+    }
+    let identity = crate::prep_token::inode_identity(&metadata);
+    let content =
+        crate::bounded_read::read_capped(file, max, crate::orchestrator_context::CONTEXT_FILE_NAME)
+            .map_err(|_| PreparationStale::ContextUnreadable)?;
+    Ok((content, identity))
+}
+
+/// The refusal a `StartAgent` whose preparation no longer holds gets.
+///
+/// One fixed sentence for all five checks, for the reason
+/// [`revalidate_preparation`]'s doc gives, and the remedy the caller needs is
+/// the same in every case: prepare again.
+pub fn stale_preparation_refusal() -> String {
+    format!(
+        "{}: that preparation no longer matches the project it was made against; prepare the \
+         workflow again",
+        crate::daemon_protocol::PROJECT_ERR_STALE_PREPARATION
+    )
 }
 
 /// The refusal a stale [`config_revision`] gets.

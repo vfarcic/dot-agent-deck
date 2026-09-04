@@ -312,8 +312,20 @@ pub const CAP_PREPARE_WORKFLOW: &str = "prepare-workflow";
 /// is a normal answer to a known verb. Strike a verb from this list if this
 /// build stops accepting it; do not leave a name here that the dispatch no
 /// longer has an arm for.
+///
+/// **[`CAP_PREPARE_WORKFLOW`] is Unix-only**, which is the one place that
+/// distinction bites. A non-Unix build refuses the verb *unconditionally* with
+/// [`PROJECT_ERR_UNSUPPORTED_PLATFORM`] — the publish cannot deliver the
+/// owner-only guarantee there — and that is not a bounded refusal of a
+/// particular request but the verb being unavailable, which is exactly the "this
+/// build stops accepting it" case above. Advertising it anyway would reduce the
+/// list to "the frame decodes", and the whole point of PRD #819's capability
+/// helper is that a client withholds rather than enables on absence.
+#[cfg(unix)]
 pub const DAEMON_CAPABILITIES: &[&str] =
     &[CAP_LIST_PROJECTS, CAP_RESOLVE_PROJECT, CAP_PREPARE_WORKFLOW];
+#[cfg(not(unix))]
+pub const DAEMON_CAPABILITIES: &[&str] = &[CAP_LIST_PROJECTS, CAP_RESOLVE_PROJECT];
 
 /// PRD #819 M2: the project verbs' refusal carries a stable machine-readable
 /// code as the first token of [`AttachResponse::error`], followed by `": "` and
@@ -391,6 +403,51 @@ pub const PROJECT_ERR_PUBLISH_FAILED: &str = "publish-failed";
 /// this as an authorization failure — it is not one, and an absent token is not
 /// refused at all.
 pub const PROJECT_ERR_STALE_TOKEN: &str = "stale-token";
+
+/// PRD #819 audit fix: an [`AttachRequest::StartAgent`] presented a `prep_token`
+/// this daemon **did** issue and which has **not** expired, but the state that
+/// preparation approved has moved — see
+/// [`crate::project_resolve::revalidate_preparation`] for the five checks.
+///
+/// A distinct code from [`PROJECT_ERR_STALE_TOKEN`] because it is a distinct
+/// fact: the token is live and the *world* changed, rather than the token being
+/// unknown or aged out. The remedy is the same (prepare again), which is why the
+/// sentence after each code reads alike, but a client or a test that cannot tell
+/// "I presented garbage" from "another launch replaced my artifact" cannot
+/// diagnose either.
+///
+/// One code for all five checks, and the sentence names none of them. Read
+/// [`crate::prep_token`]'s module doc before treating this as an authorization
+/// failure — it is a staleness and integrity refusal, and an absent token is
+/// still not refused at all.
+pub const PROJECT_ERR_STALE_PREPARATION: &str = "stale-preparation";
+
+/// PRD #819 audit fix: [`AttachRequest::PrepareWorkflow`] is refused on this
+/// platform because the publish cannot deliver the owner-only guarantee it
+/// documents.
+///
+/// **The premise this replaces was false.** The publish's mode bits,
+/// `O_NOFOLLOW | O_DIRECTORY` open and group/other-write refusal are all Unix
+/// (`crate::orchestrator_context::open_context_dir`), and the module excused
+/// that by asserting the daemon is Unix-only. It is not — [`bind_attach_listener`]
+/// returns a `crate::platform::ipc::IpcListener`, which on Windows is an active
+/// **named pipe** listener. So a Windows daemon really can be asked to create a
+/// directory and write a file at a path a *peer* named, with no protected DACL
+/// applied and with path lookups rather than a reparse-safe handle.
+///
+/// Two honest options existed: implement the DACL half with the helpers in
+/// `crate::platform::fsperm` (they exist —
+/// `create_owner_only_dir` / `set_file_owner_only` / `ensure_owner_only_dir`),
+/// or refuse the verb where the guarantee cannot be provided and narrow the
+/// documentation to match. The second was taken: Windows desktop is out of PRD
+/// #819's scope, so refusing there is consistent with what shipped, it is far
+/// smaller than a correct DACL implementation, and it turns a false claim into a
+/// true one. Enabling the verb on Windows later means building the DACL path
+/// **and** deleting this code — not deleting this code alone.
+///
+/// The verb is also struck from [`DAEMON_CAPABILITIES`] on such a platform, so a
+/// client learns at the handshake rather than at launch time.
+pub const PROJECT_ERR_UNSUPPORTED_PLATFORM: &str = "unsupported-platform";
 
 /// PRD #819 M3: the ONE code carried by every refusal that comes from
 /// *resolving* a path against a filesystem.
@@ -1902,18 +1959,62 @@ async fn handle_connection(
                     return Ok(());
                 }
             };
-            if let Some(token) = extras.prep_token.as_deref()
-                && !crate::prep_token::is_valid(token)
-            {
-                write_resp(
-                    &mut stream,
-                    &AttachResponse::err(format!(
-                        "{PROJECT_ERR_STALE_TOKEN}: that preparation is unknown or has expired; \
-                         prepare the workflow again"
-                    )),
-                )
-                .await?;
-                return Ok(());
+            //
+            // PRD #819 audit fix: "the token exists and is young" was the WHOLE
+            // check here, and it binds nothing. The record now carries the state
+            // its preparation approved, so a present token is resolved to that
+            // record and the record is re-validated against the filesystem
+            // before anything spawns. Two refusals, deliberately distinct: the
+            // token is not ours or has aged out (`stale-token`), or it is ours
+            // and live but the world moved under it (`stale-preparation`).
+            if let Some(token) = extras.prep_token.as_deref() {
+                let Some(binding) = crate::prep_token::binding(token) else {
+                    write_resp(
+                        &mut stream,
+                        &AttachResponse::err(format!(
+                            "{PROJECT_ERR_STALE_TOKEN}: that preparation is unknown or has \
+                             expired; prepare the workflow again"
+                        )),
+                    )
+                    .await?;
+                    return Ok(());
+                };
+                // Filesystem work, so it goes through the same bounded blocking
+                // pool every other project verb uses — one call, one permit, and
+                // never from inside a task that already holds one.
+                let outcome = crate::project_resolve::run_bounded(move || {
+                    crate::project_resolve::revalidate_preparation(&binding)
+                })
+                .await;
+                let stale = match outcome {
+                    Ok(Ok(())) => false,
+                    Ok(Err(stale)) => {
+                        // The cause is named here and nowhere else: the wire gets
+                        // one sentence for all of them, so the daemon log is the
+                        // only place an operator can learn which check fired.
+                        warn!(
+                            reason = %stale,
+                            "start-agent refused: the preparation no longer describes what it approved"
+                        );
+                        true
+                    }
+                    Err(e) => {
+                        // The pool could not run the check. Refusing is the only
+                        // safe answer: "we could not verify" is not "it is
+                        // fine", and the caller's remedy — prepare again — is
+                        // the same either way.
+                        warn!(reason = %e, "start-agent refused: the preparation could not be re-validated");
+                        true
+                    }
+                };
+                if stale {
+                    write_resp(
+                        &mut stream,
+                        &AttachResponse::err(crate::project_resolve::stale_preparation_refusal()),
+                    )
+                    .await?;
+                    return Ok(());
+                }
             }
 
             // PRD #93 round-5: capture the bits we need to populate the
@@ -2737,7 +2838,10 @@ async fn handle_connection(
             task,
             config_revision,
         } => {
-            let resp = match validate_project_path(&path).and_then(|()| validate_task(&task)) {
+            let resp = match refuse_prepare_where_unsupported()
+                .and_then(|()| validate_project_path(&path))
+                .and_then(|()| validate_task(&task))
+            {
                 Err(message) => AttachResponse::err(message),
                 Ok(()) => {
                     // Same seed set, same reason, as the resolve arm: it is pure
@@ -2854,6 +2958,33 @@ async fn project_candidates(
 /// On refusal it returns the message the caller wraps in an
 /// [`AttachResponse::err`], and that message names no path. See
 /// [`PROJECT_ERR_INVALID_PATH`].
+/// PRD #819 audit fix: refuse [`AttachRequest::PrepareWorkflow`] outright where
+/// the publish cannot deliver its owner-only, reparse-safe guarantee.
+///
+/// **First, before the path and the task are even validated.** The refusal is a
+/// property of the build rather than of the request, so it must not depend on
+/// the request being well-formed — and reporting "invalid path" on a platform
+/// where no path would have worked sends the operator after the wrong thing.
+///
+/// See [`PROJECT_ERR_UNSUPPORTED_PLATFORM`] for why this is a refusal rather
+/// than a Windows DACL implementation, and note that the verb is also absent
+/// from [`DAEMON_CAPABILITIES`] there, so a client that negotiates never reaches
+/// this line.
+fn refuse_prepare_where_unsupported() -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        Err(format!(
+            "{PROJECT_ERR_UNSUPPORTED_PLATFORM}: this daemon cannot publish a coordinator context \
+             with owner-only permissions on this platform, so preparing a workflow is refused; \
+             launch the orchestration from a daemon running on Unix"
+        ))
+    }
+}
+
 fn validate_project_path(path: &str) -> Result<(), String> {
     if crate::agent_pty::is_valid_orchestration_cwd(path) {
         return Ok(());
@@ -3340,6 +3471,46 @@ async fn handle_attach_stream(
 mod tests {
     use super::*;
     use spec::spec;
+
+    /// PRD #819 audit fix: `PrepareWorkflow` is available exactly where the
+    /// publish can deliver its owner-only guarantee, and the capability list
+    /// says the same thing the dispatch does.
+    ///
+    /// **Both halves are asserted against `cfg!(unix)` rather than against a
+    /// hardcoded expectation**, which is what makes this one test rather than
+    /// two that cannot both run. It pins the property that matters — the gate
+    /// and the advertisement agree — so a later change that refuses the verb
+    /// while still advertising it, or advertises it while still refusing it,
+    /// fails here on whichever platform it is built for. What it deliberately
+    /// does **not** do is prove the Windows refusal *text*; only a Windows build
+    /// can execute that arm, and `cargo clippy --all-targets` for a Windows
+    /// target type-checks it.
+    #[test]
+    fn prepare_workflow_is_offered_exactly_where_it_is_supported() {
+        let gate = refuse_prepare_where_unsupported();
+        let advertised = DAEMON_CAPABILITIES.contains(&CAP_PREPARE_WORKFLOW);
+        assert_eq!(
+            gate.is_ok(),
+            advertised,
+            "the dispatch gate and the advertised capability set must agree; gate = {gate:?}, \
+             advertised = {advertised}"
+        );
+        assert_eq!(
+            advertised,
+            cfg!(unix),
+            "the verb is Unix-only because the publish's mode bits and its \
+             `O_NOFOLLOW | O_DIRECTORY` open are"
+        );
+        // The read-only verbs are unaffected — the refusal is about the write.
+        assert!(DAEMON_CAPABILITIES.contains(&CAP_LIST_PROJECTS));
+        assert!(DAEMON_CAPABILITIES.contains(&CAP_RESOLVE_PROJECT));
+        if let Err(message) = gate {
+            assert!(
+                message.starts_with(PROJECT_ERR_UNSUPPORTED_PLATFORM),
+                "the refusal must carry the stable code, got {message:?}"
+            );
+        }
+    }
 
     /// Issue #454, the root cause pinned at its own seam: a `StartAgent` for an
     /// ORDINARY dashboard pane — no `tab_membership`, so none of the
