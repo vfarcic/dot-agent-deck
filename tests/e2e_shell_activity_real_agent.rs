@@ -48,6 +48,55 @@ use dot_agent_deck::platform::proc::{
 };
 use spec::spec;
 
+/// The command lines of `pids`, read directly rather than through
+/// [`process_table`] (issue #862).
+///
+/// The production sampler reads the argv only of a root's **session-boundary**
+/// descendants, because a Bash-tool call's whole subtree inherits that call's
+/// session and re-reading all of it every 500 ms is what made the poll stall
+/// under load. The processes these tests need to *identify* — the `ping` running
+/// under the tool shell, the agent's own MCP servers — sit below that boundary,
+/// so their `command_line` comes back `NotSampled` by design.
+///
+/// This is a test diagnostic, so it pays the cost the poll refuses to: one `ps`
+/// naming exactly the pids the assertion is about. Any failure yields an empty
+/// map rather than a panic — the caller's assertion reports it with better
+/// context than a panic here could.
+fn command_lines_of(pids: &[i32]) -> std::collections::HashMap<i32, String> {
+    if pids.is_empty() {
+        return std::collections::HashMap::new();
+    }
+    let list = pids
+        .iter()
+        .map(|pid| pid.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let Ok(out) = std::process::Command::new("ps")
+        .args(["-w", "-w", "-o", "pid=,args=", "-p"])
+        .arg(list)
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+    else {
+        return std::collections::HashMap::new();
+    };
+    let mut map = std::collections::HashMap::new();
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        let line = line.trim_start();
+        let Some((pid, rest)) = line.split_once(char::is_whitespace) else {
+            // A pid with no argv at all is still a real answer.
+            if let Ok(pid) = line.parse::<i32>() {
+                map.insert(pid, String::new());
+            }
+            continue;
+        };
+        if let Ok(pid) = pid.parse::<i32>() {
+            map.insert(pid, rest.trim_start().to_string());
+        }
+    }
+    map
+}
+
 const HAIKU_MODEL: &str = "claude-haiku-4-5-20251001";
 const PANE_NAME_SUFFIX: &str = "shell-activity-005-haiku";
 /// Unique so the prompt unambiguously names one real file rather than
@@ -427,11 +476,18 @@ fn shell_activity_006_real_claude_bash_call_crossing_the_cap_keeps_the_badge_wor
                  early rather than genuinely testing the cap"
             )
         });
-    let ping_alive = descendants(&table, shell_row.pid).into_iter().any(|p| {
-        p.command_line
-            .read()
-            .is_some_and(|argv| argv.contains("ping") && argv.contains("127.0.0.1"))
-    });
+    // The `ping` lives BELOW the tool shell's session boundary, so the
+    // production sampler deliberately never read its argv (issue #862) — read it
+    // here, for exactly this shell's descendants.
+    let ping_argv = command_lines_of(
+        &descendants(&table, shell_row.pid)
+            .into_iter()
+            .map(|p| p.pid)
+            .collect::<Vec<_>>(),
+    );
+    let ping_alive = ping_argv
+        .values()
+        .any(|argv| argv.contains("ping") && argv.contains("127.0.0.1"));
     assert!(
         ping_alive,
         "the sentinel-tagged Bash-tool shell (pid {}) is alive but has no live `ping` \
@@ -541,10 +597,16 @@ fn shell_activity_007_real_claude_idle_with_live_mcp_servers_stays_idle() {
         }) else {
             return false;
         };
-        let children: Vec<String> = descendants(&table, claude_row.pid)
-            .into_iter()
-            .map(|p| p.command_line.read().unwrap_or_default().to_string())
-            .collect();
+        // Same as in `006`: the agent's own children share its session, so they
+        // are below its boundary and the sampler never read their argv.
+        let children: Vec<String> = command_lines_of(
+            &descendants(&table, claude_row.pid)
+                .into_iter()
+                .map(|p| p.pid)
+                .collect::<Vec<_>>(),
+        )
+        .into_values()
+        .collect();
         if children.is_empty() {
             return false;
         }
@@ -593,19 +655,22 @@ fn shell_activity_007_real_claude_idle_with_live_mcp_servers_stays_idle() {
     // before the badge check), and run the descendant-scan classifier
     // directly against this live table — the M2 fixture claim proven against
     // a live process table rather than a captured one.
-    // Issue #862: BOTH roots. `root_pid` is what makes the agent's own children
-    // (its MCP servers, which share the agent's session) detached descendants
-    // whose argv gets read, so the diagnostic listing below has something to
-    // print; `claude_pid` is the root the classifier is then run against, and
-    // naming it too means this call asks for exactly the command lines that
-    // classification can consult rather than relying on the two root sets
-    // happening to coincide.
+    // Issue #862: `claude_pid` is the root the classifier below is run against,
+    // so it is the root this sample must be taken for — that is what makes the
+    // command lines classification could consult present, rather than relying on
+    // some other root's set happening to cover them. `root_pid` is named too so
+    // the walk from it still resolves. The diagnostic listings do not depend on
+    // either: they read the argv they need through `command_lines_of`.
     let table =
         process_table(&[root_pid, claude_pid]).expect("process_table() must enumerate on unix");
-    let still_alive: Vec<&str> = descendants(&table, claude_pid)
-        .into_iter()
-        .map(|p| p.command_line.read().unwrap_or_default())
-        .collect();
+    let still_alive: Vec<String> = command_lines_of(
+        &descendants(&table, claude_pid)
+            .into_iter()
+            .map(|p| p.pid)
+            .collect::<Vec<_>>(),
+    )
+    .into_values()
+    .collect();
     assert!(
         !still_alive.is_empty(),
         "the real Claude agent's children died out between the liveness check and the sample — \

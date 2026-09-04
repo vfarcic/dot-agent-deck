@@ -271,10 +271,13 @@ const PS_TABLE_ARGS: [&str; 5] = ["-A", "-w", "-w", "-o", "pid=,ppid=,tty="];
 /// survives whole — the [`super::ShellToolShape`] cross-check substring-matches
 /// inside it, and a truncated command line would silently stop matching.
 ///
-/// This phase runs **only when the bulk table shows at least one detached
-/// descendant** of one of the sample's roots, so it costs nothing on an idle
-/// deck and reads the command line of at most one process per busy pane —
-/// always a process the deck itself spawned, never an unrelated one.
+/// This phase runs **only when the bulk table shows at least one session-boundary
+/// descendant** of one of the sample's roots
+/// (`super::shell_tool_candidates` — read its doc comment, the narrowing there is
+/// what keeps this phase from re-reading a whole build tree). So it costs nothing
+/// on an idle deck, and on a busy one it reads one command line per `setsid`-ed
+/// shell-tool call — always a process the deck itself spawned, never an unrelated
+/// one, and never the `cargo`/`rustc`/`ld` subtree below that call.
 ///
 /// Kept as one portable `ps` call rather than split into a Linux
 /// `/proc/<pid>/cmdline` read and a macOS `sysctl(KERN_PROCARGS2)`: those would

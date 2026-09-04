@@ -75,12 +75,14 @@ pub struct ProcessInfo {
 /// under a build storm.
 ///
 /// The argv is still needed, for the [`ShellToolShape`] cross-check — but only
-/// for a **detached descendant** of one of the sample's roots, which is at most
-/// one process per pane and zero on an idle deck. So it is read in a second
-/// phase, for exactly the pids [`detached_descendants`] reports. This enum
-/// exists so the difference between "nothing needed it" and "we wanted it and
-/// could not get it" survives into the classifier instead of collapsing into an
-/// empty string that silently matches no shape.
+/// for a descendant of one of the sample's roots that sits at a **session
+/// boundary**: zero of those on an idle deck, and one per `setsid`-ed shell-tool
+/// call on a busy one. So it is read in a second phase, for exactly the pids
+/// [`shell_tool_candidates`] reports — a set that deliberately excludes the
+/// *subtree below* that boundary, which is where a build's `rustc` and `ld`
+/// processes live. This enum exists so the difference between "nothing needed
+/// it" and "we wanted it and could not get it" survives into the classifier
+/// instead of collapsing into an empty string that silently matches no shape.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CommandLine {
     /// The sample read this process's command line. Callers must substring-match
@@ -231,12 +233,12 @@ pub fn descendants(table: &[ProcessInfo], root_pid: i32) -> Vec<&ProcessInfo> {
 /// **When `shapes` is non-empty, `table` must have been sampled with `root_pid`
 /// among its roots** (issue #862) — that is what makes the candidates'
 /// [`CommandLine`]s present, since the sampler reads a command line for exactly
-/// the pids [`detached_descendants`] reports for its roots. A candidate that
-/// reaches the cross-check as [`CommandLine::NotSampled`] means those two sets
-/// disagreed; it is read as "not a match" and logged at `warn`, because
-/// inventing a match from a command line nobody read would pin the pane at
-/// `Working` forever. With an empty `shapes` no command line is read at all, so
-/// the roots do not matter.
+/// the pids [`shell_tool_candidates`] reports for its roots, which is also the
+/// set the cross-check below iterates. A candidate that reaches the cross-check
+/// as [`CommandLine::NotSampled`] means those two sets disagreed; it is read as
+/// "not a match" and logged at `warn`, because inventing a match from a command
+/// line nobody read would pin the pane at `Working` forever. With an empty
+/// `shapes` no command line is read at all, so the roots do not matter.
 ///
 /// `None` means "no answer available": `root_pid` is not in the table (it
 /// exited, or the table was sampled from another PID namespace), or its own
@@ -264,7 +266,11 @@ pub fn descendant_shell_activity(
     if shapes.is_empty() {
         return Some(true);
     }
-    for pid in detached {
+    // The cross-check consults the SESSION-BOUNDARY subset, not every detached
+    // descendant — see [`shell_tool_candidates`] for why that is both correct
+    // for the measured shape and the difference between reading one command
+    // line and reading a whole build tree's.
+    for pid in shell_tool_candidates(table, root_pid)? {
         let Some(candidate) = table.iter().find(|row| row.pid == pid) else {
             continue;
         };
@@ -281,9 +287,10 @@ pub fn descendant_shell_activity(
             CommandLine::Unavailable => continue,
             // Should be unreachable, and it is the one case worth a log line.
             // The sampler fills the command line for exactly the pids
-            // `detached_descendants` reports (see `super::process_table`), so
-            // reaching here means the sampler and this classifier disagree
-            // about that set — which would suppress the signal *silently*, the
+            // `shell_tool_candidates` reports (see `super::process_table`), and
+            // that is the very function this loop iterates, so reaching here
+            // means the table was sampled for different roots than it is being
+            // classified for — which would suppress the signal *silently*, the
             // failure mode PRD #386 exists to end. Treated as "not a match"
             // rather than as a match, because inventing a busy reading from a
             // command line nobody read would pin the pane at `Working`.
@@ -311,12 +318,11 @@ pub fn descendant_shell_activity(
 /// be read. An empty `Vec` is the positive statement that the root has no
 /// detached descendant, i.e. structurally idle.
 ///
-/// This is the **one** definition of "which processes could a cross-check ever
-/// need the command line of" (issue #862). The two-phase sampler calls it to
-/// decide whose `/proc/<pid>/cmdline` to read, and
-/// [`descendant_shell_activity`] calls it to decide whose command line to
-/// consult; sharing the function is what keeps those two sets identical rather
-/// than merely intended to be.
+/// This is the **structural test** and nothing else. Which processes a
+/// cross-check could ever need the command line of is the narrower
+/// [`shell_tool_candidates`] (issue #862), which both the two-phase sampler and
+/// [`descendant_shell_activity`]'s cross-check call — sharing that function is
+/// what keeps those two sets identical rather than merely intended to be.
 pub fn detached_descendants(table: &[ProcessInfo], root_pid: i32) -> Option<Vec<i32>> {
     let root = table.iter().find(|row| row.pid == root_pid)?;
     if root.session_id <= 0 {
@@ -334,9 +340,69 @@ pub fn detached_descendants(table: &[ProcessInfo], root_pid: i32) -> Option<Vec<
     )
 }
 
+/// The detached descendants of `root_pid` that the argv cross-check can actually
+/// be carried by: the ones at a **session boundary** — a descendant in a
+/// different POSIX session than `root_pid` whose *own parent* is in a different
+/// session than it is (issue #862).
+///
+/// **This is the narrowing that makes the two-phase sample worth having, and
+/// leaving it out was measured to matter.** `setsid()` creates a session; every
+/// process below the caller then *inherits* it. Verified directly: a
+/// `setsid bash -c 'sleep 40 & sleep 40 & wait'` reports its own session id and
+/// both `sleep`s report that same id, neither of them a leader. So for a Claude
+/// pane running a Bash-tool `cargo build`, [`detached_descendants`] is the
+/// **whole build tree** — `cargo`, every `rustc`, every `ld` — and reading all
+/// of their command lines would put the poll straight back to reading the
+/// `mmap_lock` of exactly the processes that stalled it in the first place
+/// (issue #862's episode had 13 `ld` processes wedged in `D` state). The
+/// boundary set is the one `setsid`-ed shell per detached session instead.
+///
+/// **Why that is the right set rather than merely the small one.** The measured
+/// Claude Bash-tool argv (`shell-snapshots/snapshot-…` plus `&& eval `) belongs
+/// to the process that `setsid`-ed — the session's leader, which is exactly a
+/// boundary process; `status/shell-activity/001`/`004` both assert that the real
+/// detached child is its own session leader. Its descendants carry their own
+/// command lines (`cargo`, `ld`), which is not where a shell-tool signature
+/// lives, so reading them was waste rather than evidence. A shape carried by a
+/// *non*-boundary process would need this widened, and none of the measured ones
+/// is.
+///
+/// A descendant whose parent is absent from the table is treated as a boundary:
+/// the walk only reaches a process through its parent, so this should not arise,
+/// and including it is the direction that cannot lose a candidate.
+///
+/// `None` has [`detached_descendants`]'s meaning. The two sets are non-empty
+/// together for any real process tree — `setsid` never *joins* an existing
+/// session, so the shallowest detached descendant's parent is necessarily still
+/// in the root's session and that edge is a boundary. The structural test in
+/// [`descendant_shell_activity`] keeps using the wider set anyway, which means a
+/// pane with **no** shapes never consults this function at all; note that it is
+/// not a blanket guarantee for a pane that *does* have shapes, where an empty
+/// boundary set alongside a non-empty detached set would read idle, exactly as a
+/// cross-check that matches nothing does.
+pub fn shell_tool_candidates(table: &[ProcessInfo], root_pid: i32) -> Option<Vec<i32>> {
+    let root = table.iter().find(|row| row.pid == root_pid)?;
+    if root.session_id <= 0 {
+        return None;
+    }
+    let session_of: HashMap<i32, i32> = table.iter().map(|row| (row.pid, row.session_id)).collect();
+    Some(
+        descendants(table, root_pid)
+            .into_iter()
+            .filter(|row| row.session_id > 0 && row.session_id != root.session_id)
+            .filter(|row| {
+                session_of
+                    .get(&row.ppid)
+                    .is_none_or(|parent_session| *parent_session != row.session_id)
+            })
+            .map(|row| row.pid)
+            .collect(),
+    )
+}
+
 /// Every pid whose command line the second sampling phase must read, for a
 /// sample taken on behalf of `roots` (issue #862) — the union of
-/// [`detached_descendants`] over every root, deduplicated and sorted.
+/// [`shell_tool_candidates`] over every root, deduplicated and sorted.
 ///
 /// Sorted so the `ps -p <list>` invocation built from it is deterministic, which
 /// is what makes the argv phase testable against a fixed expected command line.
@@ -346,7 +412,7 @@ pub fn detached_descendants(table: &[ProcessInfo], root_pid: i32) -> Option<Vec<
 pub fn command_line_targets(table: &[ProcessInfo], roots: &[i32]) -> Vec<i32> {
     let mut wanted: Vec<i32> = roots
         .iter()
-        .filter_map(|root| detached_descendants(table, *root))
+        .filter_map(|root| shell_tool_candidates(table, *root))
         .flatten()
         .collect();
     wanted.sort_unstable();
@@ -639,11 +705,11 @@ mod tests {
 
     /// Issue #862 — the invariant the two-phase sample rests on: the set of pids
     /// whose command line the sampler reads is EXACTLY the set the classifier
-    /// consults, because both are `detached_descendants`. Asserted directly, so
+    /// consults, because both are `shell_tool_candidates`. Asserted directly, so
     /// a future change that widens one without the other fails here rather than
     /// silently suppressing a pane's signal.
     #[test]
-    fn command_line_targets_are_exactly_the_detached_descendants() {
+    fn command_line_targets_are_exactly_the_shell_tool_candidates() {
         let table = vec![
             // Two panes' shells, each with an in-session child (an MCP server
             // shape) and a detached one (a Bash-tool shape).
@@ -658,8 +724,8 @@ mod tests {
             // this is the whole point of the change.
             row(900, 1, 900, "some unrelated wedged linker"),
         ];
-        assert_eq!(detached_descendants(&table, 100).unwrap(), vec![102]);
-        assert_eq!(detached_descendants(&table, 200).unwrap(), vec![202]);
+        assert_eq!(shell_tool_candidates(&table, 100).unwrap(), vec![102]);
+        assert_eq!(shell_tool_candidates(&table, 200).unwrap(), vec![202]);
         assert_eq!(command_line_targets(&table, &[100, 200]), vec![102, 202]);
         assert_eq!(
             command_line_targets(&table, &[]),
@@ -668,6 +734,76 @@ mod tests {
         );
         // A root the table cannot answer for costs the others nothing.
         assert_eq!(command_line_targets(&table, &[100, 4242]), vec![102]);
+    }
+
+    /// Issue #862 — the narrowing that makes the two-phase sample worth having.
+    /// `setsid()` creates a session and everything below the caller inherits it,
+    /// so a Bash-tool call that runs a build has the WHOLE build tree in a
+    /// different session than the agent. `detached_descendants` reports all of
+    /// it (the structural test wants that — any one of them means busy), but the
+    /// argv cross-check must only ever read the one process at the session
+    /// boundary, because reading the rest would put the poll back to touching
+    /// the `mmap_lock` of exactly the `ld` processes issue #862 is about.
+    #[test]
+    fn shell_tool_candidates_stop_at_the_session_boundary() {
+        const AGENT: i32 = 100;
+        const AGENT_SID: i32 = 100;
+        const TOOL_SID: i32 = 5000;
+        let table = vec![
+            row(AGENT, 1, AGENT_SID, "claude --model opus"),
+            // An in-session child, as every measured MCP server was.
+            row(101, AGENT, AGENT_SID, "npm exec @upstash/context7-mcp"),
+            // The `setsid`-ed Bash-tool shell: the boundary, and the only
+            // process that carries the measured shape.
+            row(
+                200,
+                AGENT,
+                TOOL_SID,
+                "/bin/zsh -c source x/shell-snapshots/snapshot-z.sh && eval 'cargo build'",
+            ),
+            // Its build tree. All in TOOL_SID — inherited, not created — so all
+            // are detached relative to the agent and NONE is a boundary.
+            row(201, 200, TOOL_SID, "cargo build"),
+            row(202, 201, TOOL_SID, "rustc --crate-name a"),
+            row(203, 202, TOOL_SID, "ld -z relro -o a"),
+        ];
+
+        assert_eq!(
+            detached_descendants(&table, AGENT).unwrap(),
+            vec![200, 201, 202, 203],
+            "the structural test sees the whole detached subtree, and should: any one \
+             of these existing means the pane is busy"
+        );
+        assert_eq!(
+            shell_tool_candidates(&table, AGENT).unwrap(),
+            vec![200],
+            "but only the process at the session boundary can carry a shell-tool shape, \
+             so it is the only one whose command line is ever read — reading `cargo`, \
+             `rustc` and `ld` would be both useless and the whole cost issue #862 removed"
+        );
+        assert_eq!(
+            command_line_targets(&table, &[AGENT]),
+            vec![200],
+            "and the sampler asks for exactly that one"
+        );
+        // The outcome is unchanged by the narrowing: the shape is on the
+        // boundary process, so the cross-check still finds it.
+        assert_eq!(
+            descendant_shell_activity(&table, AGENT, &[CLAUDE_BASH_TOOL_SHAPE]),
+            Some(true)
+        );
+
+        // A process that `setsid`s itself DEEP inside the tree is a boundary of
+        // its own and stays a candidate — that is PRD #386's false-positive
+        // risk, and this narrowing must not hide it.
+        let mut nested = table.clone();
+        nested.push(row(300, 202, 9000, "something that detached itself"));
+        assert_eq!(
+            shell_tool_candidates(&nested, AGENT).unwrap(),
+            vec![200, 300],
+            "a process that starts its own session deep inside the tree is a boundary of \
+             its own, so the narrowing cannot hide PRD #386's false-positive risk"
+        );
     }
 
     /// Issue #862 — a detached descendant whose command line was never sampled

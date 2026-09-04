@@ -279,11 +279,12 @@ fn shell_activity_001_finds_a_real_detached_grandchild_as_a_descendant() {
 /// (`mid`, in the test's own session) and every unrelated process on the machine
 /// must be `NotSampled`. With no root, even the grandchild must be `NotSampled`.
 /// That is the whole of issue #862's fix expressed as a property: a poll reads
-/// the command line of its own panes' detached descendants and of nothing else.
+/// the command line of the processes at its own panes' session boundaries and of
+/// nothing else on the machine.
 #[cfg(unix)]
 #[spec("status/shell-activity/008")]
 #[test]
-fn shell_activity_008_the_sample_reads_command_lines_only_for_detached_descendants() {
+fn shell_activity_008_the_sample_reads_command_lines_only_at_session_boundaries() {
     let marker = format!("shell-activity-008-target-{}", std::process::id());
     let spawned = spawn_detached_grandchild(&marker);
     let root_pid = std::process::id() as i32;
@@ -328,6 +329,20 @@ fn shell_activity_008_the_sample_reads_command_lines_only_for_detached_descendan
         CommandLine::NotSampled,
         "a descendant that shares the root's POSIX session can never be a cross-check \
          candidate, so its command line must not be read"
+    );
+
+    // 2b. And the scoping stops AT the session boundary rather than descending
+    //     past it: the grandchild is the only candidate, so a process below it
+    //     would inherit its session and still not be read. `shell_tool_candidates`
+    //     is asserted directly because that narrowing is what keeps a Bash-tool
+    //     call's whole build tree out of the argv phase (issue #862); the
+    //     synthetic-tree proof is `shell_tool_candidates_stop_at_the_session_boundary`
+    //     in `src/platform/proc/scan.rs`.
+    assert_eq!(
+        dot_agent_deck::platform::proc::shell_tool_candidates(&table, root_pid),
+        Some(vec![spawned.target_pid]),
+        "the detached grandchild must be the one and only session-boundary candidate \
+         under this test's own pid"
     );
 
     // 3. And nothing outside this test's tree is read at all. This is the claim
