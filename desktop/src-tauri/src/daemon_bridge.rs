@@ -974,6 +974,14 @@ mod tests {
     // `async fn` and `trusted_daemon()` is `pub(crate)`, so this can only be an
     // in-crate unit test; there is no Tauri e2e harness to reach it from
     // outside (PRD #819, *Testing: what rule 4 means here*).
+    //
+    // Every item in this section is `#[cfg(unix)]`, helpers included: the
+    // scripted daemon is a `tokio::net::UnixListener`, which does not exist on
+    // Windows, and `scratch_socket` has no caller once the tests are gated off.
+    // The live connect path is therefore unverified on Windows: `hello()` is
+    // not itself gated, and the `IpcStream::connect` it calls is a **named
+    // pipe** there rather than a Unix socket, so what is missing on Windows is
+    // the test, not the code.
     // -----------------------------------------------------------------------
 
     /// A one-shot daemon: accept one connection, read one request frame, answer
@@ -990,6 +998,7 @@ mod tests {
     /// directory with no execute bit and the next `bind` in it failed `EACCES`.
     /// Nothing here needs the owner-only inode — the socket lives in a
     /// per-test temp directory and no daemon is trusting it.
+    #[cfg(unix)]
     async fn scripted_daemon(
         listener: tokio::net::UnixListener,
         response: AttachResponse,
@@ -1012,6 +1021,7 @@ mod tests {
     /// A socket path inside a fresh temp directory, plus the directory itself so
     /// the caller can clean it up. Deliberately short: a Unix socket path is
     /// capped near 100 bytes, and a long temp root silently fails to bind.
+    #[cfg(unix)]
     fn scratch_socket(tag: &str) -> (std::path::PathBuf, std::path::PathBuf) {
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

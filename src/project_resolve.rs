@@ -1917,7 +1917,25 @@ command = "cat"
     /// is structural — `AgentRecord.cwd` is a `String` — so the case that can
     /// actually arise is a UTF-8 spelling whose canonical form is not, which is
     /// what a symlink into a non-UTF-8 directory produces.
-    #[cfg(unix)]
+    ///
+    /// **Linux-only because the FIXTURE is, not because the property is.**
+    /// `canonicalize_project_dir`'s `to_str().is_none()` arm is compiled on
+    /// every platform, so this test's coverage of it is Linux's alone. It was
+    /// `#[cfg(unix)]` and `build-macos` failed it at `mkdir`: APFS and HFS+
+    /// require a valid UTF-8 name and refuse `proj-\xff` with `EILSEQ`, so the
+    /// setup died before the code under test was reached. Linux treats a
+    /// filename as opaque bytes and is where the input can be constructed.
+    ///
+    /// The narrow claim, and no wider one: what macOS cannot do is *build this
+    /// fixture on its own filesystems*. Whether a non-UTF-8 name could still
+    /// reach the check there by some other route — an NFS or SMB mount handing
+    /// over arbitrary bytes — is not something this test settles either way, so
+    /// read the gate as "unverified on macOS", not as "unreachable there".
+    ///
+    /// A probe-and-skip was rejected: a skip that nextest counts as a pass is
+    /// exactly the trap CLAUDE.md rule 5 names, whereas a `cfg`-gated test is
+    /// absent from the run and cannot be mistaken for a green one.
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_non_utf8_canonical_form_is_skipped_rather_than_lossily_converted() {
         use std::ffi::OsStr;

@@ -551,6 +551,12 @@ struct ContextDirGuard;
 /// (the daemon verb canonicalises it first, which proves it exists), and
 /// `create_dir_all` would silently invent an entire chain for a typo.
 fn create_context_dir(dir: &std::path::Path) -> Result<(), ContextPublishError> {
+    // The only mutation is the `.mode()` call below, which is Unix-only, so on a
+    // platform without `DirBuilderExt` the binding is genuinely never mutated and
+    // `unused_mut` fires. Allowed there rather than restructured: dropping the
+    // `mut` would take the owner-only-at-creation mode with it, and that is PRD
+    // #819's audit fix, not a lint's business.
+    #[cfg_attr(not(unix), allow(unused_mut))]
     let mut builder = std::fs::DirBuilder::new();
     #[cfg(unix)]
     {
