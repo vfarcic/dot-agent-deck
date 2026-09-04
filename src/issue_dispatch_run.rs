@@ -1224,19 +1224,24 @@ const DEVBOX_MANIFEST: &str = "devbox.json";
 /// How long [`warm_project_environment`] waits for `devbox` before giving up on
 /// the warm-up and letting the roles proceed.
 ///
-/// A bound, not a deadline: exceeding it is not an error, it just means the
-/// roles start against an environment that is still materializing — which is
-/// exactly the state they started in before this existed, so the worst case is
-/// no worse than no warm-up at all. What it buys is that a `devbox` which never
-/// returns costs a dispatch two minutes instead of wedging it forever.
+/// **A deadlock guard, not a latency budget**, and the distinction is what sets
+/// the value. Waiting here is very nearly free in the case that matters: while
+/// devbox materializes, every role that launches through `devbox run` would be
+/// blocked on exactly the same work anyway, so the wait is moved rather than
+/// added — and moved somewhere serial, which is the entire point. Expiring
+/// early is NOT free, because it is the one path that puts a role back in the
+/// race (see [`warm_project_environment`]). So the bound is only worth setting
+/// low enough to rescue a dispatch from a `devbox` that will never return at
+/// all, which is pathological rather than merely slow.
 ///
-/// Two minutes is ~23x the 5.2s a cold `.devbox` for this repository's
-/// 22-package manifest took to materialize against an already-populated nix
-/// store (measured 2026-09-04), which is the case the warm-up is FOR: a fresh
-/// worktree of a repo the machine has built before. A genuinely first-ever nix
-/// closure can exceed it, and then the bound expires and the dispatch proceeds;
-/// the child is deliberately not killed, so that download still finishes.
-const DEVBOX_WARMUP_TIMEOUT: Duration = Duration::from_secs(120);
+/// Ten minutes, then, rather than the two this shipped with in review: a cold
+/// `.devbox` for this repository's 22-package manifest took **5.2s** against an
+/// already-populated nix store (measured 2026-09-04), but a first-ever closure
+/// fetch is a download whose length nothing here has measured, and two minutes
+/// was a guess dressed as a budget. Ten is not measured either — no honest
+/// number is available for "slow link, cold store" — it is simply far enough
+/// out that expiry means *stuck*.
+const DEVBOX_WARMUP_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// What [`warm_project_environment`] did. Every arm returns normally: a
 /// warm-up that cannot run is a missed optimisation, never a failed dispatch.
@@ -1251,7 +1256,9 @@ enum DevboxWarmup {
     Unavailable(String),
     /// `devbox` ran and exited non-zero.
     Failed(String),
-    /// `devbox` was still running when [`DEVBOX_WARMUP_TIMEOUT`] expired.
+    /// `devbox` was still running when [`DEVBOX_WARMUP_TIMEOUT`] expired. It is
+    /// left running — see [`warm_project_environment`] for why that takes a
+    /// detached task rather than simply dropping the future.
     TimedOut,
 }
 
@@ -1285,12 +1292,28 @@ enum DevboxWarmup {
 /// existed. Failing closed here would convert a devbox problem into a dispatch
 /// problem for every user who has no devbox at all.
 ///
-/// The bound in [`DEVBOX_WARMUP_TIMEOUT`] is the other half of that: on expiry
-/// the future is dropped, and because `kill_on_drop` is deliberately NOT set
-/// the `devbox` child keeps running to completion. Killing it would leave a
-/// half-materialized `.devbox` — strictly worse than the cold one we started
-/// with, and the one way this function could make things worse than doing
-/// nothing.
+/// **The timeout path is the one that is honestly worse than doing nothing, and
+/// it is bounded rather than removed.** If [`DEVBOX_WARMUP_TIMEOUT`] expires the
+/// roles start while devbox is still materializing — the original race, now with
+/// this warm-up as one more contender in it. Raised by Greptile on PR #881 and
+/// accepted as real. The two alternatives are worse: waiting forever wedges the
+/// dispatch, and killing the child abandons a half-written `.devbox`, which is
+/// the `compact json for hashing: unexpected end of JSON input` failure by
+/// construction. So the bound is set where expiry means *stuck* rather than
+/// *slow* (see [`DEVBOX_WARMUP_TIMEOUT`]), and what is left is a narrow,
+/// documented residual instead of a claim that there is none.
+///
+/// **Leaving the child running takes a detached task, not merely leaving
+/// `kill_on_drop` off.** This code first claimed the child survived on the
+/// strength of that default, and it was FALSE — measured 2026-09-04: dropping a
+/// timed-out `Command::output()` future closes our ends of the child's stdout
+/// and stderr pipes, and devbox (a Go program) dies on `SIGPIPE` at its next
+/// write. A stand-in that logged progress and then wrote a marker never wrote
+/// it. So the run is `tokio::spawn`ed and the timeout is applied to the
+/// `JoinHandle`: dropping a handle DETACHES its task, so the pipes stay drained
+/// and the child finishes. `warm_up_leaves_a_slow_devbox_running_rather_than_
+/// killing_it` is the regression test, and it fails against the dropped-future
+/// version.
 async fn warm_project_environment(worktree_dir: &Path) -> DevboxWarmup {
     warm_project_environment_with(worktree_dir, &devbox_program(), DEVBOX_WARMUP_TIMEOUT).await
 }
@@ -1322,18 +1345,41 @@ async fn warm_project_environment_with(
     // Probed BEFORE anything is spawned: the great majority of repositories
     // have no devbox environment at all, and they must pay nothing — not a
     // failed `exec`, not a `PATH` walk — for a fix that is not about them.
+    //
+    // The MANIFEST is the gate, deliberately, rather than "do this dispatch's
+    // commands actually invoke devbox?". Greptile asked for the narrower test on
+    // PR #881 and it is the right instinct with the wrong trade here, for two
+    // reasons. The command set is not knowable at this point: `dispatch_one_issue`
+    // passes `resolved_target: None` precisely because the shape is derived later
+    // from the worktree's own config, and a single agent's command comes from the
+    // DECK's `default_command`, which this module never sees. So the narrower
+    // test would have to guess — and its failure direction is to skip the warm-up
+    // for a dispatch that needed it, which is the silent dropped role this whole
+    // change exists to stop, arrived at by a subtler route. The cost it would
+    // save, meanwhile, is mostly not a cost: a repository that ships a
+    // `devbox.json` materializes it on first use by SOMEBODY, so warming here
+    // usually moves that work rather than adding it. It is genuinely wasted only
+    // for a worktree in which nothing ever enters the devbox environment, and
+    // there it is one `devbox run -- true` — 5.2s against a populated store.
     if !worktree_dir.join(DEVBOX_MANIFEST).is_file() {
         return DevboxWarmup::NoManifest;
     }
 
     let started = std::time::Instant::now();
-    let run = tokio::process::Command::new(program)
-        .args(["run", "--", "true"])
-        .current_dir(worktree_dir)
-        .output();
+    // Owned, because the run has to outlive this call: see the doc comment on
+    // why the bound is applied to a DETACHED task rather than to the future.
+    let program = program.to_string();
+    let dir = worktree_dir.to_path_buf();
+    let run = tokio::spawn(async move {
+        tokio::process::Command::new(&program)
+            .args(["run", "--", "true"])
+            .current_dir(&dir)
+            .output()
+            .await
+    });
 
     match tokio::time::timeout(bound, run).await {
-        Ok(Ok(out)) if out.status.success() => {
+        Ok(Ok(Ok(out))) if out.status.success() => {
             tracing::debug!(
                 worktree = %worktree_dir.display(),
                 elapsed_ms = started.elapsed().as_millis() as u64,
@@ -1341,7 +1387,7 @@ async fn warm_project_environment_with(
             );
             DevboxWarmup::Warmed
         }
-        Ok(Ok(out)) => {
+        Ok(Ok(Ok(out))) => {
             let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
             tracing::warn!(
                 worktree = %worktree_dir.display(),
@@ -1352,7 +1398,7 @@ async fn warm_project_environment_with(
             );
             DevboxWarmup::Failed(stderr)
         }
-        Ok(Err(e)) => {
+        Ok(Ok(Err(e))) => {
             tracing::debug!(
                 worktree = %worktree_dir.display(),
                 error = %e,
@@ -1360,12 +1406,25 @@ async fn warm_project_environment_with(
             );
             DevboxWarmup::Unavailable(e.to_string())
         }
+        // The task itself panicked or was cancelled. Nothing here can panic, so
+        // this is unreachable in practice — reported as unavailable rather than
+        // unwrapped, because a panic in a warm-up must not take a dispatch down.
+        Ok(Err(join)) => {
+            tracing::warn!(
+                worktree = %worktree_dir.display(),
+                error = %join,
+                "the devbox warm-up task did not run to completion; spawning anyway \
+                 (issue #791)"
+            );
+            DevboxWarmup::Unavailable(join.to_string())
+        }
         Err(_) => {
             tracing::warn!(
                 worktree = %worktree_dir.display(),
                 waited_secs = bound.as_secs(),
-                "devbox warm-up did not finish within its bound; spawning anyway \
-                 and leaving it running (issue #791)"
+                "devbox warm-up did not finish within its bound; it is left running \
+                 and the roles now start alongside it, so they can still race the \
+                 first materialization (issue #791)"
             );
             DevboxWarmup::TimedOut
         }
@@ -2628,7 +2687,9 @@ mod tests {
     async fn warm_up_is_bounded_when_devbox_hangs() {
         let scratch = crate::test_temp::tempdir().expect("scratch tempdir");
         std::fs::write(scratch.path().join(DEVBOX_MANIFEST), "{}\n").expect("write devbox.json");
-        let stub = stub_devbox(scratch.path(), "sleep 600");
+        // Short, because the child now SURVIVES the bound by design (see the
+        // test below) — a `sleep 600` here would leave one behind per run.
+        let stub = stub_devbox(scratch.path(), "sleep 5");
         let started = std::time::Instant::now();
         let outcome = warm_project_environment_with(
             scratch.path(),
@@ -2638,9 +2699,66 @@ mod tests {
         .await;
         assert_eq!(outcome, DevboxWarmup::TimedOut);
         assert!(
-            started.elapsed() < Duration::from_secs(30),
-            "the bound must actually bound: a 600s stand-in returned after {:?}",
+            started.elapsed() < Duration::from_secs(4),
+            "the bound must actually bound: a 5s stand-in against a 300ms bound \
+             returned after {:?}",
             started.elapsed()
+        );
+    }
+
+    /// A `devbox` that outlives the bound must be LEFT RUNNING, not killed.
+    ///
+    /// This is a regression test for a claim that shipped into review as false.
+    /// The code asserted the child survived because `kill_on_drop` is off, which
+    /// is true and insufficient: dropping a timed-out `Command::output()` future
+    /// closes our ends of the child's pipes, and devbox is a Go program that
+    /// dies on `SIGPIPE` at its next write to stderr — which it does constantly,
+    /// since materializing prints progress. Measured directly: against the
+    /// dropped-future version this test fails, because the stand-in below never
+    /// reaches its final line.
+    ///
+    /// It matters because killing it is the one outcome strictly worse than
+    /// never having warmed at all: a half-written `.devbox` state file is the
+    /// `compact json for hashing: unexpected end of JSON input` half of #791, so
+    /// an abandoned warm-up would MANUFACTURE the second failure mode while
+    /// trying to prevent the first.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn warm_up_leaves_a_slow_devbox_running_rather_than_killing_it() {
+        let scratch = crate::test_temp::tempdir().expect("scratch tempdir");
+        std::fs::write(scratch.path().join(DEVBOX_MANIFEST), "{}\n").expect("write devbox.json");
+        let finished = scratch.path().join("finished");
+        // Chatty on stderr first — that is what makes a killed child observable
+        // at all, since the death is a SIGPIPE on a write.
+        let stub = stub_devbox(
+            scratch.path(),
+            &format!(
+                "i=0\nwhile [ $i -lt 8 ]; do echo \"Info: installing $i\" >&2; sleep 0.25; \
+                 i=$((i+1)); done\nprintf done > {}",
+                finished.to_string_lossy()
+            ),
+        );
+        let outcome = warm_project_environment_with(
+            scratch.path(),
+            &stub.to_string_lossy(),
+            Duration::from_millis(300),
+        )
+        .await;
+        assert_eq!(outcome, DevboxWarmup::TimedOut);
+        assert!(
+            !finished.is_file(),
+            "the stand-in must still have been running when the bound expired, or \
+             this proves nothing about what happens to a slow one"
+        );
+
+        // Well past the stand-in's own runtime: it either finished on its own or
+        // it was killed when we stopped waiting.
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        assert!(
+            finished.is_file(),
+            "a devbox that outlives the bound must be left running — killing it \
+             abandons a half-materialized .devbox, which is the second failure \
+             mode of #791 rather than a fix for the first"
         );
     }
 
@@ -2709,11 +2827,17 @@ mod tests {
             "create_worktree must not report Created until the warm-up has finished — \
              a role spawned against a still-cold .devbox is precisely issue #791"
         );
+        // CANONICALIZED on both sides, not compared as strings. On macOS the
+        // temp root is `/var/...`, which is a symlink to `/private/var/...`, so
+        // the shell's `$PWD` — read from `getcwd()`, already resolved — never
+        // equals the path we passed in. Caught by `build-macos` on PR #881,
+        // where this assertion was the only failure in 2402 tests. What the
+        // assertion is about is directory IDENTITY, so resolving both is the
+        // fix rather than a workaround.
+        let reported = std::fs::read_to_string(&evidence).expect("read the warm-up's evidence");
         assert_eq!(
-            std::fs::read_to_string(&evidence)
-                .expect("read the warm-up's evidence")
-                .trim_end_matches('/'),
-            worktree_dir.to_string_lossy().trim_end_matches('/'),
+            std::fs::canonicalize(reported.trim()).expect("canonicalize the reported cwd"),
+            std::fs::canonicalize(&worktree_dir).expect("canonicalize the worktree dir"),
             "the warm-up must run in the NEW worktree; warming any other directory \
              leaves that worktree's .devbox exactly as cold as it was"
         );
