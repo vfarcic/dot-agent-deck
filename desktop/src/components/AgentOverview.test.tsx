@@ -1741,6 +1741,37 @@ describe("DeckShell", () => {
     expect(terminalMounted).not.toHaveBeenCalled();
   });
 
+  /**
+   * Reported by the user against PR #880: the zoom keys do nothing on the
+   * Overview screen.
+   *
+   * Asserted at the altitude the complaint is at — a zoom keystroke reaches
+   * the webview — rather than at "the listener is registered", because the
+   * second can be true while the first is not. Live mode, because that is
+   * where zoom is bound at all.
+   *
+   * The control is the deck case below it: the same keystroke, the same
+   * runtime, the other screen. Without that pair, a red here cannot
+   * distinguish "the overview does not bind zoom" from "zoom is broken".
+   */
+  it("zooms on the overview, not only on the deck", () => {
+    const state = runtime({ mode: "live", snapshot: createFixtureSnapshot("connected") });
+    render(<DeckShell runtime={state} initialView={{ kind: "overview" }} />);
+    expect(screen.getByTestId("daemon-group")).toBeVisible();
+
+    fireEvent.keyDown(document.body, { key: "=", ctrlKey: true });
+    expect(state.setZoom).toHaveBeenCalledWith(1.1);
+  });
+
+  it("zooms on the deck (the control for the overview case above)", () => {
+    const state = runtime({ mode: "live", snapshot: createFixtureSnapshot("connected") });
+    render(<DeckShell runtime={state} />);
+    expect(screen.getByTestId("agent-tile-planner")).toBeVisible();
+
+    fireEvent.keyDown(document.body, { key: "=", ctrlKey: true });
+    expect(state.setZoom).toHaveBeenCalledWith(1.1);
+  });
+
   it("still honours an overview view state in fixture mode", () => {
     render(<DeckShell runtime={runtime()} initialView={{ kind: "overview" }} />);
 
