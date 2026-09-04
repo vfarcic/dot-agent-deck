@@ -303,6 +303,40 @@ fn one_platforms_bundler_failure_does_not_cancel_the_other() {
     );
 }
 
+/// The code lines of `desktop-publish`'s "Note the unsigned alpha in the
+/// release body" step, from its `name:` to the next step at the same
+/// indentation.
+///
+/// Scoped to the step rather than the job because the two assertions below are
+/// substring checks, and over a whole job block a substring can be satisfied by
+/// something that is not the note at all -- a later step that happens to
+/// mention `dpkg`, or a `System Settings` reference in an unrelated `echo`.
+/// The guard would then pass while the note itself had been gutted, which is
+/// the one outcome it exists to prevent. (Greptile's read of PR #879, and a
+/// fair one.)
+///
+/// Comments are stripped by [`code_before_comment`] for the reason its own
+/// docstring gives, and it matters in the worst direction here: the note step
+/// carries prose *about* the routes it offers, so an unstripped block could be
+/// satisfied by a comment explaining the rule instead of by the rule.
+fn note_step(block: &str) -> String {
+    let mut lines = block
+        .lines()
+        .skip_while(|l| !l.contains("Note the unsigned alpha"));
+    let first = lines.next().unwrap_or_else(|| {
+        panic!("`desktop-publish` has no \"Note the unsigned alpha\" step:\n{block}")
+    });
+    let indent = first.len() - first.trim_start().len();
+    std::iter::once(first)
+        .chain(lines.take_while(|l| {
+            let trimmed = l.trim_start();
+            trimmed.is_empty() || l.len() - trimmed.len() > indent || !trimmed.starts_with("- ")
+        }))
+        .map(code_before_comment)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// The release-body note is the only installation instruction this project
 /// publishes for the desktop bundles -- PRD #740 Decision 11 ships the alpha
 /// unadvertised, so there is no `docs/` page to correct it. Two properties of
@@ -328,12 +362,7 @@ fn one_platforms_bundler_failure_does_not_cancel_the_other() {
 #[test]
 fn the_alpha_note_does_not_leave_a_user_with_only_a_terminal_command() {
     let all = jobs(&workflow());
-    let publish = job(&all, "desktop-publish");
-    let code: String = publish
-        .lines()
-        .map(code_before_comment)
-        .collect::<Vec<_>>()
-        .join("\n");
+    let code = note_step(job(&all, "desktop-publish"));
 
     if code.contains("com.apple.quarantine") {
         assert!(

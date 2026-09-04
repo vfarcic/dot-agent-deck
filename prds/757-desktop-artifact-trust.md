@@ -1,6 +1,6 @@
 # PRD #757: Make the published desktop artifacts trusted
 
-**Status**: Not started — the free work is scoped and shippable; the paid work is **blocked on one question**: whether to spend the Apple Developer Program's $99/yr. There is **no free path to a trusted macOS app** (Decision 2), and on Windows the free path is *better* than any paid one — but there is no Windows artifact yet. See [Open Questions](#open-questions).
+**Status**: In progress — **decided: free options only** (maintainer, 2026-09-04). No Apple Developer Program membership, no Windows certificate, no signing secret in this repository. That decision has a hard consequence worth stating in the first line rather than burying: **the macOS warning stays**, because there is no free way to remove it (Decision 2). What the free ceiling does buy is landed or scoped — M2's release-note correction has shipped, M1's measurement is the one open piece of free work, and Decisions 4-6 are kept as the record of what a later reversal would cost rather than as work.
 **Priority**: Medium
 **Created**: 2026-09-04
 **Issue**: [#757](https://github.com/vfarcic/dot-agent-deck/issues/757)
@@ -23,11 +23,13 @@ The other two platforms are in genuinely different states, and treating them as 
 
 Split the work by what it costs, because the cost is the decision and everything else follows from it.
 
-**Free, shippable now, and not blocked on anything:** stop the release note lying, and — if a measurement supports it — ad-hoc-sign the macOS bundle so its failure mode stops being *damaged, Move to Trash*. Neither needs a certificate, an account, or a secret.
+**Free, and shipped:** stop the release note lying. It gave macOS users one route that macOS Sequoia had removed the alternative to, and told `.deb` users their OS would warn them, which is false. Landed with a static assertion holding both properties.
 
-**$99/yr, and the maintainer's call:** Developer ID signing plus Apple notarization of the macOS bundle, done in a job that holds the signing key and runs nothing else — no checkout, no `pnpm install`, no `cargo build`, no third-party build scripts. This is the only thing that actually removes the warning, and there is no free substitute for it.
+**Free, and the one piece of work left:** measure, on a Mac, whether ad-hoc signing changes the macOS failure mode from *damaged, Move to Trash* to *unverified, Open Anyway* — and whether the daemon sidecar survives `codesign --verify --deep --strict`, which is a no-cost proxy for an open upstream Tauri bug. Neither needs a certificate, an account, or a secret (Decision 3).
 
-**Free, but not yet:** Windows. The free path there is the *best* path — a Microsoft Store MSIX submission is the only option in Microsoft's own comparison table that produces no SmartScreen warning at all, better than a $400/yr EV certificate — and it is moot until a Windows artifact exists at all.
+**$99/yr, and declined:** Developer ID signing plus Apple notarization. This is the only thing that actually removes the macOS warning, and Decision 2 records that there is no free substitute at any effort. The mechanism is designed and written down (Decisions 4 and 5) so that a later reversal is a build rather than a re-think, and so the cost of the decision is legible: **every macOS user meets a security dialog on first launch, forever, until this is revisited.**
+
+**Free, and not yet reachable:** Windows. The free path there is the *best* path — a Microsoft Store MSIX submission is the only option in Microsoft's own comparison table that produces no SmartScreen warning at all, better than a $400/yr EV certificate — and it is moot because **this project publishes no Windows executable of any kind** (Decision 6).
 
 The topology PRD #740 chose is untouched throughout: `desktop-bundle` still hangs off `prepare`, `finalize` still lists no desktop job in `needs:`, and a signing failure still turns the run red while leaving the CLI release complete. Signing adds a job to an existing chain; it does not get between the CLI matrix and `finalize`.
 
@@ -35,12 +37,10 @@ The topology PRD #740 chose is untouched throughout: `desktop-bundle` still hang
 
 ### In Scope
 
-- **Free:** correcting the release-body note — the macOS half gains the System Settings route it is missing, and the Linux half stops claiming an OS warning that does not exist (Decision 3).
-- **Free:** measuring, on a real Mac, whether ad-hoc signing changes the macOS failure mode, and whether the daemon sidecar survives `codesign --verify --deep --strict` — the second being a no-cost proxy for an open upstream Tauri bug that would otherwise be discovered after the certificate is bought (Decision 3).
-- **Paid, if approved:** Developer ID Application signing and Apple notarization of the macOS arm64 bundle, with the ticket stapled so a first launch works offline.
-- **Paid, if approved:** a `desktop-sign` job that is the only place in `release.yml` where a signing credential is named, with a static assertion enforcing it (Decisions 4 and 11).
-- A developer-facing `docs/develop/desktop-signing.md` covering whichever of the above lands, plus the certificate lifecycle, secret inventory, rotation and revocation runbook if the paid path is taken.
-- A written, costed statement of the Windows options, so nobody re-derives them and so the free-beats-paid finding is not lost (Decision 6).
+- **Done:** correcting the release-body note — the macOS half gains the System Settings route it was missing, and the Linux half stops claiming an OS warning that does not exist (Decision 3), with a static assertion holding both.
+- **Open:** measuring, on a real Mac, whether ad-hoc signing changes the macOS failure mode, and whether the daemon sidecar survives `codesign --verify --deep --strict` — the second being a no-cost proxy for an open upstream Tauri bug (Decision 3, M1).
+- **Open, conditional on that measurement:** ad-hoc-signing the bundle in `desktop-bundle`, if and only if M1 shows it improves the first-launch dialog.
+- A written, costed statement of what the paid path *would* be (Decisions 4 and 5) and of the Windows options (Decision 6), so that a later reversal is a build rather than a re-think and the free-beats-paid finding is not lost.
 
 ### Out of Scope
 
@@ -98,6 +98,8 @@ And if a direct download is wanted alongside the Store, there is a second free r
 
 **Linux: free already, and already adequate** — see Decision 7.
 
+**Decided, 2026-09-04: free options only.** The maintainer's answer to the $99 question was to take the free ceiling on every platform. What that costs is worth writing in the decision rather than leaving to be discovered: **on macOS the security dialog stays on first launch, for every user, on every release, until this is revisited.** The free work below makes that dialog more honest and possibly less alarming; nothing free makes it go away. Decisions 4 and 5 stay in this document as the record of what a reversal would build and what it would risk, not as scheduled work.
+
 ### Decision 3 — the free macOS work is a better failure mode and an honest note, and it is worth doing whatever the $99 answer is
 
 Two pieces, and the second is already justified while the first needs a measurement.
@@ -113,7 +115,9 @@ Two pieces, and the second is already justified while the first needs a measurem
 
 The same M1 session buys a second thing for free, and this one is a genuine risk retirement: **[tauri-apps/tauri#11992](https://github.com/tauri-apps/tauri/issues/11992) is open and reports notarization failing with *"The signature of the binary is invalid"* (error 4000) precisely when `externalBin` is configured**, resolving when it is removed. This app has an `externalBin` — `binaries/dot-agent-deck`, the daemon sidecar, which is the feature that makes an installed GUI work without a Rust toolchain. Discovering that after buying a certificate would be the expensive order to discover it in, and an ad-hoc signature is enough to run `codesign --verify --deep --strict --verbose=4` over the nested sidecar and the outer bundle, which is a direct proxy for the failure class. **Free, and it is the reason M1 comes before the money question rather than after it.**
 
-### Decision 4 — if the $99 is spent, the signing key never shares a runner with third-party build code
+### Decision 4 — if the $99 is ever spent, the signing key never shares a runner with third-party build code
+
+*Not being built — the free-options decision above declined the paid path. Kept because a design argued once is cheaper to reread than to re-derive, and because the reasoning below is the part that would be lost.*
 
 This is the design of the paid half, and everything else is detail. The obvious implementation is the one Tauri documents: put `APPLE_CERTIFICATE` and friends in `desktop-bundle`'s `env:` and let `tauri build` sign during bundling. It is about a day of work and it is what most projects do. **It also puts a Developer ID private key in the environment of the process that compiles the desktop crate's Rust dependency graph and installs `desktop/`'s npm dependency graph**, and this repository has a specific, non-hypothetical path by which unreviewed third-party code reaches that process:
 
@@ -147,7 +151,9 @@ prepare
 
 *Sign locally, publish by hand.* Genuinely eliminates the CI exposure, and it is the only option that does. It loses to #740 Decision 4's own reasoning, written about this exact failure mode: "something a human must remember to trigger gets triggered for two releases and then never, which is how an alpha artifact ends up six versions stale." The failure here is softer than the one that argument was about — forgetting yields an *unsigned* artifact rather than a *missing* one — but the result is a release history where trust is a coin flip, which is worse for a user than consistent unsignedness. It also requires Apple hardware in the maintainer's hands on every release day.
 
-### Decision 5 — a signing secret goes on a runner, and this is the argument for it rather than an assumption
+### Decision 5 — a signing secret would go on a runner, and this is the argument that would have to be made for it
+
+*Not live — no secret is being added. This is the threat model a reversal would have to answer, recorded while the research is fresh.*
 
 **This decision is the maintainer's, not this PRD's.** What follows is the threat model, stated so the decision is informed. Nothing is added to this repository under this PRD.
 
@@ -177,6 +183,10 @@ The one thing that improves the picture is notarization itself, easy to read as 
 ### Decision 6 — Windows: free beats paid, and nothing is urgent because no artifact exists
 
 There is nothing to sign. That is the whole decision for now, and it is not a judgment call: v0.39.3 publishes no Windows executable, `release.yml` names no Windows target in either matrix, and PRD #740 Decision 1 deferred the Windows *bundle* behind [#741](https://github.com/vfarcic/dot-agent-deck/issues/741) on reachability grounds — a Windows GUI cannot attach to a remote Linux daemon because the IPC transport is a named pipe on Windows and a Unix socket everywhere else. None of that has moved. Scoping Windows signing now would be designing a job for an artifact that does not exist.
+
+**This is the part most likely to be misread, so it is stated flatly: there is no `.exe` on any release, and signing is not what is standing between the project and one.** Not a desktop `.exe`, and not a CLI one either — v0.39.3's eight assets are two checksum files, four CLI binaries for Linux and macOS, and two desktop bundles. Producing a Windows *daemon/CLI* binary is [#164](https://github.com/vfarcic/dot-agent-deck/issues/164); producing a Windows *GUI* bundle is gated on #741's reachability problem, because a Windows client speaks named pipes and cannot attach to the Unix socket a Linux daemon listens on. Neither is blocked on trust, neither is in this PRD's scope, and no amount of certificate procurement moves either one.
+
+The repository is nonetheless **already advertising an executable it does not build**, which is worth fixing whoever gets to it first. `Taskfile.yml:227` derives the Scoop manifest's hash by grepping `checksums.txt` for `dot-agent-deck-windows-amd64.exe`, a filename nothing produces, so the published manifest at `vfarcic/scoop-bucket` carries — verified on 2026-09-04, for v0.39.3 — `"hash": ""` and a download URL that 404s. PRD #740 spotted this and assigned it to #164; it is repeated here because "we publish a Windows exe" is exactly the belief that manifest creates.
 
 **What to do when one does exist, in order.** Decision 2 has the comparison table; this is the ranking that falls out of it.
 
@@ -252,50 +262,60 @@ The honest limit is the same one #740 recorded and it has not improved: no test 
 
 ## Success Criteria
 
-**Free path (no decision required):**
+**The free position, which is the one being taken:**
 
-- The release note offers a macOS route that does not require a terminal, and no longer tells `.deb` users their OS will warn them.
-- The macOS failure mode is measured rather than assumed, and if ad-hoc signing improves it, it is applied — so a user meets *"Apple could not verify…"* with an *Open Anyway* route rather than *"damaged — Move to Trash"*.
-- Whether tauri#11992's failure class reaches this app is known before any money is spent.
+- The release note offers a macOS route that does not require a terminal, and no longer tells `.deb` users their OS will warn them. **Met.**
+- Neither property can silently regress: a static assertion in `xtask/linkage-check` fails the build if the note offers the terminal command as its only macOS route, or stops addressing the `.deb` on its own terms. **Met.**
+- The macOS failure mode is *measured* rather than assumed, and ad-hoc signing is applied if and only if the measurement supports it — so a user meets *"Apple could not verify…"* with an *Open Anyway* route rather than *"damaged — Move to Trash"*. **Open (M1).**
+- Whether tauri#11992's failure class reaches this app is known, for free, rather than being a surprise waiting for whoever revisits the paid path. **Open (M1).**
+- The Linux `.deb` and the CLI assets are unaffected in how they are produced, named and checksummed. **Met.**
+- A bundling failure still leaves the CLI release complete and on schedule and turns the run red — PRD #740's topology is untouched, and its assertions still pass. **Met.**
 
-**Paid path (if approved):**
+**What the free position explicitly does not achieve**, stated as a criterion because leaving it implicit is how a trade quietly becomes a belief:
 
-- A user downloads the `.dmg`, opens it, drags the app to `/Applications`, and launches it — no terminal command, no System Settings visit, and no security dialog beyond the ordinary "downloaded from the internet" confirmation.
-- The launch works **offline**, proving the ticket is stapled to the artifact rather than fetched.
-- `xcrun stapler validate` succeeds on the downloaded `.dmg`, and `spctl` accepts both the `.dmg` and the mounted `.app`, reporting a Notarized Developer ID.
-- The release body never carries the `xattr` instruction on a release whose macOS asset was signed, and never claims a signature on one that was not.
-- No signing credential is named anywhere in `release.yml` outside the `desktop-sign` job, and a static test fails if one appears.
+- macOS users **do** meet a security dialog on first launch. Every user, every release, until the $99 decision is revisited.
+- No Windows user is helped, because there is no Windows artifact to help them with.
 
-**Both:**
-
-- A signing or bundling failure leaves the CLI release complete and on schedule, exactly as today, and turns the run red.
-- The Linux `.deb` and the CLI assets are unaffected in how they are produced, named and checksummed.
+**The acceptance test a reversal would have to pass**, preserved rather than deleted: a user downloads the `.dmg` on a clean Mac, drags the app to `/Applications`, and launches it **offline** with no dialog beyond the ordinary "downloaded from the internet" confirmation; `xcrun stapler validate` succeeds and `spctl` reports a Notarized Developer ID; and no signing credential is named anywhere in `release.yml` outside `desktop-sign`.
 
 ## Milestones
 
-- [ ] **M1 — Measure, on a Mac, for free.** Two questions, one session, no credential and no money: does ad-hoc signing turn *"damaged"* into *"unverified, Open Anyway"* (Decision 3's hypothesis), and does `codesign --verify --deep --strict` survive the daemon sidecar (tauri#11992's failure class)? **This is deliberately first, before the money question**, because both answers change what the $99 buys and one of them could invalidate the whole paid path. Needs Apple hardware; needs nothing else.
-- [ ] **M2 — Ship the free work.** The note corrections of Decision 3, their static assertion, and ad-hoc signing **if and only if M1 says it helps**. Blocked on nothing. This is the increment that improves a user's day whatever the answer to M3 is.
-- [ ] **M3 — The $99 decision.** *Blocked on the maintainer.* Whether to enroll in the Apple Developer Program and hold the resulting certificate as a repository secret, per Decisions 4 and 5. Decision 2 records that there is no free substitute, so this is a spend-or-accept-the-warning choice rather than a build-or-buy one.
-- [ ] **M4 — `desktop-sign`, wired and guarded.** *Blocked on M3.* The new job per Decision 4, `desktop-bundle` switched to emitting a `ditto` archive of the `.app`, and the three static assertions of Decision 11, each mutation-tested the way #740's were.
-- [ ] **M5 — Docs.** `docs/develop/desktop-signing.md`, scoped to whichever path landed — and if the paid one did, carrying the certificate lifecycle, the secret inventory, rotation, and the revocation runbook — plus a pointer from `docs/develop/desktop-gui.md`'s **Release bundles** section. Developer-facing, so under `docs/develop/` and **not** in `site/sidebars.js`, per CLAUDE.md rule 11. User-facing install instructions stay with [#765](https://github.com/vfarcic/dot-agent-deck/issues/765), which this PRD unblocks rather than absorbs.
-- [ ] **M6 — Verified by a real signed release.** *Blocked on M3.* A real tag produces a signed, notarized, stapled `.dmg`; it is downloaded on a Mac that has never seen this source tree, checked with `stapler` and `spctl`, and launched offline. Not collapsible into "CI was green" — a green run that produced a correctly-signed but unnotarized bundle is exactly the failure this gate exists for.
+The free-options decision of Decision 2 settles M3 and takes M4 and M6 off the board. They are kept, struck through and with their reopening condition named, because a milestone deleted is a decision that has to be made again.
+
+- [ ] **M1 — Measure, on a Mac, for free.** Two questions, one session, no credential and no money: does ad-hoc signing turn *"damaged"* into *"unverified, Open Anyway"* (Decision 3's hypothesis), and does `codesign --verify --deep --strict` survive the daemon sidecar (tauri#11992's failure class)? **The only open piece of free work, and the only thing that can still improve a macOS user's first launch.** Needs Apple hardware, which is available; needs nothing else.
+- [x] **M2 — Ship the free note work.** *(Landed in PR [#879](https://github.com/vfarcic/dot-agent-deck/pull/879).)* The note corrections of Decision 3 and their static assertion `the_alpha_note_does_not_leave_a_user_with_only_a_terminal_command`, mutation-tested both ways. **Ad-hoc signing is deliberately not part of this milestone** — it belongs to M1's result, and shipping it on a hypothesis is the thing this repository's discipline exists to prevent.
+- [x] **M3 — The $99 decision.** *Answered 2026-09-04: **no**.* Free options only, on every platform. Decision 2 records that this is a spend-or-accept-the-warning choice rather than a build-or-buy one, so the answer carries a permanent consequence: the macOS dialog stays.
+- [ ] ~~**M4 — `desktop-sign`, wired and guarded.**~~ **Not being built.** Reopens only if M3 is revisited. The design is Decision 4 and the assertions are Decision 11; both are written down so a reversal is a build rather than a re-think.
+- [ ] **M5 — Docs.** Scoped down by M3 to what actually landed: `docs/develop/desktop-gui.md`'s **Release bundles** section now records both guarded properties of the note and points here. A `docs/develop/desktop-signing.md` is **not** written, because there is no signing to document — writing a certificate-lifecycle page for a certificate nobody holds is the kind of documentation that rots unread. User-facing install instructions stay with [#765](https://github.com/vfarcic/dot-agent-deck/issues/765). Remaining: fold M1's measured answer in once it exists.
+- [ ] ~~**M6 — Verified by a real signed release.**~~ **Not reachable.** There will be no signed release to verify. Its substance — download on a clean Mac, `stapler validate`, `spctl`, launch offline — is the acceptance test a reversal would have to pass, and is preserved in the test plan for that purpose.
+
+## Windows, restated as a dependency rather than a milestone
+
+Nothing in this PRD produces a Windows artifact, and nothing in it is what stands between the project and one. The order of operations, whenever someone picks it up, is:
+
+1. **An artifact has to exist first.** [#164](https://github.com/vfarcic/dot-agent-deck/issues/164) for a Windows daemon/CLI binary; [#741](https://github.com/vfarcic/dot-agent-deck/issues/741) for a Windows GUI, whose blocker is reachability rather than packaging.
+2. **Then the free trust question, in Decision 6's ranking** — Microsoft Store MSIX first (the only route with no warning at all, and free), SignPath Foundation second (free, warning stays, publisher name appears and reputation accrues).
+3. **The paid options stay unranked and unbought**, because EV stopped bypassing SmartScreen in 2024 and free now beats paid on this platform.
+
+The one thing worth doing before any of that is fixing the Scoop manifest that already points at a nonexistent `.exe` with an empty hash — Decision 6 has the detail, and it belongs to #164.
 
 ## Risks
 
-- **tauri#11992 — notarization fails with `externalBin`.** Open upstream, no workaround reported, and this app's sidecar is not optional. M1 is scheduled before M3 precisely because of this. Its result may force the fallback: sign the sidecar explicitly before bundling, or sign the nested binaries by hand in `desktop-sign` — which Decision 4's design already does, so the exposure is smaller here than for a project using Tauri's integrated signing.
-- **Half the mechanism cannot be tested until the credential exists**, and the untestable half is Apple's. Not a scheduling risk to be managed away; it is why M6 is a milestone rather than a formality.
-- **Certificates expire on a schedule, and `release.yml`'s existing guard pattern will not catch it.** The `RELEASE_TOKEN` guard tests for emptiness (`-z`), and CLAUDE.md rule 8 already records that an expired-but-present token passes it and dies later. That failure mode is *worse* for a certificate, because expiry is a known future date rather than an accident: the Developer ID certificate expires, the membership renews annually, and the App Store Connect API key can be revoked independently. `desktop-sign` should check the certificate's `notAfter` and fail early with the date in the message — cheap, offline, and the one check that turns an annual surprise into a warning.
-- **Revocation is the remediation and it is destructive.** Decision 5 states it: a leaked key is fixed by revoking a certificate that, once revoked, prevents already-installed copies from launching. The M5 runbook exists so that decision is not made for the first time under pressure.
-- **macOS runner minutes are free only while the repository is public.** #740 recorded this for the bundler; `desktop-sign` adds a second macOS job, and `notarytool --wait` can block for minutes while Apple's service processes the submission.
-- **Gatekeeper's behaviour is a moving target and the free path depends on its details.** Sequoia removed the Control-click override; Homebrew's cask policy changed on 2026-09-01; Decision 3's whole hypothesis is about which dialog appears. Every claim of that kind here should be re-checked, not assumed, at the next major macOS release.
-- **Scope creep toward Windows.** Every Windows signing question that arises belongs to whatever PRD ships a Windows bundle. Decision 6 records the facts and the ranking so they do not have to be rediscovered; it does not open the door to scoping the job.
+The decision to take the free ceiling removes most of this list — a certificate that is never bought cannot expire, leak, or be revoked. What is left is what the *free* position carries, plus what a reversal would inherit.
+
+- **The macOS dialog is now a standing cost, not a temporary one.** Every macOS user meets a security prompt on first launch, on every release, indefinitely. That is the accepted price of the free-options decision and it should be re-weighed if desktop adoption ever matters more than $99/yr does. Nothing in this PRD reduces it below "a dialog with an *Open Anyway* route"; the *only* mechanism that removes it is the one Decision 2 records as unavailable for free.
+- **M1's hypothesis may not hold, and then the free ceiling is lower than this document hopes.** If ad-hoc signing does not change the dialog, the free position is exactly what shipped in M2 — better wording, two routes — and nothing more. Written as a hypothesis rather than a plan precisely so that outcome is a measurement rather than a disappointment.
+- **tauri#11992 — notarization fails with `externalBin`.** Open upstream, no workaround reported, and this app's sidecar is not optional. Dormant while nothing is notarized, and the first thing a reversal would trip over. M1 answers the cheap half of it for free either way, which is why M1 is still worth running.
+- **Gatekeeper's behaviour is a moving target, and the free position depends entirely on its details.** Sequoia removed the Control-click override; Homebrew's cask policy changed on 2026-09-01; Decision 3's whole hypothesis is about which dialog appears. A position built on "the warning is survivable" needs re-checking at each major macOS release in a way that a notarized artifact would not.
+- **Homebrew is now closed to this project's GUI.** Casks must be codesigned and notarized. Not a regression caused here, but a door that the free decision keeps shut — worth knowing before anyone proposes a cask as the install story.
+- **Scope creep toward Windows.** Every Windows question that arises belongs to #164 or #741 first and to a signing decision second. Decision 6 records the facts and the ranking so they do not have to be rediscovered.
 
 ## Open Questions
 
-1. **Spend $99/yr on the Apple Developer Program?** This is the only question that gates anything, and Decision 2 is the reason it cannot be avoided: a free Apple Developer account cannot notarize, the fee waiver covers only nonprofits, educational institutions and government entities, the Mac App Store needs the same membership and would not accept a process-spawning sidecar, and Homebrew closed the cask loophole on 1 September 2026. **There is no free path to a trusted macOS app.** The alternatives are: pay, or take M2's free improvement and leave the warning in place.
-2. **If yes — hold the certificate in CI (Decision 4's split job) or sign by hand on release day?** Decision 5 has the threat model. The key point is that a leak's remediation is Apple revoking a certificate, which stops already-installed copies from launching.
-3. **If no — is M2 the settled answer, or should the note simply be corrected and the PRD closed?** M2 is worth doing either way; the question is whether #757 stays open as "waiting for a certificate" or is closed as "decided against, warning documented honestly".
-4. **Windows: confirm nothing is to be procured.** Decision 6 recommends it, and the reason is now that free beats paid rather than that paid is expensive — a Microsoft Store MSIX is the only option with no SmartScreen warning at all, and SignPath Foundation offers free OV signing to OSS projects. Both are moot until a Windows artifact exists, and neither has a procurement lead time to start early.
+The $99 question is answered (no) and the Windows question is answered by there being no artifact. Two things remain, and neither blocks anything shipped.
+
+1. **Does #757 close once M1 is run, or stay open as "revisit when adoption justifies $99"?** The argument for closing is that the decision is made and the free work is done; the argument for leaving it open is that the decision is explicitly a cost trade rather than a technical conclusion, and a stale open issue is a cheaper reminder than a rediscovery.
+2. **M1 needs someone at a Mac.** The commands are in the test plan and the whole thing is one session. Until it is run, whether ad-hoc signing improves the first-launch dialog stays a hypothesis in this document rather than an answer.
 
 ## Work Log
 
@@ -322,3 +342,17 @@ Two claims were deliberately narrowed rather than repaired, per CLAUDE.md rule 1
 One claim is recorded as an explicit **hypothesis rather than a fact**, because it is the crux of the free recommendation and there was no Mac in this session to settle it: that ad-hoc signing converts the *"damaged and can't be opened"* dialog into the *"Apple could not verify…"* dialog with an *Open Anyway* route. The mechanism — macOS reports "damaged" when it cannot verify a quarantined file's signature at all — is well attested and the exact dialog is not, so M1 measures it before M2 acts on it.
 
 Figures re-checked on 2026-09-04 against Apple, Microsoft Learn, Azure pricing, Homebrew and SignPath. The one figure carried over from the issue without independent verification is its $300–600/yr cloud-HSM range; Microsoft's own current page puts OV certificates at $150–300/yr, and Decision 6's ranking does not depend on either.
+
+### 2026-09-04 — Decided: free options only
+
+The maintainer's answer to the $99 question was **no** — free options on every platform — together with a check on the goal: *"The goal is to have dmg and exe files in the releases in GitHub. Correct?"*
+
+**Half of that goal is already met and half of it is not this PRD's to meet, and the distinction matters enough to record.** The `.dmg` has been on the release since v0.39.3. There is **no `.exe` of any kind** — not a GUI one and not a CLI one — and signing is not what stands between the project and one: a Windows daemon/CLI binary is #164, and a Windows GUI bundle is gated on #741's named-pipe-versus-Unix-socket reachability problem. No certificate, free or paid, produces an artifact. Decision 6 now says this flatly, because the belief is actively manufactured by the repository itself: the published Scoop manifest for v0.39.3 points at `dot-agent-deck-windows-amd64.exe` with `"hash": ""` and a URL that 404s, which was verified against `vfarcic/scoop-bucket` on the day this was written.
+
+**What the decision costs, recorded where it cannot be missed.** On macOS the free ceiling is a *better dialog*, never the absence of one. Decision 2 enumerates the four closed routes — a free Apple account cannot notarize, the fee waiver's eligibility page excludes individuals and sole proprietors in as many words, the Mac App Store needs both the same membership and an App Sandbox a process-supervising sidecar does not fit, and Homebrew removed `--no-quarantine` and began dropping unsigned casks on 2026-09-01. So every macOS user meets a security prompt on first launch, on every release, until this is revisited. That is now the Status line, a Decision, a Success Criterion and a Risk, deliberately, because a trade this shape is exactly the kind that decays into an assumption that the problem was solved.
+
+Decisions 4 and 5 — the split-job topology and the threat model — are kept struck through rather than deleted, and M4 and M6 with them. The research behind them is a day's work and the reasoning is the part that would be lost; a milestone deleted is a decision that has to be made again.
+
+**One free thing is still open and is worth running.** M1 needs a Mac and one session: whether ad-hoc signing (`APPLE_SIGNING_IDENTITY="-"`, no account, no money) converts *"damaged — Move to Trash"* into *"Apple could not verify…"* with an *Open Anyway* route, and whether the daemon sidecar survives `codesign --verify --deep --strict`. The first is the last free improvement available to a macOS user's first launch; the second retires tauri#11992's failure class for free whether or not the paid path is ever taken. It stays a **hypothesis** in this document until it is measured — shipping the config change on the strength of the mechanism alone is precisely what this repository's discipline exists to prevent.
+
+**Review round (Greptile on PR #879).** One P2, valid and fixed here: the PRD still read "Not started" while the same PR landed M2. The status line, the milestones and the success criteria now record what shipped and what did not. Greptile's file overview separately noted that the new assertion's substring checks were scoped to the whole `desktop-publish` job rather than to the note step — also right, and also fixed: the guard now extracts the note step and asserts against that, so an unrelated step mentioning `dpkg` can no longer satisfy it.
