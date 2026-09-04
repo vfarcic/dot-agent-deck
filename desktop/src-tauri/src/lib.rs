@@ -3,7 +3,6 @@ mod dto;
 mod terminal;
 
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
 use std::time::Duration;
 
 use dot_agent_deck::agent_pty::{
@@ -12,8 +11,9 @@ use dot_agent_deck::agent_pty::{
 use dot_agent_deck::config::attach_socket_path;
 use dot_agent_deck::daemon_client::{DaemonClient, EventSubscription, StartAgentOptions};
 use dot_agent_deck::daemon_stop::{StopOutcome, run_daemon_stop};
-use dot_agent_deck::event::{AgentType, BroadcastMsg, EventType, SendResult};
-use dot_agent_deck::project_config::{OrchestrationConfig, load_project_config};
+use dot_agent_deck::event::{
+    AgentType, BroadcastMsg, EventType, PreparedWorkflow, ProjectRole, SendResult,
+};
 use dot_agent_deck::prompt_delivery::AUTOMATIC_PROMPT_DEADLINE;
 
 /// Maximum wait for an agent readiness signal before the coordinator seed
@@ -32,9 +32,10 @@ use crate::daemon_bridge::{
 };
 use crate::dto::{
     BootstrapOptions, COMMAND_MAX_BYTES, ConnectionStatus, DesktopAction, DesktopActionResult,
-    DesktopSnapshot, TerminalAttachResult, WorkflowRoleInput,
-    ensure_desktop_workflow_platform_supported, mint_desktop_pane_id, safe_message,
-    validate_agent_id, validate_start_fields, validate_workflow_shape,
+    DesktopProjectListing, DesktopResolvedProject, DesktopSnapshot, TerminalAttachResult,
+    WorkflowRoleInput, ensure_desktop_workflow_platform_supported, map_project_listing,
+    map_resolved_project, mint_desktop_pane_id, safe_message, validate_agent_id,
+    validate_pasted_project_path, validate_start_fields, validate_workflow_shape,
 };
 use crate::terminal::DesktopState;
 
@@ -70,12 +71,20 @@ fn desktop_seed_buffer() -> Duration {
 /// resize coalescing the terminal bridge already uses.
 const SNAPSHOT_COALESCE_INTERVAL: Duration = Duration::from_millis(150);
 
+/// Put the launch's per-role commands into the ORCHESTRATION's role order, and
+/// refuse any disagreement about the role set.
+///
+/// PRD #819 M6: `configured` is now the daemon's projected role list
+/// ([`dot_agent_deck::event::ProjectRole`], off `prepare-workflow`) rather than
+/// an `OrchestrationConfig` this process read off its own filesystem. The rule
+/// is unchanged — same names, same order, same start marker — but the authority
+/// for it moved to the machine the agents will actually run on.
 fn order_workflow_roles(
-    config: &OrchestrationConfig,
+    configured: &[ProjectRole],
     requested: &[WorkflowRoleInput],
 ) -> Result<Vec<WorkflowRoleInput>, String> {
-    let mut config_names = HashSet::with_capacity(config.roles.len());
-    for role in &config.roles {
+    let mut config_names = HashSet::with_capacity(configured.len());
+    for role in configured {
         if !config_names.insert(role.name.as_str()) {
             return Err(format!(
                 "orchestration config contains duplicate role: {}",
@@ -91,8 +100,8 @@ fn order_workflow_roles(
         return Err("workflow request contains duplicate role names".into());
     }
 
-    let mut ordered = Vec::with_capacity(config.roles.len());
-    for config_role in &config.roles {
+    let mut ordered = Vec::with_capacity(configured.len());
+    for config_role in configured {
         let requested_role = requested_by_name
             .remove(config_role.name.as_str())
             .ok_or_else(|| {
@@ -103,7 +112,7 @@ fn order_workflow_roles(
             })?;
         if requested_role.start != config_role.start {
             return Err(format!(
-                "workflow start marker for role {} does not match .dot-agent-deck.toml",
+                "workflow start marker for role {} does not match the orchestration the daemon prepared",
                 safe_message(&config_role.name)
             ));
         }
@@ -118,67 +127,70 @@ fn order_workflow_roles(
     Ok(ordered)
 }
 
-fn validate_workflow_against_project(
-    name: &str,
-    cwd: &str,
-    requested: &[WorkflowRoleInput],
-) -> Result<(OrchestrationConfig, Vec<WorkflowRoleInput>), String> {
-    let config = load_project_config(Path::new(cwd))
-        .map_err(|error| safe_message(error.to_string()))?
-        .ok_or_else(|| {
-            format!(
-                "{} has no .dot-agent-deck.toml; a live workflow must match a configured orchestration so daemon delegation routing remains exact",
-                safe_message(cwd)
-            )
-        })?;
-    let orchestration = config
-        .orchestrations
-        .iter()
-        .find(|orchestration| orchestration.name == name)
-        .ok_or_else(|| {
-            format!(
-                "orchestration '{}' was not found in {}/.dot-agent-deck.toml",
-                safe_message(name),
-                safe_message(cwd)
-            )
-        })?;
-    let roles = order_workflow_roles(orchestration, requested)?;
-    Ok((orchestration.clone(), roles))
-}
-
-fn prepare_workflow_launch(
+/// PRD #819 M6: the launch preparation, performed **by the daemon**.
+///
+/// What this replaced was `validate_workflow_against_project` plus
+/// `prepare_workflow_launch`: a `load_project_config` against the desktop's own
+/// filesystem, and a `prepare_orchestrator_prompt` that created a directory and
+/// wrote a file there. Against a remote daemon both read and wrote the WRONG
+/// machine, and neither errored — the launch validated against a config no agent
+/// would ever see and published the coordinator context where no agent would
+/// ever read it. That is the defect PRD #819 exists to remove.
+///
+/// **The ordering inverts here, deliberately.** The comment this displaced said
+/// "preparing the file first keeps a context-write failure atomic", and that
+/// claim was only ever available because the write was local. The daemon is the
+/// party that can actually make resolve-and-publish atomic, so it does: one
+/// validated config snapshot, resolve, compose, publish, then answer. A
+/// preparation that fails answers with a refusal and starts nothing, because
+/// nothing here starts anything — the spawn is the caller's next step.
+///
+/// Returns the roles in the orchestration's own order alongside the daemon's
+/// preparation, whose `path` is the canonical spelling the spawn must use and
+/// whose `prompt` is the one-liner the coordinator receives.
+async fn prepare_workflow_launch<D: WorkflowDaemon + Sync>(
+    daemon: &D,
     name: &str,
     cwd: &str,
     task_prompt: &str,
     requested: &[WorkflowRoleInput],
-) -> Result<(Vec<WorkflowRoleInput>, String), String> {
+    config_revision: Option<&str>,
+) -> Result<(Vec<WorkflowRoleInput>, PreparedWorkflow), String> {
     let task_prompt = task_prompt.trim();
     if task_prompt.is_empty() {
         return Err("task prompt must not be empty".into());
     }
+    // A UI affordance, not the bound: the daemon applies its own
+    // `bounded_read::MAX_TASK_BYTES` before it touches a filesystem, and it is
+    // not entitled to trust this one.
     if task_prompt.len() > COMMAND_MAX_BYTES || task_prompt.contains('\0') {
         return Err(format!(
             "task prompt must be at most {COMMAND_MAX_BYTES} bytes and contain no NUL"
         ));
     }
-    let (config, roles) = validate_workflow_against_project(name, cwd, requested)?;
+    let prepared = daemon
+        .prepare_workflow(cwd, name, task_prompt, config_revision)
+        .await?;
+    // Both are `#[serde(default)]` response fields, so an absent one decodes to
+    // the empty string rather than failing to parse. Empty means "this daemon
+    // did not report it", and neither is something this client may invent: the
+    // path would reintroduce the spelling bug the canonical answer exists to
+    // close, and the prompt names a project-state file only the daemon wrote.
+    if prepared.path.is_empty() {
+        return Err(
+            "the daemon prepared the workflow but reported no canonical project path; refusing to spawn against an unconfirmed directory"
+                .into(),
+        );
+    }
+    if prepared.prompt.trim().is_empty() {
+        return Err(
+            "the daemon prepared the workflow but reported no coordinator prompt; the context would never be read"
+                .into(),
+        );
+    }
+    let roles = order_workflow_roles(&prepared.roles, requested)?;
     validate_desktop_coordinator(&roles)?;
-    // Upstream #222 moved context composition into `orchestrator_context` and
-    // gave it the task parameter, so the daemon spawn path and this one compose
-    // identically — the manual "## User task" concat this used to do is now
-    // the function's own job.
-    let seed = dot_agent_deck::orchestrator_context::prepare_orchestrator_prompt(
-        &config,
-        cwd,
-        Some(task_prompt),
-    )
-    .ok_or_else(|| {
-        format!(
-            "could not prepare coordinator context at {}/.dot-agent-deck/orchestrator-context.md; workflow was not started",
-            safe_message(cwd)
-        )
-    })?;
-    Ok((roles, seed))
+    Ok((roles, prepared))
 }
 
 fn validate_desktop_coordinator(roles: &[WorkflowRoleInput]) -> Result<&WorkflowRoleInput, String> {
@@ -233,7 +245,26 @@ fn workflow_start_options(
 trait WorkflowDaemon {
     type ReadinessWatch;
 
-    async fn start_workflow_agent(&self, options: StartAgentOptions) -> Result<String, String>;
+    /// PRD #819 M6: ask the daemon to resolve the project, compose the
+    /// coordinator context and publish it. The only step of a launch that
+    /// writes, and it happens on the daemon's filesystem rather than this one's.
+    async fn prepare_workflow(
+        &self,
+        cwd: &str,
+        orchestration: &str,
+        task: &str,
+        config_revision: Option<&str>,
+    ) -> Result<PreparedWorkflow, String>;
+
+    /// `prep_token` is the one the preparation handed back, presented so a
+    /// spawn against a preparation that has since gone stale is refused
+    /// daemon-side. It is a staleness check and not an authorization — see
+    /// `dot_agent_deck::prep_token`'s module doc.
+    async fn start_workflow_agent(
+        &self,
+        options: StartAgentOptions,
+        prep_token: Option<&str>,
+    ) -> Result<String, String>;
     async fn stop_workflow_agent(&self, agent_id: &str) -> Result<(), String>;
     async fn reconcile_workflow_agent(
         &self,
@@ -265,8 +296,24 @@ trait WorkflowDaemon {
 impl WorkflowDaemon for DaemonClient {
     type ReadinessWatch = EventSubscription;
 
-    async fn start_workflow_agent(&self, options: StartAgentOptions) -> Result<String, String> {
-        self.start_agent(options)
+    async fn prepare_workflow(
+        &self,
+        cwd: &str,
+        orchestration: &str,
+        task: &str,
+        config_revision: Option<&str>,
+    ) -> Result<PreparedWorkflow, String> {
+        DaemonClient::prepare_workflow(self, cwd, orchestration, task, config_revision)
+            .await
+            .map_err(|error| safe_message(error.to_string()))
+    }
+
+    async fn start_workflow_agent(
+        &self,
+        options: StartAgentOptions,
+        prep_token: Option<&str>,
+    ) -> Result<String, String> {
+        self.start_agent_with_prep_token(options, prep_token)
             .await
             .map_err(|error| safe_message(error.to_string()))
     }
@@ -509,6 +556,7 @@ async fn launch_workflow<D: WorkflowDaemon + Sync>(
     cols: u16,
     orchestration_id: &str,
     orchestrator_seed: &str,
+    prep_token: Option<&str>,
 ) -> Result<WorkflowLaunchResult, String> {
     validate_desktop_coordinator(roles)?;
     let created_at = daemon.now();
@@ -530,7 +578,7 @@ async fn launch_workflow<D: WorkflowDaemon + Sync>(
             rows,
             cols,
         );
-        match daemon.start_workflow_agent(options).await {
+        match daemon.start_workflow_agent(options, prep_token).await {
             Ok(agent_id) => {
                 if role.start {
                     start_target = Some((pane_id, agent_id.clone()));
@@ -686,6 +734,51 @@ async fn desktop_get_snapshot(app: AppHandle, webview: Webview) -> Result<Deskto
     Ok(refresh_and_emit(&app).await)
 }
 
+/// PRD #819 M6: the projects THIS DAEMON knows about.
+///
+/// Every path the desktop offers comes from here or from the user; none is
+/// derived from the desktop's own environment, which is the whole invariant.
+/// An empty listing is a successful answer — "this daemon has nothing live and
+/// its startup cwd is not a project" — and the webview renders its
+/// paste-a-path surface for it rather than an error.
+#[tauri::command]
+async fn desktop_list_projects(webview: Webview) -> Result<DesktopProjectListing, String> {
+    ensure_main_webview(&webview)?;
+    let daemon = trusted_daemon().await?;
+    daemon.require_compatible()?;
+    let listing = daemon
+        .client
+        .list_projects()
+        .await
+        .map_err(|error| safe_message(error.to_string()))?;
+    Ok(map_project_listing(listing))
+}
+
+/// PRD #819 M6: resolve ONE path — a path this daemon listed, or one the user
+/// typed. Read-only, and never a walk.
+///
+/// The reply's `path` is the daemon's canonical spelling and is what the
+/// webview holds from here on: it is the string that goes back on the launch.
+/// The string-shape check in front of it touches no filesystem and could not —
+/// whether a directory is a project is the daemon's answer, on the daemon's
+/// host.
+#[tauri::command]
+async fn desktop_resolve_project(
+    webview: Webview,
+    path: String,
+) -> Result<DesktopResolvedProject, String> {
+    ensure_main_webview(&webview)?;
+    validate_pasted_project_path(&path)?;
+    let daemon = trusted_daemon().await?;
+    daemon.require_compatible()?;
+    let project = daemon
+        .client
+        .resolve_project(&path)
+        .await
+        .map_err(|error| safe_message(error.to_string()))?;
+    Ok(map_resolved_project(project))
+}
+
 #[tauri::command]
 async fn desktop_bootstrap(
     app: AppHandle,
@@ -819,6 +912,7 @@ async fn desktop_run_action(
             roles,
             rows,
             cols,
+            config_revision,
         } => {
             ensure_desktop_workflow_platform_supported(std::env::consts::OS)?;
             let (rows, cols) = validate_workflow_shape(
@@ -828,26 +922,40 @@ async fn desktop_run_action(
                 rows.unwrap_or(32),
                 cols.unwrap_or(120),
             )?;
-            // Match the TUI orchestration path: materialize the canonical
-            // config's role/delegation context before any role is spawned.
-            // The supported non-Pi coordinator uses the readiness-gated,
+            // PRD #819 M6: the connection comes FIRST now. Resolution used to
+            // run two lines above the first daemon contact, against this
+            // process's own filesystem; it now runs on the daemon's, so a
+            // connection has to exist before a launch can be prepared at all.
+            // The supported non-Pi coordinator still uses the readiness-gated,
             // identity-bound retry path in `launch_workflow`; Pi is rejected
-            // before this point because its native path has no acknowledgement.
-            // Preparing the file first keeps a context-write failure atomic.
-            let (roles, orchestrator_seed) =
-                prepare_workflow_launch(&name, &cwd, &task_prompt, &roles)?;
-            let orchestration_id = mint_orchestration_id();
+            // inside the preparation, before anything is spawned.
             let daemon = trusted_daemon().await?;
             daemon.require_compatible()?;
-            let launched = launch_workflow(
+            let (roles, prepared) = prepare_workflow_launch(
                 &daemon.client,
                 &name,
                 &cwd,
+                &task_prompt,
+                &roles,
+                config_revision.as_deref(),
+            )
+            .await?;
+            let orchestration_id = mint_orchestration_id();
+            let launched = launch_workflow(
+                &daemon.client,
+                &name,
+                // The daemon's CANONICAL spelling, not the one that was sent.
+                // An alias or a symlink resolves elsewhere, canonicalising
+                // changes the basename, and an empty orchestration name is
+                // derived from that basename — so preparing under one spelling
+                // and spawning under another is PRD #220's bug verbatim.
+                &prepared.path,
                 &roles,
                 rows,
                 cols,
                 &orchestration_id,
-                &orchestrator_seed,
+                &prepared.prompt,
+                Some(&prepared.token),
             )
             .await?;
             result_agent_id = Some(launched.start_agent_id);
@@ -1012,6 +1120,8 @@ pub fn run() {
         .manage(DesktopState::default())
         .invoke_handler(tauri::generate_handler![
             desktop_get_snapshot,
+            desktop_list_projects,
+            desktop_resolve_project,
             desktop_bootstrap,
             desktop_terminal_attach,
             desktop_terminal_write,
@@ -1035,7 +1145,6 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dot_agent_deck::project_config::OrchestrationRoleConfig;
     use std::collections::VecDeque;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1049,8 +1158,21 @@ mod tests {
         delivery_id: String,
     }
 
+    /// One `prepare-workflow` request, recorded verbatim. PRD #819 M6's whole
+    /// point is that the client ASKS, so what it asked is the assertion.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct PrepareRequest {
+        cwd: String,
+        orchestration: String,
+        task: String,
+        config_revision: Option<String>,
+    }
+
     struct FakeWorkflowDaemon {
         now: Mutex<std::time::Instant>,
+        prepare_requests: Mutex<Vec<PrepareRequest>>,
+        prepare_results: Mutex<VecDeque<Result<PreparedWorkflow, String>>>,
+        start_tokens: Mutex<Vec<Option<String>>>,
         started: Mutex<Vec<StartAgentOptions>>,
         start_results: Mutex<VecDeque<Result<String, String>>>,
         stopped: Mutex<Vec<String>>,
@@ -1073,6 +1195,9 @@ mod tests {
         ) -> Self {
             Self {
                 now: Mutex::new(std::time::Instant::now()),
+                prepare_requests: Mutex::new(Vec::new()),
+                prepare_results: Mutex::new(VecDeque::new()),
+                start_tokens: Mutex::new(Vec::new()),
                 started: Mutex::new(Vec::new()),
                 start_results: Mutex::new(VecDeque::new()),
                 stopped: Mutex::new(Vec::new()),
@@ -1101,7 +1226,35 @@ mod tests {
     impl WorkflowDaemon for FakeWorkflowDaemon {
         type ReadinessWatch = ();
 
-        async fn start_workflow_agent(&self, options: StartAgentOptions) -> Result<String, String> {
+        async fn prepare_workflow(
+            &self,
+            cwd: &str,
+            orchestration: &str,
+            task: &str,
+            config_revision: Option<&str>,
+        ) -> Result<PreparedWorkflow, String> {
+            self.prepare_requests.lock().unwrap().push(PrepareRequest {
+                cwd: cwd.to_string(),
+                orchestration: orchestration.to_string(),
+                task: task.to_string(),
+                config_revision: config_revision.map(str::to_string),
+            });
+            self.prepare_results
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_else(|| Ok(prepared_workflow()))
+        }
+
+        async fn start_workflow_agent(
+            &self,
+            options: StartAgentOptions,
+            prep_token: Option<&str>,
+        ) -> Result<String, String> {
+            self.start_tokens
+                .lock()
+                .unwrap()
+                .push(prep_token.map(str::to_string));
             let mut started = self.started.lock().unwrap();
             let agent_id = format!("agent-{}", started.len());
             started.push(options);
@@ -1187,25 +1340,30 @@ mod tests {
         }
     }
 
-    fn config_role(name: &str, start: bool) -> OrchestrationRoleConfig {
-        OrchestrationRoleConfig {
-            agent: None,
+    fn config_role(name: &str, start: bool) -> ProjectRole {
+        ProjectRole {
             name: name.into(),
-            command: "configured-command".into(),
             start,
-            description: None,
-            prompt_template: None,
-            clear: true,
+        }
+    }
+
+    /// The daemon's default answer to `prepare-workflow`: a canonical path that
+    /// deliberately DIFFERS from every spelling the tests send, so a spawn that
+    /// reuses the caller's string instead of the daemon's is a failed assertion
+    /// rather than a coincidence.
+    fn prepared_workflow() -> PreparedWorkflow {
+        PreparedWorkflow {
+            context_path: "/canonical/project/.dot-agent-deck/orchestrator-context.md".into(),
+            path: "/canonical/project".into(),
+            token: "prep-token-1".into(),
+            roles: vec![config_role("planner", true), config_role("builder", false)],
+            prompt: "Read .dot-agent-deck/orchestrator-context.md and carry out your task.".into(),
         }
     }
 
     #[test]
     fn workflow_roles_follow_config_order_but_keep_launch_commands() {
-        let config = OrchestrationConfig {
-            default: false,
-            name: "loop".into(),
-            roles: vec![config_role("planner", true), config_role("builder", false)],
-        };
+        let config = [config_role("planner", true), config_role("builder", false)];
         let requested = vec![
             WorkflowRoleInput {
                 role: "builder".into(),
@@ -1227,11 +1385,7 @@ mod tests {
 
     #[test]
     fn workflow_roles_reject_missing_or_mismatched_start_role() {
-        let config = OrchestrationConfig {
-            default: false,
-            name: "loop".into(),
-            roles: vec![config_role("planner", true), config_role("builder", false)],
-        };
+        let config = [config_role("planner", true), config_role("builder", false)];
         let missing = vec![WorkflowRoleInput {
             role: "planner".into(),
             command: "claude".into(),
@@ -1254,8 +1408,24 @@ mod tests {
         assert!(order_workflow_roles(&config, &wrong_start).is_err());
     }
 
-    #[test]
-    fn workflow_launch_prepares_canonical_context_in_config_order() {
+    /// PRD #819 M6 rewrote this test rather than deleting it, because the
+    /// migration destroys its premise rather than its subject.
+    ///
+    /// What it used to do: write a real `.dot-agent-deck.toml` into a temp
+    /// directory, call the old `prepare_workflow_launch`, and read the
+    /// coordinator context back **off this machine's disk**. Every one of those
+    /// steps is now a defect — the client neither reads a project config nor
+    /// writes a context, and against a remote daemon doing either was silently
+    /// wrong. The content half of that assertion was re-established daemon-side
+    /// by the lane-1 `project/launch/001`, so it is not lost; what belongs here
+    /// is the half only this seam can state.
+    ///
+    /// So it now pins that the client **asks**. The fixture keeps the real
+    /// config file, and keeps it saying something DIFFERENT from what the fake
+    /// daemon answers, precisely so a reintroduced local read fails the test
+    /// instead of passing it by agreeing with itself.
+    #[tokio::test]
+    async fn workflow_launch_asks_the_daemon_and_reads_no_project_from_disk() {
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -1265,6 +1435,9 @@ mod tests {
             std::process::id()
         ));
         std::fs::create_dir(&project_dir).unwrap();
+        // A config that DISAGREES with the daemon: reversed role order, and a
+        // start marker on the other role. A client that reads it would order
+        // `builder` first and reject the requested start marker.
         std::fs::write(
             project_dir.join(".dot-agent-deck.toml"),
             r#"
@@ -1272,15 +1445,13 @@ mod tests {
 name = "loop"
 
 [[orchestrations.roles]]
-name = "planner"
-command = "configured-planner"
-start = true
-prompt_template = "Coordinate through the configured team."
-
-[[orchestrations.roles]]
 name = "builder"
 command = "configured-builder"
-description = "Implements the requested change"
+start = true
+
+[[orchestrations.roles]]
+name = "planner"
+command = "configured-planner"
 "#,
         )
         .unwrap();
@@ -1297,30 +1468,226 @@ description = "Implements the requested change"
                 start: true,
             },
         ];
-        let cwd = project_dir.to_str().unwrap();
-        let (roles, seed) =
-            prepare_workflow_launch("loop", cwd, "Build the requested feature.", &requested)
-                .unwrap();
+        let cwd = project_dir.to_str().unwrap().to_string();
+        let daemon = FakeWorkflowDaemon::new(
+            Ok(Some("unused-session")),
+            std::iter::empty(),
+            Ok(SendResult::Applied),
+        );
 
+        let (roles, prepared) = prepare_workflow_launch(
+            &daemon,
+            "loop",
+            &cwd,
+            "  Build the requested feature.  ",
+            &requested,
+            Some("revision-7"),
+        )
+        .await
+        .unwrap();
+
+        // The request went out verbatim — including the trimmed task and the
+        // revision the picker resolved against, which is what closes the window
+        // between the pick and the write.
+        assert_eq!(
+            *daemon.prepare_requests.lock().unwrap(),
+            [PrepareRequest {
+                cwd: cwd.clone(),
+                orchestration: "loop".into(),
+                task: "Build the requested feature.".into(),
+                config_revision: Some("revision-7".into()),
+            }]
+        );
+
+        // The DAEMON's order won, not the file's. Launch commands are still the
+        // client's own, which is the one thing this side still owns.
         assert_eq!(roles[0].role, "planner");
         assert_eq!(roles[0].command, "claude --model opus");
         assert_eq!(roles[1].role, "builder");
         assert_eq!(roles[1].command, "codex --model gpt-5.6-sol");
-        assert!(seed.contains(".dot-agent-deck/orchestrator-context.md"));
-        // Upstream #222: the seed is now a short pointer and the task itself
-        // lands in the context FILE under "## Your task" — asserted below.
-        assert!(seed.contains("## Your task"));
+        // The coordinator prompt is the daemon's, not a sentence composed here.
+        assert_eq!(prepared.prompt, prepared_workflow().prompt);
+        assert_eq!(prepared.token, "prep-token-1");
 
-        let context =
-            std::fs::read_to_string(project_dir.join(".dot-agent-deck/orchestrator-context.md"))
-                .unwrap();
-        assert!(context.contains("Coordinate through the configured team."));
-        assert!(context.contains("**builder**: Implements the requested change"));
-        assert!(context.contains("## Delegation protocol"));
-        assert!(context.contains("## Your task"));
-        assert!(context.contains("Build the requested feature."));
+        // And nothing was written to this machine. The old test read this exact
+        // file back and asserted on its contents; now its absence is the point.
+        assert!(
+            !project_dir.join(".dot-agent-deck").exists(),
+            "the client must publish no coordinator context of its own"
+        );
 
         std::fs::remove_dir_all(project_dir).unwrap();
+    }
+
+    /// The invariant, at the seam where PRD #220's bug would recur: the
+    /// canonical spelling the daemon prepared against is the one every spawn
+    /// uses, not the spelling the caller sent.
+    #[tokio::test]
+    async fn the_prepared_canonical_path_is_the_spawn_cwd() {
+        let daemon = FakeWorkflowDaemon::new(
+            Ok(Some("session-planner")),
+            [Ok(SendResult::Applied)],
+            Ok(SendResult::Applied),
+        );
+        let (roles, prepared) = prepare_workflow_launch(
+            &daemon,
+            "loop",
+            // A symlinked alias, whose basename differs from the canonical
+            // directory's — which is exactly what makes an empty orchestration
+            // name resolve differently on the two spellings.
+            "/home/dev/current",
+            "Build it.",
+            &launch_roles("claude"),
+            None,
+        )
+        .await
+        .unwrap();
+
+        launch_workflow(
+            &daemon,
+            "loop",
+            &prepared.path,
+            &roles,
+            32,
+            120,
+            "orchestration-1",
+            &prepared.prompt,
+            Some(&prepared.token),
+        )
+        .await
+        .unwrap();
+
+        let started = daemon.started.lock().unwrap();
+        assert_eq!(started.len(), 2);
+        for options in started.iter() {
+            assert_eq!(options.cwd.as_deref(), Some("/canonical/project"));
+            assert!(
+                matches!(
+                    options.tab_membership.as_ref(),
+                    Some(TabMembership::Orchestration {
+                        orchestration_cwd: Some(cwd),
+                        ..
+                    }) if cwd == "/canonical/project"
+                ),
+                "the orchestration cwd must be the canonical one too"
+            );
+        }
+        drop(started);
+
+        // Every role presents the preparation's token, so a spawn against a
+        // preparation that has since aged out is refused daemon-side.
+        assert_eq!(
+            *daemon.start_tokens.lock().unwrap(),
+            [
+                Some("prep-token-1".to_string()),
+                Some("prep-token-1".to_string())
+            ]
+        );
+    }
+
+    /// A refused preparation starts nothing — not even a subscription. The
+    /// "project left the known set between listing and launch" case arrives
+    /// here as exactly this, and the webview presents it like the empty state
+    /// rather than as an error.
+    #[tokio::test]
+    async fn a_refused_preparation_starts_no_roles() {
+        let daemon = FakeWorkflowDaemon::new(
+            Ok(Some("unused-session")),
+            std::iter::empty(),
+            Ok(SendResult::Applied),
+        );
+        daemon.prepare_results.lock().unwrap().push_back(Err(
+            "unresolved: that path is not a project this daemon can offer".into(),
+        ));
+
+        let error = prepare_workflow_launch(
+            &daemon,
+            "loop",
+            "/home/dev/gone",
+            "Build it.",
+            &launch_roles("claude"),
+            None,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.contains("unresolved"), "unexpected error: {error}");
+        assert!(daemon.started.lock().unwrap().is_empty());
+        assert_eq!(daemon.begin_readiness_count.load(Ordering::SeqCst), 0);
+    }
+
+    /// A daemon that prepared but reported no canonical path, or no coordinator
+    /// prompt, is refused rather than papered over. Both fields are
+    /// `#[serde(default)]`, so an older daemon decodes them as empty strings —
+    /// and neither is something this client may invent: the path would
+    /// reintroduce the spelling bug, and the prompt names a project-state file
+    /// only the daemon wrote.
+    #[tokio::test]
+    async fn an_unreported_path_or_prompt_refuses_the_launch() {
+        for (mutate, expected) in [
+            (
+                Box::new(|prepared: &mut PreparedWorkflow| prepared.path.clear())
+                    as Box<dyn Fn(&mut PreparedWorkflow)>,
+                "canonical project path",
+            ),
+            (
+                Box::new(|prepared: &mut PreparedWorkflow| prepared.prompt = "   ".into()),
+                "coordinator prompt",
+            ),
+        ] {
+            let daemon = FakeWorkflowDaemon::new(
+                Ok(Some("unused-session")),
+                std::iter::empty(),
+                Ok(SendResult::Applied),
+            );
+            let mut prepared = prepared_workflow();
+            mutate(&mut prepared);
+            daemon
+                .prepare_results
+                .lock()
+                .unwrap()
+                .push_back(Ok(prepared));
+
+            let error = prepare_workflow_launch(
+                &daemon,
+                "loop",
+                "/home/dev/project",
+                "Build it.",
+                &launch_roles("claude"),
+                None,
+            )
+            .await
+            .unwrap_err();
+
+            assert!(error.contains(expected), "unexpected error: {error}");
+            assert!(daemon.started.lock().unwrap().is_empty());
+        }
+    }
+
+    /// A Pi coordinator is refused during preparation, before any role is
+    /// spawned — the guard moved with the rest of the flow and did not get lost
+    /// on the way.
+    #[tokio::test]
+    async fn a_pi_coordinator_is_refused_during_preparation() {
+        let daemon = FakeWorkflowDaemon::new(
+            Ok(Some("unused-session")),
+            std::iter::empty(),
+            Ok(SendResult::Applied),
+        );
+
+        let error = prepare_workflow_launch(
+            &daemon,
+            "loop",
+            "/home/dev/project",
+            "Build it.",
+            &launch_roles("pi"),
+            None,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.contains("Pi cannot be the desktop workflow coordinator"));
+        assert!(daemon.started.lock().unwrap().is_empty());
     }
 
     fn launch_roles(start_command: &str) -> Vec<WorkflowRoleInput> {
@@ -1356,6 +1723,7 @@ description = "Implements the requested change"
             120,
             "orchestration-1",
             seed,
+            Some("prep-token-1"),
         )
         .await
         .unwrap();
@@ -1417,6 +1785,7 @@ description = "Implements the requested change"
             120,
             "orchestration-1",
             "coordinator prompt",
+            Some("prep-token-1"),
         )
         .await
         .unwrap_err();
@@ -1443,6 +1812,7 @@ description = "Implements the requested change"
             120,
             "orchestration-1",
             "coordinator prompt",
+            Some("prep-token-1"),
         )
         .await
         .unwrap();
@@ -1474,6 +1844,7 @@ description = "Implements the requested change"
             120,
             "orchestration-1",
             "coordinator prompt",
+            Some("prep-token-1"),
         )
         .await
         .unwrap_err();
@@ -1525,6 +1896,7 @@ description = "Implements the requested change"
             120,
             "orchestration-1",
             "coordinator prompt",
+            Some("prep-token-1"),
         )
         .await
         .unwrap_err();
@@ -1577,6 +1949,7 @@ description = "Implements the requested change"
             120,
             "orchestration-1",
             "coordinator prompt",
+            Some("prep-token-1"),
         )
         .await
         .unwrap_err();

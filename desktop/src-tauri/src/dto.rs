@@ -8,7 +8,9 @@ use dot_agent_deck::agent_pty::{
 };
 use dot_agent_deck::agent_registry;
 use dot_agent_deck::daemon_protocol::PROTOCOL_VERSION;
-use dot_agent_deck::event::{AgentType, SendResult, Writable};
+use dot_agent_deck::event::{
+    AgentType, ProjectListing, ProjectOrchestration, ResolvedProject, SendResult, Writable,
+};
 use dot_agent_deck::state::SessionStatus;
 use serde::{Deserialize, Serialize};
 use tauri::ipc::JavaScriptChannelId;
@@ -23,8 +25,14 @@ const ERROR_MESSAGE_MAX_CHARS: usize = 2048;
 pub struct DesktopSnapshot {
     pub connection: DesktopConnection,
     pub agents: Vec<DesktopAgent>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub project_cwd: Option<String>,
+    // PRD #819 M6: no `project_cwd`. It was `desktop_project_cwd()` — a
+    // compile-time `CARGO_MANIFEST_DIR` guess falling back to the desktop
+    // process's own `current_dir()` — and it answered a question this client is
+    // no longer allowed to ask itself. Against a remote daemon it named a path
+    // on the WRONG filesystem and nothing said so. The project a launch runs in
+    // now comes from `list-projects` / `resolve-project`; the directory the
+    // header shows comes from the daemon-reported agent `cwd` it already
+    // preferred.
     pub protocol_version: u32,
     pub source: &'static str,
 }
@@ -232,12 +240,26 @@ pub enum DesktopAction {
         cols: Option<u16>,
     },
     StartWorkflow {
+        /// The orchestration name, as offered by the daemon's
+        /// `resolve-project` reply for `cwd`.
         name: String,
+        /// The daemon-**canonical** project path, exactly as
+        /// `resolve-project` or `list-projects` spelled it. PRD #819 M6: the
+        /// webview never derives this from its own environment and never
+        /// re-spells it, because canonicalising a symlinked path changes its
+        /// basename and an empty orchestration name is derived from that
+        /// basename (PRD #220).
         cwd: String,
         task_prompt: String,
         roles: Vec<WorkflowRoleInput>,
         rows: Option<u16>,
         cols: Option<u16>,
+        /// The `configRevision` the webview last resolved against, echoed
+        /// through to `prepare-workflow`. `#[serde(default)]` and absent means
+        /// "no expectation": a launch assembled without a resolve still works,
+        /// it just does not get the staleness check.
+        #[serde(default)]
+        config_revision: Option<String>,
     },
     StopAgent {
         agent_id: String,
@@ -323,6 +345,143 @@ pub enum TerminalState {
     Attached,
     End,
     Error,
+}
+
+// ---------------------------------------------------------------------------
+// PRD #819 M6: the project surface, entirely daemon-sourced.
+//
+// These are the webview's shape for `crate::event::{ProjectListing,
+// ResolvedProject}` — camelCase, and control-stripped through `safe_message`
+// at this seam. The daemon already bounds the COUNTS (its
+// `project_resolve::MAX_*` caps); what is added here is the same display
+// scrubbing every other daemon-sourced string on this boundary gets, because
+// project and orchestration names are config content and the webview renders
+// them into DOM text nodes.
+//
+// Nothing here is persisted on either side. A selection is a property of the
+// launch being assembled and dies with it — see the PRD's *Nothing remembers a
+// project*.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DesktopProjectListing {
+    pub projects: Vec<DesktopProject>,
+    /// The project most recently active on this daemon, if any — a fact derived
+    /// from live state, never a stored preference. Absent when the daemon has
+    /// nothing live, which is the empty state rather than an error.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub primary: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DesktopProject {
+    /// The daemon-canonical absolute path. **This is the identity**, and the
+    /// exact string that goes back on `resolve-project`, `prepare-workflow` and
+    /// every `StartAgent.cwd`. The webview must never re-spell it.
+    pub path: String,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DesktopResolvedProject {
+    /// The canonical path the daemon resolved to, which may differ from the one
+    /// that was sent — an alias or a symlink resolves elsewhere, and
+    /// canonicalising changes the basename an empty orchestration name is
+    /// derived from (PRD #220). This spelling is the one that propagates.
+    pub path: String,
+    pub name: String,
+    pub orchestrations: Vec<DesktopOrchestration>,
+    /// Echoed back on the launch so a config edited between the picker and the
+    /// spawn is refused rather than silently launched against.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub config_revision: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DesktopOrchestration {
+    pub name: String,
+    pub default: bool,
+    pub roles: Vec<DesktopOrchestrationRole>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DesktopOrchestrationRole {
+    pub name: String,
+    pub start: bool,
+}
+
+fn map_orchestration(orchestration: ProjectOrchestration) -> DesktopOrchestration {
+    DesktopOrchestration {
+        name: safe_message(&orchestration.name),
+        default: orchestration.default,
+        roles: orchestration
+            .roles
+            .into_iter()
+            .map(|role| DesktopOrchestrationRole {
+                name: safe_message(&role.name),
+                start: role.start,
+            })
+            .collect(),
+    }
+}
+
+pub(crate) fn map_project_listing(listing: ProjectListing) -> DesktopProjectListing {
+    DesktopProjectListing {
+        projects: listing
+            .projects
+            .into_iter()
+            .map(|project| DesktopProject {
+                path: safe_message(&project.path),
+                name: safe_message(&project.name),
+            })
+            .collect(),
+        primary: listing.primary.map(safe_message),
+    }
+}
+
+pub(crate) fn map_resolved_project(project: ResolvedProject) -> DesktopResolvedProject {
+    // The display name is the canonical path's basename, derived HERE from the
+    // path the daemon returned rather than carried separately: the two must name
+    // the same directory, and a second field is a second thing to drift.
+    let path = safe_message(&project.path);
+    let name = path
+        .rsplit('/')
+        .find(|segment| !segment.is_empty())
+        .unwrap_or(&path)
+        .to_string();
+    DesktopResolvedProject {
+        path,
+        name,
+        orchestrations: project
+            .orchestrations
+            .into_iter()
+            .map(map_orchestration)
+            .collect(),
+        config_revision: project.config_revision.map(safe_message),
+    }
+}
+
+/// The STRING-SHAPE check the desktop may make on a path the **user** typed,
+/// before spending a daemon round trip on it.
+///
+/// It touches no filesystem, and it deliberately cannot: whether that path is a
+/// project is the daemon's answer, on the daemon's host. This rejects only what
+/// is malformed as a request — empty, relative, control-bearing, oversized —
+/// through the same `is_valid_orchestration_cwd` predicate the daemon validates
+/// the wire field with, so the two agree about what is even askable.
+pub(crate) fn validate_pasted_project_path(path: &str) -> Result<(), String> {
+    if !is_valid_orchestration_cwd(path) {
+        return Err(
+            "enter an absolute directory path, without control characters, that the daemon can see"
+                .into(),
+        );
+    }
+    Ok(())
 }
 
 fn agent_type_name(agent_type: &AgentType) -> &'static str {
@@ -467,23 +626,6 @@ pub(crate) fn socket_path_text() -> String {
     )
 }
 
-pub(crate) fn desktop_project_cwd() -> Option<String> {
-    let project_dir = option_env!("CARGO_MANIFEST_DIR")
-        .map(std::path::PathBuf::from)
-        .and_then(|path| {
-            path.parent()
-                .and_then(|path| path.parent())
-                .map(std::path::Path::to_path_buf)
-        })
-        .filter(|path| path.join(".dot-agent-deck.toml").is_file())
-        .or_else(|| {
-            std::env::current_dir()
-                .ok()
-                .filter(|path| path.join(".dot-agent-deck.toml").is_file())
-        })?;
-    Some(safe_message(project_dir.to_string_lossy()))
-}
-
 pub(crate) fn disconnected_snapshot(error: impl AsRef<str>) -> DesktopSnapshot {
     DesktopSnapshot {
         connection: DesktopConnection {
@@ -499,7 +641,6 @@ pub(crate) fn disconnected_snapshot(error: impl AsRef<str>) -> DesktopSnapshot {
             build_stamp_mismatch_only: false,
         },
         agents: Vec::new(),
-        project_cwd: desktop_project_cwd(),
         protocol_version: PROTOCOL_VERSION,
         source: "daemon",
     }

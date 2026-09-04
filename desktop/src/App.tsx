@@ -40,13 +40,26 @@ import { HandoffRail } from "./components/HandoffRail";
 import { ProfilesPanel, ProjectsPanel, PromptLibraryPanel, WorkflowPanel } from "./components/ConfigurationPanels";
 import { useAgentProfiles } from "./hooks/useAgentProfiles";
 import { useDeckRuntime } from "./hooks/useDeckRuntime";
-import { useProjects } from "./hooks/useProjects";
+import { useDaemonProjects } from "./hooks/useDaemonProjects";
 import { usePromptLibrary } from "./hooks/usePromptLibrary";
 import { desktopWorkflowPlatformIssue } from "./lib/platform";
 import type { DeckAction, DeckActionResult, DeckRuntimeState, DeckView, EvidenceItem, PanelTab, WorkflowLaunchConfig } from "./types";
 import { modeScopedKey } from "./lib/bridge";
 
 const WORKFLOW_STORAGE_KEY = modeScopedKey("dot-agent-deck.desktop.workflow-preview.v1");
+/**
+ * Two of the daemon's stable refusal codes, matched as CODES rather than as
+ * prose. Each is the first token of `AttachResponse.error`, followed by `": "` —
+ * and the sentence after it is deliberately uninformative for a path the daemon
+ * does not already know, so this screen must not depend on how much it said.
+ *
+ * `unresolved` (`daemon_protocol::PROJECT_ERR_UNRESOLVED`): the path did not
+ * resolve. `stale-revision` (`PROJECT_ERR_STALE_REVISION`): it did, but against
+ * different config bytes than the picker read — the TOCTOU gate M4 added, whose
+ * remedy is to resolve again.
+ */
+const PROJECT_UNRESOLVED_CODE = "unresolved: ";
+const PROJECT_STALE_REVISION_CODE = "stale-revision: ";
 const DESKTOP_EVIDENCE_QUERY = "(min-width: 1260px)";
 
 function evidenceOpenOnFirstLoad(): boolean {
@@ -83,7 +96,6 @@ export function ControlDeck({ runtime, workflowPlatformIssue = desktopWorkflowPl
   const [selectedEvidenceId, setSelectedEvidenceId] = useState("");
   const [evidenceOpen, setEvidenceOpen] = useState(evidenceOpenOnFirstLoad);
   const [projectsOpen, setProjectsOpen] = useState(false);
-  const [selectedProjectId, setSelectedProjectId] = useState("");
   const [profilesOpen, setProfilesOpen] = useState(false);
   const [promptsOpen, setPromptsOpen] = useState(false);
   const [selectedPromptId, setSelectedPromptId] = useState("");
@@ -94,7 +106,24 @@ export function ControlDeck({ runtime, workflowPlatformIssue = desktopWorkflowPl
   const [notice, setNotice] = useState<string>();
   const [confirm, setConfirm] = useState<ConfirmState>();
   const { profiles, updateProfile, resetProfiles } = useAgentProfiles(snapshot.profiles);
-  const { projects, activeId: activeProjectId, activeProject, setActiveId: setActiveProjectId, addProject, updateProject, removeProject } = useProjects(snapshot.worktree, snapshot.repo);
+  /*
+   * PRD #819 M6: the projects come from the daemon and nothing is remembered.
+   * `useProjects` used to seed a `localStorage` list from the desktop's own
+   * guess at a working directory and treat it as the source of truth for the
+   * launch cwd — which, against a remote daemon, named a directory on the wrong
+   * machine and did not error.
+   *
+   * The listing is re-fetched when the connection changes and when the agent
+   * set moves, because enumeration is derived from LIVE state: a project stops
+   * being known the moment its last agent exits.
+   */
+  const projectState = useDaemonProjects({
+    listProjects: runtime.listProjects,
+    resolveProject: runtime.resolveProject,
+    revision: `${snapshot.connection.status}:${snapshot.agents.length}`,
+    enabled: mode === "live" && snapshot.connection.status === "connected",
+  });
+  const activeProject = projectState.selected;
   const { prompts, addPrompt, updatePrompt, removePrompt } = usePromptLibrary();
   const [profileOrder, setProfileOrder] = useState<string[]>([]);
 
@@ -109,12 +138,6 @@ export function ControlDeck({ runtime, workflowPlatformIssue = desktopWorkflowPl
       setSelectedEvidenceId(snapshot.evidence[0]?.id ?? "");
     }
   }, [selectedEvidenceId, snapshot.evidence]);
-
-  useEffect(() => {
-    if (!selectedProjectId || !projects.some((project) => project.id === selectedProjectId)) {
-      setSelectedProjectId(activeProjectId || projects[0]?.id || "");
-    }
-  }, [activeProjectId, projects, selectedProjectId]);
 
   useEffect(() => {
     if (!selectedPromptId || !prompts.some((prompt) => prompt.id === selectedPromptId)) {
@@ -359,7 +382,36 @@ export function ControlDeck({ runtime, workflowPlatformIssue = desktopWorkflowPl
           await runtime.reconnect();
           setNotice(`${config.name} launched with ${config.roles.length} configured roles.`);
         } catch (cause) {
-          setNotice(cause instanceof Error ? cause.message : String(cause));
+          const message = cause instanceof Error ? cause.message : String(cause);
+          /*
+           * PRD #819 M6, state 2. The daemon re-resolves on launch, and
+           * enumeration is derived from live state — so a project can stop
+           * being known between the moment it was drawn and the moment Launch
+           * is pressed, when its last agent exits. That is an ORDINARY outcome,
+           * so it is presented the way the empty state is: the picker reopens
+           * saying the project is no longer known, rather than a red failure
+           * naming a refusal code.
+           */
+          if (message.includes(PROJECT_UNRESOLVED_CODE)) {
+            projectState.clearSelection();
+            void projectState.refresh();
+            setWorkflowOpen(false);
+            setProjectsOpen(true);
+            setNotice("That project is no longer one this daemon knows — nothing is running there any more. Choose another, or paste its path again.");
+            return;
+          }
+          /*
+           * The other ordinary refusal: the project is fine and its config
+           * changed under the picker. The remedy the daemon's own sentence
+           * names is "resolve again", so do exactly that rather than leaving
+           * the user a dead end, and say what happened.
+           */
+          if (message.includes(PROJECT_STALE_REVISION_CODE) && activeProject) {
+            void projectState.select(activeProject.path);
+            setNotice("This project's .dot-agent-deck.toml changed since the workflows were listed, so nothing was started. It has been re-read — check the workflow and launch again.");
+            return;
+          }
+          setNotice(message);
         }
       },
     });
@@ -406,7 +458,14 @@ export function ControlDeck({ runtime, workflowPlatformIssue = desktopWorkflowPl
               line carries the working directory alone rather than printing the
               literal "Unavailable" where a branch name belongs.
             */}
-            <div className="branch-line">{snapshot.branch && <><GitBranch size={12} /><span>{snapshot.branch}</span><i /> </>}<span title={activeProject?.cwd || snapshot.worktree}>{activeProject?.cwd || snapshot.worktree}</span></div>
+            {/*
+              `activeProject.path` is the DAEMON's canonical spelling of the
+              project chosen for the next launch; `snapshot.worktree` is the
+              daemon-reported cwd of a running agent. Both come from the daemon
+              — the third tier this line used to fall back to was the desktop's
+              own guess, and it is gone (PRD #819 M6).
+            */}
+            <div className="branch-line">{snapshot.branch && <><GitBranch size={12} /><span>{snapshot.branch}</span><i /> </>}<span title={activeProject?.path || snapshot.worktree}>{activeProject?.path || snapshot.worktree}</span></div>
           </div>
           <div className="run-instruments">
             <Instrument label="HEALTH" testId="run-health"><span className={`health-value health-${snapshot.health}`}><i />{snapshot.health}</span></Instrument>
@@ -511,15 +570,8 @@ export function ControlDeck({ runtime, workflowPlatformIssue = desktopWorkflowPl
 
       <ProjectsPanel
         open={projectsOpen}
-        projects={projects}
-        activeId={activeProjectId}
-        selectedId={selectedProjectId}
-        onSelect={setSelectedProjectId}
+        state={projectState}
         onClose={() => setProjectsOpen(false)}
-        onAdd={() => setSelectedProjectId(addProject())}
-        onUpdate={updateProject}
-        onRemove={(id) => { removeProject(id); setNotice("Project entry removed. The repository folder was not changed."); }}
-        onActivate={(id) => { setActiveProjectId(id); setNotice("Active project updated. Open Workflows when you are ready to launch its agents."); }}
         onConfigureWorkflow={() => { setProjectsOpen(false); setWorkflowOpen(true); }}
       />
       <PromptLibraryPanel
@@ -533,7 +585,7 @@ export function ControlDeck({ runtime, workflowPlatformIssue = desktopWorkflowPl
         onRemove={(id) => { removePrompt(id); setNotice("Prompt removed from this device's library."); }}
       />
       <ProfilesPanel open={profilesOpen} profiles={profiles} onClose={() => setProfilesOpen(false)} onUpdate={updateProfile} onReset={resetProfiles} onSaved={() => setNotice("Agent profile draft saved locally. Project TOML is unchanged.")} />
-      <WorkflowPanel key={activeProject?.id ?? "runtime-workflow"} open={workflowOpen} profiles={profiles} order={profileOrder} mode={mode} defaultName={activeProject?.workflowName ?? "dot-agent-deck"} defaultCwd={activeProject?.cwd || snapshot.worktree} onClose={() => setWorkflowOpen(false)} onToggle={(id) => { const profile = profiles.find((item) => item.id === id); if (profile) updateProfile(id, { enabled: !profile.enabled }); }} onMove={moveStage} onLaunch={requestLaunch} platformIssue={workflowPlatformIssue} prompts={prompts} />
+      <WorkflowPanel key={activeProject?.path ?? "runtime-workflow"} open={workflowOpen} profiles={profiles} order={profileOrder} mode={mode} project={activeProject} onChooseProject={() => { setWorkflowOpen(false); setProjectsOpen(true); }} onClose={() => setWorkflowOpen(false)} onToggle={(id) => { const profile = profiles.find((item) => item.id === id); if (profile) updateProfile(id, { enabled: !profile.enabled }); }} onMove={moveStage} onLaunch={requestLaunch} platformIssue={workflowPlatformIssue} prompts={prompts} />
       {paletteOpen && <CommandPalette commands={commandItems} onClose={() => setPaletteOpen(false)} />}
       {helpOpen && <ShortcutHelp onClose={() => setHelpOpen(false)} />}
       {confirm && <ConfirmDialog state={confirm} onClose={() => setConfirm(undefined)} />}

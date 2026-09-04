@@ -842,6 +842,177 @@ impl DaemonClient {
         self.capabilities().await?.require(capability)
     }
 
+    /// PRD #819 M6: the projects this daemon knows about. **Read-only.**
+    ///
+    /// Gated on the advertised capability rather than on the protocol version,
+    /// so an older daemon is declined by [`Self::require_capability`] before a
+    /// request it cannot parse is ever sent — its clean `ok:false` for an
+    /// unknown op is discriminated only by serde's `unknown variant …` text,
+    /// which is not a stability contract and is never matched here.
+    ///
+    /// An **empty** listing is a successful answer, not a failure: "this daemon
+    /// has nothing live and its startup cwd is not a project" is the state the
+    /// desktop renders its paste-a-path surface for.
+    pub async fn list_projects(&self) -> Result<crate::event::ProjectListing, ClientError> {
+        self.require_capability(crate::daemon_protocol::CAP_LIST_PROJECTS)
+            .await?;
+        let stream = self.connect().await?;
+        let (mut rd, mut wr) = stream.into_split();
+        let resp = issue_command(&mut rd, &mut wr, &AttachRequest::ListProjects {}).await?;
+        if !resp.ok {
+            return Err(ClientError::Server(
+                resp.error.unwrap_or_else(|| "list-projects failed".into()),
+            ));
+        }
+        resp.projects
+            .ok_or_else(|| ClientError::Malformed("list-projects ok but no listing".into()))
+    }
+
+    /// PRD #819 M6: resolve ONE path. **Read-only**, and never a walk — see
+    /// [`AttachRequest::ResolveProject`].
+    ///
+    /// `path` must be a path this daemon returned or one the **user** typed. A
+    /// caller that derives it from its own environment reintroduces the exact
+    /// defect this PRD removes: against a remote daemon the client's filesystem
+    /// is not the daemon's, and the launch is silently wrong rather than failing.
+    ///
+    /// The reply's [`crate::event::ResolvedProject::path`] is the daemon's
+    /// **canonical** spelling and may differ from the one sent. That is the
+    /// string every later `PrepareWorkflow` and `StartAgent.cwd` must carry, not
+    /// the one the caller had: canonicalising a symlinked path changes its
+    /// basename, and an empty orchestration name is derived from the basename
+    /// (PRD #220's bug, `crate::dispatch`).
+    pub async fn resolve_project(
+        &self,
+        path: &str,
+    ) -> Result<crate::event::ResolvedProject, ClientError> {
+        self.require_capability(crate::daemon_protocol::CAP_RESOLVE_PROJECT)
+            .await?;
+        let stream = self.connect().await?;
+        let (mut rd, mut wr) = stream.into_split();
+        let resp = issue_command(
+            &mut rd,
+            &mut wr,
+            &AttachRequest::ResolveProject {
+                path: path.to_string(),
+            },
+        )
+        .await?;
+        if !resp.ok {
+            return Err(ClientError::Server(
+                resp.error
+                    .unwrap_or_else(|| "resolve-project failed".into()),
+            ));
+        }
+        resp.project
+            .ok_or_else(|| ClientError::Malformed("resolve-project ok but no project".into()))
+    }
+
+    /// PRD #819 M6: prepare a launch — the only project verb that writes.
+    ///
+    /// `path` is the daemon-canonical spelling from [`Self::list_projects`] or
+    /// [`Self::resolve_project`]. `config_revision` is the one that resolve
+    /// handed back; passing it is what closes the window between the picker and
+    /// the write, and `None` means "no expectation" rather than "any revision"
+    /// (see [`AttachRequest::PrepareWorkflow::config_revision`]).
+    ///
+    /// A failed preparation starts no roles, because it starts nothing at all:
+    /// spawning is the caller's later `StartAgent` sequence, which presents
+    /// [`crate::event::PreparedWorkflow::token`] through
+    /// [`Self::start_agent_with_prep_token`].
+    pub async fn prepare_workflow(
+        &self,
+        path: &str,
+        orchestration: &str,
+        task: &str,
+        config_revision: Option<&str>,
+    ) -> Result<crate::event::PreparedWorkflow, ClientError> {
+        self.require_capability(crate::daemon_protocol::CAP_PREPARE_WORKFLOW)
+            .await?;
+        let stream = self.connect().await?;
+        let (mut rd, mut wr) = stream.into_split();
+        let resp = issue_command(
+            &mut rd,
+            &mut wr,
+            &AttachRequest::PrepareWorkflow {
+                path: path.to_string(),
+                orchestration: orchestration.to_string(),
+                task: task.to_string(),
+                config_revision: config_revision.map(str::to_string),
+            },
+        )
+        .await?;
+        if !resp.ok {
+            return Err(ClientError::Server(
+                resp.error
+                    .unwrap_or_else(|| "prepare-workflow failed".into()),
+            ));
+        }
+        resp.workflow_prepared
+            .ok_or_else(|| ClientError::Malformed("prepare-workflow ok but no preparation".into()))
+    }
+
+    /// PRD #819 M4/M6: [`Self::start_agent`] carrying the token a
+    /// [`Self::prepare_workflow`] handed back.
+    ///
+    /// The counterpart of [`Self::write_and_submit_with_identity`], and built
+    /// the same way and for the same reason: the token rides **alongside** the
+    /// base `start-agent` shape as one extra JSON key rather than widening the
+    /// [`AttachRequest::StartAgent`] variant, whose nine-field literal is
+    /// constructed across `src/` and `tests/`. The request is serialized from
+    /// that very variant and the key inserted into the resulting object, so the
+    /// two spellings of the wire shape cannot drift.
+    ///
+    /// **No capability gate, deliberately, and it differs from the three verbs
+    /// above.** `start-agent` is not a new op — every daemon this client can
+    /// handshake with already has it — and the token is `#[serde(default)]` on
+    /// the daemon's re-parse, so an older daemon ignores the key and spawns
+    /// exactly as it does today. Gating here would withhold a spawn that works,
+    /// and the token is a staleness check rather than an authorization
+    /// (`crate::prep_token`'s module doc): "the daemon does not advertise it" is
+    /// not a reason to refuse to launch.
+    ///
+    /// `prep_token: None` is byte-for-byte [`Self::start_agent`].
+    pub async fn start_agent_with_prep_token(
+        &self,
+        opts: StartAgentOptions,
+        prep_token: Option<&str>,
+    ) -> Result<String, ClientError> {
+        let Some(token) = prep_token else {
+            return self.start_agent(opts).await;
+        };
+        let req = AttachRequest::StartAgent {
+            command: opts.command,
+            cwd: opts.cwd,
+            display_name: opts.display_name,
+            rows: opts.rows,
+            cols: opts.cols,
+            env: opts.env,
+            tab_membership: opts.tab_membership,
+            agent_type: opts.agent_type,
+            seed: opts.seed,
+        };
+        let mut request = serde_json::to_value(&req)
+            .map_err(|e| ClientError::Malformed(format!("start-agent JSON: {e}")))?;
+        let serde_json::Value::Object(fields) = &mut request else {
+            return Err(ClientError::Malformed(
+                "start-agent did not serialize to a JSON object".into(),
+            ));
+        };
+        fields.insert(
+            "prep_token".into(),
+            serde_json::Value::String(token.to_string()),
+        );
+        let resp = self.issue_json_command(&request).await?;
+        if !resp.ok {
+            return Err(ClientError::Server(
+                resp.error.unwrap_or_else(|| "start-agent failed".into()),
+            ));
+        }
+        resp.id
+            .ok_or_else(|| ClientError::Malformed("start-agent ok but no id in response".into()))
+    }
+
     /// Push a TUI pane resize through to the daemon's PTY. Idempotent on the
     /// wire: each call opens a fresh short-lived connection (matching the
     /// pattern used for `stop_agent` / `list_agents`). Callers that fire

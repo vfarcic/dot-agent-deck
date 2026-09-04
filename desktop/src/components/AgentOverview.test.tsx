@@ -64,6 +64,11 @@ function runtime(overrides: Partial<DeckRuntimeState> = {}): DeckRuntimeState {
     resizeTerminal: vi.fn(async () => undefined),
     setShownTerminals: vi.fn(async () => undefined),
     reconnect: vi.fn(async () => undefined),
+    // PRD #819 M6: the runtime's project surface. The overview does not use it,
+    // but `DeckRuntimeState` is one shape and a fake that omits a member of it
+    // stops type-checking — which is the point of it being on the interface.
+    listProjects: vi.fn(async () => ({ projects: [] })),
+    resolveProject: vi.fn(async () => { throw new Error("unresolved: the overview resolves no project"); }),
     ...overrides,
   };
 }

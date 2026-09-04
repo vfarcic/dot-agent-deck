@@ -13,8 +13,8 @@ use dot_agent_deck::daemon_protocol::{AttachRequest, AttachResponse, PROTOCOL_VE
 use dot_agent_deck::platform::ipc::IpcStream;
 
 use crate::dto::{
-    BootstrapOptions, ConnectionStatus, DesktopConnection, DesktopSnapshot, desktop_project_cwd,
-    disconnected_snapshot, map_agent, safe_message, socket_path_text,
+    BootstrapOptions, ConnectionStatus, DesktopConnection, DesktopSnapshot, disconnected_snapshot,
+    map_agent, safe_message, socket_path_text,
 };
 
 const DAEMON_POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -306,7 +306,16 @@ fn connection_from_handshake(handshake: HandshakeInfo) -> DesktopConnection {
     }
 }
 
-async fn hello(socket_path: &Path) -> Result<HandshakeInfo, String> {
+/// One handshake exchange, classified — and the reply it was classified from.
+///
+/// The reply is carried out rather than dropped because it is also where the
+/// daemon advertises its capability set (PRD #819 M5), and `trusted_daemon()`
+/// is exactly the site
+/// [`DaemonClient::store_capabilities_from_hello`] was written for: capturing
+/// the set here costs nothing, while letting `DaemonClient::capabilities()`
+/// learn it on its own would spend a second `Hello` on a connection whose
+/// handshake reply is already in hand.
+async fn hello(socket_path: &Path) -> Result<(HandshakeInfo, AttachResponse), String> {
     let client_build = dot_agent_deck::build_id::local_build_id();
     let stream = IpcStream::connect(socket_path)
         .await
@@ -322,11 +331,8 @@ async fn hello(socket_path: &Path) -> Result<HandshakeInfo, String> {
     )
     .await
     .map_err(|error| safe_message(error.to_string()))?;
-    Ok(classify_handshake(
-        &response,
-        &client_build,
-        build_mismatch_allowance(),
-    ))
+    let info = classify_handshake(&response, &client_build, build_mismatch_allowance());
+    Ok((info, response))
 }
 
 pub(crate) async fn trusted_daemon() -> Result<TrustedDaemon, String> {
@@ -337,11 +343,16 @@ pub(crate) async fn trusted_daemon() -> Result<TrustedDaemon, String> {
             socket_path.to_string_lossy()
         ))
     })?;
-    let connection = connection_from_handshake(hello(&socket_path).await?);
-    Ok(TrustedDaemon {
-        client: DaemonClient::new(socket_path),
-        connection,
-    })
+    let (info, response) = hello(&socket_path).await?;
+    let connection = connection_from_handshake(info);
+    let client = DaemonClient::new(socket_path);
+    // PRD #819 M5/M6: capture the advertised set from THIS reply. Every
+    // `trusted_daemon()` builds a fresh client, so the capture is per call and
+    // never outlives the connection it describes — which is the invalidation
+    // rule `DaemonClient` states, satisfied structurally rather than by
+    // remembering to call `invalidate_capabilities`.
+    client.store_capabilities_from_hello(&response);
+    Ok(TrustedDaemon { client, connection })
 }
 
 pub(crate) async fn get_snapshot() -> DesktopSnapshot {
@@ -353,7 +364,6 @@ pub(crate) async fn get_snapshot() -> DesktopSnapshot {
         return DesktopSnapshot {
             connection: daemon.connection,
             agents: Vec::new(),
-            project_cwd: desktop_project_cwd(),
             protocol_version: PROTOCOL_VERSION,
             source: "daemon",
         };
@@ -363,7 +373,6 @@ pub(crate) async fn get_snapshot() -> DesktopSnapshot {
         Ok(records) => DesktopSnapshot {
             connection: daemon.connection,
             agents: records.into_iter().map(map_agent).collect(),
-            project_cwd: desktop_project_cwd(),
             protocol_version: PROTOCOL_VERSION,
             source: "daemon",
         },
@@ -953,6 +962,152 @@ mod tests {
         );
         assert_eq!(broken.status, ConnectionStatus::Incompatible);
         assert!(broken.build_stamp_mismatch_only);
+    }
+
+    // -----------------------------------------------------------------------
+    // The LIVE connect path, over a scripted socket.
+    //
+    // Every test above hands `classify_handshake` a fabricated `AttachResponse`,
+    // which pins the classifier and says nothing about whether `hello()` — the
+    // function that actually connects, frames a `Hello` and decodes the reply —
+    // routes a real daemon's answer through it. `hello()` is a private
+    // `async fn` and `trusted_daemon()` is `pub(crate)`, so this can only be an
+    // in-crate unit test; there is no Tauri e2e harness to reach it from
+    // outside (PRD #819, *Testing: what rule 4 means here*).
+    // -----------------------------------------------------------------------
+
+    /// A one-shot daemon: accept one connection, read one request frame, answer
+    /// with `response`. Returns the request bytes it was sent, so the test can
+    /// assert what the desktop actually asked for rather than only what it did
+    /// with the answer.
+    ///
+    /// It binds a plain `tokio::net::UnixListener` rather than
+    /// `platform::ipc::IpcListener`, deliberately: that helper flips the
+    /// **process umask** around its `bind(2)` to create the inode owner-only,
+    /// and a process-global umask is exactly the wrong thing under a plain
+    /// `cargo test`, where the whole module shares one process. Measured: with
+    /// the umask at `0o177`, a sibling test's `create_dir_all` produced a
+    /// directory with no execute bit and the next `bind` in it failed `EACCES`.
+    /// Nothing here needs the owner-only inode — the socket lives in a
+    /// per-test temp directory and no daemon is trusting it.
+    async fn scripted_daemon(
+        listener: tokio::net::UnixListener,
+        response: AttachResponse,
+    ) -> Vec<u8> {
+        use dot_agent_deck::daemon_protocol::{KIND_REQ, KIND_RESP, read_frame, write_frame};
+        let (stream, _peer) = listener.accept().await.expect("accept one client");
+        let (mut reader, mut writer) = stream.into_split();
+        let (kind, payload) = read_frame(&mut reader)
+            .await
+            .expect("read the request frame")
+            .expect("the client sent a frame");
+        assert_eq!(kind, KIND_REQ, "the desktop must open with a request frame");
+        let encoded = serde_json::to_vec(&response).expect("serialize the reply");
+        write_frame(&mut writer, KIND_RESP, &encoded)
+            .await
+            .expect("answer the client");
+        payload
+    }
+
+    /// A socket path inside a fresh temp directory, plus the directory itself so
+    /// the caller can clean it up. Deliberately short: a Unix socket path is
+    /// capped near 100 bytes, and a long temp root silently fails to bind.
+    fn scratch_socket(tag: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("dad-{tag}-{}-{unique}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create the scratch dir");
+        let socket = dir.join("s");
+        (dir, socket)
+    }
+
+    /// The happy path, end to end over a real socket: `hello()` connects, sends
+    /// a `Hello` carrying this build's own protocol version and stamp, and hands
+    /// the daemon's reply to the classifier.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn hello_frames_a_real_request_and_classifies_the_reply_it_gets_back() {
+        let (dir, socket) = scratch_socket("hello-ok");
+        let listener = tokio::net::UnixListener::bind(&socket).expect("bind");
+        let client_build = dot_agent_deck::build_id::local_build_id();
+        let mut reply = AttachResponse::hello(PROTOCOL_VERSION)
+            .with_running_agents(RunningAgentsSummary::default());
+        reply.build_version = Some(client_build.clone());
+        // PRD #819 M5/M6: the reply is also where the capability set is
+        // advertised, which is why `hello()` carries the response out rather
+        // than dropping it after classification.
+        reply.capabilities = Some(vec![
+            dot_agent_deck::daemon_protocol::CAP_LIST_PROJECTS.to_string(),
+            dot_agent_deck::daemon_protocol::CAP_RESOLVE_PROJECT.to_string(),
+            dot_agent_deck::daemon_protocol::CAP_PREPARE_WORKFLOW.to_string(),
+        ]);
+        let daemon = tokio::spawn(scripted_daemon(listener, reply));
+
+        let (info, response) = hello(&socket).await.expect("the handshake must complete");
+
+        assert_eq!(info.status, ConnectionStatus::Connected);
+        assert!(info.error.is_none(), "{:?}", info.error);
+        assert_eq!(info.server_protocol_version, Some(PROTOCOL_VERSION));
+
+        // What the desktop actually put on the wire.
+        let request = daemon.await.expect("the scripted daemon must finish");
+        let request: serde_json::Value =
+            serde_json::from_slice(&request).expect("the request must be JSON");
+        assert_eq!(request["op"], "hello");
+        assert_eq!(request["client_version"], PROTOCOL_VERSION);
+        assert_eq!(request["client_build_version"], client_build);
+
+        // And the reply reaches the caller intact, so `trusted_daemon()` can
+        // seed the client's capability cache from THIS handshake instead of
+        // spending a second `Hello` re-learning it.
+        let capabilities = dot_agent_deck::daemon_client::DaemonCapabilities::from_hello(&response);
+        assert!(capabilities.is_advertised());
+        assert!(capabilities.supports(dot_agent_deck::daemon_protocol::CAP_PREPARE_WORKFLOW));
+
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// The refusal path over the same socket: a daemon speaking a different
+    /// protocol version is refused by the live path, not merely by the
+    /// classifier in isolation — and it advertises no override, because the wire
+    /// check is not negotiable.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn hello_refuses_a_real_daemon_on_a_different_protocol_version() {
+        let (dir, socket) = scratch_socket("hello-proto");
+        let listener = tokio::net::UnixListener::bind(&socket).expect("bind");
+        let daemon = tokio::spawn(scripted_daemon(
+            listener,
+            AttachResponse::hello(PROTOCOL_VERSION + 1),
+        ));
+
+        let (info, _response) = hello(&socket).await.expect("the exchange still completes");
+
+        assert_eq!(info.status, ConnectionStatus::Incompatible);
+        let error = info.error.expect("a refusal must say why");
+        assert!(error.contains("protocol mismatch"), "{error}");
+        assert!(
+            error.contains(&(PROTOCOL_VERSION + 1).to_string()),
+            "the refusal must name the version the daemon reported: {error}"
+        );
+        assert!(!info.build_stamp_mismatch_only);
+
+        daemon.await.expect("the scripted daemon must finish");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// No daemon at all is a transport error rather than a classification, and
+    /// it must surface as `Err` instead of being dressed up as some verdict —
+    /// `get_snapshot` turns it into the disconnected snapshot.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn hello_reports_a_missing_daemon_as_a_transport_failure() {
+        let (dir, socket) = scratch_socket("hello-gone");
+        let error = hello(&socket).await.expect_err("nothing is listening");
+        assert!(!error.is_empty());
+        std::fs::remove_dir_all(dir).ok();
     }
 
     /// The load-bearing property, re-pinned at the new boundary: relaxing the

@@ -141,6 +141,13 @@ export function useDeckRuntime(): DeckRuntimeState {
   // shown set from an effect: an identity that changed every render would fire
   // that effect every render (PRD #745 M7).
   const setShownTerminals = useCallback((agentIds: string[]) => bridge.setShownTerminals(agentIds), [bridge]);
+  // PRD #819 M6. Deliberately NOT wrapped in the `setError` bookkeeping
+  // `runAction` uses: an empty listing and an unresolvable path are ordinary
+  // outcomes of choosing a project, and routing them into the deck's global
+  // error toast would present the first-run state as a fault. The picker owns
+  // its own state and says what it means.
+  const listProjects = useCallback(() => bridge.listProjects(), [bridge]);
+  const resolveProject = useCallback((path: string) => bridge.resolveProject(path), [bridge]);
 
   return {
     mode,
@@ -153,5 +160,7 @@ export function useDeckRuntime(): DeckRuntimeState {
     resizeTerminal,
     setShownTerminals,
     reconnect,
+    listProjects,
+    resolveProject,
   };
 }

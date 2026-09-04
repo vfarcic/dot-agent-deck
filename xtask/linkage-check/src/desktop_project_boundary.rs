@@ -75,16 +75,17 @@
 //!
 //! # The allowlist, and why a stale entry is a failure
 //!
-//! PRD #819 M6 (the desktop launch flow) lands *after* this rule, so the rule
-//! goes up against a tree that still violates it. Today's violations are
-//! enumerated in [`PENDING_M6`] rather than the rule being weakened to let them
-//! through — the difference matters, because a weakened rule catches nothing
-//! new either.
+//! This rule landed *before* PRD #819 M6 (the desktop launch flow), so it went
+//! up against a tree that still violated it. Those violations were enumerated
+//! in [`PENDING_M6`] rather than the rule being weakened to let them through —
+//! the difference matters, because a weakened rule catches nothing new either.
 //!
-//! An allowlist entry that matches **no** finding is itself a failure. That is
-//! the forcing function: when M6 deletes the last client-side project read, this
-//! check goes red until the corresponding [`PENDING_M6`] entries are deleted
-//! with it, so the allowlist cannot quietly outlive what it excused.
+//! An allowlist entry that matches **no** finding is itself a failure, and that
+//! forcing function has now fired: **M6 landed, [`PENDING_M6`] is empty**, and
+//! the check went red on ten stale entries until they were deleted along with
+//! the reads they excused. The allowlist mechanism stays because the property is
+//! what makes an allowlist safe to have at all — an excuse cannot quietly
+//! outlive what it excused.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -204,70 +205,23 @@ impl Finding {
     }
 }
 
-/// The violations PRD #819 M6 removes, allowlisted so this rule can land ahead
-/// of the milestone that fixes them.
+/// The violations PRD #819 M6 removed. **Empty, and that is the milestone.**
 ///
-/// Each is `(repo-relative file, kind, detail)`. **Every entry must match at
-/// least one live finding** — see the module docs. When M6 deletes
-/// `desktop_project_cwd()` and moves the launch flow onto the daemon's
-/// `prepare-workflow` verb, this list goes to empty and the constant with it.
-const PENDING_M6: &[(&str, &str, &str)] = &[
-    // `validate_workflow_against_project` / `prepare_workflow_launch`: the
-    // desktop's own copy of project resolution. M6 replaces the pair with the
-    // daemon's `prepare-workflow` verb.
-    (
-        "desktop/src-tauri/src/lib.rs",
-        "root-module",
-        "dot_agent_deck::project_config",
-    ),
-    (
-        "desktop/src-tauri/src/lib.rs",
-        "root-module",
-        "dot_agent_deck::orchestrator_context",
-    ),
-    (
-        "desktop/src-tauri/src/lib.rs",
-        "forbidden-symbol",
-        "project_config",
-    ),
-    (
-        "desktop/src-tauri/src/lib.rs",
-        "forbidden-symbol",
-        "load_project_config",
-    ),
-    (
-        "desktop/src-tauri/src/lib.rs",
-        "forbidden-symbol",
-        "orchestrator_context",
-    ),
-    (
-        "desktop/src-tauri/src/lib.rs",
-        "forbidden-symbol",
-        "prepare_orchestrator_prompt",
-    ),
-    (
-        "desktop/src-tauri/src/lib.rs",
-        "project-state-literal",
-        ".dot-agent-deck.toml",
-    ),
-    (
-        "desktop/src-tauri/src/lib.rs",
-        "project-state-literal",
-        "orchestrator-context.md",
-    ),
-    // `desktop_project_cwd()` itself: the manifest-dir-then-cwd guess, and the
-    // project filename it probes for. M6 deletes the function.
-    (
-        "desktop/src-tauri/src/dto.rs",
-        "project-state-literal",
-        ".dot-agent-deck.toml",
-    ),
-    (
-        "desktop/src-tauri/src/dto.rs",
-        "cwd-fallback",
-        "std::env::current_dir",
-    ),
-];
+/// Each entry was `(repo-relative file, kind, detail)`. Ten of them excused the
+/// desktop's own copy of project resolution — `dot_agent_deck::project_config`
+/// and `dot_agent_deck::orchestrator_context` imports, the `load_project_config`
+/// and `prepare_orchestrator_prompt` calls behind them, the
+/// `.dot-agent-deck.toml` and `orchestrator-context.md` literals they spelled,
+/// and `desktop_project_cwd()`'s `std::env::current_dir` guess. M6 replaced the
+/// pair with the daemon's `prepare-workflow` verb and deleted the function, so
+/// every one of them matched nothing and the forcing function below took the
+/// check red until they went with it — which is exactly what it is for.
+///
+/// **Keep it empty.** A new entry is a new client-side project read being
+/// excused rather than fixed, and the excuse outlives whoever wrote it. If a
+/// finding here is a false positive, that is a bug in the rule and belongs in
+/// [`ALLOWED_ROOT_MODULES`] or in the scan, argued in the PR that widens it.
+const PENDING_M6: &[(&str, &str, &str)] = &[];
 
 /// Run the rule over the checkout at `root`. Returns rendered failures, already
 /// carrying the rule sentence; an empty vector is a pass.

@@ -58,12 +58,62 @@ export interface ConnectionView {
   daemonBuildVersion?: string;
 }
 
-export interface DeckProject {
-  id: string;
+/**
+ * One project the DAEMON knows about (PRD #819 M6).
+ *
+ * It replaced `DeckProject`, which was a locally-invented record — a minted id,
+ * a free-typed `cwd`, a workflow name, notes — persisted under
+ * `dot-agent-deck.desktop.projects.v1` and used as the source of truth for the
+ * launch working directory. Nothing validated it against the daemon's world, so
+ * against a remote daemon it named a directory on the wrong machine.
+ *
+ * There is no id, because the daemon-canonical `path` IS the identity, and no
+ * editable fields, because nothing here is stored: a project is a property of
+ * the launch being assembled and dies with it.
+ */
+export interface DaemonProject {
+  /** Daemon-canonical absolute path. Sent back verbatim; never re-spelled. */
+  path: string;
   name: string;
-  cwd: string;
-  workflowName: string;
-  notes: string;
+}
+
+export interface DaemonProjectListing {
+  projects: DaemonProject[];
+  /**
+   * The project most recently active on this daemon — a fact derived from live
+   * state, not a remembered preference. Absent when the daemon has nothing
+   * live, which is the empty state rather than an error.
+   */
+  primary?: string;
+}
+
+export interface DaemonOrchestrationRole {
+  name: string;
+  start: boolean;
+}
+
+export interface DaemonOrchestration {
+  name: string;
+  default: boolean;
+  roles: DaemonOrchestrationRole[];
+}
+
+/**
+ * One resolved project: the canonical path, and the workflows that project
+ * offers. The order is `daemon → project → workflow` and it is not
+ * rearrangeable — the workflow list comes out of the project's own config, so
+ * there is nothing to offer before a project is chosen.
+ */
+export interface DaemonResolvedProject {
+  path: string;
+  name: string;
+  orchestrations: DaemonOrchestration[];
+  /**
+   * The revision these orchestrations were read from, echoed back on the launch
+   * so a config edited in between is refused rather than silently launched
+   * against.
+   */
+  configRevision?: string;
 }
 
 export interface DeckPrompt {
@@ -399,7 +449,7 @@ export type DeckAction =
   | { type: "stop_daemon"; force?: boolean }
   | { type: "restart_daemon" }
   | { type: "allow_build_mismatch" }
-  | { type: "start_workflow"; name: string; cwd: string; taskPrompt: string; roles: WorkflowLaunchRole[]; rows: number; cols: number }
+  | { type: "start_workflow"; name: string; cwd: string; taskPrompt: string; roles: WorkflowLaunchRole[]; rows: number; cols: number; configRevision?: string }
   | { type: "retry_stage"; stageId: string }
   | { type: "stop_agent"; agentId: string }
   | { type: "rename_agent"; agentId: string; displayName: string }
@@ -460,6 +510,13 @@ export interface WorkflowLaunchRole {
 
 export interface WorkflowLaunchConfig {
   name: string;
+  /**
+   * The daemon-canonical project path, straight off the resolved selection.
+   * PRD #819 M6: never typed into this form and never derived from the app's
+   * own environment — the only two sources are a path the daemon listed and a
+   * path the user pasted into the project picker, which the daemon then
+   * resolved and re-spelled.
+   */
   cwd: string;
   taskPrompt: string;
   roles: WorkflowLaunchRole[];
@@ -467,6 +524,8 @@ export interface WorkflowLaunchConfig {
   cols: number;
   customCommandCount: number;
   generatedFullAccessCount: number;
+  /** The revision the selection resolved against, if the daemon reported one. */
+  configRevision?: string;
 }
 
 export interface TerminalChunk {
@@ -507,4 +566,16 @@ export interface DeckRuntimeState {
    */
   setShownTerminals: (agentIds: string[]) => Promise<void>;
   reconnect: () => Promise<void>;
+  /**
+   * PRD #819 M6: the projects the connected daemon knows about. There is no
+   * client-side list to fall back to — an unreachable daemon means no projects
+   * to offer, which is an honest answer and not a reason to guess one.
+   */
+  listProjects: () => Promise<DaemonProjectListing>;
+  /**
+   * Resolve ONE path — one the daemon listed, or one the user pasted. The reply
+   * carries the daemon's canonical spelling, which is the string every later
+   * request uses.
+   */
+  resolveProject: (path: string) => Promise<DaemonResolvedProject>;
 }

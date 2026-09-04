@@ -1090,6 +1090,24 @@ pub struct ProjectRole {
 pub struct PreparedWorkflow {
     /// Where the coordinator context was published, daemon-side.
     pub context_path: String,
+    /// PRD #819 M6: the daemon-**canonical** project directory this preparation
+    /// resolved to — the same string [`ResolvedProject::path`] carries, restated
+    /// here so a spawn does not have to trust that the caller sent the canonical
+    /// spelling in the first place.
+    ///
+    /// This is the string every following `StartAgent.cwd` and
+    /// `orchestration_cwd` must use. Canonicalising a symlinked path changes its
+    /// basename and an empty orchestration name is derived from that basename,
+    /// so a launch that prepares under one spelling and spawns under another
+    /// reproduces PRD #220's bug verbatim (`crate::dispatch`). Answering with the
+    /// canonical path makes "the listing and the spawn agree" a property of the
+    /// reply rather than of the caller's discipline.
+    ///
+    /// Additive with `#[serde(default)]`, like [`Self::prompt`]: an older
+    /// daemon's reply decodes it as the empty string, which a caller must read as
+    /// "not reported" rather than as a working directory.
+    #[serde(default)]
+    pub path: String,
     /// Short-lived preparation token. Spawning stays a later sequence of
     /// [`crate::daemon_protocol::AttachRequest::StartAgent`] calls (PRD #819
     /// Open Question 5, settled in favour of the smaller change), so the
@@ -1104,6 +1122,25 @@ pub struct PreparedWorkflow {
     pub token: String,
     #[serde(default)]
     pub roles: Vec<ProjectRole>,
+    /// PRD #819 M6: the one-liner to inject into the coordinator's PTY, as
+    /// composed by
+    /// [`crate::orchestrator_context::prepare_orchestrator_context`].
+    ///
+    /// It is here because the client that spawns the roles has to deliver it and
+    /// **may not compose it itself**: the line names
+    /// `.dot-agent-deck/orchestrator-context.md`, which is project-state
+    /// knowledge this PRD moves daemon-side, and it varies with whether the
+    /// preparation carried a task. A client that built its own copy would be
+    /// holding a second, driftable spelling of a file only the daemon wrote.
+    ///
+    /// Additive on a response type, exactly like
+    /// [`ResolvedProject::config_revision`]: `#[serde(default)]`, so an older
+    /// daemon's reply decodes it as the empty string and a caller that finds it
+    /// empty has nothing to deliver. That is the exemption
+    /// [`crate::daemon_protocol::PROTOCOL_VERSION`]'s own policy grants response
+    /// fields, so it moves no version.
+    #[serde(default)]
+    pub prompt: String,
 }
 
 /// The daemon's reply to a [`DaemonMessage::Delegate`], one JSON line back on

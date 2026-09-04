@@ -18,3 +18,12 @@ serde_json = "1"
 tauri = { version = "2", features = [] }
 tokio = { version = "1", features = ["sync", "time"] }
 
+# The `#[tokio::test]` attribute needs `macros` + `rt`, and the scripted-socket
+# handshake tests in `daemon_bridge.rs` need `net`. All three have always been
+# reachable here through feature unification with the root crate — which is a
+# property of what ANOTHER crate happens to enable, not a declaration this crate
+# makes. Declaring them means a change over there cannot silently take this
+# crate's tests out.
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread"] }
+

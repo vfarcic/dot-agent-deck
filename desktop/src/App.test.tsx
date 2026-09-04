@@ -20,8 +20,52 @@ function runtime(overrides: Partial<DeckRuntimeState> = {}): DeckRuntimeState {
     resizeTerminal: vi.fn(async () => undefined),
     setShownTerminals: vi.fn(async () => undefined),
     reconnect: vi.fn(async () => undefined),
+    // PRD #819 M6: the project surface is daemon-sourced, so the runtime fake
+    // answers the way a daemon with nothing live does unless a test says
+    // otherwise. That default IS the first-run state.
+    listProjects: vi.fn(async () => ({ projects: [] })),
+    resolveProject: vi.fn(async () => { throw new Error("unresolved: no such project"); }),
     ...overrides,
   };
+}
+
+/**
+ * PRD #819 M6: a live runtime whose daemon knows one project offering the
+ * `dot-agent-deck` orchestration with the six roles the default profiles carry.
+ *
+ * Every launch test needs this now, and that IS the milestone: a launch is
+ * `(daemon, project, workflow)` in that order, so there is no workflow to
+ * launch until a project has been picked and resolved. Before this the working
+ * directory came from a `localStorage` list seeded by the desktop's own guess,
+ * which is what let a launch validate against one machine and run on another.
+ */
+const WORKFLOW_ROLES = ["orchestrator", "coder", "reviewer", "auditor", "tester", "release"];
+
+function liveWithProject(overrides: Partial<DeckRuntimeState> = {}): DeckRuntimeState {
+  return runtime({
+    mode: "live",
+    listProjects: vi.fn(async () => ({ projects: [{ path: "/home/dev/code/deck", name: "deck" }], primary: "/home/dev/code/deck" })),
+    resolveProject: vi.fn(async () => ({
+      path: "/home/dev/code/deck",
+      name: "deck",
+      orchestrations: [{
+        name: "dot-agent-deck",
+        default: true,
+        roles: WORKFLOW_ROLES.map((role) => ({ name: role, start: role === "orchestrator" })),
+      }],
+      configRevision: "revision-1",
+    })),
+    ...overrides,
+  });
+}
+
+/** Pick the one project the fake daemon offers, and wait for it to resolve. */
+async function chooseTheOnlyProject() {
+  fireEvent.click(screen.getByTestId("open-projects"));
+  await waitFor(() => expect(screen.getByRole("button", { name: /deck/ })).toBeVisible());
+  fireEvent.click(screen.getByRole("button", { name: /deck/ }));
+  await waitFor(() => expect(screen.getByTestId("selected-project")).toBeVisible());
+  fireEvent.click(screen.getByRole("button", { name: "Configure workflow" }));
 }
 
 describe("ControlDeck", () => {
@@ -51,35 +95,172 @@ describe("ControlDeck", () => {
     expect(screen.getByTestId("evidence-drawer")).toBeVisible();
   });
 
-  it("manages projects and sends the active project defaults into the workflow launcher", async () => {
-    const live = runtime({ mode: "live" });
+  /**
+   * PRD #819 M6 rewrote this test rather than deleting it, because the
+   * migration destroyed its premise: the old one added a project entry, typed a
+   * directory and a workflow name into it, and asserted the pair reappeared in
+   * `localStorage` under `dot-agent-deck.desktop.projects.v1` and then in the
+   * launcher. Every step of that is now a defect — the project comes from the
+   * daemon, the workflow list comes from the project, and nothing is stored.
+   *
+   * What it pins now is the chain that replaced it, plus the one thing the old
+   * one could not have said: that the path reaching the launch form is the
+   * DAEMON's canonical spelling, not the one that was clicked.
+   *
+   * The test that followed it — two clicks to remove a local project entry —
+   * went with the library it was about. There is nothing to remove from a
+   * picker over what the daemon currently knows.
+   */
+  it("picks a daemon-listed project, resolves it, and carries the daemon's canonical path into the launcher", async () => {
+    const resolveProject = vi.fn(async (path: string) => ({
+      // The daemon answers with a DIFFERENT spelling: `/home/dev/current` is a
+      // symlink and its basename is not the canonical one, which is exactly the
+      // case that produced PRD #220's empty-orchestration-name bug.
+      path: path === "/home/dev/current" ? "/home/dev/code/clipmaker" : path,
+      name: "clipmaker",
+      orchestrations: [
+        { name: "clipmaker-loop", default: true, roles: [{ name: "orchestrator", start: true }] },
+        { name: "release-only", default: false, roles: [{ name: "orchestrator", start: true }] },
+      ],
+      configRevision: "revision-1",
+    }));
+    const live = runtime({
+      mode: "live",
+      listProjects: vi.fn(async () => ({ projects: [{ path: "/home/dev/current", name: "current" }], primary: "/home/dev/current" })),
+      resolveProject,
+    });
     render(<ControlDeck runtime={live} />);
 
     fireEvent.click(screen.getByTestId("open-projects"));
     expect(screen.getByTestId("projects-panel")).toBeVisible();
-    await waitFor(() => expect(screen.getByLabelText("Saved projects")).toBeVisible());
-    fireEvent.click(screen.getByRole("button", { name: "Add project" }));
-    fireEvent.change(screen.getByLabelText("Project display name"), { target: { value: "Clipmaker" } });
-    fireEvent.change(screen.getByLabelText("Project directory"), { target: { value: "/Users/prabhusriramulu/dev/active/clipmaker" } });
-    fireEvent.change(screen.getByLabelText("Project workflow name"), { target: { value: "clipmaker-loop" } });
-    fireEvent.change(screen.getByLabelText("Project notes"), { target: { value: "Video pipeline work" } });
-    fireEvent.click(screen.getByRole("button", { name: "Use this project" }));
+    await waitFor(() => expect(screen.getByRole("button", { name: /current/ })).toBeVisible());
+    fireEvent.click(screen.getByRole("button", { name: /current/ }));
 
-    await waitFor(() => expect(screen.getByText("Active project updated. Open Workflows when you are ready to launch its agents.")).toBeVisible());
-    expect(window.localStorage.getItem("dot-agent-deck.desktop.projects.v1.fixture")).toContain("clipmaker-loop");
+    await waitFor(() => expect(screen.getByTestId("selected-project")).toBeVisible());
+    expect(resolveProject).toHaveBeenCalledWith("/home/dev/current");
+    expect(screen.getByLabelText("Resolved project path")).toHaveValue("/home/dev/code/clipmaker");
+
     fireEvent.click(screen.getByRole("button", { name: "Configure workflow" }));
+    // The workflow list is the PROJECT's, and its default is pre-selected —
+    // daemon, then project, then workflow, in that order.
     expect(screen.getByLabelText("Workflow name")).toHaveValue("clipmaker-loop");
-    expect(screen.getByLabelText("Absolute project directory")).toHaveValue("/Users/prabhusriramulu/dev/active/clipmaker");
+    // Read-only, and carrying the daemon's spelling rather than the clicked one.
+    const directory = screen.getByLabelText("Absolute project directory") as HTMLInputElement;
+    expect(directory).toHaveValue("/home/dev/code/clipmaker");
+    expect(directory.readOnly).toBe(true);
+
+    // Nothing was written anywhere. The key the old test asserted ON is the key
+    // this milestone removed, so its absence is the assertion.
+    expect(window.localStorage.getItem("dot-agent-deck.desktop.projects.v1.live")).toBeNull();
+    expect(window.localStorage.getItem("dot-agent-deck.desktop.projects.v1.fixture")).toBeNull();
+    expect(Object.keys(window.localStorage).some((key) => key.includes("projects"))).toBe(false);
   });
 
-  it("requires two clicks to remove only the local project entry", async () => {
-    render(<ControlDeck runtime={runtime()} />);
+  /**
+   * State 1: the daemon knows nothing live. It is the ONLY first-run behaviour
+   * — there is no remembered list behind it — and it is not an error.
+   */
+  it("says the daemon knows no projects and offers the path field", async () => {
+    const live = runtime({ mode: "live", listProjects: vi.fn(async () => ({ projects: [] })) });
+    render(<ControlDeck runtime={live} />);
+
     fireEvent.click(screen.getByTestId("open-projects"));
-    await waitFor(() => expect(screen.getByRole("button", { name: "Remove entry" })).toBeVisible());
-    fireEvent.click(screen.getByRole("button", { name: "Remove entry" }));
-    expect(screen.getByRole("button", { name: "Confirm remove" })).toBeVisible();
-    fireEvent.click(screen.getByRole("button", { name: "Confirm remove" }));
-    expect(screen.getByText("Project entry removed. The repository folder was not changed.")).toBeVisible();
+    await waitFor(() => expect(screen.getByTestId("projects-nothing-known")).toBeVisible());
+    expect(screen.getByTestId("projects-nothing-known")).toHaveTextContent("knows of none to offer");
+    expect(screen.getByLabelText("Project directory")).toBeVisible();
+    // Not a failure: nothing renders as a refusal for it.
+    expect(screen.queryByTestId("project-resolve-error")).toBeNull();
+  });
+
+  /**
+   * A project the daemon has nothing live in is named by pasting its path, and
+   * the daemon resolves it on its own filesystem.
+   */
+  it("resolves a pasted path through the daemon and adopts the spelling it answers with", async () => {
+    const resolveProject = vi.fn(async () => ({
+      path: "/srv/projects/api",
+      name: "api",
+      orchestrations: [{ name: "loop", default: false, roles: [{ name: "orchestrator", start: true }] }],
+      configRevision: "rev-9",
+    }));
+    const live = runtime({ mode: "live", listProjects: vi.fn(async () => ({ projects: [] })), resolveProject });
+    render(<ControlDeck runtime={live} />);
+
+    fireEvent.click(screen.getByTestId("open-projects"));
+    await waitFor(() => expect(screen.getByLabelText("Project directory")).toBeVisible());
+    fireEvent.change(screen.getByLabelText("Project directory"), { target: { value: "  /srv/projects/api/  " } });
+    fireEvent.click(screen.getByTestId("resolve-project"));
+
+    await waitFor(() => expect(screen.getByTestId("selected-project")).toBeVisible());
+    expect(resolveProject).toHaveBeenCalledWith("/srv/projects/api/");
+    expect(screen.getByLabelText("Resolved project path")).toHaveValue("/srv/projects/api");
+  });
+
+  /**
+   * A pasted path the daemon refuses is shown as the daemon's own bounded
+   * refusal — it deliberately says less about a path it does not already know,
+   * and this screen must not embellish it.
+   */
+  it("shows the daemon's refusal for a pasted path it will not resolve", async () => {
+    const live = runtime({
+      mode: "live",
+      listProjects: vi.fn(async () => ({ projects: [] })),
+      resolveProject: vi.fn(async () => { throw new Error("unresolved: that path is not a project this daemon can offer"); }),
+    });
+    render(<ControlDeck runtime={live} />);
+
+    fireEvent.click(screen.getByTestId("open-projects"));
+    await waitFor(() => expect(screen.getByLabelText("Project directory")).toBeVisible());
+    fireEvent.change(screen.getByLabelText("Project directory"), { target: { value: "/nope" } });
+    fireEvent.click(screen.getByTestId("resolve-project"));
+
+    await waitFor(() => expect(screen.getByTestId("project-resolve-error")).toBeVisible());
+    expect(screen.getByTestId("project-resolve-error")).toHaveTextContent("not a project this daemon can offer");
+    expect(screen.queryByTestId("selected-project")).toBeNull();
+  });
+
+  /**
+   * State 2: a project that WAS listed no longer resolves. Enumeration is
+   * derived from live state, so this happens when the last agent in a project
+   * exits — possibly seconds after the row was drawn. It reads like the empty
+   * state rather than an error, and the listing is refreshed so the picker
+   * stops offering something that is gone.
+   */
+  it("presents a project that left the daemon's known set like the empty state", async () => {
+    const listProjects = vi.fn(async () => ({ projects: [{ path: "/home/dev/stale", name: "stale" }] }));
+    const live = runtime({
+      mode: "live",
+      listProjects,
+      resolveProject: vi.fn(async () => { throw new Error("daemon returned error: unresolved: that path is not a project this daemon can offer"); }),
+    });
+    render(<ControlDeck runtime={live} />);
+
+    fireEvent.click(screen.getByTestId("open-projects"));
+    await waitFor(() => expect(screen.getByRole("button", { name: /stale/ })).toBeVisible());
+    fireEvent.click(screen.getByRole("button", { name: /stale/ }));
+
+    await waitFor(() => expect(screen.getByTestId("projects-nothing-known")).toBeVisible());
+    expect(screen.getByTestId("projects-nothing-known")).toHaveTextContent("no longer one this daemon knows");
+    // Like the empty state: the daemon's refusal text is NOT shown as a fault.
+    expect(screen.queryByTestId("project-resolve-error")).toBeNull();
+    // And the listing is re-asked, because it is now known to be out of date.
+    await waitFor(() => expect(listProjects.mock.calls.length).toBeGreaterThan(1));
+  });
+
+  /**
+   * The launcher refuses to launch without a project, and says where to get
+   * one. Order matters: workflows come out of the project's own config, so
+   * there is nothing to offer before a project is chosen.
+   */
+  it("blocks a live launch until a project is chosen", async () => {
+    const live = runtime({ mode: "live", listProjects: vi.fn(async () => ({ projects: [] })) });
+    render(<ControlDeck runtime={live} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Workflows" }));
+    await waitFor(() => expect(screen.getByTestId("workflow-editor")).toBeVisible());
+    expect(screen.getByTestId("workflow-needs-project")).toBeVisible();
+    expect(screen.getByTestId("launch-live-loop")).toBeDisabled();
+    expect(screen.getByLabelText("Absolute project directory")).toHaveValue("");
   });
 
   it("edits agent profiles locally and clearly marks the draft as not written to TOML", () => {
@@ -98,8 +279,10 @@ describe("ControlDeck", () => {
   });
 
   it("launches the provider-derived command after CLI, model, effort, and permission edits", async () => {
-    const live = runtime({ mode: "live" });
+    const live = liveWithProject();
     render(<ControlDeck runtime={live} />);
+    await chooseTheOnlyProject();
+    fireEvent.click(screen.getByRole("button", { name: "Close workflow editor" }));
     fireEvent.click(screen.getByTestId("open-agent-profiles"));
     fireEvent.click(screen.getByRole("button", { name: /Coder/ }));
     fireEvent.change(screen.getByLabelText("CLI"), { target: { value: "/Applications/Codex Nightly/bin/codex" } });
@@ -126,8 +309,10 @@ describe("ControlDeck", () => {
   });
 
   it("requires an explicit advanced toggle for a custom command and calls out the bypass at launch", async () => {
-    const live = runtime({ mode: "live" });
+    const live = liveWithProject();
     render(<ControlDeck runtime={live} />);
+    await chooseTheOnlyProject();
+    fireEvent.click(screen.getByRole("button", { name: "Close workflow editor" }));
     fireEvent.click(screen.getByTestId("open-agent-profiles"));
     fireEvent.click(screen.getByRole("button", { name: /Coder/ }));
     fireEvent.change(screen.getByLabelText("Permission mode"), { target: { value: "full-access" } });
@@ -152,9 +337,9 @@ describe("ControlDeck", () => {
   });
 
   it("confirmation-gates live workflow launch and keeps orchestrator as the start role", async () => {
-    const live = runtime({ mode: "live" });
+    const live = liveWithProject();
     render(<ControlDeck runtime={live} />);
-    fireEvent.click(screen.getByRole("button", { name: "Workflows" }));
+    await chooseTheOnlyProject();
     expect(screen.getByTestId("launch-live-loop")).toBeDisabled();
     expect(screen.getByText("Add the task you want the coordinator to run.")).toBeVisible();
     fireEvent.change(screen.getByLabelText("Task prompt"), { target: { value: "Wire the launch prompt into the workflow." } });
@@ -163,10 +348,41 @@ describe("ControlDeck", () => {
     fireEvent.click(screen.getAllByRole("button", { name: "Launch live loop" }).at(-1)!);
     await waitFor(() => expect(live.runAction).toHaveBeenCalledWith(expect.objectContaining({
       type: "start_workflow",
+      // The workflow name is now the ORCHESTRATION the daemon offered for the
+      // chosen project, selected from a list rather than typed — and the cwd
+      // and revision come from the same resolve, so the launch carries the
+      // daemon's own spelling and the bytes it read the roles from.
       name: "dot-agent-deck",
+      cwd: "/home/dev/code/deck",
+      configRevision: "revision-1",
       taskPrompt: "Wire the launch prompt into the workflow.",
       roles: expect.arrayContaining([expect.objectContaining({ role: "orchestrator", start: true }), expect.objectContaining({ role: "coder", start: false })]),
     })));
+  });
+
+  /**
+   * The role sets have to agree, and the daemon is the authority on what the
+   * workflow's roles are. A project whose orchestration does not carry a role
+   * the enabled profiles supply is refused here, before the launch, and the
+   * message names the mismatch rather than restating a hardcoded six.
+   */
+  it("refuses to launch when the enabled profiles do not match the workflow's roles", async () => {
+    const live = liveWithProject({
+      resolveProject: vi.fn(async () => ({
+        path: "/home/dev/code/deck",
+        name: "deck",
+        orchestrations: [{ name: "pair", default: true, roles: [{ name: "orchestrator", start: true }, { name: "coder", start: false }] }],
+        configRevision: "revision-2",
+      })),
+    });
+    render(<ControlDeck runtime={live} />);
+    await chooseTheOnlyProject();
+    fireEvent.change(screen.getByLabelText("Task prompt"), { target: { value: "Anything." } });
+
+    expect(screen.getByTestId("workflow-role-mismatch")).toHaveTextContent("pair defines orchestrator, coder");
+    expect(screen.getByTestId("workflow-role-mismatch")).toHaveTextContent("Not in this workflow: reviewer");
+    expect(screen.getByTestId("launch-live-loop")).toBeDisabled();
+    expect(live.runAction).not.toHaveBeenCalled();
   });
 
   it("explains and disables live workflow launch on Windows before confirmation", () => {

@@ -1006,8 +1006,17 @@ pub fn prepare_workflow_for_wire(
 
     Ok(crate::event::PreparedWorkflow {
         context_path: prepared.context_path.to_string_lossy().into_owned(),
+        // The canonical directory this preparation actually resolved to, so the
+        // spawn does not have to trust the caller's spelling — see
+        // `PreparedWorkflow::path`.
+        path: dir.to_string_lossy().into_owned(),
         token: crate::prep_token::issue(),
         roles,
+        // The composer already built the pointer line and until PRD #819 M6 it
+        // was dropped on the floor here. The client spawning the roles is the
+        // party that delivers it, and it may not compose its own copy — see
+        // `PreparedWorkflow::prompt`.
+        prompt: prepared.prompt,
     })
 }
 
