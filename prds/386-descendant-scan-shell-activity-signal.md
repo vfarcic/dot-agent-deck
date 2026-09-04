@@ -1,6 +1,6 @@
 # PRD #386: A shell-activity signal that actually fires — descendant-process scan
 
-**Status**: Complete — M1, M2, M3, M6 and M7 landed (process-table primitive + structural discriminator + the pane/daemon wiring, then the real-agent proof that the badge holds `Working` past Claude Code's 120 s cap, then docs/changelog/cross-version check). M4 removed from scope on 2026-08-06; **M5 (overhead measurement) deferred to a follow-up issue** by user decision on 2026-08-06 — see Work Log
+**Status**: Complete — M1, M2, M3, M5, M6 and M7 landed (process-table primitive + structural discriminator + the pane/daemon wiring, then the real-agent proof that the badge holds `Working` past Claude Code's 120 s cap, then docs/changelog/cross-version check, and finally the overhead measurement). M4 removed from scope on 2026-08-06. **M5 (overhead measurement) was deferred to a follow-up issue** by user decision on 2026-08-06 and closed on 2026-09-04 by issue [#862](https://github.com/vfarcic/dot-agent-deck/issues/862) — the numbers, the cadence decision (500 ms, confirmed) and the Route A/B decision (Route B declined) are in "M5 — the measurement"; see Work Log
 **Priority**: High (the pane status a user reads is wrong for minutes at a time, and the mechanism meant to prevent it has never fired)
 **Created**: 2026-08-06
 **GitHub Issue**: [#386](https://github.com/vfarcic/dot-agent-deck/issues/386) (filed upstream — the `Stop → Idle` assumption exists in upstream's own code)
@@ -131,6 +131,8 @@ Everything #370 built downstream of the primitive is **kept, not rewritten**: th
 
 Start with A, measure, and only take B if the measurement says so. M5 exists to make that a real measurement rather than an assumption.
 
+**Answered (2026-09-04, issue #862 — see "M5 — the measurement").** Route A shipped and stays; **Route B was declined**, and the framing above turned out to be the wrong axis: the subprocess is not the variable, the *column set* is. `ps -p 1 -o pid=` (one process) costs 12.5 ms against 12.2 ms for `ps -A -o pid=,ppid=` (382 processes), so removing the fork is all Route B buys — while it would keep reading the `/proc/<pid>/cmdline` files that made the sample stall. What shipped instead is Route A **split in two**: a bulk phase that asks for no argv at all, and an argv phase that reads the command line of only the detached descendants of the panes the sample was taken for. The cadence stayed at 500 ms. The bullets above are left as written, since they are the reasoning the measurement was taken against.
+
 **The scan.** Build a `ppid → children` index once per poll, walk down from each pane's PTY child pid, and stop at the first descendant matching the discriminator. Depth is bounded in practice (agent → shell → command) but the walk must carry a visited set: a `ppid` table sampled non-atomically can contain a cycle after PID reuse.
 
 **The gate stays.** `run_shell_activity_monitor` skips a pane when `pane_hook_session_id` returns `None`, because it needs *some* `SessionState` to update. That is left exactly as it is (scope reduction, 2026-08-06): an agent pane always has a hook session and passes the gate, so the reported bug is fully addressed without touching it, and no session-resolution fallback chain — and no placeholder-session creation — is introduced by this PRD.
@@ -151,7 +153,7 @@ Each is independently testable; the test that proves each one is named in the Te
 - [x] **M2 — The discriminator.** The structural test: a descendant whose session id differs from the agent's own (`getsid(descendant) != getsid(agent_pid)`), with the argv shape as a per-agent cross-check layered on top. Pure classification over a process table — testable against both real spawned processes and captured fixtures. The one thing this milestone must not do is compare against a *constant* (no ctty, session-leader) instead of against the agent's session id; that variant passes on a developer machine and is vacuous in CI.
 - [x] **M3 — Wire it into the pane primitive.** `RunningAgent::shell_foreground_busy`'s body swaps to the descendant scan; `shell_foreground_busy_snapshot` and `run_shell_activity_monitor` are otherwise untouched. This is the milestone at which an agent pane starts producing `ShellBusy` for the first time.
 - [ ] ~~**M4 — Drop the `pane_hook_session_id` gate.**~~ **Out of scope** (2026-08-06 — see Work Log). The gate stays, #386 covers agent panes only, and bare shell panes remain unmonitored as #370 intended. Left in place rather than renumbered so every existing reference to M5/M6/M7 keeps resolving.
-- [ ] **M5 — Overhead measurement and cadence. DEFERRED** to a follow-up issue by user decision on 2026-08-06 (see Work Log) — deliberately left unticked rather than dropped. Measure the poll's cost with a realistic process table and pane count; confirm or revise the cadence; decide Route A vs Route B on the number, and record the number in this PRD. **Two corrections for whoever picks it up:** the cadence that shipped is **500 ms**, not the 1 s this milestone was originally written against (M3 deliberately kept #370's 500 ms so M5 would measure the shape that actually shipped), and **Route A shipped** — one `ps -A -w -w -o pid=,ppid=,tty=,args=` per poll cycle, parsed once and reused across every pane, plus a `libc::getsid` per candidate descendant.
+- [x] **M5 — Overhead measurement and cadence. DONE** (2026-09-04, issue [#862](https://github.com/vfarcic/dot-agent-deck/issues/862)) — deferred to a follow-up issue by user decision on 2026-08-06 (see Work Log), filed as #862 with a field measurement attached, and closed by it. The numbers, the Route A/B decision and the cadence decision are in **"M5 — the measurement"** below. Headline: the cadence was **confirmed at 500 ms, not revised**; **Route B was declined** (it optimizes the fork/exec, which the measurement shows is not the cost); and the argv column — which cost *two* `mmap_lock`-taking `/proc` reads per process per tick, `cmdline` **and** `environ` — was deferred to the at-most-one-per-busy-pane that actually needs it. **The two corrections this milestone carried for whoever picked it up were both accurate:** the cadence that shipped was 500 ms (not the 1 s the milestone was originally written against), and Route A shipped as `ps -A -w -w -o pid=,ppid=,tty=,args=` per poll cycle plus a `libc::getsid` per row.
 - [x] **M6 — Real-agent proof and rot canary.** The three real-agent PTY tests in the Test Plan (`status/shell-activity/005`–`007`). None hand-seeds a `SessionStart`. Landed together with the two production defects they exposed — see the Work Log.
 - [x] **M7 — Docs, changelog, cross-version check.** Changelog fragment; a `docs/develop/` note on the process-shape coupling and how it is detected when it rots; CLAUDE.md rule 12 cross-version manual test (see below).
 
@@ -173,9 +175,103 @@ Each is independently testable; the test that proves each one is named in the Te
 
 **M6c — no false positive with a real agent idle (e2e tier, real agent) — `status/shell-activity/007`.** The same rig, agent brought up and left at its idle prompt with its MCP servers and `caffeinate` alive, sampled after the poll interval: the pane must read `Idle`. *Proves in a real pane*: the M2 fixture claim, against the live process table rather than a captured one.
 
-**M5 — overhead (measurement, recorded not asserted).** Poll cost against a realistic table, reported as a number in this PRD. Not a pass/fail test; a threshold assertion here would be a flake generator on a loaded machine.
+**M5 — overhead (measurement, recorded not asserted).** Poll cost against a realistic table, reported as a number in this PRD — see **"M5 — the measurement"** below, which is where those numbers live. Still not a pass/fail test, and the one test issue #862 added (`status/shell-activity/008`) deliberately asserts a *structural* property — which processes get their command line read — rather than a duration, because a threshold assertion here would be a flake generator on a loaded machine.
 
 **Deliberately not claimed.** No test here proves the behaviour for Codex, OpenCode, or Pi. Only Claude's shell-tool shape was measured, and inventing fixtures for the others would manufacture exactly the false confidence #370 shipped with. See Risks.
+
+## M5 — the measurement
+
+Taken 2026-09-04 for issue [#862](https://github.com/vfarcic/dot-agent-deck/issues/862), which is what M5 was deferred to. Host: Linux 7.0.0-29-generic, 16 cores, 27 GB RAM, procps-ng 4.0.4, debug build, warm cache. This section is M5's deliverable; the milestone above is ticked against it.
+
+### The field measurement M5 predicted, and it predicted it exactly
+
+M5's rationale said *"a `ps -A` per second on a busy machine is not free, and the deck's own workers routinely drive load averages above 20."* Issue #862 arrived carrying that, measured on the `dot-agent` box during a genuine multi-agent build storm — load average 24-28 on 16 cores, PSI `io full avg300=65.95`, ~440 processes / ~1300 threads, 8 live panes:
+
+| | value |
+| --- | --- |
+| `ps -A` sample, idle baseline (the number issue #493 recorded in `src/daemon.rs`) | ~49 ms |
+| `ps -A` sample, under the storm | **19-20 s** |
+| `SAMPLE_TIMEOUT` | 2 s |
+| `MAX_TABLE_AGE` | 3 s |
+| `POLL_INTERVAL` | 500 ms |
+| `shell-activity` warnings in one day of `deck.log` | **1716** |
+
+The daemon's behaviour under that was **correct** — it declined to classify against a stale table rather than misattribute a reused pid — but the signal stopped working entirely for the duration, and the log filled with lines saying so. Those two field numbers are taken as given here and were not re-taken; everything below is new measurement on top of them.
+
+### The discriminator: it is the `args` column, and it costs two reads per process, not one
+
+M5 framed the decision as Route A (`ps` per poll) vs Route B (native enumeration). #862 argued Route B does not address this stall, because `ps … args=` reads `/proc/<pid>/cmdline` for every process and native enumeration reads the same file — and flagged that as **a hypothesis, not a verified cause**, with a cheap discriminator: time the full column set against `pid=,ppid=` alone.
+
+Run, and the hypothesis holds — with one thing it understated. Per invocation, by `strace -e trace=openat` on a 382-process box:
+
+| column set | `/proc/<pid>/stat` | `/proc/<pid>/status` | `/proc/<pid>/cmdline` | `/proc/<pid>/environ` |
+| --- | --- | --- | --- | --- |
+| `-A -o pid=,ppid=` | 374 | 373 | **0** | **0** |
+| `-A -o pid=,ppid=,tty=` | 397 | 396 | **0** | **0** |
+| `-A -w -w -o pid=,ppid=,tty=,args=` | 374 | 373 | **372** | **372** |
+
+So `args` adds **two** per-process reads. `environ` was not in the issue's analysis and matters as much as `cmdline`: both are served through the kernel's `access_remote_vm()`, which takes the **target's** `mmap_lock`, while `stat` and `status` — where `pid`/`ppid`/`tty` come from — are not. Adding `tty=` costs no extra file at all (`tty_nr` is a field of `stat`), which is why it was kept.
+
+Wall time for the two forms, same box, `n` runs each:
+
+| condition | processes | full column set | `pid=,ppid=,tty=` | ratio |
+| --- | --- | --- | --- | --- |
+| idle, load 0.5 (n=25) | 382 | 21 ms p50, 23 max | 12-14 ms p50, 17 max | 1.6-1.8x |
+| CPU-bound `cargo build`, load 12.4, D-state ≈ 0, `io_full_avg10` ≈ 0 (n=276) | 431-447 | 46 ms p50, 87 p90, **104 max** | 19 p50, 23 p90, 40 max | 4.0x at peak load |
+| build + saturated I/O, load 18, **13-17 processes in D-state**, `io_full_avg10` up to 87 (n=178 of those samples) | 470-481 | 60 ms mean, 78 max | **15 ms mean, 19 max** | **4.07x** |
+
+And the floor, which decides Route A vs B: `ps -p 1 -o pid=` — a fork/exec that enumerates one process — takes **12.5 ms p50**, against **12.2 ms** for `ps -A -o pid=,ppid=` enumerating all 382. Enumerating the whole machine's `pid`/`ppid` is below measurement resolution; the fork *is* the cost. CPU per invocation, by `/usr/bin/time`: the full set is `user 0.04 + sys 0.02` = **60 ms of CPU**, the three-column set is `0.00 + 0.00`, i.e. under that tool's 10 ms resolution.
+
+### The mechanism, probed directly
+
+The ratio above says the argv column is load-sensitive; it does not by itself prove *why*. So: an in-process reader (no fork per read, ~265k samples of each file) timing `/proc/<pid>/*` against a process deliberately thrashing its own `mmap_lock` for write — building 60k VMAs and `fork()`ing, since `dup_mmap` holds the parent's `mmap_lock` exclusively for the whole copy:
+
+| file | p50 | p99 | max | max, idle control |
+| --- | --- | --- | --- | --- |
+| `stat` | 10.4 µs | 22.6 µs | 5.10 ms | 0.066 ms |
+| `status` | 14.5 µs | 32.6 µs | 7.10 ms | 0.128 ms |
+| `cmdline` | 13.8 µs | 44.6 µs | **40.10 ms** | 0.32 ms |
+| `environ` | 19.1 µs | 53.7 µs | **36.59 ms** | 0.40 ms |
+
+One contended process makes a single `cmdline` read cost up to 40 ms — 8x the worst `stat` and 125x its own idle worst case. `ps` walks the table serially, so a sample's wall time is the **sum** of those waits across every process on the machine. That is the mechanism, and it is why the fork/exec was never the thing that cost 20 seconds.
+
+### What could NOT be measured, stated plainly
+
+**The 19-20 s magnitude was not reproduced, and was not attempted beyond the point below.** The reproduction reached the field's process count (470-481 vs ~440), its D-state count (13-17 vs 13) and more than its I/O pressure (`io_full_avg10` up to 87 vs the field's `avg300` 65.95), and the full sample still only reached **78 ms**. The magnitude needs many processes *each* holding `mmap_lock` for a long time, which is what unbounded concurrent `ld` on saturated I/O produces — and PR [#866](https://github.com/vfarcic/dot-agent-deck/pull/866) now bounds concurrent linking machine-wide (`scripts/link-gate.sh`, `docs/develop/build-gate.md`), so recreating it would mean deliberately defeating a fix that had just landed. It was not done. The instructive negative result along the way: 16 `dd oflag=direct` writers in D-state cost the sample nothing at all, because a process blocked in `write(2)` holds no `mmap_lock` — **D-state alone is not the predicate; D-state while holding `mmap_lock` is.**
+
+So what is claimed is bounded accordingly: the argv column's *per-process `mmap_lock` exposure* is eliminated (that is a count, verified by `strace`, and it does not depend on load), and the sample's wall time under the heaviest load reproducible on this box is 15-19 ms rather than 60-78 ms. **What is not claimed is that the signal can no longer stall.** The bulk phase still forks `ps`, still reads `stat` and `status` per process, and a sufficiently wedged machine can still blow a 2 s deadline — which is exactly why the backoff below was implemented rather than treated as unnecessary.
+
+### Decision 1 — cadence: 500 ms, confirmed
+
+At 15-21 ms per sample the poll costs ~3-4% of one core of *wall* time at 2 Hz and unmeasurable CPU. The Technical Approach's original suggestion of relaxing to 1 s would halve an already-negligible cost and halve the responsiveness of a badge a user watches. M3's decision to keep #370's 500 ms so M5 would measure the shape that shipped was the right one, and the answer it produced is that the cadence was never the problem.
+
+### Decision 2 — Route B: declined
+
+Route B (native `/proc/<pid>/{stat,cmdline}` on Linux, `sysctl(KERN_PROC_ALL)` on macOS) removes the subprocess. The measurement says the subprocess is ~12 ms and the enumeration is unmeasurable, so Route B would remove ~12 ms per tick of the one part that never blew a deadline, while reading the same `cmdline` files that did, and while costing two platform-specific implementations to maintain. Declined. It stays available if the fork/exec ever becomes the binding cost, which on this evidence it is not.
+
+### Decision 3 — the fix: defer the argv column (option 2), plus adaptive backoff (option 3)
+
+The sample is now **two phases**. The bulk phase is `ps -A -w -w -o pid=,ppid=,tty=` — no `args`, so no `cmdline` and no `environ`, for any process. The argv phase then reads the command line of the pane's **session-boundary** descendants only, in one batched `ps -w -w -o pid=,args= -p <list>`, and only when that set is non-empty. `command_line_targets` and the classifier's cross-check both call the same `shell_tool_candidates`, so the "which pids need an argv" set is identical in both places by construction rather than by intention.
+
+**"Session boundary" rather than "detached descendant" is the load-bearing part, and getting it wrong would have gutted the fix.** `setsid()` creates a session; everything below the caller then *inherits* it. Verified directly on this box: a `setsid bash -c 'sleep 40 & sleep 40 & wait'` reports its own session id, and both `sleep`s report that same id with neither of them a leader. So for a Claude pane whose Bash-tool call runs `cargo build`, the *detached descendants* are the entire build tree — `cargo`, every `rustc`, every `ld` — and reading all of their command lines would have put the poll straight back to taking the `mmap_lock` of exactly the processes that stalled it, since #862's episode had 13 `ld` processes wedged in `D` state. `shell_tool_candidates` therefore takes only the descendants at which the session *changed* (their own parent is in a different session than they are): one per `setsid`-ed shell-tool call. That is also the correct set rather than merely the small one — the measured Claude argv belongs to the process that `setsid`-ed, which `status/shell-activity/001` and `004` both assert is its own session leader, and its `cargo`/`ld` descendants carry their own command lines, which is not where a shell-tool signature lives. A shape carried by a non-boundary process would need this widened, and none of the measured ones is.
+
+The **structural** test deliberately keeps using the wider `detached_descendants` set. For any real process tree the two are non-empty together — `setsid` never *joins* an existing session, so the shallowest detached descendant's parent is still in the root's session and that edge is a boundary — and keeping them separate means a pane with **no** shapes (every agent kind but Claude) is classified without the boundary set entering into it at all. Stated narrowly, because the blanket version is false: for a *Claude* pane, a table where `detached_descendants` is non-empty but the boundary set is empty would still read idle, exactly as one where the cross-check finds no match does. That is the same "sampler and classifier disagree" class as a `NotSampled` candidate, and it cannot arise from a real tree for the reason just given.
+
+The per-tick `mmap_lock` exposure therefore goes from **744 reads spanning every process on the machine** to **one read per `setsid`-ed shell-tool call in flight, always a process the deck itself spawned**, and none at all on an idle deck. `ProcessInfo::command_line` is a three-way [`CommandLine`] rather than a `String`, so "nothing needed it" (`NotSampled`) stays distinguishable from "wanted it and it was gone" (`Unavailable`) — an empty string would have silently matched no shape, which is the silent-false-negative failure mode this PRD exists to end.
+
+**Option 1 (scope the pid/ppid enumeration to pane descendants) was considered and loses on three grounds**, and it is worth recording because it is the option that reads best on the mechanism:
+
+1. **Its Linux mechanism is documented as unreliable for exactly this use.** `proc_tid_children(5)` on `/proc/<pid>/task/<tid>/children`: *"reliably provides a list of children only if all of the child processes are stopped or frozen. It does not work properly if children of the target task exit while the file is being read! Exiting children may cause non-exiting children to be omitted from the list. … most code should probably not use this interface."* A live agent tree churns MCP servers and Bash children constantly, so an omission is a silent false negative.
+2. **It buys nothing measurable once the argv column is deferred.** Whole-machine `pid`/`ppid` enumeration is 12.2 ms against a 12.5 ms fork/exec floor, and `stat`/`status` do not take `mmap_lock` (5.10/7.10 ms worst case under the probe above, against `cmdline`'s 40.10 ms).
+3. **It reduces the exposure by less.** Scoping the enumeration to descendants while keeping `args` still reads the argv of every descendant — the agent, its MCP servers, its `caffeinate`, *and* everything a Bash-tool call has spawned. Deferring the argv column to the session-boundary set reads one per shell-tool call in flight, and none when idle.
+
+**Option 3 was taken as well, on the issue's own reasoning that it is worth doing regardless of 1 or 2.** Both halves live in `SamplingHealth` (`src/daemon.rs`): a finished-but-unusable sample now earns an exponential hold-off before the next one is *started* (500 ms doubling to an 8 s cap, reset on the first usable sample), and the logging is coalesced into an episode — one warning on entry naming the cause, one heartbeat per 300 s while it persists carrying the running counts, one line on recovery. An episode of duration `T` therefore costs `2 + T / 300s` lines instead of one or two per 500 ms cycle. The hold-off deliberately gates only the *start* of a sample and never the *await* of a retained one: a retained sample's age is measured from when it started, so deferring the await could push a healthy answer past `MAX_TABLE_AGE` and discard it for being collected late rather than for being late.
+
+Two things the backoff is **not**: it is not silence (an episode that never recovers still heartbeats, because a signal whose failure mode is silence must not fail silently), and it does not change how a missing answer is interpreted — `None` still means "leave every pane's status alone", exactly as issue #429 decided.
+
+### Test coverage this milestone added
+
+`status/shell-activity/008` (fast tier, L1) pins the structural property rather than a duration: a sample taken for a root reads the command line of that root's session-boundary descendants and of **nothing else**, including nothing for a same-session child of the root, and reads none at all when given no roots. `shell_tool_candidates_stop_at_the_session_boundary` (a `scan.rs` unit test) pins the narrowing itself against a synthetic build tree, and asserts that a process which starts its own session deep inside that tree is still a candidate — so the narrowing cannot hide PRD #386's false-positive risk. `shell_activity_monitor_backs_off_after_repeated_unusable_samples` (in `src/daemon.rs`) pins the hold-off by counting sample *starts* over a 6 s window against a sampler that always answers `None`.
 
 ## Risks
 
@@ -230,6 +326,20 @@ A middle path exists and may be the honest one: **land it fork-only now**, and o
 The measurements this PRD rests on were taken on 2026-08-06 and are recorded in full in `.dot-agent-deck/370-diagnosis-notes.md` (why #370's signal never fires; live `ps` from the user's running deck) and `.dot-agent-deck/hook-silence-notes.md` (the 120 s cap, the sbx3/sbx4 control pair, the process shapes, and the discarded instruments — a 150 ms `ps` sampler too coarse to catch hooks, a Python `pty.fork` probe that reproduced neither case, and `sleep` as a long-foreground instrument, which Claude Code blocks at the tool layer). A third file, `.dot-agent-deck/386-argv-notes.md`, records the 2026-08-06 follow-up measurement against Claude Code 2.1.220 that produced the structural discriminator: the `getsid` table above, the complete unelided Bash-tool argv (read via `sysctl KERN_PROCARGS2`, since `ps -o args=` joins argv with spaces and cannot show element boundaries), the shell-resolution and prologue-assembly logic read verbatim out of the shipped bundle, the rejected argv predicates, and the Linux/container checks. Its own discarded instruments are worth keeping: `ps -o sess=` prints `0` for a non-root caller on macOS, and an isolated `HOME` for a probe agent does not authenticate (`Not logged in`) without the account linkage from the host `.claude.json`. All three files are gitignored working notes, not committed artefacts; the numbers that matter are reproduced in this PRD and in issue #386 so the record survives them.
 
 ## Work Log
+
+### 2026-09-04 — M5 done: the cadence held, Route B declined, and the `args` column was the whole cost
+
+**M5 is ticked** (issue [#862](https://github.com/vfarcic/dot-agent-deck/issues/862)). The numbers, the two decisions and what could not be measured are in **"M5 — the measurement"** above; this entry records what changed about the *understanding*, since three things in this PRD turned out to be narrower or wider than written.
+
+**The Route A/Route B framing was the wrong axis.** The Technical Approach set up "one `ps` per poll" against "native enumeration" as if the subprocess were the variable. It is not: `ps -p 1 -o pid=` (a fork/exec enumerating one process) takes 12.5 ms and `ps -A -o pid=,ppid=` (enumerating 382) takes 12.2 ms, so the fork *is* the cost of the cheap sample and the enumeration is unmeasurable. The real axis is **which columns you ask for**, because `args=` makes `ps` read `/proc/<pid>/cmdline` *and* `/proc/<pid>/environ` per process, both of which take the target's `mmap_lock`. Route B would have removed the 12 ms fork and kept the `mmap_lock` exposure — optimizing the half that never blew a deadline. #862 predicted this as a hypothesis and it survived measurement, with `environ` as the part the hypothesis had not accounted for.
+
+**The Risks section's "cost of the poll" entry was right about the shape and wrong about the term.** It said "`getsid` per descendant is negligible next to it", which held — our own CPU is unmeasurable — but it located the cost in "a `ps -A` per second on a busy machine" generally, when the cost was one column of it. The distinction matters because it is what made a fix available that neither changed the cadence nor took Route B.
+
+**`ProcessInfo::argv` became `ProcessInfo::command_line: CommandLine`,** a three-way enum, and that is not cosmetic. Once the argv is read for only some rows, "no command line" has two meanings — *nothing needed it* and *we wanted it and it was gone* — and collapsing them into an empty `String` would silently match no shape. That is failure mode 1 (a total, silent false negative) arriving by accident rather than by another product's behaviour change, which is precisely the class this PRD exists to end. `NotSampled` reaching the cross-check is treated as not-a-match **and** logged, because it means the sampler and the classifier disagree about which pids need an argv.
+
+**One option was measured and declined, and it is the one that reads best on the mechanism.** Scoping the enumeration itself to pane descendants (`/proc/<pid>/task/<tid>/children`) never touches an unrelated process at all — but `proc_tid_children(5)` documents that interface as reliable *"only if all of the child processes are stopped or frozen"*, warns that *"exiting children may cause non-exiting children to be omitted from the list"*, and concludes *"most code should probably not use this interface"*. Against a live agent tree that churns MCP servers and Bash children, an omission is a silent false negative. It also buys nothing measurable once the argv column is deferred, and needs a second, macOS-native implementation. Recorded here rather than dropped, because a future reader looking at the mechanism will reach for it.
+
+**Nothing about the signal's semantics moved.** Same discriminator, same per-agent shape catalog, same `ShellBusy`/`ShellIdle` on the same wire, `PROTOCOL_VERSION` untouched at 7. `ProcessInfo` and `CommandLine` are in-process types that derive no `serde` impls and appear in no protocol module. The rule 12 answer is therefore **no** — see that section, which #862 did not change.
 
 ### 2026-08-06 — offered upstream as a curated port (Open Question 1 reversed)
 
