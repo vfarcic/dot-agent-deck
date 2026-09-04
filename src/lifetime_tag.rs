@@ -353,6 +353,13 @@ pub unsafe fn signal_tagged(needle: &[u8], signal: libc::c_int, self_pid: libc::
 /// Non-Linux stub: there is no `/proc/<pid>/environ` to read, so no escapee can
 /// be found and the caller falls back to signalling the process group alone —
 /// exactly what it did before this existed. See the module docs.
+///
+/// # Safety
+///
+/// None required: this arm signals nothing and reads nothing. `unsafe` is kept
+/// only so the signature matches the Linux one, where it is load-bearing — the
+/// caller is a `fork`ed reaper and must not be given a differently-shaped
+/// function to call depending on the target.
 #[cfg(all(unix, not(target_os = "linux")))]
 pub unsafe fn signal_tagged(_needle: &[u8], _signal: libc::c_int, _self_pid: libc::pid_t) -> usize {
     0
