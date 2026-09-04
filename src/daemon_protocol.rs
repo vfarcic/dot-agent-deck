@@ -732,6 +732,23 @@ pub struct AttachResponse {
     /// with is owed to the new REQUEST variant beside it, not to this.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kept_worktree: Option<crate::issue_dispatch_run::KeptWorktree>,
+    /// Issue #770: the orchestration ROLE registrations the daemon is holding
+    /// in memory, populated on the [`AttachRequest::ListAgents`] reply.
+    ///
+    /// `daemon stop` reads it as a second data-loss guard beside the
+    /// managed-agent one: those maps have no persistence path, so stopping the
+    /// daemon destroys them, and any agent that survives the restart can never
+    /// delegate again. Riding `ListAgents` rather than a new request is what
+    /// keeps this compatible in both directions — a daemon predating the field
+    /// omits it (`None`), and the client then applies exactly today's
+    /// agent-only guard; an older client ignores the extra key. Additive and
+    /// optional, so no [`PROTOCOL_VERSION`] bump.
+    ///
+    /// `Some(vec![])` and `None` are deliberately distinct: the first is a new
+    /// daemon reporting that it holds no roles, the second is a daemon that
+    /// cannot answer the question at all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub orchestration_roles: Option<Vec<crate::state::OrchestrationRoleRecord>>,
 }
 
 impl AttachResponse {
@@ -1520,7 +1537,15 @@ async fn handle_connection(
                         .map(|s| s.live_snapshot());
                 }
             }
-            write_resp(&mut stream, &AttachResponse::agent_records(records)).await?;
+            // Issue #770: report the orchestration role registrations whose pane
+            // still has a live agent, so `daemon stop` can refuse to destroy
+            // them. Read under its own short guard rather than inside the join
+            // loop above — it is one snapshot of the whole map, not a per-record
+            // lookup.
+            let orchestration_roles = state.read().await.live_orchestration_roles(&registry);
+            let mut resp = AttachResponse::agent_records(records);
+            resp.orchestration_roles = Some(orchestration_roles);
+            write_resp(&mut stream, &resp).await?;
         }
         AttachRequest::StartAgent {
             command,
@@ -3997,6 +4022,7 @@ mod tests {
             agent_id: Some("agent-745".into()),
             display_name: None,
             shell_synthetic_working: false,
+            orchestration_orphaned: false,
         };
         let snap = session.live_snapshot();
         assert_eq!(

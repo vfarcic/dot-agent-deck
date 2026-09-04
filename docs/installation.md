@@ -284,10 +284,13 @@ dot-agent-deck daemon stop
 
 - **Idempotent.** If no daemon is running, the command prints `no daemon running` and exits 0.
 - **Data-loss guard.** If managed agents are still alive, the command refuses with a list of agent IDs and exits non-zero — terminating the daemon would kill those agents. Detach the agents first (close their panes, or quit the TUI to detach the deck while keeping the agents running), or pass `--force`. Run [`daemon status`](#inspecting-the-local-daemon) first if you want to see what is running before you decide.
+- **Orchestration guard.** If the daemon is holding [orchestration](orchestration.md) roles whose panes still have a live agent, the command refuses with the pane id, role name and orchestration of each one, and exits non-zero. This is a *different* loss from the one above, and the reason it gets its own refusal: the daemon keeps its role registrations in memory only, so stopping it deletes them for good. An agent that survives the stop keeps running and keeps reporting its status — its card looks completely healthy — but its `dot-agent-deck delegate` is refused from then on with "the daemon holds no orchestration role for pane …", and there is no recovery short of re-dispatching the orchestration. Let the orchestration finish, or pass `--force` knowing that is what you are spending.
 - **Grace window.** Sends `SIGTERM` and polls for the socket to disappear for up to 5 seconds. With `--force`, escalates to `SIGKILL` after that window. A `SIGTERM` timeout without `--force` exits non-zero so you can re-run with `--force` consciously.
 
 ```bash
-# Force shutdown even when managed agents are running. This kills the agents.
+# Force shutdown even when managed agents or orchestration roles are live.
+# This kills the managed agents, and permanently strands any orchestration
+# whose agent survives.
 dot-agent-deck daemon stop --force
 ```
 

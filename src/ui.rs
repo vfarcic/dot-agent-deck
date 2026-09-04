@@ -19710,6 +19710,14 @@ fn render_session_card(
         crate::event::Writable::HistoryOnly => " history ",
         crate::event::Writable::None => " view-only ",
     };
+    // Issue #770: an ORPHANED orchestration role pane — one whose role
+    // registration a daemon restart destroyed while its agent survived. Every
+    // other signal on this card is honest and healthy (status updates keep
+    // arriving, the agent keeps working), and it is exactly that healthy look
+    // that made the failure cost hours to find: the pane simply cannot delegate
+    // any more, and nothing said so until someone tried. Marked in the TITLE so
+    // it is visible at every density, and spelled out in the body below.
+    let is_orphaned = session.orchestration_orphaned;
     // PRD #20 M5 / finding #9: the agent-type label carries its registry badge
     // colour so EVERY card exposes a coloured type badge (cross-agent: Claude /
     // OpenCode / Pi / Codex each get their registry colour). The rest of the
@@ -19735,6 +19743,14 @@ fn render_session_card(
         ];
         if !is_live {
             segs.push((liveness_marker.to_string(), text_dim()));
+        }
+        if is_orphaned {
+            segs.push((
+                " orphaned ".to_string(),
+                Style::default()
+                    .fg(palette::status_color(&SessionStatus::Error))
+                    .add_modifier(Modifier::BOLD),
+            ));
         }
         segs
     };
@@ -19830,6 +19846,18 @@ fn render_session_card(
             w.saturating_sub(dir_label_len),
         )),
     ]));
+
+    // Issue #770: say what the title badge means, in the one place a reader
+    // looks when a card stops behaving. Placed directly under `Dir:` so it
+    // survives every density, and ahead of the prompt/tool rows because it is
+    // the fact that explains why those rows keep advancing while the run has in
+    // fact stalled.
+    if is_orphaned {
+        lines.push(Line::from(Span::styled(
+            truncate_with_ellipsis("Orphaned — delegation unavailable", w),
+            Style::default().fg(palette::status_color(&SessionStatus::Error)),
+        )));
+    }
 
     if is_placeholder {
         lines.push(Line::from(Span::styled(
@@ -20649,6 +20677,7 @@ pub fn render_orchestration_frame_to_buffer(
                 agent_id: None,
                 display_name: None,
                 shell_synthetic_working: false,
+                orchestration_orphaned: false,
             },
         );
         // Two different maps: the sidebar card reads `display_names` (keyed by
@@ -26281,6 +26310,7 @@ mod tests {
             agent_id: None,
             display_name: None,
             shell_synthetic_working: false,
+            orchestration_orphaned: false,
         };
 
         let lines = recent_tool_lines(&session, 3);
@@ -28797,6 +28827,7 @@ mod tests {
             agent_id: None,
             display_name: None,
             shell_synthetic_working: false,
+            orchestration_orphaned: false,
         };
         let s0 = make("s0", "p0");
         let s1 = make("s1", "p1");
@@ -29729,6 +29760,7 @@ mod tests {
             agent_id: None,
             display_name: None,
             shell_synthetic_working: false,
+            orchestration_orphaned: false,
         }
     }
 
@@ -30076,6 +30108,7 @@ mod tests {
             agent_id: None,
             display_name: None,
             shell_synthetic_working: false,
+            orchestration_orphaned: false,
         };
 
         // Spacious: get all 3
@@ -30111,6 +30144,7 @@ mod tests {
             agent_id: None,
             display_name: None,
             shell_synthetic_working: false,
+            orchestration_orphaned: false,
         };
 
         let prompts = collect_recent_prompts(&session, 3);
@@ -30137,6 +30171,7 @@ mod tests {
             agent_id: None,
             display_name: None,
             shell_synthetic_working: false,
+            orchestration_orphaned: false,
         };
 
         let prompts = collect_recent_prompts(&session, 3);
