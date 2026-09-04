@@ -378,7 +378,7 @@ So this document is **M1 + M3**. It has no external dependency, and M3 is discha
 - [x] **M7 — The regression tripwire.** A `xtask/linkage-check` rule over `desktop/src-tauri/src/`, parsing Rust rather than matching substrings, with an allowlist and the bypass-shaped tests named above, plus its own runtime tests per rule 5's note that linkage-check's assertions are runtime-only. **Documented as a tripwire and not as a security boundary**, with the residual named.
 - [x] **M8 — Docs and changelog.** `docs/develop/desktop-gui.md` gets M1's ownership table, the new launch flow, the resolve bounds, the disclosure split and the empty states. Changelog fragment via the `dot-ai-changelog-fragment` skill.
 - [x] **M11 — The post-merge audit's two daemon-side P1s.** The preparation token binds the state its preparation approved and every spawn presenting it re-validates that state; the publish refuses an existing group- or world-writable `.dot-agent-deck`; and `PrepareWorkflow` is refused, and withheld from `DAEMON_CAPABILITIES`, on platforms where the owner-only guarantee cannot be delivered. Both false claims corrected in this document rather than in a commit message alone — see [What the token binds](#what-the-token-binds-and-what-the-original-design-bound-instead) and [Where the publish's owner-only promise actually holds](#where-the-publishs-owner-only-promise-actually-holds). Numbered after M8 because it is audit remediation of already-merged work rather than a step that was planned; M9 and M10 remain the outstanding manual milestones and are unaffected.
-- [ ] **M9 — Rule 12 cross-version manual test.** Run with the eleven-variable sandbox and the sequence above; record the `Attach protocol listening` count, the daemon pid and the build id in the Work Log as evidence the run reached the real scenario.
+- [x] **M9 — Rule 12 cross-version manual test.** Run with the eleven-variable sandbox and the sequence above; record the `Attach protocol listening` count, the daemon pid and the build id in the Work Log as evidence the run reached the real scenario.
 
 ### Iteration 2 — remote proven
 
@@ -504,3 +504,67 @@ The recommended closing fix from the entry above, taken immediately. The reasoni
 **`verify_prepared_launch_peer` was deleted.** With the verb it catches nothing the verb does not, and the enumeration is short because a token store is per-process: any daemon that check would have rejected is by construction not the process that issued the token, so it either lacks the variant (refused at the decode) or does not recognise the token (refused as `stale-token`) — and both refusals arrive before anything spawns. What it cost to keep was worse than a handshake per role — its whole doc comment described a residual that no longer exists, and a redundant gate documented as load-bearing is read as a safety property by whoever arrives next.
 
 **Tests, and how each was verified by removing its fix.** `a_prepared_start_is_a_distinct_op_an_older_daemon_refuses_closed` models the older daemon literally, deserializing the request into a `PreVerbAttachRequest` — this build's enum without the variant — which is what such a daemon's decode does; it also shows the *contrast*, that the same token on `start-agent` decodes cleanly there, which is the fail-open in one line. Making `prep_token` `#[serde(default)]` fails it. `start_agent_is_unchanged_without_a_token_and_refuses_one_spelled_on_it` pins both halves of the unchanged verb, including that a JSON `null` stays absent; neutralising the wrong-verb guard fails it. `the_client_routes_a_presented_token_onto_the_prepared_verb` reads which op the client chose *through the daemon's answer* — an unknown token is `stale-token` on the prepared verb and `wrong-start-verb` on `start-agent` — and reverting `start_agent_with_prep_token` to the key-injection shape fails it. `a_prepared_start_refuses_an_unknown_token_and_spawns_on_a_live_one` and `a_prepared_start_refuses_a_token_whose_prepared_context_was_replaced` pin the staleness wiring through the new verb and both fail when the binding check is neutralised; the five binding causes themselves stay in `tests/prep_binding.rs` and are not duplicated over the socket. On the desktop, `a_daemon_without_the_prepared_verb_fails_the_launch_closed` names the scenario at the layer a user meets it — a refusal on the *first* role, so nothing starts and there is nothing to roll back — and is honestly labelled non-discriminating in its own doc comment, because the `WorkflowDaemon` trait hides the op and the test would have passed before the verb existed with a different scripted string.
+
+### 2026-09-04 — M9: the rule 12 cross-version manual test, RUN and passed
+
+**Result.** Branch head `094fe0e` was paired against tag **v0.39.2** (`364a182`) — two real builds of two different commits, with no `DOT_AGENT_DECK_BUILD_ID_OVERRIDE` and no `DOT_AGENT_DECK_TEST_OMIT_RUNNING_AGENTS` anywhere. Build ids `0.39.2-g364a182` (daemon) and `0.39.2-g094fe0e` (branch TUI); note both report `--version 0.39.2`, since `git describe --tags --abbrev=0` resolves to the same tag on the branch, so the **build id** is the only thing that distinguishes them and it is what the PRD #103 handshake compares.
+
+**All three tells hold.** Exactly **one** `Attach protocol listening` line in `$DOT_AGENT_DECK_LOG` for the whole run (`2026-09-04T08:19:11.639098Z … Attach protocol listening on <sandbox>/attach.sock`). One daemon pid — **107642**, started 08:19:11, `readlink /proc/107642/exe` = the v0.39.2 binary — and one daemon build id serving it end to end. And **both `server_version` values measured rather than inferred**: a read-only raw `Hello` frame written straight to the live attach socket as a v9 client returned
+
+```
+{"ok":true,"server_version":8,"build_version":"0.39.2-g364a182",
+ "running_agents":{"count":2,"names":["orchestrator","coder"]},
+ "daemon_version":"0.39.2","guarded_send":true}
+```
+
+so the daemon side is **8** off the wire, while the branch binary's own `daemon hello` reports **9**. Unlike the #745 run, this one is a genuine **wire-shape** pairing (8 vs 9), not semantics behind a stable wire — which is exactly the case the TUI's missing local-attach version gate (issue #405) lets happen.
+
+**Two further facts fell out of that same reply, both worth keeping.** The v8 daemon omits the `capabilities` key entirely, which is the absence case M5's fail-safe helper is built for — observed live rather than only in the env-var test. And the v9 daemon in the replacement sandbox advertised `["list-projects","resolve-project","prepare-workflow","start-prepared-agent"]`, so the field is populated on the side that has it.
+
+**What it exercised.** The branch TUI showed the build-mismatch prompt and **named both live agents**:
+
+```
+⚠  Daemon version mismatch  (2 agent(s) running)
+   running daemon:  0.39.2-g364a182
+   this binary:     0.39.2-g094fe0e
+   Restarting to upgrade will stop these agents:
+   orchestrator
+   coder
+   [S] restart daemon and continue   [any other key] keep current daemon
+```
+
+Declining attached the branch TUI to the v0.39.2 daemon with the orchestration tab rebuilt, both role cards live and the orchestrator pane's scrollback intact. Under that pairing:
+
+- **Delegate routed.** `dot-agent-deck delegate --to coder` run from the **branch** binary with the orchestrator pane's identity was received by the v8 daemon (`Received delegate signal pane_id=1 targets=["coder"]`), which respawned the worker (`new_agent_id=3`), wrote `.dot-agent-deck/worker-task-coder.md` carrying the sentinel, and delivered `Read .dot-agent-deck/worker-task-coder.md for your task.` into the worker's PTY.
+- **`work-done` round-tripped.** `Received work-done signal pane_id=2`, the delegation was retired and its idle watch cancelled, and `Worker coder has completed their task. Read .dot-agent-deck/work-done-coder.md for their full report.` landed in the orchestrator pane; the report file carried the sentinel.
+- **Status hooks repainted the card**, and were done **last** per rule 12: `agent-event --type running` → `Thinking`, `waiting` → `WaitingForInput`, `finished` → `Idle`, each read back through `daemon status`. The ordering note is not theoretical — after the first `running` the coder card's agent type flipped to `Pi`, exactly the reclassification rule 12 warns about.
+- A read-path control also held: `daemon status` from the **branch** binary against the v8 daemon returned the same table as the v0.39.2 binary did.
+
+**Nothing behaved differently from same-version.** The prediction the task carried — that the TUI never calls the new verbs, so it exercises only the pre-existing wire — is **confirmed**, and no delegate or hook silently stopped. No reclassification of the change is required on this evidence.
+
+#### The replacement-during-prepare scenario the audit asked for
+
+Rule 12 does not require this one; the security audit of this branch does. Staged over the attach socket in a second sandbox with a raw frame client, because driving it through the UI is not reliably observable.
+
+| replacement daemon | answer to `StartPreparedAgent` | spawned? |
+| --- | --- | --- |
+| **v0.39.2** (v8) | `ok:false` — ``malformed request: unknown variant `start-prepared-agent`, expected one of `list-agents`, `start-agent`, …`` | nothing; `no managed agents` |
+| **branch** (v9, fresh process) | `ok:false` — `stale-token: that preparation is unknown or has expired; prepare the workflow again` | nothing; `no managed agents` |
+
+Both fail **closed**, and both refusals are structured `ok:false` replies rather than a hang, a dropped connection or a partial launch — the older daemon refuses at the *decode*, which is the property `094fe0e` was written to produce. The same-version case is `stale-token` because the token store is per-process, as the design says.
+
+**A positive control was run so that "fails closed" is not trivially true.** A token issued by the **live** daemon and presented to that same process returned `{"ok":true,"id":"1"}` and did spawn the role. So the verb works when the token identifies a live preparation, and the two refusals above are genuine fail-closed behaviour rather than a verb that never succeeds.
+
+#### Limits, stated rather than glossed
+
+- **The roles were stand-ins, not real agents.** Each ran a small `bash` reader that logs whatever is delivered to its PTY, and the `delegate` / `work-done` / `agent-event` calls were made from the CLI with the relevant pane's identity. That proves delegate routing, hook delivery and card repaint survive the pairing; per CLAUDE.md rule 4 it does **not** prove a real agent does.
+- One consequence is visible in the log and is an artifact of the stand-in, not a cross-version defect: the worker emits no `SessionStart` hook, so the daemon waited its 30s, took the documented fallback path, and separately fired the silent-worker report into the orchestrator. Both behaved correctly.
+- **The desktop leg is not covered here.** The desktop refuses a mismatched daemon at the handshake by exact equality, so this pairing is unreachable for it by construction; M10 covers the remote desktop case.
+
+#### The sandbox, kept so a re-run can follow it
+
+All eleven variables from *Cross-version safety* were exported for **every** process, and verified as having landed by reading `/proc/<daemon>/environ` rather than assumed. `DOT_AGENT_DECK_IDLE_SHUTDOWN_SECS=0` was confirmed to have parsed (an unparseable value silently falls back to 30). Two additions worth carrying: `XDG_CONFIG_HOME` and `DOT_AGENT_DECK_CONFIG`, since `config_dir()` is `home_dir()/.config/dot-agent-deck` and the saved-session and config paths derive from it. `RUST_LOG` was set to **`dot_agent_deck=debug`** rather than a module list, and that is load-bearing for the evidence: `Attach protocol listening` has three emitters across `daemon.rs` and `daemon_protocol.rs`, so a narrower filter can drop one and turn a two-daemon run into a false count of one.
+
+The v0.39.2 binary was built in a **disk-backed** git worktree per rule 14, never on the agent scratchpad.
+
+**Both false-green traps were avoided, and the first attempt was discarded rather than reported.** In that attempt the stand-in agents were killed by a `Ctrl+C` intended for the TUI — the key went to the focused *pane*, since the deck was in `TYPING` mode — which would have left the branch TUI facing a zero-agent daemon and produced exactly trap 1's silent same-version test. The stand-in now traps `SIGINT` so a stray interrupt cannot quietly empty the daemon, and the run was restarted from a clean sandbox. Worth recording for the next person: the deck's quit gesture is `Ctrl+D` to leave the pane **first**, then quit from `COMMAND` mode; a `Ctrl+C` sent while the footer reads `TYPING` reaches the agent instead.
