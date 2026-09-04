@@ -445,6 +445,18 @@ Do NOT send `DONE: merged & closed`. This run stops before merge, so that
 message would be false. Then append one line to .dot-agent-deck/notify-log.md
 (gitignored; create it if missing) exactly as that block describes.
 
+GREPTILE'S FINDINGS ARE PART OF THE JOB, NOT PART OF THE MERGE. Greptile
+reviews once, a few minutes after the PR opens, and never again —
+greptile.json sets triggerOnUpdates: false, so do NOT wait for a re-review
+after you push fixes. Its findings live ONLY at
+`gh api repos/<owner>/<repo>/pulls/<pr>/comments`; the green `Greptile Review`
+check and the summary comment carry none of them. Fetch that endpoint once the
+check-run completes and reply on each thread — what you fixed, or why you did
+not — BEFORE you notify and stop. Do not defer it to the merge: this run stops
+before merge, and an armed auto-merge PR lands the moment the approval arrives,
+so a finding left for "before merging" is read by nobody. Measured on PR #869:
+five findings, two P1, unanswered through 3h45m of further commits.
+
 STOP CONDITION: open the PR, request review from the other maintainer with
 `gh pr create --reviewer <OTHER>`, and STOP. Do not merge. Per CLAUDE.md rule 8
 nobody merges their own unapproved PR, and for an admin account that would
