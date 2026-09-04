@@ -1980,8 +1980,9 @@ async fn run_daemon_status_cli(json: bool) -> ExitCode {
 /// `dot-agent-deck daemon stop [--force]` — PRD #103 Phase 3 (M3.2).
 /// Documented, non-`kill -9` way to recycle the local daemon after a
 /// binary upgrade. Idempotent (no-op exit 0 when no daemon is running)
-/// and safe-by-default (refuses when managed agents are alive unless
-/// `--force` is passed). The recovery flow is in
+/// and safe-by-default (refuses when managed agents are alive, or when the
+/// daemon holds live orchestration roles — issue #770 — unless `--force` is
+/// passed). The recovery flow is in
 /// [`dot_agent_deck::daemon_stop::run_daemon_stop`]; this function
 /// only translates outcomes into stdout/stderr text and exit codes.
 #[tokio::main]
@@ -1999,6 +2000,13 @@ async fn run_daemon_stop_cli(force: bool) -> ExitCode {
         Ok(dot_agent_deck::daemon_stop::StopOutcome::ForceKilled { pid }) => {
             println!("daemon force-killed via SIGKILL (pid {pid})");
             ExitCode::SUCCESS
+        }
+        Err(dot_agent_deck::daemon_stop::StopError::LiveOrchestrations { roles }) => {
+            eprint!(
+                "{}",
+                dot_agent_deck::daemon_stop::format_live_orchestrations_refusal(&roles)
+            );
+            ExitCode::FAILURE
         }
         Err(dot_agent_deck::daemon_stop::StopError::LiveAgents { ids }) => {
             eprint!(
@@ -2035,6 +2043,13 @@ async fn run_daemon_restart_cli(force: bool) -> ExitCode {
                 "daemon force-killed via SIGKILL (pid {pid}); next invocation will spawn a fresh daemon"
             );
             ExitCode::SUCCESS
+        }
+        Err(dot_agent_deck::daemon_stop::StopError::LiveOrchestrations { roles }) => {
+            eprint!(
+                "{}",
+                dot_agent_deck::daemon_stop::format_live_orchestrations_refusal(&roles)
+            );
+            ExitCode::FAILURE
         }
         Err(dot_agent_deck::daemon_stop::StopError::LiveAgents { ids }) => {
             eprint!(

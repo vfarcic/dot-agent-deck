@@ -447,6 +447,35 @@ pub const DISPLAY_NAME_METADATA_KEY: &str = "display_name";
 /// notice this replaced, kept because the text still reaches a human.
 pub const DELIVERY_NOTICE_METADATA_KEY: &str = "delivery_notice";
 
+/// `AgentEvent.metadata` key carrying a DAEMON-AUTHORED report that the pane
+/// this event came from is an ORPHANED orchestration role pane (issue #770) —
+/// a role pane the daemon spawned in a previous life, whose agent survived the
+/// daemon restart that destroyed the in-memory role maps. Such a pane can no
+/// longer delegate: [`crate::state::AppState::handle_delegate`] refuses it with
+/// "the daemon holds no orchestration role for pane …". Every other signal
+/// about it stays healthy — its hook events are still accepted and its card
+/// still updates — so without this marker the failure surfaces only at the next
+/// delegate, which for an orchestrator can be hours into a run.
+///
+/// Only [`crate::daemon`] sets it, in `ingest_event`, from
+/// [`crate::state::AppState::is_orphaned_orchestration_pane`]. It is
+/// **daemon-authoritative**: `ingest_event` REMOVES any incoming value before
+/// deciding, so a hook payload cannot paint its own card orphaned (or, worse,
+/// paint over a real one). The same-uid hook socket is unauthenticated, which
+/// is the standing reason a producer-writable marker cannot be trusted — see
+/// [`SESSION_START_ORIGIN_METADATA_KEY`].
+///
+/// Consumers that don't know the key ignore it (the documented `metadata`
+/// contract), so this needs no protocol change: the value rides the same
+/// free-form map [`DISPLAY_NAME_METADATA_KEY`] and
+/// [`DELIVERY_NOTICE_METADATA_KEY`] already use.
+pub const ORCHESTRATION_ORPHANED_METADATA_KEY: &str = "orchestration_orphaned";
+
+/// The [`ORCHESTRATION_ORPHANED_METADATA_KEY`] value meaning "yes". The key's
+/// presence is what carries the meaning; the value is fixed so the marker never
+/// becomes a channel for text the daemon did not author.
+pub const ORCHESTRATION_ORPHANED_METADATA_VALUE: &str = "1";
+
 /// `AgentEvent.metadata` key declaring WHERE a `SessionStart` came from (PRD
 /// #225 M3). The wrapper adapter is the only INTENDED producer, with one of the
 /// three values [`WRAPPER_FORK_SESSION_START_ORIGIN`] /
@@ -769,6 +798,16 @@ impl AgentEvent {
         self.metadata
             .get(SESSION_START_ORIGIN_METADATA_KEY)
             .is_some_and(|origin| origin == WRAPPER_FORK_SESSION_START_ORIGIN)
+    }
+
+    /// Issue #770: does this event carry the daemon's ORPHANED-ROLE marker (see
+    /// [`ORCHESTRATION_ORPHANED_METADATA_KEY`])? `false` for every event
+    /// without it, which is every event an older daemon relays and every event
+    /// from a pane whose orchestration role the daemon still holds.
+    pub fn is_orchestration_orphaned(&self) -> bool {
+        self.metadata
+            .get(ORCHESTRATION_ORPHANED_METADATA_KEY)
+            .is_some_and(|v| v == ORCHESTRATION_ORPHANED_METADATA_VALUE)
     }
 
     /// Issue #243: does this event carry the wrapper's INTERFACE-READY origin

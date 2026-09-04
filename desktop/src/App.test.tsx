@@ -2,6 +2,7 @@ import { fireEvent, render, screen, waitFor, within } from "@testing-library/rea
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createFixtureSnapshot } from "./data/fixture";
 import { WINDOWS_WORKFLOW_BLOCK_REASON } from "./lib/platform";
+import { DEFAULT_DESKTOP_SETTINGS, type DesktopSettingsDto } from "./lib/bridge";
 import type { DeckRuntimeState } from "./types";
 
 vi.mock("./components/TerminalViewport", () => ({
@@ -9,8 +10,28 @@ vi.mock("./components/TerminalViewport", () => ({
 }));
 
 import { ControlDeck } from "./App";
+import { SETTINGS_SECTIONS } from "./lib/settingsRegistry";
+
+/**
+ * A settings store with the shape the real bridges have: `getSettings` answers
+ * with the document AND where it lives, `saveSettings` echoes what it wrote.
+ * Backed by a plain object so a remount reads back what an earlier render
+ * saved, which is what makes the persistence assertions mean anything.
+ */
+function settingsStore(initial?: Partial<DesktopSettingsDto>, path?: string) {
+  let document: DesktopSettingsDto = { ...DEFAULT_DESKTOP_SETTINGS, ...initial };
+  return {
+    get current() { return document; },
+    getSettings: vi.fn(async () => ({ settings: structuredClone(document), path })),
+    saveSettings: vi.fn(async (next: DesktopSettingsDto) => {
+      document = structuredClone(next);
+      return structuredClone(document);
+    }),
+  };
+}
 
 function runtime(overrides: Partial<DeckRuntimeState> = {}): DeckRuntimeState {
+  const settings = settingsStore();
   return {
     mode: "fixture",
     snapshot: createFixtureSnapshot("connected"),
@@ -20,6 +41,8 @@ function runtime(overrides: Partial<DeckRuntimeState> = {}): DeckRuntimeState {
     resizeTerminal: vi.fn(async () => undefined),
     setShownTerminals: vi.fn(async () => undefined),
     reconnect: vi.fn(async () => undefined),
+    getSettings: settings.getSettings,
+    saveSettings: settings.saveSettings,
     ...overrides,
   };
 }
@@ -39,7 +62,13 @@ describe("ControlDeck", () => {
     })));
   });
 
-  afterEach(() => vi.unstubAllGlobals());
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    // The appearance override lives on the document root, which persists
+    // across renders in one jsdom, so a test that sets it would otherwise
+    // theme every test after it.
+    document.documentElement.removeAttribute("data-theme");
+  });
 
   it("renders the deterministic four-agent cockpit with evidence and stable test seams", () => {
     render(<ControlDeck runtime={runtime()} />);
@@ -414,6 +443,150 @@ describe("ControlDeck", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Evidence" }));
     expect(screen.getByTestId("evidence-drawer")).toBeVisible();
+  });
+
+  // ── The settings surface (PRD #803 M3) and the appearance override (#743 M4)
+
+  it("opens settings from the rail button and from the command palette, and closes three ways", async () => {
+    const { unmount } = render(<ControlDeck runtime={runtime()} />);
+
+    // The rail button was a toast stub with no `active` and no test seam; it is
+    // a real overlay now, and the sixth one.
+    expect(screen.queryByTestId("settings-panel")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("open-settings"));
+    expect(screen.getByTestId("settings-panel")).toBeVisible();
+    expect(screen.getByTestId("open-settings")).toHaveAttribute("aria-current", "page");
+    expect(screen.getByRole("dialog", { name: "Settings" })).toHaveAttribute("aria-modal", "true");
+
+    // Escape, through the single handler that closes every overlay.
+    fireEvent.keyDown(document.body, { key: "Escape" });
+    await waitFor(() => expect(screen.queryByTestId("settings-panel")).not.toBeInTheDocument());
+
+    // The backdrop, but not the sheet itself — a mousedown inside must not close.
+    fireEvent.click(screen.getByTestId("open-settings"));
+    fireEvent.mouseDown(screen.getByTestId("settings-panel"));
+    expect(screen.getByTestId("settings-panel")).toBeVisible();
+    fireEvent.mouseDown(screen.getByTestId("settings-panel").parentElement as HTMLElement);
+    await waitFor(() => expect(screen.queryByTestId("settings-panel")).not.toBeInTheDocument());
+
+    // And the command palette.
+    fireEvent.keyDown(document.body, { key: "k", metaKey: true });
+    fireEvent.click(screen.getByRole("button", { name: /Open settings/ }));
+    expect(screen.getByTestId("settings-panel")).toBeVisible();
+
+    // The close button.
+    fireEvent.click(screen.getByRole("button", { name: "Close settings" }));
+    await waitFor(() => expect(screen.queryByTestId("settings-panel")).not.toBeInTheDocument());
+    unmount();
+  });
+
+  it("renders the registry's active section, with no column while there is only one", () => {
+    render(<ControlDeck runtime={runtime()} />);
+    fireEvent.click(screen.getByTestId("open-settings"));
+
+    // The registry drives what is rendered, and today it holds one row, so the
+    // section column is dropped and the panel takes the whole sheet. The
+    // column's own two states are pinned with stub sections in
+    // `components/SettingsSheet.test.tsx`; what matters here is that the real
+    // registry reaches the real sheet.
+    expect(SETTINGS_SECTIONS).toHaveLength(1);
+    expect(screen.getByTestId("settings-layout")).toHaveClass("is-single");
+    expect(screen.queryByRole("navigation", { name: "Settings sections" })).not.toBeInTheDocument();
+
+    expect(screen.getByTestId(`settings-panel-${SETTINGS_SECTIONS[0].id}`)).toBeVisible();
+    expect(screen.getByRole("group", { name: "Appearance" })).toBeVisible();
+
+    // One row of chrome, then the setting (PRD #803, and the heading rule in
+    // `docs/develop/desktop-gui.md`). The sheet carries exactly one heading —
+    // its own title — and the panel carries none: the row's legend is already
+    // its visible label AND its accessible group name, which is what the
+    // assertion above rides on, so a heading over it was the word "Appearance"
+    // on screen twice. There are no eyebrows left on the surface either.
+    const sheet = screen.getByTestId("settings-panel");
+    expect(within(sheet).getAllByRole("heading").map((h) => h.textContent)).toEqual(["Settings"]);
+    expect(within(screen.getByTestId(`settings-panel-${SETTINGS_SECTIONS[0].id}`)).queryByRole("heading")).not.toBeInTheDocument();
+    expect(sheet.querySelectorAll(".eyebrow, .form-heading")).toHaveLength(0);
+  });
+
+  it("applies each appearance choice to the document root, and System CLEARS the attribute", async () => {
+    const store = settingsStore();
+    render(<ControlDeck runtime={runtime({ getSettings: store.getSettings, saveSettings: store.saveSettings })} />);
+    fireEvent.click(screen.getByTestId("open-settings"));
+
+    // System is the default, and it must leave no attribute at all — there is
+    // no [data-theme="system"] block, so writing one would match neither dark
+    // rule and pin the app to light.
+    await waitFor(() => expect(screen.getByRole("radio", { name: /System/ })).toBeChecked());
+    expect(document.documentElement.hasAttribute("data-theme")).toBe(false);
+
+    fireEvent.click(screen.getByRole("radio", { name: /Dark/ }));
+    await waitFor(() => expect(document.documentElement.getAttribute("data-theme")).toBe("dark"));
+
+    fireEvent.click(screen.getByRole("radio", { name: /Light/ }));
+    await waitFor(() => expect(document.documentElement.getAttribute("data-theme")).toBe("light"));
+
+    // Back to System: the attribute is REMOVED, not set to "system".
+    fireEvent.click(screen.getByRole("radio", { name: /System/ }));
+    await waitFor(() => expect(document.documentElement.hasAttribute("data-theme")).toBe(false));
+    expect(store.current.appearance.mode).toBe("system");
+  });
+
+  it("round-trips the appearance choice through the bridge and restores it on a remount", async () => {
+    const store = settingsStore();
+    const first = render(<ControlDeck runtime={runtime({ getSettings: store.getSettings, saveSettings: store.saveSettings })} />);
+
+    fireEvent.click(screen.getByTestId("open-settings"));
+    fireEvent.click(screen.getByRole("radio", { name: /Dark/ }));
+    await waitFor(() => expect(store.saveSettings).toHaveBeenCalled());
+
+    // The whole document crosses the bridge, so a save can never drop a section
+    // this build's UI has not loaded.
+    expect(store.saveSettings).toHaveBeenCalledWith({ version: 1, appearance: { mode: "dark" } });
+    expect(store.current.appearance.mode).toBe("dark");
+
+    first.unmount();
+    document.documentElement.removeAttribute("data-theme");
+
+    // A fresh mount reads the stored choice and applies it without the sheet
+    // ever being opened — the "applied on load, not only on change" property.
+    render(<ControlDeck runtime={runtime({ getSettings: store.getSettings, saveSettings: store.saveSettings })} />);
+    await waitFor(() => expect(document.documentElement.getAttribute("data-theme")).toBe("dark"));
+    fireEvent.click(screen.getByTestId("open-settings"));
+    await waitFor(() => expect(screen.getByRole("radio", { name: /Dark/ })).toBeChecked());
+  });
+
+  it("names the settings file in live mode and admits there is none in the fixture preview", async () => {
+    const live = settingsStore(undefined, "/home/dev/.config/dot-agent-deck/desktop.toml");
+    const { unmount } = render(<ControlDeck runtime={runtime({ mode: "live", getSettings: live.getSettings, saveSettings: live.saveSettings })} />);
+    fireEvent.click(screen.getByTestId("open-settings"));
+    await waitFor(() => expect(screen.getByTestId("settings-location"))
+      .toHaveTextContent("/home/dev/.config/dot-agent-deck/desktop.toml"));
+    unmount();
+
+    // The browser preview has no filesystem at all, so it must say so rather
+    // than print a plausible-looking path for a file that does not exist.
+    const preview = settingsStore();
+    render(<ControlDeck runtime={runtime({ mode: "fixture", getSettings: preview.getSettings, saveSettings: preview.saveSettings })} />);
+    fireEvent.click(screen.getByTestId("open-settings"));
+    const location = await screen.findByTestId("settings-location");
+    expect(location).toHaveTextContent(/local storage/i);
+    expect(location.textContent).not.toMatch(/desktop\.toml/);
+  });
+
+  it("keeps a failed save visible and applied rather than silently reverting it", async () => {
+    const store = settingsStore();
+    store.saveSettings.mockRejectedValueOnce(new Error("Permission denied"));
+    render(<ControlDeck runtime={runtime({ getSettings: store.getSettings, saveSettings: store.saveSettings })} />);
+
+    fireEvent.click(screen.getByTestId("open-settings"));
+    fireEvent.click(screen.getByRole("radio", { name: /Dark/ }));
+
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent("Permission denied");
+    expect(alert).toHaveTextContent(/will not survive a restart/);
+    // Applied anyway: the user asked for it and can see it.
+    expect(document.documentElement.getAttribute("data-theme")).toBe("dark");
+    expect(screen.getByRole("radio", { name: /Dark/ })).toBeChecked();
   });
 
   /**

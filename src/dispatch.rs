@@ -5,7 +5,7 @@ use crate::agent_pty::AgentPtyRegistry;
 use crate::event::BroadcastMsg;
 use crate::issue_dispatch_run::{
     RemovalPolicy, WorktreeCreation, WorktreeRegistry, create_worktree, record_worktree,
-    remove_worktree, run_status,
+    remove_worktree, run_capture_args, run_status,
 };
 use crate::scheduler::StderrNotifier;
 use crate::spawn::{SpawnKind, SpawnRequest, SpawnShapeOverride, spawn};
@@ -233,6 +233,43 @@ fn derive_dispatch_paths(working_dir: &Path, name: &str) -> DispatchPaths {
     }
 }
 
+/// Human-readable description of the commit a dispatch is about to cut its
+/// worktree from — `"main at c701932"`, or `"detached HEAD at c701932"`.
+///
+/// Issue #674: `dispatch` takes no base or branch option. [`create_worktree`]
+/// runs `git worktree add <dir> -b <branch>` with no start-point, which git
+/// resolves to the CALLER's `HEAD`, so the freshness of the caller's checkout is
+/// the only thing deciding where a unit starts — and nothing in the dispatch
+/// output named it. A stale or simply unexpected base (a feature branch the user
+/// happened to be standing on) was therefore invisible at the one moment the
+/// user is looking: three units cut from a `main` six commits behind
+/// `origin/main` reported exactly the same success line as three cut from a
+/// current one.
+///
+/// Deliberately best-effort and `Option`: this is a reporting nicety on a path
+/// that has already done the real work, so a probe that fails must drop the
+/// clause rather than fail the dispatch. Read BEFORE the worktree is created,
+/// which is the state `git worktree add` will actually resolve.
+async fn describe_dispatch_base(clone_dir: &Path) -> Option<String> {
+    let clone = clone_dir.to_string_lossy();
+    let head = run_capture_args("git", &["-C", &clone, "rev-parse", "--abbrev-ref", "HEAD"])
+        .await
+        .ok()?;
+    let sha = run_capture_args("git", &["-C", &clone, "rev-parse", "--short", "HEAD"])
+        .await
+        .ok()?;
+    let (head, sha) = (head.trim(), sha.trim());
+    if head.is_empty() || sha.is_empty() {
+        return None;
+    }
+    // `rev-parse --abbrev-ref HEAD` answers the literal string `HEAD` when the
+    // checkout is detached, which as a branch name would read as a lie.
+    if head == "HEAD" {
+        return Some(format!("detached HEAD at {sha}"));
+    }
+    Some(format!("{head} at {sha}"))
+}
+
 pub struct DispatchResult {
     pub worktree_dir: PathBuf,
     pub success: bool,
@@ -328,6 +365,11 @@ pub async fn handle_dispatch(
             };
         }
     };
+
+    // Captured before the worktree exists, so it names the state `git worktree
+    // add` resolves its (absent) start-point against. See
+    // [`describe_dispatch_base`] for why this is reported at all.
+    let base = describe_dispatch_base(&clone_dir).await;
 
     match create_worktree(
         &clone_dir,
@@ -425,8 +467,12 @@ pub async fn handle_dispatch(
             // #220 M1.1). Hardcoding either word makes this message a lie in the
             // other case — and it is written straight into the caller's pane, so
             // the dispatching agent repeats it to the user verbatim.
+            //
+            // The base clause is appended rather than interpolated into both
+            // arms so a failed probe degrades to the pre-#674 sentence exactly,
+            // instead of leaving a dangling "cut from ".
             message: {
-                let mut msg = match &handle.kind {
+                let opened = match &handle.kind {
                     SpawnKind::Orchestration { name: orch } => format!(
                         "dispatch: spawned isolated orchestration '{orch}' for '{name}' in {}",
                         paths.worktree_dir.display()
@@ -435,6 +481,10 @@ pub async fn handle_dispatch(
                         "dispatch: spawned isolated agent for '{name}' in {}",
                         paths.worktree_dir.display()
                     ),
+                };
+                let mut msg = match &base {
+                    Some(base) => format!("{opened}, cut from {base}"),
+                    None => opened,
                 };
                 // Only for an orchestration: a `--single` dispatch consulted no
                 // default, so a note about which one it would have picked is
@@ -626,6 +676,83 @@ mod tests {
             .expect("git available")
             .status
             .success()
+    }
+
+    /// Run a git command in `repo`, asserting it succeeded.
+    fn git_in(repo: &Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(repo)
+            .output()
+            .expect("git available");
+        assert!(out.status.success(), "git {args:?} failed: {out:?}");
+    }
+
+    // --- the base a dispatch reports (issue #674) ---
+
+    /// Issue #674: `dispatch` cuts every unit from the caller's `HEAD` and used
+    /// to say nothing about it, so a unit started from a stale or unexpected
+    /// branch produced exactly the same success line as one started from a
+    /// current one. The reported base must name the branch the caller was
+    /// standing on and the commit it resolved to.
+    ///
+    /// The branch is created explicitly rather than relying on whatever `git
+    /// init` produced: `init.defaultBranch` is ambient user configuration, so
+    /// asserting on `main` would pass or fail with the machine.
+    #[tokio::test]
+    async fn dispatch_base_names_the_branch_and_commit_it_was_cut_from() {
+        let tmp = crate::test_temp::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        init_repo(&repo);
+        git_in(&repo, &["checkout", "-q", "-b", "feature-x"]);
+
+        let base = describe_dispatch_base(&repo)
+            .await
+            .expect("a healthy repo must yield a base");
+
+        let sha = String::from_utf8(
+            std::process::Command::new("git")
+                .args(["rev-parse", "--short", "HEAD"])
+                .current_dir(&repo)
+                .output()
+                .expect("git available")
+                .stdout,
+        )
+        .unwrap();
+        assert_eq!(base, format!("feature-x at {}", sha.trim()));
+    }
+
+    /// A detached checkout answers the literal string `HEAD` to `rev-parse
+    /// --abbrev-ref`, which would read as a branch named "HEAD" — a lie in the
+    /// one message the user relies on to know where their unit started.
+    #[tokio::test]
+    async fn dispatch_base_says_detached_rather_than_naming_a_branch_head() {
+        let tmp = crate::test_temp::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        init_repo(&repo);
+        git_in(&repo, &["checkout", "-q", "--detach", "HEAD"]);
+
+        let base = describe_dispatch_base(&repo)
+            .await
+            .expect("a detached checkout is still a healthy repo");
+
+        assert!(
+            base.starts_with("detached HEAD at "),
+            "a detached checkout must not be reported as a branch, got {base:?}"
+        );
+    }
+
+    /// The base is a reporting nicety on a path that has already created the
+    /// worktree and spawned the agent, so a probe that cannot answer must drop
+    /// the clause — never fail the dispatch, and never emit a dangling
+    /// "cut from ".
+    #[tokio::test]
+    async fn dispatch_base_is_absent_rather_than_empty_outside_a_repo() {
+        let tmp = crate::test_temp::tempdir().unwrap();
+        let not_a_repo = tmp.path().join("plain-dir");
+        std::fs::create_dir_all(&not_a_repo).unwrap();
+
+        assert_eq!(describe_dispatch_base(&not_a_repo).await, None);
     }
 
     // --- slug + path derivation ---

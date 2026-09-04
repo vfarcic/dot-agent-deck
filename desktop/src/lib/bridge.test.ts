@@ -692,7 +692,7 @@ describe("FixtureDeckBridge scenarios", () => {
  *   what makes "the overview attaches no PTYs" true even when you arrive at it
  *   from a nine-tile deck, rather than "zero new, up to three lingering".
  */
-describe("TauriDeckBridge demand-driven attach (PRD #745 M7)", () => {
+describe("TauriDeckBridge demand-driven attach (PRD 745 M7)", () => {
   /** The nine-agent fleet the PRD costs out: nine sockets, nine replays. */
   const FLEET_SIZE = 9;
 
@@ -1537,5 +1537,91 @@ describe("TauriDeckBridge demand-driven attach (PRD #745 M7)", () => {
     // generation 1 and its replacement generation 2.
     expect(replays[0].generation).toBe(2);
     await bridge.dispose();
+  });
+});
+
+describe("desktop settings (PRD 803)", () => {
+  beforeEach(() => {
+    invoke.mockReset();
+    window.localStorage.clear();
+  });
+
+  afterEach(() => vi.restoreAllMocks());
+
+  it("reads and writes the Rust-owned document through the live bridge", async () => {
+    const { TauriDeckBridge, DEFAULT_DESKTOP_SETTINGS } = await import("./bridge");
+    const stored = { version: 1, appearance: { mode: "dark" as const } };
+    invoke.mockImplementation(async (command: string) => {
+      if (command === "desktop_get_settings") return { settings: DEFAULT_DESKTOP_SETTINGS, path: "/home/dev/.config/dot-agent-deck/desktop.toml" };
+      if (command === "desktop_set_settings") return stored;
+      return { ok: true };
+    });
+
+    const bridge = new TauriDeckBridge();
+    // The read answers with the document AND where it lives, so the settings
+    // surface can name the file without a second round trip (PRD #803 M3).
+    expect(await bridge.getSettings()).toEqual({
+      settings: DEFAULT_DESKTOP_SETTINGS,
+      path: "/home/dev/.config/dot-agent-deck/desktop.toml",
+    });
+    expect(invoke).toHaveBeenCalledWith("desktop_get_settings");
+
+    expect(await bridge.saveSettings(stored)).toEqual(stored);
+    expect(invoke).toHaveBeenCalledWith("desktop_set_settings", { settings: stored });
+    await bridge.dispose();
+  });
+
+  it("falls back to defaults when the settings IPC fails, but surfaces a failed save", async () => {
+    const { TauriDeckBridge, DEFAULT_DESKTOP_SETTINGS } = await import("./bridge");
+    invoke.mockImplementation(async (command: string) => {
+      if (command === "desktop_get_settings" || command === "desktop_set_settings") {
+        throw new Error("could not write the desktop settings file: Permission denied");
+      }
+      return { ok: true };
+    });
+
+    const bridge = new TauriDeckBridge();
+    // Defaults keep the app usable, and the absent path is what makes the
+    // surface say the location is unavailable rather than invent one.
+    expect(await bridge.getSettings()).toEqual({ settings: DEFAULT_DESKTOP_SETTINGS, path: undefined });
+    await expect(bridge.saveSettings(DEFAULT_DESKTOP_SETTINGS)).rejects.toThrow("Permission denied");
+    await bridge.dispose();
+  });
+
+  it("keeps fixture settings in unscoped localStorage and never invokes Tauri", async () => {
+    const { createDeckBridge, DEFAULT_DESKTOP_SETTINGS, FIXTURE_SETTINGS_KEY, modeScopedKey } = await import("./bridge");
+    const bridge = createDeckBridge("fixture");
+
+    // No path: the browser preview has no filesystem, and the surface says so
+    // rather than printing one for a file that does not exist.
+    expect(await bridge.getSettings()).toEqual({ settings: DEFAULT_DESKTOP_SETTINGS, path: undefined });
+    const light = { version: 1, appearance: { mode: "light" as const } };
+    expect(await bridge.saveSettings(light)).toEqual(light);
+
+    // A theme choice is global: the key must NOT carry the `.fixture`/`.live`
+    // suffix every project-draft key does.
+    expect(window.localStorage.getItem(FIXTURE_SETTINGS_KEY)).toBe(JSON.stringify(light));
+    expect(FIXTURE_SETTINGS_KEY).not.toBe(modeScopedKey(FIXTURE_SETTINGS_KEY));
+    expect(window.localStorage.getItem(modeScopedKey(FIXTURE_SETTINGS_KEY))).toBeNull();
+
+    // The fixture preview can never reach the real desktop.toml: it holds no
+    // Tauri handle at all.
+    expect(invoke).not.toHaveBeenCalled();
+
+    // A fresh bridge (a page reload) reads the choice back.
+    expect(await createDeckBridge("fixture").getSettings()).toEqual({ settings: light, path: undefined });
+    await bridge.dispose();
+  });
+
+  it("coerces an unreadable stored document back to defaults", async () => {
+    const { createDeckBridge, DEFAULT_DESKTOP_SETTINGS, FIXTURE_SETTINGS_KEY, normalizeDesktopSettings } = await import("./bridge");
+    window.localStorage.setItem(FIXTURE_SETTINGS_KEY, "{not json");
+    expect((await createDeckBridge("fixture").getSettings()).settings).toEqual(DEFAULT_DESKTOP_SETTINGS);
+
+    window.localStorage.setItem(FIXTURE_SETTINGS_KEY, JSON.stringify({ version: 9, appearance: { mode: "solarized" } }));
+    expect((await createDeckBridge("fixture").getSettings()).settings).toEqual({ version: 9, appearance: { mode: "system" } });
+
+    expect(normalizeDesktopSettings(undefined)).toEqual(DEFAULT_DESKTOP_SETTINGS);
+    expect(normalizeDesktopSettings({ appearance: { mode: "dark" } })).toEqual({ version: 1, appearance: { mode: "dark" } });
   });
 });

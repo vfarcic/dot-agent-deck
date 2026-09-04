@@ -1231,7 +1231,7 @@ async fn run_capture(program: &str, args: &[String]) -> Result<String, String> {
 
 /// Like [`run_capture`] but for `&str` args — the fixed-shape `git` probes
 /// (e.g. `remote get-url origin`) build their argv inline.
-async fn run_capture_args(program: &str, args: &[&str]) -> Result<String, String> {
+pub(crate) async fn run_capture_args(program: &str, args: &[&str]) -> Result<String, String> {
     let output = tokio::process::Command::new(program)
         .args(args)
         .output()

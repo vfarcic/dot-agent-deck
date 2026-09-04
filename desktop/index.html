@@ -3,8 +3,15 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <meta name="theme-color" content="#f3f0e9" />
-    <meta name="color-scheme" content="light" />
+    <!-- PRD #743 M3. `color-scheme` is what makes the webview's OWN chrome -- its
+         scrollbars, its form controls, its default background behind the page --
+         follow the appearance instead of staying light under a dark document.
+         `theme-color` needs one element per appearance; a bare one applies to
+         both. The light value is unchanged; the dark one is `--canvas`'s dark
+         value from styles.css. -->
+    <meta name="theme-color" content="#f3f0e9" media="(prefers-color-scheme: light)" />
+    <meta name="theme-color" content="#101514" media="(prefers-color-scheme: dark)" />
+    <meta name="color-scheme" content="light dark" />
     <title>Agent Deck · Control Room</title>
   </head>
   <body>

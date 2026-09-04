@@ -38,10 +38,12 @@ Then talk to it: *"Start work on the login timeout bug."*
 
 Each unit can start as a **single agent** or as a **full multi-role orchestration** — a team of agents with an orchestrator delegating to workers, as configured in your project's `.dot-agent-deck.toml`.
 
-Which one is your call, not the agent's, so it asks you before the first unit rather than guessing. The same request can want either shape:
+Which one is your call, not the agent's, so it asks rather than guessing — **once for each unit it is about to start**, because the shape follows from what that unit is doing rather than from when in the conversation you asked for it. The same request can want either shape:
 
 - *"work on these three features"* → usually a team per feature
 - *"verify these three PRs"* → usually one agent each
+
+Both of those are three of a kind, so one answer covers all three — say so and that is the end of it. The mixed batch is where a single question goes wrong: a ten-line fix and an audit of every call site are not the same shape of work, and answering for the first should not quietly decide the rest.
 
 If you name an orchestration your project does not define, that is an error telling you what *is* available — not a silent fall back to something you did not choose. Nothing is created when that happens.
 
@@ -57,7 +59,9 @@ A dispatched unit gets a **copy of your repository**, so it already has your cod
 
 Refer to files by their path **relative to the repo root**. An absolute path pointing back into your own working directory defeats the isolation and puts two agents on the same files.
 
-One thing worth knowing: a unit's copy is made from your **last commit**. Uncommitted edits, untracked files, and ignored files are not in it. If a unit needs a change you have not committed yet, commit it first — otherwise the unit quietly works from the older version.
+One thing worth knowing: a unit's copy is made from your **last commit on the branch you are currently on**. Uncommitted edits, untracked files, and ignored files are not in it. If a unit needs a change you have not committed yet, commit it first — otherwise the unit quietly works from the older version.
+
+There is no way to point a unit at some other starting point, so whatever that branch is, every unit you start inherits it — including a branch that is behind what your team has merged, or a feature branch you happen to be sitting on rather than your main one. Get the branch where you want it **before** dispatching; a unit already running keeps the copy it was given.
 
 ## Finishing up
 

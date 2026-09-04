@@ -80,6 +80,12 @@
 //! Exits 0 on success, 1 on any failure with a per-finding summary.
 
 mod clean_tmp;
+/// PRD #743: no hard-coded colour under `desktop/src` outside the `:root`
+/// palette, so the desktop app's light/dark appearance cannot rot by attrition.
+/// Tests only — the rule and its scanner both live in the module, and nothing
+/// renders dark mode in CI, so this is the only thing that sees the decay.
+#[cfg(test)]
+mod desktop_palette;
 /// Issue #815: `scripts/devbox-check-gtk.sh`, which asserts that pkg-config
 /// resolves Tauri's GTK stack to Nix's copy rather than the host's. Tests only,
 /// and Linux only — the rule lives in the script, which CI's `devbox` job runs
@@ -91,6 +97,10 @@ mod devbox_gtk_origin;
 /// script under `node`.
 #[cfg(test)]
 mod issue_labeler_memory;
+/// The same workflow's `Extract label policy for the agent` setup step. Tests
+/// only — these drive the real script under `python3`.
+#[cfg(test)]
+mod issue_labeler_policy;
 /// Issue #785: `scripts/junit-strip-output.py`, the stripper that makes a JUnit
 /// report from a credential-holding run structurally incapable of carrying test
 /// output before anyone shares it. Since #502 took the credentialed lane out of

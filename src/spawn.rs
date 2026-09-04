@@ -2447,6 +2447,41 @@ fn next_pane_id(task_name: &str, role_index: Option<usize>) -> String {
     pane_id
 }
 
+/// Issue #770: does `pane_id` have the shape [`next_pane_id`] mints for an
+/// ORCHESTRATION ROLE pane — `sched-<name>-<counter>-r<role index>`?
+///
+/// The recognizer for the producer directly above it, and deliberately kept
+/// beside it so the two cannot drift. It answers one narrow question: is this
+/// id one the DAEMON's own spawn path produced for a role of an orchestration
+/// (`dispatch --orchestration`, a scheduled fire, issue dispatch)? That is the
+/// population issue #770 is about — those agents can outlive the daemon that
+/// spawned them, and the daemon that comes up next holds no
+/// [`crate::state::AppState::pane_role_map`] entry for them, so their
+/// `dot-agent-deck delegate` is refused forever while their hook events keep
+/// flowing.
+///
+/// It is NOT a general "is this an orchestration pane" oracle, and must not be
+/// read as one. A `Ctrl+n` orchestration tab's panes are numbered by the TUI
+/// (`0`, `1`, `2`, …) and carry nothing that distinguishes them from a plain
+/// dashboard pane, so they answer `false` here. That is the honest answer
+/// rather than a gap: those panes are the TUI's, their PTYs die with the
+/// daemon, and there is no surviving agent to strand.
+///
+/// The suffix is unambiguous by construction. `next_pane_id` appends
+/// `-<counter>` for a non-role pane and `-<counter>-r<idx>` for a role pane,
+/// and the name in between is sanitized to `[A-Za-z0-9_-]` — so the LAST
+/// `-`-separated segment of a non-role id is always pure digits, and only a
+/// role id can end in `r<digits>`. A task name that itself ends in `-r0` still
+/// gets the counter appended after it, so it cannot forge the shape.
+pub fn is_orchestration_role_pane_id(pane_id: &str) -> bool {
+    pane_id.starts_with(SCHEDULE_PANE_ID_PREFIX)
+        && pane_id
+            .rsplit('-')
+            .next()
+            .and_then(|seg| seg.strip_prefix('r'))
+            .is_some_and(|idx| !idx.is_empty() && idx.bytes().all(|b| b.is_ascii_digit()))
+}
+
 // ---------------------------------------------------------------------------
 // Tab-reuse lifecycle (PRD #127 Phase 2B, M2.2)
 // ---------------------------------------------------------------------------
@@ -5118,6 +5153,42 @@ mod tests {
             single,
             "truncation must not collapse two fires of one long name onto one id"
         );
+    }
+
+    /// Issue #770: the recognizer must agree with the producer it sits beside,
+    /// in BOTH directions — a role id is recognized and a non-role id is not.
+    /// Pinned against `next_pane_id`'s real output rather than hand-written
+    /// strings, so a change to either one fails here instead of silently
+    /// unhooking the orphan detection from the ids it is meant to catch.
+    #[test]
+    fn next_pane_id_role_ids_are_the_ones_recognized_as_orchestration_roles() {
+        for idx in [0usize, 1, 7, 12] {
+            let role = next_pane_id("github-issues", Some(idx));
+            assert!(
+                is_orchestration_role_pane_id(&role),
+                "a role id must be recognized: {role}"
+            );
+        }
+        let single = next_pane_id("github-issues", None);
+        assert!(
+            !is_orchestration_role_pane_id(&single),
+            "a non-role scheduled pane id must NOT be recognized: {single}"
+        );
+        // A task name that already ends in the role shape cannot forge one:
+        // the counter is appended after it.
+        let forged = next_pane_id("nightly-r0", None);
+        assert!(
+            !is_orchestration_role_pane_id(&forged),
+            "a task name ending in the role shape must not forge a role id: {forged}"
+        );
+        // Ids from the other minting path (the TUI's numeric allocator) and
+        // anything without the daemon's prefix answer `false`.
+        for other in ["0", "12", "r0", "orchestrator-r0", "sched-", "sched-x-r"] {
+            assert!(
+                !is_orchestration_role_pane_id(other),
+                "not a daemon-spawned role id: {other}"
+            );
+        }
     }
 
     #[test]

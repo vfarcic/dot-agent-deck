@@ -116,11 +116,22 @@ pre-agent-steps:
       if not m:
           bail("no frontmatter found")
       fm = m.group(1)
+      # Scope the search to the add-labels: block. Three keys in this
+      # frontmatter are spelled `allowed:` — network's and the tools list both
+      # come first — so an unanchored search matches `network:`'s
+      # `allowed: [defaults]`, fails to parse it as JSON, and bails on every
+      # run without ever reaching the label list.
+      anchor = re.search(r"^([ \t]*)add-labels:[ \t]*$", fm, re.M)
+      if not anchor:
+          bail("no add-labels: block found in frontmatter")
+      rest = fm[anchor.end():]
+      closer = re.search(rf"^{anchor.group(1)}\S", rest, re.M)
+      scope = rest[:closer.start()] if closer else rest
       policy = {}
       for key in ("allowed", "blocked"):
-          km = re.search(rf"^\s*{key}:\s*(\[.*\])\s*$", fm, re.M)
+          km = re.search(rf"^[ \t]*{key}:[ \t]*(\[.*\])[ \t]*$", scope, re.M)
           if not km:
-              bail(f"no {key}: list found in frontmatter")
+              bail(f"no {key}: list found in the add-labels: block")
           try:
               policy[key] = json.loads(km.group(1))
           except json.JSONDecodeError:
@@ -249,7 +260,13 @@ post-steps:
       const memoryRoot = "/tmp/gh-aw/repo-memory/default";
       const baselineRoot = path.join(process.env.RUNNER_TEMP, "gh-aw", "issue-labeler-memory-baseline");
       const allowedFiles = new Set(["feedback-issue.jsonl", "feedback-pull_request.jsonl", "predictions.jsonl"]);
-      const allowedLabels = new Set(["bug", "documentation", "enhancement", "feature", "question", "source", "config", "dependencies", "tests", "ci-cd", "devbox", "priority:high", "priority:medium", "priority:low", "size:high", "size:medium", "size:low", "needs-triage"]);
+      const allowedLabels = new Set(["bug", "documentation", "enhancement", "feature", "question", "source", "config", "dependencies", "tests", "ci-cd", "devbox", "daemon", "tui", "desktop", "priority:high", "priority:medium", "priority:low", "size:high", "size:medium", "size:low", "needs-triage"]);
+      // The cap a *prediction* may carry: keep in step with `add-labels.max`
+      // in the frontmatter above. A *correction* is deliberately bounded by the
+      // whole taxonomy instead (`allowedLabels.size`), because it snapshots
+      // whatever a maintainer left on the item, which may exceed what the
+      // classifier itself is allowed to propose.
+      const maxPredictionLabels = 6;
       const repositorySlug = process.env.GITHUB_REPOSITORY || "";
       const repositoryPattern = repositorySlug.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
       if (!repositorySlug) throw new Error("GITHUB_REPOSITORY is unavailable");
@@ -295,7 +312,7 @@ post-steps:
       function predictionValidator(entry, line) {
         const validTarget = entry && ((entry.type === "issue" && issueUrl.test(entry.url)) || (entry.type === "pull_request" && pullUrl.test(entry.url)));
         if (!validTarget || Object.keys(entry).sort().join(",") !== "labels,type,url") throw new Error(`predictions.jsonl:${line}: invalid prediction entry`);
-        validateLabels(entry.labels, 5, "predictions.jsonl", line);
+        validateLabels(entry.labels, maxPredictionLabels, "predictions.jsonl", line);
       }
 
       const validators = {
@@ -342,7 +359,7 @@ post-steps:
         const labels = terminal[0].type === "add_labels"
           ? terminal[0].labels.map(label => typeof label === "string" ? label : label.name).sort()
           : [];
-        validateLabels(labels, 5, "agent_output.json", 1);
+        validateLabels(labels, maxPredictionLabels, "agent_output.json", 1);
         expected["predictions.jsonl"].push({ url, type, labels });
         expected["predictions.jsonl"] = expected["predictions.jsonl"].slice(-2000);
       }
@@ -369,13 +386,13 @@ safe-outputs:
     continue-on-error: false
     max-ai-credits: 10
   add-labels:
-    max: 5
+    max: 6
     # Label policy: the single source of truth, enforced at infrastructure
     # level (the safe-outputs job rejects anything else, whatever the model
     # says) and read by the agent at runtime to build its candidate table.
     # Both lists are case-insensitive globs. Recompile after changes.
     #
-    allowed: ["bug", "documentation", "enhancement", "feature", "question", "source", "config", "dependencies", "tests", "ci-cd", "devbox", "priority:high", "priority:medium", "priority:low", "size:high", "size:medium", "size:low", "needs-triage"]
+    allowed: ["bug", "documentation", "enhancement", "feature", "question", "source", "config", "dependencies", "tests", "ci-cd", "devbox", "daemon", "tui", "desktop", "priority:high", "priority:medium", "priority:low", "size:high", "size:medium", "size:low", "needs-triage"]
     blocked: ["PRD", "duplicate", "good first issue", "help wanted", "invalid", "manual-review", "stale", "wontfix"]
   noop:
     # No-op runs are frequent for this workflow (every human label change on an
@@ -419,6 +436,7 @@ Use these values wherever they appear below.
 
 - Type, at most one: `bug` for broken behavior; `feature` for new user-visible behavior; `enhancement` for improvements to existing behavior or maintainer tooling; `documentation` for documentation-only work; `question` when the item primarily asks for information.
 - Area, zero or more when explicit: `source`, `config`, `dependencies`, `tests`, `ci-cd`, or `devbox`. Existing deterministic pull request path-labeling may already have applied these.
+- Component, zero or more: `daemon` for the background daemon, `tui` for the terminal front-end, `desktop` for the Tauri GUI under `desktop/`. This is a different axis from Area, not a competing one: Area says what kind of file changed, Component says which of the three shipped surfaces owns it, so a component label sits alongside `source` or `tests` rather than replacing it. Several at once is normal rather than exceptional, because a protocol change is routinely `daemon` plus every client that consumes it. Apply none when the work is genuinely surface-independent.
 - Priority, issues only and exactly one when the impact is clear: `priority:high` for security, data loss, release blockers, or widespread core breakage; `priority:medium` for ordinary actionable work; `priority:low` for polish, narrow edge cases, or non-urgent cleanup.
 - Size, exactly one when estimable: `size:low` for less than a day, `size:medium` for roughly one to three days, and `size:high` for broader architectural or multi-part work.
 - Triage fallback, issues only: use `needs-triage` when the report lacks enough information to choose a type or priority confidently. Do not combine it with speculative labels.
