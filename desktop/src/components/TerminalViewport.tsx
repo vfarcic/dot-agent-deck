@@ -3,7 +3,7 @@ import { FitAddon } from "@xterm/addon-fit";
 import { WebglAddon } from "@xterm/addon-webgl";
 import { Terminal } from "@xterm/xterm";
 import type { TerminalBuffer, TerminalFeed } from "../types";
-import { registerTerminal, unregisterTerminal } from "../lib/terminalRegistry";
+import { registerRefit, registerTerminal, unregisterRefit, unregisterTerminal } from "../lib/terminalRegistry";
 
 interface TerminalViewportProps {
   agentId: string;
@@ -126,11 +126,20 @@ export function TerminalViewport({
     const frame = window.requestAnimationFrame(fit);
     const observer = new ResizeObserver(fit);
     observer.observe(host);
+    // PRD #744: a zoom change has to re-fit this pane, and the observer cannot
+    // be relied on to do it. Page zoom does shrink the pane's WIDTH, so the
+    // observer usually fires — but `.agent-panel`'s height is clamped at 320px
+    // and stops moving above 110%, and nothing in a test environment has a
+    // layout engine to observe either way. Registering `fit` here is what makes
+    // the trigger explicit and testable; the observer stays as the backstop
+    // that catches the real post-layout geometry.
+    registerRefit(agentId, fit);
 
     return () => {
       window.cancelAnimationFrame(frame);
       observer.disconnect();
       inputDisposable.dispose();
+      unregisterRefit(agentId, fit);
       unregisterTerminal(agentId, terminal);
       webglAddon?.dispose();
       terminal.dispose();

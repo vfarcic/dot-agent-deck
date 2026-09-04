@@ -736,6 +736,20 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .segmented label.is-selected > span { color: var(--teal); background: var(--paper-strong); box-shadow: 0 0 0 1px var(--teal-focus); }
 .segmented input { position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
 .segmented input:focus-visible + span { outline: 2px solid var(--focus-ring); outline-offset: 1px; }
+/* A row whose label is a plain `<label>` rather than a `<legend>`: a single
+   control needs no group, so `for`/`id` is the whole accessible name. The
+   selector carries the same 13px/650 sub-header treatment the legend gets, so
+   a select row and a segmented row read as the same convention. */
+.settings-row > label { color: var(--ink); font-size: 13px; font-weight: 650; }
+.settings-row select { min-width: 96px; height: 28px; padding: 0 7px; border: 1px solid var(--line-strong); border-radius: 5px; color: var(--ink); background: var(--paper); font-size: 10px; }
+.settings-row select:disabled { color: var(--faint); background: var(--paper-sunken); cursor: not-allowed; }
+
+/* Panel prose, which `docs/develop/desktop-gui.md` allows only for a
+   consequence the reader has to act on. The one instance is the browser
+   preview's "use your browser's zoom instead"; it never renders in the
+   packaged app. Sized below the row label deliberately — it is a consequence,
+   not a second heading. */
+.settings-hint { margin: 0; color: var(--muted); font-size: 9px; line-height: 1.5; }
 .settings-error { margin: 0; padding: 9px 11px; display: flex; align-items: flex-start; gap: 7px; border: 1px solid var(--red-rim); border-radius: 4px; color: var(--red-ink); background: var(--red-soft); font-size: 9px; line-height: 1.5; }
 .settings-error svg { flex: 0 0 auto; margin-top: 1px; }
 
