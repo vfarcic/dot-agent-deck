@@ -314,6 +314,24 @@ Every task states the same job:
 
 The feedback half needs **no skill of its own**: `CLAUDE.md` already governs it end to end — rule 2's `fmt`/`clippy` gates before any commit, rule 8's requirement to respond to every finding (fix it, or say why not), thread resolution, and the stale-approval mechanics. `/verify-pr` is invoked for the verification half only, and **stays unchanged and read-only** by this skill: nothing here edits it, and the unit must not either.
 
+### Check the closing references against what the PR actually does
+
+**Every task also asks the unit one question about the PR's own claim:** does each `Closes #N` / `Fixes #N` reference name an issue this diff actually finishes? Merging a PR closes those issues automatically, so an over-reaching reference does not merely mislabel the PR — **it silently closes live work**, and the issue disappears from `/issue-queue` and `/prd-queue` without anyone deciding that it should.
+
+This is the same defect the queue skills' premise spot-check exists for, arrived at from the other end. There it is a stale issue claiming to be live; here it is a live issue about to be recorded as done. Both are a claim nobody checked against reality before acting on it.
+
+**The failure mode to look for is a PR that fixes one family of a multi-part issue and closes the whole thing.** #818 is the shape: it tracks a whole red `e2e-deterministic` lane across several families, and a PR fixing one of them should say `Refs #818`, not `Closes #818`. PR #837 is the worked example of getting it *right* after the fact — it declares `Closes` for #832 only, and carries #818 as a prose `Refs`, with the remaining families named at the end.
+
+The check is cheap and the answer is a reading, not a grep:
+
+```bash
+gh pr view <n> --json closingIssuesReferences,files \
+  -q '"CLOSES: "+([.closingIssuesReferences[].number]|map(tostring)|join(","))+"\nFILES: "+([.files[].path]|join(" "))'
+gh issue view <N> --json title,body -q .title
+```
+
+**A reference that over-reaches is a finding to raise, not something to silently fix** — on someone else's PR the unit must never push, and on the runner's own the narrowing is a body edit the runner should see. Say which issues the diff genuinely finishes and which it only advances.
+
 ### Push permission is keyed to AUTHORSHIP
 
 The selection step already knows who wrote each PR, so the task states the fact and the permission that follows from it — no mode, no inference:
@@ -383,6 +401,13 @@ WHAT TO DO
   each finding: fix it, or say why not. CLAUDE.md governs this — rule 2's fmt and
   clippy gates before any commit, rule 8's respond-to-every-finding, thread
   resolution, and the stale-approval mechanics. Read CLAUDE.md first and follow it.
+- CHECK THE CLOSING REFERENCES against what the diff actually does. For each
+  `Closes #N` / `Fixes #N` this PR declares, confirm the diff genuinely finishes
+  issue N. Merging closes those issues automatically, so a reference that
+  over-reaches silently closes live work — a PR fixing one family of a
+  multi-part issue should say `Refs #N`, not `Closes #N`. Report any mismatch as
+  a finding, naming which issues the diff finishes and which it only advances.
+  Do not silently rewrite the PR body.
 - END with what remains: what you verified, what you fixed, what is still open,
   and who it is waiting on.
 
