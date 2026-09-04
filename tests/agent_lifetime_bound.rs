@@ -583,13 +583,24 @@ fn setsid_escapee_survives(cap: Option<&str>, fate: OuterFate, budget: Duration)
     // Never leak this test's own probe, whatever the outcome above — otherwise a
     // regression in the code under test would itself mint the orphan #861 is
     // about.
+    //
+    // Deliberately the single pid and NOT `kill(-pid, …)`, unlike the
+    // group-resident probe above. A review finding on this PR pointed out that
+    // the escapee is tracked by a bare number, so a check-then-act cleanup can
+    // in principle signal a replacement that inherited the pid — and a *group*
+    // send multiplies that from one stranger to a whole group of them. The
+    // narrow form costs nothing here: this escapee's only children are the
+    // transient `sleep 1`s of its own loop, which end within a second of it
+    // whether they are signalled or not.
+    //
+    // The residual on the single send is the same bounded same-UID exposure
+    // every pid-addressed site in this repository carries, and it is bounded
+    // rather than closed for the reason `wrap`'s reaper gives at length: a
+    // number carries no identity, and a strict guarantee needs an OS-owned
+    // container rather than a pid.
     if common::process_running(escapee_pid) {
-        // SAFETY: best-effort cleanup of a pid this test created. Same
-        // check-then-act residual as every other site here: between
-        // `process_running` and the signal the pid could be reaped and
-        // reissued, so this is bounded same-UID exposure, not an impossibility.
+        // SAFETY: best-effort cleanup of a pid this test created.
         unsafe {
-            libc::kill(-escapee_pid, libc::SIGKILL);
             libc::kill(escapee_pid, libc::SIGKILL);
         }
     }

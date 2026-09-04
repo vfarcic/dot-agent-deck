@@ -34,10 +34,12 @@
 //! unless one deliberately rebuilds its own, and `/proc/<pid>/environ` still
 //! reports it after the process's whole ancestry is gone.
 //!
-//! Inheritance is the only route a tag travels, and every minted value is
-//! unique (unit-tested over 1000 mints), so a sweep reaches only processes that
-//! inherited it from the one child it was armed for — not a sibling pane, not a
-//! concurrent test run, not a developer's own agents.
+//! Inheritance is the only route a tag travels, the needle is matched as an
+//! exact NUL-delimited environment entry rather than a substring, and no two
+//! tags held by *live* processes collide (see [`LifetimeTag::mint`] for what
+//! that guarantee is and is not). So a sweep reaches only processes that
+//! inherited the tag from the one child it was armed for — not a sibling pane,
+//! not a concurrent test run, not a developer's own agents.
 //!
 //! # What this covers, and what it does not
 //!
@@ -82,18 +84,21 @@
 /// production sets it or reads it.
 pub const DOT_AGENT_DECK_TEST_LIFETIME_TAG: &str = "DOT_AGENT_DECK_TEST_LIFETIME_TAG";
 
-/// Room for the whole `NAME=VALUE` needle, so it can travel through a `fork` as
-/// a plain `Copy` value with no allocation behind it.
+/// Room for the whole `\0NAME=VALUE\0` needle, so it can travel through a
+/// `fork` as a plain `Copy` value with no allocation behind it.
 ///
-/// The name is 32 bytes, the `=` one more, and [`LifetimeTag::mint`] builds a
-/// value of three hex integers joined by `-` — at most 16 + 1 + 8 + 1 + 16 = 42
-/// bytes even at `u64::MAX`. 96 leaves the name room to grow without silently
-/// truncating a needle into a prefix that could match a *different* spawn's tag.
-/// `mint` refuses rather than truncates if it ever does not fit.
+/// The two boundary NULs are one byte each, the name is 32, the `=` one more,
+/// and [`LifetimeTag::mint`] builds a value of three hex integers joined by `-`
+/// — at most 16 + 1 + 8 + 1 + 16 = 42 bytes even at `u64::MAX`. That is 77, so
+/// 96 leaves the name room to grow. `mint` and [`LifetimeTag::inherited`] refuse
+/// rather than truncate if it ever does not fit, because a truncated needle is a
+/// *prefix*, and a prefix is exactly what the boundaries exist to stop matching.
 const NEEDLE_CAP: usize = 96;
 
 /// A tag unique to one spawn: the `NAME=VALUE` bytes to put in the child's
-/// environment, and the needle its reaper searches for.
+/// environment, and — wrapped in the NUL boundaries that make it an exact
+/// environment *entry* rather than a substring — the needle its reaper searches
+/// for.
 ///
 /// `Copy` and self-contained on purpose — it is captured before a `fork` and
 /// read in the child, where dereferencing anything the parent allocated would
@@ -107,26 +112,60 @@ pub struct LifetimeTag {
 impl LifetimeTag {
     /// Mint a tag for one spawn, or `None` if the needle would not fit.
     ///
-    /// Uniqueness comes from three parts, because each one alone has a hole: the
-    /// spawning process's pid separates concurrent decks and test binaries, a
-    /// per-process counter separates panes spawned by one of them, and
-    /// `CLOCK_MONOTONIC` nanoseconds separate a pid from the same pid after
-    /// reuse. Uniqueness is what makes a sweep safe — it is the only thing
-    /// standing between "signal this spawn's escapees" and "signal every process
-    /// on the box that ever carried a tag".
+    /// # What the uniqueness guarantee actually is
+    ///
+    /// **No two tags held by processes alive at the same time collide**, and
+    /// that — not global uniqueness — is what a sweep needs, because a sweep can
+    /// only ever signal a live process. Three parts, each closing a hole the
+    /// others leave:
+    ///
+    /// - the spawning process's **pid** separates concurrent decks, daemons and
+    ///   test binaries;
+    /// - a per-process **counter** separates panes spawned by one of them;
+    /// - `CLOCK_MONOTONIC` **nanoseconds** separate a pid from the same pid
+    ///   after reuse, which is the case the first two cannot see.
+    ///
+    /// State the residual rather than claiming more. `CLOCK_MONOTONIC` restarts
+    /// at boot and the counter restarts per process, so two tags minted on
+    /// *different boots* can collide. That is inert: a process cannot outlive
+    /// the boot it was tagged on, so a colliding tag can never name a live
+    /// process, and a reaper is itself gone with its boot. Within one boot the
+    /// guarantee holds — a pid is reusable, but a reused pid means the earlier
+    /// holder is dead, and the nanosecond component distinguishes the two.
+    ///
+    /// [`minted_tags_are_unique`] measures the within-process half over 1000
+    /// mints; the cross-process half rests on the pid, and the cross-reuse half
+    /// on the clock.
     ///
     /// Allocates. Call it in the parent, before any `fork`.
+    ///
+    /// [`minted_tags_are_unique`]: self
     pub fn mint() -> Option<Self> {
         use std::sync::atomic::{AtomicU64, Ordering};
         static SEQ: AtomicU64 = AtomicU64::new(0);
 
         let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-        let text = format!(
-            "{DOT_AGENT_DECK_TEST_LIFETIME_TAG}={:x}-{:x}-{:x}",
+        Self::from_value(&format!(
+            "{:x}-{:x}-{:x}",
             std::process::id(),
             seq,
             monotonic_nanos()
-        );
+        ))
+    }
+
+    /// Build the boundary-wrapped needle for `value`, or `None` if it would not
+    /// fit in [`NEEDLE_CAP`].
+    ///
+    /// The needle is `\0NAME=VALUE\0`, not `NAME=VALUE`. An environment block is
+    /// NUL-separated, so the two boundaries are what make a match an exact
+    /// *entry*: without them the needle is a bare substring, and one tag that
+    /// happens to be a prefix of another — or the same text sitting inside some
+    /// other variable's value — matches too. That matters more here than it
+    /// usually would, because a match is followed by `SIGTERM` and then
+    /// `SIGKILL`, so an overbroad match is a signal delivered to a process this
+    /// spawn has no claim on.
+    fn from_value(value: &str) -> Option<Self> {
+        let text = format!("\0{DOT_AGENT_DECK_TEST_LIFETIME_TAG}={value}\0");
         let bytes = text.as_bytes();
         if bytes.len() > NEEDLE_CAP {
             return None;
@@ -177,36 +216,35 @@ impl LifetimeTag {
     /// no claim on.
     pub fn inherited() -> Option<Self> {
         let value = std::env::var(DOT_AGENT_DECK_TEST_LIFETIME_TAG).ok()?;
-        if value.is_empty() {
+        // An empty value would build the needle `\0NAME=\0`, which matches any
+        // process that carries the variable empty — including ones from another
+        // run. A NUL in the value cannot come from `execve` and would truncate
+        // the needle's own boundary.
+        if value.is_empty() || value.contains('\0') {
             return None;
         }
-        let text = format!("{DOT_AGENT_DECK_TEST_LIFETIME_TAG}={value}");
-        let bytes = text.as_bytes();
-        if bytes.len() > NEEDLE_CAP {
-            return None;
-        }
-        let mut needle = [0u8; NEEDLE_CAP];
-        needle[..bytes.len()].copy_from_slice(bytes);
-        Some(Self {
-            needle,
-            len: bytes.len(),
-        })
+        Self::from_value(&value)
     }
 
     /// The value to set [`DOT_AGENT_DECK_TEST_LIFETIME_TAG`] to on the child.
     ///
-    /// Infallible: `mint` builds the needle out of ASCII only, and the `=` it
-    /// splits on is always present.
+    /// The needle it is carved out of is `\0NAME=VALUE\0`, so this drops the
+    /// trailing boundary as well as everything up to the `=`.
+    ///
+    /// Infallible: the needle is built by [`Self::from_value`] from ASCII, and
+    /// both the `=` and the trailing NUL are always present.
     pub fn value(&self) -> &str {
         let needle = self.needle();
         let split = needle
             .iter()
             .position(|b| *b == b'=')
-            .expect("a minted needle always contains its `=`");
-        std::str::from_utf8(&needle[split + 1..]).expect("a minted needle is ASCII")
+            .expect("a built needle always contains its `=`");
+        let end = needle.len() - 1;
+        std::str::from_utf8(&needle[split + 1..end]).expect("a built needle is ASCII")
     }
 
-    /// The `NAME=VALUE` bytes to search a `/proc/<pid>/environ` for.
+    /// The `\0NAME=VALUE\0` bytes to search a `/proc/<pid>/environ` for — an
+    /// exact entry, boundaries included. See [`Self::from_value`].
     pub fn needle(&self) -> &[u8] {
         &self.needle[..self.len]
     }
@@ -406,6 +444,15 @@ unsafe fn parse_pid(name: *const libc::c_char) -> Option<libc::pid_t> {
 /// the spawner happened to put it, so reading only the first block would find
 /// it by luck rather than by construction.
 ///
+/// `needle` is a whole entry with its own NUL boundaries (`\0NAME=VALUE\0`), and
+/// the **first** entry in the block has no NUL in front of it — so the stream is
+/// primed with one synthetic NUL, which makes every entry uniformly preceded by
+/// a boundary and costs nothing. The trailing boundary comes from the block's
+/// own separators; Linux terminates the block with a NUL, so the last entry has
+/// one too. A process that has rewritten its own environ into something without
+/// a trailing NUL is the one shape this can miss, which is a benign false
+/// negative — it declines to signal rather than signalling the wrong thing.
+///
 /// # Safety
 ///
 /// Async-signal-safe: a stack buffer, `open`/`read`/`close`, and a byte compare.
@@ -423,7 +470,9 @@ unsafe fn environ_contains(pid: libc::pid_t, needle: &[u8]) -> bool {
 
     let mut window = [0u8; 4096 + NEEDLE_CAP];
     let carry = needle.len() - 1;
-    let mut held = 0usize;
+    // The synthetic leading boundary described above: reads append after it.
+    window[0] = 0;
+    let mut held = 1usize;
     let mut found = false;
     loop {
         let want = window.len() - held;
@@ -520,18 +569,71 @@ mod tests {
     fn a_minted_tag_round_trips_through_its_needle() {
         let tag = LifetimeTag::mint().expect("mint a tag");
         let needle = tag.needle();
-        assert!(
-            needle.starts_with(DOT_AGENT_DECK_TEST_LIFETIME_TAG.as_bytes()),
-            "the needle must be the NAME=VALUE the child's environment carries"
+        assert_eq!(
+            needle.first().copied(),
+            Some(0),
+            "the needle must open with a NUL boundary, or it can match a \
+             substring of some other entry rather than an entry of its own"
+        );
+        assert_eq!(
+            needle.last().copied(),
+            Some(0),
+            "the needle must close with a NUL boundary, or a tag that is a \
+             PREFIX of another tag matches that tag's entry"
         );
         assert_eq!(
             std::str::from_utf8(needle).unwrap(),
-            format!("{DOT_AGENT_DECK_TEST_LIFETIME_TAG}={}", tag.value()),
-            "`value()` must be exactly the half after the `=`"
+            format!("\0{DOT_AGENT_DECK_TEST_LIFETIME_TAG}={}\0", tag.value()),
+            "`value()` must be exactly the span between the `=` and the closing \
+             boundary"
         );
         assert!(
             !tag.value().is_empty(),
             "an empty value would match nothing"
+        );
+    }
+
+    /// Scenario: build two tags where one value strictly extends the other, plus
+    /// an environment block with the tag's text buried inside an unrelated
+    /// variable's value, and assert no needle matches anything but its own
+    /// entry.
+    ///
+    /// The regression guard for a review finding on this PR. The needle was a
+    /// bare `NAME=VALUE`, so the shorter tag matched the longer one's entry as a
+    /// substring — and since every match receives SIGTERM and then SIGKILL, an
+    /// overbroad match is a signal delivered to a process the sweep has no
+    /// claim on.
+    #[test]
+    fn a_tag_that_is_a_prefix_of_another_does_not_match_it() {
+        let short = LifetimeTag::from_value("abc").expect("build the shorter tag");
+        let long = LifetimeTag::from_value("abcd").expect("build the longer tag");
+
+        // How each appears in a real environment block: NUL-separated entries.
+        let short_env = format!("A=1\0{DOT_AGENT_DECK_TEST_LIFETIME_TAG}=abc\0B=2\0");
+        let long_env = format!("A=1\0{DOT_AGENT_DECK_TEST_LIFETIME_TAG}=abcd\0B=2\0");
+
+        assert!(
+            contains(short_env.as_bytes(), short.needle()),
+            "a tag must still match its own entry"
+        );
+        assert!(
+            contains(long_env.as_bytes(), long.needle()),
+            "a tag must still match its own entry"
+        );
+        assert!(
+            !contains(long_env.as_bytes(), short.needle()),
+            "the shorter tag matched the longer tag's entry — the sweep would \
+             signal another spawn's descendants"
+        );
+        assert!(
+            !contains(short_env.as_bytes(), long.needle()),
+            "the longer tag matched the shorter tag's entry"
+        );
+        let embedded = format!("A=1\0OTHER={DOT_AGENT_DECK_TEST_LIFETIME_TAG}=abc\0B=2\0");
+        assert!(
+            !contains(embedded.as_bytes(), short.needle()),
+            "the tag matched inside another variable's value, which is not an \
+             entry of its own"
         );
     }
 
@@ -557,17 +659,20 @@ mod tests {
         // parent's reaper searches for and the one a nested `wrap`'s reaper
         // searches for must be byte-identical — otherwise neither can see the
         // other's escapees, which is the single-point-of-failure this reuse
-        // exists to avoid.
-        let text = format!("{DOT_AGENT_DECK_TEST_LIFETIME_TAG}={}", minted.value());
-        let bytes = text.as_bytes();
-        let mut needle = [0u8; NEEDLE_CAP];
-        needle[..bytes.len()].copy_from_slice(bytes);
-        let reparsed = LifetimeTag {
-            needle,
-            len: bytes.len(),
-        };
+        // exists to avoid. `inherited()` rebuilds through the same
+        // `from_value`, which is what makes that hold — and going through the
+        // value is the round trip an environment variable actually takes.
+        let reparsed = LifetimeTag::from_value(minted.value()).expect("rebuild from the value");
         assert_eq!(reparsed.needle(), minted.needle());
         assert_eq!(reparsed.value(), minted.value());
+
+        // A value too long for the needle must be REFUSED, not truncated: a
+        // truncated needle is a prefix, and matching a prefix is exactly what
+        // the boundaries exist to prevent.
+        assert!(
+            LifetimeTag::from_value(&"x".repeat(NEEDLE_CAP)).is_none(),
+            "an over-long value must be refused rather than truncated"
+        );
     }
 
     #[test]
@@ -659,6 +764,20 @@ mod tests {
             .stderr(Stdio::null())
             .spawn()
             .expect("spawn the untagged child");
+        // A decoy whose tag value strictly EXTENDS ours. With the needle's NUL
+        // boundaries this must not match; without them it did, and the sweep
+        // would have SIGKILLed a process belonging to no spawn of ours.
+        let mut decoy = Command::new("/bin/sleep")
+            .arg("30")
+            .env(
+                DOT_AGENT_DECK_TEST_LIFETIME_TAG,
+                format!("{}extra", tag.value()),
+            )
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn the prefix-collision decoy");
 
         // `execve` is asynchronous with respect to `spawn` returning, and
         // `/proc/<pid>/environ` reports the *exec'd* image's environment, so
@@ -682,12 +801,15 @@ mod tests {
         let _ = tagged.wait();
         let _ = untagged.kill();
         let _ = untagged.wait();
+        let _ = decoy.kill();
+        let _ = decoy.wait();
 
         assert_eq!(
             matched, 1,
             "the sweep must find exactly the one child carrying this tag — \
              finding none means an escapee would never be reached, and finding \
-             more means it reaches processes that are not this spawn's"
+             more means it reaches processes that are not this spawn's, which \
+             here would be the decoy whose value merely EXTENDS ours"
         );
         assert_eq!(
             strangers, 0,
