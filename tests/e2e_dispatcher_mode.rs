@@ -114,9 +114,7 @@ fn open_cat_caller_pane(deck: &TuiDeck) -> String {
     deck.send_keys(b"\t");
     deck.send_keys(&[0x7f; 96]); // clear whatever the config seeded
     deck.send_keys(b"cat");
-    let (col, row) = deck
-        .find_in_grid("[Submit]")
-        .expect("the new-pane form should render a [Submit] button");
+    let (col, row) = deck.wait_for_in_grid("[Submit]");
     deck.click(col, row);
     deck.wait_for_absence("[Submit]");
 
@@ -475,9 +473,7 @@ fn new_pane_016_dispatcher_opens_dashboard_card_with_real_agent() {
     deck.wait_for_string("dispatcher mode");
 
     // Submit via the [Submit] button — deterministic, no fragile Enter count.
-    let (scol, srow) = deck
-        .find_in_grid("[Submit]")
-        .expect("the new-pane form should render a [Submit] button");
+    let (scol, srow) = deck.wait_for_in_grid("[Submit]");
     deck.click(scol, srow);
 
     // Submitting closes the form and spawns the dispatcher CARD.

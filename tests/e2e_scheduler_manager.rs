@@ -227,9 +227,7 @@ fn manager_002_edit_spawns_seeded_authoring_agent_prefilled() {
     deck.wait_for_string("Select Directory");
     deck.send_keys(b" "); // Space → confirm the (row) dir → locked schedule form
     deck.wait_for_string("Edit Schedule"); // the mode-locked Edit form is up
-    let (scol, srow) = deck
-        .find_in_grid("[Submit]")
-        .expect("the mode-locked schedule form must render a [Submit] button");
+    let (scol, srow) = deck.wait_for_in_grid("[Submit]");
     deck.click(scol, srow); // submit → spawn the seeded authoring agent
 
     // Submitting must spawn the CONFIGURED authoring command (not `claude`) and
@@ -477,9 +475,7 @@ fn manager_006_click_row_moves_selection() {
     );
 
     // Click the (currently unselected) `bravo` row at its on-screen position.
-    let (col, row) = deck
-        .find_in_grid("bravo")
-        .expect("the manager list must render the `bravo` row");
+    let (col, row) = deck.wait_for_in_grid("bravo");
     deck.click(col, row);
 
     // The selection marker must move to the clicked row: `▶ bravo` now renders.
@@ -651,9 +647,7 @@ fn manager_010_blank_default_command_falls_back_to_claude() {
     deck.wait_for_string("Select Directory");
     deck.send_keys(b" "); // Space → confirm the dir → locked schedule form
     deck.wait_for_string("New Schedule"); // the mode-locked Add form is up
-    let (scol, srow) = deck
-        .find_in_grid("[Submit]")
-        .expect("the mode-locked schedule form must render a [Submit] button");
+    let (scol, srow) = deck.wait_for_in_grid("[Submit]");
     deck.click(scol, srow); // submit → spawn the seeded authoring agent
 
     // R1 fallback: a blank `default_command` must resolve to `claude`
@@ -725,9 +719,7 @@ fn manager_016_wheel_over_dialog_does_not_scroll_side_pane() {
     deck.wait_for_string("Mode:");
     deck.send_bytes(b"\x1b[C"); // No mode -> scroll
     deck.wait_for_string("scroll mode");
-    let (submit_col, submit_row) = deck
-        .find_in_grid("[Submit]")
-        .expect("new-pane form must render [Submit]");
+    let (submit_col, submit_row) = deck.wait_for_in_grid("[Submit]");
     deck.click(submit_col, submit_row);
     deck.wait_for_string("SIDE_SCROLL_LINE_119");
     deck.wait_for_string("[Command Mode Ctrl+D]");
@@ -926,9 +918,7 @@ fn form_002_add_spawns_authoring_agent_in_picked_dir() {
     deck.wait_for_string("Select Directory");
     deck.send_keys(b" "); // Space → confirm the current dir → locked schedule form
     deck.wait_for_string("New Schedule"); // the mode-locked Add form is up
-    let (scol, srow) = deck
-        .find_in_grid("[Submit]")
-        .expect("the mode-locked schedule form must render a [Submit] button");
+    let (scol, srow) = deck.wait_for_in_grid("[Submit]");
     deck.click(scol, srow); // submit → spawn the seeded authoring agent
 
     // The configured command spawned the authoring agent (base seed delivered).
@@ -1029,9 +1019,7 @@ fn form_003_edit_prefills_seed_and_spawns_in_row_working_dir() {
     deck.wait_for_string("Select Directory");
     deck.send_keys(b" "); // Space → confirm the (row) dir → locked schedule form
     deck.wait_for_string("Edit Schedule"); // the mode-locked Edit form is up
-    let (scol, srow) = deck
-        .find_in_grid("[Submit]")
-        .expect("the mode-locked schedule form must render a [Submit] button");
+    let (scol, srow) = deck.wait_for_in_grid("[Submit]");
     deck.click(scol, srow); // submit → spawn the seeded authoring agent
 
     // The authoring seed is pre-filled with the existing schedule's values: the
@@ -1149,9 +1137,7 @@ fn assert_schedule_flow_cancel_returns_to_manager(entry_key: &[u8], at: CancelAt
         CancelBy::Esc => deck.send_keys(b"\x1b"),
         CancelBy::Q => deck.send_keys(b"q"),
         CancelBy::ClickCancel => {
-            let (col, row) = deck
-                .find_in_grid("[Cancel]")
-                .expect("the picker/form must render a clickable [Cancel] button");
+            let (col, row) = deck.wait_for_in_grid("[Cancel]");
             deck.click(col, row);
         }
     }
@@ -1348,9 +1334,7 @@ fn form_006_edit_repick_different_dir_wins_in_seed() {
     deck.wait_for_string("INNERMARK"); // B's marker child → we are inside B
     deck.send_keys(b" "); // Space → confirm B (the picked dir) → locked Edit form
     deck.wait_for_string("Edit Schedule");
-    let (scol, srow) = deck
-        .find_in_grid("[Submit]")
-        .expect("the mode-locked schedule form must render a [Submit] button");
+    let (scol, srow) = deck.wait_for_in_grid("[Submit]");
     deck.click(scol, srow); // submit → spawn the seeded authoring agent
 
     // Wait until the existing-schedule block is delivered THROUGH its prompt line
@@ -1472,9 +1456,7 @@ fn form_007_issue_dispatch_option_seeds_issue_dispatch_authoring() {
     // signal (the bare `[schedule: issues]` chip renders at every cycler index).
     deck.wait_for_string("schedule: issues mode");
 
-    let (scol, srow) = deck
-        .find_in_grid("[Submit]")
-        .expect("the new-pane form should render a [Submit] button");
+    let (scol, srow) = deck.wait_for_in_grid("[Submit]");
     deck.click(scol, srow); // submit → spawn the seeded authoring agent
 
     // The delivered seed must be the ISSUE-DISPATCH authoring seed: it tells the

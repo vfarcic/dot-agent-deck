@@ -79,9 +79,7 @@ fn open_cat_caller_pane(deck: &TuiDeck) -> String {
     deck.send_keys(b"\t");
     deck.send_keys(&[0x7f; 128]);
     deck.send_keys(b"cat");
-    let (col, row) = deck
-        .find_in_grid("[Submit]")
-        .expect("new-pane form should render Submit");
+    let (col, row) = deck.wait_for_in_grid("[Submit]");
     deck.click(col, row);
     deck.wait_for_absence("[Submit]");
 

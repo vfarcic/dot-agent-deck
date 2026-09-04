@@ -4,7 +4,7 @@
 //!
 //! Spawns the real `dot-agent-deck` binary inside an isolated PTY, opens the
 //! directory picker via Ctrl+N, and drives the mouse via SGR reports through
-//! `TuiDeck::click` / `find_in_grid` / `send_bytes`. Each interaction is
+//! `TuiDeck::click` / `wait_for_in_grid` / `send_bytes`. Each interaction is
 //! asserted to equal the corresponding keystroke. Decision 6: gated behind
 //! the `e2e` feature so `cargo test-fast` never compiles it.
 //!
@@ -29,9 +29,7 @@ fn open_picker(deck: &TuiDeck) {
 
 /// Click the button/affordance whose label text is `needle`.
 fn click_target(deck: &TuiDeck, needle: &str) {
-    let (col, row) = deck
-        .find_in_grid(needle)
-        .unwrap_or_else(|| panic!("expected a clickable {needle} affordance in the picker"));
+    let (col, row) = deck.wait_for_in_grid(needle);
     deck.click(col, row);
 }
 

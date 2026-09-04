@@ -385,10 +385,10 @@ fn new_pane_014_last_command_survives_restart() {
 #[test]
 fn new_pane_015_registry_defaults_and_codex_launches_wrapped() {
     let deck = TuiDeck::launch_with_fixture("minimal");
-    let initial = open_new_pane_form(&deck);
-    let (agent_x, agent_y) = deck.find_in_grid("Agent:").unwrap_or_else(|| {
-        panic!("the actual new-pane UI must expose an Agent selector.\nGrid:\n{initial}")
-    });
+    open_new_pane_form(&deck);
+    // `wait_for_in_grid` dumps the grid itself on timeout, so the form
+    // snapshot this used to keep for its panic message is no longer needed.
+    let (agent_x, agent_y) = deck.wait_for_in_grid("Agent:");
     deck.click(agent_x, agent_y);
 
     for (index, agent_type) in [

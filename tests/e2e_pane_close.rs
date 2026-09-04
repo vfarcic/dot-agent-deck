@@ -122,9 +122,7 @@ fn close_confirm_003_real_button_and_key_share_confirmation() {
     deck.send_keys(b"\x04");
     deck.wait_for_string("[Back to Pane Ctrl+D]");
 
-    let (col, row) = deck
-        .find_in_grid("[Close Ctrl+W]")
-        .expect("the command-mode button bar must render the Close button");
+    let (col, row) = deck.wait_for_in_grid("[Close Ctrl+W]");
     deck.click(col + 1, row);
     deck.wait_for_string("Close selected pane?");
     let clicked_modal = deck.snapshot_grid();
@@ -161,9 +159,7 @@ fn close_confirm_004_pre_render_mouse_burst_cannot_confirm() {
     deck.send_keys(b"\x04");
     deck.wait_for_string("[Back to Pane Ctrl+D]");
 
-    let (col, row) = deck
-        .find_in_grid("[Close Ctrl+W]")
-        .expect("the command-mode button bar must render the Close button");
+    let (col, row) = deck.wait_for_in_grid("[Close Ctrl+W]");
     let click_col = col + 1;
     let sgr_col = click_col + 1;
     let sgr_row = row + 1;

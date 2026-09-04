@@ -252,9 +252,7 @@ fn card_stats_005_real_agent_card_narrows_without_restructuring() {
     control.send_keys(PANE_NAME_SUFFIX.as_bytes());
     control.send_keys(b"\t");
     control.send_keys(format!("claude --model {HAIKU_MODEL} --allowedTools Bash").as_bytes());
-    let (submit_col, submit_row) = control
-        .find_in_grid("[Submit]")
-        .expect("new-pane form should render [Submit]");
+    let (submit_col, submit_row) = control.wait_for_in_grid("[Submit]");
     control.click(submit_col, submit_row);
 
     assert!(

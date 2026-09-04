@@ -1786,18 +1786,16 @@ impl TuiDeck {
 
     /// Locate the first occurrence of `needle` in the current rendered
     /// grid, returning its 0-based `(col, row)` start cell, or `None` if it
-    /// is not on screen. Used by click tests to find a button's on-screen
-    /// position before clicking it (so the test follows the real layout
-    /// rather than hard-coding coordinates).
+    /// is not on screen.
+    ///
+    /// **This reads the grid exactly once**, so it answers "is the needle on
+    /// screen *right now*" and nothing more. That makes it the right tool for
+    /// asserting ABSENCE, and for an `if let` where `None` is a legitimate
+    /// branch — and the wrong tool for locating something an input event was
+    /// supposed to paint. Use [`wait_for_in_grid`](Self::wait_for_in_grid)
+    /// for that; the reasoning is on its doc comment.
     pub fn find_in_grid(&self, needle: &str) -> Option<(u16, u16)> {
-        let grid = self.snapshot_grid();
-        for (row, line) in grid.lines().enumerate() {
-            if let Some(byte_idx) = line.find(needle) {
-                let col = line[..byte_idx].chars().count();
-                return Some((col as u16, row as u16));
-            }
-        }
-        None
+        grid_find(&self.snapshot_grid(), needle)
     }
 
     /// Poll [`find_in_grid`] until `needle` is on screen, returning its
@@ -1814,21 +1812,83 @@ impl TuiDeck {
     /// snapshots, and the clear can land between them. Polling the lookup
     /// itself means the coordinates always come from a grid that actually
     /// contained the needle.
+    ///
+    /// **The discriminator, applied across the suite by issues #807/#395.**
+    /// A lookup is racy when the preceding wait proved a *different* string
+    /// than the one being located — `wait_for_string("New Schedule")` then
+    /// `find_in_grid("[Submit]")`, where the schedule form paints its button
+    /// row in a second pass (`render_modal_button_row` drawing over the
+    /// blank line the `Paragraph` reserved), so the title can be on screen
+    /// while the button is not. It is NOT racy when the wait proved the same
+    /// target, and it is not this bug at all when the `None` is meaningful —
+    /// an absence assertion, or an `if let` with a real else-branch. Waiting
+    /// for something that should be absent hangs to [`WAIT_TIMEOUT`], so do
+    /// not convert those.
     pub fn wait_for_in_grid(&self, needle: &str) -> (u16, u16) {
-        let deadline = Instant::now() + WAIT_TIMEOUT;
-        loop {
-            if let Some(found) = self.find_in_grid(needle) {
-                return found;
-            }
-            if Instant::now() > deadline {
-                let grid = self.snapshot_grid();
-                panic!(
-                    "did not find {needle:?} in the grid within {WAIT_TIMEOUT:?}.\n\
-                     Final grid:\n{grid}"
-                );
-            }
-            std::thread::sleep(Duration::from_millis(20));
+        match poll_grid_for(
+            || self.snapshot_grid(),
+            needle,
+            WAIT_TIMEOUT,
+            GRID_POLL_INTERVAL,
+        ) {
+            Ok(found) => found,
+            Err(grid) => panic!(
+                "did not find {needle:?} in the grid within {WAIT_TIMEOUT:?}.\n\
+                 Final grid:\n{grid}"
+            ),
         }
+    }
+}
+
+/// How long [`poll_grid_for`] sleeps between reads of the grid.
+pub(crate) const GRID_POLL_INTERVAL: Duration = Duration::from_millis(20);
+
+/// Scan one already-captured grid for `needle`, returning the 0-based
+/// `(col, row)` of its first occurrence.
+///
+/// Split out of [`TuiDeck::find_in_grid`] so the scan and the polling around
+/// it (see [`poll_grid_for`]) can be unit-tested without a PTY — the two
+/// halves are what issue #807 is about, and only a test that can hand them a
+/// scripted sequence of frames can show they differ.
+pub(crate) fn grid_find(grid: &str, needle: &str) -> Option<(u16, u16)> {
+    for (row, line) in grid.lines().enumerate() {
+        if let Some(byte_idx) = line.find(needle) {
+            let col = line[..byte_idx].chars().count();
+            return Some((col as u16, row as u16));
+        }
+    }
+    None
+}
+
+/// Re-read the grid via `read_grid` until [`grid_find`] locates `needle`, or
+/// `timeout` elapses — in which case the last grid read is returned as `Err`
+/// for the caller's failure message.
+///
+/// This is the whole difference between a bare `find_in_grid(..).expect(..)`
+/// and [`TuiDeck::wait_for_in_grid`]: ratatui flushes a frame as a byte
+/// stream and the harness reader thread consumes it in chunks, so under PTY
+/// contention a single read can land mid-repaint and see a region that is
+/// transiently cleared. One read has no way to tell that apart from a real
+/// absence; re-reading does.
+///
+/// Generic over the grid source rather than taking `&TuiDeck` so the harness
+/// unit tests can drive it with a scripted frame sequence.
+pub(crate) fn poll_grid_for(
+    mut read_grid: impl FnMut() -> String,
+    needle: &str,
+    timeout: Duration,
+    poll_interval: Duration,
+) -> Result<(u16, u16), String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let grid = read_grid();
+        if let Some(found) = grid_find(&grid, needle) {
+            return Ok(found);
+        }
+        if Instant::now() > deadline {
+            return Err(grid);
+        }
+        std::thread::sleep(poll_interval);
     }
 }
 
