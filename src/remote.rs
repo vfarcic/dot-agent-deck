@@ -274,6 +274,43 @@ pub trait SshExecutor {
     }
 }
 
+/// Issue #858: seconds of headroom the laptop-side wallclock kill gets on top
+/// of the worst case the probe's own ssh options permit.
+///
+/// The kill's job is the case those options cannot see — a remote that
+/// completes the handshake, answers keepalives, and still never returns. It
+/// only ever does that job if it fires *after* ssh has given up on its own, so
+/// the margin exists to keep the two from racing on a link whose real latency
+/// lands near the bound. Five seconds is small next to the budgets involved
+/// and large next to the scheduling jitter of a 50ms poll loop.
+const WALLCLOCK_KILL_MARGIN_SECS: u64 = 5;
+
+/// The laptop-side wallclock deadline, in seconds, for an ssh invocation whose
+/// options [`SystemSshExecutor::build_command`] built from `ssh_budget_secs`.
+///
+/// Those options are `ConnectTimeout=secs`, `ServerAliveInterval=secs` and
+/// `ServerAliveCountMax=1`, which bound ssh's own wallclock at roughly
+/// `2 * secs`: up to `secs` in the pre-handshake phase, then up to one missed
+/// keepalive interval of post-handshake silence.
+///
+/// **Arming the kill at `secs` made it the binding constraint rather than the
+/// backstop it is documented to be** (issue #858): a connection ssh was still
+/// allowed ~20s to complete was killed at 10s and reported to the user as
+/// `probe exceeded 10s wallclock deadline`, on a link that worked when they
+/// immediately ran the command again. Deriving the deadline from the same
+/// number the options are built from keeps the kill strictly outside them
+/// whatever `secs` is — which is why the fix is this derivation and not a
+/// larger `PROBE_TIMEOUT_SECS_DEFAULT`, a change that would have scaled the
+/// same inconsistency instead of removing it.
+///
+/// Saturating throughout: the probe timeout is clamped to an hour at its own
+/// call sites, but this is reachable with any `u64` and must not panic.
+pub const fn wallclock_kill_secs(ssh_budget_secs: u64) -> u64 {
+    // ConnectTimeout=secs, then ServerAliveInterval=secs x ServerAliveCountMax=1.
+    let ssh_worst_case = ssh_budget_secs.saturating_mul(2);
+    ssh_worst_case.saturating_add(WALLCLOCK_KILL_MARGIN_SECS)
+}
+
 /// Production implementation: shells out to the `ssh` binary on the user's
 /// machine. No new dependency on a Rust ssh client — we deliberately reuse
 /// the user's existing ssh config (`~/.ssh/config`, agent, known_hosts).
@@ -287,7 +324,11 @@ pub trait SshExecutor {
 /// 2. A laptop-side wallclock kill enforced by `run_with_wallclock_kill`
 ///    inside `run()`, which catches the reachable-but-stalled-remote-command
 ///    case the ssh options miss: server completes the handshake and answers
-///    keepalives, but the remote command hangs before producing output.
+///    keepalives, but the remote command hangs before producing output. Its
+///    deadline is NOT `wallclock_timeout` itself but [`wallclock_kill_secs`]
+///    of it, so the kill outlasts what layer 1 permits instead of pre-empting
+///    it (issue #858). Read the deadline back with
+///    [`SystemSshExecutor::kill_deadline_secs`].
 ///
 /// `None` keeps the original behavior on both layers — relevant for
 /// long-running invocations like `remote add`'s install pipeline where a 10s
@@ -377,6 +418,16 @@ impl SystemSshExecutor {
                 count_max,
             }),
         }
+    }
+
+    /// The laptop-side wallclock deadline this executor arms on each ssh
+    /// invocation, in seconds — `None` when it imposes no kill at all.
+    ///
+    /// Exposed so a test can assert the deadline against the ssh options
+    /// [`Self::build_command`] emits alongside it, rather than against a
+    /// hard-coded number.
+    pub fn kill_deadline_secs(&self) -> Option<u64> {
+        self.wallclock_timeout.map(wallclock_kill_secs)
     }
 
     /// Build the `ssh` command without spawning it. Exposed for tests so we
@@ -547,7 +598,7 @@ impl Default for SystemSshExecutor {
 impl SshExecutor for SystemSshExecutor {
     fn run(&self, target: &SshTarget, command: &str) -> Result<SshOutput, SshError> {
         let mut cmd = self.build_command(target, command);
-        let output = match self.wallclock_timeout {
+        let output = match self.kill_deadline_secs() {
             // Uncapped, so the truncation flag is always false here.
             Some(secs) => run_with_wallclock_kill(&mut cmd, target, secs, None)?.0,
             None => cmd.output().map_err(|source| SshError::Io {
@@ -594,7 +645,7 @@ impl SshExecutor for SystemSshExecutor {
         command: &str,
         max_capture_bytes: usize,
     ) -> Result<CappedOutput, SshError> {
-        let Some(secs) = self.wallclock_timeout else {
+        let Some(secs) = self.kill_deadline_secs() else {
             // No wallclock: use the post-hoc truncation from the default impl.
             // This branch is only reached by callers that have opted out of
             // the timeout (e.g. `remote add`'s install pipeline), which today
@@ -1783,6 +1834,36 @@ mod tests {
         assert!(
             args.iter().any(|a| a == "ServerAliveCountMax=1"),
             "with_wallclock_timeout must force a single missed-keepalive abort: {args:?}"
+        );
+
+        // Issue #858: the laptop-side kill is documented as a BACKSTOP against
+        // a remote that accepts the connection and never returns — the case
+        // the ssh options above cannot see. So its deadline must exceed the
+        // worst case those very options permit: up to `ConnectTimeout` in the
+        // pre-handshake phase, then up to `ServerAliveInterval ×
+        // ServerAliveCountMax` of post-handshake silence before ssh itself
+        // disconnects. Armed at `secs` it was the BINDING constraint instead,
+        // and a connection ssh was still allowed ~20s to finish was killed at
+        // 10s and reported as an unreachable host.
+        //
+        // Asserted as a RELATIONSHIP between the argv and the deadline rather
+        // than as a number, so it keeps holding if either constant moves.
+        let option = |key: &str| -> u64 {
+            args.iter()
+                .find_map(|a| a.strip_prefix(key))
+                .unwrap_or_else(|| panic!("missing ssh option {key}: {args:?}"))
+                .parse()
+                .unwrap_or_else(|e| panic!("unparseable ssh option {key}: {e}"))
+        };
+        let ssh_worst_case = option("ConnectTimeout=")
+            + option("ServerAliveInterval=") * option("ServerAliveCountMax=");
+        let deadline = SystemSshExecutor::with_wallclock_timeout(7)
+            .kill_deadline_secs()
+            .expect("the probe executor arms a laptop-side kill");
+        assert!(
+            deadline > ssh_worst_case,
+            "the laptop-side kill ({deadline}s) must outlast what its own ssh options \
+             permit ({ssh_worst_case}s), or it pre-empts ssh instead of backstopping it"
         );
     }
 
