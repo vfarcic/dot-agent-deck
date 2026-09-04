@@ -1771,8 +1771,18 @@ async fn confirm_prompt_delivery(
         )
         .await
         {
-            PromptWatch::Confirmed => {
-                log_prompt_confirmed(DELIVERY_LOG_PATH, &pane_id, &delivery_id, attempt);
+            // Issue #685: `confirmation` says which of the matcher's shapes
+            // confirmed this, so a turn that carries the prompt twice is a
+            // distinct line rather than an ordinary success. It changes nothing
+            // about the delivery — every shape returns here.
+            PromptWatch::Confirmed(confirmation) => {
+                log_prompt_confirmed(
+                    DELIVERY_LOG_PATH,
+                    &pane_id,
+                    &delivery_id,
+                    attempt,
+                    confirmation,
+                );
                 return;
             }
             // Issue #424 D5: our prompt came back doubled with no separator, so
