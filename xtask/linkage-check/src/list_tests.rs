@@ -18,6 +18,8 @@ use regex::Regex;
 
 use xtask_docs::{CatalogEntry, DocsConfig, parse_catalog};
 
+use crate::paths::slash_path;
+
 /// One synthetic test as observed at a single git ref.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TestEntry {
@@ -686,12 +688,29 @@ fn collect_tests_on_disk(root: &Path) -> Result<BTreeMap<String, TestEntry>, Str
     collect_tests_from_sources(&sources)
 }
 
+/// The repo-relative path of a walked file, spelled the way [`TestEntry::file`]
+/// promises: `/`-separated on every platform.
+///
+/// `abs_path` comes out of [`walk_rs_files`], so its separators are the host's,
+/// and `to_string_lossy` — what this used to end with — keeps them, so on
+/// Windows the inventory tables printed `tests\e2e_foo.rs` (issue #831).
+/// The field is display-only — [`compute_created`] and [`compute_modified`] key
+/// on `spec_id` and compare only `scenario` and `body_fingerprint`, never
+/// `file` — which is why this was cosmetic rather than a wrong report. It is
+/// still worth fixing at the source: the same field is filled from
+/// `git ls-tree` output on the base side ([`collect_tests_at_ref`]), which is
+/// always forward-slashed, so one field had two producers that disagreed by
+/// platform, and one added assertion on it would have gone red on
+/// `build-windows`.
+///
+/// Normalising here, where the string is built, rather than at each print site
+/// keeps the promise in one place. See [`slash_path`] for why it is a component
+/// walk and not a `\` → `/` replacement.
 fn rel_to_root(root: &Path, abs_path: &Path) -> Result<String, String> {
-    Ok(abs_path
+    let rel = abs_path
         .strip_prefix(root)
-        .map_err(|e| format!("strip prefix {}: {e}", abs_path.display()))?
-        .to_string_lossy()
-        .into_owned())
+        .map_err(|e| format!("strip prefix {}: {e}", abs_path.display()))?;
+    Ok(slash_path(rel))
 }
 
 fn walk_rs_files(
@@ -1104,5 +1123,126 @@ mod tests {
         assert!(!layer_token_is_l1("L2 (re-sequenced from L1: ...)"));
         assert!(!layer_token_is_l1("L2 synthetic"));
         assert!(!layer_token_is_l1(""));
+    }
+
+    /// Issue #831: the repo-relative `file` string is `/`-separated even though
+    /// the walk that produced it used the host's separator.
+    ///
+    /// Building a real tree in a tempdir is the whole point: the path under
+    /// assertion is a **walked** one — `walk_rs_files` gets it from `read_dir`,
+    /// so its separators are whatever the platform produced, and `\` on Windows
+    /// is what `to_string_lossy` used to leak into the inventory table. The
+    /// pre-existing parser tests feed a synthetic `"src/tab.rs"` literal that is
+    /// forward-slashed before it ever reaches this code and is stored verbatim,
+    /// so an assertion on the field there cannot fail on any platform — which
+    /// is why the defect survived.
+    ///
+    /// Nested directories on purpose: a two-component path exercises one
+    /// separator and a four-component one exercises three. Both walks are
+    /// covered because `rel_to_root` is called from each.
+    ///
+    /// This host is Linux, so the exact-string assertions cannot *fail* here —
+    /// `build-windows` is the only one of the three build jobs running native
+    /// Windows path semantics, so it is what proves them, and no gate on a
+    /// Linux host can. What this host does prove is the two
+    /// platform-independent halves: the recorded string carries no native
+    /// separator, and it still resolves to the very file the walk found.
+    #[test]
+    fn a_walked_path_is_recorded_with_forward_slashes() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let root = tmp.path();
+
+        let tests_file = root.join("tests").join("nested").join("e2e_walked.rs");
+        std::fs::create_dir_all(tests_file.parent().expect("has a parent")).expect("mkdir tests");
+        std::fs::write(
+            &tests_file,
+            r#"
+                #[spec("walked/tests/001")]
+                #[test]
+                /// Scenario: a test file the tests/ walk has to find.
+                fn walked_001_from_tests() { let _ = 1; }
+            "#,
+        )
+        .expect("write the tests/ fixture");
+
+        let src_file = root.join("src").join("deep").join("nest").join("tab.rs");
+        std::fs::create_dir_all(src_file.parent().expect("has a parent")).expect("mkdir src");
+        std::fs::write(
+            &src_file,
+            r#"
+                #[cfg(test)]
+                mod tests {
+                    #[spec("walked/src/001")]
+                    #[test]
+                    /// Scenario: a src file the src/ walk has to find.
+                    fn walked_001_from_src() { let _ = 2; }
+                }
+            "#,
+        )
+        .expect("write the src/ fixture");
+
+        let map = collect_tests_on_disk(root).expect("the fixture tree must be walkable");
+        assert_eq!(map.len(), 2, "{map:#?}");
+
+        // These two are the assertions that go red on Windows without the fix:
+        // the walk hands `rel_to_root` `tests\nested\e2e_walked.rs` there.
+        assert_eq!(map["walked/tests/001"].file, "tests/nested/e2e_walked.rs");
+        assert_eq!(map["walked/src/001"].file, "src/deep/nest/tab.rs");
+
+        for (spec_id, walked) in [
+            ("walked/tests/001", &tests_file),
+            ("walked/src/001", &src_file),
+        ] {
+            let recorded = &map[spec_id].file;
+            assert!(
+                !recorded.contains(std::path::MAIN_SEPARATOR) || std::path::MAIN_SEPARATOR == '/',
+                "{recorded} still carries the native separator"
+            );
+            // Separator-free is only half of it. The string also has to still
+            // name the file the walk found, which is what makes it a path
+            // rather than a shape — and what a caller who pastes it needs.
+            assert_eq!(
+                std::fs::canonicalize(root.join(recorded)).expect("the recorded path must resolve"),
+                std::fs::canonicalize(walked).expect("the walked path must resolve"),
+                "{recorded} does not round-trip to the file the walk found"
+            );
+        }
+    }
+
+    /// The normalisation is a component walk, not a `\` → `/` replacement —
+    /// proven here against a real directory entry rather than the synthetic
+    /// `Path` the `paths` module's own unit test uses.
+    ///
+    /// On Unix a backslash is a legal character **in a file name**, so this
+    /// fixture is one file called `we\ird.rs` inside `tests/`, not a `we`
+    /// directory. A `replace` would record `tests/we/ird.rs`, which resolves to
+    /// nothing — so the round-trip is the assertion that catches it. Unix-only
+    /// because on Windows those same bytes really are two components.
+    #[cfg(unix)]
+    #[test]
+    fn a_backslash_in_a_walked_file_name_survives_as_itself() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let root = tmp.path();
+
+        let odd = root.join("tests").join(r"we\ird.rs");
+        std::fs::create_dir_all(odd.parent().expect("has a parent")).expect("mkdir tests");
+        std::fs::write(
+            &odd,
+            r#"
+                #[spec("walked/odd/001")]
+                #[test]
+                /// Scenario: a file whose name contains a backslash.
+                fn odd_001_backslash_name() { let _ = 3; }
+            "#,
+        )
+        .expect("write the odd-name fixture");
+
+        let map = collect_tests_on_disk(root).expect("the fixture tree must be walkable");
+        let recorded = &map["walked/odd/001"].file;
+        assert_eq!(recorded, r"tests/we\ird.rs");
+        assert_eq!(
+            std::fs::canonicalize(root.join(recorded)).expect("the recorded path must resolve"),
+            std::fs::canonicalize(&odd).expect("the walked path must resolve"),
+        );
     }
 }
