@@ -40,12 +40,14 @@ import type { DeckRuntimeState } from "../types";
  * How long a burst of zoom changes is allowed to run before the level is
  * written to disk.
  *
- * The shape is a **trailing flush** rather than a debounce that can starve: the
- * first change schedules a write for `now + interval`, later changes inside
- * that window replace the pending value without moving the deadline, so a key
- * held for ten seconds writes once every 400ms rather than once at the end. A
- * pure debounce would write nothing at all until the key was released, which
- * loses the level entirely if the app is killed mid-burst.
+ * The shape is **leading edge plus a trailing flush**, not a debounce: the first
+ * change of a burst is written straight through, later changes inside the
+ * window replace a pending value without moving the deadline, and the deadline
+ * flushes whatever accumulated. So a key held for ten seconds writes roughly
+ * twice per interval rather than once at the end. A pure debounce would write
+ * nothing at all until the key was released, which loses the level entirely if
+ * the app is killed mid-burst — and the leading write closes a startup race
+ * besides, which `commit` explains.
  *
  * 400ms is chosen against the OS key-repeat rate rather than against the disk:
  * long enough that any plausible repeat rate collapses to a couple of writes a
@@ -106,27 +108,46 @@ export function useZoom(runtime: DeckRuntimeState, settings: DesktopSettingsStat
    */
   const lastPersisted = useRef(stored);
 
+  const write = useCallback((next: number) => {
+    lastPersisted.current = next;
+    const current = settingsRef.current;
+    // The whole document, with only this section replaced — a save must never
+    // drop a section this build's UI has not loaded (`settingsContract.ts`).
+    current.save({ ...current.settings, zoom: { level: next } });
+  }, []);
+
   const flushPersist = useCallback(() => {
     persistTimer.current = undefined;
     const pending = persistPending.current;
     persistPending.current = undefined;
-    if (pending === undefined) return;
-    lastPersisted.current = pending;
-    const current = settingsRef.current;
-    // The whole document, with only this section replaced — a save must never
-    // drop a section this build's UI has not loaded (`settingsContract.ts`).
-    current.save({ ...current.settings, zoom: { level: pending } });
-  }, []);
+    if (pending !== undefined) write(pending);
+  }, [write]);
 
   const commit = useCallback((next: number) => {
     if (next === levelRef.current) return;
     levelRef.current = next;
     setLevel(next);
-    persistPending.current = next;
     if (persistTimer.current === undefined) {
+      // **Leading edge**, and it is not only about matching the coalescer this
+      // app already documents (`SnapshotCoalescer`: the first change writes
+      // immediately, the rest are throttled, one trailing write flushes the
+      // remainder). It closes a startup race that a purely trailing flush
+      // leaves open.
+      //
+      // `useDesktopSettings` protects a user's choice from the asynchronous
+      // initial load with an `edited` ref — but that ref is only set *inside*
+      // `save`. With a trailing-only flush, `save` has not been called yet when
+      // `getSettings()` resolves, so a zoom keystroke made in that window was
+      // overwritten by whatever was on disk at launch: the change appeared to
+      // take and then reverted, which is the exact failure that hook's own
+      // comment describes. Writing the first change of a burst straight through
+      // sets `edited` in time, and costs one extra write per burst.
+      write(next);
       persistTimer.current = setTimeout(flushPersist, ZOOM_PERSIST_INTERVAL_MS);
+    } else {
+      persistPending.current = next;
     }
-  }, [flushPersist]);
+  }, [flushPersist, write]);
 
   const apply = useCallback((intent: ZoomIntent) => {
     commit(applyZoomIntent(levelRef.current, intent));

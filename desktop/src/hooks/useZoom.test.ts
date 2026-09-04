@@ -18,15 +18,31 @@ import type { DeckRuntimeState } from "../types";
  * The hook itself never reads `event.target`, which is why driving it directly
  * is honest and not a dodge.
  */
+/**
+ * A settings state that behaves like the real `useDesktopSettings`, which
+ * matters more than it sounds.
+ *
+ * `save` there is **optimistic**: it sets React state to the new document
+ * synchronously and writes behind it. So after a write, the document the hook
+ * reads back already carries the new level. An earlier version of this harness
+ * only recorded the call and left `settings` alone, which manufactured a lag
+ * that cannot happen in the app — and hid a spurious adopt in `useZoom`'s sync
+ * effect behind test-only timing. Mutating in place is enough, because every
+ * write is accompanied by the `setLevel` that re-renders.
+ */
 function settingsState(level = 1, overrides: Partial<DesktopSettingsState> = {}): DesktopSettingsState & { saved: DesktopSettingsDto[] } {
   const saved: DesktopSettingsDto[] = [];
-  return {
+  const state: DesktopSettingsState & { saved: DesktopSettingsDto[] } = {
     settings: { ...DEFAULT_DESKTOP_SETTINGS, zoom: { level } },
     loaded: true,
-    save: vi.fn((next: DesktopSettingsDto) => { saved.push(next); }),
+    save: vi.fn((next: DesktopSettingsDto) => {
+      saved.push(next);
+      state.settings = next;
+    }),
     saved,
     ...overrides,
   };
+  return state;
 }
 
 /**
@@ -204,15 +220,41 @@ describe("useZoom", () => {
     renderHook(() => useZoom(runtimeState(), settings));
 
     act(() => { for (let i = 0; i < 6; i += 1) press("="); });
-    // Nothing on disk yet: the whole point is that a held key does not rewrite
-    // desktop.toml once per key repeat.
-    expect(settings.saved).toHaveLength(0);
+    // Leading edge: the FIRST change of the burst is on disk already, and the
+    // other five are collapsed rather than written. Six keystrokes, one write —
+    // the property is that a held key does not rewrite desktop.toml once per
+    // key repeat, not that it writes nothing.
+    expect(settings.saved).toHaveLength(1);
+    expect(settings.saved[0].zoom.level).toBe(0.9);
 
     act(() => { vi.advanceTimersByTime(ZOOM_PERSIST_INTERVAL_MS); });
-    expect(settings.saved).toHaveLength(1);
-    // 0.75 stepped six rungs is 1.75, and that is what was written — the
-    // intermediate levels are dropped, not queued.
-    expect(settings.saved[0].zoom.level).toBe(1.75);
+    // 0.75 stepped six rungs is 1.75, and the trailing flush writes exactly
+    // that — the four intermediate levels are dropped, not queued.
+    expect(settings.saved).toHaveLength(2);
+    expect(settings.saved[1].zoom.level).toBe(1.75);
+  });
+
+  /**
+   * Why the leading write exists, beyond matching this app's own coalescer.
+   *
+   * `useDesktopSettings` protects a user's choice from the asynchronous initial
+   * load with an `edited` ref — but it sets that ref only *inside* `save`. With
+   * a trailing-only flush, `save` has not been called yet when `getSettings()`
+   * resolves, so a zoom keystroke made in that window was overwritten by
+   * whatever was on disk at launch: the change appeared to take and then
+   * reverted a moment later.
+   *
+   * The `edited` ref lives in the real hook, so what this can assert is the
+   * half that closes the race here: the keystroke reaches `save` **before** any
+   * timer runs, which is what gets the ref set in time.
+   */
+  it("writes the first change of a burst before any timer runs", () => {
+    const settings = settingsState();
+    renderHook(() => useZoom(runtimeState(), settings));
+
+    act(() => press("="));
+    expect(settings.save).toHaveBeenCalledTimes(1);
+    expect(settings.saved[0].zoom.level).toBe(1.1);
   });
 
   it("saves the whole document, so it cannot drop a section it does not know about", () => {
@@ -240,25 +282,42 @@ describe("useZoom", () => {
     const settings = settingsState(0.75);
     renderHook(() => useZoom(runtimeState(), settings));
 
-    act(() => press("="));
-    act(() => { vi.advanceTimersByTime(ZOOM_PERSIST_INTERVAL_MS); });
-    expect(settings.saved).toHaveLength(1);
-
-    act(() => press("="));
-    act(() => { vi.advanceTimersByTime(ZOOM_PERSIST_INTERVAL_MS); });
-    expect(settings.saved).toHaveLength(2);
-    expect(settings.saved[1].zoom.level).toBe(1.0);
+    // Three windows of a sustained hold. Each writes, so the level on disk
+    // tracks the one on screen throughout — a pure debounce would have written
+    // nothing at all until the key came up, losing the level entirely if the
+    // app died mid-burst.
+    for (let window = 0; window < 3; window += 1) {
+      act(() => { press("="); press("="); });
+      act(() => { vi.advanceTimersByTime(ZOOM_PERSIST_INTERVAL_MS); });
+    }
+    expect(settings.saved.length).toBeGreaterThanOrEqual(3);
+    // 0.75 stepped six rungs, and the last thing written is where it ended up.
+    expect(settings.saved[settings.saved.length - 1].zoom.level).toBe(1.75);
   });
 
   it("flushes a pending level on unmount, so the last change of a session survives", () => {
     const settings = settingsState();
     const { unmount } = renderHook(() => useZoom(runtimeState(), settings));
 
-    act(() => press("="));
-    expect(settings.saved).toHaveLength(0);
-    unmount();
+    // Two presses: the first is the leading write, the second is only pending.
+    act(() => { press("="); press("="); });
     expect(settings.saved).toHaveLength(1);
     expect(settings.saved[0].zoom.level).toBe(1.1);
+
+    unmount();
+    expect(settings.saved).toHaveLength(2);
+    expect(settings.saved[1].zoom.level).toBe(1.25);
+  });
+
+  it("writes nothing extra on unmount when nothing is pending", () => {
+    const settings = settingsState();
+    const { unmount } = renderHook(() => useZoom(runtimeState(), settings));
+
+    act(() => press("="));
+    act(() => { vi.advanceTimersByTime(ZOOM_PERSIST_INTERVAL_MS); });
+    const before = settings.saved.length;
+    unmount();
+    expect(settings.saved).toHaveLength(before);
   });
 
   /**
@@ -308,34 +367,38 @@ describe("useZoom", () => {
   });
 
   /**
-   * The echo guard, and the race it closes.
+   * The echo guard, and why it is load-bearing rather than defensive.
    *
-   * The document trails this hook by up to one persist interval, so mid-burst
-   * it holds an OLDER level than the one on screen. A sync effect that adopted
-   * the stored value unconditionally would pull the level backwards under the
-   * user's fingers while they were still holding the key — the zoom would
-   * stutter or stick. The guard is what tells "the document caught up with us"
-   * apart from "somebody else changed it".
+   * `useDesktopSettings.save` is optimistic, so the leading write of a burst
+   * makes the stored document read back the FIRST level of that burst while the
+   * screen is already several rungs further on. A sync effect that adopted the
+   * stored value on every change would therefore drag the level backwards
+   * mid-burst — 1.1 written, 1.5 on screen, and the effect resets it to 1.1.
+   * Comparing against `lastPersisted` is what tells "the document caught up
+   * with us" apart from "somebody else changed it".
+   *
+   * An earlier version of this test built the scenario by re-rendering with a
+   * deliberately stale settings object. That was unreachable in the app — an
+   * optimistic save means the document never lags — and it was only passing
+   * because the harness's `save` did not update `settings` either. The burst
+   * below is the real mechanism.
    */
-  it("is not dragged backwards by a document that is still catching up", () => {
-    const runtime = runtimeState();
-    const { result, rerender } = renderHook(({ settings }) => useZoom(runtime, settings), {
-      initialProps: { settings: settingsState(1) },
-    });
+  it("is not dragged backwards by its own leading write", () => {
+    const settings = settingsState();
+    const { result } = renderHook(() => useZoom(runtimeState(), settings));
 
-    // Three steps to 1.5, then the first flush writes it.
     act(() => { press("="); press("="); press("="); });
+    // The document holds the leading write…
+    expect(settings.saved[0].zoom.level).toBe(1.1);
+    // …and the level is where the third keystroke put it, not back at the
+    // document's value.
     expect(result.current.level).toBe(1.5);
-    act(() => { vi.advanceTimersByTime(ZOOM_PERSIST_INTERVAL_MS); });
 
-    // Two more steps while the document still reads the level from the flush
-    // above — which is what a re-render carrying that older document looks
-    // like.
-    act(() => { press("="); press("="); });
-    expect(result.current.level).toBe(2);
-    rerender({ settings: settingsState(1.5) });
-    expect(result.current.level).toBe(2);
-    expect(runtime.setZoom).toHaveBeenLastCalledWith(2);
+    // Still true after the trailing flush brings the document level with it.
+    act(() => { vi.advanceTimersByTime(ZOOM_PERSIST_INTERVAL_MS); });
+    expect(result.current.level).toBe(1.5);
+    act(() => press("="));
+    expect(result.current.level).toBe(1.75);
   });
 
   it("does not bind the keys where the bridge cannot scale a webview", () => {
