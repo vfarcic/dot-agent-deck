@@ -162,6 +162,23 @@ export function useZoom(runtime: DeckRuntimeState, settings: DesktopSettingsStat
   // pending write is ignored, per `lastPersisted` above.
   useEffect(() => {
     if (stored === lastPersisted.current) return;
+    // **An external change supersedes anything still queued here**, and
+    // dropping it is not tidiness — keeping it is a bug with a two-part
+    // symptom (Greptile P1 on PR #880). Hold a zoom key, then pick a level in
+    // Settings: without this, the adopt below takes the new level while the
+    // armed timer still holds the older keyboard one, and 400ms later that
+    // stale value is written over the user's choice. The window then follows
+    // it, because the write moves `lastPersisted` and the next render adopts
+    // backwards — so the level visibly falls back a moment after being set,
+    // and the wrong one is restored at the next launch.
+    //
+    // Nothing needs writing in its place: whoever changed the document has
+    // already persisted it.
+    if (persistTimer.current !== undefined) {
+      clearTimeout(persistTimer.current);
+      persistTimer.current = undefined;
+    }
+    persistPending.current = undefined;
     lastPersisted.current = stored;
     levelRef.current = stored;
     setLevel(stored);
@@ -236,15 +253,47 @@ export function useZoom(runtime: DeckRuntimeState, settings: DesktopSettingsStat
     return () => window.removeEventListener("keydown", onKeyDown, true);
   }, [apply, available]);
 
-  // A pending level must reach the disk when the component goes away, or the
-  // last change of a session is lost — which for the app's final zoom before a
-  // quit is the one the user most expects to survive.
-  useEffect(() => () => {
-    if (persistTimer.current !== undefined) {
+  /**
+   * Flush a pending level on every teardown path we can actually observe.
+   *
+   * The React unmount alone is not enough, and assuming it was is the second
+   * defect Greptile caught on PR #880: closing the native window tears the
+   * webview down without unmounting anything, so a burst whose trailing value
+   * had not been written lost it. `pagehide` and a `visibilitychange` to
+   * hidden are what the webview does give us, and they also cover the ordinary
+   * "alt-tab away and come back later" case.
+   *
+   * **This is best effort and the residual gap is stated rather than papered
+   * over.** `save` starts an asynchronous IPC that shutdown does not await, so
+   * a hard kill inside that round trip can still lose the last change of a
+   * burst. Two things bound it. The leading-edge write means a single
+   * deliberate keypress is already on its way to disk before any of this
+   * matters, so what remains at risk is the tail of a held-key burst.
+   * And the alternative — persisting Rust-side inside `desktop_set_zoom` —
+   * was rejected: it would make the keys and the Settings row write through
+   * different code, losing the property that they cannot disagree, and it
+   * would turn every keystroke into a read-modify-write of the whole document,
+   * which is more disk traffic rather than less. A durable close would need
+   * Rust-side close interception that awaits a webview round trip, which is a
+   * disproportionate amount of machinery for a zoom level.
+   */
+  useEffect(() => {
+    const flushNow = () => {
+      if (persistTimer.current === undefined) return;
       clearTimeout(persistTimer.current);
       persistTimer.current = undefined;
       flushPersist();
-    }
+    };
+    const onHidden = () => {
+      if (document.visibilityState === "hidden") flushNow();
+    };
+    window.addEventListener("pagehide", flushNow);
+    document.addEventListener("visibilitychange", onHidden);
+    return () => {
+      window.removeEventListener("pagehide", flushNow);
+      document.removeEventListener("visibilitychange", onHidden);
+      flushNow();
+    };
   }, [flushPersist]);
 
   return { level, apply, set, available };

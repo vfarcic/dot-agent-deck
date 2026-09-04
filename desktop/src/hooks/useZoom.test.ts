@@ -401,6 +401,89 @@ describe("useZoom", () => {
     expect(result.current.level).toBe(1.75);
   });
 
+  /**
+   * Greptile P1 on PR #880, and neither fix was covered by the suite that
+   * shipped them — so these are the two tests that would have caught them.
+   *
+   * A keyboard burst arms a timer holding a pending level. If the user then
+   * picks a level in Settings, that pending value is stale: leaving it armed
+   * writes the OLDER keyboard level over the newer choice 400ms later, and
+   * because the write moves `lastPersisted`, the next render adopts backwards
+   * and the window visibly falls back too. The wrong level is then restored at
+   * the next launch.
+   */
+  it("drops a pending keyboard write when the document changes underneath it", () => {
+    const settings = settingsState();
+    const { result, rerender } = renderHook(({ state }) => useZoom(runtimeState(), state), {
+      initialProps: { state: settings },
+    });
+
+    // A burst: 1.1 written on the leading edge, 1.25 left pending.
+    act(() => { press("="); press("="); });
+    expect(settings.saved.map((doc) => doc.zoom.level)).toEqual([1.1]);
+
+    // The Settings row picks 2.0 — its only channel is the document.
+    act(() => { settings.save({ ...settings.settings, zoom: { level: 2 } }); });
+    rerender({ state: settings });
+    expect(result.current.level).toBe(2);
+
+    // The stale pending 1.25 must never land.
+    act(() => { vi.advanceTimersByTime(ZOOM_PERSIST_INTERVAL_MS * 2); });
+    expect(settings.saved.map((doc) => doc.zoom.level)).toEqual([1.1, 2]);
+    expect(settings.settings.zoom.level).toBe(2);
+    // And the window did not fall back either.
+    expect(result.current.level).toBe(2);
+  });
+
+  /**
+   * Closing the native window tears the webview down without unmounting
+   * anything, so the React cleanup alone did not save a burst's trailing
+   * value. `pagehide` and a `visibilitychange` to hidden are the teardown
+   * signals a webview actually gives us.
+   */
+  it("flushes a pending level on pagehide", () => {
+    const settings = settingsState();
+    const { unmount } = renderHook(() => useZoom(runtimeState(), settings));
+    act(() => { press("="); press("="); });
+    expect(settings.saved.map((doc) => doc.zoom.level)).toEqual([1.1]);
+
+    act(() => { window.dispatchEvent(new Event("pagehide")); });
+    expect(settings.saved.map((doc) => doc.zoom.level)).toEqual([1.1, 1.25]);
+    unmount();
+  });
+
+  it("flushes a pending level when the window goes hidden", () => {
+    const settings = settingsState();
+    const { unmount } = renderHook(() => useZoom(runtimeState(), settings));
+    act(() => { press("="); press("="); });
+
+    const spy = vi.spyOn(document, "visibilityState", "get").mockReturnValue("hidden");
+    try {
+      act(() => { document.dispatchEvent(new Event("visibilitychange")); });
+      expect(settings.saved.map((doc) => doc.zoom.level)).toEqual([1.1, 1.25]);
+    } finally {
+      spy.mockRestore();
+      unmount();
+    }
+  });
+
+  // `visibilitychange` fires on becoming visible too, and a flush there would
+  // be harmless but pointless — asserted so the listener stays keyed on the
+  // hidden transition rather than on every change.
+  it("does not flush when the window merely becomes visible again", () => {
+    const settings = settingsState();
+    renderHook(() => useZoom(runtimeState(), settings));
+    act(() => { press("="); press("="); });
+
+    const spy = vi.spyOn(document, "visibilityState", "get").mockReturnValue("visible");
+    try {
+      act(() => { document.dispatchEvent(new Event("visibilitychange")); });
+      expect(settings.saved.map((doc) => doc.zoom.level)).toEqual([1.1]);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
   it("does not bind the keys where the bridge cannot scale a webview", () => {
     const settings = settingsState();
     const runtime = runtimeState({ mode: "fixture" });

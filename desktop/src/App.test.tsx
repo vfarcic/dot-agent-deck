@@ -623,7 +623,12 @@ describe("ControlDeck", () => {
     fireEvent.click(screen.getByRole("button", { name: "Keyboard shortcuts" }));
     const dialog = screen.getByRole("dialog", { name: "Control keys" });
     expect(within(dialog).getByText("Zoom in, out, reset")).toBeVisible();
-    expect(within(dialog).getByText("⌘ + / − / 0")).toBeVisible();
+    // Neutral wording rather than a platform-detected glyph, because either
+    // modifier works on either platform (`zoomIntentFromKey` accepts both) so
+    // there is nothing to detect. Note the `⌘ K` row above it has the same
+    // pre-existing problem and is deliberately left alone — see Open Question
+    // 5 in `prds/744-desktop-zoom-text-size.md`.
+    expect(within(dialog).getByText("⌘/Ctrl + / − / 0")).toBeVisible();
   });
 
   it("declares every terminal-tab tile to the bridge in a single call", () => {
