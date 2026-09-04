@@ -2235,16 +2235,29 @@ fn arm_idle_worker_watch(
         // Issue #424 S3: one-shot, exactly like the delegate pointer in
         // `dispatch_one_owned` — the outstanding-delegation record is consumed
         // either way and nothing retries this prompt — so the payload record its
-        // write left guards nothing and must not survive to refuse a later
-        // report of the same text into the same orchestrator. The idle text is
+        // write left guards nothing and, once the submit has actually drained
+        // the input box, must not survive to refuse a later report of the same
+        // text into the same orchestrator. The idle text is
         // composed from the role and a coarse elapsed time, so two reports
         // repeating byte for byte is ordinary, not exotic.
-        if matches!(
-            outcome,
-            Ok(crate::agent_pty::GuardedSend::Applied | crate::agent_pty::GuardedSend::Ambiguous)
-        ) {
-            registry.note_payload_settled(&orchestrator_pane_id, &prompt);
-        }
+        //
+        // Issue #715: `Ambiguous` used to share that arm — verbatim the shape
+        // PR #713 fixed on the silence report, and left here only to keep that
+        // PR's blast radius contained. It must not: an ambiguous submit leaves
+        // prompt bytes sitting un-submitted in the orchestrator's input box, and
+        // releasing the record there admits a later byte-identical prompt that
+        // submits those leftovers together with whatever the user has typed
+        // since, as one turn. What that costs in the other direction is one
+        // SUPPRESSED idle prompt about a worker that is still silent — bounded
+        // to `PAYLOAD_RECORD_TTL` and only into a pane the user typed into after
+        // the write — against an INVENTED turn carrying text the user never
+        // sent. See [`settle_one_shot_payload_record`].
+        settle_one_shot_payload_record(
+            &registry,
+            &orchestrator_pane_id,
+            &prompt,
+            outcome.as_ref().ok().copied(),
+        );
         match outcome {
             Ok(crate::agent_pty::GuardedSend::Applied) => tracing::info!(
                 worker_pane_id = %worker_pane_id,
@@ -2253,12 +2266,16 @@ fn arm_idle_worker_watch(
                 "idle-worker watch: reported a silent worker to the orchestrator"
             ),
             // A partial write: some bytes reached the authorized target, so the
-            // one-shot record stays consumed rather than being retried into a
-            // duplicate prompt.
+            // prompt is not retried into a duplicate — and, unlike `Applied`,
+            // its payload record is deliberately left standing, because those
+            // bytes may still be in the pane's input box. See
+            // [`settle_one_shot_payload_record`].
             Ok(crate::agent_pty::GuardedSend::Ambiguous) => warn!(
                 pane_id = %orchestrator_pane_id,
                 role = %delegation.role,
-                "idle-worker watch: idle prompt delivery was ambiguous (partial write); not retried"
+                "idle-worker watch: idle prompt delivery was ambiguous (partial write); not \
+                 retried, and its payload record is kept so a later identical prompt cannot \
+                 submit the leftover bytes with the user's draft"
             ),
             Ok(refused) => warn!(
                 pane_id = %orchestrator_pane_id,
@@ -2885,7 +2902,12 @@ fn arm_delegate_silence_watch(
                 },
             )
             .await;
-        settle_silence_report_payload_record(&registry, &orchestrator_pane_id, &notice, &outcome);
+        settle_one_shot_payload_record(
+            &registry,
+            &orchestrator_pane_id,
+            &notice,
+            outcome.as_ref().ok().copied(),
+        );
         match outcome {
             Ok(crate::agent_pty::GuardedSend::Applied) => tracing::info!(
                 pane_id = %worker_pane_id,
@@ -2896,7 +2918,7 @@ fn arm_delegate_silence_watch(
             // report is not retried into a duplicate — and, unlike `Applied`,
             // its payload record is deliberately left standing, because those
             // bytes may still be in the pane's input box. See
-            // [`settle_silence_report_payload_record`].
+            // [`settle_one_shot_payload_record`].
             Ok(crate::agent_pty::GuardedSend::Ambiguous) => warn!(
                 pane_id = %orchestrator_pane_id,
                 role = %role,
@@ -2921,45 +2943,59 @@ fn arm_delegate_silence_watch(
     });
 }
 
-/// Issue #424 S3 / PR #713 review: release the payload record a ONE-SHOT
-/// silence report left on the orchestrator's pane — but only for the outcome
-/// that says the pane's input box is empty again.
+/// Issue #424 S3 / PR #713 review / issue #715: release the payload record a
+/// ONE-SHOT automatic write left on a pane — but only for the outcome that says
+/// the pane's input box is empty again.
 ///
-/// `Applied` wrote the report AND its submit CR, so the submit drained the
-/// input box and nothing of ours is left in it. The record that write left
-/// guards a retry this path will never make — the watch record was consumed
-/// before the send and nothing retries the report — so keeping it could only
-/// refuse a LATER, unrelated report of the same text into the same
-/// orchestrator. That repeat is ordinary rather than exotic: two silent workers
-/// on one orchestration reporting a blank pane in the same window compose
-/// byte-for-byte equal text (`scheduler/idle-worker/017`), and
-/// `arm_idle_worker_watch` reasons the same way about its own report.
+/// `Some(Applied)` wrote the payload AND its submit CR, so the submit drained
+/// the input box and nothing of ours is left in it. The record that write left
+/// guards a retry a one-shot caller will never make — its watch or delegation
+/// record was consumed before the send and nothing retries the payload — so
+/// keeping it could only refuse a LATER, unrelated delivery of the same bytes
+/// into the same pane. That repeat is ordinary rather than exotic at every
+/// caller here: two silent workers on one orchestration reporting a blank pane
+/// in the same window compose byte-for-byte equal reports
+/// (`scheduler/idle-worker/017`), the idle prompt is a role name plus a COARSE
+/// elapsed time, and the delegate task pointer is deliberately the same fixed
+/// one-liner on every hand-off.
 ///
-/// `Ambiguous` deliberately does NOT release it, even though it is just as
-/// one-shot. It is by definition a PARTIAL write — some report bytes reached
+/// `Some(Ambiguous)` deliberately does NOT release it, even though it is just as
+/// one-shot. It is by definition a PARTIAL write — some payload bytes reached
 /// the authorized target and the submit did not complete — so those bytes are
-/// still sitting in the input box, un-submitted. Clearing the record there
-/// asserts the payload settled when the whole meaning of the outcome is that we
-/// do not know whether it did, and a later identical report into a pane the
-/// user has typed into since would then be admitted and submit the leftover
-/// report bytes together with the user's unsent draft as one unintended turn.
-/// The two costs are not symmetric: keeping the record costs a SUPPRESSED later
-/// report (and only until `agent_pty`'s `PAYLOAD_RECORD_TTL` elapses),
-/// while releasing it costs an INVENTED turn carrying text the user never sent.
-/// Suppressing a diagnostic beats inventing input. So this is one `matches!`
-/// arm on purpose — do not fold `Ambiguous` back into it.
+/// still sitting in the input box, un-submitted, and **nothing anywhere removes
+/// them**. Clearing the record there asserts the payload settled when the whole
+/// meaning of the outcome is that we do not know whether it did, and a later
+/// identical delivery into a pane the user has typed into since would then be
+/// admitted and submit the leftover bytes together with the user's unsent draft
+/// as one unintended turn. The two costs are not symmetric: keeping the record
+/// costs a SUPPRESSED later delivery — and only into a pane the user has typed
+/// into since the write, and only until `agent_pty`'s `PAYLOAD_RECORD_TTL`
+/// elapses — while releasing it costs an INVENTED turn carrying text the user
+/// never sent. Suppressing a later delivery beats inventing input. So this is
+/// one `matches!` arm on purpose — do not fold `Ambiguous` back into it.
 ///
-/// Every other outcome — a refusal or a writer error — wrote nothing, so there
-/// is no record of ours to release and calling this would consume a concurrent
-/// delivery of the same bytes' record instead (issue #424 S2).
-fn settle_silence_report_payload_record(
+/// Note what this narrowing does NOT fix, so nobody reads it as more than it is:
+/// an `Ambiguous` submit still STRANDS those bytes in the input box, exactly as
+/// before. What changes is only that they are no longer silently MERGED into a
+/// later turn. Each caller records what its own suppressed delivery costs, since
+/// that differs — a diagnostic at the two report sites, a whole delegation at
+/// the task pointer.
+///
+/// Every other outcome — a refusal, or `None` for a writer error that wrote
+/// nothing at all — left no record of ours, so calling this would consume a
+/// concurrent delivery of the same bytes' record instead (issue #424 S2).
+///
+/// Shared by all three one-shot callers BECAUSE they drifted: #713 narrowed the
+/// silence report and left its two siblings on `Applied | Ambiguous`, which is
+/// issue #715. One decision, one place.
+fn settle_one_shot_payload_record(
     registry: &crate::agent_pty::AgentPtyRegistry,
-    orchestrator_pane_id: &str,
-    notice: &str,
-    outcome: &Result<crate::agent_pty::GuardedSend, crate::agent_pty::AgentPtyError>,
+    pane_id: &str,
+    payload: &str,
+    outcome: Option<crate::agent_pty::GuardedSend>,
 ) {
-    if matches!(outcome, Ok(crate::agent_pty::GuardedSend::Applied)) {
-        registry.note_payload_settled(orchestrator_pane_id, notice);
+    if matches!(outcome, Some(crate::agent_pty::GuardedSend::Applied)) {
+        registry.note_payload_settled(pane_id, payload);
     }
 }
 
@@ -5209,6 +5245,12 @@ async fn dispatch_one_owned(
             crate::agent_pty::GuardedSend::NoLiveTarget,
         ))
     };
+    // Issue #715: the payload record's release is decided by the OUTCOME, not by
+    // the `delivered` flag below, and the two now disagree on exactly one
+    // outcome. Flattened HERE because the match consumes `outcome`;
+    // `RefusedUserInput` flattens to `Stale` — nothing written — which is
+    // precisely how the settle decision must read it.
+    let submit_outcome = outcome.as_ref().ok().map(|detail| detail.outcome());
     let delivered = match outcome {
         // `Ambiguous` is a partial write: some bytes reached the authorized
         // worker, so the delegate may or may not have landed — exactly the
@@ -5218,7 +5260,9 @@ async fn dispatch_one_owned(
             warn!(
                 pane_id = %pane_id,
                 role = %target_role,
-                "delegate: task pointer delivery was ambiguous (partial write); not retried"
+                "delegate: task pointer delivery was ambiguous (partial write); not retried, and \
+                 its payload record is kept so a later identical pointer cannot submit the \
+                 leftover bytes with the user's draft"
             );
             true
         }
@@ -5264,13 +5308,14 @@ async fn dispatch_one_owned(
             false
         }
     };
-    // The two arms below are complements of one `delivered`, and they release
-    // two DIFFERENT records for two different reasons — issue #424's payload
-    // record when the write landed, issue #448's commission when it did not.
-    // Neither subsumes the other: the payload record is created by the write
-    // itself, so a refusal leaves none to settle, while the commission is armed
-    // before this function's first poll and so survives a write that never
-    // happened.
+    // The two releases below settle two DIFFERENT records for two different
+    // reasons — issue #424's payload record when the submit drained the input
+    // box, issue #448's commission when the pointer may never have reached the
+    // worker. Neither subsumes the other: the payload record is created by the
+    // write itself, so a refusal leaves none to settle, while the commission is
+    // armed before this function's first poll and so survives a write that never
+    // happened. Issue #715: they are consequently NO LONGER complements of one
+    // `delivered` — see below for the one outcome on which they disagree.
     //
     // Issue #424 S3 (auditor HIGH): this path is ONE-SHOT — nothing above
     // retries the pointer, and `Ambiguous` says so explicitly — so the record
@@ -5282,9 +5327,28 @@ async fn dispatch_one_owned(
     // the write, rather than left to the 60 s TTL. Only when something was
     // actually written — a refusal created no record, and releasing then would
     // consume a concurrent delivery's.
-    if delivered {
-        registry.note_payload_settled(&pane_id, &one_liner);
-    }
+    //
+    // Issue #715: and only on `Applied`, which is why this reads
+    // `submit_outcome` rather than `delivered`. `Ambiguous` deliberately keeps
+    // `delivered == true` — the bytes MAY have reached the worker, so the
+    // commission stays owed and the silence watch stays armed — while leaving
+    // the payload record standing, because those same bytes may instead be
+    // sitting un-submitted in the worker's input box with nothing anywhere to
+    // remove them.
+    //
+    // The cost of that is sharper here than at the two report sites, and was
+    // weighed rather than swept in: refusing a repeat costs a DELEGATION —
+    // work that never starts — not merely a diagnostic, and the pointer's fixed
+    // text makes the repeat GUARANTEED byte-identical rather than merely likely.
+    // Taken anyway, because the refusal is neither silent nor unaccounted: the
+    // later delegation takes the `RefusedUserInput` arm above, which publishes a
+    // `DeliveryNotice` naming exactly this cause on the worker's card, and
+    // `delivered == false` there releases the commission so the orchestrator is
+    // not left owing a completion. Refusing and reporting why beats submitting
+    // the leftover pointer bytes on top of the user's unsent draft, and it is
+    // bounded — the refusal needs the user to have typed since the ambiguous
+    // write and lapses with `PAYLOAD_RECORD_TTL`.
+    settle_one_shot_payload_record(&registry, &pane_id, &one_liner, submit_outcome);
     // Commission audit exit 5 (issue #448 review, finding 1): the delegate never
     // reached the worker, so the orchestrator is owed no completion from it — see
     // [`release_undelivered_commission`] for what an unreleased debt costs.
@@ -10382,17 +10446,17 @@ mod tests {
         // payload record behind. Nothing here reaches around it: this is the
         // same function `arm_delegate_silence_watch` calls with the outcome its
         // own guarded submit returned.
-        settle_silence_report_payload_record(
+        settle_one_shot_payload_record(
             &registry,
             AMBIGUOUS_PANE,
             &report,
-            &Ok(crate::agent_pty::GuardedSend::Ambiguous),
+            Some(crate::agent_pty::GuardedSend::Ambiguous),
         );
-        settle_silence_report_payload_record(
+        settle_one_shot_payload_record(
             &registry,
             APPLIED_PANE,
             &report,
-            &Ok(crate::agent_pty::GuardedSend::Applied),
+            Some(crate::agent_pty::GuardedSend::Applied),
         );
 
         // The user types into both panes. This is the clock that arms the
@@ -10429,6 +10493,299 @@ mod tests {
             "control: the same sequence whose submit reported APPLIED does release the record, so \
              the identical repeat is admitted — which is what makes the refusal above a property \
              of the outcome rather than of the harness"
+        );
+    }
+
+    /// Scenario: Deliver the PRD #126 idle-worker prompt into two orchestrator
+    /// panes exactly the way the daemon does, then run the production settle
+    /// decision over each — one pane's submit is reported `Ambiguous` (a partial
+    /// write), the other's `Applied`. The user types into both panes and a
+    /// byte-identical second prompt follows: the ambiguous pane must REFUSE it,
+    /// because prompt bytes may still be sitting un-submitted in its input box,
+    /// while the applied pane still admits it.
+    #[cfg(unix)]
+    #[spec("scheduler/idle-worker/019")]
+    #[tokio::test]
+    async fn idle_worker_019_an_ambiguous_idle_prompt_keeps_its_payload_record() {
+        // Issue #715: `arm_idle_worker_watch`'s release was
+        // `Ok(Applied | Ambiguous)` — verbatim the shape PR #713 narrowed on the
+        // silence report, left alone only to keep that PR's blast radius
+        // contained. `Ambiguous` is a PARTIAL write, so some prompt bytes may be
+        // sitting in the orchestrator's input box with no submit behind them,
+        // and releasing the record there lets a later identical prompt be
+        // admitted into a pane the user has typed into, submitting the leftovers
+        // plus the user's unsent draft as one turn.
+        //
+        // Why a byte-identical repeat is ordinary rather than exotic here: the
+        // idle text is a role name plus a COARSE elapsed time
+        // (`format_idle_elapsed`), so two prompts about the same role inside one
+        // bucket compose byte for byte alike.
+        //
+        // The physical write is `Applied` on BOTH panes, for the same reason
+        // `scheduler/idle-worker/018` records: a real `/bin/cat` PTY writer
+        // cannot be faulted into a partial write from this seam, and
+        // `write_and_submit_guarded` classifies partiality inside the writer's
+        // critical section. That costs nothing, because the registry state the
+        // decision reads is identical either way — both arms of that
+        // classification call `note_automatic_write` with the same payload, so
+        // the record an ambiguous write leaves IS the record an applied one
+        // leaves. What differs is only the outcome the daemon then acts on.
+        const AMBIGUOUS_PANE: &str = "idle-prompt-ambiguous-orchestrator";
+        const APPLIED_PANE: &str = "idle-prompt-applied-orchestrator";
+
+        let registry = Arc::new(AgentPtyRegistry::new());
+        // The production composer, at the granularity the daemon uses it.
+        let prompt =
+            compose_idle_worker_prompt("coder", std::time::Duration::from_secs(9 * 60 + 30));
+        assert_eq!(
+            prompt,
+            compose_idle_worker_prompt("coder", std::time::Duration::from_secs(9 * 60 + 44)),
+            "precondition for the whole hazard: the coarse elapsed bucket makes two prompts \
+             about one role byte-identical, so a later repeat is ordinary rather than exotic"
+        );
+
+        let spawn_orchestrator = |pane: &str| {
+            registry
+                .spawn_agent(crate::agent_pty::SpawnOptions {
+                    command: Some("/bin/cat"),
+                    env: vec![(
+                        crate::agent_pty::DOT_AGENT_DECK_PANE_ID.to_string(),
+                        pane.to_string(),
+                    )],
+                    ..crate::agent_pty::SpawnOptions::default()
+                })
+                .expect("spawn orchestrator stand-in")
+        };
+        let ambiguous_agent = spawn_orchestrator(AMBIGUOUS_PANE);
+        let applied_agent = spawn_orchestrator(APPLIED_PANE);
+
+        // First idle prompt on both panes, delivered the production way.
+        for (pane, agent) in [
+            (AMBIGUOUS_PANE, &ambiguous_agent),
+            (APPLIED_PANE, &applied_agent),
+        ] {
+            assert_eq!(
+                registry
+                    .write_and_submit_guarded(pane, &prompt, Some(agent), || async { true })
+                    .await
+                    .expect("first idle prompt"),
+                crate::agent_pty::GuardedSend::Applied,
+                "precondition: the first idle prompt must reach {pane}"
+            );
+        }
+        // The production decision, fed each of the two outcomes that leave a
+        // payload record behind. Nothing here reaches around it: this is the
+        // same function `arm_idle_worker_watch` calls with the outcome its own
+        // guarded submit returned.
+        settle_one_shot_payload_record(
+            &registry,
+            AMBIGUOUS_PANE,
+            &prompt,
+            Some(crate::agent_pty::GuardedSend::Ambiguous),
+        );
+        settle_one_shot_payload_record(
+            &registry,
+            APPLIED_PANE,
+            &prompt,
+            Some(crate::agent_pty::GuardedSend::Applied),
+        );
+
+        // The user types into both panes. This is the clock that arms the
+        // repeat-payload refusal: without it the guard abstains and the
+        // ambiguous assertion below would pass for the wrong reason.
+        registry.note_user_input(AMBIGUOUS_PANE);
+        registry.note_user_input(APPLIED_PANE);
+
+        let ambiguous_repeat = registry
+            .write_and_submit_guarded(AMBIGUOUS_PANE, &prompt, Some(&ambiguous_agent), || async {
+                true
+            })
+            .await
+            .expect("second identical idle prompt after an ambiguous first");
+        let applied_repeat = registry
+            .write_and_submit_guarded(APPLIED_PANE, &prompt, Some(&applied_agent), || async {
+                true
+            })
+            .await
+            .expect("second identical idle prompt after an applied first");
+        registry.shutdown_all();
+
+        assert_eq!(
+            ambiguous_repeat,
+            crate::agent_pty::GuardedSend::Stale,
+            "an AMBIGUOUS submit is a partial write, so the idle prompt's bytes may still be in \
+             the orchestrator's input box: its payload record must survive and refuse a \
+             byte-identical later prompt rather than submit those leftovers together with the \
+             user's unsent draft"
+        );
+        assert_eq!(
+            applied_repeat,
+            crate::agent_pty::GuardedSend::Applied,
+            "control: the same sequence whose submit reported APPLIED does release the record, so \
+             the identical repeat is admitted — which is what makes the refusal above a property \
+             of the outcome rather than of the harness"
+        );
+    }
+
+    /// Scenario: Write the delegate task pointer into two worker panes exactly
+    /// the way `dispatch_one_owned` does, then run the production settle decision
+    /// over each — one pane's submit is reported `Ambiguous` (a partial write),
+    /// the other's `Applied`. The user types into both panes and the NEXT
+    /// delegation's pointer — the same fixed one-liner, so guaranteed
+    /// byte-identical — follows: the ambiguous pane must REFUSE it rather than
+    /// submit the stranded pointer bytes together with that draft.
+    #[cfg(unix)]
+    #[spec("orchestration/delegate/031")]
+    #[tokio::test]
+    async fn delegate_031_an_ambiguous_task_pointer_keeps_its_payload_record() {
+        // Issue #715, the sharper of the two siblings PR #713 left alone:
+        // `dispatch_one_owned` released the payload record on its `delivered`
+        // flag, which `Ambiguous` deliberately sets — because the bytes MAY have
+        // reached the worker, so the commission stays owed and the silence watch
+        // stays armed. That is the right answer to "did this reach the worker?"
+        // and the wrong one to "is the pane's input box empty again?", which only
+        // `Applied` answers yes to. The fix reads the outcome for the second
+        // question and leaves `delivered` alone.
+        //
+        // What the refusal below costs is a DELEGATION rather than a diagnostic —
+        // weighed in `dispatch_one_owned`'s own comment, and taken because the
+        // refusal is reported (`RefusedUserInput` publishes a `DeliveryNotice`
+        // on the worker's card) and releases the commission, whereas admitting
+        // the repeat submits text the user never sent.
+        //
+        // The physical write is `Applied` on BOTH panes, for the reason
+        // `scheduler/idle-worker/018` records: a `/bin/cat` PTY writer cannot be
+        // faulted into a partial write from this seam, and the registry state the
+        // decision reads is identical either way, since both classification arms
+        // call `note_automatic_write` with the same payload.
+        const AMBIGUOUS_PANE: &str = "task-pointer-ambiguous-worker";
+        const APPLIED_PANE: &str = "task-pointer-applied-worker";
+
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let cwd = tempfile::tempdir().expect("tempdir");
+        let cwd_path = cwd.path().to_str().expect("utf8 cwd");
+        // The production pointer, built the way `dispatch_one_owned` builds it:
+        // resolve the task body (which writes the worker task file) and compose
+        // the single-line pointer at it.
+        let pointer_for = |task: &str| {
+            compose_delegate_prompt(&resolve_delegate_task_body(
+                Some(cwd_path),
+                None,
+                task,
+                "coder",
+                AMBIGUOUS_PANE,
+            ))
+        };
+        let one_liner = pointer_for("Implement the first thing.");
+        assert_eq!(
+            one_liner,
+            pointer_for("Implement a completely different second thing."),
+            "the pointer is deliberately the same fixed one-liner on every hand-off, so a later \
+             delegation's bytes are GUARANTEED identical rather than merely likely — which is \
+             what makes releasing this record on an ambiguous submit reachable in practice"
+        );
+
+        let spawn_worker = |pane: &str| {
+            registry
+                .spawn_agent(crate::agent_pty::SpawnOptions {
+                    command: Some("/bin/cat"),
+                    env: vec![(
+                        crate::agent_pty::DOT_AGENT_DECK_PANE_ID.to_string(),
+                        pane.to_string(),
+                    )],
+                    ..crate::agent_pty::SpawnOptions::default()
+                })
+                .expect("spawn worker stand-in")
+        };
+        let ambiguous_agent = spawn_worker(AMBIGUOUS_PANE);
+        let applied_agent = spawn_worker(APPLIED_PANE);
+
+        // The first delegation's pointer on both panes, delivered the production
+        // way — the same primitive `dispatch_one_owned` calls, in its detailed
+        // form.
+        for (pane, agent) in [
+            (AMBIGUOUS_PANE, &ambiguous_agent),
+            (APPLIED_PANE, &applied_agent),
+        ] {
+            assert_eq!(
+                registry
+                    .write_and_submit_guarded_detailed(pane, &one_liner, Some(agent), || async {
+                        true
+                    })
+                    .await
+                    .expect("first task pointer"),
+                crate::agent_pty::GuardedSendDetail::Outcome(
+                    crate::agent_pty::GuardedSend::Applied
+                ),
+                "precondition: the first task pointer must reach {pane}"
+            );
+        }
+        // The production decision, fed each of the two outcomes that leave a
+        // payload record behind — flattened exactly as the call site flattens
+        // its `GuardedSendDetail`.
+        settle_one_shot_payload_record(
+            &registry,
+            AMBIGUOUS_PANE,
+            &one_liner,
+            Some(
+                crate::agent_pty::GuardedSendDetail::Outcome(
+                    crate::agent_pty::GuardedSend::Ambiguous,
+                )
+                .outcome(),
+            ),
+        );
+        settle_one_shot_payload_record(
+            &registry,
+            APPLIED_PANE,
+            &one_liner,
+            Some(
+                crate::agent_pty::GuardedSendDetail::Outcome(
+                    crate::agent_pty::GuardedSend::Applied,
+                )
+                .outcome(),
+            ),
+        );
+
+        // The user types into both worker panes. This is the clock that arms the
+        // repeat-payload refusal: without it the guard abstains and the
+        // ambiguous assertion below would pass for the wrong reason.
+        registry.note_user_input(AMBIGUOUS_PANE);
+        registry.note_user_input(APPLIED_PANE);
+
+        let ambiguous_repeat = registry
+            .write_and_submit_guarded_detailed(
+                AMBIGUOUS_PANE,
+                &one_liner,
+                Some(&ambiguous_agent),
+                || async { true },
+            )
+            .await
+            .expect("next delegation's pointer after an ambiguous first");
+        let applied_repeat = registry
+            .write_and_submit_guarded_detailed(
+                APPLIED_PANE,
+                &one_liner,
+                Some(&applied_agent),
+                || async { true },
+            )
+            .await
+            .expect("next delegation's pointer after an applied first");
+        registry.shutdown_all();
+
+        assert_eq!(
+            ambiguous_repeat,
+            crate::agent_pty::GuardedSendDetail::RefusedUserInput,
+            "an AMBIGUOUS submit is a partial write, so the pointer bytes may still be in the \
+             worker's input box: its payload record must survive and refuse the next \
+             delegation's identical pointer — reported on the card by this very outcome — rather \
+             than submit those leftovers together with the user's unsent draft"
+        );
+        assert_eq!(
+            applied_repeat,
+            crate::agent_pty::GuardedSendDetail::Outcome(crate::agent_pty::GuardedSend::Applied),
+            "control: the same sequence whose submit reported APPLIED does release the record, so \
+             the next delegation's identical pointer is admitted — which is what makes the \
+             refusal above a property of the outcome rather than of the harness"
         );
     }
 
