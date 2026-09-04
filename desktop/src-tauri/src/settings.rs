@@ -255,9 +255,11 @@ impl Default for DesktopSettings {
 /// out every value, and the duplication is unavoidable rather than sloppy: this
 /// side is the authority for what a *stored* level may be, because the
 /// launch-time apply reads the document before any JavaScript runs, and that
-/// side is the authority for *stepping*, because a keystroke never reaches
-/// Rust. If they drift, the app launches at one level and the Settings row
-/// claims another. The same discipline — two copies, both pinned, each pointing
+/// side is the authority for *stepping*, because the key event itself is never
+/// seen here — a keystroke reaches Rust only as an already-decided level, via
+/// `desktop_set_zoom`, so this side can validate a level but could not compute
+/// the next one. If they drift, the app launches at one level and the Settings
+/// row claims another. The same discipline — two copies, both pinned, each pointing
 /// at the other — is why `desktop/src/lib/displayText.ts` and
 /// `src/untrusted_text.rs` are still in agreement.
 ///

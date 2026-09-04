@@ -12,10 +12,12 @@
  * # Why this row exists at all, given the shortcut
  *
  * `Cmd +/-/0` needs no teaching. The row is not here to teach it — it is here
- * because **a webview zoom has no indicator of its own**. Nothing else in the
- * app can answer "what level am I at?", and at 110% against 100% that is not a
- * question you can answer by looking. Choosing `100%` here is also the reset,
- * so there is no separate reset control.
+ * because **a webview zoom has no indicator of its own**. No other surface in
+ * this app displays the level (the `?` overlay lists the keys, not the value),
+ * and at 110% against 100% it is not a question you can answer by looking. The
+ * hand-editable `desktop.toml` holds it, which is not the same as the app
+ * telling you. Choosing `100%` here is also the reset, so there is no separate
+ * reset control.
  *
  * # A select, not a segmented control
  *
@@ -59,8 +61,8 @@ export function ZoomPanel({ settings, onSave, saveError, mode }: SettingsPanelPr
           `docs/develop/desktop-gui.md`'s text bar on the stated exception —
           "an error, or a consequence the user has to act on". A browser preview
           cannot scale a webview, so the actionable half is telling the reader
-          where the zoom they want actually is. It never renders in the packaged
-          app. */}
+          where the zoom they want actually is. It renders in fixture mode
+          alone, which a packaged app is not. */}
       {!available && (
         <p className="settings-hint">Use your browser's own zoom in the preview; this scales the desktop window.</p>
       )}

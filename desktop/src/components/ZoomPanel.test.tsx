@@ -19,7 +19,7 @@ function renderPanel(overrides: Partial<DesktopSettingsDto> = {}, mode: RuntimeM
 }
 
 describe("ZoomPanel", () => {
-  it("shows the stored level, which is the only place a webview zoom is visible", () => {
+  it("shows the stored level, which no other surface in the app displays", () => {
     renderPanel({ zoom: { level: 1.5 } });
     expect(screen.getByLabelText("Zoom")).toHaveValue("1.5");
     expect(screen.getByRole("option", { name: "150%" })).toBeInTheDocument();
