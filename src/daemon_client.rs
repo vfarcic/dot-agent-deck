@@ -11,8 +11,10 @@
 //! re-exported from [`crate::daemon_protocol`] — there is exactly one
 //! definition of the wire format in the crate.
 
+use std::collections::BTreeSet;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -275,6 +277,153 @@ fn sanitize_record_tab_membership(rec: &mut AgentRecord) {
 }
 
 // ---------------------------------------------------------------------------
+// PRD #819 M5: the client's reading of the daemon's advertised capability set.
+// ---------------------------------------------------------------------------
+
+/// PRD #819 M5: the capability set observed on ONE handshake reply, plus the
+/// client's fail-safe reading of it.
+///
+/// This is the general form of the [`AttachResponse::guarded_send`] check
+/// (`daemon_advertises_guarded_send` below): it consults the daemon's
+/// **explicit capability advertisement, never the protocol version number**,
+/// and it withholds rather than proceeds when the advertisement is missing.
+///
+/// Three properties, each of which is a decision rather than an accident:
+///
+/// * **Absence withholds.** `capabilities: None` on the wire — an older daemon
+///   that predates the field, or a newer one that chose not to answer — reads
+///   as [`Self::absent`], for which [`Self::supports`] is `false` for every
+///   string. Absence is never "probably fine, it is local".
+/// * **Unknown strings are ignored, not rejected.** The set is just strings;
+///   one this build has no constant for is carried and matched like any other,
+///   so a newer daemon can grow the set without breaking an older client.
+/// * **Nothing here branches on serde's `unknown variant …` text.** That text
+///   is what an older daemon's clean `ok:false` refusal of an unknown verb is
+///   otherwise discriminated by, and it is not a stability contract. This type
+///   exists to replace that string match.
+///
+/// It is **compatibility metadata, not authentication** — a daemon controls
+/// its own replies and can claim anything. What it buys is a stable answer to
+/// "will this op parse over there".
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DaemonCapabilities {
+    /// `None` is the wire's own absence, preserved rather than flattened to an
+    /// empty set: [`Self::is_advertised`] can then tell "this daemon said
+    /// nothing" from "this daemon said it supports nothing", which are the same
+    /// for [`Self::supports`] but not for a diagnostic.
+    advertised: Option<BTreeSet<String>>,
+}
+
+impl DaemonCapabilities {
+    /// Capture the set from a `Hello` reply. The ONLY constructor that reads
+    /// the wire, so there is one place where absence is turned into "withhold".
+    pub fn from_hello(resp: &AttachResponse) -> Self {
+        Self {
+            advertised: resp
+                .capabilities
+                .as_ref()
+                .map(|list| list.iter().cloned().collect()),
+        }
+    }
+
+    /// The older-daemon reading: nothing was advertised, so everything is
+    /// withheld. Equivalent to [`Self::from_hello`] on a reply whose
+    /// `capabilities` field is absent.
+    pub fn absent() -> Self {
+        Self { advertised: None }
+    }
+
+    /// Whether the daemon advertised a set at all. `false` means this client
+    /// knows nothing about the daemon's verbs and must withhold every one of
+    /// them — it does NOT mean the daemon supports none.
+    pub fn is_advertised(&self) -> bool {
+        self.advertised.is_some()
+    }
+
+    /// Whether `capability` was advertised. `false` for an unadvertised daemon,
+    /// for a daemon advertising a different set, and for a daemon advertising
+    /// an empty set — the three cases a caller must treat identically.
+    pub fn supports(&self, capability: &str) -> bool {
+        self.advertised
+            .as_ref()
+            .is_some_and(|set| set.contains(capability))
+    }
+
+    /// The withhold decision, as an error a caller can propagate. `Ok(())` only
+    /// when `capability` was explicitly advertised.
+    ///
+    /// This is the single spelling of the decline, so the message stays uniform
+    /// across call sites when the TUI adopts the project verbs (PRD #819 M6 /
+    /// the split-out `ui.rs` work). It deliberately names the capability and not
+    /// the daemon's version: the version is not what was checked.
+    pub fn require(&self, capability: &str) -> Result<(), ClientError> {
+        if self.supports(capability) {
+            return Ok(());
+        }
+        Err(ClientError::Server(format!(
+            "daemon does not advertise the `{capability}` capability; withholding the request \
+             rather than assuming support (an older daemon answers an unknown op with a bare \
+             ok:false, which is not something to branch on)"
+        )))
+    }
+}
+
+/// PRD #819 M5: the daemon identity a captured [`DaemonCapabilities`] describes.
+///
+/// Both fields come off the same `Hello` reply the set did. `build_version` is
+/// the finer-grained one (PRD #103's `DAD_BUILD_ID`, commit hash and dirty
+/// marker included), so a rebuilt daemon at the same endpoint is a different
+/// generation even at an unchanged `PROTOCOL_VERSION`.
+///
+/// It is recorded rather than only compared because the reply carries no
+/// per-process nonce: two runs of the same binary at the same socket are
+/// indistinguishable here, and that is fine — the capability set is a property
+/// of the BUILD, so a same-build restart advertises the same set. What the
+/// generation catches is the case that is not fine: a *different* build
+/// answering at an endpoint whose set was already captured.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DaemonGeneration {
+    pub server_version: Option<u32>,
+    pub build_version: Option<String>,
+}
+
+impl DaemonGeneration {
+    fn from_hello(resp: &AttachResponse) -> Self {
+        Self {
+            server_version: resp.server_version,
+            build_version: resp.build_version.clone(),
+        }
+    }
+}
+
+/// One captured handshake: the set, and the endpoint + generation it describes.
+///
+/// The pair is the cache key. A set that outlives the connection it describes is
+/// worse than no cache, so nothing is returned from here without the endpoint
+/// matching — see [`cached_capabilities_for`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CapabilitySnapshot {
+    endpoint: PathBuf,
+    generation: DaemonGeneration,
+    capabilities: DaemonCapabilities,
+}
+
+/// The cache read, as a free function so the key rule is unit-testable without a
+/// daemon, a socket, or a `DaemonClient` whose endpoint cannot be mutated.
+///
+/// Returns the captured set ONLY when the snapshot describes `endpoint`. A
+/// snapshot taken against a different endpoint is not "close enough": the two
+/// daemons are unrelated processes that may be different builds entirely.
+fn cached_capabilities_for(
+    snapshot: Option<&CapabilitySnapshot>,
+    endpoint: &Path,
+) -> Option<DaemonCapabilities> {
+    snapshot
+        .filter(|snap| snap.endpoint == endpoint)
+        .map(|snap| snap.capabilities.clone())
+}
+
+// ---------------------------------------------------------------------------
 // Unix-socket transport
 // ---------------------------------------------------------------------------
 
@@ -284,11 +433,26 @@ fn sanitize_record_tab_membership(rec: &mut AgentRecord) {
 #[derive(Debug, Clone)]
 pub struct DaemonClient {
     socket_path: PathBuf,
+    /// PRD #819 M5: the capability set captured at the handshake for
+    /// `socket_path`, shared across clones of this handle so the set is fetched
+    /// ONCE per daemon rather than once per project-aware call.
+    ///
+    /// Shared deliberately: `DaemonClient` is cloned freely and each clone talks
+    /// to the same daemon over the same path, so a per-clone cache would be a
+    /// per-call handshake with extra steps.
+    ///
+    /// A `std::sync::Mutex` rather than a `tokio` one because the lock is never
+    /// held across an `.await` — [`Self::capabilities`] reads it, drops it,
+    /// handshakes, then re-takes it to store.
+    capabilities: Arc<Mutex<Option<CapabilitySnapshot>>>,
 }
 
 impl DaemonClient {
     pub fn new(socket_path: PathBuf) -> Self {
-        Self { socket_path }
+        Self {
+            socket_path,
+            capabilities: Arc::new(Mutex::new(None)),
+        }
     }
 
     pub fn socket_path(&self) -> &Path {
@@ -561,6 +725,121 @@ impl DaemonClient {
         )
         .await?;
         Ok(resp.guarded_send == Some(true))
+    }
+
+    /// PRD #819 M5: the daemon's advertised capability set for THIS endpoint,
+    /// captured once at a handshake and cached for the life of the connection
+    /// it describes.
+    ///
+    /// The first call performs one `Hello` exchange; later calls return the
+    /// captured set without touching the socket. That is the whole point of the
+    /// method: the [`Self::daemon_advertises_guarded_send`] probe below opens a
+    /// **fresh connection and sends a second `Hello` every time it is
+    /// consulted**, which is affordable for a check made once per prompt and is
+    /// not affordable for a check made before every project-aware action.
+    ///
+    /// **What invalidates it**, and nothing else does:
+    ///
+    /// * a different endpoint — the cache is keyed by socket path, and a
+    ///   snapshot taken against another daemon is never returned
+    ///   ([`cached_capabilities_for`]);
+    /// * an explicit [`Self::invalidate_capabilities`], which a caller issues on
+    ///   reconnect — the daemon may have been replaced by a different build
+    ///   while this handle was idle, and a set that outlives the connection it
+    ///   describes is worse than no cache.
+    ///
+    /// A transport failure is NOT cached: it surfaces as `Err` and the next call
+    /// re-handshakes. `Err` is itself fail-safe — a caller that cannot learn the
+    /// capability withholds, exactly as it does for an absent one.
+    ///
+    /// Two concurrent first-callers may each handshake; the exchange is
+    /// idempotent and the second store simply overwrites an identical snapshot.
+    /// Holding the lock across the `.await` to prevent that would be a worse
+    /// trade than one redundant `Hello`.
+    pub async fn capabilities(&self) -> Result<DaemonCapabilities, ClientError> {
+        if let Some(hit) = self.cached_capabilities() {
+            return Ok(hit);
+        }
+        let stream = self.connect().await?;
+        let (mut rd, mut wr) = stream.into_split();
+        let resp = issue_command(
+            &mut rd,
+            &mut wr,
+            &AttachRequest::Hello {
+                client_version: crate::daemon_protocol::PROTOCOL_VERSION,
+                client_build_version: None,
+            },
+        )
+        .await?;
+        if !resp.ok {
+            return Err(ClientError::Server(resp.error.unwrap_or_else(|| {
+                "handshake failed while reading capabilities".into()
+            })));
+        }
+        Ok(self.store_capabilities_from_hello(&resp))
+    }
+
+    /// Seed the cache from a `Hello` reply the caller already has.
+    ///
+    /// The handshake this PRD wants the set captured at is the one that already
+    /// happens at startup ([`crate::build_version_handshake`]) or at the
+    /// desktop's `trusted_daemon()` — both of which hold an
+    /// [`AttachResponse`] and would otherwise force [`Self::capabilities`] to
+    /// spend a second `Hello` re-learning what that reply already said. This is
+    /// the seam for those sites; it is not wired to one yet, because with the
+    /// TUI's project-resolution sites out of scope for PRD #819 there is no
+    /// project-aware caller to seed it for (see the PRD's *Capability
+    /// negotiation* section).
+    ///
+    /// Returns the captured set so a caller can act on it without a second read.
+    pub fn store_capabilities_from_hello(&self, resp: &AttachResponse) -> DaemonCapabilities {
+        let capabilities = DaemonCapabilities::from_hello(resp);
+        let snapshot = CapabilitySnapshot {
+            endpoint: self.socket_path.clone(),
+            generation: DaemonGeneration::from_hello(resp),
+            capabilities: capabilities.clone(),
+        };
+        *self.capabilities.lock().unwrap_or_else(|p| p.into_inner()) = Some(snapshot);
+        capabilities
+    }
+
+    /// Drop the captured set, so the next [`Self::capabilities`] re-handshakes.
+    /// Call this on reconnect: the daemon behind an unchanged socket path may be
+    /// a different process, and a different build.
+    pub fn invalidate_capabilities(&self) {
+        *self.capabilities.lock().unwrap_or_else(|p| p.into_inner()) = None;
+    }
+
+    /// The capture this handle currently holds for its own endpoint, if any.
+    /// `None` means "not captured yet" — never "the daemon advertised nothing",
+    /// which is [`DaemonCapabilities::absent`] and is a captured value.
+    pub fn cached_capabilities(&self) -> Option<DaemonCapabilities> {
+        let guard = self.capabilities.lock().unwrap_or_else(|p| p.into_inner());
+        cached_capabilities_for(guard.as_ref(), &self.socket_path)
+    }
+
+    /// PRD #819 M5: the fail-safe check, following the
+    /// [`Self::daemon_advertises_guarded_send`] precedent — it consults the
+    /// explicit capability, NOT the protocol version, and it answers `false`
+    /// rather than "probably" when the daemon said nothing.
+    ///
+    /// `Ok(false)` for an unadvertised daemon; `Err` for a transport failure,
+    /// which a caller treats the same way (withhold) rather than as a licence to
+    /// fall back to resolving the request itself.
+    pub async fn daemon_advertises(&self, capability: &str) -> Result<bool, ClientError> {
+        Ok(self.capabilities().await?.supports(capability))
+    }
+
+    /// [`Self::daemon_advertises`] with the decline already spelled: `Ok(())`
+    /// only when `capability` was explicitly advertised, and otherwise the
+    /// uniform withhold error from [`DaemonCapabilities::require`].
+    ///
+    /// This is what a project-aware call site puts in front of an
+    /// [`AttachRequest::ListProjects`] / `ResolveProject` / `PrepareWorkflow`,
+    /// so that an older daemon's clean `ok:false` — whose only discriminator is
+    /// serde's `unknown variant …` text — is never reached, let alone matched.
+    pub async fn require_capability(&self, capability: &str) -> Result<(), ClientError> {
+        self.capabilities().await?.require(capability)
     }
 
     /// Push a TUI pane resize through to the daemon's PTY. Idempotent on the
@@ -912,6 +1191,10 @@ mod tests {
 
     #[cfg(unix)]
     use crate::agent_pty::AgentPtyRegistry;
+    use crate::daemon_protocol::{
+        CAP_LIST_PROJECTS, CAP_PREPARE_WORKFLOW, CAP_RESOLVE_PROJECT, DAEMON_CAPABILITIES,
+        PROTOCOL_VERSION,
+    };
     #[cfg(unix)]
     use crate::daemon_protocol::{bind_attach_listener, serve_attach};
     #[cfg(unix)]
@@ -1188,6 +1471,337 @@ mod tests {
             "guarded send must fail safe before submission when capability is absent; result={result:?}, submissions={}",
             submissions.load(Ordering::SeqCst)
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // PRD #819 M5: the client-side capability helper.
+    //
+    // The property under test throughout is that ABSENCE WITHHOLDS. Every
+    // "daemon does not advertise" shape below — the field missing, a different
+    // set, an empty set — has to reach the same answer, because on the wire they
+    // are indistinguishable from each other and from a daemon that will refuse
+    // the verb.
+    // -----------------------------------------------------------------------
+
+    fn hello_advertising(list: &[&str]) -> AttachResponse {
+        AttachResponse {
+            capabilities: Some(list.iter().map(|c| c.to_string()).collect()),
+            ..AttachResponse::hello(crate::daemon_protocol::PROTOCOL_VERSION)
+        }
+    }
+
+    #[test]
+    fn capabilities_from_an_advertising_daemon_permit_the_advertised_verbs() {
+        let caps = DaemonCapabilities::from_hello(
+            &AttachResponse::hello(PROTOCOL_VERSION).with_capabilities(),
+        );
+        assert!(caps.is_advertised());
+        for cap in DAEMON_CAPABILITIES {
+            assert!(caps.supports(cap), "`{cap}` must be permitted");
+            assert!(caps.require(cap).is_ok(), "`{cap}` must not be declined");
+        }
+    }
+
+    #[test]
+    fn capabilities_absent_withhold_every_verb() {
+        // The older-daemon case: a `Hello` reply from a build that predates the
+        // field. It is NOT distinguishable from a newer daemon that chose to
+        // omit it, which is exactly why it must withhold rather than proceed.
+        let older = AttachResponse::hello(PROTOCOL_VERSION);
+        assert!(older.capabilities.is_none(), "fixture must omit the field");
+
+        for caps in [
+            DaemonCapabilities::from_hello(&older),
+            DaemonCapabilities::absent(),
+            DaemonCapabilities::default(),
+        ] {
+            assert!(!caps.is_advertised());
+            for cap in DAEMON_CAPABILITIES {
+                assert!(!caps.supports(cap), "absence must withhold `{cap}`");
+                let err = caps
+                    .require(cap)
+                    .expect_err("absence must decline, never enable");
+                let text = err.to_string();
+                assert!(
+                    text.contains(cap),
+                    "the decline must name the capability it withheld: {text}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn capabilities_advertising_a_different_set_withhold_the_rest() {
+        // A daemon that knows one verb and not the others. Only the one it named
+        // is permitted — the others are as withheld as if it had said nothing.
+        let caps = DaemonCapabilities::from_hello(&hello_advertising(&[CAP_LIST_PROJECTS]));
+        assert!(caps.is_advertised());
+        assert!(caps.supports(CAP_LIST_PROJECTS));
+        assert!(!caps.supports(CAP_RESOLVE_PROJECT));
+        assert!(!caps.supports(CAP_PREPARE_WORKFLOW));
+
+        // And the degenerate one: advertising an EMPTY set is a real answer
+        // ("I support none of these"), and reaches the same withhold as silence.
+        let empty = DaemonCapabilities::from_hello(&hello_advertising(&[]));
+        assert!(empty.is_advertised(), "an empty set is still an answer");
+        for cap in DAEMON_CAPABILITIES {
+            assert!(!empty.supports(cap));
+        }
+    }
+
+    #[test]
+    fn unknown_capability_strings_are_ignored_rather_than_rejected() {
+        // A NEWER daemon advertising verbs this build has no constant for. The
+        // reply must still decode, and the strings this build does know must
+        // still be honoured — that is what lets the set grow without a bump.
+        let decoded = serde_json::from_value::<AttachResponse>(serde_json::json!({
+            "ok": true,
+            "server_version": PROTOCOL_VERSION,
+            "capabilities": [
+                "list-projects",
+                "a-verb-from-a-later-build",
+                "another-one",
+            ],
+        }))
+        .expect("unknown capability strings must not reject the whole response");
+
+        let caps = DaemonCapabilities::from_hello(&decoded);
+        assert!(caps.supports(CAP_LIST_PROJECTS));
+        assert!(!caps.supports(CAP_RESOLVE_PROJECT));
+        // Carried verbatim, not filtered against this build's own list: the
+        // client is not the authority on what verbs exist.
+        assert!(caps.supports("a-verb-from-a-later-build"));
+    }
+
+    #[test]
+    fn cached_capabilities_are_not_reused_across_endpoints() {
+        // The cache key rule, exercised directly: a set captured against one
+        // socket is never handed out for another. Tested on the free function
+        // because a `DaemonClient`'s endpoint cannot be mutated after
+        // construction — which is the primary defence, and this is the second.
+        let snapshot = CapabilitySnapshot {
+            endpoint: PathBuf::from("/tmp/deck-a.sock"),
+            generation: DaemonGeneration::default(),
+            capabilities: DaemonCapabilities::from_hello(
+                &AttachResponse::hello(PROTOCOL_VERSION).with_capabilities(),
+            ),
+        };
+
+        let same = cached_capabilities_for(Some(&snapshot), Path::new("/tmp/deck-a.sock"))
+            .expect("the endpoint it was captured for is a hit");
+        assert!(same.supports(CAP_LIST_PROJECTS));
+
+        assert_eq!(
+            cached_capabilities_for(Some(&snapshot), Path::new("/tmp/deck-b.sock")),
+            None,
+            "a snapshot from another daemon must never satisfy this endpoint"
+        );
+        assert_eq!(
+            cached_capabilities_for(None, Path::new("/tmp/deck-a.sock")),
+            None
+        );
+    }
+
+    #[test]
+    fn seeding_from_a_hello_reply_records_the_daemon_generation() {
+        let client = DaemonClient::new(PathBuf::from("/tmp/deck-generation.sock"));
+        assert_eq!(client.cached_capabilities(), None, "starts uncaptured");
+
+        let mut reply = AttachResponse::hello(PROTOCOL_VERSION).with_capabilities();
+        reply.build_version = Some("0.39.2-gdeadbee".into());
+        let captured = client.store_capabilities_from_hello(&reply);
+        assert!(captured.supports(CAP_RESOLVE_PROJECT));
+        assert_eq!(client.cached_capabilities(), Some(captured));
+
+        let snapshot = client
+            .capabilities
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("seeded snapshot");
+        assert_eq!(
+            snapshot.generation,
+            DaemonGeneration {
+                server_version: Some(PROTOCOL_VERSION),
+                build_version: Some("0.39.2-gdeadbee".into()),
+            }
+        );
+
+        client.invalidate_capabilities();
+        assert_eq!(
+            client.cached_capabilities(),
+            None,
+            "reconnect must drop a set that no longer describes a live connection"
+        );
+    }
+
+    /// The set is captured ONCE per daemon: N project-aware calls cost one
+    /// `Hello`, not N. Drives a synthetic daemon that counts handshakes.
+    #[cfg(unix)]
+    #[test]
+    fn capabilities_are_captured_once_per_handshake_not_once_per_call() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("build capability-cache runtime");
+        runtime.block_on(capabilities_are_captured_once_per_handshake_not_once_per_call_inner());
+    }
+
+    #[cfg(unix)]
+    async fn capabilities_are_captured_once_per_handshake_not_once_per_call_inner() {
+        let (dir, path, listener) = {
+            let _g = BIND_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("capability-cache.sock");
+            let listener = bind_attach_listener(&path).expect("bind capability daemon");
+            (dir, path, listener)
+        };
+        let handshakes = Arc::new(AtomicUsize::new(0));
+        let server_handshakes = handshakes.clone();
+        let server = tokio::spawn(async move {
+            while let Ok(Ok(mut stream)) =
+                tokio::time::timeout(std::time::Duration::from_millis(500), listener.accept()).await
+            {
+                let Some((KIND_REQ, payload)) = read_frame(&mut stream)
+                    .await
+                    .expect("read capability request frame")
+                else {
+                    continue;
+                };
+                let request: serde_json::Value =
+                    serde_json::from_slice(&payload).expect("decode capability request");
+                assert_eq!(
+                    request.get("op").and_then(|op| op.as_str()),
+                    Some("hello"),
+                    "the helper must not send anything but a handshake"
+                );
+                server_handshakes.fetch_add(1, Ordering::SeqCst);
+                let response = AttachResponse::hello(crate::daemon_protocol::PROTOCOL_VERSION)
+                    .with_capabilities();
+                crate::daemon_protocol::write_resp(&mut stream, &response)
+                    .await
+                    .expect("write capability response");
+            }
+        });
+        let client = DaemonClient::new(path);
+
+        assert!(client.daemon_advertises(CAP_LIST_PROJECTS).await.unwrap());
+        client
+            .require_capability(CAP_RESOLVE_PROJECT)
+            .await
+            .expect("advertised verb is permitted");
+        assert!(
+            client
+                .daemon_advertises(CAP_PREPARE_WORKFLOW)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !client
+                .daemon_advertises("a-verb-this-daemon-never-named")
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            handshakes.load(Ordering::SeqCst),
+            1,
+            "four capability questions must cost ONE handshake"
+        );
+
+        // A clone shares the capture — it is the same daemon at the same path.
+        assert!(
+            client
+                .clone()
+                .daemon_advertises(CAP_LIST_PROJECTS)
+                .await
+                .unwrap()
+        );
+        assert_eq!(handshakes.load(Ordering::SeqCst), 1);
+
+        // Reconnect: the daemon behind this path may now be a different build.
+        client.invalidate_capabilities();
+        assert!(client.daemon_advertises(CAP_LIST_PROJECTS).await.unwrap());
+        assert_eq!(
+            handshakes.load(Ordering::SeqCst),
+            2,
+            "invalidation must force a fresh capture"
+        );
+
+        drop(client);
+        server.await.unwrap();
+        drop(dir);
+    }
+
+    /// The older-daemon case end to end: a daemon whose `Hello` omits the field
+    /// entirely. Every project verb is withheld, and — the part that matters —
+    /// the client never sends one, so it never sees the `ok:false` whose only
+    /// discriminator is serde's `unknown variant …` text.
+    #[cfg(unix)]
+    #[test]
+    fn an_older_daemon_withholds_every_project_verb() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("build older-daemon runtime");
+        runtime.block_on(an_older_daemon_withholds_every_project_verb_inner());
+    }
+
+    #[cfg(unix)]
+    async fn an_older_daemon_withholds_every_project_verb_inner() {
+        let (dir, path, listener) = {
+            let _g = BIND_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("older-daemon.sock");
+            let listener = bind_attach_listener(&path).expect("bind older daemon");
+            (dir, path, listener)
+        };
+        let project_verbs = Arc::new(AtomicUsize::new(0));
+        let server_project_verbs = project_verbs.clone();
+        let server = tokio::spawn(async move {
+            while let Ok(Ok(mut stream)) =
+                tokio::time::timeout(std::time::Duration::from_millis(500), listener.accept()).await
+            {
+                let Some((KIND_REQ, payload)) = read_frame(&mut stream)
+                    .await
+                    .expect("read older-daemon request frame")
+                else {
+                    continue;
+                };
+                let request: serde_json::Value =
+                    serde_json::from_slice(&payload).expect("decode older-daemon request");
+                let response = if request.get("op").and_then(|op| op.as_str()) == Some("hello") {
+                    // Pre-PRD-#819 shape: no `capabilities` on the reply.
+                    AttachResponse::hello(crate::daemon_protocol::PROTOCOL_VERSION)
+                } else {
+                    server_project_verbs.fetch_add(1, Ordering::SeqCst);
+                    AttachResponse::err("unknown variant `list-projects`")
+                };
+                crate::daemon_protocol::write_resp(&mut stream, &response)
+                    .await
+                    .expect("write older-daemon response");
+            }
+        });
+        let client = DaemonClient::new(path);
+
+        let caps = client.capabilities().await.expect("handshake succeeds");
+        assert!(!caps.is_advertised());
+        for cap in DAEMON_CAPABILITIES {
+            assert!(
+                client.require_capability(cap).await.is_err(),
+                "`{cap}` must be withheld against a daemon that never advertised it"
+            );
+        }
+        assert_eq!(
+            project_verbs.load(Ordering::SeqCst),
+            0,
+            "withholding means the verb is never sent, so its refusal text is never read"
+        );
+
+        drop(client);
+        server.await.unwrap();
+        drop(dir);
     }
 
     #[test]
