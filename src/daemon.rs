@@ -1365,10 +1365,236 @@ async fn run_shell_activity_monitor(
     state: SharedState,
     event_tx: broadcast::Sender<BroadcastMsg>,
 ) {
-    run_shell_activity_monitor_with(pty_registry, state, event_tx, || {
-        crate::platform::proc::process_table_async()
+    run_shell_activity_monitor_with(pty_registry, state, event_tx, |roots| {
+        let roots = roots.to_vec();
+        async move { crate::platform::proc::process_table_async(&roots).await }
     })
     .await
+}
+
+// ── The shell-activity poll's three time constants ──
+//
+// Module-level rather than function-local since issue #862, because
+// `SamplingHealth` below derives its backoff from `POLL_INTERVAL` and reports
+// `MAX_TABLE_AGE` in its log line. Used by `run_shell_activity_monitor_with`
+// and by nothing else.
+
+// PRD #370 Open Question (poll cadence): 500ms is a first-cut balance
+// between feeling responsive and negligible overhead (one registry lock
+// + one `ps -A` sample per tick, reused across every live pane, plus a
+// `getsid` per row).
+//
+// Issue #493 measured the sample it pays for AS IT THEN WAS — the old
+// `pid=,ppid=,tty=,args=` column set: ~49ms of wall time per `ps -A` on an idle
+// 16-core Linux box with ~620 processes (release build), i.e. ~10% of one core
+// at 2Hz, of which only ~1.4ms was this process's own CPU (the `getsid` loop
+// plus parsing). It is why skipping the sample when no pane needs it is worth
+// the guard below rather than merely tidy. It is NOT the current cost of the
+// sample; see the next paragraph.
+//
+// ── PRD #386 M5, answered by issue #862: 500ms CONFIRMED, not revised ──
+//
+// The cadence was never what stalled the signal; the `args` column was — it
+// made `ps` read `/proc/<pid>/cmdline` AND `/proc/<pid>/environ` for every
+// process on the machine, both of which take the target's `mmap_lock` (see
+// `PS_TABLE_ARGS` in `platform/proc/unix.rs`). With the argv column deferred to
+// the handful of pids that actually need it, the bulk sample measures (Linux
+// 7.0.0, 16 cores, debug build, warm, ~380-480 processes):
+//
+//   idle (load 0.5)                         12-14ms p50, vs a 12.5ms
+//                                           `ps -p 1` fork/exec floor
+//   CPU-bound build (load 12.4)             19ms p50, 23ms p90, 40ms max
+//   build + saturated I/O (load 18,
+//     13-17 procs in D-state,
+//     io_full_avg10 up to 87)               15ms mean, 19ms max
+//
+// against 21ms p50 / 46ms p50 / 60ms mean respectively for the old column set,
+// whose worst observed sample was 104ms. So at 2Hz this is ~3-4% of one core of
+// WALL time and, per `/usr/bin/time`, below that tool's 10ms resolution of
+// measurable CPU — where the old column set cost 60ms of CPU per sample.
+// Relaxing to 1s would halve an already-negligible cost and halve the signal's
+// responsiveness, which is the wrong trade for a badge a user watches. The full
+// measurement — including the 19-20s field sample this is a response to, and
+// what could NOT be reproduced — is in
+// `prds/386-descendant-scan-shell-activity-signal.md` (M5).
+const POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+// Issue #429: an upper bound on how long a tick WAITS for a sample —
+// deliberately not a bound on how long the sample's child may live (see
+// `inflight` below). Generous next to the 12-19ms a healthy sample takes across
+// the whole load range measured for #862, so ordinary load does not trip it —
+// but a machine wedged hard enough does, which is what `SamplingHealth` is for.
+const SAMPLE_TIMEOUT: Duration = Duration::from_secs(2);
+
+// How old a sample's table may be and still be worth classifying against. It
+// exists to stop a long-overrunning sample's answer from being applied to a
+// machine that has moved on; discarding an ANSWERED sample is free, since that
+// child is already finished, so unlike abandoning an un-answered one it cannot
+// accumulate.
+//
+// A healthy sample answers in tens of milliseconds, so this trips only when
+// something is genuinely wrong — and it does trip: issue #862 recorded a 19-20s
+// sample under a real build storm, and this constant discarding it (correctly)
+// is what left every pane's status alone for the duration.
+const MAX_TABLE_AGE: Duration = Duration::from_secs(3);
+
+/// Why one shell-activity tick got no usable process table (issue #862).
+///
+/// The three cases differ in what they say about the machine and in whether the
+/// sample that produced them is *finished*, which is what decides whether the
+/// next one is held off — see [`SamplingHealth::record_trouble`].
+#[derive(Debug, Clone, Copy)]
+enum SamplingTrouble {
+    /// The sample answered, but so long after it started that its table
+    /// describes a machine that has since moved on (past `MAX_TABLE_AGE`).
+    /// Finished, so a fresh one would be started immediately without a hold-off.
+    StaleTable { age: Duration },
+    /// The sample answered `None` — `ps` could not be run, or produced nothing
+    /// parseable. Finished, same as above.
+    Failed,
+    /// The sample has not answered within `SAMPLE_TIMEOUT` and is being retained
+    /// for the next tick to await. **Not** finished: the retention already
+    /// bounds the `ps` children to one, so there is nothing to hold off.
+    Overran { timeout: Duration, panes: usize },
+}
+
+/// The shell-activity poll's sampling health across consecutive ticks, and the
+/// two things issue #862 derives from it: **how long to wait before starting the
+/// next sample**, and **how much to say about it in the log**.
+///
+/// It exists because the pre-#862 loop did neither. A machine under sustained
+/// pressure produced a sample that blew `MAX_TABLE_AGE`, warned, was discarded,
+/// and was replaced on the very next tick by a fresh `ps` just as likely to
+/// wedge — so the daemon kept one `ps` alive against a machine it was
+/// contributing load to, and narrated every cycle. The field episode recorded in
+/// #862 logged **1716** `shell-activity` warnings in one day that way.
+///
+/// Both halves are deliberately conservative:
+///
+/// - The hold-off applies **only to starting a new sample**, never to awaiting a
+///   retained one. A retained sample's age is measured from when it *started*,
+///   so deferring the await could push a perfectly healthy answer past
+///   `MAX_TABLE_AGE` and discard it for being collected late rather than for
+///   being late — turning a throttle into a second failure mode.
+/// - The log is coalesced into an **episode**, not silenced: one warning on
+///   entry naming the cause, one heartbeat per [`Self::HEARTBEAT`] while it
+///   persists carrying the running counts, and one line on recovery. An episode
+///   of duration `T` therefore costs `2 + T / HEARTBEAT` lines rather than one
+///   per poll cycle. Going quiet altogether would trade a findable problem for
+///   an invisible one, which is the wrong direction for a signal whose whole
+///   failure mode is silence.
+#[derive(Debug, Default)]
+struct SamplingHealth {
+    /// When the current degraded episode began, or `None` when healthy.
+    since: Option<tokio::time::Instant>,
+    /// When this episode last emitted a line, so the heartbeat can be spaced.
+    logged_at: Option<tokio::time::Instant>,
+    /// Finished-but-unusable samples in this episode. Drives the backoff, so an
+    /// overrun (which is retained, not finished) deliberately does not bump it.
+    backoff_steps: u32,
+    /// Per-cause counts for this episode, reported on the heartbeat and on
+    /// recovery so one line says what the whole episode consisted of.
+    stale_tables: u32,
+    failures: u32,
+    overruns: u32,
+    /// The earliest instant a new sample may be started.
+    hold_until: Option<tokio::time::Instant>,
+}
+
+impl SamplingHealth {
+    /// The longest a hold-off ever grows to. Eight seconds keeps a wedged
+    /// machine to roughly one `ps` per eight seconds instead of one per 500 ms,
+    /// while still recovering the signal within one badge-refresh of the machine
+    /// coming back — the pane status this feeds is something a user watches.
+    const BACKOFF_MAX: Duration = Duration::from_secs(8);
+    /// How often a persisting episode re-states itself.
+    const HEARTBEAT: Duration = Duration::from_secs(300);
+
+    /// Whether a new sample may be started on this tick.
+    fn may_start_sample(&self) -> bool {
+        !self
+            .hold_until
+            .is_some_and(|until| tokio::time::Instant::now() < until)
+    }
+
+    /// Record a tick that got no usable table, and log it if this episode has
+    /// something new to say.
+    fn record_trouble(&mut self, trouble: SamplingTrouble) {
+        let now = tokio::time::Instant::now();
+        let entering = self.since.is_none();
+        let since = *self.since.get_or_insert(now);
+        match trouble {
+            SamplingTrouble::StaleTable { .. } => self.stale_tables += 1,
+            SamplingTrouble::Failed => self.failures += 1,
+            SamplingTrouble::Overran { .. } => self.overruns += 1,
+        }
+        // Only a FINISHED sample earns a hold-off; a retained one is already
+        // the single `ps` this loop is willing to have outstanding.
+        if !matches!(trouble, SamplingTrouble::Overran { .. }) {
+            self.backoff_steps = self.backoff_steps.saturating_add(1);
+            let step = POLL_INTERVAL
+                .checked_mul(1u32 << self.backoff_steps.saturating_sub(1).min(8))
+                .unwrap_or(Self::BACKOFF_MAX)
+                .min(Self::BACKOFF_MAX);
+            self.hold_until = Some(now + step);
+        }
+
+        let due = self
+            .logged_at
+            .is_none_or(|at| now.duration_since(at) >= Self::HEARTBEAT);
+        if !entering && !due {
+            return;
+        }
+        self.logged_at = Some(now);
+        let episode_ms = now.duration_since(since).as_millis();
+        let next_sample_in_ms = self
+            .hold_until
+            .map(|until| until.saturating_duration_since(now).as_millis())
+            .unwrap_or(0);
+        // One message shape for entry and heartbeat alike, so a log reader can
+        // grep one string and get the whole episode. `cause` names what this
+        // particular tick hit; the counts say what the episode has consisted of.
+        let cause = match trouble {
+            SamplingTrouble::StaleTable { .. } => "sample answered too late to trust",
+            SamplingTrouble::Failed => "sample produced no usable table",
+            SamplingTrouble::Overran { .. } => "sample overran its deadline",
+        };
+        let (age_ms, timeout_ms, panes) = match trouble {
+            SamplingTrouble::StaleTable { age } => (Some(age.as_millis()), None, None),
+            SamplingTrouble::Failed => (None, None, None),
+            SamplingTrouble::Overran { timeout, panes } => {
+                (None, Some(timeout.as_millis()), Some(panes))
+            }
+        };
+        warn!(
+            cause,
+            age_ms,
+            timeout_ms,
+            panes,
+            episode_ms,
+            stale_tables = self.stale_tables,
+            failures = self.failures,
+            overruns = self.overruns,
+            next_sample_in_ms,
+            max_age_ms = MAX_TABLE_AGE.as_millis(),
+            "shell-activity: no usable process table; leaving every pane's status alone and              backing off before the next sample (classifying current pids against a stale table              can misattribute a reused pid, and a wedged `ps` says nothing about the panes). This              line repeats at most every 300s while the condition lasts"
+        );
+    }
+
+    /// Record a tick that got a usable table, closing any episode in progress.
+    fn record_healthy(&mut self) {
+        let Some(since) = self.since else {
+            return;
+        };
+        tracing::info!(
+            episode_ms = since.elapsed().as_millis(),
+            stale_tables = self.stale_tables,
+            failures = self.failures,
+            overruns = self.overruns,
+            "shell-activity: process-table sampling recovered; the signal is live again"
+        );
+        *self = Self::default();
+    }
 }
 
 /// [`run_shell_activity_monitor`] with the process-table sample injected, so the
@@ -1381,36 +1607,21 @@ async fn run_shell_activity_monitor(
 /// here, around whatever the sampler returns, so a test sampler that never
 /// completes exercises the real timeout path rather than a stubbed one. That
 /// also lets a test count how many samples were *started*, which is what pins
-/// the one-child-at-a-time invariant described on `inflight` below.
+/// the one-child-at-a-time invariant described on `inflight` below and the
+/// hold-off described on [`SamplingHealth`].
+///
+/// It receives the tick's **roots** — the candidate panes' shell pids — because
+/// which command lines the sample reads is derived from them (issue #862); see
+/// [`AgentPtyRegistry::shell_activity_roots`].
 async fn run_shell_activity_monitor_with<S, F>(
     pty_registry: Arc<AgentPtyRegistry>,
     state: SharedState,
     event_tx: broadcast::Sender<BroadcastMsg>,
     sample: S,
 ) where
-    S: Fn() -> F,
+    S: Fn(&[i32]) -> F,
     F: std::future::Future<Output = Option<Vec<crate::platform::proc::ProcessInfo>>>,
 {
-    // PRD #370 Open Question (poll cadence): 500ms is a first-cut balance
-    // between feeling responsive and negligible overhead (one registry lock
-    // + one `ps -A` sample per tick, reused across every live pane, plus a
-    // `getsid` per row). PRD #386 M5 is where that cost gets measured and the
-    // cadence confirmed or revised; left unchanged here deliberately, so M5
-    // measures the shape that actually shipped.
-    //
-    // Issue #493 measured the sample it pays for: ~49ms of wall time per `ps -A`
-    // on an idle 16-core Linux box with ~620 processes (release build), i.e.
-    // ~10% of one core at 2Hz — of which only ~1.4ms is this process's own CPU
-    // (the `getsid` loop plus parsing); the rest is the `ps` child and waiting
-    // on it. That is the number M5 wants for the Route A vs. Route B (native
-    // enumeration) question, and it is why skipping the sample when no pane
-    // needs it is worth the guard below rather than merely tidy.
-    const POLL_INTERVAL: Duration = Duration::from_millis(500);
-    // Issue #429: an upper bound on how long a tick WAITS for a sample —
-    // deliberately not a bound on how long the sample's child may live (see
-    // `inflight` below). Generous next to the ~49ms a healthy `ps -A` takes, so
-    // ordinary load never trips it.
-    const SAMPLE_TIMEOUT: Duration = Duration::from_secs(2);
     let mut last_known: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
     // The sample still in flight from an earlier tick, if any (#500 review, P1).
     //
@@ -1455,16 +1666,16 @@ async fn run_shell_activity_monitor_with<S, F>(
         Vec<crate::agent_pty::ShellActivityCandidate>,
         std::pin::Pin<Box<F>>,
     )> = None;
-    // How old a sample's table may be and still be worth classifying against.
-    // A healthy sample answers in ~49ms and a heavily loaded one in a few
-    // hundred, so this never trips in normal operation; it exists purely to stop
-    // a long-overrunning sample's answer from being applied to a machine that has
-    // moved on. Discarding an ANSWERED sample is free — that child is already
-    // finished, so unlike abandoning an un-answered one it cannot accumulate.
-    const MAX_TABLE_AGE: Duration = Duration::from_secs(3);
     // Whether the in-flight sample has already been reported as overrunning, so
     // a permanently-wedged `ps` logs once rather than every 2.5s forever.
     let mut inflight_reported = false;
+
+    // Issue #862 (PRD #386 M5's third option): how long to wait before starting
+    // the next sample after an unusable one, and how much to say about it. The
+    // reasoning — and why the hold-off gates only the START of a sample and
+    // never the AWAIT of a retained one — is on `SamplingHealth` itself, so it
+    // lives in one place rather than two that can drift.
+    let mut health = SamplingHealth::default();
 
     loop {
         tokio::time::sleep(POLL_INTERVAL).await;
@@ -1496,6 +1707,18 @@ async fn run_shell_activity_monitor_with<S, F>(
             // through with an empty snapshot lets the `retain` below clear
             // `last_known`, which is what makes a later reuse of the same pane
             // id start edge-detection from a clean slate.
+            //
+            // Deliberately does NOT touch `health` (issue #862). "There are no
+            // panes" says nothing about whether the machine can be sampled, and
+            // clearing the hold-off here would let pane churn defeat it — close
+            // the last pane, reopen it, and a wedged machine gets forked at
+            // again immediately, which is the same reasoning `inflight`'s
+            // unconditional retention rests on. The cost is bounded and worth
+            // naming: a pane opened during a degraded episode can wait up to
+            // `SamplingHealth::BACKOFF_MAX` for its first shell-activity
+            // reading, during which its badge is whatever its own hook events
+            // say — which is the normal source anyway, this signal being the
+            // backstop for the gaps between them.
             Vec::new()
         } else {
             // Resume the sample already in flight, or start the tick's own. Only
@@ -1506,11 +1729,27 @@ async fn run_shell_activity_monitor_with<S, F>(
             let (started, at_start, mut pending) = match resumed {
                 Some(resumed) => resumed,
                 None => {
+                    // Issue #862: hold off STARTING a new sample while the
+                    // backoff is in effect. Nothing is in flight here (that is
+                    // the `None` arm), so there is no answer to collect late and
+                    // no `MAX_TABLE_AGE` interaction — the tick simply has no
+                    // opinion, exactly like a timed-out one, and `last_known` is
+                    // left untouched so no spurious edge is emitted when the
+                    // reading resumes.
+                    if !health.may_start_sample() {
+                        continue;
+                    }
                     inflight_reported = false;
                     (
                         tokio::time::Instant::now(),
                         candidates.clone(),
-                        Box::pin(sample()),
+                        // The roots the argv phase reads command lines for
+                        // (issue #862) — this tick's candidate panes and nothing
+                        // else. Captured with the sample, so a retained one's
+                        // command lines describe the panes it was started for,
+                        // which is the same set the `was_resumed` filter below
+                        // restricts the classification to.
+                        Box::pin(sample(&AgentPtyRegistry::shell_activity_roots(&candidates))),
                     )
                 }
             };
@@ -1520,15 +1759,10 @@ async fn run_shell_activity_monitor_with<S, F>(
                     // describes a machine that has since moved on. No opinion.
                     let age = started.elapsed();
                     if age > MAX_TABLE_AGE {
-                        warn!(
-                            age_ms = age.as_millis(),
-                            max_age_ms = MAX_TABLE_AGE.as_millis(),
-                            "shell-activity: discarding a process-table sample that answered too \
-                             late to trust; leaving every pane's status alone (classifying current \
-                             pids against a stale table can misattribute a reused pid)"
-                        );
+                        health.record_trouble(SamplingTrouble::StaleTable { age });
                         continue;
                     }
+                    health.record_healthy();
                     if was_resumed {
                         // A retained sample's table was taken when `at_start`
                         // was the truth, so a pid in it means what it meant
@@ -1594,18 +1828,20 @@ async fn run_shell_activity_monitor_with<S, F>(
                 // the next tick starts a fresh one; an overrunning sample is
                 // RETAINED, so the next tick waits on the same `ps` instead of
                 // spawning a second one.
-                Ok(None) => continue,
+                Ok(None) => {
+                    health.record_trouble(SamplingTrouble::Failed);
+                    continue;
+                }
                 Err(_elapsed) => {
+                    // `inflight_reported` still bounds this to one entry per
+                    // retained sample; `record_trouble` then bounds the whole
+                    // EPISODE, across however many samples it spans (#862).
                     if !inflight_reported {
                         inflight_reported = true;
-                        warn!(
-                            timeout_ms = SAMPLE_TIMEOUT.as_millis(),
-                            panes = candidates.len(),
-                            "shell-activity: process-table sample overran its deadline; leaving \
-                             every pane's status alone and continuing to wait on the SAME sample \
-                             (a wedged `ps` says nothing about the panes, and starting another \
-                             would only pile up unkillable children)"
-                        );
+                        health.record_trouble(SamplingTrouble::Overran {
+                            timeout: SAMPLE_TIMEOUT,
+                            panes: candidates.len(),
+                        });
                     }
                     inflight = Some((started, at_start, pending));
                     continue;
@@ -2701,7 +2937,7 @@ mod hook_ingestion_tests {
             let state = state.clone();
             let samples = samples.clone();
             async move {
-                run_shell_activity_monitor_with(registry, state, event_tx, move || {
+                run_shell_activity_monitor_with(registry, state, event_tx, move |_roots| {
                     let samples = samples.clone();
                     async move {
                         samples.fetch_add(1, AtomicOrdering::SeqCst);
@@ -2729,6 +2965,120 @@ mod hook_ingestion_tests {
 
         monitor_handle.abort();
         let _ = monitor_handle.await;
+    }
+
+    /// Scenario: issue #862. Spawn a real `/bin/sh` pane so there IS a candidate
+    /// to classify, then run the real shell-activity monitor with a sample that
+    /// always answers `None` — a `ps` that cannot be run at all — and count how
+    /// many samples it starts over a fixed window. The count must be bounded by
+    /// the exponential hold-off (500ms, 1s, 2s, 4s, 8s, capped) rather than one
+    /// per 500ms tick, and the pane's status must be left exactly where it was.
+    /// Before the fix a permanently unusable sample forked a fresh `ps` twice a
+    /// second against a machine the daemon was itself adding load to, and warned
+    /// about it every cycle — which is how one day of `deck.log` accumulated the
+    /// 1716 `shell-activity` warnings recorded in the issue.
+    #[tokio::test]
+    async fn shell_activity_monitor_backs_off_after_repeated_unusable_samples() {
+        const PANE: &str = "pane-862";
+        const SESSION: &str = "sess-862";
+
+        let registry = Arc::new(AgentPtyRegistry::new());
+        registry
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/sh"),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), PANE.to_string())],
+                agent_type: None,
+                ..SpawnOptions::default()
+            })
+            .expect("spawn shell agent");
+
+        let state: SharedState =
+            Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
+        let (event_tx, mut rx) = broadcast::channel(EVENT_BROADCAST_CAPACITY);
+
+        let event = |event_type: crate::event::EventType| AgentEvent {
+            session_id: SESSION.to_string(),
+            agent_type: AgentType::ClaudeCode,
+            event_type,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp: chrono::Utc::now(),
+            user_prompt: None,
+            metadata: std::collections::HashMap::new(),
+            pane_id: Some(PANE.to_string()),
+            agent_id: None,
+            agent_version: None,
+            schema_version: None,
+            live_target: None,
+        };
+        state
+            .write()
+            .await
+            .apply_event(event(crate::event::EventType::SessionStart));
+        state
+            .write()
+            .await
+            .apply_event(event(crate::event::EventType::ShellBusy));
+        assert_eq!(
+            state.read().await.sessions[SESSION].status,
+            crate::state::SessionStatus::Working,
+            "precondition: the pane must start out reading Working, so a status the \
+             backoff wrongly changed would be visible"
+        );
+
+        let samples = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let monitor_handle = tokio::spawn({
+            let registry = registry.clone();
+            let state = state.clone();
+            let samples = samples.clone();
+            async move {
+                run_shell_activity_monitor_with(registry, state, event_tx, move |_roots| {
+                    samples.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    // Answers immediately, and unusably. Unlike the wedged-`ps`
+                    // case above this sample FINISHES, so nothing is retained
+                    // and the only thing standing between it and a fresh fork
+                    // on the very next tick is the hold-off.
+                    async { None }
+                })
+                .await
+            }
+        });
+
+        // 6s of wall clock. Without the hold-off the loop starts one sample per
+        // 500ms tick: 12. With it the starts fall at roughly t=0.5, 1.0, 2.0 and
+        // 4.0 (each hold-off doubling from the 500ms base), so 4-5 depending on
+        // where the ticks land.
+        const WINDOW: Duration = Duration::from_millis(6_000);
+        tokio::time::sleep(WINDOW).await;
+        let started = samples.load(std::sync::atomic::Ordering::SeqCst);
+
+        assert!(
+            started >= 2,
+            "the backoff must throttle the sample, not stop it: only {started} sample(s) \
+             started in {WINDOW:?}, so the signal would never recover on its own"
+        );
+        assert!(
+            started <= 7,
+            "{started} samples started in {WINDOW:?} — an unthrottled 500ms poll would \
+             start ~12, so this is not backing off; a `ps` fork twice a second against \
+             an already-struggling machine is what issue #862 is about"
+        );
+        assert_eq!(
+            state.read().await.sessions[SESSION].status,
+            crate::state::SessionStatus::Working,
+            "a sample that produced no usable table says nothing about the pane, so the \
+             status must be left exactly as it was — the backoff changes WHEN the next \
+             sample runs and nothing about how a missing answer is interpreted"
+        );
+        assert!(
+            matches!(rx.try_recv(), Err(broadcast::error::TryRecvError::Empty)),
+            "and no event may be synthesized from a sample that produced no table"
+        );
+
+        monitor_handle.abort();
+        let _ = monitor_handle.await;
+        registry.shutdown_all();
     }
 
     /// Scenario: issue #429's load-bearing decision. Spawn a real `/bin/sh`
@@ -2799,7 +3149,7 @@ mod hook_ingestion_tests {
             let state = state.clone();
             let samples = samples.clone();
             async move {
-                run_shell_activity_monitor_with(registry, state, event_tx, move || {
+                run_shell_activity_monitor_with(registry, state, event_tx, move |_roots| {
                     samples.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     // The wedged `ps`: a sample that never answers. The
                     // monitor's SAMPLE_TIMEOUT is what has to end this tick.
@@ -2910,7 +3260,7 @@ mod hook_ingestion_tests {
                 session_id: shell_pid,
                 has_controlling_tty: true,
                 session_leader: true,
-                argv: "/bin/sh".to_string(),
+                command_line: crate::platform::proc::CommandLine::Read("/bin/sh".to_string()),
             },
             crate::platform::proc::ProcessInfo {
                 pid: shell_pid + 1,
@@ -2918,7 +3268,9 @@ mod hook_ingestion_tests {
                 session_id: shell_pid + 1,
                 has_controlling_tty: false,
                 session_leader: true,
-                argv: "detached-thing".to_string(),
+                command_line: crate::platform::proc::CommandLine::Read(
+                    "detached-thing".to_string(),
+                ),
             },
         ];
 
@@ -2926,7 +3278,7 @@ mod hook_ingestion_tests {
             let registry = registry.clone();
             let state = state.clone();
             async move {
-                run_shell_activity_monitor_with(registry, state, event_tx, move || {
+                run_shell_activity_monitor_with(registry, state, event_tx, move |_roots| {
                     let busy_table = busy_table.clone();
                     async move {
                         // Answers eventually, but far past MAX_TABLE_AGE — the
@@ -3039,7 +3391,7 @@ mod hook_ingestion_tests {
             let state = state.clone();
             let late_table = late_table.clone();
             async move {
-                run_shell_activity_monitor_with(registry, state, event_tx, move || {
+                run_shell_activity_monitor_with(registry, state, event_tx, move |_roots| {
                     let late_table = late_table.clone();
                     async move {
                         // Longer than SAMPLE_TIMEOUT (2s) so the sample is
@@ -3087,7 +3439,7 @@ mod hook_ingestion_tests {
                     session_id: pid,
                     has_controlling_tty: true,
                     session_leader: true,
-                    argv: "/bin/sh".to_string(),
+                    command_line: crate::platform::proc::CommandLine::Read("/bin/sh".to_string()),
                 },
                 crate::platform::proc::ProcessInfo {
                     pid: pid + 100_000,
@@ -3095,7 +3447,9 @@ mod hook_ingestion_tests {
                     session_id: pid + 100_000,
                     has_controlling_tty: false,
                     session_leader: true,
-                    argv: "detached-thing".to_string(),
+                    command_line: crate::platform::proc::CommandLine::Read(
+                        "detached-thing".to_string(),
+                    ),
                 },
             ]
         };

@@ -1942,7 +1942,11 @@ impl RunningAgent {
         &self,
         shapes: &[crate::platform::proc::ShellToolShape],
     ) -> Option<bool> {
-        let table = crate::platform::proc::process_table()?;
+        let shell_pid = self.child.process_id()? as i32;
+        // This pane's own pid is the sample's only root, so the argv phase reads
+        // the command line of this pane's detached descendants and of nothing
+        // else (issue #862).
+        let table = crate::platform::proc::process_table(&[shell_pid])?;
         self.shell_activity_in(&table, shapes)
     }
 
@@ -7041,7 +7045,7 @@ impl AgentPtyRegistry {
         if candidates.is_empty() {
             return Some(Vec::new());
         }
-        let table = crate::platform::proc::process_table()?;
+        let table = crate::platform::proc::process_table(&Self::shell_activity_roots(&candidates))?;
         Some(Self::classify_shell_activity(&candidates, &table))
     }
 
@@ -7090,6 +7094,18 @@ impl AgentPtyRegistry {
                 })
             })
             .collect()
+    }
+
+    /// The pids a shell-activity sample must be taken **on behalf of** — one per
+    /// candidate pane (issue #862).
+    ///
+    /// The sampler needs these to decide whose command line to read: its second
+    /// phase reads the argv of exactly the detached descendants of these roots
+    /// (`crate::platform::proc::command_line_targets`) and of nothing else, which
+    /// is what keeps a tick from touching an unrelated process's `mmap_lock`.
+    /// Order does not matter — the sampler sorts and dedupes.
+    pub fn shell_activity_roots(candidates: &[ShellActivityCandidate]) -> Vec<i32> {
+        candidates.iter().map(|c| c.shell_pid).collect()
     }
 
     /// The **classification half** of the snapshot: pure, lock-free work over a

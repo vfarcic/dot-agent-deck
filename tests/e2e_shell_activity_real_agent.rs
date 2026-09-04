@@ -405,11 +405,20 @@ fn shell_activity_006_real_claude_bash_call_crossing_the_cap_keeps_the_badge_wor
     // own spawned agent — `setsid` changes session/group, never `ppid`) so a
     // concurrently running e2e test's own ping or MCP servers can never be
     // mistaken for this one's.
-    let table = process_table().expect("process_table() must enumerate on unix");
+    // Issue #862: the sample reads command lines only for detached descendants
+    // of the roots it is given. This test's own pid is the right root: the deck
+    // binary, its daemon and the agent all `setsid` out of the test's session,
+    // so every process this assertion cares about is a detached descendant of it
+    // and gets its argv read, while nothing outside this test's tree does.
     let root_pid = std::process::id() as i32;
+    let table = process_table(&[root_pid]).expect("process_table() must enumerate on unix");
     let shell_row = descendants(&table, root_pid)
         .into_iter()
-        .find(|p| p.argv.contains(SENTINEL_006))
+        .find(|p| {
+            p.command_line
+                .read()
+                .is_some_and(|argv| argv.contains(SENTINEL_006))
+        })
         .unwrap_or_else(|| {
             panic!(
                 "no live descendant of this test carries the sentinel {SENTINEL_006:?} in its \
@@ -418,9 +427,11 @@ fn shell_activity_006_real_claude_bash_call_crossing_the_cap_keeps_the_badge_wor
                  early rather than genuinely testing the cap"
             )
         });
-    let ping_alive = descendants(&table, shell_row.pid)
-        .into_iter()
-        .any(|p| p.argv.contains("ping") && p.argv.contains("127.0.0.1"));
+    let ping_alive = descendants(&table, shell_row.pid).into_iter().any(|p| {
+        p.command_line
+            .read()
+            .is_some_and(|argv| argv.contains("ping") && argv.contains("127.0.0.1"))
+    });
     assert!(
         ping_alive,
         "the sentinel-tagged Bash-tool shell (pid {}) is alive but has no live `ping` \
@@ -517,18 +528,22 @@ fn shell_activity_007_real_claude_idle_with_live_mcp_servers_stays_idle() {
     let claude_pid_cell: std::cell::Cell<Option<i32>> = std::cell::Cell::new(None);
     let children_argv_cell: std::cell::RefCell<Vec<String>> = std::cell::RefCell::new(Vec::new());
     let found_children = common::wait_until(Duration::from_secs(30), || {
-        let Some(table) = process_table() else {
+        // Issue #862: this test's own pid as the sample's root — see the same
+        // note in `status/shell-activity/006` above for why that is the root
+        // that makes the deck's whole subtree's argv available here.
+        let Some(table) = process_table(&[root_pid]) else {
             return false;
         };
-        let Some(claude_row) = descendants(&table, root_pid)
-            .into_iter()
-            .find(|p| p.argv.contains("claude") && p.argv.contains("--allowedTools"))
-        else {
+        let Some(claude_row) = descendants(&table, root_pid).into_iter().find(|p| {
+            p.command_line
+                .read()
+                .is_some_and(|argv| argv.contains("claude") && argv.contains("--allowedTools"))
+        }) else {
             return false;
         };
         let children: Vec<String> = descendants(&table, claude_row.pid)
             .into_iter()
-            .map(|p| p.argv.clone())
+            .map(|p| p.command_line.read().unwrap_or_default().to_string())
             .collect();
         if children.is_empty() {
             return false;
@@ -578,10 +593,18 @@ fn shell_activity_007_real_claude_idle_with_live_mcp_servers_stays_idle() {
     // before the badge check), and run the descendant-scan classifier
     // directly against this live table — the M2 fixture claim proven against
     // a live process table rather than a captured one.
-    let table = process_table().expect("process_table() must enumerate on unix");
+    // Issue #862: BOTH roots. `root_pid` is what makes the agent's own children
+    // (its MCP servers, which share the agent's session) detached descendants
+    // whose argv gets read, so the diagnostic listing below has something to
+    // print; `claude_pid` is the root the classifier is then run against, and
+    // naming it too means this call asks for exactly the command lines that
+    // classification can consult rather than relying on the two root sets
+    // happening to coincide.
+    let table =
+        process_table(&[root_pid, claude_pid]).expect("process_table() must enumerate on unix");
     let still_alive: Vec<&str> = descendants(&table, claude_pid)
         .into_iter()
-        .map(|p| p.argv.as_str())
+        .map(|p| p.command_line.read().unwrap_or_default())
         .collect();
     assert!(
         !still_alive.is_empty(),

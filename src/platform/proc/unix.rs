@@ -235,21 +235,65 @@ fn getsid_or_negative(pid: i32) -> i32 {
     unsafe { libc::getsid(pid) }
 }
 
-/// The one `ps` invocation both samplers share, so the sync and async paths can
-/// never drift into asking `ps` for different columns.
+/// The **bulk phase**'s `ps` invocation, shared by both samplers so the sync and
+/// async paths can never drift into asking `ps` for different columns.
+///
+/// The trailing `=` on every `-o` field suppresses the header line entirely.
+/// `-w -w` is kept even though the argv column is gone: BSD `ps` truncates its
+/// output to the window width (79 columns when stdout is not a terminal), and
+/// while three short columns are nowhere near that, keeping the flag makes
+/// `args=` the *only* thing this invocation lost and removes truncation from the
+/// set of things a macOS reader has to reason about.
+///
+/// **Issue #862 removed `args=`, and that removal is the whole point of the
+/// change.** Measured with `strace` on procps-ng 4.0.4, per invocation on a
+/// 382-process box:
+///
+/// | column set | `stat` | `status` | `cmdline` | `environ` |
+/// | --- | --- | --- | --- | --- |
+/// | `pid=,ppid=,tty=` | 397 | 396 | **0** | **0** |
+/// | `pid=,ppid=,tty=,args=` | 374 | 373 | **372** | **372** |
+///
+/// So `args` cost *two* extra per-process reads, not one. Both
+/// `/proc/<pid>/cmdline` and `/proc/<pid>/environ` are served through the
+/// kernel's `access_remote_vm()`, which takes the **target's** `mmap_lock`;
+/// `stat` and `status`, which is where `pid`/`ppid`/`tty` come from, are not.
+/// That made the sample's wall time the sum of every unrelated process's
+/// `mmap_lock` wait, which is the mechanism behind the 19-20 s field sample
+/// recorded in issue #862. The command lines the cross-check actually needs are
+/// read in the second phase — see [`PS_COMMAND_LINE_ARGS`].
+const PS_TABLE_ARGS: [&str; 5] = ["-A", "-w", "-w", "-o", "pid=,ppid=,tty="];
+
+/// The **argv phase**'s `ps` invocation prefix, to which the caller appends a
+/// comma-separated pid list (issue #862).
 ///
 /// `-w -w` disables `ps`'s width truncation on both macOS and Linux, so the argv
-/// column survives whole; the trailing `=` on every `-o` field suppresses the
-/// header line entirely.
-const PS_TABLE_ARGS: [&str; 5] = ["-A", "-w", "-w", "-o", "pid=,ppid=,tty=,args="];
+/// survives whole — the [`super::ShellToolShape`] cross-check substring-matches
+/// inside it, and a truncated command line would silently stop matching.
+///
+/// This phase runs **only when the bulk table shows at least one detached
+/// descendant** of one of the sample's roots, so it costs nothing on an idle
+/// deck and reads the command line of at most one process per busy pane —
+/// always a process the deck itself spawned, never an unrelated one.
+///
+/// Kept as one portable `ps` call rather than split into a Linux
+/// `/proc/<pid>/cmdline` read and a macOS `sysctl(KERN_PROCARGS2)`: those would
+/// remove this phase's fork/exec, but they are two platform-specific
+/// implementations to maintain for a fork that only happens while a pane is
+/// genuinely running a shell command, and Route A's whole premise is one
+/// identical invocation on both platforms.
+const PS_COMMAND_LINE_ARGS: [&str; 4] = ["-w", "-w", "-o", "pid=,args="];
 
-/// Turn a finished `ps` run into a table, or `None` when it said nothing usable.
+/// Turn a finished bulk-phase `ps` run into a table, or `None` when it said
+/// nothing usable.
 ///
 /// Shared by [`process_table`] and [`process_table_async`]. The `getsid(2)` per
 /// row happens here: it is a pure kernel lookup with no I/O wait, which is why
 /// it is safe to leave on the caller's thread even in the async path (measured
-/// at ~1.4 ms for ~620 rows in a release build, against ~49 ms of wall time for
-/// the `ps` run itself).
+/// at ~1.4 ms for ~620 rows in a release build).
+///
+/// Every row comes back [`super::CommandLine::NotSampled`]; the argv phase fills
+/// in the few that need one.
 fn table_from_ps_output(success: bool, stdout: &[u8]) -> Option<Vec<super::ProcessInfo>> {
     if !success {
         return None;
@@ -259,33 +303,98 @@ fn table_from_ps_output(success: bool, stdout: &[u8]) -> Option<Vec<super::Proce
     if rows.is_empty() { None } else { Some(rows) }
 }
 
+/// The pid list argument for the argv phase: `-p 123,456`.
+///
+/// Split out so both samplers build it identically and so the formatting is
+/// unit-testable without spawning anything.
+fn ps_pid_list(pids: &[i32]) -> String {
+    pids.iter()
+        .map(|pid| pid.to_string())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// Turn a finished argv-phase `ps` run into `pid → command line`.
+///
+/// **The exit status is deliberately not consulted, unlike
+/// [`table_from_ps_output`]'s.** `ps -p <list>` reports failure when *no* pid in
+/// the list matched, and on Linux/procps returns 0 while printing the survivors
+/// when only some did (measured) — but that partial-match status is not
+/// something this project has verified on BSD `ps`, and a platform that returned
+/// non-zero there would silently cost every busy pane its cross-check because
+/// one *other* pane's candidate happened to exit during the sample. Parsing
+/// whatever came out is safe in either case: a `ps` that genuinely failed writes
+/// its complaint to stderr and leaves stdout empty, so the map comes back empty
+/// on its own.
+///
+/// An empty map is not an error: the bulk table is still perfectly good, and
+/// every wanted pid then reads [`super::CommandLine::Unavailable`], which the
+/// classifier treats as "not a match" — the same reading a process that exited
+/// between the phases gets. A failed argv phase therefore costs a pane one poll
+/// of the cross-check, not the whole sample.
+fn command_lines_from_ps_output(stdout: &[u8]) -> std::collections::HashMap<i32, String> {
+    super::scan::parse_ps_command_lines(&String::from_utf8_lossy(stdout))
+}
+
 /// Sample every process on the machine into a [`super::ProcessInfo`] table
 /// (PRD #386 M1, Route A), or `None` if `ps` could not be run or produced
 /// nothing parseable.
 ///
-/// One `ps -A` per call, parsed once and reusable for *every* pane in that
-/// poll, so the cost is one fork/exec per poll cycle rather than per pane. The
-/// session id of each row comes from [`getsid_or_negative`], not from `ps`.
+/// `roots` are the pids the sample is being taken on behalf of — each pane's PTY
+/// child. They select **whose command line gets read** (issue #862): the bulk
+/// `ps -A` asks for no argv column at all, and a second `ps` then reads the
+/// command line of exactly the detached descendants of these roots, which is
+/// what [`super::command_line_targets`] computes. Pass an empty slice to skip
+/// the argv phase entirely and get a table whose every row is
+/// [`super::CommandLine::NotSampled`] — useful when the caller only wants the
+/// structural test, which reads no command line.
+///
+/// One `ps -A` per call, parsed once and reusable for *every* pane in that poll,
+/// so the cost is one fork/exec per poll cycle rather than per pane; the argv
+/// phase adds a second fork/exec only when some root actually has a detached
+/// descendant, and it is batched across every root. The session id of each row
+/// comes from [`getsid_or_negative`], not from `ps`.
 ///
 /// **Synchronous and unbounded — never call this from an async task** (issue
-/// #429). It blocks the calling thread for the whole `ps` run, measured at
-/// ~49 ms on an idle 16-core Linux box with ~620 processes, and forever if `ps`
-/// wedges in D-state on a stuck filesystem. [`process_table_async`] is the
+/// #429). It blocks the calling thread for the whole `ps` run, and forever if
+/// `ps` wedges in D-state on a stuck filesystem. [`process_table_async`] is the
 /// variant for a Tokio context. This one remains for synchronous callers and
 /// tests.
 ///
-/// Route B (native enumeration — `/proc/<pid>/{stat,cmdline}` on Linux,
-/// `sysctl(KERN_PROC_ALL)` on macOS) stays open behind PRD #386's M5
-/// measurement; it removes the subprocess at the cost of two platform-specific
-/// implementations, and is only worth taking if the measurement says so.
-pub fn process_table() -> Option<Vec<super::ProcessInfo>> {
+/// **Route B (native enumeration) was declined on the issue #862 measurement**,
+/// which is what PRD #386's M5 asked for. Measured on this box (Linux 7.0.0,
+/// 16 cores, 382 processes, warm): the bulk phase costs 12 ms against a 12.5 ms
+/// `ps -p 1` fork/exec floor, i.e. enumerating the whole machine's `pid`/`ppid`
+/// is below measurement resolution and the fork *is* the cost. So Route B would
+/// remove ~12 ms of fork/exec per tick and nothing else — while reading the same
+/// `/proc/<pid>/cmdline` files that made the sample stall in the first place, and
+/// costing two platform-specific implementations. It optimizes the half that was
+/// never the problem. See `prds/386-descendant-scan-shell-activity-signal.md`
+/// (M5) for the full numbers.
+pub fn process_table(roots: &[i32]) -> Option<Vec<super::ProcessInfo>> {
     let output = std::process::Command::new("ps")
         .args(PS_TABLE_ARGS)
         .stdin(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .output()
         .ok()?;
-    table_from_ps_output(output.status.success(), &output.stdout)
+    let mut table = table_from_ps_output(output.status.success(), &output.stdout)?;
+    let wanted = super::command_line_targets(&table, roots);
+    if wanted.is_empty() {
+        return Some(table);
+    }
+    let argv = std::process::Command::new("ps")
+        .args(PS_COMMAND_LINE_ARGS)
+        .arg("-p")
+        .arg(ps_pid_list(&wanted))
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()
+        .map(|out| command_lines_from_ps_output(&out.stdout))
+        .unwrap_or_default();
+    super::fill_command_lines(&mut table, &wanted, &argv);
+    Some(table)
 }
 
 /// [`process_table`] for an async caller: the same sample, but awaited instead
@@ -296,25 +405,27 @@ pub fn process_table() -> Option<Vec<super::ProcessInfo>> {
 ///
 /// - **It does not occupy a Tokio worker thread.** The wait for `ps` to exit is
 ///   a real `await` on the runtime's child reaper, so the worker goes back to
-///   the queue for the ~49 ms the sample takes instead of sitting in
-///   `waitpid`. That ~49 ms every 500 ms — ~10% of one worker, *even with zero
-///   panes open* — is what previously stalled hook ingestion, client requests
-///   and daemon shutdown behind this signal. `spawn_blocking` would only
-///   relocate that stall to the blocking pool; worse, `tokio::time::timeout`
-///   around a `spawn_blocking` handle does not cancel the thread, so a
-///   permanently-wedged `ps` at 2 Hz would leak one pool thread per tick until
-///   the 512-thread cap. Awaiting an async child is what actually fixes it.
+///   the queue for the time the sample takes instead of sitting in `waitpid`.
+///   That wait every 500 ms — *even with zero panes open*, before issue #493 —
+///   is what previously stalled hook ingestion, client requests and daemon
+///   shutdown behind this signal. `spawn_blocking` would only relocate that
+///   stall to the blocking pool; worse, `tokio::time::timeout` around a
+///   `spawn_blocking` handle does not cancel the thread, so a permanently-wedged
+///   `ps` at 2 Hz would leak one pool thread per tick until the 512-thread cap.
+///   Awaiting an async child is what actually fixes it.
 /// - **It is cancel-safe, so a timeout can genuinely bound it.** `kill_on_drop`
 ///   means dropping this future — which is exactly what
 ///   [`tokio::time::timeout`] does on expiry — kills the `ps` child and leaves
-///   it to the runtime's orphan reaper rather than abandoning it.
+///   it to the runtime's orphan reaper rather than abandoning it. Both phases
+///   are inside this one future, so the caller's single deadline bounds the
+///   whole sample and the argv phase needs no deadline of its own.
 ///
 /// **Callers MUST wrap this in a timeout**; it has no internal deadline, and a
 /// `ps` wedged in D-state never returns. The deadline lives at the call site
 /// (see `run_shell_activity_monitor`) because the *interpretation* of a blown
 /// deadline is the caller's: a timed-out sample means "no opinion", never "not
 /// busy".
-pub async fn process_table_async() -> Option<Vec<super::ProcessInfo>> {
+pub async fn process_table_async(roots: &[i32]) -> Option<Vec<super::ProcessInfo>> {
     // `output()` forces `stdout`/`stderr` to pipes (tokio, unlike `std`, leaves
     // `stdin` alone — hence the explicit null), and `wait_with_output` drains
     // both concurrently, so the captured-and-discarded stderr cannot deadlock.
@@ -325,7 +436,25 @@ pub async fn process_table_async() -> Option<Vec<super::ProcessInfo>> {
         .output()
         .await
         .ok()?;
-    table_from_ps_output(output.status.success(), &output.stdout)
+    let mut table = table_from_ps_output(output.status.success(), &output.stdout)?;
+    let wanted = super::command_line_targets(&table, roots);
+    if wanted.is_empty() {
+        return Some(table);
+    }
+    let argv = match tokio::process::Command::new("ps")
+        .args(PS_COMMAND_LINE_ARGS)
+        .arg("-p")
+        .arg(ps_pid_list(&wanted))
+        .stdin(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .output()
+        .await
+    {
+        Ok(out) => command_lines_from_ps_output(&out.stdout),
+        Err(_) => std::collections::HashMap::new(),
+    };
+    super::fill_command_lines(&mut table, &wanted, &argv);
+    Some(table)
 }
 
 // ---------------------------------------------------------------------------
@@ -537,6 +666,55 @@ mod tests {
         assert_eq!(
             checked_signal_pid(u32::MAX).unwrap_err().kind(),
             std::io::ErrorKind::InvalidInput
+        );
+    }
+    /// Issue #862 — the regression guard for the whole fix. The bulk phase must
+    /// NOT ask `ps` for the `args` column: that one column is what made it read
+    /// `/proc/<pid>/cmdline` and `/proc/<pid>/environ` for every process on the
+    /// machine, both of which take the target's `mmap_lock`, and it is why a
+    /// sample went from ~49 ms to 19-20 s under a build storm. Re-adding it
+    /// would reopen that silently — nothing else in the suite would notice,
+    /// because the classification stays correct and only gets slow.
+    ///
+    /// Stated as "no `args`" rather than as an exact string so that adding a
+    /// genuinely cheap column later does not fail this for the wrong reason.
+    #[test]
+    fn the_bulk_process_table_sample_never_asks_ps_for_the_argv_column() {
+        let joined = PS_TABLE_ARGS.join(" ");
+        assert!(
+            !joined.contains("args"),
+            "the bulk phase must not request the argv column (issue #862): {joined:?}"
+        );
+        assert!(
+            !joined.contains("command") && !joined.contains("comm"),
+            "nor any other column `ps` serves out of /proc/<pid>/cmdline: {joined:?}"
+        );
+        // And the argv phase, which is where a command line is allowed to come
+        // from, must still ask for one — otherwise the cross-check would be
+        // vetoing every candidate on an empty string.
+        let argv_phase = PS_COMMAND_LINE_ARGS.join(" ");
+        assert!(
+            argv_phase.contains("args="),
+            "the argv phase must request the argv column: {argv_phase:?}"
+        );
+        assert!(
+            argv_phase.contains("-w -w"),
+            "and must disable ps's width truncation, or a long command line is \
+             silently cut and stops matching its measured shape: {argv_phase:?}"
+        );
+    }
+
+    /// The argv phase's pid list is what `ps -p` is handed, so its formatting is
+    /// worth pinning without spawning anything (issue #862).
+    #[test]
+    fn ps_pid_list_is_comma_separated_with_no_spaces() {
+        assert_eq!(ps_pid_list(&[42]), "42");
+        assert_eq!(ps_pid_list(&[42, 7, 1234]), "42,7,1234");
+        assert_eq!(
+            ps_pid_list(&[]),
+            "",
+            "an empty list never reaches `ps` — the sampler returns early — but the \
+             formatting must not invent a stray separator"
         );
     }
 }
