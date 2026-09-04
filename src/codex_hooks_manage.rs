@@ -250,14 +250,15 @@ pub fn install_to(codex_home: &Path, binary_path: &str) -> std::io::Result<()> {
             Ok(value) => value,
             Err(parse_err) => {
                 // Preserve the user's bytes (best-effort backup) and refuse to
-                // overwrite — never discard content we couldn't parse.
-                let backup = codex_home.join("hooks.json.bak");
-                let _ = std::fs::write(&backup, &bytes);
+                // overwrite — never discard content we couldn't parse. The copy
+                // is published, not `std::fs::write`n: that followed a symlink
+                // planted at this predictable `.bak` name (#731).
+                let backup = crate::agent_hook_config::backup_malformed(&path, &bytes);
                 return Err(io::Error::new(
                     ErrorKind::InvalidData,
                     format!(
-                        "existing hooks.json is not valid JSON (preserved at {}): {parse_err}",
-                        backup.display()
+                        "existing hooks.json is not valid JSON ({}): {parse_err}",
+                        crate::agent_hook_config::preserved_phrase(backup.as_deref())
                     ),
                 ));
             }
@@ -974,6 +975,49 @@ mod tests {
         assert_eq!(
             deck_rules, 1,
             "deck hook present exactly once after re-install"
+        );
+    }
+
+    /// A malformed `hooks.json` is preserved at `hooks.json.bak` — and the copy
+    /// must never be made THROUGH a symlink planted at that path.
+    ///
+    /// The backup destination is fully predictable, and `std::fs::write` follows
+    /// a symlink, so a writer able to add an entry to `~/.codex` could point
+    /// `hooks.json.bak` at any file it could write and have the deck fill that
+    /// file with the malformed config's bytes (#731's second half). The victim
+    /// here stands for that file.
+    #[cfg(unix)]
+    #[test]
+    fn a_malformed_config_backup_does_not_follow_a_symlink_planted_at_the_backup_path() {
+        let dir = crate::test_temp::tempdir().expect("codex home tempdir");
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, b"victim bytes").expect("seed victim");
+
+        let malformed = "{ this is not json";
+        std::fs::write(dir.path().join("hooks.json"), malformed).expect("seed hooks.json");
+        let backup = dir.path().join("hooks.json.bak");
+        std::os::unix::fs::symlink(&victim, &backup).expect("plant symlink");
+
+        let err = install_to(dir.path(), "/abs/dot-agent-deck")
+            .expect_err("a config we cannot parse must not be rewritten");
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
+
+        assert_eq!(
+            std::fs::read(&victim).expect("read victim"),
+            b"victim bytes",
+            "the backup was written through the planted symlink and overwrote the victim"
+        );
+        assert!(
+            !std::fs::symlink_metadata(&backup)
+                .expect("stat backup")
+                .file_type()
+                .is_symlink(),
+            "the backup must be a real file, not the planted symlink"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&backup).expect("read backup"),
+            malformed,
+            "the user's bytes must still be preserved beside the original"
         );
     }
 
