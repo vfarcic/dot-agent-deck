@@ -1063,6 +1063,14 @@ async fn acquire_worktree_lock(clone_dir: &Path) -> Option<crate::platform::lock
 /// names the responsible dispatch rather than a bare "the deck". Written on
 /// the `Created` arm only, and best-effort — see [`crate::worktree_owner`] for
 /// why both of those are load-bearing.
+///
+/// Issue #791 — the same `Created` arm also WARMS the new worktree's project
+/// environment, and being the only `git worktree add` in `src/` is again why
+/// this is the place for it: every caller spawns only after awaiting this
+/// function, so a warm-up finished before it returns is a warm-up finished
+/// before any role starts. That ordering is the entire fix, and
+/// [`warm_project_environment`] documents the race it closes and why every way
+/// it can fail still returns `Created`.
 pub async fn create_worktree(
     clone_dir: &Path,
     worktree_dir: &Path,
@@ -1076,9 +1084,10 @@ pub async fn create_worktree(
     }
     // Issue #541: keep this deck's own concurrent creations off each other's
     // half-created entries. Held across the probe AND the add so the two are
-    // atomic with respect to another dispatch of the same name; released on drop
-    // at the end of the function.
-    let _repo_lock = acquire_worktree_lock(clone_dir).await;
+    // atomic with respect to another dispatch of the same name, and DROPPED
+    // EXPLICITLY on the `Created` arm below — see the comment there for why the
+    // warm-up must not run under it.
+    let repo_lock = acquire_worktree_lock(clone_dir).await;
 
     let clone = clone_dir.to_string_lossy();
     let wt = worktree_dir.to_string_lossy();
@@ -1172,6 +1181,23 @@ pub async fn create_worktree(
             // costs one `--yes` confirmation later, which is the fail-safe
             // direction; a failed dispatch is not.
             crate::worktree_owner::write_marker_best_effort(worktree_dir, branch, creator).await;
+            // Release the per-repository ADD lock before warming. The lock
+            // exists to serialize `git worktree add` against itself (#541); the
+            // warm-up below is a subprocess that can sit for seconds and is
+            // bounded in minutes, and holding a 60s-wait lock across it would
+            // push a concurrent dispatch of ANOTHER worktree past
+            // `WORKTREE_LOCK_WAIT` into the unserialized path — reintroducing
+            // the hazard the lock is for, to protect two materializations that
+            // do not touch each other's `.devbox` in the first place.
+            drop(repo_lock);
+            // Issue #791: materialize this worktree's project environment ONCE,
+            // HERE, before returning — so that by the time any caller spawns a
+            // role into it, there is no cold `.devbox` left to race over. The
+            // outcome is deliberately dropped: EVERY one of them, warmed or
+            // not, still reports `Created`, because a worktree that exists has
+            // been created whatever devbox did afterwards. See
+            // [`warm_project_environment`] for why none of them is an error.
+            warm_project_environment(worktree_dir).await;
             Ok(WorktreeCreation::Created)
         }
         // Concurrent claim (TOCTOU): the dir is present now though we arrived
@@ -1183,6 +1209,165 @@ pub async fn create_worktree(
             } else {
                 Err(e)
             }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Issue #791 — warming a freshly created worktree's project environment
+// ---------------------------------------------------------------------------
+
+/// The file whose presence means "this worktree has a devbox environment".
+/// Absent, there is nothing to materialize and no reason to spawn anything.
+const DEVBOX_MANIFEST: &str = "devbox.json";
+
+/// How long [`warm_project_environment`] waits for `devbox` before giving up on
+/// the warm-up and letting the roles proceed.
+///
+/// A bound, not a deadline: exceeding it is not an error, it just means the
+/// roles start against an environment that is still materializing — which is
+/// exactly the state they started in before this existed, so the worst case is
+/// no worse than no warm-up at all. What it buys is that a `devbox` which never
+/// returns costs a dispatch two minutes instead of wedging it forever.
+///
+/// Two minutes is ~23x the 5.2s a cold `.devbox` for this repository's
+/// 22-package manifest took to materialize against an already-populated nix
+/// store (measured 2026-09-04), which is the case the warm-up is FOR: a fresh
+/// worktree of a repo the machine has built before. A genuinely first-ever nix
+/// closure can exceed it, and then the bound expires and the dispatch proceeds;
+/// the child is deliberately not killed, so that download still finishes.
+const DEVBOX_WARMUP_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// What [`warm_project_environment`] did. Every arm returns normally: a
+/// warm-up that cannot run is a missed optimisation, never a failed dispatch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DevboxWarmup {
+    /// No `devbox.json` in the new worktree, so there is nothing to
+    /// materialize and NO process was started.
+    NoManifest,
+    /// `devbox run -- true` completed successfully; `.devbox` is warm.
+    Warmed,
+    /// `devbox` could not be executed at all — not on `PATH`, not executable.
+    Unavailable(String),
+    /// `devbox` ran and exited non-zero.
+    Failed(String),
+    /// `devbox` was still running when [`DEVBOX_WARMUP_TIMEOUT`] expired.
+    TimedOut,
+}
+
+/// Issue #791: materialize a freshly created worktree's `.devbox` ONCE and
+/// SERIALLY, before its caller spawns anything into it.
+///
+/// **What this fixes.** devbox's per-project `.devbox` materialization is not
+/// safe against concurrent invocations of itself. Six roles of an orchestration
+/// starting together in a fresh worktree are six concurrent first invocations,
+/// and the loser dies at launch — reported as
+/// `remove …/virtenv/bin/setup-corepack.mjs: no such file or directory` or its
+/// complementary `symlink …: file exists`, or, with the nodejs plugin disabled,
+/// as `compact json for hashing: unexpected end of JSON input` from a
+/// half-written state file. The failure is SILENT unless you count roles: the
+/// deck reports the orchestration as started and it simply runs with five roles
+/// instead of six, twice observed taking `agent-orchestrator` and so leaving
+/// workers with nobody to delegate to. Only the FIRST materialization is
+/// exposed; once `.devbox` is warm every later invocation succeeds, which is
+/// why the main checkout never fails and why a failed orchestration succeeds on
+/// restart.
+///
+/// So one invocation, awaited to completion, is the whole mechanism: after it
+/// there is no first-materialization window left for a role to lose.
+///
+/// **Why it never fails a dispatch.** Every reachable outcome returns normally
+/// and the caller goes on to spawn. A repository with no `devbox.json`, a
+/// machine with no `devbox`, a `devbox` that exits non-zero for a reason of its
+/// own (an `init_hook` that needs a credential this host lacks) — none of those
+/// is a reason to refuse a dispatch that would otherwise have worked. They cost
+/// the optimisation, and the roles then race exactly as they did before this
+/// existed. Failing closed here would convert a devbox problem into a dispatch
+/// problem for every user who has no devbox at all.
+///
+/// The bound in [`DEVBOX_WARMUP_TIMEOUT`] is the other half of that: on expiry
+/// the future is dropped, and because `kill_on_drop` is deliberately NOT set
+/// the `devbox` child keeps running to completion. Killing it would leave a
+/// half-materialized `.devbox` — strictly worse than the cold one we started
+/// with, and the one way this function could make things worse than doing
+/// nothing.
+async fn warm_project_environment(worktree_dir: &Path) -> DevboxWarmup {
+    warm_project_environment_with(worktree_dir, &devbox_program(), DEVBOX_WARMUP_TIMEOUT).await
+}
+
+/// The program the warm-up runs. `devbox`, resolved from `PATH` exactly as the
+/// `git` / `gh` calls in this module are.
+///
+/// The `cfg(test)` override exists for one assertion — that `create_worktree`
+/// really does await the warm-up before reporting `Created` — which cannot be
+/// made against the real `devbox` without materializing a nix environment
+/// inside a unit test. Production has no override and no way to reach one.
+fn devbox_program() -> String {
+    #[cfg(test)]
+    {
+        if let Some(p) = tests::devbox_program_override() {
+            return p;
+        }
+    }
+    "devbox".to_string()
+}
+
+/// The body of [`warm_project_environment`], with the program and the bound
+/// passed in so the degradation paths can be driven without a real `devbox`.
+async fn warm_project_environment_with(
+    worktree_dir: &Path,
+    program: &str,
+    bound: Duration,
+) -> DevboxWarmup {
+    // Probed BEFORE anything is spawned: the great majority of repositories
+    // have no devbox environment at all, and they must pay nothing — not a
+    // failed `exec`, not a `PATH` walk — for a fix that is not about them.
+    if !worktree_dir.join(DEVBOX_MANIFEST).is_file() {
+        return DevboxWarmup::NoManifest;
+    }
+
+    let started = std::time::Instant::now();
+    let run = tokio::process::Command::new(program)
+        .args(["run", "--", "true"])
+        .current_dir(worktree_dir)
+        .output();
+
+    match tokio::time::timeout(bound, run).await {
+        Ok(Ok(out)) if out.status.success() => {
+            tracing::debug!(
+                worktree = %worktree_dir.display(),
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "warmed the worktree's devbox environment before spawning (issue #791)"
+            );
+            DevboxWarmup::Warmed
+        }
+        Ok(Ok(out)) => {
+            let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            tracing::warn!(
+                worktree = %worktree_dir.display(),
+                status = %out.status,
+                stderr = %stderr,
+                "devbox warm-up failed; spawning anyway, so concurrent roles may \
+                 race the first materialization (issue #791)"
+            );
+            DevboxWarmup::Failed(stderr)
+        }
+        Ok(Err(e)) => {
+            tracing::debug!(
+                worktree = %worktree_dir.display(),
+                error = %e,
+                "no usable `devbox` for the warm-up; spawning without one (issue #791)"
+            );
+            DevboxWarmup::Unavailable(e.to_string())
+        }
+        Err(_) => {
+            tracing::warn!(
+                worktree = %worktree_dir.display(),
+                waited_secs = bound.as_secs(),
+                "devbox warm-up did not finish within its bound; spawning anyway \
+                 and leaving it running (issue #791)"
+            );
+            DevboxWarmup::TimedOut
         }
     }
 }
@@ -2337,5 +2522,200 @@ mod tests {
         let abs = canonical_workspace(abs_root).expect("absolute path accepted");
         assert!(abs.is_absolute());
         assert_eq!(abs, PathBuf::from(abs_root));
+    }
+
+    // --- Issue #791: warming a fresh worktree's devbox environment ---
+
+    /// The program [`devbox_program`] hands back, when a test has set one.
+    ///
+    /// Exists for [`create_worktree_warms_the_environment_before_it_reports_created`]
+    /// alone: the ordering it asserts is a property of `create_worktree`, and
+    /// there is no way to observe it against the real `devbox` without
+    /// materializing a nix environment inside a unit test. Under `cargo
+    /// nextest` — the runner CLAUDE.md rule 5 names — every test is its own
+    /// process, so this global is not shared with any other test.
+    static DEVBOX_PROGRAM_OVERRIDE: Mutex<Option<String>> = Mutex::new(None);
+
+    pub(super) fn devbox_program_override() -> Option<String> {
+        DEVBOX_PROGRAM_OVERRIDE
+            .lock()
+            .expect("devbox program override lock")
+            .clone()
+    }
+
+    /// Write an executable stand-in for `devbox` and return its path. `body` is
+    /// the shell script after the shebang.
+    #[cfg(unix)]
+    fn stub_devbox(dir: &Path, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("devbox-stub");
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).expect("write devbox stand-in");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod devbox stand-in");
+        path
+    }
+
+    /// A worktree with no `devbox.json` must not spawn anything at all. Proven
+    /// by pointing the warm-up at a program that does not exist: reaching the
+    /// spawn would report `Unavailable`, so `NoManifest` is evidence the
+    /// manifest probe short-circuited before any `exec`.
+    #[tokio::test]
+    async fn warm_up_starts_no_process_for_a_worktree_with_no_devbox_manifest() {
+        let scratch = crate::test_temp::tempdir().expect("scratch tempdir");
+        assert_eq!(
+            warm_project_environment_with(
+                scratch.path(),
+                "/nonexistent/dot-agent-deck-devbox",
+                Duration::from_secs(5),
+            )
+            .await,
+            DevboxWarmup::NoManifest
+        );
+    }
+
+    /// A machine with no `devbox` on `PATH` degrades to "no warm-up" rather
+    /// than to a failed dispatch. devbox is optional for this project, so this
+    /// is the ordinary case for most contributors, not an error path.
+    #[tokio::test]
+    async fn warm_up_degrades_when_devbox_is_not_installed() {
+        let scratch = crate::test_temp::tempdir().expect("scratch tempdir");
+        std::fs::write(scratch.path().join(DEVBOX_MANIFEST), "{}\n").expect("write devbox.json");
+        let outcome = warm_project_environment_with(
+            scratch.path(),
+            "/nonexistent/dot-agent-deck-devbox",
+            Duration::from_secs(5),
+        )
+        .await;
+        assert!(
+            matches!(outcome, DevboxWarmup::Unavailable(_)),
+            "an absent devbox must be reported as unavailable, never propagated as a \
+             dispatch failure; got {outcome:?}"
+        );
+    }
+
+    /// A `devbox` that runs and fails — an `init_hook` needing a credential
+    /// this host lacks, a manifest referencing a flake that will not build —
+    /// is reported and stepped over. The roles then race exactly as they did
+    /// before the warm-up existed, which is the pre-#791 status quo and not a
+    /// new failure mode.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn warm_up_degrades_when_devbox_exits_non_zero() {
+        let scratch = crate::test_temp::tempdir().expect("scratch tempdir");
+        std::fs::write(scratch.path().join(DEVBOX_MANIFEST), "{}\n").expect("write devbox.json");
+        let stub = stub_devbox(scratch.path(), "echo 'nix build failed' >&2\nexit 3");
+        let outcome = warm_project_environment_with(
+            scratch.path(),
+            &stub.to_string_lossy(),
+            Duration::from_secs(30),
+        )
+        .await;
+        match outcome {
+            DevboxWarmup::Failed(stderr) => assert!(
+                stderr.contains("nix build failed"),
+                "the failure must carry devbox's own words, or the log says nothing \
+                 actionable; got {stderr:?}"
+            ),
+            other => panic!("a non-zero devbox must report Failed, got {other:?}"),
+        }
+    }
+
+    /// A `devbox` that never returns must cost the dispatch its bound and no
+    /// more. Without this the warm-up would be a new way to wedge a dispatch
+    /// forever — a strictly worse failure than the race it removes.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn warm_up_is_bounded_when_devbox_hangs() {
+        let scratch = crate::test_temp::tempdir().expect("scratch tempdir");
+        std::fs::write(scratch.path().join(DEVBOX_MANIFEST), "{}\n").expect("write devbox.json");
+        let stub = stub_devbox(scratch.path(), "sleep 600");
+        let started = std::time::Instant::now();
+        let outcome = warm_project_environment_with(
+            scratch.path(),
+            &stub.to_string_lossy(),
+            Duration::from_millis(300),
+        )
+        .await;
+        assert_eq!(outcome, DevboxWarmup::TimedOut);
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "the bound must actually bound: a 600s stand-in returned after {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// THE ordering assertion, and the reason the warm-up lives inside
+    /// `create_worktree` rather than at its call sites.
+    ///
+    /// `create_worktree` is the only `git worktree add` in `src/`, so a
+    /// worktree cannot come into existence anywhere else; every caller spawns
+    /// only after awaiting it. This pins the remaining link: that the warm-up
+    /// has already COMPLETED by the time `Created` is reported. The stand-in
+    /// writes a marker file, and the marker is asserted the instant
+    /// `create_worktree` returns — so a warm-up moved into the background, or
+    /// after the return, or dropped altogether, fails here.
+    ///
+    /// It is a structural claim, deliberately: reproducing the race itself
+    /// proves nothing either way (issue #791 measured 6/6 clean and later 1/6
+    /// failing on the same code), so what is worth pinning is the ordering.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn create_worktree_warms_the_environment_before_it_reports_created() {
+        let scratch = crate::test_temp::tempdir().expect("scratch tempdir");
+        let repo = scratch.path().join("repo");
+        init_repo_with_commit(&repo);
+        // Committed, so the fresh worktree checks one out and the warm-up's
+        // manifest probe sees it — exactly as a real dispatched worktree does.
+        std::fs::write(repo.join(DEVBOX_MANIFEST), "{}\n").expect("write devbox.json");
+        let git_add = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["add", DEVBOX_MANIFEST])
+            .output()
+            .expect("git add devbox.json");
+        assert!(git_add.status.success());
+        let git_commit = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["commit", "--quiet", "-m", "devbox"])
+            .output()
+            .expect("git commit devbox.json");
+        assert!(git_commit.status.success());
+
+        let evidence = scratch.path().join("warmed");
+        let stub = stub_devbox(
+            scratch.path(),
+            &format!(
+                "sleep 0.2\nprintf '%s' \"$PWD\" > {}\n",
+                evidence.to_string_lossy()
+            ),
+        );
+        *DEVBOX_PROGRAM_OVERRIDE
+            .lock()
+            .expect("devbox program override lock") = Some(stub.to_string_lossy().into_owned());
+
+        let worktree_dir = scratch.path().join("repo-dispatch-warm");
+        let outcome = create_worktree(
+            &repo,
+            &worktree_dir,
+            "agent/dispatch-warm",
+            false,
+            Creator::dispatch("warm"),
+        )
+        .await;
+        assert_eq!(outcome, Ok(WorktreeCreation::Created));
+        assert!(
+            evidence.is_file(),
+            "create_worktree must not report Created until the warm-up has finished — \
+             a role spawned against a still-cold .devbox is precisely issue #791"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&evidence)
+                .expect("read the warm-up's evidence")
+                .trim_end_matches('/'),
+            worktree_dir.to_string_lossy().trim_end_matches('/'),
+            "the warm-up must run in the NEW worktree; warming any other directory \
+             leaves that worktree's .devbox exactly as cold as it was"
+        );
     }
 }

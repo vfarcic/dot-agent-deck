@@ -76,14 +76,22 @@ struct Fixture {
 }
 
 impl Fixture {
-    /// `packages` are devbox.json entries verbatim; `workflows` are
-    /// `(file name, contents)` pairs written under `.github/workflows/`.
+    /// `packages` are devbox.json entries verbatim, in the ARRAY form;
+    /// `workflows` are `(file name, contents)` pairs written under
+    /// `.github/workflows/`.
     fn new(packages: &[&str], workflows: &[(&str, String)]) -> Self {
-        let dir = tempfile::tempdir().expect("temp dir for the fixture repository");
         let quoted: Vec<String> = packages.iter().map(|p| format!("    \"{p}\"")).collect();
+        Self::with_packages(&format!("[\n{}\n  ]", quoted.join(",\n")), workflows)
+    }
+
+    /// The same, with the whole `packages` VALUE written verbatim — so a test
+    /// can pin the object form devbox itself writes (issue #791), which the
+    /// `name@version` strings above cannot express.
+    fn with_packages(packages: &str, workflows: &[(&str, String)]) -> Self {
+        let dir = tempfile::tempdir().expect("temp dir for the fixture repository");
         fs::write(
             dir.path().join("devbox.json"),
-            format!("{{\n  \"packages\": [\n{}\n  ]\n}}\n", quoted.join(",\n")),
+            format!("{{\n  \"packages\": {packages}\n}}\n"),
         )
         .expect("write the fixture devbox.json");
 
@@ -689,5 +697,171 @@ fn a_quoted_flow_style_toolchain_pin_fails() {
     assert!(
         text.contains("unreadable"),
         "the failure must name the pin as unreadable, not merely absent:\n{text}"
+    );
+}
+
+/// devbox.json's `packages` in the OBJECT form, with `rustc` carrying
+/// per-package options — the exact shape `devbox add … --disable-plugin` leaves
+/// behind, applied to a name this guard actually scans.
+fn object_packages(nextest: &str, rustc: &str, clippy: &str) -> String {
+    format!(
+        "{{\n    \
+         \"jq\": \"1.8.2\",\n    \
+         \"cargo-nextest\": \"{nextest}\",\n    \
+         \"rustc\": {{\n      \
+         \"version\": \"{rustc}\",\n      \
+         \"disable_plugin\": true\n    \
+         }},\n    \
+         \"cargo\": \"1.97.1\",\n    \
+         \"clippy\": \"{clippy}\",\n    \
+         \"rustfmt\": \"1.97.1\",\n    \
+         \"path:tauri-deps#tauri-deps\": \"\"\n  \
+         }}"
+    )
+}
+
+/// Issue #791: the object form is READ, in both its spellings.
+///
+/// This is not a hypothetical shape. `devbox add nodejs@24.12.0
+/// --disable-plugin` rewrites the WHOLE `packages` block from the array form to
+/// this one — every entry, not just the one that gained an option — so the day
+/// any package needs a per-package option, every pin in the file changes
+/// spelling at once. Renovate reads both forms (its devbox manager parses
+/// `packages` as an array-or-record union), so both are pins it tracks and
+/// bumps, and a guard that reads only one of them is a lockstep between the
+/// wrong two things — the same hole as reading only block-style YAML (#710).
+#[test]
+fn object_form_packages_are_read() {
+    if !bash_present() {
+        eprintln!("SKIP: needs `bash` on PATH");
+        return;
+    }
+    let out = Fixture::with_packages(
+        &object_packages("0.9.143", "1.97.1", "1.97.1"),
+        &good_workflows(),
+    )
+    .run();
+    assert!(
+        out.status.success(),
+        "an agreeing object-form devbox.json must pass, or the two drift tests \
+         below prove nothing:\n{}",
+        combined(&out)
+    );
+}
+
+/// The half that matters: drift is still caught through the object form. If it
+/// were not, the conversion would have silently turned the guard off — which is
+/// exactly what the array-only scanner did on the day devbox rewrote the file.
+#[test]
+fn drifted_object_form_nextest_pin_fails() {
+    if !bash_present() {
+        eprintln!("SKIP: needs `bash` on PATH");
+        return;
+    }
+    let out = Fixture::with_packages(
+        &object_packages("0.9.140", "1.97.1", "1.97.1"),
+        &good_workflows(),
+    )
+    .run();
+    let text = combined(&out);
+    assert!(
+        !out.status.success(),
+        "0.9.140 vs 0.9.143 must fail in the object form too:\n{text}"
+    );
+    assert!(
+        text.contains("cargo-nextest") && text.contains("0.9.140") && text.contains("0.9.143"),
+        "the failure must name the class and BOTH versions:\n{text}"
+    );
+}
+
+/// A version living inside a per-package object is a pin like any other. This
+/// is the one entry shape the array form cannot express at all, so without it
+/// the `nodejs` entry that #791 created would be readable by nobody — and the
+/// day someone puts `disable_plugin` on a Rust component, the guard would go
+/// from comparing that pin to reporting it absent.
+#[test]
+fn a_version_nested_in_a_package_object_is_read() {
+    if !bash_present() {
+        eprintln!("SKIP: needs `bash` on PATH");
+        return;
+    }
+    let out = Fixture::with_packages(
+        &object_packages("0.9.143", "1.98.0", "1.97.1"),
+        &good_workflows(),
+    )
+    .run();
+    let text = combined(&out);
+    assert!(
+        !out.status.success(),
+        "a nested `version` that disagrees must be compared, not skipped:\n{text}"
+    );
+    assert!(
+        text.contains("internally inconsistent") && text.contains("1.98.0"),
+        "the nested pin must be read as rustc's version and reported against its \
+         three siblings:\n{text}"
+    );
+}
+
+/// The per-name absence check survives the form change. Dropping `clippy` from
+/// the object form must read as missing, not as agreeing by silence — the
+/// Greptile finding that `one_missing_devbox_rust_component_fails` pins for the
+/// array form.
+#[test]
+fn one_missing_devbox_rust_component_fails_in_object_form() {
+    if !bash_present() {
+        eprintln!("SKIP: needs `bash` on PATH");
+        return;
+    }
+    let packages = object_packages("0.9.143", "1.97.1", "1.97.1")
+        .lines()
+        .filter(|l| !l.contains("\"clippy\""))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let out = Fixture::with_packages(&packages, &good_workflows()).run();
+    let text = combined(&out);
+    assert!(
+        !out.status.success(),
+        "an object-form devbox.json missing one Rust component must fail:\n{text}"
+    );
+    assert!(
+        text.contains("pins no clippy"),
+        "the failure must name the component that went missing:\n{text}"
+    );
+}
+
+/// The scan is scoped to the `packages` block, so a `shell.scripts` entry that
+/// happens to share a package's name is not read as that package's pin.
+///
+/// Only reachable once object entries are read at all: `"cargo": "cargo build"`
+/// is the same `"key": "value"` shape as a package, and the old array-form grep
+/// could not have matched it. Getting this wrong fails LOUDLY (a script body is
+/// not a version), but it would fail on a file whose pins are perfectly fine,
+/// which makes the guard the problem.
+#[test]
+fn a_script_named_after_a_package_is_not_a_pin() {
+    if !bash_present() {
+        eprintln!("SKIP: needs `bash` on PATH");
+        return;
+    }
+    let fixture = Fixture::with_packages(
+        &object_packages("0.9.143", "1.97.1", "1.97.1"),
+        &good_workflows(),
+    );
+    let devbox = fixture.dir.path().join("devbox.json");
+    let with_scripts = fs::read_to_string(&devbox)
+        .expect("read the fixture devbox.json")
+        .replace(
+            "\n}\n",
+            "\n,\n  \"shell\": {\n    \"scripts\": {\n      \
+             \"cargo\": \"cargo build --release\",\n      \
+             \"cargo-nextest\": \"cargo nextest run\"\n    }\n  }\n}\n",
+        );
+    fs::write(&devbox, with_scripts).expect("rewrite the fixture devbox.json");
+    let out = fixture.run();
+    assert!(
+        out.status.success(),
+        "a devbox SCRIPT named after a package must not be read as that package's \
+         pin — the pins here agree and nothing should be reported:\n{}",
+        combined(&out)
     );
 }
