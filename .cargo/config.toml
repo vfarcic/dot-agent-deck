@@ -80,6 +80,13 @@ xtask = "run --quiet --package xtask-linkage-check --"
 # a runner spec, not a measurement, and a larger runner or a changed default
 # moves it. `DAD_LINK_JOBS=0` in the job is the lever if it ever bites.
 #
+# THE SCRIPT IS A BUILD INPUT, not an optional wrapper. rustc resolves this
+# path before it links anything, so if the file is absent the build stops with
+# `error: linker '...' not found` and none of the scripts' degradation paths get
+# a chance to run. Anything that builds this repo from a filtered copy of the
+# tree has to carry it — `flake.nix`'s fileset names both scripts for that
+# reason, after CI's `nix` job failed on exactly this.
+#
 # Kill switch: `DAD_LINK_JOBS=0`. Slot count: `DAD_LINK_JOBS=N`. Different
 # linker driver: `DAD_LINKER=clang` — needed because this key overrides a
 # `linker` set in a personal `~/.cargo/config.toml`. Every failure path inside

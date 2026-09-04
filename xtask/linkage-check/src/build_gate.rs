@@ -695,6 +695,107 @@ fn default_pool_location_ignores_tmpdir() {
     );
 }
 
+/// A FIFO at a slot path would wedge every link on the machine forever, and
+/// `/tmp` is world-writable with a path that embeds only our uid — so another
+/// local user can put one there. Opening a FIFO for write blocks in `open(2)`
+/// until a reader arrives; that happens before the wait budget exists and
+/// outside anything `flock -w` can time out, since that timeout covers the lock
+/// and not the open. A hang is the one outcome the degradation ladder exists to
+/// rule out, so this is a regression test rather than a hypothetical.
+/// (Greptile P1 on PR #866.)
+#[test]
+fn a_fifo_at_a_slot_path_runs_ungated_instead_of_hanging() {
+    if !bash_present() {
+        eprintln!("SKIP: needs `bash` on PATH");
+        return;
+    }
+    let pool = tempfile::tempdir().expect("pool dir");
+    let link = pool.path().join("link");
+    fs::create_dir_all(&link).expect("create the pool subdir");
+    let slot = link.join("slot.0");
+    let c = std::ffi::CString::new(slot.as_os_str().as_encoded_bytes()).expect("slot path");
+    assert_eq!(
+        unsafe { libc::mkfifo(c.as_ptr(), 0o600) },
+        0,
+        "could not create the hostile FIFO this test is about"
+    );
+
+    let began = std::time::Instant::now();
+    let out = Command::new("bash")
+        .arg(build_gate())
+        .args([
+            "--pool", "link", "--jobs", "2", "--wait", "600", "--", "bash", "-c", "echo ran",
+        ])
+        .env("DAD_BUILD_GATE_DIR", pool.path())
+        .output()
+        .expect("run the gate");
+    let waited = began.elapsed();
+    let text = combined(&out);
+
+    assert!(out.status.success(), "must still run the command: {text}");
+    assert!(text.contains("ran"), "the command did not run: {text}");
+    assert!(
+        waited < std::time::Duration::from_secs(20),
+        "took {waited:?} — a FIFO slot blocked the open, which no timeout covers"
+    );
+}
+
+/// A pool base that is not a directory at all is the same class: refuse it
+/// rather than build a slot path underneath it.
+#[test]
+fn a_non_directory_pool_base_runs_ungated() {
+    if !bash_present() {
+        eprintln!("SKIP: needs `bash` on PATH");
+        return;
+    }
+    let dir = tempfile::tempdir().expect("temp dir");
+    let base = dir.path().join("not-a-dir");
+    fs::write(&base, "").expect("create the file standing where the pool should be");
+    let out = Command::new("bash")
+        .arg(build_gate())
+        .args([
+            "--pool", "link", "--jobs", "2", "--", "bash", "-c", "echo ran",
+        ])
+        .env("DAD_BUILD_GATE_DIR", &base)
+        .output()
+        .expect("run the gate");
+    let text = combined(&out);
+    assert!(out.status.success(), "must still run the command: {text}");
+    assert!(text.contains("ran"), "the command did not run: {text}");
+}
+
+/// The pool is created private, so that a base we DO own cannot then have slot
+/// entries planted in it by another user on a shared `/tmp`.
+#[test]
+fn the_pool_is_created_private_to_this_user() {
+    if !bash_present() || !flock_present() {
+        eprintln!("SKIP: needs `bash` and `flock` on PATH");
+        return;
+    }
+    let parent = tempfile::tempdir().expect("pool parent");
+    let base = parent.path().join("pool");
+    let out = Command::new("bash")
+        .arg(build_gate())
+        .args(["--pool", "link", "--jobs", "2", "--", "true"])
+        .env("DAD_BUILD_GATE_DIR", &base)
+        .output()
+        .expect("run the gate");
+    assert!(out.status.success(), "gate failed: {}", combined(&out));
+    for d in [base.clone(), base.join("link")] {
+        let mode = fs::metadata(&d)
+            .unwrap_or_else(|e| panic!("{} was not created: {e}", d.display()))
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode & 0o077,
+            0,
+            "{} is {mode:o}; group/other access lets another user plant a slot",
+            d.display()
+        );
+    }
+}
+
 /// A slot count far above any plausible core count is not a bound, and
 /// honouring it literally would create that many files before discovering as
 /// much.

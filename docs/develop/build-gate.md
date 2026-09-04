@@ -80,12 +80,17 @@ The gate is an optimisation on a shared box. The outcomes it must never produce 
 
 - `scripts/build-gate.sh` missing or not executable — a partial checkout, a `noexec` mount — and `link-gate.sh` execs the real linker directly;
 - no `flock` on PATH;
-- the pool directory cannot be created or is not writable;
+- the pool directory cannot be created, is not writable, is not a directory, or **is not owned by us** — `/tmp` is world-writable and the default path embeds only a uid, so another local user can create it first, and a squatted pool is refused rather than trusted;
+- a slot path exists but is not a plain file. This one prevents a **hang** rather than an error, which is why it is checked rather than assumed: opening a FIFO for write blocks in `open(2)` until a reader arrives, before the wait budget exists and outside anything `flock -w` can time out (that timeout covers the lock, not the open), so a single FIFO planted at one of these paths would otherwise wedge every link on the machine forever;
 - `DAD_LINK_JOBS=0` or `off`;
 - a `DAD_LINK_JOBS` that is not a number (it says so on stderr, then builds), or one above 1024, which is not a bound;
 - the whole-run wait budget expires — after `DAD_BUILD_GATE_WAIT` seconds (default 900) without a slot it warns and proceeds. This is what bounds the hang: even a pool wedged by some future bug costs a delay, never a red build.
 
+**`scripts/link-gate.sh` itself is the one exception, and it is not a degradation — it is a build input.** `.cargo/config.toml` names it as the *linker*, so rustc resolves the path before it links anything and an absent file is a hard `error: linker '…/scripts/link-gate.sh' not found` on the first crate with a build script, with nothing of ours having run yet. Everything in the ladder above happens *inside* the two scripts, which presupposes the seam exists. Treat it like `build.rs`: on Linux this repository does not build without it. That is not hypothetical — it is how CI's `nix` job failed when the gate first landed, because `flake.nix`'s source fileset did not include `scripts/`, and it is why that fileset now names both files and why a test asserts `.cargo/config.toml` still points at them.
+
 **There is no stale-lock path, by construction.** `flock(2)` locks are held by an open file description and released by the kernel when the last descriptor closes — on SIGKILL, on OOM-kill, on a power cut. A slot can never be left held by a process that is gone, which is exactly the failure a pid-in-a-file lock has and this does not. Nothing reads, writes, validates or expires a lock's contents; the slot files stay empty and are never unlinked. This matters more than usual here, because the storm the gate exists for ends in an OOM kill.
+
+The pool is also created with a private umask, so a base we do own cannot then have slot entries planted in it. (The FIFO rung came from Greptile's P1 on PR #866, and it was a real defect: a bare append to a FIFO was measured blocking indefinitely.)
 
 Waiters scan slots from a random offset and, when all are busy, block on a randomly chosen one with a short timeout before rescanning, so no waiter queues permanently behind one long-held slot while a different one frees.
 

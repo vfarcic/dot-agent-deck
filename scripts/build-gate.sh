@@ -123,17 +123,44 @@ command -v flock >/dev/null 2>&1 || exec "$@"
 # somewhere else: a pool at a path other builds will not look in is worse than
 # no pool, because it bounds nothing while reporting success. It degrades to an
 # ungated run instead, like every other rung.
-gate_dir="${DAD_BUILD_GATE_DIR:-/tmp/dad-build-gate-$(id -u 2>/dev/null || echo 0)}/$pool"
-mkdir -p "$gate_dir" 2>/dev/null || exec "$@"
+gate_base="${DAD_BUILD_GATE_DIR:-/tmp/dad-build-gate-$(id -u 2>/dev/null || echo 0)}"
+gate_dir="$gate_base/$pool"
+# `umask 077` so both levels are created private. On a world-writable `/tmp`
+# the path below is guessable, and anything another user can put there we would
+# otherwise open.
+(umask 077 && mkdir -p "$gate_dir") 2>/dev/null || exec "$@"
+
+# REFUSE A POOL WE DO NOT OWN. `/tmp` is world-writable and the default path
+# embeds only our uid, so another local user can create it first. `-O` is the
+# check that matters: a squatted directory is owned by whoever made it, so this
+# degrades to an ungated run instead of trusting its contents. Combined with the
+# private umask above, a base we do own cannot then be written by anyone else.
+for d in "$gate_base" "$gate_dir"; do
+    [ -d "$d" ] || exec "$@"
+    [ -O "$d" ] || exec "$@"
+done
 [ -w "$gate_dir" ] || exec "$@"
 
 # The slot files are created once and then only ever locked. `flock` on a
 # non-existent path would create it itself, but pre-creating keeps a failed
 # creation (a full or read-only filesystem) on the degrade path rather than
 # turning into a per-attempt error.
+#
+# EVERY SLOT MUST BE A PLAIN FILE, and this is checked rather than assumed
+# because the failure it prevents is a HANG rather than an error. Opening a
+# FIFO for write blocks in `open(2)` until a reader arrives — before the wait
+# budget below exists, and outside anything `flock -w` can time out, since that
+# timeout covers the lock and not the open. So a single FIFO at one of these
+# paths would wedge every link on the machine forever, which is the one outcome
+# the whole degradation ladder exists to rule out. A symlink is refused for the
+# same reason: `-f` resolves it, so it could name a FIFO elsewhere.
 slot=0
 while [ "$slot" -lt "$jobs" ]; do
-    : >>"$gate_dir/slot.$slot" 2>/dev/null || exec "$@"
+    path="$gate_dir/slot.$slot"
+    if [ -e "$path" ] || [ -L "$path" ]; then
+        { [ -f "$path" ] && [ ! -L "$path" ]; } || exec "$@"
+    fi
+    : >>"$path" 2>/dev/null || exec "$@"
     slot=$((slot + 1))
 done
 
