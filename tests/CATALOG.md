@@ -2004,6 +2004,13 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** that the prompt names the agent by its *display* name specifically (loose match — with `running_agents` omitted the label comes from `list_agents()`, so the display name OR a non-zero "(N agent(s) running)" header is accepted); exact prompt wording.
 - **Platform coverage:** mac+linux.
 
+##### lifecycle/handshake/008 — A daemon whose `Hello` omits `capabilities` makes a project-aware client WITHHOLD the project verbs, and the withheld verb never reaches the wire (PRD #819 M5 capability negotiation).
+- **Layer:** L2 (lane 1 — a real `DaemonClient` against a protocol-faithful synthetic daemon on its own Unix socket; no binary is spawned).
+- **Agent:** none (a scripted in-process daemon thread; the production `Hello` handler calls `AttachResponse::with_capabilities()` unconditionally and takes no argument, so no real daemon can be asked to omit the field, and a production env knob on the `DOT_AGENT_DECK_TEST_OMIT_RUNNING_AGENTS` model would fake the thing being measured).
+- **Asserts:** against a `Hello` with no `capabilities` key, `DaemonCapabilities::is_advertised()` is false, `require_capability` declines all three of `list-projects` / `resolve-project` / `prepare-workflow` with a `ClientError::Server` naming the capability, and — the core claim — the scripted daemon's own request log holds the single `hello` and nothing else, so no project verb reached the wire and the `unknown variant …` refusal text was never read. Against a second scripted daemon that DOES advertise, the same call site proceeds: all three are permitted, `list-projects` appears in that daemon's log after one handshake, and the scripted listing comes back.
+- **Does not assert:** any TUI or desktop surface (PRD #819 leaves the project-aware call sites out of scope, so the test supplies the guarded call site); the daemon-side behaviour of the verbs themselves (`project/resolve/001`, `project/launch/001`–`002`); the fallback for an omitted `running_agents`, which is `lifecycle/handshake/007`'s separate claim.
+- **Platform coverage:** mac+linux.
+
 #### lifecycle/login-path
 
 ##### lifecycle/login-path/001 — A dashboard new-pane whose command is a bare binary living only in the user's login-shell PATH spawns successfully when the daemon was launched without that dir on PATH (PRD #170 M1.3).
