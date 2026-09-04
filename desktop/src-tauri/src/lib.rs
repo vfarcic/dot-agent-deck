@@ -307,20 +307,11 @@ trait WorkflowDaemon {
         config_revision: Option<&str>,
     ) -> Result<PreparedWorkflow, String>;
 
-    /// PRD #819 audit fix (P2, finding 2): confirm the daemon behind this
-    /// endpoint still enforces preparation tokens, on a handshake taken
-    /// immediately before a prepared spawn.
-    ///
-    /// Called once per prepared role rather than once per launch, because each
-    /// role's spawn is its own connection and therefore its own exposure. See
-    /// `daemon_bridge::verify_prepared_launch_peer` for what it closes and for
-    /// the sliver it does not.
-    async fn verify_prepared_launch_peer(&self) -> Result<(), String>;
-
-    /// `prep_token` is the one the preparation handed back, presented so a
-    /// spawn against a preparation that has since gone stale is refused
-    /// daemon-side. It is a staleness check and not an authorization — see
-    /// `dot_agent_deck::prep_token`'s module doc.
+    /// `prep_token` is the one the preparation handed back. A token routes the
+    /// spawn onto `start-prepared-agent`, where the token is a required field,
+    /// so a daemon that does not know that verb refuses the request outright and
+    /// the launch fails closed with nothing started. It is a staleness check and
+    /// not an authorization — see `dot_agent_deck::prep_token`'s module doc.
     async fn start_workflow_agent(
         &self,
         options: StartAgentOptions,
@@ -367,10 +358,6 @@ impl WorkflowDaemon for DaemonClient {
         DaemonClient::prepare_workflow(self, cwd, orchestration, task, config_revision)
             .await
             .map_err(|error| safe_message(error.to_string()))
-    }
-
-    async fn verify_prepared_launch_peer(&self) -> Result<(), String> {
-        daemon_bridge::verify_prepared_launch_peer(self.socket_path()).await
     }
 
     async fn start_workflow_agent(
@@ -632,28 +619,21 @@ async fn launch_workflow<D: WorkflowDaemon + Sync>(
     let mut start_target = None;
 
     for (role_index, role) in roles.iter().enumerate() {
-        // PRD #819 audit fix (P2, finding 2): this spawn presents a preparation
-        // token, and it is about to open its OWN connection to do so — one that
-        // exchanges no `Hello` and re-checks no protocol version. An older
-        // daemon substituted since the preparation would accept the stable
-        // `StartAgent` shape, ignore the unknown `prep_token` key, and start the
-        // role with no preparation enforcement at all. So re-confirm the peer
-        // per role, and refuse rather than spawn if it cannot be confirmed:
-        // "we could not verify" is not "it is fine".
+        // PRD #819 audit follow-up: each role's spawn opens its OWN short-lived
+        // connection, one that exchanges no `Hello` and re-checks no protocol
+        // version. That used to be a fail-open — the token rode on the stable
+        // `start-agent` op as an additive key, so an older daemon substituted
+        // since the preparation accepted the request, ignored the key and
+        // started the role unenforced. The preceding round of this fix verified
+        // the peer on a separate connection first, which narrowed the window to
+        // the gap between two `connect()` calls without shutting it.
         //
-        // Only for a prepared spawn. A token-less start has no preparation to
-        // protect and is left byte-for-byte as it was.
-        if prep_token.is_some()
-            && let Err(error) = daemon.verify_prepared_launch_peer().await
-        {
-            let cleanup_status = rollback_workflow_agents(daemon, &started).await;
-            return Err(format!(
-                "refusing to start workflow role {} against a daemon that no longer confirms it \
-                 enforces this preparation: {}; {cleanup_status}",
-                safe_message(&role.role),
-                safe_message(error)
-            ));
-        }
+        // It is shut here instead, and one hop lower: a token routes this spawn
+        // onto `start-prepared-agent`, a verb such a daemon does not have, so it
+        // fails the frame decode and answers `ok: false` on the spawn's own
+        // connection. The refusal below is that answer, and it rolls back what
+        // has already started. A token-less start is byte-for-byte unchanged and
+        // spends no extra round trip on a preparation it does not have.
         let pane_id = mint_desktop_pane_id();
         let options = workflow_start_options(
             name,
@@ -1260,12 +1240,10 @@ mod tests {
         now: Mutex<std::time::Instant>,
         prepare_requests: Mutex<Vec<PrepareRequest>>,
         prepare_results: Mutex<VecDeque<Result<PreparedWorkflow, String>>>,
-        /// PRD #819 audit fix (P2, finding 2): every peer re-verification and
-        /// every prepared spawn, in the order they happened. Ordering is the
-        /// property under test — a verification that runs AFTER the spawn it
-        /// guards guards nothing — so one log rather than two counters.
-        peer_log: Mutex<Vec<String>>,
-        peer_results: Mutex<VecDeque<Result<(), String>>>,
+        /// Every spawn this fake was asked for, in order and by role name.
+        /// `started` records the options; this records the sequence, which is
+        /// what a rollback assertion needs to say WHICH role a launch died on.
+        spawn_log: Mutex<Vec<String>>,
         start_tokens: Mutex<Vec<Option<String>>>,
         started: Mutex<Vec<StartAgentOptions>>,
         start_results: Mutex<VecDeque<Result<String, String>>>,
@@ -1291,8 +1269,7 @@ mod tests {
                 now: Mutex::new(std::time::Instant::now()),
                 prepare_requests: Mutex::new(Vec::new()),
                 prepare_results: Mutex::new(VecDeque::new()),
-                peer_log: Mutex::new(Vec::new()),
-                peer_results: Mutex::new(VecDeque::new()),
+                spawn_log: Mutex::new(Vec::new()),
                 start_tokens: Mutex::new(Vec::new()),
                 started: Mutex::new(Vec::new()),
                 start_results: Mutex::new(VecDeque::new()),
@@ -1342,21 +1319,12 @@ mod tests {
                 .unwrap_or_else(|| Ok(prepared_workflow()))
         }
 
-        async fn verify_prepared_launch_peer(&self) -> Result<(), String> {
-            self.peer_log.lock().unwrap().push("verify".into());
-            self.peer_results
-                .lock()
-                .unwrap()
-                .pop_front()
-                .unwrap_or(Ok(()))
-        }
-
         async fn start_workflow_agent(
             &self,
             options: StartAgentOptions,
             prep_token: Option<&str>,
         ) -> Result<String, String> {
-            self.peer_log.lock().unwrap().push(format!(
+            self.spawn_log.lock().unwrap().push(format!(
                 "start:{}",
                 options.display_name.as_deref().unwrap_or("?")
             ));
@@ -1694,76 +1662,45 @@ command = "configured-planner"
         );
     }
 
-    /// PRD #819 audit fix (P2, finding 2). Scenario: prepare a workflow, then
-    /// launch it. Every role that presents the preparation token must
-    /// re-confirm the peer FIRST, on its own handshake — because the spawn
-    /// itself opens a connection that exchanges no `Hello` and re-checks no
-    /// protocol version, so an older daemon substituted in between would ignore
-    /// the unknown `prep_token` key and start the role unenforced.
+    /// PRD #819 audit follow-up. Scenario: prepare a workflow, then launch it
+    /// against a daemon that does not know the prepared-start verb — it answers
+    /// the structured `malformed request: unknown variant
+    /// \`start-prepared-agent\`` such a daemon replies with, on the spawn's own
+    /// connection. The launch must fail closed: **nothing started at all**,
+    /// nothing to roll back, and no coordinator briefed.
     ///
-    /// The assertion is the interleaving, not a count: a verification that runs
-    /// after the spawn it guards guards nothing.
+    /// This replaces the peer re-verification the preceding round added. That
+    /// checked the daemon on a SEPARATE connection immediately before each
+    /// prepared spawn, which narrowed the substitution window to the gap between
+    /// two `connect()` calls but could not shut it. The verb shuts it: there is
+    /// no window, because the refusal arrives on the connection the spawn would
+    /// have used.
+    ///
+    /// The refusal lands on the FIRST role deliberately, which is what makes
+    /// this a different assertion from
+    /// `lost_start_response_reconciles_failed_pane_before_rollback` — that one
+    /// dies on role two and pins the ROLLBACK; this one pins that a refused
+    /// launch can leave nothing behind to roll back.
+    ///
+    /// **Honest about what it discriminates:** the desktop reaches the daemon
+    /// through `WorkflowDaemon`, which hides the op, so this test would also
+    /// pass before the verb existed with a different scripted string. It is here
+    /// to name the scenario at the layer a user meets it. The evidence that the
+    /// op actually changed is `the_client_routes_a_presented_token_onto_the_prepared_verb`
+    /// and `a_prepared_start_is_a_distinct_op_an_older_daemon_refuses_closed`
+    /// in the root crate, each verified by removing its fix.
     #[tokio::test]
-    async fn every_prepared_role_start_re_verifies_the_peer_first() {
+    async fn a_daemon_without_the_prepared_verb_fails_the_launch_closed() {
         let daemon = FakeWorkflowDaemon::new(
             Ok(Some("session-planner")),
             [Ok(SendResult::Applied)],
             Ok(SendResult::Applied),
         );
-        let (roles, prepared) = prepare_workflow_launch(
-            &daemon,
-            "loop",
-            "/home/dev/project",
-            "Build it.",
-            &launch_roles("claude"),
-            None,
-        )
-        .await
-        .unwrap();
-
-        launch_workflow(
-            &daemon,
-            "loop",
-            &prepared.path,
-            &roles,
-            32,
-            120,
-            "orchestration-1",
-            &prepared.prompt,
-            Some(&prepared.token),
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(
-            *daemon.peer_log.lock().unwrap(),
-            ["verify", "start:planner", "verify", "start:builder"],
-            "each prepared spawn must be preceded by its own peer verification"
-        );
-    }
-
-    /// The counterpart, and the one that makes the failure CLOSED: a peer that
-    /// stops confirming it enforces the preparation refuses the spawn rather
-    /// than taking it, and the roles already started are rolled back.
-    ///
-    /// The refusal lands on the SECOND role deliberately. A launch that dies on
-    /// role one proves only that the check is reachable; dying on role two
-    /// proves the check is re-made per connection, which is the whole reason it
-    /// is inside the loop.
-    #[tokio::test]
-    async fn a_peer_that_stops_confirming_the_preparation_refuses_and_rolls_back() {
-        let daemon = FakeWorkflowDaemon::new(
-            Ok(Some("session-planner")),
-            [Ok(SendResult::Applied)],
-            Ok(SendResult::Applied),
-        );
-        {
-            let mut peer_results = daemon.peer_results.lock().unwrap();
-            peer_results.push_back(Ok(()));
-            peer_results.push_back(Err(
-                "daemon does not advertise the `prepare-workflow` capability".into(),
-            ));
-        }
+        daemon.start_results.lock().unwrap().push_back(Err(
+            "malformed request: unknown variant `start-prepared-agent`, expected one of \
+             `list-agents`, `start-agent`, `hello`"
+                .into(),
+        ));
         let (roles, prepared) = prepare_workflow_launch(
             &daemon,
             "loop",
@@ -1790,24 +1727,33 @@ command = "configured-planner"
         .unwrap_err();
 
         assert!(
-            error.contains("no longer confirms it enforces this preparation"),
-            "unexpected error: {error}"
+            error.contains("start-prepared-agent"),
+            "the daemon's own refusal must survive to the user: {error}"
+        );
+        // Exactly one spawn was ATTEMPTED and it was refused — which is what
+        // makes this the daemon's answer rather than this client declining to
+        // ask — and the second role was never reached. (`started` records
+        // attempts, not successes: the fake logs the options before consulting
+        // its scripted result, which is what
+        // `lost_start_response_reconciles_failed_pane_before_rollback` relies on
+        // to find the failed role's pane.)
+        assert_eq!(*daemon.spawn_log.lock().unwrap(), ["start:planner"]);
+        assert_eq!(daemon.started.lock().unwrap().len(), 1);
+        assert!(
+            daemon.stopped.lock().unwrap().is_empty(),
+            "the one attempt was refused, so no role is live and there is nothing to roll back"
         );
         assert!(
-            error.contains("prepare-workflow"),
-            "the peer's own reason must survive: {error}"
+            daemon.submissions.lock().unwrap().is_empty(),
+            "a launch that failed closed must not brief a coordinator"
         );
-        // The second role was never spawned, and the first was stopped.
-        assert_eq!(daemon.started.lock().unwrap().len(), 1);
-        assert_eq!(*daemon.stopped.lock().unwrap(), ["agent-0".to_string()]);
-        assert!(daemon.submissions.lock().unwrap().is_empty());
     }
 
-    /// A token-LESS launch is left exactly as it was: there is no preparation to
-    /// protect, so no handshake is spent on one. This is the half that keeps the
-    /// fix from becoming a per-spawn tax on every other path.
+    /// The token-LESS counterpart, and the half that keeps the fix from becoming
+    /// a tax on every other path: a launch with no preparation sends no token,
+    /// so it stays on plain `start-agent` and nothing about it changed.
     #[tokio::test]
-    async fn a_token_less_launch_verifies_no_peer() {
+    async fn a_token_less_launch_presents_no_token() {
         let daemon = FakeWorkflowDaemon::new(
             Ok(Some("session-planner")),
             [Ok(SendResult::Applied)],
@@ -1828,15 +1774,7 @@ command = "configured-planner"
         .await
         .unwrap();
 
-        assert!(
-            !daemon
-                .peer_log
-                .lock()
-                .unwrap()
-                .iter()
-                .any(|entry| entry == "verify"),
-            "a token-less start must not pay for a verification it does not need"
-        );
+        assert_eq!(*daemon.start_tokens.lock().unwrap(), [None, None]);
     }
 
     /// PRD #819 audit fix. Scenario: connect to a daemon that speaks this exact

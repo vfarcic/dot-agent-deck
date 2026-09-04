@@ -234,6 +234,25 @@ pub const KIND_STREAM_REJECT: u8 = 0x17;
 /// [`AttachResponse::kept_worktree`] field is additive and would have needed no
 /// bump on its own.
 ///
+/// PRD #819 bumped 8 → 9, and **one bump covers every request variant that PRD
+/// added**: [`AttachRequest::ListProjects`], [`AttachRequest::ResolveProject`],
+/// [`AttachRequest::PrepareWorkflow`] and
+/// [`AttachRequest::StartPreparedAgent`]. They are on the bump list for the
+/// ordinary reason — an older daemon fails the frame decode on a variant it does
+/// not have — and the last of them arrived after the first three, during the
+/// same unreleased cycle, which is exactly when a variant is free. The
+/// [`AttachResponse::capabilities`] field that goes with them is additive and
+/// optional and would have needed no bump of its own; it is what lets a client
+/// tell "speaks 9" from "answers this verb" once there is more than one build at
+/// 9.
+///
+/// **Do not read that as licence to keep adding variants at 9.** It holds only
+/// while 9 is unreleased: the moment a build carrying it ships, another variant
+/// is another break for every user, and this repo's bump policy makes that
+/// another minor release (`docs/develop/versioning.md`). The deadline is the
+/// whole reason `StartPreparedAgent` was taken now rather than left as the
+/// recorded next step it started as.
+///
 /// # Where this constant is enforced
 ///
 /// **Exactly one call site refuses on it: the desktop.**
@@ -302,6 +321,13 @@ pub const CAP_RESOLVE_PROJECT: &str = "resolve-project";
 /// Capability string for [`AttachRequest::PrepareWorkflow`].
 pub const CAP_PREPARE_WORKFLOW: &str = "prepare-workflow";
 
+/// Capability string for [`AttachRequest::StartPreparedAgent`].
+///
+/// Withheld wherever [`CAP_PREPARE_WORKFLOW`] is withheld, and the two are only
+/// useful together: a build that cannot prepare a workflow can never have issued
+/// a token, so a prepared start on it has nothing to present.
+pub const CAP_START_PREPARED_AGENT: &str = "start-prepared-agent";
+
 /// The capability set this build advertises on the [`AttachRequest::Hello`]
 /// reply, via [`AttachResponse::with_capabilities`].
 ///
@@ -313,17 +339,26 @@ pub const CAP_PREPARE_WORKFLOW: &str = "prepare-workflow";
 /// build stops accepting it; do not leave a name here that the dispatch no
 /// longer has an arm for.
 ///
-/// **[`CAP_PREPARE_WORKFLOW`] is Unix-only**, which is the one place that
-/// distinction bites. A non-Unix build refuses the verb *unconditionally* with
-/// [`PROJECT_ERR_UNSUPPORTED_PLATFORM`] — the publish cannot deliver the
-/// owner-only guarantee there — and that is not a bounded refusal of a
-/// particular request but the verb being unavailable, which is exactly the "this
-/// build stops accepting it" case above. Advertising it anyway would reduce the
-/// list to "the frame decodes", and the whole point of PRD #819's capability
-/// helper is that a client withholds rather than enables on absence.
+/// **[`CAP_PREPARE_WORKFLOW`] and [`CAP_START_PREPARED_AGENT`] are Unix-only**,
+/// which is the one place that distinction bites. A non-Unix build refuses both
+/// verbs *unconditionally* with [`PROJECT_ERR_UNSUPPORTED_PLATFORM`] — the
+/// publish cannot deliver the owner-only guarantee there, so no preparation can
+/// exist and nothing can be started against one — and that is not a bounded
+/// refusal of a particular request but the verb being unavailable, which is
+/// exactly the "this build stops accepting it" case above. Advertising either
+/// anyway would reduce the list to "the frame decodes", and the whole point of
+/// PRD #819's capability helper is that a client withholds rather than enables
+/// on absence. The two travel together deliberately: they are one feature split
+/// across two round trips, and a build offering the second without the first
+/// would be advertising a verb that can only ever answer
+/// [`PROJECT_ERR_STALE_TOKEN`].
 #[cfg(unix)]
-pub const DAEMON_CAPABILITIES: &[&str] =
-    &[CAP_LIST_PROJECTS, CAP_RESOLVE_PROJECT, CAP_PREPARE_WORKFLOW];
+pub const DAEMON_CAPABILITIES: &[&str] = &[
+    CAP_LIST_PROJECTS,
+    CAP_RESOLVE_PROJECT,
+    CAP_PREPARE_WORKFLOW,
+    CAP_START_PREPARED_AGENT,
+];
 #[cfg(not(unix))]
 pub const DAEMON_CAPABILITIES: &[&str] = &[CAP_LIST_PROJECTS, CAP_RESOLVE_PROJECT];
 
@@ -394,19 +429,20 @@ pub const PROJECT_ERR_NO_ORCHESTRATION: &str = "no-such-orchestration";
 /// specific than [`crate::project_resolve::generic_refusal`].
 pub const PROJECT_ERR_PUBLISH_FAILED: &str = "publish-failed";
 
-/// PRD #819 M4: an [`AttachRequest::StartAgent`] presented a `prep_token` this
-/// daemon did not issue, or issued longer ago than
+/// PRD #819 M4: an [`AttachRequest::StartPreparedAgent`] presented a `prep_token`
+/// this daemon did not issue, or issued longer ago than
 /// [`crate::prep_token::PREP_TOKEN_TTL`].
 ///
 /// One code for both, because they are one answer: the token does not identify
 /// a live preparation. Read [`crate::prep_token`]'s module doc before treating
-/// this as an authorization failure — it is not one, and an absent token is not
-/// refused at all.
+/// this as an authorization failure — it is not one. There is no "absent token"
+/// case to except any more: the token is a required field of the verb, and a
+/// request without one does not decode.
 pub const PROJECT_ERR_STALE_TOKEN: &str = "stale-token";
 
-/// PRD #819 audit fix: an [`AttachRequest::StartAgent`] presented a `prep_token`
-/// this daemon **did** issue and which has **not** expired, but the state that
-/// preparation approved has moved — see
+/// PRD #819 audit fix: an [`AttachRequest::StartPreparedAgent`] presented a
+/// `prep_token` this daemon **did** issue and which has **not** expired, but the
+/// state that preparation approved has moved — see
 /// [`crate::project_resolve::revalidate_preparation`] for the five checks.
 ///
 /// A distinct code from [`PROJECT_ERR_STALE_TOKEN`] because it is a distinct
@@ -418,9 +454,25 @@ pub const PROJECT_ERR_STALE_TOKEN: &str = "stale-token";
 ///
 /// One code for all five checks, and the sentence names none of them. Read
 /// [`crate::prep_token`]'s module doc before treating this as an authorization
-/// failure — it is a staleness and integrity refusal, and an absent token is
-/// still not refused at all.
+/// failure — it is a staleness and integrity refusal.
 pub const PROJECT_ERR_STALE_PREPARATION: &str = "stale-preparation";
+
+/// PRD #819 audit follow-up: an [`AttachRequest::StartAgent`] payload carried a
+/// `prep_token` key, which that verb does not enforce.
+///
+/// The remedy is the verb, not the value: send
+/// [`AttachRequest::StartPreparedAgent`]. It is a refusal rather than a shrug
+/// because the alternative is the exact failure this code's sibling verb exists
+/// to remove — serde drops unknown keys on `StartAgent`, so ignoring the token
+/// would start the role *unenforced* and report success, and the caller would
+/// have no way to tell that from a preparation that was honoured.
+///
+/// No production caller reaches it: the TUI, the desktop and dispatch all spawn
+/// without a token, and the one client method that presents one
+/// ([`crate::daemon_client::DaemonClient::start_agent_with_prep_token`]) sends
+/// the prepared verb. The wire tests build the payload deliberately, which is
+/// the point of the code existing.
+pub const PROJECT_ERR_WRONG_START_VERB: &str = "wrong-start-verb";
 
 /// PRD #819 audit fix: [`AttachRequest::PrepareWorkflow`] is refused on this
 /// platform because the publish cannot deliver the owner-only guarantee it
@@ -825,6 +877,74 @@ pub enum AttachRequest {
         #[serde(default)]
         config_revision: Option<String>,
     },
+    /// PRD #819 audit follow-up: start ONE role of a workflow this daemon
+    /// prepared. [`AttachRequest::StartAgent`] plus a **required** `prep_token`.
+    ///
+    /// # Why a verb and not a field
+    ///
+    /// The token used to ride on `StartAgent` as an additive JSON key, and that
+    /// shape **fails open on the wire**. `StartAgent` is a stable op every
+    /// daemon back to PRD #76 accepts; an older one decodes the base variant,
+    /// ignores the unknown key and starts the role with no preparation
+    /// enforcement at all. Nothing on this protocol could catch that from the
+    /// client side either: `DaemonClient::connect` is a bare socket connect,
+    /// `issue_json_command` writes one request frame, and [`handle_connection`]
+    /// decodes exactly one `KIND_REQ` per connection — so a role-start
+    /// connection exchanges no [`AttachRequest::Hello`] and re-checks no
+    /// [`PROTOCOL_VERSION`]. Verifying the peer on a *previous* connection
+    /// narrows the window to the gap between two `connect()` calls; it cannot
+    /// shut it.
+    ///
+    /// A distinct `op` removes the timing argument entirely. A daemon that does
+    /// not know this variant fails the frame decode and answers the structured
+    /// `malformed request: unknown variant …` refusal from [`handle_connection`]
+    /// — `ok: false`, nothing spawned, on the very connection the spawn would
+    /// have used. **The launch fails closed with no window at all.**
+    ///
+    /// # What it does NOT change
+    ///
+    /// This is not an authorization boundary and the token is not an
+    /// authorization token — read [`crate::prep_token`]'s module doc. Any peer
+    /// on this socket already holds the daemon user's local-exec authority
+    /// through `StartAgent`, which takes arbitrary `command`, `cwd` and `env`; a
+    /// peer that wants to spawn something arbitrary calls that and is not
+    /// slowed down here. What the verb protects is a *coordinator* against
+    /// launching on a preparation some other launch replaced — a staleness and
+    /// integrity property, and the same one the token always carried.
+    ///
+    /// The fields after `prep_token` are `StartAgent`'s, spelled out rather than
+    /// nested so the wire shape of a role start is one flat object either way.
+    /// Every one carries the same `serde` attribute it does there, so the two
+    /// cannot drift in their defaults.
+    StartPreparedAgent {
+        /// The token [`AttachRequest::PrepareWorkflow`] handed back
+        /// ([`crate::event::PreparedWorkflow::token`]).
+        ///
+        /// **Required, and that is the entire point.** A `#[serde(default)]`
+        /// here would let a client omit it and be served anyway, which is the
+        /// silent downgrade the verb exists to remove; an absent or wrongly
+        /// typed value fails the decode and takes the same structured
+        /// malformed-request path an older daemon takes.
+        prep_token: String,
+        #[serde(default)]
+        command: Option<String>,
+        #[serde(default)]
+        cwd: Option<String>,
+        #[serde(default = "default_rows")]
+        rows: u16,
+        #[serde(default = "default_cols")]
+        cols: u16,
+        #[serde(default)]
+        env: Vec<(String, String)>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        display_name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tab_membership: Option<TabMembership>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_type: Option<AgentType>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        seed: Option<String>,
+    },
 }
 
 fn default_rows() -> u16 {
@@ -881,34 +1001,38 @@ struct WriteAndSubmitExtras {
     delivery_id: Option<String>,
 }
 
-/// PRD #819 M4: the optional preparation token that rides alongside an
-/// [`AttachRequest::StartAgent`] request as an extra JSON key.
+/// PRD #819 audit follow-up: the detector that keeps the *removed* token-on-
+/// `StartAgent` path from coming back as a silent one.
 ///
-/// **Not declared on the enum variant, and for the same reason
-/// [`WriteAndSubmitExtras`] is not.** `StartAgent`'s nine-field shape is
-/// constructed as an exhaustive struct literal at call sites across `src/` and
-/// `tests/`, and widening the variant would break every one of them at compile
-/// time — including the e2e suite that specifies this milestone. The handler
-/// re-parses the SAME request payload into this struct; the field is
-/// `#[serde(default)]`, so a client that omits it decodes to `None`, and unknown
-/// keys on the base variant are ignored by serde, so the two parses of one
-/// payload never conflict.
+/// M4 landed the preparation token as an additive `prep_token` key alongside
+/// [`AttachRequest::StartAgent`], re-parsed from the same payload the way
+/// [`WriteAndSubmitExtras`] still is. That shape fails open against an older
+/// peer — see [`AttachRequest::StartPreparedAgent`], which replaced it — and it
+/// never shipped: `PROTOCOL_VERSION` was already 9 and unreleased when it was
+/// removed, so no deployed daemon or client ever spoke it.
 ///
-/// **An absent token changes nothing.** `StartAgent` behaves exactly as it did
-/// before this field existed — the TUI, the desktop and every existing test call
-/// it without one, and none of them may break. A *present* token is validated
-/// and a stale or unknown value is refused with
-/// [`PROJECT_ERR_STALE_TOKEN`]. That asymmetry is deliberate and is not a
-/// degrade-to-unauthorized hole of the #608 kind: the token is not an
-/// authorization token at all (see [`crate::prep_token`]'s module doc), so
-/// "absent means unauthorized" would be claiming a boundary this socket does not
-/// have.
+/// Removing the field would have made `start-agent` *ignore* a `prep_token`,
+/// because serde drops unknown keys on the base variant — turning a caller
+/// aiming at the wrong verb into an unenforced spawn, which is precisely the
+/// failure being removed. So the re-parse stays, purely to notice the key and
+/// refuse: a token belongs on `start-prepared-agent`, and this verb says so
+/// rather than starting the role.
+///
+/// The field is `serde_json::Value` rather than `String` on purpose. Presence is
+/// the whole question — a wrongly typed token is still a caller reaching for the
+/// prepared path — and `Option<Value>` accepts any JSON, so this parse cannot
+/// fail on a payload that already decoded as `StartAgent` and there is no
+/// malformed branch to get wrong. JSON `null` deserializes to `None`, which is
+/// the same as absent and is the right reading of it.
+///
+/// **An absent key still changes nothing.** The TUI, the desktop, dispatch and
+/// every existing test call `start-agent` without one, and none of them may
+/// break.
 #[derive(Debug, Default, Deserialize)]
 struct StartAgentExtras {
-    /// The token a [`AttachRequest::PrepareWorkflow`] handed back, if the caller
-    /// is spawning the roles of a prepared workflow.
+    /// Present iff the caller put a `prep_token` key on a plain `start-agent`.
     #[serde(default)]
-    prep_token: Option<String>,
+    prep_token: Option<serde_json::Value>,
 }
 
 /// PRD #161 M1.1: a snapshot of the agents the daemon is currently managing,
@@ -1845,6 +1969,60 @@ async fn handle_connection(
         }
     };
 
+    // PRD #819 audit follow-up: `StartPreparedAgent` is `StartAgent` plus a
+    // REQUIRED token, so it is normalised into the base shape and an explicit
+    // token here. Everything downstream is then ONE spawn arm — the prepared and
+    // unprepared starts cannot drift apart in what they register, what they
+    // seed, or what they clean up, which is the failure mode a second copy of
+    // that 200-line arm would have.
+    //
+    // Note what this normalisation does NOT do: it does not put the token back
+    // on the wire's `start-agent`. The `op` a peer sent has already decided
+    // whether this connection is a prepared start, which is the whole property
+    // the verb buys — a daemon that lacks the variant never reaches this line.
+    let (req, prepared_token) = match req {
+        AttachRequest::StartPreparedAgent {
+            prep_token,
+            command,
+            cwd,
+            rows,
+            cols,
+            env,
+            display_name,
+            tab_membership,
+            agent_type,
+            seed,
+        } => {
+            // Refused where `PrepareWorkflow` is refused, and for its reason
+            // rather than a reason of its own: no preparation can exist on this
+            // platform, so nothing can be started against one. Saying so beats
+            // the `stale-token` this would otherwise produce — that answer is
+            // true but sends an operator looking for a client bug — and it keeps
+            // `DAEMON_CAPABILITIES`'s promise honest, since the verb is withheld
+            // there and a withheld verb this build still answered would make the
+            // advertised set mean less than it says.
+            if let Err(message) = refuse_prepared_start_where_unsupported() {
+                write_resp(&mut stream, &AttachResponse::err(message)).await?;
+                return Ok(());
+            }
+            (
+                AttachRequest::StartAgent {
+                    command,
+                    cwd,
+                    rows,
+                    cols,
+                    env,
+                    display_name,
+                    tab_membership,
+                    agent_type,
+                    seed,
+                },
+                Some(prep_token),
+            )
+        }
+        other => (other, None),
+    };
+
     match req {
         AttachRequest::ListAgents => {
             let mut records = registry.agent_records();
@@ -1930,44 +2108,46 @@ async fn handle_connection(
                 return Ok(());
             }
 
-            // PRD #819 M4: a spawn that is part of a prepared workflow MAY carry
-            // the token `PrepareWorkflow` handed back, as an extra JSON key
-            // alongside the base variant (see `StartAgentExtras`). Absent, this
-            // is a no-op and the arm behaves exactly as it did before the field
-            // existed. Present, a token this daemon did not issue — or issued
-            // longer ago than `prep_token::PREP_TOKEN_TTL` — is refused before
-            // anything is spawned.
+            // PRD #819 audit follow-up: a token reaches this arm ONLY by having
+            // arrived on `start-prepared-agent`, which the normalisation above
+            // turned into the base shape plus `prepared_token`. A plain
+            // `start-agent` that spells a `prep_token` key is a caller aiming at
+            // the wrong verb, and it is refused rather than served: serde drops
+            // unknown keys on the base variant, so serving it would start the
+            // role UNENFORCED and report success — the fail-open the verb exists
+            // to remove, reintroduced by silence. See `StartAgentExtras`.
             //
-            // The base variant already decoded, and every field of the extras is
-            // `Option<String>` with `#[serde(default)]`, so the only way this
-            // re-parse of the same payload can fail is a `prep_token` key that is
-            // PRESENT with the wrong JSON type. Refuse that rather than
-            // `unwrap_or_default`-ing it into an absent token: a caller that
-            // meant to present a token and malformed it should hear about it,
-            // not be silently downgraded to the token-less path.
-            let extras: StartAgentExtras = match serde_json::from_slice(&frame.1) {
-                Ok(extras) => extras,
-                Err(e) => {
+            // `Option<serde_json::Value>` accepts any JSON, and this payload has
+            // already decoded as `StartAgent`, so the re-parse cannot fail; the
+            // `Err` arm is refused anyway rather than defaulted, because the one
+            // thing that must never happen here is a token being downgraded into
+            // an absent one.
+            if prepared_token.is_none() {
+                let carries_token = match serde_json::from_slice::<StartAgentExtras>(&frame.1) {
+                    Ok(extras) => extras.prep_token.is_some(),
+                    Err(_) => true,
+                };
+                if carries_token {
                     write_resp(
                         &mut stream,
                         &AttachResponse::err(format!(
-                            "{PROJECT_ERR_STALE_TOKEN}: malformed prep token — refusing the \
-                             spawn: {e}"
+                            "{PROJECT_ERR_WRONG_START_VERB}: a preparation token does not belong \
+                             on `start-agent`, which enforces none; send `start-prepared-agent` \
+                             instead. Nothing was started."
                         )),
                     )
                     .await?;
                     return Ok(());
                 }
-            };
-            //
+            }
             // PRD #819 audit fix: "the token exists and is young" was the WHOLE
             // check here, and it binds nothing. The record now carries the state
-            // its preparation approved, so a present token is resolved to that
+            // its preparation approved, so a presented token is resolved to that
             // record and the record is re-validated against the filesystem
             // before anything spawns. Two refusals, deliberately distinct: the
             // token is not ours or has aged out (`stale-token`), or it is ours
             // and live but the world moved under it (`stale-preparation`).
-            if let Some(token) = extras.prep_token.as_deref() {
+            if let Some(token) = prepared_token.as_deref() {
                 let Some(binding) = crate::prep_token::binding(token) else {
                     write_resp(
                         &mut stream,
@@ -2882,6 +3062,25 @@ async fn handle_connection(
             };
             write_resp(&mut stream, &resp).await?
         }
+        // Unreachable by construction: the normalisation above this `match`
+        // rewrote every `StartPreparedAgent` into the `StartAgent` shape plus an
+        // explicit token, and nothing between the two can mint one. It is an arm
+        // rather than an `unreachable!()` because `handle_connection` serves
+        // other clients and a panic would take one connection's bug out on all
+        // of them — the same reasoning `PROJECT_ERR_UNIMPLEMENTED` records. If
+        // this text is ever observed, the normalisation was edited and the spawn
+        // path it feeds is what to read.
+        AttachRequest::StartPreparedAgent { .. } => {
+            warn!("start-prepared-agent reached the dispatch un-normalised — refusing the spawn");
+            write_resp(
+                &mut stream,
+                &AttachResponse::err(
+                    "start-prepared-agent: internal error — the prepared start was not \
+                     normalised; nothing was started",
+                ),
+            )
+            .await?
+        }
     }
     Ok(())
 }
@@ -2981,6 +3180,33 @@ fn refuse_prepare_where_unsupported() -> Result<(), String> {
             "{PROJECT_ERR_UNSUPPORTED_PLATFORM}: this daemon cannot publish a coordinator context \
              with owner-only permissions on this platform, so preparing a workflow is refused; \
              launch the orchestration from a daemon running on Unix"
+        ))
+    }
+}
+
+/// PRD #819 audit follow-up: the same refusal for
+/// [`AttachRequest::StartPreparedAgent`], for the same reason one hop earlier.
+///
+/// Not a property of the request: [`refuse_prepare_where_unsupported`] refuses
+/// every preparation on such a build, and the `PrepareWorkflow` arm is the only
+/// production path to [`crate::prep_token::issue`] — so this daemon can never
+/// have issued a token, and every prepared start on it is answering for a
+/// preparation that could not have happened. `PROJECT_ERR_STALE_TOKEN` would also be true of that and is
+/// the wrong sentence — it sends an operator after an expiry or a client bug
+/// instead of after the platform. The verb is withheld from
+/// [`DAEMON_CAPABILITIES`] there too, so a client that negotiates never reaches
+/// this line.
+fn refuse_prepared_start_where_unsupported() -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        Err(format!(
+            "{PROJECT_ERR_UNSUPPORTED_PLATFORM}: this daemon cannot prepare a workflow on this \
+             platform, so it holds no preparation to start a role against; launch the \
+             orchestration from a daemon running on Unix"
         ))
     }
 }

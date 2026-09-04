@@ -44,8 +44,9 @@ use dot_agent_deck::daemon_protocol::{
     KIND_STREAM_END, KIND_STREAM_IN, KIND_STREAM_OUT, KIND_STREAM_REJECT, PROJECT_ERR_INVALID_PATH,
     PROJECT_ERR_NO_ORCHESTRATION, PROJECT_ERR_PUBLISH_FAILED, PROJECT_ERR_STALE_PREPARATION,
     PROJECT_ERR_STALE_REVISION, PROJECT_ERR_STALE_TOKEN, PROJECT_ERR_TASK_REJECTED,
-    PROJECT_ERR_UNIMPLEMENTED, PROJECT_ERR_UNRESOLVED, PROTOCOL_VERSION, RunningAgentsSummary,
-    TabMembership, bind_attach_listener, serve_attach_with_counter, write_resp,
+    PROJECT_ERR_UNIMPLEMENTED, PROJECT_ERR_UNRESOLVED, PROJECT_ERR_WRONG_START_VERB,
+    PROTOCOL_VERSION, RunningAgentsSummary, TabMembership, bind_attach_listener,
+    serve_attach_with_counter, write_resp,
 };
 use dot_agent_deck::event::{
     AgentEvent, AgentType, EventType, LiveTarget, SendResult, TargetKind, Writable,
@@ -1524,20 +1525,188 @@ async fn prepare_workflow_refuses_a_symlinked_context_directory() {
     );
 }
 
-/// PRD #819 M4: `StartAgent` may carry the preparation token as an extra JSON
-/// key. **Absent, nothing changes**; present, an unknown or expired value is
-/// refused before anything is spawned.
+/// The wire as a daemon that PREDATES `start-prepared-agent` sees it:
+/// [`AttachRequest`] without that variant.
 ///
-/// The absent half is the one that would break the world quietly: the TUI, the
-/// desktop and every existing test call `start-agent` without a token, and a
-/// field that fails closed would have taken all of them down.
-#[tokio::test]
-async fn start_agent_ignores_an_absent_prep_token_and_refuses_an_unknown_one() {
-    let server = start_server().await;
-    let (_dir, project) = mint_project(LAUNCHABLE_PROJECT);
+/// Deserializing a request into this enum is what such a daemon's
+/// `handle_connection` literally does with the frame, so its verdict is the
+/// older daemon's answer rather than a description of one. Only the two ops the
+/// tests below need are declared — serde's `unknown variant` verdict does not
+/// depend on how many siblings an enum has, and every other variant would be
+/// dead weight that drifts.
+#[derive(Debug, serde::Deserialize)]
+#[serde(tag = "op", rename_all = "kebab-case")]
+#[allow(dead_code)]
+enum PreVerbAttachRequest {
+    ListAgents,
+    /// Serde ignores unknown keys, which is the whole point: an older daemon
+    /// decoded a `start-agent` carrying a `prep_token` and dropped the token on
+    /// the floor. Two fields are enough to show that happening.
+    StartAgent {
+        #[serde(default)]
+        command: Option<String>,
+        #[serde(default)]
+        cwd: Option<String>,
+    },
+}
 
-    // Absent: unchanged. This is the same request shape every existing caller
-    // sends.
+/// A prepared start, as a JSON object, ready to have its `op` rewritten.
+fn prepared_start_payload(
+    token: &str,
+    cwd: Option<&str>,
+) -> serde_json::Map<String, serde_json::Value> {
+    let request = AttachRequest::StartPreparedAgent {
+        prep_token: token.to_string(),
+        command: Some("/bin/sh".into()),
+        cwd: cwd.map(str::to_string),
+        rows: 24,
+        cols: 80,
+        env: vec![],
+        display_name: None,
+        tab_membership: None,
+        agent_type: None,
+        seed: None,
+    };
+    match serde_json::to_value(&request).expect("a prepared start serializes") {
+        serde_json::Value::Object(fields) => fields,
+        other => panic!("a prepared start must serialize to a JSON object, got {other}"),
+    }
+}
+
+/// PRD #819 audit follow-up: the preparation token rides on a **distinct op**,
+/// and a daemon that does not know that op refuses the whole request without
+/// spawning.
+///
+/// This is the claim the verb exists for, so it is asserted in the three parts
+/// it decomposes into rather than gestured at:
+///
+/// 1. the request really is a new `op` with the token as a top-level field, and
+///    a daemon predating it fails the decode — modelled by
+///    [`PreVerbAttachRequest`], which is that daemon's `AttachRequest`;
+/// 2. the shape it REPLACED does not fail there. The same token on the stable
+///    `start-agent` op decodes cleanly against the older enum, which is the
+///    fail-open in one line: the request was accepted, the unknown key dropped,
+///    and the role started with no preparation enforcement at all. **This build
+///    refuses that shape** rather than serving it;
+/// 3. an op this build cannot decode takes `handle_connection`'s structured
+///    malformed-request path — `ok: false`, nothing spawned, daemon still
+///    serving — which is the path an older daemon takes for the real verb.
+///
+/// Without the fix, part 1 is unwritable (there is no variant) and part 2 is the
+/// SHIPPING behaviour rather than a refusal.
+#[tokio::test]
+async fn a_prepared_start_is_a_distinct_op_an_older_daemon_refuses_closed() {
+    let server = start_server().await;
+    let token = "prep-0000000000000000000000000000000";
+    let payload = prepared_start_payload(token, None);
+
+    // ---- 1. A new op, carrying the token as a required top-level field.
+    assert_eq!(
+        payload.get("op").and_then(serde_json::Value::as_str),
+        Some("start-prepared-agent"),
+        "the prepared start must be its own op, not a decorated `start-agent`"
+    );
+    assert_eq!(
+        payload
+            .get("prep_token")
+            .and_then(serde_json::Value::as_str),
+        Some(token),
+        "the token must be a field of the variant, not an extra key a peer can drop"
+    );
+    let older =
+        serde_json::from_value::<PreVerbAttachRequest>(serde_json::Value::Object(payload.clone()))
+            .expect_err("a daemon predating the verb must fail the decode, not accept it");
+    assert!(
+        older.to_string().contains("unknown variant"),
+        "the older daemon's refusal is serde's unknown-variant error, got {older}"
+    );
+
+    // The token is REQUIRED, so a caller that omits it is refused by this build
+    // too — an optional field here would be the same silent downgrade one hop in.
+    let mut tokenless = payload.clone();
+    tokenless.remove("prep_token");
+    let resp = issue_json_request(&server, serde_json::Value::Object(tokenless)).await;
+    assert!(
+        !resp.ok,
+        "a prepared start with no token must not be served: {resp:?}"
+    );
+    assert!(
+        resp.error
+            .as_deref()
+            .is_some_and(|e| e.contains("malformed request")),
+        "a missing required token fails the decode, got {:?}",
+        resp.error
+    );
+
+    // ---- 2. The shape this replaced, and why it had to be replaced.
+    let mut on_start_agent = payload.clone();
+    on_start_agent.insert("op".into(), "start-agent".into());
+    serde_json::from_value::<PreVerbAttachRequest>(serde_json::Value::Object(
+        on_start_agent.clone(),
+    ))
+    .expect(
+        "an older daemon ACCEPTS a token spelled on `start-agent` and drops the key — that is \
+         the fail-open the verb removes, and it must be shown rather than asserted",
+    );
+    let resp = issue_json_request(&server, serde_json::Value::Object(on_start_agent)).await;
+    assert!(
+        !resp.ok,
+        "this build must refuse a token on `start-agent` rather than spawn unenforced"
+    );
+    assert!(resp.id.is_none(), "a refused start-agent starts nothing");
+    let error = resp.error.unwrap_or_default();
+    assert!(
+        error.starts_with(PROJECT_ERR_WRONG_START_VERB),
+        "expected `{PROJECT_ERR_WRONG_START_VERB}`, got {error:?}"
+    );
+
+    // ---- 3. The path an older daemon takes for the real verb.
+    let mut later_build = payload;
+    later_build.insert(
+        "op".into(),
+        "start-prepared-agent-from-a-later-build".into(),
+    );
+    let resp = issue_json_request(&server, serde_json::Value::Object(later_build)).await;
+    assert!(!resp.ok, "an unknown op must be refused, not accepted");
+    assert!(
+        resp.error
+            .as_deref()
+            .is_some_and(|e| e.contains("malformed request")),
+        "an unknown op replies with the structured malformed-request error, got {:?}",
+        resp.error
+    );
+    assert!(
+        server.registry.agent_records().is_empty(),
+        "not one of the refusals above may have spawned anything"
+    );
+
+    // The daemon is still serving all of them, which is the half a panic fails.
+    let mut s = UnixStream::connect(&server.path).await.unwrap();
+    write_request(&mut s, &AttachRequest::ListAgents).await;
+    assert!(
+        read_response(&mut s).await.ok,
+        "the daemon must keep serving after refusing a prepared start"
+    );
+}
+
+/// PRD #819 audit follow-up: plain `start-agent` is byte-for-byte unchanged for
+/// every caller that has one — and refuses the one thing it must not silently
+/// accept.
+///
+/// The unchanged half is the one that would break the world quietly: the TUI,
+/// the desktop, dispatch and every existing test call `start-agent` without a
+/// token, and a verb that started failing on them would take all of them down.
+///
+/// The refusing half exists because removing the token FIELD is not the same as
+/// removing the token PATH. Serde drops unknown keys on the base variant, so a
+/// caller aiming at the wrong verb would otherwise be served an unenforced spawn
+/// and told it succeeded — which is the fail-open the new verb removes,
+/// reintroduced by silence.
+#[tokio::test]
+async fn start_agent_is_unchanged_without_a_token_and_refuses_one_spelled_on_it() {
+    let server = start_server().await;
+
+    // The request shape every existing caller sends.
     let resp = issue_json_request(
         &server,
         serde_json::json!({ "op": "start-agent", "command": "/bin/sh", "rows": 24, "cols": 80 }),
@@ -1545,12 +1714,13 @@ async fn start_agent_ignores_an_absent_prep_token_and_refuses_an_unknown_one() {
     .await;
     assert!(
         resp.ok && resp.id.is_some(),
-        "start-agent with no prep token must behave exactly as before: {:?}",
+        "start-agent with no token must behave exactly as before: {:?}",
         resp.error
     );
     let spawned = server.registry.agent_records().len();
 
-    // Present and unknown: refused, and nothing spawned.
+    // A JSON `null` is the same as absent and must stay on the unchanged path:
+    // it names no preparation, so there is no wrong verb to send anyone to.
     let resp = issue_json_request(
         &server,
         serde_json::json!({
@@ -1558,25 +1728,94 @@ async fn start_agent_ignores_an_absent_prep_token_and_refuses_an_unknown_one() {
             "command": "/bin/sh",
             "rows": 24,
             "cols": 80,
-            "prep_token": "prep-0000000000000000000000000000000",
+            "prep_token": serde_json::Value::Null,
         }),
     )
     .await;
+    assert!(
+        resp.ok && resp.id.is_some(),
+        "a null prep_token is an absent one: {:?}",
+        resp.error
+    );
+
+    // Present, in any shape at all: refused. The wrongly typed case is here
+    // because presence is the question — a caller that malformed its token still
+    // meant to present one, and must not be downgraded into the token-less path.
+    for token in [
+        serde_json::json!("prep-0000000000000000000000000000000"),
+        serde_json::json!(7),
+    ] {
+        let spawned_before = server.registry.agent_records().len();
+        let resp = issue_json_request(
+            &server,
+            serde_json::json!({
+                "op": "start-agent",
+                "command": "/bin/sh",
+                "rows": 24,
+                "cols": 80,
+                "prep_token": token,
+            }),
+        )
+        .await;
+        assert!(
+            !resp.ok,
+            "a token on `start-agent` must be refused: {token}"
+        );
+        assert!(resp.id.is_none(), "a refused start-agent starts nothing");
+        let error = resp.error.unwrap_or_default();
+        assert!(
+            error.starts_with(PROJECT_ERR_WRONG_START_VERB),
+            "expected `{PROJECT_ERR_WRONG_START_VERB}` for {token}, got {error:?}"
+        );
+        assert!(
+            error.contains("start-prepared-agent"),
+            "the refusal must name the verb that DOES enforce a token: {error:?}"
+        );
+        assert_eq!(
+            server.registry.agent_records().len(),
+            spawned_before,
+            "a refused start-agent must not have spawned a pane"
+        );
+    }
+    assert_eq!(
+        server.registry.agent_records().len(),
+        spawned + 1,
+        "only the two token-less starts may have spawned"
+    );
+}
+
+/// PRD #819 audit follow-up: the prepared verb still runs every check the token
+/// carried — an unknown or aged-out token is `stale-token`, and a live one
+/// spawns.
+///
+/// The accepting half is what stops the refusing half from passing against a
+/// daemon that simply refuses every prepared start, which is the shape a
+/// mis-wired new verb would have.
+#[tokio::test]
+async fn a_prepared_start_refuses_an_unknown_token_and_spawns_on_a_live_one() {
+    let server = start_server().await;
+    let (_dir, project) = mint_project(LAUNCHABLE_PROJECT);
+
+    let resp = issue_json_request(
+        &server,
+        serde_json::Value::Object(prepared_start_payload(
+            "prep-0000000000000000000000000000000",
+            None,
+        )),
+    )
+    .await;
     assert!(!resp.ok, "an unknown prep token must be refused");
-    assert!(resp.id.is_none(), "a refused start-agent starts nothing");
+    assert!(resp.id.is_none(), "a refused prepared start starts nothing");
     let error = resp.error.unwrap_or_default();
     assert!(
         error.starts_with(PROJECT_ERR_STALE_TOKEN),
         "expected `{PROJECT_ERR_STALE_TOKEN}`, got {error:?}"
     );
-    assert_eq!(
-        server.registry.agent_records().len(),
-        spawned,
-        "a refused start-agent must not have spawned a pane"
+    assert!(
+        server.registry.agent_records().is_empty(),
+        "a refused prepared start must not have spawned a pane"
     );
 
-    // Present and freshly issued: accepted. Without this half the test above
-    // would pass against a daemon that rejected every token.
     let resp = issue_json_request(
         &server,
         serde_json::json!({
@@ -1588,43 +1827,43 @@ async fn start_agent_ignores_an_absent_prep_token_and_refuses_an_unknown_one() {
     )
     .await;
     assert!(resp.ok, "the preparation must succeed: {:?}", resp.error);
-    let token = resp.workflow_prepared.expect("a PreparedWorkflow").token;
+    let prepared = resp.workflow_prepared.expect("a PreparedWorkflow");
 
     let resp = issue_json_request(
         &server,
-        serde_json::json!({
-            "op": "start-agent",
-            "command": "/bin/sh",
-            "rows": 24,
-            "cols": 80,
-            "prep_token": token,
-        }),
+        serde_json::Value::Object(prepared_start_payload(
+            &prepared.token,
+            Some(&prepared.path),
+        )),
     )
     .await;
     assert!(
         resp.ok && resp.id.is_some(),
-        "a freshly issued prep token must be accepted: {:?}",
+        "a freshly issued prep token must spawn through the prepared verb: {:?}",
         resp.error
     );
 }
 
-/// PRD #819's audit fix, end to end over the wire: two preparations in one
+/// PRD #819's audit fix, now through the prepared verb: two preparations in one
 /// project, and the **first** token's spawn is refused while the second's is
 /// accepted.
 ///
-/// `tests/prep_binding.rs` proves the checker; this proves the **wiring** — that
-/// the `start-agent` arm resolves a presented token to its binding, runs the
-/// re-validation, and answers `stale-preparation` without spawning anything. The
-/// two together are the finding: before the fix, `start-agent` validated only
-/// that the token existed and was young, so this request succeeded and launched
-/// a coordinator pointed at a file holding the *other* preparation's brief.
+/// `tests/prep_binding.rs` proves the checker across all five staleness causes
+/// and this proves the **wiring** — that the prepared-start arm resolves a
+/// presented token to its binding, runs `revalidate_preparation`, and answers
+/// `stale-preparation` without spawning anything. The two together are the
+/// finding: before the binding existed, a spawn validated only that the token
+/// was young, so this request succeeded and launched a coordinator pointed at a
+/// file holding the *other* preparation's brief. One wiring test rather than
+/// five, because the arm calls the one checker those five cases exercise; a
+/// second copy of them here would pin the test author's idea of the checker.
 ///
 /// The distinction from `stale-token` is asserted, not assumed: this token is one
 /// this daemon issued and is seconds old, so a refusal carrying the wrong code
 /// would say the token was unknown — which would send an operator looking for a
 /// client bug instead of a replaced artifact.
 #[tokio::test]
-async fn start_agent_refuses_a_token_whose_prepared_context_was_replaced() {
+async fn a_prepared_start_refuses_a_token_whose_prepared_context_was_replaced() {
     let server = start_server().await;
     let (_dir, project) = mint_project(LAUNCHABLE_PROJECT);
 
@@ -1655,24 +1894,16 @@ async fn start_agent_refuses_a_token_whose_prepared_context_was_replaced() {
         "both preparations name the same fixed path, which is the shape of the defect"
     );
 
-    let spawned = server.registry.agent_records().len();
     let resp = issue_json_request(
         &server,
-        serde_json::json!({
-            "op": "start-agent",
-            "command": "/bin/sh",
-            "cwd": first.path,
-            "rows": 24,
-            "cols": 80,
-            "prep_token": first.token,
-        }),
+        serde_json::Value::Object(prepared_start_payload(&first.token, Some(&first.path))),
     )
     .await;
     assert!(
         !resp.ok,
         "a token whose artifact was replaced must be refused"
     );
-    assert!(resp.id.is_none(), "a refused start-agent starts nothing");
+    assert!(resp.id.is_none(), "a refused prepared start starts nothing");
     let error = resp.error.unwrap_or_default();
     assert!(
         error.starts_with(PROJECT_ERR_STALE_PREPARATION),
@@ -1682,24 +1913,16 @@ async fn start_agent_refuses_a_token_whose_prepared_context_was_replaced() {
         !error.starts_with(PROJECT_ERR_STALE_TOKEN),
         "the token IS live; reporting it as unknown would misdirect the diagnosis"
     );
-    assert_eq!(
-        server.registry.agent_records().len(),
-        spawned,
-        "a refused start-agent must not have spawned a pane"
+    assert!(
+        server.registry.agent_records().is_empty(),
+        "a refused prepared start must not have spawned a pane"
     );
 
     // The second preparation's token still spawns, which is what stops the
     // assertions above from passing against a daemon that refuses every token.
     let resp = issue_json_request(
         &server,
-        serde_json::json!({
-            "op": "start-agent",
-            "command": "/bin/sh",
-            "cwd": second.path,
-            "rows": 24,
-            "cols": 80,
-            "prep_token": second.token,
-        }),
+        serde_json::Value::Object(prepared_start_payload(&second.token, Some(&second.path))),
     )
     .await;
     assert!(
@@ -1714,14 +1937,7 @@ async fn start_agent_refuses_a_token_whose_prepared_context_was_replaced() {
     // whole feature down rather than fail visibly here.
     let resp = issue_json_request(
         &server,
-        serde_json::json!({
-            "op": "start-agent",
-            "command": "/bin/sh",
-            "cwd": second.path,
-            "rows": 24,
-            "cols": 80,
-            "prep_token": second.token,
-        }),
+        serde_json::Value::Object(prepared_start_payload(&second.token, Some(&second.path))),
     )
     .await;
     assert!(
@@ -1729,6 +1945,94 @@ async fn start_agent_refuses_a_token_whose_prepared_context_was_replaced() {
         "the same token must spawn a second role: {:?}",
         resp.error
     );
+}
+
+/// PRD #819 audit follow-up: the CLIENT routes a presented token onto the
+/// prepared verb, so the daemon-side refusal above is the one a real launch
+/// meets rather than a property only a hand-built payload can reach.
+///
+/// **The op is asserted through the answer, not by reading the frame**, and that
+/// works because the two arms now give different codes for the same input. A
+/// token this daemon never issued is `stale-token` on `start-prepared-agent` and
+/// `wrong-start-verb` on `start-agent`, so the refusal names which op the client
+/// chose. That is a stronger check than inspecting the request would be: it
+/// reads what the daemon actually dispatched.
+///
+/// Verified by reverting `start_agent_with_prep_token` to the shape it replaced
+/// — serializing `StartAgent` and inserting a `prep_token` key — which turns the
+/// first refusal into `wrong-start-verb` and fails this test.
+#[tokio::test]
+async fn the_client_routes_a_presented_token_onto_the_prepared_verb() {
+    use dot_agent_deck::daemon_client::{DaemonClient, StartAgentOptions};
+
+    let server = start_server().await;
+    let (_dir, project) = mint_project(LAUNCHABLE_PROJECT);
+    let client = DaemonClient::new(server.path.clone());
+
+    let refusal = client
+        .start_agent_with_prep_token(
+            StartAgentOptions {
+                command: Some("/bin/sh".into()),
+                ..StartAgentOptions::default()
+            },
+            Some("prep-0000000000000000000000000000000"),
+        )
+        .await
+        .expect_err("a token this daemon never issued must not spawn")
+        .to_string();
+    assert!(
+        refusal.contains(PROJECT_ERR_STALE_TOKEN),
+        "expected the prepared verb's own refusal `{PROJECT_ERR_STALE_TOKEN}`, got {refusal:?}"
+    );
+    assert!(
+        !refusal.contains(PROJECT_ERR_WRONG_START_VERB),
+        "the client sent `start-agent` with the token as an extra key — the fail-open shape the \
+         verb replaced: {refusal:?}"
+    );
+    assert!(
+        server.registry.agent_records().is_empty(),
+        "a refused prepared start must not have spawned a pane"
+    );
+
+    // The positive half, so the assertions above cannot pass against a client
+    // that refuses to send anything at all: a real preparation's token spawns
+    // through the same method, capability gate included.
+    let prepared = client
+        .prepare_workflow(
+            project.to_str().expect("utf-8 project path"),
+            "loop",
+            "Mint a token to spawn with.",
+            None,
+        )
+        .await
+        .expect("the preparation must succeed");
+    let id = client
+        .start_agent_with_prep_token(
+            StartAgentOptions {
+                command: Some("/bin/sh".into()),
+                cwd: Some(prepared.path.clone()),
+                ..StartAgentOptions::default()
+            },
+            Some(&prepared.token),
+        )
+        .await
+        .expect("a live preparation's token must spawn through the prepared verb");
+    assert!(!id.is_empty(), "a spawn reports the registry id it created");
+
+    // And `None` stays on plain `start-agent`, which is the path the TUI, the
+    // desktop and dispatch all take: it must neither gain a capability gate nor
+    // meet the wrong-verb refusal.
+    let id = client
+        .start_agent_with_prep_token(
+            StartAgentOptions {
+                command: Some("/bin/sh".into()),
+                ..StartAgentOptions::default()
+            },
+            None,
+        )
+        .await
+        .expect("a token-less start is byte-for-byte the ordinary `start-agent`");
+    assert!(!id.is_empty());
 }
 
 /// PRD #819 M2/M5: the `Hello` reply advertises each project verb explicitly,

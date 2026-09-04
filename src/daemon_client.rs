@@ -952,27 +952,45 @@ impl DaemonClient {
             .ok_or_else(|| ClientError::Malformed("prepare-workflow ok but no preparation".into()))
     }
 
-    /// PRD #819 M4/M6: [`Self::start_agent`] carrying the token a
-    /// [`Self::prepare_workflow`] handed back.
+    /// PRD #819 M4/M6: start one role of a workflow this daemon prepared.
     ///
-    /// The counterpart of [`Self::write_and_submit_with_identity`], and built
-    /// the same way and for the same reason: the token rides **alongside** the
-    /// base `start-agent` shape as one extra JSON key rather than widening the
-    /// [`AttachRequest::StartAgent`] variant, whose nine-field literal is
-    /// constructed across `src/` and `tests/`. The request is serialized from
-    /// that very variant and the key inserted into the resulting object, so the
-    /// two spellings of the wire shape cannot drift.
+    /// `prep_token: None` is byte-for-byte [`Self::start_agent`] and sends the
+    /// ordinary `start-agent` op; a token sends
+    /// [`AttachRequest::StartPreparedAgent`], on which the token is a **required
+    /// field of the variant** rather than an additive key.
     ///
-    /// **No capability gate, deliberately, and it differs from the three verbs
-    /// above.** `start-agent` is not a new op — every daemon this client can
-    /// handshake with already has it — and the token is `#[serde(default)]` on
-    /// the daemon's re-parse, so an older daemon ignores the key and spawns
-    /// exactly as it does today. Gating here would withhold a spawn that works,
-    /// and the token is a staleness check rather than an authorization
-    /// (`crate::prep_token`'s module doc): "the daemon does not advertise it" is
-    /// not a reason to refuse to launch.
+    /// # Why the distinct verb, and what it fixes on THIS side of the wire
     ///
-    /// `prep_token: None` is byte-for-byte [`Self::start_agent`].
+    /// The token used to ride alongside `start-agent` as an extra JSON key, the
+    /// way [`Self::write_and_submit_with_identity`]'s identity fields still do.
+    /// That was fail-open: `start-agent` is an op every daemon back to PRD #76
+    /// accepts, so an older one decoded the base variant, ignored the unknown
+    /// key and started the role unenforced — and this client could not see it
+    /// happen. A role start is its own short-lived connection: [`Self::connect`]
+    /// is a bare `IpcStream::connect`, [`Self::issue_json_command`] writes one
+    /// request frame and reads one response, and the daemon decodes exactly one
+    /// request per connection. There is no `Hello` on it and nowhere to put one,
+    /// so no amount of checking beforehand could cover the spawn itself.
+    ///
+    /// A distinct op needs no timing argument: a daemon that lacks the variant
+    /// fails the decode and answers `ok: false` **on the spawn's own
+    /// connection**, so the launch fails closed and starts nothing.
+    ///
+    /// # The capability gate, and why it is the lesser half
+    ///
+    /// [`crate::daemon_protocol::CAP_START_PREPARED_AGENT`] is required first,
+    /// the way the three project verbs require theirs, so an unadvertising
+    /// daemon is declined here rather than sent a request it cannot parse — its
+    /// refusal text is serde's `unknown variant …`, which is not a stability
+    /// contract and is never matched. But the gate reads a set captured at some
+    /// earlier handshake, so it is an affordance, not the guarantee: the
+    /// guarantee is the daemon's own refusal of an op it does not have, which
+    /// costs no round trip and cannot go stale.
+    ///
+    /// The token is still not an authorization token — `crate::prep_token`'s
+    /// module doc. Any peer here can spawn arbitrary commands through
+    /// `start-agent` and is not slowed down by this; what the verb protects is a
+    /// coordinator from launching against a preparation something else replaced.
     pub async fn start_agent_with_prep_token(
         &self,
         opts: StartAgentOptions,
@@ -981,7 +999,10 @@ impl DaemonClient {
         let Some(token) = prep_token else {
             return self.start_agent(opts).await;
         };
-        let req = AttachRequest::StartAgent {
+        self.require_capability(crate::daemon_protocol::CAP_START_PREPARED_AGENT)
+            .await?;
+        let req = AttachRequest::StartPreparedAgent {
+            prep_token: token.to_string(),
             command: opts.command,
             cwd: opts.cwd,
             display_name: opts.display_name,
@@ -992,25 +1013,18 @@ impl DaemonClient {
             agent_type: opts.agent_type,
             seed: opts.seed,
         };
-        let mut request = serde_json::to_value(&req)
-            .map_err(|e| ClientError::Malformed(format!("start-agent JSON: {e}")))?;
-        let serde_json::Value::Object(fields) = &mut request else {
-            return Err(ClientError::Malformed(
-                "start-agent did not serialize to a JSON object".into(),
-            ));
-        };
-        fields.insert(
-            "prep_token".into(),
-            serde_json::Value::String(token.to_string()),
-        );
-        let resp = self.issue_json_command(&request).await?;
+        let stream = self.connect().await?;
+        let (mut rd, mut wr) = stream.into_split();
+        let resp = issue_command(&mut rd, &mut wr, &req).await?;
         if !resp.ok {
             return Err(ClientError::Server(
-                resp.error.unwrap_or_else(|| "start-agent failed".into()),
+                resp.error
+                    .unwrap_or_else(|| "start-prepared-agent failed".into()),
             ));
         }
-        resp.id
-            .ok_or_else(|| ClientError::Malformed("start-agent ok but no id in response".into()))
+        resp.id.ok_or_else(|| {
+            ClientError::Malformed("start-prepared-agent ok but no id in response".into())
+        })
     }
 
     /// Push a TUI pane resize through to the daemon's PTY. Idempotent on the

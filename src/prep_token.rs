@@ -46,9 +46,17 @@
 //! `env` — `crate::daemon_protocol::AttachRequest::StartAgent`'s own
 //! trust-boundary note says the daemon's job there is "to expose PTY plumbing,
 //! not to be a privilege boundary". A peer that wanted to start an arbitrary
-//! process does not need a token and is not slowed down by one. Presenting a
-//! token is therefore **optional** on `StartAgent`, and an absent one leaves that
-//! verb behaving exactly as it does today.
+//! process does not need a token and is not slowed down by one.
+//!
+//! **A token is presented on its own verb**,
+//! `crate::daemon_protocol::AttachRequest::StartPreparedAgent`, where it is a
+//! required field; plain `StartAgent` enforces none and refuses a payload that
+//! spells one. Read that split as what it is — the token rode on `StartAgent` as
+//! an additive key until the audit follow-up, and an older daemon silently
+//! ignored the key and spawned unenforced. Splitting the verb makes such a
+//! daemon refuse the request outright. It does **not** make the token an
+//! authorization mechanism, and a peer able to call `StartAgent` still needs
+//! none.
 //!
 //! Binding the record to project state is not a step toward authorization and
 //! must not be read as one. It stops a *mistake* — a launch consuming state some

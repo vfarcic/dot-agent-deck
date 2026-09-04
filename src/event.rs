@@ -1109,16 +1109,19 @@ pub struct PreparedWorkflow {
     #[serde(default)]
     pub path: String,
     /// Short-lived preparation token. Spawning stays a later sequence of
-    /// [`crate::daemon_protocol::AttachRequest::StartAgent`] calls (PRD #819
-    /// Open Question 5, settled in favour of the smaller change), so the
-    /// atomicity the launch verb promises has to be policed across that gap:
-    /// the sequence presents this token and stale use is refused.
+    /// per-role calls (PRD #819 Open Question 5, settled in favour of the
+    /// smaller change), so the atomicity the launch verb promises has to be
+    /// policed across that gap: the sequence presents this token and stale use
+    /// is refused.
     ///
-    /// M4 landed issuance ([`crate::prep_token::issue`]) and checking (the
-    /// `prep_token` extra key on `start-agent`). **Read
-    /// [`crate::prep_token`]'s module doc before treating it as anything more
-    /// than a staleness check** — it is not an authorization token, presenting
-    /// it is optional, and the attach socket is not a privilege boundary.
+    /// M4 landed issuance ([`crate::prep_token::issue`]) and checking. The audit
+    /// follow-up moved the presentation onto its own verb,
+    /// [`crate::daemon_protocol::AttachRequest::StartPreparedAgent`], where the
+    /// token is a **required** field — an older daemon then refuses the whole
+    /// request as an unknown variant instead of ignoring an additive key and
+    /// spawning unenforced. **Read [`crate::prep_token`]'s module doc before
+    /// treating it as anything more than a staleness check** — it is not an
+    /// authorization token, and the attach socket is not a privilege boundary.
     pub token: String,
     #[serde(default)]
     pub roles: Vec<ProjectRole>,

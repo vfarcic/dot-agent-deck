@@ -5,8 +5,8 @@
 //! slip.** `PrepareWorkflow` publishes the coordinator context to a path that is
 //! **fixed per project** — `<project>/.dot-agent-deck/orchestrator-context.md` —
 //! and the original design issued a token recording only `(token, issuance
-//! time)`. `StartAgent` then validated only that the token existed and was
-//! younger than the TTL. So two ordinary clients preparing in the same project
+//! time)`. The spawn then validated only that the token existed and was younger
+//! than the TTL. So two ordinary clients preparing in the same project
 //! interleaved, with **no attacker required**:
 //!
 //! 1. preparation A publishes context A and receives token A;
@@ -32,6 +32,15 @@
 //! preparation is refused at its spawn rather than launched against the wrong
 //! brief. `two_preparations_in_one_project_refuse_the_first_and_accept_the_second`
 //! pins exactly that pair.
+//!
+//! **These prove the CHECKER; the WIRING is proved once, next door.** Every case
+//! below calls `revalidate_preparation` directly. That the daemon's
+//! `start-prepared-agent` arm resolves a presented token to its binding and runs
+//! this checker before spawning anything is
+//! `a_prepared_start_refuses_a_token_whose_prepared_context_was_replaced` in
+//! `tests/daemon_protocol.rs` — one wire test rather than five, because the arm
+//! calls the one function these five exercise and a second copy of them over the
+//! socket would pin a test author's idea of the checker instead of this one.
 //!
 //! **Fast tier, and deliberately not linked against `tests/common/`** — same
 //! reasoning as `tests/context_publish.rs` and `tests/daemon_protocol.rs`:
