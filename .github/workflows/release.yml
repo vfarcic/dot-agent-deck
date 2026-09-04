@@ -772,10 +772,13 @@ jobs:
             printf "%s\n\n" "$BODY"
             printf "%s\n" "$MARKER"
             printf "### Desktop GUI (alpha, unsigned)\n\n"
-            printf "The \`dot-agent-deck-desktop-alpha-*\` assets are an early preview of the desktop GUI. They are **unsigned**, so your OS will warn you, and they are not covered by the support expectations of the CLI.\n\n"
-            printf "On macOS, clear the quarantine flag after moving the app to /Applications:\n\n"
-            printf "\`\`\`sh\nxattr -dr com.apple.quarantine \"/Applications/Agent Deck.app\"\n\`\`\`\n\n"
-            printf "Signing and notarization are tracked in https://github.com/vfarcic/dot-agent-deck/issues/757. Checksums for these assets are in \`checksums-desktop-alpha.txt\`.\n"
+            printf "The \`dot-agent-deck-desktop-alpha-*\` assets are an early preview of the desktop GUI. They are **unsigned**, and they are not covered by the support expectations of the CLI. Verify what you downloaded against \`checksums-desktop-alpha.txt\`.\n\n"
+            printf "**macOS** (\`.dmg\`) -- macOS quarantines an unsigned app and refuses the first launch. Move the app to /Applications, then use either route:\n\n"
+            printf -- "- Open **System Settings > Privacy & Security**, find the message naming Agent Deck, and choose **Open Anyway**. Control-clicking the app to bypass this no longer works on macOS Sequoia and later, which is why this route is listed first.\n"
+            printf -- "- Or clear the quarantine flag from a terminal:\n\n"
+            printf "  \`\`\`sh\n  xattr -dr com.apple.quarantine \"/Applications/Agent Deck.app\"\n  \`\`\`\n\n"
+            printf "**Linux** (\`.deb\`) -- nothing blocks this install and nothing warns you: \`dpkg -i\` does not verify package signatures. Checking the SHA-256 against \`checksums-desktop-alpha.txt\` is the only verification available, so do it.\n\n"
+            printf "Signing and notarization are tracked in https://github.com/vfarcic/dot-agent-deck/issues/757.\n"
           } | gh release edit "v$RELEASE_VERSION" --repo "$REPO" --notes-file -
 
   docs:

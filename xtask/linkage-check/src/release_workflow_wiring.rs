@@ -303,6 +303,60 @@ fn one_platforms_bundler_failure_does_not_cancel_the_other() {
     );
 }
 
+/// The release-body note is the only installation instruction this project
+/// publishes for the desktop bundles -- PRD #740 Decision 11 ships the alpha
+/// unadvertised, so there is no `docs/` page to correct it. Two properties of
+/// it are load-bearing enough to guard, and both were defects until PRD #757.
+///
+/// **A no-terminal route must exist wherever the terminal one does.** macOS
+/// Sequoia removed the Control-click Gatekeeper bypass, so a note offering
+/// only `xattr -dr com.apple.quarantine` leaves a user who will not run a
+/// recursive command against `/Applications` with nothing at all -- and
+/// teaches everyone else a habit that transfers to the next thing that asks
+/// for it. Written as an implication rather than a presence check so it stays
+/// correct in both directions: once the macOS bundle is signed and the `xattr`
+/// line is deleted (PRD #757 Decision 10), this passes vacuously rather than
+/// having to be edited in the same commit.
+///
+/// **The Linux asset must be addressed on its own terms.** The note used to
+/// say the assets "are unsigned, so your OS will warn you", which is simply
+/// false for the `.deb`: `dpkg` ships with per-package signature verification
+/// disabled (`no-debsig`), so `dpkg -i` checks nothing and warns about
+/// nothing. Naming `dpkg` is the cheapest observable proxy for "somebody
+/// wrote a Linux sentence" -- a single sentence written for macOS cannot
+/// satisfy it.
+#[test]
+fn the_alpha_note_does_not_leave_a_user_with_only_a_terminal_command() {
+    let all = jobs(&workflow());
+    let publish = job(&all, "desktop-publish");
+    let code: String = publish
+        .lines()
+        .map(code_before_comment)
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    if code.contains("com.apple.quarantine") {
+        assert!(
+            code.contains("System Settings"),
+            "the release note offers `xattr -dr com.apple.quarantine` as its \
+             only macOS route. Control-clicking an app to bypass Gatekeeper no \
+             longer works on macOS Sequoia and later, so the System Settings > \
+             Privacy & Security > Open Anyway route has to be there too -- \
+             otherwise a user unwilling to run a recursive command against \
+             /Applications is given nothing. PRD #757 Decision 3."
+        );
+    }
+
+    assert!(
+        code.contains("dpkg"),
+        "the release note says nothing specific about the `.deb`. It used to \
+         cover it with a sentence written for macOS -- \"unsigned, so your OS \
+         will warn you\" -- and that clause is false for Linux: `dpkg` ships \
+         with `no-debsig`, so `dpkg -i` verifies no package signature and \
+         issues no warning. PRD #757 Decisions 3 and 7."
+    );
+}
+
 /// The code portion of `line` -- everything before an unquoted `#` that opens a
 /// trailing shell comment. A whole-line comment reduces to its indentation.
 ///
