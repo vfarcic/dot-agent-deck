@@ -193,6 +193,57 @@ async fn prepare_workflow_launch<D: WorkflowDaemon + Sync>(
     Ok((roles, prepared))
 }
 
+/// PRD #819 audit fix: turn a **withheld** `prepare-workflow` into the outcome
+/// it actually is, rather than letting the launch fail on
+/// `DaemonCapabilities::require`'s uniform withhold sentence.
+///
+/// The daemon strikes `prepare-workflow` from `DAEMON_CAPABILITIES` where the
+/// publish cannot deliver the owner-only guarantee it documents — the mode
+/// bits, the `O_NOFOLLOW | O_DIRECTORY` open and the group/other-write refusal
+/// are all Unix, and the constant is `#[cfg(not(unix))]`-narrowed to the two
+/// read-only verbs. It also refuses the verb outright there, with
+/// `unsupported-platform`; but a client that gates on the capability never
+/// reaches that refusal, so without this the *only* thing the user would see is
+/// a sentence about capability advertisement.
+///
+/// The inference is narrow on purpose, and each clause is load-bearing:
+///
+/// * the caller has already passed `require_compatible`, so this daemon speaks
+///   **this exact** `PROTOCOL_VERSION` — an older daemon, which advertises
+///   nothing, is not what is being classified here;
+/// * `is_advertised()` excludes the unadvertised case, which stays with the
+///   generic sentence because "we know nothing about this daemon's verbs" is a
+///   different fact;
+/// * `list-projects` must be present, because that is what a platform-narrowed
+///   set looks like. A daemon advertising some other set entirely is not making
+///   a statement about its platform, and gets the generic sentence too.
+///
+/// It carries the daemon's own `unsupported-platform` code so the webview has
+/// one thing to recognise for one outcome, whichever side concluded it.
+fn ensure_daemon_can_prepare(
+    capabilities: Option<&dot_agent_deck::daemon_client::DaemonCapabilities>,
+) -> Result<(), String> {
+    use dot_agent_deck::daemon_protocol::{
+        CAP_LIST_PROJECTS, CAP_PREPARE_WORKFLOW, PROJECT_ERR_UNSUPPORTED_PLATFORM,
+    };
+
+    let Some(capabilities) = capabilities else {
+        return Ok(());
+    };
+    if !capabilities.is_advertised()
+        || capabilities.supports(CAP_PREPARE_WORKFLOW)
+        || !capabilities.supports(CAP_LIST_PROJECTS)
+    {
+        return Ok(());
+    }
+    Err(format!(
+        "{PROJECT_ERR_UNSUPPORTED_PLATFORM}: this daemon offers the project verbs but withholds \
+         `{CAP_PREPARE_WORKFLOW}`, which is what a daemon does when its platform cannot give the \
+         published coordinator context an owner-only guarantee. Nothing was started. Launch this \
+         workflow from the TUI on the daemon's own host, or point the app at a Unix daemon."
+    ))
+}
+
 fn validate_desktop_coordinator(roles: &[WorkflowRoleInput]) -> Result<&WorkflowRoleInput, String> {
     let start_role = roles
         .iter()
@@ -256,6 +307,16 @@ trait WorkflowDaemon {
         config_revision: Option<&str>,
     ) -> Result<PreparedWorkflow, String>;
 
+    /// PRD #819 audit fix (P2, finding 2): confirm the daemon behind this
+    /// endpoint still enforces preparation tokens, on a handshake taken
+    /// immediately before a prepared spawn.
+    ///
+    /// Called once per prepared role rather than once per launch, because each
+    /// role's spawn is its own connection and therefore its own exposure. See
+    /// `daemon_bridge::verify_prepared_launch_peer` for what it closes and for
+    /// the sliver it does not.
+    async fn verify_prepared_launch_peer(&self) -> Result<(), String>;
+
     /// `prep_token` is the one the preparation handed back, presented so a
     /// spawn against a preparation that has since gone stale is refused
     /// daemon-side. It is a staleness check and not an authorization — see
@@ -306,6 +367,10 @@ impl WorkflowDaemon for DaemonClient {
         DaemonClient::prepare_workflow(self, cwd, orchestration, task, config_revision)
             .await
             .map_err(|error| safe_message(error.to_string()))
+    }
+
+    async fn verify_prepared_launch_peer(&self) -> Result<(), String> {
+        daemon_bridge::verify_prepared_launch_peer(self.socket_path()).await
     }
 
     async fn start_workflow_agent(
@@ -567,6 +632,28 @@ async fn launch_workflow<D: WorkflowDaemon + Sync>(
     let mut start_target = None;
 
     for (role_index, role) in roles.iter().enumerate() {
+        // PRD #819 audit fix (P2, finding 2): this spawn presents a preparation
+        // token, and it is about to open its OWN connection to do so — one that
+        // exchanges no `Hello` and re-checks no protocol version. An older
+        // daemon substituted since the preparation would accept the stable
+        // `StartAgent` shape, ignore the unknown `prep_token` key, and start the
+        // role with no preparation enforcement at all. So re-confirm the peer
+        // per role, and refuse rather than spawn if it cannot be confirmed:
+        // "we could not verify" is not "it is fine".
+        //
+        // Only for a prepared spawn. A token-less start has no preparation to
+        // protect and is left byte-for-byte as it was.
+        if prep_token.is_some()
+            && let Err(error) = daemon.verify_prepared_launch_peer().await
+        {
+            let cleanup_status = rollback_workflow_agents(daemon, &started).await;
+            return Err(format!(
+                "refusing to start workflow role {} against a daemon that no longer confirms it \
+                 enforces this preparation: {}; {cleanup_status}",
+                safe_message(&role.role),
+                safe_message(error)
+            ));
+        }
         let pane_id = mint_desktop_pane_id();
         let options = workflow_start_options(
             name,
@@ -931,6 +1018,7 @@ async fn desktop_run_action(
             // inside the preparation, before anything is spawned.
             let daemon = trusted_daemon().await?;
             daemon.require_compatible()?;
+            ensure_daemon_can_prepare(daemon.client.cached_capabilities().as_ref())?;
             let (roles, prepared) = prepare_workflow_launch(
                 &daemon.client,
                 &name,
@@ -1172,6 +1260,12 @@ mod tests {
         now: Mutex<std::time::Instant>,
         prepare_requests: Mutex<Vec<PrepareRequest>>,
         prepare_results: Mutex<VecDeque<Result<PreparedWorkflow, String>>>,
+        /// PRD #819 audit fix (P2, finding 2): every peer re-verification and
+        /// every prepared spawn, in the order they happened. Ordering is the
+        /// property under test — a verification that runs AFTER the spawn it
+        /// guards guards nothing — so one log rather than two counters.
+        peer_log: Mutex<Vec<String>>,
+        peer_results: Mutex<VecDeque<Result<(), String>>>,
         start_tokens: Mutex<Vec<Option<String>>>,
         started: Mutex<Vec<StartAgentOptions>>,
         start_results: Mutex<VecDeque<Result<String, String>>>,
@@ -1197,6 +1291,8 @@ mod tests {
                 now: Mutex::new(std::time::Instant::now()),
                 prepare_requests: Mutex::new(Vec::new()),
                 prepare_results: Mutex::new(VecDeque::new()),
+                peer_log: Mutex::new(Vec::new()),
+                peer_results: Mutex::new(VecDeque::new()),
                 start_tokens: Mutex::new(Vec::new()),
                 started: Mutex::new(Vec::new()),
                 start_results: Mutex::new(VecDeque::new()),
@@ -1246,11 +1342,24 @@ mod tests {
                 .unwrap_or_else(|| Ok(prepared_workflow()))
         }
 
+        async fn verify_prepared_launch_peer(&self) -> Result<(), String> {
+            self.peer_log.lock().unwrap().push("verify".into());
+            self.peer_results
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(Ok(()))
+        }
+
         async fn start_workflow_agent(
             &self,
             options: StartAgentOptions,
             prep_token: Option<&str>,
         ) -> Result<String, String> {
+            self.peer_log.lock().unwrap().push(format!(
+                "start:{}",
+                options.display_name.as_deref().unwrap_or("?")
+            ));
             self.start_tokens
                 .lock()
                 .unwrap()
@@ -1583,6 +1692,206 @@ command = "configured-planner"
                 Some("prep-token-1".to_string())
             ]
         );
+    }
+
+    /// PRD #819 audit fix (P2, finding 2). Scenario: prepare a workflow, then
+    /// launch it. Every role that presents the preparation token must
+    /// re-confirm the peer FIRST, on its own handshake — because the spawn
+    /// itself opens a connection that exchanges no `Hello` and re-checks no
+    /// protocol version, so an older daemon substituted in between would ignore
+    /// the unknown `prep_token` key and start the role unenforced.
+    ///
+    /// The assertion is the interleaving, not a count: a verification that runs
+    /// after the spawn it guards guards nothing.
+    #[tokio::test]
+    async fn every_prepared_role_start_re_verifies_the_peer_first() {
+        let daemon = FakeWorkflowDaemon::new(
+            Ok(Some("session-planner")),
+            [Ok(SendResult::Applied)],
+            Ok(SendResult::Applied),
+        );
+        let (roles, prepared) = prepare_workflow_launch(
+            &daemon,
+            "loop",
+            "/home/dev/project",
+            "Build it.",
+            &launch_roles("claude"),
+            None,
+        )
+        .await
+        .unwrap();
+
+        launch_workflow(
+            &daemon,
+            "loop",
+            &prepared.path,
+            &roles,
+            32,
+            120,
+            "orchestration-1",
+            &prepared.prompt,
+            Some(&prepared.token),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            *daemon.peer_log.lock().unwrap(),
+            ["verify", "start:planner", "verify", "start:builder"],
+            "each prepared spawn must be preceded by its own peer verification"
+        );
+    }
+
+    /// The counterpart, and the one that makes the failure CLOSED: a peer that
+    /// stops confirming it enforces the preparation refuses the spawn rather
+    /// than taking it, and the roles already started are rolled back.
+    ///
+    /// The refusal lands on the SECOND role deliberately. A launch that dies on
+    /// role one proves only that the check is reachable; dying on role two
+    /// proves the check is re-made per connection, which is the whole reason it
+    /// is inside the loop.
+    #[tokio::test]
+    async fn a_peer_that_stops_confirming_the_preparation_refuses_and_rolls_back() {
+        let daemon = FakeWorkflowDaemon::new(
+            Ok(Some("session-planner")),
+            [Ok(SendResult::Applied)],
+            Ok(SendResult::Applied),
+        );
+        {
+            let mut peer_results = daemon.peer_results.lock().unwrap();
+            peer_results.push_back(Ok(()));
+            peer_results.push_back(Err(
+                "daemon does not advertise the `prepare-workflow` capability".into(),
+            ));
+        }
+        let (roles, prepared) = prepare_workflow_launch(
+            &daemon,
+            "loop",
+            "/home/dev/project",
+            "Build it.",
+            &launch_roles("claude"),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let error = launch_workflow(
+            &daemon,
+            "loop",
+            &prepared.path,
+            &roles,
+            32,
+            120,
+            "orchestration-1",
+            &prepared.prompt,
+            Some(&prepared.token),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            error.contains("no longer confirms it enforces this preparation"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            error.contains("prepare-workflow"),
+            "the peer's own reason must survive: {error}"
+        );
+        // The second role was never spawned, and the first was stopped.
+        assert_eq!(daemon.started.lock().unwrap().len(), 1);
+        assert_eq!(*daemon.stopped.lock().unwrap(), ["agent-0".to_string()]);
+        assert!(daemon.submissions.lock().unwrap().is_empty());
+    }
+
+    /// A token-LESS launch is left exactly as it was: there is no preparation to
+    /// protect, so no handshake is spent on one. This is the half that keeps the
+    /// fix from becoming a per-spawn tax on every other path.
+    #[tokio::test]
+    async fn a_token_less_launch_verifies_no_peer() {
+        let daemon = FakeWorkflowDaemon::new(
+            Ok(Some("session-planner")),
+            [Ok(SendResult::Applied)],
+            Ok(SendResult::Applied),
+        );
+
+        launch_workflow(
+            &daemon,
+            "loop",
+            "/canonical/project",
+            &launch_roles("claude"),
+            32,
+            120,
+            "orchestration-1",
+            "seed",
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            !daemon
+                .peer_log
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|entry| entry == "verify"),
+            "a token-less start must not pay for a verification it does not need"
+        );
+    }
+
+    /// PRD #819 audit fix. Scenario: connect to a daemon that speaks this exact
+    /// protocol version, offers the read-only project verbs and withholds
+    /// `prepare-workflow`. The launch must stop with the daemon's own
+    /// `unsupported-platform` code and a sentence a user can act on, instead of
+    /// the uniform capability-withhold sentence that says nothing about why.
+    ///
+    /// The three negative cases are asserted in the same test because each is a
+    /// clause of the inference: an unadvertised daemon, a daemon that DOES
+    /// advertise the verb, and a set that is not a platform-narrowed one all
+    /// keep the generic path.
+    #[test]
+    fn a_withheld_prepare_workflow_reads_as_an_unsupported_platform() {
+        use dot_agent_deck::daemon_client::DaemonCapabilities;
+        use dot_agent_deck::daemon_protocol::{
+            AttachResponse, CAP_LIST_PROJECTS, CAP_PREPARE_WORKFLOW, CAP_RESOLVE_PROJECT,
+            PROJECT_ERR_UNSUPPORTED_PLATFORM,
+        };
+
+        fn advertising(capabilities: &[&str]) -> DaemonCapabilities {
+            DaemonCapabilities::from_hello(&AttachResponse {
+                capabilities: Some(capabilities.iter().map(|c| (*c).to_string()).collect()),
+                ..AttachResponse::ok()
+            })
+        }
+
+        // The platform-narrowed set: exactly what a non-Unix daemon advertises.
+        let error = ensure_daemon_can_prepare(Some(&advertising(&[
+            CAP_LIST_PROJECTS,
+            CAP_RESOLVE_PROJECT,
+        ])))
+        .unwrap_err();
+        assert!(
+            error.starts_with(&format!("{PROJECT_ERR_UNSUPPORTED_PLATFORM}: ")),
+            "the code must be the first token so the webview can match it: {error}"
+        );
+        assert!(
+            error.contains("owner-only") && error.contains("Nothing was started"),
+            "the sentence must say what happened and why: {error}"
+        );
+
+        // Not classified: nothing captured, nothing advertised, the verb present,
+        // and a set that says nothing about a platform.
+        assert!(ensure_daemon_can_prepare(None).is_ok());
+        assert!(ensure_daemon_can_prepare(Some(&DaemonCapabilities::absent())).is_ok());
+        assert!(
+            ensure_daemon_can_prepare(Some(&advertising(&[
+                CAP_LIST_PROJECTS,
+                CAP_RESOLVE_PROJECT,
+                CAP_PREPARE_WORKFLOW,
+            ])))
+            .is_ok()
+        );
+        assert!(ensure_daemon_can_prepare(Some(&advertising(&["something-else"]))).is_ok());
     }
 
     /// A refused preparation starts nothing — not even a subscription. The

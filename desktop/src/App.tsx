@@ -48,18 +48,37 @@ import { modeScopedKey } from "./lib/bridge";
 
 const WORKFLOW_STORAGE_KEY = modeScopedKey("dot-agent-deck.desktop.workflow-preview.v1");
 /**
- * Two of the daemon's stable refusal codes, matched as CODES rather than as
- * prose. Each is the first token of `AttachResponse.error`, followed by `": "` —
- * and the sentence after it is deliberately uninformative for a path the daemon
- * does not already know, so this screen must not depend on how much it said.
+ * The daemon's stable refusal codes this screen recognises, matched as CODES
+ * rather than as prose. Each is the first token of `AttachResponse.error`,
+ * followed by `": "` — and the sentence after it is deliberately uninformative
+ * for a path the daemon does not already know, so this screen must not depend
+ * on how much it said.
  *
  * `unresolved` (`daemon_protocol::PROJECT_ERR_UNRESOLVED`): the path did not
  * resolve. `stale-revision` (`PROJECT_ERR_STALE_REVISION`): it did, but against
  * different config bytes than the picker read — the TOCTOU gate M4 added, whose
  * remedy is to resolve again.
+ *
+ * The last three are token-time refusals, all of which mean "nothing was
+ * started" and two of which arrive from the PRD #819 audit fix:
+ *
+ * - `stale-token` (`PROJECT_ERR_STALE_TOKEN`): the preparation is unknown to
+ *   this daemon or has aged out of its TTL.
+ * - `stale-preparation` (`PROJECT_ERR_STALE_PREPARATION`): the preparation was
+ *   ours and live, but the project, its config or the published context moved
+ *   under it — most ordinarily because a second launch in the same project
+ *   replaced the context at its fixed path. The remedy is a real one the user
+ *   can take: prepare again, which is what re-resolving and re-launching does.
+ * - `unsupported-platform` (`PROJECT_ERR_UNSUPPORTED_PLATFORM`): the daemon
+ *   will not publish a coordinator context on its platform, because the
+ *   owner-only guarantee the publish documents is Unix-only. No amount of
+ *   retrying helps, so this one says so instead of inviting one.
  */
 const PROJECT_UNRESOLVED_CODE = "unresolved: ";
 const PROJECT_STALE_REVISION_CODE = "stale-revision: ";
+const PROJECT_STALE_TOKEN_CODE = "stale-token: ";
+const PROJECT_STALE_PREPARATION_CODE = "stale-preparation: ";
+const PROJECT_UNSUPPORTED_PLATFORM_CODE = "unsupported-platform: ";
 const DESKTOP_EVIDENCE_QUERY = "(min-width: 1260px)";
 
 function evidenceOpenOnFirstLoad(): boolean {
@@ -370,17 +389,20 @@ export function ControlDeck({ runtime, workflowPlatformIssue = desktopWorkflowPl
       ? ` Among generated commands, ${config.generatedFullAccessCount} role${config.generatedFullAccessCount === 1 ? " runs" : "s run"} unrestricted — Claude Code with bypassPermissions, or Codex with no sandbox — so ${config.generatedFullAccessCount === 1 ? "it acts" : "they act"} without asking.`
       : "";
     setConfirm({
-      title: `Launch ${config.name}?`,
-      body: `This starts ${config.roles.length} live CLI agents in ${config.cwd} and sends your task prompt to the coordinator. ${commandCopy}${accessCopy} This launch does not rewrite project TOML.`,
+      title: `Launch ${config.displayName}?`,
+      body: `This starts ${config.roles.length} live CLI agents in ${config.displayPath} and sends your task prompt to the coordinator. ${commandCopy}${accessCopy} This launch does not rewrite project TOML.`,
       label: "Launch live loop",
       busyLabel: "Launching…",
       action: async () => {
         try {
-          const { customCommandCount: _customCommandCount, generatedFullAccessCount: _generatedFullAccessCount, ...launch } = config;
+          // The display twins come off with the two counts: they exist for the
+          // dialog and the notice, and the daemon gets the identities alone
+          // (PRD #819 audit fix).
+          const { customCommandCount: _customCommandCount, generatedFullAccessCount: _generatedFullAccessCount, displayName: _displayName, displayPath: _displayPath, ...launch } = config;
           await runtime.runAction({ type: "start_workflow", ...launch });
           setWorkflowOpen(false);
           await runtime.reconnect();
-          setNotice(`${config.name} launched with ${config.roles.length} configured roles.`);
+          setNotice(`${config.displayName} launched with ${config.roles.length} configured roles.`);
         } catch (cause) {
           const message = cause instanceof Error ? cause.message : String(cause);
           /*
@@ -409,6 +431,33 @@ export function ControlDeck({ runtime, workflowPlatformIssue = desktopWorkflowPl
           if (message.includes(PROJECT_STALE_REVISION_CODE) && activeProject) {
             void projectState.select(activeProject.path);
             setNotice("This project's .dot-agent-deck.toml changed since the workflows were listed, so nothing was started. It has been re-read — check the workflow and launch again.");
+            return;
+          }
+          /*
+           * The two token-time refusals. Both mean the daemon started nothing,
+           * and both have the same remedy — prepare again — so both re-resolve
+           * the project to pick up its current revision and say what happened
+           * in the words that are true of each. `stale-preparation` is the one
+           * an ordinary second launch in the same project produces, because the
+           * coordinator context lives at a path fixed per project and the later
+           * preparation is the one that survives.
+           */
+          if ((message.includes(PROJECT_STALE_PREPARATION_CODE) || message.includes(PROJECT_STALE_TOKEN_CODE)) && activeProject) {
+            void projectState.select(activeProject.path);
+            setNotice(message.includes(PROJECT_STALE_PREPARATION_CODE)
+              ? "This launch's prepared coordinator context no longer matches what the daemon approved — another launch in this project replaced it, or the project moved. Nothing was started. The project has been re-read; launch again to prepare a fresh one."
+              : "The daemon no longer holds this launch's preparation — it expired, or the daemon was replaced. Nothing was started. The project has been re-read; launch again to prepare a fresh one.");
+            return;
+          }
+          /*
+           * Not retryable, and the only one of these that is not: the daemon's
+           * platform cannot give the published context an owner-only guarantee,
+           * so it withholds the verb rather than publishing without one. Its own
+           * sentence already names what to do instead, so pass it through.
+           */
+          if (message.includes(PROJECT_UNSUPPORTED_PLATFORM_CODE)) {
+            setWorkflowOpen(false);
+            setNotice(message);
             return;
           }
           setNotice(message);
@@ -451,7 +500,7 @@ export function ControlDeck({ runtime, workflowPlatformIssue = desktopWorkflowPl
       <main className="deck-main">
         <header className="topbar">
           <div className="repo-context">
-            <div className="repo-line"><FolderGit2 size={15} /><strong>{activeProject?.name || snapshot.repo}</strong><ChevronRight size={13} /><span>{snapshot.runId}</span></div>
+            <div className="repo-line"><FolderGit2 size={15} /><strong>{activeProject?.displayName || snapshot.repo}</strong><ChevronRight size={13} /><span>{snapshot.runId}</span></div>
             {/*
               PRD #745 M8: the branch chip appears only when there IS a branch.
               Nothing daemon-side tracks one, so live mode reports none and the
@@ -459,13 +508,17 @@ export function ControlDeck({ runtime, workflowPlatformIssue = desktopWorkflowPl
               literal "Unavailable" where a branch name belongs.
             */}
             {/*
-              `activeProject.path` is the DAEMON's canonical spelling of the
-              project chosen for the next launch; `snapshot.worktree` is the
-              daemon-reported cwd of a running agent. Both come from the daemon
-              — the third tier this line used to fall back to was the desktop's
-              own guess, and it is gone (PRD #819 M6).
+              `activeProject.displayPath` is the escaped twin of the DAEMON's
+              canonical spelling of the project chosen for the next launch;
+              `snapshot.worktree` is the daemon-reported cwd of a running agent.
+              Both come from the daemon — the third tier this line used to fall
+              back to was the desktop's own guess, and it is gone (PRD #819 M6).
+
+              The DISPLAY half, not `path`. This line is a text node and a
+              `title` attribute, so it gets the escaped copy; `path` is reserved
+              for what goes back to the daemon (PRD #819 audit fix).
             */}
-            <div className="branch-line">{snapshot.branch && <><GitBranch size={12} /><span>{snapshot.branch}</span><i /> </>}<span title={activeProject?.path || snapshot.worktree}>{activeProject?.path || snapshot.worktree}</span></div>
+            <div className="branch-line">{snapshot.branch && <><GitBranch size={12} /><span>{snapshot.branch}</span><i /> </>}<span title={activeProject?.displayPath || snapshot.worktree}>{activeProject?.displayPath || snapshot.worktree}</span></div>
           </div>
           <div className="run-instruments">
             <Instrument label="HEALTH" testId="run-health"><span className={`health-value health-${snapshot.health}`}><i />{snapshot.health}</span></Instrument>

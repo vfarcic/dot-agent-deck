@@ -72,9 +72,21 @@ export interface ConnectionView {
  * the launch being assembled and dies with it.
  */
 export interface DaemonProject {
-  /** Daemon-canonical absolute path. Sent back verbatim; never re-spelled. */
+  /**
+   * Daemon-canonical absolute path, byte for byte. Sent back verbatim; never
+   * re-spelled, and never rendered — render `displayPath` instead.
+   *
+   * PRD #819 audit fix (P2, finding 1): the desktop crate used to escape and
+   * truncate this value and keep the result as the only copy, so a valid
+   * canonical path carrying a control character, or longer than 2048
+   * characters, was submitted as a *different* path. Identity and display are
+   * now two fields.
+   */
   path: string;
-  name: string;
+  /** `path`, escaped and bounded for rendering. Never sent anywhere. */
+  displayPath: string;
+  /** The daemon's basename for this project, escaped for rendering. */
+  displayName: string;
 }
 
 export interface DaemonProjectListing {
@@ -88,12 +100,18 @@ export interface DaemonProjectListing {
 }
 
 export interface DaemonOrchestrationRole {
+  /** Identity: matched by name at the launch, and it becomes the pane's label. */
   name: string;
+  /** `name`, escaped for rendering. */
+  displayName: string;
   start: boolean;
 }
 
 export interface DaemonOrchestration {
+  /** Identity: this exact string goes back as the launch's workflow name. */
   name: string;
+  /** `name`, escaped for rendering. */
+  displayName: string;
   default: boolean;
   roles: DaemonOrchestrationRole[];
 }
@@ -105,8 +123,12 @@ export interface DaemonOrchestration {
  * there is nothing to offer before a project is chosen.
  */
 export interface DaemonResolvedProject {
+  /** Identity: the canonical spelling the launch must use, byte for byte. */
   path: string;
-  name: string;
+  /** `path`, escaped and bounded for rendering. Never sent anywhere. */
+  displayPath: string;
+  /** The canonical path's basename, escaped for rendering. */
+  displayName: string;
   orchestrations: DaemonOrchestration[];
   /**
    * The revision these orchestrations were read from, echoed back on the launch
@@ -509,6 +531,7 @@ export interface WorkflowLaunchRole {
 }
 
 export interface WorkflowLaunchConfig {
+  /** The daemon's own spelling of the orchestration name, submitted verbatim. */
   name: string;
   /**
    * The daemon-canonical project path, straight off the resolved selection.
@@ -518,6 +541,20 @@ export interface WorkflowLaunchConfig {
    * resolved and re-spelled.
    */
   cwd: string;
+  /**
+   * The escaped twins of `name` and `cwd`, for the confirmation dialog and the
+   * result notice (PRD #819 audit fix). Carried on the config so the screen
+   * that renders them does no lookup of its own; both are destructured off
+   * before the action is dispatched, the way `customCommandCount` already is,
+   * so neither reaches the daemon.
+   *
+   * The builder falls back to the identity if it somehow has no orchestration
+   * to take a label from, which cannot happen while the launch button is
+   * enabled — `canLaunch` requires one — and is a worse-label fallback rather
+   * than a blank one if it ever does.
+   */
+  displayName: string;
+  displayPath: string;
   taskPrompt: string;
   roles: WorkflowLaunchRole[];
   rows: number;

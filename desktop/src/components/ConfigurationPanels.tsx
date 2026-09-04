@@ -70,9 +70,17 @@ export function ProjectsPanel({ open, state, onClose, onConfigureWorkflow }: Pro
             <button className="add-project" onClick={() => void state.refresh()} data-testid="refresh-projects"><RefreshCw size={14} /> Refresh</button>
             <nav aria-label="Daemon projects">
               {projects.map((item) => (
+                /*
+                 * `path` is the IDENTITY — the key, the selection argument and
+                 * the comparison against `primary` — and `displayPath` /
+                 * `displayName` are the halves that get rendered. Keeping the
+                 * two apart is PRD #819's audit fix: escaping the value the
+                 * launch later submits made the app and the daemon name
+                 * different directories, and the app never found out.
+                 */
                 <button key={item.path} className={item.path === selected?.path ? "is-selected" : ""} onClick={() => void state.select(item.path)} disabled={resolving}>
                   <span className={item.path === primary ? "project-icon is-active" : "project-icon"}><FolderGit2 size={15} /></span>
-                  <span><strong>{item.name}</strong><small>{item.path}</small></span>
+                  <span><strong>{item.displayName}</strong><small>{item.displayPath}</small></span>
                   {item.path === primary && <em>ACTIVE</em>}
                 </button>
               ))}
@@ -84,7 +92,7 @@ export function ProjectsPanel({ open, state, onClose, onConfigureWorkflow }: Pro
 
           <form className="project-form" onSubmit={(event) => { event.preventDefault(); void submitPasted(); }}>
             <div className="form-heading">
-              <div><span>SELECTED PROJECT</span><h3>{selected?.name ?? "No project chosen"}</h3></div>
+              <div><span>SELECTED PROJECT</span><h3>{selected?.displayName ?? "No project chosen"}</h3></div>
               {selected ? <span className="active-project-badge"><Check size={11} /> Ready to launch</span> : null}
             </div>
             <div className="project-fields">
@@ -94,8 +102,8 @@ export function ProjectsPanel({ open, state, onClose, onConfigureWorkflow }: Pro
               {resolveError && <small className="project-field-error" data-testid="project-resolve-error"><AlertTriangle size={12} /> {resolveError}</small>}
               {selected && (
                 <div className="project-fields" data-testid="selected-project">
-                  <label><span>Daemon path</span><input aria-label="Resolved project path" value={selected.path} readOnly spellCheck={false} /><small>The daemon&apos;s own spelling. The launch uses this exact string.</small></label>
-                  <span>Workflows in this project: {selected.orchestrations.length ? selected.orchestrations.map((orchestration) => orchestration.name).join(", ") : "none configured"}</span>
+                  <label><span>Daemon path</span><input aria-label="Resolved project path" value={selected.displayPath} readOnly spellCheck={false} /><small>The daemon&apos;s own spelling. The launch uses it exactly as the daemon reported it.</small></label>
+                  <span>Workflows in this project: {selected.orchestrations.length ? selected.orchestrations.map((orchestration) => orchestration.displayName).join(", ") : "none configured"}</span>
                 </div>
               )}
             </div>
@@ -374,7 +382,11 @@ export function WorkflowPanel({ open, profiles, order, mode, project, onChoosePr
     setName(orchestrations.find((orchestration) => orchestration.default)?.name ?? orchestrations[0]?.name ?? "");
   }, [name, orchestrations]);
   if (!open) return null;
+  // Two values, deliberately: `cwd` is the daemon's canonical spelling and is
+  // what the launch submits; `cwdDisplay` is the escaped twin and is all that
+  // is rendered (PRD #819 audit fix).
   const cwd = project?.path ?? "";
+  const cwdDisplay = project?.displayPath ?? "";
   const orchestration = orchestrations.find((candidate) => candidate.name === name);
   const ordered = [...order.map((id) => profiles.find((profile) => profile.id === id)).filter((profile): profile is AgentProfile => Boolean(profile)), ...profiles.filter((profile) => !order.includes(profile.id))];
   const enabled = ordered.filter((profile) => profile.enabled);
@@ -386,6 +398,9 @@ export function WorkflowPanel({ open, profiles, order, mode, project, onChoosePr
   // happened to ship defaults for. The daemon refuses a mismatch either way;
   // saying so here is what stops the refusal arriving as a surprise.
   const requiredRoles = orchestration?.roles.map((role) => role.name) ?? [];
+  // The same list for the mismatch banner, escaped. The identity list above is
+  // what the comparisons run on; this one only ever reaches a text node.
+  const requiredRoleLabels = orchestration?.roles.map((role) => role.displayName) ?? [];
   const missingRoles = requiredRoles.filter((role) => !roles.some((candidate) => candidate.role === role));
   const extraRoles = roles.filter((role) => !requiredRoles.includes(role.role)).map((role) => role.role);
   const allRequiredRolesEnabled = Boolean(orchestration) && !missingRoles.length && !extraRoles.length && enabled.some((profile) => profile.roleId === "orchestrator");
@@ -407,14 +422,14 @@ export function WorkflowPanel({ open, profiles, order, mode, project, onChoosePr
               this project defines, and the daemon is the only party that can
               say what those are.
             */}
-            <label><span>Workflow name</span><select aria-label="Workflow name" value={name} onChange={(event) => setName(event.target.value)} disabled={!orchestrations.length}>{orchestrations.length ? orchestrations.map((candidate) => <option key={candidate.name} value={candidate.name}>{candidate.name}{candidate.default ? " (default)" : ""}</option>) : <option value="">No workflow available</option>}</select></label>
+            <label><span>Workflow name</span><select aria-label="Workflow name" value={name} onChange={(event) => setName(event.target.value)} disabled={!orchestrations.length}>{orchestrations.length ? orchestrations.map((candidate) => <option key={candidate.name} value={candidate.name}>{candidate.displayName}{candidate.default ? " (default)" : ""}</option>) : <option value="">No workflow available</option>}</select></label>
             {/*
               READ-ONLY, and the whole point. This used to be a free-text
               directory that went straight into the launch; it is now the
               daemon's canonical spelling of the chosen project, and the only
               way to change it is to choose a different project.
             */}
-            <label><span>Project directory (from the daemon)</span><input aria-label="Absolute project directory" value={cwd} readOnly placeholder="Choose a project first" spellCheck={false} data-testid="workflow-project-path" /></label>
+            <label><span>Project directory (from the daemon)</span><input aria-label="Absolute project directory" value={cwdDisplay} readOnly placeholder="Choose a project first" spellCheck={false} data-testid="workflow-project-path" /></label>
             <label className="workflow-task-prompt">
               <span className="task-prompt-label">
                 Task prompt
@@ -438,7 +453,7 @@ export function WorkflowPanel({ open, profiles, order, mode, project, onChoosePr
             {project && !orchestrations.length && <small data-testid="workflow-no-orchestrations"><AlertTriangle size={12} /> The daemon resolved this project but it defines no workflow with roles.</small>}
             {!taskPrompt.trim() && <small><AlertTriangle size={12} /> Add the task you want the coordinator to run.</small>}
             {platformIssue && <small data-testid="workflow-platform-issue"><AlertTriangle size={12} /> {platformIssue}</small>}
-            {orchestration && (missingRoles.length > 0 || extraRoles.length > 0) && <small data-testid="workflow-role-mismatch"><AlertTriangle size={12} /> {orchestration.name} defines {requiredRoles.join(", ") || "no roles"}.{missingRoles.length ? ` Enable a profile for: ${missingRoles.join(", ")}.` : ""}{extraRoles.length ? ` Not in this workflow: ${extraRoles.join(", ")}.` : ""}</small>}
+            {orchestration && (missingRoles.length > 0 || extraRoles.length > 0) && <small data-testid="workflow-role-mismatch"><AlertTriangle size={12} /> {orchestration.displayName} defines {requiredRoleLabels.join(", ") || "no roles"}.{missingRoles.length ? ` Enable a profile for: ${missingRoles.join(", ")}.` : ""}{extraRoles.length ? ` Not in this workflow: ${extraRoles.join(", ")}.` : ""}</small>}
             {invalidCommands.length > 0 && <small><AlertTriangle size={12} /> Fix the launch command for: {invalidCommands.map(({ profile }) => profile.role).join(", ")}.</small>}
           </div>
         )}
@@ -458,7 +473,7 @@ export function WorkflowPanel({ open, profiles, order, mode, project, onChoosePr
         </div>
         <footer className="sheet-footer workflow-footer">
           <span>{enabled.length} active roles · {ordered.length - enabled.length} skipped</span>
-          {mode === "live" ? <button className="button primary" data-testid="launch-live-loop" disabled={!canLaunch} onClick={() => onLaunch({ name: name.trim(), cwd, taskPrompt: taskPrompt.trim(), roles, rows: 32, cols: 120, customCommandCount, generatedFullAccessCount, configRevision: project?.configRevision })}><Bot size={14} /> Launch live loop</button> : <button className="button primary" onClick={onClose}><Check size={14} /> Use preview</button>}
+          {mode === "live" ? <button className="button primary" data-testid="launch-live-loop" disabled={!canLaunch} onClick={() => onLaunch({ name, cwd, displayName: orchestration?.displayName ?? name, displayPath: cwdDisplay, taskPrompt: taskPrompt.trim(), roles, rows: 32, cols: 120, customCommandCount, generatedFullAccessCount, configRevision: project?.configRevision })}><Bot size={14} /> Launch live loop</button> : <button className="button primary" onClick={onClose}><Check size={14} /> Use preview</button>}
         </footer>
       </section>
     </div>

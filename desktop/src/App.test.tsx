@@ -2,7 +2,7 @@ import { fireEvent, render, screen, waitFor, within } from "@testing-library/rea
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createFixtureSnapshot } from "./data/fixture";
 import { WINDOWS_WORKFLOW_BLOCK_REASON } from "./lib/platform";
-import type { DeckRuntimeState } from "./types";
+import type { DaemonOrchestration, DaemonProject, DaemonResolvedProject, DeckRuntimeState } from "./types";
 
 vi.mock("./components/TerminalViewport", () => ({
   TerminalViewport: ({ agentId }: { agentId: string }) => <pre data-testid={`terminal-${agentId}`}>terminal</pre>,
@@ -41,20 +41,45 @@ function runtime(overrides: Partial<DeckRuntimeState> = {}): DeckRuntimeState {
  */
 const WORKFLOW_ROLES = ["orchestrator", "coder", "reviewer", "auditor", "tester", "release"];
 
+/*
+ * PRD #819 audit fix (P2, finding 1): every daemon-supplied identity crosses
+ * the Tauri boundary byte for byte with an ESCAPED TWIN beside it — `path` and
+ * `displayPath`, `name` and `displayName`. These three builders are the only
+ * place the fixtures spell that pairing out, so a test cannot quietly go back
+ * to a single field that is both the thing rendered and the thing submitted,
+ * which is what let an escaped path be displayed and then launched against.
+ *
+ * The twins are equal here because these fixtures use ordinary names; the
+ * cases where they DIFFER are covered where the split is implemented, in the
+ * desktop crate's `dto` tests.
+ */
+function daemonProject(path: string, name: string): DaemonProject {
+  return { path, displayPath: path, displayName: name };
+}
+
+function daemonOrchestration(name: string, isDefault: boolean, roles: readonly string[], startRole = "orchestrator"): DaemonOrchestration {
+  return {
+    name,
+    displayName: name,
+    default: isDefault,
+    roles: roles.map((role) => ({ name: role, displayName: role, start: role === startRole })),
+  };
+}
+
+function daemonResolvedProject(path: string, name: string, orchestrations: DaemonOrchestration[], configRevision: string): DaemonResolvedProject {
+  return { path, displayPath: path, displayName: name, orchestrations, configRevision };
+}
+
 function liveWithProject(overrides: Partial<DeckRuntimeState> = {}): DeckRuntimeState {
   return runtime({
     mode: "live",
-    listProjects: vi.fn(async () => ({ projects: [{ path: "/home/dev/code/deck", name: "deck" }], primary: "/home/dev/code/deck" })),
-    resolveProject: vi.fn(async () => ({
-      path: "/home/dev/code/deck",
-      name: "deck",
-      orchestrations: [{
-        name: "dot-agent-deck",
-        default: true,
-        roles: WORKFLOW_ROLES.map((role) => ({ name: role, start: role === "orchestrator" })),
-      }],
-      configRevision: "revision-1",
-    })),
+    listProjects: vi.fn(async () => ({ projects: [daemonProject("/home/dev/code/deck", "deck")], primary: "/home/dev/code/deck" })),
+    resolveProject: vi.fn(async () => daemonResolvedProject(
+      "/home/dev/code/deck",
+      "deck",
+      [daemonOrchestration("dot-agent-deck", true, WORKFLOW_ROLES)],
+      "revision-1",
+    )),
     ...overrides,
   });
 }
@@ -112,21 +137,21 @@ describe("ControlDeck", () => {
    * picker over what the daemon currently knows.
    */
   it("picks a daemon-listed project, resolves it, and carries the daemon's canonical path into the launcher", async () => {
-    const resolveProject = vi.fn(async (path: string) => ({
+    const resolveProject = vi.fn(async (path: string) => daemonResolvedProject(
       // The daemon answers with a DIFFERENT spelling: `/home/dev/current` is a
       // symlink and its basename is not the canonical one, which is exactly the
       // case that produced PRD #220's empty-orchestration-name bug.
-      path: path === "/home/dev/current" ? "/home/dev/code/clipmaker" : path,
-      name: "clipmaker",
-      orchestrations: [
-        { name: "clipmaker-loop", default: true, roles: [{ name: "orchestrator", start: true }] },
-        { name: "release-only", default: false, roles: [{ name: "orchestrator", start: true }] },
+      path === "/home/dev/current" ? "/home/dev/code/clipmaker" : path,
+      "clipmaker",
+      [
+        daemonOrchestration("clipmaker-loop", true, ["orchestrator"]),
+        daemonOrchestration("release-only", false, ["orchestrator"]),
       ],
-      configRevision: "revision-1",
-    }));
+      "revision-1",
+    ));
     const live = runtime({
       mode: "live",
-      listProjects: vi.fn(async () => ({ projects: [{ path: "/home/dev/current", name: "current" }], primary: "/home/dev/current" })),
+      listProjects: vi.fn(async () => ({ projects: [daemonProject("/home/dev/current", "current")], primary: "/home/dev/current" })),
       resolveProject,
     });
     render(<ControlDeck runtime={live} />);
@@ -177,12 +202,12 @@ describe("ControlDeck", () => {
    * the daemon resolves it on its own filesystem.
    */
   it("resolves a pasted path through the daemon and adopts the spelling it answers with", async () => {
-    const resolveProject = vi.fn(async () => ({
-      path: "/srv/projects/api",
-      name: "api",
-      orchestrations: [{ name: "loop", default: false, roles: [{ name: "orchestrator", start: true }] }],
-      configRevision: "rev-9",
-    }));
+    const resolveProject = vi.fn(async () => daemonResolvedProject(
+      "/srv/projects/api",
+      "api",
+      [daemonOrchestration("loop", false, ["orchestrator"])],
+      "rev-9",
+    ));
     const live = runtime({ mode: "live", listProjects: vi.fn(async () => ({ projects: [] })), resolveProject });
     render(<ControlDeck runtime={live} />);
 
@@ -227,7 +252,7 @@ describe("ControlDeck", () => {
    * stops offering something that is gone.
    */
   it("presents a project that left the daemon's known set like the empty state", async () => {
-    const listProjects = vi.fn(async () => ({ projects: [{ path: "/home/dev/stale", name: "stale" }] }));
+    const listProjects = vi.fn(async () => ({ projects: [daemonProject("/home/dev/stale", "stale")] }));
     const live = runtime({
       mode: "live",
       listProjects,
@@ -366,14 +391,138 @@ describe("ControlDeck", () => {
    * the enabled profiles supply is refused here, before the launch, and the
    * message names the mismatch rather than restating a hardcoded six.
    */
+  /**
+   * PRD #819 audit fix (P2, finding 1) at the UI seam.
+   *
+   * Scenario: the daemon offers a project whose canonical path carries an
+   * escape byte and whose orchestration name carries one too. The picker and
+   * the launcher must render only the ESCAPED twins, and the launch must
+   * submit the daemon's own spelling of both — byte for byte, control
+   * character included. Rendering the identity would put a control byte in a
+   * DOM text node; submitting the display value would launch in a different
+   * directory under a workflow name the daemon cannot find.
+   */
+  it("renders the escaped twins and submits the daemon's own spelling", async () => {
+    const rawPath = "/home/dev/co\u0001de/deck";
+    const rawWorkflow = "dot-agent\u0001-deck";
+    const live = liveWithProject({
+      listProjects: vi.fn(async () => ({
+        projects: [{ path: rawPath, displayPath: "/home/dev/code/deck", displayName: "deck" }],
+        primary: rawPath,
+      })),
+      resolveProject: vi.fn(async () => ({
+        path: rawPath,
+        displayPath: "/home/dev/code/deck",
+        displayName: "deck",
+        orchestrations: [{
+          name: rawWorkflow,
+          displayName: "dot-agent-deck",
+          default: true,
+          roles: WORKFLOW_ROLES.map((role) => ({ name: role, displayName: role, start: role === "orchestrator" })),
+        }],
+        configRevision: "revision-1",
+      })),
+    });
+    render(<ControlDeck runtime={live} />);
+    await chooseTheOnlyProject();
+
+    // Rendered: the escaped twin, and nowhere the raw byte.
+    const projectPath = screen.getByTestId("workflow-project-path") as HTMLInputElement;
+    expect(projectPath.value).toBe("/home/dev/code/deck");
+    expect(screen.getByLabelText("Workflow name")).toHaveTextContent("dot-agent-deck (default)");
+    expect(document.body.textContent).not.toContain("\u0001");
+
+    fireEvent.change(screen.getByLabelText("Task prompt"), { target: { value: "Build it." } });
+    fireEvent.click(screen.getByTestId("launch-live-loop"));
+    // The confirmation dialog names both values, and it is a text node too.
+    expect(screen.getByRole("alertdialog")).toHaveTextContent("Launch dot-agent-deck?");
+    expect(screen.getByRole("alertdialog")).toHaveTextContent("in /home/dev/code/deck and sends");
+    expect(document.body.textContent).not.toContain("\u0001");
+    fireEvent.click(screen.getAllByRole("button", { name: "Launch live loop" }).at(-1)!);
+
+    // Submitted: the daemon's own spelling of the path AND of the workflow
+    // name — and neither display twin rides along to the daemon.
+    await waitFor(() => {
+      const launch = vi.mocked(live.runAction).mock.calls[0]?.[0];
+      if (launch?.type !== "start_workflow") throw new Error("expected workflow launch");
+      expect(launch.cwd).toBe(rawPath);
+      expect(launch.name).toBe(rawWorkflow);
+      expect(launch).not.toHaveProperty("displayName");
+      expect(launch).not.toHaveProperty("displayPath");
+    });
+    // And the success notice is the escaped twin as well.
+    await waitFor(() => expect(screen.getByRole("status")).toHaveTextContent("dot-agent-deck launched with 6 configured roles."));
+    expect(document.body.textContent).not.toContain("\u0001");
+  });
+
+  /**
+   * PRD #819 audit fix: `stale-preparation` is the refusal an ORDINARY second
+   * launch in the same project produces, because the coordinator context is
+   * published at a path fixed per project and the later preparation is the one
+   * that survives. Nothing was started, and the remedy is a real one — prepare
+   * again — so the screen must say that rather than showing the daemon's raw
+   * refusal, and must re-read the project so the next attempt is fresh.
+   */
+  it("presents a stale preparation as a re-launchable outcome and re-reads the project", async () => {
+    const live = liveWithProject({
+      runAction: vi.fn(async () => {
+        throw new Error("failed to start workflow role coder: stale-preparation: that preparation no longer describes what it approved; prepare the workflow again; rolled back 1 role");
+      }),
+    });
+    render(<ControlDeck runtime={live} />);
+    await chooseTheOnlyProject();
+    const resolvesAfterPick = vi.mocked(live.resolveProject).mock.calls.length;
+    fireEvent.change(screen.getByLabelText("Task prompt"), { target: { value: "Build it." } });
+    fireEvent.click(screen.getByTestId("launch-live-loop"));
+    fireEvent.click(screen.getAllByRole("button", { name: "Launch live loop" }).at(-1)!);
+
+    await waitFor(() => {
+      expect(screen.getByRole("status")).toHaveTextContent("no longer matches what the daemon approved");
+    });
+    expect(screen.getByRole("status")).toHaveTextContent("Nothing was started");
+    expect(screen.getByRole("status")).toHaveTextContent("launch again");
+    // Re-read, so the next attempt carries the project's current revision.
+    expect(vi.mocked(live.resolveProject).mock.calls.length).toBeGreaterThan(resolvesAfterPick);
+  });
+
+  /**
+   * PRD #819 audit fix: the other new code, and the one outcome here that is
+   * NOT retryable. A daemon whose platform cannot give the published
+   * coordinator context an owner-only guarantee withholds the verb rather than
+   * publishing without one, so the screen passes the daemon's own sentence
+   * through — it already names what to do instead — and closes the launcher
+   * instead of inviting another attempt.
+   */
+  it("presents an unsupported-platform refusal without inviting a retry", async () => {
+    const live = liveWithProject({
+      runAction: vi.fn(async () => {
+        throw new Error("unsupported-platform: this daemon offers the project verbs but withholds `prepare-workflow`. Nothing was started. Launch this workflow from the TUI on the daemon's own host, or point the app at a Unix daemon.");
+      }),
+    });
+    render(<ControlDeck runtime={live} />);
+    await chooseTheOnlyProject();
+    const resolvesAfterPick = vi.mocked(live.resolveProject).mock.calls.length;
+    fireEvent.change(screen.getByLabelText("Task prompt"), { target: { value: "Build it." } });
+    fireEvent.click(screen.getByTestId("launch-live-loop"));
+    fireEvent.click(screen.getAllByRole("button", { name: "Launch live loop" }).at(-1)!);
+
+    await waitFor(() => {
+      expect(screen.getByRole("status")).toHaveTextContent("Launch this workflow from the TUI on the daemon's own host");
+    });
+    expect(screen.queryByTestId("workflow-editor")).toBeNull();
+    // No re-resolve: nothing about the project changed, and trying again cannot
+    // help until the daemon does.
+    expect(vi.mocked(live.resolveProject).mock.calls.length).toBe(resolvesAfterPick);
+  });
+
   it("refuses to launch when the enabled profiles do not match the workflow's roles", async () => {
     const live = liveWithProject({
-      resolveProject: vi.fn(async () => ({
-        path: "/home/dev/code/deck",
-        name: "deck",
-        orchestrations: [{ name: "pair", default: true, roles: [{ name: "orchestrator", start: true }, { name: "coder", start: false }] }],
-        configRevision: "revision-2",
-      })),
+      resolveProject: vi.fn(async () => daemonResolvedProject(
+        "/home/dev/code/deck",
+        "deck",
+        [daemonOrchestration("pair", true, ["orchestrator", "coder"])],
+        "revision-2",
+      )),
     });
     render(<ControlDeck runtime={live} />);
     await chooseTheOnlyProject();

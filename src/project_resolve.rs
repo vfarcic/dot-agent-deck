@@ -108,17 +108,69 @@ pub const MAX_PROJECT_ORCHESTRATIONS: usize = 128;
 /// the two cap one response at 128 x 64 role entries.
 pub const MAX_PROJECT_ROLES: usize = 64;
 
-/// Upper bound on each projected name (an orchestration's, a role's, a
-/// project's display name).
+/// Upper bound on a projected **project display name** — the directory
+/// basename enumeration offers beside a path.
 ///
-/// **512 bytes.** Names are untrusted text out of a config file or a directory
-/// basename; `NAME_MAX` is 255 bytes on the filesystems this actually runs on
-/// (ext4, XFS, btrfs, APFS, NTFS), and a config-declared name that long is
-/// already unreadable in a picker. 512 leaves headroom over that figure without
-/// letting a single name carry a payload. Refused rather than truncated, so a
-/// picker never shows a name that no longer matches the one a spawn would
-/// resolve.
+/// **512 bytes.** A basename is untrusted text out of a directory entry;
+/// `NAME_MAX` is 255 bytes on the filesystems this actually runs on (ext4, XFS,
+/// btrfs, APFS, NTFS), and a directory name that long is already unreadable in
+/// a picker. 512 leaves headroom over that figure without letting a single name
+/// carry a payload. A candidate past it is **dropped from the listing rather
+/// than truncated** — the same disposition every other bound here takes, for
+/// the same reason: a silently shortened name is a wrong answer that looks like
+/// a right one. It is a drop rather than a refusal because the path is still a
+/// perfectly good project; only its label is unusable, and the enumeration's
+/// contract is already "include only what resolves".
+///
+/// **This bound applies only to the display-only half**, and
+/// [`MAX_PROJECTED_LAUNCH_NAME_BYTES`] applies to the two projected names that
+/// are protocol identities. The split is the PRD #819 audit's second P2 finding:
+/// a project's basename is rendered and never sent back, so its ceiling is a
+/// readability question; an orchestration's or a role's name is sent back and
+/// has to satisfy the spawn's own validator, so its ceiling is a
+/// *compatibility* question and is not ours to choose.
 pub const MAX_PROJECTED_NAME_BYTES: usize = 512;
+
+/// Upper bound on a projected **orchestration or role name** — the two
+/// projected names a client sends back.
+///
+/// **Derived from [`crate::agent_pty::DISPLAY_NAME_MAX_LEN`] rather than
+/// chosen**, because the consumer's limit is the only limit that can be right
+/// here. PRD #819 audit fix (P2, finding 1): this used to be
+/// [`MAX_PROJECTED_NAME_BYTES`] (512) while the value's *destination* accepts
+/// 128 — an orchestration name becomes `TabMembership::Orchestration.name` and
+/// a role name becomes both `TabMembership::Orchestration.role_name` and the
+/// pane's `display_name`, and `agent_pty::validate_tab_membership` runs every
+/// one of those through `is_valid_display_name`, whose length rule is
+/// `DISPLAY_NAME_MAX_LEN`. An over-long membership does not degrade: it
+/// **fails the spawn** with `AgentPtyError::Validation`.
+///
+/// So a name of 129..=512 bytes was offered by the picker and then refused at
+/// launch. Two limits on one value, in two crates, is how that class of bug
+/// returns, so there is now one — and the direction is deliberate:
+///
+/// * **Tightening the projection** is what shipped. It is strictly stronger
+///   against a hostile config (the response-size argument
+///   [`MAX_PROJECTED_NAME_BYTES`] and [`MAX_PROJECT_ORCHESTRATIONS`] make is
+///   unaffected by a *smaller* cap), and it makes the offered set equal to the
+///   launchable set, which is the property the picker's whole existence rests
+///   on.
+/// * **Loosening the consumer** was the alternative and does not work: the
+///   desktop's own `validate_workflow_shape` is not the binding limit — the
+///   daemon's is. Raising the desktop's check to 512 would have moved the same
+///   refusal one hop later, into the spawn, where it arrives as a failed launch
+///   with roles already started instead of as a project that cannot be offered.
+///
+/// A name past the cap is **refused, not truncated**, for the reason
+/// [`MAX_PROJECTED_NAME_BYTES`] gives: a shortened name is a name a spawn would
+/// not resolve.
+pub const MAX_PROJECTED_LAUNCH_NAME_BYTES: usize = crate::agent_pty::DISPLAY_NAME_MAX_LEN;
+
+// The split above only makes sense in one direction: the bound on a name that
+// has to survive the spawn is the tighter of the two. A compile-time assertion
+// rather than a test, because it is a relationship between two constants and a
+// build error is a better place to learn about an inverted one than a test run.
+const _: () = assert!(MAX_PROJECTED_NAME_BYTES > MAX_PROJECTED_LAUNCH_NAME_BYTES);
 
 /// Upper bound on the candidate directories one enumeration will do filesystem
 /// work for.
@@ -197,7 +249,12 @@ pub enum ProjectResolveError {
     TooManyOrchestrations(usize),
     /// One orchestration declares more roles than [`MAX_PROJECT_ROLES`].
     TooManyRoles(usize),
-    /// A projected name exceeds [`MAX_PROJECTED_NAME_BYTES`].
+    /// An orchestration's or a role's projected name exceeds
+    /// [`MAX_PROJECTED_LAUNCH_NAME_BYTES`].
+    ///
+    /// Only those two, because only those two are names a client sends back. An
+    /// over-long project *display* basename is dropped from an enumeration
+    /// rather than turned into an error — see [`MAX_PROJECTED_NAME_BYTES`].
     NameTooLong(usize),
     /// The blocking task carrying this work did not complete (runtime shutdown,
     /// or a panic inside it). Never a statement about the caller's path.
@@ -244,7 +301,8 @@ impl ProjectResolveError {
                 "an orchestration declares {n} roles; at most {MAX_PROJECT_ROLES} can be offered"
             ),
             Self::NameTooLong(n) => format!(
-                "a declared name is {n} bytes; at most {MAX_PROJECTED_NAME_BYTES} can be offered"
+                "a declared name is {n} bytes; at most {MAX_PROJECTED_LAUNCH_NAME_BYTES} can be \
+                 offered for a name a client sends back"
             ),
             Self::Internal => "the daemon could not complete the request".to_string(),
         };
@@ -561,7 +619,7 @@ pub fn project_config_onto_wire(
             continue;
         }
         let name = crate::project_config::resolve_orchestration_name(&orch.name, dir);
-        bound_name(&name)?;
+        bound_launch_name(&name)?;
         out.push(ProjectOrchestration {
             name,
             default: default_index == Some(index),
@@ -572,7 +630,7 @@ pub fn project_config_onto_wire(
 }
 
 /// Project one orchestration's roles under [`MAX_PROJECT_ROLES`] and
-/// [`MAX_PROJECTED_NAME_BYTES`].
+/// [`MAX_PROJECTED_LAUNCH_NAME_BYTES`].
 ///
 /// Split out so the launch verb applies the **same** caps to the roles it
 /// answers with as the resolve verb applies to the ones it offers. Two
@@ -586,7 +644,7 @@ pub fn project_roles_onto_wire(
     }
     let mut roles = Vec::with_capacity(orch.roles.len());
     for role in &orch.roles {
-        bound_name(&role.name)?;
+        bound_launch_name(&role.name)?;
         roles.push(ProjectRole {
             name: role.name.clone(),
             start: role.start,
@@ -595,8 +653,16 @@ pub fn project_roles_onto_wire(
     Ok(roles)
 }
 
-fn bound_name(name: &str) -> Result<(), ProjectResolveError> {
-    if name.len() > MAX_PROJECTED_NAME_BYTES {
+/// Bound one projected name that a client **sends back** — an orchestration's
+/// or a role's.
+///
+/// The cap is the consumer's own ([`MAX_PROJECTED_LAUNCH_NAME_BYTES`]), so what
+/// this function admits is exactly what `agent_pty::validate_tab_membership`
+/// and `spawn_agent` will accept later. Read that constant's doc for why the
+/// alignment goes in this direction; the short version is that the alternative
+/// moves the refusal into the spawn, after roles have already started.
+fn bound_launch_name(name: &str) -> Result<(), ProjectResolveError> {
+    if name.len() > MAX_PROJECTED_LAUNCH_NAME_BYTES {
         return Err(ProjectResolveError::NameTooLong(name.len()));
     }
     Ok(())
@@ -844,6 +910,11 @@ pub fn resolve_candidates(candidates: &[ProjectCandidate]) -> ProjectListing {
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| path.clone());
+        // The DISPLAY-name bound, not the launch one: this basename is rendered
+        // beside the path and is never sent back, so its ceiling is the
+        // readability figure rather than the spawn validator's. Tightening it to
+        // `MAX_PROJECTED_LAUNCH_NAME_BYTES` would drop a perfectly launchable
+        // project from the listing over a long directory name.
         if name.len() > MAX_PROJECTED_NAME_BYTES {
             debug!("project enumeration skipped a candidate whose basename exceeds the name bound");
             continue;
@@ -1599,7 +1670,7 @@ command = "cat"
     #[test]
     fn an_over_long_name_is_refused_rather_than_truncated() {
         let (_guard, root) = scratch();
-        let long = "n".repeat(MAX_PROJECTED_NAME_BYTES + 1);
+        let long = "n".repeat(MAX_PROJECTED_LAUNCH_NAME_BYTES + 1);
         write_project(
             &root,
             &format!(
@@ -1611,9 +1682,59 @@ command = "cat"
         let err = project_config_onto_wire(&root, &config)
             .expect_err("an over-long name must be refused");
         assert!(
-            matches!(err, ProjectResolveError::NameTooLong(n) if n > MAX_PROJECTED_NAME_BYTES),
+            matches!(
+                err,
+                ProjectResolveError::NameTooLong(n) if n > MAX_PROJECTED_LAUNCH_NAME_BYTES
+            ),
             "expected NameTooLong, got {err:?}"
         );
+    }
+
+    /// PRD #819 audit fix (P2, finding 1): **the offered set is the launchable
+    /// set**, asserted from both sides of the seam at the exact boundary.
+    ///
+    /// The projection used to admit up to 512 bytes while the value's
+    /// destination — `TabMembership::Orchestration.name` / `.role_name`, and
+    /// the pane's `display_name` — accepts `DISPLAY_NAME_MAX_LEN`, so a name of
+    /// 129..=512 bytes was offered by the picker and then **failed the spawn**.
+    /// So the property is not "long names are refused somewhere": it is that
+    /// the last name the projection admits is one `is_valid_display_name`
+    /// accepts, and the first it refuses is one that validator would have
+    /// refused too. Widen either number alone and one of these two halves goes
+    /// red.
+    #[test]
+    fn the_longest_projected_launch_name_is_one_the_spawn_will_accept() {
+        use crate::agent_pty::is_valid_display_name;
+
+        let at_ceiling = "n".repeat(MAX_PROJECTED_LAUNCH_NAME_BYTES);
+        let over_ceiling = "n".repeat(MAX_PROJECTED_LAUNCH_NAME_BYTES + 1);
+        // The consumer's half: what the projection admits, the spawn accepts —
+        // and what it refuses, the spawn would have refused.
+        assert!(
+            is_valid_display_name(&at_ceiling),
+            "a name at the projection ceiling must survive the spawn's own validator"
+        );
+        assert!(
+            !is_valid_display_name(&over_ceiling),
+            "one byte past the ceiling must be a name the spawn refuses, or the caps are not aligned"
+        );
+
+        // The projection's half, for both names it sends back: an orchestration's
+        // and a role's.
+        let (_guard, root) = scratch();
+        write_project(
+            &root,
+            &format!(
+                "[[orchestrations]]\nname = \"{at_ceiling}\"\n\n[[orchestrations.roles]]\n\
+                 name = \"{at_ceiling}\"\ncommand = \"cat\"\n"
+            ),
+        );
+        let config = read_project_config(&root).expect("read");
+        let projected = project_config_onto_wire(&root, &config)
+            .expect("a name at the ceiling must be offered, not refused");
+        assert_eq!(projected.len(), 1);
+        assert_eq!(projected[0].name, at_ceiling);
+        assert_eq!(projected[0].roles[0].name, at_ceiling);
     }
 
     /// Concurrent slow resolves: four times as many callers as permits, every

@@ -351,17 +351,61 @@ pub enum TerminalState {
 // PRD #819 M6: the project surface, entirely daemon-sourced.
 //
 // These are the webview's shape for `crate::event::{ProjectListing,
-// ResolvedProject}` — camelCase, and control-stripped through `safe_message`
-// at this seam. The daemon already bounds the COUNTS (its
-// `project_resolve::MAX_*` caps); what is added here is the same display
-// scrubbing every other daemon-sourced string on this boundary gets, because
-// project and orchestration names are config content and the webview renders
-// them into DOM text nodes.
+// ResolvedProject}` — camelCase, and carrying every daemon-supplied identity
+// **byte for byte** alongside a separate, scrubbed, display-only twin.
+//
+// # PRD #819 audit fix (P2, finding 1): why there are two fields, not one
+//
+// The first version of this seam ran each value through [`safe_message`] and
+// kept the result as the ONLY copy. That breaks the principle the whole PRD
+// exists to establish — the daemon owns canonical identity — because the
+// desktop stores these values and later sends them back: `path` becomes
+// `PrepareWorkflow.cwd` and every `StartAgent.cwd`, an orchestration `name`
+// becomes `StartWorkflow.name`, a role `name` becomes the requested role and
+// the pane's `display_name`, and `config_revision` is echoed back so a config
+// edited under the picker is refused. Two concrete failures followed:
+//
+// * **Truncation, strictly inside the wire bounds.** `safe_message` cuts at
+//   [`ERROR_MESSAGE_MAX_CHARS`] **characters** while the daemon accepts a
+//   request path up to `agent_pty::CWD_MAX_LEN` (4096) **bytes**. A canonical
+//   path of 2049..=4096 characters is valid on the wire in both directions and
+//   was displayed AND submitted as a shorter, different path — so the launch
+//   resolved somewhere other than where the user chose, or nowhere.
+// * **Control stripping, which is worse than it first looks.** A canonical
+//   path CAN carry an ASCII control byte — `canonicalize_project_dir` checks
+//   UTF-8 and directory-ness, not control-freeness, and a filename may hold
+//   any byte but `/` and NUL — while `is_valid_cwd` REJECTS those bytes, so
+//   such a path is one the daemon will refuse on the way back. Scrubbing it
+//   does not fix that; it converts a path the daemon would have refused
+//   cleanly into a *different* path the daemon accepts, which may well be
+//   another real project. Carried verbatim, the launch is refused with
+//   `invalid-path`, which is the honest answer for a path this wire cannot
+//   express.
+// * `primary` was scrubbed and so was the `path` it is compared against for
+//   the picker's ACTIVE marker, so the marker worked — but only because the
+//   same mangling was applied to both. Fixing one field and not the other
+//   would have broken it outright, which is why they move together.
+//
+// So the identity is carried verbatim and the escaping moved to a sibling
+// field: `displayPath` / `displayName` are what the webview renders, `path` /
+// `name` / `configRevision` are what goes back to the daemon. Rendering does
+// not require mutating the value that is submitted, and `safe_message` keeps
+// its job on the half that reaches a DOM text node — project and orchestration
+// names are config content, so they are still untrusted text.
 //
 // Nothing here is persisted on either side. A selection is a property of the
 // launch being assembled and dies with it — see the PRD's *Nothing remembers a
 // project*.
 // ---------------------------------------------------------------------------
+
+/// The display-only twin of a daemon-supplied identity.
+///
+/// One named seam rather than a bare [`safe_message`] call per field, so the
+/// two halves of every pair below are visibly a pair, and so `grep display_only`
+/// finds every place a daemon identity is turned into renderable text.
+fn display_only(identity: &str) -> String {
+    safe_message(identity)
+}
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -370,6 +414,10 @@ pub struct DesktopProjectListing {
     /// The project most recently active on this daemon, if any — a fact derived
     /// from live state, never a stored preference. Absent when the daemon has
     /// nothing live, which is the empty state rather than an error.
+    ///
+    /// **Verbatim**, because it is compared against [`DesktopProject::path`] to
+    /// mark the active row: a scrubbed copy of one and a verbatim copy of the
+    /// other would silently stop matching.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub primary: Option<String>,
 }
@@ -377,25 +425,36 @@ pub struct DesktopProjectListing {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DesktopProject {
-    /// The daemon-canonical absolute path. **This is the identity**, and the
-    /// exact string that goes back on `resolve-project`, `prepare-workflow` and
-    /// every `StartAgent.cwd`. The webview must never re-spell it.
+    /// The daemon-canonical absolute path, **byte for byte**. This is the
+    /// identity, and the exact string that goes back on `resolve-project`,
+    /// `prepare-workflow` and every `StartAgent.cwd`. The webview must never
+    /// re-spell it — and, since the audit fix, neither does this seam.
     pub path: String,
-    pub name: String,
+    /// [`Self::path`] made safe to render. Never sent anywhere.
+    pub display_path: String,
+    /// The daemon's projected basename, made safe to render. Display-only on
+    /// both sides: nothing sends a project's *name* back, only its path.
+    pub display_name: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DesktopResolvedProject {
-    /// The canonical path the daemon resolved to, which may differ from the one
-    /// that was sent — an alias or a symlink resolves elsewhere, and
-    /// canonicalising changes the basename an empty orchestration name is
-    /// derived from (PRD #220). This spelling is the one that propagates.
+    /// The canonical path the daemon resolved to, **byte for byte**. It may
+    /// differ from the one that was sent — an alias or a symlink resolves
+    /// elsewhere, and canonicalising changes the basename an empty
+    /// orchestration name is derived from (PRD #220). This spelling is the one
+    /// that propagates, so it is carried unmodified.
     pub path: String,
-    pub name: String,
+    /// [`Self::path`] made safe to render. Never sent anywhere.
+    pub display_path: String,
+    /// The canonical path's basename, made safe to render. Display-only.
+    pub display_name: String,
     pub orchestrations: Vec<DesktopOrchestration>,
     /// Echoed back on the launch so a config edited between the picker and the
-    /// spawn is refused rather than silently launched against.
+    /// spawn is refused rather than silently launched against — so **verbatim**:
+    /// a re-spelled revision would fail the daemon's comparison for a reason
+    /// nobody could see.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub config_revision: Option<String>,
 }
@@ -403,7 +462,11 @@ pub struct DesktopResolvedProject {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DesktopOrchestration {
+    /// **Verbatim** — this goes back as `PrepareWorkflow.orchestration`, and a
+    /// name the daemon offered must be a name the daemon can find again.
     pub name: String,
+    /// [`Self::name`] made safe to render.
+    pub display_name: String,
     pub default: bool,
     pub roles: Vec<DesktopOrchestrationRole>,
 }
@@ -411,19 +474,26 @@ pub struct DesktopOrchestration {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DesktopOrchestrationRole {
+    /// **Verbatim** — `order_workflow_roles` matches the requested roles against
+    /// these by exact name, and the name becomes the pane's `display_name` and
+    /// its `TabMembership.role_name`.
     pub name: String,
+    /// [`Self::name`] made safe to render.
+    pub display_name: String,
     pub start: bool,
 }
 
 fn map_orchestration(orchestration: ProjectOrchestration) -> DesktopOrchestration {
     DesktopOrchestration {
-        name: safe_message(&orchestration.name),
+        display_name: display_only(&orchestration.name),
+        name: orchestration.name,
         default: orchestration.default,
         roles: orchestration
             .roles
             .into_iter()
             .map(|role| DesktopOrchestrationRole {
-                name: safe_message(&role.name),
+                display_name: display_only(&role.name),
+                name: role.name,
                 start: role.start,
             })
             .collect(),
@@ -436,11 +506,12 @@ pub(crate) fn map_project_listing(listing: ProjectListing) -> DesktopProjectList
             .projects
             .into_iter()
             .map(|project| DesktopProject {
-                path: safe_message(&project.path),
-                name: safe_message(&project.name),
+                display_path: display_only(&project.path),
+                display_name: display_only(&project.name),
+                path: project.path,
             })
             .collect(),
-        primary: listing.primary.map(safe_message),
+        primary: listing.primary,
     }
 }
 
@@ -448,21 +519,26 @@ pub(crate) fn map_resolved_project(project: ResolvedProject) -> DesktopResolvedP
     // The display name is the canonical path's basename, derived HERE from the
     // path the daemon returned rather than carried separately: the two must name
     // the same directory, and a second field is a second thing to drift.
-    let path = safe_message(&project.path);
-    let name = path
+    //
+    // It is split off the VERBATIM path and scrubbed afterwards, not off the
+    // scrubbed one: truncating first can cut the basename off entirely, so the
+    // order of those two steps is the difference between a shortened label and
+    // the wrong label.
+    let basename = project
+        .path
         .rsplit('/')
         .find(|segment| !segment.is_empty())
-        .unwrap_or(&path)
-        .to_string();
+        .unwrap_or(project.path.as_str());
     DesktopResolvedProject {
-        path,
-        name,
+        display_path: display_only(&project.path),
+        display_name: display_only(basename),
+        path: project.path,
         orchestrations: project
             .orchestrations
             .into_iter()
             .map(map_orchestration)
             .collect(),
-        config_revision: project.config_revision.map(safe_message),
+        config_revision: project.config_revision,
     }
 }
 
@@ -1181,5 +1257,160 @@ mod tests {
         let error = ensure_desktop_workflow_platform_supported("windows").unwrap_err();
         assert!(error.contains("unavailable on Windows"));
         assert!(error.contains("POSIX-shell quoted"));
+    }
+
+    // -----------------------------------------------------------------------
+    // PRD #819 audit fix (P2, finding 1): daemon identities cross this seam
+    // unmodified, and the escaping lives in a sibling field.
+    // -----------------------------------------------------------------------
+
+    /// A path this seam is not allowed to rewrite, and a name it is.
+    ///
+    /// `\u{1}` is an ASCII control character `safe_message` strips. A canonical
+    /// path can carry one — `canonicalize_project_dir` checks UTF-8 and
+    /// directory-ness, not control-freeness — and `is_valid_cwd` refuses one,
+    /// so this is the shape where scrubbing turned a path the daemon would
+    /// refuse into a *different* path it accepts.
+    const CONTROL: &str = "\u{1}";
+
+    fn control_bearing_path() -> String {
+        format!("/srv/pro{CONTROL}jects/api")
+    }
+
+    /// Scenario: the daemon lists a project whose canonical path carries a
+    /// strippable control character. The DTO must carry that path byte for
+    /// byte — it is the string that goes back on `resolve-project`,
+    /// `prepare-workflow` and every `StartAgent.cwd` — while the display twin
+    /// is scrubbed. `primary` is checked in the same test because the webview
+    /// compares it against `path` to mark the active row: scrubbing one and not
+    /// the other silently breaks that marker.
+    #[test]
+    fn a_control_bearing_canonical_path_reaches_the_daemon_unmodified() {
+        let path = control_bearing_path();
+        let mapped = map_project_listing(ProjectListing {
+            projects: vec![dot_agent_deck::event::KnownProject {
+                path: path.clone(),
+                name: format!("a{CONTROL}pi"),
+            }],
+            primary: Some(path.clone()),
+        });
+
+        assert_eq!(mapped.projects[0].path, path, "the identity was rewritten");
+        assert_eq!(
+            mapped.primary.as_deref(),
+            Some(path.as_str()),
+            "primary must be the same spelling as the path it marks"
+        );
+        assert_eq!(mapped.projects[0].display_path, "/srv/projects/api");
+        assert_eq!(mapped.projects[0].display_name, "api");
+        assert!(
+            !mapped.projects[0].display_path.contains(CONTROL)
+                && !mapped.projects[0].display_name.contains(CONTROL),
+            "the DISPLAY half must still be escaped"
+        );
+    }
+
+    /// Scenario: the daemon resolves a project whose canonical path carries a
+    /// control character and whose config revision is echoed back on the
+    /// launch. Both are identities; the basename shown beside them is not.
+    #[test]
+    fn a_resolved_project_carries_its_path_and_revision_verbatim() {
+        let path = control_bearing_path();
+        let revision = format!("fnv{CONTROL}1a-deadbeef");
+        let mapped = map_resolved_project(ResolvedProject {
+            path: path.clone(),
+            orchestrations: Vec::new(),
+            config_revision: Some(revision.clone()),
+        });
+
+        assert_eq!(mapped.path, path);
+        assert_eq!(
+            mapped.config_revision.as_deref(),
+            Some(revision.as_str()),
+            "a re-spelled revision fails the daemon's comparison for an invisible reason"
+        );
+        assert_eq!(mapped.display_path, "/srv/projects/api");
+        assert_eq!(
+            mapped.display_name, "api",
+            "the basename is split off the VERBATIM path and scrubbed afterwards"
+        );
+    }
+
+    /// Scenario: a canonical path longer than `safe_message`'s 2048-character
+    /// truncation but inside the wire bound the daemon documents
+    /// (`agent_pty::CWD_MAX_LEN`, 4096 bytes). It used to be submitted
+    /// truncated, i.e. as a different directory; it must now survive whole.
+    #[test]
+    fn an_oversized_canonical_path_is_carried_whole_rather_than_truncated() {
+        let path = format!("/{}", "p".repeat(3000));
+        assert!(
+            is_valid_cwd(&path),
+            "the fixture must be inside the daemon's own wire bound, or it proves nothing"
+        );
+        let mapped = map_resolved_project(ResolvedProject {
+            path: path.clone(),
+            orchestrations: Vec::new(),
+            config_revision: None,
+        });
+
+        assert_eq!(mapped.path.len(), path.len());
+        assert_eq!(mapped.path, path);
+        assert_eq!(
+            mapped.display_path.chars().count(),
+            ERROR_MESSAGE_MAX_CHARS,
+            "the display twin is still bounded"
+        );
+    }
+
+    /// Scenario: an orchestration and one of its roles carry control
+    /// characters. Both names are protocol identities — the orchestration's
+    /// goes back as `PrepareWorkflow.orchestration`, the role's is matched by
+    /// `order_workflow_roles` and becomes the pane's `display_name` — so both
+    /// cross verbatim, with escaped twins for the picker.
+    #[test]
+    fn orchestration_and_role_names_reach_the_daemon_unmodified() {
+        let orchestration_name = format!("lo{CONTROL}op");
+        let role_name = format!("plan{CONTROL}ner");
+        let mapped = map_resolved_project(ResolvedProject {
+            path: "/srv/projects/api".into(),
+            orchestrations: vec![ProjectOrchestration {
+                name: orchestration_name.clone(),
+                default: true,
+                roles: vec![dot_agent_deck::event::ProjectRole {
+                    name: role_name.clone(),
+                    start: true,
+                }],
+            }],
+            config_revision: None,
+        });
+
+        let orchestration = &mapped.orchestrations[0];
+        assert_eq!(orchestration.name, orchestration_name);
+        assert_eq!(orchestration.display_name, "loop");
+        assert_eq!(orchestration.roles[0].name, role_name);
+        assert_eq!(orchestration.roles[0].display_name, "planner");
+        assert!(orchestration.roles[0].start);
+    }
+
+    /// Scenario: the longest name the daemon will project is one this crate's
+    /// own launch validation accepts. This is the consumer half of the limit
+    /// reconciliation — the daemon's `MAX_PROJECTED_LAUNCH_NAME_BYTES` is now
+    /// `agent_pty::DISPLAY_NAME_MAX_LEN`, so the offered set is the launchable
+    /// set and `validate_workflow_shape` cannot refuse a name the picker
+    /// offered on length alone.
+    #[test]
+    fn the_longest_projected_name_passes_desktop_launch_validation() {
+        use dot_agent_deck::project_resolve::MAX_PROJECTED_LAUNCH_NAME_BYTES;
+
+        let at_ceiling = "n".repeat(MAX_PROJECTED_LAUNCH_NAME_BYTES);
+        let roles = vec![WorkflowRoleInput {
+            role: at_ceiling.clone(),
+            command: "claude".into(),
+            start: true,
+        }];
+        assert!(
+            validate_workflow_shape(&at_ceiling, "/tmp/project", &roles, 32, 120).is_ok(),
+            "a workflow and role name at the daemon's projection ceiling must be launchable"
+        );
     }
 }

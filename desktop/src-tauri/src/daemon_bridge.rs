@@ -335,6 +335,60 @@ async fn hello(socket_path: &Path) -> Result<(HandshakeInfo, AttachResponse), St
     Ok((info, response))
 }
 
+/// PRD #819 audit fix (P2, finding 2): re-verify, immediately before a
+/// **prepared** spawn, that the daemon behind this endpoint is still one that
+/// enforces preparation tokens.
+///
+/// # The window this closes, and the sliver it does not
+///
+/// The capability and the exact-equality protocol check run **once**, in
+/// [`trusted_daemon`], before `PrepareWorkflow`. Each role is then started on a
+/// **separate** connection: `DaemonClient::connect` is a bare
+/// `IpcStream::connect` and `issue_json_command` writes one request frame and
+/// reads one response, so **no `Hello` is exchanged on those connections and
+/// the protocol version is never re-checked there**. The `prep_token` rides as
+/// an additive JSON key, and an older daemon accepts the stable `StartAgent`
+/// shape, ignores the unknown key, and starts the role with no preparation
+/// enforcement whatsoever — fail-OPEN, during exactly the interval the token
+/// exists to protect. (A *same-version* replacement fails closed: it has no
+/// token store, so it refuses with `stale-token`.)
+///
+/// Calling this before each prepared spawn narrows that interval from "the whole
+/// preparation-to-launch sequence" — a `PrepareWorkflow` round trip plus every
+/// preceding role's spawn, so hundreds of milliseconds at least — to the gap
+/// between two consecutive `connect()` calls on the same socket. It does **not
+/// close it**: the check and the spawn are still two connections, and nothing
+/// on this protocol can carry both on one: `handle_connection` decodes exactly
+/// one `KIND_REQ` frame per connection before dispatching, and the later reads
+/// on an attach connection are stream frames rather than requests. The residual
+/// is recorded as an accepted risk in
+/// `prds/819-move-project-resolution-daemon-side.md`; closing it needs a
+/// prepared-start verb an older daemon rejects as an unknown variant, which is
+/// a scope decision rather than an implementation detail.
+///
+/// # Why both checks and not just the capability
+///
+/// The capability alone is the weaker half: a v8 daemon advertises no
+/// capabilities at all, so `require` already withholds — but a daemon
+/// advertising an unexpected set is not the case that matters. The
+/// exact-equality protocol comparison inside [`classify_handshake`] is what
+/// actually names "this is not the wire we prepared against", and it is the
+/// same gate `require_compatible` applies at the top of the action. Both are
+/// read off ONE `Hello` reply, so this costs one round trip on a Unix socket.
+pub(crate) async fn verify_prepared_launch_peer(socket_path: &Path) -> Result<(), String> {
+    let (info, response) = hello(socket_path).await?;
+    if info.status != ConnectionStatus::Connected {
+        return Err(info.error.unwrap_or_else(|| {
+            "the daemon behind this endpoint is no longer protocol-compatible; refusing to spawn \
+             a prepared role against it"
+                .into()
+        }));
+    }
+    dot_agent_deck::daemon_client::DaemonCapabilities::from_hello(&response)
+        .require(dot_agent_deck::daemon_protocol::CAP_PREPARE_WORKFLOW)
+        .map_err(|error| safe_message(error.to_string()))
+}
+
 pub(crate) async fn trusted_daemon() -> Result<TrustedDaemon, String> {
     let socket_path = dot_agent_deck::config::attach_socket_path();
     dot_agent_deck::platform::fsperm::verify_endpoint_trusted(&socket_path).map_err(|reason| {
