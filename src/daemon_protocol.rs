@@ -343,7 +343,54 @@ pub const PROJECT_ERR_TASK_REJECTED: &str = "task-rejected";
 /// an empty payload for the same reason: a client — or a test — cannot tell an
 /// empty answer apart from a real one. A panic was the other option and is
 /// worse; `handle_connection` serves other clients.
+///
+/// **No arm of this build's dispatch returns it any more.** M3 landed
+/// `list-projects` and `resolve-project`, M4 landed `prepare-workflow`, and the
+/// helper that produced this refusal went with the last of them. The constant
+/// stays because it is the thing the behaviour tests assert an answer is *not*:
+/// a refusal that comes from resolving a project and a refusal that comes from
+/// there being no implementation are indistinguishable to a caller that cannot
+/// name the difference, and that is exactly how an implementation gets quietly
+/// reverted. Keep it, and give it back to any verb this file grows a stub for.
 pub const PROJECT_ERR_UNIMPLEMENTED: &str = "unimplemented";
+
+/// PRD #819 M4: the caller's [`AttachRequest::PrepareWorkflow::config_revision`]
+/// does not match the config the daemon just read.
+///
+/// The client resolved against one snapshot and is asking to launch against
+/// another. Refusing is what closes the TOCTOU window between the picker, the
+/// write and the spawn; the remedy is to resolve again, which is what the
+/// sentence says.
+pub const PROJECT_ERR_STALE_REVISION: &str = "stale-revision";
+
+/// PRD #819 M4: the project resolved, but defines no role-bearing orchestration
+/// under the requested name.
+///
+/// A separate code from [`PROJECT_ERR_UNRESOLVED`] because it is a different
+/// fact and a different remedy — the project is fine and the *name* is wrong —
+/// and because it is only reachable once the path has already resolved, so it
+/// discloses nothing that refusal was protecting. The sentence still names no
+/// available orchestration: that is config content for a path the caller may
+/// merely have pasted.
+pub const PROJECT_ERR_NO_ORCHESTRATION: &str = "no-such-orchestration";
+
+/// PRD #819 M4: the project and the orchestration resolved, but the coordinator
+/// context could not be published.
+///
+/// See [`crate::orchestrator_context::ContextPublishError::client_sentence`] for
+/// what the text after it is allowed to say and why it is allowed to be more
+/// specific than [`crate::project_resolve::generic_refusal`].
+pub const PROJECT_ERR_PUBLISH_FAILED: &str = "publish-failed";
+
+/// PRD #819 M4: an [`AttachRequest::StartAgent`] presented a `prep_token` this
+/// daemon did not issue, or issued longer ago than
+/// [`crate::prep_token::PREP_TOKEN_TTL`].
+///
+/// One code for both, because they are one answer: the token does not identify
+/// a live preparation. Read [`crate::prep_token`]'s module doc before treating
+/// this as an authorization failure — it is not one, and an absent token is not
+/// refused at all.
+pub const PROJECT_ERR_STALE_TOKEN: &str = "stale-token";
 
 /// PRD #819 M3: the ONE code carried by every refusal that comes from
 /// *resolving* a path against a filesystem.
@@ -706,10 +753,18 @@ pub enum AttachRequest {
         /// the desktop's own 64 KiB check is a UI affordance and not a bound
         /// this daemon may rely on.
         task: String,
-        /// The config revision the client believes it resolved against. Stale
-        /// values are refused, which is what closes the TOCTOU window between
-        /// the picker, the write and the spawn. `#[serde(default)]` so a client
-        /// that has not yet got one can omit the key.
+        /// The config revision the client believes it resolved against, as
+        /// [`crate::event::ResolvedProject::config_revision`] handed it back.
+        /// Stale values are refused with [`PROJECT_ERR_STALE_REVISION`], which
+        /// is what closes the TOCTOU window between the picker, the write and
+        /// the spawn.
+        ///
+        /// `#[serde(default)]`, and **absent means "no expectation" rather than
+        /// "any revision"** — a client that has not resolved yet must still be
+        /// able to launch, which is what keeps the field additive. It is not a
+        /// degrade-to-unauthorized of the #608 kind: there is no authorization
+        /// here to degrade from, only a staleness check the caller can decline
+        /// to make.
         #[serde(default)]
         config_revision: Option<String>,
     },
@@ -767,6 +822,36 @@ struct WriteAndSubmitExtras {
     /// failure never double-submits (R20-004).
     #[serde(default)]
     delivery_id: Option<String>,
+}
+
+/// PRD #819 M4: the optional preparation token that rides alongside an
+/// [`AttachRequest::StartAgent`] request as an extra JSON key.
+///
+/// **Not declared on the enum variant, and for the same reason
+/// [`WriteAndSubmitExtras`] is not.** `StartAgent`'s nine-field shape is
+/// constructed as an exhaustive struct literal at call sites across `src/` and
+/// `tests/`, and widening the variant would break every one of them at compile
+/// time — including the e2e suite that specifies this milestone. The handler
+/// re-parses the SAME request payload into this struct; the field is
+/// `#[serde(default)]`, so a client that omits it decodes to `None`, and unknown
+/// keys on the base variant are ignored by serde, so the two parses of one
+/// payload never conflict.
+///
+/// **An absent token changes nothing.** `StartAgent` behaves exactly as it did
+/// before this field existed — the TUI, the desktop and every existing test call
+/// it without one, and none of them may break. A *present* token is validated
+/// and a stale or unknown value is refused with
+/// [`PROJECT_ERR_STALE_TOKEN`]. That asymmetry is deliberate and is not a
+/// degrade-to-unauthorized hole of the #608 kind: the token is not an
+/// authorization token at all (see [`crate::prep_token`]'s module doc), so
+/// "absent means unauthorized" would be claiming a boundary this socket does not
+/// have.
+#[derive(Debug, Default, Deserialize)]
+struct StartAgentExtras {
+    /// The token a [`AttachRequest::PrepareWorkflow`] handed back, if the caller
+    /// is spawning the roles of a prepared workflow.
+    #[serde(default)]
+    prep_token: Option<String>,
 }
 
 /// PRD #161 M1.1: a snapshot of the agents the daemon is currently managing,
@@ -1788,6 +1873,49 @@ async fn handle_connection(
                 return Ok(());
             }
 
+            // PRD #819 M4: a spawn that is part of a prepared workflow MAY carry
+            // the token `PrepareWorkflow` handed back, as an extra JSON key
+            // alongside the base variant (see `StartAgentExtras`). Absent, this
+            // is a no-op and the arm behaves exactly as it did before the field
+            // existed. Present, a token this daemon did not issue — or issued
+            // longer ago than `prep_token::PREP_TOKEN_TTL` — is refused before
+            // anything is spawned.
+            //
+            // The base variant already decoded, and every field of the extras is
+            // `Option<String>` with `#[serde(default)]`, so the only way this
+            // re-parse of the same payload can fail is a `prep_token` key that is
+            // PRESENT with the wrong JSON type. Refuse that rather than
+            // `unwrap_or_default`-ing it into an absent token: a caller that
+            // meant to present a token and malformed it should hear about it,
+            // not be silently downgraded to the token-less path.
+            let extras: StartAgentExtras = match serde_json::from_slice(&frame.1) {
+                Ok(extras) => extras,
+                Err(e) => {
+                    write_resp(
+                        &mut stream,
+                        &AttachResponse::err(format!(
+                            "{PROJECT_ERR_STALE_TOKEN}: malformed prep token — refusing the \
+                             spawn: {e}"
+                        )),
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            };
+            if let Some(token) = extras.prep_token.as_deref()
+                && !crate::prep_token::is_valid(token)
+            {
+                write_resp(
+                    &mut stream,
+                    &AttachResponse::err(format!(
+                        "{PROJECT_ERR_STALE_TOKEN}: that preparation is unknown or has expired; \
+                         prepare the workflow again"
+                    )),
+                )
+                .await?;
+                return Ok(());
+            }
+
             // PRD #93 round-5: capture the bits we need to populate the
             // daemon's `AppState` role map BEFORE the spawn (we'll need
             // the pane id from env and the orchestration metadata from
@@ -2591,10 +2719,13 @@ async fn handle_connection(
             };
             write_resp(&mut stream, &resp).await?
         }
-        // PRD #819 M4 still owns this one: the coordinator-context publish has
-        // to be atomic, owner-only and symlink-safe before the verb can report
-        // success, so the arm keeps answering `unimplemented` rather than
-        // publishing unsafely in the meantime.
+        // PRD #819 M4: the only project verb that writes. Resolve one validated
+        // config snapshot, check the revision the client believes it resolved
+        // against, find the orchestration, compose the coordinator context and
+        // publish it — then report success. Nothing is started here, and a
+        // failure at any step returns before the publish, which is what makes
+        // "a failed preparation starts no roles" a property of the ordering
+        // rather than of a cleanup path.
         //
         // Every field bound, with no `..` rest pattern, so the next field added
         // to the variant is a compile error at this seam rather than a value
@@ -2602,13 +2733,48 @@ async fn handle_connection(
         // having made with `orchestration_cwd`.
         AttachRequest::PrepareWorkflow {
             path,
-            orchestration: _,
+            orchestration,
             task,
-            config_revision: _,
+            config_revision,
         } => {
             let resp = match validate_project_path(&path).and_then(|()| validate_task(&task)) {
                 Err(message) => AttachResponse::err(message),
-                Ok(()) => unimplemented_project_verb(CAP_PREPARE_WORKFLOW),
+                Ok(()) => {
+                    // Same seed set, same reason, as the resolve arm: it is pure
+                    // in-memory state and it is what decides whether a refusal
+                    // carries the detailed diagnostic.
+                    let seeds = project_candidates(&registry, &state, &scheduler).await;
+                    // One `run_bounded` call, so the whole resolve → read →
+                    // compose → publish sequence runs on ONE blocking thread
+                    // under ONE permit. Splitting it would mean acquiring a
+                    // second permit from inside work that already holds one,
+                    // which is the shape that deadlocks a bounded pool.
+                    match crate::project_resolve::run_bounded(move || {
+                        crate::project_resolve::prepare_workflow_for_wire(
+                            &path,
+                            &orchestration,
+                            &task,
+                            config_revision.as_deref(),
+                            &seeds,
+                        )
+                    })
+                    .await
+                    {
+                        Ok(Ok(prepared)) => {
+                            let mut resp = AttachResponse::ok();
+                            resp.workflow_prepared = Some(prepared);
+                            resp
+                        }
+                        Ok(Err(refusal)) => AttachResponse::err(refusal),
+                        Err(e) => {
+                            warn!(reason = %e, "prepare-workflow could not complete");
+                            AttachResponse::err(format!(
+                                "{PROJECT_ERR_UNRESOLVED}: {}",
+                                crate::project_resolve::ProjectResolveError::Internal.detail()
+                            ))
+                        }
+                    }
+                }
             };
             write_resp(&mut stream, &resp).await?
         }
@@ -2727,23 +2893,6 @@ fn validate_task(task: &str) -> Result<(), String> {
         ));
     }
     Ok(())
-}
-
-/// PRD #819 M2: the refusal a project verb returns when its arguments were
-/// accepted but this build has no implementation behind it.
-///
-/// Deliberately not `ok: true` with an empty payload (indistinguishable from a
-/// real empty answer) and deliberately not a `todo!()` (a panic in a connection
-/// handler takes down a task that is serving other clients).
-///
-/// M3 landed the behaviour behind `list-projects` and `resolve-project`, so
-/// [`AttachRequest::PrepareWorkflow`] is the one verb still answering this;
-/// M4 lands the safe publish behind it.
-fn unimplemented_project_verb(capability: &str) -> AttachResponse {
-    AttachResponse::err(format!(
-        "{PROJECT_ERR_UNIMPLEMENTED}: this daemon build accepts `{capability}` but does not \
-         implement it yet (PRD #819 M2 landed the wire contract; M4 lands the safe publish)"
-    ))
 }
 
 // CodeRabbit Fix C fixup: bound the response write with `CLIENT_WRITE_TIMEOUT`.

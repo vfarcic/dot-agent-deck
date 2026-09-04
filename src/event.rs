@@ -1033,6 +1033,26 @@ pub struct ResolvedProject {
     pub path: String,
     #[serde(default)]
     pub orchestrations: Vec<ProjectOrchestration>,
+    /// PRD #819 M4: an opaque identifier for the exact config bytes this
+    /// resolution was computed from.
+    ///
+    /// The client echoes it back on
+    /// [`crate::daemon_protocol::AttachRequest::PrepareWorkflow`], and a
+    /// mismatch is refused — which is what closes the window between the
+    /// picker's resolve and the launch's write. Derived from the config
+    /// **content** as read (see
+    /// [`crate::project_resolve::config_revision`]), never from mtime or size:
+    /// those collide, and a `git checkout` or a `cp -p` perturbs them without a
+    /// real change.
+    ///
+    /// Additive on a response type: `#[serde(default)]` plus
+    /// `skip_serializing_if`, so an older daemon's reply omits the key and
+    /// decodes to `None`, and an older client ignores it. No further
+    /// `PROTOCOL_VERSION` move — that is the exemption
+    /// [`crate::daemon_protocol::PROTOCOL_VERSION`]'s own policy grants
+    /// response fields.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_revision: Option<String>,
 }
 
 /// One orchestration in a [`ResolvedProject`].
@@ -1074,8 +1094,13 @@ pub struct PreparedWorkflow {
     /// [`crate::daemon_protocol::AttachRequest::StartAgent`] calls (PRD #819
     /// Open Question 5, settled in favour of the smaller change), so the
     /// atomicity the launch verb promises has to be policed across that gap:
-    /// the sequence presents this token and stale use is refused. Issuance and
-    /// checking arrive with M4 — M2 carries the field.
+    /// the sequence presents this token and stale use is refused.
+    ///
+    /// M4 landed issuance ([`crate::prep_token::issue`]) and checking (the
+    /// `prep_token` extra key on `start-agent`). **Read
+    /// [`crate::prep_token`]'s module doc before treating it as anything more
+    /// than a staleness check** — it is not an authorization token, presenting
+    /// it is optional, and the attach socket is not a privilege boundary.
     pub token: String,
     #[serde(default)]
     pub roles: Vec<ProjectRole>,

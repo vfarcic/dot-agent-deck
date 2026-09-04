@@ -30,6 +30,8 @@ fn sample_role() -> ProjectRole {
 fn sample_resolved() -> ResolvedProject {
     ResolvedProject {
         path: "/home/dev/project".into(),
+        // PRD #819 M4: the revision the client echoes back on `PrepareWorkflow`.
+        config_revision: Some("fnv1a128-0123456789abcdef0123456789abcdef".into()),
         orchestrations: vec![ProjectOrchestration {
             name: "dispatch".into(),
             default: true,

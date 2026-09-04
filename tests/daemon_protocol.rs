@@ -42,9 +42,10 @@ use dot_agent_deck::agent_pty::{AgentPtyRegistry, AgentRecord};
 use dot_agent_deck::daemon_protocol::{
     AttachRequest, AttachResponse, DAEMON_CAPABILITIES, KIND_DETACH, KIND_REQ, KIND_RESP,
     KIND_STREAM_END, KIND_STREAM_IN, KIND_STREAM_OUT, KIND_STREAM_REJECT, PROJECT_ERR_INVALID_PATH,
-    PROJECT_ERR_TASK_REJECTED, PROJECT_ERR_UNIMPLEMENTED, PROJECT_ERR_UNRESOLVED, PROTOCOL_VERSION,
-    RunningAgentsSummary, TabMembership, bind_attach_listener, serve_attach_with_counter,
-    write_resp,
+    PROJECT_ERR_NO_ORCHESTRATION, PROJECT_ERR_PUBLISH_FAILED, PROJECT_ERR_STALE_REVISION,
+    PROJECT_ERR_STALE_TOKEN, PROJECT_ERR_TASK_REJECTED, PROJECT_ERR_UNIMPLEMENTED,
+    PROJECT_ERR_UNRESOLVED, PROTOCOL_VERSION, RunningAgentsSummary, TabMembership,
+    bind_attach_listener, serve_attach_with_counter, write_resp,
 };
 use dot_agent_deck::event::{
     AgentEvent, AgentType, EventType, LiveTarget, SendResult, TargetKind, Writable,
@@ -1107,15 +1108,17 @@ async fn unknown_op_returns_structured_error_not_a_panic() {
 /// on behaviour instead of on an `unknown variant` error indistinguishable from
 /// a typo.
 ///
-/// M3 landed the behaviour behind two of the three, so what each verb answers
-/// now differs and this test pins both halves: `prepare-workflow` is the one
-/// still reporting `unimplemented` (M4 lands its safe publish), while
-/// `list-projects` and `resolve-project` answer for real — the first with a
-/// listing, the second with a bounded refusal for a directory that is not a
-/// project. Neither may report `unimplemented` any more, which is what would
-/// otherwise let the implementation be quietly reverted.
+/// M3 landed the behaviour behind two of the three and **M4 landed the third**,
+/// so this test now pins the same claim for all of them: every verb answers for
+/// real, and none may report `unimplemented` any more — which is what would
+/// otherwise let an implementation be quietly reverted and read as a stub.
+///
+/// `/tmp` exists and is a directory but holds no `.dot-agent-deck.toml`, so both
+/// `resolve-project` and `prepare-workflow` reach the resolver proper and refuse
+/// with the bounded `unresolved` code rather than at a boundary check. That is
+/// the interesting refusal: it proves the verb did filesystem work.
 #[tokio::test]
-async fn project_verbs_are_reachable_and_only_prepare_workflow_is_unimplemented() {
+async fn project_verbs_are_reachable_and_none_report_unimplemented() {
     let server = start_server().await;
 
     let resp = issue_json_request(
@@ -1132,10 +1135,24 @@ async fn project_verbs_are_reachable_and_only_prepare_workflow_is_unimplemented(
         !resp.ok,
         "prepare-workflow must not report a hollow success"
     );
+    assert!(
+        resp.workflow_prepared.is_none(),
+        "a refusal carries no PreparedWorkflow"
+    );
     let error = resp.error.unwrap_or_default();
     assert!(
-        error.starts_with(PROJECT_ERR_UNIMPLEMENTED),
-        "prepare-workflow must still refuse with the `{PROJECT_ERR_UNIMPLEMENTED}` code, got {error:?}"
+        !error.starts_with(PROJECT_ERR_UNIMPLEMENTED),
+        "M4 landed the safe publish, so prepare-workflow must never answer \
+         `{PROJECT_ERR_UNIMPLEMENTED}` again: {error:?}"
+    );
+    assert!(
+        error.starts_with(PROJECT_ERR_UNRESOLVED),
+        "/tmp is not a project, so prepare-workflow must refuse it with the bounded \
+         `{PROJECT_ERR_UNRESOLVED}` code, got {error:?}"
+    );
+    assert!(
+        !error.contains("/tmp"),
+        "an arbitrary path must not be echoed back: {error:?}"
     );
     assert!(
         !error.contains("malformed request"),
@@ -1243,8 +1260,10 @@ async fn prepare_workflow_bounds_the_task_at_the_boundary() {
     );
 
     // Exactly at the limit is accepted by the bound, so it falls through to the
-    // not-implemented refusal — which is how we know the bound is a bound and
-    // not an off-by-one that rejects legitimate input.
+    // resolver and refuses on `/tmp` not being a project — which is how we know
+    // the bound is a bound and not an off-by-one that rejects legitimate input.
+    // (Before M4 the fall-through landed on `unimplemented`; the claim being
+    // pinned is unchanged — the task got PAST the length check.)
     let at_limit = "x".repeat(dot_agent_deck::bounded_read::MAX_TASK_BYTES as usize);
     let resp = issue_json_request(
         &server,
@@ -1260,8 +1279,8 @@ async fn prepare_workflow_bounds_the_task_at_the_boundary() {
     assert!(
         resp.error
             .as_deref()
-            .is_some_and(|e| e.starts_with(PROJECT_ERR_UNIMPLEMENTED)),
-        "a task exactly at the limit must pass the bound, got {:?}",
+            .is_some_and(|e| e.starts_with(PROJECT_ERR_UNRESOLVED)),
+        "a task exactly at the limit must pass the bound and reach the resolver, got {:?}",
         resp.error
     );
 }
@@ -1289,6 +1308,302 @@ async fn prepare_workflow_validates_the_path_before_the_task() {
             .as_deref()
             .is_some_and(|e| e.starts_with(PROJECT_ERR_INVALID_PATH)),
         "path validation runs first, got {:?}",
+        resp.error
+    );
+}
+
+/// A minimal real project, minted inside the per-test scratch root.
+///
+/// Returns the CANONICAL directory: the harness temp base can itself sit behind
+/// a symlink, and PRD #819's whole point is that one canonical spelling carries
+/// end to end — so a test that compared against the raw spelling would fail for
+/// a reason that has nothing to do with the verb.
+fn mint_project(toml: &str) -> (TempDir, PathBuf) {
+    let dir = test_temp::tempdir().expect("mint the project sandbox");
+    std::fs::write(dir.path().join(".dot-agent-deck.toml"), toml).expect("seed the project config");
+    let canonical = std::fs::canonicalize(dir.path()).expect("canonicalize the project sandbox");
+    (dir, canonical)
+}
+
+const LAUNCHABLE_PROJECT: &str = r#"
+[[orchestrations]]
+name = "loop"
+
+[[orchestrations.roles]]
+name = "planner"
+command = "cat"
+start = true
+prompt_template = "Coordinate through the configured team."
+
+[[orchestrations.roles]]
+name = "builder"
+command = "cat"
+description = "Implements the requested change"
+"#;
+
+/// PRD #819 M4: `ResolveProject` hands back a revision derived from the config
+/// bytes, `PrepareWorkflow` echoes it, and a revision that no longer matches the
+/// file on disk is refused — **before** anything is published.
+///
+/// The ordering is the assertion that matters. A stale revision that were
+/// checked after the write would still report an error while having already
+/// replaced the coordinator context, which is the TOCTOU this field exists to
+/// close rather than to describe.
+#[tokio::test]
+async fn prepare_workflow_refuses_a_stale_config_revision_before_publishing() {
+    let server = start_server().await;
+    let (_dir, project) = mint_project(LAUNCHABLE_PROJECT);
+    let context = project
+        .join(".dot-agent-deck")
+        .join("orchestrator-context.md");
+
+    let resp = issue_json_request(
+        &server,
+        serde_json::json!({ "op": "resolve-project", "path": project.to_str().unwrap() }),
+    )
+    .await;
+    assert!(resp.ok, "resolve must succeed: {:?}", resp.error);
+    let resolved = resp.project.expect("a ResolvedProject");
+    let revision = resolved
+        .config_revision
+        .expect("PRD #819 M4: a resolve carries the revision the launch echoes back");
+
+    // The config changes underneath the client. Nothing tells it; that is the
+    // window.
+    std::fs::write(
+        project.join(".dot-agent-deck.toml"),
+        LAUNCHABLE_PROJECT.replace("Implements the requested change", "Something else entirely"),
+    )
+    .expect("rewrite the project config");
+
+    let resp = issue_json_request(
+        &server,
+        serde_json::json!({
+            "op": "prepare-workflow",
+            "path": project.to_str().unwrap(),
+            "orchestration": "loop",
+            "task": "Launch against a snapshot that no longer exists.",
+            "config_revision": revision,
+        }),
+    )
+    .await;
+    assert!(!resp.ok, "a stale revision must be refused");
+    assert!(
+        resp.workflow_prepared.is_none(),
+        "a refused preparation carries no PreparedWorkflow"
+    );
+    let error = resp.error.unwrap_or_default();
+    assert!(
+        error.starts_with(PROJECT_ERR_STALE_REVISION),
+        "expected the stable `{PROJECT_ERR_STALE_REVISION}` code, got {error:?}"
+    );
+    assert!(
+        !context.exists(),
+        "the revision check must run BEFORE the publish, but {} was written",
+        context.display()
+    );
+
+    // An ABSENT revision means "I have no expectation", not "any revision" — the
+    // client that has not resolved yet must still be able to launch, which is
+    // what keeps the field additive rather than a new requirement.
+    let resp = issue_json_request(
+        &server,
+        serde_json::json!({
+            "op": "prepare-workflow",
+            "path": project.to_str().unwrap(),
+            "orchestration": "loop",
+            "task": "Launch with no revision expectation.",
+        }),
+    )
+    .await;
+    assert!(
+        resp.ok,
+        "a preparation that names no revision must still succeed: {:?}",
+        resp.error
+    );
+    assert!(context.is_file(), "and it must publish the context");
+}
+
+/// PRD #819 M4: a preparation that fails publishes nothing and starts nothing.
+///
+/// The e2e (`project/launch/001`) pins the same claim through a real
+/// `daemon serve`; this is the fast-tier half, and it is here because "starts no
+/// roles" is a property of the ORDERING — every step that can fail runs before
+/// the publish, and the verb spawns nothing at all — which is cheapest to
+/// regress and cheapest to catch.
+#[tokio::test]
+async fn a_failed_preparation_publishes_nothing_and_starts_no_roles() {
+    let server = start_server().await;
+    let (_dir, project) = mint_project(LAUNCHABLE_PROJECT);
+    let context = project
+        .join(".dot-agent-deck")
+        .join("orchestrator-context.md");
+
+    assert!(
+        server.registry.agent_records().is_empty(),
+        "precondition: no panes before the preparation"
+    );
+
+    let resp = issue_json_request(
+        &server,
+        serde_json::json!({
+            "op": "prepare-workflow",
+            "path": project.to_str().unwrap(),
+            "orchestration": "no-such-orchestration",
+            "task": "This preparation must fail.",
+        }),
+    )
+    .await;
+    assert!(!resp.ok, "an unknown orchestration must be refused");
+    let error = resp.error.unwrap_or_default();
+    assert!(
+        error.starts_with(PROJECT_ERR_NO_ORCHESTRATION),
+        "expected `{PROJECT_ERR_NO_ORCHESTRATION}`, got {error:?}"
+    );
+    assert!(
+        !error.contains("loop"),
+        "the refusal must not enumerate the orchestrations the config declares: {error:?}"
+    );
+    assert!(
+        !context.exists(),
+        "a failed preparation must publish nothing, but {} was written",
+        context.display()
+    );
+    assert!(
+        server.registry.agent_records().is_empty(),
+        "a failed preparation must start no roles"
+    );
+}
+
+/// PRD #819 M4: the publish's symlink refusal is reachable **through the verb**,
+/// not only through a direct call to the publish function.
+///
+/// `tests/context_publish.rs` pins the publish primitive's six hardening cases
+/// in isolation. This one pins that the daemon actually routes through it: a
+/// project whose `.dot-agent-deck` is a symlink refuses the launch with the
+/// stable `publish-failed` code, writes nothing through the link, and starts
+/// nothing.
+#[tokio::test]
+async fn prepare_workflow_refuses_a_symlinked_context_directory() {
+    let server = start_server().await;
+    let (_dir, project) = mint_project(LAUNCHABLE_PROJECT);
+
+    // The link target sits outside the project, which is the shape that matters:
+    // a publish that followed it would write the coordinator context — task,
+    // prompt template, role descriptions — somewhere the operator never named.
+    let elsewhere = test_temp::tempdir().expect("mint the link target");
+    let elsewhere = std::fs::canonicalize(elsewhere.path()).expect("canonicalize the link target");
+    std::os::unix::fs::symlink(&elsewhere, project.join(".dot-agent-deck"))
+        .expect("symlink .dot-agent-deck out of the project");
+
+    let resp = issue_json_request(
+        &server,
+        serde_json::json!({
+            "op": "prepare-workflow",
+            "path": project.to_str().unwrap(),
+            "orchestration": "loop",
+            "task": "This must not be written through a symlink.",
+        }),
+    )
+    .await;
+    assert!(!resp.ok, "a symlinked .dot-agent-deck must be refused");
+    assert!(resp.workflow_prepared.is_none());
+    let error = resp.error.unwrap_or_default();
+    assert!(
+        error.starts_with(PROJECT_ERR_PUBLISH_FAILED),
+        "expected `{PROJECT_ERR_PUBLISH_FAILED}`, got {error:?}"
+    );
+    assert!(
+        !elsewhere.join("orchestrator-context.md").exists(),
+        "nothing may be written through the link, but {} exists",
+        elsewhere.join("orchestrator-context.md").display()
+    );
+    assert!(
+        server.registry.agent_records().is_empty(),
+        "a failed preparation must start no roles"
+    );
+}
+
+/// PRD #819 M4: `StartAgent` may carry the preparation token as an extra JSON
+/// key. **Absent, nothing changes**; present, an unknown or expired value is
+/// refused before anything is spawned.
+///
+/// The absent half is the one that would break the world quietly: the TUI, the
+/// desktop and every existing test call `start-agent` without a token, and a
+/// field that fails closed would have taken all of them down.
+#[tokio::test]
+async fn start_agent_ignores_an_absent_prep_token_and_refuses_an_unknown_one() {
+    let server = start_server().await;
+    let (_dir, project) = mint_project(LAUNCHABLE_PROJECT);
+
+    // Absent: unchanged. This is the same request shape every existing caller
+    // sends.
+    let resp = issue_json_request(
+        &server,
+        serde_json::json!({ "op": "start-agent", "command": "/bin/sh", "rows": 24, "cols": 80 }),
+    )
+    .await;
+    assert!(
+        resp.ok && resp.id.is_some(),
+        "start-agent with no prep token must behave exactly as before: {:?}",
+        resp.error
+    );
+    let spawned = server.registry.agent_records().len();
+
+    // Present and unknown: refused, and nothing spawned.
+    let resp = issue_json_request(
+        &server,
+        serde_json::json!({
+            "op": "start-agent",
+            "command": "/bin/sh",
+            "rows": 24,
+            "cols": 80,
+            "prep_token": "prep-0000000000000000000000000000000",
+        }),
+    )
+    .await;
+    assert!(!resp.ok, "an unknown prep token must be refused");
+    assert!(resp.id.is_none(), "a refused start-agent starts nothing");
+    let error = resp.error.unwrap_or_default();
+    assert!(
+        error.starts_with(PROJECT_ERR_STALE_TOKEN),
+        "expected `{PROJECT_ERR_STALE_TOKEN}`, got {error:?}"
+    );
+    assert_eq!(
+        server.registry.agent_records().len(),
+        spawned,
+        "a refused start-agent must not have spawned a pane"
+    );
+
+    // Present and freshly issued: accepted. Without this half the test above
+    // would pass against a daemon that rejected every token.
+    let resp = issue_json_request(
+        &server,
+        serde_json::json!({
+            "op": "prepare-workflow",
+            "path": project.to_str().unwrap(),
+            "orchestration": "loop",
+            "task": "Mint a token to spawn with.",
+        }),
+    )
+    .await;
+    assert!(resp.ok, "the preparation must succeed: {:?}", resp.error);
+    let token = resp.workflow_prepared.expect("a PreparedWorkflow").token;
+
+    let resp = issue_json_request(
+        &server,
+        serde_json::json!({
+            "op": "start-agent",
+            "command": "/bin/sh",
+            "rows": 24,
+            "cols": 80,
+            "prep_token": token,
+        }),
+    )
+    .await;
+    assert!(
+        resp.ok && resp.id.is_some(),
+        "a freshly issued prep token must be accepted: {:?}",
         resp.error
     );
 }

@@ -41,6 +41,9 @@ pub mod pane;
 pub mod pane_input;
 pub mod pane_screen_text;
 pub mod platform;
+// PRD #819 M4: the short-lived preparation token that bridges the gap between
+// the launch verb and the `StartAgent` sequence that actually spawns.
+pub mod prep_token;
 pub mod project_config;
 // PRD #819 M3: the bounded, symlink-safe project reader and the daemon-side
 // enumeration built on it. Separate from `project_config` because the loader

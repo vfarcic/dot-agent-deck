@@ -406,14 +406,58 @@ pub fn read_config_file(path: &Path) -> Result<String, ProjectResolveError> {
     )
 }
 
+/// An opaque revision identifier for one config file's exact bytes.
+///
+/// **Derived from the content as read**, and deliberately not from mtime or
+/// size: those two collide (any edit that preserves length, on a filesystem
+/// whose timestamp granularity the edit fits inside) and, in the other
+/// direction, a `git checkout` or a `cp -p` perturbs them without a real change
+/// — so a metadata revision both misses changes and invents them.
+///
+/// FNV-1a, 128-bit, over the bytes [`read_config_file`] returned, prefixed with
+/// the scheme so a later derivation can be told apart from this one rather than
+/// silently compared against it. FNV-1a rather than
+/// [`std::hash::DefaultHasher`] for the reason
+/// [`crate::platform::lock`]'s own hash records: SipHash's keys are not stable
+/// across Rust versions, and this value has to mean the same thing to a client
+/// that got it from one daemon and a daemon that re-derives it later.
+///
+/// **What it detects, precisely:** that the config bytes changed between two
+/// reads. It is not collision-resistant against a *deliberately* crafted
+/// second config — FNV-1a is not a cryptographic hash, and 128 bits of it is
+/// still not one. That buys nothing here: anyone who can write
+/// `.dot-agent-deck.toml` already controls the `command` strings this daemon
+/// executes, which is strictly more than defeating a staleness check.
+pub fn config_revision(contents: &str) -> String {
+    let mut hash: u128 = 0x6c62_272e_07bb_0142_62b8_2175_6295_c58d;
+    for byte in contents.as_bytes() {
+        hash ^= u128::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0000_0100_0000_0000_0000_0000_013b);
+    }
+    format!("fnv1a128-{hash:032x}")
+}
+
 /// Read and parse `<dir>/.dot-agent-deck.toml` under every bound this module
 /// defines.
 ///
 /// `dir` is expected to be canonical already ([`canonicalize_project_dir`]),
 /// because the orchestration-name fallback is derived from its basename.
 pub fn read_project_config(dir: &Path) -> Result<ProjectConfig, ProjectResolveError> {
+    read_project_config_with_revision(dir).map(|(config, _)| config)
+}
+
+/// [`read_project_config`] plus the [`config_revision`] of the bytes it read.
+///
+/// One read, two answers: the revision has to be derived from **the same bytes
+/// that produced this `ProjectConfig`**, or it would identify a snapshot nobody
+/// resolved against. That is why it is computed here rather than by a second
+/// caller re-reading the file.
+pub fn read_project_config_with_revision(
+    dir: &Path,
+) -> Result<(ProjectConfig, String), ProjectResolveError> {
     let path = dir.join(CONFIG_FILE_NAME);
     let contents = read_config_file(&path)?;
+    let revision = config_revision(&contents);
     let mut config: ProjectConfig = toml::from_str(&contents).map_err(|source| {
         ProjectResolveError::ConfigInvalid(ProjectConfigError::Parse {
             path: path.display().to_string(),
@@ -429,7 +473,7 @@ pub fn read_project_config(dir: &Path) -> Result<ProjectConfig, ProjectResolveEr
             orch.name = crate::project_config::resolve_orchestration_name(&orch.name, dir);
         }
     }
-    Ok(config)
+    Ok((config, revision))
 }
 
 /// Name a rejected file type. Mirrors [`crate::bounded_read`]'s helper; kept
@@ -483,26 +527,39 @@ pub fn project_config_onto_wire(
         if orch.roles.is_empty() {
             continue;
         }
-        if orch.roles.len() > MAX_PROJECT_ROLES {
-            return Err(ProjectResolveError::TooManyRoles(orch.roles.len()));
-        }
         let name = crate::project_config::resolve_orchestration_name(&orch.name, dir);
         bound_name(&name)?;
-        let mut roles = Vec::with_capacity(orch.roles.len());
-        for role in &orch.roles {
-            bound_name(&role.name)?;
-            roles.push(ProjectRole {
-                name: role.name.clone(),
-                start: role.start,
-            });
-        }
         out.push(ProjectOrchestration {
             name,
             default: default_index == Some(index),
-            roles,
+            roles: project_roles_onto_wire(orch)?,
         });
     }
     Ok(out)
+}
+
+/// Project one orchestration's roles under [`MAX_PROJECT_ROLES`] and
+/// [`MAX_PROJECTED_NAME_BYTES`].
+///
+/// Split out so the launch verb applies the **same** caps to the roles it
+/// answers with as the resolve verb applies to the ones it offers. Two
+/// projections of one shape is how a picker and a spawn come to disagree, which
+/// is the class of bug this whole PRD is about.
+pub fn project_roles_onto_wire(
+    orch: &crate::project_config::OrchestrationConfig,
+) -> Result<Vec<ProjectRole>, ProjectResolveError> {
+    if orch.roles.len() > MAX_PROJECT_ROLES {
+        return Err(ProjectResolveError::TooManyRoles(orch.roles.len()));
+    }
+    let mut roles = Vec::with_capacity(orch.roles.len());
+    for role in &orch.roles {
+        bound_name(&role.name)?;
+        roles.push(ProjectRole {
+            name: role.name.clone(),
+            start: role.start,
+        });
+    }
+    Ok(roles)
 }
 
 fn bound_name(name: &str) -> Result<(), ProjectResolveError> {
@@ -523,13 +580,14 @@ pub fn resolve_project(path: &Path) -> Result<ResolvedProject, ProjectResolveErr
 /// The half of [`resolve_project`] that runs against an already-canonical
 /// directory, so enumeration does not canonicalise twice.
 fn resolve_canonical_project(dir: &Path) -> Result<ResolvedProject, ProjectResolveError> {
-    let config = read_project_config(dir)?;
+    let (config, revision) = read_project_config_with_revision(dir)?;
     let orchestrations = project_config_onto_wire(dir, &config)?;
     Ok(ResolvedProject {
         // `canonicalize_project_dir` has already refused a non-UTF-8 canonical
         // form, so this cannot lose bytes.
         path: dir.to_string_lossy().into_owned(),
         orchestrations,
+        config_revision: Some(revision),
     })
 }
 
@@ -823,6 +881,173 @@ pub fn resolve_for_wire(path: &str, seeds: &[ProjectCandidate]) -> Result<Resolv
     } else {
         Err(generic_refusal())
     }
+}
+
+// ---------------------------------------------------------------------------
+// PRD #819 M4: the launch verb
+// ---------------------------------------------------------------------------
+
+/// Resolve, compose and **publish** — the whole of
+/// [`crate::daemon_protocol::AttachRequest::PrepareWorkflow`] behind one
+/// blocking call.
+///
+/// The ordering is the point, and it is what makes "a failed preparation starts
+/// no roles" true rather than aspirational: every step that can fail runs
+/// before anything observable is created, the publish is the last thing that
+/// happens, and this function starts nothing. Roles are started by a later
+/// `StartAgent` sequence that never runs if this returns `Err`.
+///
+/// **One canonical string, carried end to end.** `path` is canonicalised once,
+/// here, and the same `PathBuf` is what the config is read from, what the
+/// orchestration name is resolved against, and what the context is published
+/// under. Re-deriving or re-spelling it between those steps is PRD #220's bug
+/// verbatim: an unnamed orchestration takes its name from the directory
+/// basename (`crate::project_config::resolve_orchestration_name`), and
+/// canonicalising a symlinked path CHANGES that basename — so a listing built
+/// from one spelling and a launch built from another disagree about the name.
+///
+/// **Blocking** — the caller goes through [`run_bounded`]. Returns either the
+/// prepared workflow or the exact `error` string the refusal carries; the
+/// detail is logged daemon-locally on every failure, whichever refusal goes
+/// back.
+pub fn prepare_workflow_for_wire(
+    path: &str,
+    orchestration: &str,
+    task: &str,
+    expected_revision: Option<&str>,
+    seeds: &[ProjectCandidate],
+) -> Result<crate::event::PreparedWorkflow, String> {
+    // --- resolve. Failures here take the disclosure split, exactly as
+    // `resolve_for_wire`'s do: a path the daemon already knows gets the detail,
+    // and every other path gets one fixed sentence.
+    let mut canonical: Option<PathBuf> = None;
+    let outcome = (|| {
+        let dir = canonicalize_project_dir(Path::new(path))?;
+        canonical = Some(dir.clone());
+        let (config, revision) = read_project_config_with_revision(&dir)?;
+        if config.orchestrations.len() > MAX_PROJECT_ORCHESTRATIONS {
+            return Err(ProjectResolveError::TooManyOrchestrations(
+                config.orchestrations.len(),
+            ));
+        }
+        Ok((dir, config, revision))
+    })();
+    let split = |err: &ProjectResolveError, canonical: Option<&Path>| {
+        if is_known_seed(path, canonical, seeds) {
+            known_path_refusal(err)
+        } else {
+            generic_refusal()
+        }
+    };
+    let (dir, config, revision) = match outcome {
+        Ok(resolved) => resolved,
+        Err(err) => {
+            warn!(reason = %err, "prepare-workflow refused: the project did not resolve");
+            return Err(split(&err, canonical.as_deref()));
+        }
+    };
+
+    // --- the revision gate, before any work and long before any write. A
+    // client that resolved against different bytes is refused rather than
+    // silently launched against the ones on disk now.
+    if let Some(expected) = expected_revision
+        && expected != revision
+    {
+        warn!("prepare-workflow refused: the client's config revision is stale");
+        return Err(stale_revision_refusal());
+    }
+
+    // --- pick the orchestration.
+    //
+    // A refusal from here on names a fact the caller could already have got:
+    // `resolve_for_wire` answers ANY path that resolves with the full
+    // projection, so "this directory is a project" is not what the uniform
+    // refusal is protecting — the uniform refusal covers resolve FAILURES, and
+    // a path that reaches this line has not had one. That is why the two
+    // refusals below carry their own codes and their own sentences rather than
+    // the one generic one.
+    //
+    // Same selection rule the spawn uses (`crate::spawn::decide_target`):
+    // roleless entries are skipped, because two entries can resolve to the SAME
+    // name and matching the empty one would refuse a target the listing
+    // legitimately offered.
+    let Some(orch) = config
+        .orchestrations
+        .iter()
+        .filter(|o| !o.roles.is_empty())
+        .find(|o| {
+            crate::project_config::resolve_orchestration_name(&o.name, &dir) == orchestration
+        })
+    else {
+        warn!(
+            "prepare-workflow refused: the project defines no orchestration under the requested name"
+        );
+        return Err(no_such_orchestration_refusal());
+    };
+    // The projection caps ARE a resolve failure — `resolve_for_wire` refuses the
+    // same config for the same reason — so this one takes the disclosure split
+    // rather than its own code. Answering it differently here would hand an
+    // arbitrary caller a role cardinality that the resolve verb withholds.
+    let roles = project_roles_onto_wire(orch).map_err(|err| {
+        warn!(reason = %err, "prepare-workflow refused: the orchestration exceeds a projection bound");
+        split(&err, Some(dir.as_path()))
+    })?;
+
+    // --- compose and publish. Last, and the only step with a side effect.
+    let prepared = crate::orchestrator_context::prepare_orchestrator_context(
+        orch,
+        &dir,
+        Some(task),
+    )
+    .map_err(|err| {
+        warn!(reason = %err, "prepare-workflow refused: the coordinator context was not published");
+        publish_refusal(&err)
+    })?;
+
+    Ok(crate::event::PreparedWorkflow {
+        context_path: prepared.context_path.to_string_lossy().into_owned(),
+        token: crate::prep_token::issue(),
+        roles,
+    })
+}
+
+/// The refusal a stale [`config_revision`] gets.
+///
+/// One fixed sentence naming neither revision: the client already holds the one
+/// it sent, and the one on disk is a property of the file rather than of the
+/// request.
+pub fn stale_revision_refusal() -> String {
+    format!(
+        "{}: the project config changed since it was resolved; resolve it again and retry",
+        crate::daemon_protocol::PROJECT_ERR_STALE_REVISION
+    )
+}
+
+/// The refusal a `PrepareWorkflow` naming an orchestration the project does not
+/// define gets.
+///
+/// It deliberately lists nothing. The available names are config *content* for
+/// a path the caller may merely have pasted, and the caller that legitimately
+/// got here from `ResolveProject` already has the list.
+pub fn no_such_orchestration_refusal() -> String {
+    format!(
+        "{}: that project defines no orchestration with roles under that name",
+        crate::daemon_protocol::PROJECT_ERR_NO_ORCHESTRATION
+    )
+}
+
+/// The refusal a failed publish gets: the stable code plus the publish error's
+/// own client-safe sentence.
+///
+/// [`crate::orchestrator_context::ContextPublishError::client_sentence`] names
+/// no path and no raw OS error; see its doc for why it is allowed to be more
+/// specific than [`generic_refusal`] is.
+pub fn publish_refusal(err: &crate::orchestrator_context::ContextPublishError) -> String {
+    format!(
+        "{}: {}",
+        crate::daemon_protocol::PROJECT_ERR_PUBLISH_FAILED,
+        err.client_sentence()
+    )
 }
 
 #[cfg(test)]
@@ -1409,6 +1634,303 @@ command = "cat"
         assert_eq!(
             resolved.orchestrations[0].name, "canonical-project",
             "canonicalisation changes the basename, and the name follows it"
+        );
+    }
+
+    /// The revision identifies the config CONTENT, and identifies nothing else.
+    ///
+    /// The three claims that make it usable as a staleness check: identical
+    /// bytes give the same value, a one-byte edit gives a different one, and a
+    /// rewrite that changes only the file's metadata gives the same one — which
+    /// is the half that rules out mtime and size, since a `git checkout` or a
+    /// `cp -p` perturbs those without a real change.
+    #[test]
+    fn the_revision_tracks_the_bytes_and_not_the_file() {
+        let (_guard, root) = scratch();
+        let project = root.join("revision-project");
+        std::fs::create_dir_all(&project).expect("create the project dir");
+        write_project(&project, SMALL_PROJECT);
+
+        let first = read_project_config_with_revision(&project)
+            .expect("read the config")
+            .1;
+        assert!(
+            first.starts_with("fnv1a128-"),
+            "the scheme is part of the value so a later derivation cannot be silently compared \
+             against this one: {first}"
+        );
+
+        // Rewritten byte-for-byte: a new inode timestamp, the same content.
+        write_project(&project, SMALL_PROJECT);
+        assert_eq!(
+            read_project_config_with_revision(&project)
+                .expect("re-read the config")
+                .1,
+            first,
+            "rewriting the same bytes must not change the revision"
+        );
+
+        // One byte different, and the length is deliberately unchanged so the
+        // test would fail against a size-based derivation.
+        write_project(&project, &SMALL_PROJECT.replace("builder", "buildeR"));
+        assert_ne!(
+            read_project_config_with_revision(&project)
+                .expect("read the edited config")
+                .1,
+            first,
+            "a same-length edit must change the revision"
+        );
+    }
+
+    /// A resolve carries the revision a later `PrepareWorkflow` echoes back.
+    /// Without it the launch verb has nothing to compare against and the
+    /// staleness check is unreachable from a client.
+    #[test]
+    fn a_resolve_carries_the_revision_of_the_config_it_read() {
+        let (_guard, root) = scratch();
+        let project = root.join("resolved-project");
+        std::fs::create_dir_all(&project).expect("create the project dir");
+        write_project(&project, SMALL_PROJECT);
+
+        let resolved = resolve_project(&project).expect("resolve");
+        assert_eq!(
+            resolved.config_revision.as_deref(),
+            Some(
+                read_project_config_with_revision(&project)
+                    .expect("read the config")
+                    .1
+                    .as_str()
+            ),
+            "the revision on the wire must be the one derived from the bytes that were resolved"
+        );
+    }
+
+    /// The launch verb refuses a stale revision, and refuses it BEFORE it
+    /// publishes anything — which is the whole point of the field. A check that
+    /// ran after the write would report an error having already replaced the
+    /// coordinator context.
+    #[test]
+    fn prepare_refuses_a_stale_revision_without_publishing() {
+        let (_guard, root) = scratch();
+        let project = root.join("staleness-project");
+        std::fs::create_dir_all(&project).expect("create the project dir");
+        write_project(&project, SMALL_PROJECT);
+        let context = project
+            .join(crate::orchestrator_context::CONTEXT_DIR_NAME)
+            .join(crate::orchestrator_context::CONTEXT_FILE_NAME);
+
+        let stale = config_revision("something else entirely");
+        let refusal = prepare_workflow_for_wire(
+            project.to_str().expect("utf-8 scratch path"),
+            "loop",
+            "a task",
+            Some(&stale),
+            &[],
+        )
+        .expect_err("a stale revision must be refused");
+        assert!(
+            refusal.starts_with(crate::daemon_protocol::PROJECT_ERR_STALE_REVISION),
+            "expected the stable stale-revision code, got {refusal}"
+        );
+        assert!(
+            !context.exists(),
+            "the revision check must run before the publish, but {} was written",
+            context.display()
+        );
+
+        // The matching revision goes through, so the refusal above is about
+        // staleness rather than about the verb being broken.
+        let current = read_project_config_with_revision(&project)
+            .expect("read the config")
+            .1;
+        let prepared = prepare_workflow_for_wire(
+            project.to_str().expect("utf-8 scratch path"),
+            "loop",
+            "a task",
+            Some(&current),
+            &[],
+        )
+        .expect("a matching revision must be accepted");
+        assert_eq!(Path::new(&prepared.context_path), context);
+        assert!(context.is_file(), "and the context is published");
+        assert!(
+            !prepared.token.is_empty(),
+            "a preparation carries the token the later spawn presents"
+        );
+    }
+
+    /// An orchestration the project does not define is refused with its own
+    /// code, and the refusal enumerates nothing — the available names are config
+    /// content for a path the caller may merely have pasted.
+    #[test]
+    fn prepare_refuses_an_unknown_orchestration_without_naming_the_known_ones() {
+        let (_guard, root) = scratch();
+        let project = root.join("named-project");
+        std::fs::create_dir_all(&project).expect("create the project dir");
+        write_project(&project, SMALL_PROJECT);
+
+        let refusal = prepare_workflow_for_wire(
+            project.to_str().expect("utf-8 scratch path"),
+            "no-such-orchestration",
+            "a task",
+            None,
+            &[],
+        )
+        .expect_err("an unknown orchestration must be refused");
+        assert!(
+            refusal.starts_with(crate::daemon_protocol::PROJECT_ERR_NO_ORCHESTRATION),
+            "expected the stable no-such-orchestration code, got {refusal}"
+        );
+        assert!(
+            !refusal.contains("loop"),
+            "the refusal must not enumerate what the config declares: {refusal}"
+        );
+    }
+
+    /// The canonical spelling carries from the resolve through to the publish.
+    ///
+    /// This is PRD #220's bug in its PRD #819 form: an unnamed orchestration is
+    /// named after the directory basename, canonicalising a symlinked path
+    /// CHANGES that basename, and a launch prepared through the alias must still
+    /// land under the canonical directory and answer to the canonical name.
+    #[cfg(unix)]
+    #[test]
+    fn a_launch_through_a_symlink_publishes_under_the_canonical_directory() {
+        let (_guard, root) = scratch();
+        let code = root.join("code");
+        let project = code.join("canonical-project");
+        std::fs::create_dir_all(&project).expect("create the project dir");
+        write_project(
+            &project,
+            "[[orchestrations]]\n\n[[orchestrations.roles]]\nname = \"planner\"\n\
+             command = \"cat\"\nstart = true\n",
+        );
+        let alias = root.join("current");
+        std::os::unix::fs::symlink(&project, &alias).expect("symlink");
+
+        let prepared = prepare_workflow_for_wire(
+            alias.to_str().expect("utf-8 scratch path"),
+            // The CANONICAL basename, because that is the name the resolve
+            // offers; `current` is the spelling that must never name anything.
+            "canonical-project",
+            "a task",
+            None,
+            &[],
+        )
+        .expect("a launch through the alias must resolve and publish");
+
+        assert_eq!(
+            Path::new(&prepared.context_path),
+            project
+                .join(crate::orchestrator_context::CONTEXT_DIR_NAME)
+                .join(crate::orchestrator_context::CONTEXT_FILE_NAME),
+            "the context must land under the canonical directory, not under the alias"
+        );
+        assert!(
+            prepare_workflow_for_wire(
+                alias.to_str().expect("utf-8 scratch path"),
+                "current",
+                "a task",
+                None,
+                &[],
+            )
+            .is_err(),
+            "the symlink's basename must never name an orchestration"
+        );
+    }
+
+    /// The launch verb's *resolve* refusals discloses exactly what the resolve
+    /// verb's do — no more.
+    ///
+    /// Prepare-workflow does filesystem work on a caller-supplied path just as
+    /// resolve-project does, so a refusal from that half must be
+    /// indistinguishable in the same way: one code, one sentence, no parser
+    /// source line, no raw OS error, no echo of the caller's path. A second
+    /// verb reaching the same reader through a different refusal is how a
+    /// disclosure bound gets quietly reopened.
+    #[test]
+    fn a_prepare_refusal_on_an_arbitrary_path_discloses_no_more_than_a_resolve_refusal() {
+        let (_guard, root) = scratch();
+        let project = root.join("broken-project");
+        std::fs::create_dir(&project).expect("mkdir");
+        write_project(&project, MALFORMED);
+
+        let refusal = prepare_workflow_for_wire(
+            project.to_str().expect("utf-8 scratch path"),
+            "loop",
+            "a task",
+            None,
+            &[],
+        )
+        .expect_err("a malformed config must be refused");
+        assert_eq!(
+            refusal,
+            generic_refusal(),
+            "an arbitrary path must get the one bounded refusal and nothing else"
+        );
+        assert!(
+            !refusal.contains("PWNED") && !refusal.contains("TOML"),
+            "no parser source line may escape: {refusal}"
+        );
+        assert!(
+            !refusal.contains("broken-project")
+                && !refusal.contains(root.to_str().expect("utf-8 scratch path")),
+            "the caller's own path must not be echoed: {refusal}"
+        );
+        assert!(
+            !refusal.contains("os error"),
+            "no raw OS error may escape: {refusal}"
+        );
+
+        let missing = prepare_workflow_for_wire(
+            &format!("{}/no-such-dir", root.display()),
+            "loop",
+            "a task",
+            None,
+            &[],
+        )
+        .expect_err("a missing directory must be refused");
+        assert_eq!(
+            missing, refusal,
+            "the response must not directly distinguish a missing directory from a broken config"
+        );
+    }
+
+    /// A projection cap is a RESOLVE failure, so the launch verb refuses it the
+    /// way the resolve verb does — through the disclosure split — rather than
+    /// handing an arbitrary caller a role cardinality that `resolve-project`
+    /// withholds.
+    #[test]
+    fn a_prepare_that_trips_a_projection_cap_takes_the_disclosure_split() {
+        let (_guard, root) = scratch();
+        let project = root.join("crowded-project");
+        std::fs::create_dir(&project).expect("mkdir");
+        let mut toml = String::from("[[orchestrations]]\nname = \"loop\"\n");
+        for i in 0..=MAX_PROJECT_ROLES {
+            toml.push_str(&format!(
+                "\n[[orchestrations.roles]]\nname = \"r{i}\"\ncommand = \"cat\"\n"
+            ));
+        }
+        write_project(&project, &toml);
+        let path = project.to_str().expect("utf-8 scratch path");
+
+        let prepare_refusal = prepare_workflow_for_wire(path, "loop", "a task", None, &[])
+            .expect_err("too many roles must be refused");
+        let resolve_refusal =
+            resolve_for_wire(path, &[]).expect_err("and the resolve refuses it too");
+        assert_eq!(
+            prepare_refusal, resolve_refusal,
+            "both verbs must refuse the same config with the same words"
+        );
+        assert!(
+            !prepare_refusal.contains(&MAX_PROJECT_ROLES.to_string()),
+            "the generic refusal must not carry the cardinality: {prepare_refusal}"
+        );
+        assert!(
+            !project
+                .join(crate::orchestrator_context::CONTEXT_DIR_NAME)
+                .exists(),
+            "a refused preparation publishes nothing"
         );
     }
 }
