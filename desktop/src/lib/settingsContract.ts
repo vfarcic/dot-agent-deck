@@ -51,6 +51,20 @@ export interface SettingsPanelProps {
    * than silently reverting.
    */
   saveError?: string;
+  /**
+   * Which runtime the app is in, so a panel can say what it cannot do here
+   * (PRD #744).
+   *
+   * Added as a fourth prop rather than read from `selectRuntimeMode()` inside
+   * whichever panel wants it, because the sheet already has it and a panel
+   * should not be sniffing `window.location` in a render. It is deliberately
+   * the *general* environmental fact rather than a feature-specific one — the
+   * browser preview cannot scale a webview (#744), and it will not be able to
+   * reach a daemon endpoint (#741) or a local model (#802) either, so all three
+   * tenants need exactly this. A prop only one panel could ever use would
+   * belong somewhere else.
+   */
+  mode: import("../types").RuntimeMode;
 }
 
 /** One row of the section registry. */

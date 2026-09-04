@@ -109,7 +109,7 @@ export function SettingsSheet({ open, onClose, settings, onSave, saveError, path
           )}
 
           <div className="settings-active" data-testid={active ? `settings-panel-${active.id}` : undefined}>
-            {Panel ? <Panel settings={settings} onSave={onSave} saveError={saveError} /> : <div className="configuration-empty">No settings sections are registered.</div>}
+            {Panel ? <Panel settings={settings} onSave={onSave} saveError={saveError} mode={mode} /> : <div className="configuration-empty">No settings sections are registered.</div>}
           </div>
         </div>
 

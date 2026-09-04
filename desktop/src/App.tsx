@@ -44,6 +44,7 @@ import { useDeckRuntime } from "./hooks/useDeckRuntime";
 import { useProjects } from "./hooks/useProjects";
 import { usePromptLibrary } from "./hooks/usePromptLibrary";
 import { useDesktopSettings } from "./hooks/useDesktopSettings";
+import { useZoom } from "./hooks/useZoom";
 import { applyAppearance } from "./lib/appearance";
 import { desktopWorkflowPlatformIssue } from "./lib/platform";
 import type { DeckAction, DeckActionResult, DeckRuntimeState, DeckView, EvidenceItem, PanelTab, WorkflowLaunchConfig } from "./types";
@@ -102,6 +103,10 @@ export function ControlDeck({ runtime, workflowPlatformIssue = desktopWorkflowPl
   const { prompts, addPrompt, updatePrompt, removePrompt } = usePromptLibrary();
   const [profileOrder, setProfileOrder] = useState<string[]>([]);
   const settings = useDesktopSettings(runtime);
+  // Called for its effects, not its value: the hook registers the
+  // capture-phase zoom listener. The Settings row reaches the same level
+  // through the settings document, so nothing here needs the return.
+  useZoom(runtime, settings);
 
   // PRD #743: applied on LOAD as well as on change. Keeping it in one effect
   // keyed on the stored value means the panel only has to save — the change
@@ -618,6 +623,6 @@ function CommandPalette({ commands, onClose }: { commands: { label: string; hint
 }
 
 function ShortcutHelp({ onClose }: { onClose: () => void }) {
-  const shortcuts = [["⌘ K", "Command menu"], ["1 — 4", "Focus agent"], ["J / K", "Move through evidence"], ["?", "Shortcut guide"], ["ESC", "Close overlay"]];
+  const shortcuts = [["⌘ K", "Command menu"], ["⌘ + / − / 0", "Zoom in, out, reset"], ["1 — 4", "Focus agent"], ["J / K", "Move through evidence"], ["?", "Shortcut guide"], ["ESC", "Close overlay"]];
   return <div className="dialog-backdrop" role="presentation" onMouseDown={onClose}><section className="shortcut-dialog" role="dialog" aria-modal="true" aria-labelledby="shortcut-title" onMouseDown={(event) => event.stopPropagation()}><header><div><HelpCircle size={18} /><h2 id="shortcut-title">Control keys</h2></div><button aria-label="Close shortcut guide" onClick={onClose}><X size={16} /></button></header>{shortcuts.map(([keys, label]) => <div key={keys}><span>{label}</span><kbd>{keys}</kbd></div>)}</section></div>;
 }

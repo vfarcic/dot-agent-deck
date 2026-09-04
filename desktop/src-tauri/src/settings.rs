@@ -207,17 +207,35 @@ pub struct AppearanceSettings {
     pub mode: AppearanceMode,
 }
 
+/// The `[zoom]` section — PRD #744's tenant, stored here.
+///
+/// One field, and it is a *scale factor* rather than a percentage, because that
+/// is the unit `webview.set_zoom` takes: keeping storage, IPC, the frontend
+/// ladder and the platform call in one unit means there is no conversion
+/// anywhere to get backwards.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ZoomSettings {
+    pub level: ZoomLevel,
+}
+
 /// The whole settings document.
 ///
-/// Deliberately carries exactly one section. A container that grows opinions
-/// about its contents blocks its dependents, so #741's endpoints and #802's
-/// voice backends each add their own section when they land — they are not
-/// pre-created here.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Deliberately carries only the sections that have a tenant. A container that
+/// grows opinions about its contents blocks its dependents, so #741's endpoints
+/// and #802's voice backends each add their own section when they land — they
+/// are not pre-created here.
+///
+/// **No `Eq`**, and that is [`ZoomLevel`]'s doing rather than an oversight: it
+/// wraps an `f64`, which is `PartialEq` but not `Eq` because `NaN != NaN`.
+/// Nothing keys a map or a set on this document, so `PartialEq` is all any
+/// caller needs — `assert_eq!` included.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DesktopSettings {
     pub version: u32,
     pub appearance: AppearanceSettings,
+    pub zoom: ZoomSettings,
 }
 
 impl Default for DesktopSettings {
@@ -225,7 +243,128 @@ impl Default for DesktopSettings {
         Self {
             version: SETTINGS_VERSION,
             appearance: AppearanceSettings::default(),
+            zoom: ZoomSettings::default(),
         }
+    }
+}
+
+/// The zoom levels this build steps through, ascending (PRD #744).
+///
+/// **This list is duplicated in `desktop/src/lib/zoom.ts` as `ZOOM_LEVELS` and
+/// the two must stay identical.** Both sides are pinned by a test that spells
+/// out every value, and the duplication is unavoidable rather than sloppy: this
+/// side is the authority for what a *stored* level may be, because the
+/// launch-time apply reads the document before any JavaScript runs, and that
+/// side is the authority for *stepping*, because a keystroke never reaches
+/// Rust. If they drift, the app launches at one level and the Settings row
+/// claims another. The same discipline — two copies, both pinned, each pointing
+/// at the other — is why `desktop/src/lib/displayText.ts` and
+/// `src/untrusted_text.rs` are still in agreement.
+///
+/// Both ends are measured; the reasoning lives in `zoom.ts`'s module docs and in
+/// `prds/744-desktop-zoom-text-size.md` rather than being restated here.
+pub const ZOOM_LEVELS: [f64; 10] = [0.75, 0.9, 1.0, 1.1, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0];
+
+/// What `Cmd 0` returns to, and what a document with no `[zoom]` section reads
+/// as.
+pub const DEFAULT_ZOOM_LEVEL: f64 = 1.0;
+
+/// A zoom level that is always one of [`ZOOM_LEVELS`].
+///
+/// A newtype rather than a bare `f64` field so the snapping happens in
+/// `Deserialize` and cannot be forgotten by a caller. It serialises as a plain
+/// number, so the TOML reads `level = 1.25` and the JSON the webview receives is
+/// `{"level":1.25}` — the wrapper is invisible on both wires.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ZoomLevel(f64);
+
+impl ZoomLevel {
+    /// The nearest level in [`ZOOM_LEVELS`], or the default for anything that is
+    /// not a usable number.
+    ///
+    /// Snapping rather than rejecting, for the same reason
+    /// [`AppearanceMode::from_str_lossy`] folds an unknown token to the default:
+    /// the document is hand-editable and may also have been written by a build
+    /// with a longer ladder, and losing every other section over one unreadable
+    /// field is the opposite of the unknown-key tolerance this schema is built
+    /// for.
+    ///
+    /// `is_finite` is the guard rather than a range check because it rejects
+    /// `NaN` and both infinities together, and `NaN` is the case that matters:
+    /// every comparison against it is false, so an unguarded nearest-value
+    /// search would return the *first* level and a corrupt document would
+    /// silently shrink the app to 75% instead of reading as the default. The
+    /// mirror of this is `clampZoom` in `zoom.ts`, tested against the same
+    /// inputs.
+    pub fn snap(value: f64) -> Self {
+        if !value.is_finite() {
+            return Self(DEFAULT_ZOOM_LEVEL);
+        }
+        let mut nearest = ZOOM_LEVELS[0];
+        for level in ZOOM_LEVELS {
+            if (level - value).abs() < (nearest - value).abs() {
+                nearest = level;
+            }
+        }
+        Self(nearest)
+    }
+
+    /// The scale factor, ready for `webview.set_zoom`.
+    pub fn as_f64(self) -> f64 {
+        self.0
+    }
+}
+
+impl Default for ZoomLevel {
+    fn default() -> Self {
+        Self(DEFAULT_ZOOM_LEVEL)
+    }
+}
+
+impl Serialize for ZoomLevel {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_f64(self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for ZoomLevel {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_any(ZoomLevelVisitor)
+    }
+}
+
+/// Accepts a TOML/JSON **integer** as well as a float, which is the whole
+/// reason this is a visitor rather than `f64::deserialize().map(snap)`.
+///
+/// `level = 1` in a hand-edited `desktop.toml` is a TOML *integer*, and `f64`'s
+/// derived deserializer rejects it with `invalid type: integer`. That failure is
+/// not local: [`load_from`] treats an unparseable document as "use defaults", so
+/// one plausible hand edit would silently reset the user's **appearance** too.
+/// Accepting the integer costs three lines and removes that.
+struct ZoomLevelVisitor;
+
+impl serde::de::Visitor<'_> for ZoomLevelVisitor {
+    type Value = ZoomLevel;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "a zoom level between {} and {}",
+            ZOOM_LEVELS[0],
+            ZOOM_LEVELS[ZOOM_LEVELS.len() - 1]
+        )
+    }
+
+    fn visit_f64<E: serde::de::Error>(self, value: f64) -> Result<ZoomLevel, E> {
+        Ok(ZoomLevel::snap(value))
+    }
+
+    fn visit_i64<E: serde::de::Error>(self, value: i64) -> Result<ZoomLevel, E> {
+        Ok(ZoomLevel::snap(value as f64))
+    }
+
+    fn visit_u64<E: serde::de::Error>(self, value: u64) -> Result<ZoomLevel, E> {
+        Ok(ZoomLevel::snap(value as f64))
     }
 }
 
@@ -244,7 +383,9 @@ impl Default for DesktopSettings {
 /// location of their own settings file is the answer to "where did that go?",
 /// which PRD #803 makes a visible footer line specifically so it is answerable
 /// without documentation. Same string, opposite intent.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+// No `Eq`, for the same reason `DesktopSettings` has none: it contains a
+// `ZoomLevel`, which wraps an `f64`.
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct DesktopSettingsSnapshot {
     pub settings: DesktopSettings,
     /// Absolute, as [`settings_path`] resolved it — including when
@@ -755,6 +896,18 @@ mod tests {
             appearance: AppearanceSettings {
                 mode: AppearanceMode::Dark,
             },
+            zoom: ZoomSettings::default(),
+        }
+    }
+
+    /// A document whose zoom is not the default, for the merge and round-trip
+    /// tests that need the two sections to be independently observable.
+    fn zoomed(level: f64) -> DesktopSettings {
+        DesktopSettings {
+            zoom: ZoomSettings {
+                level: ZoomLevel::snap(level),
+            },
+            ..DesktopSettings::default()
         }
     }
 
@@ -880,6 +1033,142 @@ mod tests {
         let loaded = load_from(&path);
         assert_eq!(loaded.appearance.mode, AppearanceMode::Light);
         assert_eq!(loaded.version, 1);
+    }
+
+    /// The zoom ladder is duplicated in `desktop/src/lib/zoom.ts`, so both
+    /// copies are pinned value-by-value and each points at the other. If they
+    /// drift, the app launches at one level and the Settings row claims
+    /// another — the launch apply reads this side, and every keystroke steps
+    /// that one.
+    #[test]
+    fn zoom_ladder_matches_the_frontend_copy() {
+        assert_eq!(
+            ZOOM_LEVELS,
+            [0.75, 0.9, 1.0, 1.1, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0],
+            "keep this identical to ZOOM_LEVELS in desktop/src/lib/zoom.ts"
+        );
+        assert!(ZOOM_LEVELS.contains(&DEFAULT_ZOOM_LEVEL));
+        assert!(
+            ZOOM_LEVELS.windows(2).all(|pair| pair[0] < pair[1]),
+            "the ladder must be ascending for `snap` and the frontend's stepping to agree"
+        );
+        // The measured ceiling: page zoom divides the CSS-pixel viewport by the
+        // level, `tauri.conf.json` declares `minWidth: 1024`, and `styles.css`
+        // declares `min-width: 320px`, past which content is clipped rather
+        // than reflowed because `body` is `overflow-x: hidden`.
+        let ceiling = ZOOM_LEVELS[ZOOM_LEVELS.len() - 1];
+        assert!(1024.0 / ceiling > 320.0);
+    }
+
+    #[test]
+    fn a_zoom_level_on_the_ladder_is_kept_exactly() {
+        for level in ZOOM_LEVELS {
+            assert_eq!(ZoomLevel::snap(level).as_f64(), level);
+        }
+    }
+
+    #[test]
+    fn an_off_ladder_zoom_level_snaps_to_the_nearest_rung() {
+        assert_eq!(ZoomLevel::snap(1.3).as_f64(), 1.25);
+        assert_eq!(ZoomLevel::snap(1.4).as_f64(), 1.5);
+        assert_eq!(ZoomLevel::snap(2.9).as_f64(), 3.0);
+    }
+
+    /// Saturating, not rejecting: a hand-typed `level = 99` should give the
+    /// biggest level this build has rather than throwing the document away.
+    #[test]
+    fn an_out_of_range_zoom_level_saturates() {
+        assert_eq!(ZoomLevel::snap(99.0).as_f64(), 3.0);
+        assert_eq!(ZoomLevel::snap(0.01).as_f64(), 0.75);
+        assert_eq!(ZoomLevel::snap(0.0).as_f64(), 0.75);
+        assert_eq!(ZoomLevel::snap(-5.0).as_f64(), 0.75);
+    }
+
+    /// Why `snap` guards with `is_finite` instead of a range check.
+    ///
+    /// Every comparison against `NaN` is false, so the nearest-rung search
+    /// would keep its initial value and answer **0.75** — a corrupt document
+    /// would silently shrink the app rather than reading as the default. Both
+    /// infinities go the same way for the same reason.
+    #[test]
+    fn a_non_finite_zoom_level_reads_as_the_default_not_the_smallest() {
+        for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert_eq!(ZoomLevel::snap(value).as_f64(), DEFAULT_ZOOM_LEVEL);
+        }
+    }
+
+    /// A hand-edited `level = 1` is a TOML **integer**, and `f64`'s derived
+    /// deserializer rejects one. That would not be a local failure: `load_from`
+    /// treats an unparseable document as "use defaults", so this one plausible
+    /// edit would also silently reset the user's appearance. The visitor accepts
+    /// integers precisely so that cannot happen — which is what the second
+    /// assertion here is really testing.
+    #[test]
+    fn an_integer_zoom_level_is_accepted_and_takes_no_other_section_with_it() {
+        let dir = tempdir();
+        let path = dir.path().join(SETTINGS_FILE_NAME);
+        std::fs::write(
+            &path,
+            "version = 1\n\n[appearance]\nmode = \"dark\"\n\n[zoom]\nlevel = 2\n",
+        )
+        .unwrap();
+        let loaded = load_from(&path);
+        assert_eq!(loaded.zoom.level.as_f64(), 2.0);
+        assert_eq!(loaded.appearance.mode, AppearanceMode::Dark);
+    }
+
+    /// The same guarantee for the values that are not numbers at all. A string
+    /// or a boolean is a genuinely malformed document, so it falls back the
+    /// ordinary way — the whole document to defaults, logged, never a failed
+    /// launch — and the assertion records that this is the behaviour rather
+    /// than a partial recovery.
+    #[test]
+    fn a_non_numeric_zoom_level_falls_back_the_ordinary_malformed_way() {
+        let dir = tempdir();
+        for raw in ["\"big\"", "true", "[1, 2]"] {
+            let path = dir.path().join(format!("zoom-{}.toml", raw.len()));
+            std::fs::write(
+                &path,
+                format!("version = 1\n\n[appearance]\nmode = \"dark\"\n\n[zoom]\nlevel = {raw}\n"),
+            )
+            .unwrap();
+            let loaded = load_from(&path);
+            assert_eq!(loaded.zoom.level.as_f64(), DEFAULT_ZOOM_LEVEL, "for {raw}");
+            assert_eq!(loaded.appearance.mode, AppearanceMode::System, "for {raw}");
+        }
+    }
+
+    /// A document written before `[zoom]` existed — which is every document on
+    /// disk today — reads as the default level and keeps its appearance.
+    #[test]
+    fn a_document_predating_the_zoom_section_reads_as_the_default_level() {
+        let dir = tempdir();
+        let path = dir.path().join(SETTINGS_FILE_NAME);
+        std::fs::write(&path, "version = 1\n\n[appearance]\nmode = \"light\"\n").unwrap();
+        let loaded = load_from(&path);
+        assert_eq!(loaded.zoom.level.as_f64(), DEFAULT_ZOOM_LEVEL);
+        assert_eq!(loaded.appearance.mode, AppearanceMode::Light);
+    }
+
+    /// The level survives the disk, which is the whole point of the feature —
+    /// and it survives it *next to* an unknown section, so the merge covers the
+    /// new tenant as well as the old one.
+    #[test]
+    fn a_zoom_level_round_trips_and_the_merge_still_preserves_an_unknown_section() {
+        let dir = tempdir();
+        let path = dir.path().join(SETTINGS_FILE_NAME);
+        let voice = "[voice]\nbackend = \"whisper\"\n";
+        std::fs::write(&path, format!("version = 1\n\n{voice}")).unwrap();
+
+        save_to(&path, &zoomed(1.75)).unwrap();
+        let reloaded = load_from(&path);
+        assert_eq!(reloaded.zoom.level.as_f64(), 1.75);
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            raw.contains(voice),
+            "the [voice] section did not survive a zoom save: {raw}"
+        );
     }
 
     /// The property the merge exists for: an older build saving must not eat a
@@ -1469,7 +1758,8 @@ mod tests {
     /// than discovered by the feature that inherits it.
     #[test]
     fn default_document_shape_is_pinned() {
-        const FRESH: &str = "version = 1\n\n[appearance]\nmode = \"system\"\n";
+        const FRESH: &str =
+            "version = 1\n\n[appearance]\nmode = \"system\"\n\n[zoom]\nlevel = 1.0\n";
         let rendered = toml::to_string_pretty(&DesktopSettings::default()).unwrap();
         assert_eq!(rendered, FRESH);
 
@@ -1487,7 +1777,11 @@ mod tests {
         let json = serde_json::to_value(DesktopSettings::default()).unwrap();
         assert_eq!(
             json,
-            serde_json::json!({ "version": 1, "appearance": { "mode": "system" } })
+            serde_json::json!({
+                "version": 1,
+                "appearance": { "mode": "system" },
+                "zoom": { "level": 1.0 },
+            })
         );
         for mode in [
             AppearanceMode::System,

@@ -1,6 +1,7 @@
 import { createFixtureSnapshot, DEFAULT_PROFILES, type FixtureState } from "../data/fixture";
 import { applyHandoffEvent, mapDaemonEvent, MAX_LIVE_EVIDENCE } from "./daemonEvents";
 import { DISPLAY_LIMITS, displayText } from "./displayText";
+import { clampZoom, DEFAULT_ZOOM } from "./zoom";
 import { UNREPORTED } from "../types";
 import type { HandoffEdge,
   AgentSession,
@@ -145,6 +146,13 @@ export interface DesktopActionResultDto {
 export interface DesktopSettingsDto {
   version: number;
   appearance: { mode: AppearanceMode };
+  /**
+   * The window's zoom level as a scale factor, always one of `ZOOM_LEVELS`
+   * (PRD #744). A scale factor rather than a percentage because that is the
+   * unit `webview.set_zoom` takes, so storage, this wire, the frontend ladder
+   * and the platform call are all in one unit.
+   */
+  zoom: { level: number };
 }
 
 /** How the app picks its light/dark palette. What it does is PRD #743's. */
@@ -153,7 +161,11 @@ export type AppearanceMode = "system" | "light" | "dark";
 const APPEARANCE_MODES: readonly AppearanceMode[] = ["system", "light", "dark"];
 
 /** Mirrors `DesktopSettings::default()`; used when nothing is stored yet. */
-export const DEFAULT_DESKTOP_SETTINGS: DesktopSettingsDto = { version: 1, appearance: { mode: "system" } };
+export const DEFAULT_DESKTOP_SETTINGS: DesktopSettingsDto = {
+  version: 1,
+  appearance: { mode: "system" },
+  zoom: { level: DEFAULT_ZOOM },
+};
 
 /**
  * The fixture bridge's settings key.
@@ -177,9 +189,18 @@ export function normalizeDesktopSettings(value: unknown): DesktopSettingsDto {
     ? record.appearance as Record<string, unknown>
     : {};
   const mode = APPEARANCE_MODES.find((candidate) => candidate === appearance.mode) ?? DEFAULT_DESKTOP_SETTINGS.appearance.mode;
+  // The zoom section is absent from every document written before PRD #744,
+  // which is every document on disk today. `clampZoom` answers the default for
+  // an absent, corrupt or off-ladder value alike, so there is no separate
+  // missing-section branch — and it is the same snapping `ZoomLevel::snap`
+  // performs Rust-side, so the two ends cannot disagree about what is stored.
+  const zoom = typeof record.zoom === "object" && record.zoom !== null
+    ? record.zoom as Record<string, unknown>
+    : {};
   return {
     version: typeof record.version === "number" && Number.isFinite(record.version) ? record.version : DEFAULT_DESKTOP_SETTINGS.version,
     appearance: { mode },
+    zoom: { level: clampZoom(zoom.level) },
   };
 }
 
@@ -250,6 +271,20 @@ export interface DeckBridge {
   runAction(action: DeckAction): Promise<DeckActionResult>;
   sendTerminalInput(agentId: string, data: string): Promise<void>;
   resizeTerminal(agentId: string, cols: number, rows: number): Promise<void>;
+  /**
+   * Scale the whole window, terminals included (PRD #744).
+   *
+   * Applying only, never persisting — the level is written through
+   * `saveSettings` behind a coalescer, because a held key would otherwise
+   * rewrite `desktop.toml` once per key repeat. Resolves to the level actually
+   * applied, i.e. the caller's level snapped to the ladder.
+   *
+   * The seam is on `DeckBridge` rather than on `TauriDeckBridge` alone so that
+   * fixture mode's no-op is structural: `FixtureDeckBridge` never imports
+   * `@tauri-apps/api/core`, so a browser preview cannot reach a webview even by
+   * mistake.
+   */
+  setZoom(level: number): Promise<number>;
   /** The desktop app's own settings document, and where it lives (PRD #803). Never rejects. */
   getSettings(): Promise<DesktopSettingsSnapshotDto>;
   /** Persist the whole document and resolve with what was written. */
@@ -567,6 +602,17 @@ class FixtureDeckBridge implements DeckBridge {
 
   async resizeTerminal(): Promise<void> {
     await Promise.resolve();
+  }
+
+  /**
+   * Fixture mode owns no webview, so there is nothing to scale — and the
+   * browser it runs in has its own zoom, which is why `useZoom` does not bind
+   * the keys here at all. Echoing the snapped level keeps the signature honest
+   * for a caller that logs what was applied.
+   */
+  async setZoom(level: number): Promise<number> {
+    await Promise.resolve();
+    return clampZoom(level);
   }
 
   /**
@@ -1115,6 +1161,16 @@ export class TauriDeckBridge implements DeckBridge {
     const session = this.sessions.get(agentId);
     if (!session) throw new Error(`Terminal for ${agentId} is not attached.`);
     await invoke("desktop_terminal_write", { sessionId: session.sessionId, data: Array.from(new TextEncoder().encode(data)) });
+  }
+
+  async setZoom(level: number): Promise<number> {
+    const invoke = await this.getInvoke();
+    // Snapped here as well as Rust-side, so the number this resolves with is
+    // the number that was applied even though the command also snaps. The
+    // command's own snap is the one that matters for safety; this one is so the
+    // caller does not have to re-derive it from a reply it would otherwise
+    // have to trust.
+    return clampZoom(await invoke<number>("desktop_set_zoom", { level: clampZoom(level) }));
   }
 
   async resizeTerminal(agentId: string, cols: number, rows: number): Promise<void> {

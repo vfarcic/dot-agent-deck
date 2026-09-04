@@ -65,6 +65,7 @@ function runtime(overrides: Partial<DeckRuntimeState> = {}): DeckRuntimeState {
     resizeTerminal: vi.fn(async () => undefined),
     setShownTerminals: vi.fn(async () => undefined),
     reconnect: vi.fn(async () => undefined),
+    setZoom: vi.fn(async (level: number) => level),
     // PRD #803 made the settings pair part of the runtime contract, and the
     // DeckShell cases below mount the whole app, so the hook calls these. The
     // overview itself reads no setting; these only have to resolve.
