@@ -266,7 +266,13 @@ A unit starts either as **one agent** or as a **multi-role orchestration**. Whic
 dot-agent-deck dispatch --list-targets
 ```
 
-Show the runner that output, ask which shape they want, and **pass the matching flag explicitly on every dispatch** (`--single` or `--orchestration '<name>'`). With neither, the shape falls back to whatever the repo's config implies, which is the guess this step exists to avoid. Reuse the answer for later dispatches in the same conversation; re-ask when the runner changes it or a unit is clearly different in kind.
+Run that **once** — it is a read-only daemon round-trip and its answer describes the repo, not the unit — then show the runner the output and **ask the shape once per unit**, as a single prompt carrying one line per issue: the number, the one-line scope read from step 5, and any duplicate or coupling that unit absorbs. Enough scope to answer with, in other words, since the shape follows from what the unit will be doing. **Pass the matching flag explicitly on every dispatch** (`--single` or `--orchestration '<name>'`). With neither, the shape falls back to whatever the repo's config implies, which is the guess this step exists to avoid.
+
+**Per unit rather than per batch, because step 5 recommends 2–3 units and 2–3 issues off this backlog routinely mix kinds.** Measured on the 2026-08-24 batch: #669 is an `lstat` guard of roughly ten lines in one function, with a reference implementation already sitting on a fork; #668 is an audit of every harness spawn path #661 does not reach, plus a reaping mechanism and its coverage. Asked as one question the runner gave one answer for all three. Asked per issue they chose `--single` for #669 and #670 and `--orchestration` for #668 — so the batch-level question produced an answer the runner did not actually want, which is exactly the outcome this step exists to prevent.
+
+**One answer can still cover the whole batch — as the runner's answer, not as your assumption.** When they say "single for all three", take it and stop asking. Asking per unit costs one extra line in one prompt; not asking costs a unit started in a shape nobody chose, and the runner discovers that by watching it work.
+
+**An older build's pane seed says the opposite, in the same context you are reading this in.** Dispatcher mode seeds every pane with `DISPATCHER_SEED_PROMPT` (`src/ui.rs`), which now asks per unit — but a pane started from a build predating issue #674 still carries "before the FIRST dispatch of a session … Reuse the answer for later dispatches". Where they disagree, this skill wins: it is the more specific instruction, and it is the one with the measurement behind it.
 
 The reasoning behind this is in [`docs/dispatcher-mode.md`](../../../docs/dispatcher-mode.md), which is where it stays — it is the product's contract, not this skill's.
 
@@ -292,10 +298,12 @@ If the runner has no preference, say which one you are taking and why (`mixed` i
 **The task goes in a file. `--task-file` is the default here, not an escape hatch:**
 
 ```bash
-dot-agent-deck dispatch <name> --single --task-file '.dot-agent-deck/<task-slug>.md'
+dot-agent-deck dispatch <name> (--single | --orchestration '<orchestration>') --task-file '.dot-agent-deck/<task-slug>.md'
 ```
 
-**This is a safety rule, not an ergonomic one, and the product says so itself.** The delegation protocol compiled into the binary and handed to every orchestrator it spawns (`src/orchestrator_context.rs`) states that `--task "…"` is a fallback safe *only* when the whole task is **a single line of plain text with no backticks, no `$`, no `"`, no `\` and no `!`**. The task below is a multi-bullet block, so it fails that allowlist on shape alone. `resolve_task`'s own doc comment in `src/main.rs` exists to explain the same hazard.
+**The shape flag is whatever the runner chose for _this_ unit in step 7 — never a default carried in this template.** It read `--single` unconditionally until issue #674, which quietly undid step 7 for anyone who copied the line: a template is the one place an answer belonging to the runner cannot be stored, because it is followed rather than reconsidered.
+
+**`--task-file` is a safety rule, not an ergonomic one, and the product says so itself.** The delegation protocol compiled into the binary and handed to every orchestrator it spawns (`src/orchestrator_context.rs`) states that `--task "…"` is a fallback safe *only* when the whole task is **a single line of plain text with no backticks, no `$`, no `"`, no `\` and no `!`**. The task below is a multi-bullet block, so it fails that allowlist on shape alone. `resolve_task`'s own doc comment in `src/main.rs` exists to explain the same hazard.
 
 **It fires on this skill's own material, with no attacker involved.** The most load-bearing sentence in a task is the one quoting code, so it is the one most likely to contain backticks — #429's *"a timed-out sample must yield `None`, never `Some(false)`"* is the example below. Inline, the caller's shell command-substitutes `` `None` `` and `` `Some(false)` `` to empty strings before `dot-agent-deck` sees argv, and dispatches *"a timed-out sample must yield , never "* — the inverted contract the issue exists to prevent. **The dispatch reports success**, because the mangling happened upstream of it. Nothing anywhere signals the instruction was eaten.
 

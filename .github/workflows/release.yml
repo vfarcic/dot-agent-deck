@@ -729,11 +729,29 @@ jobs:
       - name: Upload the desktop assets to the release
         env:
           GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
           RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
-        run: gh release upload "v$RELEASE_VERSION" dist-desktop/* --clobber
+        # `--repo` is load-bearing on every `gh` call in this job, and its
+        # absence is why every release that has reached this job published no
+        # desktop artifact at all (#852). Unlike every other job in this file,
+        # `desktop-publish` has no `actions/checkout` -- it downloads artifacts
+        # and calls the API, and needs no source tree -- so there is no git
+        # repository for `gh` to infer the target from and it dies with
+        # `failed to run git: fatal: not a git repository`. Naming the
+        # repository is cheaper than cloning a tree the job never reads.
+        #
+        # All THREE calls in this job needed it: the two in the step below were
+        # latent only because the default `bash -e` aborts the job here first,
+        # so fixing this one alone would have relocated the failure rather than
+        # removed it. `release.yml` never runs on a pull request, so nothing in
+        # CI can catch a regression of this -- the static guard that can is
+        # `gh_calls_in_checkoutless_jobs_name_their_repository` in
+        # xtask/linkage-check/src/release_workflow_wiring.rs.
+        run: gh release upload "v$RELEASE_VERSION" dist-desktop/* --clobber --repo "$REPO"
       - name: Note the unsigned alpha in the release body
         env:
           GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
           RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
         # Appended here rather than assembled in `prepare` so the note appears
         # only when the assets it describes actually exist -- a release whose
@@ -741,7 +759,9 @@ jobs:
         run: |
           set -eu
           MARKER="<!-- desktop-alpha -->"
-          BODY=$(gh release view "v$RELEASE_VERSION" --json body -q .body)
+          # `--repo`, for the reason given on the step above: no checkout in
+          # this job means no git context for `gh` to fall back on.
+          BODY=$(gh release view "v$RELEASE_VERSION" --repo "$REPO" --json body -q .body)
           case "$BODY" in
             *"$MARKER"*)
               echo "release body already carries the desktop alpha note; nothing to do"
@@ -756,7 +776,7 @@ jobs:
             printf "On macOS, clear the quarantine flag after moving the app to /Applications:\n\n"
             printf "\`\`\`sh\nxattr -dr com.apple.quarantine \"/Applications/Agent Deck.app\"\n\`\`\`\n\n"
             printf "Signing and notarization are tracked in https://github.com/vfarcic/dot-agent-deck/issues/757. Checksums for these assets are in \`checksums-desktop-alpha.txt\`.\n"
-          } | gh release edit "v$RELEASE_VERSION" --notes-file -
+          } | gh release edit "v$RELEASE_VERSION" --repo "$REPO" --notes-file -
 
   docs:
     needs: [prepare, finalize]

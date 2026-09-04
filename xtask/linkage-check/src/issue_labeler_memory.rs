@@ -17,8 +17,8 @@
 //!
 //! - the two accepts the boundary must not block — a labeling-mode prediction,
 //!   and a feedback record carrying more labels than a prediction may. The two
-//!   caps differ deliberately (5 for a prediction, the whole taxonomy for a
-//!   correction), so a test that only ever passes ≤5 labels would not notice
+//!   caps differ deliberately (6 for a prediction, the whole taxonomy for a
+//!   correction), so a test that only ever passes ≤6 labels would not notice
 //!   them being collapsed into one.
 //! - the rejects that are the reason the step exists: a row smuggled in for an
 //!   unrelated issue, a row for another repository, a label outside the
@@ -319,6 +319,68 @@ fn issue_labeler_validator_lock_and_source_agree() {
     );
 }
 
+/// Slice out the text between `open` and the next `close`, insisting `open`
+/// occurs exactly once so an anchor the workflow moved fails loudly instead of
+/// silently matching somewhere else.
+fn between<'a>(haystack: &'a str, open: &str, close: &str) -> &'a str {
+    let hits = haystack.matches(open).count();
+    assert_eq!(hits, 1, "expected exactly one `{open}`, found {hits}");
+    let start = haystack.find(open).expect("checked above") + open.len();
+    let len = haystack[start..]
+        .find(close)
+        .unwrap_or_else(|| panic!("no `{close}` after `{open}`"));
+    &haystack[start..start + len]
+}
+
+/// Split a `["a", "b"]`-shaped list into its literal members.
+fn quoted_list(inner: &str) -> Vec<String> {
+    inner
+        .split(',')
+        .map(|item| item.trim().trim_matches('"').to_string())
+        .filter(|item| !item.is_empty())
+        .collect()
+}
+
+/// The safe-output allowlist bounds what may be **applied**; the validator
+/// carries a second, independent copy of the same policy bounding what may be
+/// **stored**. Nothing but this keeps the two in step, and they have already
+/// drifted once: PR #739 moved `add-labels.max` 5 → 6 and added three component
+/// labels to the allowlist while the validator kept both old values, so the
+/// sixth label the change existed to permit would have been applied and then
+/// rejected by the post-step — failing the run instead of persisting the
+/// prediction.
+///
+/// The correction cap is deliberately *not* checked against `max`: a feedback
+/// record snapshots whatever a maintainer left on the item, so it is bounded by
+/// the whole taxonomy (`allowedLabels.size`) rather than by what the classifier
+/// may propose. `issue_labeler_accepts_seven_label_feedback` covers that side.
+#[test]
+fn issue_labeler_validator_policy_matches_the_frontmatter() {
+    let md = read_lf(&repo_root().join(WORKFLOW_MD));
+    let script = validator_source();
+
+    let declared_max = between(&md, "\n  add-labels:\n    max: ", "\n").trim();
+    let enforced_max = between(&script, "const maxPredictionLabels = ", ";").trim();
+    assert_eq!(
+        declared_max, enforced_max,
+        "{WORKFLOW_MD}: `add-labels.max` is {declared_max} but the memory validator caps a \
+         prediction at {enforced_max} — the extra label would be applied and then rejected"
+    );
+
+    let declared = quoted_list(between(&md, "\n    allowed: [\"", "]\n"));
+    let enforced = quoted_list(between(&script, "const allowedLabels = new Set([\"", "]);"));
+    assert!(
+        !declared.iter().any(|l| l.contains('*') || l.contains('?')),
+        "{WORKFLOW_MD}: the allowlist gained a glob, which the validator's literal set cannot \
+         mirror — teach it the pattern before widening this check"
+    );
+    assert_eq!(
+        declared, enforced,
+        "{WORKFLOW_MD}: the safe-output allowlist and the memory validator disagree on the \
+         taxonomy — a label the workflow may apply cannot be stored as a learned example"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Accept: what the boundary must let through
 // ---------------------------------------------------------------------------
@@ -349,16 +411,17 @@ fn issue_labeler_records_a_valid_prediction() {
 }
 
 /// Feedback mode, and the case that pins the two caps apart. A **prediction**
-/// may carry at most 5 labels; a maintainer's correction snapshots whatever the
-/// item now has, which can legitimately exceed that. Six selectable labels is
+/// may carry at most 6 labels; a maintainer's correction snapshots whatever the
+/// item now has, which can legitimately exceed that. Seven selectable labels is
 /// therefore a shape only the feedback path may accept — and the event also
 /// carries the blocked `PRD` label, which must be filtered back out rather than
 /// stored.
 #[test]
-fn issue_labeler_accepts_six_label_feedback() {
+fn issue_labeler_accepts_seven_label_feedback() {
     let corrected = [
         "bug",
         "config",
+        "daemon",
         "priority:high",
         "size:medium",
         "source",
@@ -382,7 +445,7 @@ fn issue_labeler_accepts_six_label_feedback() {
     let Some(out) = fixture.run() else { return };
     assert!(
         out.accepted,
-        "a six-label correction was rejected — the prediction cap has leaked onto the \
+        "a seven-label correction was rejected — the prediction cap has leaked onto the \
          feedback path, and every larger correction is now unlearnable:\n{}",
         out.stderr
     );
@@ -465,28 +528,29 @@ fn issue_labeler_rejects_a_non_taxonomy_label() {
     );
 }
 
-/// A prediction may name at most 5 labels. Paired with the six-label feedback
+/// A prediction may name at most 6 labels. Paired with the seven-label feedback
 /// test above, this is what holds the two caps apart in both directions.
 #[test]
 fn issue_labeler_rejects_an_oversized_prediction() {
-    let six = [
+    let seven = [
         "bug",
         "config",
+        "daemon",
         "priority:high",
         "size:low",
         "source",
         "tests",
     ];
     let fixture = MemoryFixture {
-        memory: vec![("predictions.jsonl", format!("{}\n", prediction(42, &six)))],
+        memory: vec![("predictions.jsonl", format!("{}\n", prediction(42, &seven)))],
         baseline: vec![],
-        agent_output: add_labels_output(&six),
+        agent_output: add_labels_output(&seven),
         event: opened_issue_event(42),
     };
     let Some(out) = fixture.run() else { return };
     assert!(
         out.rejected_with("invalid labels"),
-        "a 6-label prediction was accepted past the documented cap of 5:\n{}",
+        "a 7-label prediction was accepted past the documented cap of 6:\n{}",
         out.stderr
     );
 }

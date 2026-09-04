@@ -52,7 +52,7 @@
       # (the same one release.yml uses) and pins the version here. The
       # dot-ai-tag-release skill bumps this line as part of cutting a tag, and
       # release.yml refuses to release when it disagrees with the tag.
-      version = "0.39.2";
+      version = "0.39.3";
 
       # `<version>-g<short-sha>`, the same shape build.rs composes out of git
       # metadata (build_version_resolve.rs:180-196).
@@ -153,6 +153,26 @@
             # halves of the build to the root package rather than compiling
             # three binaries nobody installs.
             cargoExtraArgs = "-p dot-agent-deck";
+
+            # Issue #863: `.cargo/config.toml` points the Linux target's
+            # `linker` at `scripts/link-gate.sh`, which bounds how many links
+            # run at once ACROSS worktrees on a shared developer box. A Nix
+            # build is a hermetic, single build in a sandbox, so it has nothing
+            # to coordinate with and wants the plain linker — and it cannot use
+            # the gate even if it wanted to, because `buildDepsOnly` compiles
+            # against a dummy source crane SYNTHESISES from the manifests, and
+            # that source contains no `scripts/`. rustc resolves the linker path
+            # before it links anything, so without this the first crate with a
+            # build script stops the whole derivation with
+            # `error: linker `/build/source/./scripts/link-gate.sh` not found`.
+            #
+            # An environment variable rather than a fileset entry, deliberately:
+            # adding the scripts to `src` above fixes the real build and leaves
+            # `buildDepsOnly` broken, because the dummy source is not `src`.
+            # `CARGO_TARGET_<TRIPLE>_LINKER` outranks the config file, so this
+            # covers both derivations from one place. `cc` is exactly what rustc
+            # defaults to, which is what the gate wraps.
+            CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER = "cc";
           };
 
           # The reason crane is here. This derivation compiles nothing of ours:

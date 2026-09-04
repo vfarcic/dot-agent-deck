@@ -60,8 +60,8 @@ safe-outputs:
     continue-on-error: false
     max-ai-credits: 10
   add-labels:
-    max: 5
-    allowed: ["bug", "documentation", "enhancement", "feature", "question", "source", "config", "dependencies", "tests", "ci-cd", "devbox", "priority:high", "priority:medium", "priority:low", "size:high", "size:medium", "size:low", "needs-triage"]
+    max: 6
+    allowed: ["bug", "documentation", "enhancement", "feature", "question", "source", "config", "dependencies", "tests", "ci-cd", "devbox", "daemon", "tui", "desktop", "priority:high", "priority:medium", "priority:low", "size:high", "size:medium", "size:low", "needs-triage"]
     blocked: ["PRD", "duplicate", "good first issue", "help wanted", "invalid", "manual-review", "stale", "wontfix"]
   noop:
     report-as-issue: false
@@ -83,6 +83,7 @@ Apply labels in these independent groups:
 
 - Type, at most one: `bug` for broken behavior; `feature` for new user-visible behavior; `enhancement` for improvements to existing behavior or maintainer tooling; `documentation` for documentation-only work; `question` when the item primarily asks for information.
 - Area, zero or more when explicit: `source`, `config`, `dependencies`, `tests`, `ci-cd`, or `devbox`. Existing deterministic pull request path-labeling may already have applied these.
+- Component, zero or more: `daemon` for the background daemon, `tui` for the terminal front-end, `desktop` for the Tauri GUI under `desktop/`. This is a different axis from Area, not a competing one: Area says what kind of file changed, Component says which of the three shipped surfaces owns it, so a component label sits alongside `source` or `tests` rather than replacing it. Several at once is normal rather than exceptional, because a protocol change is routinely `daemon` plus every client that consumes it. Apply none when the work is genuinely surface-independent.
 - Priority, issues only and exactly one when the impact is clear: `priority:high` for security, data loss, release blockers, or widespread core breakage; `priority:medium` for ordinary actionable work; `priority:low` for polish, narrow edge cases, or non-urgent cleanup.
 - Size, exactly one when estimable: `size:low` for less than a day, `size:medium` for roughly one to three days, and `size:high` for broader architectural or multi-part work.
 - Triage fallback, issues only: use `needs-triage` when the report lacks enough information to choose a type or priority confidently. Do not combine it with speculative labels.

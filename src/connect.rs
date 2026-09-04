@@ -53,12 +53,23 @@ const PICKER_MAX_RETRIES: usize = 3;
 /// constant.
 pub const REMOTE_INSTALL_PATH: &str = "~/.local/bin/dot-agent-deck";
 
-/// Default cap on the version-probe ssh round-trip. Overridable via
+/// Default budget for the version-probe ssh round-trip. Overridable via
 /// `DOT_AGENT_DECK_SSH_PROBE_TIMEOUT_SECS` — useful when a remote is reachable
 /// but slow (cold-start VMs, congested networks). The probe is intentionally
 /// short: an unresponsive remote should fail-fast rather than wedge `connect`
 /// for a TCP timeout. The override is clamped to
 /// `[1, PROBE_TIMEOUT_SECS_MAX]` — see [`probe_timeout_secs`].
+///
+/// **This is what ssh is allowed, not when the laptop gives up.** It becomes
+/// `ConnectTimeout` and `ServerAliveInterval` on the probe's ssh, which bound
+/// ssh's own wallclock at roughly twice it; the laptop-side kill is armed
+/// later still, at [`crate::remote::wallclock_kill_secs`] of this value, so it
+/// backstops those options rather than pre-empting them. Issue #858 is what
+/// that separation is for: armed at this number, the kill was the binding
+/// constraint and reported a connection ssh had not finished with as an
+/// unreachable host. Raising this default is therefore NOT the remedy for a
+/// slow link failing at the deadline — it scales both bounds together and
+/// leaves the relationship between them wherever it was.
 const PROBE_TIMEOUT_SECS_DEFAULT: u64 = 10;
 /// Upper bound on the parsed env var. One hour is well above any realistic
 /// cold-start / VPN delay and prevents `Instant::now() + Duration::from_secs(secs)`
@@ -1187,6 +1198,170 @@ fn on_transport_failure(
     None
 }
 
+/// Issue #858: which blocking phase of a connect the progress indicator is
+/// currently reporting. Both are ssh round-trips to the remote, and both can
+/// take the whole probe budget on a cold link — which is what made the old
+/// behaviour (silence, then a wall of red) hard to interpret.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ConnectPhase {
+    /// Stage 1: `<install_path> --version` over ssh.
+    BinaryProbe,
+    /// Stage 1b: the `daemon hello` handshake over ssh.
+    Handshake,
+}
+
+/// Issue #858: the text of the progress indicator for `phase`. Pure, like
+/// [`retry_message`], so what the user reads can be asserted directly.
+///
+/// It names the phase rather than saying only "Connecting…", because the two
+/// phases fail for different reasons and a user watching one stall for ten
+/// seconds is the person best placed to know which.
+fn progress_line(name: &str, phase: ConnectPhase) -> String {
+    match phase {
+        ConnectPhase::BinaryProbe => format!("Connecting to '{name}'… checking the remote deck"),
+        ConnectPhase::Handshake => format!("Connecting to '{name}'… waiting for the handshake"),
+    }
+}
+
+/// Issue #858: a single-line, in-place progress indicator for the blocking ssh
+/// round-trips `connect` makes before it hands the terminal over.
+///
+/// Deliberately not animated and deliberately dependency-free: it writes the
+/// line, and erases it with a carriage return and spaces. There is no redraw
+/// thread and no ANSI, so there is nothing to race the `ssh -t` handoff and
+/// nothing to leave behind on a terminal that does not speak escape sequences.
+/// An animation was the least important part of the issue and is not worth a
+/// timer fighting the handoff.
+///
+/// Two invariants:
+///
+/// - **It draws only when `enabled`.** `run_connect_default` sets that from
+///   stdio being a terminal, so a piped or redirected `connect` gets exactly
+///   the bytes it got before.
+/// - **It is erased before anything else writes.** Every caller clears it as
+///   soon as the round-trip returns — before the upgrade nudge prompts, before
+///   a retry line reaches stderr, before an error is returned, and so before
+///   the terminal is handed to `ssh -t`. Drawing only around the blocking call
+///   is what makes that hold on every path rather than on the ones someone
+///   remembered.
+///
+/// Write errors are swallowed. The indicator is cosmetic; a failing stdout is
+/// not a reason to fail a connect that is otherwise fine.
+///
+/// The erase is exact for a line that fits the terminal, which the ~50-column
+/// text does on any ordinary one. On a terminal narrow enough to wrap it, `\r`
+/// returns to the start of the last visual row only, so a fragment of the
+/// first row can survive — cosmetic, on a width where everything else `connect`
+/// prints wraps too, and the honest price of not emitting escape sequences at a
+/// terminal we are about to hand to somebody else.
+struct ConnectProgress {
+    enabled: bool,
+    /// Characters currently on screen, so [`Self::clear`] erases exactly what
+    /// it drew. Zero when nothing is drawn.
+    drawn: usize,
+}
+
+impl ConnectProgress {
+    fn new(enabled: bool) -> Self {
+        Self { enabled, drawn: 0 }
+    }
+
+    /// Draw the indicator for `phase`, replacing whatever it drew before.
+    fn show<W: Write>(&mut self, out: &mut W, name: &str, phase: ConnectPhase) {
+        if !self.enabled {
+            return;
+        }
+        self.clear(out);
+        let line = progress_line(name, phase);
+        let _ = write!(out, "\r{line}");
+        let _ = out.flush();
+        self.drawn = line.chars().count();
+    }
+
+    /// Erase the indicator and leave the cursor at column 0. A no-op when
+    /// nothing is drawn, so callers can clear unconditionally.
+    fn clear<W: Write>(&mut self, out: &mut W) {
+        if self.drawn == 0 {
+            return;
+        }
+        let _ = write!(out, "\r{:width$}\r", "", width = self.drawn);
+        let _ = out.flush();
+        self.drawn = 0;
+    }
+}
+
+/// Issue #858: what the caller should do after a **reachability** probe
+/// failure on attempt `attempt`. Three outcomes, because the give-up differs
+/// by whether a session ever ran.
+enum ProbeRetry {
+    /// Backed off after printing the retry line; try the next attempt.
+    Again,
+    /// Budget exhausted after a live session had already been established:
+    /// the local terminal is restored and the give-up line printed, so return
+    /// this exit code.
+    GaveUp(i32),
+    /// Budget exhausted before any session ran. Nothing was "lost", so return
+    /// the probe's own error verbatim.
+    Fatal,
+}
+
+/// Issue #858: bounded-retry decision for a reachability probe failure,
+/// covering the INITIAL connect as well as a reconnect.
+///
+/// `run_connect` already owned a retry budget, but a probe failure only
+/// entered it on a reconnect — the first attempt was fatal, so a user whose
+/// initial probe lost a race with a cold link had to retry by hand, and the
+/// output carried no `not reachable yet — retrying…` line to say why. The
+/// machinery to retry existed; it just did not cover attempt 1.
+///
+/// `session_established` is what separates the two give-ups, and it is a
+/// user-visible difference rather than bookkeeping. After a live session
+/// dropped, "connection to 'x' lost and could not be re-established" is
+/// accurate and the process exits 255 like any transport failure. Before one
+/// ever ran, that sentence would be a fiction: nothing was lost, and the
+/// probe's own `Could not reach remote 'x': <detail>` — with its "check your
+/// ssh config, the host is up, the network path is open" recovery hint — is
+/// both true and the thing the user can act on. So an exhausted initial
+/// connect keeps the error it always had; only the number of attempts behind
+/// it changed.
+///
+/// Note what this does NOT widen: only [`is_reachability_error`] failures come
+/// here. A missing binary, a rejected handshake, a protocol mismatch or a
+/// forward that could not bind stays fatal on the first attempt, because
+/// retrying a fatal classification would turn one fast, actionable error into
+/// five slow ones.
+///
+/// That is narrower than "nothing hopeless is retried", and the difference is
+/// worth stating rather than discovering. `map_probe_ssh_error` deliberately
+/// folds an auth failure and a host-key rejection into `HostUnreachable` too —
+/// the user's recourse is the same "check your ssh config" either way — so
+/// those DO enter the budget, and a bad key now costs four extra fast ssh
+/// round-trips and the backoff between them before the same message arrives.
+/// That is the price of not splitting a classification the rest of `connect`
+/// treats as one thing; it is bounded, it is the behaviour a reconnect has
+/// always had, and `remote add` fails on the same condition long before
+/// `connect` is ever reached. If it becomes the common case, the fix is a
+/// finer classification in the mapper, not a special case here.
+fn on_probe_unreachable(
+    attempt: usize,
+    name: &str,
+    session_established: bool,
+    backoff: &dyn ReconnectBackoff,
+) -> ProbeRetry {
+    if attempt >= MAX_CONNECT_ATTEMPTS && !session_established {
+        return ProbeRetry::Fatal;
+    }
+    match on_transport_failure(
+        attempt,
+        name,
+        TransportFailureKind::StillUnreachable,
+        backoff,
+    ) {
+        Some(code) => ProbeRetry::GaveUp(code),
+        None => ProbeRetry::Again,
+    }
+}
+
 /// Orchestrate one connect: probe → spawn `ssh -t` → record `last_connected`,
 /// with PRD #148 auto-reconnect wrapped around the probe/spawn step.
 ///
@@ -1207,14 +1382,18 @@ fn on_transport_failure(
 ///   17 makes the laptop exit 17 — same contract one level up).
 ///
 /// The re-probe each attempt doubles as the reachability gate: right after
-/// sleep/wake the laptop's wifi/DHCP may not be back, so the *initial*
-/// connect's probe is fatal (returns the existing "Could not reach…" error),
-/// but a probe **reachability** failure on a *reconnect* attempt
-/// ([`is_reachability_error`]) folds into the SAME bounded-retry/backoff/
-/// give-up path a dropped session uses — otherwise a still-down network would
-/// let the reconnect escape the loop without counting against the budget,
-/// backing off, or restoring the terminal. Genuine incompatibilities
-/// (protocol mismatch, missing binary) stay fatal even on a reconnect.
+/// sleep/wake the laptop's wifi/DHCP may not be back, so a probe
+/// **reachability** failure ([`is_reachability_error`]) folds into the SAME
+/// bounded-retry/backoff/give-up path a dropped session uses — otherwise a
+/// still-down network would let the connect escape the loop without counting
+/// against the budget, backing off, or restoring the terminal. Since issue
+/// #858 that covers the *initial* connect too, not only a reconnect: the first
+/// attempt used to be fatal, which is why `connect` regularly failed once and
+/// worked when the user immediately ran it again. What an exhausted initial
+/// connect returns is unchanged — the actionable "Could not reach…" error, not
+/// a "connection lost" line about a session that never existed (see
+/// [`on_probe_unreachable`]). Genuine incompatibilities (protocol mismatch,
+/// missing binary) stay fatal on every attempt.
 ///
 /// Reconnection is bounded by [`MAX_CONNECT_ATTEMPTS`]. When exhausted we
 /// restore a sane local terminal (the remote TUI never got to leave alt
@@ -1247,9 +1426,22 @@ pub fn run_connect<R: BufRead, W: Write>(
 
     // 1-based count of connect attempts made (initial connect + reconnects).
     // This is the retry budget: a transport failure on attempt N — a spawn
-    // that returned 255, OR (on a reconnect) a reachability probe failure —
-    // gives up once N reaches MAX_CONNECT_ATTEMPTS.
+    // that returned 255, OR a reachability probe failure on ANY attempt
+    // (issue #858; it used to be reconnects only) — gives up once N reaches
+    // MAX_CONNECT_ATTEMPTS.
     let mut attempt = 0usize;
+    // Whether the terminal was ever handed to a live `ssh -t` session. Decides
+    // the give-up wording and exit code when the budget runs out, and gates the
+    // one-shot upgrade nudge: a retried initial connect is still the initial
+    // connect and should still nudge, while a reconnect after a drop must
+    // re-attach without re-prompting.
+    let mut session_established = false;
+    // Issue #858: the two probes below are ssh round-trips that can each take
+    // the whole probe budget, and used to run in silence. Drawn around the
+    // blocking call and erased the moment it returns, so nothing has to
+    // remember to tear it down before the `ssh -t` handoff, the nudge prompt
+    // or an error.
+    let mut progress = ConnectProgress::new(is_tty);
     loop {
         attempt += 1;
 
@@ -1257,28 +1449,26 @@ pub fn run_connect<R: BufRead, W: Write>(
         // compares laptop↔remote versions (the laptop is only ssh + a
         // terminal, so the comparison guarded nothing). It still catches an
         // unreachable host or a missing/foreign binary (the connect floor) and
-        // returns the remote version for the newer-only nudge below. A probe
-        // *error* is fatal on the initial connect (returns the existing "Could
-        // not reach…" UX), but on a RECONNECT a reachability failure (the
-        // normal "wifi/DHCP not back yet" state after sleep/wake) folds into
-        // the same bounded-retry/backoff/give-up path a dropped session uses —
-        // see `on_transport_failure`.
-        let remote_version =
-            match probe_remote_version(executor, &target, &entry.name, install_path) {
-                Ok(v) => v,
-                Err(e) if attempt > 1 && is_reachability_error(&e) => {
-                    match on_transport_failure(
-                        attempt,
-                        &entry.name,
-                        TransportFailureKind::StillUnreachable,
-                        backoff,
-                    ) {
-                        Some(code) => return Ok(code),
-                        None => continue,
-                    }
+        // returns the remote version for the newer-only nudge below. A
+        // reachability failure — the normal "wifi/DHCP not back yet" state
+        // after sleep/wake, and equally the cold-link case on a first connect —
+        // folds into the same bounded-retry/backoff/give-up path a dropped
+        // session uses, on every attempt since issue #858. Everything else
+        // stays fatal immediately. See `on_probe_unreachable`.
+        progress.show(output, &entry.name, ConnectPhase::BinaryProbe);
+        let probed_version = probe_remote_version(executor, &target, &entry.name, install_path);
+        progress.clear(output);
+        let remote_version = match probed_version {
+            Ok(v) => v,
+            Err(e) if is_reachability_error(&e) => {
+                match on_probe_unreachable(attempt, &entry.name, session_established, backoff) {
+                    ProbeRetry::Again => continue,
+                    ProbeRetry::GaveUp(code) => return Ok(code),
+                    ProbeRetry::Fatal => return Err(e),
                 }
-                Err(e) => return Err(e),
-            };
+            }
+            Err(e) => return Err(e),
+        };
 
         // Stage 1b: `daemon hello` handshake — the structural floor ("remote
         // too old to handshake" stays; the build-id comparison went with the
@@ -1287,33 +1477,35 @@ pub fn run_connect<R: BufRead, W: Write>(
         // agree on a version", and returns the remote's running-agent count
         // when the reply carries one so the nudge can state the restart cost.
         // Same reachability-vs-fatal split as the version probe: a transient
-        // transport failure on a reconnect retries, but an unanswerable
-        // handshake stays fatal so we never hand the terminal to a remote whose
-        // install we could not confirm.
-        let agent_count = match probe_remote_protocol(executor, &target, &entry.name, install_path)
-        {
+        // transport failure retries on any attempt (issue #858), but an
+        // unanswerable handshake stays fatal so we never hand the terminal to a
+        // remote whose install we could not confirm.
+        progress.show(output, &entry.name, ConnectPhase::Handshake);
+        let probed_protocol = probe_remote_protocol(executor, &target, &entry.name, install_path);
+        progress.clear(output);
+        let agent_count = match probed_protocol {
             Ok(count) => count,
-            Err(e) if attempt > 1 && is_reachability_error(&e) => {
-                match on_transport_failure(
-                    attempt,
-                    &entry.name,
-                    TransportFailureKind::StillUnreachable,
-                    backoff,
-                ) {
-                    Some(code) => return Ok(code),
-                    None => continue,
+            Err(e) if is_reachability_error(&e) => {
+                match on_probe_unreachable(attempt, &entry.name, session_established, backoff) {
+                    ProbeRetry::Again => continue,
+                    ProbeRetry::GaveUp(code) => return Ok(code),
+                    ProbeRetry::Fatal => return Err(e),
                 }
             }
             Err(e) => return Err(e),
         };
 
         // Stage 1c: one-step, pre-handover upgrade nudge (PRD #161 M1.2). Only
-        // on the *initial* connect (attempt 1) — a reconnect after a transport
-        // drop must re-attach without re-prompting. Newer-only + non-TTY-skip +
-        // default-N are decided inside `maybe_nudge_upgrade`; on `y` it runs the
-        // binary-swap `remote upgrade` then returns so we connect to the
-        // upgraded remote (a failed upgrade falls back to the existing version).
-        if attempt == 1 {
+        // on the *initial* connect — a reconnect after a transport drop must
+        // re-attach without re-prompting. Keyed on "no session has run yet"
+        // rather than on `attempt == 1` since issue #858, because an initial
+        // connect whose first probe was retried is still the initial connect
+        // and would otherwise silently lose its nudge. Newer-only +
+        // non-TTY-skip + default-N are decided inside `maybe_nudge_upgrade`; on
+        // `y` it runs the binary-swap `remote upgrade` then returns so we
+        // connect to the upgraded remote (a failed upgrade falls back to the
+        // existing version).
+        if !session_established {
             maybe_nudge_upgrade(
                 upgrader,
                 &entry.name,
@@ -1333,6 +1525,25 @@ pub fn run_connect<R: BufRead, W: Write>(
                 source,
             }
         })?;
+        if !session_established {
+            session_established = true;
+            // Greptile P1 on PR #859: the probe retries that got this FIRST
+            // session up and the reconnects PRD #148 promises after it drops
+            // are two separate budgets, and `attempt` was carrying both. A
+            // connect whose probe finally succeeded on attempt 5 dropped
+            // straight into the exhausted branch and got ZERO reconnects —
+            // the "up to four automatic reconnects after a transport drop"
+            // spent on getting connected in the first place.
+            //
+            // Reset ONCE, at the boundary between the two, so the session that
+            // just started is attempt 1 of the reconnect budget. It stays
+            // bounded: the reset is gated on `!session_established`, so a
+            // session that keeps flapping still gets `MAX_CONNECT_ATTEMPTS`
+            // spawns in total rather than a fresh budget per reconnect. On the
+            // ordinary path — probe succeeds first time — `attempt` is already
+            // 1 and this changes nothing.
+            attempt = 1;
+        }
 
         // Stage 3: route on the exit code. Reconnect ONLY on ssh's
         // transport-failure code (255); any other code is terminal.
@@ -1385,11 +1596,15 @@ pub fn run_connect_default(
     // executor (a release download can outlast the short probe timeout).
     let upgrader = SystemRemoteUpgrader::new(remotes_path.to_path_buf());
     // PRD #161 M1.2: the nudge reads from stdin / writes the prompt to stdout
-    // and is skipped entirely when stdin is not a TTY.
+    // and is skipped entirely when stdio is not a TTY. Issue #858 folded the
+    // progress indicator behind the same flag and made it read BOTH ends:
+    // every surface it gates writes to stdout and waits on a human, so a
+    // prompt nobody can see is as useless as an indicator drawn into a
+    // redirected file.
     let stdin = std::io::stdin();
-    let is_tty = stdin.is_terminal();
-    let mut input = stdin.lock();
     let stdout = std::io::stdout();
+    let is_tty = stdin.is_terminal() && stdout.is_terminal();
+    let mut input = stdin.lock();
     let mut output = stdout.lock();
     run_connect(
         entry,
@@ -1712,32 +1927,43 @@ mod tests {
         }
     }
 
-    /// Fake executor that lets the FIRST connect's probe succeed, then fails
-    /// every later `--version` probe with an ssh transport error. The connect
-    /// path folds that into [`RemoteConnectError::HostUnreachable`] — the
-    /// canonical "host not reachable yet" state on a reconnect right after
-    /// sleep/wake, before wifi/DHCP recover. Used to prove a reconnect-time
-    /// reachability failure is bounded (counts against the budget, backs off)
-    /// instead of escaping the loop on the first re-probe.
+    /// Fake executor whose `--version` probe outcome is **scripted per call**:
+    /// `true` = reachable (a normal version line), `false` = an ssh transport
+    /// error, which `probe_remote_version` folds into
+    /// [`RemoteConnectError::HostUnreachable`] — the canonical "host not
+    /// reachable yet" state. Past the end of the script the last entry repeats,
+    /// so `vec![true, false]` is "reachable once, then never again".
     ///
-    /// `daemon hello` always succeeds, but it's only ever reached on the first
-    /// attempt: on reconnects the `--version` probe fails first and short-
-    /// circuits before the protocol handshake runs.
-    struct UnreachableAfterFirstConnectExecutor {
+    /// One fake covers both configurations of the same behaviour: a
+    /// reachability failure on a RECONNECT (`[true, false]`, the PRD #148
+    /// case) and one on the INITIAL connect (`[false, …]`, issue #858). They
+    /// differ only in when the failure lands, so they share a fixture rather
+    /// than a near-duplicate of it.
+    ///
+    /// `daemon hello` always succeeds; on an unreachable round the `--version`
+    /// probe fails first and short-circuits before the handshake runs.
+    struct ScriptedProbeExecutor {
         local_version: String,
+        reachable: Vec<bool>,
         version_calls: Cell<usize>,
     }
 
-    impl UnreachableAfterFirstConnectExecutor {
-        fn new(local_version: &str) -> Self {
+    impl ScriptedProbeExecutor {
+        fn new(local_version: &str, reachable: Vec<bool>) -> Self {
+            assert!(!reachable.is_empty(), "script needs at least one outcome");
             Self {
                 local_version: local_version.to_string(),
+                reachable,
                 version_calls: Cell::new(0),
             }
         }
+
+        fn version_calls(&self) -> usize {
+            self.version_calls.get()
+        }
     }
 
-    impl SshExecutor for UnreachableAfterFirstConnectExecutor {
+    impl SshExecutor for ScriptedProbeExecutor {
         fn run(&self, target: &SshTarget, command: &str) -> Result<SshOutput, SshError> {
             if command.contains("daemon hello") {
                 let body = serde_json::to_string(&AttachResponse::hello(PROTOCOL_VERSION))
@@ -1751,16 +1977,20 @@ mod tests {
             if command.contains("--version") {
                 let n = self.version_calls.get();
                 self.version_calls.set(n + 1);
-                if n == 0 {
-                    // First connect: reachable.
+                let reachable = self
+                    .reachable
+                    .get(n)
+                    .copied()
+                    .unwrap_or_else(|| *self.reachable.last().expect("non-empty"));
+                if reachable {
                     return Ok(SshOutput {
                         status: 0,
                         stdout: format!("dot-agent-deck {}\n", self.local_version),
                         stderr: String::new(),
                     });
                 }
-                // Every reconnect attempt: host not reachable yet. An ssh
-                // transport error maps to HostUnreachable in probe_remote_version.
+                // An ssh transport error maps to HostUnreachable in
+                // probe_remote_version.
                 return Err(SshError::ConnectionRefused {
                     host: target.host.clone(),
                     port: target.port,
@@ -2111,7 +2341,7 @@ mod tests {
         // 255. The buggy code would back off once then return Err on attempt 2.
         let entry = test_entry("prod");
         let (_dir, path) = registry_with(&entry);
-        let executor = UnreachableAfterFirstConnectExecutor::new(TEST_LOCAL_VERSION);
+        let executor = ScriptedProbeExecutor::new(TEST_LOCAL_VERSION, vec![true, false]);
         let spawner = ScriptedSpawner::new(vec![255]);
         let backoff = RecordingBackoff::new();
 
@@ -2149,6 +2379,144 @@ mod tests {
     }
 
     #[test]
+    fn initial_probe_unreachable_is_retried_then_connects() {
+        // Issue #858 (the reported symptom): `connect` failed on the first
+        // invocation and worked when run again by hand, because a reachability
+        // failure on the INITIAL probe was fatal — the MAX_CONNECT_ATTEMPTS
+        // budget only ever covered a reconnect. The retry the user was
+        // performing manually is exactly the one the code already knew how to
+        // do.
+        //
+        // Trace with the script [false, false, true]:
+        //   attempt 1: --version → HostUnreachable → retry line + backoff(1)
+        //   attempt 2: --version → HostUnreachable → retry line + backoff(2)
+        //   attempt 3: --version ok → handshake ok → spawn → clean exit 0
+        // So: Ok(0) from ONE spawn after two backoffs. Before the fix this
+        // returned Err(HostUnreachable) with zero backoffs and zero spawns.
+        let entry = test_entry("prod");
+        let (_dir, path) = registry_with(&entry);
+        let executor = ScriptedProbeExecutor::new(TEST_LOCAL_VERSION, vec![false, false, true]);
+        let spawner = ScriptedSpawner::new(vec![0]);
+        let backoff = RecordingBackoff::new();
+
+        let code = run_connect_no_nudge(&entry, &executor, &spawner, &backoff, &path)
+            .expect("an initial probe failure must be retried, not fatal");
+
+        assert_eq!(code, 0, "the third attempt connected and exited cleanly");
+        assert_eq!(
+            spawner.spawn_count(),
+            1,
+            "the terminal is handed over once, on the attempt whose probe succeeded"
+        );
+        assert_eq!(
+            backoff.count(),
+            2,
+            "both unreachable initial attempts backed off before the next probe"
+        );
+        assert_eq!(
+            executor.version_calls(),
+            3,
+            "the probe was actually re-run, not short-circuited"
+        );
+        let reloaded = RemotesFile::load(&path).expect("reload registry");
+        assert!(
+            reloaded.remotes[0].last_connected.is_some(),
+            "a clean exit after a retried initial connect still records the session"
+        );
+    }
+
+    #[test]
+    fn initial_probe_retries_do_not_eat_the_reconnect_budget() {
+        // Greptile P1 on PR #859, and a defect the first cut of issue #858
+        // introduced: the probe retries that get the FIRST session up and the
+        // post-drop reconnects PRD #148 promises are two separate budgets, and
+        // folding the initial probe into the shared counter silently spent one
+        // on the other. A connect whose probe finally succeeded on attempt 5
+        // got ZERO reconnects — the session dropped and `on_transport_failure`
+        // gave up immediately, which is precisely the "up to four automatic
+        // reconnects after a transport drop" that documentation promises.
+        //
+        // Trace with probes [f, f, f, f, t] (then reachable forever) and
+        // spawns [255, 255, 0] — the sharpest case, where the initial connect
+        // consumes the entire budget before a session exists:
+        //   attempts 1-4: --version → HostUnreachable → backoff x4
+        //   attempt 5:    probe ok → spawn #1 → 255   → counter resets here
+        //   then:         spawn #2 → 255 → backoff, spawn #3 → 0 → Ok(0)
+        // So: 3 spawns, 6 backoffs, exit 0. Before the fix: 1 spawn, 4
+        // backoffs, and Ok(255) from an immediate give-up.
+        let entry = test_entry("prod");
+        let (_dir, path) = registry_with(&entry);
+        let executor =
+            ScriptedProbeExecutor::new(TEST_LOCAL_VERSION, vec![false, false, false, false, true]);
+        let spawner = ScriptedSpawner::new(vec![255, 255, 0]);
+        let backoff = RecordingBackoff::new();
+
+        let code = run_connect_no_nudge(&entry, &executor, &spawner, &backoff, &path)
+            .expect("run_connect");
+
+        assert_eq!(
+            code, 0,
+            "the reconnect after the drop must still happen and reach a clean exit"
+        );
+        assert_eq!(
+            spawner.spawn_count(),
+            3,
+            "the session that came up on the last probe attempt still gets its reconnects"
+        );
+        assert_eq!(
+            backoff.count(),
+            6,
+            "four probe backoffs plus two reconnect backoffs — the two budgets are separate"
+        );
+    }
+
+    #[test]
+    fn initial_probe_unreachable_exhausts_the_budget_with_the_actionable_error() {
+        // The other half of issue #858: retrying the initial probe must stay
+        // BOUNDED, and a host that is genuinely down must still produce the
+        // actionable "Could not reach remote 'prod': …" error rather than the
+        // reconnect path's generic "connection lost … giving up" line — no
+        // session was ever established, so nothing was lost. The fix makes
+        // first-attempt failures *retried*, not impossible: the network can
+        // still be down, and this is what the user sees when it is.
+        let entry = test_entry("prod");
+        let (_dir, path) = registry_with(&entry);
+        let executor = ScriptedProbeExecutor::new(TEST_LOCAL_VERSION, vec![false]);
+        let spawner = ScriptedSpawner::new(vec![0]);
+        let backoff = RecordingBackoff::new();
+
+        let err = run_connect_no_nudge(&entry, &executor, &spawner, &backoff, &path)
+            .expect_err("an unreachable host must still fail once the budget is spent");
+
+        assert!(
+            matches!(
+                err,
+                RemoteConnectError::HostUnreachable { ref name, .. } if name == "prod"
+            ),
+            "the give-up must keep the probe's own classification: {err:?}"
+        );
+        assert!(
+            err.to_string().contains("Check your ssh config"),
+            "the actionable recovery hint survives the retries: {err}"
+        );
+        assert_eq!(
+            executor.version_calls(),
+            MAX_CONNECT_ATTEMPTS,
+            "every attempt in the budget probed, and no more"
+        );
+        assert_eq!(
+            backoff.count(),
+            MAX_CONNECT_ATTEMPTS - 1,
+            "backoff between attempts only — the last failure gives up instead"
+        );
+        assert_eq!(
+            spawner.spawn_count(),
+            0,
+            "the terminal is never handed to a host we could not reach"
+        );
+    }
+
+    #[test]
     fn retry_message_differentiates_drop_from_unreachable() {
         // Greptile PR #152 finding 1: the spawn-255 live-drop path and the
         // reconnect-time probe-unreachable path must read differently. Both
@@ -2175,6 +2543,132 @@ mod tests {
         assert!(
             !unreachable.contains("lost"),
             "the still-unreachable line must not say a connection was 'lost': {unreachable}"
+        );
+    }
+
+    #[test]
+    fn progress_indicator_draws_and_erases_only_on_a_tty() {
+        // Issue #858 change 3, at the two altitudes that matter.
+        //
+        // The text: it says what it is waiting on, and the two phases read
+        // differently — a user watching one of them stall is the person best
+        // placed to say which.
+        let probe = progress_line("prod", ConnectPhase::BinaryProbe);
+        let handshake = progress_line("prod", ConnectPhase::Handshake);
+        assert!(probe.starts_with("Connecting to 'prod'…"), "{probe}");
+        assert!(
+            handshake.starts_with("Connecting to 'prod'…"),
+            "{handshake}"
+        );
+        assert_ne!(
+            probe, handshake,
+            "the phase must be named, not just 'Connecting'"
+        );
+
+        // On a TTY: drawn, then erased, leaving the line blank for whatever
+        // writes next — the nudge prompt, an error, or the `ssh -t` handoff.
+        let mut drawn: Vec<u8> = Vec::new();
+        let mut progress = ConnectProgress::new(true);
+        progress.show(&mut drawn, "prod", ConnectPhase::BinaryProbe);
+        let mid = String::from_utf8(drawn.clone()).unwrap();
+        assert!(
+            mid.contains(&probe),
+            "the indicator must reach the user: {mid:?}"
+        );
+        progress.clear(&mut drawn);
+        let after = String::from_utf8(drawn).unwrap();
+        assert!(
+            after.ends_with('\r'),
+            "clear must return the cursor to column 0: {after:?}"
+        );
+        assert!(
+            after.trim_end_matches(['\r', ' ']).ends_with(&probe),
+            "clear must blank the line it drew, not print over it: {after:?}"
+        );
+
+        // Not a TTY: not a byte. `connect` piped or redirected must produce
+        // exactly what it produced before this existed.
+        let mut piped: Vec<u8> = Vec::new();
+        let mut off = ConnectProgress::new(false);
+        off.show(&mut piped, "prod", ConnectPhase::BinaryProbe);
+        off.show(&mut piped, "prod", ConnectPhase::Handshake);
+        off.clear(&mut piped);
+        assert!(
+            piped.is_empty(),
+            "no indicator off a TTY: {:?}",
+            String::from_utf8_lossy(&piped)
+        );
+    }
+
+    #[test]
+    fn connect_shows_progress_on_a_tty_and_stays_silent_off_one() {
+        // The same two cases end to end through `run_connect`, because the
+        // indicator is only worth anything if the connect path actually draws
+        // it — and only safe if the non-TTY path actually doesn't.
+        let entry = test_entry("prod");
+
+        let (_dir, path) = registry_with(&entry);
+        let executor = ProbeOkExecutor::new(TEST_LOCAL_VERSION);
+        let spawner = ScriptedSpawner::new(vec![0]);
+        let backoff = RecordingBackoff::new();
+        let upgrader = RecordingUpgrader::new();
+        let mut input: &[u8] = b"";
+        let mut output: Vec<u8> = Vec::new();
+        let code = run_connect(
+            &entry,
+            &executor,
+            &spawner,
+            &backoff,
+            &upgrader,
+            &path,
+            TEST_LOCAL_VERSION,
+            REMOTE_INSTALL_PATH,
+            &mut input,
+            &mut output,
+            true, // TTY
+        )
+        .expect("run_connect");
+        assert_eq!(code, 0);
+        let printed = String::from_utf8(output).unwrap();
+        assert!(
+            printed.contains(&progress_line("prod", ConnectPhase::BinaryProbe)),
+            "the version probe is announced while it blocks: {printed:?}"
+        );
+        assert!(
+            printed.contains(&progress_line("prod", ConnectPhase::Handshake)),
+            "so is the handshake: {printed:?}"
+        );
+        // Torn down before the terminal was handed to `ssh -t`: the last thing
+        // written is the erase, not the message.
+        assert!(
+            printed.ends_with('\r'),
+            "the indicator must be erased before the handoff: {printed:?}"
+        );
+
+        let (_dir2, path2) = registry_with(&entry);
+        let executor = ProbeOkExecutor::new(TEST_LOCAL_VERSION);
+        let spawner = ScriptedSpawner::new(vec![0]);
+        let backoff = RecordingBackoff::new();
+        let mut piped: Vec<u8> = Vec::new();
+        let mut input2: &[u8] = b"";
+        run_connect(
+            &entry,
+            &executor,
+            &spawner,
+            &backoff,
+            &RecordingUpgrader::new(),
+            &path2,
+            TEST_LOCAL_VERSION,
+            REMOTE_INSTALL_PATH,
+            &mut input2,
+            &mut piped,
+            false, // not a TTY
+        )
+        .expect("run_connect");
+        assert!(
+            piped.is_empty(),
+            "a non-TTY connect writes nothing to stdout: {:?}",
+            String::from_utf8_lossy(&piped)
         );
     }
 
@@ -2308,10 +2802,14 @@ mod tests {
 
         assert_eq!(code, 0);
         assert_eq!(spawner.spawn_count(), 1);
+        // Asserted against the prompt rather than against an empty stdout: on
+        // a TTY, stdout also carries the issue #858 progress indicator, which
+        // is drawn around the probes and erased again. What must not appear is
+        // the nudge.
+        let printed = String::from_utf8(output).unwrap();
         assert!(
-            output.is_empty(),
-            "never nudge an older laptop toward the remote's version: {}",
-            String::from_utf8_lossy(&output)
+            !printed.contains("Upgrade and connect?"),
+            "never nudge an older laptop toward the remote's version: {printed}"
         );
         assert!(upgrader.calls().is_empty());
     }
@@ -2359,6 +2857,16 @@ mod tests {
             spawner.spawn_count(),
             0,
             "the terminal is never handed to an install we could not confirm"
+        );
+        // Issue #858 control: widening the retry budget to the initial connect
+        // must not widen WHAT is retried. Only `is_reachability_error`
+        // failures enter the budget; an unanswerable handshake is a fatal
+        // classification, so it must still cost one attempt and no backoff —
+        // otherwise one fast, actionable error becomes five slow ones.
+        assert_eq!(
+            backoff.count(),
+            0,
+            "a fatal classification is never folded into the reachability retry budget"
         );
         let msg = err.to_string();
         assert!(

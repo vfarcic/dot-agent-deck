@@ -1,39 +1,345 @@
+/* Colour palette (PRD #743 M1). Every colour under desktop/src comes from a
+   token declared in this block: `xtask/linkage-check`'s desktop-palette guard
+   fails the build on a hex, rgb()/hsl() or bare `white`/`black` literal found
+   anywhere else, unless that line carries a `theme-invariant: <reason>` opt-out.
+   These are the light values; the dark ones are M3. */
 :root {
   font-family: Geist, "IBM Plex Sans", "Avenir Next", system-ui, -apple-system, sans-serif;
-  color: #1d2522;
-  background: #efede6;
   font-synthesis: none;
   text-rendering: optimizeLegibility;
+  color: var(--ink);
+  background: var(--canvas);
+
+  /* Light chrome — surfaces, from the page ground up to the brightest card. */
   --canvas: #efede6;
   --paper: #f8f6f0;
   --paper-strong: #fffdf8;
+  --paper-sunken: #f1efe8;
+  --paper-sunken-strong: #eceae3;
+  --skeleton: #e5e2da;
+
+  /* Light chrome — text. */
   --ink: #1d2522;
+  --ink-soft: #434c48;
   --muted: #66706b;
   --faint: #8d948f;
+  --on-accent: #ffffff;
+
+  /* Light chrome — lines. */
   --line: #d4d0c6;
   --line-strong: #bdb9af;
+  --dialog-edge: #59615e;
+
+  /* Teal: the primary accent. */
   --teal: #0f7167;
+  --teal-deep: #075f56;
+  --focus-ring: #278d80;
+  --teal-wash-ink: #3e5e56;
+  --teal-focus: #5e9c90;
+  --teal-rim: #8db9b0;
+  --teal-edge: #bed5cf;
   --teal-soft: #d9ebe5;
+  --teal-wash: #edf5f1;
+
+  /* Green: passed / done. */
   --green: #28724d;
+  --green-rim: #83b497;
+  --green-rim-soft: #b5d4bd;
   --green-soft: #dcecdf;
+
+  /* Amber: waiting / caution. */
   --amber: #94691d;
+  --amber-ink: #65521e;
+  --amber-ink-soft: #786b4b;
+  --amber-rim: #c9a55f;
+  --amber-edge: #ddc483;
+  --amber-line: #d8cda9;
   --amber-soft: #f2e5c7;
+  --amber-bright: #fff7e5;
+
+  /* Red: failed / destructive. */
   --red: #a13e38;
+  --red-ink: #7d2e29;
+  --red-rim-strong: #c87e78;
+  --red-rim: #d9aaa5;
   --red-soft: #f3ddda;
+
+  /* Violet: needs a human. */
   --violet: #735a91;
   --violet-soft: #e8e0ef;
+
+  /* Live status, read against both the light chrome and the dark instrument
+     chrome, so these are one family rather than two. */
+  --status-ok: #6db58b;
+  --status-warn: #c69a4e;
+  --status-error: #d0685f;
+
+  /* Instrument chrome — the dark surfaces wrapped around the terminals: the
+     rail, the tab strip, the agent footer, the output panels and the reader
+     overlay. Per PRD #743 these stay dark in both appearances. */
   --terminal: #141817;
+  --shell-deep: #14201d;
+  --shell-line-deep: #131816;
+  --shell: #222a27;
+  --shell-line: #29302e;
+  --shell-raised: #313c38;
+  --shell-thumb: #46534e;
+  --shell-edge: #59625e;
+  --shell-faint: #82908a;
+  --shell-muted: #9da7a2;
+  --shell-ink-soft: #bac2be;
+  --shell-ink: #d8ded9;
+  --shell-ink-bright: #f4f5f3;
+  --shell-teal-surface: #1d3a30;
+  --shell-teal-edge: #3a6a5f;
+  --shell-teal: #72c3b3;
+  --shell-teal-text: #9fd8c8;
+  --shell-teal-text-strong: #d5f3ea;
+
+  /* Channel forms, for the colours also used at partial alpha:
+     `rgb(var(--scrim-rgb) / .12)` keeps the alpha at the call site so one token
+     serves every depth.
+
+     --paper-rgb and --teal-rgb are channel forms OF the token they are named
+     after and track it in both themes. --scrim-rgb is not one: its role is the
+     nine scrims and drop shadows, and it goes to black in dark rather than
+     following --ink. Its light value equalling --ink is a coincidence, and it is
+     why this token was renamed out of the ink family: the old name invited the
+     next person extending the palette to make it track --ink, which would light
+     the app up in dark mode instead of darkening it. */
+  --scrim-rgb: 29 37 34;
+  --paper-rgb: 248 246 240;
+  --teal-rgb: 15 113 103;
+
+  /* Layout, not colour. */
   --rail-width: 74px;
   --drawer-width: 358px;
   --radius: 6px;
 }
 
+/* Dark values (PRD #743 M3), delivered twice because both paths are required:
+   the media query is the OS default and must NOT apply when the user has
+   explicitly chosen Light, and the attribute block is an explicit Dark choice
+   winning on a light OS.
+
+   Every colour token the light block declares is re-declared in both, even
+   where the value is deliberately identical, so this reads as a complete list
+   of decisions rather than as a diff. `xtask/linkage-check`'s desktop-palette
+   guard fails the build if the two blocks drift apart or if a token is added
+   to `:root` without a dark counterpart -- neither is something a test can
+   otherwise see, because nothing renders dark mode in CI. */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    /* Surfaces. The ground is the deepest layer in dark so every card lifts off */
+    /* it; in light the ground sits mid-ladder because cream barely separates from */
+    /* cream. Otherwise the ladder's order is the light one, mirrored: more raised */
+    /* is lighter in both themes. */
+    --canvas: #101514;
+    --paper: #1f2624;
+    --paper-strong: #262e2b;
+    --paper-sunken: #1a201f;
+    --paper-sunken-strong: #161b1a;
+    --skeleton: #39423e;  /* lighter than its card, not darker: a placeholder has to be seen */
+    /* Text. */
+    --ink: #e6ebe8;
+    --ink-soft: #c0c8c4;
+    --muted: #a8b2ad;
+    --faint: #8d9792;  /* lifted until AA clears on every surface it lands on */
+    /* NOT the surface ladder. This is the label ON a filled accent -- the primary */
+    /* button, the switch knob, the checkbox tick -- and in dark those fills are */
+    /* LIGHT, so the label has to go dark. Following --paper-strong here would put */
+    /* a near-white label on a light teal button at 1.9:1. */
+    --on-accent: #0b1614;
+    /* Lines. */
+    --line: #373f3c;
+    --line-strong: #495350;
+    /* --dialog-edge and --shell-edge hold the same value in light and move in */
+    /* OPPOSITE directions here, which is the whole reason they are two tokens. */
+    /* This one rims a floating dialog whose surface just went dark, so it has to */
+    /* get lighter to keep defining the dialog's edge. */
+    --dialog-edge: #8b9490;
+    /* Teal: the primary accent. Text and fills, so it must read as text on a dark */
+    /* surface -- which is what forces --on-accent dark above. */
+    --teal: #4fc3ae;
+    --teal-deep: #79d9c7;  /* the primary button's hover: a step further is brighter in dark */
+    --focus-ring: #5ac9b6;
+    --teal-wash-ink: #a9cec5;
+    --teal-focus: #6aa89b;
+    --teal-rim: #47756b;
+    --teal-edge: #33564f;
+    --teal-soft: #1c332e;
+    --teal-wash: #16241f;
+    /* Green: passed / done. */
+    --green: #5cbb87;
+    --green-rim: #4f8266;
+    --green-rim-soft: #3a5f49;
+    --green-soft: #1a2c21;
+    /* Amber: waiting / caution. */
+    --amber: #e0b44f;
+    --amber-ink: #e4ca8d;
+    --amber-ink-soft: #c1b088;
+    --amber-rim: #7d6430;
+    --amber-edge: #695426;
+    --amber-line: #55441f;
+    --amber-soft: #2b2313;
+    --amber-bright: #241d0e;  /* the subtlest amber ground, as it is in light */
+    /* Red: failed / destructive. */
+    --red: #e28880;
+    --red-ink: #efaba4;
+    --red-rim-strong: #8f4f49;
+    --red-rim: #743e39;
+    --red-soft: #2e1a18;
+    /* Violet: needs a human. */
+    --violet: #ab92ca;
+    --violet-soft: #29223a;
+    /* Live status. Unchanged: these were already picked to read against the dark */
+    /* instrument chrome, and every one of their call sites is on it -- the rail's */
+    /* connection lamp, the composer's caution/error lines, the check rows. */
+    --status-ok: #6db58b;
+    --status-warn: #c69a4e;
+    --status-error: #d0685f;
+    /* Instrument chrome. Near-invariant by decision: PRD #743 keeps the terminals */
+    /* dark in both appearances, so these surfaces were already right. The three */
+    /* nudges are all one thing -- the canvas around them is dark now, so the */
+    /* instrument block has to sit slightly BELOW the cards to stay an inset */
+    /* rather than float on top of them. */
+    --terminal: #141817;  /* never themed. The xterm surface, PRD #743 Open Question 1 */
+    --shell-deep: #14201d;
+    --shell-line-deep: #131816;
+    --shell: #1b2220;  /* nudged down from #222a27: separation from --paper-strong */
+    --shell-line: #242b29;  /* tracks --shell */
+    --shell-raised: #2a3532;  /* tracks --shell, keeping the rail's hover step */
+    --shell-thumb: #46534e;
+    --shell-edge: #4e5754;  /* down, while --dialog-edge goes up: see above */
+    --shell-faint: #82908a;
+    --shell-muted: #9da7a2;
+    --shell-ink-soft: #bac2be;
+    --shell-ink: #d8ded9;
+    --shell-ink-bright: #f4f5f3;
+    --shell-teal-surface: #1d3a30;
+    --shell-teal-edge: #3a6a5f;
+    --shell-teal: #72c3b3;
+    --shell-teal-text: #9fd8c8;
+    --shell-teal-text-strong: #d5f3ea;
+    /* Channel forms. --paper-rgb and --teal-rgb track their own token, as in */
+    /* light. --scrim-rgb tracks nothing, which is what its name says: every */
+    /* one of its nine call sites is a scrim or a drop shadow, and a shadow cast in */
+    /* the near-white dark --ink would light the app up instead of darkening it. */
+    /* Black is the most a fixed call-site alpha can darken a dark surface by. */
+    --scrim-rgb: 0 0 0;
+    --paper-rgb: 31 38 36;  /* = --paper */
+    --teal-rgb: 79 195 174;  /* = --teal */
+  }
+}
+
+/* An explicit Dark choice, which has to win on a light OS too. */
+:root[data-theme="dark"] {
+  /* Surfaces. The ground is the deepest layer in dark so every card lifts off */
+  /* it; in light the ground sits mid-ladder because cream barely separates from */
+  /* cream. Otherwise the ladder's order is the light one, mirrored: more raised */
+  /* is lighter in both themes. */
+  --canvas: #101514;
+  --paper: #1f2624;
+  --paper-strong: #262e2b;
+  --paper-sunken: #1a201f;
+  --paper-sunken-strong: #161b1a;
+  --skeleton: #39423e;  /* lighter than its card, not darker: a placeholder has to be seen */
+  /* Text. */
+  --ink: #e6ebe8;
+  --ink-soft: #c0c8c4;
+  --muted: #a8b2ad;
+  --faint: #8d9792;  /* lifted until AA clears on every surface it lands on */
+  /* NOT the surface ladder. This is the label ON a filled accent -- the primary */
+  /* button, the switch knob, the checkbox tick -- and in dark those fills are */
+  /* LIGHT, so the label has to go dark. Following --paper-strong here would put */
+  /* a near-white label on a light teal button at 1.9:1. */
+  --on-accent: #0b1614;
+  /* Lines. */
+  --line: #373f3c;
+  --line-strong: #495350;
+  /* --dialog-edge and --shell-edge hold the same value in light and move in */
+  /* OPPOSITE directions here, which is the whole reason they are two tokens. */
+  /* This one rims a floating dialog whose surface just went dark, so it has to */
+  /* get lighter to keep defining the dialog's edge. */
+  --dialog-edge: #8b9490;
+  /* Teal: the primary accent. Text and fills, so it must read as text on a dark */
+  /* surface -- which is what forces --on-accent dark above. */
+  --teal: #4fc3ae;
+  --teal-deep: #79d9c7;  /* the primary button's hover: a step further is brighter in dark */
+  --focus-ring: #5ac9b6;
+  --teal-wash-ink: #a9cec5;
+  --teal-focus: #6aa89b;
+  --teal-rim: #47756b;
+  --teal-edge: #33564f;
+  --teal-soft: #1c332e;
+  --teal-wash: #16241f;
+  /* Green: passed / done. */
+  --green: #5cbb87;
+  --green-rim: #4f8266;
+  --green-rim-soft: #3a5f49;
+  --green-soft: #1a2c21;
+  /* Amber: waiting / caution. */
+  --amber: #e0b44f;
+  --amber-ink: #e4ca8d;
+  --amber-ink-soft: #c1b088;
+  --amber-rim: #7d6430;
+  --amber-edge: #695426;
+  --amber-line: #55441f;
+  --amber-soft: #2b2313;
+  --amber-bright: #241d0e;  /* the subtlest amber ground, as it is in light */
+  /* Red: failed / destructive. */
+  --red: #e28880;
+  --red-ink: #efaba4;
+  --red-rim-strong: #8f4f49;
+  --red-rim: #743e39;
+  --red-soft: #2e1a18;
+  /* Violet: needs a human. */
+  --violet: #ab92ca;
+  --violet-soft: #29223a;
+  /* Live status. Unchanged: these were already picked to read against the dark */
+  /* instrument chrome, and every one of their call sites is on it -- the rail's */
+  /* connection lamp, the composer's caution/error lines, the check rows. */
+  --status-ok: #6db58b;
+  --status-warn: #c69a4e;
+  --status-error: #d0685f;
+  /* Instrument chrome. Near-invariant by decision: PRD #743 keeps the terminals */
+  /* dark in both appearances, so these surfaces were already right. The three */
+  /* nudges are all one thing -- the canvas around them is dark now, so the */
+  /* instrument block has to sit slightly BELOW the cards to stay an inset */
+  /* rather than float on top of them. */
+  --terminal: #141817;  /* never themed. The xterm surface, PRD #743 Open Question 1 */
+  --shell-deep: #14201d;
+  --shell-line-deep: #131816;
+  --shell: #1b2220;  /* nudged down from #222a27: separation from --paper-strong */
+  --shell-line: #242b29;  /* tracks --shell */
+  --shell-raised: #2a3532;  /* tracks --shell, keeping the rail's hover step */
+  --shell-thumb: #46534e;
+  --shell-edge: #4e5754;  /* down, while --dialog-edge goes up: see above */
+  --shell-faint: #82908a;
+  --shell-muted: #9da7a2;
+  --shell-ink-soft: #bac2be;
+  --shell-ink: #d8ded9;
+  --shell-ink-bright: #f4f5f3;
+  --shell-teal-surface: #1d3a30;
+  --shell-teal-edge: #3a6a5f;
+  --shell-teal: #72c3b3;
+  --shell-teal-text: #9fd8c8;
+  --shell-teal-text-strong: #d5f3ea;
+  /* Channel forms. --paper-rgb and --teal-rgb track their own token, as in */
+  /* light. --scrim-rgb tracks nothing, which is what its name says: every */
+  /* one of its nine call sites is a scrim or a drop shadow, and a shadow cast in */
+  /* the near-white dark --ink would light the app up instead of darkening it. */
+  /* Black is the most a fixed call-site alpha can darken a dark surface by. */
+  --scrim-rgb: 0 0 0;
+  --paper-rgb: 31 38 36;  /* = --paper */
+  --teal-rgb: 79 195 174;  /* = --teal */
+}
 * { box-sizing: border-box; }
 html, body, #root { min-width: 320px; min-height: 100%; margin: 0; }
 body { min-height: 100vh; overflow-x: hidden; }
 button, input, select, textarea { font: inherit; }
 button { color: inherit; }
-button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible, [tabindex]:focus-visible { outline: 2px solid #278d80; outline-offset: 2px; }
+button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible, [tabindex]:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 2px; }
 button:disabled { cursor: not-allowed; opacity: .46; }
 code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "JetBrains Mono", "SFMono-Regular", Consolas, monospace; font-variant-numeric: tabular-nums; }
 
@@ -41,23 +347,23 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .deck-main { min-height: 100vh; margin-left: var(--rail-width); transition: margin-right .18s ease; }
 .control-deck.with-evidence .deck-main { margin-right: var(--drawer-width); }
 
-.rail { position: fixed; z-index: 40; inset: 0 auto 0 0; width: var(--rail-width); padding: 14px 10px; display: flex; flex-direction: column; align-items: center; background: #222a27; color: #d8ded9; border-right: 1px solid #131816; }
-.brand-mark { width: 42px; height: 42px; display: grid; place-items: center; position: relative; border: 1px solid #69736f; border-radius: 6px; font-size: 11px; font-weight: 750; letter-spacing: .08em; }
-.brand-mark i { position: absolute; right: -3px; bottom: -3px; width: 9px; height: 9px; border: 2px solid #222a27; border-radius: 50%; background: #5db8a6; }
+.rail { position: fixed; z-index: 40; inset: 0 auto 0 0; width: var(--rail-width); padding: 14px 10px; display: flex; flex-direction: column; align-items: center; background: var(--shell); color: var(--shell-ink); border-right: 1px solid var(--shell-line-deep); }
+.brand-mark { width: 42px; height: 42px; display: grid; place-items: center; position: relative; border: 1px solid var(--shell-edge); border-radius: 6px; font-size: 11px; font-weight: 750; letter-spacing: .08em; }
+.brand-mark i { position: absolute; right: -3px; bottom: -3px; width: 9px; height: 9px; border: 2px solid var(--shell); border-radius: 50%; background: var(--shell-teal); }
 .rail nav { width: 100%; margin-top: 28px; display: grid; gap: 7px; }
-.rail nav button, .rail-bottom button { width: 52px; height: 48px; margin: auto; padding: 0; display: grid; place-items: center; border: 1px solid transparent; border-radius: 5px; color: #9da7a2; background: transparent; cursor: pointer; }
-.rail nav button span { position: fixed; left: 67px; padding: 6px 9px; pointer-events: none; opacity: 0; transform: translateX(-4px); color: #f4f5f3; background: #222a27; border: 1px solid #59625e; border-radius: 4px; white-space: nowrap; font-size: 12px; transition: opacity .12s, transform .12s; }
+.rail nav button, .rail-bottom button { width: 52px; height: 48px; margin: auto; padding: 0; display: grid; place-items: center; border: 1px solid transparent; border-radius: 5px; color: var(--shell-muted); background: transparent; cursor: pointer; }
+.rail nav button span { position: fixed; left: 67px; padding: 6px 9px; pointer-events: none; opacity: 0; transform: translateX(-4px); color: var(--shell-ink-bright); background: var(--shell); border: 1px solid var(--shell-edge); border-radius: 4px; white-space: nowrap; font-size: 12px; transition: opacity .12s, transform .12s; }
 .rail nav button:hover span, .rail nav button:focus-visible span { opacity: 1; transform: translateX(0); }
-.rail nav button:hover, .rail nav button.is-active { color: #ecf3ef; border-color: #53615c; background: #313c38; }
-.rail nav button.is-active { color: #72c3b3; box-shadow: inset 3px 0 0 #72c3b3; }
+.rail nav button:hover, .rail nav button.is-active { color: var(--shell-ink-bright); border-color: var(--shell-edge); background: var(--shell-raised); }
+.rail nav button.is-active { color: var(--shell-teal); box-shadow: inset 3px 0 0 var(--shell-teal); }
 .rail-bottom { margin-top: auto; display: grid; justify-items: center; gap: 14px; }
 .rail-bottom button { height: 38px; }
-.connection-lamp { width: 9px; height: 9px; border: 2px solid #313a37; border-radius: 50%; background: #777f7b; box-shadow: 0 0 0 1px #707a75; }
-.connection-lamp.connection-connected { background: #6db58b; box-shadow: 0 0 0 1px #84c59e; }
-.connection-lamp.connection-error { background: #d16a63; }
-.connection-lamp.connection-loading { background: #d1ad65; }
+.connection-lamp { width: 9px; height: 9px; border: 2px solid var(--shell-line); border-radius: 50%; background: var(--shell-faint); box-shadow: 0 0 0 1px var(--shell-faint); }
+.connection-lamp.connection-connected { background: var(--status-ok); box-shadow: 0 0 0 1px var(--status-ok); }
+.connection-lamp.connection-error { background: var(--status-error); }
+.connection-lamp.connection-loading { background: var(--status-warn); }
 
-.topbar { height: 72px; padding: 0 18px 0 22px; position: sticky; z-index: 30; top: 0; display: grid; grid-template-columns: minmax(210px, 1fr) auto minmax(244px, auto); align-items: stretch; gap: 18px; border-bottom: 1px solid var(--line-strong); background: rgba(248, 246, 240, .97); }
+.topbar { height: 72px; padding: 0 18px 0 22px; position: sticky; z-index: 30; top: 0; display: grid; grid-template-columns: minmax(210px, 1fr) auto minmax(244px, auto); align-items: stretch; gap: 18px; border-bottom: 1px solid var(--line-strong); background: rgb(var(--paper-rgb) / .97); }
 .repo-context { min-width: 0; display: flex; flex-direction: column; justify-content: center; }
 .repo-line, .branch-line { display: flex; align-items: center; min-width: 0; }
 .repo-line { gap: 6px; font-size: 13px; }
@@ -80,23 +386,23 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .health-idle { color: var(--faint); }
 .top-actions { display: flex; align-items: center; justify-content: flex-end; gap: 7px; }
 .command-trigger { height: 30px; min-width: 118px; padding: 0 7px 0 9px; display: flex; align-items: center; gap: 6px; border: 1px solid var(--line); border-radius: 4px; color: var(--muted); background: var(--paper-strong); cursor: pointer; font-size: 10px; }
-.command-trigger kbd { margin-left: auto; padding: 2px 4px; border: 1px solid var(--line); border-radius: 3px; background: #eeece5; font-size: 8px; }
+.command-trigger kbd { margin-left: auto; padding: 2px 4px; border: 1px solid var(--line); border-radius: 3px; background: var(--paper-sunken); font-size: 8px; }
 .button { min-height: 34px; padding: 0 13px; display: inline-flex; align-items: center; justify-content: center; gap: 6px; border: 1px solid transparent; border-radius: 4px; cursor: pointer; font-size: 11px; font-weight: 650; }
 .button.compact { min-height: 30px; padding-inline: 9px; }
-.button.primary { color: #fff; background: var(--teal); border-color: #075f56; }
-.button.primary:hover { background: #0a6259; }
+.button.primary { color: var(--on-accent); background: var(--teal); border-color: var(--teal-deep); }
+.button.primary:hover { background: var(--teal-deep); }
 .button.secondary { color: var(--ink); background: var(--paper-strong); border-color: var(--line-strong); }
-.button.secondary:hover { background: #eeece5; }
-.button.danger { color: var(--red); background: #fff9f7; border-color: #d9aaa5; }
-.button.danger:hover { color: #fff; background: var(--red); border-color: var(--red); }
+.button.secondary:hover { background: var(--paper-sunken); }
+.button.danger { color: var(--red); background: var(--paper-strong); border-color: var(--red-rim); }
+.button.danger:hover { color: var(--on-accent); background: var(--red); border-color: var(--red); }
 
-.fixture-bar { min-height: 31px; padding: 0 22px; display: flex; align-items: center; gap: 10px; border-bottom: 1px solid #d8cda9; color: #645532; background: #f5ecd4; font-size: 10px; }
+.fixture-bar { min-height: 31px; padding: 0 22px; display: flex; align-items: center; gap: 10px; border-bottom: 1px solid var(--amber-line); color: var(--amber-ink); background: var(--amber-soft); font-size: 10px; }
 .fixture-bar > span { display: flex; align-items: center; gap: 5px; font-size: 9px; font-weight: 800; letter-spacing: .1em; }
-.fixture-bar p { margin: 0; color: #786b4b; }
-.fixture-bar button { margin-left: auto; display: flex; align-items: center; gap: 5px; padding: 3px 7px; border: 0; color: #65521e; background: transparent; cursor: pointer; font-weight: 700; font-size: 10px; }
+.fixture-bar p { margin: 0; color: var(--amber-ink-soft); }
+.fixture-bar button { margin-left: auto; display: flex; align-items: center; gap: 5px; padding: 3px 7px; border: 0; color: var(--amber-ink); background: transparent; cursor: pointer; font-weight: 700; font-size: 10px; }
 .fixture-bar button:hover { text-decoration: underline; }
-.connection-banner { min-height: 48px; margin: 12px 16px 0; padding: 8px 10px; display: flex; align-items: center; gap: 9px; border: 1px solid #ddc483; border-radius: var(--radius); color: #654c17; background: var(--amber-soft); }
-.connection-banner.connection-error { color: #7d2e29; background: var(--red-soft); border-color: #d7a6a1; }
+.connection-banner { min-height: 48px; margin: 12px 16px 0; padding: 8px 10px; display: flex; align-items: center; gap: 9px; border: 1px solid var(--amber-edge); border-radius: var(--radius); color: var(--amber-ink); background: var(--amber-soft); }
+.connection-banner.connection-error { color: var(--red-ink); background: var(--red-soft); border-color: var(--red-rim); }
 .connection-banner > div { display: flex; flex-direction: column; gap: 2px; }
 .connection-banner strong { font-size: 11px; }
 .connection-banner span { font-size: 10px; }
@@ -111,7 +417,7 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .workflow-strip > header, .workspace-header { min-height: 46px; padding: 8px 11px; display: flex; align-items: center; justify-content: space-between; }
 .workflow-strip h1, .workspace-header h2 { margin: 2px 0 0; font-size: 13px; font-weight: 680; }
 .workflow-strip > header > button, .workspace-tools button { display: flex; align-items: center; gap: 5px; padding: 5px 7px; border: 1px solid var(--line); border-radius: 3px; color: var(--muted); background: transparent; cursor: pointer; font-size: 9px; }
-.workflow-strip > header > button:hover, .workspace-tools button:hover, .workspace-tools button.is-active { color: var(--teal); border-color: #94bdb4; background: #edf5f1; }
+.workflow-strip > header > button:hover, .workspace-tools button:hover, .workspace-tools button.is-active { color: var(--teal); border-color: var(--teal-rim); background: var(--teal-wash); }
 .workflow-track { min-height: 66px; padding: 10px 14px 13px; display: grid; grid-template-columns: repeat(6, minmax(78px, 1fr)); border-top: 1px solid var(--line); }
 .workflow-node { min-width: 0; position: relative; display: flex; align-items: center; gap: 8px; }
 .node-glyph { width: 26px; height: 26px; flex: 0 0 26px; display: grid; place-items: center; z-index: 1; border: 1px solid var(--line-strong); border-radius: 50%; color: var(--muted); background: var(--paper-strong); font-family: "JetBrains Mono", monospace; font-size: 8px; font-weight: 700; }
@@ -119,10 +425,10 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .workflow-node strong { overflow: hidden; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
 .workflow-node small { color: var(--faint); font-family: "JetBrains Mono", monospace; font-size: 7.5px; text-transform: uppercase; }
 .workflow-link { height: 1px; position: absolute; z-index: 0; left: 25px; right: -1px; top: 50%; background: var(--line-strong); }
-.node-passed .node-glyph { color: var(--green); border-color: #83b497; background: var(--green-soft); }
-.node-active .node-glyph { color: var(--teal); border-color: var(--teal); background: var(--teal-soft); box-shadow: 0 0 0 3px rgba(15, 113, 103, .1); }
-.node-failed .node-glyph { color: var(--red); border-color: #c87e78; background: var(--red-soft); }
-.node-waiting .node-glyph { color: var(--amber); border-color: #c9a55f; background: var(--amber-soft); }
+.node-passed .node-glyph { color: var(--green); border-color: var(--green-rim); background: var(--green-soft); }
+.node-active .node-glyph { color: var(--teal); border-color: var(--teal); background: var(--teal-soft); box-shadow: 0 0 0 3px rgb(var(--teal-rgb) / .1); }
+.node-failed .node-glyph { color: var(--red); border-color: var(--red-rim-strong); background: var(--red-soft); }
+.node-waiting .node-glyph { color: var(--amber); border-color: var(--amber-rim); background: var(--amber-soft); }
 .workflow-node.is-disabled { opacity: .42; }
 .workflow-node.is-disabled .node-glyph { border-style: dashed; }
 .workflow-empty { grid-column: 1 / -1; display: grid; place-items: center; color: var(--muted); font-size: 11px; }
@@ -133,7 +439,7 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .workspace-tools { display: flex; align-items: center; gap: 9px; color: var(--muted); font-family: "JetBrains Mono", monospace; font-size: 8px; text-transform: uppercase; }
 .agent-grid { display: grid; grid-template-columns: repeat(2, minmax(360px, 1fr)); gap: 10px; }
 .agent-tile { min-width: 0; overflow: hidden; border: 1px solid var(--line-strong); border-radius: var(--radius); background: var(--paper-strong); transition: border-color .12s, box-shadow .12s; }
-.agent-tile.is-selected { border-color: #5e9c90; box-shadow: 0 0 0 1px #5e9c90; }
+.agent-tile.is-selected { border-color: var(--teal-focus); box-shadow: 0 0 0 1px var(--teal-focus); }
 .agent-header { min-height: 58px; padding: 9px 11px; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid var(--line); }
 .agent-identity { min-width: 0; display: flex; align-items: flex-start; gap: 8px; }
 .agent-state-mark { width: 8px; height: 8px; margin-top: 5px; flex: 0 0 8px; border: 2px solid var(--paper-strong); border-radius: 50%; background: var(--faint); box-shadow: 0 0 0 1px currentColor; }
@@ -144,7 +450,7 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .agent-title-line { display: flex; align-items: center; gap: 6px; }
 .agent-title-line h2 { margin: 0; font-size: 12px; font-weight: 720; }
 .agent-identity p { margin: 3px 0 0; overflow: hidden; color: var(--muted); font-family: "JetBrains Mono", monospace; font-size: 8.5px; text-overflow: ellipsis; white-space: nowrap; }
-.status-label { padding: 2px 4px; border-radius: 2px; color: var(--faint); background: #eceae3; font-size: 7px; font-weight: 800; letter-spacing: .08em; text-transform: uppercase; }
+.status-label { padding: 2px 4px; border-radius: 2px; color: var(--faint); background: var(--paper-sunken-strong); font-size: 7px; font-weight: 800; letter-spacing: .08em; text-transform: uppercase; }
 .status-label.status-running { color: var(--teal); background: var(--teal-soft); }
 .status-label.status-passed { color: var(--green); background: var(--green-soft); }
 .status-label.status-failed { color: var(--red); background: var(--red-soft); }
@@ -152,20 +458,20 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .agent-attempt { width: 38px; height: 33px; display: grid; grid-template-columns: 1fr; place-items: center; border-left: 1px solid var(--line); }
 .agent-attempt span { color: var(--faint); font-size: 7px; letter-spacing: .08em; }
 .agent-attempt strong { font-family: "JetBrains Mono", monospace; font-size: 11px; }
-.agent-assignment { min-height: 50px; padding: 7px 11px; border-bottom: 1px solid var(--line); background: #f6f4ee; }
+.agent-assignment { min-height: 50px; padding: 7px 11px; border-bottom: 1px solid var(--line); background: var(--paper); }
 .agent-assignment > span { color: var(--faint); font-size: 7px; font-weight: 800; letter-spacing: .12em; }
-.agent-assignment p { margin: 3px 0 0; display: -webkit-box; overflow: hidden; color: #434c48; font-size: 9.5px; line-height: 1.35; -webkit-box-orient: vertical; -webkit-line-clamp: 2; }
+.agent-assignment p { margin: 3px 0 0; display: -webkit-box; overflow: hidden; color: var(--ink-soft); font-size: 9.5px; line-height: 1.35; -webkit-box-orient: vertical; -webkit-line-clamp: 2; }
 .agent-instruments { min-height: 40px; display: grid; grid-template-columns: repeat(4, 1fr); border-bottom: 1px solid var(--line); }
 .agent-instruments > div { padding: 6px 8px; display: flex; flex-direction: column; gap: 2px; border-right: 1px solid var(--line); }
 .agent-instruments > div:last-child { border: 0; }
 .agent-instruments span { color: var(--faint); font-size: 6.5px; font-weight: 800; letter-spacing: .1em; }
 .agent-instruments strong { font-size: 9px; }
-.agent-tabs { height: 32px; padding: 0 5px; display: flex; align-items: stretch; gap: 1px; border-bottom: 1px solid #39413e; background: #242a28; }
-.agent-tabs button { min-width: 30px; padding: 0 7px; display: flex; align-items: center; justify-content: center; gap: 4px; border: 0; border-bottom: 2px solid transparent; color: #8f9995; background: transparent; cursor: pointer; font-size: 8px; }
+.agent-tabs { height: 32px; padding: 0 5px; display: flex; align-items: stretch; gap: 1px; border-bottom: 1px solid var(--shell-line); background: var(--shell); }
+.agent-tabs button { min-width: 30px; padding: 0 7px; display: flex; align-items: center; justify-content: center; gap: 4px; border: 0; border-bottom: 2px solid transparent; color: var(--shell-faint); background: transparent; cursor: pointer; font-size: 8px; }
 .agent-tabs button span { display: none; }
-.agent-tabs button em { min-width: 14px; padding: 1px 3px; border-radius: 8px; color: #bac2be; background: #3b4441; font-size: 7px; font-style: normal; }
-.agent-tabs button:hover, .agent-tabs button.is-active { color: #d8dfdb; }
-.agent-tabs button.is-active { border-bottom-color: #62b5a5; }
+.agent-tabs button em { min-width: 14px; padding: 1px 3px; border-radius: 8px; color: var(--shell-ink-soft); background: var(--shell-raised); font-size: 7px; font-style: normal; }
+.agent-tabs button:hover, .agent-tabs button.is-active { color: var(--shell-ink); }
+.agent-tabs button.is-active { border-bottom-color: var(--shell-teal); }
 .agent-panel { min-height: 320px; height: 42vh; max-height: 560px; display: flex; flex-direction: column; background: var(--terminal); }
 /* The terminal fills whatever the composer leaves; min-height:0 lets it shrink
    instead of shoving the composer past the tile's overflow:hidden edge. A
@@ -177,64 +483,64 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .terminal-host { height: 100%; }
 .terminal-viewport { padding: 6px 4px 3px 8px; overflow: hidden; }
 /* Always-visible external prompt box, pinned below the terminal. */
-.agent-composer { flex: 0 0 auto; display: flex; flex-direction: column; gap: 4px; padding: 7px 9px 8px; border-top: 1px solid #39413e; background: var(--paper-strong); }
-.agent-composer.is-coordinator { background: #1c2b28; border-top-color: #3a6a5f; }
+.agent-composer { flex: 0 0 auto; display: flex; flex-direction: column; gap: 4px; padding: 7px 9px 8px; border-top: 1px solid var(--shell-line); background: var(--paper-strong); }
+.agent-composer.is-coordinator { background: var(--shell); border-top-color: var(--shell-teal-edge); }
 .composer-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
 .composer-title { color: var(--faint); font-size: 8px; font-weight: 800; letter-spacing: .1em; text-transform: uppercase; }
 .composer-prompt-picker { display: flex; align-items: center; gap: 3px; color: var(--faint); }
 .composer-prompt-picker select { border: 1px solid var(--line-strong); border-radius: 5px; padding: 1px 4px; color: var(--ink); background: var(--paper); font-size: 9px; }
 .agent-composer textarea { width: 100%; resize: none; padding: 6px 8px; border: 1px solid var(--line-strong); border-radius: 6px; color: var(--ink); background: var(--paper); font-family: "JetBrains Mono", "SFMono-Regular", Consolas, monospace; font-size: 11.5px; line-height: 1.45; }
-.agent-composer textarea:focus { outline: none; border-color: #5e9c90; box-shadow: 0 0 0 1px #5e9c90; }
+.agent-composer textarea:focus { outline: none; border-color: var(--teal-focus); box-shadow: 0 0 0 1px var(--teal-focus); }
 .agent-composer textarea:disabled { opacity: .55; cursor: not-allowed; }
 .composer-actions { display: flex; align-items: center; gap: 8px; }
 .composer-spacer { flex: 1 1 auto; }
-.composer-caution { display: flex; align-items: center; gap: 4px; color: #c69a4e; font-size: 8px; line-height: 1.3; }
-.composer-error { display: flex; align-items: center; gap: 4px; color: var(--danger, #d0685f); font-size: 8.5px; }
+.composer-caution { display: flex; align-items: center; gap: 4px; color: var(--status-warn); font-size: 8px; line-height: 1.3; }
+.composer-error { display: flex; align-items: center; gap: 4px; color: var(--status-error); font-size: 8.5px; }
 .composer-status { display: flex; align-items: center; gap: 4px; margin: 0; font-size: 9px; }
-.composer-status.is-delivered { color: #6fae86; }
-.composer-status.is-failed { color: var(--danger, #d0685f); }
+.composer-status.is-delivered { color: var(--status-ok); }
+.composer-status.is-failed { color: var(--status-error); }
 .button.compact { padding: 3px 9px; font-size: 10px; gap: 4px; }
 
 /* ---- Output Reader: a large readable rendering of an agent's CLI output ---- */
-.reader-open { margin-left: auto; align-self: center; min-width: 0; padding: 3px 10px; display: flex; align-items: center; gap: 5px; border: 1px solid #3a6a5f; border-radius: 12px; color: #9fd8c8; background: #1d3a30; cursor: pointer; font-size: 9px; font-weight: 700; letter-spacing: .06em; }
-.reader-open:hover { color: #d5f3ea; background: #234238; }
+.reader-open { margin-left: auto; align-self: center; min-width: 0; padding: 3px 10px; display: flex; align-items: center; gap: 5px; border: 1px solid var(--shell-teal-edge); border-radius: 12px; color: var(--shell-teal-text); background: var(--shell-teal-surface); cursor: pointer; font-size: 9px; font-weight: 700; letter-spacing: .06em; }
+.reader-open:hover { color: var(--shell-teal-text-strong); background: var(--shell-teal-surface); }
 /* Outrank the .agent-tabs button span {display:none} tab-label rule. */
 .agent-tabs .reader-open span { display: inline; }
-.reader-overlay { position: fixed; inset: 0; z-index: 80; display: flex; justify-content: center; padding: 3vh 3vw; background: rgba(9, 13, 12, .74); backdrop-filter: blur(2px); }
-.reader-panel { position: relative; width: min(1040px, 100%); display: flex; flex-direction: column; overflow: hidden; border: 1px solid #3d4744; border-radius: 12px; background: #14201d; box-shadow: 0 28px 70px rgba(0, 0, 0, .55); }
-.reader-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 10px 14px; border-bottom: 1px solid #2c3a36; background: #182622; }
-.reader-title { display: flex; align-items: center; gap: 9px; color: #cfe0da; }
+.reader-overlay { position: fixed; inset: 0; z-index: 80; display: flex; justify-content: center; padding: 3vh 3vw; background: rgb(var(--scrim-rgb) / .74); backdrop-filter: blur(2px); }
+.reader-panel { position: relative; width: min(1040px, 100%); display: flex; flex-direction: column; overflow: hidden; border: 1px solid var(--shell-line); border-radius: 12px; background: var(--shell-deep); box-shadow: 0 28px 70px rgb(var(--scrim-rgb) / .55); }
+.reader-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 10px 14px; border-bottom: 1px solid var(--shell-line); background: var(--shell-deep); }
+.reader-title { display: flex; align-items: center; gap: 9px; color: var(--shell-ink); }
 .reader-title strong { margin-right: 8px; font-size: 13px; }
 .reader-controls { display: flex; align-items: center; gap: 8px; }
-.reader-tail { padding: 2px 7px; border-radius: 9px; color: #8a9691; background: #22302c; font-size: 8px; font-weight: 800; letter-spacing: .1em; }
-.reader-tail.is-live { color: #79d6b6; background: #1d3a30; }
-.reader-scroll { flex: 1 1 auto; min-height: 0; overflow: auto; overscroll-behavior: contain; padding: 18px 26px 22px; scrollbar-color: #46534e #14201d; scrollbar-width: thin; }
-.reader-text { margin: 0; white-space: pre-wrap; word-break: break-word; color: #dbe4df; font-family: "JetBrains Mono", "SFMono-Regular", Consolas, monospace; font-size: 13.5px; line-height: 1.7; user-select: text; }
-.reader-jump { position: absolute; bottom: 148px; left: 50%; transform: translateX(-50%); display: flex; align-items: center; gap: 6px; padding: 6px 14px; border: 1px solid #3a6a5f; border-radius: 16px; color: #bfe6d8; background: #1c2b28; cursor: pointer; font-size: 10.5px; box-shadow: 0 6px 18px rgba(0, 0, 0, .4); }
-.reader-jump:hover { background: #234238; }
-.reader-panel .agent-composer { border-top: 1px solid #2c3a36; }
+.reader-tail { padding: 2px 7px; border-radius: 9px; color: var(--shell-faint); background: var(--shell); font-size: 8px; font-weight: 800; letter-spacing: .1em; }
+.reader-tail.is-live { color: var(--shell-teal); background: var(--shell-teal-surface); }
+.reader-scroll { flex: 1 1 auto; min-height: 0; overflow: auto; overscroll-behavior: contain; padding: 18px 26px 22px; scrollbar-color: var(--shell-thumb) var(--shell-deep); scrollbar-width: thin; }
+.reader-text { margin: 0; white-space: pre-wrap; word-break: break-word; color: var(--shell-ink); font-family: "JetBrains Mono", "SFMono-Regular", Consolas, monospace; font-size: 13.5px; line-height: 1.7; user-select: text; }
+.reader-jump { position: absolute; bottom: 148px; left: 50%; transform: translateX(-50%); display: flex; align-items: center; gap: 6px; padding: 6px 14px; border: 1px solid var(--shell-teal-edge); border-radius: 16px; color: var(--shell-teal-text-strong); background: var(--shell); cursor: pointer; font-size: 10.5px; box-shadow: 0 6px 18px rgb(var(--scrim-rgb) / .4); }
+.reader-jump:hover { background: var(--shell-teal-surface); }
+.reader-panel .agent-composer { border-top: 1px solid var(--shell-line); }
 .terminal-host .xterm { height: 100%; }
-.terminal-host .xterm-viewport { scrollbar-color: #45504c #141817; scrollbar-width: thin; }
-.text-panel { width: 100%; height: 100%; padding: 10px; overflow: auto; color: #d0d6d2; background: var(--terminal); font-size: 9px; }
-.panel-caption { margin-bottom: 8px; display: flex; align-items: center; gap: 5px; color: #82908a; text-transform: uppercase; letter-spacing: .09em; }
-.diff-panel > code { padding: 4px 0; display: block; border-bottom: 1px solid #29302e; color: #a6cbbd; }
-.check-row { min-height: 39px; display: grid; grid-template-columns: 18px 1fr auto; align-items: center; gap: 5px; border-bottom: 1px solid #29302e; }
-.check-row svg { color: #78b991; }
+.terminal-host .xterm-viewport { scrollbar-color: var(--shell-thumb) var(--terminal); scrollbar-width: thin; }
+.text-panel { width: 100%; height: 100%; padding: 10px; overflow: auto; color: var(--shell-ink); background: var(--terminal); font-size: 9px; }
+.panel-caption { margin-bottom: 8px; display: flex; align-items: center; gap: 5px; color: var(--shell-faint); text-transform: uppercase; letter-spacing: .09em; }
+.diff-panel > code { padding: 4px 0; display: block; border-bottom: 1px solid var(--shell-line); color: var(--shell-teal-text); }
+.check-row { min-height: 39px; display: grid; grid-template-columns: 18px 1fr auto; align-items: center; gap: 5px; border-bottom: 1px solid var(--shell-line); }
+.check-row svg { color: var(--status-ok); }
 .check-row div { display: flex; flex-direction: column; gap: 2px; }
 .check-row strong { font-size: 9px; }
-.check-row span, .check-row small { color: #7f8985; font-family: "JetBrains Mono", monospace; font-size: 7px; }
-.handoff-panel button { width: 100%; padding: 7px 2px; display: grid; grid-template-columns: 36px 1fr; gap: 8px; border: 0; border-bottom: 1px solid #29302e; color: #d0d6d2; background: transparent; cursor: pointer; text-align: left; }
+.check-row span, .check-row small { color: var(--shell-faint); font-family: "JetBrains Mono", monospace; font-size: 7px; }
+.handoff-panel button { width: 100%; padding: 7px 2px; display: grid; grid-template-columns: 36px 1fr; gap: 8px; border: 0; border-bottom: 1px solid var(--shell-line); color: var(--shell-ink); background: transparent; cursor: pointer; text-align: left; }
 .handoff-panel button div { display: flex; flex-direction: column; gap: 3px; }
-.handoff-panel small { color: #7f8985; }
-.artifact-panel > div { padding: 7px 2px; display: flex; gap: 8px; border-bottom: 1px solid #29302e; }
+.handoff-panel small { color: var(--shell-faint); }
+.artifact-panel > div { padding: 7px 2px; display: flex; gap: 8px; border-bottom: 1px solid var(--shell-line); }
 .artifact-panel > div span { display: flex; flex-direction: column; gap: 3px; }
-.artifact-panel code { color: #7f8985; font-size: 7px; }
-.panel-empty { width: 100%; height: 100%; display: flex; align-items: center; justify-content: center; flex-direction: column; gap: 7px; color: #75807b; text-align: center; }
-.agent-footer { height: 27px; padding: 0 9px; display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 8px; border-top: 1px solid #303735; color: #8a9590; background: #202624; font-family: "JetBrains Mono", monospace; font-size: 6.8px; }
+.artifact-panel code { color: var(--shell-faint); font-size: 7px; }
+.panel-empty { width: 100%; height: 100%; display: flex; align-items: center; justify-content: center; flex-direction: column; gap: 7px; color: var(--shell-faint); text-align: center; }
+.agent-footer { height: 27px; padding: 0 9px; display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 8px; border-top: 1px solid var(--shell-line); color: var(--shell-faint); background: var(--shell); font-family: "JetBrains Mono", monospace; font-size: 6.8px; }
 .agent-footer span:nth-child(2) { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: right; }
-.agent-footer strong { color: #72bcad; font-size: 7px; }
+.agent-footer strong { color: var(--shell-teal); font-size: 7px; }
 
-.evidence-drawer { width: var(--drawer-width); position: fixed; z-index: 35; inset: 0 0 0 auto; display: grid; grid-template-rows: 72px 38px minmax(160px, 1fr) auto 30px; border-left: 1px solid var(--line-strong); background: #f5f3ed; }
+.evidence-drawer { width: var(--drawer-width); position: fixed; z-index: 35; inset: 0 0 0 auto; display: grid; grid-template-rows: 72px 38px minmax(160px, 1fr) auto 30px; border-left: 1px solid var(--line-strong); background: var(--paper); }
 .evidence-drawer > header { padding: 0 12px; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid var(--line); }
 .evidence-drawer h2 { margin: 2px 0 0; font-size: 13px; }
 .evidence-drawer > header button, .shortcut-dialog header button { width: 28px; height: 28px; display: grid; place-items: center; border: 1px solid var(--line); border-radius: 3px; background: transparent; cursor: pointer; }
@@ -250,7 +556,7 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .evidence-list strong { overflow: hidden; font-size: 9.5px; text-overflow: ellipsis; white-space: nowrap; }
 .evidence-list small { display: flex; align-items: center; gap: 3px; color: var(--faint); font-size: 7.5px; }
 .evidence-list time { color: var(--faint); font-size: 7px; }
-.verdict { width: max-content; padding: 3px 4px; border-radius: 2px; color: var(--muted); background: #e6e4dd; font-family: "JetBrains Mono", monospace; font-size: 7px; font-weight: 800; letter-spacing: .05em; }
+.verdict { width: max-content; padding: 3px 4px; border-radius: 2px; color: var(--muted); background: var(--paper-sunken-strong); font-family: "JetBrains Mono", monospace; font-size: 7px; font-weight: 800; letter-spacing: .05em; }
 .verdict-pass { color: var(--green); background: var(--green-soft); }
 .verdict-fix { color: var(--amber); background: var(--amber-soft); }
 .verdict-human { color: var(--violet); background: var(--violet-soft); }
@@ -270,44 +576,52 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .evidence-detail dt { color: var(--faint); font-size: 7px; font-weight: 750; letter-spacing: .1em; }
 .evidence-detail dd { margin: 0; overflow: hidden; font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
 .evidence-detail dd code { font-size: 8px; }
-.why-edge { padding: 8px; display: flex; gap: 7px; border: 1px solid #c9dfd9; border-radius: 4px; color: #3e5e56; background: #edf5f1; }
+.why-edge { padding: 8px; display: flex; gap: 7px; border: 1px solid var(--teal-edge); border-radius: 4px; color: var(--teal-wash-ink); background: var(--teal-wash); }
 .why-edge strong { font-size: 8.5px; }
 .why-edge p { margin: 3px 0 0; font-size: 8px; line-height: 1.4; }
 .evidence-drawer > footer { padding: 0 9px; display: flex; align-items: center; gap: 4px; border-top: 1px solid var(--line); color: var(--faint); font-size: 7px; }
 .evidence-drawer > footer span { margin-right: auto; display: flex; align-items: center; gap: 5px; text-transform: uppercase; }
 .evidence-drawer > footer span i { width: 6px; height: 6px; border-radius: 50%; background: var(--teal); }
-.evidence-drawer > footer kbd { padding: 2px 4px; border: 1px solid var(--line); border-radius: 2px; background: white; font-size: 7px; }
+.evidence-drawer > footer kbd { padding: 2px 4px; border: 1px solid var(--line); border-radius: 2px; background: var(--paper-strong); font-size: 7px; }
 
 .loading-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
 .loading-grid > div { height: 350px; padding: 18px; overflow: hidden; border: 1px solid var(--line); border-radius: var(--radius); background: var(--paper); }
-.loading-grid span, .loading-grid i, .loading-grid b { display: block; border-radius: 3px; background: linear-gradient(90deg, #e5e2da 25%, #f2f0ea 50%, #e5e2da 75%); background-size: 200% 100%; animation: shimmer 1.3s infinite; }
+.loading-grid span, .loading-grid i, .loading-grid b { display: block; border-radius: 3px; background: linear-gradient(90deg, var(--skeleton) 25%, var(--paper-sunken) 50%, var(--skeleton) 75%); background-size: 200% 100%; animation: shimmer 1.3s infinite; }
 .loading-grid span { width: 35%; height: 14px; }
 .loading-grid i { width: 70%; height: 9px; margin-top: 13px; }
 .loading-grid i:nth-child(3) { width: 50%; }
-.loading-grid b { height: 190px; margin-top: 24px; background-color: #d9d7d0; }
+.loading-grid b { height: 190px; margin-top: 24px; background-color: var(--skeleton); }
 @keyframes shimmer { to { background-position: -200% 0; } }
-.empty-deck { min-height: 420px; padding: 30px; display: flex; flex-direction: column; align-items: center; justify-content: center; border: 1px dashed var(--line-strong); border-radius: var(--radius); color: var(--muted); background: rgba(248, 246, 240, .55); text-align: center; }
+.empty-deck { min-height: 420px; padding: 30px; display: flex; flex-direction: column; align-items: center; justify-content: center; border: 1px dashed var(--line-strong); border-radius: var(--radius); color: var(--muted); background: rgb(var(--paper-rgb) / .55); text-align: center; }
 .empty-deck h3 { margin: 11px 0 5px; color: var(--ink); font-size: 14px; }
 .empty-deck p { max-width: 390px; margin: 0; font-size: 10px; line-height: 1.5; }
 .empty-deck > div { margin-top: 15px; display: flex; gap: 7px; }
 
-.sheet-backdrop, .dialog-backdrop { position: fixed; z-index: 80; inset: 0; display: flex; justify-content: flex-end; background: rgba(24, 30, 28, .42); }
-.config-sheet { width: min(780px, calc(100vw - 74px)); height: 100%; display: flex; flex-direction: column; border-left: 1px solid var(--line-strong); background: var(--paper); box-shadow: -12px 0 32px rgba(29, 37, 34, .12); }
+.sheet-backdrop, .dialog-backdrop { position: fixed; z-index: 80; inset: 0; display: flex; justify-content: flex-end; background: rgb(var(--scrim-rgb) / .42); }
+.config-sheet { width: min(780px, calc(100vw - 74px)); height: 100%; display: flex; flex-direction: column; border-left: 1px solid var(--line-strong); background: var(--paper); box-shadow: -12px 0 32px rgb(var(--scrim-rgb) / .12); }
 .workflow-sheet { width: min(610px, calc(100vw - 74px)); }
 .projects-sheet { width: min(850px, calc(100vw - 74px)); }
 .sheet-header { min-height: 92px; padding: 18px 20px; display: flex; align-items: flex-start; justify-content: space-between; border-bottom: 1px solid var(--line); }
 .sheet-header h2 { margin: 3px 0 5px; font-size: 20px; letter-spacing: -.02em; }
 .sheet-header p { margin: 0; color: var(--muted); font-size: 10px; }
+/* A header carrying only its title, on one line with the close button (PRD
+   #803). The 92px above is sized for an eyebrow, a title and a description, and
+   the four `ConfigurationPanels` sheets all carry that stack — so this is a
+   modifier rather than a smaller shared min-height. Measure one of those four
+   before touching either rule. The 13px matches the 61px footer's rhythm rather
+   than the 18px the taller stack needs. */
+.sheet-header.is-title-only { min-height: 0; padding-top: 13px; padding-bottom: 13px; align-items: center; }
+.sheet-header.is-title-only h2 { margin: 0; }
 .icon-button { width: 31px; height: 31px; display: grid; place-items: center; border: 1px solid var(--line); border-radius: 4px; background: transparent; cursor: pointer; }
-.local-only-notice { min-height: 40px; padding: 8px 18px; display: flex; align-items: center; gap: 7px; border-bottom: 1px solid #ddc483; color: #6f571f; background: var(--amber-soft); font-size: 9px; }
+.local-only-notice { min-height: 40px; padding: 8px 18px; display: flex; align-items: center; gap: 7px; border-bottom: 1px solid var(--amber-edge); color: var(--amber-ink); background: var(--amber-soft); font-size: 9px; }
 .local-only-notice code { font-size: 8px; }
 .profiles-layout { min-height: 0; flex: 1; display: grid; grid-template-columns: 215px minmax(0, 1fr); }
-.profile-list { padding: 10px; overflow: auto; border-right: 1px solid var(--line); background: #f1efe8; }
+.profile-list { padding: 10px; overflow: auto; border-right: 1px solid var(--line); background: var(--paper-sunken); }
 .profile-list button { width: 100%; min-height: 57px; padding: 8px; display: grid; grid-template-columns: 30px minmax(0, 1fr) auto; align-items: center; gap: 7px; border: 1px solid transparent; border-radius: 4px; background: transparent; cursor: pointer; text-align: left; }
 .profile-list button:hover, .profile-list button.is-active { border-color: var(--line); background: var(--paper-strong); }
 .profile-list button.is-active { box-shadow: inset 3px 0 0 var(--teal); }
 .profile-enabled { width: 28px; height: 28px; display: grid; place-items: center; border: 1px solid var(--line); border-radius: 50%; color: var(--faint); }
-.profile-enabled.is-enabled { color: var(--teal); border-color: #8db9b0; background: var(--teal-soft); }
+.profile-enabled.is-enabled { color: var(--teal); border-color: var(--teal-rim); background: var(--teal-soft); }
 .profile-list button > span:nth-child(2) { min-width: 0; display: flex; flex-direction: column; gap: 3px; }
 .profile-list strong { font-size: 10px; }
 .profile-list small { overflow: hidden; color: var(--muted); font-size: 7.5px; text-overflow: ellipsis; white-space: nowrap; }
@@ -318,8 +632,8 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .form-heading h3 { margin: 3px 0 0; font-size: 15px; }
 .switch-field { display: flex; align-items: center; gap: 7px; color: var(--muted); cursor: pointer; font-size: 9px; }
 .switch-field input { position: absolute; opacity: 0; pointer-events: none; }
-.switch-field > span { width: 27px; height: 15px; position: relative; border-radius: 9px; background: #b9bcb7; transition: background .12s; }
-.switch-field > span::after { content: ""; width: 11px; height: 11px; position: absolute; left: 2px; top: 2px; border-radius: 50%; background: #fff; transition: left .12s; }
+.switch-field > span { width: 27px; height: 15px; position: relative; border-radius: 9px; background: var(--line-strong); transition: background .12s; }
+.switch-field > span::after { content: ""; width: 11px; height: 11px; position: absolute; left: 2px; top: 2px; border-radius: 50%; background: var(--on-accent); transition: left .12s; }
 .switch-field input:checked + span { background: var(--teal); }
 .switch-field input:checked + span::after { left: 14px; }
 .form-grid { padding: 17px 18px; display: grid; grid-template-columns: 1fr 1fr; gap: 14px 12px; }
@@ -327,7 +641,7 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .profile-form input, .profile-form select, .profile-form textarea { width: 100%; border: 1px solid var(--line-strong); border-radius: 4px; color: var(--ink); background: var(--paper-strong); font-family: "JetBrains Mono", monospace; font-size: 10px; }
 .profile-form input, .profile-form select { height: 34px; padding: 0 9px; }
 .profile-form textarea { padding: 9px; resize: vertical; line-height: 1.5; }
-.profile-form textarea[readonly] { color: #40524d; background: #ecefe9; cursor: default; }
+.profile-form textarea[readonly] { color: var(--ink-soft); background: var(--paper-sunken-strong); cursor: default; }
 .profile-form label > small { color: var(--faint); font-size: 8px; }
 .form-wide { grid-column: 1 / -1; }
 .profile-form .field-hint { color: var(--muted); font-family: "JetBrains Mono", monospace; font-size: 8px; }
@@ -338,14 +652,14 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .profile-form .command-override-toggle > span { color: var(--muted); font-size: 8px; letter-spacing: 0; text-transform: none; }
 .command-warning, .command-error { display: flex; align-items: center; gap: 5px; color: var(--red) !important; }
 .command-note { color: var(--muted); font-size: 8px; }
-.profile-summary { margin: 0 18px 18px; padding: 10px; display: flex; gap: 8px; border: 1px solid #bed5cf; border-radius: 4px; color: #3e5e56; background: #edf5f1; font-size: 9px; }
+.profile-summary { margin: 0 18px 18px; padding: 10px; display: flex; gap: 8px; border: 1px solid var(--teal-edge); border-radius: 4px; color: var(--teal-wash-ink); background: var(--teal-wash); font-size: 9px; }
 .profile-summary code { font-size: 8px; }
-.sheet-footer { min-height: 61px; margin-top: auto; padding: 11px 18px; display: flex; align-items: center; justify-content: space-between; border-top: 1px solid var(--line); background: #f1efe8; }
+.sheet-footer { min-height: 61px; margin-top: auto; padding: 11px 18px; display: flex; align-items: center; justify-content: space-between; border-top: 1px solid var(--line); background: var(--paper-sunken); }
 .sheet-footer > div { display: flex; align-items: center; gap: 9px; }
 .sheet-footer > div > span, .sheet-footer > span { color: var(--faint); font-size: 8px; }
 .configuration-empty { display: grid; place-items: center; color: var(--muted); }
 .workflow-editor-list { padding: 12px 16px; display: grid; gap: 7px; overflow: auto; }
-.workflow-launch-form { padding: 13px 16px; display: grid; grid-template-columns: minmax(130px, .55fr) minmax(220px, 1.45fr); gap: 10px; border-bottom: 1px solid var(--line); background: #f1efe8; }
+.workflow-launch-form { padding: 13px 16px; display: grid; grid-template-columns: minmax(130px, .55fr) minmax(220px, 1.45fr); gap: 10px; border-bottom: 1px solid var(--line); background: var(--paper-sunken); }
 .workflow-launch-form label { display: flex; flex-direction: column; gap: 5px; }
 .workflow-launch-form .workflow-task-prompt { grid-column: 1 / -1; }
 .workflow-launch-form label span { color: var(--faint); font-size: 7px; font-weight: 800; letter-spacing: .1em; text-transform: uppercase; }
@@ -364,23 +678,76 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .workflow-editor-row small { color: var(--faint); font-size: 8px; }
 .compact-check { display: flex; flex-direction: row !important; align-items: center; gap: 4px !important; cursor: pointer; }
 .compact-check input { position: absolute; opacity: 0; pointer-events: none; }
-.compact-check > span { width: 17px; height: 17px; display: grid; place-items: center; border: 1px solid var(--line-strong); border-radius: 3px; color: white; }
+.compact-check > span { width: 17px; height: 17px; display: grid; place-items: center; border: 1px solid var(--line-strong); border-radius: 3px; color: var(--on-accent); }
 .compact-check input:checked + span { border-color: var(--teal); background: var(--teal); }
 .compact-check em { color: var(--muted); font-size: 8px; font-style: normal; }
 .order-buttons { display: flex; gap: 3px; }
 .order-buttons button { width: 25px; height: 25px; display: grid; place-items: center; border: 1px solid var(--line); border-radius: 3px; background: transparent; cursor: pointer; }
 .workflow-footer { margin-top: auto; }
 
-.project-notice { border-bottom-color: #9bc8bd; color: #315e55; background: #e3f0ec; }
+.project-notice { border-bottom-color: var(--teal-rim); color: var(--teal-wash-ink); background: var(--teal-wash); }
+/* Settings sheet (PRD #803 M3). Section list beside the active panel, in the
+   same shape as .projects-layout so the surface is one a user of this app
+   already recognises. */
+.settings-sheet .settings-layout { min-height: 0; flex: 1; display: grid; grid-template-columns: 232px minmax(0, 1fr); }
+/* One section: no column to choose from, so the panel takes the whole sheet. */
+.settings-sheet .settings-layout.is-single { grid-template-columns: minmax(0, 1fr); }
+.settings-sections { min-height: 0; padding: 11px; display: flex; flex-direction: column; border-right: 1px solid var(--line); background: var(--paper-sunken); }
+.settings-sections nav { min-height: 0; display: grid; align-content: start; gap: 5px; overflow: auto; }
+.settings-sections nav > button { width: 100%; min-height: 38px; padding: 8px 10px; display: grid; grid-template-columns: 18px minmax(0, 1fr); align-items: center; gap: 9px; border: 1px solid transparent; border-radius: 4px; color: var(--muted); background: transparent; cursor: pointer; font-size: 11px; text-align: left; }
+.settings-sections nav > button:hover { color: var(--ink); border-color: var(--line); background: var(--paper-strong); }
+.settings-sections nav > button.is-selected { color: var(--ink); border-color: var(--line); background: var(--paper-strong); box-shadow: inset 3px 0 0 var(--teal); }
+.settings-active { min-height: 0; display: flex; flex-direction: column; overflow: auto; }
+.settings-body { padding: 17px 18px; display: grid; gap: 15px; }
+.settings-footer { justify-content: flex-start; }
+.settings-footer > span { display: flex; align-items: center; gap: 7px; }
+.settings-footer code { color: var(--muted); font-size: 8px; }
+
+/* One setting, one row: a two-column grid — a label column, a gutter, then the
+   control immediately beside it (PRD #803's density rule —
+   docs/develop/desktop-gui.md). The sheet is 780px wide and full height, so
+   vertical space is what every section is competing for.
+
+   The label column is a fixed 132px, not `auto`, and that is the whole reason
+   this is a grid: every row's control starts at the same x, so a panel of ten
+   settings reads as two columns instead of a ragged stack. 132px fits a
+   two-word label at the size below without wrapping, and it is the widest
+   column that still leaves the control looking attached to its label — the
+   control used to sit at the row's right edge, half a panel away from the word
+   naming it, which is what a flush-right control does to a row this wide.
+
+   `float: left` on the legend is load-bearing, not a leftover. A floated legend
+   stops being the fieldset's *rendered* legend, which is the only way it
+   becomes an ordinary box among the fieldset's contents — here the grid item in
+   column one — instead of being laid out above them on a line of its own. The
+   float itself is then ignored, as it is on any grid item; the disqualification
+   is what does the work, and the row has to stay a fieldset so the group keeps
+   its accessible name. */
+.settings-row { margin: 0; padding: 0; display: grid; grid-template-columns: 132px minmax(0, 1fr); align-items: center; justify-items: start; gap: 16px; border: 0; }
+.settings-row > legend { float: left; padding: 0; color: var(--ink); font-size: 13px; font-weight: 650; }
+
+/* A segmented control: up to about four exclusive options with short labels,
+   joined into one row. Still a real radio group — one name gives arrow-key
+   navigation and a single tab stop, and the row's legend labels it. */
+.segmented { display: flex; padding: 2px; gap: 2px; border: 1px solid var(--line-strong); border-radius: 5px; background: var(--paper-sunken); }
+.segmented label { display: flex; cursor: pointer; }
+.segmented label > span { padding: 5px 13px; border-radius: 3px; color: var(--muted); font-size: 10px; }
+.segmented label:hover > span { color: var(--ink); }
+.segmented label.is-selected > span { color: var(--teal); background: var(--paper-strong); box-shadow: 0 0 0 1px var(--teal-focus); }
+.segmented input { position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+.segmented input:focus-visible + span { outline: 2px solid var(--focus-ring); outline-offset: 1px; }
+.settings-error { margin: 0; padding: 9px 11px; display: flex; align-items: flex-start; gap: 7px; border: 1px solid var(--red-rim); border-radius: 4px; color: var(--red-ink); background: var(--red-soft); font-size: 9px; line-height: 1.5; }
+.settings-error svg { flex: 0 0 auto; margin-top: 1px; }
+
 .projects-layout { min-height: 0; flex: 1; display: grid; grid-template-columns: 260px minmax(0, 1fr); }
-.project-library { min-height: 0; padding: 11px; display: flex; flex-direction: column; border-right: 1px solid var(--line); background: #f1efe8; }
-.add-project { min-height: 36px; display: flex; align-items: center; justify-content: center; gap: 6px; border: 1px dashed #8db9b0; border-radius: 4px; color: var(--teal); background: #edf5f1; cursor: pointer; font-size: 9px; font-weight: 700; }
+.project-library { min-height: 0; padding: 11px; display: flex; flex-direction: column; border-right: 1px solid var(--line); background: var(--paper-sunken); }
+.add-project { min-height: 36px; display: flex; align-items: center; justify-content: center; gap: 6px; border: 1px dashed var(--teal-rim); border-radius: 4px; color: var(--teal); background: var(--teal-wash); cursor: pointer; font-size: 9px; font-weight: 700; }
 .project-library nav { min-height: 0; margin-top: 9px; display: grid; align-content: start; gap: 5px; overflow: auto; }
 .project-library nav > button { width: 100%; min-height: 62px; padding: 8px; display: grid; grid-template-columns: 32px minmax(0, 1fr) auto; align-items: center; gap: 8px; border: 1px solid transparent; border-radius: 4px; background: transparent; cursor: pointer; text-align: left; }
 .project-library nav > button:hover, .project-library nav > button.is-selected { border-color: var(--line); background: var(--paper-strong); }
 .project-library nav > button.is-selected { box-shadow: inset 3px 0 0 var(--teal); }
-.project-icon { width: 30px; height: 30px; display: grid; place-items: center; border: 1px solid var(--line); border-radius: 5px; color: var(--faint); background: #eceae3; }
-.project-icon.is-active { color: var(--teal); border-color: #8db9b0; background: var(--teal-soft); }
+.project-icon { width: 30px; height: 30px; display: grid; place-items: center; border: 1px solid var(--line); border-radius: 5px; color: var(--faint); background: var(--paper-sunken-strong); }
+.project-icon.is-active { color: var(--teal); border-color: var(--teal-rim); background: var(--teal-soft); }
 .project-library nav > button > span:nth-child(2) { min-width: 0; display: flex; flex-direction: column; gap: 4px; }
 .project-library nav strong { overflow: hidden; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
 .project-library nav small { overflow: hidden; color: var(--muted); font-family: "JetBrains Mono", monospace; font-size: 7px; text-overflow: ellipsis; white-space: nowrap; }
@@ -397,16 +764,16 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .project-fields label > small { color: var(--faint); font-size: 8px; }
 .project-fields label > small code { font-size: 7.5px; }
 .project-field-error { display: flex; align-items: center; gap: 5px; color: var(--red); font-size: 8px; }
-.project-readiness { margin: 0 18px 18px; padding: 10px; display: flex; align-items: flex-start; gap: 8px; border: 1px solid #bed5cf; border-radius: 4px; color: #3e5e56; background: #edf5f1; }
+.project-readiness { margin: 0 18px 18px; padding: 10px; display: flex; align-items: flex-start; gap: 8px; border: 1px solid var(--teal-edge); border-radius: 4px; color: var(--teal-wash-ink); background: var(--teal-wash); }
 .project-readiness span { display: flex; flex-direction: column; gap: 3px; font-size: 8px; line-height: 1.4; }
 .project-readiness strong { color: var(--ink); font-size: 9px; }
 .project-footer > div { flex-wrap: wrap; justify-content: flex-end; }
 
 .dialog-backdrop { z-index: 100; align-items: flex-start; justify-content: center; padding: 11vh 18px 20px; }
-.command-palette { width: min(550px, 100%); overflow: hidden; border: 1px solid #59615e; border-radius: 7px; background: var(--paper-strong); box-shadow: 0 18px 50px rgba(20, 26, 24, .24); }
+.command-palette { width: min(550px, 100%); overflow: hidden; border: 1px solid var(--dialog-edge); border-radius: 7px; background: var(--paper-strong); box-shadow: 0 18px 50px rgb(var(--scrim-rgb) / .24); }
 .command-palette > label { height: 51px; padding: 0 13px; display: flex; align-items: center; gap: 8px; border-bottom: 1px solid var(--line); }
 .command-palette input { min-width: 0; flex: 1; border: 0; outline: 0; background: transparent; font-size: 12px; }
-.command-palette kbd { padding: 3px 5px; border: 1px solid var(--line); border-radius: 3px; color: var(--muted); background: #efede7; font-size: 8px; }
+.command-palette kbd { padding: 3px 5px; border: 1px solid var(--line); border-radius: 3px; color: var(--muted); background: var(--paper-sunken); font-size: 8px; }
 .command-palette > div { max-height: 330px; padding: 7px; overflow: auto; }
 .command-palette > div > button { width: 100%; min-height: 48px; padding: 7px 9px; display: grid; grid-template-columns: 24px minmax(0, 1fr) auto; align-items: center; gap: 7px; border: 0; border-radius: 4px; background: transparent; cursor: pointer; text-align: left; }
 .command-palette > div > button:hover, .command-palette > div > button:focus-visible { background: var(--teal-soft); }
@@ -416,18 +783,18 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .command-palette > div > p { padding: 18px; color: var(--muted); text-align: center; font-size: 10px; }
 .command-palette > footer { height: 29px; padding: 0 10px; display: flex; align-items: center; justify-content: space-between; border-top: 1px solid var(--line); color: var(--faint); font-size: 7px; }
 .command-palette > footer span { display: flex; align-items: center; gap: 4px; }
-.shortcut-dialog, .confirm-dialog { width: min(380px, 100%); padding: 15px; border: 1px solid var(--line-strong); border-radius: 7px; background: var(--paper-strong); box-shadow: 0 18px 50px rgba(20, 26, 24, .22); }
+.shortcut-dialog, .confirm-dialog { width: min(380px, 100%); padding: 15px; border: 1px solid var(--line-strong); border-radius: 7px; background: var(--paper-strong); box-shadow: 0 18px 50px rgb(var(--scrim-rgb) / .22); }
 .shortcut-dialog header { padding-bottom: 12px; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid var(--line); }
 .shortcut-dialog header > div { display: flex; align-items: center; gap: 7px; }
 .shortcut-dialog h2 { margin: 0; font-size: 14px; }
 .shortcut-dialog > div { padding: 9px 2px; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid var(--line); font-size: 9px; }
-.shortcut-dialog kbd { padding: 3px 6px; border: 1px solid var(--line); border-radius: 3px; background: #efede7; font-size: 8px; }
+.shortcut-dialog kbd { padding: 3px 6px; border: 1px solid var(--line); border-radius: 3px; background: var(--paper-sunken); font-size: 8px; }
 .confirm-dialog { text-align: center; }
 .danger-icon { width: 38px; height: 38px; margin: 2px auto 10px; display: grid; place-items: center; border-radius: 50%; color: var(--red); background: var(--red-soft); }
 .confirm-dialog h2 { margin: 0; font-size: 15px; }
 .confirm-dialog p { margin: 7px auto 16px; max-width: 320px; color: var(--muted); font-size: 9.5px; line-height: 1.5; }
 .confirm-dialog > div:last-child { display: flex; justify-content: center; gap: 7px; }
-.toast { max-width: min(470px, calc(100vw - 30px)); min-height: 42px; padding: 8px 9px; position: fixed; z-index: 120; right: 18px; bottom: 16px; display: grid; grid-template-columns: 18px minmax(0, 1fr) 24px; align-items: center; gap: 5px; border: 1px solid #c9a55f; border-radius: 5px; color: #5d4a1f; background: #fff7e5; box-shadow: 0 8px 22px rgba(35, 38, 34, .13); font-size: 9px; }
+.toast { max-width: min(470px, calc(100vw - 30px)); min-height: 42px; padding: 8px 9px; position: fixed; z-index: 120; right: 18px; bottom: 16px; display: grid; grid-template-columns: 18px minmax(0, 1fr) 24px; align-items: center; gap: 5px; border: 1px solid var(--amber-rim); border-radius: 5px; color: var(--amber-ink); background: var(--amber-bright); box-shadow: 0 8px 22px rgb(var(--scrim-rgb) / .13); font-size: 9px; }
 .toast button { width: 22px; height: 22px; display: grid; place-items: center; border: 0; background: transparent; cursor: pointer; }
 
 @media (min-width: 1450px) {
@@ -438,7 +805,7 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 
 @media (max-width: 1260px) {
   .control-deck.with-evidence .deck-main { margin-right: 0; }
-  .evidence-drawer { z-index: 55; box-shadow: -10px 0 28px rgba(29, 37, 34, .14); }
+  .evidence-drawer { z-index: 55; box-shadow: -10px 0 28px rgb(var(--scrim-rgb) / .14); }
   .run-instruments .instrument:nth-child(3), .run-instruments .instrument:nth-child(5) { display: none; }
   .topbar { grid-template-columns: minmax(180px, 1fr) auto minmax(230px, auto); }
 }
@@ -459,12 +826,12 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 
 @media (max-width: 680px) {
   :root { --rail-width: 0px; }
-  .rail { width: 100%; height: 54px; inset: auto 0 0; padding: 4px 8px; flex-direction: row; border: 0; border-top: 1px solid #111614; }
+  .rail { width: 100%; height: 54px; inset: auto 0 0; padding: 4px 8px; flex-direction: row; border: 0; border-top: 1px solid var(--shell-line-deep); }
   .brand-mark, .rail-bottom { display: none; }
   .rail nav { margin: 0; display: flex; justify-content: space-around; }
   .rail nav button { width: 48px; height: 44px; margin: 0; }
   .rail nav button span { display: none; }
-  .rail nav button.is-active { box-shadow: inset 0 -3px 0 #72c3b3; }
+  .rail nav button.is-active { box-shadow: inset 0 -3px 0 var(--shell-teal); }
   .deck-main { margin: 0 0 54px; }
   .topbar { padding: 0 10px; position: static; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; }
   .branch-line span:last-child, .command-trigger, .top-actions .secondary { display: none; }
@@ -505,6 +872,21 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
   .loading-grid > div:not(:first-child) { display: none; }
 }
 
+/* Below this the two-column settings row stops fitting and stacks: the label
+   column plus its gutter plus a segmented control is 322px, and the sheet goes
+   full-bleed under 680px, so a viewport of 359px is the floor for the columns.
+   Left as a fixed column it does not degrade gracefully — the control keeps its
+   intrinsic 174px, starts at the same x, and simply runs out past the panel's
+   right edge (measured: at a 290px sheet the control's right edge lands 51px
+   outside the body). The breakpoint is 420px rather than 360px so a control
+   wider than Appearance's three options — a fourth segment, a select — has room
+   before the fallback rather than after it. Stacking costs the row height it
+   saves on the desktop sheet, which is the right trade at a phone width and the
+   wrong one at 780px, so it lives here and not in the rule above. */
+@media (max-width: 420px) {
+  .settings-row { grid-template-columns: minmax(0, 1fr); gap: 6px; }
+}
+
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; }
 }
@@ -515,8 +897,8 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .handoff-rail small { color: var(--faint); font-size: 9.5px; }
 .handoff-list { display: flex; flex-direction: column; gap: 5px; }
 .handoff-edge { display: flex; flex-wrap: wrap; align-items: center; gap: 7px; padding: 5px 9px; border: 1px solid var(--line); border-radius: 5px; background: var(--paper); font-size: 11px; }
-.handoff-edge.is-failed { border-color: #d9aaa5; background: var(--red-soft); }
-.handoff-edge.is-done { border-color: #b5d4bd; background: var(--green-soft); }
+.handoff-edge.is-failed { border-color: var(--red-rim); background: var(--red-soft); }
+.handoff-edge.is-done { border-color: var(--green-rim-soft); background: var(--green-soft); }
 .handoff-endpoint { font-family: "JetBrains Mono", monospace; font-size: 10.5px; }
 .handoff-respawn { display: inline-flex; color: var(--amber); }
 .handoff-status { display: inline-flex; align-items: center; gap: 4px; margin-left: 2px; font-style: normal; font-size: 9.5px; font-weight: 750; letter-spacing: .05em; text-transform: uppercase; }
@@ -529,6 +911,13 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .handoff-task { width: 100%; margin: 1px 0 0; color: var(--muted); font-size: 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 /* ---- Agent overview: the fleet at a glance, with no terminals (PRD #745) ---- */
+/* This block arrived from #779 with nine colour literals, which PRD #743 M2's
+   guard rejects. Every one now names an existing token rather than a new one,
+   so the dark counterpart is one M3 already designed instead of a value chosen
+   here -- nothing renders dark mode in CI, so an invented one could not have
+   been checked. Two were alpha tints with no channel token to keep them as
+   tints (`--red-rgb`/`--amber-rgb` do not exist) and are now the solid `-soft`
+   surfaces meant for that role, which reads slightly stronger in light. */
 .overview-body { padding: 14px 16px 20px; }
 .daemon-group { border: 1px solid var(--line-strong); border-radius: var(--radius); background: var(--paper); }
 .daemon-group-header { min-height: 50px; padding: 9px 13px; display: flex; align-items: center; gap: 11px; border-bottom: 1px solid var(--line); background: var(--paper-strong); border-radius: var(--radius) var(--radius) 0 0; }
@@ -550,7 +939,7 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .overview-group[data-group-kind="orchestration"] { border-left: 3px solid var(--teal); }
 .overview-group[data-group-kind="mode"] { border-left: 3px solid var(--violet); }
 .overview-group[data-group-kind="standalone"] { border-left: 3px solid var(--line-strong); }
-.overview-group-header { min-height: 40px; padding: 7px 11px; display: flex; align-items: center; gap: 9px; border-bottom: 1px solid var(--line); background: #f6f4ee; color: var(--muted); }
+.overview-group-header { min-height: 40px; padding: 7px 11px; display: flex; align-items: center; gap: 9px; border-bottom: 1px solid var(--line); background: var(--paper); color: var(--muted); }
 .overview-group-identity { min-width: 0; display: flex; flex-direction: column; gap: 1px; }
 .overview-group-identity h3 { margin: 0; overflow: hidden; color: var(--ink); font-size: 12px; font-weight: 700; text-overflow: ellipsis; white-space: nowrap; }
 .overview-group-subtitle { color: var(--faint); font-size: 9px; }
@@ -594,10 +983,10 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
    edit). */
 .overview-legend, .overview-row { display: grid; grid-template-columns: var(--overview-grid); align-items: center; gap: 10px; }
 .overview-row > td { min-width: 0; padding: 0; }
-.overview-row { min-height: 34px; padding: 5px 11px; border-top: 1px solid #eae7de; }
+.overview-row { min-height: 34px; padding: 5px 11px; border-top: 1px solid var(--line); }
 .overview-row:first-child { border-top: 0; }
-.overview-row:hover { background: #f7f5ef; }
-.overview-row[data-status="failed"] { background: rgba(161, 62, 56, .05); }
+.overview-row:hover { background: var(--paper); }
+.overview-row[data-status="failed"] { background: var(--red-soft); }
 /* The status cell carries BOTH the mark and the word, because they render the
    same field and two columns for one datum is what the column picker made
    absurd (PRD #745 M12). The mark needs to be a block for its 8px box to apply
@@ -631,7 +1020,7 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .overview-tool { min-width: 0; display: flex; align-items: center; gap: 5px; color: var(--muted); }
 .overview-tool strong { flex: 0 0 auto; font-family: "JetBrains Mono", monospace; font-size: 9.5px; font-weight: 650; }
 .overview-tool em { overflow: hidden; color: var(--faint); font-family: "JetBrains Mono", monospace; font-size: 9px; font-style: normal; text-overflow: ellipsis; white-space: nowrap; }
-.overview-tool-idle { color: #a7ada9; font-size: 9px; font-style: italic; }
+.overview-tool-idle { color: var(--faint); font-size: 9px; font-style: italic; }
 /* The last user prompt: one line, always, whatever the daemon sent. `min-width:
    0` plus the nowrap/ellipsis trio is what keeps a 64 KiB prompt from widening
    its grid track or pushing its row taller than its neighbours — the render
@@ -639,10 +1028,10 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .overview-prompt { min-width: 0; overflow: hidden; color: var(--muted); font-size: 9.5px; text-overflow: ellipsis; white-space: nowrap; }
 /* The daemon-reported write lease, next to the agent's name. Muted and small:
    it is a qualifier on the row, not a status. */
-.overview-lease { flex: 0 0 auto; padding: 1px 4px; border-radius: 2px; color: var(--faint); background: rgba(0, 0, 0, .04); font-family: "JetBrains Mono", monospace; font-size: 7px; font-weight: 800; letter-spacing: .08em; text-transform: uppercase; }
-.overview-lease.lease-read, .overview-lease.lease-none { color: var(--amber); background: rgba(176, 122, 42, .1); }
+.overview-lease { flex: 0 0 auto; padding: 1px 4px; border-radius: 2px; color: var(--faint); background: rgb(var(--scrim-rgb) / .04); font-family: "JetBrains Mono", monospace; font-size: 7px; font-weight: 800; letter-spacing: .08em; text-transform: uppercase; }
+.overview-lease.lease-read, .overview-lease.lease-none { color: var(--amber); background: var(--amber-soft); }
 
-.overview-note { min-height: 260px; padding: 30px; display: flex; flex-direction: column; align-items: center; justify-content: center; border: 1px dashed var(--line-strong); border-radius: var(--radius); color: var(--muted); background: rgba(248, 246, 240, .55); text-align: center; }
+.overview-note { min-height: 260px; padding: 30px; display: flex; flex-direction: column; align-items: center; justify-content: center; border: 1px dashed var(--line-strong); border-radius: var(--radius); color: var(--muted); background: rgb(var(--paper-rgb) / .55); text-align: center; }
 .overview-note h3 { margin: 11px 0 5px; color: var(--ink); font-size: 14px; }
 .overview-note p { max-width: 460px; margin: 0 0 4px; font-size: 10px; line-height: 1.55; }
 .overview-note-hint { color: var(--faint); }
@@ -671,7 +1060,7 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 /* The column picker, in the top bar so choosing columns never leaves the
    overview (PRD #745 M12). */
 .overview-columns-picker { position: relative; }
-.overview-columns-menu { position: absolute; top: calc(100% + 6px); right: 0; z-index: 30; min-width: 196px; padding: 8px; display: flex; flex-direction: column; gap: 1px; border: 1px solid var(--line-strong); border-radius: var(--radius); background: var(--paper); box-shadow: 0 10px 26px rgba(0, 0, 0, .13); }
+.overview-columns-menu { position: absolute; top: calc(100% + 6px); right: 0; z-index: 30; min-width: 196px; padding: 8px; display: flex; flex-direction: column; gap: 1px; border: 1px solid var(--line-strong); border-radius: var(--radius); background: var(--paper); box-shadow: 0 10px 26px rgb(var(--scrim-rgb) / .13); }
 .overview-columns-menu p { margin: 0 0 6px; color: var(--faint); font-size: 9px; line-height: 1.45; }
 .overview-columns-menu label { display: flex; align-items: center; gap: 6px; padding: 3px 4px; border-radius: 3px; color: var(--ink); font-size: 10px; cursor: pointer; }
 .overview-columns-menu label:hover { background: var(--paper-strong); }

@@ -17,6 +17,7 @@ import "../styles.css";
 import stylesheetSource from "../styles.css?raw";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createFixtureSnapshot, FIXTURE_DAEMON_ID } from "../data/fixture";
+import { DEFAULT_DESKTOP_SETTINGS, type DesktopSettingsDto } from "../lib/bridge";
 import { DISPLAY_LIMITS } from "../lib/displayText";
 import { UNREPORTED } from "../types";
 import type { AgentSession, DeckRuntimeState, DeckSnapshot } from "../types";
@@ -69,6 +70,11 @@ function runtime(overrides: Partial<DeckRuntimeState> = {}): DeckRuntimeState {
     // stops type-checking — which is the point of it being on the interface.
     listProjects: vi.fn(async () => ({ projects: [] })),
     resolveProject: vi.fn(async () => { throw new Error("unresolved: the overview resolves no project"); }),
+    // PRD #803 made the settings pair part of the runtime contract, and the
+    // DeckShell cases below mount the whole app, so the hook calls these. The
+    // overview itself reads no setting; these only have to resolve.
+    getSettings: vi.fn(async () => ({ settings: structuredClone(DEFAULT_DESKTOP_SETTINGS) })),
+    saveSettings: vi.fn(async (settings: DesktopSettingsDto) => structuredClone(settings)),
     ...overrides,
   };
 }
@@ -186,7 +192,7 @@ describe("AgentOverview", () => {
 
     const prd = groupCard("orchestration", "orc-745");
     expect(prd).toHaveAttribute("data-group-kind", "orchestration");
-    expect(within(prd).getByRole("heading", { name: "PRD #745 · agent overview" })).toBeVisible();
+    expect(within(prd).getByRole("heading", { name: "PRD 745 · agent overview" })).toBeVisible();
     // The fixture declares these six out of role order on purpose.
     expect(rowNames(prd)).toEqual(["orchestrator", "coder", "tester", "reviewer", "docs", "release"]);
     const coordinator = within(prd).getByText("COORDINATOR");

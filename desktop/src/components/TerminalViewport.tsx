@@ -59,28 +59,33 @@ export function TerminalViewport({
       fontWeightBold: "600",
       lineHeight: 1.3,
       scrollback: 8_000,
+      // The embedded terminals stay dark in both app appearances (PRD #743).
+      // xterm is fed raw PTY bytes whose colours the agent CLIs chose for a
+      // dark background, and truecolor SGR bypasses these 16 slots entirely, so
+      // remapping them to the app palette cannot rescue a light pane. Every
+      // line below therefore carries the palette guard's opt-out.
       theme: {
-        background: "#141817",
-        foreground: "#d8ddd8",
-        cursor: "#5fc5b5",
-        cursorAccent: "#141817",
-        selectionBackground: "#3d5652",
-        black: "#202524",
-        red: "#e5746f",
-        green: "#75b890",
-        yellow: "#d6ae62",
-        blue: "#7ca8bd",
-        magenta: "#a89abb",
-        cyan: "#65bcb0",
-        white: "#d8ddd8",
-        brightBlack: "#717a76",
-        brightRed: "#f08b85",
-        brightGreen: "#8ccc9f",
-        brightYellow: "#e3c17b",
-        brightBlue: "#91bfd2",
-        brightMagenta: "#b9aacd",
-        brightCyan: "#78cec1",
-        brightWhite: "#f3f5f2",
+        background: "#141817", // theme-invariant: the terminals stay dark in both appearances (PRD #743)
+        foreground: "#d8ddd8", // theme-invariant: the terminals stay dark in both appearances (PRD #743)
+        cursor: "#5fc5b5", // theme-invariant: the terminals stay dark in both appearances (PRD #743)
+        cursorAccent: "#141817", // theme-invariant: the terminals stay dark in both appearances (PRD #743)
+        selectionBackground: "#3d5652", // theme-invariant: the terminals stay dark in both appearances (PRD #743)
+        black: "#202524", // theme-invariant: the terminals stay dark in both appearances (PRD #743)
+        red: "#e5746f", // theme-invariant: the terminals stay dark in both appearances (PRD #743)
+        green: "#75b890", // theme-invariant: the terminals stay dark in both appearances (PRD #743)
+        yellow: "#d6ae62", // theme-invariant: the terminals stay dark in both appearances (PRD #743)
+        blue: "#7ca8bd", // theme-invariant: the terminals stay dark in both appearances (PRD #743)
+        magenta: "#a89abb", // theme-invariant: the terminals stay dark in both appearances (PRD #743)
+        cyan: "#65bcb0", // theme-invariant: the terminals stay dark in both appearances (PRD #743)
+        white: "#d8ddd8", // theme-invariant: the terminals stay dark in both appearances (PRD #743)
+        brightBlack: "#717a76", // theme-invariant: the terminals stay dark in both appearances (PRD #743)
+        brightRed: "#f08b85", // theme-invariant: the terminals stay dark in both appearances (PRD #743)
+        brightGreen: "#8ccc9f", // theme-invariant: the terminals stay dark in both appearances (PRD #743)
+        brightYellow: "#e3c17b", // theme-invariant: the terminals stay dark in both appearances (PRD #743)
+        brightBlue: "#91bfd2", // theme-invariant: the terminals stay dark in both appearances (PRD #743)
+        brightMagenta: "#b9aacd", // theme-invariant: the terminals stay dark in both appearances (PRD #743)
+        brightCyan: "#78cec1", // theme-invariant: the terminals stay dark in both appearances (PRD #743)
+        brightWhite: "#f3f5f2", // theme-invariant: the terminals stay dark in both appearances (PRD #743)
       },
     });
     const fitAddon = new FitAddon();

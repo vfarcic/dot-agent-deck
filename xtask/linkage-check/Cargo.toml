@@ -39,4 +39,8 @@ xtask-docs = { path = "../docs" }
 libc = "0.2"
 
 [dev-dependencies]
+# Already a root-package dependency at the same version, so this pulls no new
+# crate into Cargo.lock. Used by `issue_labeler_policy` to read back the
+# `label-policy.json` the labeler's setup step writes.
+serde_json = "1"
 tempfile = "3"

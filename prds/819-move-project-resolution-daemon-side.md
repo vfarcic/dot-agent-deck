@@ -509,6 +509,8 @@ The recommended closing fix from the entry above, taken immediately. The reasoni
 
 **Result.** Branch head `094fe0e` was paired against tag **v0.39.2** (`364a182`) — two real builds of two different commits, with no `DOT_AGENT_DECK_BUILD_ID_OVERRIDE` and no `DOT_AGENT_DECK_TEST_OMIT_RUNNING_AGENTS` anywhere. Build ids `0.39.2-g364a182` (daemon) and `0.39.2-g094fe0e` (branch TUI); note both report `--version 0.39.2`, since `git describe --tags --abbrev=0` resolves to the same tag on the branch, so the **build id** is the only thing that distinguishes them and it is what the PRD #103 handshake compares.
 
+**v0.39.3 shipped after this run, and the run does NOT need repeating.** v0.39.2 was the previous release at the time; the merge of `origin/main` into this branch brought v0.39.3 with it. `git show v0.39.3:src/daemon_protocol.rs` still reads `pub const PROTOCOL_VERSION: u32 = 8`, so the 8-vs-9 pairing this run measured is exactly the pairing a v0.39.3 daemon presents, and the evidence below stands unchanged. Stated here so a later reader does not have to re-derive it, or wrongly conclude the run went stale with the release.
+
 **All three tells hold.** Exactly **one** `Attach protocol listening` line in `$DOT_AGENT_DECK_LOG` for the whole run (`2026-09-04T08:19:11.639098Z … Attach protocol listening on <sandbox>/attach.sock`). One daemon pid — **107642**, started 08:19:11, `readlink /proc/107642/exe` = the v0.39.2 binary — and one daemon build id serving it end to end. And **both `server_version` values measured rather than inferred**: a read-only raw `Hello` frame written straight to the live attach socket as a v9 client returned
 
 ```

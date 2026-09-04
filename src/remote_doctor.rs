@@ -1112,15 +1112,17 @@ impl ForwardProbe {
 /// against a listener that accepts and never speaks — [`ForwardObservation::Silent`],
 /// and the most likely real squatter — would block until the ssh wallclock
 /// deadline, which `DOT_AGENT_DECK_SSH_PROBE_TIMEOUT_SECS` lets a user stretch
-/// to an hour. Two seconds is enormous for the case that matters: a SOCKS
+/// past two hours (the deadline is [`crate::remote::wallclock_kill_secs`] of
+/// that variable, whose own clamp is an hour). Two seconds is enormous for the case that matters: a SOCKS
 /// proxy on the remote's own loopback answers in microseconds.
 ///
 /// **Scope, stated precisely because the first wording of it was wrong** (PRD
 /// #345 second audit): this bounds the **reply read** and nothing else. DNS
 /// resolution of the bind host and the `/dev/tcp` connect both happen *before*
 /// `timeout` is reached, so they are bounded only by the outer ssh probe
-/// wallclock (`DOT_AGENT_DECK_SSH_PROBE_TIMEOUT_SECS`, 10s by default and
-/// clamped to an hour), not by two seconds. That is the correct division of
+/// wallclock — [`crate::remote::wallclock_kill_secs`] of
+/// `DOT_AGENT_DECK_SSH_PROBE_TIMEOUT_SECS`, so 25s under the 10s default and
+/// a little over two hours at the one-hour clamp — not by two seconds. That is the correct division of
 /// labour — a stalled connect is a transport problem the ssh deadline already
 /// owns — but it is not what "the probe is bounded at two seconds" implies.
 const SOCKS_REPLY_TIMEOUT_SECS: u8 = 2;

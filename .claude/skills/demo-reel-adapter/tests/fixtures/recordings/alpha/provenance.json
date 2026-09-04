@@ -1,0 +1,11 @@
+{
+  "schema": 1,
+  "test": "alpha_renders_its_label",
+  "outcome": "passed",
+  "commit": "aaaaaaabbbbbbbccccccc",
+  "dirty": false,
+  "build_id": "0.39.2-gaaaaaaabbbbbbbccccccc",
+  "run_id": "11111111-2222-3333-4444-555555555555",
+  "redaction_version": 1,
+  "recorded_at_unix": 1756800000
+}

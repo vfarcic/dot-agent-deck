@@ -72,6 +72,12 @@ fn lock_settings() -> MutexGuard<'static, ()> {
 /// invalidated by a single trailing comma came back with `model`, `env`, and
 /// every `permissions` entry destroyed, while the run reported success.
 ///
+/// The copy aside goes through
+/// [`agent_hook_config::backup_malformed`](crate::agent_hook_config::backup_malformed)
+/// rather than a bare `std::fs::write`, which followed a symlink planted at that
+/// predictable `.bak` name (#731); the message names the backup only when there
+/// is one.
+///
 /// Issue #522: this used to be the install path's reader only, with a
 /// `read_settings_lenient` twin still serving [`uninstall`] and
 /// [`uninstall_from`] — which called [`write_settings`] UNCONDITIONALLY on
@@ -84,15 +90,13 @@ fn load_settings_or_refuse(path: &Path) -> io::Result<Value> {
         Ok(bytes) => match serde_json::from_slice::<Value>(&bytes) {
             Ok(value) => Ok(value),
             Err(parse_err) => {
-                let backup = path.with_extension("json.bak");
-                let _ = std::fs::write(&backup, &bytes);
+                let backup = crate::agent_hook_config::backup_malformed(path, &bytes);
                 Err(io::Error::new(
                     ErrorKind::InvalidData,
                     format!(
-                        "{} is not valid JSON (left unchanged, original preserved at {}): \
-                         {parse_err}",
+                        "{} is not valid JSON (left unchanged, original {}): {parse_err}",
                         path.display(),
-                        backup.display()
+                        crate::agent_hook_config::preserved_phrase(backup.as_deref())
                     ),
                 ))
             }
@@ -1042,6 +1046,89 @@ pub fn uninstall_from(path: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A malformed `settings.json` is preserved at `settings.json.bak` — and the
+    /// copy must never be made THROUGH a symlink planted at that path.
+    ///
+    /// The backup destination is fully predictable, and `std::fs::write` follows
+    /// a symlink, so a writer able to add an entry to `~/.claude` could point
+    /// `settings.json.bak` at any file it could write and have the deck fill
+    /// that file with the malformed config's bytes (#731's second half). The
+    /// victim here stands for that file.
+    ///
+    /// [`refuse_symlinked_destination`] does not cover this: it guards the
+    /// publish destination, which this path never reaches — the whole point of
+    /// the refusal is that the settings file is left unwritten.
+    #[cfg(unix)]
+    #[test]
+    fn a_malformed_settings_backup_does_not_follow_a_symlink_planted_at_the_backup_path() {
+        let dir = crate::test_temp::tempdir().expect("settings tempdir");
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, b"victim bytes").expect("seed victim");
+
+        let malformed = "{ \"model\": \"opus\",, }";
+        let settings = dir.path().join("settings.json");
+        std::fs::write(&settings, malformed).expect("seed settings.json");
+        let backup = dir.path().join("settings.json.bak");
+        std::os::unix::fs::symlink(&victim, &backup).expect("plant symlink");
+
+        let err = load_settings_or_refuse(&settings)
+            .expect_err("settings we cannot parse must be refused, not collapsed to {}");
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
+
+        assert_eq!(
+            std::fs::read(&victim).expect("read victim"),
+            b"victim bytes",
+            "the backup was written through the planted symlink and overwrote the victim"
+        );
+        assert!(
+            !std::fs::symlink_metadata(&backup)
+                .expect("stat backup")
+                .file_type()
+                .is_symlink(),
+            "the backup must be a real file, not the planted symlink"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&backup).expect("read backup"),
+            malformed,
+            "the user's bytes must still be preserved beside the original"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&settings).expect("read settings"),
+            malformed,
+            "the original must be left byte-for-byte intact"
+        );
+    }
+
+    /// When the copy aside cannot be made, the error must not claim a backup.
+    ///
+    /// A directory at the `.bak` name is the portable way to make the publish's
+    /// `rename` fail (`EISDIR`); before #731 the message named `<path>.bak`
+    /// unconditionally, because the write's result was discarded.
+    #[test]
+    fn a_backup_that_cannot_be_written_is_not_claimed_in_the_error() {
+        let dir = crate::test_temp::tempdir().expect("settings tempdir");
+        let settings = dir.path().join("settings.json");
+        std::fs::write(&settings, "{ nope").expect("seed settings.json");
+        // Occupied by something a file cannot be renamed onto.
+        std::fs::create_dir(dir.path().join("settings.json.bak")).expect("occupy the backup name");
+
+        let err = load_settings_or_refuse(&settings).expect_err("malformed settings are refused");
+        let message = err.to_string();
+
+        assert!(
+            !message.contains("settings.json.bak"),
+            "the error named a backup that was never written: {message}"
+        );
+        assert!(
+            message.contains("not preserved"),
+            "the error must say the copy aside did not happen: {message}"
+        );
+        assert!(
+            message.contains("left unchanged"),
+            "the original is still intact and the error must say so: {message}"
+        );
+    }
 
     /// The conventions [`binary_names_match`] reads off the target on Windows,
     /// spelled out so they can be exercised from a Linux or macOS box — the

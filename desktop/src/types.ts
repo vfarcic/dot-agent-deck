@@ -615,4 +615,8 @@ export interface DeckRuntimeState {
    * request uses.
    */
   resolveProject: (path: string) => Promise<DaemonResolvedProject>;
+  /** The desktop app's own settings, and where they live (PRD #803). */
+  getSettings: () => Promise<import("./lib/bridge").DesktopSettingsSnapshotDto>;
+  /** Persist the whole document; resolves to what was written. */
+  saveSettings: (settings: import("./lib/bridge").DesktopSettingsDto) => Promise<import("./lib/bridge").DesktopSettingsDto>;
 }

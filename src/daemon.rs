@@ -1,7 +1,7 @@
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
@@ -969,6 +969,22 @@ fn make_schedule_callback(
 /// joint-zero gate still holds). A 0→1 transition just bumps the
 /// generation — the in-flight timer becomes a no-op when it wakes,
 /// without any await on the cancel path.
+///
+/// Issue #860: a timer that wakes on an UNMOVED generation but finds the
+/// joint-zero gate busy declines to signal shutdown — and used to die there,
+/// while the monitor's `armed` flag stayed true. The monitor's next reading
+/// then found the daemon idle with (as far as it knew) a timer already in
+/// flight, so it armed nothing, and no later reading ever would: the daemon
+/// was immortal with zero clients, zero agents and zero pending schedules.
+/// Reaching that state needs only a transient the monitor does not observe,
+/// which tokio's `Notify` makes ordinary — it stores at most ONE permit, so a
+/// connect and a disconnect landing between the monitor's readings coalesce
+/// into a single wake-up whose reading is the settled, idle state, while the
+/// timer waking on its own deadline sees the busy moment between them. The
+/// declining timer therefore now clears `armed` (shared, generation-guarded)
+/// and wakes the monitor, which arms a fresh window. Retrying is the only
+/// change: the gate itself is untouched, so a shutdown still requires the
+/// full joint-zero re-check to pass under an unmoved generation.
 async fn run_idle_monitor(
     client_count: Arc<AtomicUsize>,
     pty_registry: Arc<AgentPtyRegistry>,
@@ -983,7 +999,13 @@ async fn run_idle_monitor(
     // is therefore atomic and synchronous (one `fetch_add`) — no abort,
     // no await, no race with the timer's wake-up.
     let generation = Arc::new(AtomicU64::new(0));
-    let mut armed = false;
+    // Issue #860: shared with every in-flight timer, not a local `bool`. A
+    // timer that DECLINES to signal shutdown (its joint-zero re-check found
+    // the gate busy) clears this and wakes the monitor, so the monitor arms a
+    // fresh timer. While this was a local `bool` the monitor went on believing
+    // a timer was still in flight and never armed another one — leaving the
+    // daemon immortal with no clients, no agents and no pending schedules.
+    let armed = Arc::new(AtomicBool::new(false));
 
     loop {
         let clients = client_count.load(Ordering::SeqCst);
@@ -996,7 +1018,7 @@ async fn run_idle_monitor(
         let is_idle = clients == 0 && agents == 0 && no_pending_schedules;
 
         if is_idle {
-            if !armed {
+            if !armed.load(Ordering::SeqCst) {
                 // 1→0 transition (or fresh-startup idle): bump the
                 // generation so any prior in-flight timer becomes a
                 // no-op when it wakes, then spawn a new timer that
@@ -1007,7 +1029,12 @@ async fn run_idle_monitor(
                 let shutdown_signal = shutdown.clone();
                 let gen_check = generation.clone();
                 let timer_scheduler = scheduler.clone();
+                let timer_armed = armed.clone();
+                let timer_wake = change_notify.clone();
                 let dur = threshold;
+                // Set before spawning: the timer must never observe a stale
+                // `false` and re-arm on the monitor's behalf.
+                armed.store(true, Ordering::SeqCst);
                 tokio::spawn(async move {
                     tokio::time::sleep(dur).await;
                     if gen_check.load(Ordering::SeqCst) != my_gen {
@@ -1032,17 +1059,49 @@ async fn run_idle_monitor(
                             "Daemon idle window elapsed (no clients, no agents, no pending schedules); signaling shutdown"
                         );
                         shutdown_signal.notify_one();
+                        return;
+                    }
+                    // Issue #860: the gate was busy at the deadline, so this
+                    // timer declines. Hand arming back to the monitor rather
+                    // than dying silently — otherwise nothing ever arms
+                    // another timer and the daemon never exits, however long
+                    // it stays idle afterwards.
+                    //
+                    // Claiming the decline is ONE atomic step, not a re-read
+                    // of the generation followed by a store. Arming bumps the
+                    // generation, so a successful compare-exchange proves no
+                    // replacement timer was armed between this timer's
+                    // deadline and this instant — and by bumping the
+                    // generation itself it retires this timer's own claim in
+                    // the same operation. A plain `load() == my_gen` guard
+                    // (Greptile P1 on PR #865) leaves a window: a timer
+                    // descheduled between the load and the store can clear a
+                    // REPLACEMENT timer's `armed` flag, and the monitor's next
+                    // busy reading would then skip its generation bump —
+                    // that branch only fires when `armed` — leaving the
+                    // replacement live across a busy period that should have
+                    // invalidated it, so it could fire on a window the daemon
+                    // did not stay idle through.
+                    if gen_check
+                        .compare_exchange(my_gen, my_gen + 1, Ordering::SeqCst, Ordering::SeqCst)
+                        .is_ok()
+                    {
+                        debug!(
+                            threshold_secs = dur.as_secs(),
+                            "daemon idle timer declined (gate busy at the deadline); re-arming"
+                        );
+                        timer_armed.store(false, Ordering::SeqCst);
+                        timer_wake.notify_one();
                     }
                 });
-                armed = true;
             }
-        } else if armed {
+        } else if armed.load(Ordering::SeqCst) {
             // 0→1 transition: invalidate the in-flight timer by bumping
             // the generation. The timer task is still scheduled; it'll
             // wake at its old deadline, see the mismatch, and exit
             // silently. No await needed.
             generation.fetch_add(1, Ordering::SeqCst);
-            armed = false;
+            armed.store(false, Ordering::SeqCst);
         }
 
         // Park until the next transition. Tokio Notify stores a permit if
@@ -1089,9 +1148,33 @@ async fn run_idle_monitor(
 async fn ingest_event(
     state: &SharedState,
     event_tx: &broadcast::Sender<BroadcastMsg>,
-    event: AgentEvent,
+    registry: &AgentPtyRegistry,
+    mut event: AgentEvent,
 ) {
+    // Issue #770: half of the orphan verdict, asked of the registry BEFORE the
+    // `AppState` write lock is taken. Sequencing, not style: `has_live_pane`
+    // takes the registry's own mutex, and every other path in the daemon that
+    // holds both takes the registry first (`spawn` registers a role only after
+    // `spawn_agent` has returned and released it). Asking here keeps that order
+    // rather than introducing the one nesting that would reverse it.
+    let daemon_owns_pane = event
+        .pane_id
+        .as_deref()
+        .is_some_and(|pane_id| registry.has_live_pane(pane_id));
     let mut state = state.write().await;
+    // The other half, plus the stamp: is this an orchestration role pane whose
+    // role registration a daemon restart destroyed while its agent survived?
+    // The verdict is the daemon's alone — any inbound value is dropped first,
+    // because `metadata` rides an unauthenticated same-uid socket and a
+    // producer must not be able to paint its own card (see
+    // `ORCHESTRATION_ORPHANED_METADATA_KEY`).
+    //
+    // Stamped HERE, before the fan-out, so it reaches attached TUIs even when
+    // the daemon's own `apply_event` declines the event — which is precisely
+    // what happens for an orphan: admission control asks the registry, the
+    // registry has never heard of the pane, and a non-`SessionStart` frame is
+    // dropped. The card that needs the badge is an attached TUI's.
+    state.stamp_orchestration_orphan(&mut event, daemon_owns_pane);
     let _ = event_tx.send(BroadcastMsg::Event(event.clone()));
     state.apply_event(event);
 }
@@ -1701,7 +1784,7 @@ async fn run_shell_activity_monitor_with<S, F>(
             // One ordered ingestion step (broadcast + apply under a single
             // write-lock hold), exactly as the hook loop below does it — see
             // `ingest_event` for the interleaving this closes.
-            ingest_event(&state, &event_tx, event).await;
+            ingest_event(&state, &event_tx, &pty_registry, event).await;
         }
     }
 }
@@ -2046,7 +2129,7 @@ async fn run_hook_loop(
                             // different connection, so doing it first only
                             // means a client that reacts to the event by
                             // listing agents sees the fresher answer.
-                            ingest_event(&state, &event_tx, event).await;
+                            ingest_event(&state, &event_tx, &pty_registry, event).await;
                         } else {
                             warn!("Malformed event: {line}");
                         }
@@ -3281,6 +3364,166 @@ mod hook_ingestion_tests {
         assert!(
             state.read().await.sessions.len() == 1,
             "the daemon state itself is unaffected by the registry going away"
+        );
+    }
+}
+
+/// Issue #860: the idle monitor's arming state machine.
+///
+/// These drive the real [`run_idle_monitor`] against real `AgentPtyRegistry` /
+/// `Scheduler` values on a paused-time runtime, so every wake-up is the
+/// production one and only the clock is synthetic.
+#[cfg(test)]
+mod idle_monitor_tests {
+    use super::*;
+    use crate::scheduler::{Notifier, NotifyEvent, Scheduler};
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
+
+    struct SilentNotifier;
+    impl Notifier for SilentNotifier {
+        fn notify(&self, _event: NotifyEvent) {}
+    }
+
+    /// The three keep-alive inputs the idle gate reads, wired the way
+    /// `run_daemon_with` wires them, plus a watcher that records the daemon's
+    /// shutdown signal.
+    struct Harness {
+        clients: Arc<AtomicUsize>,
+        registry: Arc<AgentPtyRegistry>,
+        scheduler: Arc<Scheduler>,
+        change: Arc<Notify>,
+        signalled: Arc<AtomicBool>,
+    }
+
+    impl Harness {
+        /// True once the monitor has told the daemon to exit.
+        fn shut_down(&self) -> bool {
+            self.signalled.load(Ordering::SeqCst)
+        }
+    }
+
+    /// Hand the runtime enough polls for a just-spawned task to reach its
+    /// first await — in particular for an armed timer to REGISTER its
+    /// `sleep`. Advancing the clock before that registration would leave the
+    /// timer's deadline in the future, which is how the first version of the
+    /// regression test below passed vacuously.
+    async fn settle() {
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    fn spawn_monitor(threshold: Duration) -> Harness {
+        let clients = Arc::new(AtomicUsize::new(0));
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let scheduler = Arc::new(Scheduler::new(Arc::new(SilentNotifier)));
+        let shutdown = Arc::new(Notify::new());
+        let change = registry.change_notify();
+
+        let signalled = Arc::new(AtomicBool::new(false));
+        tokio::spawn({
+            let shutdown = shutdown.clone();
+            let signalled = signalled.clone();
+            async move {
+                shutdown.notified().await;
+                signalled.store(true, Ordering::SeqCst);
+            }
+        });
+
+        tokio::spawn(run_idle_monitor(
+            clients.clone(),
+            registry.clone(),
+            threshold,
+            shutdown,
+            change.clone(),
+            scheduler.clone(),
+        ));
+
+        Harness {
+            clients,
+            registry,
+            scheduler,
+            change,
+            signalled,
+        }
+    }
+
+    /// Scenario (control): a daemon that is idle from its first reading, with
+    /// nothing ever disturbing the gate, signals shutdown once the window
+    /// elapses. This is `lifecycle/daemon-idle/001` at unit altitude, and it
+    /// is here to prove the harness can observe a shutdown at all — without
+    /// it the regression test below could pass vacuously.
+    #[tokio::test(start_paused = true)]
+    async fn idle_monitor_shuts_down_an_undisturbed_idle_daemon() {
+        let threshold = Duration::from_secs(30);
+        let h = spawn_monitor(threshold);
+        settle().await;
+        assert!(!h.shut_down(), "must not fire before the window elapses");
+
+        tokio::time::sleep(threshold + Duration::from_secs(1)).await;
+        settle().await;
+        assert!(
+            h.shut_down(),
+            "an undisturbed idle daemon must signal shutdown after its window"
+        );
+    }
+
+    /// Scenario (issue #860): the idle timer reaches its deadline while the
+    /// gate is *transiently* busy — a client is connected across it — so the
+    /// timer's own joint-zero re-check declines to signal shutdown. The
+    /// monitor never sees that transient: tokio's `Notify` stores at most ONE
+    /// permit, so a connect and a disconnect that land while the monitor is
+    /// between readings coalesce into a single wake-up whose reading is the
+    /// SETTLED (idle) state. Modelled here by mutating the counter and
+    /// delivering only the disconnect edge's notify, which is exactly what
+    /// the monitor observes in that case.
+    ///
+    /// The daemon is then idle again, permanently, with nothing left to
+    /// disturb it — the reported orphan's state, whose sockets were unlinked
+    /// so nothing could connect even in principle. It must still shut down.
+    #[tokio::test(start_paused = true)]
+    async fn idle_monitor_rearms_after_its_timer_declines_a_transiently_busy_gate() {
+        let threshold = Duration::from_secs(30);
+        let h = spawn_monitor(threshold);
+
+        // First reading: idle. The monitor arms a timer for `threshold`, and
+        // `settle` lets that timer register its sleep.
+        settle().await;
+
+        // A client is connected across the timer's deadline. The monitor is
+        // parked with no permit, so it cannot observe this.
+        h.clients.store(1, Ordering::SeqCst);
+        tokio::time::sleep(threshold + Duration::from_secs(1)).await;
+        settle().await;
+        assert!(
+            !h.shut_down(),
+            "precondition: the timer must have DECLINED at its deadline — a \
+             busy gate must never shut the daemon down. If this fires, the \
+             timer did not run while the gate was busy and the rest of this \
+             test proves nothing."
+        );
+
+        // ...and is gone again. This edge's notify is the single wake-up the
+        // monitor gets, and it reads the settled, idle state.
+        h.clients.store(0, Ordering::SeqCst);
+        h.change.notify_one();
+        settle().await;
+
+        assert_eq!(
+            h.clients.load(Ordering::SeqCst),
+            0,
+            "precondition: no clients"
+        );
+        assert_eq!(h.registry.live_count(), 0, "precondition: no agents");
+        assert!(h.scheduler.is_empty(), "precondition: no pending schedules");
+
+        tokio::time::sleep(threshold * 4).await;
+        settle().await;
+        assert!(
+            h.shut_down(),
+            "a daemon that is idle again after its timer declined must still \
+             shut down; instead it stayed up for four more windows with no \
+             clients, no agents and no pending schedules"
         );
     }
 }

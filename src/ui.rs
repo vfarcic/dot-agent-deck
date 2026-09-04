@@ -695,12 +695,12 @@ You are an ordinary assistant with one extra effector available: the `dot-agent-
 ## Choosing the shape — ASK, do not guess
 A unit can start as ONE agent or as a multi-role ORCHESTRATION (a team that divides the work). Which one the user wants is not inferable from the request: \"work on these three features\" usually wants a team per feature, while \"verify these three PRs\" usually wants one agent each — and both arrive here as the same words. Guessing wrong is expensive and visible.
 
-So, before the FIRST dispatch of a session:
-1. Run `dot-agent-deck dispatch --list-targets`. It prints the shapes this repo actually offers (always `single`, plus each orchestration by name).
-2. If more than one is offered, show the user the list and ask which they want. If only `single` is offered, say so and use it — there is nothing to ask.
-3. Pass their answer on every dispatch: `--single`, or `--orchestration <name>`.
+So, before dispatching:
+1. Run `dot-agent-deck dispatch --list-targets`. It prints the shapes this repo actually offers (always `single`, plus each orchestration by name). Once per session is enough — its answer describes the repo, not the unit.
+2. If more than one is offered, show the user the list and ask which they want — ONCE PER UNIT, since the shape follows from what that unit is doing. Starting several at once is one prompt with a line per unit, not one question for the batch. If only `single` is offered, say so and use it — there is nothing to ask.
+3. Pass their answer for that unit on its own dispatch: `--single`, or `--orchestration <name>`.
 
-Reuse the answer for later dispatches in the same conversation rather than asking again, unless the user changes it or the new unit is clearly different in kind.
+One answer can cover several units when the user gives one — take it and stop asking. What is never allowed is assuming it: three units of a kind and three that are not look identical from here until you ask.
 
 ## What it does
 - Creates a git worktree as a SIBLING of this repo, at ../<repo>-dispatch-<name>, on branch agent/dispatch-<name>. Isolation is automatic — never create or pick a worktree yourself.
@@ -19710,6 +19710,14 @@ fn render_session_card(
         crate::event::Writable::HistoryOnly => " history ",
         crate::event::Writable::None => " view-only ",
     };
+    // Issue #770: an ORPHANED orchestration role pane — one whose role
+    // registration a daemon restart destroyed while its agent survived. Every
+    // other signal on this card is honest and healthy (status updates keep
+    // arriving, the agent keeps working), and it is exactly that healthy look
+    // that made the failure cost hours to find: the pane simply cannot delegate
+    // any more, and nothing said so until someone tried. Marked in the TITLE so
+    // it is visible at every density, and spelled out in the body below.
+    let is_orphaned = session.orchestration_orphaned;
     // PRD #20 M5 / finding #9: the agent-type label carries its registry badge
     // colour so EVERY card exposes a coloured type badge (cross-agent: Claude /
     // OpenCode / Pi / Codex each get their registry colour). The rest of the
@@ -19735,6 +19743,14 @@ fn render_session_card(
         ];
         if !is_live {
             segs.push((liveness_marker.to_string(), text_dim()));
+        }
+        if is_orphaned {
+            segs.push((
+                " orphaned ".to_string(),
+                Style::default()
+                    .fg(palette::status_color(&SessionStatus::Error))
+                    .add_modifier(Modifier::BOLD),
+            ));
         }
         segs
     };
@@ -19830,6 +19846,18 @@ fn render_session_card(
             w.saturating_sub(dir_label_len),
         )),
     ]));
+
+    // Issue #770: say what the title badge means, in the one place a reader
+    // looks when a card stops behaving. Placed directly under `Dir:` so it
+    // survives every density, and ahead of the prompt/tool rows because it is
+    // the fact that explains why those rows keep advancing while the run has in
+    // fact stalled.
+    if is_orphaned {
+        lines.push(Line::from(Span::styled(
+            truncate_with_ellipsis("Orphaned — delegation unavailable", w),
+            Style::default().fg(palette::status_color(&SessionStatus::Error)),
+        )));
+    }
 
     if is_placeholder {
         lines.push(Line::from(Span::styled(
@@ -20649,6 +20677,7 @@ pub fn render_orchestration_frame_to_buffer(
                 agent_id: None,
                 display_name: None,
                 shell_synthetic_working: false,
+                orchestration_orphaned: false,
             },
         );
         // Two different maps: the sidebar card reads `display_names` (keyed by
@@ -26281,6 +26310,7 @@ mod tests {
             agent_id: None,
             display_name: None,
             shell_synthetic_working: false,
+            orchestration_orphaned: false,
         };
 
         let lines = recent_tool_lines(&session, 3);
@@ -28797,6 +28827,7 @@ mod tests {
             agent_id: None,
             display_name: None,
             shell_synthetic_working: false,
+            orchestration_orphaned: false,
         };
         let s0 = make("s0", "p0");
         let s1 = make("s1", "p1");
@@ -29729,6 +29760,7 @@ mod tests {
             agent_id: None,
             display_name: None,
             shell_synthetic_working: false,
+            orchestration_orphaned: false,
         }
     }
 
@@ -30076,6 +30108,7 @@ mod tests {
             agent_id: None,
             display_name: None,
             shell_synthetic_working: false,
+            orchestration_orphaned: false,
         };
 
         // Spacious: get all 3
@@ -30111,6 +30144,7 @@ mod tests {
             agent_id: None,
             display_name: None,
             shell_synthetic_working: false,
+            orchestration_orphaned: false,
         };
 
         let prompts = collect_recent_prompts(&session, 3);
@@ -30137,6 +30171,7 @@ mod tests {
             agent_id: None,
             display_name: None,
             shell_synthetic_working: false,
+            orchestration_orphaned: false,
         };
 
         let prompts = collect_recent_prompts(&session, 3);
@@ -31569,6 +31604,29 @@ mod tests {
             assert!(
                 DISPATCHER_SEED_PROMPT.contains(required),
                 "the dispatcher seed must still teach {required:?}"
+            );
+        }
+    }
+
+    /// Issue #674: the shape question is asked ONCE PER UNIT, not once per
+    /// session. The seed used to say "before the FIRST dispatch of a session"
+    /// and to tell the agent to reuse that answer for later dispatches, which
+    /// is wrong for the mixed batch: measured on 2026-08-24, three issues asked
+    /// as one question got one answer for all three, while asked per issue the
+    /// user picked `--single` for two of them and `--orchestration` for the
+    /// third. Pinned in both directions so the per-session framing cannot drift
+    /// back into the seed. `docs/dispatcher-mode.md` states the same contract to
+    /// users, in prose this test does not reach.
+    #[test]
+    fn dispatcher_seed_asks_the_shape_once_per_unit() {
+        assert!(
+            DISPATCHER_SEED_PROMPT.contains("ONCE PER UNIT"),
+            "the dispatcher seed must ask the shape per unit"
+        );
+        for banned in ["before the FIRST dispatch", "Reuse the answer"] {
+            assert!(
+                !DISPATCHER_SEED_PROMPT.contains(banned),
+                "the dispatcher seed must not ask the shape once per batch, found {banned:?}"
             );
         }
     }

@@ -86,7 +86,21 @@
 //!
 //! Exits 0 on success, 1 on any failure with a per-finding summary.
 
+/// Issue #863: `scripts/build-gate.sh` and `scripts/link-gate.sh`, the
+/// machine-wide bound on concurrent linking that `.cargo/config.toml` routes
+/// the Linux target's links through. Tests only, and Unix only — the rule
+/// lives in the scripts, and their whole value is runtime behaviour, so a
+/// compile-time gate proves nothing about them (the same reason `clean_tmp`'s
+/// deletion-safety properties are tested here rather than trusted).
+#[cfg(all(test, unix))]
+mod build_gate;
 mod clean_tmp;
+/// PRD #743: no hard-coded colour under `desktop/src` outside the `:root`
+/// palette, so the desktop app's light/dark appearance cannot rot by attrition.
+/// Tests only — the rule and its scanner both live in the module, and nothing
+/// renders dark mode in CI, so this is the only thing that sees the decay.
+#[cfg(test)]
+mod desktop_palette;
 /// PRD #819 M7: the desktop crate's project-resolution boundary. Unlike the
 /// `#[cfg(test)]` modules around it this one carries a live rule — check 12
 /// below — as well as its own tests.
@@ -102,6 +116,10 @@ mod devbox_gtk_origin;
 /// script under `node`.
 #[cfg(test)]
 mod issue_labeler_memory;
+/// The same workflow's `Extract label policy for the agent` setup step. Tests
+/// only — these drive the real script under `python3`.
+#[cfg(test)]
+mod issue_labeler_policy;
 /// Issue #785: `scripts/junit-strip-output.py`, the stripper that makes a JUnit
 /// report from a credential-holding run structurally incapable of carrying test
 /// output before anyone shares it. Since #502 took the credentialed lane out of

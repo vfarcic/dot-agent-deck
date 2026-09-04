@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createFixtureSnapshot } from "../data/fixture";
 import { createDeckBridge, selectRuntimeMode } from "../lib/bridge";
+import type { DesktopSettingsDto } from "../lib/bridge";
 import { applyTerminalChunk } from "../lib/terminalBuffer";
 const EMPTY_TERMINAL_DATA: Record<string, TerminalBuffer> = {};
 import type { DeckAction, DeckRuntimeState, DeckSnapshot, TerminalBuffer } from "../types";
@@ -135,6 +136,9 @@ export function useDeckRuntime(): DeckRuntimeState {
     }
   }, [bridge]);
 
+  const getSettings = useCallback(() => bridge.getSettings(), [bridge]);
+  const saveSettings = useCallback((settings: DesktopSettingsDto) => bridge.saveSettings(settings), [bridge]);
+
   const sendTerminalInput = useCallback((agentId: string, data: string) => bridge.sendTerminalInput(agentId, data), [bridge]);
   const resizeTerminal = useCallback((agentId: string, cols: number, rows: number) => bridge.resizeTerminal(agentId, cols, rows), [bridge]);
   // Stable for the lifetime of the bridge, because the screens declare their
@@ -162,5 +166,7 @@ export function useDeckRuntime(): DeckRuntimeState {
     reconnect,
     listProjects,
     resolveProject,
+    getSettings,
+    saveSettings,
   };
 }

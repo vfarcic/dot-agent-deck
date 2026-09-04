@@ -1059,11 +1059,14 @@ name = "dot-agent-deck-desktop"
 version = "0.1.0"
 dependencies = [
  "dot-agent-deck",
+ "libc",
  "serde",
  "serde_json",
  "tauri",
  "tauri-build",
+ "tempfile",
  "tokio",
+ "toml 1.1.4+spec-1.1.0",
 ]
 
 [[package]]
@@ -6331,6 +6334,7 @@ dependencies = [
  "libc",
  "proc-macro2",
  "regex",
+ "serde_json",
  "syn 3.0.4",
  "tempfile",
  "xtask-docs",
