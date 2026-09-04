@@ -449,8 +449,10 @@ GREPTILE'S FINDINGS ARE PART OF THE JOB, NOT PART OF THE MERGE. Greptile
 reviews once, a few minutes after the PR opens, and never again —
 greptile.json sets triggerOnUpdates: false, so do NOT wait for a re-review
 after you push fixes. Its findings live ONLY at
-`gh api repos/<owner>/<repo>/pulls/<pr>/comments`; the green `Greptile Review`
-check and the summary comment carry none of them. Fetch that endpoint once the
+`gh api repos/<owner>/<repo>/pulls/<pr>/comments --paginate`; the green
+`Greptile Review` check and the summary comment carry none of them. Keep the
+--paginate: that endpoint pages at 30 and replies count toward the 30, so
+without it a busy PR silently truncates the findings you are about to answer. Fetch that endpoint once the
 check-run completes and reply on each thread — what you fixed, or why you did
 not — BEFORE you notify and stop. Do not defer it to the merge: this run stops
 before merge, and an armed auto-merge PR lands the moment the approval arrives,
