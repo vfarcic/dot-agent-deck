@@ -50,3 +50,40 @@ test-e2e-live = "nextest run --workspace --features e2e,e2e-live"
 # PRD #77 Decision 7: `cargo xtask linkage-check` enforces catalog↔test
 # linkage. Args after the alias pass through to the binary.
 xtask = "run --quiet --package xtask-linkage-check --"
+
+# Issue #863 — the machine-wide link gate. Concurrent workspace builds from
+# separate dispatch worktrees saturated the shared dev box: `io full avg300=65.95`
+# (for two-thirds of a five-minute window EVERY runnable task was blocked on
+# disk), `dm-0` at 100%, and `ld invoked oom-killer`, which took out
+# `systemd-resolve`, `apparmor_parser`, `upowerd` and `wpa_supplicant`. The CPU
+# was idle throughout — `cpu some avg300=0.08` — so this bounds I/O and memory,
+# not CPU.
+#
+# `scripts/link-gate.sh` takes one slot from a pool shared by every checkout on
+# the machine and then execs the real linker driver with rustc's argv unchanged.
+# Cargo resolves this path relative to the directory holding `.cargo`, so every
+# worktree points at its own copy of the script and all of them contend for the
+# SAME pool — which is the point, since the thing to bound is concurrency
+# ACROSS worktrees. `build.jobs` and `-j` cannot express that: they bound one
+# invocation, and nothing coordinates invocations.
+#
+# Measured on the 27 GiB / 16-core box in the report, one relink of every test
+# binary: ungated, that ONE build peaked at 60 concurrent linker processes
+# holding 8.3 GB resident. The gate's computed default there is 6 link slots.
+#
+# LINUX ONLY, deliberately. `build-windows` and `build-macos` select different
+# target triples and never read this key, so a POSIX shell script can never
+# become the difference between a green and a red required check on a platform
+# that has no shell to run it. The Linux `build` job DOES go through it. On a
+# 4-core / 16 GiB runner the clamp resolves to 4 slots against cargo's own
+# default `-j 4`, so the gate should be inert there — but that is arithmetic on
+# a runner spec, not a measurement, and a larger runner or a changed default
+# moves it. `DAD_LINK_JOBS=0` in the job is the lever if it ever bites.
+#
+# Kill switch: `DAD_LINK_JOBS=0`. Slot count: `DAD_LINK_JOBS=N`. Different
+# linker driver: `DAD_LINKER=clang` — needed because this key overrides a
+# `linker` set in a personal `~/.cargo/config.toml`. Every failure path inside
+# the two scripts runs the link ungated rather than failing it; the rationale
+# and the degradation ladder are in `docs/develop/build-gate.md`.
+[target.x86_64-unknown-linux-gnu]
+linker = "./scripts/link-gate.sh"
