@@ -1133,8 +1133,9 @@ mod tests {
     /// so its separators are whatever the platform produced, and `\` on Windows
     /// is what `to_string_lossy` used to leak into the inventory table. The
     /// pre-existing parser tests feed a synthetic `"src/tab.rs"` literal that is
-    /// forward-slashed before it ever reaches this code, so no assertion on one
-    /// of them can fail on any platform, which is why the defect survived.
+    /// forward-slashed before it ever reaches this code and is stored verbatim,
+    /// so an assertion on the field there cannot fail on any platform — which
+    /// is why the defect survived.
     ///
     /// Nested directories on purpose: a two-component path exercises one
     /// separator and a four-component one exercises three. Both walks are
