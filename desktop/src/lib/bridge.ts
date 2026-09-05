@@ -1089,20 +1089,23 @@ export class TauriDeckBridge implements DeckBridge {
    * #802 later wants to reference.
    *
    * Loading never fails on the Rust side, so a rejection here can only be an
-   * IPC-level failure; the defaults keep the app usable either way. A failed
-   * *save* does propagate — a preference the user set and the app silently
-   * dropped is worse than an error they can see.
+   * IPC-level failure. It **propagates**, like a failed *save* does — the
+   * defaults still keep the app usable, but `useDesktopSettings` supplies them
+   * rather than this method fabricating a document.
+   *
+   * That distinction used to not exist and it now matters (issue #845). This
+   * method answered a failure with `DEFAULT_DESKTOP_SETTINGS`, mode `system`,
+   * which is indistinguishable from a real document saying "follow the OS" —
+   * so a caller could not tell "the user chose System" from "we never found
+   * out". Since the app now applies the stored choice to the document root
+   * *before this bundle runs*, that ambiguity had a visible cost: one dropped
+   * IPC call and the effect would clear a Light or Dark palette that had been
+   * read successfully, from the same file, seconds earlier. Both callers land
+   * on the same defaults either way; only the caller can tell them apart.
    */
   async getSettings(): Promise<DesktopSettingsSnapshotDto> {
     const invoke = await this.getInvoke();
-    try {
-      return normalizeDesktopSettingsSnapshot(await invoke<DesktopSettingsSnapshotDto>("desktop_get_settings"));
-    } catch {
-      // Loading never fails Rust-side, so this is an IPC-level failure. The
-      // defaults keep the app usable; the missing path makes the surface say
-      // the location is unavailable rather than invent one.
-      return { settings: structuredClone(DEFAULT_DESKTOP_SETTINGS) };
-    }
+    return normalizeDesktopSettingsSnapshot(await invoke<DesktopSettingsSnapshotDto>("desktop_get_settings"));
   }
 
   async saveSettings(settings: DesktopSettingsDto): Promise<DesktopSettingsDto> {

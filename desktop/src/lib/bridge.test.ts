@@ -1571,7 +1571,7 @@ describe("desktop settings (PRD 803)", () => {
     await bridge.dispose();
   });
 
-  it("falls back to defaults when the settings IPC fails, but surfaces a failed save", async () => {
+  it("surfaces a failed settings read as well as a failed save, rather than fabricating a document", async () => {
     const { TauriDeckBridge, DEFAULT_DESKTOP_SETTINGS } = await import("./bridge");
     invoke.mockImplementation(async (command: string) => {
       if (command === "desktop_get_settings" || command === "desktop_set_settings") {
@@ -1581,9 +1581,14 @@ describe("desktop settings (PRD 803)", () => {
     });
 
     const bridge = new TauriDeckBridge();
-    // Defaults keep the app usable, and the absent path is what makes the
-    // surface say the location is unavailable rather than invent one.
-    expect(await bridge.getSettings()).toEqual({ settings: DEFAULT_DESKTOP_SETTINGS, path: undefined });
+    // Issue #845: this used to answer a failed READ with the defaults, which
+    // say mode "system" — indistinguishable from a document that really says
+    // "follow the OS". The caller could not tell "the user chose System" from
+    // "we never found out", and since the stored choice is now applied to the
+    // document root before the bundle runs, guessing wrong wipes a palette that
+    // was read successfully seconds earlier. `useDesktopSettings` still lands on
+    // the same defaults; it now knows they are a fallback.
+    await expect(bridge.getSettings()).rejects.toThrow("Permission denied");
     await expect(bridge.saveSettings(DEFAULT_DESKTOP_SETTINGS)).rejects.toThrow("Permission denied");
     await bridge.dispose();
   });

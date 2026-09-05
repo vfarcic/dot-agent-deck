@@ -31,3 +31,19 @@ tempfile = "3"
 [target.'cfg(unix)'.dev-dependencies]
 libc = "0.2"
 
+# Issue #845: `tauri::test::MockRuntime`, which the two appearance tests that
+# need a concrete `Runtime` name instead of `Wry`. The feature is `test = []` —
+# no dependency, one gated item (`pub mod test`) — and it is a dev dependency,
+# so it is off for a normal build of the app.
+#
+# NOT on Windows, and that is measured rather than cautious. Naming ANY concrete
+# `Runtime` from a reachable test path puts imports in this crate's test binary
+# that the Windows runner's loader cannot resolve, and the binary then fails to
+# START: `cargo nextest run --workspace` dies at `--list --format terse aborted
+# with code 0xc0000139: The specified procedure could not be found` before a
+# single test in the whole workspace runs. Two CI rounds established that the
+# runtime is the variable and the feature is not — `Wry` without this feature
+# and `MockRuntime` with it fail identically. See `src/appearance.rs`.
+[target.'cfg(not(windows))'.dev-dependencies]
+tauri = { version = "2", features = ["test"] }
+

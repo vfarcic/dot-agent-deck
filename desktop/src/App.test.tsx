@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createFixtureSnapshot } from "./data/fixture";
 import { WINDOWS_WORKFLOW_BLOCK_REASON } from "./lib/platform";
@@ -553,6 +553,94 @@ describe("ControlDeck", () => {
     await waitFor(() => expect(document.documentElement.getAttribute("data-theme")).toBe("dark"));
     fireEvent.click(screen.getByTestId("open-settings"));
     await waitFor(() => expect(screen.getByRole("radio", { name: /Dark/ })).toBeChecked());
+  });
+
+  // ── The theme on the FIRST painted frame (issue #845)
+
+  /**
+   * The stored choice reaches the document root before this bundle runs:
+   * `appearance::pre_paint_script` (`desktop/src-tauri/src/appearance.rs`) is
+   * injected as a Tauri initialization script, which the webview runs after the
+   * global object exists but before it parses the document — so the first
+   * painted frame already carries the choice. These assert the frontend half of
+   * that: mounting must not undo the write before it has read a document that
+   * could replace it.
+   *
+   * Deliberately SYNCHRONOUS after `render`. The stored value does land a
+   * microtask later, so a `waitFor` here would assert the flip rather than its
+   * absence — which is the whole complaint.
+   *
+   * What jsdom cannot assert is the paint itself (#836) or that the injected
+   * script ran (#823 — no driver-level tier exists). The ordering seam on the
+   * Rust side is asserted in that module's own tests.
+   */
+  it("leaves a pre-painted theme in place while the stored document is still unread", () => {
+    document.documentElement.setAttribute("data-theme", "dark");
+    const store = settingsStore({ appearance: { mode: "dark" } });
+
+    render(<ControlDeck runtime={runtime({ getSettings: store.getSettings, saveSettings: store.saveSettings })} />);
+
+    // Before the fix this was `null`: the appearance effect applied the unread
+    // placeholder — mode "system" — and applying System is a `removeAttribute`,
+    // which on a document the injector had already seeded is a clobber.
+    expect(document.documentElement.getAttribute("data-theme")).toBe("dark");
+  });
+
+  it("still applies a choice made before the initial read resolves", async () => {
+    // The control on the gate, and the reason it is not a bare `loaded` check.
+    // Nothing gates the appearance radios on `loaded` (`SettingsSheet` uses it
+    // only for the location line), so a user can pick Dark while the read is
+    // in flight — and PRD #743 requires that to show with no restart and no
+    // round trip. The condition is "somebody chose this mode", not "the disk
+    // has answered".
+    let answer: (snapshot: { settings: DesktopSettingsDto; path?: string }) => void = () => {};
+    const getSettings = vi.fn(() => new Promise<{ settings: DesktopSettingsDto; path?: string }>((resolve) => { answer = resolve; }));
+
+    render(<ControlDeck runtime={runtime({ getSettings })} />);
+    fireEvent.click(screen.getByTestId("open-settings"));
+    fireEvent.click(screen.getByRole("radio", { name: /Dark/ }));
+
+    expect(document.documentElement.getAttribute("data-theme")).toBe("dark");
+
+    // And the document that was on disk all along does not then revert it: the
+    // same `edited` guard that keeps the state also keeps the palette.
+    await act(async () => { answer({ settings: { ...DEFAULT_DESKTOP_SETTINGS }, path: undefined }); });
+    expect(document.documentElement.getAttribute("data-theme")).toBe("dark");
+  });
+
+  it("leaves a pre-painted theme in place when the settings read FAILS", async () => {
+    // A failed read is not a choice. The app already applied the stored mode
+    // from the same file before this bundle ran, so the palette on the root is
+    // better information than the placeholder this mount is holding — and
+    // clearing it would let one dropped IPC call throw away a saved Light or
+    // Dark. `loaded` cannot tell these apart, because it is true once the read
+    // has settled either way; `chosen` is what draws the line.
+    document.documentElement.setAttribute("data-theme", "dark");
+    const getSettings = vi.fn(async () => { throw new Error("IPC unavailable"); });
+
+    render(<ControlDeck runtime={runtime({ getSettings })} />);
+    await waitFor(() => expect(getSettings).toHaveBeenCalled());
+    // Settled, and still untouched — the effect has had every chance to run.
+    await act(async () => { await Promise.resolve(); });
+    expect(document.documentElement.getAttribute("data-theme")).toBe("dark");
+
+    // Still usable: a choice made after the failure applies as normal.
+    fireEvent.click(screen.getByTestId("open-settings"));
+    fireEvent.click(screen.getByRole("radio", { name: /Light/ }));
+    expect(document.documentElement.getAttribute("data-theme")).toBe("light");
+  });
+
+  it("defers the appearance write rather than suppressing it, so a stale root is still cleared", async () => {
+    // The gate is about ORDER, not about writing less. A root carrying an
+    // attribute the stored document disagrees with must still be cleared —
+    // just not before that document has been read.
+    document.documentElement.setAttribute("data-theme", "dark");
+    const store = settingsStore({ appearance: { mode: "system" } });
+
+    render(<ControlDeck runtime={runtime({ getSettings: store.getSettings, saveSettings: store.saveSettings })} />);
+    expect(document.documentElement.getAttribute("data-theme")).toBe("dark");
+
+    await waitFor(() => expect(document.documentElement.hasAttribute("data-theme")).toBe(false));
   });
 
   it("names the settings file in live mode and admits there is none in the fixture preview", async () => {
