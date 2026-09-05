@@ -61,9 +61,27 @@
 [test-groups]
 orchestration-remit = { max-threads = 1 }
 
+# SECOND ROUND (this branch). The containment above stopped holding: `remit_007`
+# failed on a GitHub runner at 39.7s wall against ~2.3s locally, and a
+# `renovate/github-actions` run — a branch that touches no Rust at all — failed
+# `remit_001` and `remit_002` the same way. So the group is necessary and still
+# not sufficient, exactly as the note above predicts. The bounds in the file are
+# now `load_scaled` (issue #709) rather than fixed 30s, so a contended runner
+# gets proportionally longer while a quiet box still fails in 30s.
+#
+# `slow-timeout` is widened HERE as the consequence of that: `load_scaled` caps
+# at 6x, so a positive wait can now legitimately reach 180s, which is exactly the
+# default 3 x 60s kill. Without this the scaled wait would be cut off by nextest
+# instead of failing on its own assertion — losing the diagnostic the widened
+# wait exists to preserve (the same reasoning every other override in this file
+# gives). 6 x 60s leaves headroom above the 180s ceiling and is still bounded.
+#
+# The filter is a REGEX on the test-function prefix, so it keeps covering new
+# `orchestration_remit_NNN` tests automatically.
 [[profile.default.overrides]]
 filter = 'test(/^orchestration_remit_/)'
 test-group = "orchestration-remit"
+slow-timeout = { period = "60s", terminate-after = 6 }
 
 [profile.default]
 retries = 0
