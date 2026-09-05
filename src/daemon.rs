@@ -947,9 +947,21 @@ fn make_schedule_callback(
                 use crate::scheduler::Notifier as _;
 
                 let dir = Path::new(&req.working_dir);
+                // `load_config_for_dir` flattens a PARSE failure into `None`,
+                // which is the right reading for the config-derived path ("no
+                // usable config" → single-agent card) but the wrong one here: a
+                // declared `shape = "orchestration"` would then be refused with
+                // "no orchestration with roles is defined", sending an operator
+                // hunting for a missing section when the real fault is a broken
+                // file. Read the `Result` so the two causes stay distinguishable
+                // in the notification, which is the only record an unattended
+                // fire leaves.
                 let resolved = crate::spawn::SpawnShapeOverride::parse(raw).and_then(|over| {
+                    let config = crate::project_config::load_project_config(dir).map_err(|e| {
+                        format!("could not read {}/.dot-agent-deck.toml: {e}", dir.display())
+                    })?;
                     crate::spawn::decide_target_with_override(
-                        crate::spawn::load_config_for_dir(dir).as_ref(),
+                        config.as_ref(),
                         dir,
                         req.command.as_deref(),
                         Some(&over),

@@ -4249,6 +4249,14 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Does not assert:** the dispatch flow on fire (covered by `scheduler/dispatch/*`); the exact malformed-repo wording (loose substring on "repo" + owner/name/slug).
 - **Platform coverage:** mac+linux.
 
+##### scheduler/cli/005 — `dot-agent-deck schedule add/update --shape` writes the field, `schedule list` shows it (spelling out `config-derived` when unset), a shape-only edit re-registers the task in the running daemon, and an invalid value is refused without touching the file (issue #835).
+- **Layer:** L2.
+- **Agent:** none (runs the `schedule` CLI subprocess against a live `daemon serve`).
+- **Asserts:** `schedule add --shape single` succeeds and the value round-trips through the loader, while a sibling task authored without the flag keeps `shape: None`; the running daemon registers the task via the add-triggered reload; `schedule list` prints `shape=single` for the one and `shape=config-derived` for the other; `schedule update --name … --shape orchestration:review` writes the new value AND leaves the task registered and firable, which is what makes a shape-only edit fire-affecting; and `--shape team` exits non-zero, names the field, and leaves `schedules.toml` byte-identical.
+- **Why it exists:** two halves that unit tests cannot reach. The reload half is a real regression guard — `shape` decides WHAT a fire opens, so if it is absent from the scheduler's `FireFields` diff key a shape-only edit compares equal, the previously-built callback survives with the old value captured, and `schedule update --shape single` silently does nothing until another field changes or the daemon restarts. That is the most likely path a user takes to this feature (discover the surprise, correct it in place), so it must be exercised against a *running* daemon rather than a pure diff. The other half is the user-visible CLI surface itself — the flag, the rejection, and the `list` column — driven through the real binary rather than the library, including a guard that the rejection carries no source indentation (`cargo fmt` rewrote a line-continuation into literal spaces there once, and no gate caught it).
+- **Does not assert:** what a fire actually opens for each shape (`scheduler/spawn/009`); the parse vocabulary (`SpawnShapeOverride::parse` unit tests); load-time rejection of a hand-edited typo or of `shape` + `issue_dispatch` (`config.rs` unit tests); the reuse-vs-shape rule (`decide_reuse` unit tests).
+- **Platform coverage:** mac+linux.
+
 #### scheduler/spawn
 
 ##### scheduler/spawn/001 — A fire into a missing working_dir creates it (`mkdir -p`) then spawns; a fire into an uncreatable path surfaces a notification without crashing the daemon, and other tasks keep working (PRD #127 M2.1).

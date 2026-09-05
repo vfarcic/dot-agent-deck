@@ -2558,6 +2558,11 @@ pub struct ReuseEntry {
     pub agent_ids: Vec<String>,
     /// The pane reuse re-delivers into (single agent, or orchestrator role).
     pub delivery_pane_id: String,
+    /// Issue #835: what this recorded tab actually IS, so a fire that explicitly
+    /// asks for a different shape does not re-deliver into it. Taken from
+    /// [`SpawnHandle::kind`], so it is the shape that was opened rather than the
+    /// one that was requested.
+    pub kind: SpawnKind,
 }
 
 /// Daemon-owned, in-memory reuse registry keyed by scheduled task `name`
@@ -2575,6 +2580,9 @@ pub fn new_reuse_registry() -> ReuseRegistry {
 pub struct ExistingTab {
     pub pane_id: String,
     pub live: bool,
+    /// Issue #835: the shape this tab was opened with. `None` for a record made
+    /// before the field existed — treated as "unknown", which never blocks reuse.
+    pub kind: Option<SpawnKind>,
 }
 
 /// Reuse-vs-spawn decision (pure, unit-tested).
@@ -2589,15 +2597,49 @@ pub enum ReuseDecision {
 /// Decide whether a fire reuses an existing tab or spawns fresh.
 /// `new_tab_per_fire == true` always spawns fresh; otherwise reuse iff a
 /// recorded tab for the name is still live (a stale/closed one → fresh).
-pub fn decide_reuse(new_tab_per_fire: bool, existing: Option<ExistingTab>) -> ReuseDecision {
+///
+/// `requested` (issue #835) is the shape this fire was TOLD to open, i.e.
+/// `Some` only when the task declares a `shape`. When it disagrees with the tab
+/// on record, the fire spawns fresh instead of re-delivering: the recorded tab
+/// is the wrong shape, and re-delivering into it would reproduce exactly the
+/// surprise the `shape` field exists to remove — a user who discovers their
+/// schedule is firing a team, sets `shape = "single"`, and finds the next fire
+/// still landing in the old orchestrator pane.
+///
+/// `None` (a task with no declared shape) keeps the pre-#835 behaviour exactly:
+/// the shape is derived per fire and never compared, so a config-derived task
+/// reuses its tab as it always did.
+pub fn decide_reuse(
+    new_tab_per_fire: bool,
+    existing: Option<ExistingTab>,
+    requested: Option<&SpawnKind>,
+) -> ReuseDecision {
     if new_tab_per_fire {
         return ReuseDecision::SpawnFresh;
     }
     match existing {
-        Some(tab) if tab.live => ReuseDecision::Reuse {
-            pane_id: tab.pane_id,
-        },
+        Some(tab) if tab.live => {
+            // A recorded tab with no `kind` predates the field; "unknown" never
+            // blocks reuse, so this can only ever spawn fresh on a KNOWN mismatch.
+            if let (Some(want), Some(have)) = (requested, tab.kind.as_ref())
+                && want != have
+            {
+                return ReuseDecision::SpawnFresh;
+            }
+            ReuseDecision::Reuse {
+                pane_id: tab.pane_id,
+            }
+        }
         _ => ReuseDecision::SpawnFresh,
+    }
+}
+
+/// The [`SpawnKind`] a resolved target will open — the request side of
+/// [`decide_reuse`]'s comparison (issue #835).
+fn kind_of_target(target: &SpawnTarget) -> SpawnKind {
+    match target {
+        SpawnTarget::SingleAgent { .. } => SpawnKind::SingleAgent,
+        SpawnTarget::Orchestration { name, .. } => SpawnKind::Orchestration { name: name.clone() },
     }
 }
 
@@ -2682,13 +2724,18 @@ pub async fn spawn_or_reuse(
         let map = reuse.lock().unwrap();
         let existing = map.get(&req.task_name).map(|e| ExistingTab {
             pane_id: e.delivery_pane_id.clone(),
+            kind: Some(e.kind.clone()),
             // PRD #127 C3: gate reuse on the liveness of the SPECIFIC pane the
             // prompt is delivered into (orchestrator role / single-agent pane),
             // NOT "any agent for the task" — otherwise we'd re-deliver into a
             // dead orchestrator pane while a sibling role pane is still alive.
             live: registry.pane_is_live(&e.delivery_pane_id),
         });
-        decide_reuse(new_tab_per_fire, existing)
+        decide_reuse(
+            new_tab_per_fire,
+            existing,
+            req.resolved_target.as_ref().map(kind_of_target).as_ref(),
+        )
     };
 
     match decision {
@@ -2708,6 +2755,8 @@ pub async fn spawn_or_reuse(
                 let entry = ReuseEntry {
                     agent_ids: handle.agents.iter().map(|a| a.id.clone()).collect(),
                     delivery_pane_id: handle.delivery_pane_id.clone(),
+                    // What was actually opened, not what was asked for.
+                    kind: handle.kind.clone(),
                 };
                 reuse.lock().unwrap().insert(task_name, entry);
             }
@@ -5712,8 +5761,12 @@ mod tests {
         let existing = Some(ExistingTab {
             pane_id: "p1".into(),
             live: true,
+            kind: None,
         });
-        assert_eq!(decide_reuse(true, existing), ReuseDecision::SpawnFresh);
+        assert_eq!(
+            decide_reuse(true, existing, None),
+            ReuseDecision::SpawnFresh
+        );
     }
 
     #[test]
@@ -5721,9 +5774,10 @@ mod tests {
         let existing = Some(ExistingTab {
             pane_id: "p1".into(),
             live: true,
+            kind: None,
         });
         assert_eq!(
-            decide_reuse(false, existing),
+            decide_reuse(false, existing, None),
             ReuseDecision::Reuse {
                 pane_id: "p1".into()
             }
@@ -5732,12 +5786,131 @@ mod tests {
 
     #[test]
     fn decide_reuse_spawns_fresh_when_no_entry_or_stale() {
-        assert_eq!(decide_reuse(false, None), ReuseDecision::SpawnFresh);
+        assert_eq!(decide_reuse(false, None, None), ReuseDecision::SpawnFresh);
         let stale = Some(ExistingTab {
             pane_id: "p1".into(),
             live: false,
+            kind: None,
         });
-        assert_eq!(decide_reuse(false, stale), ReuseDecision::SpawnFresh);
+        assert_eq!(decide_reuse(false, stale, None), ReuseDecision::SpawnFresh);
+    }
+
+    // Issue #835 — a fire that explicitly asks for a shape must NOT re-deliver
+    // into a live tab of a different shape. This is the upgrade path a user
+    // actually takes: the schedule has been firing a team, they set
+    // `shape = "single"`, and without this the next fire lands right back in the
+    // old orchestrator pane — the very surprise the field exists to remove.
+    #[test]
+    fn decide_reuse_spawns_fresh_when_the_requested_shape_differs() {
+        let team = || {
+            Some(ExistingTab {
+                pane_id: "p1".into(),
+                live: true,
+                kind: Some(SpawnKind::Orchestration {
+                    name: "team".into(),
+                }),
+            })
+        };
+        // live orchestration tab, but this fire wants one agent
+        assert_eq!(
+            decide_reuse(false, team(), Some(&SpawnKind::SingleAgent)),
+            ReuseDecision::SpawnFresh
+        );
+        // live orchestration tab, but this fire wants a DIFFERENT orchestration
+        assert_eq!(
+            decide_reuse(
+                false,
+                team(),
+                Some(&SpawnKind::Orchestration {
+                    name: "other".into()
+                })
+            ),
+            ReuseDecision::SpawnFresh
+        );
+    }
+
+    // The matching half: an explicit shape that AGREES with the recorded tab
+    // reuses it, so declaring a shape does not silently disable tab reuse.
+    #[test]
+    fn decide_reuse_reuses_when_the_requested_shape_matches() {
+        let single = Some(ExistingTab {
+            pane_id: "p1".into(),
+            live: true,
+            kind: Some(SpawnKind::SingleAgent),
+        });
+        assert_eq!(
+            decide_reuse(false, single, Some(&SpawnKind::SingleAgent)),
+            ReuseDecision::Reuse {
+                pane_id: "p1".into()
+            }
+        );
+        let team = Some(ExistingTab {
+            pane_id: "p2".into(),
+            live: true,
+            kind: Some(SpawnKind::Orchestration {
+                name: "team".into(),
+            }),
+        });
+        assert_eq!(
+            decide_reuse(
+                false,
+                team,
+                Some(&SpawnKind::Orchestration {
+                    name: "team".into()
+                })
+            ),
+            ReuseDecision::Reuse {
+                pane_id: "p2".into()
+            }
+        );
+    }
+
+    // A task with NO declared shape is untouched: the shape is derived per fire
+    // and never compared, so a config-derived task reuses its tab exactly as it
+    // did before #835 — even when the recorded kind is known.
+    #[test]
+    fn decide_reuse_ignores_kind_when_no_shape_was_requested() {
+        let team = Some(ExistingTab {
+            pane_id: "p1".into(),
+            live: true,
+            kind: Some(SpawnKind::Orchestration {
+                name: "team".into(),
+            }),
+        });
+        assert_eq!(
+            decide_reuse(false, team, None),
+            ReuseDecision::Reuse {
+                pane_id: "p1".into()
+            }
+        );
+    }
+
+    // `kind_of_target` is the request side of that comparison: it must read the
+    // TARGET's shape, including the orchestration's resolved name, so a rename
+    // in the config counts as a different shape.
+    #[test]
+    fn kind_of_target_reads_the_targets_shape() {
+        assert_eq!(
+            kind_of_target(&SpawnTarget::SingleAgent {
+                command: Some("cat".into())
+            }),
+            SpawnKind::SingleAgent
+        );
+        let orch = crate::project_config::OrchestrationConfig {
+            name: "team".to_string(),
+            default: false,
+            roles: Vec::new(),
+        };
+        assert_eq!(
+            kind_of_target(&SpawnTarget::Orchestration {
+                name: "team".into(),
+                roles: Vec::new(),
+                config: Box::new(orch),
+            }),
+            SpawnKind::Orchestration {
+                name: "team".into()
+            }
+        );
     }
 
     // --- Phase 2B deliver-on-idle decision (M2.2 / Q6) ---
