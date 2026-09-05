@@ -426,6 +426,31 @@ pub fn parser_init_dims(rows: u16, cols: u16) -> (u16, u16) {
 /// clamps the UPPER bound to [`PTY_RESIZE_DIM_MAX`] (matching the daemon) but
 /// still relies on its one caller, `ui.rs`'s `resize_panes_to_layout`, to skip
 /// a zero axis rather than rejecting one itself — and feeding stays separately
+/// PRD #882 — reshape a pane's parser to `(rows, cols)`, but only if that is
+/// actually a change.
+///
+/// `vt100::Screen::set_size` is **not** a no-op for an unchanged size: it walks
+/// every row and calls `row.resize(..)` unconditionally, plus scroll-region
+/// arithmetic. On a full-screen pane that is thousands of cell operations while
+/// holding the parser mutex — the same mutex the render path takes to draw.
+///
+/// This matters because #882 made redundant calls the COMMON case. With one
+/// client attached the daemon grants exactly what was asked, so the optimistic
+/// write in `resize_pane_pty` and the confirming answer from the resize
+/// response carry the same geometry, and the second one is pure waste that the
+/// render loop can block on. Guarding here keeps the single-client path at one
+/// reshape per resize, as it was before this PRD.
+fn set_parser_size_if_changed(parser: &Mutex<vt100::Parser>, rows: u16, cols: u16) {
+    let (rows, cols) = parser_init_dims(rows, cols);
+    let Ok(mut parser) = parser.lock() else {
+        return;
+    };
+    if parser.screen().size() == (rows, cols) {
+        return;
+    }
+    parser.screen_mut().set_size(rows, cols);
+}
+
 /// guarded by [`guarded_parser_feed`].
 fn new_pane_parser(rows: u16, cols: u16) -> vt100::Parser {
     let (rows, cols) = parser_init_dims(rows, cols);
@@ -916,10 +941,7 @@ impl EmbeddedPaneController {
         // sweep COMPARING against this parser to decide whether to resize;
         // the sweep now compares against `requested` above, so the parser
         // holding an optimistic value cannot suppress a needed request.
-        if let Ok(mut parser) = pane.screen.lock() {
-            let (rows, cols) = parser_init_dims(rows, cols);
-            parser.screen_mut().set_size(rows, cols);
-        }
+        set_parser_size_if_changed(&pane.screen, rows, cols);
         Ok(())
     }
 
@@ -2695,10 +2717,8 @@ async fn run_pane_io_task(
                             crate::daemon_protocol::KIND_GEOMETRY => {
                                 if let Some((rows, cols)) =
                                     crate::daemon_protocol::parse_geometry_frame(&bytes)
-                                    && let Ok(mut parser) = parser.lock()
                                 {
-                                    let (rows, cols) = parser_init_dims(rows, cols);
-                                    parser.screen_mut().set_size(rows, cols);
+                                    set_parser_size_if_changed(&parser, rows, cols);
                                 }
                             }
                             _ => break,
@@ -2829,11 +2849,8 @@ async fn run_pane_io_task(
                 // child. Adopt it, for the same reason the resize worker adopts
                 // the answer rather than its request: the replayed snapshot that
                 // is about to arrive was written at THIS geometry.
-                if let Some((rows, cols)) = new_conn.applied()
-                    && let Ok(mut p) = parser.lock()
-                {
-                    let (rows, cols) = parser_init_dims(rows, cols);
-                    p.screen_mut().set_size(rows, cols);
+                if let Some((rows, cols)) = new_conn.applied() {
+                    set_parser_size_if_changed(&parser, rows, cols);
                 }
                 {
                     let mut held = agent_id.lock().unwrap();
@@ -3162,10 +3179,7 @@ async fn resize_worker(
             // has no policy to disagree with us, so the request stands.
             Ok(Ok(applied)) => {
                 let (rows, cols) = applied.unwrap_or((rows, cols));
-                if let Ok(mut parser) = parser.lock() {
-                    let (rows, cols) = parser_init_dims(rows, cols);
-                    parser.screen_mut().set_size(rows, cols);
-                }
+                set_parser_size_if_changed(&parser, rows, cols);
             }
             Ok(Err(e)) => {
                 tracing::debug!(
