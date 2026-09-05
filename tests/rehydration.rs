@@ -587,7 +587,7 @@ async fn run_partial_attach_server(listener: UnixListener) {
                     };
                     let _ = write_resp(&mut stream, &resp).await;
                 }
-                AttachRequest::AttachStream { id } => {
+                AttachRequest::AttachStream { id, .. } => {
                     if id == "agent-gone" {
                         // Simulate the race: the agent terminated between
                         // ListAgents and AttachStream. The real daemon

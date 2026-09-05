@@ -120,6 +120,35 @@ export interface TerminalAttachResult {
   agentId: string;
   generation: number;
   reused: boolean;
+  /**
+   * PRD #882 — the geometry the daemon has APPLIED for this agent: the smallest
+   * viewport among every client attached to it, which is not necessarily the
+   * size this tile asked for.
+   *
+   * The tile sizes its xterm grid from this rather than from `FitAddon.fit()`.
+   * Absent against a daemon predating the policy, and on a reused session (whose
+   * grid is already sized) — in both cases the tile's own fit stands.
+   */
+  appliedRows?: number;
+  appliedCols?: number;
+}
+
+/**
+ * PRD #882 — payload of `desktop://terminal-geometry`: the daemon changed this
+ * agent's applied geometry, because another client attached, detached or
+ * resized it.
+ *
+ * A tile cannot learn this by asking — it only ever hears about its own
+ * requests — so without the push it would keep parsing the agent's bytes at its
+ * own geometry while the PTY sits at somebody else's, which is the mis-parse
+ * PRD #104 exists to prevent.
+ */
+export interface DesktopTerminalGeometryDto {
+  sessionId: string;
+  agentId: string;
+  generation: number;
+  rows: number;
+  cols: number;
 }
 
 /**
@@ -570,6 +599,15 @@ class FixtureDeckBridge implements DeckBridge {
   }
 
   /**
+   * PRD #882 — the browser preview has no daemon, so nothing ever applies a
+   * geometry and the tile keeps whatever its own fit produced. Returning a
+   * no-op unsubscribe keeps the tile's cleanup path identical in both modes.
+   */
+  onTerminalGeometry(): () => void {
+    return () => {};
+  }
+
+  /**
    * Settings for the browser preview. This class never imports
    * `@tauri-apps/api/core`, so it structurally cannot reach `desktop.toml` — a
    * fixture visit can only ever write the localStorage key above.
@@ -675,6 +713,17 @@ export class TauriDeckBridge implements DeckBridge {
    */
   private attachRequested = new Set<string>();
   private terminalListener?: TerminalListener;
+  /**
+   * PRD #882 — the geometry the daemon has applied per agent, and who wants to
+   * hear about it changing.
+   *
+   * A tile subscribes when it mounts and reads the cached value immediately,
+   * because the push that carried it may well have arrived before the tile
+   * existed — a second client can shrink an agent long before anyone opens a
+   * terminal on it here.
+   */
+  private appliedGeometry = new Map<string, { rows: number; cols: number }>();
+  private geometryListeners = new Set<(agentId: string, rows: number, cols: number) => void>();
   private invoke?: typeof import("@tauri-apps/api/core")["invoke"];
   private lifecycle = 0;
   /** Newest-first ring of mapped hook events, capped at MAX_LIVE_EVIDENCE. */
@@ -877,7 +926,22 @@ export class TauriDeckBridge implements DeckBridge {
       this.pendingAttachments.set(agentId, attempt);
       this.attachInvocations.add(agentId);
       try {
-        const session = await invoke<TerminalAttachResult>("desktop_terminal_attach", { agentId, onOutput });
+        // PRD #882: declare this tile's measured geometry so the agent is sized
+        // to the smallest pane among every client watching it — including this
+        // one — rather than to whichever client resized last.
+        const viewport = this.pendingResizes.get(agentId) ?? this.appliedGeometry.get(agentId);
+        const session = await invoke<TerminalAttachResult>("desktop_terminal_attach", {
+          agentId,
+          onOutput,
+          rows: viewport?.rows,
+          cols: viewport?.cols,
+        });
+        const appliedRows = session.appliedRows;
+        const appliedCols = session.appliedCols;
+        if (appliedRows && appliedCols) {
+          this.appliedGeometry.set(agentId, { rows: appliedRows, cols: appliedCols });
+          this.geometryListeners.forEach((listener) => listener(agentId, appliedRows, appliedCols));
+        }
         if (
           lifecycle !== this.lifecycle
           || this.terminalChannels.get(agentId) !== onOutput
@@ -1043,10 +1107,26 @@ export class TauriDeckBridge implements DeckBridge {
       const pending = this.pendingAttachments.get(event.payload.agentId);
       if (pending && pending.lifecycle === this.lifecycle) pending.stateEvents.push(event.payload);
     });
+    // PRD #882: the daemon changed this agent's applied geometry. Route it to
+    // the tile so it reshapes its grid. Gated on the session AND generation
+    // matching, exactly like the state listener above: a frame for a session
+    // that has been replaced would otherwise resize the tile now showing a
+    // different attach.
+    const stopTerminalGeometry = await listen<DesktopTerminalGeometryDto>("desktop://terminal-geometry", (event) => {
+      const session = this.sessions.get(event.payload.agentId);
+      if (
+        !session
+        || session.sessionId !== event.payload.sessionId
+        || session.generation !== event.payload.generation
+      ) return;
+      this.appliedGeometry.set(event.payload.agentId, { rows: event.payload.rows, cols: event.payload.cols });
+      this.geometryListeners.forEach((listener) => listener(event.payload.agentId, event.payload.rows, event.payload.cols));
+    });
     return () => {
       stopSnapshot();
       stopDaemonEvent();
       stopTerminalState();
+      stopTerminalGeometry();
       if (this.terminalListener === onTerminal) this.terminalListener = undefined;
     };
   }
@@ -1117,6 +1197,17 @@ export class TauriDeckBridge implements DeckBridge {
     await invoke("desktop_terminal_write", { sessionId: session.sessionId, data: Array.from(new TextEncoder().encode(data)) });
   }
 
+  onTerminalGeometry(listener: (agentId: string, rows: number, cols: number) => void): () => void {
+    this.geometryListeners.add(listener);
+    // Replay what is already known: an agent can have been constrained by
+    // another client long before this tile mounted, and the push that said so
+    // is not repeated.
+    this.appliedGeometry.forEach((geometry, agentId) => listener(agentId, geometry.rows, geometry.cols));
+    return () => {
+      this.geometryListeners.delete(listener);
+    };
+  }
+
   async resizeTerminal(agentId: string, cols: number, rows: number): Promise<void> {
     if (cols < 1 || rows < 1) return;
     this.pendingResizes.set(agentId, { cols, rows });
@@ -1165,6 +1256,12 @@ export class TauriDeckBridge implements DeckBridge {
     this.pendingResizes.clear();
     this.resizeFrames.clear();
     this.resizeInFlight.clear();
+    // PRD #882: the applied geometries belonged to sessions this dispose just
+    // dropped. Keeping them would hand the next attach a stale viewport to
+    // declare, which under a smallest-wins policy would shrink the agent to a
+    // pane nobody is looking at any more.
+    this.appliedGeometry.clear();
+    this.geometryListeners.clear();
     this.shown.clear();
     this.warm.clear();
     this.clearAttachSuppression();

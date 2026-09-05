@@ -3,8 +3,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use dot_agent_deck::daemon_protocol::{
-    KIND_DETACH, KIND_STREAM_END, KIND_STREAM_IN, KIND_STREAM_OUT, KIND_STREAM_REJECT, read_frame,
-    write_frame,
+    KIND_DETACH, KIND_GEOMETRY, KIND_STREAM_END, KIND_STREAM_IN, KIND_STREAM_OUT,
+    KIND_STREAM_REJECT, parse_geometry_frame, read_frame, write_frame,
 };
 use dot_agent_deck::platform::ipc::IpcWriteHalf;
 use tauri::ipc::{Channel, Response};
@@ -23,6 +23,11 @@ struct TerminalSession {
     channel_id: u32,
     generation: u64,
     writer: Arc<AsyncMutex<IpcWriteHalf>>,
+    /// PRD #882 — the viewer token this session's attach was given, sent back on
+    /// every resize so the request updates THIS tile's constraint. Two tiles can
+    /// show the same agent, so the token is what tells them apart — the process
+    /// identity behind the connection cannot.
+    viewer: Option<String>,
 }
 
 pub(crate) struct DesktopState {
@@ -74,6 +79,12 @@ fn emit_terminal_state(app: &AppHandle, event: TerminalStateEvent) {
     let _ = app.emit("desktop://terminal-state", event);
 }
 
+/// PRD #882 — tell the frontend the daemon changed this agent's applied
+/// geometry, so the tile can reshape its xterm grid to match.
+fn emit_terminal_geometry(app: &AppHandle, event: crate::dto::TerminalGeometryEvent) {
+    let _ = app.emit("desktop://terminal-geometry", event);
+}
+
 fn rejection_notice(reason: &[u8]) -> Vec<u8> {
     let reason = safe_message(String::from_utf8_lossy(reason));
     let reason = reason
@@ -99,6 +110,11 @@ pub(crate) async fn attach(
     state: &DesktopState,
     agent_id: String,
     on_output: Channel<Response>,
+    // PRD #882 — the geometry this tile can draw the agent at, measured by
+    // `FitAddon` in the webview. Declaring it registers the tile as a viewer, so
+    // the daemon sizes the agent to the smallest pane among every client
+    // watching it and tells this tile whenever that changes.
+    viewport: Option<(u16, u16)>,
 ) -> Result<TerminalAttachResult, String> {
     validate_agent_id(&agent_id)?;
     let _attach_guard = state.attach_gate.lock().await;
@@ -113,16 +129,38 @@ pub(crate) async fn attach(
             agent_id,
             generation: session.generation,
             reused: true,
+            // A reused session keeps whatever geometry it already has; the
+            // frontend's grid is already sized to it and no attach happened.
+            applied_rows: None,
+            applied_cols: None,
         });
     }
     detach_agent(state, &agent_id).await;
     let daemon = trusted_daemon().await?;
     daemon.require_compatible()?;
-    let connection = daemon
-        .client
-        .attach(&agent_id)
-        .await
-        .map_err(|error| safe_message(error.to_string()))?;
+    // PRD #882: a half-measured tile (one axis zero) declares nothing rather
+    // than a geometry it does not mean — under a smallest-wins policy a bogus
+    // constraint would shrink the agent for every other client too.
+    let viewport = viewport.filter(|(rows, cols)| *rows > 0 && *cols > 0);
+    // PRD #882: participate in the policy either way. The tile very often
+    // attaches BEFORE the webview has measured it — the shown-set effect drives
+    // the attach and `FitAddon` runs a frame later — and a tile that attached as
+    // a non-participant would send its first resize with no viewer token, which
+    // the daemon applies as an unattributed override across every other client.
+    // Registering now and contributing a constraint on the first resize is the
+    // difference between joining the policy and overriding it.
+    let connection = match viewport {
+        Some(viewport) => {
+            daemon
+                .client
+                .attach_as_viewer(&agent_id, Some(viewport))
+                .await
+        }
+        None => daemon.client.attach_pending_viewport(&agent_id).await,
+    }
+    .map_err(|error| safe_message(error.to_string()))?;
+    let viewer = connection.viewer().map(|v| v.to_string());
+    let applied = connection.applied();
     let (mut reader, writer) = connection.into_split();
     let generation = state.next_generation.fetch_add(1, Ordering::Relaxed);
     let session_id = session_id(generation);
@@ -133,6 +171,7 @@ pub(crate) async fn attach(
             channel_id,
             generation,
             writer: Arc::new(AsyncMutex::new(writer)),
+            viewer,
         },
     )?;
 
@@ -183,6 +222,23 @@ pub(crate) async fn attach(
                         },
                     );
                     break;
+                }
+                // PRD #882: the daemon applied a new geometry for this agent.
+                // Non-terminal, like a rejection — the stream stays open and
+                // output keeps flowing; only the grid changes.
+                Ok(Some((KIND_GEOMETRY, payload))) => {
+                    if let Some((rows, cols)) = parse_geometry_frame(&payload) {
+                        emit_terminal_geometry(
+                            &app_for_stream,
+                            crate::dto::TerminalGeometryEvent {
+                                session_id: session_for_stream.clone(),
+                                agent_id: agent_for_stream.clone(),
+                                generation,
+                                rows,
+                                cols,
+                            },
+                        );
+                    }
                 }
                 Ok(Some((KIND_STREAM_REJECT, reason))) => {
                     // Protocol v6 rejections are explicitly non-terminal: the
@@ -265,6 +321,13 @@ pub(crate) async fn attach(
         agent_id,
         generation,
         reused: false,
+        // PRD #882: the geometry in force at attach time, resolved under the
+        // same daemon lock as the scrollback replay that is about to arrive on
+        // the channel. The frontend sizes its grid from this before writing
+        // those bytes, so the replay is parsed at the geometry it was written
+        // at rather than at whatever the tile happened to measure.
+        applied_rows: applied.map(|(rows, _)| rows),
+        applied_cols: applied.map(|(_, cols)| cols),
     })
 }
 
@@ -292,17 +355,23 @@ pub(crate) async fn resize(
     rows: u16,
 ) -> Result<(), String> {
     let (rows, cols) = validate_dimensions(rows, cols)?;
-    let agent_id = state
+    let (agent_id, viewer) = state
         .sessions()?
         .get(session_id)
-        .map(|session| session.agent_id.clone())
+        .map(|session| (session.agent_id.clone(), session.viewer.clone()))
         .ok_or_else(|| format!("terminal session not found: {}", safe_message(session_id)))?;
     let daemon = trusted_daemon().await?;
     daemon.require_compatible()?;
+    // PRD #882: name this tile's viewer so the request updates its constraint
+    // rather than overriding every other client's. The daemon answers with what
+    // it actually applied; the frontend learns that number from the
+    // `desktop://terminal-geometry` event the daemon pushes to every viewer,
+    // including this one, so nothing is returned here.
     daemon
         .client
-        .resize_agent(&agent_id, rows, cols)
+        .resize_agent_as_viewer(&agent_id, rows, cols, viewer.as_deref())
         .await
+        .map(|_| ())
         .map_err(|error| safe_message(error.to_string()))
 }
 
@@ -383,6 +452,8 @@ mod tests {
                 channel_id: generation as u32,
                 generation,
                 writer: Arc::new(AsyncMutex::new(writer)),
+                // Test seam: no attach happened, so there is no viewer token.
+                viewer: None,
             }
         }
 

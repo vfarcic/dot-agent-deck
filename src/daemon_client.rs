@@ -569,6 +569,32 @@ impl DaemonClient {
     /// resize on every layout pass should treat transient errors as
     /// best-effort — the next resize will reconcile.
     pub async fn resize_agent(&self, id: &str, rows: u16, cols: u16) -> Result<(), ClientError> {
+        self.resize_agent_as_viewer(id, rows, cols, None)
+            .await
+            .map(|_| ())
+    }
+
+    /// PRD #882 — ask the daemon to size an agent for one VIEWER, and learn what
+    /// it actually applied.
+    ///
+    /// `viewer` is the token this client received when it attached. With it, the
+    /// request updates that viewer's constraint and the daemon applies the
+    /// smallest viewport among everyone attached; without it the request is
+    /// applied directly and joins no minimum (the pre-#882 behaviour, kept for
+    /// callers that are not rendering viewers).
+    ///
+    /// **The returned pair is the geometry in force, which is not necessarily
+    /// the one asked for.** Size the local parser from it. `None` means the
+    /// daemon predates #882 and echoed nothing, in which case the caller's own
+    /// request is the right assumption — that daemon has no policy to disagree
+    /// with it.
+    pub async fn resize_agent_as_viewer(
+        &self,
+        id: &str,
+        rows: u16,
+        cols: u16,
+        viewer: Option<&str>,
+    ) -> Result<Option<(u16, u16)>, ClientError> {
         let stream = self.connect().await?;
         let (mut rd, mut wr) = stream.into_split();
         let resp = issue_command(
@@ -578,6 +604,7 @@ impl DaemonClient {
                 id: id.to_string(),
                 rows,
                 cols,
+                viewer: viewer.map(|v| v.to_string()),
             },
         )
         .await?;
@@ -586,7 +613,10 @@ impl DaemonClient {
                 resp.error.unwrap_or_else(|| "resize failed".into()),
             ));
         }
-        Ok(())
+        Ok(match (resp.applied_rows, resp.applied_cols) {
+            (Some(r), Some(c)) => Some((r, c)),
+            _ => None,
+        })
     }
 
     /// Update the daemon-side display_name and/or cwd for an agent (M2.11).
@@ -726,12 +756,63 @@ impl DaemonClient {
     /// STREAM_OUT frames (see [`crate::daemon_protocol`]'s state-machine
     /// docs).
     pub async fn attach(&self, id: &str) -> Result<AttachConnection, ClientError> {
+        self.attach_as_viewer(id, None).await
+    }
+
+    /// PRD #882 — attach as a policy participant that has not measured itself
+    /// yet.
+    ///
+    /// Registers as a viewer and receives geometry pushes, but contributes no
+    /// constraint until its first resize. This is what a client whose attach
+    /// runs before its layout does needs: attaching as a non-participant and
+    /// resizing afterwards would send that resize with no token, and the daemon
+    /// would apply it as an unattributed override across every other client.
+    pub async fn attach_pending_viewport(&self, id: &str) -> Result<AttachConnection, ClientError> {
+        self.attach_inner(id, None, true).await
+    }
+
+    /// PRD #882 — attach, optionally declaring the geometry this client can draw
+    /// the agent at.
+    ///
+    /// Passing a viewport opts into the size policy in both directions: the
+    /// agent is sized to the smallest viewport among attached viewers, and this
+    /// connection is told (via `KIND_GEOMETRY`) whenever that changes. Passing
+    /// `None` is the pre-#882 behaviour — no constraint contributed, no
+    /// geometry frames delivered — and is what a non-rendering observer wants.
+    ///
+    /// The returned connection carries the viewer token and the geometry in
+    /// force at attach time. **Size the parser from `applied`, not from the
+    /// viewport asked for**: the replayed scrollback was written at the applied
+    /// geometry, and the two differ whenever a smaller viewer is already
+    /// attached.
+    pub async fn attach_as_viewer(
+        &self,
+        id: &str,
+        viewport: Option<(u16, u16)>,
+    ) -> Result<AttachConnection, ClientError> {
+        // A caller that names a viewport always participates; one that does not
+        // is the legacy shape and stays out of the policy entirely.
+        let participates = viewport.is_some();
+        self.attach_inner(id, viewport, participates).await
+    }
+
+    async fn attach_inner(
+        &self,
+        id: &str,
+        viewport: Option<(u16, u16)>,
+        geometry_updates: bool,
+    ) -> Result<AttachConnection, ClientError> {
         let stream = self.connect().await?;
         let (mut rd, mut wr) = stream.into_split();
         let resp = issue_command(
             &mut rd,
             &mut wr,
-            &AttachRequest::AttachStream { id: id.to_string() },
+            &AttachRequest::AttachStream {
+                id: id.to_string(),
+                rows: viewport.map(|(r, _)| r),
+                cols: viewport.map(|(_, c)| c),
+                geometry_updates,
+            },
         )
         .await?;
         if !resp.ok {
@@ -739,7 +820,16 @@ impl DaemonClient {
                 resp.error.unwrap_or_else(|| "attach-stream failed".into()),
             ));
         }
-        Ok(AttachConnection { rd, wr })
+        let applied = match (resp.applied_rows, resp.applied_cols) {
+            (Some(r), Some(c)) => Some((r, c)),
+            _ => None,
+        };
+        Ok(AttachConnection {
+            rd,
+            wr,
+            viewer: resp.viewer,
+            applied,
+        })
     }
 }
 
@@ -830,6 +920,15 @@ impl EventSubscription {
 pub struct AttachConnection {
     rd: IpcReadHalf,
     wr: IpcWriteHalf,
+    /// PRD #882 — the viewer token for this attach, or `None` when no viewport
+    /// was declared. Pass it to [`DaemonClient::resize_agent_as_viewer`] so a
+    /// resize updates this view's constraint instead of overriding everyone.
+    viewer: Option<String>,
+    /// PRD #882 — the geometry the daemon has applied, as of the last frame
+    /// read. Seeded from the attach response and updated by every
+    /// `KIND_GEOMETRY` frame, so a caller polling this after each read always
+    /// has the grid the bytes it just received were written for.
+    applied: Option<(u16, u16)>,
 }
 
 impl AttachConnection {
@@ -839,15 +938,41 @@ impl AttachConnection {
     /// and treated as EOF (the daemon closes the connection on protocol
     /// violations rather than sending `STREAM_END`).
     pub async fn next_output(&mut self) -> io::Result<Option<Vec<u8>>> {
-        match read_frame(&mut self.rd).await? {
-            None => Ok(None),
-            Some((KIND_STREAM_OUT, bytes)) => Ok(Some(bytes)),
-            Some((KIND_STREAM_END, _)) => Ok(None),
-            Some((kind, _)) => {
-                tracing::warn!("unexpected frame kind 0x{kind:02x} on attach stream — ending");
-                Ok(None)
+        loop {
+            match read_frame(&mut self.rd).await? {
+                None => return Ok(None),
+                Some((KIND_STREAM_OUT, bytes)) => return Ok(Some(bytes)),
+                Some((KIND_STREAM_END, _)) => return Ok(None),
+                // PRD #882: absorb the geometry push rather than ending on it.
+                // Only an attach that declared a viewport is ever sent one, and
+                // such a caller reads the value back through
+                // [`AttachConnection::applied`] after each read; treating it as
+                // end-of-stream — which the `_` arm below would — would tear the
+                // pane down the first time a second client attached.
+                Some((crate::daemon_protocol::KIND_GEOMETRY, bytes)) => {
+                    if let Some((rows, cols)) = crate::daemon_protocol::parse_geometry_frame(&bytes)
+                    {
+                        self.applied = Some((rows, cols));
+                    }
+                }
+                Some((kind, _)) => {
+                    tracing::warn!("unexpected frame kind 0x{kind:02x} on attach stream — ending");
+                    return Ok(None);
+                }
             }
         }
+    }
+
+    /// PRD #882 — the viewer token minted for this attach, if it declared a
+    /// viewport.
+    pub fn viewer(&self) -> Option<&str> {
+        self.viewer.as_deref()
+    }
+
+    /// PRD #882 — the geometry the daemon has applied for this agent, as of the
+    /// last frame read through [`AttachConnection::next_output`].
+    pub fn applied(&self) -> Option<(u16, u16)> {
+        self.applied
     }
 
     /// Forward a chunk of keystrokes to the daemon's PTY writer.
@@ -883,7 +1008,15 @@ impl AttachConnection {
     pub(crate) fn connected_pair_for_test() -> (Self, tokio::net::UnixStream) {
         let (ours, peer) = tokio::net::UnixStream::pair().expect("socket pair for test");
         let (rd, wr) = ours.into_split();
-        (Self { rd, wr }, peer)
+        (
+            Self {
+                rd,
+                wr,
+                viewer: None,
+                applied: None,
+            },
+            peer,
+        )
     }
 }
 

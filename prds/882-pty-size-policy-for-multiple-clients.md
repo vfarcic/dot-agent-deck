@@ -1,6 +1,6 @@
 # PRD #882: What the daemon does when clients disagree about PTY size
 
-**Status**: **Decided 2026-09-04 — option 3, latest-attach wins, made explicit** (see [Decision taken](#decision-taken)). [#883](https://github.com/vfarcic/dot-agent-deck/issues/883) is unblocked and implements against it.
+**Status**: **Decided 2026-09-04 — option 1, daemon owns the size, smallest attached viewer, clients letterbox** (see [Decision taken](#decision-taken)). Implemented in the same pull request, closing both #882 and [#883](https://github.com/vfarcic/dot-agent-deck/issues/883).
 **Priority**: High — [#883](https://github.com/vfarcic/dot-agent-deck/issues/883) is blocked on it, and two of the three viable policies change what #883 builds
 **Created**: 2026-09-04
 **GitHub Issue**: [#882](https://github.com/vfarcic/dot-agent-deck/issues/882)
@@ -240,23 +240,26 @@ Marked by whether they apply under the chosen policy (option 3) or only to a fut
 
 ## Decision taken
 
-**Option 3 — latest-attach wins, made explicit — chosen by the maintainer on 2026-09-04.** #883 implements against it.
+**Option 1 — the daemon owns the size, sized to the smallest attached viewer, and clients letterbox — chosen by the maintainer on 2026-09-04.** This PRD and the implementation ship in one pull request, closing both #882 and #883.
 
-The recommendation above is deliberately left standing as written rather than rewritten to match. The analysis that produced it is the thing this PRD exists to preserve, and a recommendation quietly edited into agreement with the decision teaches the next reader nothing about the trade that was actually made.
+**This reverses an earlier decision taken the same day, and the reversal is the useful part of the record.** Option 3 (latest wins) was chosen first, while the implementation was still going to be a separate PR. When implementation moved into this PR, the calculus changed: option 1's extra cost — per-viewer accounting, a `.breaking.md`, the rendering-contract amendment, rule 12's cross-version manual test — stopped being deferred work in somebody else's issue and became work in the same review as everything else, which is the cheapest moment to pay it. The option-3 record is kept below rather than deleted, because the next person to weigh these three options should see that the answer moved on scheduling rather than on evidence.
 
-**What the decision accepts**, stated plainly so it is not rediscovered as a bug:
+The recommendation above is left standing as written for the same reason it was when it disagreed with the decision.
 
-- **The truncating direction becomes normal.** A client whose pane is smaller than the current PTY renders a top-left window of a correctly-parsed screen, so the agent's bottom rows and right-hand columns exist but are off-screen. For a full-screen agent that is its status line. This is the cost option 1 existed to avoid, and it is now expected behaviour that has to be written down (see Documentation).
-- **A ring clear per agent per attention switch.** #104's reasoning about resize being occasional no longer describes this path. What is lost is the replay for a client attaching *afterwards*, not an attached client's live scrollback — and because the desktop attaches per shown tile, "scroll a tile back into view after working in the TUI" is the routine way a user meets it.
-- **The size stays arbitrary in the sense that matters least**: it is whoever acted last, but it is now *chosen, documented and self-correcting on the next switch*, where today it is emergent and sticky until someone resizes a terminal by hand. That is the improvement being bought.
+**What the decision accepts:**
 
-**What it buys:** no protocol change, no `PROTOCOL_VERSION` question, no `.breaking.md` fragment, no rendering-contract amendment, no per-viewer geometry accounting and no dependence on the server-end `peer_pid` direction that has no production caller yet. #883 ships **close to** as already scoped — two items its original scope did not carry are the desktop's grid authority (the correction in the options section) and the resize trigger ([The trigger](#the-trigger-which-the-policy-name-does-not-settle) below).
+- **A small viewer constrains everyone.** With Open Question 1 answered "yes, every attached viewer constrains", a desktop tile showing an agent sizes that agent for a full-screen TUI user too. This is the known cost, and the mitigation is real but partial: it is *deterministic* (the smallest, not whoever moved last) and *released on detach* (hide the tile and the agent grows back), where today the same shrink happens arbitrarily and sticks until someone resizes a terminal by hand. If the overview grid proves this intolerable in use, the fix on record is Open Question 1's other answer — a declared-intent bit per viewer — which the per-viewer map is already keyed to accept.
+- **A `PROTOCOL_VERSION` bump and a new frame kind.** Incumbent viewers have to be told when the applied size changes because somebody else joined or left, and Q2 established there is no compatible push channel. The break is contained by making the push **opt-in at attach**: a client that declares its geometry on `AttachStream` is a policy participant and receives geometry frames; one that does not is legacy, receives none, and its stream cannot be broken by a frame kind it has never been sent.
+- **`Resize` becomes a request the daemon may only partly honour** — a semantic break behind a stable wire, so a `.breaking.md` fragment, and rule 12's cross-version manual test in full.
+- **Dead space in the larger client.** The TUI already renders it (blank, top-left anchored, two L1 tests); the desktop needs its grid authority moved off `fit()` and a decision about where the unused area goes.
 
-**Rule 12 is therefore answered "no" for this work**: the wire shape and the meaning of `AttachRequest::Resize` are both unchanged, and the existing `AgentRecord.rows`/`cols` suffice. The cross-version manual test is not required by this decision. If #883 finds it needs the applied-dims echo on the `Resize` response after all, that is an additive optional field on `AttachResponse` — still no bump, and Q2 above has the precedent.
+**What it buys:** every client always sees the agent's entire screen. That is the one property no other option on the table has, and the reason it was recommended.
 
-**Open Question 1 was also answered — "yes, every attached viewer constrains" — and is moot under this policy**, since option 3 arbitrates by recency rather than by a set of viewers. It is recorded because it is the answer that applies if option 1 is ever revisited, and revisiting it would otherwise re-open a settled question.
+**Open Question 1 is answered "yes — every attached viewer constrains"**, and under this policy it is load-bearing rather than moot.
 
-**If this decision is ever reversed, the argument to beat is the direction asymmetry**, not the cost: every single-size policy makes some client render a grid that is not its viewport, and this one puts the loss where content becomes unreachable rather than where space goes unused.
+**Superseded: the option-3 decision, recorded 2026-09-04 and reversed the same day.** It read: *"Option 3 — latest-attach wins, made explicit."* What it accepted was the truncating direction becoming normal (a client smaller than the PTY renders a top-left window, so a full-screen agent's status line sits off-screen) and a ring clear per agent per attention switch; what it bought was no protocol change, no `.breaking.md`, no contract amendment and no per-viewer accounting. Its trigger analysis is **not** superseded and applies to this policy too — see [The trigger](#the-trigger-which-the-policy-name-does-not-settle), which is why that section is kept below.
+
+**If this decision is ever reversed, the argument to beat is the direction asymmetry**, not the cost: every single-size policy makes some client render a grid that is not its viewport, and this one puts the loss where space goes unused rather than where content becomes unreachable.
 
 ### The trigger, which the policy name does not settle
 
@@ -272,6 +275,19 @@ Raised by Greptile on PR #884, and it is a real gap rather than a wording quibbl
 Recommendation: start with the first, because it is the policy as chosen and it is measurable in use; add the echo if watching an idle pane while driving the other client proves to be a real workflow. Either way **the trigger itself is activity, not attach** — that is the part #883 should not re-derive.
 
 ## Work Log
+
+### 2026-09-05 — Option 1 implemented; four things the design did not anticipate
+
+Built the policy: the daemon keys a per-agent geometry map **per attach**, applies the smallest viewport on each axis, prunes on attach teardown, echoes the applied geometry on both the attach and resize responses, and pushes changes to participating viewers as a new `KIND_GEOMETRY` frame. `PROTOCOL_VERSION` 8 → 9, with a `.breaking.md` fragment for the semantic change to `Resize`. The TUI stops asserting geometry and sizes its parser from the daemon's answer; the desktop's `fit()` becomes a proposal and its xterm grid is set from the applied geometry.
+
+Four things the design did not anticipate, all found while building it:
+
+- **The push cannot be avoided, and the design section understated this.** Q2 priced a push as optional ("or it settles for the clients asking"). It is not optional: when a viewer *detaches*, the minimum grows, and every remaining viewer's parser is instantly the wrong shape for the bytes arriving. No remaining viewer has any reason to ask, and the TUI has no steady-state poll — so without the push, option 1 would introduce the PRD #104 mis-parse by exactly the mechanism meant to prevent it. What made the bump acceptable is narrower than "we bumped": the push is **opt-in at attach**, so a client that predates the frame kind is never sent one and cannot have its pane torn down by a frame `next_output` would read as end-of-stream.
+- **Registering a viewer must happen under the same lock as the snapshot, in that order.** Registering can shrink the agent, and a resize clears the scrollback ring — so taking the snapshot first hands the client bytes written at the old geometry together with a token telling it to parse at the new one. That is issue #686's hazard reached by a different route, and it is why `subscribe_with_viewport` does both under one lock rather than composing two public calls.
+- **Greptile's per-attach correction earned its keep immediately.** The map is keyed per attach, not per client, and the prune runs on the attach task's drop — which also covers a client that crashes rather than detaching cleanly. A PID key would have leaked a constraint pinning a live agent to the geometry of a pane nobody was looking at any more.
+- **Invariant 3 does not survive in any form, not even a one-directional one.** The PRD predicted its expectation would "become what the daemon applied". That was wrong in an interesting way: the parser *is* what the daemon applied, so there is nothing left to compare it against. And because every request is now a round trip, the parser is transiently larger than the pane during a shrink and smaller during a grow — both indistinguishable from a defect at a call site that cannot know whether an answer is in flight. The assertion was removed and the invariant moved to the daemon, which is the side that can state it. `docs/develop/rendering-contract.md` records this.
+
+Also corrected while in the file: that document's "stream-backed panes have no PTY resize op" caveat, stale since PRD #76 M2.10 and flagged in this PRD's Documentation section.
 
 ### 2026-09-04 — Greptile review round: four findings, three of them real gaps
 

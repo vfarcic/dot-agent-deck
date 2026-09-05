@@ -199,6 +199,35 @@ pub fn clamp_pty_dims(rows: u16, cols: u16) -> (u16, u16) {
     (rows.min(PTY_RESIZE_DIM_MAX), cols.min(PTY_RESIZE_DIM_MAX))
 }
 
+/// Issue #747 — [`clamp_pty_dims`] plus the once-per-process notice.
+///
+/// Every request that can reach a child PTY goes through here, so the clamp
+/// stays observable no matter which entry point a caller used. Our own TUI
+/// pre-clamps through `clamp_pty_dims`, so this line firing means some *other*
+/// peer on the attach socket sent an over-cap request — precisely the case the
+/// cap exists for and worth seeing.
+///
+/// Shared by the PRD #882 viewer paths and the unattributed
+/// [`AgentPtyRegistry::resize`] deliberately: when the warning lived in one of
+/// them, adding the other silently created a route to the cap that reported
+/// nothing.
+fn clamp_pty_dims_reporting(id: &str, rows: u16, cols: u16) -> (u16, u16) {
+    let clamped = clamp_pty_dims(rows, cols);
+    if clamped != (rows, cols) && !OVERSIZED_RESIZE_LOGGED.swap(true, Ordering::Relaxed) {
+        tracing::warn!(
+            agent_id = %id,
+            requested_rows = rows,
+            requested_cols = cols,
+            applied_rows = clamped.0,
+            applied_cols = clamped.1,
+            max = PTY_RESIZE_DIM_MAX,
+            "resize request exceeded PTY_RESIZE_DIM_MAX and was clamped; the child PTY \
+             is narrower/shorter than the caller asked for (logged once per process)"
+        );
+    }
+    clamped
+}
+
 /// Maximum byte length the daemon will *retain* for a caller-supplied
 /// `DOT_AGENT_DECK_PANE_ID` value (and the TUI will *reuse* on rehydration).
 /// The agent's child process still receives whatever the caller sent — we
@@ -1162,6 +1191,16 @@ const SCROLLBACK_CAP_BYTES: usize = 1024 * 1024;
 /// the protocol layer (the client can reattach and replay the snapshot).
 const BROADCAST_CAPACITY: usize = 4096;
 
+/// PRD #882 — capacity of the per-agent geometry broadcast.
+///
+/// Deliberately tiny next to [`BROADCAST_CAPACITY`]: a geometry frame is
+/// emitted only when the *applied* size actually moves, which under this policy
+/// happens when a viewer joins, leaves, or changes its own pane size — not on
+/// output. A viewer that lagged past even a handful of these has missed
+/// nothing recoverable, because only the LATEST size matters and the daemon
+/// re-sends the current one to every fresh attach anyway.
+const GEOMETRY_BROADCAST_CAPACITY: usize = 16;
+
 /// PRD #20 R20-004 (finding #3): cap on the atomic-send idempotency ledger
 /// ([`AgentPtyRegistry::delivery_ledger`]). Far above any plausible number of
 /// distinct in-flight deliveries. On overflow the ledger evicts the OLDEST
@@ -1449,6 +1488,23 @@ pub struct AttachHandle {
     /// PTY returns EOF (the child died / was killed). The input path re-checks
     /// this before every write so bytes never reach a dead writer.
     pub exited: Arc<AtomicBool>,
+    /// PRD #882 — the token naming this attach as a registered viewer, or `None`
+    /// for an attach that declared no geometry. Carried back to the client so a
+    /// later resize on its own short-lived connection can say which viewer is
+    /// asking, and used to prune the constraint when this attach ends.
+    pub viewer: Option<String>,
+    /// PRD #882 — the geometry actually in force for the agent at the instant
+    /// the snapshot was taken, under the same lock. The client sizes its parser
+    /// from this rather than from what it asked for: with another, smaller
+    /// viewer attached the two differ, and the snapshot bytes are only
+    /// interpretable at this one.
+    pub pty_rows: u16,
+    pub pty_cols: u16,
+    /// PRD #882 — applied-geometry changes for this agent, for a viewer that
+    /// registered one. `None` for a legacy attach that declared no geometry,
+    /// which is exactly what keeps a client predating this policy from being
+    /// sent a frame kind it would treat as end-of-stream.
+    pub geometry_rx: Option<broadcast::Receiver<(u16, u16)>>,
 }
 
 /// PRD #20 R20-003/R20-006: the outcome of an identity-guarded atomic
@@ -1829,6 +1885,44 @@ pub struct RunningAgent {
     /// lands.
     pub pty_rows: u16,
     pub pty_cols: u16,
+    /// PRD #882 — the geometry each attached VIEWER has asked for, keyed by the
+    /// viewer token minted at attach. The daemon sizes the PTY to the smallest
+    /// of these on each axis (see [`AgentPtyRegistry::effective_dims`]), which
+    /// is what makes every viewer able to draw the agent's whole screen: the
+    /// PTY is never larger than anyone's pane, so every client is on the safe
+    /// pad-the-remainder side of a size mismatch rather than the truncating one.
+    ///
+    /// Keyed **per attach**, deliberately not per client process. One process
+    /// can hold two views of the same agent (two desktop tiles, or a tile plus
+    /// the Reader overlay), and a resize arrives on its own short-lived
+    /// connection carrying only the token — so a PID would neither say which
+    /// view asked nor be safe to prune on one of them ending.
+    ///
+    /// A key exists for every live attach that opted into the policy; the VALUE
+    /// is `None` until that viewer has told us a geometry. The two are separate
+    /// because a client can legitimately attach before it has measured
+    /// anything — the desktop attaches a tile from its shown-set effect and
+    /// measures in the webview a frame later — and a client in that state must
+    /// still be a viewer, or its later resize would arrive as an unattributed
+    /// override and stomp everybody else's constraint.
+    ///
+    /// No entries with a geometry means the size is left exactly as it is: a
+    /// legacy client that never registers still drives the PTY through the
+    /// unattributed path in [`AgentPtyRegistry::resize_for_viewer`].
+    pub viewers: HashMap<String, Option<(u16, u16)>>,
+    /// PRD #882 — geometry changes pushed to participating viewers.
+    ///
+    /// A viewer has to be told when the applied size moved because somebody
+    /// *else* joined, left or resized, and it cannot ask: the TUI has no
+    /// steady-state poll. Without this, a viewer that is not the one who
+    /// requested the change keeps parsing at its own geometry while the PTY
+    /// sits at another's — the PRD #104 mis-parse, reintroduced by the very
+    /// policy meant to prevent it.
+    ///
+    /// Subscribed only by attaches that declared a geometry, so a client that
+    /// predates this cannot be sent a frame kind it does not know (see
+    /// `KIND_GEOMETRY` in `crate::daemon_protocol`).
+    pub geometry_tx: broadcast::Sender<(u16, u16)>,
     /// PRD #93 round-2 reviewer REV-3: set to `true` by the reader thread
     /// once the PTY returns EOF (the child died or was killed). The daemon's
     /// idle monitor consults this via [`AgentPtyRegistry::live_count`] so an
@@ -3111,6 +3205,16 @@ const PANE_CLOSE_SETTLE_POLL: Duration = Duration::from_millis(50);
 
 struct RegistryInner {
     next_id: u64,
+    /// PRD #882 — monotonic source of viewer tokens, kept separate from
+    /// `next_id` so the two sequences cannot entangle.
+    ///
+    /// Monotonic is load-bearing rather than incidental: a token is never
+    /// reissued for the life of the daemon, so a stale token from a torn-down
+    /// attach can never name a *different* live viewer. That is what makes
+    /// `resize_for_viewer`'s "unknown token falls through to the unattributed
+    /// path" safe — the worst a stale token can do is size the PTY directly,
+    /// never silently overwrite somebody else's constraint.
+    next_viewer_id: u64,
     agents: HashMap<String, RunningAgent>,
     /// Issue #454: spawns that have been ADMITTED but whose `RunningAgent` is
     /// not in `agents` yet — keyed by the pre-allocated agent id, valued by the
@@ -3342,6 +3446,7 @@ impl AgentPtyRegistry {
         Self {
             inner: Mutex::new(RegistryInner {
                 next_id: 1,
+                next_viewer_id: 1,
                 agents: HashMap::new(),
                 pending_spawns: HashMap::new(),
                 cleanup_holds: HashSet::new(),
@@ -5262,6 +5367,12 @@ impl AgentPtyRegistry {
             spawn_env: captured_env,
             pty_rows: captured_rows,
             pty_cols: captured_cols,
+            // PRD #882: a fresh agent has no registered viewers. Its spawn-time
+            // geometry stands until the first attach declares one, so an agent
+            // started before any client is looking at it is not sized to zero
+            // viewers (`effective_dims` returns `None` for the empty set).
+            viewers: HashMap::new(),
+            geometry_tx: broadcast::channel(GEOMETRY_BROADCAST_CAPACITY).0,
             exited,
             // Issue #454: a fresh generation has not been handed over yet. It
             // is the one doing the taking-over, a few lines above.
@@ -6156,6 +6267,22 @@ impl AgentPtyRegistry {
             spawn_env,
             pty_rows,
             pty_cols,
+            // PRD #882: the old record's viewers are deliberately NOT carried
+            // over. Each was keyed to an attach against the agent being
+            // replaced, and the clients re-attach to the fresh one (the
+            // io_task renews the per-pane subscription — PRD #92 F12), which
+            // re-registers them with fresh tokens. Carrying the old entries
+            // would leave constraints that nothing can ever prune, since the
+            // attaches that owned them are gone. The window in between is
+            // harmless: with no viewers the policy leaves the size alone, and
+            // `pty_rows`/`pty_cols` just above are replayed into the fresh
+            // child's `SpawnOptions`, so it comes up at the geometry the policy
+            // had last settled on rather than the 24x80 default.
+            viewers: _,
+            // Dropping the sender ends the geometry stream for any receiver
+            // still held against the old agent, which is the correct signal:
+            // that agent's geometry is not a thing any more.
+            geometry_tx: _,
             exited: _,
             // Issue #454: the OLD record is being removed outright, so its
             // handover flag has nothing left to disown. The fresh generation
@@ -6459,80 +6586,229 @@ impl AgentPtyRegistry {
     /// Subscribe to an agent's live output and take its scrollback snapshot
     /// in one atomic step. Used by the attach protocol handler.
     pub fn subscribe(&self, id: &str) -> Result<AttachHandle, AgentPtyError> {
-        let inner = self.inner.lock().unwrap();
+        self.subscribe_with_viewport(id, None, false)
+    }
+
+    /// PRD #882 — subscribe, optionally registering the caller as a VIEWER whose
+    /// pane geometry constrains the agent.
+    ///
+    /// `viewport` is `Some((rows, cols))` for a client that participates in the
+    /// size policy and `None` for one that does not (a legacy client, or an
+    /// observer that renders nothing). A participant gets a viewer token, a
+    /// geometry receiver, and the applied size on the handle.
+    ///
+    /// **The order inside the lock is the point of this function.** Registering
+    /// a viewer can shrink the agent, and a resize clears the scrollback ring
+    /// (PRD #104 M3), so the snapshot has to be taken *after* the policy has been
+    /// applied. Taken before, the caller would be handed bytes written at the
+    /// old geometry together with a token telling it to parse at the new one —
+    /// which is issue #686's hazard exactly ("raw PTY bytes are only
+    /// interpretable as a screen when replayed at the geometry they were
+    /// produced at"), reached by a different route. Doing both under one lock
+    /// makes the inconsistent pairing unrepresentable rather than unlikely.
+    pub fn subscribe_with_viewport(
+        &self,
+        id: &str,
+        viewport: Option<(u16, u16)>,
+        geometry_updates: bool,
+    ) -> Result<AttachHandle, AgentPtyError> {
+        if let Some((rows, cols)) = viewport
+            && (rows == 0 || cols == 0)
+        {
+            return Err(AgentPtyError::Resize(format!(
+                "viewer rows and cols must be > 0 (got {rows}x{cols})"
+            )));
+        }
+        let mut inner = self.inner.lock().unwrap();
+        let seq = inner.next_viewer_id;
         let agent = inner
             .agents
-            .get(id)
+            .get_mut(id)
             .ok_or_else(|| AgentPtyError::NotFound(id.to_string()))?;
+        // Registering is keyed on the client SAYING it speaks this protocol, not
+        // on it having a geometry yet — see the `viewers` field docs.
+        let viewer = match (geometry_updates || viewport.is_some()).then_some(viewport) {
+            Some(viewport) => {
+                let token = format!("v{seq}");
+                let seeded = viewport.map(|(rows, cols)| clamp_pty_dims_reporting(id, rows, cols));
+                agent.viewers.insert(token.clone(), seeded);
+                // Apply BEFORE the snapshot below.
+                //
+                // A failed ioctl does NOT fail the attach. Streaming this
+                // agent's output is useful even if its geometry could not be
+                // moved, and refusing here would turn a resize problem into
+                // "the pane will not open at all" — strictly worse for the user
+                // and for diagnosing it. The viewer stays registered, so the
+                // next change re-attempts the apply.
+                if let Err(e) = Self::apply_effective_locked(agent) {
+                    tracing::warn!(
+                        agent_id = %id,
+                        viewport = ?seeded,
+                        error = %e,
+                        "registering a viewer could not apply the effective geometry; \
+                         attaching anyway at the agent's current size"
+                    );
+                }
+                Some(token)
+            }
+            None => None,
+        };
+        let geometry_rx = viewer.as_ref().map(|_| agent.geometry_tx.subscribe());
         let (snapshot, rx) = agent.bus.subscribe();
-        // PRD #20 R20-008: capture the writer AND the target's identity/liveness
-        // under this single lock, so the attach handler never needs the racy
-        // post-lock `pane_id_env_for_agent` lookup that could resolve to
-        // `<agent-gone>` (which `pane_writable` treats as `Live`).
-        Ok(AttachHandle {
+        let handle = AttachHandle {
             snapshot,
             rx,
             writer: agent.writer.clone(),
             agent_id: id.to_string(),
             pane_id_env: agent.pane_id_env.clone(),
             exited: agent.exited.clone(),
-        })
+            viewer,
+            pty_rows: agent.pty_rows,
+            pty_cols: agent.pty_cols,
+            geometry_rx,
+        };
+        // Only commit the token sequence once the agent was found and the
+        // insert actually happened, so a failed attach does not burn one.
+        if handle.viewer.is_some() {
+            inner.next_viewer_id += 1;
+        }
+        Ok(handle)
     }
 
-    /// Resize an agent's PTY. Mirrors the local-mode `MasterPty::resize`
-    /// shape (`PtySize { rows, cols, pixel_width: 0, pixel_height: 0 }`).
-    /// Zero rows or cols are rejected up front so a buggy caller can't
-    /// quietly produce a 0×0 PTY (which would deadlock any agent that
-    /// reads `TIOCGWINSZ`). Non-zero values are clamped down to
-    /// [`PTY_RESIZE_DIM_MAX`] — see the constant docs for the rationale.
+    /// PRD #882 — the geometry the policy says this agent's PTY should have:
+    /// the smallest each axis over every registered viewer.
     ///
-    /// Issue #747: the clamp is no longer *silent*. It stays a clamp rather
-    /// than a rejection — refusing would leave a wide terminal's pane stuck at
-    /// its previous geometry, which is worse than a pane narrower than the
-    /// screen — but it now emits one `warn!` per process. Our own TUI
-    /// pre-clamps through [`clamp_pty_dims`], so after #747 this line firing
-    /// means some *other* peer on the attach socket sent an over-cap request,
-    /// which is precisely the case the cap exists for and worth seeing.
-    pub fn resize(&self, id: &str, rows: u16, cols: u16) -> Result<(), AgentPtyError> {
+    /// `None` when no viewer is registered, which means "leave the size alone"
+    /// rather than "resize to nothing". Two cases reach it and both want the
+    /// current size kept: an agent spawned before any client attached, and an
+    /// agent whose only client is a legacy one that never registers a viewport.
+    ///
+    /// The two axes are minimised **independently**, matching tmux's
+    /// `window-size smallest`. A viewer that is short and wide therefore
+    /// constrains only the rows, and one that is tall and narrow only the
+    /// columns — the alternative (picking one viewer's pair wholesale) would
+    /// hand some other viewer a dimension larger than its pane, which is the
+    /// truncating direction this policy exists to avoid.
+    fn effective_dims(agent: &RunningAgent) -> Option<(u16, u16)> {
+        // Only viewers that have actually told us a geometry constrain anything.
+        // A viewer registered but not yet measured is deliberately inert rather
+        // than defaulted: a guessed value under a smallest-wins policy would
+        // shrink the agent for every other client.
+        let rows = agent.viewers.values().flatten().map(|(r, _)| *r).min()?;
+        let cols = agent.viewers.values().flatten().map(|(_, c)| *c).min()?;
+        Some((rows, cols))
+    }
+
+    /// PRD #882 — drop a viewer's constraint when its attach ends, and let the
+    /// agent grow back to the smallest of whoever is left.
+    ///
+    /// This is the half that makes the policy *reversible*, and it is the whole
+    /// difference between "a small client pins every agent small" (which is
+    /// today's behaviour, arbitrarily and until somebody resizes a terminal by
+    /// hand) and "a small client constrains the agent while it is looking at
+    /// it". Hide the desktop tile and the agent grows back.
+    ///
+    /// Silent about an unknown agent or token: a viewer is released on the
+    /// teardown path, where the agent may already be gone, and a teardown that
+    /// errors on a race it cannot prevent is noise rather than information.
+    pub fn release_viewer(&self, id: &str, token: &str) {
+        let mut inner = self.inner.lock().unwrap();
+        let Some(agent) = inner.agents.get_mut(id) else {
+            return;
+        };
+        if agent.viewers.remove(token).is_none() {
+            return;
+        }
+        if let Err(e) = Self::apply_effective_locked(agent) {
+            tracing::debug!(agent_id = %id, error = %e, "releasing a viewer could not re-apply the effective geometry");
+        }
+    }
+
+    /// PRD #882 — record a viewer's new geometry and re-apply the policy.
+    ///
+    /// `viewer` is the token from [`register_viewer`]. `None` — a client that
+    /// predates this policy, or one that resizes an agent it never attached to
+    /// — takes the **unattributed** path: the request is applied directly, as
+    /// it was before this PRD, and does not join the per-viewer minimum. That
+    /// keeps an older client working exactly as it did rather than leaving it
+    /// unable to size its own pane, and it is self-correcting: the next request
+    /// from any registered viewer recomputes the minimum and overrides it.
+    ///
+    /// Returns the geometry the daemon **actually applied**, which is not
+    /// necessarily the one asked for — that is the semantic change this PRD
+    /// makes to a stable wire, and why the caller must size its parser from the
+    /// answer rather than from its own request.
+    ///
+    /// [`register_viewer`]: Self::register_viewer
+    pub fn resize_for_viewer(
+        &self,
+        id: &str,
+        rows: u16,
+        cols: u16,
+        viewer: Option<&str>,
+    ) -> Result<(u16, u16), AgentPtyError> {
         if rows == 0 || cols == 0 {
             return Err(AgentPtyError::Resize(format!(
                 "rows and cols must be > 0 (got {rows}x{cols})"
             )));
         }
-        let (requested_rows, requested_cols) = (rows, cols);
-        let (rows, cols) = clamp_pty_dims(rows, cols);
-        if (rows, cols) != (requested_rows, requested_cols)
-            && !OVERSIZED_RESIZE_LOGGED.swap(true, Ordering::Relaxed)
-        {
-            tracing::warn!(
-                agent_id = %id,
-                requested_rows,
-                requested_cols,
-                applied_rows = rows,
-                applied_cols = cols,
-                max = PTY_RESIZE_DIM_MAX,
-                "resize request exceeded PTY_RESIZE_DIM_MAX and was clamped; the child PTY \
-                 is narrower/shorter than the caller asked for (logged once per process)"
-            );
-        }
+        let (rows, cols) = clamp_pty_dims_reporting(id, rows, cols);
         let mut inner = self.inner.lock().unwrap();
         let agent = inner
             .agents
             .get_mut(id)
             .ok_or_else(|| AgentPtyError::NotFound(id.to_string()))?;
-        // PRD #104 A1 followup: skip the entire ioctl + bookkeeping
-        // when neither dimension changes. The local TUI resize sweep
-        // calls `resize_pane_pty` on every frame the viewport is
-        // unchanged (cheap idempotent path), so without this guard
-        // every no-op tick would:
-        //   (a) issue TIOCSWINSZ to the kernel, which on Linux/macOS
-        //       delivers SIGWINCH to the child even when the dimensions
-        //       are identical — causing the inner TUI to redraw on every
-        //       frame tick;
-        //   (b) clear the scrollback ring unnecessarily, so a
-        //       hydration-replay snapshot taken mid-stream would observe
-        //       an empty buffer instead of the live agent's scrollback.
-        // Guard is *before* the ioctl to avoid both side-effects.
+        match viewer {
+            // A registered viewer: update its constraint, then take the minimum
+            // over all of them. `entry`-free on purpose — a token the registry
+            // does not know (a stale one from a previous attach, or a forged
+            // one) must NOT create a phantom viewer that nothing will ever
+            // prune, so it falls through to the unattributed path instead.
+            Some(token) if agent.viewers.contains_key(token) => {
+                // A known token: set (or first establish) this viewer's
+                // geometry. `contains_key` rather than a blind insert is what
+                // keeps a stale or forged token from creating a phantom viewer
+                // that nothing will ever prune.
+                agent.viewers.insert(token.to_string(), Some((rows, cols)));
+                Self::apply_effective_locked(agent)
+            }
+            _ => {
+                Self::apply_dims_locked(agent, rows, cols)?;
+                Ok((agent.pty_rows, agent.pty_cols))
+            }
+        }
+    }
+
+    /// PRD #882 — resolve the policy for `agent` and apply it, returning the
+    /// geometry now in force.
+    ///
+    /// With no registered viewers the current size stands, so this is safe to
+    /// call from every mutation path without special-casing the empty set.
+    fn apply_effective_locked(agent: &mut RunningAgent) -> Result<(u16, u16), AgentPtyError> {
+        if let Some((rows, cols)) = Self::effective_dims(agent) {
+            Self::apply_dims_locked(agent, rows, cols)?;
+        }
+        Ok((agent.pty_rows, agent.pty_cols))
+    }
+
+    /// PRD #882 — the one place a PTY's geometry actually moves.
+    ///
+    /// Extracted from [`AgentPtyRegistry::resize`] unchanged in behaviour so
+    /// the policy paths above and the legacy entry point cannot drift on the
+    /// three things that must happen together: the ioctl, the recorded size,
+    /// and the scrollback-ring clear. Callers hold the registry lock.
+    fn apply_dims_locked(
+        agent: &mut RunningAgent,
+        rows: u16,
+        cols: u16,
+    ) -> Result<(), AgentPtyError> {
+        // PRD #104 A1 followup: skip the entire ioctl + bookkeeping when
+        // neither dimension changes. Under PRD #882 this guard carries more
+        // weight than it did: every viewer join, release and resize runs the
+        // policy, and the common outcome is that the minimum did not move —
+        // a second viewer the same size as the first, or a viewer leaving that
+        // was never the smallest. Without the guard each of those would
+        // SIGWINCH the child and drop its scrollback ring for no change at all.
         if agent.pty_rows == rows && agent.pty_cols == cols {
             return Ok(());
         }
@@ -6545,45 +6821,44 @@ impl AgentPtyRegistry {
                 pixel_height: 0,
             })
             .map_err(|e| AgentPtyError::Resize(e.to_string()))?;
-        // Refresh the captured size so a subsequent respawn replays
-        // the latest geometry, not the spawn-time default. PRD #104
-        // also surfaces this on `AgentRecord` via `agent_records()`
-        // so the client's vt100 parser is initialised at the dims the
-        // snapshot bytes were written at.
         agent.pty_rows = rows;
         agent.pty_cols = cols;
-        // PRD #104 M3: drop the scrollback ring on resize. After this
-        // point a snapshot returned to a fresh subscriber represents
-        // a single (rows, cols) epoch — the agent's current one. The
-        // inner TUI's SIGWINCH-driven full-screen redraw repopulates
-        // scrollback at the new dims within the first frame, so this
-        // is not a content-loss for the interactive case. Pre-PRD,
-        // a snapshot could carry bytes from before *and* after a
-        // resize, and the parser at attach time had no way to know
-        // which was which.
-        //
-        // PRD #104 R2 (reviewer): the clear takes the same
-        // `AgentBus::state` mutex that `AgentBus::push` (and
-        // `subscribe`/`snapshot`) take, so push and clear serialize
-        // through one lock — no data race, no torn read.
-        // Residual best-effort gap: a `pump_reader` thread that has
-        // already returned from `reader.read(...)` with pre-resize
-        // bytes in its userspace buffer but has not yet acquired the
-        // bus lock will push those bytes AFTER this clear. The kernel
-        // can also have pre-SIGWINCH-emit bytes buffered on the
-        // master FD that `pump_reader` will read after the ioctl
-        // returns. Neither can be closed without holding the bus lock
-        // across a blocking `read()` (or coordinating with the inner
-        // agent's SIGWINCH ack — neither tractable). The interactive
-        // recovery path makes this acceptable: the inner TUI's
-        // SIGWINCH-driven full-screen redraw emits a clear + reposition
-        // + content burst at the new dims that overwrites the parser's
-        // live screen within a frame, so any leaked pre-resize bytes
-        // age out of the parser's live area into the (still-correct
-        // at the wider dim case) parser-side scrollback. See the
-        // Risks table in `prds/104-snapshot-replay-preserves-pty-dims.md`.
+        // PRD #104 M3: drop the scrollback ring so a snapshot returned to a
+        // fresh subscriber covers a single dimension epoch. See the long note
+        // in `resize` for the residual best-effort gap and why it is
+        // acceptable.
         agent.bus.clear_scrollback();
+        // PRD #882: tell every participating viewer what the size is now. The
+        // requester learns the same number from its own response, so this is
+        // for the OTHER viewers — the ones whose parser would otherwise stay at
+        // a geometry the PTY no longer has. Send errors mean nobody is
+        // subscribed, which is the ordinary case for an agent with no attached
+        // client and not a condition to report.
+        let _ = agent.geometry_tx.send((rows, cols));
         Ok(())
+    }
+
+    /// Resize an agent's PTY directly, bypassing the PRD #882 viewer policy.
+    ///
+    /// This is the UNATTRIBUTED path — it applies the geometry as asked and
+    /// does not join the per-viewer minimum, which is what a caller that is not
+    /// a registered viewer gets. It stays because a great deal of the codebase
+    /// (tests, tooling, and any client predating the policy) legitimately means
+    /// "make this PTY this size" and has no viewer token to offer.
+    ///
+    /// A client that renders the agent should call
+    /// [`AgentPtyRegistry::resize_for_viewer`] with the token from its attach
+    /// instead, so its pane size constrains the agent rather than overriding
+    /// everyone else's.
+    ///
+    /// Zero rows or cols are rejected so a buggy caller can't quietly produce a
+    /// 0×0 PTY (which would deadlock any agent that reads `TIOCGWINSZ`), and
+    /// non-zero values are clamped down to [`PTY_RESIZE_DIM_MAX`] — see the
+    /// constant docs for the rationale. Issue #747: the clamp is not silent, but
+    /// stays a clamp rather than a rejection, since refusing would leave a wide
+    /// terminal's pane stuck at its previous geometry.
+    pub fn resize(&self, id: &str, rows: u16, cols: u16) -> Result<(), AgentPtyError> {
+        self.resize_for_viewer(id, rows, cols, None).map(|_| ())
     }
 
     /// Last-known PTY size for the agent attached to `pane_id_env`,
@@ -6599,6 +6874,19 @@ impl AgentPtyRegistry {
                 a.pane_id_env.as_deref() == Some(pane_id_env) && !a.exited.load(Ordering::SeqCst)
             })
             .map(|a| (a.pty_rows, a.pty_cols))
+    }
+
+    /// PRD #882 — the geometry currently applied to an agent, by agent id.
+    ///
+    /// Sibling of [`pty_size_for_pane`], which is keyed by pane. This one is
+    /// keyed the way the viewer policy is — a pane outlives the agents that
+    /// occupy it, so a pane-keyed lookup can answer for a different generation
+    /// than the viewers were registered against.
+    ///
+    /// [`pty_size_for_pane`]: Self::pty_size_for_pane
+    pub fn pty_size_for_agent(&self, id: &str) -> Option<(u16, u16)> {
+        let inner = self.inner.lock().unwrap();
+        inner.agents.get(id).map(|a| (a.pty_rows, a.pty_cols))
     }
 
     /// Issue #686: the agent's scrollback snapshot together with the PTY dims it
@@ -7207,6 +7495,8 @@ impl AgentPtyRegistry {
         inner.agents.insert(
             id.clone(),
             RunningAgent {
+                viewers: HashMap::new(),
+                geometry_tx: broadcast::channel(GEOMETRY_BROADCAST_CAPACITY).0,
                 child,
                 // `adopt(None)` is the portable "there is no group to hold"
                 // constructor: a no-op ZST on Unix, and an unassigned (jobless)
@@ -10688,6 +10978,312 @@ mod spawn_tests {
             String::from_utf8_lossy(bytes),
             snap.len()
         );
+    }
+
+    /// PRD #882 — the policy itself: two viewers of different sizes leave the
+    /// PTY at the smallest on each axis, so neither client is ever asked to draw
+    /// a grid larger than its own pane.
+    #[test]
+    fn viewer_policy_sizes_to_the_smallest_viewport() {
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let id = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/cat"),
+                rows: 24,
+                cols: 80,
+                ..SpawnOptions::default()
+            })
+            .expect("spawn should succeed");
+
+        // A single viewer gets exactly what it asked for.
+        let big = registry
+            .subscribe_with_viewport(&id, Some((50, 200)), true)
+            .expect("attach as viewer");
+        assert_eq!(
+            (big.pty_rows, big.pty_cols),
+            (50, 200),
+            "one viewer: the agent takes that viewer's geometry"
+        );
+
+        // A second, smaller viewer pulls the agent down to what BOTH can draw.
+        let small = registry
+            .subscribe_with_viewport(&id, Some((30, 100)), true)
+            .expect("attach as second viewer");
+        assert_eq!(
+            (small.pty_rows, small.pty_cols),
+            (30, 100),
+            "two viewers: the agent takes the smallest of each axis"
+        );
+
+        // The axes are minimised INDEPENDENTLY. A short, wide third viewer
+        // constrains only the rows; taking one viewer's pair wholesale would
+        // hand somebody a dimension bigger than their pane.
+        let wide = registry
+            .subscribe_with_viewport(&id, Some((10, 400)), true)
+            .expect("attach as third viewer");
+        assert_eq!(
+            (wide.pty_rows, wide.pty_cols),
+            (10, 100),
+            "rows come from the shortest viewer and cols from the narrowest, independently"
+        );
+
+        registry.shutdown_all();
+    }
+
+    /// PRD #882 — releasing a viewer gives the constraint back: the agent grows
+    /// to the smallest of whoever is left. This is what makes the policy
+    /// reversible rather than a one-way ratchet down to the smallest pane that
+    /// ever looked at the agent.
+    #[test]
+    fn releasing_a_viewer_grows_the_agent_back() {
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let id = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/cat"),
+                rows: 24,
+                cols: 80,
+                ..SpawnOptions::default()
+            })
+            .expect("spawn should succeed");
+
+        let big = registry
+            .subscribe_with_viewport(&id, Some((50, 200)), true)
+            .expect("attach big viewer");
+        let small = registry
+            .subscribe_with_viewport(&id, Some((30, 100)), true)
+            .expect("attach small viewer");
+        assert_eq!((small.pty_rows, small.pty_cols), (30, 100));
+
+        registry.release_viewer(
+            &id,
+            small.viewer.as_deref().expect("small viewer has a token"),
+        );
+        assert_eq!(
+            registry.pty_size_for_agent(&id),
+            Some((50, 200)),
+            "with the small viewer gone the agent returns to the remaining viewer's size"
+        );
+
+        // The last viewer leaving does NOT resize to nothing — an agent with no
+        // one watching keeps the geometry it had.
+        registry.release_viewer(&id, big.viewer.as_deref().expect("big viewer has a token"));
+        assert_eq!(
+            registry.pty_size_for_agent(&id),
+            Some((50, 200)),
+            "no viewers means leave the size alone, not resize to zero"
+        );
+
+        registry.shutdown_all();
+    }
+
+    /// PRD #882 — a client that attaches BEFORE it has measured itself is still
+    /// a viewer, and its first resize joins the policy instead of overriding it.
+    ///
+    /// This is the desktop's ordering, not a hypothetical: a tile is attached by
+    /// the shown-set effect and measured by `FitAddon` in the webview a frame
+    /// later. Registering only on a declared viewport would leave that tile
+    /// outside the policy, so its first resize would carry no token and the
+    /// daemon would apply it as an unattributed override across every other
+    /// client — the exact "last writer wins" behaviour this PRD replaces.
+    #[test]
+    fn a_viewer_that_attaches_before_measuring_still_joins_the_policy() {
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let id = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/cat"),
+                rows: 24,
+                cols: 80,
+                ..SpawnOptions::default()
+            })
+            .expect("spawn should succeed");
+
+        let measured = registry
+            .subscribe_with_viewport(&id, Some((50, 200)), true)
+            .expect("attach a measured viewer");
+        assert_eq!((measured.pty_rows, measured.pty_cols), (50, 200));
+
+        // Attaches with no geometry yet, but opts in.
+        let pending = registry
+            .subscribe_with_viewport(&id, None, true)
+            .expect("attach an unmeasured viewer");
+        let pending_token = pending
+            .viewer
+            .clone()
+            .expect("an opted-in attach gets a token");
+        assert_eq!(
+            (pending.pty_rows, pending.pty_cols),
+            (50, 200),
+            "a viewer with no geometry yet must be inert, not treated as zero or as a default"
+        );
+
+        // Its first resize now lands as that viewer's constraint...
+        let applied = registry
+            .resize_for_viewer(&id, 30, 100, Some(&pending_token))
+            .expect("first resize from a pending viewer");
+        assert_eq!(
+            applied,
+            (30, 100),
+            "the first resize establishes the constraint"
+        );
+
+        // ...and the constraint is genuinely per-viewer, not an override: it is
+        // released when that attach ends, which an unattributed request could
+        // never be.
+        registry.release_viewer(&id, &pending_token);
+        assert_eq!(
+            registry.pty_size_for_agent(&id),
+            Some((50, 200)),
+            "releasing the late-measuring viewer gives the constraint back, which proves \
+             its resize joined the policy rather than overriding it"
+        );
+
+        registry.shutdown_all();
+    }
+
+    /// PRD #882 — a resize from one viewer updates only that viewer's
+    /// constraint. The daemon answers with what it ACTUALLY applied, which is
+    /// not what was asked for while a smaller viewer is attached.
+    #[test]
+    fn a_viewer_resize_is_a_request_not_an_assertion() {
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let id = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/cat"),
+                rows: 24,
+                cols: 80,
+                ..SpawnOptions::default()
+            })
+            .expect("spawn should succeed");
+
+        let big = registry
+            .subscribe_with_viewport(&id, Some((50, 200)), true)
+            .expect("attach big viewer");
+        let _small = registry
+            .subscribe_with_viewport(&id, Some((30, 100)), true)
+            .expect("attach small viewer");
+
+        // The big viewer asks for more. It does not get it, and it is TOLD it
+        // did not get it — which is the whole reason the response echoes the
+        // applied geometry.
+        let applied = registry
+            .resize_for_viewer(&id, 60, 300, big.viewer.as_deref())
+            .expect("resize should succeed");
+        assert_eq!(
+            applied,
+            (30, 100),
+            "the request is bounded by the smaller viewer, and the answer says so"
+        );
+
+        // The same viewer asking for LESS than the other one does move the
+        // agent: it is now the smallest.
+        let applied = registry
+            .resize_for_viewer(&id, 20, 60, big.viewer.as_deref())
+            .expect("resize should succeed");
+        assert_eq!(
+            applied,
+            (20, 60),
+            "asking for less than everyone else takes effect"
+        );
+
+        registry.shutdown_all();
+    }
+
+    /// PRD #882 — a resize with no viewer token, or with one the daemon does not
+    /// know, takes the unattributed path: applied directly, joining no minimum.
+    ///
+    /// This is the compatibility contract for a client predating the policy, and
+    /// the safety property for a stale token. A stale token must NOT be able to
+    /// silently overwrite some live viewer's constraint, which is what a
+    /// "create the entry if missing" implementation would do.
+    #[test]
+    fn an_unknown_viewer_token_falls_through_to_the_unattributed_path() {
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let id = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/cat"),
+                rows: 24,
+                cols: 80,
+                ..SpawnOptions::default()
+            })
+            .expect("spawn should succeed");
+
+        let small = registry
+            .subscribe_with_viewport(&id, Some((30, 100)), true)
+            .expect("attach small viewer");
+        let small_token = small.viewer.clone().expect("token");
+
+        // A legacy client with no token sizes the PTY directly.
+        let applied = registry
+            .resize_for_viewer(&id, 44, 144, None)
+            .expect("unattributed resize should succeed");
+        assert_eq!(applied, (44, 144), "no token: applied as asked");
+
+        // ...and it did not become a viewer, so the registered viewer's own
+        // next request still resolves against only the real viewers.
+        let applied = registry
+            .resize_for_viewer(&id, 30, 100, Some(&small_token))
+            .expect("resize should succeed");
+        assert_eq!(
+            applied,
+            (30, 100),
+            "the unattributed request left no phantom constraint behind"
+        );
+
+        // An unknown token behaves the same way and, critically, does not
+        // overwrite the live viewer's entry.
+        registry
+            .resize_for_viewer(&id, 99, 199, Some("v-not-a-real-token"))
+            .expect("unknown token should not error");
+        let applied = registry
+            .resize_for_viewer(&id, 30, 100, Some(&small_token))
+            .expect("resize should succeed");
+        assert_eq!(
+            applied,
+            (30, 100),
+            "the live viewer's constraint survived a request bearing an unknown token"
+        );
+
+        registry.shutdown_all();
+    }
+
+    /// PRD #882 — a viewer that changes nothing costs nothing.
+    ///
+    /// The policy runs on every join, release and resize, and the common outcome
+    /// is that the minimum did not move. Without the no-op guard each of those
+    /// would SIGWINCH the child and drop its scrollback ring for no change at
+    /// all — which under this policy would make attaching a second, larger
+    /// client silently destroy the first one's replay.
+    #[test]
+    fn a_viewer_that_does_not_change_the_minimum_leaves_scrollback_alone() {
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let id = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/cat"),
+                rows: 24,
+                cols: 80,
+                ..SpawnOptions::default()
+            })
+            .expect("spawn should succeed");
+
+        let small = registry
+            .subscribe_with_viewport(&id, Some((24, 80)), true)
+            .expect("attach viewer at the spawn geometry");
+        assert_eq!((small.pty_rows, small.pty_cols), (24, 80));
+
+        write_and_wait_for_scrollback(&registry, &id, b"hello");
+        assert!(!registry.snapshot(&id).unwrap().is_empty());
+
+        // A LARGER second viewer cannot move the minimum, so nothing happens.
+        let big = registry
+            .subscribe_with_viewport(&id, Some((50, 200)), true)
+            .expect("attach larger viewer");
+        assert_eq!((big.pty_rows, big.pty_cols), (24, 80));
+        assert!(
+            !registry.snapshot(&id).unwrap().is_empty(),
+            "attaching a larger viewer must not resize, and so must not clear the ring"
+        );
+
+        registry.shutdown_all();
     }
 
     #[test]

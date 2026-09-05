@@ -141,6 +141,38 @@ pub const KIND_SHUTDOWN_ACK: u8 = 0x16;
 /// stream wire shape, so it rides the `PROTOCOL_VERSION` 5 → 6 bump (see below).
 pub const KIND_STREAM_REJECT: u8 = 0x17;
 
+/// PRD #882 — server → client on an attach stream: the agent's PTY geometry
+/// changed, payload `{"rows":N,"cols":M}`.
+///
+/// **Sent only to an attach that declared a viewport** (`AttachStream`'s
+/// optional `rows`/`cols`), and that gate is the whole compatibility story.
+/// [`crate::daemon_client::AttachConnection::next_output`] treats any frame kind
+/// it does not know as end-of-stream — it warns and returns `Ok(None)`, which
+/// tears the pane down — so a client predating this frame would lose its pane
+/// the first time the daemon pushed one. A client that predates it also cannot
+/// send the field that opts in, so it is never sent one.
+///
+/// The push exists because a viewer cannot ask. When the applied size moves
+/// because a *different* client attached, detached or resized, every other
+/// viewer's parser is suddenly the wrong shape for the bytes arriving, and the
+/// TUI has no steady-state poll to notice with (see PRD #882 Q2).
+pub const KIND_GEOMETRY: u8 = 0x18;
+
+/// PRD #882 — decode a `KIND_GEOMETRY` payload (`{"rows":N,"cols":M}`).
+///
+/// Returns `None` for anything that does not parse as both fields in `u16`
+/// range. A malformed geometry frame is dropped rather than guessed at: the
+/// value drives how every subsequent byte is interpreted, so half-decoding one
+/// would mis-parse the agent's screen — the exact failure PRD #104 exists to
+/// prevent — where ignoring it leaves the previous, known-good geometry in
+/// place until the next push.
+pub fn parse_geometry_frame(bytes: &[u8]) -> Option<(u16, u16)> {
+    let v: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+    let rows = u16::try_from(v.get("rows")?.as_u64()?).ok()?;
+    let cols = u16::try_from(v.get("cols")?.as_u64()?).ok()?;
+    Some((rows, cols))
+}
+
 /// PRD #76 M2.21: wire-format version for the attach socket. Bump every time
 /// the on-the-wire shape changes in a way an older client/daemon would
 /// mis-parse — new `KIND_*` codes, payload schema changes, new request
@@ -227,6 +259,25 @@ pub const KIND_STREAM_REJECT: u8 = 0x17;
 /// [`AttachResponse::kept_worktree`] field is additive and would have needed no
 /// bump on its own.
 ///
+/// **8 → 9 (PRD #882).** The attach stream gained a server → client frame kind,
+/// [`KIND_GEOMETRY`], carrying the agent's applied PTY geometry, and
+/// `AttachStream` / `Resize` gained optional fields (`rows`/`cols`,
+/// `viewer`) with `AttachResponse` gaining `viewer` / `applied_rows` /
+/// `applied_cols`. The optional fields alone would not need a bump — the
+/// additive-field precedent on `AttachResponse` is well established — but a new
+/// frame kind is a wire-shape change, and the *meaning* of `Resize` moved with
+/// it: it is now a request the daemon may only partly honour, answered with the
+/// geometry actually applied.
+///
+/// The break is deliberately contained rather than merely declared. A client
+/// that predates this never sends the `AttachStream` viewport, and the daemon
+/// sends `KIND_GEOMETRY` only to attaches that did — so an older client cannot
+/// be handed a frame kind that
+/// [`crate::daemon_client::AttachConnection::next_output`] would read as
+/// end-of-stream and tear its pane down for. What an older client loses is
+/// participation: its resizes take the unattributed path and it is not told when
+/// somebody else moves the size.
+///
 /// # Where this constant is enforced
 ///
 /// **No call site refuses on it today, and that is issue #405.** The bump
@@ -256,7 +307,7 @@ pub const KIND_STREAM_REJECT: u8 = 0x17;
 /// makes a skew *nameable* — it is the number the handshake reports, what
 /// `daemon hello` prints, and the input any future compatibility gate will
 /// read; #405 is what will make it *refused*.
-pub const PROTOCOL_VERSION: u32 = 8;
+pub const PROTOCOL_VERSION: u32 = 9;
 
 /// Hard cap on a single frame's payload length. Defends against a malicious
 /// or buggy peer trying to allocate gigabytes off a forged length prefix.
@@ -439,6 +490,37 @@ pub enum AttachRequest {
     },
     AttachStream {
         id: String,
+        /// PRD #882 — the geometry this client can draw the agent at, if it
+        /// participates in the size policy.
+        ///
+        /// Present means "register me as a viewer": the daemon sizes the agent
+        /// to the smallest viewport among attached viewers, answers with the
+        /// applied geometry and a viewer token, and pushes later changes as
+        /// [`KIND_GEOMETRY`] frames. Absent — the pre-#882 shape, and what a
+        /// non-rendering observer should send — means the client neither
+        /// constrains the size nor is told about it, which is what keeps an
+        /// older client's stream safe from a frame kind it would mistake for
+        /// end-of-stream.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rows: Option<u16>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cols: Option<u16>,
+        /// PRD #882 — "I speak the size policy": mint me a viewer token and push
+        /// me [`KIND_GEOMETRY`] frames.
+        ///
+        /// Separate from `rows`/`cols` because a client can legitimately attach
+        /// before it has measured anything — the desktop attaches a tile from
+        /// its shown-set effect and measures in the webview a frame later. Such
+        /// a client must still become a viewer at attach time, or its first
+        /// resize would arrive with no token and be applied as an unattributed
+        /// override, stomping every other client's constraint. It registers now
+        /// and contributes a constraint once it has one.
+        ///
+        /// **This flag, not the viewport, is the compatibility gate.** A client
+        /// predating #882 cannot send it, so it never receives a frame kind
+        /// `next_output` would read as end-of-stream.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        geometry_updates: bool,
     },
     Snapshot {
         id: String,
@@ -452,6 +534,22 @@ pub enum AttachRequest {
         id: String,
         rows: u16,
         cols: u16,
+        /// PRD #882 — the viewer token from this client's `AttachStream`
+        /// response, naming which view is asking.
+        ///
+        /// A resize arrives on its own short-lived connection, so without this
+        /// the daemon knows only which *process* asked — and one process can
+        /// hold two views of the same agent (two desktop tiles, or a tile plus
+        /// the Reader overlay). With the token the request updates that
+        /// viewer's constraint and the daemon re-applies the minimum.
+        ///
+        /// Absent, or naming a viewer the daemon no longer has, takes the
+        /// unattributed path: applied directly, joining no minimum, exactly as
+        /// this request behaved before #882. That is the compatibility contract
+        /// for an older client, and it is self-correcting — the next request
+        /// from any registered viewer recomputes the minimum over it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        viewer: Option<String>,
     },
     /// M2.11: update the daemon-side display_name and cwd for an agent.
     /// Either field may be `None` to clear it. Used by the TUI's rename
@@ -670,6 +768,27 @@ pub struct AttachResponse {
     /// (in which case the client treats `None` as "incompatible").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub server_version: Option<u32>,
+    /// PRD #882 — the viewer token minted for an `AttachStream` that declared a
+    /// viewport, echoed so the client can name itself on later resizes.
+    /// Absent for a legacy attach and on every unrelated response.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub viewer: Option<String>,
+    /// PRD #882 — the geometry the daemon ACTUALLY applied, on an `AttachStream`
+    /// or `Resize` response.
+    ///
+    /// This is the field that makes the policy honest to its clients. Under
+    /// #882 a resize is a *request*: with a smaller viewer attached, the size
+    /// that takes effect is not the one asked for, and a client that assumed
+    /// otherwise would parse the agent's bytes at a geometry the PTY does not
+    /// have. Size the local parser from these, never from the request.
+    ///
+    /// Additive and optional, so a daemon predating #882 simply omits them and
+    /// the client falls back to its own request — which is exactly the old
+    /// behaviour, and correct against a daemon that has no policy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub applied_rows: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub applied_cols: Option<u16>,
     /// PRD #103 M1.1: daemon's compiled-in `env!("DAD_BUILD_ID")` — a
     /// finer-grained identifier than [`PROTOCOL_VERSION`] (it includes the
     /// commit hash and dirty marker) used by the laptop to detect
@@ -2054,11 +2173,57 @@ async fn handle_connection(
             }
             Err(e) => write_resp(&mut stream, &AttachResponse::err(e.to_string())).await?,
         },
-        AttachRequest::AttachStream { id } => {
-            handle_attach_stream(stream, registry, id, state.clone()).await?;
+        AttachRequest::AttachStream {
+            id,
+            rows,
+            cols,
+            geometry_updates,
+        } => {
+            // PRD #882: both axes or neither. A half-declared viewport is a
+            // client bug, and guessing the missing axis would register a
+            // constraint the client never asked for — which under a
+            // smallest-wins policy would shrink the agent for everybody.
+            let viewport = match (rows, cols) {
+                (Some(rows), Some(cols)) => Some((rows, cols)),
+                (None, None) => None,
+                _ => {
+                    write_resp(
+                        &mut stream,
+                        &AttachResponse::err(
+                            "attach-stream viewport needs both rows and cols, or neither"
+                                .to_string(),
+                        ),
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            };
+            handle_attach_stream(
+                stream,
+                registry,
+                id,
+                state.clone(),
+                viewport,
+                geometry_updates,
+            )
+            .await?;
         }
-        AttachRequest::Resize { id, rows, cols } => match registry.resize(&id, rows, cols) {
-            Ok(()) => write_resp(&mut stream, &AttachResponse::ok()).await?,
+        AttachRequest::Resize {
+            id,
+            rows,
+            cols,
+            viewer,
+            // PRD #882: the request is a REQUEST — the daemon answers with the
+            // geometry it actually applied, which differs from the one asked for
+            // whenever a smaller viewer is attached. The client sizes its parser
+            // from the answer.
+        } => match registry.resize_for_viewer(&id, rows, cols, viewer.as_deref()) {
+            Ok((applied_rows, applied_cols)) => {
+                let mut resp = AttachResponse::ok();
+                resp.applied_rows = Some(applied_rows);
+                resp.applied_cols = Some(applied_cols);
+                write_resp(&mut stream, &resp).await?
+            }
             Err(e) => write_resp(&mut stream, &AttachResponse::err(e.to_string())).await?,
         },
         AttachRequest::WriteAndSubmit { pane_id, text } => {
@@ -2445,8 +2610,10 @@ async fn handle_attach_stream(
     registry: Arc<AgentPtyRegistry>,
     id: String,
     state: SharedState,
+    viewport: Option<(u16, u16)>,
+    geometry_updates: bool,
 ) -> io::Result<()> {
-    let handle = match registry.subscribe(&id) {
+    let handle = match registry.subscribe_with_viewport(&id, viewport, geometry_updates) {
         Ok(h) => h,
         Err(e) => {
             let mut s = stream;
@@ -2455,10 +2622,41 @@ async fn handle_attach_stream(
         }
     };
 
+    // PRD #882: release this viewer's constraint however this task ends —
+    // clean detach, client crash, write timeout, or a panic. A leaked
+    // constraint is worse than most leaks: it does not merely waste memory,
+    // it pins a live agent to the geometry of a pane nobody is looking at any
+    // more, and nothing else in the system can ever release it.
+    struct ViewerGuard {
+        registry: Arc<AgentPtyRegistry>,
+        agent_id: String,
+        token: Option<String>,
+    }
+    impl Drop for ViewerGuard {
+        fn drop(&mut self) {
+            if let Some(token) = self.token.as_deref() {
+                self.registry.release_viewer(&self.agent_id, token);
+            }
+        }
+    }
+    let _viewer_guard = ViewerGuard {
+        registry: registry.clone(),
+        agent_id: id.clone(),
+        token: handle.viewer.clone(),
+    };
+
     let (mut rd, mut wr) = stream.into_split();
 
-    // 1. Confirm the attach succeeded.
-    write_resp(&mut wr, &AttachResponse::ok()).await?;
+    // 1. Confirm the attach succeeded, carrying the viewer token and the
+    //    geometry actually applied (PRD #882). Both were resolved under the same
+    //    registry lock as the snapshot below, so the client can size its parser
+    //    from `applied_*` and know the replayed bytes were written at exactly
+    //    that geometry.
+    let mut ok = AttachResponse::ok();
+    ok.viewer = handle.viewer.clone();
+    ok.applied_rows = Some(handle.pty_rows);
+    ok.applied_cols = Some(handle.pty_cols);
+    write_resp(&mut wr, &ok).await?;
     // 2. Replay the consistent scrollback snapshot before live bytes start
     //    flowing. `subscribe()` guarantees no overlap or gap with the bytes
     //    delivered via `rx` below. The write is bounded by
@@ -2533,12 +2731,54 @@ async fn handle_attach_stream(
     // suppresses lag detection, since we can't reach the next `rx.recv()`
     // to observe `RecvError::Lagged`. With the timeout, a wedged client is
     // detected within bounded time and the connection is dropped.
+    // PRD #882: `Some` only for a viewer that declared a viewport, so the select
+    // arm below can never emit a `KIND_GEOMETRY` frame to a client that would
+    // read it as end-of-stream. A legacy attach gets a receiver that is never
+    // ready, which parks that arm forever without affecting the others.
+    let mut geometry_rx = handle.geometry_rx;
     let output_task = tokio::spawn(async move {
         loop {
             tokio::select! {
                 // Bias toward output so heavy PTY traffic isn't starved by
                 // the (rare) reject path; both are still serviced.
                 biased;
+                // PRD #882: the applied geometry moved — because another client
+                // attached, detached or resized — so tell this viewer before the
+                // bytes drawn for the new grid reach it. Ordering against the
+                // output arm is best-effort rather than exact: `biased` services
+                // output first, so a geometry frame can trail a few output frames
+                // written at the new size. The client's parser reshapes on
+                // receipt and the agent's SIGWINCH redraw repaints the screen
+                // immediately after any resize, so a handful of bytes parsed at
+                // the previous grid is transient rather than baked in — the same
+                // best-effort argument PRD #104 M3 makes for its residual gap.
+                geom = async {
+                    match geometry_rx.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        // No viewport declared: never resolves, so this arm is
+                        // inert for a legacy attach.
+                        None => std::future::pending().await,
+                    }
+                } => match geom {
+                    Ok((rows, cols)) => {
+                        let payload = serde_json::json!({ "rows": rows, "cols": cols });
+                        let bytes = serde_json::to_vec(&payload).unwrap_or_default();
+                        if !write_or_timeout(&mut wr, KIND_GEOMETRY, &bytes).await {
+                            let _ = write_or_timeout(&mut wr, KIND_STREAM_END, b"timeout").await;
+                            break;
+                        }
+                    }
+                    // The agent is gone (sender dropped) or this receiver
+                    // lagged past the tiny geometry capacity. Neither is worth
+                    // tearing the pane down for: output has its own Closed arm
+                    // that ends the stream properly, and only the LATEST
+                    // geometry matters, so a lagged viewer is reconciled by the
+                    // next change. Stop watching and let the other arms decide
+                    // the connection's fate.
+                    Err(_) => {
+                        geometry_rx = None;
+                    }
+                },
                 out = rx.recv() => match out {
                     Ok(bytes) => {
                         if !write_or_timeout(&mut wr, KIND_STREAM_OUT, &bytes).await {
@@ -4284,6 +4524,164 @@ mod tests {
         }
     }
 
+    /// PRD #882 — the new fields are ADDITIVE: a request from a client that
+    /// predates the policy still decodes, and a request that carries them does
+    /// not change the op name or the shape of what was already there.
+    ///
+    /// This is the compatibility contract the whole containment argument rests
+    /// on, so it is pinned rather than assumed.
+    #[test]
+    fn attach_stream_and_resize_accept_the_pre_882_wire_shape() {
+        // Pre-#882 attach: no viewport at all.
+        let legacy: AttachRequest =
+            serde_json::from_str(r#"{"op":"attach-stream","id":"a1"}"#).expect("legacy decodes");
+        match legacy {
+            AttachRequest::AttachStream {
+                id,
+                rows,
+                cols,
+                geometry_updates,
+            } => {
+                assert_eq!(id, "a1");
+                assert_eq!(
+                    (rows, cols),
+                    (None, None),
+                    "an attach with no viewport must register no constraint — a guessed one \
+                     would shrink the agent for every other client"
+                );
+                assert!(
+                    !geometry_updates,
+                    "a client predating #882 cannot opt in, and this default is the \
+                     compatibility gate: it is what stops the daemon pushing that client a \
+                     KIND_GEOMETRY frame, which `next_output` would read as end-of-stream \
+                     and tear its pane down for"
+                );
+            }
+            other => panic!("expected AttachStream, got {other:?}"),
+        }
+
+        // Pre-#882 resize: no viewer token.
+        let legacy: AttachRequest =
+            serde_json::from_str(r#"{"op":"resize","id":"a1","rows":40,"cols":120}"#)
+                .expect("legacy decodes");
+        match legacy {
+            AttachRequest::Resize {
+                id,
+                rows,
+                cols,
+                viewer,
+            } => {
+                assert_eq!((id.as_str(), rows, cols), ("a1", 40, 120));
+                assert_eq!(viewer, None, "no token means the unattributed path");
+            }
+            other => panic!("expected Resize, got {other:?}"),
+        }
+
+        // And a #882 client's own requests keep the same op names, with the new
+        // fields present only when they carry a value.
+        let json = serde_json::to_value(AttachRequest::AttachStream {
+            id: "a1".into(),
+            rows: None,
+            cols: None,
+            geometry_updates: false,
+        })
+        .unwrap();
+        assert_eq!(json["op"], "attach-stream");
+        assert!(
+            json.get("rows").is_none()
+                && json.get("cols").is_none()
+                && json.get("geometry_updates").is_none(),
+            "a non-participating attach must not appear on the wire at all, so a daemon \
+             predating #882 sees byte-for-byte what it saw before"
+        );
+
+        let json = serde_json::to_value(AttachRequest::AttachStream {
+            id: "a1".into(),
+            rows: Some(30),
+            cols: Some(100),
+            geometry_updates: false,
+        })
+        .unwrap();
+        assert_eq!(json["rows"], 30);
+        assert_eq!(json["cols"], 100);
+    }
+
+    /// PRD #882 — the mechanism the whole cross-version story rests on: this
+    /// enum does **not** set `deny_unknown_fields`, so a peer decodes a request
+    /// carrying fields it has never heard of and ignores them.
+    ///
+    /// That is what makes a NEW client safe against an OLD daemon. The daemon
+    /// drops the `viewport` on the attach and the `viewer` on the resize, answers
+    /// with neither a token nor an applied geometry, and the client falls back to
+    /// its own request — which is correct, because a daemon with no policy has
+    /// nothing to disagree with it about. Asserted rather than assumed, because
+    /// adding `deny_unknown_fields` to this enum later would turn every such
+    /// request into a hard protocol error and the failure would surface only
+    /// against a version nobody tests against day to day.
+    #[test]
+    fn unknown_fields_are_ignored_so_a_newer_client_degrades_against_an_older_daemon() {
+        let req: AttachRequest = serde_json::from_str(
+            r#"{"op":"resize","id":"a1","rows":40,"cols":120,"viewer":"v7","fieldFromTheFuture":true}"#,
+        )
+        .expect("a request carrying unknown fields must still decode");
+        match req {
+            AttachRequest::Resize { id, rows, cols, .. } => {
+                assert_eq!((id.as_str(), rows, cols), ("a1", 40, 120));
+            }
+            other => panic!("expected Resize, got {other:?}"),
+        }
+
+        let req: AttachRequest = serde_json::from_str(
+            r#"{"op":"attach-stream","id":"a1","rows":30,"cols":100,"fieldFromTheFuture":true}"#,
+        )
+        .expect("an attach carrying unknown fields must still decode");
+        assert!(matches!(req, AttachRequest::AttachStream { .. }));
+
+        let resp: AttachResponse = serde_json::from_str(r#"{"ok":true,"fieldFromTheFuture":true}"#)
+            .expect("a response carrying unknown fields must still decode");
+        assert!(resp.ok);
+    }
+
+    /// PRD #882 — an `AttachResponse` from a daemon that predates the policy
+    /// decodes with no viewer and no applied geometry, which is what tells a new
+    /// client to fall back to its own request.
+    #[test]
+    fn attach_response_without_882_fields_decodes_as_no_policy() {
+        let resp: AttachResponse = serde_json::from_str(r#"{"ok":true}"#).expect("decodes");
+        assert!(resp.ok);
+        assert_eq!(resp.viewer, None);
+        assert_eq!((resp.applied_rows, resp.applied_cols), (None, None));
+    }
+
+    /// PRD #882 — `KIND_GEOMETRY` payloads decode, and a malformed one is
+    /// dropped rather than half-read.
+    ///
+    /// The value decides how every subsequent byte is interpreted, so guessing
+    /// at a partial frame would mis-parse the agent's screen — the exact failure
+    /// PRD #104 exists to prevent. Ignoring it leaves the previous, known-good
+    /// geometry in place until the next push.
+    #[test]
+    fn geometry_frames_decode_or_are_dropped_whole() {
+        assert_eq!(
+            parse_geometry_frame(br#"{"rows":30,"cols":100}"#),
+            Some((30, 100))
+        );
+        for bad in [
+            &br#"{"rows":30}"#[..],
+            &br#"{"cols":100}"#[..],
+            &br#"{"rows":-1,"cols":100}"#[..],
+            &br#"{"rows":70000,"cols":100}"#[..],
+            &br#"not json at all"#[..],
+            &b""[..],
+        ] {
+            assert_eq!(
+                parse_geometry_frame(bad),
+                None,
+                "a geometry frame that does not fully decode must be dropped, not guessed at"
+            );
+        }
+    }
+
     #[test]
     fn resize_request_serde_round_trip() {
         // Wire shape must be `op = "resize"` (kebab-case) so existing
@@ -4292,6 +4690,7 @@ mod tests {
             id: "agent-7".into(),
             rows: 50,
             cols: 200,
+            viewer: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -4302,7 +4701,7 @@ mod tests {
 
         let back: AttachRequest = serde_json::from_str(&json).unwrap();
         match back {
-            AttachRequest::Resize { id, rows, cols } => {
+            AttachRequest::Resize { id, rows, cols, .. } => {
                 assert_eq!(id, "agent-7");
                 assert_eq!(rows, 50);
                 assert_eq!(cols, 200);
