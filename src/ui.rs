@@ -8132,6 +8132,54 @@ fn apply_rename_outcome(
     }
 }
 
+/// Mirror a `session.toml` pane name into the pane-keyed display maps, applying
+/// the SAME gate `PaneController::rename_pane` applies to that same string.
+///
+/// Issue #833 follow-through, found while auditing whether the two seams that
+/// issue names are the whole set. They are not: the four session-restore sites
+/// in `run_tui` each hand `SavedPane.name` to `rename_pane` and then inserted
+/// the RAW value into both maps regardless of what that call resolved.
+/// `rename_pane` routes through [`RenameOutcome::applied`] and answers
+/// `Rejected` — touching neither `Pane.name` nor the daemon record — for a name
+/// carrying control bytes, a bidi override, or more than
+/// [`crate::agent_pty::DISPLAY_NAME_MAX_LEN`] bytes. The raw insert then put
+/// exactly that refused name into `ui.pane_names`, from which the dashboard
+/// loop copies it into `ui.display_names` — the map `render_card_grid`
+/// PREFERS over the session's own `display_name`. So `session.toml` was a
+/// further writer of the winning card title, neither scrubbed nor gated,
+/// beside the hydration and rename writers #833 names. (`render_card_grid`'s
+/// own comment enumerates all of them, and the one residual.)
+///
+/// It is the M2.11 fixup-5 divergence — "the UI inserted the raw rename text
+/// verbatim and diverged from the controller" — surviving here because this
+/// path mirrors nothing. Routing through the same typed constructor
+/// `rename_pane` itself uses makes the maps agree with the controller by
+/// construction rather than by a second normalization that can drift:
+/// `Applied` stores the trimmed label, `Cleared` (a whitespace-only name) and
+/// `Rejected` store nothing and the card falls back to its agent-id default.
+///
+/// `pub` so `dashboard/pane/012` can drive the real mirror at render altitude
+/// rather than re-implementing its three arms in the test — the same reason
+/// this module already exposes its render seams.
+///
+/// Deliberately re-derives the outcome rather than consuming `rename_pane`'s
+/// return value: that call can fail transiently against the daemon (`Err`) on a
+/// name that is perfectly valid, and a restore should still show the user's own
+/// label locally when it does. `RenameOutcome::applied` is a pure function of
+/// the string, so re-deriving it cannot disagree with what the controller
+/// resolved.
+pub fn mirror_saved_pane_name(
+    pane_display_names: &mut HashMap<String, String>,
+    pane_names: &mut HashMap<String, String>,
+    pane_id: &str,
+    saved_name: &str,
+) {
+    if let RenameOutcome::Applied(label) = RenameOutcome::applied(saved_name) {
+        pane_display_names.insert(pane_id.to_string(), label.clone());
+        pane_names.insert(pane_id.to_string(), label);
+    }
+}
+
 fn handle_rename_key(
     key: KeyEvent,
     ui: &mut UiState,
@@ -12402,10 +12450,12 @@ pub fn run_tui(
                                 saved_pane.name
                             ));
                         }
-                        ui.pane_display_names
-                            .insert(new_id.clone(), saved_pane.name.clone());
-                        ui.pane_names
-                            .insert(new_id.clone(), saved_pane.name.clone());
+                        mirror_saved_pane_name(
+                            &mut ui.pane_display_names,
+                            &mut ui.pane_names,
+                            &new_id,
+                            &saved_pane.name,
+                        );
                     }
                     ui.pane_metadata.insert(new_id, saved_pane.clone());
                 }
@@ -12465,10 +12515,12 @@ pub fn run_tui(
                     state.blocking_write().register_pane(new_id.clone());
                     if !saved_pane.name.is_empty() {
                         let _ = pane.rename_pane(&new_id, &saved_pane.name);
-                        ui.pane_display_names
-                            .insert(new_id.clone(), saved_pane.name.clone());
-                        ui.pane_names
-                            .insert(new_id.clone(), saved_pane.name.clone());
+                        mirror_saved_pane_name(
+                            &mut ui.pane_display_names,
+                            &mut ui.pane_names,
+                            &new_id,
+                            &saved_pane.name,
+                        );
                     }
                     ui.pane_metadata.insert(new_id.clone(), saved_pane.clone());
                     // Issue #308: mirror the orchestration-restore insert above
@@ -12599,10 +12651,12 @@ pub fn run_tui(
                                     }
                                     if !saved_pane.name.is_empty() {
                                         let _ = pane.rename_pane(&fb_id, &saved_pane.name);
-                                        ui.pane_display_names
-                                            .insert(fb_id.clone(), saved_pane.name.clone());
-                                        ui.pane_names
-                                            .insert(fb_id.clone(), saved_pane.name.clone());
+                                        mirror_saved_pane_name(
+                                            &mut ui.pane_display_names,
+                                            &mut ui.pane_names,
+                                            &fb_id,
+                                            &saved_pane.name,
+                                        );
                                     }
                                     ui.pane_metadata.insert(fb_id, saved_pane.clone());
                                 }
@@ -12669,9 +12723,12 @@ pub fn run_tui(
                             }
                             if !saved_pane.name.is_empty() {
                                 let _ = pane.rename_pane(&fb_id, &saved_pane.name);
-                                ui.pane_display_names
-                                    .insert(fb_id.clone(), saved_pane.name.clone());
-                                ui.pane_names.insert(fb_id.clone(), saved_pane.name.clone());
+                                mirror_saved_pane_name(
+                                    &mut ui.pane_display_names,
+                                    &mut ui.pane_names,
+                                    &fb_id,
+                                    &saved_pane.name,
+                                );
                             }
                             ui.pane_metadata.insert(fb_id, saved_pane.clone());
                         }
@@ -15454,17 +15511,39 @@ fn render_card_grid(
             // `ui.display_names`) titled it correctly.
             //
             // Issue #833: this preference is why BOTH sources have to be
-            // defended, and defending the fallback alone was not enough. Every
-            // string that can reach this line is scrubbed or refused by the
-            // seam that WRITES it, never here:
+            // defended, and defending the fallback alone was not enough. Each
+            // string that reaches this line is scrubbed or refused by the seam
+            // that WRITES it, never here. Enumerated rather than asserted,
+            // because the first version of this comment claimed the winning map
+            // had two writers and it has four:
             //   - `ui.display_names` on hydration ← `daemon_client`'s
             //     `sanitize_record_tab_membership` at the `list_agents` wire
             //     boundary;
             //   - `ui.display_names` on rename ← `pane::RenameOutcome::applied`
             //     / `agent_pty::is_valid_display_name`, which REFUSES a bad
             //     name so the map keeps the label it had;
+            //   - `ui.pane_names` on a new-pane spawn ←
+            //     `agent_pty::resolve_display_name`, the same gate plus a
+            //     command/`"shell"` fallback; the dashboard loop copies that
+            //     map into this one;
+            //   - `ui.pane_names` on a `session.toml` restore ←
+            //     `mirror_saved_pane_name`, which re-derives the controller's
+            //     own `RenameOutcome` for the saved string;
             //   - `SessionState.display_name` ← `AppState::apply_event`'s
             //     `untrusted_text::sanitize_display_name` (issue #670).
+            // ONE residual, deliberately NOT closed: an orchestration role
+            // pane is titled from `role.name` in a project's
+            // `.dot-agent-deck.toml`, inserted raw on both the live and the
+            // restore path (the restore path re-resolves the config file rather
+            // than trusting the snapshot), so the map holds the raw role name
+            // while the daemon record and `Pane.name` hold what
+            // `resolve_display_name` made of it. Left as is because that file
+            // also supplies each role's `command` — reading it is already
+            // consent to EXECUTE what it names, so scrubbing its display
+            // strings would buy nothing a hostile config could not get more
+            // directly. Recorded here because the enumeration above must not
+            // read as though it covered every insert into these maps; it covers
+            // every PRODUCER-supplied string that reaches them.
             // Scrubbing at this seam instead would have to be repeated by every
             // future reader of these two fields, which is exactly how #833
             // happened: a second reader was added beside a sanitized one.
@@ -27663,6 +27742,74 @@ mod tests {
         assert!(
             !ui.display_names.contains_key("session-123"),
             "handler must not insert raw rename_text into display_names"
+        );
+    }
+
+    #[test]
+    fn mirror_saved_pane_name_gates_a_session_file_name() {
+        // Issue #833 follow-through. `session.toml` is a THIRD writer of the
+        // card title `render_card_grid` prefers: the restore sites hand
+        // `SavedPane.name` to `rename_pane` — which answers `Rejected` and
+        // stores nothing for a hostile name — and then used to insert the RAW
+        // value into `ui.pane_names` anyway, from which the dashboard loop
+        // copies it into `ui.display_names`. Same field, same map, same render
+        // seam as the two writers #833 names, and gated by neither.
+        let mut pane_display_names: HashMap<String, String> = HashMap::new();
+        let mut pane_names: HashMap<String, String> = HashMap::new();
+
+        // An ordinary name is stored, TRIMMED — matching what the controller
+        // put on `Pane.name` and queued for the daemon, rather than the padded
+        // bytes the file happened to hold.
+        mirror_saved_pane_name(
+            &mut pane_display_names,
+            &mut pane_names,
+            "1",
+            "  café-агент-日本語  ",
+        );
+        assert_eq!(
+            pane_display_names.get("1").map(String::as_str),
+            Some("café-агент-日本語")
+        );
+        assert_eq!(
+            pane_names.get("1").map(String::as_str),
+            Some("café-агент-日本語")
+        );
+
+        // Control bytes, and the bidi override the gate's byte-level test
+        // cannot see — swept, because one surviving override is all a spoof
+        // needs. Neither map may gain an entry, so the card falls back to its
+        // agent-id default exactly as it does for a refused live rename.
+        let mut hostile: Vec<String> = vec![
+            "\u{1b}[31mevil".to_string(),
+            "pane\u{0}name".to_string(),
+            "pane\u{7f}name".to_string(),
+            "   ".to_string(),
+            "a".repeat(crate::agent_pty::DISPLAY_NAME_MAX_LEN + 1),
+        ];
+        hostile.extend(
+            [
+                '\u{202a}', '\u{202b}', '\u{202c}', '\u{202d}', '\u{202e}', '\u{2066}', '\u{2067}',
+                '\u{2068}', '\u{2069}', '\u{200e}', '\u{200f}', '\u{061c}',
+            ]
+            .into_iter()
+            .map(|c| format!("worker{c}reganam")),
+        );
+        for (i, name) in hostile.iter().enumerate() {
+            let pane_id = format!("h{i}");
+            mirror_saved_pane_name(&mut pane_display_names, &mut pane_names, &pane_id, name);
+            assert!(
+                !pane_display_names.contains_key(&pane_id) && !pane_names.contains_key(&pane_id),
+                "a name `rename_pane` refuses must not reach the display maps \
+                 from `session.toml` either: {name:?}"
+            );
+        }
+
+        // And the valid entry above survived the sweep — the control that keeps
+        // this test from passing on a mirror that stores nothing at all.
+        assert_eq!(
+            pane_display_names.len(),
+            1,
+            "only the one valid name may be stored: {pane_display_names:?}"
         );
     }
 

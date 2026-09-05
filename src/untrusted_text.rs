@@ -33,18 +33,20 @@
 //! is the divergence between those two that let the bidi half be present on one
 //! untrusted path and absent on another.
 //!
-//! Issue #833 moved ONE field off that older filter: `AgentRecord.display_name`
-//! at the same `list_agents` boundary now goes through
-//! [`sanitize_display_name`] here, because it is the card title
+//! Issue #833 brought ONE field of that seam here — `AgentRecord.display_name`,
+//! which had no filter at all rather than the control-only one. It now goes
+//! through [`sanitize_display_name`], because it is the card title
 //! `ui::render_card_grid` prefers and the daemon-side gate that was supposed to
 //! keep it clean admitted bidi. The live-snapshot strings beside it —
 //! `last_user_prompt`, `first_prompts`, `active_tool` — still use
 //! `daemon_client`'s control-only filter, so that seam is now MIXED rather than
-//! uniformly control-only. Their live counterparts arriving on the hook socket
-//! are the ones this module covers: `tool_name` / `tool_detail` through
-//! [`sanitize_tool_text`], and the hook's `display_name` metadata through
-//! [`sanitize_display_name`]. `user_prompt` at that ingest is scrubbed on
-//! neither route and is not part of #833.
+//! uniformly control-only, and `cwd` on the same record has neither (see
+//! `daemon_client::sanitize_record_tab_membership`'s doc for that residual).
+//! Their live counterparts arriving on the hook socket are the ones this module
+//! covers: `tool_name` / `tool_detail` through [`sanitize_tool_text`], and the
+//! hook's `display_name` metadata through [`sanitize_display_name`].
+//! `user_prompt` at that ingest is scrubbed on neither route and is not part of
+//! #833.
 
 use crate::agent_pty::DISPLAY_NAME_MAX_LEN;
 use crate::prompt_delivery::truncate_on_char_boundary;
@@ -182,7 +184,22 @@ pub fn sanitize_display_name(raw: &str) -> Option<String> {
 /// reservation is made only when a cut is actually needed, so a name that
 /// exactly fills the ceiling is not marked as truncated for the sake of room it
 /// does not use.
+///
+/// Requires `max >= ELLIPSIS_LEN`; below that no output can both mark the cut
+/// and fit, and the `debug_assert!` in the body says so rather than returning
+/// an over-long marker.
 fn clamp_including_marker(s: &str, max: usize) -> String {
+    // The postcondition below genuinely does NOT hold for a `max` under
+    // `ELLIPSIS_LEN`: the marker alone is three bytes, so there is no output
+    // that both marks the cut and fits. `saturating_sub` would quietly return
+    // an over-long `"…"` there. Both callers pass a constant far above it
+    // (`DISPLAY_NAME_MAX_LEN` is 128, `MAX_TOOL_TEXT_BYTES` is 65536), so this
+    // pins the precondition rather than handling it — a future caller with a
+    // small budget wants `truncate_on_char_boundary` directly.
+    debug_assert!(
+        max >= ELLIPSIS_LEN,
+        "clamp_including_marker cannot fit its own cut marker in {max} bytes"
+    );
     if s.len() <= max {
         return s.to_string();
     }

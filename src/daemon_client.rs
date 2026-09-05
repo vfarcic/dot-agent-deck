@@ -241,12 +241,22 @@ fn clamp_bytes(mut s: String, max_bytes: usize) -> String {
 ///   This field is the card TITLE the TUI actually uses — hydration copies it
 ///   into `ui.pane_display_names`, the dashboard loop fills `ui.display_names`
 ///   from that, and `ui::render_card_grid` prefers that map over the session's
-///   own `display_name` — so it is the one string on this record whose scrub
-///   the render most depends on, and it was the one string here that had none.
-///   The daemon does gate it (`agent_pty::is_valid_display_name`), but that
-///   gate lives at the other end of the wire: a daemon too old to carry the
-///   gate's bidi half, or one not running this code at all, echoes whatever it
-///   stored. Same defense-in-depth argument as `tab_membership` above.
+///   own `display_name` — so it is the string on this record whose scrub the
+///   render most depends on. The daemon does gate it
+///   (`agent_pty::is_valid_display_name`), but that gate lives at the other end
+///   of the wire: a daemon too old to carry the gate's bidi half, or one not
+///   running this code at all, echoes whatever it stored. Same
+///   defense-in-depth argument as `tab_membership` above.
+///
+/// NOT scrubbed here, and this list is the whole of what is: `id` and
+/// `pane_id_env` (daemon-minted — `id` is a monotonic counter stringified) and
+/// **`cwd`**. That last one is a real residual rather than a safe omission: the
+/// dashboard renders its basename, and the only thing standing between a
+/// hostile value and a cell is the daemon-side `agent_pty::is_valid_cwd`, whose
+/// byte test admits a bidi override for exactly the reason
+/// `is_valid_display_name`'s did before issue #833 — `U+202E` is three bytes
+/// each above `0x20`. Deliberately out of scope for #833, which names two
+/// seams, and stated here rather than left for the next reader to rediscover.
 /// - `live` snapshot (PRD #162): control bytes are stripped from
 ///   `last_user_prompt`, every `first_prompts` entry, and `active_tool.name` /
 ///   `.detail`, and each of those strings is length-bounded to

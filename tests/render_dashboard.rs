@@ -16,11 +16,11 @@ use dot_agent_deck::state::{ActiveTool, AppState, DashboardStats, SessionState, 
 use dot_agent_deck::tab::Tab;
 use dot_agent_deck::terminal_widget::TerminalWidget;
 use dot_agent_deck::ui::{
-    CardDensityKind, UiMode, card_stats_border_label, render_card_for_mode_to_buffer,
-    render_card_grid_to_buffer, render_card_to_buffer, render_card_with_declared_agent_to_buffer,
-    render_config_gen_prompt_to_buffer, render_dashboard_cards_to_buffer,
-    render_quit_confirm_to_buffer, render_star_prompt_to_buffer, render_stats_bar_to_buffer,
-    render_stop_confirm_to_buffer, sync_and_derive_selection,
+    CardDensityKind, UiMode, card_stats_border_label, mirror_saved_pane_name,
+    render_card_for_mode_to_buffer, render_card_grid_to_buffer, render_card_to_buffer,
+    render_card_with_declared_agent_to_buffer, render_config_gen_prompt_to_buffer,
+    render_dashboard_cards_to_buffer, render_quit_confirm_to_buffer, render_star_prompt_to_buffer,
+    render_stats_bar_to_buffer, render_stop_confirm_to_buffer, sync_and_derive_selection,
 };
 use dot_agent_deck::untrusted_text::MAX_TOOL_TEXT_BYTES;
 use ratatui::layout::Rect;
@@ -2325,7 +2325,12 @@ fn pane_011_multibyte_session_id_renders_the_whole_deck() {
 /// posts a 400-character one. Render both cards between healthy neighbours: the
 /// names stored on the sessions must come back scrubbed and length-clamped, no
 /// planted character may reach a rendered cell anywhere in the deck, and each
-/// neighbouring card must still draw its own title and status badge.
+/// neighbouring card must still draw its own title and status badge. Then drive
+/// the two writers of `ui.display_names`, the title source that wins over the
+/// session's own name: a rename carrying a bidi override is refused so the card
+/// keeps the label it had, and a hostile name replayed from a saved
+/// `session.toml` is refused the same way, while an ordinary name still renames
+/// and still restores.
 #[spec("dashboard/pane/012")]
 #[test]
 fn pane_012_hostile_display_name_cannot_corrupt_the_card() {
@@ -2551,6 +2556,69 @@ fn pane_012_hostile_display_name_cannot_corrupt_the_card() {
                     !c.is_control() && !PLANTED.contains(&c),
                     "U+{:04X} reached cell ({x}, {y}) through ui.display_names — the \
                      title source that WINS over the session's own name:\n{rendered}",
+                    c as u32
+                );
+            }
+        }
+    }
+
+    // --- the THIRD writer of that map: a restored `session.toml` ------------
+    // Found by auditing whether the two writers #833 names are the whole set.
+    // They are not. The four session-restore sites in `run_tui` replay
+    // `SavedPane.name` through `PaneController::rename_pane` — which resolves
+    // the SAME `RenameOutcome` asserted above and stores nothing on a
+    // `Rejected` — and then inserted the RAW saved string into `ui.pane_names`
+    // regardless, from which the dashboard loop copies it into
+    // `ui.display_names`. Same field, same winning map, same render seam, and
+    // gated by neither. `mirror_saved_pane_name` is now the one way that
+    // mirror happens, so what the controller refuses cannot enter the map from
+    // a file either.
+    let mut pane_display_names: HashMap<String, String> = HashMap::new();
+    let mut pane_names: HashMap<String, String> = HashMap::new();
+    mirror_saved_pane_name(&mut pane_display_names, &mut pane_names, "2", HOSTILE_NAME);
+    mirror_saved_pane_name(&mut pane_display_names, &mut pane_names, "3", BIDI_RENAME);
+    assert!(
+        pane_names.is_empty() && pane_display_names.is_empty(),
+        "a saved name the controller refuses must not reach the display maps: \
+         {pane_names:?}"
+    );
+    // A legitimate saved name still restores, trimmed to exactly what the
+    // controller put on `Pane.name` — the control without which the two
+    // assertions above would pass on a mirror that stores nothing at all.
+    mirror_saved_pane_name(
+        &mut pane_display_names,
+        &mut pane_names,
+        "2",
+        "  example-beta  ",
+    );
+    assert_eq!(
+        pane_names.get("2").map(String::as_str),
+        Some("example-beta")
+    );
+
+    // Render altitude: the dashboard loop copies `ui.pane_names` into
+    // `ui.display_names`, so a card whose saved name was refused falls back to
+    // the session's own scrubbed name and no cell carries a planted character.
+    let restored: [(&SessionState, Option<&str>); 4] = [
+        (&healthy_a, None),
+        (&hostile, pane_names.get("2").map(String::as_str)),
+        (&overlong, pane_names.get("3").map(String::as_str)),
+        (&healthy_b, None),
+    ];
+    let (buffer, _) = render_card_grid_to_buffer(&restored, Some(0), 0, 80, 40);
+    let rendered = buffer_to_text(&buffer);
+    assert!(
+        rendered.contains("example-beta"),
+        "a legitimate saved name must still title its restored card:\n{rendered}"
+    );
+    let area = *buffer.area();
+    for y in 0..area.height {
+        for x in 0..area.width {
+            for c in buffer[(x, y)].symbol().chars() {
+                assert!(
+                    !c.is_control() && !PLANTED.contains(&c),
+                    "U+{:04X} reached cell ({x}, {y}) through a restored \
+                     `session.toml` name:\n{rendered}",
                     c as u32
                 );
             }

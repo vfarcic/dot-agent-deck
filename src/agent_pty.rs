@@ -262,9 +262,14 @@ pub const CWD_MAX_LEN: usize = 4096;
 /// to keep exactly this class of character off the rendered title.
 /// `char::is_control` does not catch it either — it is general category `Cf`,
 /// not `Cc` — and a terminal honours it, visually reversing the text that
-/// follows. Every caller here gates a string that ends up in a rendered pane
-/// title, card title, tab label or role name, so the clause is right for all
-/// of them.
+/// follows. Nearly every caller gates a string that ends up in a rendered pane
+/// title, card title, tab label or role name, so the clause is what those
+/// callers wanted all along. The one caller that does not is
+/// [`validate_tab_membership`]'s check on `orchestration_id`, a ROUTING key
+/// that is echoed and logged rather than drawn; the clause is still safe there
+/// because [`mint_orchestration_id`] emits `orch-{hex}-{seq}`, pure ASCII, so
+/// no token this deck mints can be refused by it (pinned by
+/// `mint_orchestration_id_is_unique_and_wire_valid`).
 ///
 /// This is a GATE, not a sanitizer: a failing value is REJECTED whole (the
 /// caller keeps the name it had, or stores `None`), because every caller is
