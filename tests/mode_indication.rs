@@ -1144,6 +1144,20 @@ fn mode_scroll_006_alternate_screen_pane_is_unreachable_not_empty() {
         observed.bytes_fed_since_spawn >= minimum,
         "the alternate-screen pane must still be mature, or this proves nothing: {observed:?}"
     );
+    // Greptile P2 on PR #897, and correct: without this the case is VACUOUS.
+    // The whole point is that the depth probe reads zero *because* vt100 answers
+    // it from the alternate grid. If `ESC[?1049h` ever stopped activating that
+    // grid -- a vt100 change, or a typo in the constant -- this case would
+    // silently degrade into a second copy of the normal-screen control and keep
+    // passing, while exercising none of `facts.alternate_screen`. Pin the
+    // precondition so that failure is loud instead.
+    assert_eq!(
+        observed.scrollback_depth, 0,
+        "precondition: the alternate grid must be the one answering the depth probe, \
+         or this case silently degrades into the normal-screen control and tests nothing. \
+         The control measured {} on the same bytes: {observed:?}",
+        normal.scrollback_depth
+    );
     assert!(
         !observed.notice_visible,
         "an alternate-screen pane's history is UNREACHABLE, not absent -- the notice states \
