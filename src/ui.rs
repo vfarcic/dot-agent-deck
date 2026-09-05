@@ -625,10 +625,11 @@ Collect these fields:
 - prompt: the prompt text to deliver on each fire.
 - new_tab_per_fire: true to open a fresh tab every fire, false (default) to reuse one tab.
 - enabled: true (default) or false.
+- shape: OPTIONAL. Omit it and the fire's shape comes from working_dir's config — which means a working_dir defining [[orchestrations]] fires the WHOLE TEAM and ignores `command`. Pass \"single\" to force ONE agent running `command` in that directory anyway (the usual want when the schedule drives a project skill and just needs the repo as its cwd), \"orchestration\" for that directory's default team, or \"orchestration:<name>\" for a named one. ASK when working_dir defines orchestrations and the user described a single-agent job.
 
 Rules:
 - NEVER edit the TOML file directly. ALWAYS write via the validated CLI, which checks the cron, expands paths, and writes the global config atomically:
-  dot-agent-deck schedule add --name <name> --cron <cron> --working-dir <dir> --command <cmd> --prompt <text> [--new-tab-per-fire <true|false>] [--enabled <true|false>]
+  dot-agent-deck schedule add --name <name> --cron <cron> --working-dir <dir> --command <cmd> --prompt <text> [--new-tab-per-fire <true|false>] [--enabled <true|false>] [--shape <single|orchestration|orchestration:NAME>]
 - The user can TEST the prompt in THIS session before committing — offer to run it now and show them the result (\"run it now, show me\").
 - CONFIRM the full entry (every field) with the user before you call `schedule add`.
 - AFTER `schedule add` succeeds, tell the user this authoring pane existed ONLY to create the schedule and can be closed now — when the schedule fires, a single-agent run surfaces live in its own pane on the deck, while an orchestration-targeted run appears in its tab when the deck is (re)opened.";
@@ -814,6 +815,7 @@ fn build_schedule_authoring_mode(
                  - prompt: {prompt}\n\
                  - new_tab_per_fire: {ntpf}\n\
                  - enabled: {enabled}\n\
+                 - shape: {shape}\n\
                  Start from these values and write changes with \
                  `dot-agent-deck schedule update --name {name} ...` (NOT `add`). \
                  RENAME IS FORBIDDEN — the name {name:?} is fixed (it is the reuse-tab key); \
@@ -828,6 +830,14 @@ fn build_schedule_authoring_mode(
                 prompt = t.prompt,
                 ntpf = t.new_tab_per_fire,
                 enabled = t.enabled,
+                // Issue #835: spelled out rather than blank when unset — the
+                // absence is the surprising state (a config-derived fire in a
+                // repo with `[[orchestrations]]` ignores `command`), so an
+                // editing agent has to be able to see it and offer `--shape`.
+                shape = t
+                    .shape
+                    .as_deref()
+                    .unwrap_or("(unset — derived from working_dir's config)"),
             )
         }
     };
@@ -22340,6 +22350,7 @@ pub fn render_new_pane_form_schedule_to_buffer(
         prompt: "digest prompt".to_string(),
         new_tab_per_fire: false,
         enabled: true,
+        shape: None,
         issue_dispatch: None,
     });
     let form = NewPaneFormState::new_schedule_locked(
@@ -31744,6 +31755,7 @@ mod tests {
             prompt: format!("{name}-prompt-marker"),
             new_tab_per_fire: false,
             enabled,
+            shape: None,
             issue_dispatch: None,
         }
     }

@@ -838,6 +838,7 @@ mod tests {
             prompt: "p".to_string(),
             new_tab_per_fire: false,
             enabled,
+            shape: None,
             issue_dispatch: None,
         };
 
@@ -932,6 +933,7 @@ mod tests {
             prompt: "p".to_string(),
             new_tab_per_fire: false,
             enabled: true,
+            shape: None,
             issue_dispatch: None,
         };
         let noop: Callback = Arc::new(|| Box::pin(async {}));

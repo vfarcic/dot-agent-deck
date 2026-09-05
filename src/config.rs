@@ -571,6 +571,29 @@ pub struct ScheduledTask {
     /// Whether the daemon registers and fires this task. Default true.
     #[serde(default = "default_enabled")]
     pub enabled: bool,
+    /// Issue #835: the fire's SPAWN SHAPE, overriding what `working_dir`'s config
+    /// would imply. `None` (the default, and every pre-#835 task) derives the
+    /// shape from that dir's config exactly as before.
+    ///
+    /// Accepted values are [`crate::spawn::SpawnShapeOverride`]'s vocabulary,
+    /// mirroring `dispatch --single` / `--orchestration <name>`:
+    /// `"single"`, `"orchestration"`, `"orchestration:<name>"`. Validated at LOAD
+    /// (see [`validate_task`]) so a hand-edited typo is a load error naming the
+    /// task rather than a surprise on the next cron tick.
+    ///
+    /// Exists because the shape was previously derivable ONLY from the target
+    /// dir, so a schedule pointed at a repo defining `[[orchestrations]]` fired a
+    /// full team and silently ignored its own `command` — there was no way to say
+    /// "fire one agent HERE", in the repo whose skills and git remote the task
+    /// needs.
+    ///
+    /// Mutually exclusive with `issue_dispatch`: that task type resolves a shape
+    /// per CLONED repo, so a task-level shape has nothing to apply to. The
+    /// combination is REJECTED at load rather than ignored, matching how a
+    /// malformed `repo` is handled — silently ignoring a field the author wrote
+    /// is the defect class this whole field exists to remove.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shape: Option<String>,
     /// PRD #120: when present, this is an `issue_dispatch` task — on fire it
     /// enumerates open issues for `issue_dispatch.repo` and dispatches an agent
     /// per issue, reusing `prompt` as the per-issue template (the
@@ -736,6 +759,20 @@ impl LoadedSchedules {
 /// seam (PRD #126) and the entry is skipped, without blocking valid siblings or
 /// crashing the daemon.
 fn validate_task(task: ScheduledTask, index: usize) -> Result<ScheduledTask, ScheduleLoadError> {
+    // Issue #835: validate the `shape` STRING here, next to the issue-dispatch
+    // slug check and for the same reason — it arrives from hand-edited TOML and
+    // is re-read unattended by the daemon on every fire, so a typo must be a load
+    // error naming the task rather than a surprise cron tick. The parse is the
+    // one shared with `dispatch` and the CLI, so a value any door accepts is a
+    // value every door accepts.
+    if let Some(raw) = &task.shape
+        && let Err(message) = crate::spawn::SpawnShapeOverride::parse(raw)
+    {
+        return Err(ScheduleLoadError {
+            entry: Some(index),
+            message: format!("scheduled task {:?}: {message}", task.name),
+        });
+    }
     // PRD #120: an issue-dispatch task has no top-level `command` — the per-issue
     // spawn derives its command from each cloned repo's `.dot-agent-deck.toml`
     // (orchestration roles, or the single-agent default). Only the #127
@@ -754,6 +791,22 @@ fn validate_task(task: ScheduledTask, index: usize) -> Result<ScheduledTask, Sch
             return Err(ScheduleLoadError {
                 entry: Some(index),
                 message: format!("scheduled task {:?}: {message}", task.name),
+            });
+        }
+        // Issue #835: `shape` has nothing to apply to on an issue-dispatch task —
+        // that type resolves a shape per CLONED repo, from that clone's own
+        // config. Reject the combination rather than ignoring the field, matching
+        // how a malformed `repo` is handled: a silently-ignored field the author
+        // deliberately wrote is exactly the defect #835 is about.
+        if task.shape.is_some() {
+            return Err(ScheduleLoadError {
+                entry: Some(index),
+                message: format!(
+                    "scheduled task {:?}: `shape` cannot be combined with \
+                     `issue_dispatch` (an issue-dispatch task resolves a shape per \
+                     cloned repo, from that repo's own config); remove one of them",
+                    task.name
+                ),
             });
         }
         return Ok(expand_task(task));
@@ -2398,6 +2451,190 @@ repo = "vfarcic/dot-ai"
         assert_eq!(
             disp.max_per_run, 3,
             "omitted max_per_run must default to 3 (matches changelog)"
+        );
+    }
+
+    // Issue #835 — a `shape` scalar round-trips through the file and is carried
+    // on the loaded task. The field sits BEFORE `issue_dispatch` in the struct
+    // precisely so it serializes ahead of any sub-table; this asserts the value
+    // survives a load, and `shape_round_trips_alongside_an_issue_dispatch_sibling`
+    // below covers the ordering half.
+    #[test]
+    fn shape_round_trips_from_the_file() {
+        for (raw, label) in [
+            ("single", "single"),
+            ("orchestration", "bare orchestration"),
+            ("orchestration:review", "named orchestration"),
+        ] {
+            let toml_str = format!(
+                r#"
+[[scheduled_tasks]]
+name = "sweep"
+cron = "0 9 * * *"
+working_dir = "/work"
+command = "claude"
+prompt = "go"
+shape = "{raw}"
+"#
+            );
+            let loaded = LoadedSchedules::parse(&toml_str);
+            assert!(
+                loaded.errors.is_empty(),
+                "{label}: errors: {:?}",
+                loaded.errors
+            );
+            assert_eq!(
+                loaded.tasks[0].shape.as_deref(),
+                Some(raw),
+                "{label}: shape must survive the load verbatim"
+            );
+        }
+    }
+
+    // Issue #835 — omitting `shape` leaves it `None`, which is what keeps every
+    // pre-#835 schedule byte-identical in behaviour (the daemon skips the whole
+    // override path when it is absent).
+    #[test]
+    fn shape_absent_means_config_derived() {
+        let toml_str = r#"
+[[scheduled_tasks]]
+name = "sweep"
+cron = "0 9 * * *"
+working_dir = "/work"
+command = "claude"
+prompt = "go"
+"#;
+        let loaded = LoadedSchedules::parse(toml_str);
+        assert!(loaded.errors.is_empty(), "errors: {:?}", loaded.errors);
+        assert!(
+            loaded.tasks[0].shape.is_none(),
+            "an omitted `shape` must stay None, not default to a value"
+        );
+    }
+
+    // Issue #835 — a typo'd `shape` is a LOAD error naming the task, not a
+    // surprise on the next cron tick. The entry is skipped (never fired with some
+    // other shape) and the error names both the bad value and the vocabulary.
+    #[test]
+    fn shape_rejects_an_unknown_value_at_load() {
+        for bad in ["team", "Single", "orchestration:", "orchestrations:x", ""] {
+            let toml_str = format!(
+                r#"
+[[scheduled_tasks]]
+name = "typo"
+cron = "0 9 * * *"
+working_dir = "/work"
+command = "claude"
+prompt = "go"
+shape = "{bad}"
+"#
+            );
+            let loaded = LoadedSchedules::parse(&toml_str);
+            assert!(
+                loaded.tasks.is_empty(),
+                "shape {bad:?} must not produce a loadable task"
+            );
+            let joined = loaded
+                .errors
+                .iter()
+                .map(|e| e.message.clone())
+                .collect::<Vec<_>>()
+                .join(" | ");
+            assert!(
+                joined.contains("typo") && joined.to_lowercase().contains("shape"),
+                "shape {bad:?}: the error must name the task and the field, got {joined:?}"
+            );
+        }
+    }
+
+    // Issue #835 — `shape` alongside `issue_dispatch` is REJECTED rather than
+    // ignored. That task type resolves a shape per cloned repo, so a task-level
+    // one has nothing to apply to, and silently dropping a field the author wrote
+    // is the exact defect class #835 exists to remove.
+    #[test]
+    fn shape_is_rejected_alongside_issue_dispatch() {
+        let toml_str = r#"
+[[scheduled_tasks]]
+name = "issues"
+cron = "0 9 * * *"
+working_dir = "/work"
+prompt = "issue {{issue_number}}"
+shape = "single"
+
+[scheduled_tasks.issue_dispatch]
+repo = "vfarcic/dot-ai"
+"#;
+        let loaded = LoadedSchedules::parse(toml_str);
+        assert!(
+            loaded.tasks.is_empty(),
+            "the shape + issue_dispatch combination must not load"
+        );
+        let joined = loaded
+            .errors
+            .iter()
+            .map(|e| e.message.clone())
+            .collect::<Vec<_>>()
+            .join(" | ");
+        assert!(
+            joined.contains("shape") && joined.contains("issue_dispatch"),
+            "the error must name both fields so the author knows which to drop, got {joined:?}"
+        );
+    }
+
+    // Issue #835 — the ordering half of the round-trip: `shape` is a SCALAR and
+    // `issue_dispatch` serializes as a `[scheduled_tasks.issue_dispatch]`
+    // sub-table, so a scalar emitted after that table would land inside it and
+    // fail to re-load. Serialize a list holding both task kinds and read it back.
+    #[test]
+    fn shape_round_trips_alongside_an_issue_dispatch_sibling() {
+        let tasks = vec![
+            ScheduledTask {
+                name: "sweep".to_string(),
+                cron: "0 9 * * *".to_string(),
+                working_dir: "/work".to_string(),
+                command: Some("claude".to_string()),
+                prompt: "go".to_string(),
+                new_tab_per_fire: false,
+                enabled: true,
+                shape: Some("single".to_string()),
+                issue_dispatch: None,
+            },
+            ScheduledTask {
+                name: "issues".to_string(),
+                cron: "0 10 * * *".to_string(),
+                working_dir: "/work".to_string(),
+                command: None,
+                prompt: "issue {{issue_number}}".to_string(),
+                new_tab_per_fire: false,
+                enabled: true,
+                shape: None,
+                issue_dispatch: Some(IssueDispatchConfig {
+                    repo: "vfarcic/dot-ai".to_string(),
+                    max_per_run: 3,
+                    label: None,
+                    query: None,
+                }),
+            },
+        ];
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("schedules.toml");
+        crate::schedule_cli::write_atomic(&path, &tasks).expect("write schedules");
+        let loaded = LoadedSchedules::load_from(&path);
+        assert!(loaded.errors.is_empty(), "errors: {:?}", loaded.errors);
+        assert_eq!(
+            loaded.tasks.len(),
+            2,
+            "both tasks must survive the round-trip"
+        );
+        assert_eq!(loaded.tasks[0].shape.as_deref(), Some("single"));
+        assert!(loaded.tasks[1].shape.is_none());
+        assert_eq!(
+            loaded.tasks[1]
+                .issue_dispatch
+                .as_ref()
+                .expect("sibling keeps its issue_dispatch table")
+                .repo,
+            "vfarcic/dot-ai"
         );
     }
 

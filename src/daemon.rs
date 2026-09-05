@@ -898,18 +898,26 @@ fn make_schedule_callback(
         working_dir: task.working_dir.clone(),
         command: task.command.clone(),
         prompt: task.prompt.clone(),
-        // `None`: a scheduled task's shape still comes from its working dir's
-        // config. The PRD #220 selector is a `dispatch`-only surface.
+        // `None` here even when the task DOES carry a `shape` (issue #835): the
+        // target is resolved per fire, inside the callback below, not once at
+        // registration. See the resolution block there for why.
         resolved_target: None,
         // Unchanged behaviour: the prompt is delivered verbatim. Giving this path
         // the orchestrator context is #222's work, not this PR's.
         compose_orchestrator_context: false,
     };
     let new_tab_per_fire = task.new_tab_per_fire;
+    // Issue #835: the task's declared spawn shape, `None` for every task that does
+    // not set one. Parsed at LOAD (`config::validate_task`), so an entry that
+    // reaches here carries a value this re-parse cannot reject — but it is
+    // re-parsed rather than stored as a `SpawnShapeOverride` so `ScheduledTask`
+    // stays a plain serde struct with no spawn-layer type in it.
+    let shape = task.shape.clone();
     Arc::new(move || {
         let registry = registry.clone();
         let reuse = reuse.clone();
-        let req = req.clone();
+        let mut req = req.clone();
+        let shape = shape.clone();
         // PRD #127 finding #2: hand the daemon-wide hook-event broadcast to the
         // fire so a fresh single-agent card surfaces LIVE to an already-attached
         // TUI (see `crate::spawn::surface_spawned_pane`).
@@ -917,6 +925,53 @@ fn make_schedule_callback(
         let state = state.clone();
         Box::pin(async move {
             let notifier = crate::scheduler::StderrNotifier;
+            // Issue #835: resolve the declared shape against the target dir's
+            // config AS IT STANDS NOW.
+            //
+            // At fire time, not at registration: a schedule is authored once and
+            // fires for months, and `working_dir`'s `.dot-agent-deck.toml` can gain,
+            // rename or drop an orchestration in between. Resolving at registration
+            // would pin the answer to whatever the config said when the daemon last
+            // reloaded. (`dispatch` resolves caller-side for the opposite reason —
+            // its worktree's config is a HEAD checkout that differs from the
+            // caller's; a schedule has no such split, it simply targets a directory.)
+            //
+            // A shape that cannot be resolved ABANDONS the fire through the same
+            // `Notifier` seam every other fire failure uses. It must never fall back
+            // to the config-derived target: silently spawning a shape other than the
+            // one the author wrote is precisely the defect this field removes, and a
+            // fallback here would reproduce it with extra steps.
+            if let Some(raw) = shape.as_deref() {
+                // Scoped: the trait is needed only for this `notify` call, and the
+                // module deliberately imports `Scheduler` alone.
+                use crate::scheduler::Notifier as _;
+
+                let dir = Path::new(&req.working_dir);
+                let resolved = crate::spawn::SpawnShapeOverride::parse(raw).and_then(|over| {
+                    crate::spawn::decide_target_with_override(
+                        crate::spawn::load_config_for_dir(dir).as_ref(),
+                        dir,
+                        req.command.as_deref(),
+                        Some(&over),
+                    )
+                });
+                match resolved {
+                    Ok(target) => req.resolved_target = Some(target),
+                    Err(message) => {
+                        let message = format!("shape {raw:?}: {message}");
+                        warn!(
+                            task = %req.task_name,
+                            dir = %req.working_dir,
+                            "scheduled fire abandoned: {message}"
+                        );
+                        notifier.notify(crate::scheduler::NotifyEvent::SpawnFailed {
+                            task: req.task_name.clone(),
+                            message,
+                        });
+                        return;
+                    }
+                }
+            }
             let debounce = crate::spawn::reuse_debounce();
             if let Err(e) = crate::spawn::spawn_or_reuse(
                 req,

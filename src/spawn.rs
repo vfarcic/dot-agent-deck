@@ -255,6 +255,52 @@ pub enum SpawnShapeOverride {
     Orchestration(Option<String>),
 }
 
+/// The `shape` STRING vocabulary, shared by every door that can set one.
+///
+/// Issue #835 gives `[[scheduled_tasks]]` a `shape` field, so the same three
+/// words now arrive from three places — a hand-edited `schedules.toml`, `schedule
+/// add --shape`, and `schedule update --shape` — and are re-read by the daemon at
+/// fire time. One parser for all four so a value the CLI accepts can never be a
+/// value the loader rejects (or, worse, one the fire silently reinterprets).
+///
+/// Deliberately NOT a `serde` enum on the config field: the stored form has to
+/// round-trip as a plain TOML scalar (`shape = "orchestration:review"`), and the
+/// name half is free-form, so the parse is a string split rather than a variant
+/// match. The field is validated at LOAD (see
+/// [`crate::config::validate_task`]) so a typo is a load error naming the task,
+/// not a surprise on the next cron tick.
+impl SpawnShapeOverride {
+    /// Accepted forms: `single`, `orchestration`, `orchestration:<name>`.
+    ///
+    /// `Err` carries a message that names the offending value AND lists the
+    /// accepted vocabulary, because every caller of this surfaces it to a human
+    /// (a CLI error, a load error, or a fire-failure notification).
+    pub fn parse(raw: &str) -> Result<Self, String> {
+        let trimmed = raw.trim();
+        match trimmed {
+            "single" => Ok(Self::SingleAgent),
+            "orchestration" => Ok(Self::Orchestration(None)),
+            other => match other.strip_prefix("orchestration:") {
+                // A named orchestration. The name is NOT validated here — whether
+                // the target dir defines it is a fire-time question against that
+                // dir's config, which can change between authoring and the next
+                // fire. Only the empty name is rejected, since
+                // `orchestration:` reads as a typo for `orchestration` and would
+                // otherwise search for an orchestration literally named "".
+                Some(name) if !name.trim().is_empty() => {
+                    Ok(Self::Orchestration(Some(name.trim().to_string())))
+                }
+                Some(_) => Err(format!(
+                    "invalid shape {raw:?}: `orchestration:` needs a name after the colon (or use bare `orchestration` for the directory's default)"
+                )),
+                None => Err(format!(
+                    "invalid shape {raw:?}: expected `single`, `orchestration`, or `orchestration:<name>`"
+                )),
+            },
+        }
+    }
+}
+
 /// [`decide_target`], with an optional caller override (PRD #220).
 ///
 /// `Err` only for an override naming an orchestration the dir does not define —
@@ -4944,6 +4990,117 @@ mod tests {
 
     fn parse_config(toml: &str) -> ProjectConfig {
         toml::from_str(toml).expect("parse project config")
+    }
+
+    // Issue #835 — the `shape` STRING vocabulary. One parser serves the config
+    // loader, both CLI write doors and the daemon's fire-time resolve, so these
+    // cases pin what every one of them accepts.
+    #[test]
+    fn shape_parse_accepts_the_three_documented_forms() {
+        assert_eq!(
+            SpawnShapeOverride::parse("single").unwrap(),
+            SpawnShapeOverride::SingleAgent
+        );
+        assert_eq!(
+            SpawnShapeOverride::parse("orchestration").unwrap(),
+            SpawnShapeOverride::Orchestration(None)
+        );
+        assert_eq!(
+            SpawnShapeOverride::parse("orchestration:review").unwrap(),
+            SpawnShapeOverride::Orchestration(Some("review".to_string()))
+        );
+    }
+
+    // Surrounding whitespace is tolerated on both the value and the name, since
+    // it arrives from hand-edited TOML and a shell quoting a `--shape` argument.
+    #[test]
+    fn shape_parse_trims_surrounding_whitespace() {
+        assert_eq!(
+            SpawnShapeOverride::parse("  single  ").unwrap(),
+            SpawnShapeOverride::SingleAgent
+        );
+        assert_eq!(
+            SpawnShapeOverride::parse("orchestration:  review ").unwrap(),
+            SpawnShapeOverride::Orchestration(Some("review".to_string()))
+        );
+    }
+
+    // Anything else is an ERROR, never a silent "use the default" — the whole
+    // point of the field is that a shape the author wrote is the shape that
+    // fires. The message names the offending value and lists the vocabulary,
+    // because all three callers surface it to a human.
+    #[test]
+    fn shape_parse_rejects_everything_else() {
+        for bad in [
+            "",
+            "   ",
+            "Single",
+            "SINGLE",
+            "team",
+            "orchestration:",
+            "orchestration:   ",
+            "orchestrations",
+            "orchestration review",
+            "dispatcher",
+        ] {
+            let err = match SpawnShapeOverride::parse(bad) {
+                Ok(v) => panic!("shape {bad:?} must be rejected, got {v:?}"),
+                Err(e) => e,
+            };
+            assert!(
+                err.contains("shape"),
+                "error for {bad:?} must name the field, got {err:?}"
+            );
+            assert!(
+                err.contains("single") || err.contains("name after the colon"),
+                "error for {bad:?} must state what IS accepted, got {err:?}"
+            );
+            // These messages are printed straight to a terminal by `schedule
+            // add`/`update` and into the daemon log by a failed fire. A `\`
+            // line-continuation in the literal survived `cargo fmt` as a run of
+            // real spaces once already, so pin the rendered shape rather than
+            // trusting the source to keep its own indentation out of the string.
+            // Checked only for inputs that carry no run of spaces themselves —
+            // the message echoes the offending value, so `"   "` would otherwise
+            // fail on the user's own text rather than on the literal.
+            if !bad.contains("  ") {
+                assert!(
+                    !err.contains("  "),
+                    "error for {bad:?} must not carry source indentation, got {err:?}"
+                );
+            }
+        }
+    }
+
+    // A parsed shape drives the SAME resolver `dispatch` uses, so the end-to-end
+    // property the scheduler relies on is: `single` beats a dir that defines
+    // orchestrations, rather than merely parsing.
+    #[test]
+    fn shape_parse_single_then_resolve_beats_a_dir_defining_orchestrations() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join(".dot-agent-deck.toml"),
+            "[[orchestrations]]\nname = \"team\"\n\n\
+             [[orchestrations.roles]]\nname = \"orchestrator\"\ncommand = \"cat\"\nstart = true\n",
+        )
+        .expect("write config");
+        let cfg = load_config_for_dir(dir.path());
+        assert!(
+            matches!(
+                decide_target(cfg.as_ref(), dir.path(), Some("mycmd")),
+                SpawnTarget::Orchestration { .. }
+            ),
+            "precondition: with no shape this dir derives an orchestration"
+        );
+        let over = SpawnShapeOverride::parse("single").expect("parse single");
+        assert_eq!(
+            decide_target_with_override(cfg.as_ref(), dir.path(), Some("mycmd"), Some(&over))
+                .expect("single always resolves"),
+            SpawnTarget::SingleAgent {
+                command: Some("mycmd".to_string())
+            },
+            "`single` must win over the dir's orchestrations AND carry the command"
+        );
     }
 
     #[test]
