@@ -1,3 +1,4 @@
+mod appearance;
 mod daemon_bridge;
 mod dto;
 mod settings;
@@ -1074,6 +1075,11 @@ async fn desktop_run_action(
 pub fn run() {
     let app = tauri::Builder::default()
         .manage(DesktopState::default())
+        // Issue #845: the stored Light/Dark choice reaches the document root
+        // before the webview parses the document, so the first painted frame is
+        // already the one the user chose. Registered before `build()`, which is
+        // what puts it in the plugin store ahead of the config-declared window.
+        .plugin(appearance::init())
         .invoke_handler(tauri::generate_handler![
             desktop_get_snapshot,
             desktop_bootstrap,

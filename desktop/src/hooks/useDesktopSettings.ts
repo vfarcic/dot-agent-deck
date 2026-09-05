@@ -20,6 +20,20 @@ export interface DesktopSettingsState {
   path?: string;
   /** False until the first load resolves, so the UI can avoid claiming a value it has not read. */
   loaded: boolean;
+  /**
+   * Whether `settings` holds a document somebody actually has — read from disk,
+   * or changed in this session — rather than the placeholder this hook seeds
+   * itself with. False only between mount and the first read settling.
+   *
+   * Distinct from `loaded`, and issue #845 is why. `loaded` answers "has the
+   * disk replied"; a consumer that writes to global chrome needs "is this mode
+   * one somebody chose", which is also true of a choice made *while* the read
+   * is still in flight. Gating such a consumer on `loaded` alone would leave
+   * that click unapplied until the read lands, which is the no-restart
+   * requirement PRD #743 puts on the appearance choice, and would defeat the
+   * `edited` guard below that exists for exactly this race.
+   */
+  chosen: boolean;
   /** Set when the last save failed. The change stays applied for this session. */
   saveError?: string;
   save: (next: DesktopSettingsDto) => void;
@@ -97,5 +111,9 @@ export function useDesktopSettings(runtime: DeckRuntimeState): DesktopSettingsSt
       }));
   }, [saveSettings]);
 
-  return { settings, path, loaded, saveError, save };
+  // `edited` is a ref, and this reads it during render — safe here, and only
+  // here, because it is monotonic (false to true, never back) and every write
+  // to it is paired with a `setSettings` in the same call, so the render that
+  // observes the new value is one React was already going to perform.
+  return { settings, path, loaded, chosen: loaded || edited.current, saveError, save };
 }
