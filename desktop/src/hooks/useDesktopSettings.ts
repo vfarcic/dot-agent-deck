@@ -23,7 +23,8 @@ export interface DesktopSettingsState {
   /**
    * Whether `settings` holds a document somebody actually has — read from disk,
    * or changed in this session — rather than the placeholder this hook seeds
-   * itself with. False only between mount and the first read settling.
+   * itself with. False from mount until one of those two happens, which on a
+   * failed read and no interaction is for the life of the hook.
    *
    * Distinct from `loaded`, and issue #845 is why. `loaded` answers "has the
    * read settled"; a consumer that writes to global chrome needs "is this mode

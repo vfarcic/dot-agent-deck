@@ -61,11 +61,11 @@ const THEME_ATTRIBUTE: &str = "data-theme";
 /// body. An unrecognised token in `desktop.toml` never becomes one either:
 /// `AppearanceMode`'s deserializer maps it to the default.
 ///
-/// The script tolerates being run before `<html>` itself has been parsed. At
-/// document-start the browsers this app ships on do already expose
-/// `document.documentElement`, but that is an implementation detail of each
-/// engine rather than something the injection point guarantees, and the cost of
-/// not depending on it is four lines.
+/// The script tolerates being run before `<html>` itself has been parsed.
+/// Whether `document.documentElement` exists at document-start is up to each
+/// engine and is not something the injection point promises — unverified here
+/// for WebKitGTK and WKWebView, and the cost of not depending on it is four
+/// lines, so it does not.
 pub fn pre_paint_script(mode: AppearanceMode) -> Option<String> {
     match mode {
         AppearanceMode::System => None,
@@ -113,17 +113,6 @@ fn plugin_for<R: Runtime>(mode: AppearanceMode) -> TauriPlugin<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    // `MockRuntime`, deliberately, and **not `tauri::Wry`** — naming `Wry` from
-    // a reachable test path is what puts a WebView2 import in this crate's test
-    // binary, and the Windows runner's loader then refuses to start it at all:
-    // `--list --format terse aborted with code 0xc0000139: The specified
-    // procedure could not be found`, before a single test runs. `run()` names
-    // `Wry` too and is harmless, because nothing calls it in a test binary and
-    // the linker drops it. `MockRuntime` has no webview backend and pulls
-    // nothing, and what is under test here — which script the plugin hands the
-    // webview — does not depend on which runtime asks.
-    use tauri::plugin::Plugin;
-    use tauri::test::MockRuntime;
 
     /// The three modes there are. [`pre_paint_script`]'s own `match` is
     /// exhaustive, so a fourth variant fails to compile there; this list is
@@ -159,36 +148,66 @@ mod tests {
         }
     }
 
-    /// The ordering seam, asserted where it is actually decided.
+    /// The two assertions that need a concrete [`Runtime`] to exist.
     ///
-    /// [`Plugin::initialization_script`] is what Tauri collects from the plugin
-    /// store when it builds a webview, and an initialization script runs before
-    /// the document is parsed. So a mode reaching this method is a mode that
-    /// reaches the root before the first paint. What no test in this repo can
-    /// assert is the paint itself (#823: no driver-level tier; #836: jsdom has
-    /// no layout) — that half is a manual check against a real window.
-    #[test]
-    fn the_plugin_hands_the_webview_the_script_for_the_stored_mode() {
-        for mode in MODES {
-            let plugin: TauriPlugin<MockRuntime> = plugin_for(mode);
-            assert_eq!(
-                plugin.initialization_script(),
-                pre_paint_script(mode),
-                "{mode:?}"
-            );
-        }
-    }
+    /// **Everywhere but Windows, and that is measured rather than cautious.**
+    /// Naming any concrete `Runtime` from a path a test binary can reach puts
+    /// imports in this crate's test binary that the Windows runner's loader
+    /// cannot resolve, and the binary then fails to *start*: `cargo nextest run
+    /// --workspace` dies at `--list --format terse aborted with code
+    /// 0xc0000139: The specified procedure could not be found`, before a single
+    /// test **in the whole workspace** runs. Two CI rounds established that the
+    /// runtime is the variable: `tauri::Wry` without the `tauri/test` feature,
+    /// and `tauri::test::MockRuntime` with it, fail identically. `run()` names
+    /// `Wry` too and is harmless, because nothing calls it in a test binary and
+    /// the linker drops it.
+    ///
+    /// What that costs is small and worth naming: these two run on Linux and
+    /// macOS — both required checks — and what they assert is which string the
+    /// plugin holds, which no platform can answer differently. The desktop app
+    /// does not ship on Windows either (`ensure_desktop_workflow_platform_
+    /// supported` blocks its workflows there, and `docs/develop/desktop-gui.md`
+    /// names only WebKitGTK and WKWebView). The alternative was losing the
+    /// seam assertion on every platform, or leaving the entire workspace's
+    /// Windows test run unable to start.
+    #[cfg(not(windows))]
+    mod wiring {
+        use super::*;
+        use tauri::plugin::Plugin;
+        use tauri::test::MockRuntime;
 
-    /// The root this writes to has to be the one `styles.css` reads, which is
-    /// the main frame's. `js_init_script` is the main-frame form; the
-    /// all-frames sibling would also work but says something this does not
-    /// mean.
-    #[test]
-    fn the_script_is_registered_for_the_main_frame() {
-        let plugin: TauriPlugin<MockRuntime> = plugin_for(AppearanceMode::Dark);
-        let script = plugin
-            .initialization_script_2()
-            .expect("an explicit choice has a script");
-        assert!(script.for_main_frame_only);
+        /// The ordering seam, asserted where it is actually decided.
+        ///
+        /// [`Plugin::initialization_script`] is what Tauri collects from the
+        /// plugin store when it builds a webview, and an initialization script
+        /// runs before the document is parsed. So a mode reaching this method
+        /// is a mode that reaches the root before the first paint. What no test
+        /// in this repo can assert is the paint itself (#823: no driver-level
+        /// tier; #836: jsdom has no layout) — that half is a manual check
+        /// against a real window.
+        #[test]
+        fn the_plugin_hands_the_webview_the_script_for_the_stored_mode() {
+            for mode in MODES {
+                let plugin: TauriPlugin<MockRuntime> = plugin_for(mode);
+                assert_eq!(
+                    plugin.initialization_script(),
+                    pre_paint_script(mode),
+                    "{mode:?}"
+                );
+            }
+        }
+
+        /// The root this writes to has to be the one `styles.css` reads, which
+        /// is the main frame's. `js_init_script` is the main-frame form; the
+        /// all-frames sibling would also work but says something this does not
+        /// mean.
+        #[test]
+        fn the_script_is_registered_for_the_main_frame() {
+            let plugin: TauriPlugin<MockRuntime> = plugin_for(AppearanceMode::Dark);
+            let script = plugin
+                .initialization_script_2()
+                .expect("an explicit choice has a script");
+            assert!(script.for_main_frame_only);
+        }
     }
 }
