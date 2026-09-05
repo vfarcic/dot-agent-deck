@@ -279,6 +279,14 @@ export interface DeckBridge {
   runAction(action: DeckAction): Promise<DeckActionResult>;
   sendTerminalInput(agentId: string, data: string): Promise<void>;
   resizeTerminal(agentId: string, cols: number, rows: number): Promise<void>;
+  /**
+   * PRD #882 — subscribe to the geometry the daemon has APPLIED for an agent,
+   * replaying anything already known, and return an unsubscribe function.
+   *
+   * The replay matters: an agent can be constrained by another client long
+   * before a tile here mounts, and the push that said so is not repeated.
+   */
+  onTerminalGeometry(listener: (agentId: string, rows: number, cols: number) => void): () => void;
   /** The desktop app's own settings document, and where it lives (PRD #803). Never rejects. */
   getSettings(): Promise<DesktopSettingsSnapshotDto>;
   /** Persist the whole document and resolve with what was written. */
