@@ -3528,7 +3528,7 @@ fn the_measured_artifact_shapes_scan_inside_the_budget() {
         );
 
         let budget = match_step_budget(artifact.len());
-        let cost = credential_scan_cost(artifact.as_bytes(), &registered).expect("scanned above");
+        let cost = credential_scan_spend(artifact.as_bytes(), &registered);
         assert!(
             cost * 2 < budget,
             "{what}: {cost} steps over {} bytes is more than half the {budget} \
@@ -3679,6 +3679,101 @@ fn an_artifact_that_exhausts_the_budget_is_withheld_whole() {
     assert!(
         projected[1].is_empty(),
         "a refused cast kept an event the scan never vouched for"
+    );
+}
+
+/// Scenario: Build the shape where one candidate enumeration is expensive — a
+/// value whose continuation is four thousand identical bytes, rendered so that
+/// nearly every offset in the gap is another place it could resume — and confirm
+/// the refused scan stops INSIDE that enumeration rather than after it.
+///
+/// The bound asserted is "budget plus at most one value length": a run is
+/// measured before it is charged, so exactly one `common_prefix_len` can finish
+/// past the point of refusal, and nothing else. Charging only on the way out of
+/// `hop_candidates` — which is what this code did before Greptile's P2 on PR
+/// #894 — lets a single call spend millions of steps on a forty-kilobyte
+/// artifact whose whole allowance is a couple of hundred thousand, which is a
+/// fail-closed bound that fails slowly.
+#[test]
+fn a_refused_scan_stops_inside_the_candidate_enumeration() {
+    // Fabricated. `AAAAAAAA` opens it; the rest is one long run, so every one
+    // of the ~4000 offsets inside a rendered copy is a candidate resume point
+    // AND each one reproduces thousands of bytes.
+    let value = format!("AAAAAAAA{}", "B".repeat(4000));
+    let registered = std::slice::from_ref(&value);
+    let mut artifact = String::new();
+    pad_to(
+        &mut artifact,
+        &format!("AAAAAAAA\n{}\n", "B".repeat(4000)),
+        40_000,
+    );
+
+    assert!(
+        matches!(
+            credential_redaction_scan(artifact.as_bytes(), registered),
+            RedactionScan::Refused
+        ),
+        "the fixture must be one the scan refuses, or the bound below is \
+         asserted about a scan that never hit its budget"
+    );
+    let budget = match_step_budget(artifact.len());
+    let spent = credential_scan_spend(artifact.as_bytes(), registered);
+    assert!(
+        spent <= budget + value.len(),
+        "a refused scan spent {spent} against a budget of {budget}, overshooting \
+         by more than the one run it is allowed to finish measuring — the budget \
+         is no longer being charged inside the candidate enumeration"
+    );
+}
+
+/// Scenario: Register far more credential material than the index will hold —
+/// three hundred distinct thousand-character values — against a TINY artifact,
+/// and confirm the scan refuses rather than building the index anyway.
+///
+/// The artifact side of the index has always been capped; the pattern side was
+/// not, and `collect_credential_values` accepts an unbounded number of values
+/// with no upper length filter. The size that matters is therefore the
+/// REGISTERED SET, not the artifact — which is why the fixture here is a
+/// two-hundred-byte string, the size of a panic message. Greptile's P2 on PR
+/// #894.
+#[test]
+fn a_registered_set_too_large_to_index_is_refused_before_it_is_built() {
+    let artifact = "a panic message is a few hundred bytes, and the seam that \
+                    redacts one is supposed to be cheap";
+    let many: Vec<String> = (0..300)
+        .map(|index| format!("{index:04}{}", "credential-material-".repeat(49)))
+        .collect();
+    // Non-vacuity: each value is under `MAX_CHAINED_VALUE`, so this is the
+    // pattern-COUNT bound rather than the per-value one, and the artifact is
+    // far too small to be what exhausts anything.
+    assert!(
+        many.iter()
+            .all(|value| value.len() > 900 && value.len() < 8192),
+        "the fixture must be many ordinary-length values"
+    );
+    assert!(artifact.len() < 200, "the artifact must be tiny");
+
+    assert!(
+        matches!(
+            credential_redaction_scan(artifact.as_bytes(), &many),
+            RedactionScan::Refused
+        ),
+        "an unindexable registered set was scanned instead of refused"
+    );
+    assert_eq!(
+        redact_known_credentials_text(artifact, &many),
+        String::from_utf8_lossy(RECORDING_CREDENTIAL_SCAN_REFUSAL),
+        "a refused scan wrote something other than the whole-artifact refusal"
+    );
+
+    // A tenth of that set is indexed and scanned normally, so the refusal above
+    // is a cap and not a blanket rejection of large sets.
+    assert!(
+        matches!(
+            credential_redaction_scan(artifact.as_bytes(), &many[..30]),
+            RedactionScan::Ranges(_)
+        ),
+        "the scan refuses a set it should comfortably index"
     );
 }
 

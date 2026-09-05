@@ -2227,11 +2227,14 @@ artifact was replaced whole rather than written with bytes nothing examined \
 //     states that lie on a COMPLETE path — one that reproduces the whole value
 //     — plus every alternate candidate at such a state, for the reason
 //     `hop_candidates` gives.
-//   * The search FAILS CLOSED. `match_step_budget` and `MAX_INDEX_OCCURRENCES`
-//     bound the work; when either is exhausted the scan refuses, and the
-//     callers replace the WHOLE artifact with
-//     `RECORDING_CREDENTIAL_SCAN_REFUSAL` rather than writing bytes nothing
-//     looked at.
+//   * The search FAILS CLOSED, on all three of the things that can grow.
+//     `match_step_budget` bounds the search, `MAX_INDEX_OCCURRENCES` bounds the
+//     artifact side of the index and `MAX_INDEX_NEEDLES` the registered-set
+//     side; when any is exhausted the scan refuses, and the callers replace the
+//     WHOLE artifact with `RECORDING_CREDENTIAL_SCAN_REFUSAL` rather than
+//     writing bytes nothing looked at. The step budget is charged INSIDE the
+//     candidate enumeration rather than after it, so a refusal cannot be
+//     preceded by one call spending most of an artifact's allowance.
 //
 // WHY THIS IS NOT A SUBSEQUENCE SEARCH, which is the failure mode a naive
 // version of this has: "match, skip anything, match again" finds almost any
@@ -2389,6 +2392,22 @@ const MAX_CHAINED_VALUE: usize = 8192;
 /// alone would buy almost no search.
 const MIN_MATCH_STEPS: usize = 1 << 16;
 
+/// How many windows the REGISTERED SET may contribute to the index before the
+/// scan REFUSES.
+///
+/// [`MAX_INDEX_OCCURRENCES`] bounds the artifact side of the index and nothing
+/// bounded the pattern side: [`collect_credential_values`] accepts an unbounded
+/// number of values with no upper length filter, so a large registration could
+/// build a huge map and walk it before either the search budget or the
+/// occurrence cap was consulted — including on a two-hundred-byte panic message,
+/// where the seam is supposed to be cheap. Checked BEFORE anything is inserted,
+/// so the refusal is reached rather than raced.
+///
+/// A quarter of a million windows is a quarter of a megabyte of registered
+/// credential material. The set a real lane-2 run registers is under two
+/// thousand.
+const MAX_INDEX_NEEDLES: usize = 1 << 18;
+
 /// How many index entries one artifact may hold before the scan REFUSES.
 ///
 /// The index records a position for every occurrence of every
@@ -2509,10 +2528,22 @@ impl OccurrenceIndex {
     /// `None` when the artifact would need more than [`MAX_INDEX_OCCURRENCES`]
     /// entries — the fail-closed direction.
     fn build(data: &[u8], patterns: &[&[u8]]) -> Option<Self> {
+        // A value past `MAX_CHAINED_VALUE` never hops, so `hop_candidates` is
+        // never asked about any window of it but the first — indexing the rest
+        // would be pure cost.
+        let windows_of = |pattern: &[u8]| match pattern.len() > MAX_CHAINED_VALUE {
+            true => 1,
+            false => pattern.len().saturating_sub(MIN_WRAP_FRAGMENT - 1),
+        };
+        let needles: usize = patterns.iter().map(|pattern| windows_of(pattern)).sum();
+        if needles > MAX_INDEX_NEEDLES {
+            return None;
+        }
+
         let mut positions: HashMap<Needle, Vec<usize>> = HashMap::new();
         let mut filter = NeedleFilter::new();
         for pattern in patterns {
-            for window in pattern.windows(MIN_WRAP_FRAGMENT) {
+            for window in pattern.windows(MIN_WRAP_FRAGMENT).take(windows_of(pattern)) {
                 let key: Needle = window.try_into().expect("windows() yields exact chunks");
                 filter.insert(NeedleFilter::window_of(&key));
                 positions.entry(key).or_default();
@@ -2613,11 +2644,12 @@ fn hop_candidates(
     index: &OccurrenceIndex,
     gap_start: usize,
     remaining: &[u8],
-    steps: &mut usize,
-) -> Vec<(usize, usize)> {
+    spent: &mut usize,
+    budget: usize,
+) -> Option<Vec<(usize, usize)>> {
     let limit = data.len().min(gap_start.saturating_add(MAX_WRAP_GAP));
     let Some(crossed) = index.next_transition(gap_start).filter(|at| *at < limit) else {
-        return Vec::new();
+        return Some(Vec::new());
     };
     // The transition byte itself is never a candidate, and a candidate must sit
     // after one — so the window opens one byte past the first transition.
@@ -2628,19 +2660,28 @@ fn hop_candidates(
             .try_into()
             .expect("the slice is exactly one needle wide");
         for at in index.occurrences_in(&needle, from, limit) {
-            *steps += 1;
+            *spent += 1;
+            if *spent > budget {
+                return None;
+            }
             if is_row_transition(data[*at]) {
                 continue;
             }
             let run = common_prefix_len(data, *at, remaining);
-            *steps += run / MIN_WRAP_FRAGMENT;
+            *spent += run / MIN_WRAP_FRAGMENT;
+            if *spent > budget {
+                return None;
+            }
             found.push((*at, run));
         }
     } else {
         // Below the index's window width, so this walks the gap — but it stops
         // at the first hit, which is the only one a short tail contributes.
         for at in from..limit {
-            *steps += 1;
+            *spent += 1;
+            if *spent > budget {
+                return None;
+            }
             if is_row_transition(data[at]) {
                 continue;
             }
@@ -2650,7 +2691,7 @@ fn hop_candidates(
             }
         }
     }
-    found
+    Some(found)
 }
 
 /// One state of the continuation search, memoised so a value that can be
@@ -2678,9 +2719,10 @@ struct ValueSearch<'a> {
     index: &'a OccurrenceIndex,
     value: &'a [u8],
     states: HashMap<(usize, usize), HopState>,
-    /// What the values searched before this one already spent.
+    /// The RUNNING TOTAL for this artifact, including the values searched before
+    /// this one — the budget is shared across the whole registered set, so a set
+    /// of a hundred values cannot buy a hundred budgets.
     spent: usize,
-    steps: usize,
 }
 
 impl<'a> ValueSearch<'a> {
@@ -2691,19 +2733,18 @@ impl<'a> ValueSearch<'a> {
             value,
             states: HashMap::new(),
             spent,
-            steps: 0,
         }
+    }
+
+    fn budget(&self) -> usize {
+        match_step_budget(self.data.len())
     }
 
     /// `None` once the artifact's [`match_step_budget`] is gone, which
     /// propagates to a refusal rather than being read as "nothing found".
-    ///
-    /// The budget is shared across the whole registered set — `spent` is what
-    /// earlier values already used — so a set of a hundred values cannot buy a
-    /// hundred budgets.
     fn spend(&mut self, steps: usize) -> Option<()> {
-        self.steps += steps;
-        (self.spent + self.steps <= match_step_budget(self.data.len())).then_some(())
+        self.spent += steps;
+        (self.spent <= self.budget()).then_some(())
     }
 
     /// The memoised state at `(consumed, cursor)`, computing it if new.
@@ -2719,15 +2760,22 @@ impl<'a> ValueSearch<'a> {
         if let Some(state) = self.states.get(&(consumed, cursor)) {
             return Some(state.completes);
         }
-        let mut steps = 1;
+        // Charged and stopped INSIDE the enumeration rather than after it: a
+        // dense candidate window is where the work is, so a budget consulted
+        // only on the way out would let one call do most of an artifact's
+        // allowance before the refusal it is supposed to trigger. The overshoot
+        // that remains is one `common_prefix_len` — at most `MAX_CHAINED_VALUE`
+        // byte comparisons — because a run is measured before it is charged.
+        self.spend(1)?;
+        let budget = self.budget();
         let candidates = hop_candidates(
             self.data,
             self.index,
             cursor,
             &self.value[consumed..],
-            &mut steps,
-        );
-        self.spend(steps)?;
+            &mut self.spent,
+            budget,
+        )?;
         let count = candidates.len();
         self.states.insert(
             (consumed, cursor),
@@ -2826,9 +2874,10 @@ impl<'a> ValueSearch<'a> {
             let needle: Needle = self.value[..MIN_WRAP_FRAGMENT]
                 .try_into()
                 .expect("the slice is exactly one needle wide");
-            let starts = self.index.occurrences(&needle).to_vec();
-            self.spend(starts.len())?;
-            return Some(starts);
+            // Charged before the copy, so an artifact dense enough to blow the
+            // budget refuses instead of allocating the list first.
+            self.spend(self.index.occurrences(&needle).len())?;
+            return Some(self.index.occurrences(&needle).to_vec());
         }
         self.spend(self.data.len() / MIN_WRAP_FRAGMENT)?;
         let mut starts = Vec::new();
@@ -2919,29 +2968,33 @@ pub(crate) enum RedactionScan {
 /// into a precomputed occurrence list rather than a [`MAX_WRAP_GAP`] re-read —
 /// and [`match_step_budget`] is what bounds whatever the index does not.
 pub(crate) fn credential_redaction_scan(data: &[u8], credentials: &[String]) -> RedactionScan {
-    match credential_redaction_search(data, credentials) {
-        Some((ranges, _steps)) => RedactionScan::Ranges(ranges),
+    match credential_redaction_search(data, credentials).0 {
+        Some(ranges) => RedactionScan::Ranges(ranges),
         None => RedactionScan::Refused,
     }
 }
 
-/// What one scan of this artifact SPENDS, against its [`match_step_budget`], or
-/// `None` if it refuses.
+/// What one scan of this artifact SPENDS, against its [`match_step_budget`] —
+/// reported whether or not the scan refused.
 ///
 /// Exposed because a step count is deterministic and a wall time is not: the
 /// cost regression this guards — a hop that goes back to re-reading
-/// [`MAX_WRAP_GAP`] bytes — shows up as an order-of-magnitude change in steps
-/// on a machine of any speed, under any load, in a test that can therefore
-/// assert on it. `the_measured_artifact_shapes_scan_inside_the_budget` does.
-pub(crate) fn credential_scan_cost(data: &[u8], credentials: &[String]) -> Option<usize> {
-    credential_redaction_search(data, credentials).map(|(_ranges, steps)| steps)
+/// [`MAX_WRAP_GAP`] bytes — shows up as an order-of-magnitude change in steps on
+/// a machine of any speed, under any load, in a test that can therefore assert
+/// on it. Reported on a REFUSAL too, because the other thing worth asserting is
+/// how far a refused scan overshot before it stopped, which is the difference
+/// between charging the budget inside the candidate enumeration and charging it
+/// after. `the_measured_artifact_shapes_scan_inside_the_budget` and
+/// `a_refused_scan_stops_inside_the_candidate_enumeration` respectively.
+pub(crate) fn credential_scan_spend(data: &[u8], credentials: &[String]) -> usize {
+    credential_redaction_search(data, credentials).1
 }
 
-/// The search itself: ranges and what they cost, or `None` on a refusal.
+/// The search itself: the ranges (or `None` on a refusal), and what it spent.
 fn credential_redaction_search(
     data: &[u8],
     credentials: &[String],
-) -> Option<(Vec<(usize, usize)>, usize)> {
+) -> (Option<Vec<(usize, usize)>>, usize) {
     let mut patterns: Vec<&[u8]> = Vec::new();
     for value in credentials {
         let bytes = value.as_bytes();
@@ -2950,18 +3003,22 @@ fn credential_redaction_search(
         }
     }
     if patterns.is_empty() || data.is_empty() {
-        return Some((Vec::new(), 0));
+        return (Some(Vec::new()), 0);
     }
-    let index = OccurrenceIndex::build(data, &patterns)?;
+    let Some(index) = OccurrenceIndex::build(data, &patterns) else {
+        return (None, 0);
+    };
     let mut ranges = Vec::new();
     let mut steps = 0;
     for pattern in &patterns {
         let mut search = ValueSearch::new(data, &index, pattern, steps);
         let outcome = search.scan(&mut ranges);
-        steps += search.steps;
-        outcome?;
+        steps = search.spent;
+        if outcome.is_none() {
+            return (None, steps);
+        }
     }
-    Some((merge_redaction_ranges(ranges), steps))
+    (Some(merge_redaction_ranges(ranges)), steps)
 }
 
 /// The ranges view of [`credential_redaction_scan`], with a refusal spelled as
