@@ -4228,10 +4228,23 @@ mod tests {
             GuardedSend::Applied,
             "attempt 1 must never be refused before an automatic write timestamp exists"
         );
-        tokio::time::sleep(Duration::from_millis(75)).await;
-        let after_initial_delivery = replacement_registry
-            .snapshot(&replacement_agent)
-            .expect("initial detached delivery snapshot");
+        // Wait for attempt 1's own echo rather than betting a fixed 75 ms sleep
+        // beats the PTY round trip (issue #851). The precondition below is the
+        // same condition, and it is the one a contended `build-windows` runner
+        // lost: the fast tier has `retries = 0` and no override covers this
+        // test, so one lost bet hard-reds a REQUIRED check on a precondition
+        // rather than on the property under test. This wait is keyed on content
+        // and bounded only by a diagnostic deadline, so load makes it slower
+        // instead of wrong. Nothing precedes attempt 1 on this pane, so there is
+        // no earlier `/bin/cat` copy that could cut into its echo and no drain
+        // to do first; the `type_user_draft` below owns that half for the write
+        // that follows.
+        let after_initial_delivery = wait_for_detached_payload_echo(
+            &replacement_registry,
+            &replacement_agent,
+            REPLACEMENT_PROMPT,
+        )
+        .await;
         assert!(
             after_initial_delivery
                 .windows(REPLACEMENT_PROMPT.len())
@@ -4361,6 +4374,18 @@ mod tests {
                 .expect("initial guarded delivery"),
             GuardedSend::Applied
         );
+        // Drain the initial delivery before the user's draft is written — the
+        // same "drain, then write" discipline `type_user_bytes` applies for the
+        // fixtures that can use it. This one writes through the writer it is
+        // deliberately holding, so it owns both halves itself. That delivery put
+        // one input line in flight (its payload and submit CR), and the byte
+        // target and the line discipline's echo are two independent writers into
+        // one PTY output queue: measured on Unix under #850, a `/bin/cat` copy
+        // still pending can land in the MIDDLE of the draft's echo, an
+        // append-only split that no amount of waiting reassembles. It also keeps
+        // that copy out of the exact-equality window at the end of this test,
+        // where a byte arriving late reads as bytes the refused retry sent.
+        wait_for_drained_lines(&registry, &agent_id, 1).await;
 
         let handle = registry
             .subscribe(&agent_id)
@@ -4386,7 +4411,13 @@ mod tests {
         user_writer
             .flush()
             .expect("flush unsent attached user draft");
-        tokio::time::sleep(Duration::from_millis(75)).await;
+        // The draft's own echo, not a fixed 75 ms sleep, is what proves the
+        // user's bytes are physically visible before the clock stamp (issue
+        // #851) — the precondition below is that same condition, and it is what
+        // a contended runner failed. No quiescence wait is needed on top of it:
+        // the draft carries no line terminator, so it completes no input line
+        // and `/bin/cat` has nothing to copy back.
+        wait_for_echo_bytes(&registry, &agent_id, USER_DRAFT.as_bytes()).await;
         let before_writer_release = registry.snapshot(&agent_id).expect("pre-release snapshot");
         assert!(
             before_writer_release
