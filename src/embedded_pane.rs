@@ -892,19 +892,34 @@ impl EmbeddedPaneController {
         // outcome there). The watch channel cannot block, so this returns
         // immediately and never holds the pane lock across daemon I/O.
         let _ = pane.backend.resize_tx.send_replace(Some((rows, cols)));
-        // PRD #882: the parser is deliberately NOT set here any more.
+        // PRD #882: set the parser optimistically, and let the daemon's answer
+        // correct it.
         //
-        // It used to be set optimistically and synchronously, which is what
-        // made "the parser is kept in lockstep with the PTY" true for a single
-        // client and false the moment a second one existed (issue #883). The
-        // daemon now decides the geometry, and the pane learns it from the
-        // resize response or a `KIND_GEOMETRY` push — both of which reshape the
-        // parser. Setting it here as well would mean rendering at a size the PTY
-        // may never take, for however long the round trip lasts.
+        // The first cut of this dropped the optimistic write entirely, on the
+        // reasoning that the daemon decides the geometry so the client should
+        // wait to be told. That is wrong for the case that dominates: with one
+        // client attached the daemon grants exactly what was asked, so waiting
+        // buys nothing and costs a full round trip of lag on every resize — the
+        // pane renders its old grid inside its new box until the answer lands.
+        // It also makes the pane's geometry change at a moment unrelated to the
+        // frame that caused it, which is a race for anything comparing rendered
+        // frames across a layout change.
         //
-        // There is no non-daemon pane to exempt: every pane this controller owns
-        // is stream-backed (`Pane::backend` is a `StreamBackend`), so the round
-        // trip is the only way any pane learns its geometry.
+        // Optimistic-then-corrected keeps the single-client path byte-for-byte
+        // what it was, and in the multi-client case the transient is in the SAFE
+        // direction: the parser is briefly LARGER than the PTY, so the agent's
+        // bytes land where they were drawn (no clamped cursor, no overprinting)
+        // with stale columns to the right until the SIGWINCH redraw repaints —
+        // and the answer, or a `KIND_GEOMETRY` push, shrinks it immediately.
+        //
+        // This does NOT reintroduce issue #883. That bug was the per-frame
+        // sweep COMPARING against this parser to decide whether to resize;
+        // the sweep now compares against `requested` above, so the parser
+        // holding an optimistic value cannot suppress a needed request.
+        if let Ok(mut parser) = pane.screen.lock() {
+            let (rows, cols) = parser_init_dims(rows, cols);
+            parser.screen_mut().set_size(rows, cols);
+        }
         Ok(())
     }
 

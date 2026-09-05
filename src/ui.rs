@@ -24215,15 +24215,32 @@ mod tests {
         ] {
             ctrl.resize_pane_pty(pane_id, req.0, req.1)
                 .expect("resizing a registered seam pane must succeed");
-            let got = ctrl
+            let requested = ctrl
                 .requested_dims(pane_id)
                 .expect("the seam controller must register its panes");
             assert_eq!(
-                got, want,
+                requested, want,
                 "resize_pane_pty({}x{}) must clamp BEFORE recording the request, so an \
                  over-cap geometry never reaches the wire and the pane's delta check \
                  never compares an unclamped request against the daemon's clamped answer \
                  — which would re-send a resize on every frame forever",
+                req.0, req.1
+            );
+            let parsed = ctrl
+                .get_screen(pane_id)
+                .expect("the seam controller must register its panes")
+                .lock()
+                .expect("the seam parser lock must stay healthy")
+                .screen()
+                .size();
+            assert_eq!(
+                parsed, want,
+                "resize_pane_pty({}x{}) must clamp the OPTIMISTIC parser write too. \
+                 PRD #882 makes the daemon's answer the authority, but the client still \
+                 writes the requested geometry first so a single-client resize costs no \
+                 round trip — and an unclamped optimistic write would parse the agent's \
+                 output at a width the child can never wrap at, which is issue #747's \
+                 rewrapped pane arriving through the new path",
                 req.0, req.1
             );
         }

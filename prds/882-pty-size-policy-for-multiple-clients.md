@@ -276,6 +276,16 @@ Recommendation: start with the first, because it is the policy as chosen and it 
 
 ## Work Log
 
+### 2026-09-05 — A CI failure was taken seriously and found a real regression
+
+`e2e-deterministic` failed on `manager_016_wheel_over_dialog_does_not_scroll_side_pane` — a scheduler mouse-wheel test with no connection to PTY sizing, in a lane that is known-red. It would have been easy, and wrong, to file that as the known flake: a survey of the twelve most recent failing runs showed `orchestration_remit_*` in eleven of them and **`manager_016` in none** — and that family passed in this run. A first-time failure in a test that compares rendered frames across a layout change, in a PR that changes when a pane's geometry moves, is not a coincidence to wave through.
+
+**The defect was mine, and the test was pointing at something worse than itself.** The first cut removed the optimistic parser write from `resize_pane_pty` entirely, reasoning that since the daemon decides the geometry the client should wait to be told. That is wrong for the case that dominates: with one client attached the daemon grants exactly what was asked, so waiting buys nothing and costs a full round trip of lag on *every* resize — the pane renders its old grid inside its new box until the answer lands, and its geometry then changes at a moment unrelated to the frame that caused it.
+
+The fix is optimistic-then-corrected: write the requested geometry immediately, and let the daemon's answer (or a `KIND_GEOMETRY` push) correct it. The single-client path is byte-for-byte what it was, and in the multi-client case the transient is in the **safe** direction — the parser is briefly larger than the PTY, so bytes land where they were drawn, with stale columns to the right until the SIGWINCH redraw. It does not reintroduce issue #883, whose bug was the per-frame sweep *comparing* against the parser; that comparison now reads `requested`.
+
+`resize_layout_002` gets its parser assertion back as a result, so issue #747's invariant is once again pinned on both halves — the clamped request and the clamped optimistic write — rather than only the one the client still owned under the first cut.
+
 ### 2026-09-05 — Option 1 implemented; four things the design did not anticipate
 
 Built the policy: the daemon keys a per-agent geometry map **per attach**, applies the smallest viewport on each axis, prunes on attach teardown, echoes the applied geometry on both the attach and resize responses, and pushes changes to participating viewers as a new `KIND_GEOMETRY` frame. `PROTOCOL_VERSION` 8 → 9, with a `.breaking.md` fragment for the semantic change to `Resize`. The TUI stops asserting geometry and sizes its parser from the daemon's answer; the desktop's `fit()` becomes a proposal and its xterm grid is set from the applied geometry.
