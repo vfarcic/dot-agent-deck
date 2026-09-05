@@ -651,9 +651,15 @@ fn manager_010_blank_default_command_falls_back_to_claude() {
     deck.wait_for_string("Select Directory");
     deck.send_keys(b" "); // Space → confirm the dir → locked schedule form
     deck.wait_for_string("New Schedule"); // the mode-locked Add form is up
-    let (scol, srow) = deck
-        .find_in_grid("[Submit]")
-        .expect("the mode-locked schedule form must render a [Submit] button");
+    // Poll for the button instead of reading the grid once. The wait above and
+    // a `find_in_grid` behind it take two separate snapshots, and this form
+    // paints its button row in a second pass (`render_modal_button_row`
+    // drawing over the line the `Paragraph` reserved), so a single-shot read
+    // can land between the two and fire on a frame that is merely incomplete —
+    // issue #807's class, and what reddened `e2e-deterministic` for this test
+    // on run 33847276913. `wait_for_in_grid` also dumps the grid if the button
+    // genuinely never arrives, which `.expect()` does not.
+    let (scol, srow) = deck.wait_for_in_grid("[Submit]");
     deck.click(scol, srow); // submit → spawn the seeded authoring agent
 
     // R1 fallback: a blank `default_command` must resolve to `claude`
