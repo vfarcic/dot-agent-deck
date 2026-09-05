@@ -28,6 +28,43 @@ permissions:
   # anything to inspect.
   pull-requests: read
 
+# Issue #811 — every `actions/checkout` in this file carries
+# `persist-credentials: false`. The action defaults that input to TRUE, which
+# makes it run `git config --local http.https://github.com/.extraheader` in the
+# checkout it just made: the job's automatic GITHUB_TOKEN then sits in
+# `.git/config` for the life of the job, readable by anything the job runs.
+# `e2e-deterministic` is the sharp case and has its own note below — it executes
+# the PTY e2e tier, which is contributor-authored code — but the flag is on all
+# nine checkouts rather than that one, because no job here needs the credential
+# after the fetch:
+#
+#   * none of them pushes, and the `permissions:` block above grants no write
+#     scope for one to push WITH (`contents: read`, `pull-requests: read`, and
+#     no job overrides it);
+#   * none of them needs a remote git operation from inside the checkout, as far
+#     as the usual routes go: there is no `.gitmodules`, no `source = "git…"` in
+#     `Cargo.lock` and no `git+` entry in `desktop/pnpm-lock.yaml`, and the git
+#     these jobs do reach is local — `build.rs`'s `describe` / `rev-parse` /
+#     `status` version stamping, `cargo xtask linkage-check`'s `worktree list`
+#     and `rev-parse` reads, and the e2e harness's `git init` inside its own
+#     tempdirs. That survey is what picked the nine; the CI run on the PR that
+#     set the flag is what checked it.
+#
+# `security`'s `cargo audit` does clone the RustSec advisory DB over the
+# network, but into `~/.cargo/advisory-db` — a separate repository, which a
+# config written `--local` into this checkout never reached anyway.
+#
+# This is hardening, not the closing of an open hole. What bounded the token
+# before was SCOPE rather than absence: the read-only `permissions:` block
+# above, and a fork `pull_request` run gets a read-only token whatever that
+# block says (`.claude/skills/verify-pr/SKILL.md`). Both still hold; the flag is
+# a layer under them.
+#
+# It says nothing about the other workflows in this directory. `release.yml` and
+# `docs-publish.yml` push to `main` and MUST keep a usable credential in the
+# checkout — they check out under the RELEASE_TOKEN admin PAT for exactly that
+# reason (CLAUDE.md rule 8). Do not copy this flag onto them.
+
 jobs:
   # Renovate automerges devbox digest/pin/patch/minor bumps (renovate.json), and
   # those PRs touch nothing but devbox.json / devbox.lock. No Rust job can
@@ -138,6 +175,8 @@ jobs:
         working-directory: desktop
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
       - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
         with:
           version: 11
@@ -158,6 +197,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
         with:
           toolchain: 1.97.1
@@ -301,18 +342,23 @@ jobs:
   # a credential then the test is in the wrong lane: re-gate its file into
   # `e2e-live`. DO NOT add a key here to make it pass.
   #
-  # That is NOT the same as "no secrets in this job", which this comment used to
-  # claim and which is false. The unqualified `actions/checkout@v7` below
-  # receives the automatic `GITHUB_TOKEN` as its default `token:` input, and
-  # `persist-credentials` defaults to true, so the token is written into
-  # `.git/config` as an auth header for the life of the job — reachable by any
-  # contributor-authored test code this lane runs. What bounds it is SCOPE, not
-  # absence: this workflow's top-level `permissions:` block grants
-  # `contents: read` and `pull-requests: read` and nothing else, and a fork
-  # `pull_request` run gets a read-only token whatever the block says (see
-  # `.claude/skills/verify-pr/SKILL.md`). Setting `persist-credentials: false`
-  # on that checkout would remove even that, and is worth doing as its own
-  # change rather than folded into a prose pass.
+  # That is still NOT the same as "no secrets in this job", which this comment
+  # once claimed and which was false. The automatic GITHUB_TOKEN has not gone
+  # anywhere: `actions/checkout` below takes it as its default `token:` input
+  # and authenticates the fetch with it. What issue #811 changed is where it
+  # comes to REST. With `persist-credentials: false` on that checkout the action
+  # no longer writes it into `.git/config` as an auth header, so it is not
+  # sitting in the tree for the life of the job while this lane drives the PTY
+  # e2e tier — dozens of contributor-authored test binaries spawning the real
+  # deck. The note above `jobs:` has the survey behind that flag and why it went
+  # on all nine checkouts rather than only this one.
+  #
+  # SCOPE is still the outer bound and still does the heavier lifting: this
+  # workflow's top-level `permissions:` block grants `contents: read` and
+  # `pull-requests: read` and nothing else, and a fork `pull_request` run gets a
+  # read-only token whatever the block says (see
+  # `.claude/skills/verify-pr/SKILL.md`). The flag is a layer under that, not a
+  # replacement for it.
   #
   # That is deliberately NOT the wider claim "no agent credential reaches this
   # repository's CI", which is false: the Codex issue-labeler
@@ -360,6 +406,8 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
         with:
           toolchain: 1.97.1
@@ -422,6 +470,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
         with:
           toolchain: 1.97.1
@@ -476,6 +526,8 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
       # Issue #552 — the 35 tracked symlinks (AGENTS.md -> CLAUDE.md, the 33
       # entries under .agents/skills/, docs/img) have to come out of a checkout
       # as LINKS. Where they do not, git writes each one as a plain text file
@@ -573,6 +625,8 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
         with:
           toolchain: 1.97.1
@@ -640,6 +694,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
         with:
           toolchain: 1.97.1
@@ -684,6 +740,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
       # The Determinate installer rather than cachix/install-nix-action: it is
       # what the cache action below is built to pair with, and it turns on
       # flakes (`nix-command`, `flakes`) without a hand-written extra-conf.
@@ -725,8 +783,11 @@ jobs:
       # from source. This job's cold cost is worse than devbox's, since
       # checks.default is a full release build of the crate and its whole
       # dependency tree. Magic Nix Cache stores that in GitHub Actions' own
-      # cache, so there is no third-party service and no secret, and forks and
-      # PRs get the cache too.
+      # cache, so there is no third-party service and no repository secret to
+      # register, and forks and PRs get the cache too. Read both halves as
+      # claims about the CACHE BACKEND, not about the job: like every other job
+      # in this file it still holds the automatic GITHUB_TOKEN, which is what
+      # the note above `jobs:` is about.
       - uses: DeterminateSystems/magic-nix-cache-action@908b263ff629f4cc17666315b7fd3ec127c6244d # v14
         with:
           # GitHub Actions cache only. Left at its default, this action
@@ -801,6 +862,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
       # Issue #648. Needs nothing but bash and the checkout, so it runs FIRST —
       # a drifted pin is reported in seconds rather than after the Nix store
       # restore.
