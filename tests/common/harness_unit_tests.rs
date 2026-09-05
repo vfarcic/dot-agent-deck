@@ -3277,6 +3277,412 @@ fn two_registered_values_interleaved_across_rows_are_both_redacted() {
 }
 
 // -----------------------------------------------------------------------
+// Issue #810 — the two reproduced leaks in the greedy scan
+// -----------------------------------------------------------------------
+//
+// Both fixtures use FABRICATED values chosen so the geometry is readable in
+// the assertion messages. No real credential shape is needed to provoke
+// either leak: what provokes them is where the registered values overlap and
+// where the continuations sit, not what the bytes mean.
+
+/// A registered value that BEGINS inside another registered value's match.
+/// Fabricated; the shared `ABCDEFGH` is the overlap the scan used to step
+/// over.
+const INTERIOR_START_FIRST: &str = "first-value-ABCDEFGH";
+/// The second half of that pair — it starts at the shared run, so its own
+/// start offset lies inside the first value's match.
+const INTERIOR_START_SECOND: &str = "ABCDEFGH-second-value-tail";
+
+/// Scenario: Register two overlapping fabricated values and scan their
+/// overlap-sharing concatenation `first-value-ABCDEFGH-second-value-tail`.
+/// The second value begins inside the first one's match. Both must be gone
+/// from the redacted text.
+///
+/// This is issue #810's leak 1. The scan resumed at the smallest
+/// `first_fragment_end` among the matches at a position, which reads the
+/// bytes a fragmented match PRESERVED but still skips every offset INSIDE
+/// its first fragment — so the second value's start, which sits in the
+/// shared `ABCDEFGH`, was never a position the scan looked at. The artifact
+/// came out `[REDACTED-CREDENTIAL]-second-value-tail`.
+#[test]
+fn a_registered_value_starting_inside_another_match_is_redacted_too() {
+    let first = INTERIOR_START_FIRST.to_string();
+    let second = INTERIOR_START_SECOND.to_string();
+    let overlap = "ABCDEFGH";
+    let text = format!(
+        "{}{overlap}{}",
+        first.strip_suffix(overlap).expect("the pair must overlap"),
+        second.strip_prefix(overlap).expect("the pair must overlap"),
+    );
+
+    // Non-vacuity: both values really are present, contiguously, and they
+    // really do share the run — so this is a fixture the matcher is obliged
+    // to find rather than one built out of coincidences.
+    assert!(
+        text.contains(&first) && text.contains(&second),
+        "the fixture does not carry both values contiguously: {text}"
+    );
+    assert!(
+        text.find(&second).expect("present") < text.find(&first).expect("present") + first.len(),
+        "the second value must START INSIDE the first one's match, or this \
+         test is not about the reported shape: {text}"
+    );
+
+    let redacted = redact_known_credentials_text(&text, &[first.clone(), second.clone()]);
+    assert_no_fragment_survives(&redacted, &first, "an interior-start pair");
+    assert_no_fragment_survives(&redacted, &second, "an interior-start pair");
+    assert!(
+        !redacted.contains("second-value-tail"),
+        "the second value's tail survived the scan: {redacted}"
+    );
+}
+
+/// Scenario: Register a fabricated value whose continuation occurs TWICE
+/// after the row transition — once as a decoy that reproduces the minimum
+/// fragment and then dead-ends, and once as the genuine remainder. The value
+/// must be redacted.
+///
+/// This is issue #810's leak 2. `credential_fragments_at` recorded every
+/// candidate but followed `candidates.first()` and returned `None` when that
+/// path dead-ended, so the decoy suppressed the real continuation and the
+/// matcher redacted NOTHING AT ALL — the whole text came back unchanged.
+/// Collecting candidates is not the same as searching exhaustively while one
+/// candidate still decides whether any result exists.
+#[test]
+fn a_decoy_continuation_does_not_suppress_the_real_one() {
+    let credential = "abcdefghABCDEFGHijklmnop".to_string();
+    let registered = std::slice::from_ref(&credential);
+    // `abcdefgh` wraps to the next row. There the continuation `ABCDEFGH…`
+    // occurs first as a decoy that cannot reach `ijklmnop`, and only after
+    // it as the genuine sixteen-byte remainder.
+    let text = "abcdefgh\nABCDEFGH decoy ABCDEFGHijklmnop";
+
+    // Non-vacuity: the value is nowhere contiguous, so byte-exact matching
+    // would find nothing and the fragment matcher is the thing under test.
+    assert!(
+        !text.contains(&credential),
+        "the fixture carries the value contiguously and proves nothing: {text}"
+    );
+    assert_eq!(
+        text.matches("ABCDEFGH").count(),
+        2,
+        "the fixture must offer a decoy AND a real continuation: {text}"
+    );
+
+    let redacted = redact_known_credentials_text(text, registered);
+    assert_ne!(
+        redacted, text,
+        "the decoy suppressed the real continuation and nothing was redacted"
+    );
+    assert_no_fragment_survives(&redacted, &credential, "a decoy continuation");
+    assert!(
+        redacted.contains(" decoy "),
+        "the bytes between the fragments must be preserved: {redacted}"
+    );
+}
+
+/// Scenario: Redact the interior-start fixture twice — once with only the
+/// value whose start is interior, then with both values — and assert the
+/// second run redacts a SUPERSET of the bytes the first run redacted.
+///
+/// This is the monotonicity property issue #810 requires of the rewrite, and
+/// it is a property to assert rather than a mechanism to design: an
+/// all-match search that emits ranges from every complete path has it for
+/// free. It has to be asserted because the greedy scan did NOT have it, and
+/// [`TuiDeck::artifact_redactions`] unions the per-deck set with the
+/// process-global diagnostic store — so under leak 1 enlarging the set could
+/// REMOVE a redaction, which is the opposite of what a union is for.
+#[test]
+fn enlarging_the_registered_set_never_removes_a_redaction() {
+    let first = INTERIOR_START_FIRST.to_string();
+    let second = INTERIOR_START_SECOND.to_string();
+    let text = "first-value-ABCDEFGH-second-value-tail";
+
+    let smaller = credential_redaction_ranges(text.as_bytes(), std::slice::from_ref(&second));
+    let larger = credential_redaction_ranges(text.as_bytes(), &[first, second]);
+
+    // Non-vacuity: the smaller set really does redact something, so the
+    // superset assertion has something to be a superset of.
+    assert!(
+        !smaller.is_empty(),
+        "the smaller set redacted nothing, so this proves nothing"
+    );
+
+    let covered = |ranges: &[(usize, usize)], byte: usize| {
+        ranges
+            .iter()
+            .any(|(start, end)| (*start..*end).contains(&byte))
+    };
+    for byte in 0..text.len() {
+        assert!(
+            !covered(&smaller, byte) || covered(&larger, byte),
+            "byte {byte} of {text:?} is redacted with one registered value and \
+             NOT with two, so adding a pattern removed a redaction: \
+             {smaller:?} then {larger:?}"
+        );
+    }
+}
+
+/// The `~/.claude/.credentials.json` document as a terminal would paint it —
+/// wrapped at the harness's own width, so each token is broken across rows.
+fn rendered_credential_document() -> String {
+    wrap_to_width(FABRICATED_CLAUDE_CREDENTIALS, GRID_COLS as usize).join("\n")
+}
+
+/// The pair the cost of this matcher has always been measured with: two
+/// fabricated 128-character tokens that share their first eight bytes
+/// (`sk-ant-o`), so every occurrence of that prefix is a start for BOTH.
+fn fabricated_token_pair() -> Vec<String> {
+    vec![
+        FABRICATED_CLAUDE_ACCESS_TOKEN.to_string(),
+        FABRICATED_CLAUDE_REFRESH_TOKEN.to_string(),
+    ]
+}
+
+/// Grow `artifact` to at least `bytes` by repeating `row`.
+fn pad_to(artifact: &mut String, row: &str, bytes: usize) {
+    while artifact.len() < bytes {
+        artifact.push_str(row);
+    }
+}
+
+/// Scenario: Scan the three artifact shapes issue #810's cost data names — a
+/// realistic stream holding one rendered credential document, the same document
+/// packed every 140 bytes, and the shared eight-byte token prefix repeated so
+/// it never chains into anything — and confirm each completes well inside its
+/// [`match_step_budget`] rather than refusing, finding the document where there
+/// is one.
+///
+/// The third shape is the reason the budget and the index both exist. Under the
+/// greedy scan 1.6 MB of it took **25.3 seconds**, because every occurrence of a
+/// shared prefix paid a full `MAX_WRAP_GAP` candidate sweep per pattern whether
+/// or not a range came of it — an availability problem on an artifact dump,
+/// since `.cast` history is not size-bounded and an agent that can render the
+/// prefix can produce far more than 1.6 MB.
+///
+/// It asserts on STEPS rather than on a clock, because a step count is
+/// deterministic and a wall time is not: a hop that went back to re-reading
+/// `MAX_WRAP_GAP` bytes would show up here on a machine of any speed under any
+/// load. The wall times measured at the full sizes are on
+/// [`credential_redaction_scan`]; the fixtures here are a tenth of those, which
+/// is where the ratio stops changing and keeps the test off the fast tier's
+/// critical path.
+#[test]
+fn the_measured_artifact_shapes_scan_inside_the_budget() {
+    let registered = fabricated_token_pair();
+    let document = rendered_credential_document();
+
+    // Realistic: one rendered document inside ordinary render.
+    let mut realistic = String::new();
+    pad_to(
+        &mut realistic,
+        "worker-1 \u{2502} waiting for the agent to report ready \u{2502}\n",
+        100_000,
+    );
+    realistic.push_str(&document);
+    pad_to(
+        &mut realistic,
+        "worker-2 \u{2502} waiting for the agent to report ready \u{2502}\n",
+        200_000,
+    );
+
+    // Packed: the same document every 140 bytes — the densest shape measured.
+    let mut packed = String::new();
+    pad_to(
+        &mut packed,
+        &format!("{document}\n-- 140 bytes of pane chrome between two renders ------------\n"),
+        200_000,
+    );
+
+    // Adversarial: the shared prefix over and over, chaining into nothing.
+    let mut adversarial = String::new();
+    pad_to(
+        &mut adversarial,
+        "sk-ant-o\u{2502}nothing follows this\n",
+        200_000,
+    );
+
+    for (what, artifact, must_find) in [
+        ("a realistic artifact", realistic, true),
+        ("a packed artifact", packed, true),
+        ("the adversarial shape", adversarial, false),
+    ] {
+        // Non-vacuity: the shapes really are big enough to be the shapes they
+        // claim, so a budget expressed per byte has something to bound.
+        assert!(
+            artifact.len() > 150_000,
+            "{what}: the fixture is too small to be the shape it claims"
+        );
+        let ranges = match credential_redaction_scan(artifact.as_bytes(), &registered) {
+            RedactionScan::Ranges(ranges) => ranges,
+            RedactionScan::Refused => panic!(
+                "{what}: the scan exhausted its budget on a shape it is sized \
+                 for, so every artifact of this shape would be withheld whole"
+            ),
+        };
+        assert_eq!(
+            !ranges.is_empty(),
+            must_find,
+            "{what}: the scan found {} ranges",
+            ranges.len()
+        );
+
+        let budget = match_step_budget(artifact.len());
+        let cost = credential_scan_cost(artifact.as_bytes(), &registered).expect("scanned above");
+        assert!(
+            cost * 2 < budget,
+            "{what}: {cost} steps over {} bytes is more than half the {budget} \
+             the budget allows — this shape used to sit far below it, so \
+             something reintroduced per-hop rescanning",
+            artifact.len()
+        );
+    }
+}
+
+/// Scenario: Redact over artifacts SHORTER than one [`MIN_WRAP_FRAGMENT`]
+/// window, from empty up to seven bytes, with values registered that could
+/// match part of them. Nothing panics and nothing is mangled.
+///
+/// The index walks a rolling four-byte window and probes an eight-byte one, so
+/// every artifact between four and seven bytes long has a window that opens but
+/// no needle that fits. Cheap to get wrong and impossible to notice: a
+/// `fixture.toml` is never that short, but a panic payload can be, and the seam
+/// that redacts panics is the one that must not panic.
+#[test]
+fn an_artifact_shorter_than_one_window_is_redacted_without_panicking() {
+    let registered = vec!["abcdefghijklmnop".to_string(), "abc".to_string()];
+    for length in 0..=7usize {
+        let artifact = "abcdefg"[..length].to_string();
+        let redacted = redact_known_credentials_text(&artifact, &registered);
+        // Only the short registered value can occur, and only contiguously.
+        let expected = match length {
+            0..=2 => artifact.clone(),
+            _ => artifact.replacen("abc", "[REDACTED-CREDENTIAL]", 1),
+        };
+        assert_eq!(
+            redacted, expected,
+            "a {length}-byte artifact came back wrong"
+        );
+    }
+}
+
+/// Scenario: Register a fabricated value far longer than any credential — the
+/// shape a mis-registration produces, a whole configuration blob read as one
+/// JSON string — and confirm a contiguous occurrence is still redacted while a
+/// wrapped one is left alone, with nothing overflowing on the way.
+///
+/// This pins `MAX_CHAINED_VALUE`, which exists because the continuation search
+/// recurses once per hop: without it a registered value of a few hundred
+/// kibibytes would exhaust the stack inside the panic seam, and the panic seam
+/// is the one place in this harness that must not itself crash. The wrapped half
+/// asserts a LIMIT rather than a guarantee, and is here so that limit is written
+/// down where someone changing the constant will see it.
+#[test]
+fn a_value_far_longer_than_any_credential_keeps_byte_exact_redaction() {
+    // The unique `HEADER01` opening matters: a value whose own opening window
+    // recurs inside it is a start at every recurrence, and a 9 KB value repeated
+    // that way is an adversarial fixture in its own right — it exhausts the step
+    // budget and this test then measures the budget instead of the bound.
+    let value = format!("HEADER01{}", "abcdefgh-ijklmnop-".repeat(600));
+    assert!(
+        value.len() > 8192 && value.matches("HEADER01").count() == 1,
+        "the fixture must exceed MAX_CHAINED_VALUE, and open uniquely"
+    );
+    let registered = std::slice::from_ref(&value);
+
+    let contiguous = format!("before {value} after");
+    assert_eq!(
+        redact_known_credentials_text(&contiguous, registered),
+        "before [REDACTED-CREDENTIAL] after",
+        "a contiguous occurrence of an over-long value stopped being redacted"
+    );
+
+    // The documented limit: chained across a row transition, it is not matched.
+    let split = value.len() / 2;
+    let wrapped = format!("{}\n{}", &value[..split], &value[split..]);
+    assert_eq!(
+        redact_known_credentials_text(&wrapped, registered),
+        wrapped,
+        "an over-long value was chained across rows, so MAX_CHAINED_VALUE is \
+         no longer bounding the recursion this test exists to bound"
+    );
+}
+
+/// Scenario: Hand the scan an artifact built to make its continuation search
+/// blow up — a fabricated value whose two halves are each rendered on their own
+/// row, over and over, so every start sees hundreds of places to resume — and
+/// confirm it REFUSES, and that the refusal replaces the whole artifact instead
+/// of writing the part it managed to scan.
+///
+/// This is the fail-closed half of issue #810, and it is a test rather than a
+/// comment because the failure it guards is silent: a budget that returned the
+/// ranges it had found so far would write every byte it never looked at, which
+/// is the leak the budget exists to prevent rather than a degraded version of
+/// preventing it.
+#[test]
+fn an_artifact_that_exhausts_the_budget_is_withheld_whole() {
+    // Fabricated, and shaped for the blow-up rather than for realism: each half
+    // is exactly `MIN_WRAP_FRAGMENT`, and each row offers another place the
+    // second half could resume, so the candidates at one state grow with
+    // `MAX_WRAP_GAP` rather than staying at one or two.
+    let value = "AAAAAAAABBBBBBBB".to_string();
+    let registered = std::slice::from_ref(&value);
+    let mut artifact = String::new();
+    pad_to(&mut artifact, "AAAAAAAA\nBBBBBBBB\n", 40_000);
+
+    // Non-vacuity: a small artifact of the SAME shape is scanned rather than
+    // refused, so what follows is a budget and not a blanket refusal.
+    let mut small = String::new();
+    pad_to(&mut small, "AAAAAAAA\nBBBBBBBB\n", 1_000);
+    assert!(
+        matches!(
+            credential_redaction_scan(small.as_bytes(), registered),
+            RedactionScan::Ranges(_)
+        ),
+        "the scan refuses even a small artifact of this shape, so the refusal \
+         below proves nothing about the budget"
+    );
+
+    assert!(
+        matches!(
+            credential_redaction_scan(artifact.as_bytes(), registered),
+            RedactionScan::Refused
+        ),
+        "the scan did not refuse an artifact whose search exceeds its budget"
+    );
+
+    let written = redact_known_credentials_bytes(artifact.as_bytes(), registered);
+    assert_eq!(
+        written, RECORDING_CREDENTIAL_SCAN_REFUSAL,
+        "a refused scan wrote something other than the whole-artifact refusal"
+    );
+    assert!(
+        !String::from_utf8_lossy(&written).contains("AAAAAAAA"),
+        "a refused scan wrote unscanned bytes from the artifact"
+    );
+
+    // The same refusal reaches `full-stream.cast`, which redacts across the
+    // concatenated stream and therefore cannot vouch for any single event.
+    let events = vec![
+        CastEvent {
+            offset_secs: 0.1,
+            data: artifact.as_bytes().to_vec(),
+        },
+        CastEvent {
+            offset_secs: 0.2,
+            data: b"a later event".to_vec(),
+        },
+    ];
+    let projected = redact_cast_events(&events, registered);
+    assert_eq!(projected.len(), events.len(), "an event was dropped");
+    assert_eq!(projected[0], RECORDING_CREDENTIAL_SCAN_REFUSAL);
+    assert!(
+        projected[1].is_empty(),
+        "a refused cast kept an event the scan never vouched for"
+    );
+}
+
+// -----------------------------------------------------------------------
 // Issue #502 — the credential reaches the agent that needs it
 // -----------------------------------------------------------------------
 

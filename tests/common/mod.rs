@@ -1950,34 +1950,29 @@ impl TuiDeck {
     /// a credential or identity value some harness path registered, and the
     /// per-deck set is already a subset of it in practice.
     ///
-    /// **Enlarging the set is NOT monotonic, and this comment used to claim it
-    /// was.** "The union can only add redactions" is false under the first of
-    /// the two matcher gaps tracked in
-    /// [#810](https://github.com/vfarcic/dot-agent-deck/issues/810). Put a
-    /// value whose start lies INSIDE an earlier value in the per-deck set, and
-    /// only that earlier value in the global store: with the deck value alone
-    /// the scan reaches its start and redacts it, but once the union adds the
-    /// earlier value the greedy scan matches that one first, resumes at the end
-    /// of its first fragment, steps over the deck value's interior start, and
-    /// leaves the deck value's tail in the artifact. So adding a pattern can
-    /// REMOVE a redaction until the matcher is replaced — #810 now carries
-    /// monotonicity (adding a pattern must never remove a redaction) as a
-    /// required property of the rewrite. Nextest's process-per-test model
-    /// bounds the blast radius to one test, since no other test's store can
-    /// reach this artifact, but it does not bound two credential or identity
-    /// paths interacting INSIDE the same test — which, with nine live tests
-    /// registering identity after launch, is exactly the shape this union
-    /// creates. It is kept anyway: the alternative is the silent drift it was
-    /// added to close, where a post-launch registration reached the panic seam
-    /// and never the `.cast`.
+    /// **Enlarging the set is monotonic AGAIN — but only since issue #810, and
+    /// the history is worth keeping because this comment once claimed it while
+    /// it was false.** "The union can only add redactions" did not hold under
+    /// the greedy scan: put a value whose start lay INSIDE an earlier value in
+    /// the per-deck set, and only that earlier value in the global store, and
+    /// adding the earlier value made the scan match it first, resume at the end
+    /// of its first fragment, step over the deck value's interior start and
+    /// leave the deck value's tail in the artifact. So a UNION could REMOVE a
+    /// redaction. [`credential_redaction_scan`] now searches every registered
+    /// value independently over the whole artifact and unions the results, which
+    /// gives monotonicity for free, and
+    /// `enlarging_the_registered_set_never_removes_a_redaction` asserts it
+    /// rather than leaving it to this paragraph. Nextest's process-per-test
+    /// model bounded the blast radius of the old behaviour to one test, but it
+    /// never bounded two credential or identity paths interacting INSIDE the
+    /// same test — which, with nine live tests registering identity after
+    /// launch, is exactly the shape this union creates.
     ///
-    /// The cost is not one failed substring search per artifact either. A value
-    /// that never appears can still drive repeated bounded continuation scans
-    /// wherever it shares a prefix with rendered bytes, and the union enlarges
-    /// the set that can do so; `docs/develop/e2e-lanes.md` records the measured
-    /// adversarial case (~25 s for 1.6 MB of repeated shared prefixes) against
-    /// ~162 ms for a realistic 2.1 MB artifact. #810's indexed rewrite and
-    /// fail-closed budget carry that too.
+    /// The one thing the union still buys is cost, and #810 bounded that too. A
+    /// value that never appears can still drive continuation search wherever it
+    /// shares a prefix with rendered bytes, and the union enlarges the set that
+    /// can do so — so the step budget is per ARTIFACT rather than per value, and
+    /// a scan that exhausts it withholds the artifact whole.
     fn artifact_redactions(&self) -> Vec<String> {
         let mut values = self.recording_redactions.clone();
         values.extend(lock_diagnostic_redactions().iter().cloned());
@@ -2146,8 +2141,21 @@ impl TuiDeck {
 
 pub(crate) const RECORDING_CREDENTIAL_REDACTION: &[u8] = b"[REDACTED-CREDENTIAL]";
 
+/// What replaces a WHOLE artifact when [`credential_redaction_scan`] refuses.
+///
+/// Distinct from [`RECORDING_CREDENTIAL_REDACTION`] on purpose: the two mean
+/// different things, and reading a refusal as an ordinary redaction would hide
+/// the one case where the harness deliberately threw an artifact away. It names
+/// the issue because whoever finds it in a recording needs to know it is a
+/// budget, not a crash.
+pub(crate) const RECORDING_CREDENTIAL_SCAN_REFUSAL: &[u8] =
+    b"[WITHHELD-ARTIFACT: the credential scan exhausted its cost budget, so this \
+artifact was replaced whole rather than written with bytes nothing examined \
+(issue #810)]\n";
+
 // ---------------------------------------------------------------------------
-// Matching a credential a TERMINAL WRAPPED (issue #502/#785 blocker A)
+// Matching a credential a TERMINAL WRAPPED (issue #502/#785 blocker A,
+// rewritten as an all-match search by issue #810)
 // ---------------------------------------------------------------------------
 //
 // Byte-exact matching is not enough, and the arithmetic says so precisely. An
@@ -2175,11 +2183,55 @@ pub(crate) const RECORDING_CREDENTIAL_REDACTION: &[u8] = b"[REDACTED-CREDENTIAL]
 // had to be reopened for. A gap is arbitrary rendered content, so on a real
 // grid it holds whatever else was on screen — including the other registered
 // value, because the key and the response id Claude Code's approval prompt
-// paints are always registered together and the id is a suffix of the key. The
-// scan therefore resumes at the end of a match's FIRST fragment, never past the
-// last, and every alternate place a hop could have resumed is redacted along
-// with the one it took. `credential_redaction_ranges` and `fragment_candidates`
-// carry the measured cases.
+// paints are always registered together and the id is a suffix of the key.
+//
+// WHY THIS IS AN ALL-MATCH SEARCH RATHER THAN A GREEDY SCAN, which is the
+// whole of issue #810. What stood here before was a greedy left-to-right scan
+// with a single committed continuation chain, and it was point-fixed four times
+// — contiguous-only matching; skipping the bytes a fragmented match preserved;
+// redacting only the first place a hop could resume; keeping one match per
+// position by length — with a leak of the same ordering-dependent shape turning
+// up after each one. PR #805's second security audit then reproduced two more,
+// with fabricated values:
+//
+//   1. A registered value that STARTED INSIDE an earlier match survived. The
+//      scan resumed at the smallest first-fragment end among the matches at a
+//      position, which still skipped every offset inside that fragment — so
+//      `first-value-ABCDEFGH` and `ABCDEFGH-second-value-tail`, scanned over
+//      their concatenation, left `[REDACTED-CREDENTIAL]-second-value-tail`.
+//   2. A DECOY continuation suppressed a real one and then NOTHING was redacted
+//      at all, because the chain followed `candidates.first()` and gave up if
+//      that path dead-ended.
+//
+// Collecting candidates is not the same as searching exhaustively while one
+// candidate still decides whether any result exists. So the search below has no
+// cursor and no committed chain:
+//
+//   * NO OFFSET IS SKIPPED. `OccurrenceIndex` walks every byte offset of the
+//     artifact once and records every position of every `MIN_WRAP_FRAGMENT`-byte
+//     window any registered value needs, so a start is never missed because an
+//     earlier match consumed the offset.
+//   * Every non-empty registered value is searched INDEPENDENTLY over the whole
+//     input, so the result is a union over the registered set. That is what
+//     makes it MONOTONIC: for registered sets `A ⊆ B`, every byte redacted under
+//     `A` is redacted under `B` — and if `B` exhausts the budget where `A` did
+//     not, the artifact is withheld whole, which redacts more rather than less.
+//     The greedy scan did not have the property — a value added to the set could
+//     take the chain and step over another value's interior start — and
+//     `TuiDeck::artifact_redactions` unions two sets, so the absence was
+//     reachable inside one test.
+//     `enlarging_the_registered_set_never_removes_a_redaction` asserts it.
+//   * Continuations are explored as a bounded DAG over states
+//     `(bytes consumed, cursor)`, DEDUPLICATED on that pair, so two paths that
+//     arrive at the same place are explored once. Ranges are emitted only from
+//     states that lie on a COMPLETE path — one that reproduces the whole value
+//     — plus every alternate candidate at such a state, for the reason
+//     `hop_candidates` gives.
+//   * The search FAILS CLOSED. `match_step_budget` and `MAX_INDEX_OCCURRENCES`
+//     bound the work; when either is exhausted the scan refuses, and the
+//     callers replace the WHOLE artifact with
+//     `RECORDING_CREDENTIAL_SCAN_REFUSAL` rather than writing bytes nothing
+//     looked at.
 //
 // WHY THIS IS NOT A SUBSEQUENCE SEARCH, which is the failure mode a naive
 // version of this has: "match, skip anything, match again" finds almost any
@@ -2188,63 +2240,54 @@ pub(crate) const RECORDING_CREDENTIAL_REDACTION: &[u8] = b"[REDACTED-CREDENTIAL]
 // may look. A contiguous occurrence still produces exactly one range, so this is
 // a strict superset of the byte-exact matcher it replaces.
 //
-// WHAT THIS DOES NOT CLAIM, AND IT IS MORE THAN THE FLOOR. Start with the
-// framing, because every doc that described this as "the last thing between a
-// key and a published video" was overstating it: **this is a BLOCKLIST and it is
-// best-effort.** It can only remove values something registered, and the scan
-// that finds them is greedy left-to-right with a single committed continuation
-// chain. It has been point-fixed four times (contiguous-only matching; skipping
-// the bytes a fragmented match preserved; redacting only the first place a hop
-// could resume; keeping one match per position by length) and PR #805's second
-// security audit reproduced TWO more leaks in the code as it stands, with
-// fabricated values:
+// WHAT THIS DOES NOT CLAIM. Start with the framing, because every doc that
+// described this as "the last thing between a key and a published video" was
+// overstating it: **this is a BLOCKLIST and it is best-effort.** It can only
+// remove values something registered. The named limits that survive the rewrite
+// are about the FLOOR and the BOUNDS rather than about ordering:
 //
-//   1. A registered value that STARTS INSIDE an earlier match survives. The scan
-//      resumes at the smallest first-fragment end among the matches at a
-//      position, which still skips every offset inside that fragment — so
-//      `first-value-ABCDEFGH` and `ABCDEFGH-second-value-tail`, scanned over
-//      their concatenation, leave `[REDACTED-CREDENTIAL]-second-value-tail`.
-//   2. A DECOY continuation suppresses a real one and then nothing is redacted
-//      at all. `credential_fragments_at` follows `candidates.first()` and returns
-//      `None` if that path dead-ends, so a value whose genuine continuation
-//      appears after a decoy is left entirely in place.
+//   * A run of credential bytes shorter than `MIN_WRAP_FRAGMENT` can survive
+//     when it is not itself the tail of a complete path — the six-byte
+//     remainder of a 102 / 6 break is the measured case.
+//   * A run that IS at least `MIN_WRAP_FRAGMENT` bytes but sits on no complete
+//     path is not redacted either, because nothing reproduced the whole value
+//     through it. Eight bytes of a 108-character key is not the leak this seam
+//     exists to stop, and the alternative — redacting every occurrence of every
+//     eight-byte window of every registered value — would replace unrelated
+//     rendered text wherever a human-readable registered value shares a window
+//     with it. See `MIN_WRAP_FRAGMENT` on how wide the registered population
+//     actually is.
+//   * A value whose fragments are separated by something OTHER than a row
+//     transition, or by more than `MAX_WRAP_GAP` bytes, is not bridged. Both
+//     bounds are deliberate and are what keep this from degenerating into a
+//     subsequence search (below); they are limits all the same.
+//   * A registered value longer than `MAX_CHAINED_VALUE` is matched
+//     CONTIGUOUSLY ONLY. That bounds the continuation search's recursion depth,
+//     and at 8 KiB it is three orders of magnitude past any credential this
+//     harness registers.
 //
-// Both are issue #810, which carries the design: a bounded
-// dynamic-programming/NFA search over deduplicated continuation states emitting
-// ranges only from COMPLETE paths, exact occurrences from an overlap-preserving
-// multi-pattern scan, and a cost budget that fails closed by replacing the whole
-// artifact rather than writing unscanned bytes. Do not add a fifth point fix
-// here: each of the four closed a real leak and each was followed by another of
-// the same ordering-dependent shape. What actually stands between a credential
-// and a public URL is the demo reel's private-by-default upload plus the owner's
-// review before flipping it — see `docs/develop/demo-reel.md`.
+// What actually stands between a credential and a public URL is the demo reel's
+// private-by-default upload plus the owner's review before flipping it — see
+// `docs/develop/demo-reel.md`.
 //
 // WHAT IT DOES GUARANTEE, verified rather than argued. Every range constructed
-// here reproduces registered credential bytes exactly — the first is a common
-// prefix, chained ranges are common prefixes of the remaining credential,
-// alternates are exact candidate runs — and `merge_redaction_ranges` merges only
-// strict overlaps and never fills gaps. So it OVER-redacts rather than
-// mis-redacts: it can obscure a coincidental fragment of a panic, it cannot
-// replace arbitrary bytes it did not match. And it removes the realistic
-// geometries a terminal produces, which is what it was built for.
+// here reproduces registered credential bytes exactly — a start range is a
+// common prefix of the value, every hop range is an exact run of the value's
+// remaining bytes — and `merge_redaction_ranges` merges only strict overlaps and
+// never fills gaps. So it OVER-redacts rather than mis-redacts: it can obscure a
+// coincidental fragment of a panic, it cannot replace arbitrary bytes it did not
+// match — with the one exception it announces, a refused scan, which replaces
+// the artifact whole and says so. And it removes the realistic geometries a
+// terminal produces, which is what it was built for.
 //
-// THE FLOOR, which is the narrower claim this paragraph used to be about.
-// `MIN_WRAP_FRAGMENT` is a floor on evidence, so a run of credential bytes
-// SHORTER than it can survive: the six-byte remainder of a 102 / 6 break stays
-// in the artifact when a coincidence elsewhere on the row took the chain. Six
-// bytes is below the bar this matcher states for evidence everywhere else, which
-// is the reason the floor is where it is rather than an exception to it. In the
-// other direction the floor over-redacts, and `collect_credential_values` widens
-// that surface by registering every auth-document string of 16 characters or
-// more even when its field name is not sensitive — see the note on
-// `MIN_WRAP_FRAGMENT` below.
-//
-// COST has an adversarial tail, and it is part of #810 too: a realistic 2.1 MB
-// artifact holding one rendered credential document scans in ~162 ms, while
-// 1.6 MB of repeated shared prefixes takes ~25 SECONDS, because each occurrence
-// of a shared eight-byte prefix can trigger two full `MAX_WRAP_GAP` candidate
-// scans whether or not a range is kept — and `.cast` history is not
-// size-bounded.
+// COST. The greedy scan re-read up to `MAX_WRAP_GAP` bytes per hop, which made a
+// realistic 2.1 MB artifact holding one rendered credential document cost
+// ~162 ms and 1.6 MB of repeated shared eight-byte prefixes cost ~25 SECONDS —
+// an availability problem on an artifact dump, since `.cast` history is not
+// size-bounded. The index replaces those sweeps with one linear pass over the
+// artifact plus a binary search per hop with a full-length continuation — a
+// SHORT TAIL still walks the gap, stopping at the first place it resumes.
+// `credential_redaction_scan` carries the re-measured figures.
 
 /// The shortest run of credential bytes a wrapped match accepts as a fragment,
 /// other than the final one.
@@ -2292,6 +2335,72 @@ pub(crate) const MIN_WRAP_FRAGMENT: usize = 8;
 /// multi-megabyte stream.
 const MAX_WRAP_GAP: usize = 4096;
 
+/// How much search one artifact may buy before the scan REFUSES: a floor, plus
+/// [`MATCH_STEPS_PER_BYTE`] per input byte.
+///
+/// A step is one candidate examined, one start considered, or eight bytes
+/// compared. Making the budget proportional to the input states the property
+/// being defended rather than a number someone liked: **the scan may do a
+/// constant amount of work per byte of artifact and no more.** That is exactly
+/// what the greedy scan lost — every occurrence of a shared prefix paid a full
+/// [`MAX_WRAP_GAP`] sweep, so 1.6 MB of them cost 25 seconds — and it is what a
+/// fixed ceiling would fail to express, since it would refuse a large ordinary
+/// artifact and accept a small quadratic one.
+///
+/// One budget covers the WHOLE registered set rather than one per value, so a
+/// set that grows cannot buy more search. That is the direction that keeps the
+/// bound honest, and it is why the per-byte allowance has room in it:
+/// [`credential_redaction_scan`] records the densest shape measured — a 2 MB
+/// artifact packed with a rendered credential document every 140 bytes — at
+/// 1.19 M steps for a two-value set, against a budget of 8.4 M.
+///
+/// The floor is what keeps a SMALL artifact scannable: a panic message is a few
+/// hundred bytes, and per-byte alone would refuse it for doing any work at all.
+pub(crate) fn match_step_budget(len: usize) -> usize {
+    MIN_MATCH_STEPS.saturating_add(len.saturating_mul(MATCH_STEPS_PER_BYTE))
+}
+
+/// How much work one byte of artifact buys. See [`match_step_budget`].
+const MATCH_STEPS_PER_BYTE: usize = 4;
+
+/// The longest registered value whose fragments are CHAINED across rows.
+/// Anything longer is matched contiguously only.
+///
+/// The continuation search recurses once per hop and a hop consumes at least
+/// [`MIN_WRAP_FRAGMENT`] bytes, so its depth is bounded by
+/// `value.len() / MIN_WRAP_FRAGMENT` — around a thousand frames at this limit,
+/// which is a few hundred kibibytes of stack. Without a bound, a registered
+/// value of a few hundred kibibytes would overflow the stack inside the panic
+/// seam, which is the one place in this harness that must not itself crash.
+///
+/// Eight kibibytes is three orders of magnitude above any credential this
+/// harness registers (an Anthropic key is 108 bytes, a Claude OAuth token 128),
+/// so what it actually catches is a MIS-REGISTRATION — a whole configuration
+/// blob picked up as one JSON string by [`collect_credential_values`], which has
+/// no upper length filter. Such a value keeps byte-exact redaction, which is all
+/// that was ever realistic for it: a value this long is broken into hundreds of
+/// pieces by any terminal that renders it, and chaining across them is not a
+/// geometry anyone has seen.
+const MAX_CHAINED_VALUE: usize = 8192;
+
+/// The floor of [`match_step_budget`] — so a small artifact is not refused
+/// merely for being small. A panic message, a `fixture.toml` and a single grid
+/// are all in the hundreds-to-thousands of bytes, where the per-byte allowance
+/// alone would buy almost no search.
+const MIN_MATCH_STEPS: usize = 1 << 16;
+
+/// How many index entries one artifact may hold before the scan REFUSES.
+///
+/// The index records a position for every occurrence of every
+/// [`MIN_WRAP_FRAGMENT`]-byte window any registered value contains, so its size
+/// is bounded by the input for a credential-shaped value and unbounded only if a
+/// registered value's windows are ubiquitous in the artifact. Refusing there is
+/// the right direction: a "credential" whose eight-byte windows appear a million
+/// times in one recording is either an adversarial artifact or a registration
+/// mistake, and both are cases for withholding the artifact rather than
+/// publishing it.
+const MAX_INDEX_OCCURRENCES: usize = 1 << 21;
+
 /// Bytes that mean "the writer moved to another row" — the only thing that
 /// licenses bridging a gap at all.
 ///
@@ -2310,58 +2419,233 @@ fn is_row_transition(byte: u8) -> bool {
 }
 
 /// How many leading bytes of `wanted` `data[cursor..]` reproduces.
+///
+/// Written over slice iterators rather than over an index range because it is
+/// the innermost loop of the whole scan and these tests build unoptimised, where
+/// the bounds check per indexed access is not free.
 fn common_prefix_len(data: &[u8], cursor: usize, wanted: &[u8]) -> usize {
-    let limit = data.len().saturating_sub(cursor).min(wanted.len());
-    (0..limit)
-        .take_while(|index| data[cursor + index] == wanted[*index])
+    data.get(cursor..)
+        .unwrap_or_default()
+        .iter()
+        .zip(wanted)
+        .take_while(|(here, there)| here == there)
         .count()
 }
 
-/// Every place after a row transition, within [`MAX_WRAP_GAP`], where
-/// `remaining` resumes — as `(position, run length)`, ascending.
+/// The fixed-size window the multi-pattern index is keyed by.
+type Needle = [u8; MIN_WRAP_FRAGMENT];
+
+/// Every position of every window the registered set can ask about, plus every
+/// row transition — the overlap-preserving multi-pattern scan issue #810 asks
+/// for, built once per artifact.
 ///
-/// The chain still follows the FIRST one and never backtracks. The rest are why
-/// this returns a list instead of a position, and the reason is a property of
+/// Overlap-preserving is the load-bearing word: an occurrence is recorded at
+/// EVERY offset where a window matches, so nothing is hidden because a longer
+/// match covered the offset. That is the property the greedy scan lacked, and
+/// the one that lets the search examine every byte offset without paying the
+/// [`MAX_WRAP_GAP`] re-read per hop that made the adversarial shape cost 25
+/// seconds.
+struct OccurrenceIndex {
+    /// Ascending positions, per window. A window with no entry never occurs.
+    positions: HashMap<Needle, Vec<usize>>,
+    /// Ascending positions of every [`is_row_transition`] byte, so "where does
+    /// the next row start" is a binary search rather than a scan.
+    transitions: Vec<usize>,
+}
+
+/// A 64 Kibit superset filter over the needles' first FOUR bytes, so the index
+/// build hashes almost nothing.
+///
+/// This is not an optimisation looking for a problem. The build walks every byte
+/// of the artifact, and a per-BYTE prefilter is far too coarse for base64-shaped
+/// material: the 242 windows of one fabricated token pair open with several
+/// dozen distinct bytes, most of them ordinary letters and digits, so most of a
+/// rendered artifact passed it and paid a `HashMap` probe. Measured on a 2.1 MB
+/// realistic artifact in the unoptimised profile the tests run in, that was
+/// **3.5 s** — worse than the greedy scan this replaces, for a search whose own
+/// cost is 51 steps. Four bytes takes the false-positive rate to roughly
+/// `needles / 65536`, and the same artifact to the tens of milliseconds.
+///
+/// A superset filter can only cost time, never coverage: a set bit means "probe
+/// the map", and a clear bit means those four bytes open no needle at all.
+struct NeedleFilter {
+    bits: Vec<u64>,
+}
+
+impl NeedleFilter {
+    const SLOTS: usize = 1 << 16;
+
+    fn new() -> Self {
+        Self {
+            bits: vec![0u64; Self::SLOTS / 64],
+        }
+    }
+
+    /// The four bytes as the build loop carries them: little-endian, so the
+    /// EARLIEST of the four is the low byte and a rolling `>> 8` keeps it that
+    /// way without re-reading the input.
+    fn window_of(bytes: &[u8]) -> u32 {
+        u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+    }
+
+    fn slot(window: u32) -> usize {
+        // Bits 16..32 of a Fibonacci-hashed product: the cheapest mixing that
+        // does not leave consecutive four-byte windows in adjacent slots.
+        ((window.wrapping_mul(0x9E37_79B1) >> 16) as usize) & (Self::SLOTS - 1)
+    }
+
+    fn insert(&mut self, window: u32) {
+        let slot = Self::slot(window);
+        self.bits[slot >> 6] |= 1 << (slot & 63);
+    }
+
+    fn may_open_a_needle(&self, window: u32) -> bool {
+        let slot = Self::slot(window);
+        self.bits[slot >> 6] >> (slot & 63) & 1 == 1
+    }
+}
+
+impl OccurrenceIndex {
+    /// `None` when the artifact would need more than [`MAX_INDEX_OCCURRENCES`]
+    /// entries — the fail-closed direction.
+    fn build(data: &[u8], patterns: &[&[u8]]) -> Option<Self> {
+        let mut positions: HashMap<Needle, Vec<usize>> = HashMap::new();
+        let mut filter = NeedleFilter::new();
+        for pattern in patterns {
+            for window in pattern.windows(MIN_WRAP_FRAGMENT) {
+                let key: Needle = window.try_into().expect("windows() yields exact chunks");
+                filter.insert(NeedleFilter::window_of(&key));
+                positions.entry(key).or_default();
+            }
+        }
+
+        // ONE pass, with the four-byte window rolled rather than re-read. Both
+        // are here because this loop is the artifact's per-byte cost and the
+        // tests build unoptimised: a second pass for the transitions, or a fresh
+        // four-byte read per offset, each cost a few hundred milliseconds on a
+        // 2.1 MB artifact whose search itself is 51 steps.
+        let mut transitions = Vec::new();
+        let mut window: u32 = 0;
+        let mut recorded = 0usize;
+        let last_start = data.len().saturating_sub(MIN_WRAP_FRAGMENT);
+        for (index, byte) in data.iter().enumerate() {
+            if is_row_transition(*byte) {
+                transitions.push(index);
+            }
+            window = (window >> 8) | ((*byte as u32) << 24);
+            // The window now spans `index - 3 ..= index`, so it opens at
+            // `index - 3` — and a needle needs `MIN_WRAP_FRAGMENT` bytes after
+            // that.
+            let Some(start) = index
+                .checked_sub(3)
+                .filter(|at| data.len() >= MIN_WRAP_FRAGMENT && *at <= last_start)
+            else {
+                continue;
+            };
+            if !filter.may_open_a_needle(window) {
+                continue;
+            }
+            let key: Needle = data[start..start + MIN_WRAP_FRAGMENT]
+                .try_into()
+                .expect("the slice is exactly one needle wide");
+            if let Some(list) = positions.get_mut(&key) {
+                list.push(start);
+                recorded += 1;
+                if recorded > MAX_INDEX_OCCURRENCES {
+                    return None;
+                }
+            }
+        }
+        Some(Self {
+            positions,
+            transitions,
+        })
+    }
+
+    /// Every position of `needle`, ascending.
+    fn occurrences(&self, needle: &Needle) -> &[usize] {
+        self.positions.get(needle).map_or(&[], Vec::as_slice)
+    }
+
+    /// Positions of `needle` in `lo..hi`, ascending.
+    fn occurrences_in(&self, needle: &Needle, lo: usize, hi: usize) -> &[usize] {
+        let all = self.occurrences(needle);
+        let from = all.partition_point(|at| *at < lo);
+        let to = all.partition_point(|at| *at < hi);
+        &all[from..to]
+    }
+
+    /// The first row transition at or after `from`, if there is one.
+    fn next_transition(&self, from: usize) -> Option<usize> {
+        let at = self
+            .transitions
+            .partition_point(|position| *position < from);
+        self.transitions.get(at).copied()
+    }
+}
+
+/// Every place after a row transition, within [`MAX_WRAP_GAP`] of `gap_start`,
+/// where `remaining` resumes — as `(position, run length)`, ascending.
+///
+/// ALL of them, not the first: the search explores every one as its own
+/// continuation, which is what stops a decoy from suppressing a real
+/// continuation (issue #810's leak 2). And all of them are REDACTED when the
+/// state they leave is on a complete path, for a reason that is a property of
 /// the registered set rather than a hypothetical: a registered value can be a
 /// SUFFIX of another registered value. An Anthropic key and the 20-character
 /// response id Claude Code's approval prompt paints are exactly that pair, and
 /// [`api_key_recording_redactions`] always registers them together — so the run
 /// that resumes the key on the next row ALSO occurs, a few characters earlier,
-/// inside a response id rendered on that row. Following the first candidate is
-/// then following the coincidence, and the real continuation is left sitting
-/// there. It is a whole 16 characters of key material when the value wraps
-/// 92 / 16 inside a pane.
-///
-/// Whichever one the chain follows, both are runs that reproduce credential
-/// bytes exactly, so both are redacted. There is no way to tell them apart and
-/// no need to.
+/// inside a response id rendered on that row. Whichever one a path follows, both
+/// are runs that reproduce credential bytes exactly, so both are redacted. There
+/// is no way to tell them apart and no need to.
 ///
 /// A candidate is recorded only when it reproduces a FULL
-/// [`MIN_WRAP_FRAGMENT`]. A shorter tail is exempt for the CHAIN — the 102 / 6
-/// break's six-byte remainder, whose coincidence argument was already spent on
-/// the 102 bytes before it — but it is not evidence on its own, and redacting
-/// every place a six- or one-byte tail happens to occur would be over-redaction
-/// with nothing behind it. So a short tail stops at the one candidate the chain
-/// takes, exactly as before.
-///
-/// Cost is unchanged in the bound and only in the bound: one pass over at most
-/// [`MAX_WRAP_GAP`] positions comparing at most [`MIN_WRAP_FRAGMENT`] bytes at
-/// each. That was already what a gap containing no candidate cost; it is now
-/// what every hop with a full-length tail costs. Still linear in the input for
-/// a fixed credential set, still no backtracking, still no growth in the number
-/// of hops.
-fn fragment_candidates(data: &[u8], gap_start: usize, remaining: &[u8]) -> Vec<(usize, usize)> {
-    let need = &remaining[..remaining.len().min(MIN_WRAP_FRAGMENT)];
-    let alternates_are_evidence = need.len() == MIN_WRAP_FRAGMENT;
+/// [`MIN_WRAP_FRAGMENT`]. A SHORT TAIL — fewer than that many bytes left, the
+/// 102 / 6 break's six-byte remainder — is exempt from the floor, because the
+/// coincidence argument was already spent on the 102 bytes before it. It is not
+/// evidence on its own though, so a short tail yields only the FIRST place it
+/// resumes: every such place completes the value by construction, so taking one
+/// loses no match, while taking all of them would redact every occurrence of a
+/// six- or one-byte string in the artifact.
+fn hop_candidates(
+    data: &[u8],
+    index: &OccurrenceIndex,
+    gap_start: usize,
+    remaining: &[u8],
+    steps: &mut usize,
+) -> Vec<(usize, usize)> {
     let limit = data.len().min(gap_start.saturating_add(MAX_WRAP_GAP));
+    let Some(crossed) = index.next_transition(gap_start).filter(|at| *at < limit) else {
+        return Vec::new();
+    };
+    // The transition byte itself is never a candidate, and a candidate must sit
+    // after one — so the window opens one byte past the first transition.
+    let from = crossed + 1;
     let mut found = Vec::new();
-    let mut crossed_a_row = false;
-    for index in gap_start..limit {
-        if is_row_transition(data[index]) {
-            crossed_a_row = true;
-        } else if crossed_a_row && common_prefix_len(data, index, need) == need.len() {
-            found.push((index, common_prefix_len(data, index, remaining)));
-            if !alternates_are_evidence {
+    if remaining.len() >= MIN_WRAP_FRAGMENT {
+        let needle: Needle = remaining[..MIN_WRAP_FRAGMENT]
+            .try_into()
+            .expect("the slice is exactly one needle wide");
+        for at in index.occurrences_in(&needle, from, limit) {
+            *steps += 1;
+            if is_row_transition(data[*at]) {
+                continue;
+            }
+            let run = common_prefix_len(data, *at, remaining);
+            *steps += run / MIN_WRAP_FRAGMENT;
+            found.push((*at, run));
+        }
+    } else {
+        // Below the index's window width, so this walks the gap — but it stops
+        // at the first hit, which is the only one a short tail contributes.
+        for at in from..limit {
+            *steps += 1;
+            if is_row_transition(data[at]) {
+                continue;
+            }
+            if common_prefix_len(data, at, remaining) == remaining.len() {
+                found.push((at, remaining.len()));
                 break;
             }
         }
@@ -2369,78 +2653,203 @@ fn fragment_candidates(data: &[u8], gap_start: usize, remaining: &[u8]) -> Vec<(
     found
 }
 
-/// One occurrence of one credential, as the ranges that carry it.
-struct CredentialMatch {
-    /// Every range that carries credential bytes: the chained fragments, plus
-    /// every alternate candidate [`fragment_candidates`] found in a bridged
-    /// gap. The chain's own fragments ascend; the alternates do not interleave
-    /// with them in order, which is why [`credential_redaction_ranges`] sorts
-    /// and coalesces before returning.
-    ranges: Vec<(usize, usize)>,
-    /// End of the FIRST fragment — where the outer scan resumes, so that every
-    /// byte this match PRESERVED is still examined for another credential.
-    first_fragment_end: usize,
+/// One state of the continuation search, memoised so a value that can be
+/// reached two ways is explored once.
+struct HopState {
+    /// Every place this state can resume at, and how much of the value each
+    /// reproduces. Cached rather than recomputed because both passes over the
+    /// DAG — "can this complete" and "write the ranges" — need the same list,
+    /// and recomputing it charged the budget three times for one hop.
+    candidates: Vec<(usize, usize)>,
+    /// Whether some path from here reproduces the rest of the value.
+    completes: bool,
 }
 
-/// Match `credential` starting at `start`, allowing a TUI to have painted it
-/// across several rows, and return the byte ranges that carry it.
+/// The exhaustive continuation search for ONE registered value over one
+/// artifact.
 ///
-/// A contiguous occurrence comes back as exactly one range, which is what makes
-/// this a strict superset of byte-exact matching.
-///
-/// **KNOWN LEAK (issue #810): the chain commits to `candidates.first()` and
-/// returns `None` if that path dead-ends.** Every candidate is recorded, but one
-/// candidate still decides whether any result exists at all, so a decoy
-/// continuation suppresses a valid later one and the value is left entirely
-/// unredacted. Reproduced by PR #805's second audit with fabricated values.
-/// Collecting candidates is not the same as searching exhaustively; the fix is
-/// the all-match search in #810, not a different choice of candidate here.
-fn credential_fragments_at(
-    data: &[u8],
-    start: usize,
-    credential: &[u8],
-) -> Option<CredentialMatch> {
-    let mut consumed = common_prefix_len(data, start, credential);
-    if consumed == 0 {
-        return None;
-    }
-    // Cheap rejection BEFORE anything is allocated: on a large stream this is
-    // reached once per occurrence of the credential's first byte.
-    if consumed < credential.len() && consumed < MIN_WRAP_FRAGMENT {
-        return None;
-    }
-    let mut cursor = start + consumed;
-    let first_fragment_end = cursor;
-    let mut ranges = vec![(start, cursor)];
-    while consumed < credential.len() {
-        let candidates = fragment_candidates(data, cursor, &credential[consumed..]);
-        // Never zero-length: a candidate reproduces at least one byte, so this
-        // loop always advances.
-        let (resume, run) = *candidates.first()?;
-        consumed += run;
-        cursor = resume + run;
-        if consumed < credential.len() && run < MIN_WRAP_FRAGMENT {
-            return None;
+/// States are `(bytes consumed, cursor)` and are deduplicated on that pair, so
+/// the exponential blow-up a backtrack-free chain used to avoid by GUESSING is
+/// avoided by memoisation instead. `completes` answers "can the whole value be
+/// reproduced from here"; `emit` then walks only the states that can, so a range
+/// is written because some path reproduced the ENTIRE value through it.
+struct ValueSearch<'a> {
+    data: &'a [u8],
+    index: &'a OccurrenceIndex,
+    value: &'a [u8],
+    states: HashMap<(usize, usize), HopState>,
+    /// What the values searched before this one already spent.
+    spent: usize,
+    steps: usize,
+}
+
+impl<'a> ValueSearch<'a> {
+    fn new(data: &'a [u8], index: &'a OccurrenceIndex, value: &'a [u8], spent: usize) -> Self {
+        Self {
+            data,
+            index,
+            value,
+            states: HashMap::new(),
+            spent,
+            steps: 0,
         }
-        ranges.push((resume, cursor));
-        // The chain took the first candidate; the others reproduce the same
-        // credential bytes and are redacted too — see `fragment_candidates`.
-        ranges.extend(candidates[1..].iter().map(|(at, run)| (*at, at + run)));
     }
-    Some(CredentialMatch {
-        ranges,
-        first_fragment_end,
-    })
+
+    /// `None` once the artifact's [`match_step_budget`] is gone, which
+    /// propagates to a refusal rather than being read as "nothing found".
+    ///
+    /// The budget is shared across the whole registered set — `spent` is what
+    /// earlier values already used — so a set of a hundred values cannot buy a
+    /// hundred budgets.
+    fn spend(&mut self, steps: usize) -> Option<()> {
+        self.steps += steps;
+        (self.spent + self.steps <= match_step_budget(self.data.len())).then_some(())
+    }
+
+    /// The memoised state at `(consumed, cursor)`, computing it if new.
+    ///
+    /// Inserted BEFORE the recursion with `completes: false`, so a state still
+    /// in flight answers "no" rather than recursing forever. A hop always
+    /// advances the cursor, so no path can revisit a state — the insert is what
+    /// keeps that from being a claim nothing enforces.
+    fn state(&mut self, consumed: usize, cursor: usize) -> Option<bool> {
+        if consumed == self.value.len() {
+            return Some(true);
+        }
+        if let Some(state) = self.states.get(&(consumed, cursor)) {
+            return Some(state.completes);
+        }
+        let mut steps = 1;
+        let candidates = hop_candidates(
+            self.data,
+            self.index,
+            cursor,
+            &self.value[consumed..],
+            &mut steps,
+        );
+        self.spend(steps)?;
+        let count = candidates.len();
+        self.states.insert(
+            (consumed, cursor),
+            HopState {
+                candidates,
+                completes: false,
+            },
+        );
+        let mut completes = false;
+        for position in 0..count {
+            let (at, run) = self.states[&(consumed, cursor)].candidates[position];
+            let next = consumed + run;
+            if next < self.value.len() && run < MIN_WRAP_FRAGMENT {
+                continue;
+            }
+            if self.state(next, at + run)? {
+                completes = true;
+            }
+        }
+        if let Some(state) = self.states.get_mut(&(consumed, cursor)) {
+            state.completes = completes;
+        }
+        Some(completes)
+    }
+
+    /// Write every range reachable from a state that lies on a complete path.
+    ///
+    /// Alternates are written even when they dead-end: the caller has already
+    /// established that this state completes, and every candidate at it
+    /// reproduces the value's next bytes exactly — `hop_candidates` explains why
+    /// telling the real continuation from the coincidental one is neither
+    /// possible nor necessary. Recursion, unlike emission, follows only
+    /// completing states, which is what bounds the walk.
+    fn emit(&mut self, consumed: usize, cursor: usize, out: &mut Vec<(usize, usize)>) {
+        let Some(state) = self.states.get(&(consumed, cursor)) else {
+            return;
+        };
+        if !state.completes {
+            return;
+        }
+        let candidates = state.candidates.clone();
+        // Marked spent so a diamond in the DAG is written once. `completes` is
+        // left as it is: it is the answer, and nothing re-reads the flag below.
+        if let Some(state) = self.states.get_mut(&(consumed, cursor)) {
+            state.candidates = Vec::new();
+        }
+        for (at, run) in candidates {
+            let next = consumed + run;
+            if next < self.value.len() && run < MIN_WRAP_FRAGMENT {
+                continue;
+            }
+            out.push((at, at + run));
+            if next < self.value.len() {
+                self.emit(next, at + run, out);
+            }
+        }
+    }
+
+    /// Every range this value contributes, over every start the index offers.
+    fn scan(&mut self, out: &mut Vec<(usize, usize)>) -> Option<()> {
+        for start in self.starts()? {
+            let head = common_prefix_len(self.data, start, self.value);
+            self.spend(1 + head / MIN_WRAP_FRAGMENT)?;
+            if head == self.value.len() {
+                // A contiguous occurrence is one range, which is what makes
+                // this a strict superset of byte-exact matching.
+                out.push((start, start + head));
+                continue;
+            }
+            if head < MIN_WRAP_FRAGMENT {
+                continue;
+            }
+            if self.value.len() > MAX_CHAINED_VALUE {
+                // Contiguous-only past this length — see `MAX_CHAINED_VALUE`.
+                continue;
+            }
+            let cursor = start + head;
+            if self.state(head, cursor)? {
+                out.push((start, cursor));
+                self.emit(head, cursor, out);
+            }
+        }
+        Some(())
+    }
+
+    /// Every offset the value could begin at, ascending.
+    ///
+    /// A value at least one needle wide comes from the index, which records
+    /// EVERY offset its opening window occurs at — the "examine every byte
+    /// offset" requirement, paid for once per artifact instead of once per
+    /// position. A shorter value cannot chain at all (a first fragment has to be
+    /// a full [`MIN_WRAP_FRAGMENT`] or the whole value), so only its contiguous
+    /// occurrences matter and a direct walk finds them.
+    fn starts(&mut self) -> Option<Vec<usize>> {
+        if self.value.len() >= MIN_WRAP_FRAGMENT {
+            let needle: Needle = self.value[..MIN_WRAP_FRAGMENT]
+                .try_into()
+                .expect("the slice is exactly one needle wide");
+            let starts = self.index.occurrences(&needle).to_vec();
+            self.spend(starts.len())?;
+            return Some(starts);
+        }
+        self.spend(self.data.len() / MIN_WRAP_FRAGMENT)?;
+        let mut starts = Vec::new();
+        for at in 0..self.data.len() {
+            if self.data[at] == self.value[0]
+                && common_prefix_len(self.data, at, self.value) == self.value.len()
+            {
+                starts.push(at);
+            }
+        }
+        Some(starts)
+    }
 }
 
 /// Sort and coalesce, so the ranges come back ascending and non-overlapping —
 /// what both consumers rely on.
 ///
-/// Overlaps are ordinary now rather than a defect: the same bytes can be
-/// claimed both by a fragmented match's alternate candidate and by the
-/// registered value that candidate sits inside. Strictly overlapping ranges
-/// coalesce; two that merely TOUCH are left as two, which is what a scan that
-/// found two adjacent credentials always produced.
+/// Overlaps are ordinary rather than a defect: the same bytes can be claimed by
+/// two registered values, or by a value and an alternate candidate inside it.
+/// Strictly overlapping ranges coalesce; two that merely TOUCH are left as two,
+/// which is what a scan that found two adjacent credentials always produced.
 fn merge_redaction_ranges(mut ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
     ranges.sort_unstable();
     let mut merged: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
@@ -2453,101 +2862,132 @@ fn merge_redaction_ranges(mut ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)
     merged
 }
 
-/// Locate the byte ranges to replace, taking EVERY value that matches at a
-/// shared start rather than one of them. Matching bytes before JSON/asciinema
-/// encoding also catches secrets that contain characters the artifact format
-/// would escape.
+/// What one scan produced: the ranges to replace, or a REFUSAL.
 ///
-/// One credential can contribute SEVERAL ranges — see the block above. The bytes
-/// between them are deliberately left in the artifact: in a grid they are the
-/// newline, the pane border and the neighbouring column, and in a `.cast` they
-/// are the escape sequences that keep it replayable.
-///
-/// LEFT IN THE ARTIFACT IS NOT LEFT UNREAD. That distinction is the whole of
-/// issue #785's second round. The first version of this scan jumped `offset` to
-/// the END of a fragmented match, so every byte it had preserved was skipped —
-/// and those bytes are arbitrary rendered content, which on a real grid
-/// includes the OTHER registered value. Measured with the pair the live lane
-/// actually registers: a 108-character key wrapped 102 / 6 with its
-/// 20-character response id painted on the next row ahead of the continuation
-/// left 14 characters of that id intact, and the whole derivative was
-/// reconstructable. So the scan resumes at the end of the FIRST fragment and
-/// reads the gap like any other bytes.
-///
-/// NOR IS A MATCH ALLOWED TO SHADOW ANOTHER AT THE SAME START, which is the
-/// third round and was found by the Claude-document fixture PR #805's audit
-/// blocker 2 asked for. This used to keep `max_by_key(pattern length)` — one
-/// match per position, "the longest value at a shared start". Two registered
-/// values of the SAME length that share [`MIN_WRAP_FRAGMENT`] leading bytes then
-/// decide it by tie-break, and a real credential document has exactly that pair:
-/// `~/.claude/.credentials.json` holds an `accessToken` beginning `sk-ant-oat01-`
-/// beside a `refreshToken` beginning `sk-ant-ort01-`, so both match the first
-/// eight bytes of either. The tie-break took the refresh token, whose chain then
-/// bridged forward to its own real occurrence two rows down; that match's first
-/// fragment was the eight coincidental bytes, so `offset` advanced eight bytes
-/// and the access token's remaining 120 characters were never looked at again.
-/// Measured with the fabricated pair: 120 of 128 characters survived into
-/// `final-grid.txt` while the artifact showed a redaction placeholder at exactly
-/// the right place.
-///
-/// So every match at a position contributes its ranges, and `offset` resumes at
-/// the SMALLEST first-fragment end among them — the same "read the preserved
-/// bytes" rule, applied across values instead of within one. Every range any
-/// match produces reproduces registered credential bytes exactly (see
-/// [`credential_fragments_at`]), so adding all of them can only over-redact,
-/// never mis-redact, and the ranges merge afterwards.
-///
-/// Cost is unchanged, and measured rather than argued: the scan already
-/// evaluated every pattern at every position and merely discarded all but one
-/// result, so keeping them costs a `min` per match. Measured back to back on the
-/// same build, old implementation against new, with the fabricated 128-byte
-/// `accessToken`/`refreshToken` pair registered: a realistic 2.1 MB stream
-/// holding ONE rendered credential document, 183 ms before and **162 ms** after
-/// (and 3 ranges before against **4** after — the old scan missed one on a
-/// realistic artifact, not only on a fixture built to provoke it); a stream
-/// packed with that document every 140 bytes, 3.59 s before and 3.61 s after;
-/// the adversarial shape of eight-byte prefixes that never chain, 25.33 s before
-/// and 25.30 s after. Those last two are far slower than the same shapes cost
-/// with the key/response-id pair (10.6 ms and 895 ms per ~2 MB) and that is the
-/// PAIR, not this change: two 128-byte values sharing an eight-byte prefix means
-/// every occurrence of that prefix pays a full `MAX_WRAP_GAP` candidate sweep
-/// twice. A real artifact renders the document once or twice, which is the
-/// realistic row.
-///
-/// **KNOWN LEAK (issue #810): the outer scan skips every offset INSIDE a match's
-/// first fragment.** Resuming at the smallest `first_fragment_end` is what keeps
-/// the bytes a match preserved readable to the scan, but a registered value that
-/// begins inside that fragment and extends past it is still never looked for —
-/// reproduced by PR #805's second audit with `first-value-ABCDEFGH` and
-/// `ABCDEFGH-second-value-tail`. At minimum the scan must examine every byte
-/// offset; the design that does it without the cost is #810.
-fn credential_redaction_ranges(data: &[u8], credentials: &[String]) -> Vec<(usize, usize)> {
-    let patterns: Vec<&[u8]> = credentials
-        .iter()
-        .map(String::as_bytes)
-        .filter(|value| !value.is_empty())
-        .collect();
-    let mut ranges = Vec::new();
-    let mut offset = 0;
-    while offset < data.len() {
-        let mut resume = None;
-        for pattern in &patterns {
-            if let Some(found) = credential_fragments_at(data, offset, pattern) {
-                ranges.extend(found.ranges);
-                resume = Some(resume.map_or(found.first_fragment_end, |at: usize| {
-                    at.min(found.first_fragment_end)
-                }));
-            }
-        }
-        // `.max()` rather than a bare assignment so a degenerate match can never
-        // fail to advance the scan; no match at all advances by one byte.
-        offset = resume.map_or(offset + 1, |at| at.max(offset + 1));
-    }
-    merge_redaction_ranges(ranges)
+/// The refusal is the fail-closed half of issue #810. A budget that returned the
+/// ranges it had found so far would write the bytes it never looked at, which is
+/// exactly the failure the budget exists to prevent — so it is a separate
+/// outcome the callers must handle, not an empty result they can mistake for
+/// "nothing to redact".
+pub(crate) enum RedactionScan {
+    /// Ascending, non-overlapping.
+    Ranges(Vec<(usize, usize)>),
+    /// The search cost budget was exhausted. Replace the WHOLE artifact.
+    Refused,
 }
 
+/// Locate the byte ranges to replace: an ALL-MATCH search over every registered
+/// value, independently, at every offset.
+///
+/// Matching bytes before JSON/asciinema encoding also catches secrets that
+/// contain characters the artifact format would escape.
+///
+/// One value can contribute SEVERAL ranges — see the block above. The bytes
+/// between them are deliberately left in the artifact: in a grid they are the
+/// newline, the pane border and the neighbouring column, and in a `.cast` they
+/// are the escape sequences that keep it replayable. LEFT IN THE ARTIFACT IS NOT
+/// LEFT UNREAD: the index walks every byte offset, so a value rendered inside
+/// another value's gap — or inside its match — is looked for at that offset like
+/// any other. Issue #785's second round and issue #810's leak 1 were both that
+/// distinction going wrong under a cursor, and there is no cursor here to get it
+/// wrong.
+///
+/// COST, measured on this build in the unoptimised profile the tests run in,
+/// with the fabricated 128-byte `accessToken`/`refreshToken` pair registered —
+/// two values sharing an eight-byte prefix, which is the pair that made the
+/// greedy scan's numbers what they were. Two runs of each on an otherwise idle
+/// 16-core box:
+///
+/// | shape | greedy scan | this search | steps |
+/// | --- | --- | --- | --- |
+/// | realistic 2.1 MB artifact, one rendered credential document | 162 ms | 0.35–0.59 s | 51 |
+/// | 2 MB packed with that document every 140 bytes | 3.61 s | 5.5–6.0 s | 1 185 748 |
+/// | 1.6 MB of repeated shared eight-byte prefixes that never chain | 25.30 s | 2.3–2.7 s | 400 000 |
+///
+/// Read the first two rows honestly: they got SLOWER, by roughly 2x and 1.6x.
+/// Both are the price of exhaustiveness — every offset is a start for every
+/// value now, and the packed row emits 15 720 ranges where the greedy scan
+/// emitted a fraction of that. The realistic row's cost is almost entirely
+/// [`OccurrenceIndex::build`]'s single pass over the artifact, since the search
+/// on it is 51 steps; `NeedleFilter` is what keeps that pass in this range
+/// rather than at the 3.5 s a per-byte prefilter cost.
+///
+/// The third row is the one issue #810 called unacceptable as a general
+/// artifact-dump cost, and it is where the design pays for itself: an agent that
+/// can render the prefix can produce far more than 1.6 MB, and `.cast` history
+/// is not size-bounded. The index is what removes it — a hop is a binary search
+/// into a precomputed occurrence list rather than a [`MAX_WRAP_GAP`] re-read —
+/// and [`match_step_budget`] is what bounds whatever the index does not.
+pub(crate) fn credential_redaction_scan(data: &[u8], credentials: &[String]) -> RedactionScan {
+    match credential_redaction_search(data, credentials) {
+        Some((ranges, _steps)) => RedactionScan::Ranges(ranges),
+        None => RedactionScan::Refused,
+    }
+}
+
+/// What one scan of this artifact SPENDS, against its [`match_step_budget`], or
+/// `None` if it refuses.
+///
+/// Exposed because a step count is deterministic and a wall time is not: the
+/// cost regression this guards — a hop that goes back to re-reading
+/// [`MAX_WRAP_GAP`] bytes — shows up as an order-of-magnitude change in steps
+/// on a machine of any speed, under any load, in a test that can therefore
+/// assert on it. `the_measured_artifact_shapes_scan_inside_the_budget` does.
+pub(crate) fn credential_scan_cost(data: &[u8], credentials: &[String]) -> Option<usize> {
+    credential_redaction_search(data, credentials).map(|(_ranges, steps)| steps)
+}
+
+/// The search itself: ranges and what they cost, or `None` on a refusal.
+fn credential_redaction_search(
+    data: &[u8],
+    credentials: &[String],
+) -> Option<(Vec<(usize, usize)>, usize)> {
+    let mut patterns: Vec<&[u8]> = Vec::new();
+    for value in credentials {
+        let bytes = value.as_bytes();
+        if !bytes.is_empty() && !patterns.contains(&bytes) {
+            patterns.push(bytes);
+        }
+    }
+    if patterns.is_empty() || data.is_empty() {
+        return Some((Vec::new(), 0));
+    }
+    let index = OccurrenceIndex::build(data, &patterns)?;
+    let mut ranges = Vec::new();
+    let mut steps = 0;
+    for pattern in &patterns {
+        let mut search = ValueSearch::new(data, &index, pattern, steps);
+        let outcome = search.scan(&mut ranges);
+        steps += search.steps;
+        outcome?;
+    }
+    Some((merge_redaction_ranges(ranges), steps))
+}
+
+/// The ranges view of [`credential_redaction_scan`], with a refusal spelled as
+/// "every byte" — which is what the callers do with it.
+pub(crate) fn credential_redaction_ranges(
+    data: &[u8],
+    credentials: &[String],
+) -> Vec<(usize, usize)> {
+    match credential_redaction_scan(data, credentials) {
+        RedactionScan::Ranges(ranges) => ranges,
+        RedactionScan::Refused if data.is_empty() => Vec::new(),
+        RedactionScan::Refused => vec![(0, data.len())],
+    }
+}
+
+/// Replace every registered credential in `data`, or — when the scan refuses —
+/// replace `data` ENTIRELY.
+///
+/// The refusal branch is the fail-closed half of issue #810: a partial scan's
+/// ranges would be written alongside the bytes it never reached, which is the
+/// leak the budget exists to stop rather than a degraded version of avoiding it.
 pub(crate) fn redact_known_credentials_bytes(data: &[u8], credentials: &[String]) -> Vec<u8> {
-    let ranges = credential_redaction_ranges(data, credentials);
+    let ranges = match credential_redaction_scan(data, credentials) {
+        RedactionScan::Ranges(ranges) => ranges,
+        RedactionScan::Refused => return RECORDING_CREDENTIAL_SCAN_REFUSAL.to_vec(),
+    };
     if ranges.is_empty() {
         return data.to_vec();
     }
@@ -2579,7 +3019,23 @@ pub(crate) fn redact_cast_events(events: &[CastEvent], credentials: &[String]) -
         .iter()
         .flat_map(|event| event.data.iter().copied())
         .collect();
-    let ranges = credential_redaction_ranges(&stream, credentials);
+    let ranges = match credential_redaction_scan(&stream, credentials) {
+        RedactionScan::Ranges(ranges) => ranges,
+        // Fail closed across the WHOLE cast, not per event: the scan ran over
+        // the concatenated stream, so there is no event it can vouch for. The
+        // first event carries the notice and the rest come back empty, which
+        // keeps the file a replayable asciinema v2 cast.
+        RedactionScan::Refused => {
+            return events
+                .iter()
+                .enumerate()
+                .map(|(position, _)| match position {
+                    0 => RECORDING_CREDENTIAL_SCAN_REFUSAL.to_vec(),
+                    _ => Vec::new(),
+                })
+                .collect();
+        }
+    };
     if ranges.is_empty() {
         return events.iter().map(|event| event.data.clone()).collect();
     }
@@ -2685,7 +3141,7 @@ pub(crate) fn redact_cast_events(events: &[CastEvent], credentials: &[String]) -
 // wrong for the case that matters and is fixed: at 120 columns an
 // `ANTHROPIC_API_KEY=` line breaks a 108-character key 102 / 6 and its response
 // id 14 / 6, so the whole credential was reconstructable out of a panic grid
-// while neither registered pattern matched. `credential_redaction_ranges` now
+// while neither registered pattern matched. `credential_redaction_scan` now
 // bridges row transitions — see the block above it — and the same change covers
 // `final-grid.txt`, its SVG and `full-stream.cast`, because all three go through
 // that one function.
@@ -2708,11 +3164,18 @@ fn lock_diagnostic_redactions() -> std::sync::MutexGuard<'static, Vec<String>> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// Longest first, because [`credential_redaction_ranges`] prefers the longest
-/// value at a shared start, then de-duplicated. The secondary sort by value is
-/// what makes `dedup` exact: `dedup` only removes ADJACENT equals, so sorting
-/// by length alone leaves two copies of the same string unmerged whenever a
-/// different value of the same length sorts between them.
+/// Longest first, then de-duplicated. The secondary sort by value is what makes
+/// `dedup` exact: `dedup` only removes ADJACENT equals, so sorting by length
+/// alone leaves two copies of the same string unmerged whenever a different
+/// value of the same length sorts between them.
+///
+/// The ordering itself is now cosmetic. It was load-bearing while
+/// `credential_redaction_ranges` kept one match per position and preferred the
+/// longest value at a shared start; since issue #810 every registered value is
+/// searched INDEPENDENTLY over the whole artifact and the results are unioned,
+/// so no value can shadow another and the order they arrive in changes nothing.
+/// De-duplication still earns its place — it keeps a repeated value from being
+/// searched twice.
 fn normalise_redactions(values: &mut Vec<String>) {
     values.retain(|value| !value.is_empty());
     values.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
@@ -3897,9 +4360,11 @@ pub(crate) fn claude_api_key_response_id(key: &str) -> String {
 /// `.cast`, a `final-grid.txt` or a copied `fixture.toml`: the key, and the
 /// 20-character derivative Claude Code's approval prompt paints on the terminal.
 ///
-/// Longest first, because [`credential_redaction_ranges`] prefers the longest
-/// value at a shared start — the two do not share one, but the list is sorted
-/// that way by its consumer anyway and this keeps the intent local.
+/// Longest first, matching the order [`normalise_redactions`] imposes on the
+/// list this joins. Cosmetic since issue #810 — every registered value is
+/// searched independently and the results unioned, so nothing depends on which
+/// comes first — and kept because a list that arrives in its consumer's order
+/// is easier to read next to one.
 ///
 /// Pure in the key so the redaction it produces is covered by a unit test on
 /// the fast tier rather than only by the credentialed lane. The env read stays
