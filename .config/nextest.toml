@@ -61,26 +61,55 @@
 [test-groups]
 orchestration-remit = { max-threads = 1 }
 
-# SECOND ROUND (this branch). The containment above stopped holding: `remit_007`
-# failed on a GitHub runner at 39.7s wall against ~2.3s locally, and a
+# SECOND ROUND (this branch). The containment above stopped holding on GitHub's
+# runners: `remit_007` failed at 39.7s wall against ~2.3s locally, and a
 # `renovate/github-actions` run — a branch that touches no Rust at all — failed
-# `remit_001` and `remit_002` the same way. So the group is necessary and still
-# not sufficient, exactly as the note above predicts. The bounds in the file are
-# now `load_scaled` (issue #709) rather than fixed 30s, so a contended runner
-# gets proportionally longer while a quiet box still fails in 30s.
+# `remit_001` and `remit_002` the same way.
 #
-# `slow-timeout` is widened HERE as the consequence of that: `load_scaled` caps
-# at 6x, so a positive wait can now legitimately reach 180s, which is exactly the
-# default 3 x 60s kill. Without this the scaled wait would be cut off by nextest
-# instead of failing on its own assertion — losing the diagnostic the widened
-# wait exists to preserve (the same reasoning every other override in this file
-# gives). 6 x 60s leaves headroom above the 180s ceiling and is still bounded.
+# THE FIX IS `threads-required`, AND THE ROW ABOVE ALREADY SAID SO. Read the
+# measurement table again: row 3 is `30s serial (-j 1) -> 7 PASS, each 2-5s`.
+# `-j 1` means NOTHING ELSE WAS RUNNING. Row 5's `+ this group` reproduced that
+# on a 16-core dev box, where a `max-threads = 1` group leaves 15 other threads
+# for a tier that mostly is not fighting these seven for the same resource. On a
+# 4-vCPU runner it does not reproduce it at all: `max-threads = 1` serialises the
+# group against ITSELF only, and the rest of the tier — 2589 tests at 4 threads —
+# still competes for every core these decks and daemons need. So the condition
+# the table proves is sufficient was never actually established in CI.
+#
+# `threads-required = "num-test-threads"` reserves the whole pool, which IS row
+# 3's condition, and it is the same mechanism `dispatch_015` below uses for the
+# same reason. `priority` is load-bearing alongside it rather than decoration:
+# reached mid-run, an exclusive test makes nextest DRAIN every running test
+# before it can take the pool, and this tier's tail holds 250-320s tests, so the
+# group is scheduled early instead and the reservation costs only its own ~19s.
+#
+# A BOUND WAS TRIED FIRST AND MEASURABLY DID NOTHING, which is why it is not the
+# fix. The file's two positive bounds were made `load_scaled` (issue #709) and
+# `remit_001` still failed — its own assertion message printed `within 30s`,
+# i.e. the scale factor was 1.0. `load_scaled` is `clamp(load1 / nproc, 1.0,
+# 6.0)`, and a 4-vCPU runner running 4 test threads sits at load1/nproc ~= 1.0,
+# so it cannot widen anything precisely where the widening was needed. It is
+# kept because it is correct on a contended DEV box (which is what #709 measured
+# and what a dispatch agent actually runs on), but it must not be mistaken for
+# what makes CI green.
+#
+# `slow-timeout` is widened because `load_scaled` CAN reach 6x on that dev box,
+# putting a positive wait at 180s — exactly the default 3 x 60s kill — and being
+# killed there costs the assertion's diagnostic, the same reasoning every other
+# override in this file gives. 6 x 60s clears the 180s ceiling and stays bounded.
+#
+# STILL CONTAINMENT, NOT A CURE. #818's actual question — why concurrent decks
+# interfere when both failures land on the same daemon ListAgents/live-status
+# join, for `pane 1 (agent_id 1)`, identifiers every test in the file reuses —
+# is untouched. Delete all of this when that is found, not before.
 #
 # The filter is a REGEX on the test-function prefix, so it keeps covering new
 # `orchestration_remit_NNN` tests automatically.
 [[profile.default.overrides]]
 filter = 'test(/^orchestration_remit_/)'
 test-group = "orchestration-remit"
+threads-required = "num-test-threads"
+priority = 50
 slow-timeout = { period = "60s", terminate-after = 6 }
 
 [profile.default]
