@@ -276,6 +276,20 @@ Recommendation: start with the first, because it is the policy as chosen and it 
 
 ## Work Log
 
+### 2026-09-05 — Cross-version rule 12 completed: the delegate and hook halves, against a real v0.39.3 daemon
+
+The attach/resize half was done when the policy landed; the **delegate** half was left explicitly outstanding, because role maps are built by the TUI's orchestration setup, so reaching that flow means driving an interactive TUI through orchestration creation on *both* binaries rather than hand-sending a frame. It has now been done, and delegate, work-done and status hooks all survive the version gap.
+
+**The run.** An isolated sandbox (its own `HOME`, `XDG_*`, state dir, both sockets, `DOT_AGENT_DECK_LOG`, `DOT_AGENT_DECK_EXPERIMENTAL=0` and `DOT_AGENT_DECK_IDLE_SHUTDOWN_SECS=0`), a project carrying a two-role `[[orchestrations]]` block (`orchestrator` start role plus `coder`, both `cat`), and the real `v0.39.3` release binary downloaded from the GitHub release rather than rebuilt. Sequence per rule 12: v0.39.3 daemon → **v0.39.3 TUI** to bring the two roles up under it → detach that TUI through the quit dialog's `Detach` so the daemon and its agents survive → **branch TUI**, which showed the build-mismatch prompt naming `orchestrator` and `coder` (`0.39.3-ga023377` versus `0.39.3-g2763230d`) → **declined**, attaching to the old daemon unchanged.
+
+**Both documented false-green traps avoided, and a third one hit on the first attempt.** Exactly **one** `Attach protocol listening` line for the whole run; the daemon pid unchanged end to end (`2299901`, with `/proc/<pid>/exe` still the v0.39.3 binary); zero `idle window elapsed` lines; and the mismatch prompt is itself positive evidence that agents were live, since the no-agents trap restarts silently and prompts nothing. The log stayed isolated — no line from the sandbox daemon reached `~/.local/state/dot-agent-deck/deck.log`. The third trap is not in rule 12 and belongs there: **`Ctrl+C` in `PaneInput` mode goes to the pane, not to the deck**, so the first attempt killed the orchestrator's `cat` and left a one-role orchestration that could not delegate at all. The deck's own footer says it (`Ctrl+d for dashboard`); leave pane input before quitting.
+
+**Delegate, as a control pair.** With the v0.39.3 TUI attached, a v0.39.3 `delegate --to coder` from the orchestrator pane routed: `Received delegate signal pane_id=1 targets=["coder"]`, `worker-task-coder.md` written with the task text, and the pointer injected into the worker pane, which rendered it. With the **branch** TUI attached to that same daemon, the **branch** binary's `delegate` did the same — task file rewritten with a sentinel asserted *absent* beforehand, and the coder pane rendering the fresh pointer in the branch TUI's own parser.
+
+**Hooks.** `work-done` from the worker pane: both binaries produced `Received work-done signal pane_id=2 done=false` and the delegation being retired, three seconds apart, with the orchestrator pane rendering `Worker coder has completed their task.` Status hooks ran **last**, as rule 12 instructs, because `agent-event --type running` makes the daemon classify the pane as `Pi` and that changes prompt routing: both binaries produced an identical `event_type=Thinking pane_id=Some("2") agent_type=Pi tool_name=None tool_detail=None`.
+
+**And the surface this PR actually changes, under the old daemon.** Shrinking the outer terminal from 200x50 to 150x40 while the branch TUI was attached to the v0.39.3 daemon reflowed both panes correctly: the branch client now *requests* geometry from a daemon that has no viewer policy and never answers with one, and the fallback holds. No `ERROR`, and no `WARN` beyond the expected silent-worker reports (`cat` emits no agent events), for the whole run.
+
 ### 2026-09-05 — Greptile review: four real defects, and the live test earned its keep
 
 Six findings on PR #895. Four were genuine defects in this implementation, all of the same family — a geometry that reaches a parser at the wrong moment:
