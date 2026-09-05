@@ -257,3 +257,199 @@ fn cli_004_add_issue_dispatch_writes_table_and_reloads() {
         String::from_utf8_lossy(&bad.stderr),
     );
 }
+
+/// Scenario: Start `daemon serve` with no schedules. Run the real
+/// `dot-agent-deck schedule add --shape single`, assert the flag lands in the
+/// global `schedules.toml` and the running daemon registers the task. Then run
+/// `schedule list` and assert it prints the shape (and `config-derived` for a
+/// task without one). Then run `schedule update --shape orchestration:review`
+/// and assert the running daemon re-registers the task — a shape-only edit is
+/// fire-affecting. Finally assert an invalid `--shape` exits non-zero and does
+/// not change the file.
+#[spec("scheduler/cli/005")]
+#[test]
+fn cli_005_shape_flag_writes_lists_and_reloads() {
+    let daemon = common::spawn_daemon_serve(None, "0");
+    let cwd = common::race_safe_tempdir();
+
+    let out = daemon.run_schedule_cli_from(
+        cwd.path(),
+        &[
+            "add",
+            "--name",
+            "shaped-task",
+            "--cron",
+            "0 9 * * *",
+            "--working-dir",
+            "/tmp",
+            "--command",
+            "cat",
+            "--prompt",
+            "go",
+            "--shape",
+            "single",
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "schedule add --shape single should succeed.\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+
+    // A second task with NO shape, so `list` can be checked for both states.
+    let out = daemon.run_schedule_cli_from(
+        cwd.path(),
+        &[
+            "add",
+            "--name",
+            "derived-task",
+            "--cron",
+            "0 10 * * *",
+            "--working-dir",
+            "/tmp",
+            "--command",
+            "cat",
+            "--prompt",
+            "go",
+        ],
+    );
+    assert!(out.status.success(), "plain schedule add should succeed");
+
+    // (a) The flag reaches the file and round-trips through the loader.
+    let global =
+        std::fs::read_to_string(&daemon.schedules_path).expect("global schedules.toml exists");
+    let loaded = dot_agent_deck::config::LoadedSchedules::parse(&global);
+    assert!(
+        loaded.errors.is_empty(),
+        "the written task must round-trip with no load errors, got: {:?}",
+        loaded.errors
+    );
+    let shaped = loaded
+        .tasks
+        .iter()
+        .find(|t| t.name == "shaped-task")
+        .expect("shaped-task present after round-trip");
+    assert_eq!(shaped.shape.as_deref(), Some("single"));
+    let derived = loaded
+        .tasks
+        .iter()
+        .find(|t| t.name == "derived-task")
+        .expect("derived-task present after round-trip");
+    assert!(
+        derived.shape.is_none(),
+        "an omitted --shape must stay unset"
+    );
+
+    // (b) The running daemon registered it via the add-triggered reload.
+    assert!(
+        daemon.wait_for_schedule_registered("shaped-task"),
+        "the daemon must register a --shape task via the add-triggered reload"
+    );
+
+    // (c) `schedule list` shows the shape, including the unset case — the whole
+    //     point of the column is that the ABSENCE is what surprises.
+    let out = daemon.run_schedule_cli_from(cwd.path(), &["list"]);
+    let listing = String::from_utf8_lossy(&out.stdout);
+    let shaped_line = listing
+        .lines()
+        .find(|l| l.contains("shaped-task"))
+        .expect("shaped-task row present in `schedule list`");
+    let derived_line = listing
+        .lines()
+        .find(|l| l.contains("derived-task"))
+        .expect("derived-task row present in `schedule list`");
+    assert!(
+        shaped_line.contains("shape=single"),
+        "`schedule list` must show a set shape, got: {shaped_line:?}"
+    );
+    assert!(
+        derived_line.contains("shape=config-derived"),
+        "`schedule list` must spell out an unset shape, got: {derived_line:?}"
+    );
+
+    // (d) A shape-only `update` is fire-affecting: the running daemon must
+    //     re-register the task rather than keep firing the old shape.
+    let out = daemon.run_schedule_cli_from(
+        cwd.path(),
+        &[
+            "update",
+            "--name",
+            "shaped-task",
+            "--shape",
+            "orchestration:review",
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "schedule update --shape should succeed.\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let global =
+        std::fs::read_to_string(&daemon.schedules_path).expect("global schedules.toml exists");
+    let loaded = dot_agent_deck::config::LoadedSchedules::parse(&global);
+    assert_eq!(
+        loaded
+            .tasks
+            .iter()
+            .find(|t| t.name == "shaped-task")
+            .expect("shaped-task still present")
+            .shape
+            .as_deref(),
+        Some("orchestration:review"),
+        "the updated shape must be written"
+    );
+    assert!(
+        daemon.wait_for_schedule_registered("shaped-task"),
+        "a shape-only update must leave the task registered and firable"
+    );
+
+    // (e) An invalid shape is refused, non-zero, and changes nothing.
+    let before =
+        std::fs::read_to_string(&daemon.schedules_path).expect("global schedules.toml exists");
+    let out = daemon.run_schedule_cli_from(
+        cwd.path(),
+        &[
+            "add",
+            "--name",
+            "bad-shape",
+            "--cron",
+            "0 9 * * *",
+            "--working-dir",
+            "/tmp",
+            "--command",
+            "cat",
+            "--prompt",
+            "go",
+            "--shape",
+            "team",
+        ],
+    );
+    assert!(
+        !out.status.success(),
+        "an invalid --shape must exit non-zero, got success.\nstdout:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        combined.contains("shape"),
+        "the rejection must name the field, got: {combined}"
+    );
+    // The message is read off a terminal, so it must not carry the source's own
+    // indentation — `cargo fmt` once rewrote a line-continuation into real
+    // spaces here, and no gate caught it.
+    assert!(
+        !combined.contains("shape \"team\":  "),
+        "the rejection must not carry source indentation, got: {combined}"
+    );
+    let after =
+        std::fs::read_to_string(&daemon.schedules_path).expect("global schedules.toml exists");
+    assert_eq!(
+        before, after,
+        "a refused --shape must not modify schedules.toml"
+    );
+}

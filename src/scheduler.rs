@@ -262,6 +262,13 @@ struct FireFields {
     /// callback so the next fire enumerates the new set, exactly as a prompt
     /// edit does. `None` for #127 single-spawn tasks.
     issue_dispatch: Option<crate::config::IssueDispatchConfig>,
+    /// Issue #835: the declared spawn shape. Fire-affecting for the same reason
+    /// `issue_dispatch` is — it decides WHAT the fire opens, so a shape-only edit
+    /// must rebuild the callback. Without it here, `schedule update --shape …`
+    /// writes the file, the daemon reloads, this struct still compares equal, and
+    /// the old callback keeps firing the old shape until some other field changes
+    /// or the daemon restarts — i.e. the headline edit path silently does nothing.
+    shape: Option<String>,
 }
 
 impl FireFields {
@@ -274,6 +281,7 @@ impl FireFields {
             prompt: task.prompt.clone(),
             new_tab_per_fire: task.new_tab_per_fire,
             issue_dispatch: task.issue_dispatch.clone(),
+            shape: task.shape.clone(),
         }
     }
 
@@ -289,6 +297,7 @@ impl FireFields {
             prompt: String::new(),
             new_tab_per_fire: false,
             issue_dispatch: None,
+            shape: None,
         }
     }
 }
@@ -319,7 +328,8 @@ pub struct ReloadDiff {
     /// Task names removed (no longer in the config, or now disabled).
     pub removed: Vec<String>,
     /// Task names whose fire-affecting config changed — cron, prompt,
-    /// working_dir, command, or new_tab_per_fire (re-registered in place).
+    /// working_dir, command, new_tab_per_fire, issue_dispatch or shape
+    /// (re-registered in place).
     pub updated: Vec<String>,
 }
 
@@ -537,7 +547,8 @@ impl Scheduler {
 
         // Add new tasks and re-register ones whose fire-affecting config
         // changed. The guard compares ALL fire-affecting fields (cron, prompt,
-        // working_dir, command, new_tab_per_fire), not just the cron — a
+        // working_dir, command, new_tab_per_fire, issue_dispatch, shape), not
+        // just the cron — a
         // prompt-only edit must rebuild the callback so the next fire delivers
         // the new prompt rather than the value captured at first registration
         // (PRD #127 stale-prompt bug).
@@ -838,6 +849,7 @@ mod tests {
             prompt: "p".to_string(),
             new_tab_per_fire: false,
             enabled,
+            shape: None,
             issue_dispatch: None,
         };
 
@@ -864,6 +876,70 @@ mod tests {
         assert_eq!(diff.removed, vec!["b".to_string()]);
         assert!(scheduler.contains("a") && scheduler.contains("c"));
         assert!(!scheduler.contains("b") && !scheduler.contains("d"));
+    }
+
+    // Issue #835 — a SHAPE-only edit is fire-affecting and must re-register the
+    // task. `shape` decides WHAT a fire opens, so if it is missing from
+    // `FireFields` this reload compares equal, the previously-built callback
+    // survives with the old value captured, and `schedule update --name x
+    // --shape single` silently does nothing until some other field changes or
+    // the daemon restarts — which is the most likely way a user reaches this
+    // feature at all (they discover the surprise, then correct it in place).
+    #[test]
+    fn reload_apply_treats_a_shape_only_edit_as_fire_affecting() {
+        let scheduler = Scheduler::with_stderr_notifier();
+        let counter = Arc::new(AtomicUsize::new(0));
+        let make = |_t: &ScheduledTask| counting_callback(counter.clone());
+
+        let task = |shape: Option<&str>| ScheduledTask {
+            name: "x".to_string(),
+            cron: "0 9 * * *".to_string(),
+            working_dir: "/tmp".to_string(),
+            command: Some("cat".to_string()),
+            prompt: "p".to_string(),
+            new_tab_per_fire: false,
+            enabled: true,
+            shape: shape.map(|s| s.to_string()),
+            issue_dispatch: None,
+        };
+
+        assert_eq!(
+            scheduler.reload_apply(&[task(None)], make).added,
+            vec!["x".to_string()]
+        );
+
+        // None -> Some: the edit that turns the surprise off.
+        assert_eq!(
+            scheduler
+                .reload_apply(&[task(Some("single"))], make)
+                .updated,
+            vec!["x".to_string()],
+            "adding a shape must re-register the task"
+        );
+
+        // Some -> a DIFFERENT Some: switching which orchestration fires.
+        assert_eq!(
+            scheduler
+                .reload_apply(&[task(Some("orchestration:review"))], make)
+                .updated,
+            vec!["x".to_string()],
+            "changing the shape must re-register the task"
+        );
+
+        // Some -> None: clearing it back to config-derived.
+        assert_eq!(
+            scheduler.reload_apply(&[task(None)], make).updated,
+            vec!["x".to_string()],
+            "clearing the shape must re-register the task"
+        );
+
+        // Unchanged shape is still a no-op, so this does not re-register on
+        // every reload (which would reset reuse/running state needlessly).
+        let diff = scheduler.reload_apply(&[task(None)], make);
+        assert!(
+            diff.updated.is_empty() && diff.added.is_empty() && diff.removed.is_empty(),
+            "an unchanged task must not re-register, got {diff:?}"
+        );
     }
 
     // B2 — a callback that PANICS must not leave the task permanently
@@ -932,6 +1008,7 @@ mod tests {
             prompt: "p".to_string(),
             new_tab_per_fire: false,
             enabled: true,
+            shape: None,
             issue_dispatch: None,
         };
         let noop: Callback = Arc::new(|| Box::pin(async {}));

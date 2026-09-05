@@ -28,6 +28,17 @@ const PROMPT_MARKER: &str = "SCHEDPROMPTMARKER";
 /// Build one `[[scheduled_tasks]]` block. `command` is written into the TOML
 /// when `Some` and omitted when `None`.
 fn task_block(name: &str, working_dir: &str, command: Option<&str>) -> String {
+    task_block_with_shape(name, working_dir, command, None)
+}
+
+/// [`task_block`] plus issue #835's optional `shape` scalar, written only when
+/// `Some` so the no-shape blocks stay byte-identical to the pre-#835 ones.
+fn task_block_with_shape(
+    name: &str,
+    working_dir: &str,
+    command: Option<&str>,
+    shape: Option<&str>,
+) -> String {
     let mut s = String::new();
     s.push_str("[[scheduled_tasks]]\n");
     s.push_str(&format!("name = \"{name}\"\n"));
@@ -39,6 +50,9 @@ fn task_block(name: &str, working_dir: &str, command: Option<&str>) -> String {
         s.push_str(&format!("command = \"{cmd}\"\n"));
     }
     s.push_str(&format!("prompt = \"{PROMPT_MARKER}\"\n"));
+    if let Some(shape) = shape {
+        s.push_str(&format!("shape = \"{shape}\"\n"));
+    }
     s.push_str("enabled = true\n\n");
     s
 }
@@ -548,5 +562,159 @@ fn spawn_007_scheduler_agent_event_joins_registry_record() {
         joined.is_some(),
         "the scheduler's spawn_or_reuse pane must be admitted into daemon state so its real lifecycle report joins the registry record; expected agent={agent_id:?} pane={pane_id:?}, got {:?}",
         daemon.agent_records()
+    );
+}
+
+/// Scenario: Point three tasks at ONE `working_dir` that defines two
+/// `[[orchestrations]]` (`team`, and `other` carrying `default = true`), so
+/// every fire would derive an orchestration if left to the config. Fire a task
+/// carrying `shape = "single"` and assert it opens a NON-orchestration card that
+/// actually runs the task's own `command` (an on-disk marker) with the prompt
+/// delivered; fire one carrying `shape = "orchestration:team"` and assert it
+/// opens the NAMED team rather than the declared default; fire one carrying
+/// `shape = "orchestration:nope"` and assert the fire is abandoned — a
+/// notification naming the bad value and listing what IS available, no new
+/// agent, and a daemon that keeps serving.
+#[spec("scheduler/spawn/009")]
+#[test]
+fn spawn_009_declared_shape_overrides_the_target_dirs_config() {
+    let scratch = common::harness_tempdir().expect("scratch tempdir");
+    let base = scratch.path();
+
+    // ONE target dir for all three tasks: the override has to be what separates
+    // their outcomes, not the directory. `other` carries `default = true` so the
+    // `orchestration:team` case proves the NAME won rather than the default.
+    let target = base.join("repo");
+    std::fs::create_dir_all(&target).expect("create target dir");
+    std::fs::write(
+        target.join(".dot-agent-deck.toml"),
+        "[[orchestrations]]\nname = \"team\"\n\n\
+         [[orchestrations.roles]]\nname = \"orchestrator\"\ncommand = \"cat\"\nstart = true\n\n\
+         [[orchestrations]]\nname = \"other\"\ndefault = true\n\n\
+         [[orchestrations.roles]]\nname = \"orchestrator\"\ncommand = \"cat\"\nstart = true\n",
+    )
+    .expect("write orchestration config");
+
+    // The marker is the proof that `command` was not merely stored but RUN —
+    // "the schedule silently ignores its own command" is the defect under test,
+    // and a single-agent card alone would not distinguish it from a card running
+    // something else.
+    let cmd_marker = base.join("SINGLE_SHAPE_CMD_RAN");
+    let single_command = format!("touch \\\"{}\\\"; exec cat", cmd_marker.to_string_lossy());
+
+    let mut toml = String::new();
+    toml.push_str(&task_block_with_shape(
+        "forced-single",
+        &target.to_string_lossy(),
+        Some(&single_command),
+        Some("single"),
+    ));
+    toml.push_str(&task_block_with_shape(
+        "forced-named",
+        &target.to_string_lossy(),
+        Some("cat"),
+        Some("orchestration:team"),
+    ));
+    toml.push_str(&task_block_with_shape(
+        "forced-missing",
+        &target.to_string_lossy(),
+        Some("cat"),
+        Some("orchestration:nope"),
+    ));
+
+    let mut daemon = common::spawn_daemon_serve(Some(&toml), "0");
+
+    // `shape = "single"` in a dir that defines orchestrations → ONE plain card,
+    // running the task's own command, with the prompt delivered to it.
+    daemon
+        .run_now("forced-single")
+        .expect("run-now forced-single");
+    let single = daemon
+        .wait_for_agent_where(
+            |r| !matches!(r.tab_membership, Some(TabMembership::Orchestration { .. })),
+            Duration::from_secs(10),
+        )
+        .unwrap_or_else(|| {
+            panic!(
+                "`shape = \"single\"` must open a single-agent card even though the dir \
+                 defines [[orchestrations]], got {:?}",
+                daemon.agent_records()
+            )
+        });
+    assert!(
+        common::wait_for_path(&cmd_marker, Duration::from_secs(10)),
+        "`shape = \"single\"` must actually RUN the task's `command` (marker file), \
+         not merely open a card"
+    );
+    assert!(
+        daemon.attach_and_wait_for_output(&single.id, PROMPT_MARKER, Duration::from_secs(10)),
+        "the prompt must be delivered to the forced single-agent card"
+    );
+    assert_eq!(
+        daemon
+            .agent_records()
+            .iter()
+            .filter(|r| matches!(r.tab_membership, Some(TabMembership::Orchestration { .. })))
+            .count(),
+        0,
+        "`shape = \"single\"` must spawn NO orchestration role panes, got {:?}",
+        daemon.agent_records()
+    );
+
+    // `shape = "orchestration:team"` → the NAMED orchestration, not the one
+    // carrying `default = true`.
+    daemon
+        .run_now("forced-named")
+        .expect("run-now forced-named");
+    let named = daemon
+        .wait_for_agent_where(
+            |r| {
+                matches!(
+                    &r.tab_membership,
+                    Some(TabMembership::Orchestration { name, .. })
+                        if name == "team"
+                )
+            },
+            Duration::from_secs(10),
+        )
+        .unwrap_or_else(|| {
+            panic!(
+                "`shape = \"orchestration:team\"` must open the NAMED orchestration, not the \
+                 `default = true` one, got {:?}",
+                daemon.agent_records()
+            )
+        });
+    assert!(
+        daemon.attach_and_wait_for_output(&named.id, PROMPT_MARKER, Duration::from_secs(10)),
+        "the prompt must be delivered to the named orchestration's start role"
+    );
+
+    // `shape = "orchestration:nope"` → abandoned fire, surfaced, nothing spawned.
+    let before = daemon.agent_records().len();
+    daemon
+        .run_now("forced-missing")
+        .expect("run-now forced-missing");
+    assert!(
+        daemon.wait_for_stderr_contains("nope", Duration::from_secs(10)),
+        "a shape naming an undefined orchestration must surface a notification naming it"
+    );
+    assert!(
+        daemon.wait_for_stderr_contains("team", Duration::from_secs(10)),
+        "the failure notification must list the orchestrations that ARE available"
+    );
+    // Never a silent degrade to some other shape: that is the defect #835 removes.
+    // No settle wait is needed and none is allowed (Decision 21): the two stderr
+    // waits above are the positive signal that this fire ran to completion and
+    // was abandoned, so the registry count is meaningful the moment they return.
+    assert_eq!(
+        daemon.agent_records().len(),
+        before,
+        "an unresolvable shape must fire NOTHING (no degrade to a card or another \
+         orchestration), got {:?}",
+        daemon.agent_records()
+    );
+    assert!(
+        daemon.is_alive_public(),
+        "daemon must not crash on an unresolvable shape"
     );
 }

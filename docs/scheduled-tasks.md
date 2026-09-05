@@ -49,8 +49,21 @@ dot-agent-deck schedule add \
   --prompt "Generate the morning brief. Notify when done." \
   --enabled true
 
+# Force ONE agent even though the working dir defines [[orchestrations]]:
+dot-agent-deck schedule add \
+  --name pr-sweep \
+  --cron "0 9 * * *" \
+  --working-dir ~/code/dot-agent-deck \
+  --command claude \
+  --prompt "Triage the open PRs." \
+  --shape single
+
 # Update fields of an existing task (no --new-name; rename is forbidden):
 dot-agent-deck schedule update --name morning-digest --cron "0 8 * * MON-FRI"
+
+# Change the shape of an existing task, or clear it back to config-derived:
+dot-agent-deck schedule update --name pr-sweep --shape orchestration:review
+dot-agent-deck schedule update --name pr-sweep --shape ""
 
 # Pause / resume without deleting:
 dot-agent-deck schedule disable --name morning-digest
@@ -135,6 +148,9 @@ Generate a brief: Barcelona weather forecast for today, plus the list of
 GitHub issues opened in the last 24h across vfarcic/dot-ai and
 vfarcic/dot-agent-deck. Notify when done.
 """
+# shape = "single"        # optional: force ONE agent even where this dir
+                          # defines [[orchestrations]]. Omit to derive the
+                          # shape from that dir's config (the default).
 new_tab_per_fire = false
 enabled = true
 ```
@@ -146,8 +162,9 @@ enabled = true
 | `name` | string | yes | Unique id. Also the key that ties a task to its reused tab — see [Tab reuse](#tab-reuse). Renaming is forbidden (it would orphan an open reused tab); treat a rename as remove + add. |
 | `cron` | string | yes | A **5-field POSIX** cron expression (`min hour day-of-month month day-of-week`), e.g. `0 9 * * MON-FRI`. Evaluated in **local time**. 6/7-field forms (with a seconds field) are also accepted. |
 | `working_dir` | string | yes | Directory the fire spawns into. `~` and `$VAR` / `${VAR}` are expanded at load time; a relative path resolves against `$HOME` (never the authoring agent's cwd). Created with `mkdir -p` if missing. |
-| `command` | string | **yes** | The agent command for the **single-agent** card (e.g. `claude`, `opencode`, `pi`, `codex`, or `devin`), mirroring the new-deck dialog's command field. **Required**: `schedule add` errors without it and the loader **rejects (skips) a command-less entry** — there is **no `$SHELL` fallback**. Required **universally**, including orchestration-target schedules: it is still validated at load, but **ignored at fire** when the target dir defines an `[[orchestrations]]` block (the orchestration's role commands win). |
+| `command` | string | **yes** | The agent command for the **single-agent** card (e.g. `claude`, `opencode`, `pi`, `codex`, or `devin`), mirroring the new-deck dialog's command field. **Required**: `schedule add` errors without it and the loader **rejects (skips) a command-less entry** — there is **no `$SHELL` fallback**. Required **universally**, including orchestration-target schedules: it is still validated at load, but **ignored at fire** whenever the fire resolves to an orchestration — which is the case when the target dir defines an `[[orchestrations]]` block and the task does not set `shape` (the orchestration's role commands win). Set `shape = "single"` to make `command` take effect in such a directory. |
 | `prompt` | string | yes | The prompt delivered into the spawned agent (or the orchestrator role). |
+| `shape` | string | no (default: derived) | Forces the fire's **spawn shape** instead of deriving it from `working_dir`'s config. `"single"` opens **one** agent card running `command`, *even where that directory defines `[[orchestrations]]`*; `"orchestration"` opens that directory's default orchestration; `"orchestration:<name>"` opens the one with that name. **Omit it** and the shape is derived exactly as before. Any other value is a **load error** naming the task (not a surprise on the next fire). Cannot be combined with `issue_dispatch` — that task type resolves a shape per cloned repo — and the combination is rejected rather than ignored. |
 | `new_tab_per_fire` | bool | no (default `false`) | `false` reuses one tab per task; `true` opens a fresh tab every fire. See [Tab reuse](#tab-reuse). |
 | `enabled` | bool | no (default `true`) | `false` keeps the definition but stops it firing. |
 
@@ -157,10 +174,16 @@ enabled = true
 
 ### What happens when a task fires
 
-When a task fires, the scheduler reads the **target `working_dir`'s** `.dot-agent-deck.toml`:
+When a task fires, the scheduler decides its **shape**. If the task sets `shape`, that choice wins outright. Otherwise the shape is derived from the **target `working_dir`'s** `.dot-agent-deck.toml`:
 
 - If it defines an **`[[orchestrations]]`** block → an **orchestration tab** is opened rooted at that directory and the prompt is delivered to the `orchestrator` role (the task's `command` is ignored here).
 - Otherwise → a **single agent card** is opened, running `command`, and the prompt is delivered to it.
+
+**This is why `shape` exists.** Without it the shape came from the directory alone, so a schedule pointed at a repo that defines `[[orchestrations]]` fired the whole team and quietly ignored its own `command` — and nothing in the config, `schedule list` or the CLI said so. That is the common case for a schedule that *wants* the repo as its `working_dir` (so the repo's `.claude/skills/` load and `git` commands run in the right place) but wants **one** agent to do the job. `shape = "single"` is that combination.
+
+A `shape` naming an orchestration the target directory does not define **abandons the fire**: the failure is surfaced through the daemon's notification seam with a message listing what *is* available, and **nothing is spawned**. It never falls back to another shape — silently spawning something other than what you asked for is the surprise this field removes.
+
+`schedule list` prints the resolved shape for every task, showing `shape=config-derived` when the field is unset, so the behaviour above is visible without reading source.
 
 **The first prompt waits for the agent to be ready.** When a fire spawns a new agent, the deck waits for it to finish starting up before delivering the prompt, so nothing is lost while the agent is still coming up.
 

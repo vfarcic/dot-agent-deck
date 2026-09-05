@@ -31,6 +31,11 @@ pub struct AddArgs {
     pub prompt: String,
     pub new_tab_per_fire: bool,
     pub enabled: bool,
+    /// Issue #835: the fire's spawn shape — `"single"`, `"orchestration"` or
+    /// `"orchestration:<name>"`. `None` omits the field, keeping the pre-#835
+    /// config-derived behaviour. Validated here (before any file write) through
+    /// the same parser the loader and the daemon use.
+    pub shape: Option<String>,
     /// PRD #120: when present, this `schedule add` authors an ISSUE-DISPATCH
     /// task — it writes a `[scheduled_tasks.issue_dispatch]` sub-table and the
     /// `command` requirement is relaxed (the per-issue command comes from each
@@ -51,6 +56,14 @@ pub struct UpdateArgs {
     pub prompt: Option<String>,
     pub new_tab_per_fire: Option<bool>,
     pub enabled: Option<bool>,
+    /// Issue #835: `None` leaves the stored shape untouched; `Some(value)` sets
+    /// it. An **empty** (or whitespace-only) value CLEARS the field, reverting the
+    /// task to config-derived shaping — the only way back, since omitting the flag
+    /// has to mean "unchanged" like every other field here. Deliberately not a
+    /// fourth word in the shape vocabulary: `schedules.toml` expresses
+    /// config-derived as the field's ABSENCE, and a `shape = "auto"` that means
+    /// the same thing would be a second spelling of one state.
+    pub shape: Option<String>,
 }
 
 /// Append a new task. Errors if the cron is malformed or a task with the same
@@ -86,6 +99,21 @@ pub fn add(tasks: &mut Vec<ScheduledTask>, args: AddArgs) -> Result<(), String> 
             cfg.query.as_deref(),
         )?;
     }
+    // Issue #835: validate `--shape` through the SAME parser the loader uses, so
+    // the CLI can never write a value the daemon would reject at load, and reject
+    // it alongside `--repo` for the same reason the loader does (an issue-dispatch
+    // task resolves a shape per cloned repo, so a task-level one has nothing to
+    // apply to).
+    if let Some(raw) = &args.shape {
+        crate::spawn::SpawnShapeOverride::parse(raw)?;
+        if args.issue_dispatch.is_some() {
+            return Err(
+                "--shape cannot be combined with --repo: an issue-dispatch task \
+                        resolves a shape per cloned repo, from that repo's own config"
+                    .to_string(),
+            );
+        }
+    }
     validate_cron(&args.cron).map_err(|e| format!("invalid cron expression: {e}"))?;
     if tasks.iter().any(|t| t.name == args.name) {
         return Err(format!(
@@ -101,6 +129,7 @@ pub fn add(tasks: &mut Vec<ScheduledTask>, args: AddArgs) -> Result<(), String> 
         prompt: args.prompt,
         new_tab_per_fire: args.new_tab_per_fire,
         enabled: args.enabled,
+        shape: args.shape,
         issue_dispatch: args.issue_dispatch,
     });
     Ok(())
@@ -112,6 +141,14 @@ pub fn add(tasks: &mut Vec<ScheduledTask>, args: AddArgs) -> Result<(), String> 
 pub fn update(tasks: &mut [ScheduledTask], args: UpdateArgs) -> Result<(), String> {
     if let Some(cron) = &args.cron {
         validate_cron(cron).map_err(|e| format!("invalid cron expression: {e}"))?;
+    }
+    // Issue #835: validated BEFORE the task is looked up so a bad value never
+    // half-applies — every other field on this path is validated up front too. An
+    // empty value is the documented "clear it" form and so skips the parse.
+    if let Some(raw) = &args.shape
+        && !raw.trim().is_empty()
+    {
+        crate::spawn::SpawnShapeOverride::parse(raw)?;
     }
     let task = tasks
         .iter_mut()
@@ -134,6 +171,23 @@ pub fn update(tasks: &mut [ScheduledTask], args: UpdateArgs) -> Result<(), Strin
     }
     if let Some(enabled) = args.enabled {
         task.enabled = enabled;
+    }
+    if let Some(raw) = args.shape {
+        if raw.trim().is_empty() {
+            // The documented escape hatch back to config-derived shaping.
+            task.shape = None;
+        } else {
+            // Rejected here rather than written, mirroring the loader: an
+            // issue-dispatch task has no shape to override.
+            if task.issue_dispatch.is_some() {
+                return Err(format!(
+                    "schedule {:?} is an issue-dispatch task; `--shape` does not apply \
+                     (it resolves a shape per cloned repo, from that repo's own config)",
+                    task.name
+                ));
+            }
+            task.shape = Some(raw.trim().to_string());
+        }
     }
     Ok(())
 }
@@ -276,8 +330,18 @@ pub fn format_list(tasks: &[ScheduledTask]) -> String {
             },
             Err(_) => "<invalid cron>".to_string(),
         };
+        // Issue #835: show the shape, because its ABSENCE is what surprises. A
+        // task with no `shape` in a dir defining `[[orchestrations]]` fires a
+        // whole team and ignores its own `command`, and before this column the
+        // only way to discover that was to read `decide_target`. `config-derived`
+        // is therefore printed explicitly rather than left blank — a blank cell
+        // would hide exactly the state worth seeing.
+        let shape = match &t.shape {
+            Some(s) => s.as_str(),
+            None => "config-derived",
+        };
         out.push_str(&format!(
-            "{state}  {name}  cron={cron:?}  next={next}  dir={dir}\n",
+            "{state}  {name}  cron={cron:?}  next={next}  shape={shape}  dir={dir}\n",
             name = t.name,
             cron = t.cron,
             dir = t.working_dir,
@@ -301,9 +365,173 @@ mod tests {
             prompt: "hi".to_string(),
             new_tab_per_fire: false,
             enabled: true,
+            // Issue #835: config-derived shape by default (the pre-#835 behaviour).
+            shape: None,
             // PRD #120: ordinary single-spawn task by default.
             issue_dispatch: None,
         }
+    }
+
+    // Issue #835 — `add --shape` stores the value, and a bad one is refused
+    // BEFORE anything is written, through the same parser the loader uses. The
+    // CLI must never be able to author a file the daemon then rejects at load.
+    #[test]
+    fn add_stores_a_valid_shape_and_refuses_an_invalid_one() {
+        for good in ["single", "orchestration", "orchestration:review"] {
+            let mut tasks = Vec::new();
+            let mut args = sample_add("shaped", "0 9 * * *");
+            args.shape = Some(good.to_string());
+            add(&mut tasks, args)
+                .unwrap_or_else(|e| panic!("shape {good:?} must be accepted: {e}"));
+            assert_eq!(tasks[0].shape.as_deref(), Some(good));
+        }
+        for bad in ["team", "Single", "orchestration:", ""] {
+            let mut tasks = Vec::new();
+            let mut args = sample_add("shaped", "0 9 * * *");
+            args.shape = Some(bad.to_string());
+            let err = add(&mut tasks, args)
+                .expect_err("an invalid shape must be refused before the write");
+            assert!(
+                err.contains("shape"),
+                "shape {bad:?}: error must name the field, got {err:?}"
+            );
+            assert!(
+                tasks.is_empty(),
+                "shape {bad:?}: no task may be appended when the shape is invalid"
+            );
+        }
+    }
+
+    // Issue #835 — omitting `--shape` writes no field at all, which is what
+    // leaves an existing schedule's behaviour untouched.
+    #[test]
+    fn add_without_shape_leaves_it_unset() {
+        let mut tasks = Vec::new();
+        add(&mut tasks, sample_add("plain", "0 9 * * *")).expect("add");
+        assert!(tasks[0].shape.is_none());
+    }
+
+    // Issue #835 — `--shape` alongside `--repo` is refused at write time, for the
+    // same reason the loader refuses the stored combination: an issue-dispatch
+    // task resolves a shape per cloned repo.
+    #[test]
+    fn add_refuses_shape_together_with_repo() {
+        let mut tasks = Vec::new();
+        let mut args = sample_add("issues", "0 9 * * *");
+        args.command = None;
+        args.shape = Some("single".to_string());
+        args.issue_dispatch = Some(IssueDispatchConfig {
+            repo: "vfarcic/dot-ai".to_string(),
+            max_per_run: 3,
+            label: None,
+            query: None,
+        });
+        let err = add(&mut tasks, args).expect_err("shape + repo must be refused");
+        assert!(
+            err.contains("--shape") && err.contains("--repo"),
+            "the error must name both flags, got {err:?}"
+        );
+        assert!(tasks.is_empty(), "nothing may be appended");
+    }
+
+    // Issue #835 — `update --shape` sets the value; an EMPTY value clears it back
+    // to config-derived (the only way back, since an omitted flag has to mean
+    // "unchanged" like every other field on this path); an invalid value is
+    // refused and leaves the stored value untouched.
+    #[test]
+    fn update_sets_clears_and_validates_shape() {
+        let mut tasks = Vec::new();
+        add(&mut tasks, sample_add("t", "0 9 * * *")).expect("add");
+
+        update(
+            &mut tasks,
+            UpdateArgs {
+                name: "t".to_string(),
+                shape: Some("orchestration:review".to_string()),
+                ..Default::default()
+            },
+        )
+        .expect("set shape");
+        assert_eq!(tasks[0].shape.as_deref(), Some("orchestration:review"));
+
+        // An omitted flag leaves it alone.
+        update(
+            &mut tasks,
+            UpdateArgs {
+                name: "t".to_string(),
+                enabled: Some(false),
+                ..Default::default()
+            },
+        )
+        .expect("unrelated update");
+        assert_eq!(
+            tasks[0].shape.as_deref(),
+            Some("orchestration:review"),
+            "an omitted --shape must not disturb the stored value"
+        );
+
+        // An invalid value is refused and changes nothing.
+        let err = update(
+            &mut tasks,
+            UpdateArgs {
+                name: "t".to_string(),
+                shape: Some("team".to_string()),
+                ..Default::default()
+            },
+        )
+        .expect_err("invalid shape must be refused");
+        assert!(err.contains("shape"), "got {err:?}");
+        assert_eq!(
+            tasks[0].shape.as_deref(),
+            Some("orchestration:review"),
+            "a refused update must not half-apply"
+        );
+
+        // An empty value clears it.
+        update(
+            &mut tasks,
+            UpdateArgs {
+                name: "t".to_string(),
+                shape: Some(String::new()),
+                ..Default::default()
+            },
+        )
+        .expect("clear shape");
+        assert!(
+            tasks[0].shape.is_none(),
+            "an empty --shape must clear the field back to config-derived"
+        );
+    }
+
+    // Issue #835 — `schedule list` shows the shape, because its ABSENCE is the
+    // surprising state: a task with no shape in a dir defining
+    // `[[orchestrations]]` fires a whole team and ignores its own `command`, and
+    // before this column the only way to find out was to read `decide_target`.
+    #[test]
+    fn format_list_shows_the_shape_including_when_unset() {
+        let mut tasks = Vec::new();
+        add(&mut tasks, sample_add("derived", "0 9 * * *")).expect("add derived");
+        let mut shaped = sample_add("forced", "0 9 * * *");
+        shaped.shape = Some("single".to_string());
+        add(&mut tasks, shaped).expect("add forced");
+
+        let out = format_list(&tasks);
+        let derived_line = out
+            .lines()
+            .find(|l| l.contains("derived"))
+            .expect("derived row present");
+        let forced_line = out
+            .lines()
+            .find(|l| l.contains("forced"))
+            .expect("forced row present");
+        assert!(
+            derived_line.contains("shape=config-derived"),
+            "an unset shape must be spelled out, not left blank: {derived_line:?}"
+        );
+        assert!(
+            forced_line.contains("shape=single"),
+            "a set shape must be shown verbatim: {forced_line:?}"
+        );
     }
 
     // PRD #127 follow-up — `add` REQUIRES a non-empty `command`. A missing or
@@ -363,6 +591,9 @@ mod tests {
             prompt: "fix {{issue_number}}".to_string(),
             new_tab_per_fire: false,
             enabled: true,
+            // Issue #835: an issue-dispatch task carries no shape either — the
+            // combination is refused by `add`.
+            shape: None,
             issue_dispatch: Some(IssueDispatchConfig {
                 repo: repo.to_string(),
                 max_per_run: 2,
