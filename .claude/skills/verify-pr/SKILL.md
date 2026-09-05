@@ -204,6 +204,8 @@ cd ../dot-agent-deck-pr-<n> && cargo nextest run --features e2e <test-name>
 
 Passes in isolation → report it as a suspected flake with the log, not as a blocking failure. Fails consistently → it is a defect. Running many e2e suites at once on one machine causes resource contention, which is its own source of timing noise; that is a reason to rerun serially, not to dismiss a failure.
 
+**A suspected flake still needs an owner (#908).** "Not blocking" is not "not your problem": red must never go unexplained, whoever caused it. Once you have classified a failure, check whether an issue already tracks that test — `gh issue list --search '<test-name>'` — and link it in your report; file one if none exists. A failure you did not cause does not oblige you to fix it, but it does oblige you to leave it tracked rather than silently passed over. This is what stops an ever-growing set of tests that everyone has learned to ignore: measured 2026-09-05, `orchestration_remit_001` was failing on 11 open PRs at once, already quarantined to serial execution, with an open fix nobody was obliged to land.
+
 ## Phase 6 — Verdict and report
 
 Write the report to `target/verify-pr/pr-<n>-report.md` **in the main checkout** — gitignored, and it survives the worktree teardown. Then print it in the conversation. Do not post it anywhere.
