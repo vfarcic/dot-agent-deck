@@ -703,7 +703,9 @@ fn spawn_009_declared_shape_overrides_the_target_dirs_config() {
         "the failure notification must list the orchestrations that ARE available"
     );
     // Never a silent degrade to some other shape: that is the defect #835 removes.
-    std::thread::sleep(Duration::from_secs(2));
+    // No settle wait is needed and none is allowed (Decision 21): the two stderr
+    // waits above are the positive signal that this fire ran to completion and
+    // was abandoned, so the registry count is meaningful the moment they return.
     assert_eq!(
         daemon.agent_records().len(),
         before,
