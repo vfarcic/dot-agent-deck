@@ -252,11 +252,32 @@ pub const CWD_MAX_LEN: usize = 4096;
 /// (bytes < 0x20 plus 0x7F DEL). Unicode beyond 0x7F is allowed so the
 /// user can type UTF-8 names. Rejects values containing ANSI escapes,
 /// NUL, newlines, carriage returns, etc. — anything that could perturb
-/// the TUI render path when echoed back via `list_agents`.
+/// the TUI render path when echoed back via `list_agents` — and, since issue
+/// #833, the Unicode bidirectional formatting codepoints
+/// [`crate::untrusted_text::is_bidi_format_char`] names.
+///
+/// **The byte test alone could not express that last clause.** `U+202E`
+/// RIGHT-TO-LEFT OVERRIDE encodes as `E2 80 AE`: three bytes that each satisfy
+/// `>= 0x20 && != 0x7f`, so it walked through a check whose stated purpose is
+/// to keep exactly this class of character off the rendered title.
+/// `char::is_control` does not catch it either — it is general category `Cf`,
+/// not `Cc` — and a terminal honours it, visually reversing the text that
+/// follows. Every caller here gates a string that ends up in a rendered pane
+/// title, card title, tab label or role name, so the clause is right for all
+/// of them.
+///
+/// This is a GATE, not a sanitizer: a failing value is REJECTED whole (the
+/// caller keeps the name it had, or stores `None`), because every caller is
+/// validating a request whose sender can send a corrected one.
+/// [`crate::untrusted_text::sanitize_display_name`] is the repairing
+/// counterpart, used at seams where the surrounding data must still be applied.
 pub fn is_valid_display_name(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= DISPLAY_NAME_MAX_LEN
         && value.bytes().all(|b| b >= 0x20 && b != 0x7f)
+        && !value
+            .chars()
+            .any(crate::untrusted_text::is_bidi_format_char)
 }
 
 /// Canonical resolver for the human-readable display name shown on a pane
@@ -7806,6 +7827,43 @@ mod tests {
         assert_eq!(resolve_display_name(None, None), "shell");
         assert_eq!(resolve_display_name(Some("   "), None), "shell");
         assert_eq!(resolve_display_name(None, Some("   ")), "shell");
+    }
+
+    #[test]
+    fn is_valid_display_name_rejects_bidi_format_characters() {
+        // Issue #833. The byte test this function is built on cannot express
+        // this: U+202E RIGHT-TO-LEFT OVERRIDE encodes as `E2 80 AE`, three
+        // bytes that each satisfy `>= 0x20 && != 0x7f`. It is `Cf`, not `Cc`,
+        // so `char::is_control` misses it too — and a terminal honours it,
+        // reversing the title text that follows. Enumerated rather than
+        // spot-checked, because one surviving override is all a spoof needs.
+        for c in ['\u{202a}', '\u{202b}', '\u{202c}', '\u{202d}', '\u{202e}']
+            .into_iter()
+            .chain(['\u{2066}', '\u{2067}', '\u{2068}', '\u{2069}'])
+            .chain(['\u{200e}', '\u{200f}', '\u{061c}'])
+        {
+            let name = format!("deploy{c}er");
+            assert!(
+                !is_valid_display_name(&name),
+                "U+{:04X} must be refused",
+                c as u32
+            );
+            // The byte-level half genuinely does not see it — this is the
+            // assertion that says WHY the extra clause had to be added rather
+            // than being redundant with what was already there.
+            assert!(
+                name.bytes().all(|b| b >= 0x20 && b != 0x7f),
+                "U+{:04X} must be a case the byte test alone admits, or this \
+                 test is not covering the gap it was written for",
+                c as u32
+            );
+        }
+
+        // Control: ordinary UTF-8 names, including right-to-left script that
+        // needs no override character to render correctly, stay valid.
+        for ok in ["deployer", "café-агент-日本語", "مرحبا-agent", "worker-3"] {
+            assert!(is_valid_display_name(ok), "{ok} must stay valid");
+        }
     }
 
     #[test]

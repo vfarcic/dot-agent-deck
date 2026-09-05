@@ -15452,6 +15452,22 @@ fn render_card_grid(
             // this the live card degraded to the truncated pane id while a
             // reconnect (which reads the daemon registry's display_name into
             // `ui.display_names`) titled it correctly.
+            //
+            // Issue #833: this preference is why BOTH sources have to be
+            // defended, and defending the fallback alone was not enough. Every
+            // string that can reach this line is scrubbed or refused by the
+            // seam that WRITES it, never here:
+            //   - `ui.display_names` on hydration ← `daemon_client`'s
+            //     `sanitize_record_tab_membership` at the `list_agents` wire
+            //     boundary;
+            //   - `ui.display_names` on rename ← `pane::RenameOutcome::applied`
+            //     / `agent_pty::is_valid_display_name`, which REFUSES a bad
+            //     name so the map keeps the label it had;
+            //   - `SessionState.display_name` ← `AppState::apply_event`'s
+            //     `untrusted_text::sanitize_display_name` (issue #670).
+            // Scrubbing at this seam instead would have to be repeated by every
+            // future reader of these two fields, which is exactly how #833
+            // happened: a second reader was added beside a sanitized one.
             let display_name = ids
                 .get(col_idx)
                 .and_then(|id| ui.display_names.get(*id))

@@ -54,8 +54,8 @@ use tokio::task::JoinHandle;
 
 use chrono::Utc;
 use dot_agent_deck::agent_pty::{
-    AgentPtyRegistry, AgentRecord, DOT_AGENT_DECK_AGENT_ID, DOT_AGENT_DECK_PANE_ID, SpawnOptions,
-    TabMembership,
+    AgentPtyRegistry, AgentRecord, DISPLAY_NAME_MAX_LEN, DOT_AGENT_DECK_AGENT_ID,
+    DOT_AGENT_DECK_PANE_ID, SpawnOptions, TabMembership,
 };
 use dot_agent_deck::daemon::{Daemon, run_daemon_with};
 use dot_agent_deck::daemon_client::{DaemonClient, StartAgentOptions};
@@ -71,8 +71,9 @@ use dot_agent_deck::state::{
 };
 use dot_agent_deck::ui::{
     dead_slot_pane_id, fill_dead_slots_with_placeholders, is_dead_slot_pane_id,
-    partition_hydrated_panes, resolve_orch_config_for_hydration,
+    partition_hydrated_panes, render_card_grid_to_buffer, resolve_orch_config_for_hydration,
 };
+use dot_agent_deck::untrusted_text::is_bidi_format_char;
 use spec::spec;
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::AtomicUsize;
@@ -2472,7 +2473,8 @@ fn has_control_bytes(s: &str) -> bool {
 }
 
 /// Mock that mimics a hostile / malformed daemon: replies to ListAgents with
-/// ONE `AgentRecord` whose live `SessionSnapshot` carries ANSI escapes, NUL
+/// ONE `AgentRecord` whose `display_name` (issue #833) and whose live
+/// `SessionSnapshot` carry ANSI escapes, NUL
 /// bytes, and other control chars in `last_user_prompt`, in every
 /// `first_prompts` entry, and in `active_tool.name` / `.detail`, where
 /// `last_user_prompt`, `active_tool.name`, `active_tool.detail`, AND every
@@ -2502,7 +2504,18 @@ async fn run_hostile_live_list_server(listener: UnixListener) {
                 let hostile = AgentRecord {
                     id: "hostile-live-7".into(),
                     pane_id_env: Some("pane-hostile".into()),
-                    display_name: None,
+                    // Issue #833: hostile in BOTH dimensions, like the live
+                    // strings below — control bytes, a bidi override that the
+                    // daemon's own `is_valid_display_name` gate accepts, and
+                    // ~100 KiB of padding so the clamp has to apply here too.
+                    // Multi-byte padding, unlike the ASCII `over_long` the live
+                    // strings use: this field's ceiling is the daemon's own
+                    // 128-byte `DISPLAY_NAME_MAX_LEN`, so the clamp has to snap
+                    // back to a character boundary rather than slice a `\u{3bc}`.
+                    display_name: Some(format!(
+                        "de\x1bplo\u{202e}yer\x00 {}",
+                        "\u{3bc}".repeat(400)
+                    )),
                     cwd: None,
                     tab_membership: None,
                     agent_type: Some(AgentType::ClaudeCode),
@@ -2549,11 +2562,16 @@ async fn run_hostile_live_list_server(listener: UnixListener) {
 }
 
 /// Scenario: A hostile / malformed daemon advertises via `list_agents` an
-/// `AgentRecord.live` whose prompt and active-tool strings carry ANSI escapes,
+/// `AgentRecord` whose `display_name` carries ANSI escapes, a NUL and a
+/// right-to-left override and is ~800 bytes long (issue #833), and whose
+/// `AgentRecord.live` prompt and active-tool strings carry ANSI escapes,
 /// NUL bytes, and other control chars AND are over-long (~100 KiB each), and
 /// whose `first_prompts` is oversized (6 entries, each also over-long).
 /// Calling `DaemonClient::list_agents` against that daemon must return the
-/// record with its live snapshot preserved (the agent is real) but SCRUBBED —
+/// record with its `display_name` scrubbed of control bytes AND bidi overrides
+/// and clamped to `DISPLAY_NAME_MAX_LEN` — rendering clean into the card title
+/// that `ui.display_names` wins with — and with its live snapshot preserved
+/// (the agent is real) but SCRUBBED —
 /// no control bytes survive in `last_user_prompt`, any `first_prompts` entry,
 /// or `active_tool.name` / `.detail` — and CLAMPED — every one of
 /// `last_user_prompt`, `active_tool.name`, `active_tool.detail`, and each
@@ -2600,8 +2618,78 @@ async fn live_007_list_agents_sanitizes_and_clamps_hostile_live_snapshot_inner()
         1,
         "one hostile record advertised; got {records:?}"
     );
+
+    // Issue #833. `display_name` is the title the card actually uses: hydration
+    // copies this field into `ui.pane_display_names`, the dashboard loop fills
+    // `ui.display_names` from that, and `render_card_grid` PREFERS that map over
+    // the session's own name. It was the one string on this record the wire
+    // boundary did not scrub, and the daemon-side gate that is supposed to keep
+    // it clean (`agent_pty::is_valid_display_name`) is a byte-level ASCII
+    // control check that accepts a bidi override — so a daemon can echo one back
+    // having validated it.
+    let name = records[0]
+        .display_name
+        .as_deref()
+        .expect("a name with printable content survives as a name, scrubbed not dropped");
+    assert!(
+        !has_control_bytes(name),
+        "display_name must be scrubbed of control bytes; got {name:?}"
+    );
+    assert!(
+        !name.chars().any(is_bidi_format_char),
+        "display_name must be scrubbed of bidi overrides; got {name:?}"
+    );
+    let body = name.strip_suffix('\u{2026}').unwrap_or(name);
+    assert!(
+        body.len() <= DISPLAY_NAME_MAX_LEN,
+        "display_name must be clamped to the daemon's own ceiling; got {} bytes",
+        body.len()
+    );
+    assert!(
+        body.ends_with('\u{3bc}'),
+        "the clamp must snap back to a character boundary; got {body:?}"
+    );
+
+    // Render altitude: draw the returned name through the seam that runs the
+    // deck's own `ui.display_names.get(id).or(session.display_name)` resolution,
+    // which is where this string ends up, and check the CELLS. A control byte
+    // here is written to the real terminal on the next flush; a U+202E reorders
+    // the title text after it.
+    let now = Utc::now();
+    let session = SessionState {
+        session_id: "pane-hostile".to_string(),
+        agent_type: AgentType::ClaudeCode,
+        cwd: None,
+        status: SessionStatus::Working,
+        active_tool: None,
+        started_at: now,
+        last_activity: now,
+        recent_events: VecDeque::new(),
+        tool_count: 0,
+        last_user_prompt: None,
+        first_prompts: Vec::new(),
+        pane_id: Some("pane-hostile".to_string()),
+        agent_id: Some("hostile-live-7".to_string()),
+        display_name: None,
+        shell_synthetic_working: false,
+        orchestration_orphaned: false,
+    };
+    let (buffer, _) = render_card_grid_to_buffer(&[(&session, Some(name))], Some(0), 0, 80, 20);
+    let area = *buffer.area();
+    for y in 0..area.height {
+        for x in 0..area.width {
+            for c in buffer[(x, y)].symbol().chars() {
+                assert!(
+                    !c.is_control() && !is_bidi_format_char(c),
+                    "U+{:04X} reached cell ({x}, {y}) of the hydrated card title",
+                    c as u32
+                );
+            }
+        }
+    }
+
     let live = records[0].live.as_ref().expect(
-        "the live snapshot must be preserved (the agent is real) — scrubbed/clamped, not dropped",
+        "the live snapshot must be preserved (the agent is real) \u{2014} scrubbed/clamped, not dropped",
     );
 
     // No raw control bytes survive into any rendered string, AND each string

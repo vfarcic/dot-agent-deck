@@ -32,6 +32,19 @@
 //! not part of #670. Reach for this module rather than writing a third copy: it
 //! is the divergence between those two that let the bidi half be present on one
 //! untrusted path and absent on another.
+//!
+//! Issue #833 moved ONE field off that older filter: `AgentRecord.display_name`
+//! at the same `list_agents` boundary now goes through
+//! [`sanitize_display_name`] here, because it is the card title
+//! `ui::render_card_grid` prefers and the daemon-side gate that was supposed to
+//! keep it clean admitted bidi. The live-snapshot strings beside it —
+//! `last_user_prompt`, `first_prompts`, `active_tool` — still use
+//! `daemon_client`'s control-only filter, so that seam is now MIXED rather than
+//! uniformly control-only. Their live counterparts arriving on the hook socket
+//! are the ones this module covers: `tool_name` / `tool_detail` through
+//! [`sanitize_tool_text`], and the hook's `display_name` metadata through
+//! [`sanitize_display_name`]. `user_prompt` at that ingest is scrubbed on
+//! neither route and is not part of #833.
 
 use crate::agent_pty::DISPLAY_NAME_MAX_LEN;
 use crate::prompt_delivery::truncate_on_char_boundary;
@@ -142,6 +155,33 @@ pub fn sanitize_display_name(raw: &str) -> Option<String> {
         return None;
     }
     Some(truncate_on_char_boundary(trimmed, DISPLAY_NAME_MAX_LEN))
+}
+
+/// Byte ceiling applied to a producer-supplied tool name or tool detail at
+/// hook ingest ([`sanitize_tool_text`]).
+///
+/// Deliberately the same 64 KiB `crate::daemon_client` clamps the SAME two
+/// strings to when they arrive over the `list_agents` echo instead of over the
+/// hook socket. The two routes carry one field between them, so a ceiling that
+/// differed by route would mean the card's tool line had two different maximum
+/// lengths depending on whether the TUI had reconnected — and issue #833 is
+/// precisely a defect of one field's two routes disagreeing.
+pub const MAX_TOOL_TEXT_BYTES: usize = 65536;
+
+/// Sanitize a producer-supplied tool name or tool detail into something safe to
+/// store and render.
+///
+/// Strips control and bidi characters, then clamps to [`MAX_TOOL_TEXT_BYTES`]
+/// on a character boundary via [`truncate_on_char_boundary`], marking the cut
+/// with a trailing `…` exactly as [`sanitize_display_name`] does.
+///
+/// Unlike [`sanitize_display_name`] this returns a `String` rather than an
+/// `Option`, and does NOT trim: an empty result is a meaningful value here (the
+/// tool simply reported no detail) where an empty card title is not, and the
+/// leading/trailing whitespace of a tool detail is the producer's own
+/// formatting of a command line rather than padding around a name.
+pub fn sanitize_tool_text(raw: &str) -> String {
+    truncate_on_char_boundary(&strip_control_and_bidi(raw, false), MAX_TOOL_TEXT_BYTES)
 }
 
 #[cfg(test)]
@@ -282,6 +322,44 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn sanitize_tool_text_strips_and_clamps_without_trimming() {
+        // Issue #833. Same strip policy as a display name — the tool line is a
+        // width-constrained region on the same card — but no trim and no
+        // `Option`: an empty detail is a meaningful value where an empty card
+        // title is not, and the surrounding whitespace of a command line is
+        // the producer's own formatting rather than padding around a name.
+        assert_eq!(sanitize_tool_text("Bash"), "Bash");
+        assert_eq!(
+            sanitize_tool_text("src/\u{202e}gnidaer\u{7f}\r\n rm -rf /"),
+            "src/gnidaer rm -rf /"
+        );
+        assert_eq!(sanitize_tool_text(""), "");
+        assert_eq!(sanitize_tool_text("\u{1b}\u{202e}\0\u{7f}"), "");
+        // Whitespace is the producer's, and is kept.
+        assert_eq!(sanitize_tool_text("  git status  "), "  git status  ");
+
+        // Clamped on a character boundary and marked, like a display name.
+        let over = "\u{3bc}".repeat(MAX_TOOL_TEXT_BYTES);
+        let out = sanitize_tool_text(&over);
+        let body = out.strip_suffix('…').expect("an over-long value is marked");
+        assert!(
+            body.len() <= MAX_TOOL_TEXT_BYTES,
+            "clamp overshot the ceiling: {} bytes",
+            body.len()
+        );
+        assert!(
+            body.ends_with('\u{3bc}'),
+            "the cut split a character: {body:?}"
+        );
+
+        // Stripping happens BEFORE the clamp, so a value padded past the
+        // ceiling with control bytes is a real value once scrubbed rather than
+        // 64 KiB of padding cut down and then scrubbed to nothing.
+        let padded = format!("{}{}", "\u{1b}".repeat(MAX_TOOL_TEXT_BYTES + 10), "Bash");
+        assert_eq!(sanitize_tool_text(&padded), "Bash");
     }
 
     #[test]
