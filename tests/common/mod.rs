@@ -8066,6 +8066,9 @@ impl DaemonProc {
 
         let req = dot_agent_deck::daemon_protocol::AttachRequest::AttachStream {
             id: agent_id.to_string(),
+            rows: None,
+            cols: None,
+            geometry_updates: false,
         };
         let payload = serde_json::to_vec(&req).expect("serialize AttachStream");
         let mut header = [0u8; 5];
@@ -8129,6 +8132,9 @@ impl DaemonProc {
 
         let req = dot_agent_deck::daemon_protocol::AttachRequest::AttachStream {
             id: agent_id.to_string(),
+            rows: None,
+            cols: None,
+            geometry_updates: false,
         };
         let payload = serde_json::to_vec(&req).expect("serialize AttachStream");
         let mut header = [0u8; 5];

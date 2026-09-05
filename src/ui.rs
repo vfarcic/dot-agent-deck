@@ -15187,14 +15187,22 @@ fn resize_panes_to_layout(layout: &FrameLayout, embedded: &EmbeddedPaneControlle
         if rows == 0 || cols == 0 {
             continue;
         }
-        // Compare against the pane's current parser size (kept in lockstep with
-        // the PTY by `resize_pane_pty`) and only commit a real delta, so a
-        // steady frame issues no resize traffic.
-        let current = embedded.get_screen(pane_id).and_then(|arc| {
-            let parser = arc.lock().ok()?;
-            Some(parser.screen().size())
-        });
-        if current != Some((rows, cols)) {
+        // PRD #882: compare against what this pane last REQUESTED, not against
+        // its parser.
+        //
+        // The parser was the right comparison while a client owned its own
+        // geometry — `resize_pane_pty` set it synchronously, so "parser" and
+        // "what I asked for" were the same number. Under the size policy they
+        // are not: the parser holds the geometry the DAEMON applied, which is
+        // smaller than this pane's target whenever another client's view of the
+        // agent is smaller. Comparing against the parser would therefore find a
+        // delta on every frame and re-send a resize forever (issue #747's note
+        // on the clamp makes the same argument about a different mismatch).
+        //
+        // Comparing against the request keeps the original property — a steady
+        // frame issues no resize traffic — while letting the applied geometry
+        // sit below the target for as long as somebody else needs it to.
+        if embedded.requested_dims(pane_id) != Some((rows, cols)) {
             let _ = embedded.resize_pane_pty(pane_id, rows, cols);
         }
     }
@@ -24079,7 +24087,17 @@ mod tests {
 
         // Drive the production chain the main loop runs: one layout pass, then
         // the PTY-sizing sweep over it. Returns, per pane, the dims the layout
-        // asked for and the geometry the local parser actually ended up at.
+        // asked for and the dims the sweep actually REQUESTED of the daemon.
+        //
+        // PRD #882 moved what the second half can be: the local parser is no
+        // longer set by the client — it holds the geometry the DAEMON applied,
+        // delivered by the resize response or a `KIND_GEOMETRY` push — and this
+        // seam has no daemon behind it, so there is nothing to answer. Issue
+        // #747's invariant is unchanged and still fully covered, because the
+        // half the client still owns is the one asserted here: an over-cap value
+        // must never reach the wire. The other half — that the parser matches
+        // what the child gets — is now structural rather than enforced, since
+        // the parser IS the daemon's answer and `AgentPtyRegistry` clamps it.
         let sweep = |width: u16, zoomed: bool| -> Vec<(u16, u16, u16, u16)> {
             let ctrl = EmbeddedPaneController::for_render_seam_with_focused_pane("r0", 24, 80, b"");
             // Held for the life of the sweep: dropping a pane's child-input
@@ -24113,14 +24131,10 @@ mod tests {
             targets
                 .into_iter()
                 .map(|(id, rows, cols)| {
-                    let (parser_rows, parser_cols) = ctrl
-                        .get_screen(&id)
-                        .expect("every laid-out pane must be registered on the seam controller")
-                        .lock()
-                        .expect("the seam parser lock must stay healthy")
-                        .screen()
-                        .size();
-                    (rows, cols, parser_rows, parser_cols)
+                    let (req_rows, req_cols) = ctrl
+                        .requested_dims(&id)
+                        .expect("every laid-out pane must have been asked to resize");
+                    (rows, cols, req_rows, req_cols)
                 })
                 .collect()
         };
@@ -24133,17 +24147,17 @@ mod tests {
 
         // --- Control: 4200 cols unzoomed. The 66% column is 2770 inner cols,
         // comfortably under the cap, so nothing may be clamped here. ---
-        for (target_rows, target_cols, parser_rows, parser_cols) in sweep(4200, false) {
+        for (target_rows, target_cols, req_rows, req_cols) in sweep(4200, false) {
             assert_eq!(
                 (target_rows, target_cols),
                 (36, 2770),
                 "control: an under-cap pane must target its full inner rect"
             );
             assert_eq!(
-                (parser_rows, parser_cols),
+                (req_rows, req_cols),
                 (36, 2770),
-                "control: an under-cap pane's parser must be left at its full \
-                 inner rect — the cap may not narrow an ordinary pane"
+                "control: an under-cap pane must REQUEST its full inner rect — \
+                 the cap may not narrow an ordinary pane"
             );
         }
 
@@ -24156,7 +24170,7 @@ mod tests {
                 raw_cols > PTY_RESIZE_DIM_MAX,
                 "fixture must actually exceed the cap ({raw_cols} vs {PTY_RESIZE_DIM_MAX})"
             );
-            for (target_rows, target_cols, parser_rows, parser_cols) in sweep(width, zoomed) {
+            for (target_rows, target_cols, req_rows, req_cols) in sweep(width, zoomed) {
                 assert_eq!(
                     (target_rows, target_cols),
                     child_geometry(36, raw_cols),
@@ -24167,26 +24181,24 @@ mod tests {
                      while the child gets something narrower"
                 );
                 assert_eq!(
-                    (parser_rows, parser_cols),
+                    (req_rows, req_cols),
                     child_geometry(36, raw_cols),
-                    "at {width} cols (zoomed={zoomed}) the local vt100 parser must \
-                     sit at the SAME geometry the daemon hands the child \
-                     ({PTY_RESIZE_DIM_MAX} cols max); parsing the agent's output \
-                     at {parser_cols} cols while the child wraps it at \
-                     {PTY_RESIZE_DIM_MAX} is issue #747's rewrapped pane"
+                    "at {width} cols (zoomed={zoomed}) the geometry put ON THE WIRE must \
+                     already be capped at {PTY_RESIZE_DIM_MAX}; sending a wider one and \
+                     letting the daemon quietly narrow it is issue #747's rewrapped pane, \
+                     and under PRD #882 it would also make the pane's delta check compare \
+                     an unclamped request against a clamped answer forever"
                 );
             }
         }
 
         // --- The resize PRIMITIVE, not just the layout that drives it. The
         // layout sweep above is the only production caller today, but
-        // `resize_pane_pty` is a `pub` method whose two halves must not be able
-        // to disagree: whatever it hands `set_size` is also what it puts on the
-        // watch channel bound for `AttachRequest::Resize`. Bounding only the
-        // layout would leave the divergence one new call site away. ---
-        // One over-cap axis at a time, each paired with a small one: a parser
-        // that is over-cap on BOTH axes is 16.7M cells, which is real time and
-        // real memory to buy no extra coverage of a per-axis `min`.
+        // `resize_pane_pty` is a `pub` method whose recorded request and its
+        // wire request must not be able to disagree: whatever it records as
+        // "what I asked for" is also what it puts on the watch channel bound for
+        // `AttachRequest::Resize`. Bounding only the layout would leave the
+        // divergence one new call site away. ---
         let ctrl = EmbeddedPaneController::for_render_seam_with_focused_pane("wide", 24, 80, b"");
         let _tall_input = ctrl.add_scroll_seam_pane("tall", 24, 80, b"");
         for (pane_id, req, want) in [
@@ -24203,7 +24215,18 @@ mod tests {
         ] {
             ctrl.resize_pane_pty(pane_id, req.0, req.1)
                 .expect("resizing a registered seam pane must succeed");
-            let got = ctrl
+            let requested = ctrl
+                .requested_dims(pane_id)
+                .expect("the seam controller must register its panes");
+            assert_eq!(
+                requested, want,
+                "resize_pane_pty({}x{}) must clamp BEFORE recording the request, so an \
+                 over-cap geometry never reaches the wire and the pane's delta check \
+                 never compares an unclamped request against the daemon's clamped answer \
+                 — which would re-send a resize on every frame forever",
+                req.0, req.1
+            );
+            let parsed = ctrl
                 .get_screen(pane_id)
                 .expect("the seam controller must register its panes")
                 .lock()
@@ -24211,9 +24234,13 @@ mod tests {
                 .screen()
                 .size();
             assert_eq!(
-                got, want,
-                "resize_pane_pty({}x{}) must clamp before touching the parser, so the \
-                 parser can never be told a geometry the daemon would narrow behind it",
+                parsed, want,
+                "resize_pane_pty({}x{}) must clamp the OPTIMISTIC parser write too. \
+                 PRD #882 makes the daemon's answer the authority, but the client still \
+                 writes the requested geometry first so a single-client resize costs no \
+                 round trip — and an unclamped optimistic write would parse the agent's \
+                 output at a width the child can never wrap at, which is issue #747's \
+                 rewrapped pane arriving through the new path",
                 req.0, req.1
             );
         }

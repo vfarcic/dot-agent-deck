@@ -512,6 +512,7 @@ export function ControlDeck({ runtime, workflowPlatformIssue = desktopWorkflowPl
                   onTabChange={(tab) => setTabs((current) => ({ ...current, [agent.id]: tab }))}
                   onTerminalInput={runtime.sendTerminalInput}
                   onTerminalResize={runtime.resizeTerminal}
+                  appliedGeometry={runtime.appliedGeometry?.[agent.id]}
                   onEvidenceSelect={(id) => { setSelectedEvidenceId(id); setEvidenceOpen(true); }}
                   onSubmitText={submitText}
                   onRename={mode === "live" ? renameAgent : undefined}

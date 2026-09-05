@@ -711,9 +711,21 @@ async fn desktop_terminal_attach(
     state: State<'_, DesktopState>,
     agent_id: String,
     on_output: Channel<Response>,
+    // PRD #882 — the geometry this tile measured, declared so the agent is sized
+    // to the smallest pane among every client watching it. Optional: a caller
+    // with nothing measured yet (or the browser preview) declares nothing and
+    // constrains nothing.
+    rows: Option<u16>,
+    cols: Option<u16>,
 ) -> Result<TerminalAttachResult, String> {
     ensure_main_webview(&webview)?;
-    terminal::attach(&app, &state, agent_id, on_output).await
+    let viewport = match (rows, cols) {
+        (Some(rows), Some(cols)) => Some((rows, cols)),
+        // Both or neither: half a viewport is a caller bug, and guessing the
+        // missing axis would register a constraint nobody asked for.
+        _ => None,
+    };
+    terminal::attach(&app, &state, agent_id, on_output, viewport).await
 }
 
 #[tauri::command]
@@ -1017,7 +1029,11 @@ async fn desktop_run_action(
             on_output,
         } => {
             let channel: Channel<Response> = on_output.channel_on(webview.clone());
-            let attached = terminal::attach(&app, &state, agent_id.clone(), channel).await?;
+            // PRD #882: this action carries no measured geometry (it is the
+            // declarative attach path, not the tile's own), so it declares no
+            // viewport and constrains nothing. The tile's first resize registers
+            // its size a frame later.
+            let attached = terminal::attach(&app, &state, agent_id.clone(), channel, None).await?;
             result_agent_id = Some(agent_id);
             result_terminal = Some(attached);
         }

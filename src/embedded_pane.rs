@@ -179,6 +179,26 @@ struct StreamBackend {
     /// an internal detail. Recording the reason lets the pane say what actually
     /// happened.
     lost: Arc<Mutex<Option<PaneLostReason>>>,
+    /// PRD #882 — this pane's viewer token, shared with the I/O task the same
+    /// way `agent_id` is and for the same reason: PRD #92 F12's
+    /// auto-renew-on-respawn path re-attaches to a NEW agent, which mints a new
+    /// token, and the resize worker must send whichever one is current.
+    ///
+    /// `None` until the first attach answers, and again for a daemon that
+    /// predates the policy (it echoes no token). A resize sent without one takes
+    /// the daemon's unattributed path — the pre-#882 behaviour — which is the
+    /// correct fallback in both cases: there is no viewer registered to update.
+    viewer: Arc<Mutex<Option<String>>>,
+    /// PRD #882 — the last geometry the DAEMON said it applied for this pane.
+    ///
+    /// This, not the local parser, is what the per-frame sweep compares its
+    /// layout target against. The parser used to be the comparison because it
+    /// was kept "in lockstep with the PTY" by the client itself — an assumption
+    /// only true while one client existed (issue #883). Under the size policy
+    /// the applied geometry can differ from anything this client asked for, and
+    /// can move without this client asking at all, so the client tracks what it
+    /// last REQUESTED here and reconciles against what the daemon answers.
+    requested: Arc<Mutex<Option<(u16, u16)>>>,
 }
 
 /// Why a pane's attach I/O task stopped trying to reach its agent.
@@ -406,6 +426,31 @@ pub fn parser_init_dims(rows: u16, cols: u16) -> (u16, u16) {
 /// clamps the UPPER bound to [`PTY_RESIZE_DIM_MAX`] (matching the daemon) but
 /// still relies on its one caller, `ui.rs`'s `resize_panes_to_layout`, to skip
 /// a zero axis rather than rejecting one itself — and feeding stays separately
+/// PRD #882 — reshape a pane's parser to `(rows, cols)`, but only if that is
+/// actually a change.
+///
+/// `vt100::Screen::set_size` is **not** a no-op for an unchanged size: it walks
+/// every row and calls `row.resize(..)` unconditionally, plus scroll-region
+/// arithmetic. On a full-screen pane that is thousands of cell operations while
+/// holding the parser mutex — the same mutex the render path takes to draw.
+///
+/// This matters because #882 made redundant calls the COMMON case. With one
+/// client attached the daemon grants exactly what was asked, so the optimistic
+/// write in `resize_pane_pty` and the confirming answer from the resize
+/// response carry the same geometry, and the second one is pure waste that the
+/// render loop can block on. Guarding here keeps the single-client path at one
+/// reshape per resize, as it was before this PRD.
+fn set_parser_size_if_changed(parser: &Mutex<vt100::Parser>, rows: u16, cols: u16) {
+    let (rows, cols) = parser_init_dims(rows, cols);
+    let Ok(mut parser) = parser.lock() else {
+        return;
+    };
+    if parser.screen().size() == (rows, cols) {
+        return;
+    }
+    parser.screen_mut().set_size(rows, cols);
+}
+
 /// guarded by [`guarded_parser_feed`].
 fn new_pane_parser(rows: u16, cols: u16) -> vt100::Parser {
     let (rows, cols) = parser_init_dims(rows, cols);
@@ -720,6 +765,10 @@ impl EmbeddedPaneController {
                 resize_tx,
                 resize_task: None,
                 lost: Arc::new(Mutex::new(None)),
+                // Render-only seam: no attach, so no viewer and nothing
+                // requested. Both stay `None` for the pane's life.
+                viewer: Arc::new(Mutex::new(None)),
+                requested: Arc::new(Mutex::new(None)),
             },
             screen: Arc::new(Mutex::new(parser)),
             name: pane_id.to_string(),
@@ -854,16 +903,73 @@ impl EmbeddedPaneController {
         let pane = panes
             .get(pane_id)
             .ok_or_else(|| PaneError::CommandFailed(format!("Pane {pane_id} not found")))?;
+        // PRD #882: record what this pane ASKED for. The per-frame sweep
+        // compares its layout target against this rather than against the
+        // parser, so it issues one request per genuine layout change even while
+        // the daemon is holding the agent at a smaller size for another client.
+        // Comparing against the parser instead would re-send on every frame
+        // forever, because under this policy the parser holds the daemon's
+        // answer and the target holds the wish, and the two legitimately differ.
+        *pane.backend.requested.lock().unwrap() = Some((rows, cols));
         // `send_replace` overwrites whatever value was pending and ignores
         // the no-receivers case (the worker would only be gone if the
         // pane was being torn down — losing the resize is the right
         // outcome there). The watch channel cannot block, so this returns
         // immediately and never holds the pane lock across daemon I/O.
         let _ = pane.backend.resize_tx.send_replace(Some((rows, cols)));
-        if let Ok(mut parser) = pane.screen.lock() {
-            parser.screen_mut().set_size(rows, cols);
-        }
+        // PRD #882: set the parser optimistically, and let the daemon's answer
+        // correct it.
+        //
+        // The first cut of this dropped the optimistic write entirely, on the
+        // reasoning that the daemon decides the geometry so the client should
+        // wait to be told. That is wrong for the case that dominates: with one
+        // client attached the daemon grants exactly what was asked, so waiting
+        // buys nothing and costs a full round trip of lag on every resize — the
+        // pane renders its old grid inside its new box until the answer lands.
+        // It also makes the pane's geometry change at a moment unrelated to the
+        // frame that caused it, which is a race for anything comparing rendered
+        // frames across a layout change.
+        //
+        // Optimistic-then-corrected keeps the single-client path byte-for-byte
+        // what it was, and in the multi-client case the transient is in the SAFE
+        // direction: the parser is briefly LARGER than the PTY, so the agent's
+        // bytes land where they were drawn (no clamped cursor, no overprinting)
+        // with stale columns to the right until the SIGWINCH redraw repaints —
+        // and the answer, or a `KIND_GEOMETRY` push, shrinks it immediately.
+        //
+        // This does NOT reintroduce issue #883. That bug was the per-frame
+        // sweep COMPARING against this parser to decide whether to resize;
+        // the sweep now compares against `requested` above, so the parser
+        // holding an optimistic value cannot suppress a needed request.
+        set_parser_size_if_changed(&pane.screen, rows, cols);
         Ok(())
+    }
+
+    /// PRD #882 — this pane's viewer token, or `None` if the pane never attached
+    /// as a viewer (the render-only seam) or is talking to a daemon that
+    /// predates the policy and echoed none.
+    ///
+    /// Exposed so a test can assert that a pane actually registered — "the
+    /// resize carried a token" is the difference between participating in the
+    /// policy and silently taking the daemon's unattributed override path, and
+    /// the two are indistinguishable from the outside without it.
+    pub fn viewer_token(&self, pane_id: &str) -> Option<String> {
+        let panes = self.panes.lock().unwrap();
+        panes.get(pane_id)?.backend.viewer.lock().ok()?.clone()
+    }
+
+    /// PRD #882 — the geometry this pane last ASKED the daemon for, or `None`
+    /// if it has not asked yet.
+    ///
+    /// The per-frame sweep in `ui.rs` compares its layout target against this to
+    /// decide whether a request is new. It deliberately does not consult the
+    /// parser: under the size policy the parser holds the daemon's ANSWER, which
+    /// legitimately differs from the request whenever another client's pane is
+    /// smaller — so a parser-based comparison would find a delta on every frame
+    /// and re-send forever.
+    pub fn requested_dims(&self, pane_id: &str) -> Option<(u16, u16)> {
+        let panes = self.panes.lock().unwrap();
+        *panes.get(pane_id)?.backend.requested.lock().ok()?
     }
 
     /// PRD #611 M2 — everything a scroll attempt needs to know about whether
@@ -1094,7 +1200,13 @@ impl EmbeddedPaneController {
                 // path below.
                 let attach_err: ClientError = match tokio::time::timeout(
                     CREATE_PANE_ATTACH_TIMEOUT,
-                    client_for_calls.attach(&id),
+                    // PRD #882: the pane's own geometry — the same `(rows, cols)`
+                    // this pane's agent was just spawned at — declared as this
+                    // viewer's viewport. Declaring it at attach rather than
+                    // waiting for the first layout sweep means a second client
+                    // attaching in between cannot size the agent as if this pane
+                    // were not there.
+                    client_for_calls.attach_as_viewer(&id, Some((rows, cols))),
                 )
                 .await
                 {
@@ -1190,6 +1302,18 @@ impl EmbeddedPaneController {
         // `saturating_sub(2)` border allowance — so a short or narrow terminal
         // arrives here with a zero axis and no caller in between rejects it, the
         // way `resize_panes_to_layout` does on the resize path.
+        //
+        // PRD #882 (raised by Greptile on PR #895): prefer the geometry the
+        // attach response says the daemon has APPLIED over the dims the caller
+        // computed. The caller's value is one of two stale things — the
+        // `AgentRecord` read before this attach, or the pane's own layout target
+        // — and another viewer can have moved the minimum in between, because
+        // attaching is itself what registers this viewer and can shrink the
+        // agent. The snapshot that is about to be replayed on this connection
+        // was taken under the same daemon lock as `applied`, so it is the ONLY
+        // geometry those bytes are interpretable at. Parsing them at the
+        // caller's dims is PRD #104's scramble, reached through the new path.
+        let (rows, cols) = conn.applied().unwrap_or((rows, cols));
         let parser = Arc::new(Mutex::new(new_pane_parser(rows, cols)));
         let mouse_mode = Arc::new(AtomicBool::new(false));
         let hyperlinks = Arc::new(Mutex::new(HyperlinkMap::new()));
@@ -1216,10 +1340,21 @@ impl EmbeddedPaneController {
         // Survives until either `resize_tx` drops (pane removed) or the
         // worker is aborted by `StreamBackend::drop`. See the comment on
         // `resize_pane_pty` for the full rationale.
+        // PRD #882: the viewer token follows the same sharing pattern as
+        // `agent_id` and for the same reason — a respawn re-attaches and mints a
+        // new one, and the resize worker must send whichever is current.
+        // Seeded from the attach that produced `conn`, so the very first resize
+        // already names this viewer rather than falling through to the daemon's
+        // unattributed path.
+        let shared_viewer = Arc::new(Mutex::new(conn.viewer().map(|v| v.to_string())));
+        let requested = Arc::new(Mutex::new(None));
+
         let resize_task = runtime.spawn(resize_worker(
             resize_rx,
             daemon_path.clone(),
             Arc::clone(&shared_agent_id),
+            Arc::clone(&shared_viewer),
+            Arc::clone(&parser),
         ));
 
         let parser_for_task = Arc::clone(&parser);
@@ -1227,6 +1362,7 @@ impl EmbeddedPaneController {
         let hyperlinks_for_task = Arc::clone(&hyperlinks);
         let bytes_for_task = Arc::clone(&bytes_since_spawn);
         let agent_id_for_task = Arc::clone(&shared_agent_id);
+        let viewer_for_task = Arc::clone(&shared_viewer);
         let client_for_task = self.client.clone();
         let pane_id_for_task = pane_id.clone();
         let rejections_for_task = Arc::clone(&self.stream_rejections);
@@ -1253,6 +1389,7 @@ impl EmbeddedPaneController {
                 client_for_task,
                 conn,
                 agent_id_for_task,
+                viewer_for_task,
                 input_rx,
                 parser_for_task,
                 mouse_mode_for_task,
@@ -1282,6 +1419,8 @@ impl EmbeddedPaneController {
                 resize_tx,
                 resize_task: Some(resize_task),
                 lost,
+                viewer: shared_viewer,
+                requested,
             },
             screen: parser,
             name,
@@ -1379,10 +1518,29 @@ impl EmbeddedPaneController {
             // Bounded per-agent attach: same rationale as the list-agents
             // timeout above, scaled down because there can be up to
             // HYDRATE_MAX_PANES of these in series.
+            // PRD #882: the viewport this attach declares. `record.rows/cols`
+            // is the daemon's own current geometry (PRD #104 plumbed it through
+            // `list_agents`), so declaring it registers this viewer without
+            // moving the size. `(0, 0)` from a daemon predating #104 means "we
+            // do not know" — declare nothing rather than guess, since a guessed
+            // constraint under a smallest-wins policy would shrink the agent for
+            // every other client too.
+            let viewport_for_attach = match (record.rows, record.cols) {
+                (0, _) | (_, 0) => None,
+                (rows, cols) => Some((rows, cols)),
+            };
             let attach_result = runtime.block_on(async move {
                 tokio::time::timeout(
                     HYDRATE_ATTACH_TIMEOUT,
-                    client_for_attach.attach(&id_for_attach),
+                    // PRD #882: declare the DAEMON's own current geometry as
+                    // this viewer's viewport. It constrains nothing that was not
+                    // already true, so hydration cannot shrink an agent somebody
+                    // else is using, and it opts the attach into geometry
+                    // pushes — which a rehydrating pane needs, because the first
+                    // thing that can move the size afterwards is another client.
+                    // The pane's real target arrives one frame later from
+                    // `resize_panes_to_layout` and reconciles it.
+                    client_for_attach.attach_as_viewer(&id_for_attach, viewport_for_attach),
                 )
                 .await
             });
@@ -1624,10 +1782,23 @@ impl EmbeddedPaneController {
         let agent_id = record.id.clone();
         let id_for_attach = agent_id.clone();
         let client_for_attach = client.clone();
+        // PRD #882: the viewport this attach declares. `record.rows/cols`
+        // is the daemon's own current geometry (PRD #104 plumbed it through
+        // `list_agents`), so declaring it registers this viewer without
+        // moving the size. `(0, 0)` from a daemon predating #104 means "we
+        // do not know" — declare nothing rather than guess, since a guessed
+        // constraint under a smallest-wins policy would shrink the agent for
+        // every other client too.
+        let viewport_for_attach = match (record.rows, record.cols) {
+            (0, _) | (_, 0) => None,
+            (rows, cols) => Some((rows, cols)),
+        };
         let conn = match runtime.block_on(async move {
             tokio::time::timeout(
                 HYDRATE_ATTACH_TIMEOUT,
-                client_for_attach.attach(&id_for_attach),
+                // PRD #882: see the sibling hydration attach — the daemon's own
+                // geometry, so this viewer joins the policy without changing it.
+                client_for_attach.attach_as_viewer(&id_for_attach, viewport_for_attach),
             )
             .await
         }) {
@@ -2466,6 +2637,9 @@ async fn run_pane_io_task(
     client: DaemonClient,
     initial_conn: AttachConnection,
     agent_id: Arc<Mutex<String>>,
+    // PRD #882 — this pane's viewer token, refreshed on every re-attach so the
+    // resize worker always names the viewer the daemon currently has.
+    viewer: Arc<Mutex<Option<String>>>,
     mut input_rx: tokio::sync::mpsc::UnboundedReceiver<StreamCmd>,
     parser: Arc<Mutex<vt100::Parser>>,
     mouse_mode: Arc<AtomicBool>,
@@ -2526,6 +2700,26 @@ async fn run_pane_io_task(
                                     .lock()
                                     .unwrap()
                                     .push((pane_id.clone(), reason));
+                            }
+                            // PRD #882: the daemon applied a new geometry —
+                            // because another client attached, detached or
+                            // resized this agent. Reshape the parser so the
+                            // bytes that follow are interpreted at the grid they
+                            // were drawn for. NON-terminal, like STREAM_REJECT:
+                            // the stream stays open and output keeps flowing.
+                            //
+                            // This is the arm that makes the policy correct for
+                            // a client that is only WATCHING. Without it, a
+                            // viewer that never asks for anything keeps parsing
+                            // at its own geometry while the PTY sits at
+                            // somebody else's — the PRD #104 mis-parse, arriving
+                            // by the very mechanism meant to prevent it.
+                            crate::daemon_protocol::KIND_GEOMETRY => {
+                                if let Some((rows, cols)) =
+                                    crate::daemon_protocol::parse_geometry_frame(&bytes)
+                                {
+                                    set_parser_size_if_changed(&parser, rows, cols);
+                                }
                             }
                             _ => break,
                         },
@@ -2630,13 +2824,34 @@ async fn run_pane_io_task(
         // id it holds must wait out this window instead of dropping the pane
         // on top of the agent the daemon is about to hand us.
         io_state.store(IO_REATTACHING, Ordering::SeqCst);
-        match resolve_and_reattach(&client, &pane_id).await {
+        // PRD #882: the pane's own parser size is what it is drawing at right
+        // now, so it is the honest viewport to re-declare for the fresh agent.
+        let viewport = parser
+            .lock()
+            .ok()
+            .map(|p| p.screen().size())
+            .filter(|(rows, cols)| *rows > 0 && *cols > 0);
+        match resolve_and_reattach(&client, &pane_id, viewport).await {
             Ok((new_agent_id, new_conn)) => {
                 tracing::debug!(
                     pane_id = %pane_id,
                     new_agent_id = %new_agent_id,
                     "auto-reattach: subscribed to new agent for pane"
                 );
+                // PRD #882: the fresh attach minted a new viewer token (or
+                // none, against a daemon predating the policy). Publish it
+                // before the resize worker can fire again — a worker still
+                // holding the previous agent's token would fall through to the
+                // daemon's unattributed path and override every other client
+                // instead of updating this pane's constraint.
+                *viewer.lock().unwrap() = new_conn.viewer().map(|v| v.to_string());
+                // The attach answered with the geometry now in force for the new
+                // child. Adopt it, for the same reason the resize worker adopts
+                // the answer rather than its request: the replayed snapshot that
+                // is about to arrive was written at THIS geometry.
+                if let Some((rows, cols)) = new_conn.applied() {
+                    set_parser_size_if_changed(&parser, rows, cols);
+                }
                 {
                     let mut held = agent_id.lock().unwrap();
                     // PRD #611: the mouse flag describes a CHILD's requested
@@ -2827,6 +3042,13 @@ impl ReattachGiveUp {
 async fn resolve_and_reattach(
     client: &DaemonClient,
     pane_id_env: &str,
+    // PRD #882 — the geometry this pane is currently drawn at, declared as the
+    // viewer's viewport on the fresh attach. A respawn drops the old agent and
+    // with it every viewer constraint (they were keyed to attaches against an
+    // agent that no longer exists), so re-declaring here is what restores this
+    // pane's place in the policy rather than leaving the new child sized by
+    // whoever happens to resize first.
+    viewport: Option<(u16, u16)>,
 ) -> Result<(String, AttachConnection), ReattachGiveUp> {
     let start = tokio::time::Instant::now();
     let mut delay = REATTACH_LOOKUP_INITIAL_DELAY;
@@ -2863,7 +3085,7 @@ async fn resolve_and_reattach(
                         trailing_attach_errors = 0;
                         last_attach_error = None;
                     }
-                    Some(new_id) => match client.attach(&new_id).await {
+                    Some(new_id) => match client.attach_as_viewer(&new_id, viewport).await {
                         Ok(conn) => return Ok((new_id, conn)),
                         Err(e) => {
                             // Counted, not just logged: the agent demonstrably
@@ -2920,6 +3142,8 @@ async fn resize_worker(
     mut rx: tokio::sync::watch::Receiver<Option<(u16, u16)>>,
     daemon_path: PathBuf,
     agent_id: Arc<Mutex<String>>,
+    viewer: Arc<Mutex<Option<String>>>,
+    parser: Arc<Mutex<vt100::Parser>>,
 ) {
     // Mark the initial `None` value as seen so the first `changed()` call
     // waits for an actual resize, not the channel's seed value.
@@ -2934,12 +3158,29 @@ async fn resize_worker(
         // to a freshly-respawned agent; the next resize naturally targets
         // the new agent.
         let id = agent_id.lock().unwrap().clone();
+        // PRD #882: name which VIEWER is asking, so the request updates this
+        // pane's constraint instead of overriding every other client's. Cloned
+        // under a brief lock, never held across the await below.
+        let token = viewer.lock().unwrap().clone();
 
         let client = DaemonClient::new(daemon_path.clone());
-        match tokio::time::timeout(RESIZE_DAEMON_TIMEOUT, client.resize_agent(&id, rows, cols))
-            .await
+        match tokio::time::timeout(
+            RESIZE_DAEMON_TIMEOUT,
+            client.resize_agent_as_viewer(&id, rows, cols, token.as_deref()),
+        )
+        .await
         {
-            Ok(Ok(())) => {}
+            // PRD #882: the daemon answers with what it ACTUALLY applied, which
+            // is smaller than the request whenever another client's pane is
+            // smaller. Size the parser from the answer — sizing it from the
+            // request is what would leave this pane parsing at a geometry the
+            // PTY does not have, which is PRD #104's mis-parse arriving by a new
+            // route. A daemon predating the policy echoes nothing (`None`) and
+            // has no policy to disagree with us, so the request stands.
+            Ok(Ok(applied)) => {
+                let (rows, cols) = applied.unwrap_or((rows, cols));
+                set_parser_size_if_changed(&parser, rows, cols);
+            }
             Ok(Err(e)) => {
                 tracing::debug!(
                     agent_id = %id,

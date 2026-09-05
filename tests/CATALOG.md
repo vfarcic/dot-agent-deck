@@ -2068,6 +2068,30 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** the daemon actually applying the clamp to a real child PTY (covered by `tests/daemon_protocol.rs`'s `assert_resize_clamps`, which reads it back through `stty size`); the rendered cells of an over-cap pane (covered by `render/widget/003`); the once-per-process `warn!` either clamp now emits (observability, not behaviour); any width a real terminal reaches — both fixtures are far past any physical display, which is the point.
 - **Platform coverage:** mac+linux+windows.
 
+#### resize/policy
+
+##### resize/policy/001 — A smaller second client attached to the same agent shrinks that agent for every client (PRD #882).
+- **Layer:** L2 (PTY-attached: the real binary in a vt100 harness, plus a SECOND client opened directly against the deck's own attach socket).
+- **Agent:** none (the pane runs `sleep`; the policy is about geometry, not about what the agent does).
+- **Asserts:** with the deck running at 120x32 — verified wider than 40 columns first, so the test cannot pass vacuously — a second client attaches to the same agent declaring a 20x40 viewport, and the daemon then reports that agent at exactly 20x40 through `list_agents`. A PTY has one window size, so the alternative to shrinking is the small client showing a cropped corner of a screen drawn for 120 columns, with the agent's status line off the edge and no way to reach it.
+- **Does not assert:** what the deck's pane *renders* in the columns past 40 (the blank remainder is `TerminalWidget`'s `min(area, screen)` draw, covered deterministically by `render/widget/002` and `render/widget/003`); the per-axis independence of the minimum (covered by the `viewer_policy_sizes_to_the_smallest_viewport` unit test, which can construct three viewers cheaply); anything about a real agent's reflow.
+- **Platform coverage:** mac+linux (the second client attaches over a Unix domain socket).
+
+##### resize/policy/002 — Releasing the smaller client gives the constraint back and the agent grows again (PRD #882).
+- **Layer:** L2 (same shape as `resize/policy/001`).
+- **Agent:** none (`sleep`).
+- **Asserts:** starting from the pinned state of `resize/policy/001` — asserted as a prerequisite rather than assumed — dropping the second client's attach lets the agent grow back past 40 columns with nobody resizing a terminal by hand. This is the half that makes the policy reversible: without it, an agent would ratchet down to the smallest pane that ever looked at it and stay there, which is the sticky behaviour issue #883 reported and this PRD replaces.
+- **Does not assert:** the exact width it grows back to (that is the deck's own layout arithmetic, covered by `resize/layout/*`); how quickly (the assertion is a settle, not a latency bound); release on a client that *crashes* rather than detaching cleanly — the daemon-side guard covers both paths identically because it runs on the attach task's drop, and the unit test `releasing_a_viewer_grows_the_agent_back` pins the registry behaviour directly.
+- **Platform coverage:** mac+linux.
+
+##### resize/policy/003 — A live Claude agent keeps working after another client shrinks its PTY (PRD #882).
+- **Layer:** L2 (PTY-attached, real spawned binary) — **lane 2**, needs a working Claude credential; runs on a developer's machine and nowhere in CI.
+- **Agent:** Claude Haiku (`claude-haiku-4-5-20251001`), genuinely interactive, with onboarding + per-folder trust seeded and `--allowedTools Bash Read` so no permission prompt blocks.
+- **Asserts:** with a real Claude UI rendered in a 160-column deck, a second client attaches to the same agent declaring 24x60 — shrinking the agent for everyone — and the live agent then answers a directive by naming the uniquely-named sentinel file `sizepolicy_r7k2q.txt`, which paints inside the resized pane. Only reachable if the real agent survived being resized by a client it knows nothing about, redrew at the imposed geometry, and kept working. The sentinel does not appear in the directive that asks for it, so an echo of the user's own typing cannot satisfy the assertion.
+- **Why a real agent:** the deterministic siblings run `sleep`, which draws nothing. An agent's SIGWINCH redraw at the new geometry is what makes a letterboxed pane look correct rather than looking like PRD #104's corruption, and a stand-in cannot show that.
+- **Does not assert:** anything when skipped — where credentials are absent this test executes nothing, so `resize/policy/001` and `/002` carry the CI-visible coverage; the exact reflowed line breaks (LLM- and terminal-dependent); release-on-detach (that is `resize/policy/002`).
+- **Platform coverage:** mac+linux.
+
 #### resize/render
 
 ##### resize/render/001 — Enlarging the outer terminal fills the new width across an embedded pane — no empty band on the right edge.

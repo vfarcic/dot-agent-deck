@@ -500,6 +500,19 @@ export interface DeckRuntimeState {
   sendTerminalInput: (agentId: string, data: string) => Promise<void>;
   resizeTerminal: (agentId: string, cols: number, rows: number) => Promise<void>;
   /**
+   * PRD #882 — the geometry the daemon has APPLIED per agent, keyed by agent id.
+   *
+   * A terminal must render at this, not at the size of its own tile: a PTY has
+   * one window size, so the daemon sizes each agent to the smallest pane among
+   * every client attached and larger panes pad the remainder.
+   *
+   * Optional, and absence is a real state rather than an oversight — the browser
+   * preview has no daemon, and a live runtime has nothing here until the first
+   * attach answers. A tile with no entry keeps whatever its own fit produced,
+   * which is the correct answer when nothing is disagreeing with it.
+   */
+  appliedGeometry?: Record<string, { rows: number; cols: number }>;
+  /**
    * States the whole set of agents whose terminal is on screen (PRD #745 M7).
    * A screen that mounts terminals calls this once per render commit with every
    * shown id; a screen that mounts none calls it with `[]`. Attach follows this

@@ -304,6 +304,32 @@ pub struct TerminalAttachResult {
     pub agent_id: String,
     pub generation: u64,
     pub reused: bool,
+    /// PRD #882 — the geometry the daemon has APPLIED for this agent, which is
+    /// the smallest viewport among every client attached to it and so is not
+    /// necessarily the size this tile asked for.
+    ///
+    /// The frontend sizes its xterm grid from this rather than from
+    /// `FitAddon.fit()`. Absent only when talking to a daemon that predates the
+    /// policy, in which case the tile's own fit is the right answer — that
+    /// daemon has no other client's constraint to tell us about.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub applied_rows: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub applied_cols: Option<u16>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalGeometryEvent {
+    pub session_id: String,
+    pub agent_id: String,
+    pub generation: u64,
+    /// PRD #882 — the geometry the daemon just applied, pushed because another
+    /// client attached, detached or resized this agent. The tile reshapes its
+    /// xterm grid to match; without it the tile would keep parsing the agent's
+    /// bytes at its own geometry while the PTY sits at somebody else's.
+    pub rows: u16,
+    pub cols: u16,
 }
 
 #[derive(Debug, Clone, Serialize)]

@@ -31,7 +31,7 @@ compute_frame_layout(frame_area, &TabView, &TabBarInfo, pane_ids) -> FrameLayout
 - `render_mode_tab` (`src/ui.rs`, ~`fn render_mode_tab`) — consumes `FrameLayout` instead of computing its own layout.
 - `ui.side_pane_rects` and `ui.agent_pane_rect` (used for mouse hit-testing) are populated **from** `FrameLayout` after computation, not assembled inline during render. This keeps hit-testing reading the same rects the widgets drew into.
 
-### 2. PTY size is derived from the layout rect, not pushed by event handlers
+### 2. PTY size is REQUESTED from the layout rect, not pushed by event handlers
 
 After the layout pass, a single resize step compares each pane's current PTY size against its target inner rect (area minus borders) and commits only the deltas:
 
@@ -40,6 +40,13 @@ resize_panes_to_layout(layout: &FrameLayout, embedded: &EmbeddedPaneController)
 ```
 
 No code path resizes a PTY based on its own private dimension calculation. Tab state mutations just update tab state; the next layout pass picks up the new shape.
+
+**PRD #882 changed who decides, and this is the single most important thing to know about invariants 2 and 3.** A PTY has exactly one window size, so every client attached to an agent sees the same grid — per-client sizing of a live TUI is unavailable, not unimplemented, because the agent lays out for one `TIOCGWINSZ` answer and emits absolute cursor positioning for that grid. The daemon therefore owns the geometry: it sizes each agent to the **smallest viewport among its attached viewers**, and larger clients pad the remainder. The layout rect is now what a client **asks for**, not what it gets.
+
+Two consequences follow, and both are load-bearing:
+
+- **The delta check compares against the last REQUEST, not the parser.** `resize_panes_to_layout` used to compare its target against the pane's local vt100 parser, which worked while `resize_pane_pty` set that parser synchronously — "kept in lockstep with the PTY" was true for exactly as long as one client existed (issue #883). The parser now holds the daemon's ANSWER, which legitimately differs from the target whenever another client's pane is smaller, so a parser-based comparison would find a delta on every frame and re-send forever. `EmbeddedPaneController::requested_dims` is the comparison.
+- **The parser is reshaped by the answer, never by the request.** `resize_pane_pty` no longer touches it. The pane learns its geometry from the resize response's `applied_rows`/`applied_cols`, from the attach response, or from a `KIND_GEOMETRY` push — the last of which is what keeps a client that is only *watching* correct, since it never asks for anything and so would otherwise never learn that somebody else moved the size.
 
 **Enforced by:**
 
@@ -57,18 +64,22 @@ The next frame's layout-driven resize handles all of these.
 
 ### 3. `TerminalWidget` renders 1:1 against its area
 
-The widget assumes the upstream contract holds — the PTY screen is already the size of the inner area in cells — and draws every cell of the PTY screen into the corresponding cell of the area, in row-major order. **No `min(area, screen)` column clamp. No cursor-anchored row window.**
+The widget draws the PTY screen 1:1 into the area — screen cell (r, c) → inner cell (r, c), row-major, from row 0 / col 0 — and leaves anything past the screen blank. **No cursor-anchored row window.**
 
-If the contract is violated, the failure is **loud**, not silently wrong:
+**PRD #882 removed the equality assertion, and the removal is a design change rather than a relaxation.** PRD #84 could assert `screen == inner area` because the client owned the geometry: `resize_pane_pty` set the parser synchronously, so the two were the same number by construction and any difference was a bug. The daemon owns it now (invariant 2), and the two legitimately differ whenever another client's view of the agent is smaller — which is the entire point of the policy.
 
-- **Debug builds:** `debug_assert!` that PTY `(rows, cols)` equals inner-area `(height, width)`, each axis capped at `PTY_RESIZE_DIM_MAX`.
-- **Release builds:** log once on mismatch and fall back to `min` rather than panicking — behavior at least as good as today, never a crash.
+Nor could the assertion be kept for one direction only. Every request is a round trip now, so during a shrink the parser is briefly *larger* than the area and during a grow briefly smaller. Both are transient, and both are indistinguishable from a real defect at a call site that cannot know whether an answer is in flight. An assertion there would either panic on ordinary operation or say nothing worth hearing.
+
+**The invariant did not disappear; it moved to the side that can state it.** The daemon computes the applied geometry from its registered viewers, and "the PTY is never larger than any viewer's pane" is enforced and tested there. What remains in the widget is the rendering rule that follows from it — and `min(area, screen)` is now the **designed path** rather than a defense against an upstream failure. A pane narrower or shorter than its box is what a correctly applied policy looks like from inside a client that is not the smallest one.
+
+`TerminalWidget::contract_guaranteed` survives as a parameter so existing callers and tests still compile, but no longer arms anything.
 
 **The `PTY_RESIZE_DIM_MAX` cap is part of invariant 3's expectation, not an exception to it** (issue #747). A child PTY cannot be made larger than that cap — the daemon refuses on principle, since a same-uid peer on the attach socket could otherwise drive an agent to an absurd geometry — so on a terminal wider than the cap `resize_panes_to_layout` deliberately sizes the pane to the cap and the drawn area is legitimately larger. The pane then renders the child's full 4096 columns through the `min(area, screen)` fallback and leaves the rest blank, which is the honest outcome: the child has no more columns to show. `crate::agent_pty::clamp_pty_dims` is the single place that spells the cap, and invariant 2's `pane_target_dims` applies it so the layout target, the local vt100 parser, the `AttachRequest::Resize` on the wire and the child PTY all carry the same number. Clamping only at the far end — as the code did before #747 — left the parser rendering at one width while the child wrapped at another, silently.
 
 **Enforced by:**
 
-- `TerminalWidget::render` (`src/terminal_widget.rs`, ~`fn render`). The current `cols = inner.width.min(screen_size.1)` clamp (~line 94) and the cursor-anchored row-window logic (~lines 98–117) are removed and replaced by the 1:1 draw plus the debug-assert / release-log-and-fallback above.
+- `TerminalWidget::render` (`src/terminal_widget.rs`, ~`fn render`) — the 1:1 draw from the top-left, with `min(area, screen)` bounding the loop.
+- `AgentPtyRegistry::effective_dims` / `apply_dims_locked` (`src/agent_pty.rs`) — where the geometry is actually decided, and the place to test that it never exceeds a viewer's pane.
 
 ### 4. Fixed, explicit resize sequencing
 
@@ -97,7 +108,7 @@ That single convergence point is the whole contract. The earlier "everyone resiz
 
 ## Out of scope / known caveats
 
-- **Stream-backed (daemon) panes have no PTY resize op.** `resize_panes_to_layout` silently skips them; they keep current best-effort behavior. The daemon-side resize op is owned by PRD #81 (Remote Kubernetes Transport), not this contract. See the note in `src/embedded_pane.rs` (~272–295).
+- ~~**Stream-backed (daemon) panes have no PTY resize op.**~~ **Stale since PRD #76 M2.10 and corrected here.** `resize_pane_pty` handles stream-backed panes itself: it writes to a per-pane single-slot coalescing channel whose worker forwards an `AttachRequest::Resize` to the daemon. `resize_panes_to_layout` does not skip them — it drives every pane through the one primitive.
 - **No new layout features.** No splittable panes, resizable splitters, or zoom mode. The layouts produced are exactly the ones the app already has.
 - **No vt100/ratatui replacement.** The contract is about how *we* drive them, not about swapping them.
 
