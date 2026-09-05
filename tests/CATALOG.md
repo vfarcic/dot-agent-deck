@@ -4192,6 +4192,13 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Does not assert:** the intermediate five-row `BlockCommand` geometry or exact block-glyph shapes (the richest seven-row tier pins whole-banner suppression); real terminal mouse-report decoding (covered by the next scanner delegation); wall-clock scheduling in the live 16ms loop; horizontal multi-column pane geometry; real-agent behavior; or that any particular agent produces the synthetic repaint pattern.
 - **Platform coverage:** mac+linux+windows.
 
+##### mode/scroll/006 — An alternate-screen pane's history is unreachable, not absent.
+- **Layer:** L1 (in-process production keyboard scroll, vt100 depth probe, and pane render seams; no PTY subprocess).
+- **Agent:** none (agent-agnostic synthetic newline-terminated history plus the `ESC[?1049h` / `ESC[?1049l` mode switches).
+- **Asserts:** ordinary newline output past the eight-screenful maturity bar leaves real retained depth, moves the view on PageUp, and arms no notice; the identical bytes followed by an alternate-screen switch stay mature yet must arm no notice, because `vt100` builds its alternate grid with zero scrollback capacity and routes every scrollback read there, making the depth structurally zero while the normal grid still holds the history; and a switch back to the normal screen restores exactly the depth the control measured, which is what makes "unreachable, not absent" measured rather than asserted.
+- **Does not assert:** what any particular agent puts on the alternate screen or when; that a focused pane's forwarded `ESC[5~` reaches the agent's own pager (that is the agent's, not the deck's); real-agent behavior; or the notice's render tiers and TTL (covered by `mode/scroll/005`).
+- **Platform coverage:** mac+linux+windows.
+
 #### mode/live
 
 ##### mode/live/001 — A real PTY-attached deck keeps the persistent mode chip after the command banner collapses.
