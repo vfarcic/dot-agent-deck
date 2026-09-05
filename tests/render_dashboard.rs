@@ -2419,14 +2419,16 @@ fn pane_012_hostile_display_name_cannot_corrupt_the_card() {
         .display_name
         .as_deref()
         .expect("an over-long name is repaired, not dropped");
+    assert!(
+        clamped.len() <= DISPLAY_NAME_MAX_LEN,
+        "the stored name must be clamped to the daemon's own ceiling MARKER \
+         INCLUDED, so it stays a name that ceiling's own gate would accept if it \
+         ever came back the other way (Greptile, PR #902), got {} bytes",
+        clamped.len()
+    );
     let body = clamped
         .strip_suffix('…')
         .expect("a clamped name is marked as cut");
-    assert!(
-        body.len() <= DISPLAY_NAME_MAX_LEN,
-        "the stored name must be clamped to the daemon's own ceiling, got {} bytes",
-        body.len()
-    );
     assert!(
         body.chars().all(|c| c == 'μ'),
         "the clamp must snap back to a character boundary: {body:?}"
@@ -2717,14 +2719,16 @@ fn pane_014_hostile_tool_text_cannot_corrupt_the_card() {
         .as_ref()
         .and_then(|t| t.detail.as_deref())
         .expect("an over-long detail is repaired, not dropped");
+    assert!(
+        clamped.len() <= MAX_TOOL_TEXT_BYTES,
+        "the stored detail must be clamped to the ingest ceiling MARKER \
+         INCLUDED, matching the strict clamp the same two strings get on the \
+         daemon-echo route (Greptile, PR #902), got {} bytes",
+        clamped.len()
+    );
     let body = clamped
         .strip_suffix('…')
         .expect("a clamped detail is marked as cut");
-    assert!(
-        body.len() <= MAX_TOOL_TEXT_BYTES,
-        "the stored detail must be clamped to the ingest ceiling, got {} bytes",
-        body.len()
-    );
     assert!(
         body.chars().all(|c| c == 'μ'),
         "the clamp must snap back to a character boundary"

@@ -6688,7 +6688,13 @@ impl AppState {
         // The counterpart route for the SAME two strings — a daemon echoing
         // them back inside `AgentRecord.live` — has been scrubbed and clamped at
         // the wire boundary since PRD #162 (`daemon_client`), so this closes the
-        // half of one field that had no scrub on either end of it.
+        // half of one field that had no scrub on either end of it. The two are
+        // still not identical: that boundary uses `daemon_client`'s own
+        // control-only filter, which drops C0/C1 and DEL but NOT bidi, while
+        // this uses `strip_control_and_bidi`. So a bidi override survives the
+        // echo route and not this one. Narrowing that residual is deliberately
+        // outside #833, which names two seams; it is recorded in
+        // `crate::untrusted_text`'s module doc.
         //
         // Ahead of the admission-control `return`s below deliberately: an event
         // this instance rejects is dropped whole, so scrubbing it first costs

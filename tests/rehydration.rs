@@ -2639,12 +2639,14 @@ async fn live_007_list_agents_sanitizes_and_clamps_hostile_live_snapshot_inner()
         !name.chars().any(is_bidi_format_char),
         "display_name must be scrubbed of bidi overrides; got {name:?}"
     );
-    let body = name.strip_suffix('\u{2026}').unwrap_or(name);
     assert!(
-        body.len() <= DISPLAY_NAME_MAX_LEN,
-        "display_name must be clamped to the daemon's own ceiling; got {} bytes",
-        body.len()
+        name.len() <= DISPLAY_NAME_MAX_LEN,
+        "display_name must be clamped to the daemon's own ceiling MARKER \
+         INCLUDED, so what the wire boundary returns is still a name that \
+         ceiling's own gate would accept (Greptile, PR #902); got {} bytes",
+        name.len()
     );
+    let body = name.strip_suffix('\u{2026}').unwrap_or(name);
     assert!(
         body.ends_with('\u{3bc}'),
         "the clamp must snap back to a character boundary; got {body:?}"
