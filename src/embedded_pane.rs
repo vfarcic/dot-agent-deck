@@ -1280,6 +1280,18 @@ impl EmbeddedPaneController {
         // `saturating_sub(2)` border allowance — so a short or narrow terminal
         // arrives here with a zero axis and no caller in between rejects it, the
         // way `resize_panes_to_layout` does on the resize path.
+        //
+        // PRD #882 (raised by Greptile on PR #895): prefer the geometry the
+        // attach response says the daemon has APPLIED over the dims the caller
+        // computed. The caller's value is one of two stale things — the
+        // `AgentRecord` read before this attach, or the pane's own layout target
+        // — and another viewer can have moved the minimum in between, because
+        // attaching is itself what registers this viewer and can shrink the
+        // agent. The snapshot that is about to be replayed on this connection
+        // was taken under the same daemon lock as `applied`, so it is the ONLY
+        // geometry those bytes are interpretable at. Parsing them at the
+        // caller's dims is PRD #104's scramble, reached through the new path.
+        let (rows, cols) = conn.applied().unwrap_or((rows, cols));
         let parser = Arc::new(Mutex::new(new_pane_parser(rows, cols)));
         let mouse_mode = Arc::new(AtomicBool::new(false));
         let hyperlinks = Arc::new(Mutex::new(HyperlinkMap::new()));

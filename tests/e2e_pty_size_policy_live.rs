@@ -109,11 +109,26 @@ fn policy_003_a_live_agent_keeps_working_after_another_client_shrinks_it() {
 
     // The live agent is now running at a geometry imposed by a client it has no
     // knowledge of. Drive it and require real work to come back.
-    deck.send_keys(b"\x04");
-    deck.wait_for_string("[Command Mode Ctrl+D]");
-    deck.send_keys(
-        b"List the files in this directory and reply with the name of the only file ending in .txt\r",
+    //
+    // The sentinel must not already be on screen, or the assertion below could
+    // be satisfied by the deck's own chrome — a directory listing, a pane title,
+    // a path in a form — rather than by the agent doing the work. Cheap, and it
+    // is the difference between a test and a coincidence.
+    assert!(
+        !deck.snapshot_grid().contains(SENTINEL_FILE),
+        "test prerequisite: the sentinel must not be visible before the agent is asked \
+         for it; grid:\n{}",
+        deck.snapshot_grid()
     );
+
+    // Type straight into the pane: `[Command Mode Ctrl+D]` in the footer means
+    // keystrokes are reaching the AGENT and Ctrl+D is how you would leave.
+    // Sending Ctrl+D first would hand the directive to the deck instead, which
+    // is how the first draft of this test failed against a live Haiku.
+    deck.send_keys(
+        b"List the files in this directory and reply with the name of the only file ending in .txt",
+    );
+    deck.send_keys(b"\r");
 
     assert!(
         deck.wait_for_grid_string_within(SENTINEL_FILE, Duration::from_secs(120)),

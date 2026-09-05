@@ -2768,14 +2768,20 @@ async fn handle_attach_stream(
                             break;
                         }
                     }
-                    // The agent is gone (sender dropped) or this receiver
-                    // lagged past the tiny geometry capacity. Neither is worth
-                    // tearing the pane down for: output has its own Closed arm
-                    // that ends the stream properly, and only the LATEST
-                    // geometry matters, so a lagged viewer is reconciled by the
-                    // next change. Stop watching and let the other arms decide
-                    // the connection's fate.
-                    Err(_) => {
+                    // Lagged past the tiny geometry capacity. Keep the
+                    // receiver: a tokio broadcast receiver stays usable after
+                    // `Lagged`, and only the LATEST geometry matters, so the
+                    // next change reconciles this viewer. Dropping it here
+                    // instead would silence geometry for the rest of the
+                    // connection — and a passive viewer has no poll to recover
+                    // with, so it would parse the agent's output at a stale grid
+                    // until it happened to reattach.
+                    Err(broadcast::error::RecvError::Lagged(_)) => {}
+                    // The agent is gone (sender dropped). Not worth tearing the
+                    // pane down for on its own: the output arm has its own
+                    // Closed branch that ends the stream properly. Stop watching
+                    // and let it decide the connection's fate.
+                    Err(broadcast::error::RecvError::Closed) => {
                         geometry_rx = None;
                     }
                 },

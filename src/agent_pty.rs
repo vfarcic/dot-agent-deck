@@ -6772,7 +6772,18 @@ impl AgentPtyRegistry {
                 agent.viewers.insert(token.to_string(), Some((rows, cols)));
                 Self::apply_effective_locked(agent)
             }
-            _ => {
+            // A token that was minted and has since been released — its attach
+            // ended while this resize was in flight, which is ordinary since the
+            // two travel on separate connections. IGNORE it rather than falling
+            // through to the unattributed path: applying it directly would
+            // bypass every remaining viewer's minimum and could leave the PTY
+            // larger than an attached pane indefinitely, because an idle viewer
+            // has no reason to send another resize and nothing else recomputes.
+            // The caller still learns the geometry in force from the answer.
+            Some(_) => Ok((agent.pty_rows, agent.pty_cols)),
+            // No token at all: a client that predates the policy, or a caller
+            // that is not a rendering viewer. Applied directly, as before #882.
+            None => {
                 Self::apply_dims_locked(agent, rows, cols)?;
                 Ok((agent.pty_rows, agent.pty_cols))
             }
@@ -11188,15 +11199,19 @@ mod spawn_tests {
         registry.shutdown_all();
     }
 
-    /// PRD #882 — a resize with no viewer token, or with one the daemon does not
-    /// know, takes the unattributed path: applied directly, joining no minimum.
+    /// PRD #882 — the two token-less paths, which are deliberately NOT the same.
     ///
-    /// This is the compatibility contract for a client predating the policy, and
-    /// the safety property for a stale token. A stale token must NOT be able to
-    /// silently overwrite some live viewer's constraint, which is what a
-    /// "create the entry if missing" implementation would do.
+    /// **No token** is the compatibility contract for a client predating the
+    /// policy: applied directly, joining no minimum, exactly as before.
+    ///
+    /// **A token the daemon does not know** is a stale one — its attach ended
+    /// while the resize was in flight, which is ordinary since the two travel on
+    /// separate connections — and is IGNORED. Treating it as an unattributed
+    /// override would bypass every remaining viewer's minimum with nothing to
+    /// recompute afterwards, and creating an entry for it would leave a phantom
+    /// viewer nothing can ever prune. Both are worse than doing nothing.
     #[test]
-    fn an_unknown_viewer_token_falls_through_to_the_unattributed_path() {
+    fn an_unknown_viewer_token_is_ignored_while_no_token_applies_directly() {
         let registry = Arc::new(AgentPtyRegistry::new());
         let id = registry
             .spawn_agent(SpawnOptions {
@@ -11229,18 +11244,25 @@ mod spawn_tests {
             "the unattributed request left no phantom constraint behind"
         );
 
-        // An unknown token behaves the same way and, critically, does not
-        // overwrite the live viewer's entry.
-        registry
+        // A token the daemon does not know — a stale one from an attach that has
+        // since ended, arriving because resizes travel on their own connection —
+        // is IGNORED, not applied. Applying it would bypass the live viewer's
+        // minimum, and nothing would recompute afterwards: an idle viewer has no
+        // reason to send another resize, so the PTY could stay larger than an
+        // attached pane indefinitely (raised by Greptile on PR #895).
+        let applied = registry
             .resize_for_viewer(&id, 99, 199, Some("v-not-a-real-token"))
             .expect("unknown token should not error");
-        let applied = registry
-            .resize_for_viewer(&id, 30, 100, Some(&small_token))
-            .expect("resize should succeed");
         assert_eq!(
             applied,
             (30, 100),
-            "the live viewer's constraint survived a request bearing an unknown token"
+            "a stale token must not move the PTY at all — the answer reports the geometry \
+             still in force from the live viewer"
+        );
+        assert_eq!(
+            registry.pty_size_for_agent(&id),
+            Some((30, 100)),
+            "and the live viewer's constraint is genuinely untouched"
         );
 
         registry.shutdown_all();

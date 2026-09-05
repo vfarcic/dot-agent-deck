@@ -1,4 +1,5 @@
 import { createFixtureSnapshot, DEFAULT_PROFILES, type FixtureState } from "../data/fixture";
+import { getTerminal } from "./terminalRegistry";
 import { applyHandoffEvent, mapDaemonEvent, MAX_LIVE_EVIDENCE } from "./daemonEvents";
 import { DISPLAY_LIMITS, displayText } from "./displayText";
 import { UNREPORTED } from "../types";
@@ -948,6 +949,27 @@ export class TauriDeckBridge implements DeckBridge {
         const appliedCols = session.appliedCols;
         if (appliedRows && appliedCols) {
           this.appliedGeometry.set(agentId, { rows: appliedRows, cols: appliedCols });
+          // PRD #882 (raised by Greptile on PR #895): reshape the grid
+          // SYNCHRONOUSLY, before the buffered replay is delivered a few lines
+          // below.
+          //
+          // Notifying the listeners only schedules a React state update, and
+          // the tile resizes in an effect after that commits — but the replay
+          // is written to xterm immediately. When the applied geometry differs
+          // from what the tile fitted (which is the whole point of the policy),
+          // xterm would parse the replay at the wrong grid and keep the
+          // resulting wrapping and cursor damage, since the daemon's snapshot
+          // is a single dimension epoch that will not be re-sent. Resizing the
+          // live instance first closes that window; the listener below still
+          // fires so React state and any later re-render agree with it.
+          try {
+            const terminal = getTerminal(agentId);
+            if (terminal && (terminal.cols !== appliedCols || terminal.rows !== appliedRows)) {
+              terminal.resize(appliedCols, appliedRows);
+            }
+          } catch {
+            // A tile mid-mount can reject a resize; the effect reconciles it.
+          }
           this.geometryListeners.forEach((listener) => listener(agentId, appliedRows, appliedCols));
         }
         if (
@@ -1128,6 +1150,17 @@ export class TauriDeckBridge implements DeckBridge {
         || session.generation !== event.payload.generation
       ) return;
       this.appliedGeometry.set(event.payload.agentId, { rows: event.payload.rows, cols: event.payload.cols });
+      // Same reasoning as the attach path: reshape the live grid synchronously,
+      // because output keeps arriving while a React state update waits for its
+      // commit, and those bytes were drawn for the new geometry.
+      try {
+        const terminal = getTerminal(event.payload.agentId);
+        if (terminal && (terminal.cols !== event.payload.cols || terminal.rows !== event.payload.rows)) {
+          terminal.resize(event.payload.cols, event.payload.rows);
+        }
+      } catch {
+        // A tile mid-mount can reject a resize; the effect reconciles it.
+      }
       this.geometryListeners.forEach((listener) => listener(event.payload.agentId, event.payload.rows, event.payload.cols));
     });
     return () => {
