@@ -85,8 +85,16 @@ export function useDesktopSettings(runtime: DeckRuntimeState): DesktopSettingsSt
         if (!edited.current) setSettings(snapshot.settings);
         setRead(true);
       })
-      // The live bridge already falls back to defaults, so a rejection here is
-      // a bridge that has no settings at all. Defaults keep the app usable.
+      // Swallowed, and `settings` keeps the defaults it was seeded with — a
+      // desktop whose settings could not be read is still usable, and there is
+      // no surface for a read error the way `saveError` is one for a write.
+      //
+      // This is now the ORDINARY failure path rather than an exotic one, and
+      // issue #845 is what moved it: `TauriDeckBridge.getSettings` used to
+      // answer an IPC failure with the same defaults itself, so a rejection
+      // here could only be a bridge with no settings at all. It propagates now,
+      // because a fabricated document saying mode "system" is indistinguishable
+      // from a real one — which is exactly why `read` below is NOT set here.
       .catch(() => undefined)
       .finally(() => { if (!cancelled) setLoaded(true); });
     return () => { cancelled = true; };
