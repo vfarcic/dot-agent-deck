@@ -202,9 +202,16 @@ Do **not** hand-roll a worktree under the scratchpad to get a second baseline. A
 cd ../dot-agent-deck-pr-<n> && cargo nextest run --features e2e <test-name>
 ```
 
-Passes in isolation → report it as a suspected flake with the log, not as a blocking failure. Fails consistently → it is a defect. Running many e2e suites at once on one machine causes resource contention, which is its own source of timing noise; that is a reason to rerun serially, not to dismiss a failure.
+Fails consistently → it is a defect. Passes in isolation → it is not a defect in the change under review, but it is still a defect in the test: a test that only passes on an idle machine is making a timing assumption. Running many e2e suites at once causes resource contention, which is its own source of timing noise; that is a reason to rerun serially, not to dismiss a failure.
 
-**A suspected flake still needs an owner (#908).** "Not blocking" is not "not your problem": red must never go unexplained, whoever caused it. Once you have classified a failure, check whether an issue already tracks that test — `gh issue list --search '<test-name>'` — and link it in your report; file one if none exists. A failure you did not cause does not oblige you to fix it, but it does oblige you to leave it tracked rather than silently passed over. This is what stops an ever-growing set of tests that everyone has learned to ignore: measured 2026-09-05, `orchestration_remit_001` was failing on 11 open PRs at once, already quarantined to serial execution, with an open fix nobody was obliged to land.
+**The lane must be green before a PR is done, whoever caused the red (#908).** This replaces the older rule that a suspected flake was "not a blocking failure" — that tolerance is exactly how failures accumulated. Measured 2026-09-05: 16 of 21 open PRs were red on `e2e-deterministic`, almost all one family, with `orchestration_remit_001` alone failing on 11 — already pinned to serial execution via `test-groups.orchestration-remit = { max-threads = 1 }`, with an open fix (#837) nobody was obliged to land. Serializing the group was treating the symptom; #837's title names the real fix — *make the tests wait for the confirmation they race*, rather than sleep.
+
+Two ways to clear a red test, and only two:
+
+1. **Fix it in this PR.** From a green baseline this is usually cheap, because a lane that was green before your change and red after it is almost certainly yours.
+2. **Quarantine it** with a **named owner** and an **expiry issue** — `gh issue list --search '<test-name>'` first, and link the existing one if there is one. Quarantine is the pressure valve that keeps rule cost bounded when you genuinely hit someone else's deep race at the wrong moment. The expiry is what stops it becoming the graveyard the rule exists to prevent.
+
+Leaving a test red and merely tracked is no longer sufficient.
 
 ## Phase 6 — Verdict and report
 
