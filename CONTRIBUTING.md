@@ -47,6 +47,8 @@ E2e tier — two lanes since issue #502, split by whether a test reaches a **rea
 | 2 — real agent | `cargo test-e2e-live` | a **superset**: all 71 files, so lane 1 plus the 24 credentialed ones | **your machine only — never CI** |
 | 3 — local | either alias with a filter | the test you are debugging, then its module | your machine |
 
+The `Command` column is the convenient spelling, not the definition. A lane is selected by the cargo **features** its files' `#![cfg(…)]` attributes read, so a raw `cargo nextest run --workspace --features e2e,e2e-live <filter>` runs lane 2 exactly as `cargo test-e2e-live <filter>` does. The aliases in [`.cargo/config.toml`](.cargo/config.toml) are worth using anyway — they are shorter and carry `--workspace` for you — but running the raw command counts.
+
 **There is no obligation to run the full tier before opening a PR.** That mandate was removed with issue #502: CI runs lane 1 on every PR, and every dispatched agent running the whole tier concurrently was itself a source of failures (#415 measured 6-7 of 40 files failing in parallel against 40/40 at `-j 1`). What you *do* owe is **the tests covering what you changed** — any tier, credentialed included — found via [`tests/CATALOG.md`](tests/CATALOG.md), the `#[spec]` annotations, or `cargo xtask list-tests`, and named in your PR description:
 
 ```sh

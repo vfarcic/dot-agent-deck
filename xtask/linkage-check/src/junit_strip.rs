@@ -96,9 +96,14 @@ const NEXTEST_FAILURE_REPORT: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 "#;
 
 /// The script's own `--self-test` must pass. Since #502 removed the
-/// credentialed workflow, the only places that tell a reader to run it are
-/// prose — `docs/develop/e2e-lanes.md` and the script's own usage block — so a
-/// self-test that has rotted is worse than none.
+/// credentialed workflow, no workflow or script runs the stripper over a real
+/// report for anyone — every pointer to it is prose. The nearest one to the
+/// moment of need is `.config/nextest.toml`'s comment on
+/// `store-failure-output`, which is where a person meets the instruction in the
+/// course of a nextest run rather than having gone looking for it;
+/// `docs/develop/e2e-lanes.md` carries the fuller version, and the script's own
+/// usage block repeats it. A self-test that has rotted is therefore worse than
+/// none.
 #[test]
 fn junit_strip_self_test_passes() {
     if !python_present() {

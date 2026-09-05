@@ -15,6 +15,8 @@ Issue #502 split the L2 e2e suite in two by whether a test reaches a **real agen
 
 `cargo test-e2e-live` is a **superset** run, not a live-only run. The 24 credentialed files open with `#![cfg(all(feature = "e2e", feature = "e2e-live"))]`, so `e2e-live` without `e2e` compiles every e2e file to an empty crate; there is deliberately no live-only alias. Filter it (`cargo test-e2e-live claude_001`) rather than running it whole.
 
+**The aliases are the convenient spelling of each lane, not its definition.** What selects a lane is the cargo **feature set**, because that is what the `#![cfg(…)]` attributes read: `.cargo/config.toml` expands `test-e2e` to `nextest run --workspace --features e2e` and `test-e2e-live` to `nextest run --workspace --features e2e,e2e-live`, and any equivalent invocation enabling the same features — a raw `cargo nextest run --workspace --features e2e,e2e-live <filter>`, say — compiles and selects exactly the same files. So a contributor who ran the raw command has discharged the same obligation and should be able to tell that from the docs. Use the aliases anyway where you can: they are shorter, they carry `--workspace` (issue #489) without your having to remember it, and they are the spelling CI and `bacon.toml` use, so "green here" and "green there" stay the same claim.
+
 Lane 1 is not a required status check. The required set is still `build`, `build-macos`, `build-windows` and `security`; rule 8 records why it is deliberately advisory.
 
 ## Why lane 2 is not in CI
