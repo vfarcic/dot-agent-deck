@@ -19478,6 +19478,32 @@ fn pane_has_nothing_to_scroll(embedded: &EmbeddedPaneController, pane_id: &str) 
     if facts.scrollback_depth > 0 {
         return false;
     }
+    // Issue #891 — a THIRD term, and the same reasoning as the other two: say
+    // nothing unless the evidence is about the agent.
+    //
+    // `vt100` builds its alternate grid with a scrollback capacity of zero and
+    // routes every scrollback read and write to whichever grid the mode selects,
+    // so `scrollback_depth` above is structurally `0` for the whole time a pane
+    // sits on the alternate screen — for claude opening a picker exactly as much
+    // as for an agent that genuinely retains nothing. Meanwhile
+    // `bytes_since_spawn` counts straight across the switch, so the conjunction
+    // that is meant to describe a terminal-managed agent is satisfied by any
+    // mature pane that merely entered alternate mode, and the notice tells the
+    // user their history is gone while the normal grid still holds every line of
+    // it (measured: 258 retained lines, reported as none).
+    //
+    // This is the defect PRD #611's review finding 3 already fixed once, by a
+    // different route: "Left counting, the very next scroll would explain Agent
+    // Deck's own history loss as a property of the agent"
+    // (`src/embedded_pane.rs`, the `parser_reset` arm). Unreachable is not empty,
+    // so the deck stays quiet rather than claiming the stronger thing.
+    //
+    // Deliberately NOT an agent check — PRD #611's "detect the condition, not the
+    // agent name" holds unchanged. This reads a terminal mode, which is a fact
+    // about the pane's current state that any agent can enter and leave.
+    if facts.alternate_screen {
+        return false;
+    }
     let screenful = u64::from(facts.rows) * u64::from(facts.cols);
     // A pane with no area has no screenful to compare against, and the
     // threshold would collapse to zero — which would arm the notice on a pane
@@ -21152,6 +21178,41 @@ pub fn synthetic_decstbm_repaint_stream(rows: u16, cols: u16) -> Vec<u8> {
     }
     bytes
 }
+
+/// Issue #891 — the opposite fixture to [`synthetic_decstbm_repaint_stream`]:
+/// ordinary newline-terminated output, enough of it to clear
+/// [`SCROLL_NOTICE_MIN_SCREENFULS`], so the parser retains a real nonzero
+/// scrollback depth *and* the mature-pane half of the trigger is satisfied.
+///
+/// Both halves matter. A fixture that only scrolls proves nothing about the
+/// notice (it never had the bytes to arm), and a fixture that only feeds bytes
+/// is the repaint stream above. This one is the case the notice must never fire
+/// on: an app-managed agent that genuinely handed the terminal its history.
+#[doc(hidden)]
+pub fn synthetic_scrollable_history_stream(rows: u16, cols: u16) -> Vec<u8> {
+    assert!(rows >= 2 && cols >= 2, "the history fixture needs a region");
+    let target_bytes = SCROLL_NOTICE_MIN_SCREENFULS * u64::from(rows) * u64::from(cols);
+    let mut bytes = Vec::with_capacity(target_bytes as usize + usize::from(rows));
+    let mut line = 0_u64;
+    while (bytes.len() as u64) <= target_bytes {
+        bytes.extend_from_slice(format!("history line {line}\r\n").as_bytes());
+        line += 1;
+    }
+    bytes
+}
+
+/// Issue #891 — enter the alternate screen (`ESC [ ? 1049 h`), the mode switch
+/// `vt100` answers from a grid built with **zero** scrollback capacity.
+///
+/// Kept as a named constant rather than typed into each test, because the whole
+/// defect is that the deck never looked at this mode: a literal buried in a test
+/// is not something `grep alternate` finds.
+#[doc(hidden)]
+pub const ENTER_ALTERNATE_SCREEN: &[u8] = b"\x1b[?1049h";
+
+/// Issue #891 — leave the alternate screen again.
+#[doc(hidden)]
+pub const LEAVE_ALTERNATE_SCREEN: &[u8] = b"\x1b[?1049l";
 
 /// Render the seam pane through [`render_terminal_panes`], with the frame clock
 /// injectable for exact transient-notice edges.
