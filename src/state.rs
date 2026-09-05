@@ -6669,6 +6669,44 @@ impl AppState {
     }
 
     pub fn apply_event(&mut self, mut event: AgentEvent) {
+        // Issue #833: `tool_name` / `tool_detail` are PRODUCER-supplied — every
+        // agent on the deck can post to the hook socket — and both are drawn
+        // into a card's tool line (`ui::recent_tool_lines` reads them off the
+        // `recent_events` journal below) as well as stored on `active_tool`,
+        // from where they travel back out over `ListAgents`. They were kept
+        // verbatim on both.
+        //
+        // Scrubbed HERE, at the top of the ingest, rather than at either of
+        // those two uses. The value is STORED twice by this one function and
+        // read by consumers that are not the card — `daemon_status`'s JSON
+        // document and the desktop DTO among them — so a scrub at the one seam
+        // that draws it today would leave the stored value hostile for every
+        // other reader and would have to be re-applied by each new one. That is
+        // the exact shape of the defect #833 reports: `ui.display_names` was a
+        // second reader added beside a sanitized one.
+        //
+        // The counterpart route for the SAME two strings — a daemon echoing
+        // them back inside `AgentRecord.live` — has been scrubbed and clamped at
+        // the wire boundary since PRD #162 (`daemon_client`), so this closes the
+        // half of one field that had no scrub on either end of it. The two are
+        // still not identical: that boundary uses `daemon_client`'s own
+        // control-only filter, which drops C0/C1 and DEL but NOT bidi, while
+        // this uses `strip_control_and_bidi`. So a bidi override survives the
+        // echo route and not this one. Narrowing that residual is deliberately
+        // outside #833, which names two seams; it is recorded in
+        // `crate::untrusted_text`'s module doc.
+        //
+        // Ahead of the admission-control `return`s below deliberately: an event
+        // this instance rejects is dropped whole, so scrubbing it first costs
+        // only the work, while a later insertion point is one more thing a
+        // future early-return can be added in front of.
+        if let Some(name) = event.tool_name.as_mut() {
+            *name = crate::untrusted_text::sanitize_tool_text(name);
+        }
+        if let Some(detail) = event.tool_detail.as_mut() {
+            *detail = crate::untrusted_text::sanitize_tool_text(detail);
+        }
+
         // PRD #20 R20-003 (finding #4): the ORIGINAL hook `session_id` on the
         // wire, captured BEFORE the same-agent reuse guard below remaps it onto
         // the stable card id. This is the generation the daemon's send guard

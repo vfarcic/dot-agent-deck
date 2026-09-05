@@ -234,6 +234,29 @@ fn clamp_bytes(mut s: String, max_bytes: usize) -> String {
 /// - `tab_membership`: clamped to `None` if the embedded `name` fails
 ///   [`validate_tab_membership`] (logged via `tracing::warn!` — the agent is
 ///   real, we just don't trust the bucketing hint).
+/// - `display_name` (issue #833): scrubbed of control characters AND bidi
+///   overrides and clamped to [`crate::agent_pty::DISPLAY_NAME_MAX_LEN`] via
+///   [`crate::untrusted_text::sanitize_display_name`]; a name with nothing
+///   printable left becomes `None`, which hydration renders as the agent id.
+///   This field is the card TITLE the TUI actually uses — hydration copies it
+///   into `ui.pane_display_names`, the dashboard loop fills `ui.display_names`
+///   from that, and `ui::render_card_grid` prefers that map over the session's
+///   own `display_name` — so it is the string on this record whose scrub the
+///   render most depends on. The daemon does gate it
+///   (`agent_pty::is_valid_display_name`), but that gate lives at the other end
+///   of the wire: a daemon too old to carry the gate's bidi half, or one not
+///   running this code at all, echoes whatever it stored. Same
+///   defense-in-depth argument as `tab_membership` above.
+///
+/// NOT scrubbed here, and this list is the whole of what is: `id` and
+/// `pane_id_env` (daemon-minted — `id` is a monotonic counter stringified) and
+/// **`cwd`**. That last one is a real residual rather than a safe omission: the
+/// dashboard renders its basename, and the only thing standing between a
+/// hostile value and a cell is the daemon-side `agent_pty::is_valid_cwd`, whose
+/// byte test admits a bidi override for exactly the reason
+/// `is_valid_display_name`'s did before issue #833 — `U+202E` is three bytes
+/// each above `0x20`. Deliberately out of scope for #833, which names two
+/// seams, and stated here rather than left for the next reader to rediscover.
 /// - `live` snapshot (PRD #162): control bytes are stripped from
 ///   `last_user_prompt`, every `first_prompts` entry, and `active_tool.name` /
 ///   `.detail`, and each of those strings is length-bounded to
@@ -241,6 +264,18 @@ fn clamp_bytes(mut s: String, max_bytes: usize) -> String {
 ///   most [`crate::state::MAX_FIRST_PROMPTS`] entries. The snapshot is KEPT as
 ///   `Some(..)` — the agent is real; only its strings are scrubbed.
 fn sanitize_record_tab_membership(rec: &mut AgentRecord) {
+    if let Some(raw) = rec.display_name.take() {
+        rec.display_name = crate::untrusted_text::sanitize_display_name(&raw);
+        if rec.display_name.is_none() {
+            tracing::warn!(
+                agent_id = %rec.id,
+                name_len = raw.len(),
+                "list_agents: dropping daemon-supplied display_name with no printable \
+                 content — the card falls back to the agent id"
+            );
+        }
+    }
+
     if let Some(tm) = rec.tab_membership.take() {
         let name_len = tm.name().len();
         match validate_tab_membership(tm) {
@@ -1188,6 +1223,64 @@ mod tests {
             "guarded send must fail safe before submission when capability is absent; result={result:?}, submissions={}",
             submissions.load(Ordering::SeqCst)
         );
+    }
+
+    #[test]
+    fn sanitize_record_tab_membership_scrubs_display_name() {
+        // Issue #833. `display_name` is the card TITLE the TUI actually uses —
+        // hydration copies it into `ui.pane_display_names`, from which the
+        // dashboard loop fills `ui.display_names`, and `render_card_grid`
+        // prefers that map over the session's own name — and it was the one
+        // string on this record with no scrub here at all.
+        let mut rec = AgentRecord {
+            id: "9".into(),
+            pane_id_env: None,
+            display_name: Some(format!("de\x1bplo\u{202e}yer\0 {}", "\u{3bc}".repeat(400))),
+            cwd: None,
+            tab_membership: None,
+            agent_type: None,
+            rows: 0,
+            cols: 0,
+            live: None,
+            spawned_at_ms: None,
+        };
+        sanitize_record_tab_membership(&mut rec);
+        let name = rec
+            .display_name
+            .as_deref()
+            .expect("a name with printable content is repaired, not dropped");
+        assert!(
+            !name.chars().any(char::is_control),
+            "no control character may survive: {name:?}"
+        );
+        assert!(
+            !name.chars().any(crate::untrusted_text::is_bidi_format_char),
+            "no bidi override may survive: {name:?}"
+        );
+        let body = name.strip_suffix('…').expect("a clamped name is marked");
+        assert!(
+            body.len() <= crate::agent_pty::DISPLAY_NAME_MAX_LEN,
+            "the name must be clamped to the daemon's own ceiling, got {} bytes",
+            body.len()
+        );
+        assert!(
+            body.ends_with('\u{3bc}'),
+            "the clamp must snap back to a character boundary: {body:?}"
+        );
+
+        // Nothing printable left → `None`, so hydration falls back to the
+        // agent id rather than titling the card with an empty string.
+        let mut blank = rec.clone();
+        blank.display_name = Some("\x1b\u{202e}\0\x7f  ".into());
+        sanitize_record_tab_membership(&mut blank);
+        assert_eq!(blank.display_name, None);
+
+        // And an ordinary name round-trips untouched — the control that keeps
+        // the two assertions above from passing on a scrub that eats everything.
+        let mut ok = rec.clone();
+        ok.display_name = Some("deployer".into());
+        sanitize_record_tab_membership(&mut ok);
+        assert_eq!(ok.display_name.as_deref(), Some("deployer"));
     }
 
     #[test]
