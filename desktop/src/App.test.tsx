@@ -608,6 +608,28 @@ describe("ControlDeck", () => {
     expect(document.documentElement.getAttribute("data-theme")).toBe("dark");
   });
 
+  it("leaves a pre-painted theme in place when the settings read FAILS", async () => {
+    // A failed read is not a choice. The app already applied the stored mode
+    // from the same file before this bundle ran, so the palette on the root is
+    // better information than the placeholder this mount is holding — and
+    // clearing it would let one dropped IPC call throw away a saved Light or
+    // Dark. `loaded` cannot tell these apart, because it is true once the read
+    // has settled either way; `chosen` is what draws the line.
+    document.documentElement.setAttribute("data-theme", "dark");
+    const getSettings = vi.fn(async () => { throw new Error("IPC unavailable"); });
+
+    render(<ControlDeck runtime={runtime({ getSettings })} />);
+    await waitFor(() => expect(getSettings).toHaveBeenCalled());
+    // Settled, and still untouched — the effect has had every chance to run.
+    await act(async () => { await Promise.resolve(); });
+    expect(document.documentElement.getAttribute("data-theme")).toBe("dark");
+
+    // Still usable: a choice made after the failure applies as normal.
+    fireEvent.click(screen.getByTestId("open-settings"));
+    fireEvent.click(screen.getByRole("radio", { name: /Light/ }));
+    expect(document.documentElement.getAttribute("data-theme")).toBe("light");
+  });
+
   it("defers the appearance write rather than suppressing it, so a stale root is still cleared", async () => {
     // The gate is about ORDER, not about writing less. A root carrying an
     // attribute the stored document disagrees with must still be cleared —

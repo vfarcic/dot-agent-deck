@@ -26,12 +26,18 @@ export interface DesktopSettingsState {
    * itself with. False only between mount and the first read settling.
    *
    * Distinct from `loaded`, and issue #845 is why. `loaded` answers "has the
-   * disk replied"; a consumer that writes to global chrome needs "is this mode
-   * one somebody chose", which is also true of a choice made *while* the read
-   * is still in flight. Gating such a consumer on `loaded` alone would leave
-   * that click unapplied until the read lands, which is the no-restart
-   * requirement PRD #743 puts on the appearance choice, and would defeat the
-   * `edited` guard below that exists for exactly this race.
+   * read settled"; a consumer that writes to global chrome needs "is this mode
+   * one somebody chose". They part company in both directions:
+   *
+   * - A choice made *while* the read is in flight is chosen but not loaded.
+   *   Gating such a consumer on `loaded` would leave that click unapplied until
+   *   the read lands — the no-restart requirement PRD #743 puts on the
+   *   appearance choice, and the race the `edited` guard below exists for.
+   * - A read that **failed** is loaded but chose nothing. `settings` then holds
+   *   the same placeholder it was seeded with, and treating that as a choice
+   *   would let a transient IPC failure overwrite the palette the user actually
+   *   stored — which this app has already applied, from the same file, before
+   *   this bundle ran.
    */
   chosen: boolean;
   /** Set when the last save failed. The change stays applied for this session. */
@@ -44,6 +50,11 @@ export function useDesktopSettings(runtime: DeckRuntimeState): DesktopSettingsSt
   const [settings, setSettings] = useState<DesktopSettingsDto>(DEFAULT_DESKTOP_SETTINGS);
   const [path, setPath] = useState<string>();
   const [loaded, setLoaded] = useState(false);
+  // Whether a document actually came back, which `loaded` does NOT answer:
+  // `loaded` is true once the read has SETTLED, failure included. The two part
+  // company only on the failure path, and that is exactly where the difference
+  // is load-bearing — see `chosen`.
+  const [read, setRead] = useState(false);
   const [saveError, setSaveError] = useState<string>();
   // Whether the user has already changed something. The initial load is async,
   // so without this a choice made before it resolves is silently overwritten by
@@ -71,6 +82,7 @@ export function useDesktopSettings(runtime: DeckRuntimeState): DesktopSettingsSt
         // already moved on from it.
         setPath(snapshot.path);
         if (!edited.current) setSettings(snapshot.settings);
+        setRead(true);
       })
       // The live bridge already falls back to defaults, so a rejection here is
       // a bridge that has no settings at all. Defaults keep the app usable.
@@ -115,5 +127,5 @@ export function useDesktopSettings(runtime: DeckRuntimeState): DesktopSettingsSt
   // here, because it is monotonic (false to true, never back) and every write
   // to it is paired with a `setSettings` in the same call, so the render that
   // observes the new value is one React was already going to perform.
-  return { settings, path, loaded, chosen: loaded || edited.current, saveError, save };
+  return { settings, path, loaded, chosen: read || edited.current, saveError, save };
 }

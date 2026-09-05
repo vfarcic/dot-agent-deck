@@ -28,11 +28,11 @@
 //! # What this deliberately does not own
 //!
 //! The frontend stays the source of truth the moment it has read the document:
-//! this writes the root once, before anything else runs, and never again. It
+//! this writes the root once, before the document is parsed, and not again. It
 //! does not observe changes, and a choice made in the settings sheet is applied
 //! by `lib/appearance.ts` exactly as before. The mode is read once, when the
-//! plugin is constructed, which is the same startup in which the only declared
-//! window is created.
+//! plugin is constructed, which is the same startup that creates the one window
+//! `tauri.conf.json` declares.
 //!
 //! `data-theme` and its two values are shared with `desktop/src/styles.css` and
 //! `desktop/src/lib/appearance.ts`; `grep -rn data-theme desktop/` finds all of
@@ -113,10 +113,21 @@ fn plugin_for<R: Runtime>(mode: AppearanceMode) -> TauriPlugin<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tauri::Wry;
+    // `MockRuntime`, deliberately, and **not `tauri::Wry`** — naming `Wry` from
+    // a reachable test path is what puts a WebView2 import in this crate's test
+    // binary, and the Windows runner's loader then refuses to start it at all:
+    // `--list --format terse aborted with code 0xc0000139: The specified
+    // procedure could not be found`, before a single test runs. `run()` names
+    // `Wry` too and is harmless, because nothing calls it in a test binary and
+    // the linker drops it. `MockRuntime` has no webview backend and pulls
+    // nothing, and what is under test here — which script the plugin hands the
+    // webview — does not depend on which runtime asks.
     use tauri::plugin::Plugin;
+    use tauri::test::MockRuntime;
 
-    /// Every mode, so a fourth one cannot be added without deciding this.
+    /// The three modes there are. [`pre_paint_script`]'s own `match` is
+    /// exhaustive, so a fourth variant fails to compile there; this list is
+    /// then widened by hand to match it.
     const MODES: [AppearanceMode; 3] = [
         AppearanceMode::System,
         AppearanceMode::Light,
@@ -159,7 +170,7 @@ mod tests {
     #[test]
     fn the_plugin_hands_the_webview_the_script_for_the_stored_mode() {
         for mode in MODES {
-            let plugin: TauriPlugin<Wry> = plugin_for(mode);
+            let plugin: TauriPlugin<MockRuntime> = plugin_for(mode);
             assert_eq!(
                 plugin.initialization_script(),
                 pre_paint_script(mode),
@@ -168,12 +179,13 @@ mod tests {
         }
     }
 
-    /// A script only helps if it runs on the main frame, which is the one that
-    /// paints. `js_init_script` is the main-frame form; the all-frames sibling
-    /// would also work but says something this does not mean.
+    /// The root this writes to has to be the one `styles.css` reads, which is
+    /// the main frame's. `js_init_script` is the main-frame form; the
+    /// all-frames sibling would also work but says something this does not
+    /// mean.
     #[test]
     fn the_script_is_registered_for_the_main_frame() {
-        let plugin: TauriPlugin<Wry> = plugin_for(AppearanceMode::Dark);
+        let plugin: TauriPlugin<MockRuntime> = plugin_for(AppearanceMode::Dark);
         let script = plugin
             .initialization_script_2()
             .expect("an explicit choice has a script");
