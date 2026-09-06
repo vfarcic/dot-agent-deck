@@ -235,6 +235,7 @@ mod tests {
             live,
             spawned_at_ms: None,
             cli_name: None,
+            crashed: None,
         }
     }
 

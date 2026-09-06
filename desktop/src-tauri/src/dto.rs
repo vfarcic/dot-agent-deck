@@ -2089,6 +2089,7 @@ mod tests {
             // Issue #856: as the DAEMON reported it. The fixture agent is
             // Codex, and `codex` is what a codex daemon resolves.
             cli_name: Some("codex".into()),
+            crashed: None,
         }
     }
 

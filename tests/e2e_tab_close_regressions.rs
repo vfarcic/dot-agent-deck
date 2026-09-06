@@ -211,6 +211,7 @@ async fn handle_connection(
                 live: None,
                 spawned_at_ms: None,
                 cli_name: None,
+                crashed: None,
             });
             write_resp(&mut stream, &AttachResponse::with_id(id))
                 .await
@@ -291,6 +292,7 @@ fn mode_record(fixture: &str, mode: &str, agent_id: &str, pane_id: &str) -> Agen
         live: None,
         spawned_at_ms: None,
         cli_name: None,
+        crashed: None,
     }
 }
 

@@ -1872,6 +1872,7 @@ mod tests {
             // record by hand rather than by spawning anything.
             spawned_at_ms: None,
             cli_name: None,
+            crashed: None,
         }
     }
 

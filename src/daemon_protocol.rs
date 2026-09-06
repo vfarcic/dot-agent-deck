@@ -5559,6 +5559,7 @@ mod tests {
             live: None,
             spawned_at_ms: None,
             cli_name: None,
+            crashed: None,
         };
         let json = serde_json::to_string(&rec).unwrap();
         let back: AgentRecord = serde_json::from_str(&json).unwrap();
@@ -5579,6 +5580,7 @@ mod tests {
             live: None,
             spawned_at_ms: None,
             cli_name: None,
+            crashed: None,
         };
         let v: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&rec).unwrap()).unwrap();
@@ -5743,6 +5745,7 @@ mod tests {
             }),
             spawned_at_ms: None,
             cli_name: None,
+            crashed: None,
         };
         let json = serde_json::to_string(&rec).expect("AgentRecord serializes");
         let back: AgentRecord = serde_json::from_str(&json).expect("AgentRecord deserializes");
@@ -6024,6 +6027,7 @@ mod tests {
             live: None,
             spawned_at_ms: None,
             cli_name: Some("claude".into()),
+            crashed: None,
         };
         let value: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&rec).expect("serializes"))

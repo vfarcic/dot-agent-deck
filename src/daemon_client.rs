@@ -1300,6 +1300,7 @@ impl DaemonClient {
                     // filled one in from its own table would be reinstating the
                     // derivation this field exists to remove.
                     cli_name: None,
+                    crashed: None,
                 })
                 .collect(),
             schedule_revision,
@@ -3405,6 +3406,7 @@ mod tests {
             live: None,
             spawned_at_ms: None,
             cli_name: None,
+            crashed: None,
         };
         sanitize_record_tab_membership(&mut rec);
         let name = rec
@@ -3467,6 +3469,7 @@ mod tests {
             live: None,
             spawned_at_ms: None,
             cli_name: None,
+            crashed: None,
         };
         sanitize_record_tab_membership(&mut rec);
         assert!(rec.tab_membership.is_none(), "invalid name must be cleared");
@@ -3492,6 +3495,7 @@ mod tests {
             live: None,
             spawned_at_ms: None,
             cli_name: None,
+            crashed: None,
         };
         sanitize_record_tab_membership(&mut ok);
         assert_eq!(

@@ -332,6 +332,7 @@ async fn handle_connection(
                         live: None,
                         spawned_at_ms: None,
                         cli_name: None,
+                        crashed: None,
                     }]
                 })
                 .unwrap_or_default();
@@ -914,6 +915,7 @@ fn stop_019_tab_close_is_concurrent_and_keeps_pane_order() {
             &six_role_orchestration(),
             "/work",
             pane_ids.iter().cloned().map(Some).collect(),
+            None,
             None,
         )
         .expect("open hydrated six-role orchestration");

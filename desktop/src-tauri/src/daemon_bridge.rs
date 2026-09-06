@@ -2429,6 +2429,7 @@ mod tests {
             live: None,
             spawned_at_ms: None,
             cli_name: None,
+            crashed: None,
         }
     }
 
