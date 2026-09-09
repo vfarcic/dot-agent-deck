@@ -7,10 +7,16 @@
 # eligible spends ZERO agent tokens — the review job does not run at all.
 #
 # The agent never holds a credential that can approve. It emits a verdict comment;
-# the `vote` job below holds the App token, re-validates independently, and casts
-# the review. That split is load-bearing: gh-aw runs the agent inside a
-# firewalled container with its own approval gate bypassed, so an agent holding
-# an approving credential would be one prompt injection away from using it.
+# the `vote` job below holds the App token, re-validates the PR number, the head
+# SHA and the gates itself, and casts the review.
+#
+# Be precise about what that split buys, because it is easy to overstate: it does
+# NOT make an injected verdict safe. If the diff talks the agent into emitting
+# APPROVE, the vote job faithfully approves. What it bounds is everything else —
+# the agent runs with its own approval gate bypassed inside the container, so an
+# agent holding this token could otherwise approve a different pull request, at a
+# different SHA, or one whose checks are red or whose paths are deny-listed.
+# Blast radius, not immunity.
 name: Agent PR review
 
 "on":
@@ -21,18 +27,6 @@ name: Agent PR review
     # so the second firing normally finds nothing to do and costs nothing.
     - cron: "0 5 * * *"
     - cron: "0 17 * * *"
-  # TEMPORARY — REMOVE BEFORE MERGING THIS PULL REQUEST.
-  #
-  # workflow_dispatch only works from the default branch, so this trigger exists
-  # to exercise the reviewer from its own pull request before it is merged. A
-  # pull_request workflow runs from the PR's head branch, and only this branch
-  # carries this file, so only this pull request can trigger it.
-  #
-  # It cannot vote: pr_review_select.py allows live mode only on the schedule
-  # and workflow_dispatch events, so a pull_request run is always a dry run.
-  pull_request:
-    types: [opened, synchronize, ready_for_review]
-
   workflow_dispatch:
     inputs:
       pr_number:
@@ -146,9 +140,11 @@ jobs:
   # retryable: a missed vote is simply picked up by the next sweep.
   prepare_vote:
     needs: [prepare, review]
-    if: >-
-      always()
-      && needs.prepare.outputs.live == 'true'
+    # Runs even in dry run, deliberately. It is a plain `gh` query costing no
+    # agent tokens, and its log is the answer to "which pull requests would be
+    # approved if I turned voting on" — so a dry dispatch previews the live run
+    # instead of the live run being the first exercise of this code.
+    if: always()
     runs-on: ubuntu-latest
     outputs:
       items: ${{ steps.pick.outputs.items }}
