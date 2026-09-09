@@ -92,7 +92,9 @@ fn assert_py_ok(body: &str) {
 /// the safe direction, but still a bug.
 #[test]
 fn trusts_a_verdict_from_our_own_workflow() {
-    assert_py_ok("assert _is_trusted_verdict_comment(comment('github-actions[bot]', BLOCK + MARKER))");
+    assert_py_ok(
+        "assert _is_trusted_verdict_comment(comment('github-actions[bot]', BLOCK + MARKER))",
+    );
 }
 
 /// The P1. On a public repository this is any GitHub account, and accepting it
