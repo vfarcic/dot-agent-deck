@@ -316,6 +316,15 @@ pub struct PaneScrollFacts {
     /// Lines the parser actually retains right now, measured by asking vt100 to
     /// clamp an impossible offset — never the configured scrollback capacity.
     pub scrollback_depth: usize,
+    /// Issue #891 — whether the pane is currently on the ALTERNATE screen.
+    ///
+    /// Load-bearing for [`scrollback_depth`], not decoration beside it. `vt100`
+    /// builds its alternate grid with a scrollback capacity of **zero**
+    /// (`vt100-0.16.2/src/screen.rs:76`) and dispatches every scrollback read and
+    /// write to whichever grid the mode selects, so while this is `true` the depth
+    /// above is structurally `0` however much the pane has produced — and says
+    /// nothing whatever about what the normal grid retained.
+    pub alternate_screen: bool,
     /// Agent-output bytes handed to this pane's parser since the pane was made.
     pub bytes_since_spawn: u64,
     /// The parser's live geometry, which is what one "screenful" means here.
@@ -888,8 +897,10 @@ impl EmbeddedPaneController {
         parser.screen_mut().set_scrollback(usize::MAX);
         let scrollback_depth = parser.screen().scrollback();
         parser.screen_mut().set_scrollback(view);
+        let alternate_screen = parser.screen().alternate_screen();
         Some(PaneScrollFacts {
             scrollback_depth,
+            alternate_screen,
             bytes_since_spawn,
             rows,
             cols,

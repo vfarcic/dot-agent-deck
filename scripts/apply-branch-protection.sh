@@ -107,7 +107,14 @@ RENOVATE_APP_ID="${RENOVATE_APP_ID:-2740}"
 # `-` rather than `:-`, unlike the tunables above: with `:-` an explicitly empty
 # value falls back to the default, which would make that escape hatch a dead
 # end. Unset still means "the four defaults".
-REQUIRED_CHECKS="${REQUIRED_CHECKS-build build-macos build-windows security}"
+# `e2e-deterministic` joined the four on 2026-09-05 (issue #908): a lane nothing
+# requires is a lane that stays red, and it was red on 16 of 21 open PRs when
+# that was measured. EDITING THIS DEFAULT DOES NOT CHANGE THE LIVE REPOSITORY —
+# the ruleset only moves when someone runs `apply`, which sends a full `PUT`
+# (warning 3 above). Do not run `apply` until the open pull requests have
+# rebased past the flake fixes, or every one of them becomes unmergeable at
+# once; then run `status` and read the contexts back.
+REQUIRED_CHECKS="${REQUIRED_CHECKS-build build-macos build-windows security e2e-deterministic}"
 
 # Acknowledge that an empty REQUIRED_CHECKS is intended. Without this set to
 # `true`, an empty (or whitespace-only) REQUIRED_CHECKS is a hard error rather

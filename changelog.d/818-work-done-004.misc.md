@@ -1,0 +1,7 @@
+## A lane-1 e2e flake that turned `e2e-deterministic` red on unrelated branches
+
+`orchestration/work-done/004` asserted four needles against the rendered orchestration surface, but only the FIRST of them waited; the other three were instantaneous `pane_contains` checks. The daemon composes its unsolicited-completion label as one message and the TUI renders whatever of it has arrived, so a grid sampled the moment the first needle appears can legitimately be mid-message. On a contended runner the test failed on the report-frame assertion having *passed* the two before it — a partial render, not a missing report, and the same symptom appeared on a `renovate/github-actions` run whose diff contains no Rust at all.
+
+Each positive needle is now a bounded wait, which asserts the same thing without pinning *when* inside the message's own render. The negative assertion (the summary-file pointer must NOT appear) stays instantaneous deliberately, and is strictly more reliable there than before, because it now runs after every positive needle has settled.
+
+**This is one family of [#818](https://github.com/vfarcic/dot-agent-deck/issues/818), which stays open.** #818 is an umbrella over several rotating families with more than one cause; the `orchestration_remit_*` family is fixed separately in #837 by removing the race those tests lose, and the single-shot `find_in_grid` repaint races are #872's sweep. Neither mechanism covers `work_done_004`, which is why it is fixed here.

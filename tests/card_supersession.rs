@@ -5,9 +5,25 @@ use dot_agent_deck::state::AppState;
 use spec::spec;
 
 const PANE_ID: &str = "scheduler-handoff-pane";
+/// A SECOND managed pane, for the one test that has to prove a frame cannot
+/// reach across panes (`status/supersede/011`).
+const OTHER_PANE_ID: &str = "scheduler-handoff-pane-b";
 const TASK_NAME: &str = "morning-digest";
 
 fn event(
+    session_id: &str,
+    agent_type: AgentType,
+    event_type: EventType,
+    agent_id: Option<&str>,
+    timestamp: chrono::DateTime<Utc>,
+) -> AgentEvent {
+    event_on_pane(
+        PANE_ID, session_id, agent_type, event_type, agent_id, timestamp,
+    )
+}
+
+fn event_on_pane(
+    pane_id: &str,
     session_id: &str,
     agent_type: AgentType,
     event_type: EventType,
@@ -24,7 +40,7 @@ fn event(
         timestamp,
         user_prompt: None,
         metadata: Default::default(),
-        pane_id: Some(PANE_ID.to_string()),
+        pane_id: Some(pane_id.to_string()),
         agent_id: agent_id.map(str::to_string),
         agent_version: None,
         schema_version: None,
@@ -393,5 +409,154 @@ fn status_supersede_008_a_respawn_across_session_end_keeps_the_friendly_name() {
         "the replacement card dropped the pane's friendly name — a `clear = true` \
          delegate's worker then renders as `ClaudeCode · <session-uuid>` instead of \
          its role (issue #663)"
+    );
+}
+
+/// Scenario: A Pi pane reports under its stable `{pane_id}-session` id, then respawns
+/// under a new registry agent id a minute later with no `SessionEnd` in between — the
+/// `clear = true` shape, where the old child is SIGKILLed and never gets to say goodbye.
+/// The one card left on the pane must still report the instant the FIRST generation
+/// started, not the instant the replacement's first frame happened to arrive.
+#[spec("status/supersede/009")]
+#[test]
+fn status_supersede_009_started_at_survives_a_same_key_respawn() {
+    let stable_session_id = format!("{PANE_ID}-session");
+    let first_timestamp = Utc::now();
+
+    let mut state = AppState::default();
+    state.register_pane(PANE_ID.to_string());
+    state.apply_event(event(
+        &stable_session_id,
+        AgentType::Pi,
+        EventType::Thinking,
+        Some("pi-agent-2"),
+        first_timestamp,
+    ));
+
+    assert_eq!(
+        state.sessions[&stable_session_id].started_at, first_timestamp,
+        "precondition: the first generation's card starts when its first frame arrived"
+    );
+
+    state.apply_event(event(
+        &stable_session_id,
+        AgentType::Pi,
+        EventType::Thinking,
+        Some("pi-agent-3"),
+        first_timestamp + Duration::seconds(60),
+    ));
+
+    assert_eq!(
+        state.sessions[&stable_session_id].agent_id.as_deref(),
+        Some("pi-agent-3"),
+        "precondition: the respawn took the card, so this is the rebuild path under test"
+    );
+    assert_eq!(
+        state.sessions[&stable_session_id].started_at, first_timestamp,
+        "the pane's start time was re-derived from the respawn instead of carried across"
+    );
+}
+
+/// Scenario: A pane's spawn-time card is replaced by a respawn reporting under a
+/// DIFFERENT session id and a different registry agent id, again with no `SessionEnd`
+/// in between. The surviving card must carry the pane's original start time, exactly as
+/// the same-key respawn does — the two respawn shapes must not disagree about when the
+/// pane started being used.
+#[spec("status/supersede/010")]
+#[test]
+fn status_supersede_010_started_at_survives_a_cross_key_respawn() {
+    let first_timestamp = Utc::now();
+
+    let mut state = AppState::default();
+    state.register_pane(PANE_ID.to_string());
+    state.apply_event(event(
+        "spawn-placeholder",
+        AgentType::ClaudeCode,
+        EventType::SessionStart,
+        Some("agent-a"),
+        first_timestamp,
+    ));
+
+    assert_eq!(
+        state.sessions["spawn-placeholder"].started_at, first_timestamp,
+        "precondition: the outgoing generation's card starts at its own first frame"
+    );
+
+    state.apply_event(event(
+        "replacement-session",
+        AgentType::ClaudeCode,
+        EventType::SessionStart,
+        Some("agent-b"),
+        first_timestamp + Duration::seconds(60),
+    ));
+
+    assert_eq!(
+        state.sessions.len(),
+        1,
+        "precondition: the replacement retired the outgoing card, so one card remains"
+    );
+    assert_eq!(
+        state.sessions["replacement-session"].started_at, first_timestamp,
+        "the pane's start time was re-derived from the replacement instead of carried across"
+    );
+}
+
+/// Scenario: A Pi card on one pane accumulates a tool tally, then a frame arrives naming
+/// the SAME producer session id but a different pane and a different registry agent id.
+/// The card's identity and history belong to the first pane's agent, so the cross-pane
+/// frame must not be allowed to take them over.
+#[spec("status/supersede/011")]
+#[test]
+fn status_supersede_011_a_cross_pane_frame_cannot_refresh_the_card_identity() {
+    let shared_session_id = format!("{PANE_ID}-session");
+    let first_timestamp = Utc::now();
+
+    let mut state = AppState::default();
+    state.register_pane(PANE_ID.to_string());
+    state.register_pane(OTHER_PANE_ID.to_string());
+
+    state.apply_event(event_on_pane(
+        PANE_ID,
+        &shared_session_id,
+        AgentType::Pi,
+        EventType::Thinking,
+        Some("pi-agent-2"),
+        first_timestamp,
+    ));
+    state.apply_event(event_on_pane(
+        PANE_ID,
+        &shared_session_id,
+        AgentType::Pi,
+        EventType::ToolEnd,
+        Some("pi-agent-2"),
+        first_timestamp + Duration::seconds(1),
+    ));
+
+    assert_eq!(
+        state.sessions[&shared_session_id].tool_count, 1,
+        "precondition: the first pane's agent accumulated history on this card"
+    );
+
+    state.apply_event(event_on_pane(
+        OTHER_PANE_ID,
+        &shared_session_id,
+        AgentType::Pi,
+        EventType::Thinking,
+        Some("pi-agent-9"),
+        first_timestamp + Duration::seconds(2),
+    ));
+
+    assert_eq!(
+        state.sessions[&shared_session_id].agent_id.as_deref(),
+        Some("pi-agent-2"),
+        "a frame from another pane took over the card identity on a session-key match alone"
+    );
+    assert_eq!(
+        state.sessions[&shared_session_id].tool_count, 1,
+        "a frame from another pane rebuilt the card and discarded its accumulated history"
+    );
+    assert_eq!(
+        state.sessions[&shared_session_id].started_at, first_timestamp,
+        "a frame from another pane rebuilt the card and reset its start time"
     );
 }

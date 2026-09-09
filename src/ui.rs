@@ -30,11 +30,11 @@ use crate::palette;
 use crate::pane::{AgentSpawnOptions, PaneController, PaneError, RenameOutcome};
 use crate::project_config::{ModeConfig, OrchestrationConfig, load_project_config};
 use crate::prompt_delivery::{
-    AUTOMATIC_PROMPT_DEADLINE, AgentStartRearm, ConfirmationCapability, attempt_delivery_id,
-    attempt_writes_payload, log_prompt_abandoned, log_prompt_accumulated, log_prompt_confirmed,
-    log_prompt_probe_submitted, log_prompt_stopped, log_prompt_unconfirmable,
-    log_prompt_unconfirmed, log_prompt_written, mint_delivery_id, pane_confirmation_capability,
-    prompt_submission_accumulated, prompt_submission_matches, submission_is_after_watermark,
+    AUTOMATIC_PROMPT_DEADLINE, AgentStartRearm, ConfirmationCapability, ConfirmedSubmission,
+    attempt_delivery_id, attempt_writes_payload, classify_prompt_submission, log_prompt_abandoned,
+    log_prompt_accumulated, log_prompt_confirmed, log_prompt_probe_submitted, log_prompt_stopped,
+    log_prompt_unconfirmable, log_prompt_unconfirmed, log_prompt_written, mint_delivery_id,
+    pane_confirmation_capability, prompt_submission_accumulated, submission_is_after_watermark,
     unconfirmed_retry_delay,
 };
 use crate::state::{AppState, DashboardStats, SessionState, SessionStatus, SharedState};
@@ -625,10 +625,11 @@ Collect these fields:
 - prompt: the prompt text to deliver on each fire.
 - new_tab_per_fire: true to open a fresh tab every fire, false (default) to reuse one tab.
 - enabled: true (default) or false.
+- shape: OPTIONAL. Omit it and the fire's shape comes from working_dir's config — which means a working_dir defining [[orchestrations]] fires the WHOLE TEAM and ignores `command`. Pass \"single\" to force ONE agent running `command` in that directory anyway (the usual want when the schedule drives a project skill and just needs the repo as its cwd), \"orchestration\" for that directory's default team, or \"orchestration:<name>\" for a named one. ASK when working_dir defines orchestrations and the user described a single-agent job.
 
 Rules:
 - NEVER edit the TOML file directly. ALWAYS write via the validated CLI, which checks the cron, expands paths, and writes the global config atomically:
-  dot-agent-deck schedule add --name <name> --cron <cron> --working-dir <dir> --command <cmd> --prompt <text> [--new-tab-per-fire <true|false>] [--enabled <true|false>]
+  dot-agent-deck schedule add --name <name> --cron <cron> --working-dir <dir> --command <cmd> --prompt <text> [--new-tab-per-fire <true|false>] [--enabled <true|false>] [--shape <single|orchestration|orchestration:NAME>]
 - The user can TEST the prompt in THIS session before committing — offer to run it now and show them the result (\"run it now, show me\").
 - CONFIRM the full entry (every field) with the user before you call `schedule add`.
 - AFTER `schedule add` succeeds, tell the user this authoring pane existed ONLY to create the schedule and can be closed now — when the schedule fires, a single-agent run surfaces live in its own pane on the deck, while an orchestration-targeted run appears in its tab when the deck is (re)opened.";
@@ -814,6 +815,7 @@ fn build_schedule_authoring_mode(
                  - prompt: {prompt}\n\
                  - new_tab_per_fire: {ntpf}\n\
                  - enabled: {enabled}\n\
+                 - shape: {shape}\n\
                  Start from these values and write changes with \
                  `dot-agent-deck schedule update --name {name} ...` (NOT `add`). \
                  RENAME IS FORBIDDEN — the name {name:?} is fixed (it is the reuse-tab key); \
@@ -828,6 +830,14 @@ fn build_schedule_authoring_mode(
                 prompt = t.prompt,
                 ntpf = t.new_tab_per_fire,
                 enabled = t.enabled,
+                // Issue #835: spelled out rather than blank when unset — the
+                // absence is the surprising state (a config-derived fire in a
+                // repo with `[[orchestrations]]` ignores `command`), so an
+                // editing agent has to be able to see it and offer `--shape`.
+                shape = t
+                    .shape
+                    .as_deref()
+                    .unwrap_or("(unset — derived from working_dir's config)"),
             )
         }
     };
@@ -3744,12 +3754,13 @@ fn process_pending_seed_prompts(
             }
             bind_delivery_generation(delivery, snapshot, &sp.pane_id);
             match prompt_submission_evidence(snapshot, &sp.pane_id, &sp.prompt, delivery) {
-                Some(SubmissionEvidence::Confirmed) => {
+                Some(SubmissionEvidence::Confirmed(confirmation)) => {
                     log_prompt_confirmed(
                         "seed",
                         &sp.pane_id,
                         &delivery.delivery_id,
                         delivery.attempts,
+                        confirmation,
                     );
                     backoff.remove(&sp.pane_id);
                     deliveries.remove(&sp.pane_id);
@@ -4130,9 +4141,10 @@ fn capture_prompt_delivery(ui: &mut UiState, pane_id: &str, pane: &dyn PaneContr
 ///   and re-created #424's silent loss in a shape no log would explain;
 /// * the TEXT — an unrelated prompt the human typed into the target pane is not
 ///   our prompt arriving, and comparison goes through
-///   [`prompt_submission_matches`] so a seed longer than `USER_PROMPT_MAX_LEN`
-///   still matches its truncated report, and a CR-swallowed newline-separated
-///   doubled submission counts as delivered rather than leaving the retry armed;
+///   [`crate::prompt_delivery::prompt_submission_matches`] so a seed longer than
+///   `USER_PROMPT_MAX_LEN` still matches its truncated report, and a
+///   CR-swallowed newline-separated doubled submission counts as delivered
+///   rather than leaving the retry armed;
 /// * the WATERMARK — an event already in the pane's journal when we wrote is
 ///   pre-existing history. `attempts == 0` (nothing written yet) can never
 ///   confirm.
@@ -4154,7 +4166,8 @@ fn prompt_submission_evidence(
     if delivery.attempts == 0 {
         return None;
     }
-    let mut evidence = None;
+    let mut confirmed: Option<ConfirmedSubmission> = None;
+    let mut accumulated = false;
     for session in snapshot
         .sessions
         .values()
@@ -4180,17 +4193,31 @@ fn prompt_submission_evidence(
             let Some(reported) = event.user_prompt.as_deref() else {
                 continue;
             };
-            if prompt_submission_matches(expected, reported) {
-                // A clean confirmation anywhere in the journal wins outright:
+            if let Some(shape) = classify_prompt_submission(expected, reported) {
+                // A confirmation anywhere in the journal wins outright:
                 // accumulation elsewhere does not make a real delivery dirty.
-                return Some(SubmissionEvidence::Confirmed);
+                //
+                // Issue #685: the scan no longer RETURNS on the first
+                // confirmation, so which SHAPE gets logged cannot depend on
+                // `sessions`' hash order when a journal holds more than one.
+                // The evidence returned is unchanged — any confirmation still
+                // beats any accumulation, and the most notable shape wins only
+                // among confirmations. See `ConfirmedSubmission::more_notable`.
+                confirmed = Some(match confirmed {
+                    Some(existing) => existing.more_notable(shape),
+                    None => shape,
+                });
+                continue;
             }
             if prompt_submission_accumulated(expected, reported) {
-                evidence = Some(SubmissionEvidence::Accumulated);
+                accumulated = true;
             }
         }
     }
-    evidence
+    if let Some(shape) = confirmed {
+        return Some(SubmissionEvidence::Confirmed(shape));
+    }
+    accumulated.then_some(SubmissionEvidence::Accumulated)
 }
 
 /// Issue #424 D5: what a pane's journal says about a written prompt, once
@@ -4201,9 +4228,14 @@ fn prompt_submission_evidence(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SubmissionEvidence {
     /// The agent reported submitting our prompt — verbatim, truncated, or as
-    /// newline-separated copies ([`prompt_submission_matches`]). The delivery is
+    /// newline-separated copies
+    /// ([`crate::prompt_delivery::prompt_submission_matches`]). The delivery is
     /// real.
-    Confirmed,
+    ///
+    /// Issue #685: carries WHICH of those three shapes it was, so the delivery
+    /// log can tell a clean single-copy turn apart from one carrying the prompt
+    /// twice. Observability only — all three finalize the delivery identically.
+    Confirmed(ConfirmedSubmission),
     /// The agent reported our prompt submitted as repeated copies run together
     /// with no separator ([`prompt_submission_accumulated`]). A payload had been
     /// sitting in the input box and a later write appended to it, so what the
@@ -4817,9 +4849,13 @@ fn deliver_orchestrator_prompt(
         });
         if let Some(evidence) = evidence {
             match evidence {
-                SubmissionEvidence::Confirmed => {
-                    log_prompt_confirmed("orchestrator", &start_pane_id, &delivery_id, attempts)
-                }
+                SubmissionEvidence::Confirmed(confirmation) => log_prompt_confirmed(
+                    "orchestrator",
+                    &start_pane_id,
+                    &delivery_id,
+                    attempts,
+                    confirmation,
+                ),
                 // Issue #424 D5: the role prompt came back doubled with no
                 // separator. The orchestrator HAS submitted it, so the role is
                 // genuinely working and finalizing is honest; what must stop is
@@ -5672,6 +5708,14 @@ pub enum Action {
     /// writer + daemon reload). Definition-only: it must NOT close an open tab
     /// for that schedule (the main-loop handler does no agent teardown).
     ScheduleDelete(String),
+    /// Issue #914: the manager dialog's `t` action — flip the named schedule's
+    /// `enabled` flag (rewrite `schedules.toml` via the validated writer +
+    /// daemon reload), pausing or resuming it without discarding the definition.
+    ///
+    /// Deliberately NOT two-step like [`Action::ScheduleDelete`]: delete destroys
+    /// the definition, so it earns a confirm; this is reversible by pressing the
+    /// same key again, and a prompt there is friction for nothing.
+    ScheduleToggleEnabled(String),
 }
 
 /// Kitty/xterm modifier parameter for a CSI sequence: `1 + bitmask`, where
@@ -7999,6 +8043,16 @@ fn handle_scheduled_tasks_key(key: KeyEvent, ui: &mut UiState) -> Action {
             }
             Action::Continue
         }
+        // Issue #914: pause/resume the selected schedule. The dialog already
+        // RENDERS `disabled`; until this key existed there was no way to reach
+        // that state from the deck, so the one management action with no button
+        // was the one you need when a schedule is misbehaving.
+        KeyCode::Char('t') => {
+            if let Some(task) = ui.scheduled_tasks.get(ui.scheduled_selected) {
+                return Action::ScheduleToggleEnabled(task.name.clone());
+            }
+            Action::Continue
+        }
         _ => Action::Continue,
     }
 }
@@ -8129,6 +8183,54 @@ fn apply_rename_outcome(
             // No-op by design. Re-asserting the prior label would
             // require a redundant clone; the maps already hold it.
         }
+    }
+}
+
+/// Mirror a `session.toml` pane name into the pane-keyed display maps, applying
+/// the SAME gate `PaneController::rename_pane` applies to that same string.
+///
+/// Issue #833 follow-through, found while auditing whether the two seams that
+/// issue names are the whole set. They are not: the four session-restore sites
+/// in `run_tui` each hand `SavedPane.name` to `rename_pane` and then inserted
+/// the RAW value into both maps regardless of what that call resolved.
+/// `rename_pane` routes through [`RenameOutcome::applied`] and answers
+/// `Rejected` — touching neither `Pane.name` nor the daemon record — for a name
+/// carrying control bytes, a bidi override, or more than
+/// [`crate::agent_pty::DISPLAY_NAME_MAX_LEN`] bytes. The raw insert then put
+/// exactly that refused name into `ui.pane_names`, from which the dashboard
+/// loop copies it into `ui.display_names` — the map `render_card_grid`
+/// PREFERS over the session's own `display_name`. So `session.toml` was a
+/// further writer of the winning card title, neither scrubbed nor gated,
+/// beside the hydration and rename writers #833 names. (`render_card_grid`'s
+/// own comment enumerates all of them, and the one residual.)
+///
+/// It is the M2.11 fixup-5 divergence — "the UI inserted the raw rename text
+/// verbatim and diverged from the controller" — surviving here because this
+/// path mirrors nothing. Routing through the same typed constructor
+/// `rename_pane` itself uses makes the maps agree with the controller by
+/// construction rather than by a second normalization that can drift:
+/// `Applied` stores the trimmed label, `Cleared` (a whitespace-only name) and
+/// `Rejected` store nothing and the card falls back to its agent-id default.
+///
+/// `pub` so `dashboard/pane/012` can drive the real mirror at render altitude
+/// rather than re-implementing its three arms in the test — the same reason
+/// this module already exposes its render seams.
+///
+/// Deliberately re-derives the outcome rather than consuming `rename_pane`'s
+/// return value: that call can fail transiently against the daemon (`Err`) on a
+/// name that is perfectly valid, and a restore should still show the user's own
+/// label locally when it does. `RenameOutcome::applied` is a pure function of
+/// the string, so re-deriving it cannot disagree with what the controller
+/// resolved.
+pub fn mirror_saved_pane_name(
+    pane_display_names: &mut HashMap<String, String>,
+    pane_names: &mut HashMap<String, String>,
+    pane_id: &str,
+    saved_name: &str,
+) {
+    if let RenameOutcome::Applied(label) = RenameOutcome::applied(saved_name) {
+        pane_display_names.insert(pane_id.to_string(), label.clone());
+        pane_names.insert(pane_id.to_string(), label);
     }
 }
 
@@ -10977,6 +11079,49 @@ fn dispatch_action(
                 }
             }
         }
+        Action::ScheduleToggleEnabled(name) => {
+            // Issue #914: pause/resume — flip `enabled` through the same
+            // validated writer every other door uses, then tell the running
+            // daemon so the change lands on the NEXT fire rather than on the
+            // next daemon start. Definition-preserving by construction: unlike
+            // delete, nothing is removed, so an open tab and the task's prompt,
+            // cron and working dir all survive.
+            let mut loaded = config::LoadedSchedules::load();
+            let want_enabled = !loaded
+                .tasks
+                .iter()
+                .find(|t| t.name == name)
+                .map(|t| t.enabled)
+                .unwrap_or(true);
+            match crate::schedule_cli::set_enabled(&mut loaded.tasks, &name, want_enabled) {
+                Ok(()) => {
+                    let path = config::schedules_path();
+                    if let Err(e) = crate::schedule_cli::write_atomic(&path, &loaded.tasks) {
+                        ui.status_message =
+                            Some((format!("Toggle failed: {e}"), std::time::Instant::now()));
+                    } else {
+                        let _ = send_daemon_request_blocking(
+                            &crate::daemon_protocol::AttachRequest::ReloadSchedules,
+                        );
+                        let verb = if want_enabled { "Enabled" } else { "Paused" };
+                        ui.status_message = Some((
+                            format!("{verb} schedule '{name}'"),
+                            std::time::Instant::now(),
+                        ));
+                    }
+                }
+                Err(e) => {
+                    ui.status_message =
+                        Some((format!("Toggle failed: {e}"), std::time::Instant::now()));
+                }
+            }
+            // Dialog stays open, like run-now and delete: refresh the rows so the
+            // status cell and next-fire column show the new state immediately.
+            if ui.mode == UiMode::ScheduledTasks {
+                ui.scheduled_tasks = config::LoadedSchedules::load().tasks;
+                ui.scheduled_live_names = live_schedule_names();
+            }
+        }
         Action::Continue => {}
     }
     Flow::Continue
@@ -12402,10 +12547,12 @@ pub fn run_tui(
                                 saved_pane.name
                             ));
                         }
-                        ui.pane_display_names
-                            .insert(new_id.clone(), saved_pane.name.clone());
-                        ui.pane_names
-                            .insert(new_id.clone(), saved_pane.name.clone());
+                        mirror_saved_pane_name(
+                            &mut ui.pane_display_names,
+                            &mut ui.pane_names,
+                            &new_id,
+                            &saved_pane.name,
+                        );
                     }
                     ui.pane_metadata.insert(new_id, saved_pane.clone());
                 }
@@ -12465,10 +12612,12 @@ pub fn run_tui(
                     state.blocking_write().register_pane(new_id.clone());
                     if !saved_pane.name.is_empty() {
                         let _ = pane.rename_pane(&new_id, &saved_pane.name);
-                        ui.pane_display_names
-                            .insert(new_id.clone(), saved_pane.name.clone());
-                        ui.pane_names
-                            .insert(new_id.clone(), saved_pane.name.clone());
+                        mirror_saved_pane_name(
+                            &mut ui.pane_display_names,
+                            &mut ui.pane_names,
+                            &new_id,
+                            &saved_pane.name,
+                        );
                     }
                     ui.pane_metadata.insert(new_id.clone(), saved_pane.clone());
                     // Issue #308: mirror the orchestration-restore insert above
@@ -12599,10 +12748,12 @@ pub fn run_tui(
                                     }
                                     if !saved_pane.name.is_empty() {
                                         let _ = pane.rename_pane(&fb_id, &saved_pane.name);
-                                        ui.pane_display_names
-                                            .insert(fb_id.clone(), saved_pane.name.clone());
-                                        ui.pane_names
-                                            .insert(fb_id.clone(), saved_pane.name.clone());
+                                        mirror_saved_pane_name(
+                                            &mut ui.pane_display_names,
+                                            &mut ui.pane_names,
+                                            &fb_id,
+                                            &saved_pane.name,
+                                        );
                                     }
                                     ui.pane_metadata.insert(fb_id, saved_pane.clone());
                                 }
@@ -12669,9 +12820,12 @@ pub fn run_tui(
                             }
                             if !saved_pane.name.is_empty() {
                                 let _ = pane.rename_pane(&fb_id, &saved_pane.name);
-                                ui.pane_display_names
-                                    .insert(fb_id.clone(), saved_pane.name.clone());
-                                ui.pane_names.insert(fb_id.clone(), saved_pane.name.clone());
+                                mirror_saved_pane_name(
+                                    &mut ui.pane_display_names,
+                                    &mut ui.pane_names,
+                                    &fb_id,
+                                    &saved_pane.name,
+                                );
                             }
                             ui.pane_metadata.insert(fb_id, saved_pane.clone());
                         }
@@ -13151,7 +13305,6 @@ pub fn run_tui(
                 tick,
                 has_pane_control,
                 &*pane,
-                pane_layout,
                 &tab_view,
                 &tab_bar_info,
                 &frame_layout,
@@ -15452,6 +15605,44 @@ fn render_card_grid(
             // this the live card degraded to the truncated pane id while a
             // reconnect (which reads the daemon registry's display_name into
             // `ui.display_names`) titled it correctly.
+            //
+            // Issue #833: this preference is why BOTH sources have to be
+            // defended, and defending the fallback alone was not enough. Each
+            // string that reaches this line is scrubbed or refused by the seam
+            // that WRITES it, never here. Enumerated rather than asserted,
+            // because the first version of this comment claimed the winning map
+            // had two writers and it has four:
+            //   - `ui.display_names` on hydration ← `daemon_client`'s
+            //     `sanitize_record_tab_membership` at the `list_agents` wire
+            //     boundary;
+            //   - `ui.display_names` on rename ← `pane::RenameOutcome::applied`
+            //     / `agent_pty::is_valid_display_name`, which REFUSES a bad
+            //     name so the map keeps the label it had;
+            //   - `ui.pane_names` on a new-pane spawn ←
+            //     `agent_pty::resolve_display_name`, the same gate plus a
+            //     command/`"shell"` fallback; the dashboard loop copies that
+            //     map into this one;
+            //   - `ui.pane_names` on a `session.toml` restore ←
+            //     `mirror_saved_pane_name`, which re-derives the controller's
+            //     own `RenameOutcome` for the saved string;
+            //   - `SessionState.display_name` ← `AppState::apply_event`'s
+            //     `untrusted_text::sanitize_display_name` (issue #670).
+            // ONE residual, deliberately NOT closed: an orchestration role
+            // pane is titled from `role.name` in a project's
+            // `.dot-agent-deck.toml`, inserted raw on both the live and the
+            // restore path (the restore path re-resolves the config file rather
+            // than trusting the snapshot), so the map holds the raw role name
+            // while the daemon record and `Pane.name` hold what
+            // `resolve_display_name` made of it. Left as is because that file
+            // also supplies each role's `command` — reading it is already
+            // consent to EXECUTE what it names, so scrubbing its display
+            // strings would buy nothing a hostile config could not get more
+            // directly. Recorded here because the enumeration above must not
+            // read as though it covered every insert into these maps; it covers
+            // every PRODUCER-supplied string that reaches them.
+            // Scrubbing at this seam instead would have to be repeated by every
+            // future reader of these two fields, which is exactly how #833
+            // happened: a second reader was added beside a sanitized one.
             let display_name = ids
                 .get(col_idx)
                 .and_then(|id| ui.display_names.get(*id))
@@ -15502,7 +15693,6 @@ fn render_frame(
     tick: u64,
     has_pane_control: bool,
     pane_controller: &dyn PaneController,
-    pane_layout: PaneLayout,
     tab_view: &ActiveTabView,
     tab_bar: &TabBarInfo,
     layout: &FrameLayout,
@@ -15622,17 +15812,16 @@ fn render_frame(
     // frame (see the Orchestration arm of `compute_frame_layout`), and reading
     // the value the geometry actually used is what makes "the rects were split
     // one way and the panes drawn another" unrepresentable — there is exactly
-    // one `if zoomed` in the layout, and no second one here. The `pane_layout`
-    // argument is the deck's STORED toggle (`ui.pane_layout`); a Mode tab
-    // carries no pane layout of its own and returns below before this is read.
-    let pane_layout = match &layout.content {
-        FrameContent::Cards { pane_layout, .. } => *pane_layout,
-        FrameContent::Mode { .. } => pane_layout,
-    };
-
+    // one `if zoomed` in the layout, and no second one here. Issue #749: it is
+    // bound in the SAME destructure as the rects it has to agree with, so no
+    // other layout value is in scope for this function to reach for by
+    // accident — the single source is compiler-enforced, not conventional. A
+    // Mode tab carries no pane layout of its own and returns before the binding
+    // exists, which is why this cannot be resolved above the branch.
+    //
     // Branch on the content the layout pass resolved. Mode tabs render and
     // return here; dashboard / orchestration fall through to the card grid.
-    let (dashboard_area, panes_area, pane_ids, pane_rects) = match &layout.content {
+    let (dashboard_area, panes_area, pane_ids, pane_rects, pane_layout) = match &layout.content {
         FrameContent::Mode {
             agent_area,
             side_area,
@@ -15672,8 +15861,14 @@ fn render_frame(
             panes_area,
             pane_ids,
             pane_rects,
-            ..
-        } => (*dashboard_area, *panes_area, pane_ids, pane_rects),
+            pane_layout,
+        } => (
+            *dashboard_area,
+            *panes_area,
+            pane_ids,
+            pane_rects,
+            *pane_layout,
+        ),
     };
 
     // PRD #84: the OUTER rect each pane in the right column was sized to this
@@ -18723,7 +18918,7 @@ fn render_scheduled_tasks(frame: &mut Frame, ui: &UiState) -> ScheduledTasksClic
     // the inner width, so they don't drive it — the list columns, the header,
     // the confirmation, the action-button row, the title, and the empty-state
     // message do. (`[Add a] [Edit e] [Delete d] [Run now r]`, indented one cell.)
-    const BUTTON_ROW_W: usize = 1 + 7 + 1 + 8 + 1 + 10 + 1 + 11;
+    const BUTTON_ROW_W: usize = 1 + 7 + 1 + 8 + 1 + 10 + 1 + 11 + 1 + 10;
     let list_w = 2 + name_col + status_col + next_col;
     // R-Sug1: the header line appends a scroll indicator (e.g. `  (↑12 ↓34)`)
     // when rows are hidden. Reserve its worst-case width in the header budget so
@@ -18891,6 +19086,15 @@ fn render_scheduled_tasks(frame: &mut Frame, ui: &UiState) -> ScheduledTasksClic
         .get(ui.scheduled_selected)
         .map(|t| Action::ScheduleRunNow(t.name.clone()))
         .unwrap_or(Action::Continue);
+    // Issue #914: pause/resume the selected row. A FIXED label rather than a
+    // `Pause`/`Resume` that tracks the row's state — `BUTTON_ROW_W` above is a
+    // compile-time budget with a `debug_assert_eq!` drift guard, and a label
+    // whose width varies with the selection would defeat it.
+    let toggle_action = ui
+        .scheduled_tasks
+        .get(ui.scheduled_selected)
+        .map(|t| Action::ScheduleToggleEnabled(t.name.clone()))
+        .unwrap_or(Action::Continue);
     // PRD #127: each button advertises its shortcut key alongside the label —
     // `[Add a]` / `[Edit e]` / `[Delete d]` / `[Run now r]` — mirroring the
     // `[Scheduled Tasks s]` button-bar button so a keyboard user can tell which
@@ -18902,6 +19106,7 @@ fn render_scheduled_tasks(frame: &mut Frame, ui: &UiState) -> ScheduledTasksClic
         Button::new("Edit", "e", Action::ScheduleEdit, has_rows),
         Button::new("Delete", "d", Action::ScheduleArmDelete, has_rows),
         Button::new("Run now", "r", run_now_action, has_rows),
+        Button::new("Toggle", "t", toggle_action, has_rows),
     ];
     // R-Nit1: `BUTTON_ROW_W` (used above to budget the modal width before the
     // buttons exist) must equal the actual rendered button-row width — indent
@@ -19476,6 +19681,32 @@ fn pane_has_nothing_to_scroll(embedded: &EmbeddedPaneController, pane_id: &str) 
         return false;
     };
     if facts.scrollback_depth > 0 {
+        return false;
+    }
+    // Issue #891 — a THIRD term, and the same reasoning as the other two: say
+    // nothing unless the evidence is about the agent.
+    //
+    // `vt100` builds its alternate grid with a scrollback capacity of zero and
+    // routes every scrollback read and write to whichever grid the mode selects,
+    // so `scrollback_depth` above is structurally `0` for the whole time a pane
+    // sits on the alternate screen — for claude opening a picker exactly as much
+    // as for an agent that genuinely retains nothing. Meanwhile
+    // `bytes_since_spawn` counts straight across the switch, so the conjunction
+    // that is meant to describe a terminal-managed agent is satisfied by any
+    // mature pane that merely entered alternate mode, and the notice tells the
+    // user their history is gone while the normal grid still holds every line of
+    // it (measured: 258 retained lines, reported as none).
+    //
+    // This is the defect PRD #611's review finding 3 already fixed once, by a
+    // different route: "Left counting, the very next scroll would explain Agent
+    // Deck's own history loss as a property of the agent"
+    // (`src/embedded_pane.rs`, the `parser_reset` arm). Unreachable is not empty,
+    // so the deck stays quiet rather than claiming the stronger thing.
+    //
+    // Deliberately NOT an agent check — PRD #611's "detect the condition, not the
+    // agent name" holds unchanged. This reads a terminal mode, which is a fact
+    // about the pane's current state that any agent can enter and leave.
+    if facts.alternate_screen {
         return false;
     }
     let screenful = u64::from(facts.rows) * u64::from(facts.cols);
@@ -20726,17 +20957,7 @@ pub fn render_orchestration_frame_to_buffer(
     terminal
         .draw(|frame| {
             render_frame(
-                frame,
-                &state,
-                &mut ui,
-                &filtered,
-                0,
-                true,
-                &ctrl,
-                PaneLayout::Stacked,
-                &tab_view,
-                &tab_bar,
-                &layout,
+                frame, &state, &mut ui, &filtered, 0, true, &ctrl, &tab_view, &tab_bar, &layout,
             );
         })
         .expect("TestBackend draw should succeed");
@@ -21152,6 +21373,41 @@ pub fn synthetic_decstbm_repaint_stream(rows: u16, cols: u16) -> Vec<u8> {
     }
     bytes
 }
+
+/// Issue #891 — the opposite fixture to [`synthetic_decstbm_repaint_stream`]:
+/// ordinary newline-terminated output, enough of it to clear
+/// [`SCROLL_NOTICE_MIN_SCREENFULS`], so the parser retains a real nonzero
+/// scrollback depth *and* the mature-pane half of the trigger is satisfied.
+///
+/// Both halves matter. A fixture that only scrolls proves nothing about the
+/// notice (it never had the bytes to arm), and a fixture that only feeds bytes
+/// is the repaint stream above. This one is the case the notice must never fire
+/// on: an app-managed agent that genuinely handed the terminal its history.
+#[doc(hidden)]
+pub fn synthetic_scrollable_history_stream(rows: u16, cols: u16) -> Vec<u8> {
+    assert!(rows >= 2 && cols >= 2, "the history fixture needs a region");
+    let target_bytes = SCROLL_NOTICE_MIN_SCREENFULS * u64::from(rows) * u64::from(cols);
+    let mut bytes = Vec::with_capacity(target_bytes as usize + usize::from(rows));
+    let mut line = 0_u64;
+    while (bytes.len() as u64) <= target_bytes {
+        bytes.extend_from_slice(format!("history line {line}\r\n").as_bytes());
+        line += 1;
+    }
+    bytes
+}
+
+/// Issue #891 — enter the alternate screen (`ESC [ ? 1049 h`), the mode switch
+/// `vt100` answers from a grid built with **zero** scrollback capacity.
+///
+/// Kept as a named constant rather than typed into each test, because the whole
+/// defect is that the deck never looked at this mode: a literal buried in a test
+/// is not something `grep alternate` finds.
+#[doc(hidden)]
+pub const ENTER_ALTERNATE_SCREEN: &[u8] = b"\x1b[?1049h";
+
+/// Issue #891 — leave the alternate screen again.
+#[doc(hidden)]
+pub const LEAVE_ALTERNATE_SCREEN: &[u8] = b"\x1b[?1049l";
 
 /// Render the seam pane through [`render_terminal_panes`], with the frame clock
 /// injectable for exact transient-notice edges.
@@ -22340,6 +22596,7 @@ pub fn render_new_pane_form_schedule_to_buffer(
         prompt: "digest prompt".to_string(),
         new_tab_per_fire: false,
         enabled: true,
+        shape: None,
         issue_dispatch: None,
     });
     let form = NewPaneFormState::new_schedule_locked(
@@ -22885,16 +23142,7 @@ mod tests {
                     .map(|(_, r)| *r);
 
                 render_frame(
-                    frame,
-                    &state,
-                    &mut ui,
-                    &filtered,
-                    0,
-                    false,
-                    &noop,
-                    PaneLayout::Stacked,
-                    &tab_view,
-                    &tab_bar,
+                    frame, &state, &mut ui, &filtered, 0, false, &noop, &tab_view, &tab_bar,
                     &layout,
                 );
             })
@@ -26153,16 +26401,7 @@ mod tests {
                     1,
                 );
                 render_frame(
-                    frame,
-                    &state,
-                    &mut ui,
-                    &filtered,
-                    0,
-                    false,
-                    &noop,
-                    PaneLayout::Stacked,
-                    &tab_view,
-                    &tab_bar,
+                    frame, &state, &mut ui, &filtered, 0, false, &noop, &tab_view, &tab_bar,
                     &layout,
                 )
             })
@@ -26244,16 +26483,7 @@ mod tests {
                     1,
                 );
                 render_frame(
-                    frame,
-                    &state,
-                    &mut ui,
-                    &filtered,
-                    0,
-                    false,
-                    &noop,
-                    PaneLayout::Stacked,
-                    &tab_view,
-                    &tab_bar,
+                    frame, &state, &mut ui, &filtered, 0, false, &noop, &tab_view, &tab_bar,
                     &layout,
                 )
             })
@@ -26386,16 +26616,7 @@ mod tests {
                     1,
                 );
                 render_frame(
-                    frame,
-                    &state,
-                    &mut ui,
-                    &filtered,
-                    0,
-                    false,
-                    &noop,
-                    PaneLayout::Stacked,
-                    &tab_view,
-                    &tab_bar,
+                    frame, &state, &mut ui, &filtered, 0, false, &noop, &tab_view, &tab_bar,
                     &layout,
                 )
             })
@@ -26748,16 +26969,7 @@ mod tests {
                     1,
                 );
                 render_frame(
-                    frame,
-                    &state,
-                    &mut ui,
-                    &filtered,
-                    0,
-                    false,
-                    &noop,
-                    PaneLayout::Stacked,
-                    &tab_view,
-                    &tab_bar,
+                    frame, &state, &mut ui, &filtered, 0, false, &noop, &tab_view, &tab_bar,
                     &layout,
                 )
             })
@@ -26842,16 +27054,7 @@ mod tests {
                     1,
                 );
                 render_frame(
-                    frame,
-                    &state,
-                    &mut ui,
-                    &filtered,
-                    0,
-                    false,
-                    &noop,
-                    PaneLayout::Stacked,
-                    &tab_view,
-                    &tab_bar,
+                    frame, &state, &mut ui, &filtered, 0, false, &noop, &tab_view, &tab_bar,
                     &layout,
                 )
             })
@@ -26911,16 +27114,7 @@ mod tests {
                     1,
                 );
                 render_frame(
-                    frame,
-                    &state,
-                    &mut ui,
-                    &filtered,
-                    0,
-                    false,
-                    &noop,
-                    PaneLayout::Stacked,
-                    &tab_view,
-                    &tab_bar,
+                    frame, &state, &mut ui, &filtered, 0, false, &noop, &tab_view, &tab_bar,
                     &layout,
                 )
             })
@@ -27647,6 +27841,74 @@ mod tests {
         assert!(
             !ui.display_names.contains_key("session-123"),
             "handler must not insert raw rename_text into display_names"
+        );
+    }
+
+    #[test]
+    fn mirror_saved_pane_name_gates_a_session_file_name() {
+        // Issue #833 follow-through. `session.toml` is a THIRD writer of the
+        // card title `render_card_grid` prefers: the restore sites hand
+        // `SavedPane.name` to `rename_pane` — which answers `Rejected` and
+        // stores nothing for a hostile name — and then used to insert the RAW
+        // value into `ui.pane_names` anyway, from which the dashboard loop
+        // copies it into `ui.display_names`. Same field, same map, same render
+        // seam as the two writers #833 names, and gated by neither.
+        let mut pane_display_names: HashMap<String, String> = HashMap::new();
+        let mut pane_names: HashMap<String, String> = HashMap::new();
+
+        // An ordinary name is stored, TRIMMED — matching what the controller
+        // put on `Pane.name` and queued for the daemon, rather than the padded
+        // bytes the file happened to hold.
+        mirror_saved_pane_name(
+            &mut pane_display_names,
+            &mut pane_names,
+            "1",
+            "  café-агент-日本語  ",
+        );
+        assert_eq!(
+            pane_display_names.get("1").map(String::as_str),
+            Some("café-агент-日本語")
+        );
+        assert_eq!(
+            pane_names.get("1").map(String::as_str),
+            Some("café-агент-日本語")
+        );
+
+        // Control bytes, and the bidi override the gate's byte-level test
+        // cannot see — swept, because one surviving override is all a spoof
+        // needs. Neither map may gain an entry, so the card falls back to its
+        // agent-id default exactly as it does for a refused live rename.
+        let mut hostile: Vec<String> = vec![
+            "\u{1b}[31mevil".to_string(),
+            "pane\u{0}name".to_string(),
+            "pane\u{7f}name".to_string(),
+            "   ".to_string(),
+            "a".repeat(crate::agent_pty::DISPLAY_NAME_MAX_LEN + 1),
+        ];
+        hostile.extend(
+            [
+                '\u{202a}', '\u{202b}', '\u{202c}', '\u{202d}', '\u{202e}', '\u{2066}', '\u{2067}',
+                '\u{2068}', '\u{2069}', '\u{200e}', '\u{200f}', '\u{061c}',
+            ]
+            .into_iter()
+            .map(|c| format!("worker{c}reganam")),
+        );
+        for (i, name) in hostile.iter().enumerate() {
+            let pane_id = format!("h{i}");
+            mirror_saved_pane_name(&mut pane_display_names, &mut pane_names, &pane_id, name);
+            assert!(
+                !pane_display_names.contains_key(&pane_id) && !pane_names.contains_key(&pane_id),
+                "a name `rename_pane` refuses must not reach the display maps \
+                 from `session.toml` either: {name:?}"
+            );
+        }
+
+        // And the valid entry above survived the sweep — the control that keeps
+        // this test from passing on a mirror that stores nothing at all.
+        assert_eq!(
+            pane_display_names.len(),
+            1,
+            "only the one valid name may be stored: {pane_display_names:?}"
         );
     }
 
@@ -31744,6 +32006,7 @@ mod tests {
             prompt: format!("{name}-prompt-marker"),
             new_tab_per_fire: false,
             enabled,
+            shape: None,
             issue_dispatch: None,
         }
     }
@@ -35379,14 +35642,14 @@ mod tests {
         );
 
         let repeated = "bounded repetition";
-        assert!(prompt_submission_matches(
+        assert!(crate::prompt_delivery::prompt_submission_matches(
             repeated,
             &std::iter::repeat_n(repeated, 16)
                 .collect::<Vec<_>>()
                 .join("\n")
         ));
         assert!(
-            !prompt_submission_matches(
+            !crate::prompt_delivery::prompt_submission_matches(
                 repeated,
                 &std::iter::repeat_n(repeated, 17)
                     .collect::<Vec<_>>()
@@ -35394,7 +35657,7 @@ mod tests {
             ),
             "the recovery shape is deliberately bounded to 16 copies"
         );
-        assert!(!prompt_submission_matches(
+        assert!(!crate::prompt_delivery::prompt_submission_matches(
             repeated,
             &format!("{repeated}\nsomething else")
         ));

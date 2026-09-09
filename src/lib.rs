@@ -30,6 +30,7 @@ pub mod init;
 pub mod issue_dispatch;
 pub mod issue_dispatch_run;
 pub mod keybindings;
+pub mod lifetime_tag;
 pub mod logging;
 pub mod login_shell;
 pub mod mode_manager;
