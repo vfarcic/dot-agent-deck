@@ -315,3 +315,97 @@ fn orchestration_010_active_no_status_tint_and_idle_no_grey() {
         "an inactive orchestration tab must carry neither REVERSED nor BOLD, got {inactive_modifier:?}"
     );
 }
+
+/// The rendered single-row tab strip as a plain string.
+fn rendered_row(buffer: &ratatui::buffer::Buffer) -> String {
+    let area = buffer.area();
+    (0..area.width)
+        .map(|x| buffer[(x, 0)].symbol().to_string())
+        .collect()
+}
+
+/// Scenario: Render the tab strip for a dispatched orchestration whose label
+/// carries its per-run identity (`dispatch-team · issue-960`) — first wide
+/// enough to fit, then narrow enough that the strip's trailing-ellipsis
+/// truncation bites. Asserts the full run label paints when it fits, and that
+/// when it does not the CANONICAL orchestration name still reads while the run
+/// suffix is what gets elided — with the inverse label ordering as the control
+/// that loses the canonical name instead.
+#[spec("tabs/orchestration/013")]
+#[test]
+fn orchestration_013_dispatched_run_label_reads_name_first_under_truncation() {
+    // The label a reattached dispatched orchestration comes back under
+    // (issue #960) — `{name} · {cwd basename}`, produced once by
+    // `spawn.rs`'s `dispatched_orchestration_display_title` and carried on
+    // every role pane's `TabMembership`.
+    const RUN_LABEL: &str = "dispatch-team · issue-960";
+    const NAME: &str = "dispatch-team";
+
+    // Wide: nothing is truncated, so the whole run identity is on screen and
+    // the user can tell this tab from a sibling dispatch of the same
+    // orchestration.
+    let wide = render_tab_bar_to_buffer(
+        &["Dashboard", RUN_LABEL],
+        &[false, true],
+        0,
+        80,
+        &[None, None],
+    );
+    assert!(
+        rendered_row(&wide).contains(RUN_LABEL),
+        "a dispatched tab's full run label must paint when it fits; row = {:?}",
+        rendered_row(&wide)
+    );
+
+    // Narrow: `fit_tab_labels` gives each of the two tabs an equal per-tab cap
+    // and `truncate_to_cap` keeps the HEAD, appending `…`. At width 33 the
+    // overhead is 5 (two pads plus one divider), so the cap is 14 — one more
+    // than `dispatch-team`, which is exactly the case worth pinning: the
+    // canonical name survives whole and the run suffix is what goes.
+    //
+    // This is the claim `dispatched_orchestration_display_title`'s doc comment
+    // makes — "`name` stays the PREFIX so the canonical label reads first and
+    // survives the tab strip's trailing-ellipsis truncation" — asserted rather
+    // than asserted-in-prose, since it is the whole reason for the field order.
+    let narrow = render_tab_bar_to_buffer(
+        &["Dashboard", RUN_LABEL],
+        &[false, true],
+        0,
+        33,
+        &[None, None],
+    );
+    let narrow_row = rendered_row(&narrow);
+    assert!(
+        narrow_row.contains(NAME),
+        "under truncation the canonical orchestration name must still read; row = {narrow_row:?}"
+    );
+    assert!(
+        narrow_row.contains('…'),
+        "precondition: width 33 must actually truncate, or this proves nothing; \
+         row = {narrow_row:?}"
+    );
+    assert!(
+        !narrow_row.contains("issue-960"),
+        "precondition: the run suffix is what should be elided at this width, so a row that \
+         still holds it means the truncation never bit; row = {narrow_row:?}"
+    );
+
+    // The CONTROL that makes the ordering load-bearing rather than arbitrary:
+    // the same two components in the opposite order lose the canonical name
+    // entirely at the identical width. Without this, "the name reads first"
+    // could be satisfied by any label that happens to be short enough.
+    let inverted = render_tab_bar_to_buffer(
+        &["Dashboard", "issue-960 · dispatch-team"],
+        &[false, true],
+        0,
+        33,
+        &[None, None],
+    );
+    let inverted_row = rendered_row(&inverted);
+    assert!(
+        !inverted_row.contains(NAME),
+        "suffix-first ordering must LOSE the canonical name under the same truncation — if it \
+         survives here, this width is not tight enough for the comparison to mean anything; \
+         row = {inverted_row:?}"
+    );
+}
