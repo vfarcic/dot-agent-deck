@@ -148,7 +148,12 @@ for (const state of STATES) {
   });
 }
 
-test("the daemon lamp paints a different colour for each connection state", async ({ page }) => {
+/*
+  Not "a different colour for each state" — `empty` and `connected` share one
+  deliberately, and the pair below says why. What the lamp separates is fault
+  from health, and the two faults from each other.
+*/
+test("the daemon lamp's colour separates fault from health", async ({ page }) => {
   const painted = new Map<string, string>();
   for (const state of STATES) {
     await openState(page, state.scenario);

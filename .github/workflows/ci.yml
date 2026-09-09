@@ -197,8 +197,12 @@ jobs:
   # no geometry, so those tests can assert what React renders into a tree and
   # nothing about what a reader sees. This job drives the SAME production bundle
   # `pnpm build` produces, served by `vite preview`, in engines that lay out and
-  # paint. Every assertion in `desktop/e2e` reads geometry, scroll extent or a
-  # composited colour — the things jsdom structurally cannot answer.
+  # paint. Every FILE in `desktop/e2e` makes at least one assertion jsdom
+  # structurally cannot — geometry, scroll extent, a composited colour, a real
+  # pointer press or storage surviving a real reload — alongside ordinary
+  # DOM-shape checks that live here because the screen they are about is only
+  # reachable in a browser. `docs/develop/desktop-gui.md` says which parts of
+  # each file are which.
   #
   # Two engines, and the second is the point. Until this existed, every
   # automated check of this app ran in Chromium or in jsdom, while the app SHIPS

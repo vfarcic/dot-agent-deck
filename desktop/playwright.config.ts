@@ -24,9 +24,9 @@ import { defineConfig, devices } from "@playwright/test";
  * **No retries, on purpose.** A retry turns a flake into a green tick and
  * deletes the evidence, which is the failure mode issue #807 documents for the
  * Rust e2e tier on a 4-vCPU runner. The specs wait on state — a locator being
- * visible, a count reaching nine — and never on a timer, so a failure here is
- * meant to be a fact rather than a coin toss. `.config/nextest.toml` takes the
- * same position for the Rust tiers.
+ * visible, the legend printing a chosen column set, a count reaching fifteen —
+ * and never on a timer, so a failure here is meant to be a fact rather than a
+ * coin toss. `.config/nextest.toml` takes the same position for the Rust tiers.
  */
 export default defineConfig({
   testDir: "./e2e",
