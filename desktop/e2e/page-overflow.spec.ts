@@ -34,6 +34,27 @@ async function pageMetrics(page: Page) {
   }));
 }
 
+/**
+ * The page-overflow contract, asserted identically by both tests below.
+ *
+ * It is a shared function rather than a copied block because the two tests
+ * disagreed: the overview one checked `body`, `documentElement` and the
+ * viewport, and the deck one checked `body` alone (found by Greptile on PR
+ * #958). `body` carries `overflow-x: hidden`, so it can be within its own
+ * client width while the ROOT scrolls — which is the case a reader would see as
+ * a page that slides sideways. Both halves are needed, and now neither test can
+ * be more rigorous than the other by accident.
+ */
+function expectNoPageOverflow(metrics: Awaited<ReturnType<typeof pageMetrics>>) {
+  expect(metrics.bodyScroll, "content extends past the body, clipped by overflow-x: hidden").toBeLessThanOrEqual(
+    metrics.bodyClient,
+  );
+  expect(metrics.rootScroll, "the root scrolls sideways, so the whole page slides").toBeLessThanOrEqual(
+    metrics.rootClient,
+  );
+  expect(metrics.rootClient, "the root is wider than the viewport").toBeLessThanOrEqual(metrics.viewport);
+}
+
 for (const viewport of VIEWPORTS) {
   test.describe(`at ${viewport.name}`, () => {
     test.use({ viewport: { width: viewport.width, height: viewport.height } });
@@ -42,12 +63,7 @@ for (const viewport of VIEWPORTS) {
       await openOverview(page, "crowded");
       await showAllColumns(page);
 
-      const metrics = await pageMetrics(page);
-      expect(metrics.bodyScroll, "content extends past the body, clipped by overflow-x: hidden").toBeLessThanOrEqual(
-        metrics.bodyClient,
-      );
-      expect(metrics.rootScroll).toBeLessThanOrEqual(metrics.rootClient);
-      expect(metrics.rootClient).toBeLessThanOrEqual(metrics.viewport);
+      expectNoPageOverflow(await pageMetrics(page));
 
       // The counterpart, so this is not passing because the screen collapsed to
       // nothing. At the narrow viewport the table region really is overflowing,
@@ -67,8 +83,7 @@ for (const viewport of VIEWPORTS) {
       // State, not a timer: the rail is rendered once the shell has mounted.
       await expect(page.getByTestId("open-overview")).toBeVisible();
 
-      const metrics = await pageMetrics(page);
-      expect(metrics.bodyScroll).toBeLessThanOrEqual(metrics.bodyClient);
+      expectNoPageOverflow(await pageMetrics(page));
     });
   });
 }

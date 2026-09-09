@@ -7,8 +7,18 @@ import { expect, test, type Page } from "@playwright/test";
  * `chrome-headless-shell` over CDP, and `docs/develop/desktop-gui.md` records
  * what that could not reach: `color-scheme: light dark` on `<meta>` and
  * `theme-color` with a `media` attribute, "the concrete things Chromium cannot
- * answer for WebKitGTK/WKWebView" (issue #823). Under the `webkit` project this
- * file runs those two questions through a WebKit engine.
+ * answer for WebKitGTK/WKWebView" (issue #823).
+ *
+ * Under the `webkit` project this file puts the FIRST of those two questions to
+ * a WebKit engine, and only that one. The `color-scheme` test below measures an
+ * engine-side effect: the document's used colour scheme, read through the
+ * `Canvas` system colour against forced-scheme controls. The `theme-color` test
+ * cannot, because which `theme-color` an engine resolved is not observable from
+ * inside the page in either engine (measured -- the comment on that test has
+ * the sweep). Whether an engine honours `media` on `theme-color` therefore
+ * remains answered by NOTHING automated, and `docs/develop/desktop-gui.md` says
+ * plainly that no step of the manual walk names it either -- closing it needs
+ * the real-window rung, issue #953.
  *
  * It is deliberately NOT a re-implementation of the palette comparison. The 399
  * declarations are still checked where they were, and the two static guards in
@@ -104,26 +114,82 @@ test.describe("appearance in a real engine", () => {
     expect(luminance(dark)).toBeLessThan(0.1);
   });
 
-  test("the dark theme-color still matches the dark canvas it was copied from", async ({ page }) => {
+  /*
+    Narrowed in PR #958 after a Greptile finding, and the narrowing is the point
+    of the long title: this test does NOT assert that the engine applies `media`
+    to `theme-color`, because that is not observable from inside the page.
+
+    `theme-color` tints browser UI chrome, and nothing reports back which meta
+    the engine resolved. Swept in both engines of this tier, at the same
+    `?fixture=1` page and under an emulated dark preference: no property whose
+    name matches /theme/i exists anywhere on the prototype chains of `window`,
+    `document`, `navigator` or `screen`; `theme-color` is not a CSS property, so
+    `CSS.supports("theme-color", "#101514")` is `false` and
+    `getComputedStyle(document.documentElement).getPropertyValue("theme-color")`
+    is the empty string; and `HTMLMetaElement.prototype` carries nothing that
+    reports resolution. Chromium's CDP does have a `themeColor`, but it is the
+    web app MANIFEST's `theme_color`, and CDP is Chromium-only in any case — so
+    it cannot answer the WebKit question this tier exists for. A previous
+    version of this test re-derived the pick with `window.matchMedia(meta.media)`
+    and read that as the engine's own selection, which an engine that honours
+    `matchMedia` while ignoring `media` on `theme-color` would have passed.
+
+    What IS observable, and all this asserts:
+      1. `index.html` carries exactly one `theme-color` per appearance, each
+         carrying a `media` attribute. A bare one applies to both appearances
+         and silently defeats the pair, so the shape is the assertion.
+      2. The engine's own `matchMedia` resolves those two `media` strings the way
+         the app assumes, in BOTH directions — so a pair that could never
+         separate fails here.
+      3. The dark meta's content is still the colour the engine composites for
+         `--canvas` in dark. `index.html` says in a comment that the dark
+         `theme-color` IS `--canvas`'s dark value from `styles.css`; nothing
+         checked it, so the two could drift the next time either is touched.
+         This part is a real engine-side measurement — `canvasBackground` reads a
+         painted, composited colour — it just says nothing about `theme-color`.
+  */
+  test("theme-color is one media-scoped meta per appearance, and the dark one still matches the dark canvas — whether the engine applies that media is not observable from the page and is not asserted", async ({
+    page,
+  }) => {
     await page.goto("/?fixture=1");
     await expect(page.getByTestId("open-overview")).toBeVisible();
+
+    const metas = await page.evaluate(() =>
+      Array.from(document.querySelectorAll<HTMLMetaElement>('meta[name="theme-color"]')).map((meta) => ({
+        content: meta.content,
+        media: meta.getAttribute("media"),
+      })),
+    );
+    expect(metas, "index.html no longer carries exactly one media-scoped theme-color per appearance").toEqual([
+      { content: "#f3f0e9", media: "(prefers-color-scheme: light)" },
+      { content: "#101514", media: "(prefers-color-scheme: dark)" },
+    ]);
+
+    for (const scheme of ["light", "dark"] as const) {
+      await page.emulateMedia({ colorScheme: scheme });
+      await expect
+        .poll(() => page.evaluate(() => window.matchMedia("(prefers-color-scheme: dark)").matches))
+        .toBe(scheme === "dark");
+
+      // A bare meta would land in both iterations via the `all` fallback, and a
+      // pair that both match or neither match fails the single-element compare.
+      const matched = await page.evaluate(() =>
+        Array.from(document.querySelectorAll<HTMLMetaElement>('meta[name="theme-color"]'))
+          .filter((meta) => window.matchMedia(meta.getAttribute("media") ?? "all").matches)
+          .map((meta) => meta.content),
+      );
+      expect(
+        matched,
+        `the engine's matchMedia did not single out one theme-color under a ${scheme} preference`,
+      ).toEqual([scheme === "dark" ? "#101514" : "#f3f0e9"]);
+    }
+
+    // Left in dark by the loop, but pinned again so the drift guard below does
+    // not depend on the loop's iteration order.
     await page.emulateMedia({ colorScheme: "dark" });
     await expect
       .poll(() => page.evaluate(() => window.matchMedia("(prefers-color-scheme: dark)").matches))
       .toBe(true);
-
-    // `index.html` carries one `theme-color` per appearance and says in a
-    // comment that the dark one IS `--canvas`'s dark value. Nothing checked
-    // that, so the two could drift the next time either is touched. The engine
-    // picks the meta by evaluating its own `media` attribute — the `media`
-    // support #823 names as the part that varies between engines — and the
-    // canvas colour is the composited value the engine actually painted.
-    const chosen = await page.evaluate(() =>
-      Array.from(document.querySelectorAll<HTMLMetaElement>('meta[name="theme-color"]'))
-        .filter((meta) => !meta.media || window.matchMedia(meta.media).matches)
-        .map((meta) => meta.content),
-    );
-    expect(chosen, "no theme-color matched the dark appearance").toEqual(["#101514"]);
 
     const painted = await canvasBackground(page);
     const parts = (painted.match(/[\d.]+/g) ?? []).map(Number);
