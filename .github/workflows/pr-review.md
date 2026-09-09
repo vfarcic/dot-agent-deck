@@ -21,14 +21,21 @@ on:
 # ENGINE — the only two lines to change when switching models. After editing,
 # run `gh aw compile` and commit the regenerated pr-review.lock.yml.
 engine: claude
-model: claude-opus-5
+model: claude-sonnet-5
 
 network:
   allowed: [defaults]
 
 timeout-minutes: 20
-max-ai-credits: 30
-max-daily-ai-credits: 300
+
+# RUNAWAY GUARDS, not a budget. A cap set below the cost of the work is worse
+# than no cap: the first attempt spent $0.32 against a $0.30 ceiling and
+# produced nothing, so we paid for two aborted reviews and got zero verdicts.
+# These sit well above a normal review so they only fire on a genuine runaway
+# (an injection-induced loop, a pathological diff). Spend is bounded instead by
+# max_prs, by SHA-idempotence, and by the org-level limit at Anthropic.
+max-ai-credits: 150
+max-daily-ai-credits: 2000
 
 concurrency:
   group: pr-review-${{ github.repository }}
@@ -43,7 +50,16 @@ permissions:
 # checks the pull request out into a worktree and runs the gates — correct for a
 # human-driven local review, and unsafe here, because this job has credentials and
 # the pull request is untrusted input. The rubric is deliberately read-only.
+# Minimal tool surface. The default grant included Write, Edit, NotebookEdit,
+# WebFetch, Task and Workflow — none of which a read-only reviewer should hold,
+# and all of which are paid for on every run as tool-schema tokens (the measured
+# 37k cache-write was the engine's system prompt plus its full tool catalogue,
+# NOT CLAUDE.md, which does not appear in the agent context at all).
 tools:
+  edit: false
+  bash:
+    - "gh pr view:*"
+    - "gh pr diff:*"
   github:
     mode: gh-proxy
     toolsets: [pull_requests]
