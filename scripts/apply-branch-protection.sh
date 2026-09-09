@@ -108,13 +108,23 @@ RENOVATE_APP_ID="${RENOVATE_APP_ID:-2740}"
 # value falls back to the default, which would make that escape hatch a dead
 # end. Unset still means "the five defaults".
 #
-# `e2e-deterministic` joined the required set deliberately, replacing the
-# advisory arrangement this script's comments used to describe. It earned it by
-# catching a real defect rather than a flake: `inline_001_rename_save_commits`
-# asserted a rename that never happened and passed only by racing a stale
-# frame, which no other gate could see. The cost is the one this file already
-# warns about two paragraphs up — it is a fifth name a fork's CI must produce,
-# and the ALLOW_NO_REQUIRED_CHECKS escape hatch covers that case unchanged.
+# `e2e-deterministic` joined the original four on 2026-09-05 (issue #908), and
+# there are two independent reasons on the record for it. First, a lane nothing
+# requires is a lane that stays red: it was red on 16 of 21 open pull requests
+# when that was measured. Second, it earned it by catching a real defect rather
+# than a flake — `inline_001_rename_save_commits` asserted a rename that never
+# happened and passed only by racing a stale frame, which no other gate could
+# see.
+#
+# EDITING THIS DEFAULT DOES NOT CHANGE THE LIVE REPOSITORY — the ruleset only
+# moves when someone runs `apply`, which sends a full `PUT` (warning 3 above).
+# Do not run `apply` until the open pull requests have rebased past the flake
+# fixes, or every one of them becomes unmergeable at once; then run `status` and
+# read the contexts back.
+#
+# The cost is the one this file already warns about two paragraphs up: it is a
+# fifth name a fork's CI must produce, and the ALLOW_NO_REQUIRED_CHECKS escape
+# hatch covers that case unchanged.
 REQUIRED_CHECKS="${REQUIRED_CHECKS-build build-macos build-windows security e2e-deterministic}"
 
 # Acknowledge that an empty REQUIRED_CHECKS is intended. Without this set to

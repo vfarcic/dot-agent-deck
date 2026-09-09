@@ -231,24 +231,40 @@ fn work_done_004_unsolicited_completion_is_visibly_labelled_in_the_attached_tui(
 
     // Then: does it reach the user's screen? A long daemon-injected line has to
     // survive the orchestration surface's wrapping to be worth anything.
+    //
+    // EVERY POSITIVE NEEDLE BELOW WAITS. The daemon composes one message and the
+    // TUI renders whatever of it has arrived, so a grid sampled the instant the
+    // FIRST needle appears can legitimately be mid-message — the label drawn and
+    // the framed report not yet. Issue #818's sibling symptom: on a contended
+    // runner this test failed at the report-frame assertion having PASSED the two
+    // above it, which is that partial render and not a missing report. These were
+    // instantaneous `pane_contains` checks; each is now a bounded wait, which
+    // asserts exactly the same thing (the needle must become visible) without
+    // pinning WHEN inside the message's own render. The budget is `load_scaled`
+    // for the reason issue #709 gives: a fast box still fails fast.
+    let visible_timeout = common::load_scaled(Duration::from_secs(20));
     assert!(
-        wait_for_pane_string(&deck, UNSOLICITED_NEEDLE, Duration::from_secs(20)),
+        wait_for_pane_string(&deck, UNSOLICITED_NEEDLE, visible_timeout),
         "the unsolicited label reached the orchestrator's PTY but never became visible in the \
          rendered orchestration surface\nFinal grid:\n{}",
         deck.snapshot_grid()
     );
     assert!(
-        pane_contains(&deck, DAEMON_CLAUSE),
+        wait_for_pane_string(&deck, DAEMON_CLAUSE, visible_timeout),
         "the label must identify itself as a daemon report, not as a message from a person or an \
          agent\nFinal grid:\n{}",
         deck.snapshot_grid()
     );
     assert!(
-        pane_contains(&deck, REPORT_FRAME_NEEDLE) && pane_contains(&deck, SENTINEL),
+        wait_for_pane_string(&deck, REPORT_FRAME_NEEDLE, visible_timeout)
+            && wait_for_pane_string(&deck, SENTINEL, visible_timeout),
         "the worker's own report must still reach the orchestrator, framed as untrusted \
          data\nFinal grid:\n{}",
         deck.snapshot_grid()
     );
+    // Deliberately NOT a wait: this is a negative window, and every needle above
+    // has already settled, so the whole message is on the grid by now. Widening a
+    // "must NOT appear" check would only make it slower and weaker.
     assert!(
         !pane_contains(&deck, POINTER_NEEDLE),
         "the orchestrator was pointed at a summary file that was never written — the #433 \
