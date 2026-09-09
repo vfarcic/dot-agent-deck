@@ -16,18 +16,104 @@
 //! It runs **three** real `cargo build`s, all into the same scratch
 //! `CARGO_TARGET_DIR` under `target/`:
 //!
-//! 1. `(VERSION_A, BUILD_ID_A)` — the cold one. On a fresh worktree this
-//!    compiles the whole dependency graph: **~10 minutes and ~1.5 GB of disk,
-//!    once per worktree**. Every later run of this test is incremental.
+//! 1. `(VERSION_A, BUILD_ID_A)` — the cold one. Into a scratch dir nothing has
+//!    built in yet this compiles the bin's whole dependency graph: **224
+//!    packages**, 280 compilation units (201 for the target, 79 host ones for
+//!    build scripts and proc macros). Not the 613 issue #928 quotes — 613 is
+//!    `cargo metadata --all-features` for the *workspace*, which counts the
+//!    Tauri desktop crate and every dev-dependency, none of which this build
+//!    touches.
 //! 2. `(VERSION_B, BUILD_ID_A)` — only `DAD_VERSION` changed.
 //! 3. `(VERSION_B, BUILD_ID_B)` — only `DAD_BUILD_ID` changed.
 //!
-//! Builds 2 and 3 re-run the build script and relink (tens of seconds), which
-//! is exactly why the scratch dir is stable and shared rather than a fresh
-//! tempdir per step. The widened `slow-timeout` override for this test in
-//! `.config/nextest.toml` exists for the cold case.
+//! Builds 2 and 3 re-run the build script, **recompile this package** — a
+//! changed `cargo:rustc-env` invalidates the lib and the bin, not merely the
+//! link — and relink, which is exactly why the scratch dir is stable and
+//! shared rather than a fresh tempdir per step. The widened `slow-timeout`
+//! override for this test in `.config/nextest.toml` exists for the cold case.
 //!
-//! Two containment choices worth keeping:
+//! ## What it costs, and what actually drives that (issue #928)
+//!
+//! The single largest factor is **how busy the machine is** — by more than the
+//! whole rest of this section put together. Measured on one 16-core dev box,
+//! `--jobs` capped to 8 as `capped_jobs` caps it, the three nested builds back
+//! to back:
+//!
+//! | machine | cold | warm | scratch dir |
+//! | --- | --- | --- | --- |
+//! | quiet (load 3-8) | 65.0s | 24.0s | 1.8 GB |
+//! | three other agents building (load 13-18) | 400.9s | 142.3s | 1.8 GB |
+//! | quiet, `CARGO_INCREMENTAL=0` as CI sets it | 98.5s | — | 1.3 GB |
+//! | busy, `CARGO_INCREMENTAL=0` (load 14-22) | 455.6s | 182.0s | 1.3 GB |
+//!
+//! That is a **6x** spread on identical work and identical flags. The whole
+//! test through `cargo test-e2e version_001` measured 395.3s cold on the busy
+//! box; on GitHub `ubuntu-latest`, across 13 `e2e-deterministic` runs read from
+//! their own logs (2026-09-06 to 2026-09-09), 71.9s to 305.4s — 4.2x — with
+//! two further runs that had no restored cache at 351.1s and 369.9s. So do not
+//! read one slow run as a regression, and do not tune this test against a
+//! single measurement.
+//!
+//! ## Issue #928's cache premise was wrong, which is why nothing changed here
+//!
+//! #928 read the scratch `CARGO_TARGET_DIR` as defeating CI's cache — "cold on
+//! every run, forever". It does not. `Swatinem/rust-cache` caches the whole
+//! `target/` tree, and its pre-save cleanup *recurses* into a nested target
+//! dir: `cleanTargetDir` calls a directory a profile only if that directory
+//! holds `build`, `.fingerprint` or `deps`, and `target/version-injection-e2e`
+//! holds none of the three at its root, so it is walked rather than pruned.
+//! `rmExcept` then keeps every entry belonging to a dependency and drops only
+//! this workspace's own. Transcribed from the action at the SHA `ci.yml` pins
+//! and run against a real populated scratch dir: **995 entries kept, 24
+//! removed** — the 24 being this package's own artifacts and fingerprints plus
+//! `incremental/`, `examples/` and the two cargo lock files.
+//!
+//! So a cache-hit run starts build 1 with the dependency graph already
+//! compiled, and what it pays — three times, every run — is a recompile of
+//! **this** package (140k lines under `src/`) plus a link. That is the floor
+//! for the shape this test has, and two ways under it were considered and
+//! rejected: collapsing the builds would stop pinning either
+//! `rerun-if-env-changed` directive individually (changing both variables at
+//! once proves neither, since either one alone re-runs the whole script), and
+//! seeding the scratch dir from the main `target/debug` would mean reaching
+//! into cargo's artifact layout so that a test whose job is to prove a BUILD
+//! behaves correctly starts from another build's output. A shared compilation
+//! cache (`sccache`) would genuinely reach it and is out of this issue's scope,
+//! since it would touch every build in the repository rather than this one.
+//!
+//! ## The `debug = 0` profile that is deliberately NOT here
+//!
+//! Dropping debug info from these builds looks obviously right: the produced
+//! binary is executed twice per build, for `--version` and `daemon hello`, and
+//! neither reads a debugger or a symbolised backtrace. Measured on the quiet
+//! box, a `dev`-inheriting profile with `debug = 0` against plain `dev`:
+//!
+//! | | cold | warm | scratch dir |
+//! | --- | --- | --- | --- |
+//! | `dev` | 65.0s | 24.0s | 1.8 GB |
+//! | `debug = 0` | 55.5s | 19.5s / 22.3s | 1.1 GB |
+//! | `dev`, `CARGO_INCREMENTAL=0` | 98.5s | — | 1.3 GB |
+//! | `debug = 0`, `CARGO_INCREMENTAL=0` | 101.4s | — | 650 MB |
+//!
+//! The time saving is 10-15% where it appears at all and slightly **negative**
+//! in the configuration CI actually uses — inside this box's noise either way,
+//! which is the point of the 6x table above. (On the busy box it looked like a
+//! halving. It was load, not debug info.) The disk saving is real and about
+//! half.
+//!
+//! It is not here because of the cache. To take effect in CI the profile has to
+//! be declared in `Cargo.toml`: rust-cache keys on that manifest and does not
+//! re-save on an exact key match, so setting `CARGO_PROFILE_DEV_DEBUG=0` in
+//! this file rotates no key, leaves the cache serving `debug` artifacts the
+//! build can no longer use, and makes every run pay a cold build with nothing
+//! written back. Declaring it rotates the key once — but the first cache
+//! written after that carries the old `debug` artifacts forward for good, since
+//! cargo never garbage collects a target dir and rust-cache re-saves whatever
+//! it restored. CI would store *more*, not less, for a time saving inside the
+//! noise. Halving what a worktree keeps on disk is still worth having; it
+//! belongs with issue #927, which owns per-worktree build cost.
+//!
+//! Three containment choices worth keeping:
 //!
 //! - The build goes to its **own** `CARGO_TARGET_DIR`, so it can neither
 //!   clobber the `target/debug/dot-agent-deck` that every other e2e test spawns
@@ -37,7 +123,14 @@
 //! - The nested build's parallelism is **capped at half the machine's cores**
 //!   (`--jobs`), because it runs while nextest is executing the rest of the e2e
 //!   suite and a full-parallel nested compile can starve the timed tests around
-//!   it into flaking.
+//!   it into flaking. That premise used to be mostly false and is now true: see
+//!   the next point.
+//! - nextest schedules this test at the **front** of its queue (`priority` in
+//!   `.config/nextest.toml`) instead of at its natural binary-name position
+//!   about 70% of the way down. It was the last of ~2,680 tests to finish in 13
+//!   of 13 CI runs *and* the last to start, at t = 148.6-156.9s every time, so
+//!   the job's whole test wall clock was that offset plus this test's duration.
+//!   The full measurement is in that file's comment.
 //!
 //! Decision 6: gated behind the `e2e` feature so `cargo test-fast` never
 //! compiles it.
@@ -68,6 +161,9 @@ fn workspace_root() -> PathBuf {
 }
 
 /// The isolated `CARGO_TARGET_DIR` every injected build writes into.
+///
+/// No other build in the repository targets it — `grep -r version-injection-e2e`
+/// finds this file and the comments in `.config/nextest.toml` that describe it.
 fn scratch_target_dir() -> PathBuf {
     let base = std::env::var_os("CARGO_TARGET_DIR")
         .map(PathBuf::from)
