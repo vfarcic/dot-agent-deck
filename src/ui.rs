@@ -37,6 +37,7 @@ use crate::prompt_delivery::{
     pane_confirmation_capability, prompt_submission_accumulated, submission_is_after_watermark,
     unconfirmed_retry_delay,
 };
+use crate::repo_identity;
 use crate::state::{AppState, DashboardStats, SessionState, SessionStatus, SharedState};
 use crate::tab::{OrchestrationRoleStatus, OrchestrationStatus, Tab, TabId, TabManager};
 use crate::tab_layout::fit_tab_labels;
@@ -6850,14 +6851,31 @@ fn handle_stop_confirm_key(key: KeyEvent, ui: &mut UiState) -> Action {
     }
 }
 
+/// Open the project repository in the user's browser and build the status
+/// message for whichever way that went.
+///
+/// Shared by the star prompt's `s` key and its `[Star]` button, which were two
+/// byte-identical copies of this block before issue #945 — so re-pointing the
+/// repo slug had to be done twice, and a change to one message could silently
+/// drift from the other.
+fn star_repo_and_report() -> String {
+    star_message(open::that(repo_identity::URL).is_ok())
+}
+
+/// The status message for a star attempt, split out from the browser call so
+/// the exact bytes are testable without launching anything.
+fn star_message(opened: bool) -> String {
+    if opened {
+        "Thanks for starring! ⭐".to_string()
+    } else {
+        format!("Visit {} to star ⭐", repo_identity::DISPLAY)
+    }
+}
+
 fn handle_star_prompt_key(key: KeyEvent, ui: &mut UiState) -> Action {
     match key.code {
         KeyCode::Char('s') => {
-            let msg = if open::that("https://github.com/vfarcic/dot-agent-deck").is_ok() {
-                "Thanks for starring! ⭐".to_string()
-            } else {
-                "Visit github.com/vfarcic/dot-agent-deck to star ⭐".to_string()
-            };
+            let msg = star_repo_and_report();
             ui.star_prompt_state.dismiss_permanently();
             ui.mode = UiMode::Normal;
             ui.status_message = Some((msg, std::time::Instant::now()));
@@ -10792,11 +10810,7 @@ fn dispatch_action(
         }
         // star-prompt [Star]: open the repo and stop asking (== `s`).
         Action::StarConfirm => {
-            let msg = if open::that("https://github.com/vfarcic/dot-agent-deck").is_ok() {
-                "Thanks for starring! ⭐".to_string()
-            } else {
-                "Visit github.com/vfarcic/dot-agent-deck to star ⭐".to_string()
-            };
+            let msg = star_repo_and_report();
             ui.star_prompt_state.dismiss_permanently();
             ui.mode = UiMode::Normal;
             ui.status_message = Some((msg, std::time::Instant::now()));
@@ -18147,7 +18161,7 @@ fn render_star_prompt(frame: &mut Frame) -> Vec<(Action, Rect)> {
         Line::styled("  please consider starring the repo!", text_primary()),
         Line::from(""),
         Line::styled(
-            "  github.com/vfarcic/dot-agent-deck",
+            format!("  {}", repo_identity::DISPLAY),
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::UNDERLINED),
@@ -22625,6 +22639,26 @@ mod tests {
 
     fn default_ui() -> UiState {
         UiState::default()
+    }
+
+    /// Issue #945 turned the star prompt's fallback message from a literal
+    /// into a `format!` over `repo_identity::DISPLAY`, so the bytes it renders
+    /// are asserted against the literal it replaced. The success message never
+    /// named the repo and is here only to pin the other branch.
+    #[test]
+    fn star_message_is_byte_identical_to_the_literals_it_replaced() {
+        assert_eq!(star_message(true), "Thanks for starring! ⭐");
+        if repo_identity::SLUG == "vfarcic/dot-agent-deck" {
+            assert_eq!(
+                star_message(false),
+                "Visit github.com/vfarcic/dot-agent-deck to star ⭐"
+            );
+        } else {
+            println!(
+                "SKIP: the repo_identity seam has been re-pointed to {}; upstream byte-identity does not apply",
+                repo_identity::SLUG
+            );
+        }
     }
 
     /// PRD #163 M5: the OSC 52 clipboard escape is built by one shared
