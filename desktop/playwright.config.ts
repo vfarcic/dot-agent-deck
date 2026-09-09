@@ -62,6 +62,13 @@ export default defineConfig({
     // leave `baseURL` pointing at whatever else is listening.
     command: "pnpm exec vite build && pnpm exec vite preview --port 4173 --strictPort --host 127.0.0.1",
     url: "http://127.0.0.1:4173/",
+    // `false` in CI, so a run there always builds and serves its own bundle.
+    // Locally it is `true`, and that is the footgun: `--strictPort` only makes
+    // a busy 4173 an error for a server THIS config starts, so if an unrelated
+    // service of yours is already listening there, the whole suite is driven
+    // against that service instead of the built bundle and nothing errors. If
+    // the specs fail in ways that make no sense, check what owns 4173 before
+    // debugging the app.
     reuseExistingServer: !process.env.CI,
     // The build is inside this command, so the default 60s is not enough on a
     // cold runner.

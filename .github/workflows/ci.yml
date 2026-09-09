@@ -266,11 +266,25 @@ jobs:
       # downloaded (Chromium 187, its headless shell 114, WebKit 95, ffmpeg 2),
       # unpacking to 927 MB, in ~50s.
       #
-      # Deliberately NOT wrapped in `actions/cache`. The repository's cache
+      # Deliberately NOT wrapped in `actions/cache`, for two reasons, and the
+      # second is the one a future "let's just cache this to speed CI up" PR
+      # has to argue against. Cost is the weaker one: the repository's cache
       # budget is shared, and `Swatinem/rust-cache` in four other jobs is what
       # actually keeps CI fast; adding a several-hundred-megabyte entry here to
-      # save part of a one-minute download risks evicting those. Revisit if the
-      # download ever becomes this job's bottleneck.
+      # save part of a one-minute download risks evicting those.
+      #
+      # The security property is the stronger one. A GitHub Actions cache entry
+      # is writable by a workflow run on ANY branch, so a cached browser
+      # payload keyed by Playwright version would be a cross-branch poisoning
+      # target: a malicious or compromised branch could populate or overwrite
+      # that entry, and a later trusted run would restore those binaries and
+      # then EXECUTE them. Re-downloading from the pinned CDN on every run
+      # removes that write surface entirely. Note what it does NOT do: it does
+      # not make the download independently verified. The pin is a browser
+      # revision number resolved from the lockfile, not a hash of the archive
+      # bytes, so what arrives is trusted on TLS and CDN trust alone. Losing a
+      # cross-branch write path is the whole of what a cache would cost here,
+      # and a speed argument alone does not settle it.
       #
       # `--with-deps` is for WebKit, not for Chromium: WebKit needs a GTK4 and
       # GStreamer runtime that the runner image does not carry in full. It runs
@@ -298,6 +312,11 @@ jobs:
             desktop/playwright-report/
             desktop/test-results/
           if-no-files-found: warn
+          # Without this these inherit the repository/org default, which can be
+          # 90 days. The content is synthetic — the tier drives only the
+          # `?fixture=1` scenarios — so this is tidiness rather than a leak, but
+          # nobody opens a failure trace from a PR that closed two months ago.
+          retention-days: 7
 
   build:
     needs: changes
