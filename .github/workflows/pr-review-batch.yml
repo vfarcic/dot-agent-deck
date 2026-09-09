@@ -79,6 +79,12 @@ jobs:
       count: ${{ steps.pick.outputs.count }}
       live: ${{ steps.pick.outputs.live }}
     steps:
+      # Checks out the BASE branch, never the pull request head. This job runs
+      # the selection script, so it must be the version on the default branch —
+      # a pull request must not be able to alter its own eligibility.
+      - name: Check out the base branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
       - name: Select eligible pull requests
         id: pick
         env:
