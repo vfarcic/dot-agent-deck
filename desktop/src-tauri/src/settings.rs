@@ -1759,23 +1759,46 @@ mod tests {
     /// means the cost of that is a failed save rather than a write through
     /// someone else's symlink, so this is closing a nuisance rather than a
     /// hole — but the nuisance is free to close.
+    ///
+    /// # Why this asserts the suffix's SHAPE and never searches for the pid
+    ///
+    /// It used to assert `!name.contains(&std::process::id().to_string())`,
+    /// and that assertion was **probabilistically false**: the suffix is 16
+    /// random hex characters, ten of whose sixteen symbols are decimal digits,
+    /// so a decimal pid turns up inside one by chance. It is not hypothetical
+    /// — it reddened the required `build-windows` job on PR #872, a PR that
+    /// touches no desktop code at all, on the name
+    /// `.desktop.toml.tmp.1bea3738d823864d` (which carries the all-decimal
+    /// runs `3738`, `8238` and `823864`). A four-digit pid collides on the
+    /// order of one run in a few hundred, and every collision is a false
+    /// report against whichever PR happens to be running.
+    ///
+    /// A substring search cannot express the property anyway. What the
+    /// docstring above actually claims is that the name is a random token
+    /// rather than the `<pid>.<counter>` construction, and the check below
+    /// settles exactly that, deterministically: `create_temp` formats
+    /// `{:016x}`, so the suffix is sixteen hex digits and nothing else. A
+    /// `<pid>.<counter>` name fails it on the `.` alone, and fails it again on
+    /// the length. Strictly stronger than the search it replaces, and it
+    /// cannot flake.
     #[test]
     fn temp_names_are_unpredictable_rather_than_the_pid_and_a_counter() {
         let dir = tempdir();
         let dest = dir.path().join(SETTINGS_FILE_NAME);
+        let prefix = format!(".{SETTINGS_FILE_NAME}.tmp.");
 
         let mut names = std::collections::BTreeSet::new();
         for _ in 0..16 {
             let (file, tmp) = create_temp(dir.path(), &dest).unwrap();
             drop(file);
             let name = tmp.file_name().unwrap().to_string_lossy().into_owned();
+            let suffix = name
+                .strip_prefix(&prefix)
+                .unwrap_or_else(|| panic!("unexpected temp name: {name}"));
             assert!(
-                !name.contains(&std::process::id().to_string()),
-                "the temp name still carries the pid: {name}"
-            );
-            assert!(
-                name.starts_with(&format!(".{SETTINGS_FILE_NAME}.tmp.")),
-                "unexpected temp name: {name}"
+                suffix.len() == 16 && suffix.bytes().all(|b| b.is_ascii_hexdigit()),
+                "the temp suffix must be the 16 hex digits `{{:016x}}` writes, \
+                 not a derived name like `<pid>.<counter>`: {name}"
             );
             names.insert(name);
             std::fs::remove_file(&tmp).unwrap();
