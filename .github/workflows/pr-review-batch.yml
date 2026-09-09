@@ -1,0 +1,138 @@
+---
+# Agent PR review — enumeration, fan-out, and the vote.
+#
+# Shape mirrors issue-labeler-batch.yml: this plain workflow decides WHICH pull
+# requests to review, then calls the gh-aw reviewer (pr-review.lock.yml) once per
+# pull request. Enumeration is a plain `gh` query, so a sweep that finds nothing
+# eligible spends ZERO agent tokens — the review job does not run at all.
+#
+# The agent never holds a credential that can approve. It emits a verdict comment;
+# the `vote` job below holds the App token, re-validates independently, and casts
+# the review. That split is load-bearing: gh-aw runs codex with
+# --dangerously-bypass-approvals-and-sandbox inside its firewalled container, so
+# the agent has no approval gate of its own.
+name: Agent PR review
+
+"on":
+  schedule:
+    # Sweeps are idempotent (a pull request with a current verdict is skipped),
+    # so a missed or overlapping run costs nothing.
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: Single pull request to review. Empty = sweep all eligible.
+        required: false
+        type: string
+      dry_run:
+        description: Produce verdicts but cast no votes.
+        required: true
+        default: true
+        type: boolean
+      max_prs:
+        description: Maximum pull requests to review in one sweep.
+        required: false
+        default: "5"
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  # One sweep at a time. GitHub keeps at most one pending run per group, so a
+  # burst of schedule ticks collapses instead of stacking.
+  group: agent-pr-review-${{ github.repository }}
+  cancel-in-progress: false
+
+env:
+  # Whose pull requests get REVIEWED. Anyone not listed is never read by the
+  # agent at all — an outside contribution still requires a human, which is both
+  # the intent and the security boundary: the agent's input comes only from
+  # authors you trust. Renovate is included because its major bumps are read by
+  # a human today, and a verdict lets that read be skipped.
+  REVIEW_AUTHORS: vfarcic prageethw app/renovate
+  # Whose pull requests the App will VOTE on. Renovate is a ruleset bypass actor
+  # and merges without any approval, so a vote on its PRs changes no mechanism —
+  # it is a visible signal, nothing more. Kept deliberately separate from the
+  # review list so widening one never silently widens the other.
+  VOTE_AUTHORS: vfarcic prageethw app/renovate
+
+jobs:
+  prepare:
+    # Kill switch, mirroring the labeler's ISSUE_LABELER_ENABLED. Unset = off.
+    if: vars.PR_REVIEW_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      items: ${{ steps.pick.outputs.items }}
+      count: ${{ steps.pick.outputs.count }}
+      live: ${{ steps.pick.outputs.live }}
+    steps:
+      - name: Select eligible pull requests
+        id: pick
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          ONLY_PR: ${{ inputs.pr_number }}
+          MAX_PRS: ${{ inputs.max_prs || '5' }}
+          # Live only when a human dispatches with dry_run unchecked AND the repo
+          # variable says so. A scheduled run can never vote unless PR_REVIEW_LIVE
+          # is set, so turning the schedule on does not turn voting on.
+          DISPATCH_DRY_RUN: ${{ inputs.dry_run }}
+          REPO_LIVE: ${{ vars.PR_REVIEW_LIVE }}
+        run: python3 .github/scripts/pr_review_select.py
+
+  review:
+    needs: prepare
+    if: needs.prepare.outputs.count != '0'
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        item: ${{ fromJSON(needs.prepare.outputs.items) }}
+    permissions:
+      actions: write
+      contents: read
+      pull-requests: read
+    uses: ./.github/workflows/pr-review.lock.yml
+    with:
+      pr_number: ${{ matrix.item.number }}
+      head_sha: ${{ matrix.item.sha }}
+    secrets:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+
+  vote:
+    needs: [prepare, review]
+    # Never on a failed review, never in dry run, never with an empty set.
+    if: >-
+      always()
+      && needs.review.result == 'success'
+      && needs.prepare.outputs.live == 'true'
+      && needs.prepare.outputs.count != '0'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        item: ${{ fromJSON(needs.prepare.outputs.items) }}
+    permissions:
+      contents: read
+    steps:
+      - name: Check out the base branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Mint an App token
+        id: app
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
+        with:
+          app-id: ${{ secrets.REVIEW_APP_ID }}
+          private-key: ${{ secrets.REVIEW_APP_PRIVATE_KEY }}
+
+      - name: Validate the verdict and cast the vote
+        env:
+          # The App token, and ONLY here — never in a job the agent runs in.
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ matrix.item.number }}
+          EXPECTED_SHA: ${{ matrix.item.sha }}
+          VOTE_ALLOWED: ${{ matrix.item.vote_allowed }}
+        run: python3 .github/scripts/pr_review_vote.py
