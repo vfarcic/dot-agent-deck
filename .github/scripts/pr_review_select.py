@@ -67,7 +67,11 @@ def main():
     # meaning a temporary pull_request trigger added for testing could cast real
     # approvals. Voting events are named explicitly so that adding any new trigger
     # is inert until someone decides otherwise.
-    voting_events = {"schedule", "workflow_dispatch"}
+    # Deliberately NOT "schedule". While voting is being trialled, the power to
+    # cast a real approval belongs to a human at a keyboard, not to a cron job:
+    # setting PR_REVIEW_LIVE should not silently authorise unattended approvals
+    # overnight. Add "schedule" back when the verdicts have earned it.
+    voting_events = {"workflow_dispatch"}
     live = (
         env("REPO_LIVE") == "true"
         and env("EVENT_NAME") in voting_events

@@ -26,16 +26,20 @@ model: claude-sonnet-5
 network:
   allowed: [defaults]
 
+# Wall clock is the runaway guard. There is deliberately NO credit cap.
+#
+# A credit cap does not prevent spend — it wastes it: by the time it fires the
+# tokens are paid for and the job dies with no verdict. Measured three times
+# here (a $0.30 cap against a $0.32 review, then a shared 150-credit pool that
+# starved three of five legs). Worse, because cost scales with diff size, any
+# fixed number fails selectively on the LARGEST pull requests — the ones a
+# review is most valuable on.
+#
+# Spend is bounded where bounding is free: by SHA-idempotence (each head is
+# reviewed once), by the eligibility filter, by max_prs on the caller, and by
+# the org-level spend limit at Anthropic — the only ceiling that fails safely,
+# refusing new requests instead of killing work already paid for.
 timeout-minutes: 20
-
-# RUNAWAY GUARDS, not a budget. A cap set below the cost of the work is worse
-# than no cap: the first attempt spent $0.32 against a $0.30 ceiling and
-# produced nothing, so we paid for two aborted reviews and got zero verdicts.
-# These sit well above a normal review so they only fire on a genuine runaway
-# (an injection-induced loop, a pathological diff). Spend is bounded instead by
-# max_prs, by SHA-idempotence, and by the org-level limit at Anthropic.
-max-ai-credits: 150
-max-daily-ai-credits: 2000
 
 # The PR number is in the GROUP, not only in job-discriminator. With a single
 # shared group, GitHub keeps one pending run per group and CANCELS the rest —
