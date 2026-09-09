@@ -14,9 +14,15 @@
 #   (a) SELECTION — "which recording dirs are in scope" (needs git):
 #       `build.sh select`  -> prints the in-scope recording-dir IDs, one per line.
 #
-#   (b) ASSEMBLY — "build manifest.json from a given list of IDs" (pure: reads
-#       each test.md + CATALOG.md, emits JSON; no git, no network):
+#   (b) ASSEMBLY — "build manifest.json from a given list of IDs" (reads each
+#       test.md + CATALOG.md and each recording's provenance.json, emits JSON;
+#       no network):
 #       `build.sh assemble [ID...] [--manifest PATH]`
+#       Deterministic and fixture-testable, with ONE impure edge since issue
+#       #808: it needs the commit to check provenance against, which is one
+#       `git rev-parse HEAD`. `REEL_ADAPTER_EXPECT_COMMIT` overrides that, which
+#       is what keeps the acceptance test offline, and the resolution is LAZY —
+#       a list that reaches no provenance check never touches git.
 #
 #   reel (default) — run (a), then (b), then invoke the engine forwarding
 #       --out/--publish. Clean-skips when nothing is in scope, naming WHICH of
@@ -33,6 +39,50 @@
 #        `git diff --name-only <MAIN_REF>` restricted to `*.rs` — basename match
 #        sidesteps the test.md "<immediate-parent>/<file>" path quirk and is
 #        robust for the flat `tests/*.rs` (and `src/*.rs`) layout this repo uses.
+#
+# CAST PROVENANCE (issue #808) — the fourth gate, enforced at ASSEMBLY:
+#   The three gates above are a `test -f` plus two STATIC facts about the test,
+#   so they say nothing about the ARTIFACT: a cast an older revision left on disk
+#   satisfies every one of them. PR #805 made the harness discard the previous
+#   run's artifacts at launch and on the runtime-skip path, which closes the
+#   routes that REACH those call sites — and two do not. A FILTERED run (the
+#   normal way anyone works, and what CLAUDE.md rule 5 asks for) never selects
+#   the test at all, so nothing discards its older cast; and `skip_unless!`
+#   evaluates its preflight BEFORE `_skip_if_err` is entered, so a kill inside a
+#   `check_*_available` — or inside an importer it calls — lands before the
+#   skip-path discard. Provenance covers both at once, which is why the answer
+#   was not a third discard.
+#
+#   The harness writes `provenance.json` beside each dump. `assemble` REFUSES a
+#   clip on three of its fields and REPORTS the rest:
+#     * refused when the sidecar is ABSENT, unparseable, of an unknown `schema`,
+#       or missing a required field — so a pre-provenance cast and a dump that
+#       died before its sidecar are both unpublishable;
+#     * refused when `outcome` is not `passed` — a failure dump is a diagnostic,
+#       not a clip;
+#     * refused when `commit` is not the revision this reel is being built at.
+#   Reported, gating nothing: `run_id` (one value per nextest run; a reel
+#   legitimately spans several filtered runs at one commit, so differing ids WARN
+#   rather than refuse), `build_id`, `recorded_at_unix`, `redaction_version` and
+#   `dirty`.
+#
+#   What that proves, stated no wider than it is: a selected clip was written by
+#   a harness built from THIS commit, by a run that was not unwinding a panic. It
+#   does NOT prove the clip came from the LATEST run — a passing clip recorded at
+#   this commit by an earlier run is accepted, and correctly so, since the code
+#   that produced it is the code under test. Under `dirty` even that narrows: one
+#   commit then covers more than one working state, which is why the dirty flag
+#   is reported loudly. It says nothing about whether the cast's CONTENT is
+#   redacted (the harness blocklist is best-effort, issue #810), and it is not a
+#   signature — the sidecar sits in the same gitignored directory as the cast, so
+#   whoever can write one can write the other.
+#
+#   Enforced at ASSEMBLY ONLY, and that is enough rather than a shortcut: every
+#   route to a manifest goes through `assemble`, both the `reel` pipeline and the
+#   standalone `build.sh assemble <id...>` an injected id list would use. The
+#   marker gate is duplicated in `select_ids` for a different reason — so its
+#   near-miss diagnostic fires during selection too — not because assembly's copy
+#   is insufficient.
 #
 # Reel-eligibility MARKER (opt-in, committed, explicit — PRD #20):
 #   Having a cast just means a test is PTY-attached; it does NOT mean it belongs
@@ -66,6 +116,26 @@ CATALOG_FILE="${REEL_ADAPTER_CATALOG:-tests/CATALOG.md}"
 MAIN_REF="${REEL_ADAPTER_MAIN_REF:-origin/main}"
 ENGINE="${REEL_ADAPTER_ENGINE:-$SCRIPT_DIR/../demo-reel/reel.sh}"
 
+# The commit every recording's provenance must name (issue #808). Empty — the
+# default — means "resolve it from git at the moment the first provenance check
+# needs it", which is what the `reel` pipeline does. Setting it is an OPERATOR
+# ASSERTION in the same class as `clean-e2e-tmp --ignore-liveness`: it is how the
+# acceptance test stays offline and deterministic, and pointing it at the wrong
+# value defeats the commit gate entirely. It cannot LOOSEN anything by accident,
+# though — a wrong value refuses every clip rather than admitting a stale one.
+EXPECT_COMMIT="${REEL_ADAPTER_EXPECT_COMMIT:-}"
+
+# `provenance.json` schema this adapter understands. The harness's
+# `RECORDING_PROVENANCE_SCHEMA` (tests/common/mod.rs) must match, and
+# `tests/harness_isolation.rs` fails the fast tier when the two drift.
+PROVENANCE_SCHEMA=1
+
+# Shortest sha accepted as identifying a commit, mirroring the harness's
+# `MIN_BUILD_COMMIT_LEN`. Git's auto-abbreviation floor is 7, so this refuses
+# nothing a normal `git rev-parse --short HEAD` produces while refusing an
+# abbreviation short enough that a prefix match would be weak evidence.
+MIN_COMMIT_LEN=7
+
 SKIP_MSG="skipped: no e2e tests changed on this branch"
 
 # Where `select_ids` records the ids it dropped for a MISSING ` [reel]` marker —
@@ -90,11 +160,12 @@ die() { echo "demo-reel-adapter: $*" >&2; exit 1; }
 # Composed in ONE place, called from both paths, so the two messages cannot drift
 # back into saying the same wrong thing.
 #
-# Exclusions arrive as TWO buckets separated by a literal `--`, because a list can
-# lose ids to either gate and the composed reason has to survive BOTH firing at
-# once (PR #778 review). An id is never `--` itself — ids are single recording-dir
-# names, and `assemble` rejects `/` and `..` before this is ever called.
-#   usage: skip_message <scope-phrase> [cast-less-id...] -- [unmarked-id...]
+# Exclusions arrive as THREE buckets separated by literal `--`s, because a list
+# can lose ids to any of the gates and the composed reason has to survive more
+# than one firing at once (PR #778 review, extended for issue #808's provenance
+# gate). An id is never `--` itself — ids are single recording-dir names, and
+# `assemble` rejects `/` and `..` before this is ever called.
+#   usage: skip_message <scope-phrase> [cast-less...] -- [unmarked...] -- [stale...]
 skip_message() {
   local scope="$1"; shift
   # Declared one per line: macOS ships /bin/bash 3.2.57 and this file already
@@ -102,23 +173,37 @@ skip_message() {
   # stay in the single-target form the rest of the script uses.
   local cast_less=()
   local unmarked=()
-  local past_sep="" arg
+  local stale=()
+  local bucket=0 arg
   for arg in "$@"; do
-    if [[ -z "$past_sep" && "$arg" == "--" ]]; then past_sep=1; continue; fi
-    if [[ -n "$past_sep" ]]; then unmarked+=("$arg"); else cast_less+=("$arg"); fi
+    if [[ "$arg" == "--" ]]; then bucket=$((bucket + 1)); continue; fi
+    case "$bucket" in
+      0) cast_less+=("$arg") ;;
+      1) unmarked+=("$arg") ;;
+      *) stale+=("$arg") ;;
+    esac
   done
 
-  # Nothing was dropped for a missing marker, so the scope gate really is the
-  # whole story. A cast-less-ONLY list lands here deliberately: "no e2e tests
+  # Nothing reached the marker or provenance gate, so the scope gate really is
+  # the whole story. A cast-less-ONLY list lands here deliberately: "no e2e tests
   # changed" is literally true of a list that contains no e2e test (a dir with no
   # cast is an L1 render test, not a clip candidate), and each such id has already
   # had its own naming diagnostic on stderr mid-loop.
-  if [[ ${#unmarked[@]} -eq 0 ]]; then
+  if [[ ${#unmarked[@]} -eq 0 && ${#stale[@]} -eq 0 ]]; then
     printf '%s\n' "$SKIP_MSG"
     return 0
   fi
 
-  printf '%s\n' "skipped: ${#unmarked[@]} e2e test(s) $scope, but none is reel-eligible — no [reel] marker in $CATALOG_FILE for: $(join_ids "${unmarked[@]}")"
+  # The headline names the gate that dropped the most ids' worth of the reader's
+  # attention, and the marker wording is kept EXACTLY as issue #735 established
+  # it. A stale-only list gets its own headline rather than borrowing that one:
+  # "none is reel-eligible" would send a reader to add a marker that changes
+  # nothing, which is the same misattribution #735 was about, in a new bucket.
+  if [[ ${#unmarked[@]} -gt 0 ]]; then
+    printf '%s\n' "skipped: ${#unmarked[@]} e2e test(s) $scope, but none is reel-eligible — no [reel] marker in $CATALOG_FILE for: $(join_ids "${unmarked[@]}")"
+  else
+    printf '%s\n' "skipped: ${#stale[@]} e2e test(s) $scope, but none has a recording whose provenance checks out — nothing was published"
+  fi
   # The marker is not the whole reason when the same list ALSO lost ids before
   # they ever reached the marker gate: saying only "none is reel-eligible" would
   # scope that verdict over the cast-less ones too and send a reader to add a
@@ -127,7 +212,15 @@ skip_message() {
   if [[ ${#cast_less[@]} -gt 0 ]]; then
     printf '%s\n' "  (a further ${#cast_less[@]} id(s) in the same list were dropped EARLIER, for an unrelated reason — no full-stream.cast, so not an e2e clip at all and no [reel] marker would help: $(join_ids "${cast_less[@]}"))"
   fi
-  printf '%s\n' "  ([reel] is OPT-IN and its absence is usually the right answer: a clip exists so a human can watch REAL behavior, so only a test that genuinely spins up a real agent is marked — a stand-in (cat, scripted echo, recorder stubs, synthesized hook events) stays unmarked and never becomes a clip. See CLAUDE.md rule 4.)"
+  # Same discipline for the provenance bucket: it is a THIRD unrelated reason,
+  # and a marker will not fix it either. The per-id reason is already on stderr,
+  # so this names the ids and the remedy rather than repeating each verdict.
+  if [[ ${#stale[@]} -gt 0 ]]; then
+    printf '%s\n' "  (${#stale[@]} id(s) were dropped by the CAST PROVENANCE gate — the recording on disk is not proven to come from a passing run of the current revision, so it may predate this branch entirely (issue #808): $(join_ids "${stale[@]}"). Each id's own verdict is on stderr above. Re-record with DOT_AGENT_DECK_RECORD=1 cargo test-e2e-live <filter> at this commit.)"
+  fi
+  if [[ ${#unmarked[@]} -gt 0 ]]; then
+    printf '%s\n' "  ([reel] is OPT-IN and its absence is usually the right answer: a clip exists so a human can watch REAL behavior, so only a test that genuinely spins up a real agent is marked — a stand-in (cat, scripted echo, recorder stubs, synthesized hook events) stays unmarked and never becomes a clip. See CLAUDE.md rule 4.)"
+  fi
 }
 
 # Render an id list for a human: "a, b, c". Used for both of skip_message's
@@ -156,19 +249,23 @@ Usage:
   build.sh select
       Print the in-scope recording-dir IDs (one per line). Uses git.
   build.sh assemble [ID...] [--manifest PATH]
-      Build manifest.json from the given recording-dir IDs (pure: no git, no
-      network). Excludes any ID without a full-stream.cast, or whose catalog id
-      lacks the trailing [reel] eligibility marker; orders by catalog id.
-      Clean-skips when no ID resolves to a reel-eligible e2e clip, naming any ID
-      dropped for a missing [reel] marker — and, when the list also lost IDs for
-      having no cast, naming those separately rather than blaming the marker for
-      the whole skip.
+      Build manifest.json from the given recording-dir IDs (no network; one
+      `git rev-parse HEAD` unless REEL_ADAPTER_EXPECT_COMMIT is set). Excludes
+      any ID without a full-stream.cast, any whose catalog id lacks the trailing
+      [reel] eligibility marker, and any whose provenance.json is absent or
+      records a different commit or a non-passing outcome (issue #808); orders by
+      catalog id. Clean-skips when no ID resolves to a publishable clip, naming
+      the IDs each gate dropped separately rather than blaming one gate for the
+      whole skip.
 
 Environment overrides:
   REEL_ADAPTER_RECORDINGS_DIR  (default: .dot-agent-deck/recordings)
   REEL_ADAPTER_CATALOG         (default: tests/CATALOG.md)
   REEL_ADAPTER_MAIN_REF        (default: origin/main)
   REEL_ADAPTER_ENGINE          (default: <skill>/../demo-reel/reel.sh)
+  REEL_ADAPTER_EXPECT_COMMIT   (default: git rev-parse HEAD) — the commit each
+                               recording's provenance must name. An operator
+                               assertion; a wrong value refuses every clip.
 EOF
 }
 
@@ -259,6 +356,151 @@ catalog_reel_eligible() {
 }
 
 # --------------------------------------------------------------------------
+# Cast provenance (issue #808).
+# --------------------------------------------------------------------------
+
+# The commit every recording's provenance must name. `REEL_ADAPTER_EXPECT_COMMIT`
+# wins; otherwise `git rev-parse HEAD`. Resolved ONCE per run into `EXPECT_COMMIT`
+# and LAZILY — only when an id actually reaches the provenance gate — so an
+# empty, cast-less or all-unmarked list still needs no git at all.
+#
+# FAILS CLOSED. With no override and no resolvable HEAD there is nothing to check
+# provenance against, and the only two options are to publish unchecked or to
+# stop. It stops: `die`, not a warning, because a warning would leave the run
+# publishing exactly the casts this gate exists to refuse.
+resolve_expected_commit() {
+  [[ -n "$EXPECT_COMMIT" ]] && return 0
+  EXPECT_COMMIT="$(git rev-parse HEAD 2>/dev/null || true)"
+  [[ -n "$EXPECT_COMMIT" ]] || die "cannot determine the commit to check cast provenance against: \
+\`git rev-parse HEAD\` failed here and REEL_ADAPTER_EXPECT_COMMIT is unset. Refusing to \
+publish unverified recordings — run from the repo checkout, or set \
+REEL_ADAPTER_EXPECT_COMMIT=<sha> if you know what revision these casts came from."
+  [[ ${#EXPECT_COMMIT} -ge $MIN_COMMIT_LEN ]] || die "the commit to check cast provenance \
+against ('$EXPECT_COMMIT') is shorter than $MIN_COMMIT_LEN characters, so a prefix match \
+against it would not identify a revision"
+}
+
+# Verdict on one recording's `provenance.json`.
+#
+# Returns 0 when the clip may be published and sets `PROV_SUMMARY` (plus
+# `PROV_RUN_ID` and `PROV_DIRTY` for the caller's cross-clip reporting); returns
+# 1 and sets `PROV_REASON` to a human sentence otherwise. Globals rather than
+# stdout because `assemble` runs in the main shell and needs several values back;
+# a command substitution would also swallow the exit status distinction.
+#
+# Every branch below is a REFUSAL — there is no "warn and include" path, because
+# the whole point is that the previous behaviour (`test -f`) already included
+# everything.
+PROV_REASON=""
+PROV_SUMMARY=""
+PROV_RUN_ID=""
+PROV_DIRTY=""
+check_provenance() {
+  local id="$1"
+  local file="$RECORDINGS_DIR/$id/provenance.json"
+  PROV_REASON=""; PROV_SUMMARY=""; PROV_RUN_ID=""; PROV_DIRTY=""
+
+  if [[ ! -f "$file" ]]; then
+    PROV_REASON="no provenance.json beside the cast — the recording predates the provenance sidecar, or its dump died before writing it (the sidecar is written LAST for exactly this reason)"
+    return 1
+  fi
+
+  # One jq call for every field, so a malformed file fails once here rather than
+  # eight times below. `// ""` turns an absent field into an empty string, which
+  # the required-field check then names.
+  #
+  # Joined on US (0x1f), NOT a tab, and the difference is load-bearing: bash
+  # treats tab as IFS *whitespace*, so a run of them collapses to one delimiter
+  # and every field after an empty one shifts left — which silently read the
+  # build_id as the commit and admitted a sidecar with no commit at all. A
+  # non-whitespace IFS delimits once per occurrence, so empty fields survive.
+  # 0x1f cannot occur in any of these values (jq would escape it in JSON).
+  local fields
+  if ! fields="$(jq -r '
+        [ ((.schema // "") | tostring),
+          (.outcome // ""),
+          (.commit // ""),
+          (.build_id // ""),
+          (.run_id // ""),
+          ((.recorded_at_unix // "") | tostring),
+          ((.redaction_version // "") | tostring),
+          ((.dirty // false) | tostring) ] | join("\u001f")' "$file" 2>/dev/null)"; then
+    PROV_REASON="provenance.json is not readable JSON — a corrupt sidecar cannot vouch for a cast"
+    return 1
+  fi
+
+  local schema outcome commit build_id run_id recorded_at redaction_version dirty
+  IFS=$'\037' read -r schema outcome commit build_id run_id recorded_at redaction_version dirty <<EOF
+$fields
+EOF
+
+  if [[ "$schema" != "$PROVENANCE_SCHEMA" ]]; then
+    PROV_REASON="provenance.json declares schema '$schema', and this adapter only understands $PROVENANCE_SCHEMA — refusing rather than guessing what its fields mean"
+    return 1
+  fi
+
+  # Required-field completeness, checked as a set so the message names every
+  # missing one at once. A sidecar missing a field is a sidecar this adapter
+  # cannot read the way it was written, whether the gap is a harness bug or a
+  # hand-edit.
+  local missing=""
+  [[ -n "$outcome" ]]           || missing="${missing:+$missing, }outcome"
+  [[ -n "$commit" ]]            || missing="${missing:+$missing, }commit"
+  [[ -n "$build_id" ]]          || missing="${missing:+$missing, }build_id"
+  [[ -n "$run_id" ]]            || missing="${missing:+$missing, }run_id"
+  [[ -n "$recorded_at" ]]       || missing="${missing:+$missing, }recorded_at_unix"
+  [[ -n "$redaction_version" ]] || missing="${missing:+$missing, }redaction_version"
+  if [[ -n "$missing" ]]; then
+    PROV_REASON="provenance.json is missing required field(s): $missing"
+    return 1
+  fi
+
+  if [[ "$outcome" != "passed" ]]; then
+    PROV_REASON="the recording came from a run whose outcome was '$outcome', not 'passed' — a failure dump is a diagnostic, not a clip"
+    return 1
+  fi
+
+  # The commit gate. An EMPTY commit never reaches here — the required-field
+  # check above already refused it — and that matters, because the harness writes
+  # "" whenever `DAD_BUILD_ID` carries no usable sha (a git-less or shallow
+  # build, or an operator-injected id). A binary that cannot say which commit it
+  # came from cannot support a provenance claim, so "" is a refusal rather than a
+  # wildcard.
+  resolve_expected_commit
+  # Prefix match in whichever direction is shorter, because one side is a short
+  # sha (`DAD_BUILD_ID`'s abbreviation, whose length follows core.abbrev) and the
+  # other is normally a full 40. The shorter side must still be long enough to
+  # identify a revision.
+  local short="$commit" long="$EXPECT_COMMIT"
+  if [[ ${#EXPECT_COMMIT} -lt ${#commit} ]]; then short="$EXPECT_COMMIT"; long="$commit"; fi
+  if [[ ${#short} -lt $MIN_COMMIT_LEN ]]; then
+    PROV_REASON="provenance.json records commit '$commit', which is shorter than $MIN_COMMIT_LEN characters — too short to identify a revision"
+    return 1
+  fi
+  if [[ "$long" != "$short"* ]]; then
+    PROV_REASON="the recording was made at commit $commit, but this reel is being built at ${EXPECT_COMMIT:0:12} — the cast comes from a DIFFERENT revision, possibly one predating the current redaction (issues #502/#785)"
+    return 1
+  fi
+
+  PROV_RUN_ID="$run_id"
+  PROV_DIRTY="$dirty"
+  PROV_SUMMARY="commit $commit · run $run_id · build $build_id · redaction v$redaction_version · recorded $(human_time "$recorded_at")"
+  [[ "$dirty" == "true" ]] && PROV_SUMMARY="$PROV_SUMMARY · TREE WAS DIRTY"
+  return 0
+}
+
+# Epoch seconds -> something a human can read, degrading to the raw number.
+# The harness records epoch seconds because it has no date-formatting dependency;
+# formatting belongs wherever `date` exists. GNU takes `-d @N`, BSD/macOS takes
+# `-r N`, and a host with neither still gets the number.
+human_time() {
+  local epoch="$1"
+  date -u -d "@$epoch" +'%Y-%m-%dT%H:%M:%SZ' 2>/dev/null \
+    || date -u -r "$epoch" +'%Y-%m-%dT%H:%M:%SZ' 2>/dev/null \
+    || printf 'epoch %s' "$epoch"
+}
+
+# --------------------------------------------------------------------------
 # Concern (b): assemble manifest.json from an explicit list of recording IDs.
 # Pure — reads test.md + CATALOG.md only. Excludes cast-less (L1) IDs. Orders by
 # catalog id. Clean-skips (prints SKIP_MSG, writes NO manifest, exit 0) when
@@ -277,6 +519,13 @@ assemble() {
   # `build.sh assemble <id...>` subcommand takes raw ids with no such filtering.
   local ineligible=()
   local cast_less=()
+  # Issue #808: ids whose recording failed the provenance gate. A third bucket
+  # rather than folding them into `ineligible`, because "not reel-eligible" is a
+  # statement about the TEST (its catalog marker) while this is a statement about
+  # the ARTIFACT on disk, and the two call for opposite responses — one may want
+  # a marker added, the other wants a re-record and never a marker.
+  local stale=()
+  local run_ids="" any_dirty=""
   rows="$(mktemp)"
   # The rows scratch file is removed on the normal exit paths below, but a
   # validation `die` can abort mid-loop — so also clean it up on any exit
@@ -312,6 +561,22 @@ assemble() {
       ineligible+=("$id")
       continue
     fi
+    # Provenance LAST, for the same reason the marker gate is checked last in
+    # `select_ids`: its verdict is only worth printing about an id that would
+    # otherwise have been published. An unmarked test's stale cast is not a
+    # near-miss anyone needs to hear about.
+    if ! check_provenance "$id"; then
+      echo "demo-reel-adapter: excluding '$id' ($PROV_REASON)" >&2
+      stale+=("$id")
+      continue
+    fi
+    echo "demo-reel-adapter: including '$id' — provenance OK: $PROV_SUMMARY" >&2
+    # Collected for the two cross-clip notes below. Newline-delimited in a
+    # string rather than an array so `sort -u` can count the distinct ids
+    # without a bash-4 associative array (macOS ships /bin/bash 3.2.57).
+    run_ids="$run_ids$PROV_RUN_ID
+"
+    [[ "$PROV_DIRTY" == "true" ]] && any_dirty=1
     desc="$(extract_description "$md")"
     ord="$(catalog_ord "$catid")"
     title_dec="$(printf '%s' "$title" | html_decode)"
@@ -324,8 +589,30 @@ assemble() {
   if [[ ! -s "$rows" ]]; then
     rm -f "$rows"
     skip_message "in the given list" \
-      ${cast_less[@]+"${cast_less[@]}"} -- ${ineligible[@]+"${ineligible[@]}"}
+      ${cast_less[@]+"${cast_less[@]}"} -- ${ineligible[@]+"${ineligible[@]}"} \
+      -- ${stale[@]+"${stale[@]}"}
     return 0
+  fi
+
+  # Some ids passed provenance and some did not: the manifest is still written
+  # from the ones that did, because dropping a whole reel over one stale clip
+  # would only teach people to bypass the gate. Named here so the omission is
+  # visible in the same place the manifest is announced, not only mid-loop.
+  if [[ ${#stale[@]} -gt 0 ]]; then
+    echo "demo-reel-adapter: WARNING — ${#stale[@]} clip(s) were left OUT by the provenance gate and are NOT in this reel: $(join_ids "${stale[@]}"). Re-record them at this commit if the reel is meant to include them." >&2
+  fi
+
+  # Two cross-clip notes, both advisory. Neither can be a refusal without
+  # refusing something correct: a reel legitimately assembles clips from several
+  # FILTERED runs at one commit (which is how CLAUDE.md rule 5 asks people to
+  # work), and recording from a dirty tree is the ordinary dogfood case.
+  local distinct_runs
+  distinct_runs="$(printf '%s' "$run_ids" | sort -u | grep -c . || true)"
+  if [[ "${distinct_runs:-0}" -gt 1 ]]; then
+    echo "demo-reel-adapter: NOTE — these clips come from $distinct_runs distinct recording runs (all at the expected commit). Legitimate for clips recorded by separate filtered runs; worth a look if you expected one run." >&2
+  fi
+  if [[ -n "$any_dirty" ]]; then
+    echo "demo-reel-adapter: WARNING — at least one clip was recorded from a DIRTY tree, so its commit does not fully identify the code that produced it (two working states share one commit). Watch the reel before flipping it public." >&2
   fi
 
   # Sort by catalog ordinal (zero-padded) then by id for determinism; strip the
@@ -341,6 +628,14 @@ assemble() {
 
 # --------------------------------------------------------------------------
 # Concern (a): print the in-scope recording-dir IDs (one per line).
+#
+# Deliberately does NOT check cast provenance (issue #808). "In scope" is a
+# statement about the TEST — did its source change on this branch, is it marked,
+# is it an e2e test at all — and provenance is a statement about the ARTIFACT,
+# which is `assemble`'s business. Keeping the split means `build.sh select` stays
+# a pure scope query with no git-HEAD dependency of its own, and there is exactly
+# one place the publish decision is made. Nothing escapes through the gap: every
+# route to a manifest runs `assemble`.
 # --------------------------------------------------------------------------
 select_ids() {
   local changed base md id src catid
@@ -504,14 +799,19 @@ case "$cmd" in
       # changes: an empty `ineligible` means nothing was in scope at all, a
       # non-empty one means tests changed but are deliberately not reel-eligible.
       # The cast-less bucket is EMPTY here and always will be: `select_ids`'s gate
-      # (1) drops cast-less dirs itself, so this path never sees one. The `--`
-      # still leads, so both call sites pass the same two-bucket shape.
-      skip_message "changed on this branch" -- ${ineligible[@]+"${ineligible[@]}"}
+      # (1) drops cast-less dirs itself, so this path never sees one. The STALE
+      # bucket is empty for a different reason — provenance is checked at
+      # ASSEMBLY, so a stale id is still SELECTED here and reaches `assemble`,
+      # which then clean-skips with its own three-bucket message. Both trailing
+      # `--`s still lead, so every call site passes the same shape.
+      skip_message "changed on this branch" -- ${ineligible[@]+"${ineligible[@]}"} --
       exit 0
     fi
     rm -f "$manifest"
     assemble "$manifest" "${scope[@]}"
-    # assemble clean-skipped (every selected dir turned out to be cast-less).
+    # assemble clean-skipped: either every selected dir turned out to be
+    # cast-less, or — since issue #808 — every one of them failed the provenance
+    # gate. `assemble` has already said which on stdout, naming the ids.
     [[ -f "$manifest" ]] || exit 0
     [[ -x "$ENGINE" ]] || die "engine not found or not executable: $ENGINE"
     # Compose a descriptive title unless the caller pinned one with --title, and

@@ -1540,6 +1540,65 @@ describe("TauriDeckBridge demand-driven attach (PRD 745 M7)", () => {
   });
 });
 
+describe("webview zoom (PRD 744)", () => {
+  beforeEach(() => {
+    invoke.mockReset();
+    window.localStorage.clear();
+  });
+
+  afterEach(() => vi.restoreAllMocks());
+
+  it("applies a level through the app command, not the core webview permission", async () => {
+    const { TauriDeckBridge } = await import("./bridge");
+    invoke.mockImplementation(async (_command: string, args: Record<string, unknown>) => args.level);
+
+    const bridge = new TauriDeckBridge();
+    expect(await bridge.setZoom(1.5)).toBe(1.5);
+    // `desktop_set_zoom` rather than `plugin:webview|set_webview_zoom`: the
+    // core webview default permission set does NOT include
+    // `allow-set-webview-zoom`, and widening the app's capability to reach a
+    // call Rust can make itself would be more privilege for no gain.
+    expect(invoke).toHaveBeenCalledWith("desktop_set_zoom", { level: 1.5 });
+    await bridge.dispose();
+  });
+
+  it("snaps before it invokes, so an off-ladder level cannot reach the window", async () => {
+    const { TauriDeckBridge } = await import("./bridge");
+    invoke.mockImplementation(async (_command: string, args: Record<string, unknown>) => args.level);
+
+    const bridge = new TauriDeckBridge();
+    expect(await bridge.setZoom(1.3)).toBe(1.25);
+    expect(await bridge.setZoom(40)).toBe(3);
+    expect(await bridge.setZoom(Number.NaN)).toBe(1);
+    expect(invoke).toHaveBeenCalledWith("desktop_set_zoom", { level: 1.25 });
+    expect(invoke).toHaveBeenCalledWith("desktop_set_zoom", { level: 3 });
+    expect(invoke).toHaveBeenCalledWith("desktop_set_zoom", { level: 1 });
+    await bridge.dispose();
+  });
+
+  it("snaps the reply too, so a hostile or older host cannot report an off-ladder level", async () => {
+    const { TauriDeckBridge } = await import("./bridge");
+    invoke.mockImplementation(async () => 12.5);
+
+    const bridge = new TauriDeckBridge();
+    expect(await bridge.setZoom(1.5)).toBe(3);
+    await bridge.dispose();
+  });
+
+  // Structural, not a check: `FixtureDeckBridge` never imports
+  // `@tauri-apps/api/core`, so a browser preview cannot reach a webview even by
+  // mistake. `useZoom` also declines to bind the keys there, because a browser
+  // has its own zoom.
+  it("is a no-op in fixture mode and touches no Tauri handle", async () => {
+    const { createDeckBridge } = await import("./bridge");
+    const bridge = createDeckBridge("fixture");
+    expect(await bridge.setZoom(2)).toBe(2);
+    expect(await bridge.setZoom(1.3)).toBe(1.25);
+    expect(invoke).not.toHaveBeenCalled();
+    await bridge.dispose();
+  });
+});
+
 describe("desktop settings (PRD 803)", () => {
   beforeEach(() => {
     invoke.mockReset();
@@ -1550,7 +1609,7 @@ describe("desktop settings (PRD 803)", () => {
 
   it("reads and writes the Rust-owned document through the live bridge", async () => {
     const { TauriDeckBridge, DEFAULT_DESKTOP_SETTINGS } = await import("./bridge");
-    const stored = { version: 1, appearance: { mode: "dark" as const } };
+    const stored = { version: 1, appearance: { mode: "dark" as const }, zoom: { level: 1.25 } };
     invoke.mockImplementation(async (command: string) => {
       if (command === "desktop_get_settings") return { settings: DEFAULT_DESKTOP_SETTINGS, path: "/home/dev/.config/dot-agent-deck/desktop.toml" };
       if (command === "desktop_set_settings") return stored;
@@ -1595,7 +1654,7 @@ describe("desktop settings (PRD 803)", () => {
     // No path: the browser preview has no filesystem, and the surface says so
     // rather than printing one for a file that does not exist.
     expect(await bridge.getSettings()).toEqual({ settings: DEFAULT_DESKTOP_SETTINGS, path: undefined });
-    const light = { version: 1, appearance: { mode: "light" as const } };
+    const light = { version: 1, appearance: { mode: "light" as const }, zoom: { level: 1 } };
     expect(await bridge.saveSettings(light)).toEqual(light);
 
     // A theme choice is global: the key must NOT carry the `.fixture`/`.live`
@@ -1619,9 +1678,22 @@ describe("desktop settings (PRD 803)", () => {
     expect((await createDeckBridge("fixture").getSettings()).settings).toEqual(DEFAULT_DESKTOP_SETTINGS);
 
     window.localStorage.setItem(FIXTURE_SETTINGS_KEY, JSON.stringify({ version: 9, appearance: { mode: "solarized" } }));
-    expect((await createDeckBridge("fixture").getSettings()).settings).toEqual({ version: 9, appearance: { mode: "system" } });
+    expect((await createDeckBridge("fixture").getSettings()).settings).toEqual({ version: 9, appearance: { mode: "system" }, zoom: { level: 1 } });
 
     expect(normalizeDesktopSettings(undefined)).toEqual(DEFAULT_DESKTOP_SETTINGS);
-    expect(normalizeDesktopSettings({ appearance: { mode: "dark" } })).toEqual({ version: 1, appearance: { mode: "dark" } });
+    expect(normalizeDesktopSettings({ appearance: { mode: "dark" } })).toEqual({ version: 1, appearance: { mode: "dark" }, zoom: { level: 1 } });
+
+    // PRD #744: an absent, corrupt or off-ladder zoom section all normalise the
+    // same way, and none of them takes the appearance choice down with it —
+    // which is the whole reason `clampZoom` snaps rather than rejects.
+    for (const zoom of [undefined, null, "big", {}, { level: "1.5" }, { level: null }, { level: Number.NaN }]) {
+      expect(normalizeDesktopSettings({ appearance: { mode: "dark" }, zoom })).toEqual({
+        version: 1,
+        appearance: { mode: "dark" },
+        zoom: { level: 1 },
+      });
+    }
+    expect(normalizeDesktopSettings({ zoom: { level: 1.3 } }).zoom.level).toBe(1.25);
+    expect(normalizeDesktopSettings({ zoom: { level: 99 } }).zoom.level).toBe(3);
   });
 });

@@ -511,4 +511,16 @@ export interface DeckRuntimeState {
   getSettings: () => Promise<import("./lib/bridge").DesktopSettingsSnapshotDto>;
   /** Persist the whole document; resolves to what was written. */
   saveSettings: (settings: import("./lib/bridge").DesktopSettingsDto) => Promise<import("./lib/bridge").DesktopSettingsDto>;
+  /**
+   * Scale the whole window, terminals included (PRD #744).
+   *
+   * Applying only — the level is persisted through `saveSettings`, behind a
+   * coalescer, because a held zoom key would otherwise rewrite `desktop.toml`
+   * once per key repeat. Resolves to the level actually applied, which is the
+   * caller's level snapped to the ladder.
+   *
+   * A no-op outside the Tauri window: a browser has its own zoom, and there is
+   * no webview to scale.
+   */
+  setZoom: (level: number) => Promise<number>;
 }

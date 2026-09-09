@@ -934,6 +934,34 @@ fn child_group_backstop_close_ceiling() -> libc::c_int {
     soft.clamp(CHILD_GROUP_BACKSTOP_MIN_FD, CHILD_GROUP_BACKSTOP_MAX_FD)
 }
 
+/// Resolve this spawn's lifetime tag and put it in the child's environment, so
+/// the forked reaper can still find that child's descendants after they have
+/// left its process group (issue #861 — see [`child_group_backstop_main`]).
+///
+/// Usually the tag is one this wrapper already carries, because a deck-spawned
+/// wrapper is itself a child of `agent_pty::spawn` and inherited the pane's;
+/// [`crate::lifetime_tag::LifetimeTag::for_child`] reuses it so one tag covers
+/// the whole subtree. A wrapper invoked directly — a developer's
+/// `dot-agent-deck wrap`, `tests/wrap_io.rs`,
+/// `tests/agent_lifetime_bound.rs` — mints its own. Setting the variable
+/// explicitly either way rather than relying on inheritance costs nothing and
+/// keeps the child's environment right even if some path between here and the
+/// exec scrubs it.
+///
+/// `None` in production: [`crate::lifetime_tag::LifetimeTag::for_child`]
+/// returns nothing unless `DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS` names a cap,
+/// which the test harness sets and nothing else does. A production wrapper
+/// therefore exports no extra variable and behaves exactly as before.
+#[cfg(unix)]
+fn inject_lifetime_tag(cmd: &mut StdCommand) -> Option<crate::lifetime_tag::LifetimeTag> {
+    let tag = crate::lifetime_tag::LifetimeTag::for_child()?;
+    cmd.env(
+        crate::lifetime_tag::DOT_AGENT_DECK_TEST_LIFETIME_TAG,
+        tag.value(),
+    );
+    Some(tag)
+}
+
 /// Issue #657: a test-only hard bound on the WRAPPED CHILD's process group that
 /// deliberately does NOT depend on this wrapper staying alive.
 ///
@@ -996,8 +1024,24 @@ fn child_group_backstop_close_ceiling() -> libc::c_int {
 /// wrapper needs the child in its own group so `killpg` targets the child and
 /// its descendants and nothing else. This adds a second, independent holder of
 /// that same kill rather than trading the grouping away.
+///
+/// # Two callers since issue #861, and the second is the one that matters
+///
+/// `wrap`'s two spawn paths were the only callers, which covered exactly the
+/// agents `wrap_launch_command` rewrites — the `IntegrationStrategy::Wrapper`
+/// ones. Codex is one; **Claude Code is not** (it is `NativeHooks` and is
+/// spawned bare), and the orphan #861 measured was a Claude Code Bash-tool
+/// shell. So `agent_pty::spawn` calls this too, at the boundary every launch
+/// path funnels through, and a pane gets a reaper whether or not there is a
+/// wrapper in the middle. The `tag` parameter is what the two callers share
+/// downwards: `LifetimeTag::for_child` reuses an inherited tag rather than
+/// minting over it, so a deck-spawned wrapper's reaper and the pane's own reaper
+/// hunt the same needle.
 #[cfg(unix)]
-fn arm_child_group_backstop(child_pid: libc::pid_t) {
+pub(crate) fn arm_child_group_backstop(
+    child_pid: libc::pid_t,
+    tag: Option<crate::lifetime_tag::LifetimeTag>,
+) {
     use crate::agent_pty::DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS;
     use crate::daemon::parse_max_lifetime_secs;
 
@@ -1036,7 +1080,7 @@ fn arm_child_group_backstop(child_pid: libc::pid_t) {
             // lingering as a zombie under a wrapper that never waits for it.
             libc::setsid();
             if libc::fork() == 0 {
-                child_group_backstop_main(child_pid, max_lifetime, close_ceiling);
+                child_group_backstop_main(child_pid, tag, max_lifetime, close_ceiling);
             }
             libc::_exit(0);
         },
@@ -1064,10 +1108,45 @@ fn arm_child_group_backstop(child_pid: libc::pid_t) {
 /// Body of the forked reaper described on [`arm_child_group_backstop`]. Runs in
 /// a fresh single-threaded process and so restricts itself to async-signal-safe
 /// libc calls (`signal`, `close`, `clock_gettime`, `nanosleep`, `killpg`,
-/// `_exit`). Never returns.
+/// `kill`, `getpid`, and — through [`crate::lifetime_tag::signal_tagged`] —
+/// `open` / `read` / `getdents64`). Never returns.
+///
+/// # The group half, and the half a group cannot reach (issue #861)
+///
+/// `killpg(child_pid, …)` reaches the child and everything that stayed in its
+/// process group, which is most of what an agent spawns. It reaches nothing that
+/// left, and agents put processes outside the group as a matter of routine —
+/// Claude Code's Bash tool `setsid`s every shell it runs into a session of its
+/// own. Such a process inherits the cap in its environment and, before this,
+/// was bounded by nothing: measured on the shared dev box, pid 2043710 at
+/// `PPID 1` carrying `DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS=300` and alive four
+/// days.
+///
+/// So the deadline now signals two sets: the child's process group, and every
+/// process still carrying this spawn's [`crate::lifetime_tag::LifetimeTag`].
+/// The two overlap heavily and that is fine — a second signal to a process
+/// already being torn down is a no-op.
+///
+/// **The early exit had to change with it, and that is the substance rather than
+/// a detail.** This loop used to `_exit(0)` the moment the child's group was
+/// gone, on the reasoning that nothing was left to bound. An escapee falsifies
+/// that: it outlives the group by definition, and the reported orphan's group
+/// was long gone. So group death now triggers one tag sweep instead of an exit —
+/// if nothing carries the tag the reaper still exits immediately, exactly as
+/// before, and if something does the reaper stays to its deadline and ends it
+/// there. The escapee's own cap says it may run until then, so killing it early
+/// would be the reaper deciding a question the cap has already answered.
+///
+/// **What this does not cover.** A `SIGKILL` aimed at the reaper itself leaves
+/// the deadline with no holder, and nothing here changes that — the reaper
+/// leaves its parent's group so a group kill cannot take it, but a direct signal
+/// still can. Nor does it reach a descendant that rebuilt its environment and
+/// dropped the tag. And on a non-Linux Unix the sweep is a no-op returning `0`,
+/// so the group half is all there is; see [`crate::lifetime_tag`].
 #[cfg(unix)]
 fn child_group_backstop_main(
     child_pid: libc::pid_t,
+    tag: Option<crate::lifetime_tag::LifetimeTag>,
     max_lifetime: Duration,
     close_ceiling: libc::c_int,
 ) -> ! {
@@ -1082,27 +1161,68 @@ fn child_group_backstop_main(
         }
         close_all_descriptors(close_ceiling);
 
+        let self_pid = libc::getpid();
+        // Signalling by tag with signal 0 delivers nothing and counts, which is
+        // how "is any escapee still out there?" is asked without disturbing one.
+        let tagged = |signal: libc::c_int| -> usize {
+            match tag {
+                // SAFETY (under this fn's enclosing `unsafe`): `signal_tagged`
+                // is async-signal-safe by contract — no allocation and no call
+                // off POSIX's list. See its docs.
+                Some(tag) => crate::lifetime_tag::signal_tagged(tag.needle(), signal, self_pid),
+                None => 0,
+            }
+        };
+
         let deadline = monotonic_millis().saturating_add(millis_saturating(max_lifetime));
+        // Set once the group is gone AND a sweep found an escapee still holding
+        // the tag, which is the only reason to keep waiting past group death.
+        // Latched rather than re-tested so the poll loop stays a `killpg(…, 0)`
+        // and never becomes a `/proc` walk four times a second.
+        let mut escapees_pending = false;
         while monotonic_millis() < deadline {
-            if !pid_group_alive(child_pid) {
-                libc::_exit(0);
+            if !escapees_pending && !pid_group_alive(child_pid) {
+                if tagged(0) == 0 {
+                    libc::_exit(0);
+                }
+                escapees_pending = true;
             }
             sleep_millis(millis_saturating(CHILD_GROUP_BACKSTOP_POLL));
         }
-        if !pid_group_alive(child_pid) {
+
+        // Re-check before signalling: the group id is a bare number carrying no
+        // identity, so signalling one that has been gone since the last poll
+        // risks a reused pgid. See [`CHILD_GROUP_BACKSTOP_POLL`] on how narrow
+        // that window is and why it is bounded rather than closed. A tag needs
+        // no such check — it names this spawn, not a number the kernel reissues.
+        let group_alive = pid_group_alive(child_pid);
+        if group_alive {
+            libc::killpg(child_pid, libc::SIGTERM);
+        }
+        let escapees = tagged(libc::SIGTERM);
+        if !group_alive && escapees == 0 {
             libc::_exit(0);
         }
-        libc::killpg(child_pid, libc::SIGTERM);
 
         let escalate = monotonic_millis()
             .saturating_add(millis_saturating(crate::agent_pty::WRAP_TERMINATE_GRACE));
         while monotonic_millis() < escalate {
-            if !pid_group_alive(child_pid) {
+            // Only the group's departure can shorten the grace: an escapee was
+            // just sent a SIGTERM it may be ignoring, and re-sweeping `/proc`
+            // every 50 ms to find out would cost more than waiting out 1.5 s.
+            if escapees == 0 && !pid_group_alive(child_pid) {
                 libc::_exit(0);
             }
             sleep_millis(50);
         }
-        libc::killpg(child_pid, libc::SIGKILL);
+        // Re-checked here rather than trusting `group_alive` from before the
+        // grace window: with an escapee pending, that window is now 1.5 s of
+        // not looking, and the original code could never arrive here with a
+        // dead group because it exited the loop the moment the group went.
+        if pid_group_alive(child_pid) {
+            libc::killpg(child_pid, libc::SIGKILL);
+        }
+        tagged(libc::SIGKILL);
         libc::_exit(0);
     }
 }
@@ -2016,6 +2136,8 @@ fn run_wrap_pty(
         cmd.pre_exec(move || child_pre_exec(ctty_fd));
     }
 
+    let lifetime_tag = inject_lifetime_tag(&mut cmd);
+
     // finding #12: record catchable signals BEFORE the child exists so a signal
     // in the spawn/setup window is forwarded through normal cleanup rather than
     // killing the wrapper and orphaning the child. Restored on drop.
@@ -2036,7 +2158,7 @@ fn run_wrap_pty(
     // Issue #657: armed AFTER the slave copies are dropped and before the reap
     // loop can be interrupted, so the child's group has a bound of its own even
     // if this wrapper is SIGKILL'd a moment from now. No-op outside tests.
-    arm_child_group_backstop(child_pid);
+    arm_child_group_backstop(child_pid, lifetime_tag);
 
     // Take the pipe ends for any redirected descriptor.
     let pipe_in = if stdin_tty { None } else { child.stdin.take() };
@@ -2336,6 +2458,8 @@ fn run_wrap_pipe(
         cmd.pre_exec(|| child_pre_exec(-1));
     }
 
+    let lifetime_tag = inject_lifetime_tag(&mut cmd);
+
     // finding #12: install the restorable signal guard BEFORE spawning so a
     // signal in the spawn window is recorded and forwarded, not fatal.
     let _signal_guard = SignalGuard::install();
@@ -2349,7 +2473,7 @@ fn run_wrap_pipe(
     };
     let child_pid = child.id() as libc::pid_t;
     // Issue #657: same independent bound on the child's group as the PTY path.
-    arm_child_group_backstop(child_pid);
+    arm_child_group_backstop(child_pid, lifetime_tag);
 
     // PRD #225 M3: same fork-time card-surfacing event as the PTY path, and the
     // same marker — it says "a session exists", not "the agent is ready".

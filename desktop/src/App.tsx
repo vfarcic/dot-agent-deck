@@ -43,7 +43,8 @@ import { useAgentProfiles } from "./hooks/useAgentProfiles";
 import { useDeckRuntime } from "./hooks/useDeckRuntime";
 import { useProjects } from "./hooks/useProjects";
 import { usePromptLibrary } from "./hooks/usePromptLibrary";
-import { useDesktopSettings } from "./hooks/useDesktopSettings";
+import { useDesktopSettings, type DesktopSettingsState } from "./hooks/useDesktopSettings";
+import { useZoom } from "./hooks/useZoom";
 import { applyAppearance } from "./lib/appearance";
 import { desktopWorkflowPlatformIssue } from "./lib/platform";
 import type { DeckAction, DeckActionResult, DeckRuntimeState, DeckView, EvidenceItem, PanelTab, WorkflowLaunchConfig } from "./types";
@@ -75,11 +76,42 @@ export default function App() {
  */
 export function DeckShell({ runtime, workflowPlatformIssue, initialView = { kind: "deck" } }: { runtime: DeckRuntimeState; workflowPlatformIssue?: string; initialView?: DeckView }) {
   const [view, setView] = useState<DeckView>(initialView);
+  /**
+   * The settings document and the zoom keys live HERE, not in the deck,
+   * because both are the app's and not one screen's — and `DeckShell` is the
+   * only component mounted for every view. The deck is unmounted while the
+   * overview is up, which is exactly how the zoom keys came to be dead on the
+   * overview: they were bound in `ControlDeck`, so they went away with it.
+   * `zooms on the overview, not only on the deck` in
+   * `components/AgentOverview.test.tsx` is the guard, with the deck case
+   * beside it as its control.
+   *
+   * A second view added later gets zoom for free. One that renders its own
+   * settings state instead of taking this one would re-create the bug.
+   */
+  const settings = useDesktopSettings(runtime);
+  useZoom(runtime, settings);
   if (view.kind === "overview") return <AgentOverview runtime={runtime} onNavigate={setView} />;
-  return <ControlDeck runtime={runtime} workflowPlatformIssue={workflowPlatformIssue} onNavigate={setView} />;
+  return <DeckSurface runtime={runtime} settings={settings} workflowPlatformIssue={workflowPlatformIssue} onNavigate={setView} />;
 }
 
-export function ControlDeck({ runtime, workflowPlatformIssue = desktopWorkflowPlatformIssue(), onNavigate }: { runtime: DeckRuntimeState; workflowPlatformIssue?: string; onNavigate?: (view: DeckView) => void }) {
+/**
+ * The deck with a settings state of its own.
+ *
+ * A three-line wrapper so the deck can still be rendered standalone — which is
+ * what the tests do, and what every caller did before the settings state moved
+ * up to {@link DeckShell}. The alternative was an optional `settings` prop on
+ * {@link DeckSurface} falling back to its own hook, and that carries a trap
+ * this does not: two live settings instances, one of them rendered by nothing,
+ * so a later `save` against the wrong one would write state no screen reads.
+ * Here there is exactly one instance per tree.
+ */
+export function ControlDeck(props: { runtime: DeckRuntimeState; workflowPlatformIssue?: string; onNavigate?: (view: DeckView) => void }) {
+  const settings = useDesktopSettings(props.runtime);
+  return <DeckSurface {...props} settings={settings} />;
+}
+
+export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktopWorkflowPlatformIssue(), onNavigate }: { runtime: DeckRuntimeState; settings: DesktopSettingsState; workflowPlatformIssue?: string; onNavigate?: (view: DeckView) => void }) {
   const { snapshot, mode, setShownTerminals } = runtime;
   const [selectedAgentId, setSelectedAgentId] = useState("");
   const [tabs, setTabs] = useState<Record<string, PanelTab>>({});
@@ -101,7 +133,6 @@ export function ControlDeck({ runtime, workflowPlatformIssue = desktopWorkflowPl
   const { projects, activeId: activeProjectId, activeProject, setActiveId: setActiveProjectId, addProject, updateProject, removeProject } = useProjects(snapshot.worktree, snapshot.repo);
   const { prompts, addPrompt, updatePrompt, removePrompt } = usePromptLibrary();
   const [profileOrder, setProfileOrder] = useState<string[]>([]);
-  const settings = useDesktopSettings(runtime);
 
   // PRD #743: applied on LOAD as well as on change. Keeping it in one effect
   // keyed on the stored value means the panel only has to save — the change
@@ -618,6 +649,6 @@ function CommandPalette({ commands, onClose }: { commands: { label: string; hint
 }
 
 function ShortcutHelp({ onClose }: { onClose: () => void }) {
-  const shortcuts = [["⌘ K", "Command menu"], ["1 — 4", "Focus agent"], ["J / K", "Move through evidence"], ["?", "Shortcut guide"], ["ESC", "Close overlay"]];
+  const shortcuts = [["⌘ K", "Command menu"], ["⌘/Ctrl + / − / 0", "Zoom in, out, reset"], ["1 — 4", "Focus agent"], ["J / K", "Move through evidence"], ["?", "Shortcut guide"], ["ESC", "Close overlay"]];
   return <div className="dialog-backdrop" role="presentation" onMouseDown={onClose}><section className="shortcut-dialog" role="dialog" aria-modal="true" aria-labelledby="shortcut-title" onMouseDown={(event) => event.stopPropagation()}><header><div><HelpCircle size={18} /><h2 id="shortcut-title">Control keys</h2></div><button aria-label="Close shortcut guide" onClick={onClose}><X size={16} /></button></header>{shortcuts.map(([keys, label]) => <div key={keys}><span>{label}</span><kbd>{keys}</kbd></div>)}</section></div>;
 }

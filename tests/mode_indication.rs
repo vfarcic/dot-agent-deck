@@ -19,15 +19,17 @@ use dot_agent_deck::state::{SessionState, SessionStatus};
 use dot_agent_deck::terminal_widget::TerminalWidget;
 use dot_agent_deck::ui::{
     BannerTier, COMMAND_BANNER_TTL, CardDensityKind, CommandBannerSignal, CommandBannerState,
-    CommandBannerVisibility, ReconcileSeamPane, SCROLL_NOTICE_MIN_SCREENFULS, SCROLL_NOTICE_SHORT,
-    SCROLL_NOTICE_TEXT, SCROLL_SEAM_COLS, SCROLL_SEAM_ROWS, UiMode, command_banner_tier,
-    observe_command_banner_key_burst, observe_focused_agent_key_scroll,
-    observe_focused_agent_mouse_scroll, observe_focused_agent_without_scroll,
-    observe_pane_input_scrollback_reconcile, observe_pane_input_without_focused_pane,
-    observe_scroll_notice_lifecycle, render_button_bar_for_mode_to_buffer,
-    render_button_bar_to_buffer, render_button_bar_with_bindings_to_buffer,
-    render_card_for_mode_to_buffer, render_card_to_buffer, render_command_banner_pane_to_buffer,
+    CommandBannerVisibility, ENTER_ALTERNATE_SCREEN, LEAVE_ALTERNATE_SCREEN, ReconcileSeamPane,
+    SCROLL_NOTICE_MIN_SCREENFULS, SCROLL_NOTICE_SHORT, SCROLL_NOTICE_TEXT, SCROLL_SEAM_COLS,
+    SCROLL_SEAM_ROWS, UiMode, command_banner_tier, observe_command_banner_key_burst,
+    observe_focused_agent_key_scroll, observe_focused_agent_mouse_scroll,
+    observe_focused_agent_without_scroll, observe_pane_input_scrollback_reconcile,
+    observe_pane_input_without_focused_pane, observe_scroll_notice_lifecycle,
+    render_button_bar_for_mode_to_buffer, render_button_bar_to_buffer,
+    render_button_bar_with_bindings_to_buffer, render_card_for_mode_to_buffer,
+    render_card_to_buffer, render_command_banner_pane_to_buffer,
     render_focused_pane_cursor_for_mode_to_position, synthetic_decstbm_repaint_stream,
+    synthetic_scrollable_history_stream,
 };
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -1094,6 +1096,93 @@ fn mode_deck_001_selected_card_accent_tracks_mode() {
             buffer_to_styled_text(&command),
             buffer_to_styled_text(&typing)
         )
+    );
+}
+
+/// Scenario: Feed a focused pane ordinary newline output past the eight-screenful maturity bar so it holds real scrollback, then switch it to the alternate screen and press PageUp. The deck must not claim the pane has no scrollback: an alternate-screen pane is one whose history the deck cannot currently reach, not one that never had any, and leaving the alternate screen must show that history was there the whole time.
+#[spec("mode/scroll/006")]
+#[test]
+fn mode_scroll_006_alternate_screen_pane_is_unreachable_not_empty() {
+    let kb = KeybindingConfig::default();
+    let page_up = KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE);
+    let minimum =
+        SCROLL_NOTICE_MIN_SCREENFULS * u64::from(SCROLL_SEAM_ROWS) * u64::from(SCROLL_SEAM_COLS);
+
+    let history = synthetic_scrollable_history_stream(SCROLL_SEAM_ROWS, SCROLL_SEAM_COLS);
+
+    // Control: the identical history on the NORMAL screen. This is the case the
+    // notice must already stay quiet on, and it is what makes the alternate-screen
+    // red below attributable to the mode switch rather than to the fixture.
+    let normal = observe_focused_agent_key_scroll(&kb, UiMode::Normal, page_up, &history, 0);
+    assert!(
+        normal.bytes_fed_since_spawn >= minimum,
+        "control: the fixture must clear the maturity bar, or neither case can arm the notice: {normal:?}"
+    );
+    assert!(
+        normal.scrollback_depth > 0,
+        "control: ordinary newline output must leave real retained depth: {normal:?}"
+    );
+    assert!(
+        !normal.notice_visible,
+        "control: a pane with reachable history must never arm the notice: {normal:?}"
+    );
+    assert!(
+        normal.scrollback_after > normal.scrollback_before,
+        "control: PageUp must actually move the view back: {normal:?}"
+    );
+
+    // The defect: the same pane, now on the alternate screen. vt100 builds the
+    // alternate grid with ZERO scrollback capacity and dispatches every scrollback
+    // read and write to it while the mode is set, so the depth probe reads 0 no
+    // matter how much the pane produced -- while `bytes_since_spawn` keeps counting
+    // straight across the switch.
+    let mut alternate = history.clone();
+    alternate.extend_from_slice(ENTER_ALTERNATE_SCREEN);
+    let observed = observe_focused_agent_key_scroll(&kb, UiMode::Normal, page_up, &alternate, 0);
+
+    assert!(
+        observed.bytes_fed_since_spawn >= minimum,
+        "the alternate-screen pane must still be mature, or this proves nothing: {observed:?}"
+    );
+    // Greptile P2 on PR #897, and correct: without this the case is VACUOUS.
+    // The whole point is that the depth probe reads zero *because* vt100 answers
+    // it from the alternate grid. If `ESC[?1049h` ever stopped activating that
+    // grid -- a vt100 change, or a typo in the constant -- this case would
+    // silently degrade into a second copy of the normal-screen control and keep
+    // passing, while exercising none of `facts.alternate_screen`. Pin the
+    // precondition so that failure is loud instead.
+    assert_eq!(
+        observed.scrollback_depth, 0,
+        "precondition: the alternate grid must be the one answering the depth probe, \
+         or this case silently degrades into the normal-screen control and tests nothing. \
+         The control measured {} on the same bytes: {observed:?}",
+        normal.scrollback_depth
+    );
+    assert!(
+        !observed.notice_visible,
+        "an alternate-screen pane's history is UNREACHABLE, not absent -- the notice states \
+         'this pane has no scrollback to move through', which is false here: the same bytes \
+         left {} retained lines on the normal screen. Reporting the deck's own blind spot as a \
+         property of the agent is the defect PRD #611 already fixed once for the parser-rebuild \
+         path (src/embedded_pane.rs:3413). Observed: {observed:?}",
+        normal.scrollback_depth
+    );
+
+    // And the history really is intact underneath: leaving the alternate screen
+    // brings back exactly what the normal-screen control measured. This is what
+    // makes "unreachable, not absent" a measured claim rather than an assertion.
+    let mut round_trip = history.clone();
+    round_trip.extend_from_slice(ENTER_ALTERNATE_SCREEN);
+    round_trip.extend_from_slice(LEAVE_ALTERNATE_SCREEN);
+    let restored = observe_focused_agent_key_scroll(&kb, UiMode::Normal, page_up, &round_trip, 0);
+    assert_eq!(
+        restored.scrollback_depth, normal.scrollback_depth,
+        "leaving the alternate screen must restore the very depth the control measured, \
+         proving the history was retained throughout: {restored:?}"
+    );
+    assert!(
+        !restored.notice_visible,
+        "a pane back on the normal screen must not carry a notice: {restored:?}"
     );
 }
 
