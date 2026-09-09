@@ -87,16 +87,31 @@ describe("SettingsSheet section column", () => {
     expect(screen.getByTestId("stub-body-alpha")).toBeVisible();
   });
 
-  it("collapses for the real registry today, because it has one section", () => {
-    // The bridge between the two tests above and what a user actually sees.
-    // When #741 or #802 adds a row this flips on its own and the assertion
-    // becomes the one in the two-section test — nothing here has to change.
-    expect(SETTINGS_SECTIONS).toHaveLength(1);
+  it("shows the column for the real registry, which now has two sections", () => {
+    // The bridge between the two stub-driven tests above and what a user
+    // actually sees. This was the collapsed case until PRD #744's Zoom row
+    // landed; it flipped on its own, with no change to the sheet, which is
+    // exactly the claim the collapse was built to make good. Inverted rather
+    // than deleted, so the live registry's real layout stays pinned.
+    expect(SETTINGS_SECTIONS).toHaveLength(2);
     renderSheet();
-    expect(screen.getByTestId("settings-layout")).toHaveClass("is-single");
-    expect(screen.queryByRole("navigation", { name: "Settings sections" })).not.toBeInTheDocument();
+    expect(screen.getByTestId("settings-layout")).not.toHaveClass("is-single");
+    expect(screen.getByRole("navigation", { name: "Settings sections" })).toBeVisible();
+    // The first row is the one that renders; the rest are reachable buttons.
     expect(screen.getByTestId(`settings-panel-${SETTINGS_SECTIONS[0].id}`)).toBeVisible();
     expect(screen.getByRole("group", { name: "Appearance" })).toBeVisible();
+    for (const section of SETTINGS_SECTIONS) {
+      expect(screen.getByTestId(`settings-section-${section.id}`)).toBeVisible();
+    }
+  });
+
+  it("switches to the Zoom section and renders its row", () => {
+    renderSheet();
+    fireEvent.click(screen.getByTestId("settings-section-zoom"));
+    expect(screen.getByTestId("settings-panel-zoom")).toBeVisible();
+    expect(screen.getByLabelText("Zoom")).toBeVisible();
+    // And the Appearance panel is gone rather than both being mounted.
+    expect(screen.queryByRole("group", { name: "Appearance" })).not.toBeInTheDocument();
   });
 
   it("says there is nothing to show if the registry is ever emptied", () => {

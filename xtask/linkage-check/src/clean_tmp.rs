@@ -239,6 +239,38 @@ pub(crate) const MAX_PINNED_ORPHAN_CAP_SECS: u64 = 900;
 /// developer is most likely to run `--apply` is right after a run died, which
 /// is exactly when orphans are still alive.
 ///
+/// **"Up to that cap" is narrower than it reads, and issue #861 is what pinned
+/// the scope down.** It holds for the class the paragraph above names — the
+/// deck's lazily-spawned daemon, and a wrapped agent's child since #657/#661 —
+/// because each is either one of this project's own binaries enforcing the cap
+/// in-process, or is `killpg`'d at the deadline by a forked reaper that holds it
+/// independently of any owner. It did **not** hold for a descendant that
+/// `setsid`s out of every group those reapers can signal: measured on the shared
+/// dev box, pid 2043710 carried `DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS=300` in
+/// its own environment at `PPID 1` and had been alive **four days** — about
+/// 1170x its cap.
+///
+/// That did not make this floor unsafe, and the reason is worth stating rather
+/// than assuming, because the obvious reading points the wrong way. No finite
+/// floor bounds an unbounded writer, so for that class a larger number would
+/// have bought nothing. And the floor was never what protected that class: this
+/// reaper decides `live-pid` from the **test process's** pid in the root's name
+/// and never from an orphan's, so an escapee has never held its own root against
+/// `--apply` at any age. That was already known and already accepted — 221 such
+/// orphans were censused for #668, "each still holding a working directory the
+/// tooling had already deleted" — with the cost named as the process itself:
+/// retained inodes, a polluted `ps`, and the chance of it re-creating paths
+/// under a root that was just removed.
+///
+/// So #861 changed the claim rather than the number, and then narrowed the gap
+/// it exposed: `src/lifetime_tag.rs` gives the deadline a way to find a process
+/// by a per-spawn tag in its environment instead of by a process group, so an
+/// escapee that carries the tag is now bounded by the same cap on Linux for as
+/// long as its reaper lives. That leaves this derivation better supported than
+/// when it was written and still not universal — a `SIGKILL` of the reaper
+/// itself, a descendant that rebuilt its environment, and a non-Linux host each
+/// remain outside it.
+///
 /// The old age-only rule never had this problem: its 6h floor was 72× the
 /// orphan cap. This floor restores that protection at 2× the cap instead of
 /// 72×, which is ample, and costs #461 nothing — the case it was filed for was

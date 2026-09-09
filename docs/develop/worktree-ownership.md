@@ -23,6 +23,8 @@ At **creation time**, in the success arm of `issue_dispatch_run::create_worktree
 
 Writing it at creation rather than at first use is what closes the window in which a worktree the deck genuinely created is not yet recognisable as its own.
 
+That same success arm does one other thing, for an unrelated reason: it materializes the new worktree's devbox environment once, serially, before returning — so that concurrently started roles cannot race a cold `.devbox`. It is best-effort in the same way the marker is, and for the same kind of reason. See [devbox and concurrent starts](devbox-concurrency.md).
+
 The write is **best-effort and never fatal**: a failure warns and is dropped. The cost of a missing marker is one extra confirmation at reclaim time; the cost of propagating the error would be a failed dispatch. It is also **idempotent** — a single whole-file write, so a re-created or re-attached worktree replaces the document instead of accumulating one per creation.
 
 The marker's content records **who** created the worktree (which creation path, and what for), plus the deck version, a timestamp, the pid and the branch. That content is informational. The gate itself is an **existence check** and never parses it, so a future change to the document's shape cannot silently reclassify every existing deck-created worktree as foreign.

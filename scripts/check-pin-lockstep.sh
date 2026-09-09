@@ -2,7 +2,9 @@
 #
 # Issue #648 — the Rust toolchain and cargo-nextest versions are pinned TWICE,
 # once in `devbox.json` (what a `devbox shell` gets) and once in
-# `.github/workflows/` (what CI gets). Nothing checked that the two agree, and
+# `.github/workflows/` (what CI gets). `devbox.json`'s `packages` has two
+# spellings and this reads both — see `devbox_pins` below, and issue #791 for
+# the day devbox rewrote the file from one to the other. Nothing checked that the two agree, and
 # on 2026-08-11 they stopped agreeing: `devbox.json` moved to cargo-nextest
 # 0.9.143 via an automerged Renovate PR (#510) while `ci.yml` sat on 0.9.140
 # for eleven days. `renovate.json`'s own rule had said the quiet part out loud —
@@ -40,8 +42,10 @@
 #      drift under a check reporting `ok`.
 #   2. At least one site exists on each side, so a rename cannot make the whole
 #      check pass vacuously.
-#   3. All sites within a side agree with each other (all seven `toolchain:`
-#      lines; devbox's rustc/cargo/clippy/rustfmt, which are one toolchain).
+#   3. All sites within a side agree with each other (every `toolchain:` line
+#      across the workflows; devbox's rustc/cargo/clippy/rustfmt, which are one
+#      toolchain). The site count is derived, never written down here — it was
+#      "seven" in this comment while the files carried nine.
 #   4. The two sides agree with each other. This is the lockstep itself.
 #
 # It deliberately hardcodes NO version. Every value is read off the files, so
@@ -239,21 +243,158 @@ scan_workflow_nextest() {
   done < <(workflow_files)
 }
 
-# Emits "devbox.json <version>" per named package in devbox.json's array.
+# Every `<name><TAB><version>` pair in devbox.json's `packages`, in file order.
+#
+# `packages` HAS TWO SPELLINGS and devbox writes both, which is why this is a
+# parser rather than the one-line `grep -oE "\"$name@[^\"]*\""` it used to be.
+# The array form (`"rustc@1.97.1"`) is what a file only ever touched by plain
+# `devbox add <pkg>` keeps. The object form (`"rustc": "1.97.1"`, or
+# `"rustc": {"version": "1.97.1", …}` once a package carries a per-package
+# option) is what devbox REWRITES THE WHOLE FILE to the moment any one package
+# takes an option — `--disable-plugin` on nodejs (issue #791) converted all 22
+# entries in one go. Reading only the array form therefore did not fail on the
+# one changed entry; it lost every Rust pin at once and said "devbox.json pins
+# no rustc at all" four times over. That is the loud direction, and the "or its
+# spelling changed (fix the script)" clause in that message is exactly this fix.
+#
+# Reading both is also what keeps the lockstep between the right two things.
+# Renovate's devbox manager parses `packages` as a union of the array form and a
+# record whose values are either a version string or an object carrying one
+# (`lib/modules/manager/devbox/schema.ts`), so BOTH spellings are pins Renovate
+# tracks and bumps — and a guard that reads only one of them is blind to drift
+# in the other, the same shape of hole as reading only block-style YAML (#710).
+#
+# Scoped to the `packages` block by a brace/bracket walk rather than grepped
+# over the whole file, so a `shell.scripts` entry that happens to be named after
+# a package (`"cargo": "cargo build"`) cannot be read as that package's pin. The
+# walk tracks string state, so a brace inside a value is not a nesting change.
+devbox_pins() {
+  awk '
+    { all = all $0 "\n" }
+
+    # Index of the character one past the value that starts at `start` (the
+    # opening `{` or `[`), honouring nesting and quoted strings.
+    function close_at(s, start,   i, c, depth, instr) {
+      depth = 0
+      instr = 0
+      for (i = start; i <= length(s); i++) {
+        c = substr(s, i, 1)
+        if (instr) {
+          if (c == "\\") i++
+          else if (c == "\"") instr = 0
+          continue
+        }
+        if (c == "\"") { instr = 1; continue }
+        if (c == "{" || c == "[") depth++
+        else if (c == "}" || c == "]") {
+          depth--
+          if (depth == 0) return i + 1
+        }
+      }
+      return length(s) + 1
+    }
+
+    # The contents of the first quoted token in `s` — the key of an object
+    # entry, or the whole `name@version` of an array entry.
+    function unquote(s) {
+      if (!match(s, /"[^"]*"/)) return ""
+      return substr(s, RSTART + 1, RLENGTH - 2)
+    }
+
+    # The contents of the LAST quoted token in a matched `… "key": "value"`
+    # head. Written as "drop everything through the opening quote of the value"
+    # rather than "take everything after the first colon", because a devbox
+    # package name may itself contain one — `path:gcloud#google-cloud-sdk` is
+    # two of the entries in this repository.
+    function tailvalue(s,   t) {
+      t = s
+      sub(/^[^"]*"[^"]*"[[:space:]]*:[[:space:]]*"/, "", t)
+      sub(/"$/, "", t)
+      return t
+    }
+
+    # The value of a `"version": "X.Y.Z"` key anywhere in `s`, or "".
+    function versionof(s,   t) {
+      if (!match(s, /"version"[[:space:]]*:[[:space:]]*"[^"]*"/)) return ""
+      t = substr(s, RSTART, RLENGTH)
+      sub(/^"version"[[:space:]]*:[[:space:]]*"/, "", t)
+      sub(/"$/, "", t)
+      return t
+    }
+
+    function emit_array_entry(tok,   at) {
+      at = index(tok, "@")
+      # A version-less entry (a `path:` flake ref) is emitted with an EMPTY
+      # version rather than dropped: `scan_devbox` only looks up the names it
+      # was asked for, and for one of those an empty value has to reach the
+      # "not an exact X.Y.Z version" complaint instead of reading as absent.
+      if (at > 0) print substr(tok, 1, at - 1) "\t" substr(tok, at + 1)
+      else print tok "\t"
+    }
+
+    END {
+      p = index(all, "\"packages\"")
+      if (p == 0) exit
+      s = substr(all, p)
+      if (!match(s, /^"packages"[[:space:]]*:[[:space:]]*[\[{]/)) exit
+      # The match ends ON the opening bracket, so RLENGTH indexes it.
+      open_at = RLENGTH
+      body = substr(s, open_at, close_at(s, open_at) - open_at)
+
+      # Every branch below is anchored at `^`, so RSTART is 1 and RLENGTH alone
+      # says how far to advance. Both are SAVED before anything else runs:
+      # `match` is global state in awk, and calling `unquote` between reading
+      # RLENGTH and using it silently reinterprets the rest of the file.
+      while (length(body) > 0) {
+        # `"name": { … }` — a package carrying per-package options.
+        if (match(body, /^[][{}[:space:],]*"[^"]*"[[:space:]]*:[[:space:]]*\{/)) {
+          head = substr(body, 1, RLENGTH)
+          obj_at = RLENGTH
+          obj_end = close_at(body, obj_at)
+          v = versionof(substr(body, obj_at, obj_end - obj_at))
+          # An object with no `version` key pins nothing, and is reported as
+          # absent by `scan_devbox` — loud, and the only honest answer.
+          if (v != "") print unquote(head) "\t" v
+          body = substr(body, obj_end)
+          continue
+        }
+        # `"name": "version"` — the ordinary object entry.
+        if (match(body, /^[][{}[:space:],]*"[^"]*"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+          head = substr(body, 1, RLENGTH)
+          body = substr(body, RLENGTH + 1)
+          print unquote(head) "\t" tailvalue(head)
+          continue
+        }
+        # `"name@version"` — the array entry.
+        if (match(body, /^[][{}[:space:],]*"[^"]*"/)) {
+          head = substr(body, 1, RLENGTH)
+          body = substr(body, RLENGTH + 1)
+          emit_array_entry(unquote(head))
+          continue
+        }
+        # Anything else (a bare `true`, a number, an unrecognised shape): step
+        # over one character and keep going. Nothing is invented from it, so an
+        # unreadable spelling loses its pins loudly rather than inventing one.
+        body = substr(body, 2)
+      }
+    }
+  ' "$root/devbox.json"
+}
+
+# Emits "devbox.json(<name>) <version>" per named package in devbox.json.
 scan_devbox() {
-  local name entry value found
+  local name value found pins
+  pins="$(devbox_pins)"
   for name in "$@"; do
     found=0
-    while IFS= read -r entry; do
+    while IFS= read -r value; do
       found=1
-      value="${entry#\"$name@}"
-      value="${value%\"}"
       if ! printf '%s' "$value" | grep -qE "$SEMVER"; then
         printf '%s%s\n' "$SCAN_ERR" "devbox.json pins $name at '$value', which is not an exact X.Y.Z version."
         continue
       fi
       printf 'devbox.json(%s) %s\n' "$name" "$value"
-    done < <(grep -oE "\"$name@[^\"]*\"" "$root/devbox.json" || true)
+    done < <(printf '%s\n' "$pins" | awk -F'\t' -v n="$name" '$1 == n { print $2 }')
     # A component that VANISHED is not a component that agrees. `compare` only
     # ever sees the versions that were found, so without this a devbox.json
     # which dropped or renamed `clippy` would leave the other three agreeing

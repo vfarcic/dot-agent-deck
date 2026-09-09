@@ -283,6 +283,13 @@ enum ScheduleAction {
         new_tab_per_fire: bool,
         #[arg(long, action = clap::ArgAction::Set, default_value_t = true)]
         enabled: bool,
+        /// Issue #835: force the fire's spawn shape instead of deriving it from
+        /// `--working-dir`'s config: `single` (ONE agent running `--command`, even
+        /// where the dir defines `[[orchestrations]]`), `orchestration` (that
+        /// dir's default one) or `orchestration:<name>`. Omit to keep the
+        /// config-derived behaviour.
+        #[arg(long)]
+        shape: Option<String>,
         // PRD #120: issue-dispatch knobs. When `--repo` is present this `add`
         // authors an ISSUE-DISPATCH task (writes `[scheduled_tasks.issue_dispatch]`,
         // and `--command` is optional — the per-issue command comes from each
@@ -314,6 +321,12 @@ enum ScheduleAction {
         new_tab_per_fire: Option<bool>,
         #[arg(long)]
         enabled: Option<bool>,
+        /// Issue #835: set the fire's spawn shape (`single`, `orchestration`,
+        /// `orchestration:<name>`). Pass an EMPTY value (`--shape ""`) to clear it
+        /// and go back to deriving the shape from the target dir's config;
+        /// omitting the flag leaves the stored value unchanged.
+        #[arg(long)]
+        shape: Option<String>,
     },
     /// Remove a task definition (does not kill an open tab for it).
     Remove {
@@ -2178,6 +2191,7 @@ async fn run_schedule_cli(action: ScheduleAction) -> ExitCode {
             prompt,
             new_tab_per_fire,
             enabled,
+            shape,
             repo,
             max_per_run,
             label,
@@ -2204,6 +2218,7 @@ async fn run_schedule_cli(action: ScheduleAction) -> ExitCode {
                     prompt,
                     new_tab_per_fire,
                     enabled,
+                    shape,
                     issue_dispatch,
                 },
             )
@@ -2216,6 +2231,7 @@ async fn run_schedule_cli(action: ScheduleAction) -> ExitCode {
             prompt,
             new_tab_per_fire,
             enabled,
+            shape,
         } => schedule_cli::update(
             &mut tasks,
             schedule_cli::UpdateArgs {
@@ -2226,6 +2242,7 @@ async fn run_schedule_cli(action: ScheduleAction) -> ExitCode {
                 prompt,
                 new_tab_per_fire,
                 enabled,
+                shape,
             },
         ),
         ScheduleAction::Remove { name } => schedule_cli::remove(&mut tasks, &name),

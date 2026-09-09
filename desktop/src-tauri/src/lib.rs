@@ -811,6 +811,52 @@ async fn desktop_set_settings(
     Ok(settings)
 }
 
+/// Apply a zoom level to the main webview (PRD #744).
+///
+/// # Why this is a command rather than `getCurrentWebview().setZoom()`
+///
+/// The frontend route needs the `core:webview:allow-set-webview-zoom`
+/// permission, which `core:default` does **not** include — its webview default
+/// set is `allow-get-all-webviews`, `allow-webview-position`,
+/// `allow-webview-size` and `allow-internal-toggle-devtools`. Broadening the
+/// webview's own core surface to reach a call we can make ourselves would be
+/// strictly more privilege for no gain. This also keeps the zoom behind the
+/// `DeckBridge` seam like every other bridge call, so fixture mode no-ops
+/// structurally rather than by a check.
+///
+/// # It does not persist anything
+///
+/// Applying and storing are separate on purpose: the webview is told here, and
+/// the level is written by [`desktop_set_settings`] behind a coalescer, because
+/// a held key would otherwise rewrite `desktop.toml` once per repeat. The
+/// launch-time apply in [`run`] reads the stored level and calls the same
+/// `set_zoom`.
+///
+/// The level is snapped to the ladder before it is applied, so a webview
+/// sending an arbitrary float cannot drive the window to 40x — the same
+/// `ZoomLevel::snap` the document uses, so the two paths cannot disagree about
+/// what a level means.
+#[tauri::command]
+async fn desktop_set_zoom(webview: Webview, level: f64) -> Result<f64, String> {
+    ensure_main_webview(&webview)?;
+    let snapped = settings::ZoomLevel::snap(level);
+    apply_zoom(&webview, snapped);
+    Ok(snapped.as_f64())
+}
+
+/// Push a level at a webview, logging rather than propagating a failure.
+///
+/// Shared by the command above and the launch-time apply, so there is one call
+/// site for `set_zoom` and not two that could drift. A failure is not worth
+/// failing either caller over: the command's caller has already applied the
+/// level optimistically in the UI, and a launch that refuses to start because a
+/// zoom could not be set would be a far worse bug than a window at 100%.
+fn apply_zoom(webview: &Webview, level: settings::ZoomLevel) {
+    if let Err(error) = webview.set_zoom(level.as_f64()) {
+        eprintln!("dot-agent-deck-desktop: could not set webview zoom: {error}");
+    }
+}
+
 #[tauri::command]
 async fn desktop_run_action(
     app: AppHandle,
@@ -1074,6 +1120,30 @@ async fn desktop_run_action(
 pub fn run() {
     let app = tauri::Builder::default()
         .manage(DesktopState::default())
+        // PRD #744: apply the stored zoom before the webview has run any of our
+        // JavaScript, so a user at 150% does not watch the app paint at 100%
+        // and then jump. That is the whole reason this leg exists Rust-side;
+        // the frontend applies only on *change*.
+        //
+        // Note this is a deliberate departure from PRD #743's arrangement,
+        // whose one effect applies the appearance on load AND on change
+        // precisely so there is "no second path that could disagree with this
+        // one" (`App.tsx`). Zoom takes the split because it has something
+        // appearance does not — a Rust-side option that removes a visible
+        // flash — and pays for it with exactly the failure #743 warns about:
+        // if this leg regresses, the window comes up at 100% while the
+        // Settings row reads the stored level. `prds/744-*.md` records the
+        // condition under which the split should be given up.
+        //
+        // A missing window is not an error. `load_snapshot` never fails, and a
+        // default level makes this a no-op rather than a special case.
+        .setup(|app| {
+            let level = settings::load_snapshot().settings.zoom.level;
+            if let Some(window) = app.get_webview_window("main") {
+                apply_zoom(window.as_ref(), level);
+            }
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             desktop_get_snapshot,
             desktop_bootstrap,
@@ -1083,6 +1153,7 @@ pub fn run() {
             desktop_terminal_detach,
             desktop_get_settings,
             desktop_set_settings,
+            desktop_set_zoom,
             desktop_run_action,
         ])
         .build(tauri::generate_context!())

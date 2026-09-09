@@ -117,6 +117,11 @@ mod issue_labeler_policy;
 #[cfg(test)]
 mod junit_strip;
 mod list_tests;
+/// Issue #831: printing a walked path the way this repository writes
+/// paths. Shared by `desktop_palette` and `list_tests`, which both build a
+/// repo-relative string out of a directory walk and print it next to
+/// forward-slashed literals.
+mod paths;
 /// Issue #648: the toolchain pins duplicated between `devbox.json` and
 /// `.github/workflows/`. Tests only, and Unix only — the rule itself lives in
 /// `scripts/check-pin-lockstep.sh`, which CI's `devbox` job also runs directly.

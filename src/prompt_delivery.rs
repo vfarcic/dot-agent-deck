@@ -481,37 +481,174 @@ fn normalize_for_match(s: &str) -> &str {
 /// available at this seam — refusing every truncated report — would reject the
 /// ordinary confirmation of any prompt over 200 bytes, i.e. reinstate issue
 /// #424 for every long dispatch prompt.
+///
+/// # The three shapes are not equally clean (#685)
+///
+/// Two of them mean the agent submitted a turn carrying our prompt more than
+/// once, and this `bool` cannot say which one answered. That is a reporting gap
+/// rather than a delivery one — the accept set here is deliberate and pinned —
+/// so [`classify_prompt_submission`] names the shape for the log and this stays
+/// exactly as wide as it was. See [`ConfirmedSubmission`].
 pub fn prompt_submission_matches(expected: &str, reported: &str) -> bool {
+    classify_prompt_submission(expected, reported).is_some()
+}
+
+/// Issue #685: WHICH of [`prompt_submission_matches`]'s three shapes confirmed a
+/// delivery — the fact that tells a clean single-copy turn apart from a
+/// duplicated one in the delivery log.
+///
+/// Every variant is a confirmation, every variant is terminal for the delivery,
+/// and **no delivery decision reads this**: it exists so the log can say what
+/// happened, and nothing else. The three shapes were never equally clean — two
+/// of them mean the agent is acting on a turn that carries our prompt MORE THAN
+/// ONCE — but all three used to emit the same `info` line, so a duplicated turn
+/// was indistinguishable from an ordinary success in three of the four
+/// repetition shapes issue #685 measured.
+///
+/// # The knowable / unknowable split
+///
+/// [`Self::RepeatedCopies`] and [`Self::TruncatedPrefix`] are DIFFERENT facts
+/// and must not be reported as one. The first says the repetition is visible in
+/// the text that arrived. The second says the report is a
+/// [`USER_PROMPT_MAX_LEN`] prefix that one copy and five hundred copies render
+/// identically, so the question cannot be answered from it in either direction —
+/// and a line claiming a duplicate that may not have happened is worse than the
+/// silence this issue is about. That is why the second is a weaker line at a
+/// quieter level rather than the same warning; see [`log_prompt_confirmed`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfirmedSubmission {
+    /// The report is the prompt verbatim: complete text, one copy. The only
+    /// shape that positively shows a clean single turn.
+    SingleCopy,
+    /// Shape 3 — the report is the prompt repeated with newline separators, and
+    /// the repetition is VISIBLE in the text that arrived.
+    ///
+    /// `copies` is `Some` only when the report carried the WHOLE repeated text,
+    /// in which case it is the exact number submitted. It is `None` when the
+    /// match came from the truncated form, and that is deliberately not a
+    /// number: every count whose rendering exceeds [`USER_PROMPT_MAX_LEN`]
+    /// produces the same prefix (the residual documented on
+    /// [`prompt_submission_matches`]), and the loop counter at the point of that
+    /// match is **not** a floor on the real count either — it is the first
+    /// candidate that outgrew the reported length, which for a prompt whose
+    /// copies straddle the limit can exceed what was actually submitted. A
+    /// wrong number in a warning is worse than no number, so there is none.
+    ///
+    /// What is certain in both cases is the repetition itself, which is what
+    /// makes this the case an operator can act on.
+    RepeatedCopies { copies: Option<u32> },
+    /// The report is the [`USER_PROMPT_MAX_LEN`]-truncated form of ONE copy —
+    /// which is also, byte for byte, the truncated form of every repetition of a
+    /// prompt that long. Reachable only for a prompt longer than that limit,
+    /// since a shorter one is reported complete and lands on
+    /// [`Self::SingleCopy`].
+    ///
+    /// So the delivery is confirmed and whether the turn carries the prompt more
+    /// than once is UNKNOWABLE from this evidence. This is the cell that makes
+    /// the issue matter: a `dispatch` or issue-dispatch prompt is routinely well
+    /// over 200 bytes, so it lands here whether it was submitted once or three
+    /// times. **#526's full-prompt digest is what removes the cell**; this
+    /// variant only stops it from being reported as a clean single copy.
+    TruncatedPrefix,
+}
+
+impl ConfirmedSubmission {
+    /// The stable slug the delivery log carries in its `confirmation` field, so
+    /// the three shapes are greppable without matching on message prose.
+    pub fn log_slug(self) -> &'static str {
+        match self {
+            Self::SingleCopy => "single-copy",
+            Self::RepeatedCopies { .. } => "repeated-copies",
+            Self::TruncatedPrefix => "truncated-report",
+        }
+    }
+
+    /// How notable this confirmation is when one delivery has more than one of
+    /// them to report — which `crate::ui`'s seed and orchestrator paths can,
+    /// because they scan a whole journal rather than a stream.
+    ///
+    /// Reporting the least notable would hide a duplicate behind a clean line,
+    /// so the most notable wins. This orders LOG LINES and nothing else: all
+    /// three shapes are equally `Confirmed`, and the delivery outcome does not
+    /// depend on which one is picked.
+    fn notability(self) -> u8 {
+        match self {
+            Self::SingleCopy => 0,
+            Self::TruncatedPrefix => 1,
+            Self::RepeatedCopies { .. } => 2,
+        }
+    }
+
+    /// The more notable of two confirmations of the same delivery, `self` on a
+    /// tie. See `notability` for the order and why it exists.
+    pub fn more_notable(self, other: Self) -> Self {
+        if other.notability() > self.notability() {
+            other
+        } else {
+            self
+        }
+    }
+}
+
+/// [`prompt_submission_matches`]'s body, reporting WHICH shape matched instead
+/// of a bare `bool`. See that function for the three shapes, the normalization
+/// contract and the accepted truncation residual.
+///
+/// This is a mechanical relabelling of the `true`s, not a new decision: the set
+/// of `(expected, reported)` pairs that confirm a delivery is **exactly** the
+/// one that function has always accepted, in the same evaluation order, and
+/// `prompt_submission_matches` is now `.is_some()` over this. Issue #685 is an
+/// observability change and explicitly not a widening or a narrowing — the two
+/// tests that pin the accept set on both sides
+/// (`repeated_copies_of_the_seed_count_as_delivered` and
+/// `bare_concatenation_is_accumulation_and_not_confirmation`) still call the
+/// `bool` API unmodified and are what proves that.
+///
+/// The one non-mechanical detail: the single verbatim check and the single
+/// TRUNCATED check used to be one `||`, and are split apart here because they
+/// answer the knowable/unknowable question differently. Same disjunction, same
+/// order, same short-circuit.
+pub fn classify_prompt_submission(expected: &str, reported: &str) -> Option<ConfirmedSubmission> {
     let expected = normalize_for_match(expected);
     let reported = normalize_for_match(reported);
     if expected.is_empty() {
         // Nothing was written, so nothing can be evidence about it. Guards the
         // repetition loop below against an infinite family of empty candidates.
-        return false;
+        return None;
     }
-    if reported == expected || reported == truncate_on_char_boundary(expected, USER_PROMPT_MAX_LEN)
-    {
-        return true;
+    if reported == expected {
+        return Some(ConfirmedSubmission::SingleCopy);
+    }
+    if reported == truncate_on_char_boundary(expected, USER_PROMPT_MAX_LEN) {
+        // Only reachable past the limit: at or under it `truncate_on_char_boundary`
+        // returns the text unchanged, which the check above already settled.
+        return Some(ConfirmedSubmission::TruncatedPrefix);
     }
     // Shape 3. Built incrementally and bounded by the REPORTED length so a
     // multi-kilobyte dispatch prompt never allocates more than the hook could
     // possibly have reported.
     let mut candidate = String::from(expected);
-    for _ in 2..=MAX_REPEATED_SUBMISSION_COPIES {
+    for copies in 2..=MAX_REPEATED_SUBMISSION_COPIES {
         candidate.push('\n');
         candidate.push_str(expected);
         if candidate.len() > reported.len() {
             // Every longer candidate is longer still, so only a TRUNCATED form
             // can match from here — and truncation is a fixed 200-byte prefix
             // of the same repeating text, identical for every larger copy
-            // count. One check settles all of them.
-            return reported == truncate_on_char_boundary(&candidate, USER_PROMPT_MAX_LEN);
+            // count. One check settles all of them — and settling them all is
+            // exactly why the copy count comes back `None` here rather than as
+            // `copies`, which is the first candidate that outgrew the report and
+            // not a bound on what was submitted.
+            return (reported == truncate_on_char_boundary(&candidate, USER_PROMPT_MAX_LEN))
+                .then_some(ConfirmedSubmission::RepeatedCopies { copies: None });
         }
         if reported == candidate {
-            return true;
+            return Some(ConfirmedSubmission::RepeatedCopies {
+                copies: Some(copies),
+            });
         }
     }
-    false
+    None
 }
 
 /// Whether a hook-reported `user_prompt` shows our prompt ACCUMULATED in the
@@ -848,6 +985,11 @@ pub fn log_prompt_probe_submitted(path: &str, pane_id: &str, delivery_id: &str, 
 /// from the task rather than on the task as written. The delivery is TERMINATED
 /// on it — retyping a third copy into an agent already working is the unsafe
 /// direction — and this line is what tells the two apart afterwards.
+///
+/// Issue #685: this is only the SEPARATOR-FREE half of that event. The
+/// newline-separated half is a confirmation rather than an accumulation (shape 3
+/// of [`prompt_submission_matches`], deliberately), so it warns from
+/// [`log_prompt_confirmed`] instead — same level, different line.
 pub fn log_prompt_accumulated(path: &str, pane_id: &str, delivery_id: &str, attempts: u32) {
     tracing::warn!(
         path,
@@ -859,16 +1001,92 @@ pub fn log_prompt_accumulated(path: &str, pane_id: &str, delivery_id: &str, atte
     );
 }
 
-/// Info-level record that the agent reported submitting the prompt we wrote —
-/// the only evidence that turns a provisional write into a delivery.
-pub fn log_prompt_confirmed(path: &str, pane_id: &str, delivery_id: &str, attempt: u32) {
-    tracing::info!(
-        path,
-        pane_id,
-        delivery_id,
-        attempt,
-        "prompt delivery confirmed by the agent's submitted prompt"
-    );
+/// Record that the agent reported submitting the prompt we wrote — the only
+/// evidence that turns a provisional write into a delivery — classified by
+/// WHICH of [`prompt_submission_matches`]'s shapes said so.
+///
+/// # Issue #685: three lines, two levels, and why
+///
+/// Before this, all three shapes emitted one `info` line, so a turn that
+/// carried the prompt twice read to an operator exactly like a clean success.
+/// The measured table is in the issue: the separate `warn`
+/// ([`log_prompt_accumulated`]) fired in one of four repetition shapes, and in
+/// **none** of them for a prompt over [`USER_PROMPT_MAX_LEN`] — which a
+/// `dispatch` or issue-dispatch prompt routinely is.
+///
+/// * [`ConfirmedSubmission::SingleCopy`] — `info`, and the message is unchanged
+///   byte for byte. This is the ordinary case and it must stay quiet.
+/// * [`ConfirmedSubmission::RepeatedCopies`] — `warn`. The repetition is in the
+///   text that arrived, so this is a fact an operator can act on: the agent is
+///   working from a turn that states the task more than once. Same level as
+///   [`log_prompt_accumulated`], which is the same event through the
+///   separator-free grammar.
+/// * [`ConfirmedSubmission::TruncatedPrefix`] — `info`, distinct message. The
+///   report is a 200-byte prefix, so the honest content of the line is *we
+///   cannot tell*, and it is emitted for **every** long-prompt confirmation.
+///   `warn`ing it would be the #818 shape — thousands of unactionable warnings
+///   — and claiming a duplicate that may not have happened is worse than the
+///   silence being fixed. Kept at `info` rather than dropped to `debug` so the
+///   line an operator gets today does not disappear from a default-level log.
+///
+/// All three keep the `prompt delivery confirmed by the agent's submitted
+/// prompt` prefix, which existing delivery-log readers key on
+/// (`tests/e2e_prompt_delivery_confirmation.rs`), and each carries a stable
+/// `confirmation` slug ([`ConfirmedSubmission::log_slug`]) so the shapes are
+/// greppable without matching prose.
+///
+/// The repeated arm's `copies` is a STRING field rather than a number because
+/// one `tracing` call site has one field type and the count is genuinely absent
+/// when the report was truncated (see [`ConfirmedSubmission::RepeatedCopies`]);
+/// `copies="unknown-truncated-report"` says that, where a `0` or a made-up floor
+/// would not.
+///
+/// **This changes no delivery decision.** All three shapes are `Confirmed`, all
+/// three are terminal, and nothing branches on the classification except the
+/// three arms below.
+pub fn log_prompt_confirmed(
+    path: &str,
+    pane_id: &str,
+    delivery_id: &str,
+    attempt: u32,
+    confirmation: ConfirmedSubmission,
+) {
+    let shape = confirmation.log_slug();
+    match confirmation {
+        ConfirmedSubmission::SingleCopy => tracing::info!(
+            path,
+            pane_id,
+            delivery_id,
+            attempt,
+            confirmation = shape,
+            "prompt delivery confirmed by the agent's submitted prompt"
+        ),
+        ConfirmedSubmission::RepeatedCopies { copies } => tracing::warn!(
+            path,
+            pane_id,
+            delivery_id,
+            attempt,
+            confirmation = shape,
+            copies = copies.map_or_else(
+                || "unknown-truncated-report".to_string(),
+                |count| count.to_string()
+            ),
+            "prompt delivery confirmed by the agent's submitted prompt, which arrived as \
+             repeated newline-separated copies; the turn the agent is acting on states the \
+             task more than once"
+        ),
+        ConfirmedSubmission::TruncatedPrefix => tracing::info!(
+            path,
+            pane_id,
+            delivery_id,
+            attempt,
+            confirmation = shape,
+            reported_prefix_bytes = USER_PROMPT_MAX_LEN,
+            "prompt delivery confirmed by the agent's submitted prompt, reported only as a \
+             truncated prefix that one copy and any number of copies render identically; \
+             whether the turn was duplicated is undecidable from it"
+        ),
+    }
 }
 
 /// Info-level record that this delivery has no confirmation channel at all, so
@@ -1056,6 +1274,303 @@ mod tests {
             seed,
             &format!("{seed}\n{seed}")
         ));
+    }
+
+    /// Issue #685: the same 2x2 fixture set the issue's table was measured with
+    /// — both repetition shapes, at 2 and 3 copies, for a prompt under
+    /// [`USER_PROMPT_MAX_LEN`] and one over it, each put through the hook's
+    /// truncation — asserted against the CLASSIFICATION rather than the bare
+    /// `bool`.
+    ///
+    /// What the table said before this: the `warn` fired in one of the four
+    /// cells, and in NONE of them for a long prompt. What it says now is in the
+    /// `expected` column below — the three cells that used to be a silent clean
+    /// confirmation are now either a distinct knowable duplicate (the short
+    /// newline-separated shape) or report themselves undecidable (every
+    /// long-prompt shape, whichever separator).
+    ///
+    /// The accept set is untouched, and the row-by-row `prompt_submission_matches`
+    /// cross-check at the bottom of each iteration is what says so: every shape
+    /// that classifies is exactly a shape the `bool` API confirms.
+    #[test]
+    fn confirmation_classification_covers_every_repetition_shape() {
+        // `crate::hook` truncates every reported `user_prompt` through exactly
+        // this function before it can reach an `AgentEvent`, so applying it here
+        // is the hook's own truncation and not a stand-in for it.
+        let through_the_hook = |text: &str| truncate_on_char_boundary(text, USER_PROMPT_MAX_LEN);
+
+        let short = "Use Bash to verify seed-confirm-alpha-7f31.txt exists then print it";
+        assert!(short.len() < USER_PROMPT_MAX_LEN);
+        let long = format!(
+            "Read .dot-agent-deck/worker-task-coder.md and begin. {}",
+            "y".repeat(USER_PROMPT_MAX_LEN)
+        );
+        assert!(long.len() > USER_PROMPT_MAX_LEN);
+
+        let cases: Vec<(&str, &str, Option<ConfirmedSubmission>)> = vec![
+            // The baselines: one copy of each length.
+            ("short/single", short, Some(ConfirmedSubmission::SingleCopy)),
+            (
+                "long/single",
+                &long,
+                Some(ConfirmedSubmission::TruncatedPrefix),
+            ),
+            // Newline-separated — shape 3, the matcher's own repetition
+            // grammar. Short: the repetition is visible in the report, so it is
+            // a KNOWABLE duplicate. Two copies fit under the limit and are
+            // counted exactly; three do not, so the count is withheld while the
+            // repetition itself stays certain — see `RepeatedCopies` for why a
+            // withheld count is the honest answer rather than a floor.
+            (
+                "short/newline/2",
+                short,
+                Some(ConfirmedSubmission::RepeatedCopies { copies: Some(2) }),
+            ),
+            (
+                "short/newline/3",
+                short,
+                Some(ConfirmedSubmission::RepeatedCopies { copies: None }),
+            ),
+            // Long: every repetition collapses onto the same prefix a single
+            // copy produces, so the report cannot answer the question either
+            // way. This is the cell that makes the issue matter — a dispatch
+            // prompt lives here.
+            (
+                "long/newline/2",
+                &long,
+                Some(ConfirmedSubmission::TruncatedPrefix),
+            ),
+            (
+                "long/newline/3",
+                &long,
+                Some(ConfirmedSubmission::TruncatedPrefix),
+            ),
+            // Separator-free — NOT the matcher's business. Short: no
+            // confirmation at all, which is what routes it to
+            // `prompt_submission_accumulated` and its own `warn`. Long: the
+            // doubled text truncates onto the ordinary long-prompt prefix, so
+            // the matcher confirms it and the accumulation detector is never
+            // consulted; undecidable is the honest report.
+            ("short/bare/2", short, None),
+            ("short/bare/3", short, None),
+            (
+                "long/bare/2",
+                &long,
+                Some(ConfirmedSubmission::TruncatedPrefix),
+            ),
+            (
+                "long/bare/3",
+                &long,
+                Some(ConfirmedSubmission::TruncatedPrefix),
+            ),
+        ];
+
+        let reported_for = |name: &str, expected: &str| -> String {
+            let text = match name.rsplit_once('/') {
+                Some((shape, "2")) if shape.ends_with("newline") => {
+                    format!("{expected}\n{expected}")
+                }
+                Some((shape, "3")) if shape.ends_with("newline") => {
+                    format!("{expected}\n{expected}\n{expected}")
+                }
+                Some((shape, "2")) if shape.ends_with("bare") => format!("{expected}{expected}"),
+                Some((shape, "3")) if shape.ends_with("bare") => {
+                    format!("{expected}{expected}{expected}")
+                }
+                _ => expected.to_string(),
+            };
+            through_the_hook(&text)
+        };
+
+        let mut observed = Vec::new();
+        for (name, expected, want) in &cases {
+            let reported = reported_for(name, expected);
+            let got = classify_prompt_submission(expected, &reported);
+            observed.push((*name, got));
+            assert_eq!(
+                got, *want,
+                "{name}: classification must match the shape the issue's table measured"
+            );
+            // The classification never widens or narrows what confirms a
+            // delivery: it is `prompt_submission_matches` with the `true`s
+            // labelled, and this is the assertion that keeps it that way.
+            assert_eq!(
+                got.is_some(),
+                prompt_submission_matches(expected, &reported),
+                "{name}: classification and the bool matcher must accept exactly the same set"
+            );
+        }
+
+        // The one cell that already warned, and still does, through the
+        // separate detector rather than through a confirmation.
+        assert!(prompt_submission_accumulated(
+            short,
+            &through_the_hook(&format!("{short}{short}"))
+        ));
+        assert!(prompt_submission_accumulated(
+            short,
+            &through_the_hook(&format!("{short}{short}{short}"))
+        ));
+
+        // Eight of the ten cells confirm, and exactly ONE of those eight is a
+        // clean single copy. That ratio is the complaint restated as an
+        // assertion: before this, all eight emitted the same `info` line as
+        // that one clean cell.
+        assert_eq!(observed.iter().filter(|(_, got)| got.is_some()).count(), 8);
+        assert_eq!(
+            observed
+                .iter()
+                .filter(|(_, got)| *got == Some(ConfirmedSubmission::SingleCopy))
+                .count(),
+            1,
+            "observed={observed:?}"
+        );
+    }
+
+    /// Issue #685: the actual LOG output of the three confirmation shapes,
+    /// captured through a real `tracing` subscriber rather than inferred from
+    /// the return value — which is the whole point of the issue, since every
+    /// shape returns the same thing.
+    ///
+    /// What each line has to establish:
+    ///
+    /// * a clean single copy is unchanged, at `info`, with the message existing
+    ///   delivery-log readers key on;
+    /// * a knowable duplicate is `WARN` and says so;
+    /// * the undecidable case is NOT `WARN` and does NOT claim a duplicate — a
+    ///   line asserting a duplicate that may not have happened is worse than the
+    ///   silence being fixed — while still being distinguishable from the clean
+    ///   line.
+    #[test]
+    fn confirmation_log_lines_distinguish_the_three_shapes() {
+        use std::io::Write;
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone, Default)]
+        struct CapturedLog(Arc<Mutex<Vec<u8>>>);
+
+        impl Write for CapturedLog {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLog {
+            type Writer = CapturedLog;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let capture = |confirmation: ConfirmedSubmission| -> String {
+            let captured = CapturedLog::default();
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(captured.clone())
+                .with_max_level(tracing_subscriber::filter::LevelFilter::DEBUG)
+                .with_ansi(false)
+                .finish();
+            let guard = tracing::subscriber::set_default(subscriber);
+            log_prompt_confirmed("dispatch", "pane-7", "d-42", 3, confirmation);
+            drop(guard);
+            String::from_utf8(captured.0.lock().unwrap().clone())
+                .expect("captured log must be valid UTF-8")
+        };
+
+        let clean = capture(ConfirmedSubmission::SingleCopy);
+        assert!(clean.contains("INFO"), "clean={clean:?}");
+        assert!(!clean.contains("WARN"), "clean={clean:?}");
+        assert!(
+            clean.contains("prompt delivery confirmed by the agent's submitted prompt"),
+            "the ordinary confirmation line must not move; clean={clean:?}"
+        );
+        assert!(
+            clean.contains("confirmation=\"single-copy\""),
+            "clean={clean:?}"
+        );
+
+        let repeated = capture(ConfirmedSubmission::RepeatedCopies { copies: Some(2) });
+        assert!(
+            repeated.contains("WARN"),
+            "a duplicate the report makes VISIBLE is the actionable case and must warn; \
+             repeated={repeated:?}"
+        );
+        assert!(
+            repeated.contains("repeated newline-separated copies")
+                && repeated.contains("states the task more than once"),
+            "repeated={repeated:?}"
+        );
+        assert!(
+            repeated.contains("confirmation=\"repeated-copies\"")
+                && repeated.contains("copies=\"2\""),
+            "repeated={repeated:?}"
+        );
+
+        // The truncated half of the same shape still warns — the repetition is
+        // certain either way — but must publish no copy count, because the one
+        // available at that point is not a bound on what was submitted.
+        let repeated_truncated = capture(ConfirmedSubmission::RepeatedCopies { copies: None });
+        assert!(
+            repeated_truncated.contains("WARN")
+                && repeated_truncated.contains("repeated newline-separated copies")
+                && repeated_truncated.contains("copies=\"unknown-truncated-report\""),
+            "repeated_truncated={repeated_truncated:?}"
+        );
+
+        let undecidable = capture(ConfirmedSubmission::TruncatedPrefix);
+        assert!(
+            !undecidable.contains("WARN"),
+            "every long-prompt confirmation lands here, so warning would be the #818 shape; \
+             undecidable={undecidable:?}"
+        );
+        assert!(
+            undecidable.contains("INFO"),
+            "the line an operator gets today must not vanish below the default level; \
+             undecidable={undecidable:?}"
+        );
+        assert!(
+            undecidable.contains("undecidable")
+                && !undecidable.contains("states the task more than once")
+                && !undecidable.contains("repeated newline-separated copies"),
+            "the weaker fact must not be reported as the stronger one; \
+             undecidable={undecidable:?}"
+        );
+        assert!(
+            undecidable.contains("confirmation=\"truncated-report\"")
+                && undecidable.contains(&format!("reported_prefix_bytes={USER_PROMPT_MAX_LEN}")),
+            "undecidable={undecidable:?}"
+        );
+
+        // The three lines must be mutually distinguishable, which is the
+        // property the issue is actually about: before this they were one line.
+        assert!(
+            clean != repeated && repeated != undecidable && clean != undecidable,
+            "clean={clean:?} repeated={repeated:?} undecidable={undecidable:?}"
+        );
+    }
+
+    /// Issue #685: [`ConfirmedSubmission::more_notable`] decides which line one
+    /// delivery logs when a journal holds several confirmations, so a duplicate
+    /// can never be hidden behind a clean confirmation that happened to be
+    /// visited first — `crate::ui`'s scan walks a `HashMap` of sessions.
+    #[test]
+    fn a_visible_duplicate_outranks_a_clean_confirmation_in_the_log() {
+        let clean = ConfirmedSubmission::SingleCopy;
+        let undecidable = ConfirmedSubmission::TruncatedPrefix;
+        let duplicate = ConfirmedSubmission::RepeatedCopies { copies: Some(2) };
+        for (a, b) in [(clean, duplicate), (undecidable, duplicate)] {
+            assert_eq!(a.more_notable(b), duplicate);
+            assert_eq!(b.more_notable(a), duplicate);
+        }
+        assert_eq!(clean.more_notable(undecidable), undecidable);
+        assert_eq!(undecidable.more_notable(clean), undecidable);
+        // Ties keep the shape already held, so repeated visits of one journal
+        // are stable rather than alternating.
+        assert_eq!(clean.more_notable(clean), clean);
+        assert_eq!(duplicate.more_notable(duplicate), duplicate);
     }
 
     /// D5: the retry schedule writes the payload twice and probes thereafter.

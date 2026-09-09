@@ -41,6 +41,7 @@ function runtime(overrides: Partial<DeckRuntimeState> = {}): DeckRuntimeState {
     resizeTerminal: vi.fn(async () => undefined),
     setShownTerminals: vi.fn(async () => undefined),
     reconnect: vi.fn(async () => undefined),
+    setZoom: vi.fn(async (level: number) => level),
     getSettings: settings.getSettings,
     saveSettings: settings.saveSettings,
     ...overrides,
@@ -480,18 +481,20 @@ describe("ControlDeck", () => {
     unmount();
   });
 
-  it("renders the registry's active section, with no column while there is only one", () => {
+  it("renders the registry's active section, with the column its two sections earn", () => {
     render(<ControlDeck runtime={runtime()} />);
     fireEvent.click(screen.getByTestId("open-settings"));
 
-    // The registry drives what is rendered, and today it holds one row, so the
-    // section column is dropped and the panel takes the whole sheet. The
-    // column's own two states are pinned with stub sections in
-    // `components/SettingsSheet.test.tsx`; what matters here is that the real
-    // registry reaches the real sheet.
-    expect(SETTINGS_SECTIONS).toHaveLength(1);
-    expect(screen.getByTestId("settings-layout")).toHaveClass("is-single");
-    expect(screen.queryByRole("navigation", { name: "Settings sections" })).not.toBeInTheDocument();
+    // The registry drives what is rendered. This asserted the COLLAPSED layout
+    // until PRD #744's Zoom row made it two, and it flipped with no change to
+    // the sheet — inverted rather than deleted, because what matters here is
+    // still that the real registry reaches the real sheet. The column's own two
+    // states stay pinned with stub sections in
+    // `components/SettingsSheet.test.tsx`, so this does not become their only
+    // coverage.
+    expect(SETTINGS_SECTIONS).toHaveLength(2);
+    expect(screen.getByTestId("settings-layout")).not.toHaveClass("is-single");
+    expect(screen.getByRole("navigation", { name: "Settings sections" })).toBeVisible();
 
     expect(screen.getByTestId(`settings-panel-${SETTINGS_SECTIONS[0].id}`)).toBeVisible();
     expect(screen.getByRole("group", { name: "Appearance" })).toBeVisible();
@@ -540,8 +543,14 @@ describe("ControlDeck", () => {
     await waitFor(() => expect(store.saveSettings).toHaveBeenCalled());
 
     // The whole document crosses the bridge, so a save can never drop a section
-    // this build's UI has not loaded.
-    expect(store.saveSettings).toHaveBeenCalledWith({ version: 1, appearance: { mode: "dark" } });
+    // this build's UI has not loaded. `zoom` riding along untouched here IS
+    // that guarantee — the Appearance panel knows nothing about PRD #744's
+    // section and still cannot lose it.
+    expect(store.saveSettings).toHaveBeenCalledWith({
+      version: 1,
+      appearance: { mode: "dark" },
+      zoom: { level: 1 },
+    });
     expect(store.current.appearance.mode).toBe("dark");
 
     first.unmount();
@@ -599,6 +608,29 @@ describe("ControlDeck", () => {
    * `TerminalViewport` is mocked in this file, so nothing here can be asserted
    * from mounted terminals — the bridge call IS the observable.
    */
+  /**
+   * The `?` overlay is where this app's bindings are listed, so a shortcut it
+   * binds and does not list makes the list wrong rather than shorter. The zoom
+   * keys need no teaching — that is not what the row is for.
+   *
+   * Note this overlay is not today a complete list of everything the app binds:
+   * `AgentComposer` distinguishes `Enter` from `Shift+Enter` and neither
+   * appears. That predates PRD #744 and is recorded as its Open Question 5
+   * rather than fixed here.
+   */
+  it("lists the zoom keys in the shortcut overlay", () => {
+    render(<ControlDeck runtime={runtime()} />);
+    fireEvent.click(screen.getByRole("button", { name: "Keyboard shortcuts" }));
+    const dialog = screen.getByRole("dialog", { name: "Control keys" });
+    expect(within(dialog).getByText("Zoom in, out, reset")).toBeVisible();
+    // Neutral wording rather than a platform-detected glyph, because either
+    // modifier works on either platform (`zoomIntentFromKey` accepts both) so
+    // there is nothing to detect. Note the `⌘ K` row above it has the same
+    // pre-existing problem and is deliberately left alone — see Open Question
+    // 5 in `prds/744-desktop-zoom-text-size.md`.
+    expect(within(dialog).getByText("⌘/Ctrl + / − / 0")).toBeVisible();
+  });
+
   it("declares every terminal-tab tile to the bridge in a single call", () => {
     const setShownTerminals = vi.fn(async () => undefined);
     render(<ControlDeck runtime={runtime({ setShownTerminals })} />);

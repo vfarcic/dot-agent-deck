@@ -11,16 +11,18 @@ use std::sync::{Arc, Mutex};
 
 use dot_agent_deck::agent_pty::DISPLAY_NAME_MAX_LEN;
 use dot_agent_deck::event::{AgentEvent, AgentType, DISPLAY_NAME_METADATA_KEY, EventType};
+use dot_agent_deck::pane::RenameOutcome;
 use dot_agent_deck::state::{ActiveTool, AppState, DashboardStats, SessionState, SessionStatus};
 use dot_agent_deck::tab::Tab;
 use dot_agent_deck::terminal_widget::TerminalWidget;
 use dot_agent_deck::ui::{
-    CardDensityKind, UiMode, card_stats_border_label, render_card_for_mode_to_buffer,
-    render_card_grid_to_buffer, render_card_to_buffer, render_card_with_declared_agent_to_buffer,
-    render_config_gen_prompt_to_buffer, render_dashboard_cards_to_buffer,
-    render_quit_confirm_to_buffer, render_star_prompt_to_buffer, render_stats_bar_to_buffer,
-    render_stop_confirm_to_buffer, sync_and_derive_selection,
+    CardDensityKind, UiMode, card_stats_border_label, mirror_saved_pane_name,
+    render_card_for_mode_to_buffer, render_card_grid_to_buffer, render_card_to_buffer,
+    render_card_with_declared_agent_to_buffer, render_config_gen_prompt_to_buffer,
+    render_dashboard_cards_to_buffer, render_quit_confirm_to_buffer, render_star_prompt_to_buffer,
+    render_stats_bar_to_buffer, render_stop_confirm_to_buffer, sync_and_derive_selection,
 };
+use dot_agent_deck::untrusted_text::MAX_TOOL_TEXT_BYTES;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier};
 use ratatui::widgets::Widget;
@@ -2323,7 +2325,12 @@ fn pane_011_multibyte_session_id_renders_the_whole_deck() {
 /// posts a 400-character one. Render both cards between healthy neighbours: the
 /// names stored on the sessions must come back scrubbed and length-clamped, no
 /// planted character may reach a rendered cell anywhere in the deck, and each
-/// neighbouring card must still draw its own title and status badge.
+/// neighbouring card must still draw its own title and status badge. Then drive
+/// the two writers of `ui.display_names`, the title source that wins over the
+/// session's own name: a rename carrying a bidi override is refused so the card
+/// keeps the label it had, and a hostile name replayed from a saved
+/// `session.toml` is refused the same way, while an ordinary name still renames
+/// and still restores.
 #[spec("dashboard/pane/012")]
 #[test]
 fn pane_012_hostile_display_name_cannot_corrupt_the_card() {
@@ -2347,6 +2354,10 @@ fn pane_012_hostile_display_name_cannot_corrupt_the_card() {
     // override — the last of which `char::is_control` does NOT catch.
     const PLANTED: [char; 6] = ['\u{1b}', '\u{0}', '\r', '\n', '\u{7f}', '\u{202e}'];
     const HOSTILE_NAME: &str = "\u{1b}[31m dispatch\u{0}-\u{202e}670 \u{7f}\r\nsweep";
+    // Issue #833: a name whose ONLY planted character is the bidi override, so
+    // it isolates the half of the policy a byte-level control-character check
+    // cannot reach.
+    const BIDI_RENAME: &str = "worker\u{202e}reganam";
 
     let mut state = AppState::default();
     let mut post = |session_id: &str, pane_id: &str, name: &str| {
@@ -2413,14 +2424,16 @@ fn pane_012_hostile_display_name_cannot_corrupt_the_card() {
         .display_name
         .as_deref()
         .expect("an over-long name is repaired, not dropped");
+    assert!(
+        clamped.len() <= DISPLAY_NAME_MAX_LEN,
+        "the stored name must be clamped to the daemon's own ceiling MARKER \
+         INCLUDED, so it stays a name that ceiling's own gate would accept if it \
+         ever came back the other way (Greptile, PR #902), got {} bytes",
+        clamped.len()
+    );
     let body = clamped
         .strip_suffix('…')
         .expect("a clamped name is marked as cut");
-    assert!(
-        body.len() <= DISPLAY_NAME_MAX_LEN,
-        "the stored name must be clamped to the daemon's own ceiling, got {} bytes",
-        body.len()
-    );
     assert!(
         body.chars().all(|c| c == 'μ'),
         "the clamp must snap back to a character boundary: {body:?}"
@@ -2475,6 +2488,142 @@ fn pane_012_hostile_display_name_cannot_corrupt_the_card() {
         rendered.contains("example-alpha") && rendered.contains("example-gamma"),
         "both neighbouring cards must still render their own titles:\n{rendered}"
     );
+
+    // --- the map that actually WINS at render (issue #833) ------------------
+    // Everything above holds only while `ui.display_names` has no entry for the
+    // card: `render_card_grid` PREFERS that map and merely falls back to
+    // `SessionState.display_name`. So #670's ingest scrub defends exactly one of
+    // the title's two sources, and the other has two writers of its own — the
+    // daemon's `list_agents` echo (`session/live/007`) and the rename the
+    // dashboard dispatch loop mirrors from a `RenameOutcome`.
+    //
+    // The rename writer is gated rather than sanitized, because the label it
+    // stores must stay byte-identical to what the controller put on `Pane.name`
+    // and queued for the daemon (PRD #76 M2.11 fixup 5). `RenameOutcome::applied`
+    // is the single canonical way that outcome is derived, so what it refuses
+    // never reaches the map.
+    assert_eq!(
+        RenameOutcome::applied(HOSTILE_NAME),
+        RenameOutcome::Rejected,
+        "a rename carrying control bytes must be refused, not mirrored into \
+         ui.display_names"
+    );
+    // A bidi override ALONE is the case the gate's byte-level `>= 0x20 && != 0x7f`
+    // test cannot see: U+202E encodes as three UTF-8 bytes that are each well
+    // above the ASCII control range, so it walks through a check written to keep
+    // exactly this class of character off the card.
+    assert_eq!(
+        RenameOutcome::applied(BIDI_RENAME),
+        RenameOutcome::Rejected,
+        "a rename carrying a bidi override must be refused — it reorders the \
+         title text that follows it on the card"
+    );
+    // Control: the gate must still ACCEPT an ordinary name, trimmed. Without
+    // this the two assertions above would also pass with renaming broken outright.
+    assert_eq!(
+        RenameOutcome::applied("  café-агент-日本語  "),
+        RenameOutcome::Applied("café-агент-日本語".to_string()),
+        "an ordinary UTF-8 name must still be accepted and trimmed"
+    );
+
+    // Render altitude for that writer: mirror the outcome exactly as the
+    // dashboard dispatch loop does (`apply_rename_outcome`'s three arms), then
+    // draw. A refused rename leaves the label the card already had, and no cell
+    // may carry a planted character.
+    let mut mirrored = Some("example-beta".to_string());
+    match RenameOutcome::applied(BIDI_RENAME) {
+        RenameOutcome::Applied(name) => mirrored = Some(name),
+        RenameOutcome::Cleared => mirrored = None,
+        RenameOutcome::Rejected => {}
+    }
+    let renamed: [(&SessionState, Option<&str>); 4] = [
+        (&healthy_a, None),
+        (&hostile, mirrored.as_deref()),
+        (&overlong, None),
+        (&healthy_b, None),
+    ];
+    let (buffer, _) = render_card_grid_to_buffer(&renamed, Some(0), 0, 80, 40);
+    let rendered = buffer_to_text(&buffer);
+    assert!(
+        rendered.contains("example-beta"),
+        "a refused rename must leave the card titled as it was:\n{rendered}"
+    );
+    let area = *buffer.area();
+    for y in 0..area.height {
+        for x in 0..area.width {
+            for c in buffer[(x, y)].symbol().chars() {
+                assert!(
+                    !c.is_control() && !PLANTED.contains(&c),
+                    "U+{:04X} reached cell ({x}, {y}) through ui.display_names — the \
+                     title source that WINS over the session's own name:\n{rendered}",
+                    c as u32
+                );
+            }
+        }
+    }
+
+    // --- the THIRD writer of that map: a restored `session.toml` ------------
+    // Found by auditing whether the two writers #833 names are the whole set.
+    // They are not. The four session-restore sites in `run_tui` replay
+    // `SavedPane.name` through `PaneController::rename_pane` — which resolves
+    // the SAME `RenameOutcome` asserted above and stores nothing on a
+    // `Rejected` — and then inserted the RAW saved string into `ui.pane_names`
+    // regardless, from which the dashboard loop copies it into
+    // `ui.display_names`. Same field, same winning map, same render seam, and
+    // gated by neither. `mirror_saved_pane_name` is now the one way that
+    // mirror happens, so what the controller refuses cannot enter the map from
+    // a file either.
+    let mut pane_display_names: HashMap<String, String> = HashMap::new();
+    let mut pane_names: HashMap<String, String> = HashMap::new();
+    mirror_saved_pane_name(&mut pane_display_names, &mut pane_names, "2", HOSTILE_NAME);
+    mirror_saved_pane_name(&mut pane_display_names, &mut pane_names, "3", BIDI_RENAME);
+    assert!(
+        pane_names.is_empty() && pane_display_names.is_empty(),
+        "a saved name the controller refuses must not reach the display maps: \
+         {pane_names:?}"
+    );
+    // A legitimate saved name still restores, trimmed to exactly what the
+    // controller put on `Pane.name` — the control without which the two
+    // assertions above would pass on a mirror that stores nothing at all.
+    mirror_saved_pane_name(
+        &mut pane_display_names,
+        &mut pane_names,
+        "2",
+        "  example-beta  ",
+    );
+    assert_eq!(
+        pane_names.get("2").map(String::as_str),
+        Some("example-beta")
+    );
+
+    // Render altitude: the dashboard loop copies `ui.pane_names` into
+    // `ui.display_names`, so a card whose saved name was refused falls back to
+    // the session's own scrubbed name and no cell carries a planted character.
+    let restored: [(&SessionState, Option<&str>); 4] = [
+        (&healthy_a, None),
+        (&hostile, pane_names.get("2").map(String::as_str)),
+        (&overlong, pane_names.get("3").map(String::as_str)),
+        (&healthy_b, None),
+    ];
+    let (buffer, _) = render_card_grid_to_buffer(&restored, Some(0), 0, 80, 40);
+    let rendered = buffer_to_text(&buffer);
+    assert!(
+        rendered.contains("example-beta"),
+        "a legitimate saved name must still title its restored card:\n{rendered}"
+    );
+    let area = *buffer.area();
+    for y in 0..area.height {
+        for x in 0..area.width {
+            for c in buffer[(x, y)].symbol().chars() {
+                assert!(
+                    !c.is_control() && !PLANTED.contains(&c),
+                    "U+{:04X} reached cell ({x}, {y}) through a restored \
+                     `session.toml` name:\n{rendered}",
+                    c as u32
+                );
+            }
+        }
+    }
 }
 
 /// Scenario: Render a neutral session with a declared Codex identity, then
@@ -2544,6 +2693,155 @@ fn pane_013_declared_agent_fallback_yields_to_observed_agent() {
     assert!(
         baseline.contains("No agent"),
         "without an observation or declaration the pre-#308 placeholder remains:\n{baseline}"
+    );
+}
+
+/// Scenario: A hook posts a `ToolStart` whose `tool_name` and `tool_detail`
+/// carry an ESC sequence, a NUL, a CR/LF pair, a DEL and a right-to-left
+/// override, and a second whose detail is 100 KiB long. Render all four cards:
+/// the hostile card's tool line must draw its readable remainder with no
+/// planted character in any cell anywhere in the deck, the over-long detail
+/// must be stored clamped, and both neighbouring cards must keep their own
+/// titles and status badges.
+#[spec("dashboard/pane/014")]
+#[test]
+fn pane_014_hostile_tool_text_cannot_corrupt_the_card() {
+    // Issue #833 gap 2. `tool_name` / `tool_detail` arrive on the hook socket —
+    // the same surface `dashboard/pane/012` covers for `display_name` — and
+    // `apply_event` stored them verbatim on both the session's `active_tool`
+    // and the `recent_events` journal the card's tool line is drawn from. The
+    // asymmetry that made this a gap rather than a design choice: the SAME two
+    // strings arriving over the daemon's `list_agents` echo are scrubbed and
+    // clamped at the wire boundary (`session/live/007`), so the live ingest was
+    // the one unprotected half of one field's two routes.
+    //
+    // Drives the real `AppState::apply_event` transition rather than assigning
+    // `active_tool` on a fixture, for the reason `pane_012` gives: the defect is
+    // in the ingest, and a hand-built fixture would keep passing with it.
+    const PLANTED: [char; 6] = ['\u{1b}', '\u{0}', '\r', '\n', '\u{7f}', '\u{202e}'];
+    const HOSTILE_TOOL: &str = "Ba\u{1b}[31msh\u{0}";
+    const HOSTILE_DETAIL: &str = "src/\u{202e}gnidaer\u{7f}\r\n rm -rf /";
+
+    let mut state = AppState::default();
+    let mut post = |session_id: &str, pane_id: &str, tool: &str, detail: &str| {
+        state.register_pane(pane_id.to_string());
+        state.apply_event(AgentEvent {
+            session_id: session_id.to_string(),
+            agent_type: AgentType::ClaudeCode,
+            event_type: EventType::ToolStart,
+            tool_name: Some(tool.to_string()),
+            tool_detail: Some(detail.to_string()),
+            cwd: Some("/home/dev/worker".to_string()),
+            timestamp: chrono::Utc::now(),
+            user_prompt: None,
+            metadata: HashMap::new(),
+            pane_id: Some(pane_id.to_string()),
+            agent_id: None,
+            agent_version: None,
+            schema_version: None,
+            live_target: None,
+        });
+        state
+            .sessions
+            .get(session_id)
+            .expect("apply_event keys the session map on the producer's id verbatim")
+            .clone()
+    };
+
+    let healthy_a = post("sess-alpha", "1", "Read", "example-alpha.rs");
+    let hostile = post("sess-hostile", "2", HOSTILE_TOOL, HOSTILE_DETAIL);
+    // Well past the wire boundary's own 64 KiB ceiling, and multi-byte so the
+    // clamp has to snap back to a character boundary instead of slicing one.
+    let overlong_raw = "μ".repeat(100_000);
+    let overlong = post("sess-overlong", "3", "Edit", &overlong_raw);
+    let healthy_b = post("sess-gamma", "4", "Grep", "example-gamma.rs");
+
+    // --- ingest ------------------------------------------------------------
+    let tool = hostile
+        .active_tool
+        .as_ref()
+        .expect("a ToolStart with a name records an active tool");
+    // The printable payload of the ESC sequence stays, by design and for the
+    // same reason `pane_012` keeps `[31m`: once the ESC is gone the rest is
+    // ordinary text, and stripping it would mean parsing ANSI.
+    assert_eq!(
+        tool.name, "Ba[31msh",
+        "the stored tool name must be the scrubbed text"
+    );
+    assert_eq!(
+        tool.detail.as_deref(),
+        Some("src/gnidaer rm -rf /"),
+        "the stored tool detail must be the scrubbed text"
+    );
+    for c in PLANTED {
+        assert!(
+            !tool.name.contains(c) && !tool.detail.as_deref().unwrap_or_default().contains(c),
+            "U+{:04X} survived ingest: {:?} / {:?}",
+            c as u32,
+            tool.name,
+            tool.detail
+        );
+    }
+    let clamped = overlong
+        .active_tool
+        .as_ref()
+        .and_then(|t| t.detail.as_deref())
+        .expect("an over-long detail is repaired, not dropped");
+    assert!(
+        clamped.len() <= MAX_TOOL_TEXT_BYTES,
+        "the stored detail must be clamped to the ingest ceiling MARKER \
+         INCLUDED, matching the strict clamp the same two strings get on the \
+         daemon-echo route (Greptile, PR #902), got {} bytes",
+        clamped.len()
+    );
+    let body = clamped
+        .strip_suffix('…')
+        .expect("a clamped detail is marked as cut");
+    assert!(
+        body.chars().all(|c| c == 'μ'),
+        "the clamp must snap back to a character boundary"
+    );
+
+    // --- render ------------------------------------------------------------
+    let cards: [(&SessionState, Option<&str>); 4] = [
+        (&healthy_a, Some("example-alpha")),
+        (&hostile, Some("example-hostile")),
+        (&overlong, Some("example-overlong")),
+        (&healthy_b, Some("example-gamma")),
+    ];
+    let (buffer, _) = render_card_grid_to_buffer(&cards, Some(0), 0, 80, 40);
+    let rendered = buffer_to_text(&buffer);
+
+    // One status badge per card, so counting badges counts surviving cards.
+    assert_eq!(
+        rendered.matches("Working").count(),
+        4,
+        "one hostile tool line must not cost the other agents their cards:\n{rendered}"
+    );
+    // Asserted over the CELLS, not over `buffer_to_text`'s joined form — that
+    // helper separates rows with a real `\n`, so a planted newline would hide
+    // inside the separators it adds.
+    let area = *buffer.area();
+    for y in 0..area.height {
+        for x in 0..area.width {
+            for c in buffer[(x, y)].symbol().chars() {
+                assert!(
+                    !c.is_control() && !PLANTED.contains(&c),
+                    "U+{:04X} reached cell ({x}, {y}), where a flush writes it to the real \
+                     terminal:\n{rendered}",
+                    c as u32
+                );
+            }
+        }
+    }
+    assert!(
+        rendered.contains("Ba[31msh — src/gnidaer rm -rf /"),
+        "the readable remainder of the tool line must still render:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("Read — example-alpha.rs")
+            && rendered.contains("Grep — example-gamma.rs"),
+        "both neighbouring cards must still render their own tool lines:\n{rendered}"
     );
 }
 

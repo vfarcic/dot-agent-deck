@@ -137,6 +137,10 @@ export function useDeckRuntime(): DeckRuntimeState {
   }, [bridge]);
 
   const getSettings = useCallback(() => bridge.getSettings(), [bridge]);
+  // Stable for the lifetime of the bridge: `useZoom` holds it across a
+  // capture-phase listener whose effect must not be torn down and re-registered
+  // on every render.
+  const setZoom = useCallback((level: number) => bridge.setZoom(level), [bridge]);
   const saveSettings = useCallback((settings: DesktopSettingsDto) => bridge.saveSettings(settings), [bridge]);
 
   const sendTerminalInput = useCallback((agentId: string, data: string) => bridge.sendTerminalInput(agentId, data), [bridge]);
@@ -159,5 +163,6 @@ export function useDeckRuntime(): DeckRuntimeState {
     reconnect,
     getSettings,
     saveSettings,
+    setZoom,
   };
 }

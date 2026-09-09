@@ -252,11 +252,37 @@ pub const CWD_MAX_LEN: usize = 4096;
 /// (bytes < 0x20 plus 0x7F DEL). Unicode beyond 0x7F is allowed so the
 /// user can type UTF-8 names. Rejects values containing ANSI escapes,
 /// NUL, newlines, carriage returns, etc. — anything that could perturb
-/// the TUI render path when echoed back via `list_agents`.
+/// the TUI render path when echoed back via `list_agents` — and, since issue
+/// #833, the Unicode bidirectional formatting codepoints
+/// [`crate::untrusted_text::is_bidi_format_char`] names.
+///
+/// **The byte test alone could not express that last clause.** `U+202E`
+/// RIGHT-TO-LEFT OVERRIDE encodes as `E2 80 AE`: three bytes that each satisfy
+/// `>= 0x20 && != 0x7f`, so it walked through a check whose stated purpose is
+/// to keep exactly this class of character off the rendered title.
+/// `char::is_control` does not catch it either — it is general category `Cf`,
+/// not `Cc` — and a terminal honours it, visually reversing the text that
+/// follows. Nearly every caller gates a string that ends up in a rendered pane
+/// title, card title, tab label or role name, so the clause is what those
+/// callers wanted all along. The one caller that does not is
+/// [`validate_tab_membership`]'s check on `orchestration_id`, a ROUTING key
+/// that is echoed and logged rather than drawn; the clause is still safe there
+/// because [`mint_orchestration_id`] emits `orch-{hex}-{seq}`, pure ASCII, so
+/// no token this deck mints can be refused by it (pinned by
+/// `mint_orchestration_id_is_unique_and_wire_valid`).
+///
+/// This is a GATE, not a sanitizer: a failing value is REJECTED whole (the
+/// caller keeps the name it had, or stores `None`), because every caller is
+/// validating a request whose sender can send a corrected one.
+/// [`crate::untrusted_text::sanitize_display_name`] is the repairing
+/// counterpart, used at seams where the surrounding data must still be applied.
 pub fn is_valid_display_name(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= DISPLAY_NAME_MAX_LEN
         && value.bytes().all(|b| b >= 0x20 && b != 0x7f)
+        && !value
+            .chars()
+            .any(crate::untrusted_text::is_bidi_format_char)
 }
 
 /// Canonical resolver for the human-readable display name shown on a pane
@@ -1105,6 +1131,34 @@ pub fn spawn(opts: SpawnOptions<'_>) -> Result<AgentPty, AgentPtyError> {
         cmd.env(k, v);
     }
 
+    // Issue #861: mint this pane's lifetime tag and export it, so a descendant
+    // that later `setsid`s out of the pane's process group can still be found
+    // and bounded by the cap it inherits. Applied AFTER `opts.env` so a caller
+    // cannot accidentally shadow it, and `None` in production —
+    // `for_child` returns nothing unless
+    // `DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS` names a cap, which the harness
+    // sets and nothing else does.
+    //
+    // This seam rather than `wrap`'s, because `wrap` covers only
+    // Wrapper-strategy agents: Codex is wrapped, Claude Code is `NativeHooks`
+    // and is spawned bare, and the orphan in #861 was a Claude Code Bash-tool
+    // shell. Every launch path that reaches a real child funnels through here
+    // (see the `wrap_launch_command` note above), so one call covers wrapped and
+    // unwrapped agents, the daemon's panes, the TUI's, and a test's in-process
+    // registry alike.
+    //
+    // Deliberately NOT routed through `opts.env`, which is what `spawn_env`
+    // captures and `respawn_agent_for_pane` replays: a persisted tag would come
+    // back on a respawn naming a reaper that died with the previous generation.
+    // Applied straight to `cmd` instead, so every generation mints its own.
+    let lifetime_tag = crate::lifetime_tag::LifetimeTag::for_child();
+    if let Some(tag) = &lifetime_tag {
+        cmd.env(
+            crate::lifetime_tag::DOT_AGENT_DECK_TEST_LIFETIME_TAG,
+            tag.value(),
+        );
+    }
+
     let child = pair
         .slave
         .spawn_command(cmd)
@@ -1118,7 +1172,8 @@ pub fn spawn(opts: SpawnOptions<'_>) -> Result<AgentPty, AgentPtyError> {
     // job joined later would not contain the descendants the child had already
     // spawned. Infallible by contract — a Windows job quirk degrades teardown to a
     // single-process kill (logged) instead of failing an otherwise-healthy spawn.
-    let process_group = crate::platform::proc::AgentProcessGroup::adopt(child.process_id());
+    let child_pid = child.process_id();
+    let process_group = crate::platform::proc::AgentProcessGroup::adopt(child_pid);
 
     // Wrap the freshly-spawned child in an RAII guard *before* any fallible
     // step below: a failure in `take_writer` / `try_clone_reader` (or a
@@ -1128,6 +1183,26 @@ pub fn spawn(opts: SpawnOptions<'_>) -> Result<AgentPty, AgentPtyError> {
 
     // Drop the slave — we interact through the master side only.
     drop(pair.slave);
+
+    // Issue #861: a reaper that outlives this process, holding the same deadline
+    // for this pane's group and for anything that carried the tag out of it. A
+    // no-op when no tag was minted — production, and any platform without
+    // `fork`.
+    //
+    // Placed here for the same reason `wrap` places its own call after the same
+    // drop: the fork's short-lived intermediate inherits this process's whole fd
+    // table, and a copy of the PTY slave in it — however briefly — is a
+    // reference on a terminal whose hangup is what ends the child on its own.
+    // Still ahead of the fallible `take_writer` / `try_clone_reader` steps below,
+    // so a spawn that fails halfway leaves the child bounded rather than loose.
+    //
+    // `ChildGuard` covers that same halfway failure by killing the child
+    // outright, and this is deliberately not a substitute for it: the guard runs
+    // only while THIS process lives, which is the assumption #861 is about.
+    #[cfg(unix)]
+    if let Some(pid) = child_pid {
+        crate::wrap::arm_child_group_backstop(pid as libc::pid_t, lifetime_tag);
+    }
 
     let writer = pair
         .master
@@ -7806,6 +7881,43 @@ mod tests {
         assert_eq!(resolve_display_name(None, None), "shell");
         assert_eq!(resolve_display_name(Some("   "), None), "shell");
         assert_eq!(resolve_display_name(None, Some("   ")), "shell");
+    }
+
+    #[test]
+    fn is_valid_display_name_rejects_bidi_format_characters() {
+        // Issue #833. The byte test this function is built on cannot express
+        // this: U+202E RIGHT-TO-LEFT OVERRIDE encodes as `E2 80 AE`, three
+        // bytes that each satisfy `>= 0x20 && != 0x7f`. It is `Cf`, not `Cc`,
+        // so `char::is_control` misses it too — and a terminal honours it,
+        // reversing the title text that follows. Enumerated rather than
+        // spot-checked, because one surviving override is all a spoof needs.
+        for c in ['\u{202a}', '\u{202b}', '\u{202c}', '\u{202d}', '\u{202e}']
+            .into_iter()
+            .chain(['\u{2066}', '\u{2067}', '\u{2068}', '\u{2069}'])
+            .chain(['\u{200e}', '\u{200f}', '\u{061c}'])
+        {
+            let name = format!("deploy{c}er");
+            assert!(
+                !is_valid_display_name(&name),
+                "U+{:04X} must be refused",
+                c as u32
+            );
+            // The byte-level half genuinely does not see it — this is the
+            // assertion that says WHY the extra clause had to be added rather
+            // than being redundant with what was already there.
+            assert!(
+                name.bytes().all(|b| b >= 0x20 && b != 0x7f),
+                "U+{:04X} must be a case the byte test alone admits, or this \
+                 test is not covering the gap it was written for",
+                c as u32
+            );
+        }
+
+        // Control: ordinary UTF-8 names, including right-to-left script that
+        // needs no override character to render correctly, stay valid.
+        for ok in ["deployer", "café-агент-日本語", "مرحبا-agent", "worker-3"] {
+            assert!(is_valid_display_name(ok), "{ok} must stay valid");
+        }
     }
 
     #[test]
