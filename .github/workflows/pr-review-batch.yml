@@ -8,9 +8,9 @@
 #
 # The agent never holds a credential that can approve. It emits a verdict comment;
 # the `vote` job below holds the App token, re-validates independently, and casts
-# the review. That split is load-bearing: gh-aw runs codex with
-# --dangerously-bypass-approvals-and-sandbox inside its firewalled container, so
-# the agent has no approval gate of its own.
+# the review. That split is load-bearing: gh-aw runs the agent inside a
+# firewalled container with its own approval gate bypassed, so an agent holding
+# an approving credential would be one prompt injection away from using it.
 name: Agent PR review
 
 "on":
@@ -126,7 +126,7 @@ jobs:
       pr_number: ${{ matrix.item.number }}
       head_sha: ${{ matrix.item.sha }}
     secrets:
-      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
 
   vote:
     needs: [prepare, review]

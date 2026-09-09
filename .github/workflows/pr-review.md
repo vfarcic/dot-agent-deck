@@ -14,14 +14,14 @@ on:
         required: true
         type: string
     secrets:
-      OPENAI_API_KEY:
-        description: OpenAI API key used by Codex
+      ANTHROPIC_API_KEY:
+        description: Anthropic API key used by the Claude engine
         required: true
 
 # ENGINE — the only two lines to change when switching models. After editing,
 # run `gh aw compile` and commit the regenerated pr-review.lock.yml.
-engine: codex
-model: gpt-5
+engine: claude
+model: claude-opus-5
 
 network:
   allowed: [defaults]
@@ -61,10 +61,10 @@ pre-agent-steps:
   # producing no verdict. Same limitation as release.yml's RELEASE_TOKEN guard.
   - name: Require the engine credential
     env:
-      ENGINE_KEY: ${{ secrets.OPENAI_API_KEY }}
+      ENGINE_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
     run: |
       if [ -z "$ENGINE_KEY" ]; then
-        echo "::error title=Missing engine credential::OPENAI_API_KEY is unset or empty. The reviewer cannot run. If this workflow was invoked via workflow_call, check that the caller passes it under secrets:." >&2
+        echo "::error title=Missing engine credential::ANTHROPIC_API_KEY is unset or empty. The reviewer cannot run. If this workflow was invoked via workflow_call, check that the caller passes it under secrets:." >&2
         exit 1
       fi
       echo "engine credential present"
