@@ -18145,9 +18145,34 @@ fn render_stop_confirm(frame: &mut Frame, selected: usize, agent_count: usize) {
     frame.render_widget(paragraph, popup_area);
 }
 
+/// Width of the star prompt popup.
+///
+/// The historical 50 columns, widened when the repo identity line would not fit
+/// inside them, and always capped by the terminal. Issue #945 made the identity
+/// a one-line seam a fork can re-point, and the one thing this popup must not
+/// do is clip the repository it is asking the user to star — at 50 columns the
+/// two borders and the two-space indent leave 46, so a slug over 35 characters
+/// used to be silently truncated.
+///
+/// Upstream's `github.com/vfarcic/dot-agent-deck` is 33 columns and fits with
+/// room to spare, so this returns the same 50 as before for an upstream build.
+/// A GitHub slug is `[A-Za-z0-9._-]`, so a `chars()` count is its display width.
+fn star_popup_width(area_width: u16, identity: &str) -> u16 {
+    /// The two-space indent the identity line is rendered with.
+    const INDENT: u16 = 2;
+    /// Left + right border of the enclosing `Borders::ALL` block.
+    const BORDERS: u16 = 2;
+
+    let needed = u16::try_from(identity.chars().count())
+        .unwrap_or(u16::MAX)
+        .saturating_add(INDENT)
+        .saturating_add(BORDERS);
+    50u16.max(needed).min(area_width.saturating_sub(4))
+}
+
 fn render_star_prompt(frame: &mut Frame) -> Vec<(Action, Rect)> {
     let area = frame.area();
-    let popup_width = 50u16.min(area.width.saturating_sub(4));
+    let popup_width = star_popup_width(area.width, repo_identity::DISPLAY);
     let popup_height = 10u16.min(area.height.saturating_sub(4));
     let x = (area.width.saturating_sub(popup_width)) / 2;
     let y = (area.height.saturating_sub(popup_height)) / 2;
@@ -22639,6 +22664,39 @@ mod tests {
 
     fn default_ui() -> UiState {
         UiState::default()
+    }
+
+    /// Issue #945 made the star prompt's repo identity a one-line seam a fork
+    /// can re-point, so the popup has to fit whatever it is pointed at rather
+    /// than clipping the repository it is asking the user to star. Upstream's
+    /// identity must still produce the historical 50 columns unchanged.
+    #[test]
+    fn star_popup_widens_for_a_long_identity_but_is_unchanged_upstream() {
+        // Upstream: 33 columns of identity fits the historical 50 exactly as
+        // before, at every terminal width wide enough to hold the popup.
+        assert_eq!(
+            star_popup_width(80, "github.com/vfarcic/dot-agent-deck"),
+            50
+        );
+        assert_eq!(
+            star_popup_width(200, "github.com/vfarcic/dot-agent-deck"),
+            50
+        );
+
+        // 35 characters of slug is the last one that fit the old fixed width
+        // (50 - 2 borders - 2 indent = 46, minus the 11-char `github.com/`).
+        let at_the_old_limit = format!("github.com/{}", "s".repeat(35));
+        assert_eq!(star_popup_width(80, &at_the_old_limit), 50);
+
+        // One character more used to be clipped; the popup now grows with it.
+        let over_the_old_limit = format!("github.com/{}", "s".repeat(36));
+        assert_eq!(star_popup_width(80, &over_the_old_limit), 51);
+
+        // The terminal still wins: a popup never grows past `width - 4`.
+        assert_eq!(star_popup_width(40, &over_the_old_limit), 36);
+
+        // A terminal too narrow for any popup degrades rather than underflows.
+        assert_eq!(star_popup_width(3, &over_the_old_limit), 0);
     }
 
     /// Issue #945 turned the star prompt's fallback message from a literal
