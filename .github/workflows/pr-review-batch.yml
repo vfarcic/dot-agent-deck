@@ -132,20 +132,57 @@ jobs:
     secrets:
       ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
 
-  vote:
+  # Recompute who is votable AFTER the reviews land, rather than reusing the
+  # review list. Two reasons, both real:
+  #
+  #   - A verdict produced by an EARLIER run would otherwise be orphaned: the
+  #     review pass skips that pull request as already-reviewed, so it never
+  #     reaches the vote job and can never be approved. Turning PR_REVIEW_LIVE
+  #     on would silently do nothing for every pull request already reviewed.
+  #   - A vote job that fails transiently would otherwise lose that pull request
+  #     permanently — the verdict stands, so the next run skips it too.
+  #
+  # Selecting on "has a current verdict" instead makes voting idempotent and
+  # retryable: a missed vote is simply picked up by the next sweep.
+  prepare_vote:
     needs: [prepare, review]
-    # Never on a failed review, never in dry run, never with an empty set.
     if: >-
       always()
-      && needs.review.result == 'success'
       && needs.prepare.outputs.live == 'true'
-      && needs.prepare.outputs.count != '0'
+    runs-on: ubuntu-latest
+    outputs:
+      items: ${{ steps.pick.outputs.items }}
+      count: ${{ steps.pick.outputs.count }}
+    steps:
+      - name: Check out the base branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Select pull requests with a current verdict
+        id: pick
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          ONLY_PR: ${{ inputs.pr_number }}
+          MAX_PRS: ${{ inputs.max_prs || '50' }}
+          DISPATCH_DRY_RUN: ${{ inputs.dry_run }}
+          EVENT_NAME: ${{ github.event_name }}
+          REPO_LIVE: ${{ vars.PR_REVIEW_LIVE }}
+          SELECT_MODE: vote
+        run: python3 .github/scripts/pr_review_select.py
+
+  vote:
+    needs: [prepare, prepare_vote]
+    if: >-
+      always()
+      && needs.prepare_vote.result == 'success'
+      && needs.prepare.outputs.live == 'true'
+      && needs.prepare_vote.outputs.count != '0'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       max-parallel: 3
       matrix:
-        item: ${{ fromJSON(needs.prepare.outputs.items) }}
+        item: ${{ fromJSON(needs.prepare_vote.outputs.items) }}
     permissions:
       contents: read
     steps:

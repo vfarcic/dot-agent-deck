@@ -52,6 +52,11 @@ def touches_denied(repo, number):
 def main():
     repo = env("REPO")
     only_pr = env("ONLY_PR")
+    # "review" selects pull requests that NEED a verdict; "vote" selects those
+    # that HAVE a current one and may be voted on. Two passes, because a verdict
+    # produced by this run must still be votable, and a verdict produced by an
+    # earlier run must not be orphaned just because it is no longer new.
+    mode = env("SELECT_MODE", "review")
     review_authors = set(env("REVIEW_AUTHORS").split())
     vote_authors = set(env("VOTE_AUTHORS").split())
     try:
@@ -129,17 +134,28 @@ def main():
             skipped.append((number, f"{open_threads} unresolved review thread(s)"))
             continue
 
-        # Idempotence: a current verdict means this sweep has nothing to add.
         existing = latest_verdict(repo, number)
-        if existing and existing.get("head_sha") == sha:
+        has_current_verdict = bool(existing and existing.get("head_sha") == sha)
+
+        if mode == "review" and has_current_verdict:
+            # Idempotence: nothing to add for a head that already has a verdict.
             skipped.append((number, f"already has a verdict for {sha[:8]}"))
+            continue
+        if mode == "vote" and not has_current_verdict:
+            skipped.append((number, f"no current verdict for {sha[:8]}"))
             continue
 
         denied = touches_denied(repo, number)
+        vote_allowed = author in vote_authors and not denied
+        if mode == "vote" and not vote_allowed:
+            reason = denied[:3] if denied else f"author {author} not in VOTE_AUTHORS"
+            skipped.append((number, f"verdict stands but no vote: {reason}"))
+            continue
+
         items.append({
             "number": number,
             "sha": sha,
-            "vote_allowed": author in vote_authors and not denied,
+            "vote_allowed": vote_allowed,
             "denied_paths": denied[:5],
         })
         if len(items) >= max_prs:

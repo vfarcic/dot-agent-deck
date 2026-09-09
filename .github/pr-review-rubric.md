@@ -41,7 +41,13 @@ with the tests it needed. Judging that is yours (see priority 3).
 
 ## Output
 
-Post one comment containing a short summary, then exactly one fenced `json` block, last:
+Post one comment. It must **begin** with a single status line, on its own, in exactly this form — so a reader scanning the PR list knows the outcome without reading further:
+
+- `**APPROVE** — no defects found.`
+- `**REQUEST CHANGES** — <n> issue(s) found, see below.`
+- `**INSUFFICIENT** — could not review confidently, see below.`
+
+Then your summary, then exactly one fenced `json` block, last:
 
 ````
 ```json
@@ -58,5 +64,7 @@ Post one comment containing a short summary, then exactly one fenced `json` bloc
 - `APPROVE` — you read the whole diff and would be comfortable with it on `main`.
 - `REQUEST_CHANGES` — a specific defect. Name the file and what goes wrong.
 - `INSUFFICIENT` — too large, or too dependent on context you cannot see. Say what you would need.
+
+Whether that verdict actually became a GitHub approval is **not** something you can know or state — a separate job decides, and it declines to vote on pull requests touching protected paths. Say nothing about approvals having been cast; the review on the pull request is the record of that.
 
 `head_sha` must be the SHA you were given. If you cannot determine it, emit `INSUFFICIENT` rather than guessing: a mismatched SHA is discarded and fails the run.
