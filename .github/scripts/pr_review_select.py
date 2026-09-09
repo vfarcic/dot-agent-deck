@@ -17,6 +17,7 @@ from pr_review_common import (  # noqa: E402
     checks_green,
     gh_json,
     latest_verdict,
+    unresolved_threads,
 )
 
 # Authors whose pull requests are only eligible when they carry a specific label.
@@ -104,6 +105,11 @@ def main():
         green, why = checks_green(repo, sha)
         if not green:
             skipped.append((number, why))
+            continue
+
+        open_threads = unresolved_threads(repo, number)
+        if open_threads:
+            skipped.append((number, f"{open_threads} unresolved review thread(s)"))
             continue
 
         # Idempotence: a current verdict means this sweep has nothing to add.

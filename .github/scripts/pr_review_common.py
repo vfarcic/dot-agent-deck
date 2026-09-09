@@ -86,6 +86,27 @@ def checks_green(repo, sha):
     return True, "all required contexts green, no failures"
 
 
+def unresolved_threads(repo, pr_number):
+    """Count unresolved review threads. Greptile's findings arrive as these.
+
+    A pull request with open threads is not ready: `required_review_thread_resolution`
+    blocks its merge regardless of approvals, so reviewing it spends tokens on a
+    verdict that cannot help, and voting on it would be an approval that changes
+    nothing. Only available over GraphQL.
+    """
+    owner, name = repo.split("/")
+    query = (
+        "query($o:String!,$n:String!,$p:Int!){repository(owner:$o,name:$n){"
+        "pullRequest(number:$p){reviewThreads(first:100){nodes{isResolved}}}}}"
+    )
+    data = gh_json(
+        "api", "graphql", "-f", f"query={query}", "-F", f"o={owner}", "-F", f"n={name}",
+        "-F", f"p={pr_number}",
+        "--jq", "[.data.repository.pullRequest.reviewThreads.nodes[]|select(.isResolved==false)]|length",
+    )
+    return int(data or 0)
+
+
 def parse_verdict(body):
     """Extract and validate a pr-review/v1 verdict from a comment body.
 
