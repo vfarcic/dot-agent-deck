@@ -28,8 +28,8 @@ name: Agent PR review
   # pull_request workflow runs from the PR's head branch, and only this branch
   # carries this file, so only this pull request can trigger it.
   #
-  # It cannot vote: pr_review_select.py restricts live mode to workflow_dispatch
-  # alone, so a pull_request run is always a dry run.
+  # It cannot vote: pr_review_select.py allows live mode only on the schedule
+  # and workflow_dispatch events, so a pull_request run is always a dry run.
   pull_request:
     types: [opened, synchronize, ready_for_review]
 
@@ -95,10 +95,10 @@ jobs:
           REPO: ${{ github.repository }}
           ONLY_PR: ${{ inputs.pr_number }}
           MAX_PRS: ${{ inputs.max_prs || '50' }}
-          # Voting requires a manual dispatch with dry_run unchecked AND
-          # PR_REVIEW_LIVE set. A SCHEDULED run can never vote at all, whatever
-          # PR_REVIEW_LIVE says — while this is being trialled, casting an
-          # approval is a human act, not something a cron job does overnight.
+          # PR_REVIEW_LIVE is the single switch that authorises voting, and it
+          # authorises the UNATTENDED kind too: with it set, the daily sweep
+          # casts approvals on its own. A manual dispatch can additionally force
+          # a dry run via dry_run=true. A pull_request run never votes.
           DISPATCH_DRY_RUN: ${{ inputs.dry_run }}
           EVENT_NAME: ${{ github.event_name }}
           REPO_LIVE: ${{ vars.PR_REVIEW_LIVE }}
