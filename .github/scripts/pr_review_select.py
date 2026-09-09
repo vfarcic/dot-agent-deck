@@ -59,10 +59,20 @@ def main():
     except ValueError:
         max_prs = 5
 
-    # Live requires BOTH the repo variable and a dispatch that did not ask for a
-    # dry run. A scheduled tick has no dry_run input, so enabling the schedule
-    # never by itself enables voting.
-    live = env("REPO_LIVE") == "true" and env("DISPATCH_DRY_RUN") != "true"
+    # Live requires ALL of: the repo variable, an event that is allowed to vote,
+    # and a dispatch that did not ask for a dry run.
+    #
+    # The event check is not redundant. A pull_request event carries no dry_run
+    # input, so without it live-ness would fall back to the repo variable alone —
+    # meaning a temporary pull_request trigger added for testing could cast real
+    # approvals. Voting events are named explicitly so that adding any new trigger
+    # is inert until someone decides otherwise.
+    voting_events = {"schedule", "workflow_dispatch"}
+    live = (
+        env("REPO_LIVE") == "true"
+        and env("EVENT_NAME") in voting_events
+        and env("DISPATCH_DRY_RUN") != "true"
+    )
 
     owner = repo.split("/")[0]
     prs = gh_json(

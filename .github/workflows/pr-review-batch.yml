@@ -18,6 +18,18 @@ name: Agent PR review
     # Sweeps are idempotent (a pull request with a current verdict is skipped),
     # so a missed or overlapping run costs nothing.
     - cron: "*/30 * * * *"
+  # TEMPORARY — REMOVE BEFORE MERGING THIS PULL REQUEST.
+  #
+  # workflow_dispatch only works from the default branch, so this trigger exists
+  # to exercise the reviewer from its own pull request before it is merged. A
+  # pull_request workflow runs from the PR's head branch, and only this branch
+  # carries this file, so only this pull request can trigger it.
+  #
+  # It cannot vote: pr_review_select.py restricts live mode to the schedule and
+  # workflow_dispatch events, so a pull_request run is always a dry run.
+  pull_request:
+    types: [opened, synchronize, ready_for_review]
+
   workflow_dispatch:
     inputs:
       pr_number:
@@ -78,6 +90,7 @@ jobs:
           # variable says so. A scheduled run can never vote unless PR_REVIEW_LIVE
           # is set, so turning the schedule on does not turn voting on.
           DISPATCH_DRY_RUN: ${{ inputs.dry_run }}
+          EVENT_NAME: ${{ github.event_name }}
           REPO_LIVE: ${{ vars.PR_REVIEW_LIVE }}
         run: python3 .github/scripts/pr_review_select.py
 
