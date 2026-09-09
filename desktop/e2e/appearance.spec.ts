@@ -126,8 +126,9 @@ test.describe("appearance in a real engine", () => {
     `document`, `navigator` or `screen`; `theme-color` is not a CSS property, so
     `CSS.supports("theme-color", "#101514")` is `false` and
     `getComputedStyle(document.documentElement).getPropertyValue("theme-color")`
-    is the empty string; and `HTMLMetaElement.prototype` carries nothing that
-    reports resolution. Chromium's CDP does have a `themeColor`, but it is the
+    is the empty string; and `HTMLMetaElement.prototype` has exactly six own
+    properties in both engines -- `constructor`, `content`, `httpEquiv`,
+    `media`, `name`, `scheme` -- none of which reports resolution. Chromium's CDP does have a `themeColor`, but it is the
     web app MANIFEST's `theme_color`, and CDP is Chromium-only in any case — so
     it cannot answer the WebKit question this tier exists for. A previous
     version of this test re-derived the pick with `window.matchMedia(meta.media)`
