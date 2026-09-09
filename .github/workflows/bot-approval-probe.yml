@@ -1,0 +1,24 @@
+# THROWAWAY probe using a real GitHub App identity.
+# Needs NO repo-setting change - the App has its own pull_requests:write.
+name: bot-approval-probe
+on:
+  pull_request:
+    types: [opened, synchronize, ready_for_review]
+permissions: {}
+jobs:
+  approve:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/create-github-app-token@v2
+        id: app
+        with:
+          app-id: ${{ secrets.REVIEW_APP_ID }}
+          private-key: ${{ secrets.REVIEW_APP_PRIVATE_KEY }}
+      - name: Approve as the App
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          PR: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          gh pr review "$PR" --repo "$REPO" --approve \
+            --body "Probe only: testing whether an App approval satisfies main-protected. Not a review."
