@@ -2318,10 +2318,11 @@ forms it is.";
     /// `ensure_main_webview` and the framework's own argument decoding are
     /// outside every test in this crate — see issue #823 for the missing tier.
     /// [`tests::the_settings_commands_own_bodies_carry_no_value_from_the_document`]
-    /// drives the two command *bodies* through the public functions they are
-    /// each a one-line wrapper over, which is as close to the real handlers as
-    /// this tier reaches. Greptile raised this on PR #943, and the claim is
-    /// narrowed rather than overstated.
+    /// drives the two command *bodies* through the public functions they wrap,
+    /// which is as close to the real handlers as this tier reaches — see that
+    /// test's own comment for the two pieces it still does not reach, and for
+    /// where the second of them is covered instead. Greptile raised this on PR
+    /// #943, and the claim is narrowed rather than overstated.
     #[test]
     fn a_credential_from_the_webview_reaches_neither_the_echo_nor_the_document() {
         let payloads = [
@@ -2481,11 +2482,21 @@ forms it is.";
     /// sentinel-bearing document on disk.
     ///
     /// `desktop_get_settings` is `Ok(settings::load_snapshot())` after its
-    /// webview guard, and `desktop_set_settings` is `settings::save(&settings)`
-    /// then `Ok(settings)`. So calling [`load_snapshot`] and [`save`] under the
-    /// real path seam exercises everything in those handlers except
-    /// `ensure_main_webview` — which is what a unit tier can reach, since a
-    /// `Webview` needs a running Tauri app to exist.
+    /// webview guard. `desktop_set_settings` is `settings::save(&settings)`
+    /// then `Ok(settings)`, plus a `map_err` closure that logs
+    /// `error.detail()` and returns `safe_message(error.public())`. So calling
+    /// [`load_snapshot`] and [`save`] under the real path seam drives both
+    /// success paths, and **two** things in those handlers stay out of reach
+    /// rather than one: `ensure_main_webview`, because a `Webview` needs a
+    /// running Tauri app to exist; and that `map_err` closure, because this
+    /// test does not provoke a save failure.
+    ///
+    /// The closure is not uncovered, though — it is covered somewhere else,
+    /// which is worth knowing before reading this test as the whole story. The
+    /// only two values it can emit are `error.detail()` and
+    /// `safe_message(error.public())`, and
+    /// [`tests::no_settings_write_error_carries_a_value_from_the_document`]
+    /// asserts both are free of the sentinel, against real save failures.
     ///
     /// This is deliberately more than re-serialising a hand-built struct: the
     /// snapshot here is the one the command would actually return, read off a
