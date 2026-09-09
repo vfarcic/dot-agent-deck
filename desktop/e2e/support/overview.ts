@@ -36,8 +36,53 @@ export const ALL_COLUMNS = [
   "lastUserPrompt",
 ] as const;
 
+/** One of the nine ids above. */
+export type OverviewColumn = (typeof ALL_COLUMNS)[number];
+
 /** The one column the picker refuses to untick, so `check()` must skip it. */
-const PERMANENT_COLUMN = "displayName";
+export const PERMANENT_COLUMN = "displayName";
+
+/**
+ * The four columns the screen shows before anyone chooses, in grid order.
+ *
+ * A second deliberate copy, of `DEFAULT_OVERVIEW_COLUMNS`. Reversing it — a
+ * spec that read the defaults off the screen it is about to assert — would make
+ * "Restore defaults restored the defaults" true by construction, which is the
+ * one thing that test must not be.
+ */
+export const DEFAULT_COLUMNS = ["status", "displayName", "spawnedAtMs", "cwd"] as const satisfies readonly OverviewColumn[];
+
+/**
+ * Each column's own legend text, as the visible legend strip prints it.
+ *
+ * Copied from `OVERVIEW_COLUMNS` for the reason `ALL_COLUMNS` is, and guarded
+ * the same way: `showAllColumns` asserts the rendered legend equals
+ * `legendFor(ALL_COLUMNS)` exactly and in order, so a renamed or reordered
+ * legend fails the run instead of being quietly accepted by a count.
+ */
+export const COLUMN_LEGEND: Record<OverviewColumn, string> = {
+  status: "STATUS",
+  displayName: "AGENT",
+  lastActivityMs: "LAST ACTIVITY",
+  spawnedAtMs: "UPTIME",
+  cli: "CLI",
+  activeTool: "ACTIVE TOOL",
+  toolCount: "TOOLS",
+  cwd: "WORKING DIRECTORY",
+  lastUserPrompt: "LAST PROMPT",
+};
+
+/**
+ * The legend a chosen set should produce: grid order, never without the
+ * permanent column. It mirrors the app's `orderedColumns` rather than calling
+ * it — the selection is a SET and the layout is a property of the screen, so a
+ * spec that ticked columns in some order and expected them back in that order
+ * would be asserting the wrong contract.
+ */
+export function legendFor(columns: Iterable<OverviewColumn>): string[] {
+  const chosen = new Set<string>([...columns, PERMANENT_COLUMN]);
+  return ALL_COLUMNS.filter((column) => chosen.has(column)).map((column) => COLUMN_LEGEND[column]);
+}
 
 /**
  * Load the fixture and click through to the agent overview.
@@ -58,12 +103,24 @@ export async function openOverview(page: Page, scenario: FixtureScenario = "crow
  * cards can only fall out of step once there is somewhere to scroll to.
  */
 export async function showAllColumns(page: Page): Promise<void> {
-  await page.getByTestId("overview-columns-toggle").click();
-  const menu = page.getByTestId("overview-columns-menu");
-  await expect(menu).toBeVisible();
+  await chooseColumns(page, ALL_COLUMNS);
+}
+
+/**
+ * Leave the picker showing exactly `wanted` — plus the permanent column, which
+ * has no route out — then close it and wait for the layout to take the new
+ * template.
+ *
+ * Every tick and untick is a real click on a real checkbox, so the picker's own
+ * event handling is exercised rather than bypassed by writing state.
+ */
+export async function chooseColumns(page: Page, wanted: Iterable<OverviewColumn>): Promise<void> {
+  const chosen = [...wanted];
+  const target = new Set<string>(chosen);
+  const menu = await openColumnPicker(page);
 
   for (const column of ALL_COLUMNS) {
-    const checkbox = page.getByTestId(`overview-column-${column}`);
+    const checkbox = columnCheckbox(page, column);
     await expect(checkbox, `column "${column}" has no checkbox — the id list here has drifted from ALL_OVERVIEW_COLUMNS`).toBeAttached();
     if (column === PERMANENT_COLUMN) {
       // Permanent means `disabled`, and `check()` on a disabled input waits
@@ -71,16 +128,43 @@ export async function showAllColumns(page: Page): Promise<void> {
       await expect(checkbox).toBeChecked();
       continue;
     }
-    if (!(await checkbox.isChecked())) await checkbox.check();
+    const ticked = await checkbox.isChecked();
+    if (ticked === target.has(column)) continue;
+    if (ticked) await checkbox.uncheck();
+    else await checkbox.check();
   }
 
   await page.keyboard.press("Escape");
   await expect(menu).toBeHidden();
-  // The layout has actually taken the new template once the legend prints one
-  // label per column. This is the state wait that replaces "give React a
-  // moment" — without it the first `boundingBox()` can read the four-column
-  // grid.
-  await expect(page.locator(".overview-legend span")).toHaveCount(ALL_COLUMNS.length);
+  // The layout has actually taken the new template once the legend prints the
+  // labels for the chosen set, in grid order. This is the state wait that
+  // replaces "give React a moment" — without it the first `boundingBox()` can
+  // read the previous grid. Asserting the TEXTS rather than a count is what
+  // keeps `COLUMN_LEGEND` honest.
+  await expect(legendLabels(page)).toHaveText(legendFor(chosen));
+}
+
+/** The picker's checkbox for one column. */
+export function columnCheckbox(page: Page, column: OverviewColumn): Locator {
+  return page.getByTestId(`overview-column-${column}`);
+}
+
+/** The picker's menu, whether or not it is currently mounted. */
+export function columnsMenu(page: Page): Locator {
+  return page.getByTestId("overview-columns-menu");
+}
+
+/** Click the picker's trigger and wait for the menu to be on screen. */
+export async function openColumnPicker(page: Page): Promise<Locator> {
+  await page.getByTestId("overview-columns-toggle").click();
+  const menu = columnsMenu(page);
+  await expect(menu).toBeVisible();
+  return menu;
+}
+
+/** The visible legend strip — one label per column currently on screen. */
+export function legendLabels(page: Page): Locator {
+  return page.locator(".overview-legend span");
 }
 
 /** The single scroll region the legend and every group card live inside. */

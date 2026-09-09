@@ -228,14 +228,16 @@ jobs:
     if: needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true'
     runs-on: ubuntu-latest
     # NOT a measured runner wall clock — this job's own first run is the first
-    # measurement, so this is derived rather than observed. Locally the whole
-    # suite (20 tests across two engines, including the `vite build` the
-    # Playwright `webServer` runs first) takes ~30s at 8 workers and the slowest
-    # single test is ~12s; CI runs at `workers: 1`, and the browser download and
-    # the apt install for WebKit's runtime deps are the two steps that dominate.
-    # 20 minutes leaves room for all of that while still capping a wedged
-    # browser at a fraction of the 6-hour runner default. Re-tune downward once
-    # honest runs exist; do not raise it to paper over a hang.
+    # measurement, so this is derived rather than observed. Measured on a warm
+    # 16-core dev box after #836's second phase took the suite from 20 tests to
+    # 54 across two engines, including the `vite build` the Playwright
+    # `webServer` runs first: 24.6s at 8 workers, 1m06s at `--workers=1`, which
+    # is the shape CI runs in. On top of that CI pays for `pnpm install`, the
+    # ~400 MiB browser download and the apt install for WebKit's runtime deps,
+    # and those three dominate. 20 minutes leaves room for all of it while still
+    # capping a wedged browser at a fraction of the 6-hour runner default.
+    # Re-tune downward once honest runs exist; do not raise it to paper over a
+    # hang.
     timeout-minutes: 20
     defaults:
       run:
