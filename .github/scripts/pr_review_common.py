@@ -42,6 +42,33 @@ VERDICT_BLOCK = re.compile(r"```json\s*(\{.*?\})\s*```", re.DOTALL)
 SCHEMA = "pr-review/v1"
 VERDICTS = {"APPROVE", "REQUEST_CHANGES", "INSUFFICIENT"}
 
+# A verdict is only a verdict if OUR workflow wrote it.
+#
+# Without this, the transport between the agent and the vote job is
+# unauthenticated: this is a public repository, so anyone with a GitHub account
+# can comment a forged pr-review/v1 block quoting the pull request's public head
+# SHA, and the vote job would cast the required approval with the App
+# credential. The same hole is a denial of service — one malformed block from a
+# stranger raises out of the selector and kills the sweep.
+#
+# Two independent conditions, both required. The login can only be produced by
+# an Actions run in this repository (a person cannot post as it), and the
+# provenance marker is emitted by gh-aw's safe-output for this specific
+# workflow, so an unrelated workflow's comment does not qualify either.
+TRUSTED_VERDICT_AUTHOR = "github-actions[bot]"
+VERDICT_PROVENANCE = "gh-aw-agentic-workflow:"
+VERDICT_WORKFLOW_ID = "workflow_id: pr-review"
+
+
+def _is_trusted_verdict_comment(comment):
+    author = ((comment.get("user") or {}).get("login")) or ""
+    body = comment.get("body") or ""
+    return (
+        author == TRUSTED_VERDICT_AUTHOR
+        and VERDICT_PROVENANCE in body
+        and VERDICT_WORKFLOW_ID in body
+    )
+
 
 def gh(*args, check=True):
     """Run gh and return stdout. Raises on failure so nothing fails silently."""
@@ -133,12 +160,19 @@ def parse_verdict(body):
 
 
 def latest_verdict(repo, pr_number):
-    """Newest pr-review/v1 verdict on a pull request, or None."""
+    """Newest pr-review/v1 verdict written by OUR workflow, or None.
+
+    Comments from anyone else are discarded before being parsed at all, so a
+    forged or malformed block from an untrusted commenter can neither become
+    authoritative nor raise. A malformed verdict from the trusted author still
+    raises — that is a broken reviewer and must be loud, not silently skipped.
+    """
     comments = gh_json(
         "api", f"repos/{repo}/issues/{pr_number}/comments", "--paginate",
-        "--jq", "[.[] | {id, body, created_at}]",
+        "--jq", "[.[] | {id, body, created_at, user: {login: .user.login}}]",
     ) or []
-    for comment in sorted(comments, key=lambda c: c["created_at"], reverse=True):
+    trusted = [c for c in comments if _is_trusted_verdict_comment(c)]
+    for comment in sorted(trusted, key=lambda c: c["created_at"], reverse=True):
         verdict = parse_verdict(comment.get("body"))
         if verdict is not None:
             return verdict

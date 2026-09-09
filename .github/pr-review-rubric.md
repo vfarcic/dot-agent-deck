@@ -10,18 +10,11 @@ The approval your verdict can lead to may be the only review this pull request g
 
 ## What is already established — do not re-check it
 
-Before you were invoked, this pull request was verified to be non-draft, from a
-trusted author, on a branch of this repository, with **all required CI contexts
-green and no failed check anywhere**, **no unresolved review threads**, and no
-reviewer requesting changes. Take all of that as given.
+Before you were invoked, this pull request was verified to be non-draft, from a trusted author, on a branch of this repository, with **all required CI contexts green and no failed check anywhere**, **no unresolved review threads**, and no reviewer requesting changes. Take all of that as given.
 
-So: do not check CI status, do not look for test results, do not verify that
-other reviewers are satisfied, and do not mention any of it in your verdict. It
-is noise — the reader already knows. Spend your turns on the diff.
+So: do not check CI status, do not look for test results, do not verify that other reviewers are satisfied, and do not mention any of it in your verdict. It is noise — the reader already knows. Spend your turns on the diff.
 
-The one thing CI green does *not* tell you, and which is squarely your job: it
-proves the tests that exist pass. It says nothing about whether the change came
-with the tests it needed. Judging that is yours (see priority 3).
+The one thing CI green does *not* tell you, and which is squarely your job: it proves the tests that exist pass. It says nothing about whether the change came with the tests it needed. Judging that is yours (see priority 3).
 
 ## Hard constraints
 
