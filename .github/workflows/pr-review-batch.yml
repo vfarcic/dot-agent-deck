@@ -102,10 +102,19 @@ jobs:
       max-parallel: 3
       matrix:
         item: ${{ fromJSON(needs.prepare.outputs.items) }}
+    # Must be at least what pr-review.lock.yml's own jobs request, or the run
+    # fails at startup before any job begins. Its safe-output jobs need issues
+    # and pull-requests write in order to post the verdict comment.
+    #
+    # That write does NOT let the agent approve anything: this is GITHUB_TOKEN,
+    # and can_approve_pull_request_reviews is false on this repository, so an
+    # Actions identity cannot cast an approving review at all. The App token,
+    # which can, exists only in the `vote` job below.
     permissions:
-      actions: write
+      actions: read
       contents: read
-      pull-requests: read
+      issues: write
+      pull-requests: write
     uses: ./.github/workflows/pr-review.lock.yml
     with:
       pr_number: ${{ matrix.item.number }}
