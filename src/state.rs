@@ -6744,7 +6744,84 @@ impl AppState {
         )
     }
 
+    /// Issue #321 residual 1: remember when the PANE started being used, so a
+    /// session rebuilt on it carries the original instant instead of the
+    /// rebuild's own timestamp.
+    ///
+    /// `started_at` is pane-scoped by design — both rebuild paths
+    /// ([`Self::insert_placeholder_session`] and the create path in
+    /// [`Self::apply_event`]) read it back out of `pane_started_at` — but the
+    /// only writer used to be the `SessionEnd` branch. A respawn that never
+    /// sends one is exactly the `clear = true` delegate, which `SIGKILL`s the
+    /// worker, so BOTH supersession paths re-derived `started_at` from the
+    /// replacement's first event: the cross-key retire loop as well as the
+    /// same-key identity refresh. That made a pane's start time depend on
+    /// whether its previous agent got to exit gracefully, and it contradicted
+    /// the same-key site's own comment, which already claimed the pane-scoped
+    /// `started_at` was "carried across". This is what makes that claim true.
+    ///
+    /// Keeps the EARLIEST instant seen for the pane. The write is idempotent on
+    /// its own — a superseded session's `started_at` was itself read out of this
+    /// map whenever the map had an entry — but the retire loop can drop several
+    /// sessions in one pass, and a monotone floor means no ordering among them
+    /// can move a pane's start time FORWARD, which is the only direction that
+    /// would lose information.
+    ///
+    /// The `SessionEnd` branch still writes `pane_started_at` directly rather
+    /// than through here: it runs inside a closure that holds a borrow of
+    /// `self.sessions`, and its write is a pane's first by construction, so
+    /// routing it through a `&mut self` method would mean restructuring that
+    /// branch to buy a property it already has.
+    fn remember_pane_start(&mut self, pane_id: &str, started_at: DateTime<Utc>) {
+        self.pane_started_at
+            .entry(pane_id.to_string())
+            .and_modify(|existing| {
+                if started_at < *existing {
+                    *existing = started_at;
+                }
+            })
+            .or_insert(started_at);
+    }
+
     pub fn apply_event(&mut self, mut event: AgentEvent) {
+        // Issue #833: `tool_name` / `tool_detail` are PRODUCER-supplied — every
+        // agent on the deck can post to the hook socket — and both are drawn
+        // into a card's tool line (`ui::recent_tool_lines` reads them off the
+        // `recent_events` journal below) as well as stored on `active_tool`,
+        // from where they travel back out over `ListAgents`. They were kept
+        // verbatim on both.
+        //
+        // Scrubbed HERE, at the top of the ingest, rather than at either of
+        // those two uses. The value is STORED twice by this one function and
+        // read by consumers that are not the card — `daemon_status`'s JSON
+        // document and the desktop DTO among them — so a scrub at the one seam
+        // that draws it today would leave the stored value hostile for every
+        // other reader and would have to be re-applied by each new one. That is
+        // the exact shape of the defect #833 reports: `ui.display_names` was a
+        // second reader added beside a sanitized one.
+        //
+        // The counterpart route for the SAME two strings — a daemon echoing
+        // them back inside `AgentRecord.live` — has been scrubbed and clamped at
+        // the wire boundary since PRD #162 (`daemon_client`), so this closes the
+        // half of one field that had no scrub on either end of it. The two are
+        // still not identical: that boundary uses `daemon_client`'s own
+        // control-only filter, which drops C0/C1 and DEL but NOT bidi, while
+        // this uses `strip_control_and_bidi`. So a bidi override survives the
+        // echo route and not this one. Narrowing that residual is deliberately
+        // outside #833, which names two seams; it is recorded in
+        // `crate::untrusted_text`'s module doc.
+        //
+        // Ahead of the admission-control `return`s below deliberately: an event
+        // this instance rejects is dropped whole, so scrubbing it first costs
+        // only the work, while a later insertion point is one more thing a
+        // future early-return can be added in front of.
+        if let Some(name) = event.tool_name.as_mut() {
+            *name = crate::untrusted_text::sanitize_tool_text(name);
+        }
+        if let Some(detail) = event.tool_detail.as_mut() {
+            *detail = crate::untrusted_text::sanitize_tool_text(detail);
+        }
+
         // PRD #20 R20-003 (finding #4): the ORIGINAL hook `session_id` on the
         // wire, captured BEFORE the same-agent reuse guard below remaps it onto
         // the stable card id. This is the generation the daemon's send guard
@@ -7122,6 +7199,11 @@ impl AppState {
                 .collect();
             for id in to_remove {
                 if let Some(removed) = self.sessions.remove(&id) {
+                    // Issue #321 residual 1: the pane keeps its start time
+                    // across the rebuild the create path is about to do. See
+                    // [`Self::remember_pane_start`] for why the `SessionEnd`
+                    // branch was not the only place that owed this write.
+                    self.remember_pane_start(pane_id, removed.started_at);
                     // First non-empty friendly name on this pane wins.
                     if inherited_display_name.is_none() {
                         inherited_display_name = removed.display_name;
@@ -7172,6 +7254,40 @@ impl AppState {
         // failure `status/supersede/003` forbids one screen up. Distinct-session
         // supersession is unaffected and still vanishes the armed id
         // (`status/supersede/002`, `prompt/close-confirm/005`).
+        //
+        // Issue #321 residual 2: the match ALSO requires that the stored session
+        // and the event agree about which pane they are on. This site is the one
+        // supersession path that does not derive its target from the pane — the
+        // retire loop above selects by `session.pane_id == event.pane_id` and so
+        // cannot reach another pane by construction, while this one selects
+        // purely by `event.session_id`.
+        //
+        // The reasoning that left the check out was that a session-key match is
+        // the strongest identity evidence available and panes do not share
+        // session ids, so a pane comparison would be redundant. That is an
+        // ASSUMPTION about how producers construct session ids, not an invariant
+        // anything here enforces: `{pane_id}-session` is Pi's convention (see
+        // `src/main.rs`), and nothing rejects a frame that reuses another pane's
+        // key. Where the assumption fails, this block hands the stored card's
+        // identity — and, via the create path below, its `recent_events`,
+        // `tool_count` and `first_prompts` — to an agent reporting from a
+        // DIFFERENT pane, silently and with no evidence that the two are
+        // related.
+        //
+        // Deliberately narrow: it refuses only when BOTH sides name a pane and
+        // the panes differ. An absent pane id on either side is not evidence of
+        // a wrong pane, and turning "we cannot tell" into a refusal would
+        // reinstate the stale-`agent_id` card PRD #284 fixed, for the untagged
+        // shapes the reuse guard above deliberately still admits. Every pane
+        // comparison that is possible is made; none is invented.
+        //
+        // What this does NOT close is the unconditional `session.pane_id`
+        // refresh further down, which still moves a surviving card onto the
+        // event's pane. That is a different seam with its own consumers (the
+        // untagged-adoption path depends on it) and is out of scope here — what
+        // this guard protects is the card's IDENTITY and accumulated history,
+        // which is what "refresh a session's identity from the wrong pane"
+        // means.
         if claims_generation
             && let Some(incoming_agent_id) = event.agent_id.as_deref()
             && self.sessions.get(&event.session_id).is_some_and(|session| {
@@ -7179,10 +7295,25 @@ impl AppState {
                     .agent_id
                     .as_deref()
                     .is_some_and(|current| current != incoming_agent_id)
+                    && match (session.pane_id.as_deref(), event.pane_id.as_deref()) {
+                        (Some(stored), Some(incoming)) => stored == incoming,
+                        _ => true,
+                    }
                     && self.supersedes_generation(&event, session)
             })
         {
             let superseded = self.sessions.remove(&event.session_id);
+            if let Some(session) = superseded.as_ref()
+                && let Some(pane_id) = session.pane_id.as_deref()
+            {
+                // Issue #321 residual 1: as in the retire loop above, the pane
+                // keeps its start time when the create path rebuilds this key
+                // for the incoming generation. This is the site whose own
+                // comment already promised it.
+                let started_at = session.started_at;
+                let pane_id = pane_id.to_string();
+                self.remember_pane_start(&pane_id, started_at);
+            }
             // First non-empty friendly name on this pane wins, as above.
             if inherited_display_name.is_none() {
                 inherited_display_name = superseded.and_then(|session| session.display_name);

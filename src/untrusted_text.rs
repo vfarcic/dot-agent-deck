@@ -32,6 +32,21 @@
 //! not part of #670. Reach for this module rather than writing a third copy: it
 //! is the divergence between those two that let the bidi half be present on one
 //! untrusted path and absent on another.
+//!
+//! Issue #833 brought ONE field of that seam here — `AgentRecord.display_name`,
+//! which had no filter at all rather than the control-only one. It now goes
+//! through [`sanitize_display_name`], because it is the card title
+//! `ui::render_card_grid` prefers and the daemon-side gate that was supposed to
+//! keep it clean admitted bidi. The live-snapshot strings beside it —
+//! `last_user_prompt`, `first_prompts`, `active_tool` — still use
+//! `daemon_client`'s control-only filter, so that seam is now MIXED rather than
+//! uniformly control-only, and `cwd` on the same record has neither (see
+//! `daemon_client::sanitize_record_tab_membership`'s doc for that residual).
+//! Their live counterparts arriving on the hook socket are the ones this module
+//! covers: `tool_name` / `tool_detail` through [`sanitize_tool_text`], and the
+//! hook's `display_name` metadata through [`sanitize_display_name`].
+//! `user_prompt` at that ingest is scrubbed on neither route and is not part of
+//! #833.
 
 use crate::agent_pty::DISPLAY_NAME_MAX_LEN;
 use crate::prompt_delivery::truncate_on_char_boundary;
@@ -115,7 +130,7 @@ pub fn escape_control_and_bidi(s: &str) -> String {
 ///
 /// Strips control and bidi characters, trims surrounding whitespace, then
 /// clamps to [`DISPLAY_NAME_MAX_LEN`] bytes on a character boundary via
-/// [`truncate_on_char_boundary`] — the same truncator
+/// [`clamp_including_marker`] — which builds on the same truncator
 /// `ui::render_session_card` already applies to the equally producer-controlled
 /// `session_id`, so a clamped name is marked with the same trailing `…` the
 /// user sees on a shortened id. `None` means "no usable name": the caller
@@ -125,7 +140,12 @@ pub fn escape_control_and_bidi(s: &str) -> String {
 /// The byte ceiling is deliberately the daemon's own
 /// [`DISPLAY_NAME_MAX_LEN`], so a name that reaches a card through the hook
 /// socket cannot be longer than one that reaches it through
-/// `agent_pty::is_valid_display_name` on the attach socket. The two differ in
+/// `agent_pty::is_valid_display_name` on the attach socket. That is now true of
+/// the WHOLE returned string rather than of its body: the ceiling used to be
+/// applied before the `…` was appended, so this could return
+/// `DISPLAY_NAME_MAX_LEN + 3` bytes — a name the daemon's gate would refuse if
+/// it ever came back the other way (Greptile, PR #902). See
+/// [`clamp_including_marker`]. The two differ in
 /// what they do about a bad value — the daemon **rejects** the whole name,
 /// this **repairs** it — because the daemon is validating a request a user just
 /// typed and can retype, while this is scrubbing a field on an event whose
@@ -141,7 +161,81 @@ pub fn sanitize_display_name(raw: &str) -> Option<String> {
     if trimmed.is_empty() {
         return None;
     }
-    Some(truncate_on_char_boundary(trimmed, DISPLAY_NAME_MAX_LEN))
+    Some(clamp_including_marker(trimmed, DISPLAY_NAME_MAX_LEN))
+}
+
+/// Clamp `s` so the RESULT — the `…` cut marker included — is at most `max`
+/// bytes, snapping back to a character boundary.
+///
+/// [`truncate_on_char_boundary`] keeps up to `max` bytes and THEN appends the
+/// three-byte marker, so its result can be `max + 3`. That is right for its own
+/// callers, whose `max` is a render budget: `ui::render_session_card` is fitting
+/// a session id into a title, and three bytes of marker are part of what it
+/// draws. It is wrong for both callers here, whose `max` is a byte ceiling some
+/// OTHER component enforces — [`DISPLAY_NAME_MAX_LEN`] is the length
+/// `agent_pty::is_valid_display_name` rejects past, and
+/// [`MAX_TOOL_TEXT_BYTES`] is the length `daemon_client` clamps the same two
+/// tool strings to on their other route, strictly and with no marker. A
+/// sanitizer that emitted `max + 3` would produce a display name the daemon's
+/// own gate refuses, which is exactly the round trip `sanitize_display_name`'s
+/// doc claims cannot happen (Greptile, PR #902).
+///
+/// A value already within `max` passes through untouched, marker and all — the
+/// reservation is made only when a cut is actually needed, so a name that
+/// exactly fills the ceiling is not marked as truncated for the sake of room it
+/// does not use.
+///
+/// Requires `max >= ELLIPSIS_LEN`; below that no output can both mark the cut
+/// and fit, and the `debug_assert!` in the body says so rather than returning
+/// an over-long marker.
+fn clamp_including_marker(s: &str, max: usize) -> String {
+    // The postcondition below genuinely does NOT hold for a `max` under
+    // `ELLIPSIS_LEN`: the marker alone is three bytes, so there is no output
+    // that both marks the cut and fits. `saturating_sub` would quietly return
+    // an over-long `"…"` there. Both callers pass a constant far above it
+    // (`DISPLAY_NAME_MAX_LEN` is 128, `MAX_TOOL_TEXT_BYTES` is 65536), so this
+    // pins the precondition rather than handling it — a future caller with a
+    // small budget wants `truncate_on_char_boundary` directly.
+    debug_assert!(
+        max >= ELLIPSIS_LEN,
+        "clamp_including_marker cannot fit its own cut marker in {max} bytes"
+    );
+    if s.len() <= max {
+        return s.to_string();
+    }
+    truncate_on_char_boundary(s, max.saturating_sub(ELLIPSIS_LEN))
+}
+
+/// Byte length of the `…` both clamps here reserve room for.
+const ELLIPSIS_LEN: usize = '…'.len_utf8();
+
+/// Byte ceiling applied to a producer-supplied tool name or tool detail at
+/// hook ingest ([`sanitize_tool_text`]).
+///
+/// Deliberately the same 64 KiB `crate::daemon_client` clamps the SAME two
+/// strings to when they arrive over the `list_agents` echo instead of over the
+/// hook socket, and — since Greptile's review of PR #902 — the same INCLUSIVE
+/// of the `…` cut marker, so neither route can return a longer string than the
+/// other. The two routes carry one field between them, so a ceiling that
+/// differed by route would mean the card's tool line had two different maximum
+/// lengths depending on whether the TUI had reconnected — and issue #833 is
+/// precisely a defect of one field's two routes disagreeing.
+pub const MAX_TOOL_TEXT_BYTES: usize = 65536;
+
+/// Sanitize a producer-supplied tool name or tool detail into something safe to
+/// store and render.
+///
+/// Strips control and bidi characters, then clamps to [`MAX_TOOL_TEXT_BYTES`]
+/// on a character boundary via [`truncate_on_char_boundary`], marking the cut
+/// with a trailing `…` exactly as [`sanitize_display_name`] does.
+///
+/// Unlike [`sanitize_display_name`] this returns a `String` rather than an
+/// `Option`, and does NOT trim: an empty result is a meaningful value here (the
+/// tool simply reported no detail) where an empty card title is not, and the
+/// leading/trailing whitespace of a tool detail is the producer's own
+/// formatting of a command line rather than padding around a name.
+pub fn sanitize_tool_text(raw: &str) -> String {
+    clamp_including_marker(&strip_control_and_bidi(raw, false), MAX_TOOL_TEXT_BYTES)
 }
 
 #[cfg(test)]
@@ -260,7 +354,19 @@ mod tests {
         assert_eq!(sanitize_display_name(&at_cap), Some(at_cap.clone()));
         let over = "a".repeat(DISPLAY_NAME_MAX_LEN + 1);
         let clamped = sanitize_display_name(&over).expect("a long name is repaired, not dropped");
-        assert_eq!(clamped, format!("{at_cap}…"));
+        // The marker is INSIDE the ceiling (Greptile, PR #902): the whole
+        // returned string must be something `agent_pty::is_valid_display_name`
+        // would still accept, so the body gives up three bytes to it rather
+        // than the result running three bytes over.
+        assert_eq!(
+            clamped,
+            format!("{}…", "a".repeat(DISPLAY_NAME_MAX_LEN - '…'.len_utf8()))
+        );
+        assert!(
+            clamped.len() <= DISPLAY_NAME_MAX_LEN,
+            "the marker must fit inside the ceiling, got {} bytes",
+            clamped.len()
+        );
 
         // Multi-byte: the cut must snap DOWN to a boundary rather than split a
         // character. Swept across widths and offsets because the surviving byte
@@ -270,18 +376,69 @@ mod tests {
             for pad in 0..4usize {
                 let raw = "x".repeat(pad) + &filler.to_string().repeat(DISPLAY_NAME_MAX_LEN);
                 let out = sanitize_display_name(&raw).expect("non-empty input yields a name");
-                let body = out.strip_suffix('…').expect("an over-long name is marked");
                 assert!(
-                    body.len() <= DISPLAY_NAME_MAX_LEN,
-                    "clamp overshot the ceiling: {} bytes for filler {filler:?} pad {pad}",
-                    body.len()
+                    out.len() <= DISPLAY_NAME_MAX_LEN,
+                    "clamp overshot the ceiling MARKER INCLUDED: {} bytes for \
+                     filler {filler:?} pad {pad}",
+                    out.len()
                 );
+                let body = out.strip_suffix('…').expect("an over-long name is marked");
                 assert!(
                     body.ends_with(filler),
                     "the cut split a character for filler {filler:?} pad {pad}: {body:?}"
                 );
             }
         }
+    }
+
+    #[test]
+    fn sanitize_tool_text_strips_and_clamps_without_trimming() {
+        // Issue #833. Same strip policy as a display name — the tool line is a
+        // width-constrained region on the same card — but no trim and no
+        // `Option`: an empty detail is a meaningful value where an empty card
+        // title is not, and the surrounding whitespace of a command line is
+        // the producer's own formatting rather than padding around a name.
+        assert_eq!(sanitize_tool_text("Bash"), "Bash");
+        assert_eq!(
+            sanitize_tool_text("src/\u{202e}gnidaer\u{7f}\r\n rm -rf /"),
+            "src/gnidaer rm -rf /"
+        );
+        assert_eq!(sanitize_tool_text(""), "");
+        assert_eq!(sanitize_tool_text("\u{1b}\u{202e}\0\u{7f}"), "");
+        // Whitespace is the producer's, and is kept.
+        assert_eq!(sanitize_tool_text("  git status  "), "  git status  ");
+
+        // Clamped on a character boundary and marked, like a display name.
+        let over = "\u{3bc}".repeat(MAX_TOOL_TEXT_BYTES);
+        let out = sanitize_tool_text(&over);
+        // Marker inside the ceiling, matching the strict, marker-less clamp
+        // `daemon_client` applies to these same two strings on their other
+        // route (Greptile, PR #902).
+        assert!(
+            out.len() <= MAX_TOOL_TEXT_BYTES,
+            "clamp overshot the ceiling MARKER INCLUDED: {} bytes",
+            out.len()
+        );
+        let body = out.strip_suffix('…').expect("an over-long value is marked");
+        assert!(
+            body.len() <= MAX_TOOL_TEXT_BYTES,
+            "clamp overshot the ceiling: {} bytes",
+            body.len()
+        );
+        // A value that exactly fills the ceiling is NOT marked: the three bytes
+        // are reserved only when a cut is actually needed.
+        let at_cap = "a".repeat(MAX_TOOL_TEXT_BYTES);
+        assert_eq!(sanitize_tool_text(&at_cap), at_cap);
+        assert!(
+            body.ends_with('\u{3bc}'),
+            "the cut split a character: {body:?}"
+        );
+
+        // Stripping happens BEFORE the clamp, so a value padded past the
+        // ceiling with control bytes is a real value once scrubbed rather than
+        // 64 KiB of padding cut down and then scrubbed to nothing.
+        let padded = format!("{}{}", "\u{1b}".repeat(MAX_TOOL_TEXT_BYTES + 10), "Bash");
+        assert_eq!(sanitize_tool_text(&padded), "Bash");
     }
 
     #[test]

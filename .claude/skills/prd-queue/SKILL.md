@@ -148,6 +148,60 @@ Measured on 2026-08-25: **34 of the 39** open PRD-labelled issues have a documen
 
 A missing document is **not** a defect to fix here and **not** grounds for silently dropping the row. Show it in step 5 as *"no PRD document — needs `/prd-create` first"*, and let the runner decide.
 
+## Step 3b — Spot-check the premise, and mark the row rather than dropping it
+
+Step 3 asks whether the candidate has a **document**. Step 4 will ask whether someone is **already working** it. Neither asks whether the document is **still true**. A PRD that was implemented and never closed presents itself as available work indefinitely, and before this step no step asked the question — step 5's scope read might happen to surface it, but nothing required anyone to look.
+
+**Steps 3b and 4 are independent, and may be run in either order.** Where the candidate list is long, run step 4 first and premise-check only what survives it — there is no reason to read a document for a PRD already in flight. This sits at 3b because a document's *existence* and its *truth* are the same question asked twice, not because it has to run before the in-flight check.
+
+**Step 0 already contains the correct warning, and that is exactly the problem:** *"a PRD is exactly the kind of long-lived document most likely to describe work that has since partly landed."* That is advice about **which ref to verify against**, not a step that gates a candidate. This step is where it becomes actionable.
+
+**A PRD is the worst case for a stale premise, for three compounding reasons.** It is long-lived by construction, so more `main` has moved under it than under any issue. It lands in pieces — the in-flight check needs its own substep 4b because a PRD spans several PRs — so *partly* landed is its normal state rather than an exotic one. And a PRD unit is expensive: the whole lifecycle, and possibly a six-role team. **The near-miss was a PRD.** #236 was selected for dispatch and presented as *"a live data-loss bug"*, quoting its own present-tense problem statement, when `RemovalPolicy::KeepIfDirty` and the `worktree list|reclaim` verbs had both shipped weeks earlier. It carries the `PRD` label and a document at `prds/236-worktree-removal-safety-reclamation.md`, so it would have reached this queue as an ordinary row. It was caught only because the runner happened to ask what a phrase in it meant; without that question a six-role team would have been dispatched onto finished work.
+
+**This step produces a note on a row. It never removes one, and it never closes anything.** A heuristic that hides real work fails invisibly, which is worse than the state it replaces — the runner cannot correct a row they were never shown. Adjudicating a stale PRD is also not selection's job: a `looks stale` row goes to the runner as a question, and `/prd-close` is the runner's tool, not this skill's.
+
+### Check the document, not only the issue body
+
+**The scope read in step 5 already comes from `prds/<n>-*.md` rather than the issue body, and so does this check** — that is what the unit will actually work from, and the two can disagree. Read the document's problem statement and its milestone list, on `origin/main`:
+
+```bash
+git show origin/main:prds/<n>-<slug>.md | sed -n '1,80p'
+```
+
+**Partial completion is the outcome to look hardest for, because it is the one that reads as fully live.** A PRD whose first three milestones shipped still describes all of them in the present tense. Where the document carries milestone checkboxes, they are a claim to check rather than an answer — they are updated by hand, by `/prd-update-progress`, and a document that stopped being updated is precisely the one most likely to be stale.
+
+Then state the **central claim** in one line, find its **anchor** — a symbol in backticks, a `src/*.rs` path, a version string, a CLI verb, a config key — and check it against **`origin/main`**, never the checkout, for step 0's reason:
+
+```bash
+git grep -n 'prepare_orchestrator_prompt' origin/main -- src/
+git ls-tree --name-only origin/main -- src/foo.rs
+```
+
+Classify the row into exactly one of three outcomes, and **report all three** in step 5:
+
+- **`premise holds`** — the document's central claim is still true of `origin/main`.
+- **`premise looks stale — verify`** — the evidence points at work that already landed, in whole or in part. Say which milestones look landed and what the evidence was, so the runner can judge it in one line. **A partly-landed PRD is usually still dispatchable** — the note changes the unit's starting point rather than disqualifying the row.
+- **`premise not mechanically checkable`** — no anchor, or an anchor a grep cannot settle. **This is an ordinary outcome, not a failure**, and such a row is exactly as dispatchable as one marked `premise holds`.
+
+### What these greps do NOT decide, measured on this backlog
+
+**Symbol absence is not evidence of staleness, and for a PRD it is actively misleading.** Extracting every backticked `[a-z][a-z0-9_]{5,}` identifier from the 215 open issues on 2026-09-04 and testing it against `origin/main` flagged **65 — 30% of the backlog** — and in a twelve-row sample none indicated a stale premise. **The single largest category was a symbol the issue proposes creating**, which is absent precisely because the work is *undone*: `check_gemini_available` (#211, the Gemini adapter PRD) and `check_aider_available` (#212, the Aider adapter PRD) are both PRD rows where absence means the PRD is **live**. A PRD describes what does not exist yet, so for this skill the naive sweep does not merely add noise — **on a PRD row it can point the wrong way entirely**, reporting a live PRD as stale for the very reason it is live. A separate heuristic premise-check over this backlog on the same day produced **24 flags with 23 false positives**. Its one true positive was #483, where the cited `ensure_claim_label` survives only in the prose of `prds/421-issue-triage-labels-and-dispatch-claims.md` and not in `src/` — a reminder that *where* you search decides the answer as much as *what* you search for.
+
+The remaining sampled flags were a git SHA (`dac0ad0`, `e22cd1e`), fields of a dependency crate's `termios` (`c_ispeed`, `c_line`, from `libc`), GitHub Actions YAML keys (`workflow_call`), a label name (`wontfix`), an external binary (`ffmpeg`), and a test id absent as a whole token but present as the prefix of two real test functions (`spawn_006`) — seven kinds in all, of things that merely look like a symbol.
+
+**File-path absence is quiet but not clean.** The same sweep found only **two** of 215 issues citing a `src|tests|xtask/*.rs` path absent from `origin/main`, and **both were wrong**: #248's `src/unix/mod.rs` is inside the `libc` crate and #293's `src/win/psuedocon.rs` is inside `portable-pty`. Check whose tree a cited path names before reporting it missing.
+
+**A later merged PR naming the issue is far too common to flag on.** 119 of the 215 open issues — **55%** — are named by a PR merged after they were filed, which for a PRD is the ordinary state rather than a signal. Narrowing to a resolving verb (`fixes`, `closes`, `implements`, `supersedes`) within 90 characters of the reference still flags **47 — 22%**, and the sample is dominated by references that say the opposite on reading: *"recorded as #864, **not shipped**"*, *"filed not fixed"*. It is useful for locating **which** milestones landed once a row is already suspect — PR #779's *"Closes the first two iterations of PRD #745 (M1–M12)"* is exactly the partial-completion evidence this step wants — and it is not a trigger on its own.
+
+**Two further traps, both of which have produced a confident wrong answer here:**
+
+- **A grep that matches the *fix* looks like a grep that matches the *bug*.** #358's audit had to separate "credentials absent from `/tmp`" — which the issue itself had already observed and correctly distrusted as luck — from "the containing directory is now owner-only", which was the actual fix. **Absence of a symptom is not evidence of a fix.**
+- **Word-boundary and pattern mistakes invert the answer in both directions, and they catch careful people.** A `grep -w sigterm_001` reported a test as deleted when it exists as the prefix of a longer name, and a `grep -icE 'trust'` counted 49 hits that were all the framing mechanism rather than the claim. The sweep quoted above walked into the same trap while being written: `c_line` is absent from this tree as a token, but a substring search finds it inside the unrelated `cmd_c_line` in `src/platform/paths.rs`, so the two searches disagree about whether it is present. Anchor patterns at the boundary you actually mean, and read a sample of the hits before believing the count.
+
+**So the reliable signal here is a reading, and the commands above only make it fast.** When the evidence is ambiguous — and it usually is — mark the row **`premise not mechanically checkable`**. That bucket exists for evidence that cannot settle the claim, and a row carrying it is exactly as dispatchable as one marked `premise holds`, so nothing is lost by using it.
+
+**Do not reach for `premise holds` to express doubt.** It asserts the claim was checked and still stands, step 5 prints it as a confirmation, and no later step re-checks it — so a row that quietly upgrades *"could not tell"* to *"verified"* is the same unverified-claim defect this step exists to catch, reintroduced by the step itself. A row wrongly marked unclear costs a glance; a row wrongly marked verified costs the work, and a row wrongly dropped costs it silently.
+
 ## Step 4 — Eliminate what is already in flight
 
 Three independent checks, because no one of them is sufficient. This is `/issue-queue` step 3 carried over intact — the incident that produced it (a duplicate dispatch onto a bug already being fixed, yielding two PRs with identical closing refs) is shape-independent — with one PRD-specific correction in 4c.
@@ -218,7 +272,7 @@ An off-convention name cannot be mapped back to a PRD mechanically — `agent/di
 
 ## Step 5 — Show the queue, then ask how many
 
-Print each candidate with **number, title, the PRD document path, a one-line scope read, and any in-flight or missing-document note**. The scope read comes from the document, not the issue body — that is what the unit will actually work from:
+Print each candidate with **number, title, the PRD document path, a one-line scope read, step 3b's premise mark, and any in-flight or missing-document note**. Print the premise mark on every row, including `premise holds` — a mark that appears only when something is wrong is indistinguishable from a step that was skipped. The scope read comes from the document, not the issue body — that is what the unit will actually work from:
 
 ```bash
 sed -n '1,60p' prds/<n>-<slug>.md
