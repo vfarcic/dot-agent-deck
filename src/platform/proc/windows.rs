@@ -638,7 +638,7 @@ pub fn foreground_pgid(_master: &dyn portable_pty::MasterPty) -> Option<i32> {
 /// half — [`super::ProcessInfo`], [`super::descendants`] and
 /// [`super::descendant_shell_activity`] — still compiles and is still tested
 /// here, so a future Windows backend only has to supply this one function.
-pub fn process_table() -> Option<Vec<super::ProcessInfo>> {
+pub fn process_table(_roots: &[i32]) -> Option<Vec<super::ProcessInfo>> {
     None
 }
 
@@ -646,7 +646,7 @@ pub fn process_table() -> Option<Vec<super::ProcessInfo>> {
 /// `cfg` branch of its own (issue #429). Unconditionally `None` for the same
 /// reason, and it never awaits anything: there is no subprocess to bound, so the
 /// caller's timeout simply never fires here.
-pub async fn process_table_async() -> Option<Vec<super::ProcessInfo>> {
+pub async fn process_table_async(_roots: &[i32]) -> Option<Vec<super::ProcessInfo>> {
     None
 }
 

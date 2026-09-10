@@ -51,7 +51,7 @@ use dot_agent_deck::agent_pty::{AgentPtyRegistry, DOT_AGENT_DECK_PANE_ID, SpawnO
 #[cfg(unix)]
 use dot_agent_deck::platform::proc::CLAUDE_BASH_TOOL_SHAPE;
 use dot_agent_deck::platform::proc::{
-    ProcessInfo, descendant_shell_activity, descendants, process_table,
+    CommandLine, ProcessInfo, descendant_shell_activity, descendants, process_table,
 };
 
 use spec::spec;
@@ -210,7 +210,12 @@ fn shell_activity_001_finds_a_real_detached_grandchild_as_a_descendant() {
     let deadline = Instant::now() + Duration::from_secs(2);
     let mut found: Option<ProcessInfo> = None;
     while found.is_none() && Instant::now() < deadline {
-        let table = process_table().expect("process_table() must enumerate on unix");
+        // Issue #862: the sample reads a command line only for the detached
+        // descendants of the roots it is given, so this test — which asserts on
+        // the target's argv — must name its own pid as the root. That IS the
+        // property under test here: pass no root and the argv comes back
+        // `NotSampled`, which the second half of this test pins.
+        let table = process_table(&[root_pid]).expect("process_table() must enumerate on unix");
         found = descendants(&table, root_pid)
             .into_iter()
             .find(|p| p.pid == spawned.target_pid)
@@ -235,10 +240,20 @@ fn shell_activity_001_finds_a_real_detached_grandchild_as_a_descendant() {
         target.session_leader,
         "a process that just called setsid() is its own session leader: {target:?}"
     );
+    let target_argv = target
+        .command_line
+        .read()
+        .unwrap_or_else(|| {
+            panic!(
+                "a detached descendant of the sample's root must have its command line read \
+                 (issue #862's two-phase sample): {target:?}"
+            )
+        })
+        .to_string();
     assert!(
-        target.argv.contains(&marker),
-        "descendant argv must be the full command line — marker {marker:?} not found in {:?}",
-        target.argv
+        target_argv.contains(&marker),
+        "descendant argv must be the full command line — marker {marker:?} not found in \
+         {target_argv:?}"
     );
 
     // SAFETY: `getsid(2)` with pid 0 means "the caller's own session id"; it
@@ -252,6 +267,114 @@ fn shell_activity_001_finds_a_real_detached_grandchild_as_a_descendant() {
         target.session_id, own_sid,
         "a setsid()'d grandchild must be its own session leader: its session id must differ \
          from the test process's own (target={target:?}, own_sid={own_sid})"
+    );
+}
+
+/// Scenario: spawns the same real detached grandchild as
+/// `status/shell-activity/001` (a `setsid`'d, marker-tagged `/bin/sleep`, on
+/// pipes, off any terminal — the shape a Claude Bash-tool child has), then
+/// samples the process table twice: once naming the test's own pid as a root and
+/// once naming no root at all. With the root, the detached grandchild's command
+/// line must be `Read` and carry the marker; the test's own non-detached child
+/// (`mid`, in the test's own session) and every unrelated process on the machine
+/// must be `NotSampled`. With no root, even the grandchild must be `NotSampled`.
+/// That is the whole of issue #862's fix expressed as a property: a poll reads
+/// the command line of the processes at its own panes' session boundaries and of
+/// nothing else on the machine.
+#[cfg(unix)]
+#[spec("status/shell-activity/008")]
+#[test]
+fn shell_activity_008_the_sample_reads_command_lines_only_at_session_boundaries() {
+    let marker = format!("shell-activity-008-target-{}", std::process::id());
+    let spawned = spawn_detached_grandchild(&marker);
+    let root_pid = std::process::id() as i32;
+    let mid_pid = spawned.mid.id() as i32;
+
+    // `mid`'s `pre_exec` fork/setsid/exec races this thread, exactly as in
+    // `status/shell-activity/001` — poll until the grandchild is observable.
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut table = Vec::new();
+    while Instant::now() < deadline {
+        table = process_table(&[root_pid]).expect("process_table() must enumerate on unix");
+        if table.iter().any(|p| p.pid == spawned.target_pid) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    let row = |table: &[ProcessInfo], pid: i32| {
+        table
+            .iter()
+            .find(|p| p.pid == pid)
+            .cloned()
+            .unwrap_or_else(|| panic!("pid {pid} must appear in the process-table sample"))
+    };
+
+    // 1. The detached grandchild: its command line IS read, because it is a
+    //    detached descendant of the root the sample was taken for.
+    let target = row(&table, spawned.target_pid);
+    let target_argv = target.command_line.read().unwrap_or_else(|| {
+        panic!("the detached grandchild's command line must be read: {target:?}")
+    });
+    assert!(
+        target_argv.contains(&marker),
+        "and it must be the full command line — marker {marker:?} not in {target_argv:?}"
+    );
+
+    // 2. `mid`, a real child of this test in this test's OWN session, is not a
+    //    detached descendant, so nothing reads its command line — the scoping is
+    //    by session, not merely by descendancy.
+    assert_eq!(
+        row(&table, mid_pid).command_line,
+        CommandLine::NotSampled,
+        "a descendant that shares the root's POSIX session can never be a cross-check \
+         candidate, so its command line must not be read"
+    );
+
+    // 2b. And the scoping stops AT the session boundary rather than descending
+    //     past it: the grandchild is the only candidate, so a process below it
+    //     would inherit its session and still not be read. `shell_tool_candidates`
+    //     is asserted directly because that narrowing is what keeps a Bash-tool
+    //     call's whole build tree out of the argv phase (issue #862); the
+    //     synthetic-tree proof is `shell_tool_candidates_stop_at_the_session_boundary`
+    //     in `src/platform/proc/scan.rs`.
+    assert_eq!(
+        dot_agent_deck::platform::proc::shell_tool_candidates(&table, root_pid),
+        Some(vec![spawned.target_pid]),
+        "the detached grandchild must be the one and only session-boundary candidate \
+         under this test's own pid"
+    );
+
+    // 3. And nothing outside this test's tree is read at all. This is the claim
+    //    the old `ps -A … args=` sample could not make: it read
+    //    `/proc/<pid>/cmdline` AND `/proc/<pid>/environ` for every process on
+    //    the machine, each of which takes that process's `mmap_lock`.
+    let unrelated: Vec<i32> = table
+        .iter()
+        .filter(|p| p.command_line != CommandLine::NotSampled)
+        .map(|p| p.pid)
+        .filter(|pid| *pid != spawned.target_pid)
+        .collect();
+    assert!(
+        unrelated.is_empty(),
+        "only the detached descendants of the sample's roots may have a command line \
+         read; these other pids did too: {unrelated:?}"
+    );
+
+    // 4. With no roots, the argv phase does not run at all — so even the
+    //    grandchild comes back `NotSampled`. This is what makes claim 3 a
+    //    property of the roots rather than an accident of this process tree.
+    let rootless = process_table(&[]).expect("process_table() must enumerate on unix");
+    assert_eq!(
+        row(&rootless, spawned.target_pid).command_line,
+        CommandLine::NotSampled,
+        "a sample taken for no root must read no command line whatsoever"
+    );
+    assert!(
+        rootless
+            .iter()
+            .all(|p| p.command_line == CommandLine::NotSampled),
+        "and that must hold for every row, not just the grandchild's"
     );
 }
 
@@ -282,7 +405,7 @@ fn shell_activity_002_descendant_walk_terminates_on_a_ppid_cycle() {
             session_id: IRRELEVANT_SID,
             has_controlling_tty: false,
             session_leader: false,
-            argv: "cycle-entry".to_string(),
+            command_line: CommandLine::Read("cycle-entry".to_string()),
         },
         ProcessInfo {
             pid: 1,
@@ -290,7 +413,7 @@ fn shell_activity_002_descendant_walk_terminates_on_a_ppid_cycle() {
             session_id: IRRELEVANT_SID,
             has_controlling_tty: false,
             session_leader: false,
-            argv: "cycle-back-to-root".to_string(),
+            command_line: CommandLine::Read("cycle-back-to-root".to_string()),
         },
         ProcessInfo {
             pid: 3,
@@ -298,7 +421,7 @@ fn shell_activity_002_descendant_walk_terminates_on_a_ppid_cycle() {
             session_id: IRRELEVANT_SID,
             has_controlling_tty: false,
             session_leader: false,
-            argv: "past-the-cycle".to_string(),
+            command_line: CommandLine::Read("past-the-cycle".to_string()),
         },
     ];
 
@@ -368,7 +491,7 @@ fn backbone_rows(flip_ctty_to_none: bool) -> Vec<ProcessInfo> {
         session_id: AGENT_SID,
         has_controlling_tty: has_ctty,
         session_leader: false,
-        argv: "claude --model opus".to_string(),
+        command_line: CommandLine::Read("claude --model opus".to_string()),
     }];
     for (pid, argv) in [
         (51787, "npm exec @upstash/context7-mcp"),
@@ -383,7 +506,7 @@ fn backbone_rows(flip_ctty_to_none: bool) -> Vec<ProcessInfo> {
             session_id: AGENT_SID,
             has_controlling_tty: has_ctty,
             session_leader: false,
-            argv: argv.to_string(),
+            command_line: CommandLine::Read(argv.to_string()),
         });
     }
     rows
@@ -400,7 +523,9 @@ fn bash_tool_descendant_row() -> ProcessInfo {
         session_id: BASH_TOOL_SID,
         has_controlling_tty: false,
         session_leader: true,
-        argv: "/bin/zsh -c source …/shell-snapshots/snapshot-zsh-… && eval …".to_string(),
+        command_line: CommandLine::Read(
+            "/bin/zsh -c source …/shell-snapshots/snapshot-zsh-… && eval …".to_string(),
+        ),
     }
 }
 
@@ -633,14 +758,21 @@ fn shell_activity_004_shell_foreground_busy_flips_for_a_real_detached_pipe_child
 
     // Independent oracle: confirm this is genuinely the topology #370 could
     // never see, not just that the snapshot happened to say `true`.
-    let table = process_table().expect("process_table() must enumerate on unix");
+    // Issue #862: name the pane's shell as the sample's root, so the argv phase
+    // reads the command line of its detached descendants — which is what the
+    // `marker` search below needs.
+    let table = process_table(&[shell_pid]).expect("process_table() must enumerate on unix");
     let own_row = table
         .iter()
         .find(|p| p.pid == shell_pid)
         .expect("the pane's own shell must appear in its own process table sample");
     let target = descendants(&table, shell_pid)
         .into_iter()
-        .find(|p| p.argv.contains(&marker))
+        .find(|p| {
+            p.command_line
+                .read()
+                .is_some_and(|argv| argv.contains(&marker))
+        })
         .unwrap_or_else(|| {
             panic!(
                 "detached target carrying marker {marker:?} not found among descendants of \
@@ -706,8 +838,14 @@ fn shell_activity_004_shell_foreground_busy_flips_for_a_real_detached_pipe_child
 #[test]
 fn shell_activity_001_process_table_is_none_on_windows() {
     assert_eq!(
-        process_table(),
+        process_table(&[std::process::id() as i32]),
         None,
         "process_table() must be None on Windows, matching foreground_pgid's existing contract"
+    );
+    assert_eq!(
+        process_table(&[]),
+        None,
+        "and with no roots too — issue #862's argv phase changes nothing here, since there \
+         is no table for it to run a second phase against"
     );
 }

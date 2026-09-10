@@ -48,6 +48,55 @@ use dot_agent_deck::platform::proc::{
 };
 use spec::spec;
 
+/// The command lines of `pids`, read directly rather than through
+/// [`process_table`] (issue #862).
+///
+/// The production sampler reads the argv only of a root's **session-boundary**
+/// descendants, because a Bash-tool call's whole subtree inherits that call's
+/// session and re-reading all of it every 500 ms is what made the poll stall
+/// under load. The processes these tests need to *identify* — the `ping` running
+/// under the tool shell, the agent's own MCP servers — sit below that boundary,
+/// so their `command_line` comes back `NotSampled` by design.
+///
+/// This is a test diagnostic, so it pays the cost the poll refuses to: one `ps`
+/// naming exactly the pids the assertion is about. Any failure yields an empty
+/// map rather than a panic — the caller's assertion reports it with better
+/// context than a panic here could.
+fn command_lines_of(pids: &[i32]) -> std::collections::HashMap<i32, String> {
+    if pids.is_empty() {
+        return std::collections::HashMap::new();
+    }
+    let list = pids
+        .iter()
+        .map(|pid| pid.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let Ok(out) = std::process::Command::new("ps")
+        .args(["-w", "-w", "-o", "pid=,args=", "-p"])
+        .arg(list)
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+    else {
+        return std::collections::HashMap::new();
+    };
+    let mut map = std::collections::HashMap::new();
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        let line = line.trim_start();
+        let Some((pid, rest)) = line.split_once(char::is_whitespace) else {
+            // A pid with no argv at all is still a real answer.
+            if let Ok(pid) = line.parse::<i32>() {
+                map.insert(pid, String::new());
+            }
+            continue;
+        };
+        if let Ok(pid) = pid.parse::<i32>() {
+            map.insert(pid, rest.trim_start().to_string());
+        }
+    }
+    map
+}
+
 const HAIKU_MODEL: &str = "claude-haiku-4-5-20251001";
 const PANE_NAME_SUFFIX: &str = "shell-activity-005-haiku";
 /// Unique so the prompt unambiguously names one real file rather than
@@ -405,11 +454,20 @@ fn shell_activity_006_real_claude_bash_call_crossing_the_cap_keeps_the_badge_wor
     // own spawned agent — `setsid` changes session/group, never `ppid`) so a
     // concurrently running e2e test's own ping or MCP servers can never be
     // mistaken for this one's.
-    let table = process_table().expect("process_table() must enumerate on unix");
+    // Issue #862: the sample reads command lines only for detached descendants
+    // of the roots it is given. This test's own pid is the right root: the deck
+    // binary, its daemon and the agent all `setsid` out of the test's session,
+    // so every process this assertion cares about is a detached descendant of it
+    // and gets its argv read, while nothing outside this test's tree does.
     let root_pid = std::process::id() as i32;
+    let table = process_table(&[root_pid]).expect("process_table() must enumerate on unix");
     let shell_row = descendants(&table, root_pid)
         .into_iter()
-        .find(|p| p.argv.contains(SENTINEL_006))
+        .find(|p| {
+            p.command_line
+                .read()
+                .is_some_and(|argv| argv.contains(SENTINEL_006))
+        })
         .unwrap_or_else(|| {
             panic!(
                 "no live descendant of this test carries the sentinel {SENTINEL_006:?} in its \
@@ -418,9 +476,18 @@ fn shell_activity_006_real_claude_bash_call_crossing_the_cap_keeps_the_badge_wor
                  early rather than genuinely testing the cap"
             )
         });
-    let ping_alive = descendants(&table, shell_row.pid)
-        .into_iter()
-        .any(|p| p.argv.contains("ping") && p.argv.contains("127.0.0.1"));
+    // The `ping` lives BELOW the tool shell's session boundary, so the
+    // production sampler deliberately never read its argv (issue #862) — read it
+    // here, for exactly this shell's descendants.
+    let ping_argv = command_lines_of(
+        &descendants(&table, shell_row.pid)
+            .into_iter()
+            .map(|p| p.pid)
+            .collect::<Vec<_>>(),
+    );
+    let ping_alive = ping_argv
+        .values()
+        .any(|argv| argv.contains("ping") && argv.contains("127.0.0.1"));
     assert!(
         ping_alive,
         "the sentinel-tagged Bash-tool shell (pid {}) is alive but has no live `ping` \
@@ -517,19 +584,29 @@ fn shell_activity_007_real_claude_idle_with_live_mcp_servers_stays_idle() {
     let claude_pid_cell: std::cell::Cell<Option<i32>> = std::cell::Cell::new(None);
     let children_argv_cell: std::cell::RefCell<Vec<String>> = std::cell::RefCell::new(Vec::new());
     let found_children = common::wait_until(Duration::from_secs(30), || {
-        let Some(table) = process_table() else {
+        // Issue #862: this test's own pid as the sample's root — see the same
+        // note in `status/shell-activity/006` above for why that is the root
+        // that makes the deck's whole subtree's argv available here.
+        let Some(table) = process_table(&[root_pid]) else {
             return false;
         };
-        let Some(claude_row) = descendants(&table, root_pid)
-            .into_iter()
-            .find(|p| p.argv.contains("claude") && p.argv.contains("--allowedTools"))
-        else {
+        let Some(claude_row) = descendants(&table, root_pid).into_iter().find(|p| {
+            p.command_line
+                .read()
+                .is_some_and(|argv| argv.contains("claude") && argv.contains("--allowedTools"))
+        }) else {
             return false;
         };
-        let children: Vec<String> = descendants(&table, claude_row.pid)
-            .into_iter()
-            .map(|p| p.argv.clone())
-            .collect();
+        // Same as in `006`: the agent's own children share its session, so they
+        // are below its boundary and the sampler never read their argv.
+        let children: Vec<String> = command_lines_of(
+            &descendants(&table, claude_row.pid)
+                .into_iter()
+                .map(|p| p.pid)
+                .collect::<Vec<_>>(),
+        )
+        .into_values()
+        .collect();
         if children.is_empty() {
             return false;
         }
@@ -578,11 +655,22 @@ fn shell_activity_007_real_claude_idle_with_live_mcp_servers_stays_idle() {
     // before the badge check), and run the descendant-scan classifier
     // directly against this live table — the M2 fixture claim proven against
     // a live process table rather than a captured one.
-    let table = process_table().expect("process_table() must enumerate on unix");
-    let still_alive: Vec<&str> = descendants(&table, claude_pid)
-        .into_iter()
-        .map(|p| p.argv.as_str())
-        .collect();
+    // Issue #862: `claude_pid` is the root the classifier below is run against,
+    // so it is the root this sample must be taken for — that is what makes the
+    // command lines classification could consult present, rather than relying on
+    // some other root's set happening to cover them. `root_pid` is named too so
+    // the walk from it still resolves. The diagnostic listings do not depend on
+    // either: they read the argv they need through `command_lines_of`.
+    let table =
+        process_table(&[root_pid, claude_pid]).expect("process_table() must enumerate on unix");
+    let still_alive: Vec<String> = command_lines_of(
+        &descendants(&table, claude_pid)
+            .into_iter()
+            .map(|p| p.pid)
+            .collect::<Vec<_>>(),
+    )
+    .into_values()
+    .collect();
     assert!(
         !still_alive.is_empty(),
         "the real Claude agent's children died out between the liveness check and the sample — \
