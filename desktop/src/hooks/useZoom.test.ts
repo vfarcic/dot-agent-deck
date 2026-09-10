@@ -35,6 +35,13 @@ function settingsState(level = 1, overrides: Partial<DesktopSettingsState> = {})
   const state: DesktopSettingsState & { saved: DesktopSettingsDto[] } = {
     settings: { ...DEFAULT_DESKTOP_SETTINGS, zoom: { level } },
     loaded: true,
+    // Issue #845 added this alongside `loaded`, and a successful read sets
+    // both — so `loaded: true` without it would model a state the real hook
+    // never reaches. `useZoom` reads neither field, so the value cannot move
+    // any assertion here; it has to be in this literal rather than left to
+    // `overrides` because a required field supplied only by a `Partial` spread
+    // types as `boolean | undefined`.
+    chosen: true,
     save: vi.fn((next: DesktopSettingsDto) => {
       saved.push(next);
       state.settings = next;

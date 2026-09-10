@@ -1,3 +1,4 @@
+mod appearance;
 mod daemon_bridge;
 mod dto;
 mod settings;
@@ -1136,6 +1137,11 @@ async fn desktop_run_action(
 pub fn run() {
     let app = tauri::Builder::default()
         .manage(DesktopState::default())
+        // Issue #845: the stored Light/Dark choice reaches the document root
+        // before the webview parses the document, so the first painted frame is
+        // already the one the user chose. Registered before `build()`, which is
+        // what puts it in the plugin store ahead of the config-declared window.
+        .plugin(appearance::init())
         // PRD #744: apply the stored zoom before the webview has run any of our
         // JavaScript, so a user at 150% does not watch the app paint at 100%
         // and then jump. That is the whole reason this leg exists Rust-side;
@@ -1144,9 +1150,13 @@ pub fn run() {
         // Note this is a deliberate departure from PRD #743's arrangement,
         // whose one effect applies the appearance on load AND on change
         // precisely so there is "no second path that could disagree with this
-        // one" (`App.tsx`). Zoom takes the split because it has something
-        // appearance does not — a Rust-side option that removes a visible
-        // flash — and pays for it with exactly the failure #743 warns about:
+        // one" (`App.tsx`). Appearance now has a Rust-side pre-paint leg too
+        // (issue #845, the `.plugin(..)` above), so that is no longer what
+        // separates them — the split is on the *frontend* side: appearance's
+        // effect still applies on load as well as on change, so the two legs
+        // agree by construction, while zoom's frontend applies only on change
+        // and this leg is the sole thing that sets the initial level. Zoom
+        // therefore pays the price #743 warns about and appearance does not:
         // if this leg regresses, the window comes up at 100% while the
         // Settings row reads the stored level. `prds/744-*.md` records the
         // condition under which the split should be given up.
