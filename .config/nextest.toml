@@ -151,14 +151,90 @@ slow-timeout = { period = "60s", terminate-after = 7 }
 # then one per changed variable, which is what pins the two
 # `cargo:rerun-if-env-changed` directives individually — all into its own
 # `target/version-injection-e2e` CARGO_TARGET_DIR. That isolation is required so
-# it cannot clobber the `target/debug` binary the rest of the suite spawns, and
-# it means the FIRST run on a machine pays a cold ~10 min dependency build;
-# later runs are incremental, as are builds 2 and 3 within a run (build-script
-# rerun + relink). The nested builds are `--jobs`-capped so they cannot starve
-# the timed e2e tests running alongside them. Widened here rather than globally,
-# and still bounded so a wedged build cannot run forever.
+# it cannot clobber the `target/debug` binary the rest of the suite spawns. The
+# nested builds are `--jobs`-capped so they cannot starve the timed e2e tests
+# running alongside them.
+#
+# `priority` IS THE FIX FOR ISSUE #928, and what it fixes is not the build's
+# cost — it is WHEN the build starts. nextest schedules in binary-name order,
+# and `dot-agent-deck::e2e_version_injection` sits about 70% of the way down
+# that queue (`dot-agent-deck` unit tests, then the `e2e_*` binaries in
+# alphabetical order, then `harness_unit`, `render_*`, `xtask-linkage-check`),
+# so this test was STARTED late and, being the longest, finished last.
+#
+# Measured across 13 `e2e-deterministic` runs on GitHub `ubuntu-latest`
+# (2026-09-06 to 2026-09-09), reading each run's own log:
+#
+#   * it was the last of the ~2,680 tests to complete in 13 of 13 runs;
+#   * nextest started it at t = 148.6-156.9s every time, mean 152.0s. The
+#     offset is that stable, on runners whose speed varies 4x, most likely
+#     because the queue ahead of it is largely PTY tests whose wall clock is
+#     set by their own waits rather than by the runner — that part is an
+#     explanation, not a measurement;
+#   * every OTHER test in the tier had finished by t = 198-292s;
+#   * so the tier's wall clock was exactly `that offset + this test's
+#     duration`: 220.6, 257.9, 270.8, 285.8, 318.8, 336.7, 439.6, 440.9,
+#     441.2, 444.5, 448.3, 449.9 and 454.9 seconds.
+#
+# Scheduled at the FRONT of the queue instead, the tier's wall clock becomes
+# `max(this test, everything else)` rather than `queue depth ahead of it + this
+# test`. On the seven runs above 439s that is ~150s off a ~445s tier.
+#
+# It is NOT free on every run, and the fastest run is where that shows: this
+# test took 71.9s there and the rest of the tier finished at 198.1s, so the
+# ceiling on the gain is 220.6s -> 198.1s, and the rest of the tier now shares
+# the machine with the compile for its whole length instead of roughly half of
+# it. A tier that slowed by more than 11% under that would come out behind. The
+# `--jobs` cap below is what bounds it, and the trade is deliberate: the
+# seven 440s runs are the ones worth fixing.
+#
+# VERIFIED, not assumed. `--test-threads 1` makes completion order equal
+# schedule order, so `cargo test-e2e --test-threads 1 -E
+# 'binary(e2e_version_injection) or binary(e2e_handshake)'` answers it directly
+# — `e2e_handshake` sorts earlier by binary name, so it goes first if and only
+# if this key is not doing anything. With the line below it printed
+# `version_001 ... (1/8)` and the seven handshake tests after it; with the line
+# commented out, the handshake tests took 1/8 through 7/8 and this one came
+# last. nextest also only WARNS on an unrecognised key (`ignoring unknown
+# configuration key: profile.default.overrides.N.<key>`) and carries on, so
+# read that line's absence as the second half of the confirmation.
+#
+# WHY 25 AND NOT 100. `dispatch_015` below carries `priority = 50` together
+# with `threads-required = "num-test-threads"`, and its comment explains why:
+# an exclusive test reached mid-run makes nextest DRAIN every running test
+# before it can take the pool, so it is deliberately scheduled first and its
+# reservation then costs only its own runtime. Ordering THIS test above it
+# would make that drain wait out a multi-minute compile — the exact cost that
+# comment exists to avoid. 25 keeps this one second, and in lane 1, where
+# `dispatch_015` is `e2e-live`-gated and not compiled at all, second is first.
+#
+# THE COST, PLAINLY: the nested compile now overlaps the WHOLE tier instead of
+# only its tail. On the run measured in most detail (34304601686) it overlapped
+# for 113s of its 288s and then ran alone on an otherwise idle runner for 175s
+# — which is also why issue #928 called the `--jobs` cap "protecting nothing".
+# From here the cap is what it was written to be: the bound on a nested compile
+# that really does run beside the timed PTY tests. It is unchanged at half the
+# machine's cores; the tests already known to be contention-sensitive keep
+# their own carve-outs above.
+#
+# `slow-timeout` is REVISITED AND KEPT at 120s x 10, which is what issue #928
+# asked for rather than what it guessed. The cold case has NOT gone away — a
+# runner whose cache did not restore (4 of the 16 runs whose cache status was
+# checked reported "No cache found") or a fresh worktree still pays the full
+# dependency build — and the observed spread across those 13 runs is 71.9s to
+# 305.4s, a 4.2x range on nominally identical hardware, with two further runs,
+# both with no restored cache, at 351.1s and 369.9s. Measured locally the same
+# work swings 6x on one machine purely with how busy it is (65.0s quiet against
+# 400.9s with three other agents building); the table is in the test file.
+# Scheduling the test first also means it now runs contended for its whole
+# duration rather than mostly alone, which can only widen that spread upward.
+# Being killed here costs the test's own assertion message, the only thing that
+# separates "the injection never reached the binary" from "the build did not
+# finish" (same reasoning as the overrides above). Widened here rather than
+# globally, and still bounded so a wedged build cannot run forever.
 [[profile.default.overrides]]
 filter = 'test(version_001_injected_build_env_reaches_the_binary)'
+priority = 25
 slow-timeout = { period = "120s", terminate-after = 10 }
 
 # `devin/live/001` boots a THIRD-PARTY interactive TUI (the Devin CLI) inside a
