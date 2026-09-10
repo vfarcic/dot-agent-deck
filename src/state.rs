@@ -1156,6 +1156,14 @@ pub struct AppState {
     /// out-of-order / older-generation event is IGNORED so a delayed prior-event
     /// can neither restore a stale id nor clear a newer one, and a delayed
     /// prior-generation `SessionEnd` cannot wipe the current generation.
+    ///
+    /// Issue #684: an entry only ever exists because a producer ANNOUNCED a
+    /// conversation, or because an ordinary frame carrying a pane id arrived. A
+    /// `SessionStart` that announces nothing — the wrapper's boot provenance, the
+    /// daemon's card-surfacing start — draws its card without establishing one,
+    /// so "this pane has an entry" is not merely "something happened on this
+    /// pane". Consumers that bind this value as a delivery target depend on that:
+    /// see `provisional_start` in [`Self::apply_event`].
     pane_hook_session: HashMap<String, (String, DateTime<Utc>)>,
     /// Issue #424 F2 / H4 (auditor HIGH): how many times each pane's established
     /// hook generation has been CLOSED — ended, or superseded by a different one.
@@ -7482,9 +7490,16 @@ impl AppState {
         // that same value, so both then authorized a retry into a conversation
         // that is over while the agent is really in the successor. Boot
         // provenance is a statement that the real agent has not started yet: it
-        // may ESTABLISH a generation where the pane has none, and refresh the one
-        // it already names, but it is never authority to move a pane that already
-        // has a conversation — in either direction. That also strictly improves
+        // may refresh the generation it already names, but it is never authority
+        // to move a pane that already has a conversation — in either direction.
+        //
+        // Issue #684 removed the third permission this paragraph used to grant.
+        // Boot provenance may no longer ESTABLISH a generation on a pane that has
+        // none either: a TUI-owned delivery binds `pane_hook_session_id` before it
+        // writes, so a generation established by something that announced no
+        // conversation became the target the prompt claimed, and the real agent's
+        // announcement then read as that target being lost. See `provisional_start`
+        // below. That also strictly improves
         // #532: the wrapper's fork-time start can no longer take the generation
         // off the wrapped agent's native session.
         if let Some(ref pane_id) = event.pane_id {
@@ -7492,21 +7507,53 @@ impl AppState {
             // Issue #243: widened to EITHER wrapper origin. The reasoning above is
             // about wrapper provenance, not about the fork moment specifically —
             // an interface-ready event is still the wrapper talking about its own
-            // session id, so it may establish a generation where the pane has none
-            // and refresh the one it already names, but never move a pane that
-            // already has a conversation.
-            let launcher_origin_start =
-                event.event_type == EventType::SessionStart && event.is_wrapper_session_start();
+            // session id, so it may refresh the generation it already names, but
+            // never establish one (issue #684) and never move a pane that already
+            // has a conversation.
+            // Issue #684: a `SessionStart` that announces nothing is
+            // PROVISIONAL. Two producers emit one — the wrapper's boot-provenance
+            // start (PRD #225 M3) and the daemon's own card-surfacing start
+            // (`CARD_SURFACE_SESSION_START_ORIGIN`) — and both exist to draw a
+            // CARD before any conversation exists, not to speak for the pane.
+            //
+            // Widened from `launcher_origin_start`, which named only the wrapper
+            // half. The card-surfacing start carries no origin marker at all
+            // until this issue added one, so it fell through every exclusion here
+            // and was read as a conversation announcing itself; `is_daemon_synthetic`
+            // keeps any future daemon-authored start in the same class by default
+            // rather than needing to be listed here again.
+            let provisional_start = event.event_type == EventType::SessionStart
+                && (event.is_wrapper_session_start() || event.is_daemon_synthetic());
             let announces_generation =
-                event.event_type == EventType::SessionStart && !launcher_origin_start;
+                event.event_type == EventType::SessionStart && !provisional_start;
             let advance = match self.pane_hook_session.get(pane_id) {
-                None => true,
+                // Issue #684: a provisional start may not ESTABLISH a generation
+                // either, which is the half that was missing. Letting it do so
+                // was not merely cosmetic: a TUI-owned delivery binds
+                // `pane_hook_session_id` as its target before it writes, so the
+                // pane id (or the wrapper's own session) became the conversation
+                // the prompt claimed to be entering — and the agent's genuine
+                // announcement moments later was then a DIFFERENT generation
+                // replacing it, i.e. both a `note_generation_closed` below and a
+                // changed target in `crate::ui::delivery_target_changed`. The
+                // prompt was discarded with the pane healthy and idle
+                // (`prompt/pane-input/033`, which pins both provisional
+                // establishing events as cases of the one mechanism).
+                //
+                // Leaving the pane with NO generation until a producer announces
+                // one is what the daemon-side latch already does
+                // (`latch_generation` refuses to bind either wrapper origin), so
+                // this makes the map agree with the latch instead of introducing
+                // a second policy. Non-start frames are untouched and still
+                // establish on any pane id, so a producer whose native hooks emit
+                // no `SessionStart` at all is unaffected.
+                None => !provisional_start,
                 Some((current_id, current_ts)) => {
                     if *current_id == incoming_session_id {
                         // Same generation: keep the id, bump the established
                         // timestamp so subsequent older events stay rejected.
                         incoming_ts > *current_ts
-                    } else if launcher_origin_start {
+                    } else if provisional_start {
                         // Boot provenance never replaces a live conversation.
                         false
                     } else {
