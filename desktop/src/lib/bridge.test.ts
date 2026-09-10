@@ -1697,3 +1697,140 @@ describe("desktop settings (PRD 803)", () => {
     expect(normalizeDesktopSettings({ zoom: { level: 99 } }).zoom.level).toBe(3);
   });
 });
+
+/**
+ * Issue #827: the frontend half of PRD #803's rule that a secret goes in
+ * neither `desktop.toml` nor `localStorage`.
+ *
+ * These are the RUNTIME proofs; the structural ones — that
+ * `normalizeDesktopSettings` never spreads its input, that the DTOs carry only
+ * the pinned fields, and that the `localStorage` key set cannot grow unnoticed
+ * — live in `xtask/linkage-check/src/desktop_settings_secrets.rs`, because
+ * `desktop-web` is advisory and a guard that can be merged past is not a
+ * boundary. Read the two together: the structural half is what makes these
+ * hard to defeat quietly, and these are what prove the behaviour a text scan
+ * cannot.
+ */
+describe("desktop settings hold no credential (issue 827)", () => {
+  /** Credential-shaped and unique, so finding it in any sink is unambiguous. */
+  const SENTINEL = "sk-live-827-DO-NOT-STORE-e3b0c44298fc1c149afb";
+
+  /** Every value in `localStorage`, under every key, as one string. */
+  function allStoredValues(): string {
+    const values: string[] = [];
+    for (let i = 0; i < window.localStorage.length; i += 1) {
+      const key = window.localStorage.key(i);
+      if (key === null) continue;
+      values.push(key, window.localStorage.getItem(key) ?? "");
+    }
+    return values.join("\n");
+  }
+
+  beforeEach(() => {
+    invoke.mockReset();
+    window.localStorage.clear();
+  });
+
+  afterEach(() => vi.restoreAllMocks());
+
+  /**
+   * The normaliser constructs its result, so a field nobody declared is
+   * dropped rather than carried. Every placement below is one a credential
+   * could actually arrive in — including under names the Rust naming tripwire
+   * is blind to (`endpoint`, `value`), which is the gap #827 was opened about.
+   */
+  it("drops any field the DTO does not declare, wherever it sits", async () => {
+    const { normalizeDesktopSettings, DEFAULT_DESKTOP_SETTINGS } = await import("./bridge");
+    const payloads: unknown[] = [
+      { apiKey: SENTINEL },
+      { endpoint: SENTINEL },
+      { value: SENTINEL },
+      { authorization: `Bearer ${SENTINEL}` },
+      { appearance: { mode: "dark", apiKey: SENTINEL } },
+      { voice: { api_key: SENTINEL, endpoint: SENTINEL } },
+      { zoom: { level: 1.25, token: SENTINEL } },
+      { version: SENTINEL },
+      { appearance: { mode: SENTINEL } },
+      [SENTINEL],
+      SENTINEL,
+    ];
+    for (const payload of payloads) {
+      const normalized = normalizeDesktopSettings(payload);
+      expect(JSON.stringify(normalized)).not.toContain(SENTINEL);
+      // And the result is always a complete, valid document rather than a
+      // partial one: dropping the unknown field must not drop the known ones.
+      expect(Object.keys(normalized).sort()).toEqual(["appearance", "version", "zoom"]);
+    }
+    // A wrongly-typed known field falls back rather than propagating, the same
+    // way `AppearanceMode::from_str_lossy` does Rust-side.
+    expect(normalizeDesktopSettings({ version: SENTINEL, appearance: { mode: SENTINEL } }))
+      .toEqual(DEFAULT_DESKTOP_SETTINGS);
+  });
+
+  /**
+   * The fixture bridge is the only bridge that writes settings to
+   * `localStorage` at all, so it is the one place PRD #803's second clause can
+   * be broken. A credential submitted through the settings surface reaches
+   * storage nowhere — under the settings key or any other.
+   */
+  it("writes no credential to localStorage in fixture mode, under any key", async () => {
+    const { createDeckBridge } = await import("./bridge");
+    const bridge = createDeckBridge("fixture");
+    await bridge.getSettings();
+
+    const hostile = {
+      version: 1,
+      appearance: { mode: "dark" as const },
+      zoom: { level: 1.25 },
+      // A panel that spread its own state, which is the realistic mistake.
+      apiKey: SENTINEL,
+      voice: { api_key: SENTINEL },
+    };
+    const saved = await bridge.saveSettings(hostile as never);
+    expect(JSON.stringify(saved)).not.toContain(SENTINEL);
+    expect(allStoredValues()).not.toContain(SENTINEL);
+    // The choice itself did survive — the drop is of the undeclared field, not
+    // of the save.
+    expect(saved.appearance.mode).toBe("dark");
+    expect(allStoredValues()).toContain("dark");
+    await bridge.dispose();
+  });
+
+  /**
+   * The live bridge keeps settings in `desktop.toml` and touches
+   * `localStorage` for them not at all, so the second clause holds there
+   * structurally. Both directions are checked, because a normaliser is only a
+   * boundary if it runs on the way in as well as the way out: a hostile or
+   * newer host answering `desktop_get_settings` with a credential-bearing
+   * document cannot get it into the app's state either.
+   */
+  it("keeps localStorage out of the live settings path in both directions", async () => {
+    const { TauriDeckBridge } = await import("./bridge");
+    invoke.mockImplementation(async (command: string, args: Record<string, unknown>) => {
+      if (command === "desktop_get_settings") {
+        return {
+          settings: { version: 1, appearance: { mode: "dark" }, zoom: { level: 1 }, apiKey: SENTINEL },
+          path: "/home/dev/.config/dot-agent-deck/desktop.toml",
+        };
+      }
+      if (command === "desktop_set_settings") return args.settings;
+      return { ok: true };
+    });
+
+    const bridge = new TauriDeckBridge();
+    const loaded = await bridge.getSettings();
+    expect(JSON.stringify(loaded)).not.toContain(SENTINEL);
+
+    const saved = await bridge.saveSettings({
+      version: 1,
+      appearance: { mode: "light" },
+      zoom: { level: 1 },
+      apiKey: SENTINEL,
+    } as never);
+    expect(JSON.stringify(saved)).not.toContain(SENTINEL);
+    // Nothing at all reached storage: the live settings path has no
+    // `localStorage` access to leak through.
+    expect(window.localStorage.length).toBe(0);
+    await bridge.dispose();
+  });
+});

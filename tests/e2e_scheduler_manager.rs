@@ -932,9 +932,19 @@ fn form_002_add_spawns_authoring_agent_in_picked_dir() {
     deck.wait_for_string("Select Directory");
     deck.send_keys(b" "); // Space → confirm the current dir → locked schedule form
     deck.wait_for_string("New Schedule"); // the mode-locked Add form is up
-    let (scol, srow) = deck
-        .find_in_grid("[Submit]")
-        .expect("the mode-locked schedule form must render a [Submit] button");
+    // Poll rather than read the grid once, for exactly the reason
+    // `manager_010` above does — these two tests reach this form through the
+    // same key sequence, and `ec7f2080` fixed that one while leaving this one
+    // racy. The wait above and a `find_in_grid` behind it take two separate
+    // snapshots, and this form paints its button row in a second pass
+    // (`render_modal_button_row` drawing over the line the `Paragraph`
+    // reserved), so a single-shot read can land on a frame that is merely
+    // incomplete. That is issue #807's class, and it is what reddened
+    // `e2e-deterministic` on run 34241464313 (PR #943): CI failed here in
+    // 10.009s while the same test passed in 3.072s run alone. `wait_for_in_grid`
+    // also dumps the grid if the button genuinely never arrives, which
+    // `.expect()` does not.
+    let (scol, srow) = deck.wait_for_in_grid("[Submit]");
     deck.click(scol, srow); // submit → spawn the seeded authoring agent
 
     // The configured command spawned the authoring agent (base seed delivered).

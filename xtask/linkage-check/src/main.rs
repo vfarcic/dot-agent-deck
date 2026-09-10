@@ -94,6 +94,13 @@ mod clean_tmp;
 /// renders dark mode in CI, so this is the only thing that sees the decay.
 #[cfg(test)]
 mod desktop_palette;
+/// Issue #827: the desktop settings store's credential boundary on the
+/// surfaces `settings.rs`'s own tests cannot reach — the Rust schema's field
+/// TYPES, the TypeScript DTO, the settings normaliser and the `localStorage`
+/// key set. Tests only, and here rather than in vitest for the same reason the
+/// palette guard is: `desktop-web` is advisory and this gate is required.
+#[cfg(test)]
+mod desktop_settings_secrets;
 /// Issue #815: `scripts/devbox-check-gtk.sh`, which asserts that pkg-config
 /// resolves Tauri's GTK stack to Nix's copy rather than the host's. Tests only,
 /// and Linux only — the rule lives in the script, which CI's `devbox` job runs
