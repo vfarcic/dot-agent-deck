@@ -107,6 +107,12 @@ mod desktop_settings_secrets;
 /// through `scripts/devbox-smoke.sh`.
 #[cfg(all(test, target_os = "linux"))]
 mod devbox_gtk_origin;
+/// PR #966 / Renovate #989: the gh-aw `*.lock.yml` files are GENERATED, and
+/// Renovate bumps the action pins inside them without regenerating the body.
+/// That broke every PR-review agent job with a gateway config error. Tests
+/// only — the remedy is `gh aw compile`, not a hand-edit.
+#[cfg(test)]
+mod gh_aw_lock_consistency;
 /// Issue #603: the adaptive issue labeler's post-agent memory validator. Tests
 /// only — the rule lives in the agentic workflow, and these drive the real
 /// script under `node`.
