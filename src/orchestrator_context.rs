@@ -205,11 +205,12 @@ pub fn build_orchestrator_context(config: &OrchestrationConfig) -> String {
     content
 }
 
-/// The heading of the unattended notice, as a constant because
-/// [`read_back_context`] recognises the section this writes.
+/// The heading of the unattended notice.
 ///
 /// Leading and trailing newline included so a match cannot land inside a longer
-/// heading a template happened to write.
+/// heading a template happened to write. **This is not what
+/// [`read_back_context`] matches on** — see [`composer_tail`] for why a heading
+/// is the wrong thing to recognise.
 const UNATTENDED_SECTION_HEADING: &str = "\n## Unattended run\n";
 
 /// Issue #703, option 1: tell an unattended coordinator that it is unattended.
@@ -290,6 +291,34 @@ fn task_precedence_notice() -> &'static str {
      Everything from `## Your task` to the end of this file is the task, including any `##` \
      headings inside it. Those headings belong to the task — read them as part of it, not as \
      further sections of this document.\n"
+}
+
+/// Exactly the bytes [`compose_orchestrator_context`] appends after
+/// [`build_orchestrator_context`] for an **unattended** run, which is what
+/// [`read_back_context`] recognises.
+///
+/// **Recognising the `## Unattended run` heading instead was a real defect, and
+/// in the harmful direction** — Greptile's P1 on PR #1010. The composed file
+/// copies the start role's `prompt_template` in verbatim, so a template that
+/// writes a section headed `## Unattended run` — plausibly to *document* what to
+/// do when unattended — made every later compaction or `/clear` on an
+/// **attended** `Ctrl+n` run re-arm with the unattended text, telling an
+/// orchestrator whose operator was sitting right there that the approval gates
+/// did not apply. Delayed, invisible, and exactly backwards.
+///
+/// A suffix match closes it **by construction** rather than by likelihood: the
+/// composer always emits `## Available agents`, `## Delegation protocol` and
+/// `## Important` *after* the template, so the tail of the region before
+/// `## Your task` is always composer-written and a template's own copy of this
+/// text can never occupy it. No sidecar file, no new wire field and no new tab
+/// state — the artifact already carries an unforgeable answer, it was just being
+/// read in the wrong place.
+fn composer_tail(has_task: bool) -> String {
+    let mut tail = unattended_notice(has_task);
+    if has_task {
+        tail.push_str(task_precedence_notice());
+    }
+    tail
 }
 
 /// Fold the caller's own task, if any, into the composed context.
@@ -447,16 +476,16 @@ const TASK_SECTION_MARKER: &str = "\n## Your task\n\n";
 /// the artifact keeps `Tab::Orchestration` a plain `config`/`cwd` pair, which is
 /// what the task half already relied on.
 ///
-/// **The attendance is read from the prefix BEFORE the task marker**, so task
-/// text — an issue body, a brief written by another agent — cannot forge the
-/// notice by containing its heading. That prefix does include the start role's
-/// own `prompt_template`, so a template that itself writes an
-/// `## Unattended run` heading reads back as unattended; that is a template
-/// author quoting the deck's own section into their standing instructions rather
-/// than untrusted input, and it moves the attendance in the direction they
-/// wrote. Two degradations run the other way, toward `Attended`: a context file
-/// pruned before the re-arm, and a `prompt_template` containing the literal
-/// `## Your task` marker (which already misdirects the task read today).
+/// **The attendance is recognised as the composer-owned TAIL of the region
+/// before the task marker** ([`composer_tail`]), not as a heading appearing
+/// anywhere in it. Neither the task text — an issue body, a brief written by
+/// another agent — nor the start role's own `prompt_template` can forge it,
+/// because the composer always writes three more sections after the template and
+/// the task always follows the marker. Two degradations remain, both toward
+/// `Attended`, which is the direction that keeps a gate rather than removing
+/// one: a context file pruned before the re-arm, and a `prompt_template`
+/// containing the literal `## Your task` marker (which already misdirects the
+/// task read today).
 fn read_back_context(cwd: &str) -> (Option<String>, Attendance) {
     let file_path = std::path::Path::new(cwd)
         .join(CONTEXT_DIR_NAME)
@@ -471,7 +500,7 @@ fn read_back_context(cwd: &str) -> (Option<String>, Attendance) {
         }
         None => (content.as_str(), None),
     };
-    let attendance = if before_task.contains(UNATTENDED_SECTION_HEADING) {
+    let attendance = if before_task.ends_with(&composer_tail(task.is_some())) {
         Attendance::Unattended
     } else {
         Attendance::Attended
@@ -1457,6 +1486,56 @@ mod tests {
                 "{attendance:?}: the marker must split at the real task"
             );
         }
+    }
+
+    /// Greptile's P1 on PR #1010, and the harmful direction: a **template** that
+    /// writes its own `## Unattended run` section — plausibly to document what to
+    /// do when unattended — must not turn an ATTENDED run's compaction re-arm
+    /// into an unattended one. The template is copied into the file verbatim, so
+    /// recognising the heading anywhere in the prefix classified such a run as
+    /// unattended and re-armed an operator's own `Ctrl+n` orchestration with
+    /// "the approval gates do not apply".
+    ///
+    /// The stronger form is asserted: the template here contains the ENTIRE
+    /// notice, byte for byte, not merely its heading. It cannot occupy the tail
+    /// of the prefix because the composer always writes `## Available agents`,
+    /// `## Delegation protocol` and `## Important` after the template.
+    #[test]
+    fn a_template_writing_the_notice_cannot_unattend_an_attended_run() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path().to_string_lossy().to_string();
+
+        let mut hostile = config();
+        let start = hostile
+            .roles
+            .iter_mut()
+            .find(|r| r.start)
+            .expect("the fixture has a start role");
+        start.prompt_template = Some(format!("You lead the team.\n{}", composer_tail(true)));
+
+        prepare_orchestrator_prompt(&hostile, &cwd, Some("Fix the bug."), Attendance::Attended)
+            .expect("spawn-time write");
+        reassert_orchestrator_prompt(&hostile, &cwd).expect("re-assertion written");
+
+        let c = published(&cwd);
+        let (before_task, _) = c.split_once(TASK_SECTION_MARKER).expect("task section");
+        // The template's copy is still in there — this is not about scrubbing it.
+        assert!(
+            before_task.contains(UNATTENDED_SECTION_HEADING),
+            "precondition: the template's own copy of the notice must survive:\n{c}"
+        );
+        // What must NOT have happened is a second, composer-written copy: that is
+        // the re-arm having reclassified an attended run as unattended.
+        assert_eq!(
+            before_task.matches(UNATTENDED_SECTION_HEADING).count(),
+            1,
+            "a template quoting the notice must not make an ATTENDED run re-arm as \
+             unattended — exactly one copy (the template's own) may appear:\n{c}"
+        );
+        assert!(
+            c.contains("Fix the bug."),
+            "the task must survive the re-assertion:\n{c}"
+        );
     }
 
     /// Version skew, the half that is reachable from this branch: a context file
