@@ -191,6 +191,133 @@ jobs:
       # bundle gate in one step, no Rust or Tauri required.
       - run: pnpm build
 
+  # Issues #823 and #836 — the browser-level tier. `desktop-web` above runs ~296
+  # vitest tests under `environment: "jsdom"`, and jsdom is a DOM implementation
+  # rather than a browser: it runs no layout engine, paints nothing and computes
+  # no geometry, so those tests can assert what React renders into a tree and
+  # nothing about what a reader sees. This job drives the SAME production bundle
+  # `pnpm build` produces, served by `vite preview`, in engines that lay out and
+  # paint. Every FILE in `desktop/e2e` makes at least one assertion jsdom
+  # structurally cannot — geometry, scroll extent, a composited colour, a real
+  # pointer press or storage surviving a real reload — alongside ordinary
+  # DOM-shape checks that live here because the screen they are about is only
+  # reachable in a browser. `docs/develop/desktop-gui.md` says which parts of
+  # each file are which.
+  #
+  # Two engines, and the second is the point. Until this existed, every
+  # automated check of this app ran in Chromium or in jsdom, while the app SHIPS
+  # on WebKit — WebKitGTK under Tauri on Linux, WKWebView on macOS. Playwright's
+  # `webkit` is its own build from the WebKit source tree (the binary it launches
+  # on Linux is `minibrowser-gtk`, WebKit's GTK port), so it answers WebCore and
+  # JavaScriptCore questions the way WebKit answers them. It is not the
+  # distribution's WebKitGTK, not WKWebView and not a Tauri window; what that
+  # leaves uncovered is enumerated in `docs/develop/desktop-gui.md`.
+  #
+  # ADVISORY, deliberately, and not by inheriting `desktop-web`'s status. The
+  # ruleset requires exactly `build`, `build-macos`, `build-windows` and
+  # `security` (CLAUDE.md rule 8), and this job is new: nothing has ever run a
+  # browser suite on a GitHub runner for this repository, so its stability there
+  # is unmeasured until it has run. That is the same reasoning `e2e-deterministic`
+  # below records for its own advisory status — requiring a job whose runner
+  # behaviour is unknown blocks every PR on the first surprise. What would have
+  # to be true to change it: a run history showing no flake attributable to the
+  # runner rather than to the app, and then a deliberate `REQUIRED_CHECKS` change
+  # applied with `scripts/apply-branch-protection.sh`, which is a repository
+  # administration act and not something a PR can do.
+  #
+  # Same `changes` gate as `desktop-web`: a devbox-only or flake-only PR cannot
+  # touch the bundle this job builds.
+  desktop-browser:
+    needs: changes
+    if: needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true'
+    runs-on: ubuntu-latest
+    # NOT a measured runner wall clock — this job's own first run is the first
+    # measurement, so this is derived rather than observed. Measured on a warm
+    # 16-core dev box after #836's second phase took the suite from 20 tests to
+    # 54 across two engines, including the `vite build` the Playwright
+    # `webServer` runs first: 24.6s at 8 workers, 1m06s at `--workers=1`, which
+    # is the shape CI runs in. On top of that CI pays for `pnpm install`, the
+    # ~400 MiB browser download and the apt install for WebKit's runtime deps,
+    # and those three dominate. 20 minutes leaves room for all of it while still
+    # capping a wedged browser at a fraction of the 6-hour runner default.
+    # Re-tune downward once honest runs exist; do not raise it to paper over a
+    # hang.
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: desktop
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
+        with:
+          version: 12
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: desktop/pnpm-lock.yaml
+      - run: pnpm install --frozen-lockfile
+      # The browser binaries are PINNED rather than cached, and the pin is the
+      # lockfile: `pnpm install --frozen-lockfile` resolves one exact
+      # `@playwright/test` version, and that version downloads one exact browser
+      # revision each, so nothing here floats. Measured on a dev box: 399 MiB
+      # downloaded (Chromium 187, its headless shell 114, WebKit 95, ffmpeg 2),
+      # unpacking to 927 MB, in ~50s.
+      #
+      # Deliberately NOT wrapped in `actions/cache`, for two reasons, and the
+      # second is the one a future "let's just cache this to speed CI up" PR
+      # has to argue against. Cost is the weaker one: the repository's cache
+      # budget is shared, and `Swatinem/rust-cache` in four other jobs is what
+      # actually keeps CI fast; adding a several-hundred-megabyte entry here to
+      # save part of a one-minute download risks evicting those.
+      #
+      # The security property is the stronger one. A GitHub Actions cache entry
+      # is writable by a workflow run on ANY branch, so a cached browser
+      # payload keyed by Playwright version would be a cross-branch poisoning
+      # target: a malicious or compromised branch could populate or overwrite
+      # that entry, and a later trusted run would restore those binaries and
+      # then EXECUTE them. Re-downloading from the pinned CDN on every run
+      # removes that write surface entirely. Note what it does NOT do: it does
+      # not make the download independently verified. The pin is a browser
+      # revision number resolved from the lockfile, not a hash of the archive
+      # bytes, so what arrives is trusted on TLS and CDN trust alone. Losing a
+      # cross-branch write path is the whole of what a cache would cost here,
+      # and a speed argument alone does not settle it.
+      #
+      # `--with-deps` is for WebKit, not for Chromium: WebKit needs a GTK4 and
+      # GStreamer runtime that the runner image does not carry in full. It runs
+      # apt, so it is the slowest step here.
+      - run: pnpm exec playwright install --with-deps chromium webkit
+      # Playwright transpiles specs without type-checking them, so a type error
+      # under `desktop/e2e` would run happily and could pass. This is the gate
+      # that makes it an error, and it is fast enough to run before the browsers
+      # are launched.
+      - run: pnpm test:browser:types
+      - run: pnpm test:browser
+      # `retries` is 0 in `playwright.config.ts` — a retry turns a flake into a
+      # green tick and deletes the evidence — so the trace and the HTML report
+      # are the whole record of a failure. Both are written only on failure
+      # (`trace: retain-on-failure`), and the attempt is in the artifact name for
+      # the reason spelled out on `build-macos`: a job-level re-run overwrites
+      # the conclusion in place, and upload-artifact v4+ refuses to overwrite an
+      # existing name.
+      - name: Preserve this attempt's browser report
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: playwright-attempt-${{ github.run_attempt }}
+          path: |
+            desktop/playwright-report/
+            desktop/test-results/
+          if-no-files-found: warn
+          # Without this these inherit the repository/org default, which can be
+          # 90 days. The content is synthetic — the tier drives only the
+          # `?fixture=1` scenarios — so this is tidiness rather than a leak, but
+          # nobody opens a failure trace from a PR that closed two months ago.
+          retention-days: 7
+
   build:
     needs: changes
     if: needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true'
