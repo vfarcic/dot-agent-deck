@@ -4,8 +4,7 @@
 //! `gh-aw-manifest` comment at the top, the exact SHA and version of every
 //! action the file pins. Renovate does not know the file is generated: it sees
 //! `uses: …@<sha> # <version>` lines like any other workflow and bumps them,
-//! leaving the rest of the generated content — and the manifest — at the old
-//! version.
+//! leaving the rest of the generated content — and the manifest — behind.
 //!
 //! That is not hypothetical. On 2026-09-10, PR #989 bumped
 //! `github/gh-aw-actions/setup` from v0.86.2 to v0.89.0 inside
@@ -18,11 +17,10 @@
 //! stopped it, and the breakage surfaced only when someone ran the workflow.
 //!
 //! This is the same shape as `pin_lockstep.rs`: two places that must agree, in
-//! files no single gate reads. So the rule is the narrow, mechanical one — every
-//! action pin in a lock file must match that file's own manifest entry for the
-//! same action. It catches a partial bump, a total bump that leaves the manifest
-//! behind, and a hand-edit; it says nothing about whether the pinned version is
-//! current, which is Renovate's job.
+//! files no single gate reads. The rules are mechanical — within one lock, every
+//! pinned action must appear in that file's manifest at the same SHA, and no
+//! action may appear at two SHAs. Nothing here says whether the pinned version
+//! is *current*; that is Renovate's job.
 //!
 //! The remedy is to regenerate, not to hand-edit the pins into agreement: the
 //! mismatch is a symptom, and the generated body is what actually has to change.
@@ -41,8 +39,8 @@
 //!    what looks like a pin-only diff.
 //! 2. **The CLI version is not pinned by this repo.** Nothing in `devbox.json`
 //!    or `scripts/` fixes it, so whoever recompiles decides which version the
-//!    locks are generated at. Check `gh aw --version` before you do, and say
-//!    which version you used in the commit.
+//!    locks are generated at. Check `gh aw --version` first, and say which
+//!    version you used in the commit.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -98,7 +96,13 @@ fn manifest_pins(text: &str) -> BTreeMap<String, (String, String)> {
 fn used_pins(text: &str) -> Vec<(usize, String, String, String)> {
     let mut out = Vec::new();
     for (n, line) in text.lines().enumerate() {
-        let Some(after) = line.trim().strip_prefix("uses: ") else {
+        // Both YAML forms: a `uses:` key under a named step, and the bare
+        // `- uses:` list item. The generated locks only use the first today,
+        // but a parser that silently skips valid pins is the same class of
+        // hole Greptile flagged in the manifest lookup, so accept both.
+        let trimmed = line.trim();
+        let trimmed = trimmed.strip_prefix("- ").unwrap_or(trimmed);
+        let Some(after) = trimmed.strip_prefix("uses: ") else {
             continue;
         };
         let Some((reference, comment)) = after.split_once(" # ") else {
@@ -120,13 +124,92 @@ fn used_pins(text: &str) -> Vec<(usize, String, String, String)> {
     out
 }
 
-/// Every pinned action in a generated lock must match that file's own manifest.
+fn short(sha: &str) -> &str {
+    &sha[..8.min(sha.len())]
+}
+
+const REMEDY: &str = "Fix: regenerate with `gh aw compile <workflow-name>` (never bare — see the \
+                      module docs) at the `gh aw` version you intend; do not hand-edit the pins \
+                      into agreement, because the generated body has to change too.";
+
+/// Every consistency problem in one lock file's text.
 ///
-/// A mismatch means something edited the generated file without regenerating
-/// it — in practice Renovate bumping a pin. The failure names the file, the
-/// line, and both versions, because the fix depends on which way they disagree.
+/// Pure over `(label, text)` so the synthetic tests below can exercise each
+/// failure shape without a fixture on disk. Greptile's review of PR #996 asked
+/// for exactly that: the file-walking test alone could pass vacuously, since
+/// the real locks are (now) clean.
+fn problems_in(label: &str, text: &str) -> Vec<String> {
+    let manifest = manifest_pins(text);
+    let pins = used_pins(text);
+
+    if pins.is_empty() {
+        return Vec::new(); // not a generated lock, or nothing pinned
+    }
+    if manifest.is_empty() {
+        return vec![format!(
+            "{label}: pins {} action(s) but has no gh-aw-manifest entries. Either this is not a \
+             generated lock, or the manifest comment was stripped. {REMEDY}",
+            pins.len()
+        )];
+    }
+
+    let mut problems = Vec::new();
+    let mut by_repo: BTreeMap<&str, BTreeMap<&str, Vec<usize>>> = BTreeMap::new();
+
+    for (line, repo, sha, version) in &pins {
+        by_repo
+            .entry(repo)
+            .or_default()
+            .entry(sha)
+            .or_default()
+            .push(*line);
+
+        match manifest.get(repo) {
+            // The SHA decides which code runs, so it is what must agree. The
+            // trailing comment is informational and its text varies — the
+            // generator writes "v9.0.0 (source v9)" for some actions — so
+            // comparing it would fail on files nothing has touched.
+            Some((want_sha, want_version)) if sha != want_sha => problems.push(format!(
+                "{label}:{line}: {repo} is pinned to {} (comment says {version}) but this file's \
+                 own manifest records {} ({want_version}). Something edited this GENERATED file \
+                 without regenerating it. {REMEDY}",
+                short(sha),
+                short(want_sha),
+            )),
+            Some(_) => {}
+            // Greptile, PR #996: skipping this was a hole. A partial edit that
+            // drops a manifest entry, or adds an action to the body only, would
+            // otherwise pass a guard whose docs claim every pin is checked.
+            None => problems.push(format!(
+                "{label}:{line}: {repo} is pinned to {} but has NO entry in this file's \
+                 gh-aw-manifest. Either the pin was added to the generated body by hand, or the \
+                 manifest entry was removed. {REMEDY}",
+                short(sha),
+            )),
+        }
+    }
+
+    for (repo, shas) in by_repo {
+        if shas.len() > 1 {
+            let detail: Vec<String> = shas
+                .iter()
+                .map(|(s, lines)| format!("{} at {lines:?}", short(s)))
+                .collect();
+            problems.push(format!(
+                "{label}: {repo} is pinned at {} different SHAs — {}. That is a PARTIAL edit: \
+                 something bumped some occurrences and missed others. {REMEDY}",
+                shas.len(),
+                detail.join(", "),
+            ));
+        }
+    }
+
+    problems
+}
+
+/// The real files must be internally consistent.
 #[test]
-fn lock_action_pins_match_their_own_manifest() {
+fn generated_locks_agree_with_their_own_manifests() {
     let files = lock_files();
     assert!(
         !files.is_empty(),
@@ -137,88 +220,103 @@ fn lock_action_pins_match_their_own_manifest() {
     for path in &files {
         let text = std::fs::read_to_string(path)
             .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
-        let manifest = manifest_pins(&text);
-        if manifest.is_empty() {
-            problems.push(format!(
-                "{}: no gh-aw-manifest entries found; is this really a generated lock?",
-                path.display()
-            ));
-            continue;
-        }
-        for (line, repo, sha, version) in used_pins(&text) {
-            let Some((want_sha, want_version)) = manifest.get(&repo) else {
-                continue; // pinned but unmanifested: not this test's rule
-            };
-            // The SHA decides which code runs, so it is what must agree. The
-            // trailing comment is informational and its text varies — the
-            // generator writes "v9.0.0 (source v9)" for some actions — so
-            // comparing it would fail on files nothing has touched.
-            if &sha != want_sha {
-                problems.push(format!(
-                    "{path}:{line}: {repo} is pinned to {sha_short} (comment says \
-                     {version}) but this file's own manifest records {want_short} \
-                     ({want_version}). Something edited this GENERATED file without \
-                     regenerating it. Fix: upgrade the `gh aw` CLI to the wanted \
-                     version and re-run `gh aw compile` — do not hand-edit the pins \
-                     into agreement, because the generated body has to change too.",
-                    path = path.display(),
-                    sha_short = &sha[..8.min(sha.len())],
-                    want_short = &want_sha[..8.min(want_sha.len())],
-                ));
-            }
-        }
+        problems.extend(problems_in(&path.display().to_string(), &text));
     }
 
     assert!(
         problems.is_empty(),
-        "generated gh-aw lock files disagree with their own manifests:\n  {}",
+        "generated gh-aw lock files are inconsistent:\n  {}",
         problems.join("\n  ")
     );
 }
 
-/// A single action must not appear at two different SHAs within one lock.
-///
-/// This did NOT happen in #989 — that bump was internally consistent, and this
-/// test passes against it. It is here for the shape the sibling test cannot
-/// see: an edit that touches some occurrences and not others. A hand-fix
-/// reaching for the pins directly is the likeliest way to produce one, which is
-/// exactly what the sibling test's message tells you not to do.
-#[test]
-fn no_lock_pins_one_action_at_two_versions() {
-    let mut problems = Vec::new();
-    for path in lock_files() {
-        let text = std::fs::read_to_string(&path)
-            .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
-        // Keyed on SHA, for the same reason as above: the comment text varies
-        // by action even in a freshly generated file.
-        let mut seen: BTreeMap<String, BTreeMap<String, Vec<usize>>> = BTreeMap::new();
-        for (line, repo, sha, _version) in used_pins(&text) {
-            seen.entry(repo)
-                .or_default()
-                .entry(sha)
-                .or_default()
-                .push(line);
+/// Each failure shape, on constructed input. Without these the test above
+/// passes whenever the real locks happen to be clean, which tells you nothing
+/// about whether the check works.
+#[cfg(test)]
+mod synthetic {
+    use super::problems_in;
+
+    const SHA_A: &str = "6aab9e5b5c91c615506061f09bedd81a23babe3c";
+    const SHA_B: &str = "af9516b9001c6aa6d4817b7484de4bb017ebb27f";
+
+    fn lock(manifest_sha: &str, manifest_version: &str, uses: &[(&str, &str)]) -> String {
+        let mut s = format!(
+            "# gh-aw-manifest: {{\"version\":1,\"actions\":[{{\"repo\":\"github/gh-aw-actions/setup\",\"sha\":\"{manifest_sha}\",\"version\":\"{manifest_version}\"}}]}}\njobs:\n"
+        );
+        for (sha, version) in uses {
+            s.push_str(&format!(
+                "        uses: github/gh-aw-actions/setup@{sha} # {version}\n"
+            ));
         }
-        for (repo, shas) in seen {
-            if shas.len() > 1 {
-                let detail: Vec<String> = shas
-                    .iter()
-                    .map(|(s, lines)| format!("{} at {lines:?}", &s[..8.min(s.len())]))
-                    .collect();
-                problems.push(format!(
-                    "{}: {repo} is pinned at {} different SHAs — {}. That is a \
-                     PARTIAL edit: something bumped some occurrences and missed \
-                     others. Regenerate with `gh aw compile`.",
-                    path.display(),
-                    shas.len(),
-                    detail.join(", "),
-                ));
-            }
-        }
+        s
     }
-    assert!(
-        problems.is_empty(),
-        "generated gh-aw lock files pin an action inconsistently:\n  {}",
-        problems.join("\n  ")
-    );
+
+    #[test]
+    fn a_consistent_lock_has_no_problems() {
+        let text = lock(SHA_A, "v0.86.2", &[(SHA_A, "v0.86.2"), (SHA_A, "v0.86.2")]);
+        assert!(problems_in("t", &text).is_empty());
+    }
+
+    /// The #989 shape: every `uses:` bumped, manifest left behind.
+    #[test]
+    fn a_wholesale_bump_that_leaves_the_manifest_behind_is_caught() {
+        let text = lock(SHA_A, "v0.86.2", &[(SHA_B, "v0.89.0"), (SHA_B, "v0.89.0")]);
+        let p = problems_in("t", &text);
+        assert_eq!(p.len(), 2, "one per pin: {p:?}");
+        assert!(
+            p.iter().all(|m| m.contains("own manifest records")),
+            "{p:?}"
+        );
+    }
+
+    /// The shape Greptile flagged: a pin with no manifest entry at all.
+    #[test]
+    fn a_pin_with_no_manifest_entry_is_caught() {
+        let text = "# gh-aw-manifest: {\"version\":1,\"actions\":[{\"repo\":\"actions/checkout\",\"sha\":\"1111111111111111111111111111111111111111\",\"version\":\"v7\"}]}\njobs:\n        uses: github/gh-aw-actions/setup@6aab9e5b5c91c615506061f09bedd81a23babe3c # v0.86.2\n";
+        let p = problems_in("t", text);
+        assert_eq!(p.len(), 1, "{p:?}");
+        assert!(
+            p[0].contains("NO entry in this file's gh-aw-manifest"),
+            "{}",
+            p[0]
+        );
+    }
+
+    /// A partial edit: some occurrences bumped, others missed.
+    #[test]
+    fn a_partial_bump_is_caught_as_two_shas() {
+        let text = lock(SHA_B, "v0.89.0", &[(SHA_B, "v0.89.0"), (SHA_A, "v0.86.2")]);
+        let p = problems_in("t", &text);
+        assert!(
+            p.iter().any(|m| m.contains("different SHAs")),
+            "expected the partial-edit message: {p:?}"
+        );
+    }
+
+    /// A stripped manifest must not read as "nothing to check".
+    #[test]
+    fn a_lock_with_pins_but_no_manifest_is_caught() {
+        let text = format!("jobs:\n        uses: github/gh-aw-actions/setup@{SHA_A} # v0.86.2\n");
+        let p = problems_in("t", &text);
+        assert_eq!(p.len(), 1, "{p:?}");
+        assert!(p[0].contains("no gh-aw-manifest entries"), "{}", p[0]);
+    }
+
+    /// The bare `- uses:` list form must parse too. The generated locks do not
+    /// use it today, but a silent skip would hide a real pin if that changed.
+    #[test]
+    fn the_dash_uses_form_is_parsed() {
+        let text = format!(
+            "# gh-aw-manifest: {{\"repo\":\"github/gh-aw-actions/setup\",\"sha\":\"{SHA_A}\",\"version\":\"v0.86.2\"}}\njobs:\n      - uses: github/gh-aw-actions/setup@{SHA_B} # v0.89.0\n"
+        );
+        let p = problems_in("t", &text);
+        assert_eq!(p.len(), 1, "the dash form was skipped entirely: {p:?}");
+    }
+
+    /// A file that pins nothing is not this guard's business.
+    #[test]
+    fn a_file_with_no_pins_is_ignored() {
+        assert!(problems_in("t", "jobs:\n  build:\n    runs-on: ubuntu-latest\n").is_empty());
+    }
 }
