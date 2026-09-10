@@ -15,8 +15,12 @@
 #
 # Usage: sample-box.sh [--interval SECONDS] [--out FILE] [--label TEXT]
 #
-# Reads only /proc and runs only ps/df. It starts no build, holds no link slot
-# and writes nothing outside --out, so it does not perturb what it measures.
+# Reads /proc and shells out to ps, pgrep, df, fuser and awk -- all read-only
+# and all cheap. (`pgrep` counts the pools, `fuser` reads the link slots and is
+# optional; see the WARNING it prints when absent.) What matters for a sampler
+# is the next sentence, not the exact list: it starts no build, holds no link
+# slot and writes nothing outside --out, so it does not perturb what it
+# measures.
 
 set -u
 
