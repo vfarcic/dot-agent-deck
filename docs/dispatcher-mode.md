@@ -53,25 +53,6 @@ Each dispatched unit appears on your deck like any other work: a card for a sing
 
 The unit works in `../<your-repo>-dispatch-<name>` — a sibling directory of your project, never inside it.
 
-## A dispatched team knows nobody is watching it
-
-A unit started as a **team** gets your project's orchestration configuration as it stands, including the orchestrator's own standing instructions from `.dot-agent-deck.toml`. Those instructions are usually written for the case where you are sitting in front of the pane, so they often contain a step like *"show me the plan and wait for approval"* or *"pause for review before merging"*. In a dispatched unit there is nobody to answer, and nothing reports back to you when a unit is waiting — so a team that took such a step literally would sit there for as long as you left it, with its workers idle, and you would have no way of knowing.
-
-So a dispatched team is told, in the same file as its task, that it is running unattended: nobody has been asked to watch its pane, a step that waits for your approval does not apply to it, and the task it was dispatched with is the approval that step was waiting for. If it reaches a decision that genuinely is not its to make, it is told to say so — through whatever notification your orchestrator's instructions describe — and finish, rather than wait silently.
-
-**You do not have to change your configuration for this.** Your orchestrator's `prompt_template` stays exactly as you wrote it, and the gates in it still mean what they say for a team you open yourself with `Ctrl+n` or launch from the desktop app. What changes is how the unit was started, not what your config says — so one template covers both, and a team that is being watched keeps the gates you put there on purpose.
-
-A unit started as a **single agent** has no orchestrator and no standing instructions to inherit: it receives your task and nothing else, so there is no gate for it to stop at. It also has no notification instructions to fall back on, which is why you still check on single-agent units yourself.
-
-## Which instructions win
-
-A dispatched team's orchestrator holds two sets of instructions at once: the standing ones from your `.dot-agent-deck.toml`, and the task you dispatched. They can disagree, and the unit is told which one wins:
-
-- **The task wins on what to do and when to stop.** Its stop condition is the run's stop condition — a later step of the standing instructions that would go past it (merging, releasing, publishing, deleting) does not fire unless the task asks for it.
-- **The standing instructions win on how to work** — which agents exist, that the orchestrator delegates rather than implements, your conventions and your quality gates. A task that says what to build does not license skipping them.
-
-Everything after the task's own heading is the task, headings included. So you can dispatch a task written with its own `##` sections without those sections being read as amendments to your orchestration config.
-
 ## Pointing a unit at the right thing
 
 A dispatched unit gets a **copy of your repository**, so it already has your code, your docs, and any instructions you keep in the repo. Ask for work by referring to what is in there — *"execute the release checklist in docs/release.md"* — rather than pasting the contents of those files into the request. Pasted text can go stale against the copy the unit is actually holding.
