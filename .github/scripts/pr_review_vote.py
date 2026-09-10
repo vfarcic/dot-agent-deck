@@ -94,6 +94,23 @@ def deny_reason(paths):
     return "This touches a path that requires a human approval."
 
 
+def auto_merge_armed(repo, pr_number):
+    """Read the auto-merge state fresh, at the moment it is about to be acted on.
+
+    Deliberately re-read rather than reused from the step-1 snapshot: several
+    network round-trips (the check sweep, the verdict fetch) sit between the two
+    points, and arming auto-merge in that window would turn an approval into an
+    unattended merge on a sensitive path. This NARROWS the window to one call; it
+    does not close it. Nothing here can — GitHub offers no way to approve and
+    assert "and auto-merge was not armed" atomically, so a caller arming it
+    microseconds after this returns still wins. One call's width is the floor.
+    """
+    current = gh_json(
+        "pr", "view", pr_number, "--repo", repo, "--json", "autoMergeRequest"
+    )
+    return (current or {}).get("autoMergeRequest") is not None
+
+
 def add_label(repo, pr_number):
     """Best-effort. Needs `issues: write` on the App; a failure must not lose the vote."""
     if not gh_ok("pr", "edit", pr_number, "--repo", repo, "--add-label", ATTENTION_LABEL):
@@ -104,6 +121,50 @@ def add_label(repo, pr_number):
         )
         return False
     return True
+
+
+def clear_label(repo, pr_number):
+    """Drop the attention marker when the diff is no longer sensitive.
+
+    The label is applied per-review, but it outlives the diff that earned it: a
+    later push can remove every protected path, and the ordinary path would then
+    vote normally while the pull request still advertises itself as needing a
+    human eye. `--remove-label` on a pull request that does not carry it is a
+    no-op that exits 0, so this needs no "is it there" probe.
+    """
+    gh_ok("pr", "edit", pr_number, "--repo", repo, "--remove-label", ATTENTION_LABEL)
+
+
+def attention_body(decision, reason, touched, sha, reasons):
+    """The review body for a sensitive pull request the App is still voting on.
+
+    Heading and closing both follow `decision`. Submitting `--request-changes`
+    under an "Approved" heading told the author the opposite of what was decided,
+    precisely when defects had been found, so the two are derived here together
+    rather than written once and reused across both verdicts.
+    """
+    if decision == "APPROVE":
+        heading = "## ⚠️ Approved, but read this before merging"
+        closing = (
+            "I reviewed the diff and found it sound, so this approval satisfies the "
+            "required review and you are not waiting on a second maintainer. It is "
+            "**not** a statement that the obligation above has been met — I cannot see "
+            "whether it has. You are the human in this loop."
+        )
+    else:
+        heading = "## ⚠️ Changes requested — and read this before merging"
+        closing = (
+            "I reviewed the diff and found the defects above, so this is a rejection "
+            "and **not** an approval: it does not satisfy the required review. The "
+            "obligation above stands on top of them, and I cannot see whether it has "
+            "been met. You are the human in this loop."
+        )
+    return (
+        f"{heading}\n\n{reason}\n\n"
+        f"**Touches:** {touched}\n\n"
+        f"---\n\nAutomated review (`{decision}`) for `{sha[:8]}`.\n\n{reasons}\n\n"
+        f"{closing}"
+    )
 
 
 def comment(repo, pr_number, body):
@@ -128,7 +189,7 @@ def main():
         "--repo",
         repo,
         "--json",
-        "headRefOid,isDraft,reviewDecision,autoMergeRequest",
+        "headRefOid,isDraft,reviewDecision",
     )
     if current["headRefOid"] != expected_sha:
         print(
@@ -142,7 +203,6 @@ def main():
     if current.get("reviewDecision") == "CHANGES_REQUESTED":
         print(f"#{pr_number}: a reviewer requested changes during review; not voting.")
         return
-    auto_merge_armed = current.get("autoMergeRequest") is not None
 
     # 2. The gates must still be green, checked here and not taken on trust.
     green, why = checks_green(repo, expected_sha)
@@ -191,7 +251,8 @@ def main():
     if not vote_allowed:
         reason = deny_reason(denied_paths)
         touched = ", ".join(f"`{p}`" for p in denied_paths[:5]) or "a protected path"
-        if auto_merge_armed:
+        # Read this last, not from the step-1 snapshot: see auto_merge_armed().
+        if auto_merge_armed(repo, pr_number):
             comment(
                 repo,
                 pr_number,
@@ -210,15 +271,7 @@ def main():
 
         flag = "--approve" if decision == "APPROVE" else "--request-changes"
         labelled = add_label(repo, pr_number)
-        body = (
-            f"## ⚠️ Approved, but read this before merging\n\n{reason}\n\n"
-            f"**Touches:** {touched}\n\n"
-            f"---\n\nAutomated review (`{decision}`) for `{expected_sha[:8]}`.\n\n{reasons}\n\n"
-            "I reviewed the diff and found it sound, so this approval satisfies the required "
-            "review and you are not waiting on a second maintainer. It is **not** a statement "
-            "that the obligation above has been met — I cannot see whether it has. You are the "
-            "human in this loop."
-        )
+        body = attention_body(decision, reason, touched, expected_sha, reasons)
         gh("pr", "review", pr_number, "--repo", repo, flag, "--body", body)
         print(
             f"#{pr_number}: cast {decision} for {expected_sha[:8]} with an attention marker "
@@ -226,7 +279,9 @@ def main():
         )
         return
 
-    # 5. The ordinary case.
+    # 5. The ordinary case. Nothing protected is touched at this SHA, so an
+    # attention marker from an earlier one is now a lie the pull request list tells.
+    clear_label(repo, pr_number)
     body = (
         f"Automated review (`{decision}`) for `{expected_sha[:8]}`.\n\n{reasons}\n\n"
         "This vote was cast by the review App on the verdict linked above. "

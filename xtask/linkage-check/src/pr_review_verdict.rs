@@ -208,6 +208,28 @@ fn the_deny_reason_is_the_most_specific_one() {
     );
 }
 
+/// PR #1000 review: on a sensitive path the App submits `--request-changes` for a
+/// `REQUEST_CHANGES` verdict, but the body was written once for the approval case
+/// and said "Approved" and "this approval satisfies the required review" either
+/// way. A rejection that announces itself as an approval is worse than no vote,
+/// so the heading and the closing must both follow the verdict.
+#[test]
+fn the_attention_body_follows_the_verdict_not_the_approval_case() {
+    assert_py_ok(
+        "from pr_review_vote import attention_body\n\
+         ok = attention_body('APPROVE', 'reason', '`a`', 'abcdef1234', '- r')\n\
+         assert 'Approved, but read this' in ok, ok\n\
+         assert 'this approval satisfies the required review' in ok, ok\n\
+         no = attention_body('REQUEST_CHANGES', 'reason', '`a`', 'abcdef1234', '- r')\n\
+         assert 'Changes requested' in no, no\n\
+         assert 'Approved' not in no, no\n\
+         assert 'this is a rejection' in no, no\n\
+         assert 'does not satisfy the required review' in no, no\n\
+         for body in (ok, no):\n\
+         \x20   assert 'reason' in body and '`a`' in body and 'abcdef12' in body, body",
+    );
+}
+
 /// The paths on which a verdict may stand but a vote must not be cast. The
 /// reviewer must not be able to widen its own powers, so its own workflow and
 /// the governance files are excluded.
