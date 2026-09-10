@@ -853,3 +853,251 @@ fn cargo_config_routes_linux_links_through_the_gate() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// The mold seam (issue #906). `link-gate.sh` prepends `-fuse-ld=mold` to
+// rustc's argv when mold is on PATH, no explicit `DAD_LINKER` is set, and
+// `DAD_NO_MOLD` is not 1.
+//
+// WHY THESE NEED A CONTROLLED PATH RATHER THAN THE AMBIENT ONE. The branch
+// turns on `command -v mold`, and `devbox.json` now pins mold — so a test
+// reading the ambient PATH asserts the OPPOSITE condition on a bare
+// contributor machine (mold absent) than it does inside a devbox shell (mold
+// present), passing in both while actually checking neither. Measured: mold is
+// absent from a plain shell on this box and present in the devbox profile. So
+// the tests below build a PATH holding exactly the tools the two scripts
+// reach for, and decide mold's presence themselves.
+//
+// This is also why every pre-existing link-gate test above is blind to this
+// branch: each one sets `DAD_LINKER` to point at its recorder, and an explicit
+// `DAD_LINKER` is precisely what suppresses mold. Naming the recorder `cc`
+// instead — the default `$linker` — is what lets the branch be reached at all.
+// ---------------------------------------------------------------------------
+
+/// Tools `link-gate.sh` and `build-gate.sh` actually invoke. `bash` is here for
+/// the recorder's `#!/usr/bin/env bash` shebang, which resolves the
+/// interpreter through PATH.
+const GATE_TOOLS: [&str; 8] = [
+    "bash", "dirname", "awk", "nproc", "date", "id", "mkdir", "flock",
+];
+
+/// Build a PATH directory containing only `GATE_TOOLS`, a `cc` that records the
+/// argv it was handed, and — when asked — a `mold`.
+///
+/// Returns `None` if any tool is missing, so a host short of one skips rather
+/// than failing someone's unrelated change.
+fn mold_fixture(dir: &Path, with_mold: bool) -> Option<(PathBuf, PathBuf)> {
+    let bin = dir.join("bin");
+    fs::create_dir_all(&bin).ok()?;
+    for tool in GATE_TOOLS {
+        std::os::unix::fs::symlink(which(tool).ok()?, bin.join(tool)).ok()?;
+    }
+    if with_mold {
+        // Only ever `command -v`'d: the flag goes to the compiler driver, so
+        // this is never executed and needs no behaviour.
+        let mold = bin.join("mold");
+        fs::write(&mold, "#!/usr/bin/env bash\nexit 0\n").ok()?;
+        fs::set_permissions(&mold, fs::Permissions::from_mode(0o755)).ok()?;
+    }
+    // Named `cc` so it IS the default `${DAD_LINKER:-cc}`, leaving DAD_LINKER
+    // unset and the mold branch reachable.
+    let cc = bin.join("cc");
+    fs::write(
+        &cc,
+        "#!/usr/bin/env bash\nprintf '%s\\n' \"$@\" > \"$RECORD_TO\"\nexit 0\n",
+    )
+    .ok()?;
+    fs::set_permissions(&cc, fs::Permissions::from_mode(0o755)).ok()?;
+    Some((bin, cc))
+}
+
+/// Run the real `link-gate.sh` against a controlled PATH and return the argv
+/// that reached the driver.
+fn argv_through_link_gate(
+    with_mold: bool,
+    envs: &[(&str, &str)],
+    args: &[&str],
+) -> Option<Vec<String>> {
+    let bash = which("bash").ok()?;
+    let dir = tempfile::tempdir().expect("temp dir");
+    let pool = tempfile::tempdir().expect("pool dir");
+    let (bin, _cc) = mold_fixture(dir.path(), with_mold)?;
+    let record_to = dir.path().join("argv");
+
+    let mut cmd = Command::new(&bash);
+    cmd.arg(link_gate())
+        .args(args)
+        .env("PATH", &bin)
+        .env("RECORD_TO", &record_to)
+        .env("DAD_BUILD_GATE_DIR", pool.path())
+        // The ambient environment must not decide the branch under test.
+        .env_remove("DAD_LINKER")
+        .env_remove("DAD_NO_MOLD");
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+    let out = cmd.output().expect("run the link gate");
+    assert!(
+        out.status.success(),
+        "the link gate must never fail a link: {}",
+        combined(&out)
+    );
+    let seen = fs::read_to_string(&record_to).expect("the recorder wrote nothing");
+    Some(
+        seen.strip_suffix('\n')
+            .unwrap_or(&seen)
+            .split('\n')
+            .map(str::to_string)
+            .collect(),
+    )
+}
+
+/// Shapes rustc really emits, including one with a space and one empty, so
+/// prepending a flag is proven not to disturb the rest.
+const RUSTC_ARGV: [&str; 6] = [
+    "-Wl,--as-needed",
+    "-o",
+    "/tmp/a b/target/debug/deps/test-1234",
+    "-nodefaultlibs",
+    "",
+    "-Wl,-Bstatic",
+];
+
+/// With mold on PATH the driver is told to use it — and the flag is PREPENDED,
+/// leaving rustc's own argv byte-identical after it. The ordering matters:
+/// `-fuse-ld=` is last-wins, so appending it would silently override a
+/// `-fuse-ld` rustc itself passed rather than deferring to it.
+#[test]
+fn mold_is_used_when_available_and_argv_is_otherwise_untouched() {
+    if !bash_present() || !flock_present() {
+        eprintln!("SKIP: needs `bash` and `flock` on PATH");
+        return;
+    }
+    let Some(seen) = argv_through_link_gate(true, &[], &RUSTC_ARGV) else {
+        eprintln!("SKIP: host is missing one of {GATE_TOOLS:?}");
+        return;
+    };
+    let mut want = vec!["-fuse-ld=mold".to_string()];
+    want.extend(RUSTC_ARGV.iter().map(|s| s.to_string()));
+    assert_eq!(
+        seen, want,
+        "mold was on PATH, so -fuse-ld=mold must be prepended with rustc's \
+         argv following it verbatim"
+    );
+}
+
+/// The property the whole detection-instead-of-RUSTFLAGS choice exists to buy:
+/// a host without mold links exactly as it did before, with no injected flag.
+/// If this ever fails, every build outside a devbox shell fails with
+/// `cannot find -fuse-ld=mold`.
+#[test]
+fn a_host_without_mold_links_exactly_as_before() {
+    if !bash_present() || !flock_present() {
+        eprintln!("SKIP: needs `bash` and `flock` on PATH");
+        return;
+    }
+    let Some(seen) = argv_through_link_gate(false, &[], &RUSTC_ARGV) else {
+        eprintln!("SKIP: host is missing one of {GATE_TOOLS:?}");
+        return;
+    };
+    assert_eq!(
+        seen,
+        RUSTC_ARGV.to_vec(),
+        "with no mold on PATH the argv must be forwarded untouched"
+    );
+}
+
+/// `DAD_NO_MOLD=1` is the documented opt-out for bisecting a suspected linker
+/// difference. It has to win even where mold is available, or it is not an
+/// escape hatch.
+#[test]
+fn dad_no_mold_opts_out_even_where_mold_is_available() {
+    if !bash_present() || !flock_present() {
+        eprintln!("SKIP: needs `bash` and `flock` on PATH");
+        return;
+    }
+    let Some(seen) = argv_through_link_gate(true, &[("DAD_NO_MOLD", "1")], &RUSTC_ARGV) else {
+        eprintln!("SKIP: host is missing one of {GATE_TOOLS:?}");
+        return;
+    };
+    assert_eq!(
+        seen,
+        RUSTC_ARGV.to_vec(),
+        "DAD_NO_MOLD=1 must suppress the injection even with mold on PATH"
+    );
+}
+
+/// Only `1` opts out. A stray `DAD_NO_MOLD=0` — the shape someone writes
+/// meaning "no, do use mold" — must not read as truthy and quietly disable the
+/// linker the box was configured for.
+#[test]
+fn dad_no_mold_zero_does_not_opt_out() {
+    if !bash_present() || !flock_present() {
+        eprintln!("SKIP: needs `bash` and `flock` on PATH");
+        return;
+    }
+    let Some(seen) = argv_through_link_gate(true, &[("DAD_NO_MOLD", "0")], &RUSTC_ARGV) else {
+        eprintln!("SKIP: host is missing one of {GATE_TOOLS:?}");
+        return;
+    };
+    assert_eq!(
+        seen.first().map(String::as_str),
+        Some("-fuse-ld=mold"),
+        "only DAD_NO_MOLD=1 opts out; 0 must leave mold in use"
+    );
+}
+
+/// An explicit `DAD_LINKER` takes precedence: someone who named their own
+/// driver gets it unmodified, with no `-fuse-ld=mold` injected behind their
+/// back. That driver may not understand the flag at all.
+#[test]
+fn an_explicit_dad_linker_wins_over_mold() {
+    if !bash_present() || !flock_present() {
+        eprintln!("SKIP: needs `bash` and `flock` on PATH");
+        return;
+    }
+    let bash = match which("bash") {
+        Ok(b) => b,
+        Err(()) => {
+            eprintln!("SKIP: needs `bash` on PATH");
+            return;
+        }
+    };
+    let dir = tempfile::tempdir().expect("temp dir");
+    let pool = tempfile::tempdir().expect("pool dir");
+    let Some((bin, _cc)) = mold_fixture(dir.path(), true) else {
+        eprintln!("SKIP: host is missing one of {GATE_TOOLS:?}");
+        return;
+    };
+    // A DIFFERENT recorder, so the assertion also proves which binary ran.
+    let chosen = write_recorder(dir.path());
+    let record_to = dir.path().join("argv");
+
+    let out = Command::new(&bash)
+        .arg(link_gate())
+        .args(RUSTC_ARGV)
+        .env("PATH", &bin)
+        .env("DAD_LINKER", &chosen)
+        .env("RECORD_TO", &record_to)
+        .env("DAD_BUILD_GATE_DIR", pool.path())
+        .env_remove("DAD_NO_MOLD")
+        .output()
+        .expect("run the link gate");
+    assert!(
+        out.status.success(),
+        "the link gate must never fail a link: {}",
+        combined(&out)
+    );
+    let seen = fs::read_to_string(&record_to).expect("the chosen linker was never reached");
+    let seen: Vec<&str> = seen
+        .strip_suffix('\n')
+        .unwrap_or(&seen)
+        .split('\n')
+        .collect();
+    assert_eq!(
+        seen,
+        RUSTC_ARGV.to_vec(),
+        "an explicit DAD_LINKER must receive rustc's argv with no -fuse-ld=mold \
+         added — it may not understand the flag"
+    );
+}

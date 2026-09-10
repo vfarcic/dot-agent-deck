@@ -137,7 +137,7 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_IO",
 ] }
 # `%USERPROFILE%` / `%LOCALAPPDATA%` resolution for `src/platform/paths.rs`.
-dirs = "6"
+dirs = "7"
 
 # Integration tests don't inherit the package's `[dependencies]`, so the
 # harness/L2 tests need `libc` listed here to call `kill(2)` directly (process-

@@ -1,0 +1,203 @@
+---
+# Agent PR review — enumeration, fan-out, and the vote.
+#
+# Shape mirrors issue-labeler-batch.yml: this plain workflow decides WHICH pull
+# requests to review, then calls the gh-aw reviewer (pr-review.lock.yml) once per
+# pull request. Enumeration is a plain `gh` query, so a sweep that finds nothing
+# eligible spends ZERO agent tokens — the review job does not run at all.
+#
+# The agent never holds a credential that can approve. It emits a verdict comment;
+# the `vote` job below holds the App token, re-validates the PR number, the head
+# SHA and the gates itself, and casts the review.
+#
+# Be precise about what that split buys, because it is easy to overstate: it does
+# NOT make an injected verdict safe. If the diff talks the agent into emitting
+# APPROVE, the vote job faithfully approves. What it bounds is everything else —
+# the agent runs with its own approval gate bypassed inside the container, so an
+# agent holding this token could otherwise approve a different pull request, at a
+# different SHA, or one whose checks are red or whose paths are deny-listed.
+# Blast radius, not immunity.
+name: Agent PR review
+
+"on":
+  schedule:
+    # Once a day is the working cadence; the second firing exists only because
+    # GitHub delays and sometimes drops scheduled runs, and at one firing a day
+    # a dropped one costs a silent day with no verdicts. Sweeps are idempotent,
+    # so the second firing normally finds nothing to do and costs nothing.
+    - cron: "0 5 * * *"
+    - cron: "0 17 * * *"
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: Single pull request to review. Empty = sweep all eligible.
+        required: false
+        type: string
+      dry_run:
+        description: Produce verdicts but cast no votes.
+        required: true
+        default: true
+        type: boolean
+      max_prs:
+        description: Runaway guard, not a coverage cap. Leave it alone unless scoping a manual test.
+        required: false
+        default: "50"
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  # One sweep at a time. GitHub keeps at most one pending run per group, so a
+  # burst of schedule ticks collapses instead of stacking.
+  group: agent-pr-review-${{ github.repository }}
+  cancel-in-progress: false
+
+env:
+  # Whose pull requests get REVIEWED. Anyone not listed is never read by the
+  # agent at all — an outside contribution still requires a human, which is both
+  # the intent and the security boundary: the agent's input comes only from
+  # authors you trust. Renovate is included because its major bumps are read by
+  # a human today, and a verdict lets that read be skipped.
+  REVIEW_AUTHORS: vfarcic prageethw app/renovate
+  # Whose pull requests the App will VOTE on. Renovate is a ruleset bypass actor
+  # and merges without any approval, so a vote on its PRs changes no mechanism —
+  # it is a visible signal, nothing more. Kept deliberately separate from the
+  # review list so widening one never silently widens the other.
+  VOTE_AUTHORS: vfarcic prageethw app/renovate
+
+jobs:
+  prepare:
+    # Kill switch, mirroring the labeler's ISSUE_LABELER_ENABLED. Unset = off.
+    if: vars.PR_REVIEW_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      items: ${{ steps.pick.outputs.items }}
+      count: ${{ steps.pick.outputs.count }}
+      live: ${{ steps.pick.outputs.live }}
+    steps:
+      # Checks out the BASE branch, never the pull request head. This job runs
+      # the selection script, so it must be the version on the default branch —
+      # a pull request must not be able to alter its own eligibility.
+      - name: Check out the base branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Select eligible pull requests
+        id: pick
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          ONLY_PR: ${{ inputs.pr_number }}
+          MAX_PRS: ${{ inputs.max_prs || '50' }}
+          # PR_REVIEW_LIVE is the single switch that authorises voting, and it
+          # authorises the UNATTENDED kind too: with it set, the daily sweep
+          # casts approvals on its own. A manual dispatch can additionally force
+          # a dry run via dry_run=true. A pull_request run never votes.
+          DISPATCH_DRY_RUN: ${{ inputs.dry_run }}
+          EVENT_NAME: ${{ github.event_name }}
+          REPO_LIVE: ${{ vars.PR_REVIEW_LIVE }}
+        run: python3 .github/scripts/pr_review_select.py
+
+  review:
+    needs: prepare
+    if: needs.prepare.outputs.count != '0'
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        item: ${{ fromJSON(needs.prepare.outputs.items) }}
+    # Must be at least what pr-review.lock.yml's own jobs request, or the run
+    # fails at startup before any job begins. Its safe-output jobs need issues
+    # and pull-requests write in order to post the verdict comment.
+    #
+    # That write does NOT let the agent approve anything: this is GITHUB_TOKEN,
+    # and can_approve_pull_request_reviews is false on this repository, so an
+    # Actions identity cannot cast an approving review at all. The App token,
+    # which can, exists only in the `vote` job below.
+    permissions:
+      actions: read
+      contents: read
+      issues: write
+      pull-requests: write
+    uses: ./.github/workflows/pr-review.lock.yml
+    with:
+      pr_number: ${{ matrix.item.number }}
+      head_sha: ${{ matrix.item.sha }}
+    secrets:
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+
+  # Recompute who is votable AFTER the reviews land, rather than reusing the
+  # review list. Two reasons, both real:
+  #
+  #   - A verdict produced by an EARLIER run would otherwise be orphaned: the
+  #     review pass skips that pull request as already-reviewed, so it never
+  #     reaches the vote job and can never be approved. Turning PR_REVIEW_LIVE
+  #     on would silently do nothing for every pull request already reviewed.
+  #   - A vote job that fails transiently would otherwise lose that pull request
+  #     permanently — the verdict stands, so the next run skips it too.
+  #
+  # Selecting on "has a current verdict" instead makes voting idempotent and
+  # retryable: a missed vote is simply picked up by the next sweep.
+  prepare_vote:
+    needs: [prepare, review]
+    # Runs even in dry run, deliberately. It is a plain `gh` query costing no
+    # agent tokens, and its log is the answer to "which pull requests would be
+    # approved if I turned voting on" — so a dry dispatch previews the live run
+    # instead of the live run being the first exercise of this code.
+    if: always()
+    runs-on: ubuntu-latest
+    outputs:
+      items: ${{ steps.pick.outputs.items }}
+      count: ${{ steps.pick.outputs.count }}
+    steps:
+      - name: Check out the base branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Select pull requests with a current verdict
+        id: pick
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          ONLY_PR: ${{ inputs.pr_number }}
+          MAX_PRS: ${{ inputs.max_prs || '50' }}
+          DISPATCH_DRY_RUN: ${{ inputs.dry_run }}
+          EVENT_NAME: ${{ github.event_name }}
+          REPO_LIVE: ${{ vars.PR_REVIEW_LIVE }}
+          SELECT_MODE: vote
+        run: python3 .github/scripts/pr_review_select.py
+
+  vote:
+    needs: [prepare, prepare_vote]
+    if: >-
+      always()
+      && needs.prepare_vote.result == 'success'
+      && needs.prepare.outputs.live == 'true'
+      && needs.prepare_vote.outputs.count != '0'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        item: ${{ fromJSON(needs.prepare_vote.outputs.items) }}
+    permissions:
+      contents: read
+    steps:
+      - name: Check out the base branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Mint an App token
+        id: app
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
+        with:
+          app-id: ${{ secrets.REVIEW_APP_ID }}
+          private-key: ${{ secrets.REVIEW_APP_PRIVATE_KEY }}
+
+      - name: Validate the verdict and cast the vote
+        env:
+          # The App token, and ONLY here — never in a job the agent runs in.
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ matrix.item.number }}
+          EXPECTED_SHA: ${{ matrix.item.sha }}
+          VOTE_ALLOWED: ${{ matrix.item.vote_allowed }}
+        run: python3 .github/scripts/pr_review_vote.py

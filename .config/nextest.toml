@@ -21,49 +21,61 @@
 # profile's 240s. So: put every timeout carve-out under `[profile.default]`,
 # and do not add a second profile without also adding the `-P` that selects it.
 
-# Issue #818: `tests/e2e_orchestration_remit.rs`'s seven tests need BOTH a
-# concurrency cap (here) and bounds larger than the harness default (30s, in the
-# file itself). Neither alone is enough, which is the whole reason this comment
-# is long — each half looks like the wrong fix when tested without the other.
+# Issue #818: a `[test-groups]` entry `orchestration-remit = { max-threads = 1 }`
+# and a `test(/^orchestration_remit_/)` override used to sit here, serialising
+# `tests/e2e_orchestration_remit.rs`'s seven tests against each other. Both are
+# gone. The defect they contained was fixed in the tests themselves by PR #837,
+# which is the condition the group's own comment set for removing it — "delete
+# this group when that is found, not before".
 #
-# Measured, four ways:
+# This tombstone exists because that comment also named a SUSPECTED CAUSE, and
+# it was wrong. Deleting it silently would leave the wrong lead as the file's
+# last word on a flake that reddened every branch for a week. It read: "the
+# daemon's ListAgents/live-status join never reporting the injected
+# `Compacting` for `pane 1 (agent_id 1)`, identifiers every test in the file
+# reuses" — i.e. concurrent decks leaking into each other through reused
+# identifiers.
 #
-#   bounds  concurrency          result
-#   10s     default parallelism  2 FAIL — remit_001, remit_007
-#   30s     default parallelism  2 FAIL — same two
-#   30s     serial (`-j 1`)      7 PASS — each 2-5s
-#   10s     serial (this group)  1 FAIL — remit_001 alone, needing >10s (took 13.5s)
-#   30s     + this group         7 PASS — 18.7s total
+# Measured on the pre-#837 file, that exact panic reproduces with ONE deck in
+# existence: that single test alone, `-j 1`, under a 64-way CPU load on 16
+# cores — 5 of 8 rounds red. There is no second deck in that run to interfere
+# with, so identifier reuse is not the mechanism. It could not have been: each
+# deck's hook socket is `<per-test tempdir>/hook.sock` and its daemon is
+# addressed only through that same 0700 tempdir (`TuiDeck`,
+# `tests/common/mod.rs`), so `pane 1` is scoped to one deck and an injection
+# into it cannot reach another.
 #
-# Read rows 2 and 4 together before touching either half. Row 2 says raising the
-# bound does not help under parallelism, which looks like "the bound is
-# irrelevant"; row 4 refutes that — serialised, with nothing competing,
-# `remit_001` still blew past 10s. So the bound is NECESSARY BUT NOT SUFFICIENT,
-# and removing either half puts lane 1 back to red.
+# The real cause was event ORDERING inside a single test, which is exactly why
+# serialising the group helped without fixing anything. The fixture appends a
+# delivered pointer to its log BEFORE forking the `python3` that confirms the
+# delivery, and `AppState::apply_event`'s `Thinking` arm sets `session.status`
+# unconditionally, so a confirmation still in flight landed after the test's
+# injected `Compacting` and destroyed the status the test then polled for. Load
+# decided which side won, so a cap that removed load looked like an isolation
+# fix. #837 made each test wait for the confirmation's own APPLIED footprint
+# before injecting anything.
 #
-# This is what turned `e2e-deterministic` red on EVERY branch and on `main` five
-# seconds after #789 merged, after five consecutive green runs.
+# Verified at FULL parallelism with no group — the one configuration #837 could
+# not test, because this group was in force for every run it made:
 #
-# It is CONTAINMENT, not a cure. It does not explain why concurrent decks
-# interfere — both failures land on the same wait, the daemon's
-# ListAgents/live-status join never reporting the injected `Compacting` for
-# `pane 1 (agent_id 1)`, identifiers every test in the file reuses. #818 stays
-# open for the isolation bug; delete this group when that is found, not before.
+#   variant                  concurrency          load        result
+#   pre-#837                 full parallelism     64-way      2 of 6 rounds RED
+#   pre-#837                 solo, `-j 1`         64-way      5 of 8 rounds RED
+#   post-#837                solo, `-j 1`         64-way      8 of 8 green
+#   post-#837                full parallelism     none        2 of 2 green
+#   post-#837                full parallelism     64-way      12 of 12 green
+#   post-#837                full parallelism     96-way      8 of 8 green
 #
-# `max-threads = 1` serialises the group against ITSELF only — the rest of the
-# tier still runs at full parallelism alongside it, so the tier's wall clock is
-# unchanged (it is set by one ~260s test, not by these seven).
+# 22 green module rounds at full parallelism, the loaded 20 of them with the
+# load average climbing to 229 on 16 cores. Unserialised the seven take ~7s
+# together on an idle box and ~14s under the 96-way load, against the 18.7s the
+# group's own comment recorded for them serialised.
 #
-# The filter is a REGEX on the test-function prefix Decision 17 mandates, so a
-# new `orchestration_remit_008` joins the group automatically rather than
-# silently running unconstrained — unlike the `test(exact_name)` carve-outs
-# below, whose own comments warn that a rename makes them match nothing.
-[test-groups]
-orchestration-remit = { max-threads = 1 }
-
-[[profile.default.overrides]]
-filter = 'test(/^orchestration_remit_/)'
-test-group = "orchestration-remit"
+# So: before re-adding a concurrency cap for this file, check whether the
+# barriers in `open_and_confirm_initial_delivery` and `prime_active_tool`
+# (`tests/e2e_orchestration_remit.rs`) are still in place. A cap here masked a
+# test-ordering defect for the length of issue #818, and a green cap is
+# indistinguishable from a fix.
 
 [profile.default]
 retries = 0
@@ -151,14 +163,90 @@ slow-timeout = { period = "60s", terminate-after = 7 }
 # then one per changed variable, which is what pins the two
 # `cargo:rerun-if-env-changed` directives individually — all into its own
 # `target/version-injection-e2e` CARGO_TARGET_DIR. That isolation is required so
-# it cannot clobber the `target/debug` binary the rest of the suite spawns, and
-# it means the FIRST run on a machine pays a cold ~10 min dependency build;
-# later runs are incremental, as are builds 2 and 3 within a run (build-script
-# rerun + relink). The nested builds are `--jobs`-capped so they cannot starve
-# the timed e2e tests running alongside them. Widened here rather than globally,
-# and still bounded so a wedged build cannot run forever.
+# it cannot clobber the `target/debug` binary the rest of the suite spawns. The
+# nested builds are `--jobs`-capped so they cannot starve the timed e2e tests
+# running alongside them.
+#
+# `priority` IS THE FIX FOR ISSUE #928, and what it fixes is not the build's
+# cost — it is WHEN the build starts. nextest schedules in binary-name order,
+# and `dot-agent-deck::e2e_version_injection` sits about 70% of the way down
+# that queue (`dot-agent-deck` unit tests, then the `e2e_*` binaries in
+# alphabetical order, then `harness_unit`, `render_*`, `xtask-linkage-check`),
+# so this test was STARTED late and, being the longest, finished last.
+#
+# Measured across 13 `e2e-deterministic` runs on GitHub `ubuntu-latest`
+# (2026-09-06 to 2026-09-09), reading each run's own log:
+#
+#   * it was the last of the ~2,680 tests to complete in 13 of 13 runs;
+#   * nextest started it at t = 148.6-156.9s every time, mean 152.0s. The
+#     offset is that stable, on runners whose speed varies 4x, most likely
+#     because the queue ahead of it is largely PTY tests whose wall clock is
+#     set by their own waits rather than by the runner — that part is an
+#     explanation, not a measurement;
+#   * every OTHER test in the tier had finished by t = 198-292s;
+#   * so the tier's wall clock was exactly `that offset + this test's
+#     duration`: 220.6, 257.9, 270.8, 285.8, 318.8, 336.7, 439.6, 440.9,
+#     441.2, 444.5, 448.3, 449.9 and 454.9 seconds.
+#
+# Scheduled at the FRONT of the queue instead, the tier's wall clock becomes
+# `max(this test, everything else)` rather than `queue depth ahead of it + this
+# test`. On the seven runs above 439s that is ~150s off a ~445s tier.
+#
+# It is NOT free on every run, and the fastest run is where that shows: this
+# test took 71.9s there and the rest of the tier finished at 198.1s, so the
+# ceiling on the gain is 220.6s -> 198.1s, and the rest of the tier now shares
+# the machine with the compile for its whole length instead of roughly half of
+# it. A tier that slowed by more than 11% under that would come out behind. The
+# `--jobs` cap below is what bounds it, and the trade is deliberate: the
+# seven 440s runs are the ones worth fixing.
+#
+# VERIFIED, not assumed. `--test-threads 1` makes completion order equal
+# schedule order, so `cargo test-e2e --test-threads 1 -E
+# 'binary(e2e_version_injection) or binary(e2e_handshake)'` answers it directly
+# — `e2e_handshake` sorts earlier by binary name, so it goes first if and only
+# if this key is not doing anything. With the line below it printed
+# `version_001 ... (1/8)` and the seven handshake tests after it; with the line
+# commented out, the handshake tests took 1/8 through 7/8 and this one came
+# last. nextest also only WARNS on an unrecognised key (`ignoring unknown
+# configuration key: profile.default.overrides.N.<key>`) and carries on, so
+# read that line's absence as the second half of the confirmation.
+#
+# WHY 25 AND NOT 100. `dispatch_015` below carries `priority = 50` together
+# with `threads-required = "num-test-threads"`, and its comment explains why:
+# an exclusive test reached mid-run makes nextest DRAIN every running test
+# before it can take the pool, so it is deliberately scheduled first and its
+# reservation then costs only its own runtime. Ordering THIS test above it
+# would make that drain wait out a multi-minute compile — the exact cost that
+# comment exists to avoid. 25 keeps this one second, and in lane 1, where
+# `dispatch_015` is `e2e-live`-gated and not compiled at all, second is first.
+#
+# THE COST, PLAINLY: the nested compile now overlaps the WHOLE tier instead of
+# only its tail. On the run measured in most detail (34304601686) it overlapped
+# for 113s of its 288s and then ran alone on an otherwise idle runner for 175s
+# — which is also why issue #928 called the `--jobs` cap "protecting nothing".
+# From here the cap is what it was written to be: the bound on a nested compile
+# that really does run beside the timed PTY tests. It is unchanged at half the
+# machine's cores; the tests already known to be contention-sensitive keep
+# their own carve-outs above.
+#
+# `slow-timeout` is REVISITED AND KEPT at 120s x 10, which is what issue #928
+# asked for rather than what it guessed. The cold case has NOT gone away — a
+# runner whose cache did not restore (4 of the 16 runs whose cache status was
+# checked reported "No cache found") or a fresh worktree still pays the full
+# dependency build — and the observed spread across those 13 runs is 71.9s to
+# 305.4s, a 4.2x range on nominally identical hardware, with two further runs,
+# both with no restored cache, at 351.1s and 369.9s. Measured locally the same
+# work swings 6x on one machine purely with how busy it is (65.0s quiet against
+# 400.9s with three other agents building); the table is in the test file.
+# Scheduling the test first also means it now runs contended for its whole
+# duration rather than mostly alone, which can only widen that spread upward.
+# Being killed here costs the test's own assertion message, the only thing that
+# separates "the injection never reached the binary" from "the build did not
+# finish" (same reasoning as the overrides above). Widened here rather than
+# globally, and still bounded so a wedged build cannot run forever.
 [[profile.default.overrides]]
 filter = 'test(version_001_injected_build_env_reaches_the_binary)'
+priority = 25
 slow-timeout = { period = "120s", terminate-after = 10 }
 
 # `devin/live/001` boots a THIRD-PARTY interactive TUI (the Devin CLI) inside a

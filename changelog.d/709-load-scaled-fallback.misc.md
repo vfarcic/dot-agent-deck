@@ -1,0 +1,11 @@
+## An unmeasurable machine load no longer multiplies every test wait by six
+
+`common::load_scaled` widens a test's wait ceiling in proportion to how contended the machine is (issue #709). It read that contention from `machine_load_per_cpu`, which is Linux-only by construction — `/proc/loadavg` has no cheap equivalent elsewhere — and then substituted the **maximum** 6x factor whenever no measurement came back.
+
+So every `load_scaled` wait on macOS and Windows was multiplied by six unconditionally, idle machine or not, because "no measurement" is precisely the permanent state of those platforms. That is the largest possible error rather than a safe default: the true factor on an idle box is exactly 1.0. `build-macos` runs `cargo nextest run --workspace`, so it was being paid on every macOS CI run — a genuine fast-tier failure took 48s instead of 8s to report — and it made the accompanying code comments false, since they described an idle machine as still failing at the base ceiling.
+
+An unmeasurable load now yields **1.0**, leaving the base untouched; a non-finite reading is treated the same way, so the factor is total and cannot hand `Duration::mul_f64` a `NaN` to panic on. The widening for *genuinely measured* contention is unchanged — #709's measured failure (load average 44 on 16 cores) still scales by 2.75, and a runaway average still clamps at 6.0.
+
+Reverting the fallback cannot regress macOS relative to its own history. The waits #709 converted were flat, unscaled ceilings before it, on every platform including macOS, and every base is at least as generous as the number it replaced: the child-boot base is 8s against the 2s and 5s deadlines it took over, and the one sub-second base is unchanged from the value inlined before it. So an unscaled macOS run is the pre-#709 configuration or better, and that configuration was green. The 6x was never measured to be needed off Linux — #709's starvation was measured on a 16-core Linux box, where the measurement works and the scaling still applies.
+
+The factor is now a separate pure function so the non-Linux branch is testable **on** Linux, where `machine_load_per_cpu` never returns `None` and the case is otherwise unreachable — which is how this sat unnoticed. Three harness unit tests cover it, and they were confirmed to fail against the previous behaviour before being kept.

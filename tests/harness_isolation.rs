@@ -213,8 +213,10 @@ fn a_discard_that_cannot_delete_a_stale_artifact_fails_the_run() {
 ///
 /// A source guard rather than an observation, because observing it needs a real
 /// PTY launch and this file is in the fast tier — the launch path itself is
-/// exercised by the 57 of the 71 `tests/e2e_*.rs` files that build a `TuiDeck`
-/// (the other 14 drive a headless or in-process daemon and never launch one).
+/// exercised by every `tests/e2e_*.rs` file that launches a `TuiDeck`, which is
+/// most of the tier; the rest drive a headless or in-process daemon and never
+/// launch one. No counts here on purpose — the sentence this replaced named a
+/// split, and both of its numbers had rotted as e2e files were added.
 #[test]
 fn tui_deck_launch_discards_the_previous_recording_before_it_spawns() {
     let source = harness_source();

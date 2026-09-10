@@ -683,6 +683,44 @@
         }
       }
     },
+    "mold@2.42.0": {
+      "last_modified": "2026-08-27T07:16:00Z",
+      "resolved": "github:NixOS/nixpkgs/c27cdad491a991b11ed731760aa2ef8db0cb0410#mold",
+      "source": "devbox-search",
+      "version": "2.42.0",
+      "systems": {
+        "aarch64-darwin": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/jif2jvan5dabvi914s9i86fv9i1gc85r-mold-unwrapped-wrapper-2.42.0",
+              "default": true
+            }
+          ],
+          "store_path": "/nix/store/jif2jvan5dabvi914s9i86fv9i1gc85r-mold-unwrapped-wrapper-2.42.0"
+        },
+        "aarch64-linux": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/qf1sxzj70rzw36xm1f1ydhssmpp573k2-mold-unwrapped-wrapper-2.42.0",
+              "default": true
+            }
+          ],
+          "store_path": "/nix/store/qf1sxzj70rzw36xm1f1ydhssmpp573k2-mold-unwrapped-wrapper-2.42.0"
+        },
+        "x86_64-linux": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/4qlkb64qf364lsygwadiiyjjbc0hcq6i-mold-unwrapped-wrapper-2.42.0",
+              "default": true
+            }
+          ],
+          "store_path": "/nix/store/4qlkb64qf364lsygwadiiyjjbc0hcq6i-mold-unwrapped-wrapper-2.42.0"
+        }
+      }
+    },
     "nodejs@24.12.0": {
       "last_modified": "2025-12-27T12:56:01Z",
       "plugin_version": "0.0.4",

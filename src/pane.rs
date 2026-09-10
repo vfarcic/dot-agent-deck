@@ -542,6 +542,36 @@ mod tests {
     }
 
     #[test]
+    fn rename_outcome_applied_rejects_bidi_override() {
+        // Issue #833. This is the half the control-byte test above cannot
+        // reach: `U+202E` is general category `Cf`, not `Cc`, and encodes as
+        // three UTF-8 bytes each above 0x20, so the gate's byte test saw
+        // nothing wrong with it and the dispatch loop mirrored the name
+        // straight into `ui.display_names` — the map `render_card_grid`
+        // PREFERS over the session's own name. On the card it reverses the
+        // text that follows it.
+        assert_eq!(
+            RenameOutcome::applied("worker\u{202e}reganam"),
+            RenameOutcome::Rejected
+        );
+        // Swept rather than spot-checked: one live override is all a spoof
+        // needs, so a range typo in `is_bidi_format_char` must not leave one
+        // reachable through a rename.
+        for c in ['\u{202a}', '\u{202b}', '\u{202c}', '\u{202d}', '\u{202e}']
+            .into_iter()
+            .chain(['\u{2066}', '\u{2067}', '\u{2068}', '\u{2069}'])
+            .chain(['\u{200e}', '\u{200f}', '\u{061c}'])
+        {
+            assert_eq!(
+                RenameOutcome::applied(format!("safe{c}name")),
+                RenameOutcome::Rejected,
+                "U+{:04X} must be refused by the rename gate",
+                c as u32
+            );
+        }
+    }
+
+    #[test]
     fn rename_outcome_applied_treats_empty_as_cleared() {
         assert_eq!(RenameOutcome::applied(""), RenameOutcome::Cleared);
     }
@@ -567,11 +597,13 @@ mod tests {
 
     #[test]
     fn rename_outcome_applied_accepts_unicode_label() {
-        // `is_valid_display_name` allows bytes ≥ 0x20 (control bytes
-        // and DEL are the only thing filtered), so legitimate UTF-8
-        // labels — kanji, emoji, accented Latin — must round-trip as
-        // Applied with the trimmed bytes preserved. Pads with
-        // surrounding whitespace to exercise the trim step too.
+        // `is_valid_display_name` filters control bytes, DEL and (issue
+        // #833) the bidi formatting codepoints, and nothing else — so
+        // legitimate UTF-8 labels — kanji, Cyrillic, accented Latin — must
+        // round-trip as Applied with the trimmed bytes preserved. This is the
+        // control for the two rejection tests above: without it they would
+        // also pass with the gate refusing everything. Pads with surrounding
+        // whitespace to exercise the trim step too.
         assert_eq!(
             RenameOutcome::applied("  café-агент-日本語  "),
             RenameOutcome::Applied("café-агент-日本語".to_string())

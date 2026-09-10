@@ -82,3 +82,4 @@ State these explicitly in the report rather than letting them read as verified:
 - **Real-agent coverage that skipped** — see `e2e-skips.txt`. Skipped real-agent tests count as PASSED.
 - **The rule 12 manual cross-version test**, unless you actually ran it.
 - **Flake vs defect** — a single e2e failure is not a verdict until it has been rerun in isolation (rule 6).
+- **No red test is left merely tracked** (#908) — the lane must be green before the PR is done: each failure is either fixed in the PR or quarantined with a named owner and an expiry issue.
