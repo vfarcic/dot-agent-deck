@@ -760,7 +760,7 @@ jobs:
       # inputs that would pin the payload too; deliberately NOT set here, because
       # the right value needs its own upstream verification and a measured run,
       # which is a separate change from making these two refs immutable.
-      - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
+      - uses: DeterminateSystems/nix-installer-action@3138316df39ed29be04236d7ffc686fa525866aa # v23
         with:
           # `determinate` defaults to TRUE, which installs Determinate Nix (a
           # downstream distribution) and runs its FlakeHub login on every job.
