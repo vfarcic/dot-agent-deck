@@ -1,0 +1,20 @@
+# Fixture for the L2 `pane spawn` live-TUI tests (issue #868:
+# tests/e2e_pane_spawn_live.rs). Defines a single orchestration with TWO
+# roles — the tab opens with `orchestrator` + `coder` — and the test itself
+# rewrites this file mid-session to add a THIRD role, `reviewer`, that was
+# never part of the config the tab was opened from, then spawns it into the
+# already-running orchestration via the real `dot-agent-deck pane spawn`
+# CLI. Each role runs `cat`, which stays alive on stdin so the role panes
+# remain open (and rendered as deck cards) for the whole test. No real LLM
+# tokens spent.
+[[orchestrations]]
+name = "spawn-orch"
+
+[[orchestrations.roles]]
+name = "orchestrator"
+command = "cat"
+start = true
+
+[[orchestrations.roles]]
+name = "coder"
+command = "cat"

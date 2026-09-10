@@ -683,6 +683,7 @@ mod tests {
                 last_activity_ms: None,
             }),
             spawned_at_ms: None,
+            crashed: None,
         }
     }
 

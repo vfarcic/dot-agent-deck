@@ -199,6 +199,12 @@ enum Commands {
         #[command(subcommand)]
         cmd: OrchestratorCmd,
     },
+    /// Manage the calling pane's own worker panes within its orchestration
+    /// (issue #868).
+    Pane {
+        #[command(subcommand)]
+        cmd: PaneCmd,
+    },
     /// Daemon-side subcommands. Used internally by remote transports — not
     /// part of the everyday user surface.
     Daemon {
@@ -360,6 +366,27 @@ enum OrchestratorCmd {
     /// extension in Pi's global extension dir. Idempotent (re-run to refresh a
     /// stale copy). Exits non-zero with the install hint when `pi` is absent.
     Setup,
+}
+
+#[derive(Subcommand)]
+enum PaneCmd {
+    /// Restart a worker role's pane within the calling orchestrator's own
+    /// orchestration (issue #868). Recovery for a role marked `crashed`;
+    /// refused for a healthy role unless `--force` is given.
+    Restart {
+        /// Worker role name to restart (as declared in .dot-agent-deck.toml).
+        role: String,
+        /// Restart even when the target pane's current agent hasn't
+        /// crashed. Without this, restarting a healthy pane is refused.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Spawn a worker role that is declared in .dot-agent-deck.toml but was
+    /// never spawned into this running orchestration instance (issue #868).
+    Spawn {
+        /// Worker role name to spawn (as declared in .dot-agent-deck.toml).
+        role: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1204,6 +1231,123 @@ fn main() -> ExitCode {
                             }
                         }
                     }
+                }
+            }
+        },
+        Some(Commands::Pane { cmd }) => match cmd {
+            PaneCmd::Restart { role, force } => {
+                let pane_id = match std::env::var(DOT_AGENT_DECK_PANE_ID) {
+                    Ok(id) => id,
+                    Err(_) => {
+                        eprintln!(
+                            "Error: DOT_AGENT_DECK_PANE_ID environment variable not set.\nThis command should be run from within a dot-agent-deck managed pane."
+                        );
+                        return ExitCode::FAILURE;
+                    }
+                };
+                let signal = dot_agent_deck::event::RestartRoleSignal {
+                    pane_id,
+                    role: role.clone(),
+                    force,
+                    timestamp: chrono::Utc::now(),
+                };
+                let msg = dot_agent_deck::event::DaemonMessage::RestartRole(signal);
+                let json = match serde_json::to_string(&msg) {
+                    Ok(j) => j,
+                    Err(e) => {
+                        eprintln!("Failed to serialize restart-role signal: {e}");
+                        return ExitCode::FAILURE;
+                    }
+                };
+                use dot_agent_deck::hook::SocketReply;
+                // Issue #868: `pane restart`'s own, larger reply budget —
+                // see `RESTART_ROLE_REPLY_TIMEOUT`'s doc for why `delegate`'s
+                // 5s is too small for a respawn's worst case.
+                let line = match dot_agent_deck::hook::send_and_await_restart_role_reply(&json) {
+                    SocketReply::Unreachable => {
+                        eprintln!(
+                            "Error: could not reach the dot-agent-deck daemon socket, so the \
+                             restart of role {role} was NOT delivered."
+                        );
+                        return ExitCode::FAILURE;
+                    }
+                    // Same reasoning as `delegate`'s `NoReply`: a daemon that
+                    // doesn't know this verb yet (older build) must not read
+                    // as a proven failure.
+                    SocketReply::NoReply => return ExitCode::SUCCESS,
+                    SocketReply::Line(line) => line,
+                };
+                let resp =
+                    serde_json::from_str::<dot_agent_deck::event::RestartRoleResponse>(&line)
+                        .ok()
+                        .filter(|r| r.is_restart_role_reply());
+                let Some(resp) = resp else {
+                    return ExitCode::SUCCESS;
+                };
+                if resp.restarted {
+                    println!("Restarted role {role}");
+                    ExitCode::SUCCESS
+                } else {
+                    eprintln!(
+                        "Error: restart of role {role} failed: {}",
+                        resp.error.as_deref().unwrap_or("unknown error")
+                    );
+                    ExitCode::FAILURE
+                }
+            }
+            PaneCmd::Spawn { role } => {
+                let pane_id = match std::env::var(DOT_AGENT_DECK_PANE_ID) {
+                    Ok(id) => id,
+                    Err(_) => {
+                        eprintln!(
+                            "Error: DOT_AGENT_DECK_PANE_ID environment variable not set.\nThis command should be run from within a dot-agent-deck managed pane."
+                        );
+                        return ExitCode::FAILURE;
+                    }
+                };
+                let signal = dot_agent_deck::event::SpawnRoleSignal {
+                    pane_id,
+                    role: role.clone(),
+                    timestamp: chrono::Utc::now(),
+                };
+                let msg = dot_agent_deck::event::DaemonMessage::SpawnRole(signal);
+                let json = match serde_json::to_string(&msg) {
+                    Ok(j) => j,
+                    Err(e) => {
+                        eprintln!("Failed to serialize spawn-role signal: {e}");
+                        return ExitCode::FAILURE;
+                    }
+                };
+                use dot_agent_deck::hook::SocketReply;
+                let line = match dot_agent_deck::hook::send_and_await_reply(&json) {
+                    SocketReply::Unreachable => {
+                        eprintln!(
+                            "Error: could not reach the dot-agent-deck daemon socket, so the \
+                             spawn of role {role} was NOT delivered."
+                        );
+                        return ExitCode::FAILURE;
+                    }
+                    // Same reasoning as `delegate`'s `NoReply`: a daemon that
+                    // doesn't know this verb yet (older build) must not read
+                    // as a proven failure.
+                    SocketReply::NoReply => return ExitCode::SUCCESS,
+                    SocketReply::Line(line) => line,
+                };
+                let resp = serde_json::from_str::<dot_agent_deck::event::SpawnRoleResponse>(&line)
+                    .ok()
+                    .filter(|r| r.is_spawn_role_reply());
+                let Some(resp) = resp else {
+                    return ExitCode::SUCCESS;
+                };
+                if resp.spawned {
+                    println!("Spawned role {role}");
+                    ExitCode::SUCCESS
+                } else {
+                    eprintln!(
+                        "Error: spawn of role {role} failed: {}",
+                        resp.error.as_deref().unwrap_or("unknown error")
+                    );
+                    ExitCode::FAILURE
                 }
             }
         },

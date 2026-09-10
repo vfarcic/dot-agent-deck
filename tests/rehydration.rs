@@ -1633,6 +1633,7 @@ async fn route_002_reattach_rebuilds_two_same_cwd_orchestration_tabs_inner() {
                 &bucket.cwd,
                 role_pane_ids,
                 bucket.display_title.as_deref(),
+                bucket.orchestration_id.as_deref(),
             )
             .expect("rebuilding an orchestration tab from its bucket should succeed");
     }
@@ -2547,6 +2548,7 @@ async fn run_hostile_live_list_server(listener: UnixListener) {
                         last_activity_ms: None,
                     }),
                     spawned_at_ms: None,
+                    crashed: None,
                 };
                 let resp = AttachResponse {
                     ok: true,

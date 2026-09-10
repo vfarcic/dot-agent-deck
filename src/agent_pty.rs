@@ -692,6 +692,19 @@ pub fn validate_orchestration_surface(
     if !is_valid_orchestration_cwd(&surface.cwd) {
         return None;
     }
+    // Issue #868: `orchestration_id` has the identical
+    // routing-key semantics `validate_tab_membership` already guards for its
+    // own `orchestration_id` field (PRD #140 M1.1) — it decides which tab a
+    // role pane joins, feeds `TabManager::orchestration_tab_index_for`, and is
+    // logged. Same treatment: reject the whole surface rather than null it
+    // out, since nulling would merge two same-`(name, cwd)` instances back
+    // into one routing group and reintroduce the cross-delivery this PRD
+    // fixes.
+    if let Some(id) = surface.orchestration_id.as_deref()
+        && !is_valid_display_name(id)
+    {
+        return None;
+    }
     // Cosmetic title with a defined `None` fallback: null it out on a bad value
     // rather than dropping the orchestration tab over a bad label string.
     if surface
@@ -1454,6 +1467,12 @@ fn pump_reader(
     if let Some(registry) = registry.upgrade() {
         registry.signal_agent_exit(&agent_id);
     }
+    // Issue #868: must run regardless of whether `pane_id_env` is set — a
+    // dashboard pane crashes just as much as an orchestration one, and the
+    // block below (release/sweep/notify) only fires when a pane id exists.
+    if let Some(registry) = registry.upgrade() {
+        registry.mark_agent_crashed(&agent_id);
+    }
     if let Some(pane_id) = pane_id_env.as_deref()
         && let Some(registry) = registry.upgrade()
         && registry.is_agent_still_registered(&agent_id)
@@ -1981,6 +2000,14 @@ pub struct RunningAgent {
     /// lifetime. No "which duration is this?" flag is needed, because the two
     /// answers come from two different records.
     pub spawned_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Issue #868: set to `Some(true)` when `pump_reader`'s EOF branch
+    /// observes this agent's child exiting NATURALLY (the registry entry was
+    /// still present at that moment — nothing had removed it in anticipation,
+    /// as `close_agent`/`respawn_agent_for_pane` both do before their own
+    /// kill). `None` for a still-running agent, and irrelevant for a
+    /// deliberately-closed/respawned one since its whole entry is removed
+    /// before this could ever be set.
+    pub crashed: Option<bool>,
 }
 
 impl RunningAgent {
@@ -2200,6 +2227,18 @@ pub struct AgentRecord {
     /// basis `live` and `last_activity_ms` were added on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spawned_at_ms: Option<i64>,
+    /// Issue #868: `Some(true)` when the agent's process exited on its own
+    /// rather than via a deliberate `close_agent`/`respawn_agent_for_pane`
+    /// teardown. The name says "crashed", but the flag fires on ANY natural
+    /// process exit — including a clean `exit 0` — not only a genuine crash;
+    /// `pane restart <role>` without `--force` therefore succeeds equally
+    /// against a role whose command simply finished. `None` for a running
+    /// agent, an older daemon that predates this field, or (moot, since the
+    /// whole entry is removed) a deliberately-closed one. `skip_serializing_if`
+    /// keeps the wire shape backwards-compatible, matching every other
+    /// optional field on this struct.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub crashed: Option<bool>,
 }
 
 /// Skip-predicate for `AgentRecord::rows` / `AgentRecord::cols`
@@ -3181,7 +3220,11 @@ pub struct PaneRespawn {
 /// puts us back at issue #606, where the pane is re-created while its
 /// predecessor's cleanup is still running and the cleanup then deletes the
 /// newcomer's state.
-const PANE_CLOSE_SETTLE_TIMEOUT: Duration = Duration::from_secs(6);
+// Issue #868: `pub(crate)` rather than private — `hook.rs`'s
+// `RESTART_ROLE_REPLY_TIMEOUT` sizes `pane restart`'s CLI round-trip budget
+// off this same constant (plus `AGENT_TERMINATE_GRACE`), rather than
+// hardcoding a second copy of the respawn's worst-case duration.
+pub(crate) const PANE_CLOSE_SETTLE_TIMEOUT: Duration = Duration::from_secs(6);
 
 /// Poll cadence for [`PANE_CLOSE_SETTLE_TIMEOUT`]. Matches the 50 ms cadence
 /// `terminate_child_with_grace_and_wait` polls `try_wait` at, so the wait
@@ -4320,6 +4363,23 @@ impl AgentPtyRegistry {
         self.inner.lock().unwrap().agents.contains_key(agent_id)
     }
 
+    /// Marks `agent_id`'s entry as crashed if it is still registered — a
+    /// no-op if the entry has already been removed (a deliberate
+    /// `close_agent`/`respawn_agent_for_pane` teardown, which removes the
+    /// entry before its own kill completes, same as
+    /// `is_agent_still_registered`'s own doc explains). Folds the
+    /// check-and-set into a single lock acquisition so there is no
+    /// TOCTOU gap between "is this still a natural exit" and "mark it" —
+    /// deliberately NOT implemented as a separate `is_agent_still_registered`
+    /// call followed by a second locked mutation, which would reopen exactly
+    /// the race this method exists to avoid.
+    fn mark_agent_crashed(&self, agent_id: &str) {
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(agent) = inner.agents.get_mut(agent_id) {
+            agent.crashed = Some(true);
+        }
+    }
+
     /// Deliver the "worker exited without work-done" notice for
     /// one [`OutstandingDelegation`] [`Self::sweep_delegations_on_exit`] just
     /// swept off `worker_pane_id`. Follows exactly the guarded-write path PRD
@@ -5354,6 +5414,8 @@ impl AgentPtyRegistry {
             // PRD #745 M11: the ONLY site that records a spawn instant, because
             // it is the only site that performs a spawn.
             spawned_at: Some(spawned_at),
+            // Issue #868: a fresh spawn hasn't exited yet, natural or not.
+            crashed: None,
         };
 
         // Use the id we pre-allocated above (before spawn) and injected
@@ -5560,6 +5622,29 @@ impl AgentPtyRegistry {
             .find(|(_, a)| {
                 a.pane_id_env.as_deref() == Some(pane_id) && !a.exited.load(Ordering::SeqCst)
             })
+            .map(|(id, _)| id.clone())
+    }
+
+    /// Issue #868: the agent id currently registered for `pane_id_env`,
+    /// INCLUDING one whose child has already exited — unlike
+    /// [`Self::pane_current_agent_id`], which filters those out and so
+    /// answers `None` for exactly the pane `pane restart`/`pane spawn` most
+    /// need to inspect: one whose current agent has already crashed. Mirrors
+    /// [`Self::respawn_agent_for_pane_declared`]'s own no-exited-filter
+    /// lookup by `pane_id_env`, exposed here as a small read-only helper
+    /// rather than duplicating the scan inline at each call site.
+    ///
+    /// Excludes [`RunningAgent::pane_handed_over`] entries: a pane can carry
+    /// more than one registry entry (a retired/crashed generation plus a live
+    /// handover successor — issue #454), and without this filter the lookup
+    /// could non-deterministically return the retired one instead of the
+    /// pane's actual current occupant.
+    pub fn agent_id_for_pane_any(&self, pane_id_env: &str) -> Option<String> {
+        let inner = self.inner.lock().unwrap();
+        inner
+            .agents
+            .iter()
+            .find(|(_, a)| a.pane_id_env.as_deref() == Some(pane_id_env) && !a.pane_handed_over)
             .map(|(id, _)| id.clone())
     }
 
@@ -6250,6 +6335,10 @@ impl AgentPtyRegistry {
             // is what makes a restarted worker report its CURRENT iteration
             // while an unrestarted role reports its whole lifetime.
             spawned_at: _,
+            // Issue #868: deliberately dropped, not carried over — the fresh
+            // child hasn't crashed, and `spawn_agent` initializes its own
+            // entry to `None` regardless.
+            crashed: _,
         } = removed;
 
         // Drop this reference to the writer Arc; the slave half closes
@@ -6765,6 +6854,7 @@ impl AgentPtyRegistry {
             live: None,
             // PRD #745 M11: absent unless THIS registry forked the child.
             spawned_at_ms: agent.spawned_at.map(|at| at.timestamp_millis()),
+            crashed: agent.crashed,
         })
     }
 
@@ -7061,6 +7151,7 @@ impl AgentPtyRegistry {
                 // filter above is what keeps a spawn instant from outliving the
                 // process it describes and ticking up as a phantom uptime.
                 spawned_at_ms: agent.spawned_at.map(|at| at.timestamp_millis()),
+                crashed: agent.crashed,
             })
             .collect();
         records.sort_by_key(|r| r.id.parse::<u64>().unwrap_or(0));
@@ -7334,6 +7425,8 @@ impl AgentPtyRegistry {
                 // `Utc::now()` that would make the synthetic agent look like it
                 // had just been started by us.
                 spawned_at: None,
+                // Issue #868: synthetic test agent hasn't exited.
+                crashed: None,
             },
         );
         id
@@ -8437,6 +8530,7 @@ mod spawn_tests {
             name: "issue-work".into(),
             cwd: "/work/github-issues/.worktrees/issue-1".into(),
             display_title: None,
+            orchestration_id: None,
             roles: vec![surface_role(0, "orchestrator"), surface_role(1, "worker")],
         }
     }
@@ -8486,6 +8580,7 @@ mod spawn_tests {
             name: "issue-work".into(),
             cwd: "/work/issue-1".into(),
             display_title: None,
+            orchestration_id: None,
             roles: vec![surface_role(ORCHESTRATION_ROLE_INDEX_MAX + 1, "rogue")],
         };
         assert!(validate_orchestration_surface(surface).is_none());
@@ -8563,10 +8658,22 @@ mod spawn_tests {
             name: "issue-work".into(),
             cwd: "/work/issue-1".into(),
             display_title: None,
+            orchestration_id: None,
             roles: vec![surface_role(0, "")],
         };
         let validated = validate_orchestration_surface(surface).expect("empty role_name accepted");
         assert_eq!(validated.roles.len(), 1);
+    }
+
+    // Issue #868: orchestration_id is a routing key with
+    // the same semantics as validate_tab_membership's own field of the same
+    // name — a control-byte value rejects the whole surface, mirroring
+    // validate_orchestration_surface_rejects_name_with_ansi_escape above.
+    #[test]
+    fn validate_orchestration_surface_rejects_orchestration_id_with_ansi_escape() {
+        let mut surface = well_formed_surface();
+        surface.orchestration_id = Some("\x1b[31mpwn".into());
+        assert!(validate_orchestration_surface(surface).is_none());
     }
 
     // M1: display_title is cosmetic with a defined `None` fallback (→ name), so
@@ -8925,6 +9032,55 @@ mod spawn_tests {
             })
             .expect("reuse of an exited agent's pane_id_env must succeed");
         assert_ne!(id1, id2);
+
+        registry.shutdown_all();
+    }
+
+    /// Scenario: spawns a naturally-exiting agent and a deliberately-closed
+    /// one, then asserts the surviving record for the natural exit carries
+    /// `crashed == Some(true)` while the deliberately-closed agent's record
+    /// is gone entirely (removed by `close_agent` before `pump_reader`'s EOF
+    /// could observe it, so there's nothing left to mark).
+    #[tokio::test]
+    async fn pump_reader_marks_natural_exit_as_crashed_but_not_deliberate_close() {
+        let registry = Arc::new(AgentPtyRegistry::new());
+
+        let natural_id = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("/usr/bin/true"),
+                ..SpawnOptions::default()
+            })
+            .expect("spawn a naturally-exiting agent");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while tokio::time::Instant::now() < deadline && registry.live_count() > 0 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            registry.live_count(),
+            0,
+            "test prerequisite: /usr/bin/true must have exited"
+        );
+        let natural_record = registry
+            .agent_record_any(&natural_id)
+            .expect("a natural exit must leave a queryable record behind");
+        assert_eq!(
+            natural_record.crashed,
+            Some(true),
+            "pump_reader's EOF branch must mark a natural exit as crashed"
+        );
+
+        let closing_id = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/sh"),
+                ..SpawnOptions::default()
+            })
+            .expect("spawn an agent to close deliberately");
+        registry.close_agent(&closing_id).expect("deliberate close");
+        assert!(
+            registry.agent_record_any(&closing_id).is_none(),
+            "close_agent removes the entry before its kill completes — the natural-exit EOF \
+             that follows must find nothing registered and must not fabricate a crashed record"
+        );
 
         registry.shutdown_all();
     }
@@ -10704,6 +10860,7 @@ mod spawn_tests {
             cols: 40,
             live: None,
             spawned_at_ms: None,
+            crashed: None,
         };
         let json = serde_json::to_string(&rec).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -10966,6 +11123,7 @@ mod spawn_tests {
             cols: 0,
             live: None,
             spawned_at_ms: None,
+            crashed: None,
         };
         let json = serde_json::to_string(&rec).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();

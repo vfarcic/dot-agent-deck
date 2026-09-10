@@ -583,6 +583,29 @@ pub fn send_and_await_reply(json: &str) -> SocketReply {
     request_from_socket_inner(json, Some(DELEGATE_REPLY_TIMEOUT))
 }
 
+/// Issue #868: `pane restart`'s own CLI round-trip budget —
+/// [`DELEGATE_REPLY_TIMEOUT`] (5s) is smaller than the respawn's own worst
+/// case inside the daemon (`AGENT_TERMINATE_GRACE` + `PANE_CLOSE_SETTLE_TIMEOUT`
+/// = up to 9s), and a timeout here silently maps to `ExitCode::SUCCESS` with
+/// no output ([`SocketReply::NoReply`]'s documented "must stay a success"
+/// contract) — so a `--force` restart of an agent that ignores SIGTERM, or
+/// any recreate-leg restart, would print nothing and exit 0 while the
+/// outcome was genuinely unknown. Comfortably above the daemon-side worst
+/// case (a few seconds of margin for the round trip itself, connect, and
+/// scheduling jitter) rather than exactly matching it.
+pub const RESTART_ROLE_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
+    crate::agent_pty::AGENT_TERMINATE_GRACE.as_secs()
+        + crate::agent_pty::PANE_CLOSE_SETTLE_TIMEOUT.as_secs()
+        + 5,
+);
+
+/// [`send_and_await_reply`], but bounded by [`RESTART_ROLE_REPLY_TIMEOUT`]
+/// instead of [`DELEGATE_REPLY_TIMEOUT`] — see that constant's doc for why
+/// `pane restart` needs a larger budget than `delegate`'s.
+pub fn send_and_await_restart_role_reply(json: &str) -> SocketReply {
+    request_from_socket_inner(json, Some(RESTART_ROLE_REPLY_TIMEOUT))
+}
+
 pub fn send_to_socket(json: &str) -> Option<()> {
     send_to_socket_at(&socket_path(), json)
 }

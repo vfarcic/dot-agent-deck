@@ -817,7 +817,14 @@ pub async fn spawn(
             // role's PTY and builds the tab mid-session. Best-effort: `send`
             // errs only when no TUI is attached (the standalone-daemon case).
             if let Some(tx) = event_tx {
-                surface_spawned_orchestration(tx, &name, &req.working_dir, &roles, &agents);
+                surface_spawned_orchestration(
+                    tx,
+                    &name,
+                    &req.working_dir,
+                    &roles,
+                    &agents,
+                    &orchestration_id,
+                );
                 // …and give every role card its ROLE NAME, the same way the
                 // single-agent branch names its card: a synthetic `SessionStart`
                 // carrying the friendly name as metadata.
@@ -1064,7 +1071,7 @@ fn spawn_one(
 /// [`crate::platform::shell::fixed_command_shell`] — still `/bin/sh` on Unix,
 /// but `%COMSPEC%` on Windows, where pinning a POSIX path would hand
 /// `agent_pty::spawn` a shell that does not exist.
-fn pane_env(pane_id: &str, pin_sh: bool) -> Vec<(String, String)> {
+pub(crate) fn pane_env(pane_id: &str, pin_sh: bool) -> Vec<(String, String)> {
     let mut env = vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane_id.to_string())];
     if pin_sh {
         env.push((
@@ -2424,6 +2431,7 @@ fn surface_spawned_orchestration(
     cwd: &str,
     roles: &[RoleSpawn],
     agents: &[SpawnedAgent],
+    orchestration_id: &str,
 ) {
     let surface_roles = roles
         .iter()
@@ -2454,6 +2462,7 @@ fn surface_spawned_orchestration(
         name: name.to_string(),
         cwd: cwd.to_string(),
         display_title,
+        orchestration_id: Some(orchestration_id.to_string()),
         roles: surface_roles,
     };
     let _ = event_tx.send(BroadcastMsg::OrchestrationSurface(surface));
@@ -2479,7 +2488,7 @@ fn surface_spawned_orchestration(
 /// that gets truncated — never the suffix. Two long task names sharing a prefix
 /// therefore produce ids that differ only in the counter, which is exactly what
 /// the counter is for.
-fn next_pane_id(task_name: &str, role_index: Option<usize>) -> String {
+pub(crate) fn next_pane_id(task_name: &str, role_index: Option<usize>) -> String {
     let n = PANE_COUNTER.fetch_add(1, Ordering::SeqCst);
     let sanitized: String = task_name
         .chars()

@@ -2449,6 +2449,66 @@ async fn run_hook_loop_with_idle_timeout(
                                         let _ = write_half.flush().await;
                                     }
                                 }
+                                DaemonMessage::RestartRole(signal) => {
+                                    info!(
+                                        pane_id = %signal.pane_id,
+                                        role = %signal.role,
+                                        force = signal.force,
+                                        "Received restart-role signal"
+                                    );
+                                    // Issue #868: same reply-on-same-connection
+                                    // pattern as `Delegate` above — the caller
+                                    // is a REQUEST, not fire-and-forget, since
+                                    // it is the only place that knows whether
+                                    // the restart actually happened.
+                                    //
+                                    // Fix-round M1/F2: `handle_restart_role_with_state`
+                                    // is a free function taking `&state` directly
+                                    // (like `handle_spawn_role_with_state` below), not
+                                    // an `AppState` method called through a pre-held
+                                    // read guard — that guard used to stay locked for
+                                    // the whole respawn. See the function's own doc.
+                                    let resp = crate::state::handle_restart_role_with_state(
+                                        signal,
+                                        &state,
+                                        &pty_registry,
+                                        &event_tx,
+                                    )
+                                    .await;
+                                    if let Ok(json) = serde_json::to_string(&resp) {
+                                        let line = format!("{json}\n");
+                                        let _ = write_half.write_all(line.as_bytes()).await;
+                                        let _ = write_half.flush().await;
+                                    }
+                                }
+                                DaemonMessage::SpawnRole(signal) => {
+                                    info!(
+                                        pane_id = %signal.pane_id,
+                                        role = %signal.role,
+                                        "Received spawn-role signal"
+                                    );
+                                    // Issue #868: same reply-on-same-connection
+                                    // pattern as `RestartRole` above. Unlike
+                                    // that handler, `handle_spawn_role_with_state`
+                                    // is a free function that takes the
+                                    // `SharedState` handle directly — it
+                                    // manages its own short-lived read/write
+                                    // lock acquisitions internally, so `&state`
+                                    // is passed here rather than an
+                                    // already-held read guard.
+                                    let resp = crate::state::handle_spawn_role_with_state(
+                                        signal,
+                                        &state,
+                                        &pty_registry,
+                                        &event_tx,
+                                    )
+                                    .await;
+                                    if let Ok(json) = serde_json::to_string(&resp) {
+                                        let line = format!("{json}\n");
+                                        let _ = write_half.write_all(line.as_bytes()).await;
+                                        let _ = write_half.flush().await;
+                                    }
+                                }
                                 DaemonMessage::Dispatch(signal) => {
                                     info!(
                                         pane_id = %signal.pane_id,

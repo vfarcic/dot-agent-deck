@@ -1869,6 +1869,7 @@ mod tests {
             // PRD #745 M11: likewise no spawn instant — this fixture builds a
             // record by hand rather than by spawning anything.
             spawned_at_ms: None,
+            crashed: None,
         }
     }
 

@@ -739,6 +739,7 @@ fn agent_record_round_trips_explicit_agent_type() {
         cols: 0,
         live: None,
         spawned_at_ms: None,
+        crashed: None,
     };
     let json = serde_json::to_string(&rec).unwrap();
     let v: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -761,6 +762,7 @@ fn agent_record_omits_agent_type_when_none() {
         cols: 0,
         live: None,
         spawned_at_ms: None,
+        crashed: None,
     };
     let v: serde_json::Value = serde_json::from_str(&serde_json::to_string(&rec).unwrap()).unwrap();
     assert!(
@@ -882,6 +884,7 @@ fn running_agents_summary_from_records_uses_display_name_then_id() {
             cols: 0,
             live: None,
             spawned_at_ms: None,
+            crashed: None,
         },
         AgentRecord {
             id: "9".into(),
@@ -894,6 +897,7 @@ fn running_agents_summary_from_records_uses_display_name_then_id() {
             cols: 0,
             live: None,
             spawned_at_ms: None,
+            crashed: None,
         },
     ];
     let summary = RunningAgentsSummary::from_records(&records);

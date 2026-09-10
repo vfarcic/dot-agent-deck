@@ -996,6 +996,19 @@ pub enum DaemonMessage {
     /// daemon simply never replies, which the CLI degrades on.
     #[serde(rename = "list_targets")]
     ListTargets(ListTargetsRequest),
+    /// Issue #868: an orchestrator asks the daemon to restart one of its own
+    /// worker roles on demand — recovery for a role marked `crashed`
+    /// without requiring a human to reach for the TUI, and (with `force`) a
+    /// deliberate restart of a healthy role too. Answered on the same
+    /// connection, like [`Self::GetSeed`]/[`Self::ListTargets`]/[`Self::Delegate`].
+    #[serde(rename = "restart_role")]
+    RestartRole(RestartRoleSignal),
+    /// Issue #868: an orchestrator asks the daemon to spawn a role that is
+    /// declared in `.dot-agent-deck.toml` but was never spawned into this
+    /// running orchestration instance. Answered on the same connection, like
+    /// [`Self::RestartRole`].
+    #[serde(rename = "spawn_role")]
+    SpawnRole(SpawnRoleSignal),
 }
 
 /// PRD #201: payload of [`DaemonMessage::GetSeed`] — the pane whose pending
@@ -1162,6 +1175,107 @@ pub struct DelegateSignal {
     pub timestamp: DateTime<Utc>,
 }
 
+/// Signal sent by the orchestrator via `dot-agent-deck pane restart <role>`
+/// (issue #868).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RestartRoleSignal {
+    pub pane_id: String,
+    pub role: String,
+    /// Restart even when the target pane's current agent hasn't crashed
+    /// (`AgentRecord::crashed != Some(true)`). Without this, restarting a
+    /// healthy pane is refused — the ordinary case is recovering a crashed
+    /// worker, not interrupting a live one.
+    pub force: bool,
+    pub timestamp: DateTime<Utc>,
+}
+
+/// The daemon's reply to a [`DaemonMessage::RestartRole`], one JSON line back
+/// on the hook-socket connection (the [`GetSeedResponse`]/[`DelegateResponse`]
+/// pattern).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RestartRoleResponse {
+    /// Affirmative discriminator, always [`RESTART_ROLE_RESPONSE_KIND`] on a
+    /// reply this daemon wrote — see [`DelegateResponse::kind`] for why this
+    /// must be checked rather than trusting an all-`#[serde(default)]`
+    /// struct's ability to parse ANY JSON object, including another verb's
+    /// reply or `{}` from an older daemon that doesn't know this verb.
+    #[serde(default)]
+    pub kind: Option<String>,
+    pub restarted: bool,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+/// The value [`RestartRoleResponse::kind`] carries on every reply this daemon
+/// writes. See [`DELEGATE_RESPONSE_KIND`] for why this is a distinct value
+/// checked on every parse rather than inferred from a plausible-looking body.
+pub const RESTART_ROLE_RESPONSE_KIND: &str = "restart_role";
+
+impl Default for RestartRoleResponse {
+    fn default() -> Self {
+        Self {
+            kind: Some(RESTART_ROLE_RESPONSE_KIND.to_string()),
+            restarted: false,
+            error: None,
+        }
+    }
+}
+
+impl RestartRoleResponse {
+    /// Whether this parsed reply positively identifies itself as a
+    /// restart-role response. See [`Self::kind`].
+    pub fn is_restart_role_reply(&self) -> bool {
+        self.kind.as_deref() == Some(RESTART_ROLE_RESPONSE_KIND)
+    }
+}
+
+/// Signal sent by the orchestrator via `dot-agent-deck pane spawn <role>`
+/// (issue #868).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpawnRoleSignal {
+    pub pane_id: String,
+    pub role: String,
+    pub timestamp: DateTime<Utc>,
+}
+
+/// The daemon's reply to a [`DaemonMessage::SpawnRole`], one JSON line back on
+/// the hook-socket connection (the [`RestartRoleResponse`] pattern).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpawnRoleResponse {
+    /// Affirmative discriminator, always [`SPAWN_ROLE_RESPONSE_KIND`] on a
+    /// reply this daemon wrote — see [`DelegateResponse::kind`] for why this
+    /// must be checked rather than trusting an all-`#[serde(default)]`
+    /// struct's ability to parse ANY JSON object.
+    #[serde(default)]
+    pub kind: Option<String>,
+    pub spawned: bool,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+/// The value [`SpawnRoleResponse::kind`] carries on every reply this daemon
+/// writes. See [`DELEGATE_RESPONSE_KIND`] for why this is a distinct value
+/// checked on every parse rather than inferred from a plausible-looking body.
+pub const SPAWN_ROLE_RESPONSE_KIND: &str = "spawn_role";
+
+impl Default for SpawnRoleResponse {
+    fn default() -> Self {
+        Self {
+            kind: Some(SPAWN_ROLE_RESPONSE_KIND.to_string()),
+            spawned: false,
+            error: None,
+        }
+    }
+}
+
+impl SpawnRoleResponse {
+    /// Whether this parsed reply positively identifies itself as a
+    /// spawn-role response. See [`Self::kind`].
+    pub fn is_spawn_role_reply(&self) -> bool {
+        self.kind.as_deref() == Some(SPAWN_ROLE_RESPONSE_KIND)
+    }
+}
+
 /// Daemon → attached-TUI broadcast (PRD #76 M2.17). The daemon publishes
 /// one of these per ingested hook event; subscribers receive them as
 /// `KIND_EVENT` frames on the attach socket.
@@ -1232,6 +1346,15 @@ pub struct OrchestrationSurface {
     /// Optional user-facing tab title; `None` falls back to `name`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_title: Option<String>,
+    /// Issue #868: the PRD #140 per-tab `Instance` orchestration
+    /// id, when the producer has one — additive, so an older daemon's surface
+    /// (or a `NameCwd`-identity orchestration, which has no such token)
+    /// carries `None`. `TabManager::orchestration_tab_index_for` requires this
+    /// to match a candidate tab's own stored id whenever BOTH sides carry one,
+    /// rather than falling back to the bare `(cwd, name)` tuple, which cannot
+    /// tell two same-named same-cwd orchestration instances apart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub orchestration_id: Option<String>,
     /// The spawned role panes, in role order.
     pub roles: Vec<OrchestrationSurfaceRole>,
 }
@@ -1759,6 +1882,7 @@ mod tests {
             name: "issue-work".into(),
             cwd: "/work/github-issues/.worktrees/issue-1".into(),
             display_title: None,
+            orchestration_id: None,
             roles: vec![
                 OrchestrationSurfaceRole {
                     pane_id: "sched-github-issues-0-r0".into(),
