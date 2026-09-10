@@ -105,6 +105,13 @@ mod desktop_palette;
 /// `#[cfg(test)]` modules around it this one carries a live rule — check 12
 /// below — as well as its own tests.
 mod desktop_project_boundary;
+/// Issue #827: the desktop settings store's credential boundary on the
+/// surfaces `settings.rs`'s own tests cannot reach — the Rust schema's field
+/// TYPES, the TypeScript DTO, the settings normaliser and the `localStorage`
+/// key set. Tests only, and here rather than in vitest for the same reason the
+/// palette guard is: `desktop-web` is advisory and this gate is required.
+#[cfg(test)]
+mod desktop_settings_secrets;
 /// Issue #815: `scripts/devbox-check-gtk.sh`, which asserts that pkg-config
 /// resolves Tauri's GTK stack to Nix's copy rather than the host's. Tests only,
 /// and Linux only — the rule lives in the script, which CI's `devbox` job runs
@@ -138,6 +145,13 @@ mod paths;
 /// `scripts/check-pin-lockstep.sh`, which CI's `devbox` job also runs directly.
 #[cfg(all(test, unix))]
 mod pin_lockstep;
+/// PR #966: the authorization boundary the PR-review agent's verdict crosses to
+/// reach the job that casts an approving review with an App credential. Which
+/// comments count as a verdict is a runtime property — the first version
+/// accepted a forged one from any GitHub account. Tests only; the rule lives in
+/// `.github/scripts/pr_review_common.py`, driven here under `python3`.
+#[cfg(test)]
+mod pr_review_verdict;
 /// PRD #740: the job-graph properties in `release.yml` that keep a desktop
 /// bundler failure off the CLI release. Tests only — nothing can run that
 /// workflow outside a tag, so a bad edit is otherwise observable only after a

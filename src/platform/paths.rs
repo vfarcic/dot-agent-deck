@@ -1301,10 +1301,34 @@ pub fn attach_socket_path() -> PathBuf {
 /// 2. `$XDG_STATE_HOME/dot-agent-deck` — freedesktop spec default.
 /// 3. `$HOME/.local/state/dot-agent-deck` — XDG fallback.
 ///
+/// An **empty** override is treated as unset and falls through to the next
+/// link, matching the `$XDG_STATE_HOME` branch's own emptiness guard (issue
+/// #898). Honoring it returned `PathBuf::from("")` — a relative empty path —
+/// and what that actually broke is worth naming, because it is not the
+/// cwd-relative write the phrase suggests. The one production consumer is
+/// [`crate::daemon_attach::ensure_daemon_running`], and the *first* thing it
+/// does with the value is hand it to `fsperm::ensure_owner_only_dir`, whose
+/// Unix tail is `set_permissions("")` — measured `ENOENT`. So lazy-spawn
+/// aborted with an `AttachError::DaemonSpawnFailed` naming a not-found path,
+/// before `spawn.lock` or `daemon.log` were joined at all, and nothing in that
+/// message points at the variable. Those two joins are separately cwd-relative
+/// (`PathBuf::from("").join("spawn.lock")` is `"spawn.lock"`), so a
+/// cwd-anchored spawn mutex and daemon log are what the guard forecloses rather
+/// than what was observed on Unix; the Windows `ensure_owner_only_dir` has its
+/// own body and was not executed for this.
+///
+/// Emptiness is the *only* thing checked: a set, non-empty value is returned
+/// verbatim, relative paths included, because the e2e harness points this at
+/// its own scratch dir.
+///
 /// Windows: the override first, then `%LOCALAPPDATA%\dot-agent-deck` (already
 /// per-user ACL'd by default).
 pub fn state_dir() -> PathBuf {
-    if let Ok(path) = std::env::var("DOT_AGENT_DECK_STATE_DIR") {
+    // Above the `#[cfg]` split on purpose: one guard covers the Unix and the
+    // Windows resolution alike.
+    if let Ok(path) = std::env::var("DOT_AGENT_DECK_STATE_DIR")
+        && !path.is_empty()
+    {
         return PathBuf::from(path);
     }
 
@@ -1979,6 +2003,111 @@ mod tests {
             match prev_state {
                 Some(v) => std::env::set_var("DOT_AGENT_DECK_STATE_DIR", v),
                 None => std::env::remove_var("DOT_AGENT_DECK_STATE_DIR"),
+            }
+        }
+    }
+
+    /// Issue #898: an **empty** `DOT_AGENT_DECK_STATE_DIR` is treated as unset,
+    /// exactly as the `$XDG_STATE_HOME` branch below it already treats an empty
+    /// value. Without the guard the override returned `PathBuf::from("")` — a
+    /// relative empty path — which on Unix made the lazy-spawn path fail its
+    /// `set_permissions("")` with `ENOENT` and report a not-found path rather
+    /// than the misconfigured variable (see [`state_dir`]'s docs for the
+    /// measurement). `DOT_AGENT_DECK_STATE_DIR=` in an environment — a shell or
+    /// CI config that exports it unconditionally — is how that arises in
+    /// practice.
+    ///
+    /// This asserts the resolver, not that consumer: the point of the fix is
+    /// that the resolution never produces the empty path in the first place, so
+    /// pinning it here keeps the assertion at the seam that changed.
+    ///
+    /// Guarding emptiness must not change anything for a **non-empty** value,
+    /// including a deliberately relative one — the e2e harness points this
+    /// override at its own scratch dir, so the verbatim pass-through is
+    /// load-bearing. The override is read above the `#[cfg]` split, so both the
+    /// Unix and the Windows configuration are covered by the one check; the
+    /// expected fallbacks below are spelled per platform for that reason.
+    #[test]
+    fn state_dir_treats_an_empty_override_as_unset() {
+        let _guard = crate::config::STATE_DIR_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prev_state = std::env::var("DOT_AGENT_DECK_STATE_DIR").ok();
+        let prev_xdg = std::env::var("XDG_STATE_HOME").ok();
+        let prev_home = std::env::var("HOME").ok();
+
+        // Windows ignores the XDG chain entirely, so the expected fallback there
+        // is `%LOCALAPPDATA%\dot-agent-deck`, derived from the same `dirs` crate
+        // the resolver uses rather than a hardcoded username.
+        #[cfg(windows)]
+        let platform_default = dirs::data_local_dir()
+            .map(|p| p.join("dot-agent-deck"))
+            .unwrap_or_else(|| home_dir().join("AppData/Local/dot-agent-deck"));
+
+        // SAFETY: env-var lock held; every value is restored on the way out.
+        unsafe {
+            std::env::set_var("DOT_AGENT_DECK_STATE_DIR", "");
+            std::env::set_var("XDG_STATE_HOME", "/var/lib/state");
+            std::env::set_var("HOME", "/home/test-user");
+        }
+
+        #[cfg(unix)]
+        assert_eq!(
+            state_dir(),
+            PathBuf::from("/var/lib/state/dot-agent-deck"),
+            "an empty override must fall through to $XDG_STATE_HOME, not resolve to a relative empty path"
+        );
+        #[cfg(windows)]
+        assert_eq!(
+            state_dir(),
+            platform_default,
+            "an empty override must fall through to the platform default, not resolve to a relative empty path"
+        );
+
+        // Control: with the override empty AND `$XDG_STATE_HOME` empty, the
+        // resolver reaches the *last* link of the documented chain rather than
+        // stopping anywhere short of it — so the guard hands control back to the
+        // existing precedence instead of substituting some other default.
+        // SAFETY: same lock held.
+        unsafe {
+            std::env::set_var("XDG_STATE_HOME", "");
+        }
+        #[cfg(unix)]
+        assert_eq!(
+            state_dir(),
+            PathBuf::from("/home/test-user/.local/state/dot-agent-deck"),
+            "with both the override and $XDG_STATE_HOME empty the $HOME fallback must apply"
+        );
+        #[cfg(windows)]
+        assert_eq!(state_dir(), platform_default);
+
+        // The other direction: a non-empty value is still honored verbatim, and
+        // "verbatim" includes an odd-but-intentional relative path — the guard
+        // tests emptiness and nothing else (no canonicalization, no existence
+        // check, no absoluteness requirement).
+        // SAFETY: same lock held.
+        unsafe {
+            std::env::set_var("DOT_AGENT_DECK_STATE_DIR", "relative-state-dir");
+        }
+        assert_eq!(
+            state_dir(),
+            PathBuf::from("relative-state-dir"),
+            "a non-empty override must still be returned verbatim, relative or not"
+        );
+
+        // SAFETY: same lock held; restoring the previous values.
+        unsafe {
+            match prev_state {
+                Some(v) => std::env::set_var("DOT_AGENT_DECK_STATE_DIR", v),
+                None => std::env::remove_var("DOT_AGENT_DECK_STATE_DIR"),
+            }
+            match prev_xdg {
+                Some(v) => std::env::set_var("XDG_STATE_HOME", v),
+                None => std::env::remove_var("XDG_STATE_HOME"),
+            }
+            match prev_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
             }
         }
     }

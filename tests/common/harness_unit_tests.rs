@@ -4585,11 +4585,26 @@ fn an_empty_or_whitespace_only_api_key_counts_as_absent() {
 /// into a failure deep in a PTY wait.
 #[test]
 fn the_opencode_env_key_path_is_offered_only_for_an_anthropic_model() {
-    assert_eq!(
-        OPENCODE_TEST_MODEL_DEFAULT.split_once('/').map(|(p, _)| p),
-        Some("openai"),
-        "the default model is the case the provider match exists to exclude"
+    // The invariant the gate actually needs from the default is that it is
+    // provider-QUALIFIED: `opencode` rejects a bare model id with "Invalid
+    // model format", and the predicate below reads the prefix.
+    //
+    // This deliberately does NOT pin which provider that prefix is. It used to
+    // assert `Some("openai")`, described as "the case the provider match exists
+    // to exclude" — which was a convenient illustration rather than a
+    // requirement, and it went red the moment issue #922 moved the default onto
+    // `anthropic/` so a key-only host could run this coverage instead of
+    // skipping it. The exclusion is fully covered by the table below, which
+    // names its cases outright and cannot drift with the default.
+    // Named apart from the loop's own `model` below, which is a different thing.
+    let (default_provider, default_model) = OPENCODE_TEST_MODEL_DEFAULT
+        .split_once('/')
+        .expect("the default OpenCode test model is provider-qualified");
+    assert!(
+        !default_provider.is_empty() && !default_model.is_empty(),
+        "provider-qualified means both halves are non-empty: {OPENCODE_TEST_MODEL_DEFAULT:?}"
     );
+
     // `opencode_test_model` memoises, so drive the pure predicate the gate
     // uses rather than the OnceLock: provider match AND key presence.
     for (model, provider_matches) in [

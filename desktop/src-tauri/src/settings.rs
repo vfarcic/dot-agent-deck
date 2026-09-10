@@ -56,16 +56,39 @@
 //!    credential belongs behind the `SecretStore` seam (PRD #803 M5), whose
 //!    intended implementation is the OS keychain.
 //!
+//!    Two different kinds of check watch that rule, and confusing them is the
+//!    mistake issue #827 was opened about.
+//!
 //!    [`tests::no_settings_key_name_trips_the_credential_tripwire`] fails the
 //!    build on a credential-shaped key **name**, and it is a **naming tripwire,
 //!    not a security boundary** — the distinction matters enough that the test,
 //!    its failure message and the developer docs all say it in those words. It
 //!    reads key names in the serialised default document and nothing else, so a
-//!    field called `endpoint` holding a token passes, a serde-omitted field is
-//!    invisible to it, and the TypeScript DTO is outside it entirely. Read a
-//!    pass as "nobody named a field like a credential", never as "a credential
-//!    cannot get in here". Issue #827 carries the checks #802 actually needs
-//!    before it stores a real key.
+//!    field called `endpoint` holding a token passes it, and the TypeScript DTO
+//!    is outside it entirely. Read a pass as "nobody named a field like a
+//!    credential", never as "a credential cannot get in here".
+//!
+//!    The **value**-side checks are the ones to rely on, and what they establish
+//!    is narrower than an absolute: *this build's schema has no field that can
+//!    carry arbitrary text*, so a credential submitted through the settings
+//!    surface or the settings IPC is stored in none of the places it could be,
+//!    absent from both directions of the IPC, and absent from the diagnostics
+//!    this crate emits. They follow one uniquely-named sentinel through every sink #827
+//!    enumerates — the document on disk across a load-modify-save round trip,
+//!    the IPC echo, the `desktop_get_settings` snapshot, the parse diagnostic,
+//!    and both halves of [`SettingsWriteError`] — reaching the two settings
+//!    commands through the public functions their bodies wrap, since a
+//!    `#[tauri::command]` needs a running app to call. They are derived from the
+//!    default document rather than from a list, so a field #802 adds is covered
+//!    the moment it appears and turns them red if it can hold text. The one
+//!    thing they do **not** claim: a key this schema does not own keeps whatever
+//!    a user or a newer build wrote there, because the save merges rather than
+//!    replaces (see [`merged_document`]) — measured by
+//!    [`tests::a_key_this_schema_does_not_own_keeps_its_value_and_reaches_nothing_else`],
+//!    not glossed. The TypeScript half of the schema, the `localStorage` key set
+//!    and the field-type allowlist are checked in
+//!    `xtask/linkage-check/src/desktop_settings_secrets.rs`, because those live
+//!    outside this crate and a vitest guard can be merged past.
 //! 2. **Field names stay `snake_case`, and single-word where it is natural.**
 //!    The same struct is serialised to TOML (which a user hand-edits, and where
 //!    `snake_case` is this repo's convention) *and* to JSON for the webview
@@ -630,8 +653,8 @@ pub fn load_from(path: &Path) -> DesktopSettings {
             Ok(settings) => settings,
             Err(error) => {
                 eprintln!(
-                    "Invalid desktop settings at {}: {error}; using defaults",
-                    path.display()
+                    "{}; using defaults",
+                    invalid_document_log(path, &contents, &error)
                 );
                 DesktopSettings::default()
             }
@@ -643,6 +666,57 @@ pub fn load_from(path: &Path) -> DesktopSettings {
             DesktopSettings::default()
         }
     }
+}
+
+/// The diagnostic [`load_from`] logs for a document this build cannot parse: a
+/// **locator**, deliberately never the document's own bytes.
+///
+/// # Why the toml error's own message is not logged
+///
+/// `toml::de::Error`'s `Display` echoes the offending value **twice** — once in
+/// a rendered source line and again in serde's `invalid type: string "…"`
+/// message. Measured, not assumed; the exact shape is pinned by
+/// [`tests::a_parse_diagnostic_carries_a_locator_and_never_the_documents_bytes`].
+/// So a hand-edited document whose value sits in a wrongly-typed field used to
+/// put that value straight into this process's stderr and the deck log, and a
+/// log is a file people paste into bug reports.
+///
+/// The trade is deliberate: the locator loses the `expected u32` half of the
+/// message and keeps the half a developer acts on — the file is named and the
+/// line is the line to open, where the offending text is in front of them
+/// anyway. Issue #827 lists the log as one of the sinks a credential must not
+/// reach; this is that sink closed for the whole document rather than for a
+/// field anyone remembered to think about.
+///
+/// A separate function because the content of the line is then testable at all:
+/// an `eprintln!` inside a match arm cannot be asserted on.
+fn invalid_document_log(path: &Path, contents: &str, error: &toml::de::Error) -> String {
+    let where_ = match error
+        .span()
+        .and_then(|span| line_and_column(contents, span.start))
+    {
+        Some((line, column)) => format!("line {line}, column {column}"),
+        // A span is present for every error this crate has produced, but it is
+        // an `Option` on the API and a locator-less message is still useful.
+        None => "an unreported position".to_string(),
+    };
+    format!(
+        "Invalid desktop settings at {}: {where_} could not be read as settings",
+        path.display()
+    )
+}
+
+/// The 1-based line and column of the byte at `offset` in `contents`.
+///
+/// `None` when `offset` is past the end or lands inside a multi-byte character,
+/// both of which mean the caller cannot describe a position it can trust. The
+/// column counts **characters** rather than bytes, because the number is for a
+/// human counting along a line in an editor.
+fn line_and_column(contents: &str, offset: usize) -> Option<(usize, usize)> {
+    let before = contents.get(..offset)?;
+    let line = before.matches('\n').count() + 1;
+    let last_line = before.rsplit('\n').next().unwrap_or(before);
+    Some((line, last_line.chars().count() + 1))
 }
 
 /// Persist the settings document atomically and owner-only.
@@ -1685,23 +1759,46 @@ mod tests {
     /// means the cost of that is a failed save rather than a write through
     /// someone else's symlink, so this is closing a nuisance rather than a
     /// hole — but the nuisance is free to close.
+    ///
+    /// # Why this asserts the suffix's SHAPE and never searches for the pid
+    ///
+    /// It used to assert `!name.contains(&std::process::id().to_string())`,
+    /// and that assertion was **probabilistically false**: the suffix is 16
+    /// random hex characters, ten of whose sixteen symbols are decimal digits,
+    /// so a decimal pid turns up inside one by chance. It is not hypothetical
+    /// — it reddened the required `build-windows` job on PR #872, a PR that
+    /// touches no desktop code at all, on the name
+    /// `.desktop.toml.tmp.1bea3738d823864d` (which carries the all-decimal
+    /// runs `3738`, `8238` and `823864`). A four-digit pid collides on the
+    /// order of one run in a few hundred, and every collision is a false
+    /// report against whichever PR happens to be running.
+    ///
+    /// A substring search cannot express the property anyway. What the
+    /// docstring above actually claims is that the name is a random token
+    /// rather than the `<pid>.<counter>` construction, and the check below
+    /// settles exactly that, deterministically: `create_temp` formats
+    /// `{:016x}`, so the suffix is sixteen hex digits and nothing else. A
+    /// `<pid>.<counter>` name fails it on the `.` alone, and fails it again on
+    /// the length. Strictly stronger than the search it replaces, and it
+    /// cannot flake.
     #[test]
     fn temp_names_are_unpredictable_rather_than_the_pid_and_a_counter() {
         let dir = tempdir();
         let dest = dir.path().join(SETTINGS_FILE_NAME);
+        let prefix = format!(".{SETTINGS_FILE_NAME}.tmp.");
 
         let mut names = std::collections::BTreeSet::new();
         for _ in 0..16 {
             let (file, tmp) = create_temp(dir.path(), &dest).unwrap();
             drop(file);
             let name = tmp.file_name().unwrap().to_string_lossy().into_owned();
+            let suffix = name
+                .strip_prefix(&prefix)
+                .unwrap_or_else(|| panic!("unexpected temp name: {name}"));
             assert!(
-                !name.contains(&std::process::id().to_string()),
-                "the temp name still carries the pid: {name}"
-            );
-            assert!(
-                name.starts_with(&format!(".{SETTINGS_FILE_NAME}.tmp.")),
-                "unexpected temp name: {name}"
+                suffix.len() == 16 && suffix.bytes().all(|b| b.is_ascii_hexdigit()),
+                "the temp suffix must be the 16 hex digits `{{:016x}}` writes, \
+                 not a derived name like `<pid>.<counter>`: {name}"
             );
             names.insert(name);
             std::fs::remove_file(&tmp).unwrap();
@@ -1828,9 +1925,39 @@ mod tests {
         "passphrase",
     ];
 
+    /// The two shapes a credential-*shaped* key name is allowed to have, and
+    /// the concrete serialised type each one is.
+    ///
+    /// **The type is half the exemption.** An exemption granted for a boolean
+    /// "is one stored" would otherwise keep covering that path after someone
+    /// changed the field to a `String` — the same name, now able to hold the
+    /// credential itself — which is the silent widening issue #827 asks this
+    /// list to stop.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum AllowedReference {
+        /// The *name of the backend* that holds the credential (`"keychain"`).
+        /// A string, whose contents are ours rather than the user's.
+        BackendName,
+        /// A flag saying a credential is stored. A boolean, which cannot carry
+        /// credential material at all — the strongest of the two shapes, and
+        /// the one to prefer.
+        StoredFlag,
+    }
+
+    impl AllowedReference {
+        /// The `toml::Value::type_str()` this shape covers, and nothing else.
+        fn type_str(self) -> &'static str {
+            match self {
+                Self::BackendName => "string",
+                Self::StoredFlag => "boolean",
+            }
+        }
+    }
+
     /// Full key **paths** (`section.field`) that legitimately contain one of
     /// [`SECRETISH`] because they are a *reference to* a credential rather than
-    /// the credential itself — the one carve-out PRD #803 allows.
+    /// the credential itself — the one carve-out PRD #803 allows — each paired
+    /// with the concrete type that carve-out covers.
     ///
     /// Empty, because nothing in today's schema needs an exception. It holds
     /// paths and not bare names deliberately: `secret_backend` as a bare name
@@ -1838,11 +1965,11 @@ mod tests {
     /// added later by someone who never read this rule, which is precisely the
     /// silent-widening this list must not do.
     ///
-    /// The form to add is one line — `"voice.secret_backend"` — with a comment
-    /// saying which of the two allowed shapes it is: the *name of the backend*
-    /// holding the credential, or a *boolean* saying one is stored. Nothing
-    /// else.
-    const SECRETISH_ALLOWED: [&str; 0] = [];
+    /// The form to add is one line — `("voice.secret_backend",
+    /// AllowedReference::BackendName)` — and the shape is not a label: a path
+    /// exempted as a [`AllowedReference::StoredFlag`] whose value is a string
+    /// is reported as an offender, with the mismatch named.
+    const SECRETISH_ALLOWED: [(&str, AllowedReference); 0] = [];
 
     const SECRET_RULE: &str = "\
 WHAT THIS CHECK IS: a NAMING TRIPWIRE, not a security boundary. It reads the \
@@ -1858,6 +1985,13 @@ is outside this test entirely;\n\
 Read a pass as \"nobody named a field like a credential\", never as \"a \
 credential cannot get in here\". If you are about to store real credential \
 material, this check will not stop you and is not the control you need.\n\n\
+WHAT DOES WATCH VALUES (issue #827): the tests below this one follow a \
+uniquely-named sentinel through the document, the IPC echo, the \
+desktop_get_settings snapshot, the parse diagnostic and both halves of \
+SettingsWriteError; and \
+xtask/linkage-check/src/desktop_settings_secrets.rs pins the field TYPES this \
+schema may use, the TypeScript DTO's names and the localStorage key set. Those \
+are what establish that a credential has no route in -- not this scan.\n\n\
 THE RULE IT WATCHES: PRD #803 sets one hard rule about credentials -- a secret \
 NEVER goes in desktop.toml and NEVER in localStorage. This document is visible \
 to anyone with the user's disk, is synced by whatever backs up ~/.config, and \
@@ -1870,10 +2004,16 @@ If the name that tripped this really is a reference and not a credential, add \
 its FULL PATH to SECRETISH_ALLOWED with a comment saying which of those two \
 forms it is.";
 
-    /// Every key path in a serialised document, dotted, including nested
-    /// tables. Both the section (`voice`) and each field under it
-    /// (`voice.backend`) are emitted, because either can be named badly.
-    fn key_paths(value: &toml::Value, prefix: &str, into: &mut Vec<String>) {
+    /// Every key path in a serialised document, dotted, paired with the value
+    /// at it — including nested tables. Both the section (`voice`) and each
+    /// field under it (`voice.backend`) are emitted, because either can be
+    /// named badly, and the value travels with the path because
+    /// [`SECRETISH_ALLOWED`] constrains the concrete type as well as the name.
+    fn key_paths<'v>(
+        value: &'v toml::Value,
+        prefix: &str,
+        into: &mut Vec<(String, &'v toml::Value)>,
+    ) {
         if let toml::Value::Table(table) = value {
             for (key, nested) in table {
                 let path = if prefix.is_empty() {
@@ -1881,29 +2021,51 @@ forms it is.";
                 } else {
                     format!("{prefix}.{key}")
                 };
-                into.push(path.clone());
+                into.push((path.clone(), nested));
                 key_paths(nested, &path, into);
             }
         }
     }
 
-    /// The paths whose **leaf** name looks credential-shaped and whose full
-    /// path is not in `allowed`.
+    /// The leaf names that look credential-shaped and are not covered by
+    /// `allowed` — either because no exemption names that full path, or because
+    /// the exemption there is for a different concrete type.
     ///
     /// The match is on the leaf because that is the field's own name; the
     /// exemption is on the full path so it cannot travel to a same-named field
-    /// in another section.
-    fn secretish_paths(value: &toml::Value, allowed: &[&str]) -> Vec<String> {
-        let mut paths = Vec::new();
-        key_paths(value, "", &mut paths);
-        paths.retain(|path| {
-            let leaf = path.rsplit('.').next().unwrap_or(path).to_ascii_lowercase();
-            SECRETISH.iter().any(|pattern| leaf.contains(pattern))
-                && !allowed
+    /// in another section; and the type is checked because an exemption is a
+    /// statement about one specific field, not about a name.
+    fn secretish_offenders(
+        value: &toml::Value,
+        allowed: &[(&str, AllowedReference)],
+    ) -> Vec<String> {
+        let mut found = Vec::new();
+        key_paths(value, "", &mut found);
+        found
+            .into_iter()
+            .filter_map(|(path, at)| {
+                let leaf = path
+                    .rsplit('.')
+                    .next()
+                    .unwrap_or(&path)
+                    .to_ascii_lowercase();
+                if !SECRETISH.iter().any(|pattern| leaf.contains(pattern)) {
+                    return None;
+                }
+                match allowed
                     .iter()
-                    .any(|exception| exception.eq_ignore_ascii_case(path))
-        });
-        paths
+                    .find(|(exception, _)| exception.eq_ignore_ascii_case(&path))
+                {
+                    None => Some(path),
+                    Some((_, shape)) if shape.type_str() == at.type_str() => None,
+                    Some((_, shape)) => Some(format!(
+                        "{path} (exempted as a {}, found a {})",
+                        shape.type_str(),
+                        at.type_str()
+                    )),
+                }
+            })
+            .collect()
     }
 
     /// The tripwire itself. Read [`SECRET_RULE`] before concluding anything
@@ -1911,7 +2073,7 @@ forms it is.";
     #[test]
     fn no_settings_key_name_trips_the_credential_tripwire() {
         let document = toml::Value::try_from(DesktopSettings::default()).unwrap();
-        let offenders = secretish_paths(&document, &SECRETISH_ALLOWED);
+        let offenders = secretish_offenders(&document, &SECRETISH_ALLOWED);
         assert!(
             offenders.is_empty(),
             "the desktop settings document has key(s) named like credentials: {}\n\n{SECRET_RULE}",
@@ -1939,7 +2101,7 @@ forms it is.";
              auth_token = \"t\"\n",
         )
         .unwrap();
-        let mut offenders = secretish_paths(&bad, &SECRETISH_ALLOWED);
+        let mut offenders = secretish_offenders(&bad, &SECRETISH_ALLOWED);
         offenders.sort();
         assert_eq!(
             offenders,
@@ -1966,10 +2128,55 @@ forms it is.";
              secret_backend = \"somewhere else entirely\"\n",
         )
         .unwrap();
-        let allowed = ["voice.secret_backend", "voice.has_api_key"];
+        let allowed = [
+            ("voice.secret_backend", AllowedReference::BackendName),
+            ("voice.has_api_key", AllowedReference::StoredFlag),
+        ];
         assert_eq!(
-            secretish_paths(&referenced, &allowed),
+            secretish_offenders(&referenced, &allowed),
             ["endpoints.secret_backend"]
+        );
+    }
+
+    /// The other half of the exemption, and the reason issue #827 asked for it:
+    /// an exemption is a statement about **one field of one type**, so it stops
+    /// applying the moment that field could carry the credential itself.
+    ///
+    /// The failure this prevents is silent by construction. A `has_api_key`
+    /// boolean is exempted honestly; someone later needs the key's *last four
+    /// digits* on the settings surface and changes it to a `String`; the name
+    /// never moves, so a path-only allowlist keeps exempting it and the
+    /// tripwire reports nothing while a string field sits under an
+    /// `api_key` name.
+    #[test]
+    fn an_exemption_for_one_type_does_not_cover_the_same_path_at_another() {
+        let allowed = [("voice.has_api_key", AllowedReference::StoredFlag)];
+
+        // The shape the exemption was granted for: nothing to report.
+        let flag = toml::from_str::<toml::Value>("[voice]\nhas_api_key = true\n").unwrap();
+        assert!(secretish_offenders(&flag, &allowed).is_empty());
+
+        // The same path, now a string. Reported, with the mismatch named so
+        // the failure says what actually changed.
+        let widened =
+            toml::from_str::<toml::Value>("[voice]\nhas_api_key = \"sk-live-nope\"\n").unwrap();
+        assert_eq!(
+            secretish_offenders(&widened, &allowed),
+            ["voice.has_api_key (exempted as a boolean, found a string)"]
+        );
+
+        // And in the other direction: a `BackendName` exemption is for a
+        // string, so it does not cover a table that grew under that name.
+        let nested = toml::from_str::<toml::Value>(
+            "[voice.secret_backend]\nname = \"keychain\"\nvalue = \"sk-live-nope\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            secretish_offenders(
+                &nested,
+                &[("voice.secret_backend", AllowedReference::BackendName)]
+            ),
+            ["voice.secret_backend (exempted as a string, found a table)"]
         );
     }
 
@@ -1989,7 +2196,7 @@ forms it is.";
         )
         .unwrap();
         assert!(
-            secretish_paths(&innocent, &SECRETISH_ALLOWED).is_empty(),
+            secretish_offenders(&innocent, &SECRETISH_ALLOWED).is_empty(),
             "the tripwire is a NAMING check; if this starts failing, the doc \
              comments claiming otherwise need updating too"
         );
@@ -1997,8 +2204,506 @@ forms it is.";
         // And a field name is judged on its own, never on its value.
         let named = toml::from_str::<toml::Value>("[voice]\napi_key = false\n").unwrap();
         assert_eq!(
-            secretish_paths(&named, &SECRETISH_ALLOWED),
+            secretish_offenders(&named, &SECRETISH_ALLOWED),
             ["voice.api_key"]
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // Issue #827: the value-side checks. Everything above this line reads key
+    // NAMES; everything below follows one uniquely-named value through the
+    // sinks a credential must not reach.
+    //
+    // What these prove, stated narrowly because the whole point of #827 is
+    // that the previous framing was too wide: **this build's schema has no
+    // field that can carry arbitrary text**, so there is no route by which a
+    // credential submitted through the settings surface, the settings IPC or
+    // the document can be stored, echoed, or logged. That is a stronger
+    // property than "the name scan found nothing" and a weaker one than
+    // "a credential cannot be in desktop.toml" — a key this schema does not
+    // own keeps whatever a user or a newer build put in it, which
+    // `a_key_this_schema_does_not_own_keeps_its_value_and_reaches_nothing_else`
+    // measures rather than glosses.
+    //
+    // The one check #827 lists that is NOT here is the end-to-end submission
+    // "through the real secret-store flow": PRD #803 M5 named the `SecretStore`
+    // seam and deliberately did not build it, and #802 designs it against a
+    // real backend. Until it exists the buildable form of "SecretStore is the
+    // only type that can accept secret material" is the one below — that no
+    // type here can — and the moment #802 adds a field that can, these tests
+    // go red and say so.
+    // ---------------------------------------------------------------------
+
+    /// A value no legitimate document can hold, credential-shaped so that
+    /// finding it in any sink is unambiguous. Long and unique on purpose: a
+    /// substring search for it cannot collide with anything this crate emits.
+    const SENTINEL: &str = "sk-live-827-DO-NOT-STORE-e3b0c44298fc1c149afb";
+
+    fn assert_free_of_sentinel(what: &str, haystack: &str) {
+        assert!(
+            !haystack.contains(SENTINEL),
+            "{what} carried the sentinel credential: {haystack}"
+        );
+    }
+
+    /// Every serialised form of a loaded document, plus the snapshot the
+    /// webview receives, checked in one place so no call site can forget one.
+    ///
+    /// The four are the sinks issue #827 enumerates on this side of the
+    /// bridge: the TOML a save would write, the JSON the IPC echo carries, the
+    /// JSON `desktop_get_settings` returns, and a freshly written file.
+    fn assert_no_sink_carries_the_sentinel(what: &str, settings: &DesktopSettings) {
+        assert_free_of_sentinel(
+            &format!("{what}: the TOML re-serialisation"),
+            &toml::to_string_pretty(settings).unwrap(),
+        );
+        assert_free_of_sentinel(
+            &format!("{what}: the IPC echo (`desktop_set_settings` returns its input)"),
+            &serde_json::to_string(settings).unwrap(),
+        );
+        let snapshot = DesktopSettingsSnapshot {
+            settings: settings.clone(),
+            path: "/home/dev/.config/dot-agent-deck/desktop.toml".to_string(),
+        };
+        assert_free_of_sentinel(
+            &format!("{what}: the `desktop_get_settings` snapshot"),
+            &serde_json::to_string(&snapshot).unwrap(),
+        );
+
+        let dir = tempdir();
+        let fresh = dir.path().join(SETTINGS_FILE_NAME);
+        save_to(&fresh, settings).unwrap();
+        assert_free_of_sentinel(
+            &format!("{what}: a freshly written document"),
+            &std::fs::read_to_string(&fresh).unwrap(),
+        );
+    }
+
+    /// The leaf (non-table) key paths of a serialised document, sorted.
+    fn leaf_paths(document: &toml::Value) -> Vec<String> {
+        let mut found = Vec::new();
+        key_paths(document, "", &mut found);
+        let mut leaves: Vec<String> = found
+            .into_iter()
+            .filter(|(_, at)| !at.is_table())
+            .map(|(path, _)| path)
+            .collect();
+        leaves.sort();
+        leaves
+    }
+
+    /// Replace the value at a dotted `path`, panicking if it is not there — a
+    /// typo in a fixture must not read as a pass.
+    fn set_at(document: &mut toml::Table, path: &str, value: toml::Value) {
+        let (head, rest) = match path.split_once('.') {
+            Some((head, rest)) => (head, Some(rest)),
+            None => (path, None),
+        };
+        let at = document
+            .get_mut(head)
+            .unwrap_or_else(|| panic!("no `{head}` in the document"));
+        match (rest, at) {
+            (None, at) => *at = value,
+            (Some(rest), toml::Value::Table(nested)) => set_at(nested, rest, value),
+            (Some(_), _) => panic!("`{head}` is not a table"),
+        }
+    }
+
+    /// **The check #802 has to keep green.** A credential arriving from the
+    /// webview — the route a real one takes — is neither stored, echoed nor
+    /// written, because no field in this schema can hold arbitrary text: every
+    /// leaf is a closed enum, a snapped float or an integer. The one place the
+    /// value does come back is named below, because it is a scope statement
+    /// rather than an exception.
+    ///
+    /// This is not a name scan. Each payload below puts the sentinel where a
+    /// credential would actually go — including under names the tripwire is
+    /// blind to (`endpoint`, `value`) and under a section that does not exist
+    /// yet — and every one of them ends the same way: either argument
+    /// deserialisation refuses the call, or the value is dropped on the way in.
+    ///
+    /// # The one place the value does come back, and why it is not a leak
+    ///
+    /// A refused payload's serde message can quote the offending value
+    /// (`invalid type: string "sk-live-…"`), and Tauri returns that to the
+    /// **caller**. The caller is the webview that just sent it, so nothing is
+    /// disclosed to a party that did not already hold it; the asserted claim is
+    /// therefore "no sink outside the sender", not "no sink at all". The sinks
+    /// that matter — the disk, the echo a *later* read would carry, the app's
+    /// own log — are covered here and in the two tests below.
+    ///
+    /// # What this exercises, precisely
+    ///
+    /// The `DesktopSettings` **deserializer**, which is what `desktop_set_settings`
+    /// takes as its argument, and the serialisation of what it returns. It does
+    /// **not** call the command function: a `#[tauri::command]` takes a
+    /// `Webview`, which cannot be constructed without a running app, so
+    /// `ensure_main_webview` and the framework's own argument decoding are
+    /// outside every test in this crate — see issue #823 for the missing tier.
+    /// [`tests::the_settings_commands_own_bodies_carry_no_value_from_the_document`]
+    /// drives the two command *bodies* through the public functions they wrap,
+    /// which is as close to the real handlers as this tier reaches — see that
+    /// test's own comment for the two pieces it still does not reach, and for
+    /// where the second of them is covered instead. Greptile raised this on PR
+    /// #943, and the claim is narrowed rather than overstated.
+    #[test]
+    fn a_credential_from_the_webview_reaches_neither_the_echo_nor_the_document() {
+        let payloads = [
+            // The known leaves, one at a time.
+            ("version", serde_json::json!({ "version": SENTINEL })),
+            (
+                "appearance.mode",
+                serde_json::json!({ "appearance": { "mode": SENTINEL } }),
+            ),
+            (
+                "zoom.level",
+                serde_json::json!({ "zoom": { "level": SENTINEL } }),
+            ),
+            // A name the tripwire would catch, and two it is blind to.
+            ("apiKey", serde_json::json!({ "apiKey": SENTINEL })),
+            ("endpoint", serde_json::json!({ "endpoint": SENTINEL })),
+            ("value", serde_json::json!({ "value": SENTINEL })),
+            // Inside a section this build does know.
+            (
+                "appearance.apiKey",
+                serde_json::json!({ "appearance": { "mode": "dark", "apiKey": SENTINEL } }),
+            ),
+            // Inside a section it does not — the shape #802's own settings
+            // will have.
+            (
+                "voice.api_key",
+                serde_json::json!({ "voice": { "api_key": SENTINEL } }),
+            ),
+            // And not as an object at all.
+            (
+                "an array",
+                serde_json::json!({ "voice": [SENTINEL, { "token": SENTINEL }] }),
+            ),
+            ("the whole document", serde_json::json!(SENTINEL)),
+        ];
+
+        let mut refused = 0;
+        let mut dropped = 0;
+        for (what, payload) in payloads {
+            match serde_json::from_value::<DesktopSettings>(payload) {
+                // Refused at the command boundary: nothing was stored, and the
+                // rejection goes to the sender (see the doc comment above).
+                Err(_) => refused += 1,
+                Ok(settings) => {
+                    dropped += 1;
+                    assert_no_sink_carries_the_sentinel(what, &settings);
+                }
+            }
+        }
+        // Both outcomes have to actually occur, or a change that made every
+        // payload fail deserialisation would leave the drop half of this test
+        // asserting nothing.
+        assert!(
+            refused > 0 && dropped > 0,
+            "{refused} refused, {dropped} accepted"
+        );
+    }
+
+    /// The disk route: a credential hand-written into a field this schema owns
+    /// survives neither the load nor the next save.
+    ///
+    /// Derived from the default document rather than from a hard-coded list, so
+    /// a field #802 adds is covered the moment it appears — and if that field
+    /// can hold text, this is the test that goes red.
+    #[test]
+    fn a_credential_at_a_known_schema_leaf_survives_neither_the_load_nor_the_next_save() {
+        let default = toml::Value::try_from(DesktopSettings::default()).unwrap();
+        let leaves = leaf_paths(&default);
+        assert_eq!(leaves, ["appearance.mode", "version", "zoom.level"]);
+
+        for leaf in leaves {
+            let dir = tempdir();
+            let path = dir.path().join(SETTINGS_FILE_NAME);
+            let mut document = default.clone().as_table().unwrap().clone();
+            set_at(
+                &mut document,
+                &leaf,
+                toml::Value::String(SENTINEL.to_string()),
+            );
+            let raw = toml::to_string_pretty(&document).unwrap();
+            assert!(
+                raw.contains(SENTINEL),
+                "fixture for {leaf} lost the sentinel"
+            );
+            std::fs::write(&path, &raw).unwrap();
+
+            let loaded = load_from(&path);
+            assert_no_sink_carries_the_sentinel(&leaf, &loaded);
+
+            // The load–modify–save round trip #827 names explicitly: saving
+            // over the offending document overwrites every key the struct
+            // owns, so the value does not survive on disk either.
+            save_to(&path, &loaded).unwrap();
+            assert_free_of_sentinel(
+                &format!("{leaf}: the document after a load-modify-save round trip"),
+                &std::fs::read_to_string(&path).unwrap(),
+            );
+        }
+    }
+
+    /// The honest complement, and the reason "a credential cannot be in
+    /// `desktop.toml`" is **not** the claim this module makes.
+    ///
+    /// The save merges the struct into whatever is on disk, so a key this
+    /// build's schema does not own keeps its value — by design, because that is
+    /// what stops an older build eating a newer one's section
+    /// ([`merged_document`]). A credential a *user* or a *newer build* put
+    /// there therefore stays there. What it cannot do is reach anything else:
+    /// the struct drops it at load, so it is absent from the IPC echo, from the
+    /// `desktop_get_settings` snapshot and from every rendering of the
+    /// document.
+    ///
+    /// Both flavours of unowned key are covered, because the merge treats them
+    /// identically and only one of them is obvious: a whole section this build
+    /// has never heard of, and a stray field inside a section it owns.
+    #[test]
+    fn a_key_this_schema_does_not_own_keeps_its_value_and_reaches_nothing_else() {
+        let dir = tempdir();
+        let path = dir.path().join(SETTINGS_FILE_NAME);
+        std::fs::write(
+            &path,
+            format!(
+                "version = 1\n\n\
+                 [appearance]\n\
+                 mode = \"{SENTINEL}\"\n\
+                 stray_token = \"{SENTINEL}\"\n\n\
+                 [voice]\n\
+                 api_key = \"{SENTINEL}\"\n"
+            ),
+        )
+        .unwrap();
+
+        let loaded = load_from(&path);
+        // The owned field folded to its default; the unowned ones never
+        // entered the struct at all.
+        assert_eq!(loaded.appearance.mode, AppearanceMode::System);
+        assert_no_sink_carries_the_sentinel("an unowned key", &loaded);
+
+        save_to(&path, &loaded).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        // Measured, not tolerated in silence: the two unowned keys still hold
+        // it and the owned one does not.
+        assert_eq!(
+            raw.matches(SENTINEL).count(),
+            2,
+            "the merge should have kept exactly the two unowned values: {raw}"
+        );
+        assert!(
+            raw.contains("mode = \"system\""),
+            "unexpected document: {raw}"
+        );
+        assert!(raw.contains("stray_token"), "unexpected document: {raw}");
+        assert!(raw.contains("api_key"), "unexpected document: {raw}");
+    }
+
+    /// The two settings commands' own bodies, driven end to end against a
+    /// sentinel-bearing document on disk.
+    ///
+    /// `desktop_get_settings` is `Ok(settings::load_snapshot())` after its
+    /// webview guard. `desktop_set_settings` is `settings::save(&settings)`
+    /// then `Ok(settings)`, plus a `map_err` closure that logs
+    /// `error.detail()` and returns `safe_message(error.public())`. So calling
+    /// [`load_snapshot`] and [`save`] under the real path seam drives both
+    /// success paths, and **two** things in those handlers stay out of reach
+    /// rather than one: `ensure_main_webview`, because a `Webview` needs a
+    /// running Tauri app to exist; and that `map_err` closure, because this
+    /// test does not provoke a save failure.
+    ///
+    /// The closure is not uncovered, though — it is covered somewhere else,
+    /// which is worth knowing before reading this test as the whole story. The
+    /// only two values it can emit are `error.detail()` and
+    /// `safe_message(error.public())`, and
+    /// [`tests::no_settings_write_error_carries_a_value_from_the_document`]
+    /// asserts both are free of the sentinel, against real save failures.
+    ///
+    /// This is deliberately more than re-serialising a hand-built struct: the
+    /// snapshot here is the one the command would actually return, read off a
+    /// real file through the real resolver, with the real path in it.
+    #[test]
+    fn the_settings_commands_own_bodies_carry_no_value_from_the_document() {
+        let _guard = ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let dir = tempdir();
+        let path = dir.path().join(SETTINGS_FILE_NAME);
+        std::fs::write(
+            &path,
+            format!(
+                "version = 1\n\n\
+                 [appearance]\n\
+                 mode = \"{SENTINEL}\"\n\n\
+                 [voice]\n\
+                 api_key = \"{SENTINEL}\"\n"
+            ),
+        )
+        .unwrap();
+
+        // SAFETY: the lock above serialises every test that touches this var.
+        unsafe { std::env::set_var(SETTINGS_PATH_ENV, &path) };
+        let snapshot = load_snapshot();
+        let saved = save(&snapshot.settings);
+        unsafe { std::env::remove_var(SETTINGS_PATH_ENV) };
+        saved.unwrap();
+
+        // The reply `desktop_get_settings` would send, as JSON, exactly as the
+        // bridge would receive it.
+        assert_free_of_sentinel(
+            "the `desktop_get_settings` reply",
+            &serde_json::to_string(&snapshot).unwrap(),
+        );
+        // Its `path` is present and is the file we pointed it at — the
+        // deliberate exception documented on `DesktopSettingsSnapshot`, and the
+        // reason this assertion is about the sentinel rather than about paths.
+        assert_eq!(snapshot.path, path.display().to_string());
+        assert_eq!(snapshot.settings.appearance.mode, AppearanceMode::System);
+
+        // The reply `desktop_set_settings` would echo.
+        assert_free_of_sentinel(
+            "the `desktop_set_settings` echo",
+            &serde_json::to_string(&snapshot.settings).unwrap(),
+        );
+
+        // And the document the save actually wrote: the owned field is
+        // scrubbed, the unowned one is preserved, exactly as
+        // `a_key_this_schema_does_not_own_keeps_its_value_and_reaches_nothing_else`
+        // establishes for the lower-level path.
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            raw.matches(SENTINEL).count(),
+            1,
+            "unexpected document: {raw}"
+        );
+        assert!(
+            raw.contains("mode = \"system\""),
+            "unexpected document: {raw}"
+        );
+    }
+
+    /// The log sink, and the measurement that made [`invalid_document_log`]
+    /// necessary.
+    ///
+    /// `toml::de::Error`'s own `Display` echoes the offending value twice — in
+    /// a rendered source line and in serde's `invalid type` message — so the
+    /// diagnostic `load_from` used to print put a hand-edited document's bytes
+    /// into this process's stderr and the deck log. Both halves are asserted:
+    /// the raw error **does** carry the value (so the redaction is proven
+    /// necessary rather than assumed), and what is logged instead does not,
+    /// while still naming the file and the line.
+    #[test]
+    fn a_parse_diagnostic_carries_a_locator_and_never_the_documents_bytes() {
+        let path = Path::new("/home/dev/.config/dot-agent-deck/desktop.toml");
+        let cases = [
+            format!("version = \"{SENTINEL}\"\n"),
+            format!("version = 1\n[zoom]\nlevel = \"{SENTINEL}\"\n"),
+            format!("version = 1\nappearance = \"{SENTINEL}\"\n"),
+            // A syntax error rather than a type error: the same rendered
+            // source line, so the same exposure.
+            format!("version = 1\nnot a key = = {SENTINEL}\n"),
+        ];
+
+        for contents in &cases {
+            let error = toml::from_str::<DesktopSettings>(contents).unwrap_err();
+            assert!(
+                error.to_string().contains(SENTINEL),
+                "the toml error stopped echoing the value, so `invalid_document_log` \
+                 can be simplified and its doc comment is now wrong: {error}"
+            );
+
+            let logged = invalid_document_log(path, contents, &error);
+            assert_free_of_sentinel("the parse diagnostic", &logged);
+            assert!(
+                logged.contains("line ") || logged.contains("an unreported position"),
+                "the diagnostic must still locate the problem: {logged}"
+            );
+            // This is the log, which is the half of the split that may name a
+            // path — the same rule `SettingsWriteError::detail` follows.
+            assert!(
+                logged.contains("desktop.toml"),
+                "unexpected diagnostic: {logged}"
+            );
+        }
+
+        // The locator itself, on a case whose position is known by hand: the
+        // offending value on line 3 starts at column 9 (`level = "`).
+        let contents = format!("version = 1\n[zoom]\nlevel = \"{SENTINEL}\"\n");
+        let error = toml::from_str::<DesktopSettings>(&contents).unwrap_err();
+        assert!(
+            invalid_document_log(path, &contents, &error).contains("line 3, column 9"),
+            "unexpected locator: {}",
+            invalid_document_log(path, &contents, &error)
+        );
+
+        // A multi-byte character before the offending value must not shift the
+        // column into nonsense, which is why the count is characters: `é` is
+        // two bytes, so `b` on line 2 is at byte 7 and column 1, not column 2.
+        assert_eq!(line_and_column("é = 1\nb = 2", 7), Some((2, 1)));
+        assert_eq!(line_and_column("é = 1\nb = 2", 5), Some((1, 5)));
+        // An offset inside a multi-byte character has no honest answer.
+        assert_eq!(line_and_column("é = 1", 1), None);
+        assert_eq!(line_and_column("abc", 99), None);
+    }
+
+    /// The error-message sink, on both sides of the [`SettingsWriteError`]
+    /// split, with a document that holds the sentinel while the save fails.
+    ///
+    /// The narrow claim, verified case by case rather than asserted in
+    /// general: every `SettingsWriteError` this module can build is
+    /// constructed from a **path** and an `io::Error` or a serialisation
+    /// error, never from the document's contents — so neither half carries a
+    /// value, and `dto::safe_message` (which is a control-character filter and
+    /// a length cap, **not** a redactor) has nothing to remove.
+    #[cfg(unix)]
+    #[test]
+    fn no_settings_write_error_carries_a_value_from_the_document() {
+        let dir = tempdir();
+        let path = dir.path().join(SETTINGS_FILE_NAME);
+        std::fs::write(
+            &path,
+            format!("version = 1\n[voice]\napi_key = \"{SENTINEL}\"\n"),
+        )
+        .unwrap();
+
+        // An unreadable existing document: the failure happens in
+        // `read_document`, with the sentinel one `open` away.
+        set_mode(&path, 0o000);
+        if std::fs::read_to_string(&path).is_ok() {
+            set_mode(&path, 0o600);
+            eprintln!(
+                "SKIP: this process can read a 0o000 file (running privileged), so an \
+                 unreadable document cannot be constructed here"
+            );
+            return;
+        }
+        let unreadable = save_to(&path, &dark()).unwrap_err();
+        set_mode(&path, 0o600);
+
+        // A read-only parent: the read succeeds, so the sentinel has been in
+        // this process's memory, and the failure is in `create_temp`.
+        set_mode(dir.path(), 0o500);
+        let unwritable_dir = save_to(&path, &dark());
+        set_mode(dir.path(), 0o700);
+
+        let mut errors = vec![unreadable];
+        match unwritable_dir {
+            Err(error) => errors.push(error),
+            Ok(()) => eprintln!(
+                "SKIP: this process can write into a 0o500 directory (running privileged)"
+            ),
+        }
+
+        for error in errors {
+            assert_free_of_sentinel("a write error's log detail", error.detail());
+            assert_free_of_sentinel("a write error's webview message", error.public());
+            assert_free_of_sentinel("a write error's `Display`", &error.to_string());
+            assert_free_of_sentinel(
+                "`safe_message` of a write error's public half",
+                &crate::dto::safe_message(error.public()),
+            );
+        }
     }
 }
