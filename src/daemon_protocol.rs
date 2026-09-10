@@ -13,9 +13,16 @@
 //!   forward-compatible by design (older peer ignores the field, newer peer
 //!   tolerates its absence).
 //!
-//! The handshake itself ([`AttachRequest::Hello`]) is enforced only by the
-//! laptop-side `connect` flow — single-binary in-process call sites already
-//! match versions by construction and don't need the check.
+//! The handshake itself ([`AttachRequest::Hello`]) is enforced by the
+//! **desktop** client, which refuses to connect unless the daemon reports
+//! exactly this [`PROTOCOL_VERSION`] (`desktop/src-tauri/src/daemon_bridge.rs`,
+//! `classify_handshake`) — that check runs before the build-stamp comparison
+//! and its session-scoped bypass cannot reach it. No other client refuses on a
+//! version *difference*: `72527b9` removed the laptop-side `connect`
+//! comparison this note used to name (issue #491 — it compared two constants
+//! that never shared a wire), leaving only a presence floor there, and the
+//! local TUI attach path never had one (issue #405). Single-binary in-process
+//! call sites match versions by construction.
 //!
 //! # Wire format
 //!
@@ -278,9 +285,36 @@ pub fn parse_geometry_frame(bytes: &[u8]) -> Option<(u16, u16)> {
 /// participation: its resizes take the unattributed path and it is not told when
 /// somebody else moves the size.
 ///
+/// **PRD #819's four new `AttachRequest` variants ride that same 9, and do not
+/// bump again.** [`AttachRequest::ListProjects`], [`AttachRequest::ResolveProject`],
+/// [`AttachRequest::PrepareWorkflow`] and [`AttachRequest::StartPreparedAgent`]
+/// are on the bump list for the ordinary reason — an older daemon fails the
+/// frame decode on a variant it does not have — but one bump covers every wire
+/// change made before 9 ships, and 9 is unreleased: `v0.39.4` carries
+/// `PROTOCOL_VERSION = 8`, and PRD #882's change above landed after that tag.
+/// The [`AttachResponse::capabilities`] field that goes with them is additive
+/// and optional and would have needed no bump of its own; it is what lets a
+/// client tell "speaks 9" from "answers this verb", which is exactly what is
+/// needed while more than one build carries 9.
+///
+/// **Do not read that as licence to keep adding variants at 9.** It holds only
+/// while 9 is unreleased: the moment a build carrying it ships, another variant
+/// is another break for every user, and this repo's bump policy makes that
+/// another minor release (`docs/develop/versioning.md`). That deadline is why
+/// `StartPreparedAgent` was taken now rather than left as the recorded next
+/// step it started as — and it now applies to PRD #882's frame kind too, since
+/// both changes are spending the same one bump.
+///
 /// # Where this constant is enforced
 ///
-/// **No call site refuses on it today, and that is issue #405.** The bump
+/// **Exactly one call site refuses on it: the desktop.**
+/// `classify_handshake` in `desktop/src-tauri/src/daemon_bridge.rs` requires
+/// `server_version == Some(PROTOCOL_VERSION)`, runs that comparison *before*
+/// the build-stamp one, and is not reachable by the stamp check's
+/// session-scoped bypass — so a desktop and a daemon that disagree here never
+/// exchange a second frame. Inside this crate nothing refuses on a version
+/// *difference* — `probe_remote_protocol`'s surviving check is a presence
+/// floor, described two paragraphs down — and that is issue #405. The bump
 /// rationales above were written while
 /// [`crate::connect::probe_remote_protocol`] compared the remote's
 /// `server_version` against the laptop's and hard-failed on a difference, and
@@ -294,14 +328,16 @@ pub fn parse_geometry_frame(bytes: &[u8]) -> Option<(u16, u16)> {
 /// cannot answer `daemon hello` at all — an install floor, not a version
 /// verdict.
 ///
-/// The local same-machine TUI↔daemon pairing is the one place a wire-shape skew
-/// can actually happen (the binary upgraded on disk under a still-running
+/// The local same-machine TUI↔daemon pairing is the place a wire-shape skew
+/// most easily happens (the binary upgraded on disk under a still-running
 /// daemon), and it is guarded by [`crate::build_version_handshake`]'s
 /// `DAD_BUILD_ID` comparison rather than by this constant. Build-id equality is
 /// strictly stronger than protocol equality when it *matches* — same build
 /// implies same protocol — but declining its restart prompt (the right choice
 /// when live agents would die with the daemon) attaches anyway with no version
-/// check of any kind. Issue #405 tracks closing that.
+/// check of any kind. Issue #405 tracks closing that. The desktop↔daemon
+/// pairing skews the same way and is the one that *does* read this constant,
+/// per the paragraph above.
 ///
 /// Keep bumping this on every wire-shape break regardless. The bump is what
 /// makes a skew *nameable* — it is the number the handshake reports, what
@@ -319,6 +355,259 @@ pub const PROTOCOL_VERSION: u32 = 9;
 /// header without the async reader, and used to allocate straight off the u32.
 /// Both sides now read the one constant — do not re-spell the 16 MiB literal.
 pub(crate) const MAX_FRAME_LEN: usize = 16 * 1024 * 1024;
+
+// ---------------------------------------------------------------------------
+// PRD #819: capability strings, and the project verbs' bounded error codes.
+// ---------------------------------------------------------------------------
+
+/// Capability string for [`AttachRequest::ListProjects`].
+///
+/// The strings are the kebab-case `op` names the request enum already
+/// serializes to, so there is one spelling of each verb rather than two that
+/// can drift.
+pub const CAP_LIST_PROJECTS: &str = "list-projects";
+
+/// Capability string for [`AttachRequest::ResolveProject`].
+pub const CAP_RESOLVE_PROJECT: &str = "resolve-project";
+
+/// Capability string for [`AttachRequest::PrepareWorkflow`].
+pub const CAP_PREPARE_WORKFLOW: &str = "prepare-workflow";
+
+/// Capability string for [`AttachRequest::StartPreparedAgent`].
+///
+/// Withheld wherever [`CAP_PREPARE_WORKFLOW`] is withheld, and the two are only
+/// useful together: a build that cannot prepare a workflow can never have issued
+/// a token, so a prepared start on it has nothing to present.
+pub const CAP_START_PREPARED_AGENT: &str = "start-prepared-agent";
+
+/// The capability set this build advertises on the [`AttachRequest::Hello`]
+/// reply, via [`AttachResponse::with_capabilities`].
+///
+/// **What an entry claims, precisely:** this build's dispatch knows the op and
+/// answers it with a defined [`AttachResponse`], rather than failing the frame
+/// decode with serde's `unknown variant …`. It does **not** claim that a given
+/// call will succeed — a bounded refusal (a rejected path, an over-long task)
+/// is a normal answer to a known verb. Strike a verb from this list if this
+/// build stops accepting it; do not leave a name here that the dispatch no
+/// longer has an arm for.
+///
+/// **[`CAP_PREPARE_WORKFLOW`] and [`CAP_START_PREPARED_AGENT`] are Unix-only**,
+/// which is the one place that distinction bites. A non-Unix build refuses both
+/// verbs *unconditionally* with [`PROJECT_ERR_UNSUPPORTED_PLATFORM`] — the
+/// publish cannot deliver the owner-only guarantee there, so no preparation can
+/// exist and nothing can be started against one — and that is not a bounded
+/// refusal of a particular request but the verb being unavailable, which is
+/// exactly the "this build stops accepting it" case above. Advertising either
+/// anyway would reduce the list to "the frame decodes", and the whole point of
+/// PRD #819's capability helper is that a client withholds rather than enables
+/// on absence. The two travel together deliberately: they are one feature split
+/// across two round trips, and a build offering the second without the first
+/// would be advertising a verb that can only ever answer
+/// [`PROJECT_ERR_STALE_TOKEN`].
+#[cfg(unix)]
+pub const DAEMON_CAPABILITIES: &[&str] = &[
+    CAP_LIST_PROJECTS,
+    CAP_RESOLVE_PROJECT,
+    CAP_PREPARE_WORKFLOW,
+    CAP_START_PREPARED_AGENT,
+];
+#[cfg(not(unix))]
+pub const DAEMON_CAPABILITIES: &[&str] = &[CAP_LIST_PROJECTS, CAP_RESOLVE_PROJECT];
+
+/// PRD #819 M2: the project verbs' refusal carries a stable machine-readable
+/// code as the first token of [`AttachResponse::error`], followed by `": "` and
+/// a generic human sentence.
+///
+/// The codes exist because the alternative is matching prose, and because the
+/// text after them is deliberately uninformative: an arbitrary caller-selected
+/// path gets a bounded refusal that names no path, no parser source line and no
+/// raw OS error. [`crate::project_config::ProjectConfigError`]'s `Display`
+/// renders the offending TOML line verbatim, so returning it for a pasted path
+/// would disclose file *content*, not merely existence. Detail is reserved for
+/// a path already in the daemon's known set — see the PRD's disclosure split —
+/// and that half arrives with M3.
+pub const PROJECT_ERR_INVALID_PATH: &str = "invalid-path";
+
+/// The `task` on [`AttachRequest::PrepareWorkflow`] exceeded
+/// [`crate::bounded_read::MAX_TASK_BYTES`], or carried a NUL. See
+/// [`PROJECT_ERR_INVALID_PATH`] for the code convention.
+pub const PROJECT_ERR_TASK_REJECTED: &str = "task-rejected";
+
+/// The verb parsed and its arguments were accepted, but this build has no
+/// implementation behind it yet (PRD #819 M2 landed the wire contract; M3 and
+/// M4 land the behaviour).
+///
+/// It is a distinct code rather than a generic failure because the two are not
+/// the same thing to a caller, and it is an error rather than `ok: true` with
+/// an empty payload for the same reason: a client — or a test — cannot tell an
+/// empty answer apart from a real one. A panic was the other option and is
+/// worse; `handle_connection` serves other clients.
+///
+/// **No arm of this build's dispatch returns it any more.** M3 landed
+/// `list-projects` and `resolve-project`, M4 landed `prepare-workflow`, and the
+/// helper that produced this refusal went with the last of them. The constant
+/// stays because it is the thing the behaviour tests assert an answer is *not*:
+/// a refusal that comes from resolving a project and a refusal that comes from
+/// there being no implementation are indistinguishable to a caller that cannot
+/// name the difference, and that is exactly how an implementation gets quietly
+/// reverted. Keep it, and give it back to any verb this file grows a stub for.
+pub const PROJECT_ERR_UNIMPLEMENTED: &str = "unimplemented";
+
+/// PRD #819 M4: the caller's [`AttachRequest::PrepareWorkflow::config_revision`]
+/// does not match the config the daemon just read.
+///
+/// The client resolved against one snapshot and is asking to launch against
+/// another. Refusing is what closes the TOCTOU window between the picker, the
+/// write and the spawn; the remedy is to resolve again, which is what the
+/// sentence says.
+pub const PROJECT_ERR_STALE_REVISION: &str = "stale-revision";
+
+/// PRD #819 M4: the project resolved, but defines no role-bearing orchestration
+/// under the requested name.
+///
+/// A separate code from [`PROJECT_ERR_UNRESOLVED`] because it is a different
+/// fact and a different remedy — the project is fine and the *name* is wrong —
+/// and because it is only reachable once the path has already resolved, so it
+/// discloses nothing that refusal was protecting. The sentence still names no
+/// available orchestration: that is config content for a path the caller may
+/// merely have pasted.
+pub const PROJECT_ERR_NO_ORCHESTRATION: &str = "no-such-orchestration";
+
+/// PRD #819 M4: the project and the orchestration resolved, but the coordinator
+/// context could not be published.
+///
+/// See [`crate::orchestrator_context::ContextPublishError::client_sentence`] for
+/// what the text after it is allowed to say and why it is allowed to be more
+/// specific than [`crate::project_resolve::generic_refusal`].
+pub const PROJECT_ERR_PUBLISH_FAILED: &str = "publish-failed";
+
+/// PRD #819 M4: an [`AttachRequest::StartPreparedAgent`] presented a `prep_token`
+/// this daemon did not issue, or issued longer ago than
+/// [`crate::prep_token::PREP_TOKEN_TTL`].
+///
+/// One code for both, because they are one answer: the token does not identify
+/// a live preparation. Read [`crate::prep_token`]'s module doc before treating
+/// this as an authorization failure — it is not one. There is no "absent token"
+/// case to except any more: the token is a required field of the verb, and a
+/// request without one does not decode.
+pub const PROJECT_ERR_STALE_TOKEN: &str = "stale-token";
+
+/// PRD #819 audit fix: an [`AttachRequest::StartPreparedAgent`] presented a
+/// `prep_token` this daemon **did** issue and which has **not** expired, but the
+/// state that preparation approved has moved — see
+/// [`crate::project_resolve::revalidate_preparation`] for the five checks.
+///
+/// A distinct code from [`PROJECT_ERR_STALE_TOKEN`] because it is a distinct
+/// fact: the token is live and the *world* changed, rather than the token being
+/// unknown or aged out. The remedy is the same (prepare again), which is why the
+/// sentence after each code reads alike, but a client or a test that cannot tell
+/// "I presented garbage" from "another launch replaced my artifact" cannot
+/// diagnose either.
+///
+/// One code for all five checks, and the sentence names none of them. Read
+/// [`crate::prep_token`]'s module doc before treating this as an authorization
+/// failure — it is a staleness and integrity refusal.
+pub const PROJECT_ERR_STALE_PREPARATION: &str = "stale-preparation";
+
+/// PRD #819 Greptile P1(a): an [`AttachRequest::StartPreparedAgent`] presented a
+/// token this daemon issued, which has **not** expired and whose approved state
+/// is still intact — but the request being made is not the one that preparation
+/// approved.
+///
+/// **This is a different fact from [`PROJECT_ERR_STALE_PREPARATION`], and until
+/// this code existed nothing checked it at all.** The audit fix made the record
+/// carry what a preparation approved and made the spawn re-validate it against
+/// the filesystem; what it did not do is compare the *submitted* spawn fields
+/// against that record. So a caller could present a token prepared for project X
+/// while submitting the `cwd`, orchestration and role of project Y, and the
+/// daemon validated X and started Y. Making the code look validated is what made
+/// that easy to miss.
+///
+/// `stale-preparation` means "your preparation was ours and live, but the world
+/// moved"; this means "your request does not match your preparation". Those send
+/// an operator in different directions — one is a race with another launch and
+/// is fixed by preparing again, the other is a client that is not sending back
+/// what it was handed and preparing again will not help — which is the same
+/// reasoning that already separates [`PROJECT_ERR_STALE_TOKEN`] from
+/// [`PROJECT_ERR_STALE_PREPARATION`].
+///
+/// See [`crate::project_resolve::verify_prepared_start`] for exactly which
+/// fields are bound and, just as load-bearing, which are deliberately not — the
+/// `command` is not, because per-launch command override is an existing,
+/// documented feature.
+pub const PROJECT_ERR_PREPARATION_MISMATCH: &str = "preparation-mismatch";
+
+/// PRD #819 audit follow-up: an [`AttachRequest::StartAgent`] payload carried a
+/// `prep_token` key, which that verb does not enforce.
+///
+/// The remedy is the verb, not the value: send
+/// [`AttachRequest::StartPreparedAgent`]. It is a refusal rather than a shrug
+/// because the alternative is the exact failure this code's sibling verb exists
+/// to remove — serde drops unknown keys on `StartAgent`, so ignoring the token
+/// would start the role *unenforced* and report success, and the caller would
+/// have no way to tell that from a preparation that was honoured.
+///
+/// No production caller reaches it: the TUI, the desktop and dispatch all spawn
+/// without a token, and the one client method that presents one
+/// ([`crate::daemon_client::DaemonClient::start_agent_with_prep_token`]) sends
+/// the prepared verb. The wire tests build the payload deliberately, which is
+/// the point of the code existing.
+pub const PROJECT_ERR_WRONG_START_VERB: &str = "wrong-start-verb";
+
+/// PRD #819 audit fix: [`AttachRequest::PrepareWorkflow`] is refused on this
+/// platform because the publish cannot deliver the owner-only guarantee it
+/// documents.
+///
+/// **The premise this replaces was false.** The publish's mode bits,
+/// `O_NOFOLLOW | O_DIRECTORY` open and group/other-write refusal are all Unix
+/// (`crate::orchestrator_context::open_context_dir`), and the module excused
+/// that by asserting the daemon is Unix-only. It is not — [`bind_attach_listener`]
+/// returns a `crate::platform::ipc::IpcListener`, which on Windows is an active
+/// **named pipe** listener. So a Windows daemon really can be asked to create a
+/// directory and write a file at a path a *peer* named, with no protected DACL
+/// applied and with path lookups rather than a reparse-safe handle.
+///
+/// Two honest options existed: implement the DACL half with the helpers in
+/// `crate::platform::fsperm` (they exist —
+/// `create_owner_only_dir` / `set_file_owner_only` / `ensure_owner_only_dir`),
+/// or refuse the verb where the guarantee cannot be provided and narrow the
+/// documentation to match. The second was taken: Windows desktop is out of PRD
+/// #819's scope, so refusing there is consistent with what shipped, it is far
+/// smaller than a correct DACL implementation, and it turns a false claim into a
+/// true one. Enabling the verb on Windows later means building the DACL path
+/// **and** deleting this code — not deleting this code alone.
+///
+/// The verb is also struck from [`DAEMON_CAPABILITIES`] on such a platform, so a
+/// client learns at the handshake rather than at launch time.
+pub const PROJECT_ERR_UNSUPPORTED_PLATFORM: &str = "unsupported-platform";
+
+/// PRD #819 M3: the ONE code carried by every refusal that comes from
+/// *resolving* a path against a filesystem.
+///
+/// It is deliberately a single code for every cause — no such directory, no
+/// config there, a config that is a FIFO, a config that does not parse — because
+/// the property this verb delivers is that **the wire response does not directly
+/// distinguish** those cases for an arbitrary caller-supplied path. A code per
+/// cause would hand that distinction back on a plate.
+///
+/// It is not the only code these verbs can return, and the difference matters:
+/// a path that fails [`validate_project_path`]'s string check answers with
+/// [`PROJECT_ERR_INVALID_PATH`] instead, before any filesystem is touched. That
+/// refusal is about the caller's own request being malformed rather than about
+/// what is on disk, so it discloses nothing this one is protecting.
+///
+/// Read the claim narrowly, and do not widen it in a comment later:
+/// canonicalisation, traversal, `open(2)` and TOML parsing do observably
+/// different amounts of work, so **no timing property is claimed** and the
+/// concurrency bound in [`crate::project_resolve`] protects availability rather
+/// than constant time. What is claimed is about the response bytes alone.
+///
+/// The text after the code splits by trust: a path the daemon already knows
+/// carries the detailed diagnostic (`crate::project_resolve::known_path_refusal`),
+/// and every other path carries one fixed generic sentence
+/// (`crate::project_resolve::generic_refusal`) that names no path, no parser
+/// source line and no raw OS error.
+pub const PROJECT_ERR_UNRESOLVED: &str = "unresolved";
 
 /// Bounded timeout for a single STREAM_OUT/STREAM_END write to a client. If
 /// a client stops draining its socket, the OS send buffer fills and our
@@ -564,7 +853,7 @@ pub enum AttachRequest {
     },
     /// PRD #100: atomic write-and-submit RPC. Routes the client's
     /// `pane_id` + `text` straight to
-    /// [`crate::agent_pty::AgentPtyRegistry::write_to_pane_and_submit`]
+    /// [`crate::agent_pty::AgentPtyRegistry::write_and_submit_guarded`]
     /// on the daemon side, which holds the per-agent writer mutex across
     /// the full `payload → SUBMIT_DELAY → CR` sequence (PRD #93 round-8
     /// atomic contract). Lets a TUI client trigger the same atomic
@@ -591,9 +880,12 @@ pub enum AttachRequest {
     /// PRD #76 M2.21: protocol-version handshake. Client sends its
     /// [`PROTOCOL_VERSION`]; server replies with its own in
     /// [`AttachResponse::server_version`]. The daemon never rejects on
-    /// `client_version`, and since issue #491 no client rejects on
-    /// `server_version` either — `connect`'s strict comparison was the last
-    /// one, and the local attach path never had one (issue #405). See the
+    /// `client_version`. On the client side, the **desktop** rejects on
+    /// `server_version` — `classify_handshake` in
+    /// `desktop/src-tauri/src/daemon_bridge.rs` requires exact equality and is
+    /// never bypassed. Issue #491 removed `connect`'s comparison and the local
+    /// TUI attach path never had one (issue #405), so the desktop is currently
+    /// the only client that refuses on a version *difference*. See the
     /// enforcement note on [`PROTOCOL_VERSION`].
     ///
     /// PRD #103 M1.2: optional `client_build_version` carries the client's
@@ -639,6 +931,146 @@ pub enum AttachRequest {
     /// warning on any error, which is the same way it treats a down daemon.
     DispatchWorktreeClosePreview {
         pane_ids: Vec<String>,
+    },
+    /// PRD #819 M2: enumerate the projects this daemon knows about. **Read-only.**
+    ///
+    /// A GUI cannot `cd`, and against a remote daemon it cannot browse to find
+    /// out either — so this is the desktop's equivalent of the TUI's selection
+    /// mechanism. The answer is derived from what the daemon already holds
+    /// (its own startup cwd, live agent cwds, orchestration cwds), revalidated
+    /// per candidate; nothing is persisted on either side. The reply rides back
+    /// on [`AttachResponse::projects`].
+    ///
+    /// A struct variant with no fields rather than a unit variant, because the
+    /// enumeration will grow bounds (a cap, a filter) and a unit variant cannot
+    /// gain a `#[serde(default)]` field without moving the wire shape again.
+    ListProjects {},
+    /// PRD #819 M2: resolve one project path. **Read-only.**
+    ///
+    /// One path in, resolved. No directory walk, no children, no parents, and
+    /// no implicit widening — resolving `/a/b` does not make `/a` or `/a/b/c`
+    /// known. This is the primitive the desktop lacks, and it is deliberately
+    /// narrower than a filesystem API: PRD #76's rejected Phase 6 was
+    /// `ListDir` / `ReadFile` / `Stat` and this is not that.
+    ///
+    /// It is **API minimisation, not authorization.** Any peer that reaches
+    /// this socket already has the daemon user's local-exec authority via
+    /// [`AttachRequest::StartAgent`] — see its trust-boundary note. Withholding
+    /// a browse verb limits the blast radius of a compromised or buggy UI and
+    /// keeps least privilege available later; it is not a privilege boundary.
+    ///
+    /// The reply rides back on [`AttachResponse::project`].
+    ResolveProject {
+        /// An absolute path. Either a path this daemon returned from
+        /// [`AttachRequest::ListProjects`], or one a user supplied verbatim —
+        /// never one a client derived from its own environment, because a
+        /// desktop client's filesystem need not be the daemon's.
+        path: String,
+    },
+    /// PRD #819 M2/M4: prepare a workflow launch — resolve, compose the
+    /// coordinator context, and publish it. **The only new verb that writes.**
+    ///
+    /// Preparing the context is an explicit launch phase rather than an
+    /// incidental side effect of resolution: enumerate and resolve stay
+    /// read-only, and there is otherwise no operation at which the daemon-side
+    /// write could happen ([`AttachRequest::StartAgent`] carries no task and no
+    /// config revision, and is issued once per role). A failed preparation
+    /// starts no roles.
+    ///
+    /// The reply rides back on [`AttachResponse::workflow_prepared`].
+    PrepareWorkflow {
+        /// The daemon-canonical path, as returned by
+        /// [`AttachRequest::ListProjects`] or [`AttachRequest::ResolveProject`].
+        /// Not a client-derived path.
+        path: String,
+        orchestration: String,
+        /// The coordinator task. Bounded server-side at
+        /// [`crate::bounded_read::MAX_TASK_BYTES`] before any filesystem work —
+        /// the desktop's own 64 KiB check is a UI affordance and not a bound
+        /// this daemon may rely on.
+        task: String,
+        /// The config revision the client believes it resolved against, as
+        /// [`crate::event::ResolvedProject::config_revision`] handed it back.
+        /// Stale values are refused with [`PROJECT_ERR_STALE_REVISION`], which
+        /// is what closes the TOCTOU window between the picker, the write and
+        /// the spawn.
+        ///
+        /// `#[serde(default)]`, and **absent means "no expectation" rather than
+        /// "any revision"** — a client that has not resolved yet must still be
+        /// able to launch, which is what keeps the field additive. It is not a
+        /// degrade-to-unauthorized of the #608 kind: there is no authorization
+        /// here to degrade from, only a staleness check the caller can decline
+        /// to make.
+        #[serde(default)]
+        config_revision: Option<String>,
+    },
+    /// PRD #819 audit follow-up: start ONE role of a workflow this daemon
+    /// prepared. [`AttachRequest::StartAgent`] plus a **required** `prep_token`.
+    ///
+    /// # Why a verb and not a field
+    ///
+    /// The token used to ride on `StartAgent` as an additive JSON key, and that
+    /// shape **fails open on the wire**. `StartAgent` is a stable op every
+    /// daemon back to PRD #76 accepts; an older one decodes the base variant,
+    /// ignores the unknown key and starts the role with no preparation
+    /// enforcement at all. Nothing on this protocol could catch that from the
+    /// client side either: `DaemonClient::connect` is a bare socket connect,
+    /// `issue_json_command` writes one request frame, and [`handle_connection`]
+    /// decodes exactly one `KIND_REQ` per connection — so a role-start
+    /// connection exchanges no [`AttachRequest::Hello`] and re-checks no
+    /// [`PROTOCOL_VERSION`]. Verifying the peer on a *previous* connection
+    /// narrows the window to the gap between two `connect()` calls; it cannot
+    /// shut it.
+    ///
+    /// A distinct `op` removes the timing argument entirely. A daemon that does
+    /// not know this variant fails the frame decode and answers the structured
+    /// `malformed request: unknown variant …` refusal from [`handle_connection`]
+    /// — `ok: false`, nothing spawned, on the very connection the spawn would
+    /// have used. **The launch fails closed with no window at all.**
+    ///
+    /// # What it does NOT change
+    ///
+    /// This is not an authorization boundary and the token is not an
+    /// authorization token — read [`crate::prep_token`]'s module doc. Any peer
+    /// on this socket already holds the daemon user's local-exec authority
+    /// through `StartAgent`, which takes arbitrary `command`, `cwd` and `env`; a
+    /// peer that wants to spawn something arbitrary calls that and is not
+    /// slowed down here. What the verb protects is a *coordinator* against
+    /// launching on a preparation some other launch replaced — a staleness and
+    /// integrity property, and the same one the token always carried.
+    ///
+    /// The fields after `prep_token` are `StartAgent`'s, spelled out rather than
+    /// nested so the wire shape of a role start is one flat object either way.
+    /// Every one carries the same `serde` attribute it does there, so the two
+    /// cannot drift in their defaults.
+    StartPreparedAgent {
+        /// The token [`AttachRequest::PrepareWorkflow`] handed back
+        /// ([`crate::event::PreparedWorkflow::token`]).
+        ///
+        /// **Required, and that is the entire point.** A `#[serde(default)]`
+        /// here would let a client omit it and be served anyway, which is the
+        /// silent downgrade the verb exists to remove; an absent or wrongly
+        /// typed value fails the decode and takes the same structured
+        /// malformed-request path an older daemon takes.
+        prep_token: String,
+        #[serde(default)]
+        command: Option<String>,
+        #[serde(default)]
+        cwd: Option<String>,
+        #[serde(default = "default_rows")]
+        rows: u16,
+        #[serde(default = "default_cols")]
+        cols: u16,
+        #[serde(default)]
+        env: Vec<(String, String)>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        display_name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tab_membership: Option<TabMembership>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_type: Option<AgentType>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        seed: Option<String>,
     },
 }
 
@@ -694,6 +1126,40 @@ struct WriteAndSubmitExtras {
     /// failure never double-submits (R20-004).
     #[serde(default)]
     delivery_id: Option<String>,
+}
+
+/// PRD #819 audit follow-up: the detector that keeps the *removed* token-on-
+/// `StartAgent` path from coming back as a silent one.
+///
+/// M4 landed the preparation token as an additive `prep_token` key alongside
+/// [`AttachRequest::StartAgent`], re-parsed from the same payload the way
+/// [`WriteAndSubmitExtras`] still is. That shape fails open against an older
+/// peer — see [`AttachRequest::StartPreparedAgent`], which replaced it — and it
+/// never shipped: `PROTOCOL_VERSION` was already 9 and unreleased when it was
+/// removed, so no deployed daemon or client ever spoke it.
+///
+/// Removing the field would have made `start-agent` *ignore* a `prep_token`,
+/// because serde drops unknown keys on the base variant — turning a caller
+/// aiming at the wrong verb into an unenforced spawn, which is precisely the
+/// failure being removed. So the re-parse stays, purely to notice the key and
+/// refuse: a token belongs on `start-prepared-agent`, and this verb says so
+/// rather than starting the role.
+///
+/// The field is `serde_json::Value` rather than `String` on purpose. Presence is
+/// the whole question — a wrongly typed token is still a caller reaching for the
+/// prepared path — and `Option<Value>` accepts any JSON, so this parse cannot
+/// fail on a payload that already decoded as `StartAgent` and there is no
+/// malformed branch to get wrong. JSON `null` deserializes to `None`, which is
+/// the same as absent and is the right reading of it.
+///
+/// **An absent key still changes nothing.** The TUI, the desktop, dispatch and
+/// every existing test call `start-agent` without one, and none of them may
+/// break.
+#[derive(Debug, Default, Deserialize)]
+struct StartAgentExtras {
+    /// Present iff the caller put a `prep_token` key on a plain `start-agent`.
+    #[serde(default)]
+    prep_token: Option<serde_json::Value>,
 }
 
 /// PRD #161 M1.1: a snapshot of the agents the daemon is currently managing,
@@ -851,6 +1317,47 @@ pub struct AttachResponse {
     /// with is owed to the new REQUEST variant beside it, not to this.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kept_worktree: Option<crate::issue_dispatch_run::KeptWorktree>,
+    /// PRD #819 M2: the answer to [`AttachRequest::ListProjects`]. `None` on
+    /// every other response. Additive + optional, so the field itself is
+    /// forward-compatible in both directions; the `PROTOCOL_VERSION` bump this
+    /// ships with is owed to the three new REQUEST variants beside it, not to
+    /// this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projects: Option<crate::event::ProjectListing>,
+    /// PRD #819 M2: the answer to [`AttachRequest::ResolveProject`]. `None` on
+    /// every other response, and on a refusal. Additive + optional on the same
+    /// basis as [`Self::projects`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<crate::event::ResolvedProject>,
+    /// PRD #819 M2: the answer to [`AttachRequest::PrepareWorkflow`]. `None` on
+    /// every other response, and on a preparation that failed — a failed
+    /// preparation publishes nothing and starts no roles. Additive + optional
+    /// on the same basis as [`Self::projects`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_prepared: Option<crate::event::PreparedWorkflow>,
+    /// PRD #819 M2/M5: explicit capability advertisement on the
+    /// [`AttachRequest::Hello`] reply — the general form of
+    /// [`Self::guarded_send`], which stays exactly as it is and is deliberately
+    /// **not** folded into this list (an older client reads only the boolean,
+    /// and moving it would break that client for no gain).
+    ///
+    /// Each entry is a stable string naming one op this build's dispatch
+    /// accepts and answers; see [`DAEMON_CAPABILITIES`]. Unknown strings are
+    /// ignored by a reader, so the set can grow without a bump.
+    ///
+    /// **Absence means "this daemon does not tell you", which a client must
+    /// treat as "withhold" — never as "proceed".** That is the
+    /// [`Self::guarded_send`] rule generalised, and it is the only safe reading:
+    /// an older daemon omits the field entirely, and it is indistinguishable
+    /// from a newer one that chose to.
+    ///
+    /// It is **compatibility metadata, NOT authentication.** A daemon controls
+    /// its own replies and can therefore claim anything; what this buys is a
+    /// stable answer to "will this op parse over there", in place of
+    /// string-matching serde's `unknown variant …` message — which is not a
+    /// stability contract. Nothing may branch on that error text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capabilities: Option<Vec<String>>,
     /// Issue #770: the orchestration ROLE registrations the daemon is holding
     /// in memory, populated on the [`AttachRequest::ListAgents`] reply.
     ///
@@ -980,6 +1487,15 @@ impl AttachResponse {
     /// build) makes a guarded send FAIL SAFE — see [`Self::guarded_send`].
     pub fn with_guarded_send(mut self) -> Self {
         self.guarded_send = Some(true);
+        self
+    }
+
+    /// PRD #819 M2/M5: advertise [`DAEMON_CAPABILITIES`] on a handshake reply.
+    /// The live daemon's `Hello` handler calls this; the static `daemon hello`
+    /// CLI probe and the plain [`Self::hello`] constructor leave the field
+    /// `None`, which a client reads as "withhold" — see [`Self::capabilities`].
+    pub fn with_capabilities(mut self) -> Self {
+        self.capabilities = Some(DAEMON_CAPABILITIES.iter().map(|c| c.to_string()).collect());
         self
     }
 }
@@ -1301,10 +1817,27 @@ async fn compute_write_and_submit_outcome(
             // arms — the resolution block above refuses an identity-less request
             // outright — so every guarded call below binds to a concrete id
             // rather than forwarding an `Option`.
-            let agent_id = extras
-                .expected_agent_id
-                .clone()
-                .expect("a Live target implies an expected agent id");
+            //
+            // Issue #617 made that a TYPE rather than a local invariant:
+            // `write_and_submit_guarded` takes a `&str`, so this is the only
+            // place the refusal above has to be re-stated, and the calls below
+            // could not forward an `Option` even if this block regressed. The
+            // early refusal is kept as the cheaper, better-reported gate — it
+            // answers `SendResult::NoLiveTarget` without touching the registry —
+            // not because the primitive still needs it.
+            //
+            // Issue #617 (auditor finding 5): this `Option → &str` conversion
+            // is load-bearing, so it REFUSES rather than panicking. It cannot
+            // fire today — `Writable::Live` is producible only from the
+            // `Some(agent_id)` arm above and `extras` is not mutated in between
+            // — but it runs inside a connection-handling task, where the
+            // residual failure mode of an `expect` is an aborted attach
+            // connection rather than a refused write. Failing closed costs
+            // nothing and answers with the same `SendResult::NoLiveTarget` the
+            // resolution block above already gives an identity-less request.
+            let Some(agent_id) = extras.expected_agent_id.clone() else {
+                return Ok(SendResult::NoLiveTarget);
+            };
             let guarded = if is_paneless {
                 // A paneless target is re-validated by agent identity (mirroring
                 // STREAM_IN). `<no-pane>` has no pane→hook-session mapping, so the
@@ -1313,79 +1846,100 @@ async fn compute_write_and_submit_outcome(
                 // target.
                 let agent_for_check = agent_id.clone();
                 registry
-                    .write_and_submit_guarded(pane_id, text, Some(&agent_id), move || async move {
+                    .write_and_submit_guarded(pane_id, text, &agent_id, move || async move {
                         st.read().await.agent_writable(&agent_for_check) == Writable::Live
                     })
                     .await
             } else {
                 let pane_for_check = pane_id.to_string();
                 let expected_session = extras.expected_session_id.clone();
+                // Issue #915 (finding 4): the ended-generation witness is keyed by
+                // AGENT, so the closure needs the identity it is already bound to.
+                let agent_for_check = agent_id.clone();
                 registry
-                    .write_and_submit_guarded(pane_id, text, Some(&agent_id), move || async move {
+                    .write_and_submit_guarded(pane_id, text, &agent_id, move || async move {
                         // PRD #20 Greptile P1 (daemon_protocol.rs:988) + the
                         // stale-pre-lock-snapshot CLASS close: this closure runs
                         // UNDER the held target writer, immediately before the
                         // write, and re-reads its authorization inputs HERE
                         // rather than trusting values captured before the guarded
-                        // send went looking for the writer. That is why
-                        // `has_live_attach` moved in: it used to be read BEFORE
-                        // `write_and_submit_guarded` acquired the writer and
-                        // consulted here (stale), so a pane that became attached
-                        // WHILE the send waited for the writer was still seen as
-                        // unattached, letting a stale prompt slip into the
-                        // freshly-attached conversation.
+                        // send went looking for the writer.
                         //
-                        // Issue #608 audit, finding 5 — WHAT SHARES A SNAPSHOT
-                        // AND WHAT DOES NOT. This comment used to call the
-                        // closure the SINGLE delivery-time authorization snapshot
-                        // in which EVERY input it consults is sampled here,
-                        // post-lock. That holds for `pane_writable` and
-                        // `pane_hook_session_id`: both are read below under ONE
-                        // `AppState` read guard, so they are mutually consistent
-                        // and both post-writer-lock. It does NOT hold for
-                        // attachment. `has_live_attach` is read from the REGISTRY
-                        // first, deliberately before `st.read()` is awaited so no
-                        // state lock is held across the registry `inner` mutex —
-                        // and `AgentPtyRegistry::subscribe` builds its receiver
-                        // under the registry/bus locks WITHOUT ever acquiring the
-                        // target writer, so holding that writer fences nothing
-                        // out. A pane can therefore become attached between this
-                        // sample and the state guard below, and the closure then
-                        // authorizes on a stale `false`. The residual window is
-                        // one lock acquisition rather than the unbounded
-                        // wait-for-writer the move above closed, but it is a real
-                        // window and it fails PERMISSIVE. Closing it means making
-                        // subscription participate in the writer-held barrier — a
-                        // registry change, deferred to the follow-up issue that
-                        // carries the sibling call sites, not done here. The
-                        // issue #608 arm below is written so it never depends on
-                        // this value; only the pre-existing named-session arm
-                        // does.
-                        let has_live_attach = registry.pane_has_live_attach(&pane_for_check);
+                        // Issue #915 (finding 5) — ATTACHMENT IS NO LONGER AN
+                        // INPUT, which is what makes the sentence above true of
+                        // everything this closure reads. It used to sample
+                        // `pane_has_live_attach` from the REGISTRY first,
+                        // deliberately before `st.read()` was awaited so no state
+                        // lock was held across the registry `inner` mutex — and
+                        // `AgentPtyRegistry::subscribe` builds its receiver under
+                        // the registry/bus locks WITHOUT ever acquiring the target
+                        // writer, so holding that writer fenced nothing out. A
+                        // pane could therefore become attached between that sample
+                        // and the state guard below, and the closure then
+                        // authorized on a stale `false` — a window as long as a
+                        // concurrent writer holds the `AppState` read lock, and
+                        // one that failed PERMISSIVE.
+                        //
+                        // The remedy taken is to drop attachment from the decision
+                        // rather than to synchronise it: the named-session arm
+                        // below now refuses an absent current generation
+                        // unconditionally, which is a strict superset of the old
+                        // attached-only rule (it can only reject more). Making
+                        // `subscribe` participate in the writer-held barrier was
+                        // assessed and rejected — it is a sync `fn` and the writer
+                        // is a `tokio::sync::Mutex`, so it cannot hold `inner` (a
+                        // `std::sync::Mutex`, guard not `Send`) across that await
+                        // and would split into phases that reintroduce the same
+                        // TOCTOU; `write_guarded` takes writer→inner, so an
+                        // inner→writer `subscribe` is a lock-order inversion; and
+                        // attach would serialize behind in-flight guarded writes,
+                        // regressing a latency the user watches.
+                        //
+                        // `pane_writable` and `pane_hook_session_id` are both read
+                        // below under ONE `AppState` read guard, so they are
+                        // mutually consistent and both post-writer-lock. With
+                        // attachment gone that is now every input, so this closure
+                        // IS the single delivery-time authorization snapshot the
+                        // comment here once claimed it was.
                         let guard = st.read().await;
                         if guard.pane_writable(&pane_for_check) != Writable::Live {
                             return false;
                         }
-                        // PRD #20 R20-003 (finding #4): is a deck client actively
-                        // driving this pane? The strict "reject a None
-                        // current-session" rule applies to a LIVE INTERACTIVE
-                        // (attached) pane — finding #4's threat is a stale prompt
-                        // surfacing in the conversation the user is watching. A
-                        // headless (unattached) delivery whose agent identity is
-                        // confirmed proceeds. In the real deck the TUI is always
-                        // attached to a pane it drives, so this is the strict
-                        // guard for every real delivery. It scopes the
-                        // NAMED-session arm only, and is the sole consumer of
-                        // `has_live_attach` here — the issue #608 arm for an
-                        // UNNAMED session deliberately does not read it.
+                        // PRD #20 R20-003 (finding #4): when the caller named a
+                        // session, require an EXACT match against the pane's
+                        // CURRENT daemon-authoritative hook-session generation. A
+                        // same-agent `/clear` / thread restart rolls the
+                        // generation over → mismatch → reject (always). A `None`
+                        // current-session (the session ended, or none was
+                        // recorded) is refused too — never a silent accept.
                         //
-                        // When the caller named a session, require an EXACT match
-                        // against the pane's CURRENT daemon-authoritative
-                        // hook-session generation. A same-agent `/clear` / thread
-                        // restart rolls the generation over → mismatch → reject
-                        // (always). A `None` current-session (the session ended,
-                        // or none was recorded) is refused too on an attached,
-                        // live-interactive pane — never a silent accept.
+                        // Issue #915 (finding 5): that last refusal used to be
+                        // scoped to an ATTACHED pane, on the reasoning that
+                        // finding #4's threat is a stale prompt surfacing in the
+                        // conversation the user is watching, so a headless
+                        // delivery with a confirmed agent identity could proceed.
+                        // Attachment was the one input this closure could not
+                        // sample under the state guard (see the block above), and
+                        // the sibling arm below had already refused to read it for
+                        // exactly that reason. Refusing regardless of attachment
+                        // makes the two arms agree and is a strict superset of the
+                        // old rule.
+                        //
+                        // What it costs, and it is a real cost: a headless
+                        // (`daemon serve`, no client attached) delivery bound to a
+                        // generation that has since ended is now refused where it
+                        // previously landed. `Stale` is retryable, but neither
+                        // `bind_generation_before_retry` nor `adopt_generation`
+                        // can UN-bind a delivery, so such a caller cannot fall
+                        // back to the unnamed arm and is abandoned at
+                        // `crate::prompt_delivery::AUTOMATIC_PROMPT_DEADLINE`
+                        // (60 s). Attached panes — `EmbeddedPaneController`
+                        // attaches to every pane it drives, so in practice every
+                        // delivery under a running TUI — already produced that
+                        // outcome before this change; what is new is that headless
+                        // deliveries produce it too. It invents no new failure
+                        // mode, and it retires the stale-read race rather than
+                        // synchronising it.
                         //
                         // Issue #608: and when the caller named NO session, the
                         // silent accept is closed on the SAME evidence, which is
@@ -1455,8 +2009,8 @@ async fn compute_write_and_submit_outcome(
                         // against a current generation is an ATTACHED one, which
                         // both rules refuse identically.
                         //
-                        // Issue #608 audit, finding 4 — WHAT THIS CARVE-OUT
-                        // CANNOT SEE. `(expected None, current None)` still
+                        // Issue #608 audit, finding 4 — WHAT THE CARVE-OUT
+                        // CANNOT SEE FOR ITSELF. `(expected None, current None)`
                         // delivers, because an agent that never emits a
                         // generation legitimately carries neither side of the
                         // comparison. But a `None` CURRENT generation is not
@@ -1468,35 +2022,71 @@ async fn compute_write_and_submit_outcome(
                         // like an agent that never had one. During a `/clear` or
                         // a thread restart the successor's `SessionStart` has not
                         // landed yet, and a caller that knows the stable agent id
-                        // but names no session can land a write in that gap —
+                        // but names no session could land a write in that gap —
                         // into a pane that has demonstrably just closed a logical
-                        // conversation. This arm ACCEPTS that write. It is a
-                        // deliberate carve-out with a known hole, not an airtight
-                        // guard, and issue #608 exists precisely because a
-                        // comment in this closure once promised more than the
-                        // code delivered.
+                        // conversation.
                         //
-                        // Closing it needs evidence this closure does not have:
-                        // an AGENT-scoped ended-generation tombstone, or an
-                        // `ever_had_generation` witness. The daemon already
-                        // records distinguishing evidence in
-                        // `AppState::pane_generation_closures` — but keyed BY
-                        // PANE, and pane ids are recycled, so a genuinely
-                        // sessionless successor must not inherit its
-                        // predecessor's policy. That is new daemon state with its
-                        // own lifetime and reuse semantics; it is deferred to the
-                        // follow-up issue rather than bolted on here, where
-                        // getting it wrong would refuse exactly the sessionless
-                        // agents this carve-out exists to protect.
+                        // Issue #915 (finding 4) closes that with the one piece
+                        // of evidence the comparison above lacks:
+                        // `agent_generation_ended`, an AGENT-scoped witness
+                        // written in the same `SessionEnd` branch that removes
+                        // the pane entry. It is read under the SAME `AppState`
+                        // guard as the generation itself, so the two are
+                        // mutually consistent, and it is keyed by the identity
+                        // this send is already bound to.
+                        //
+                        // Keyed by AGENT and not by pane, deliberately.
+                        // `AppState::pane_generation_closures` records the same
+                        // transition per pane but is never cleaned up when a
+                        // pane closes or is recycled, so reading it here would
+                        // refuse every future sessionless agent that inherits
+                        // this pane id for the daemon's remaining lifetime —
+                        // permanently, not in a race window, and precisely the
+                        // sessionless agents the carve-out exists to protect.
+                        // Registry agent ids are monotonic and never recycled
+                        // within a daemon process, and `AppState` dies with that
+                        // process, so the witness map and the id space reset
+                        // together.
+                        //
+                        // It FAILS OPEN where the evidence is absent, twice.
+                        // `AgentEvent::agent_id` is an `Option` and an external
+                        // producer (or one that lost `DOT_AGENT_DECK_AGENT_ID`)
+                        // carries `None`, so no witness is recorded for it and
+                        // this arm accepts exactly as it did before; and an
+                        // ending event whose named agent the registry cannot
+                        // confirm holds the named pane records nothing either
+                        // (round-2 audit finding 1 — otherwise a forged
+                        // `SessionEnd` on an invented pane could refuse a
+                        // third party's deliveries here). Both are degradations
+                        // to the previous behaviour, which is the right
+                        // default, and both are documented limits rather than
+                        // guarantees.
+                        //
+                        // THE WITNESS IS A LATCH, NOT A WINDOW. No path clears
+                        // it as cleanup, so "has ended a generation" is true of
+                        // that agent for the daemon's remaining lifetime. What
+                        // makes the refusal transient in practice is the check
+                        // ABOVE it, not this one: the moment a successor
+                        // generation announces itself the pane has a current
+                        // session again and the first branch refuses instead,
+                        // so the witness only ever decides the case where the
+                        // TARGET PANE has no current generation. The cost that
+                        // leaves is an agent whose successor `SessionStart`
+                        // this daemon never observes — live, in a real
+                        // conversation, and refused on every unnamed automatic
+                        // delivery until it ends. See
+                        // `crate::state::AppState::agent_generation_closures`.
                         match expected_session.as_deref() {
                             Some(expected) => match guard.pane_hook_session_id(&pane_for_check) {
                                 Some(current) if current != expected => return false,
                                 Some(_) => {}
-                                None if has_live_attach => return false,
-                                None => {}
+                                None => return false,
                             },
                             None => {
                                 if guard.pane_hook_session_id(&pane_for_check).is_some() {
+                                    return false;
+                                }
+                                if guard.agent_generation_ended(&agent_for_check) {
                                     return false;
                                 }
                             }
@@ -1618,6 +2208,60 @@ async fn handle_connection(
         }
     };
 
+    // PRD #819 audit follow-up: `StartPreparedAgent` is `StartAgent` plus a
+    // REQUIRED token, so it is normalised into the base shape and an explicit
+    // token here. Everything downstream is then ONE spawn arm — the prepared and
+    // unprepared starts cannot drift apart in what they register, what they
+    // seed, or what they clean up, which is the failure mode a second copy of
+    // that 200-line arm would have.
+    //
+    // Note what this normalisation does NOT do: it does not put the token back
+    // on the wire's `start-agent`. The `op` a peer sent has already decided
+    // whether this connection is a prepared start, which is the whole property
+    // the verb buys — a daemon that lacks the variant never reaches this line.
+    let (req, prepared_token) = match req {
+        AttachRequest::StartPreparedAgent {
+            prep_token,
+            command,
+            cwd,
+            rows,
+            cols,
+            env,
+            display_name,
+            tab_membership,
+            agent_type,
+            seed,
+        } => {
+            // Refused where `PrepareWorkflow` is refused, and for its reason
+            // rather than a reason of its own: no preparation can exist on this
+            // platform, so nothing can be started against one. Saying so beats
+            // the `stale-token` this would otherwise produce — that answer is
+            // true but sends an operator looking for a client bug — and it keeps
+            // `DAEMON_CAPABILITIES`'s promise honest, since the verb is withheld
+            // there and a withheld verb this build still answered would make the
+            // advertised set mean less than it says.
+            if let Err(message) = refuse_prepared_start_where_unsupported() {
+                write_resp(&mut stream, &AttachResponse::err(message)).await?;
+                return Ok(());
+            }
+            (
+                AttachRequest::StartAgent {
+                    command,
+                    cwd,
+                    rows,
+                    cols,
+                    env,
+                    display_name,
+                    tab_membership,
+                    agent_type,
+                    seed,
+                },
+                Some(prep_token),
+            )
+        }
+        other => (other, None),
+    };
+
     match req {
         AttachRequest::ListAgents => {
             let mut records = registry.agent_records();
@@ -1711,6 +2355,128 @@ async fn handle_connection(
                 return Ok(());
             }
 
+            // PRD #819 audit follow-up: a token reaches this arm ONLY by having
+            // arrived on `start-prepared-agent`, which the normalisation above
+            // turned into the base shape plus `prepared_token`. A plain
+            // `start-agent` that spells a `prep_token` key is a caller aiming at
+            // the wrong verb, and it is refused rather than served: serde drops
+            // unknown keys on the base variant, so serving it would start the
+            // role UNENFORCED and report success — the fail-open the verb exists
+            // to remove, reintroduced by silence. See `StartAgentExtras`.
+            //
+            // `Option<serde_json::Value>` accepts any JSON, and this payload has
+            // already decoded as `StartAgent`, so the re-parse cannot fail; the
+            // `Err` arm is refused anyway rather than defaulted, because the one
+            // thing that must never happen here is a token being downgraded into
+            // an absent one.
+            if prepared_token.is_none() {
+                let carries_token = match serde_json::from_slice::<StartAgentExtras>(&frame.1) {
+                    Ok(extras) => extras.prep_token.is_some(),
+                    Err(_) => true,
+                };
+                if carries_token {
+                    write_resp(
+                        &mut stream,
+                        &AttachResponse::err(format!(
+                            "{PROJECT_ERR_WRONG_START_VERB}: a preparation token does not belong \
+                             on `start-agent`, which enforces none; send `start-prepared-agent` \
+                             instead. Nothing was started."
+                        )),
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            }
+            // PRD #819 audit fix: "the token exists and is young" was the WHOLE
+            // check here, and it binds nothing. The record now carries the state
+            // its preparation approved, so a presented token is resolved to that
+            // record and the record is re-validated against the filesystem
+            // before anything spawns.
+            //
+            // PRD #819 Greptile P1(a): re-validating the record was only half of
+            // it. The record was checked against the FILESYSTEM and never against
+            // the REQUEST, so a caller could present a token prepared for project
+            // X while submitting the `cwd`, orchestration and role of project Y —
+            // and the daemon validated X and started Y. The submitted identity is
+            // now matched against the binding too
+            // (`project_resolve::verify_prepared_start`), which is where the list
+            // of what is bound and what deliberately is not (the `command`, so
+            // per-launch overrides keep working) lives.
+            //
+            // Three refusals, deliberately distinct, because they send an
+            // operator in three directions: the token is not ours or has aged out
+            // (`stale-token`); it is ours and live but the world moved under it
+            // (`stale-preparation`); or it is ours, live and intact and this is
+            // not the launch it approved (`preparation-mismatch`).
+            if let Some(token) = prepared_token.as_deref() {
+                let Some(binding) = crate::prep_token::binding(token) else {
+                    write_resp(
+                        &mut stream,
+                        &AttachResponse::err(format!(
+                            "{PROJECT_ERR_STALE_TOKEN}: that preparation is unknown or has \
+                             expired; prepare the workflow again"
+                        )),
+                    )
+                    .await?;
+                    return Ok(());
+                };
+                // The submitted identity, lifted out of the request as it stands
+                // rather than re-derived from the token — comparing the token to
+                // itself is what the previous round did.
+                let request = crate::project_resolve::PreparedStartRequest {
+                    cwd: cwd.clone(),
+                    membership: tab_membership.as_ref().and_then(|tm| match tm {
+                        TabMembership::Orchestration {
+                            name,
+                            role_name,
+                            is_start_role,
+                            orchestration_cwd,
+                            ..
+                        } => Some(crate::project_resolve::PreparedStartMembership {
+                            orchestration: name.clone(),
+                            orchestration_cwd: orchestration_cwd.clone(),
+                            role: role_name.clone(),
+                            is_start_role: *is_start_role,
+                        }),
+                        TabMembership::Mode { .. } => None,
+                    }),
+                };
+                // Filesystem work, so it goes through the same bounded blocking
+                // pool every other project verb uses — one call, one permit, and
+                // never from inside a task that already holds one.
+                let outcome = crate::project_resolve::run_bounded(move || {
+                    crate::project_resolve::verify_prepared_start(&binding, &request)
+                })
+                .await;
+                let refusal = match outcome {
+                    Ok(Ok(())) => None,
+                    Ok(Err(refusal)) => {
+                        // The cause is named here and nowhere else: the wire gets
+                        // one sentence per category, so the daemon log is the
+                        // only place an operator can learn which check fired.
+                        warn!(
+                            reason = %refusal,
+                            "start-prepared-agent refused: the preparation does not cover this start"
+                        );
+                        Some(refusal.wire_refusal())
+                    }
+                    Err(e) => {
+                        // The pool could not run the check. Refusing is the only
+                        // safe answer: "we could not verify" is not "it is
+                        // fine", and the caller's remedy — prepare again — is
+                        // the same either way. It is reported as a STALENESS
+                        // refusal rather than a mismatch, because an unrun check
+                        // has found no disagreement — it has found nothing.
+                        warn!(reason = %e, "start-prepared-agent refused: the preparation could not be re-validated");
+                        Some(crate::project_resolve::stale_preparation_refusal())
+                    }
+                };
+                if let Some(refusal) = refusal {
+                    write_resp(&mut stream, &AttachResponse::err(refusal)).await?;
+                    return Ok(());
+                }
+            }
+
             // PRD #93 round-5: capture the bits we need to populate the
             // daemon's `AppState` role map BEFORE the spawn (we'll need
             // the pane id from env and the orchestration metadata from
@@ -1773,9 +2539,14 @@ async fn handle_connection(
                         && !seed.trim().is_empty()
                     {
                         registry.set_pending_seed(pane_id, seed);
+                        // Issue #617 (finding 6): bind the fallback to the agent
+                        // this spawn just produced, so an injection that fires
+                        // after the pane has been recycled is refused rather
+                        // than typed into its new occupant.
                         crate::agent_pty::arm_seed_fallback(
                             registry.clone(),
                             pane_id.to_string(),
+                            id.clone(),
                             crate::agent_pty::seed_fallback_grace(),
                         );
                     }
@@ -2419,7 +3190,13 @@ async fn handle_connection(
             // client knows this daemon enforces the identity/idempotency guards
             // and may safely issue an identity-bearing write-and-submit. Its
             // absence (an older daemon) makes the client fail such a send safe.
-            let mut resp = AttachResponse::hello(PROTOCOL_VERSION).with_guarded_send();
+            // PRD #819 M2/M5: advertise the project verbs explicitly, so a
+            // client asks a stable question ("do you know this op?") instead
+            // of string-matching serde's `unknown variant` message. Absence
+            // means withhold — see `AttachResponse::capabilities`.
+            let mut resp = AttachResponse::hello(PROTOCOL_VERSION)
+                .with_guarded_send()
+                .with_capabilities();
             if !omit_running_agents {
                 let summary = RunningAgentsSummary::from_records(&registry.agent_records());
                 resp = resp.with_running_agents(summary);
@@ -2485,6 +3262,323 @@ async fn handle_connection(
             resp.kept_worktree = kept;
             write_resp(&mut stream, &resp).await?
         }
+        // PRD #819 M3. `ListProjects` answers from what the daemon already
+        // holds — no new persistence, no filesystem browsing — and every
+        // candidate is revalidated through the bounded reader before it is
+        // offered, because an agent cwd or a scheduler `working_dir` need not be
+        // a project at all.
+        AttachRequest::ListProjects {} => {
+            // Nothing caller-supplied to validate: the enumeration is derived
+            // entirely from state the daemon already holds.
+            let candidates = project_candidates(&registry, &state, &scheduler).await;
+            let resp = match crate::project_resolve::run_bounded(move || {
+                crate::project_resolve::resolve_candidates(&candidates)
+            })
+            .await
+            {
+                Ok(listing) => {
+                    // `ok` even when the listing is empty: "this daemon knows
+                    // nothing live" is an answer, not a failure, and it is the
+                    // state the client renders its paste-a-path surface for.
+                    let mut resp = AttachResponse::ok();
+                    resp.projects = Some(listing);
+                    resp
+                }
+                Err(e) => {
+                    warn!(reason = %e, "list-projects could not complete");
+                    AttachResponse::err(format!(
+                        "{PROJECT_ERR_UNRESOLVED}: {}",
+                        crate::project_resolve::ProjectResolveError::Internal.detail()
+                    ))
+                }
+            };
+            write_resp(&mut stream, &resp).await?
+        }
+        // PRD #819 M3. Resolve-only: one explicit path in, resolved through the
+        // same bounded reader the enumeration uses. No directory walk, no
+        // children, no parents, and resolving `/a/b` does not make `/a` or
+        // `/a/b/c` known. The refusal's disclosure splits by trust — see
+        // [`PROJECT_ERR_UNRESOLVED`].
+        AttachRequest::ResolveProject { path } => {
+            let resp = match validate_project_path(&path) {
+                Err(message) => AttachResponse::err(message),
+                Ok(()) => {
+                    // The seed set is what decides whether this path gets the
+                    // detailed diagnostic. Gathered here, on the async side,
+                    // because it is pure in-memory state; the canonicalisation
+                    // it is compared against happens inside the blocking half.
+                    let seeds = project_candidates(&registry, &state, &scheduler).await;
+                    match crate::project_resolve::run_bounded(move || {
+                        crate::project_resolve::resolve_for_wire(&path, &seeds)
+                    })
+                    .await
+                    {
+                        Ok(Ok(project)) => {
+                            let mut resp = AttachResponse::ok();
+                            resp.project = Some(project);
+                            resp
+                        }
+                        Ok(Err(refusal)) => AttachResponse::err(refusal),
+                        Err(e) => {
+                            warn!(reason = %e, "resolve-project could not complete");
+                            AttachResponse::err(format!(
+                                "{PROJECT_ERR_UNRESOLVED}: {}",
+                                crate::project_resolve::ProjectResolveError::Internal.detail()
+                            ))
+                        }
+                    }
+                }
+            };
+            write_resp(&mut stream, &resp).await?
+        }
+        // PRD #819 M4: the only project verb that writes. Resolve one validated
+        // config snapshot, check the revision the client believes it resolved
+        // against, find the orchestration, compose the coordinator context and
+        // publish it — then report success. Nothing is started here, and a
+        // failure at any step returns before the publish, which is what makes
+        // "a failed preparation starts no roles" a property of the ordering
+        // rather than of a cleanup path.
+        //
+        // Every field bound, with no `..` rest pattern, so the next field added
+        // to the variant is a compile error at this seam rather than a value
+        // silently dropped — the mistake `map_tab` in the desktop crate records
+        // having made with `orchestration_cwd`.
+        AttachRequest::PrepareWorkflow {
+            path,
+            orchestration,
+            task,
+            config_revision,
+        } => {
+            let resp = match refuse_prepare_where_unsupported()
+                .and_then(|()| validate_project_path(&path))
+                .and_then(|()| validate_task(&task))
+            {
+                Err(message) => AttachResponse::err(message),
+                Ok(()) => {
+                    // Same seed set, same reason, as the resolve arm: it is pure
+                    // in-memory state and it is what decides whether a refusal
+                    // carries the detailed diagnostic.
+                    let seeds = project_candidates(&registry, &state, &scheduler).await;
+                    // One `run_bounded` call, so the whole resolve → read →
+                    // compose → publish sequence runs on ONE blocking thread
+                    // under ONE permit. Splitting it would mean acquiring a
+                    // second permit from inside work that already holds one,
+                    // which is the shape that deadlocks a bounded pool.
+                    match crate::project_resolve::run_bounded(move || {
+                        crate::project_resolve::prepare_workflow_for_wire(
+                            &path,
+                            &orchestration,
+                            &task,
+                            config_revision.as_deref(),
+                            &seeds,
+                        )
+                    })
+                    .await
+                    {
+                        Ok(Ok(prepared)) => {
+                            let mut resp = AttachResponse::ok();
+                            resp.workflow_prepared = Some(prepared);
+                            resp
+                        }
+                        Ok(Err(refusal)) => AttachResponse::err(refusal),
+                        Err(e) => {
+                            warn!(reason = %e, "prepare-workflow could not complete");
+                            AttachResponse::err(format!(
+                                "{PROJECT_ERR_UNRESOLVED}: {}",
+                                crate::project_resolve::ProjectResolveError::Internal.detail()
+                            ))
+                        }
+                    }
+                }
+            };
+            write_resp(&mut stream, &resp).await?
+        }
+        // Unreachable by construction: the normalisation above this `match`
+        // rewrote every `StartPreparedAgent` into the `StartAgent` shape plus an
+        // explicit token, and nothing between the two can mint one. It is an arm
+        // rather than an `unreachable!()` because `handle_connection` serves
+        // other clients and a panic would take one connection's bug out on all
+        // of them — the same reasoning `PROJECT_ERR_UNIMPLEMENTED` records. If
+        // this text is ever observed, the normalisation was edited and the spawn
+        // path it feeds is what to read.
+        AttachRequest::StartPreparedAgent { .. } => {
+            warn!("start-prepared-agent reached the dispatch un-normalised — refusing the spawn");
+            write_resp(
+                &mut stream,
+                &AttachResponse::err(
+                    "start-prepared-agent: internal error — the prepared start was not \
+                     normalised; nothing was started",
+                ),
+            )
+            .await?
+        }
+    }
+    Ok(())
+}
+
+/// PRD #819 M3: the daemon's enumeration seeds, gathered from state it already
+/// holds.
+///
+/// Four sources, and **all four are candidates rather than projects** — an
+/// ordinary agent cwd or a scheduled task's working directory need not hold a
+/// `.dot-agent-deck.toml` at all, so
+/// [`crate::project_resolve::resolve_candidates`] revalidates every one before
+/// it is offered:
+///
+/// 1. the daemon's own startup cwd, captured once in
+///    [`crate::daemon::run_daemon_with`];
+/// 2. `AgentRecord.cwd` for every live agent;
+/// 3. `TabMembership::Orchestration::orchestration_cwd` for every orchestration
+///    role;
+/// 4. every registered schedule's `working_dir`.
+///
+/// This function touches **no filesystem**, which is why it runs on the async
+/// side: it reads two in-memory registries and the daemon's `AppState`. The
+/// `live` join is the same one [`AttachRequest::ListAgents`] performs, and it is
+/// here for one reason — `AgentRecord.live` is what carries
+/// [`crate::state::SessionSnapshot::last_activity_ms`], the real timestamp the
+/// primary nomination prefers over `spawned_at_ms`.
+async fn project_candidates(
+    registry: &Arc<AgentPtyRegistry>,
+    state: &SharedState,
+    scheduler: &Arc<crate::scheduler::Scheduler>,
+) -> Vec<crate::project_resolve::ProjectCandidate> {
+    let mut records = registry.agent_records();
+    {
+        let guard = state.read().await;
+        for record in &mut records {
+            record.live = guard
+                .sessions
+                .values()
+                .filter(|s| {
+                    s.agent_id.as_deref() == Some(record.id.as_str())
+                        && s.pane_id == record.pane_id_env
+                })
+                .max_by(|a, b| {
+                    a.last_activity
+                        .cmp(&b.last_activity)
+                        .then_with(|| a.session_id.cmp(&b.session_id))
+                })
+                .map(|s| s.live_snapshot());
+        }
+    }
+    crate::project_resolve::collect_candidates(
+        crate::project_resolve::daemon_startup_cwd().as_deref(),
+        &records,
+        &scheduler.registered_working_dirs(),
+    )
+}
+
+/// PRD #819 M2/A5: the wire-boundary check every caller-supplied project path
+/// passes **before** any filesystem access.
+///
+/// It reuses [`crate::agent_pty::is_valid_orchestration_cwd`] rather than
+/// spelling a second validator, because that predicate is already exactly this
+/// shape — non-empty, at most [`crate::agent_pty::CWD_MAX_LEN`] (4096) bytes,
+/// free of ASCII control characters, and absolute for this platform — and it is
+/// already the rule applied to the `orchestration_cwd` these paths become. A
+/// path that survives here and a path the daemon will later accept as an
+/// orchestration identity are then the same set by construction.
+///
+/// Non-UTF-8 needs no check here and is not lossily converted: the frame is
+/// JSON and `path` is a `String`, so a non-UTF-8 byte sequence fails the frame
+/// decode and never reaches this function. That is a refusal, which is the
+/// intended outcome.
+///
+/// On refusal it returns the message the caller wraps in an
+/// [`AttachResponse::err`], and that message names no path. See
+/// [`PROJECT_ERR_INVALID_PATH`].
+/// PRD #819 audit fix: refuse [`AttachRequest::PrepareWorkflow`] outright where
+/// the publish cannot deliver its owner-only, reparse-safe guarantee.
+///
+/// **First, before the path and the task are even validated.** The refusal is a
+/// property of the build rather than of the request, so it must not depend on
+/// the request being well-formed — and reporting "invalid path" on a platform
+/// where no path would have worked sends the operator after the wrong thing.
+///
+/// See [`PROJECT_ERR_UNSUPPORTED_PLATFORM`] for why this is a refusal rather
+/// than a Windows DACL implementation, and note that the verb is also absent
+/// from [`DAEMON_CAPABILITIES`] there, so a client that negotiates never reaches
+/// this line.
+fn refuse_prepare_where_unsupported() -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        Err(format!(
+            "{PROJECT_ERR_UNSUPPORTED_PLATFORM}: this daemon cannot publish a coordinator context \
+             with owner-only permissions on this platform, so preparing a workflow is refused; \
+             launch the orchestration from a daemon running on Unix"
+        ))
+    }
+}
+
+/// PRD #819 audit follow-up: the same refusal for
+/// [`AttachRequest::StartPreparedAgent`], for the same reason one hop earlier.
+///
+/// Not a property of the request: [`refuse_prepare_where_unsupported`] refuses
+/// every preparation on such a build, and the `PrepareWorkflow` arm is the only
+/// production path to [`crate::prep_token::issue`] — so this daemon can never
+/// have issued a token, and every prepared start on it is answering for a
+/// preparation that could not have happened. `PROJECT_ERR_STALE_TOKEN` would also be true of that and is
+/// the wrong sentence — it sends an operator after an expiry or a client bug
+/// instead of after the platform. The verb is withheld from
+/// [`DAEMON_CAPABILITIES`] there too, so a client that negotiates never reaches
+/// this line.
+fn refuse_prepared_start_where_unsupported() -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        Err(format!(
+            "{PROJECT_ERR_UNSUPPORTED_PLATFORM}: this daemon cannot prepare a workflow on this \
+             platform, so it holds no preparation to start a role against; launch the \
+             orchestration from a daemon running on Unix"
+        ))
+    }
+}
+
+fn validate_project_path(path: &str) -> Result<(), String> {
+    if crate::agent_pty::is_valid_orchestration_cwd(path) {
+        return Ok(());
+    }
+    Err(format!(
+        "{PROJECT_ERR_INVALID_PATH}: project path must be absolute, non-empty, \
+         free of control characters, and at most {} bytes",
+        crate::agent_pty::CWD_MAX_LEN
+    ))
+}
+
+/// PRD #819 M2/A5: the wire-boundary bound on
+/// [`AttachRequest::PrepareWorkflow`]'s caller-supplied `task`, applied before
+/// any filesystem work.
+///
+/// The bound is [`crate::bounded_read::MAX_TASK_BYTES`] — the constant issue
+/// #328 already established and documented for exactly this input class, task
+/// prose destined for an agent's prompt. Reusing it keeps one justified number
+/// rather than inventing a second. The desktop applies its own tighter 64 KiB
+/// check at its UI seam, and that is a client affordance this daemon does not
+/// rely on: the audit's requirement is a server-side bound, and a bound that
+/// only exists in one client is not one.
+///
+/// A NUL is refused alongside the length, because the text is destined for a
+/// markdown file the daemon writes and the desktop already refuses one at its
+/// own seam — so this stays a strict superset of the client's shape check.
+fn validate_task(task: &str) -> Result<(), String> {
+    if task.len() as u64 > crate::bounded_read::MAX_TASK_BYTES {
+        return Err(format!(
+            "{PROJECT_ERR_TASK_REJECTED}: task must be at most {} bytes",
+            crate::bounded_read::MAX_TASK_BYTES
+        ));
+    }
+    if task.contains('\0') {
+        return Err(format!(
+            "{PROJECT_ERR_TASK_REJECTED}: task must contain no NUL"
+        ));
     }
     Ok(())
 }
@@ -3015,6 +4109,46 @@ async fn handle_attach_stream(
 mod tests {
     use super::*;
     use spec::spec;
+
+    /// PRD #819 audit fix: `PrepareWorkflow` is available exactly where the
+    /// publish can deliver its owner-only guarantee, and the capability list
+    /// says the same thing the dispatch does.
+    ///
+    /// **Both halves are asserted against `cfg!(unix)` rather than against a
+    /// hardcoded expectation**, which is what makes this one test rather than
+    /// two that cannot both run. It pins the property that matters — the gate
+    /// and the advertisement agree — so a later change that refuses the verb
+    /// while still advertising it, or advertises it while still refusing it,
+    /// fails here on whichever platform it is built for. What it deliberately
+    /// does **not** do is prove the Windows refusal *text*; only a Windows build
+    /// can execute that arm, and `cargo clippy --all-targets` for a Windows
+    /// target type-checks it.
+    #[test]
+    fn prepare_workflow_is_offered_exactly_where_it_is_supported() {
+        let gate = refuse_prepare_where_unsupported();
+        let advertised = DAEMON_CAPABILITIES.contains(&CAP_PREPARE_WORKFLOW);
+        assert_eq!(
+            gate.is_ok(),
+            advertised,
+            "the dispatch gate and the advertised capability set must agree; gate = {gate:?}, \
+             advertised = {advertised}"
+        );
+        assert_eq!(
+            advertised,
+            cfg!(unix),
+            "the verb is Unix-only because the publish's mode bits and its \
+             `O_NOFOLLOW | O_DIRECTORY` open are"
+        );
+        // The read-only verbs are unaffected — the refusal is about the write.
+        assert!(DAEMON_CAPABILITIES.contains(&CAP_LIST_PROJECTS));
+        assert!(DAEMON_CAPABILITIES.contains(&CAP_RESOLVE_PROJECT));
+        if let Err(message) = gate {
+            assert!(
+                message.starts_with(PROJECT_ERR_UNSUPPORTED_PLATFORM),
+                "the refusal must carry the stable code, got {message:?}"
+            );
+        }
+    }
 
     /// Issue #454, the root cause pinned at its own seam: a `StartAgent` for an
     /// ORDINARY dashboard pane — no `tab_membership`, so none of the
@@ -3653,25 +4787,32 @@ mod tests {
         );
     }
 
-    /// PRD #20 Greptile P1 (daemon_protocol.rs:988) — attach-after-check
-    /// barrier, closing the stale-pre-lock-snapshot class for `has_live_attach`.
-    /// The attach flag used to be sampled BEFORE `write_and_submit_guarded`
-    /// acquired the target writer, then consulted in the post-lock re-validation
-    /// closure. If the pane became attached WHILE the send waited for that
-    /// writer, the closure saw the stale (pre-lock) "unattached" value and let a
-    /// stale prompt — whose named session no longer exists (`pane_hook_session_id`
-    /// is `None`) — slip into the freshly-attached conversation instead of
-    /// rejecting it.
+    /// Issue #915 (finding 5) — a named generation against an ABSENT current
+    /// generation is refused whatever the pane's attachment does mid-flight.
+    ///
+    /// This test was PRD #20 Greptile P1's attach-after-check barrier. The attach
+    /// flag used to be sampled BEFORE `write_and_submit_guarded` acquired the
+    /// target writer and then consulted in the post-lock re-validation closure,
+    /// and this fixture proved the closure re-read it: a pane that became
+    /// attached while the send waited for the writer was refused rather than
+    /// letting a stale prompt into the freshly-attached conversation. Sampling it
+    /// inside the closure narrowed that window but could not close it —
+    /// `subscribe` never acquires the target writer, so holding the writer fences
+    /// no attach out — so the value is no longer part of the decision at all and
+    /// the refusal is unconditional.
+    ///
+    /// It is kept, retargeted, because the mid-flight attach is still the
+    /// interesting fixture: it pins that the refusal does not depend on which
+    /// reading of attachment the closure would have taken. The pre-lock reading
+    /// is `false` and the post-lock reading is `true`, and the outcome is `Stale`
+    /// either way. `guarded_send_refuses_named_generation_on_unattached_pane` is
+    /// its sibling and covers the arm this change actually widened — a pane that
+    /// is unattached throughout, which the old attached-only rule ACCEPTED.
     ///
     /// This mirrors `guarded_send_rejects_agent_removal_after_writer_lock`: it
     /// holds the EXACT target writer so a guarded send parks AFTER its pre-lock
     /// checks but BEFORE the write, makes the pane become attached during that
-    /// window, then releases the writer. Because the fix samples attachment
-    /// INSIDE the post-lock closure (one delivery-time snapshot), the send must
-    /// observe the NEW attached state and reject with `Stale` — no bytes into the
-    /// new conversation. It pins the pre-lock reading as `false` and the post-lock
-    /// reading as `true`, so the closure is provably the single source of truth:
-    /// had the stale pre-lock value been trusted, the outcome would be `Applied`.
+    /// window, then releases the writer.
     ///
     /// PRD #42 build-windows: this test spawns a real PTY running `/bin/sh`,
     /// which does not exist on Windows, so — like its sibling
@@ -3682,7 +4823,7 @@ mod tests {
     /// is lost: the fast tier still exercises it green on Unix.
     #[cfg(unix)]
     #[tokio::test]
-    async fn guarded_send_rechecks_live_attach_after_writer_lock() {
+    async fn guarded_send_refuses_named_generation_across_a_mid_flight_attach() {
         let reg = Arc::new(AgentPtyRegistry::new());
         let pane_id = "pane-attach-after-check-barrier";
         let id = reg
@@ -3696,8 +4837,9 @@ mod tests {
         // State: the pane is registered but carries NO session, so `pane_writable`
         // defaults to `Live` (the send enters the guarded path) while
         // `pane_hook_session_id` is `None` (the named generation is gone). With an
-        // `expected_session_id` supplied, delivery then hinges ENTIRELY on whether
-        // the pane is attached at DELIVERY time — isolating the attach re-check.
+        // `expected_session_id` supplied, that is the `(named, absent)` pair the
+        // refusal now turns on — and attachment, which this fixture changes
+        // underneath the parked send, is no longer one of its inputs.
         let state: SharedState =
             Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
         state.write().await.register_pane(pane_id.to_string());
@@ -3756,12 +4898,391 @@ mod tests {
         assert_eq!(
             result,
             Ok(crate::event::SendResult::Stale),
-            "a pane attached after the pre-lock check must be re-evaluated post-lock: with \
-             its named session gone the stale prompt is refused as Stale (had the pre-lock \
-             'unattached' value been trusted, it would have been Applied)"
+            "a named generation against an absent current generation is refused as Stale, and \
+             the pane flipping from unattached (pre-lock) to attached (post-lock) underneath \
+             the parked send must not change that"
         );
 
         drop(_attach);
+        reg.shutdown_all();
+    }
+
+    /// Issue #915 (finding 5) — the arm this change actually widened: a pane
+    /// that is UNATTACHED throughout. A caller naming a generation the pane no
+    /// longer has used to be ACCEPTED here, because the refusal was scoped to
+    /// attached panes on the reasoning that a headless delivery with a confirmed
+    /// agent identity is not the threat finding #4 described. That scoping read
+    /// the one input the post-lock closure could not sample under the state
+    /// guard, and it could be stale in the permissive direction — so the
+    /// refusal is now unconditional and this is the case that changed.
+    ///
+    /// No writer is held and nothing races: the whole point is that a stable
+    /// `false` never raced, so this is not a TOCTOU test. It is the policy pin —
+    /// the send goes out against a pane with no current generation and no
+    /// subscriber, and must come back `Stale` with zero bytes.
+    ///
+    /// Unix-gated for the same reason as its sibling above: it spawns a real PTY
+    /// running `/bin/sh`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn guarded_send_refuses_named_generation_on_unattached_pane() {
+        let reg = Arc::new(AgentPtyRegistry::new());
+        let pane_id = "pane-headless-named-generation";
+        let id = reg
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/sh"),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane_id.to_string())],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn agent");
+
+        // Same shape as the sibling: registered pane, so `pane_writable` defaults
+        // to `Live` and the send enters the guarded path, but no hook session, so
+        // `pane_hook_session_id` is `None` against a named expectation.
+        let state: SharedState =
+            Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
+        state.write().await.register_pane(pane_id.to_string());
+
+        // Nobody has ever subscribed to this agent's stream, so the pane is
+        // unattached at every point in the send — the reading the old rule
+        // treated as "headless, let it through".
+        assert!(
+            !reg.pane_has_live_attach(pane_id),
+            "precondition: the pane must be UNATTACHED for the whole send"
+        );
+
+        let extras = WriteAndSubmitExtras {
+            expected_agent_id: Some(id.clone()),
+            expected_session_id: Some("queued-generation".to_string()),
+            ..Default::default()
+        };
+        let result = compute_write_and_submit_outcome(
+            &reg,
+            &state,
+            pane_id,
+            "printf 'HEADLESS-MUST-NOT-LAND\\n'",
+            &extras,
+        )
+        .await;
+
+        assert_eq!(
+            result,
+            Ok(crate::event::SendResult::Stale),
+            "a named generation against a pane with NO current generation must be refused \
+             even with no client attached (before issue #915 this arm was Applied)"
+        );
+        assert!(
+            !reg.pane_has_live_attach(pane_id),
+            "the send must not have attached anything of its own"
+        );
+
+        reg.shutdown_all();
+    }
+
+    /// Issue #915 (finding 4) — a caller that names NO generation is accepted
+    /// against an agent that never had one and refused against an agent whose
+    /// conversation has just ENDED. Both leave `pane_hook_session` empty, which
+    /// is why the closure could not tell them apart before and why the witness
+    /// is keyed by agent.
+    ///
+    /// Three arms, and the negative ones carry the design:
+    ///
+    /// * the sessionless agent is ACCEPTED — the carve-out this must not break;
+    /// * the same agent after a `SessionEnd` is REFUSED, with zero bytes;
+    /// * a SUCCESSOR agent on the SAME pane id is accepted again. A pane-keyed
+    ///   witness would refuse it, permanently, for every later occupant of that
+    ///   pane id — the failure that made agent-scoping non-optional.
+    ///
+    /// Unix-gated: it spawns real PTYs running `/bin/sh`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unnamed_send_is_refused_only_for_an_agent_whose_generation_ended() {
+        fn session_frame(
+            pane: &str,
+            agent: &str,
+            event_type: crate::event::EventType,
+            secs: i64,
+        ) -> crate::event::AgentEvent {
+            crate::event::AgentEvent {
+                session_id: format!("{agent}-generation"),
+                agent_type: crate::event::AgentType::ClaudeCode,
+                event_type,
+                tool_name: None,
+                tool_detail: None,
+                cwd: None,
+                timestamp: chrono::DateTime::<chrono::Utc>::UNIX_EPOCH
+                    + chrono::TimeDelta::seconds(secs),
+                user_prompt: None,
+                metadata: Default::default(),
+                pane_id: Some(pane.to_string()),
+                agent_id: Some(agent.to_string()),
+                agent_version: None,
+                schema_version: None,
+                live_target: None,
+            }
+        }
+
+        let reg = Arc::new(AgentPtyRegistry::new());
+        let pane_id = "pane-ended-generation-witness";
+        let state: SharedState =
+            Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
+        state.write().await.register_pane(pane_id.to_string());
+
+        let original = reg
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/sh"),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane_id.to_string())],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn the agent the generation belongs to");
+        let unnamed = |agent: &str| WriteAndSubmitExtras {
+            expected_agent_id: Some(agent.to_string()),
+            expected_session_id: None,
+            ..Default::default()
+        };
+
+        // Arm 1: no generation has ever been reported for this agent, so the
+        // carve-out applies and the send lands.
+        assert_eq!(
+            compute_write_and_submit_outcome(
+                &reg,
+                &state,
+                pane_id,
+                "printf 'SESSIONLESS-IS-STILL-ALLOWED\\n'",
+                &unnamed(&original),
+            )
+            .await,
+            Ok(crate::event::SendResult::Applied),
+            "a genuinely sessionless agent must still be writable — the carve-out this \
+             witness must not break"
+        );
+
+        // The agent's conversation runs and ends. `pane_hook_session` is empty
+        // again, so the generation comparison alone reads identically to arm 1.
+        {
+            let mut guard = state.write().await;
+            guard.apply_event(session_frame(
+                pane_id,
+                &original,
+                crate::event::EventType::SessionStart,
+                1,
+            ));
+            guard.apply_event(session_frame(
+                pane_id,
+                &original,
+                crate::event::EventType::SessionEnd,
+                2,
+            ));
+            assert!(
+                guard.pane_hook_session_id(pane_id).is_none(),
+                "precondition: the ended generation must leave the pane's entry empty"
+            );
+            assert!(
+                guard.agent_generation_ended(&original),
+                "precondition: the SessionEnd must have witnessed against the agent"
+            );
+        }
+
+        // Arm 2: same pane, same agent, same unnamed request — refused now.
+        assert_eq!(
+            compute_write_and_submit_outcome(
+                &reg,
+                &state,
+                pane_id,
+                "printf 'MUST-NOT-LAND-IN-THE-GAP\\n'",
+                &unnamed(&original),
+            )
+            .await,
+            Ok(crate::event::SendResult::Stale),
+            "an unnamed write into the gap between a SessionEnd and its successor's \
+             SessionStart must be refused (before issue #915 this was Applied)"
+        );
+
+        // Arm 3: the pane changes hands. `close_agent` removes the predecessor's
+        // record, so the successor can claim the same `DOT_AGENT_DECK_PANE_ID`.
+        reg.close_agent(&original).expect("close the predecessor");
+        let successor = reg
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/sh"),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane_id.to_string())],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn the agent that inherits the pane id");
+        assert_ne!(
+            original, successor,
+            "the hand-over must produce a NEW registry agent id"
+        );
+        assert_eq!(
+            compute_write_and_submit_outcome(
+                &reg,
+                &state,
+                pane_id,
+                "printf 'SUCCESSOR-IS-NOT-ITS-PREDECESSOR\\n'",
+                &unnamed(&successor),
+            )
+            .await,
+            Ok(crate::event::SendResult::Applied),
+            "the departed agent's witness must not be inherited by whoever takes its pane id \
+             — a pane-keyed witness would refuse this, and every later occupant, for the \
+             daemon's remaining lifetime"
+        );
+
+        reg.shutdown_all();
+    }
+
+    /// Issue #915 round-2 audit (finding 1) — a `SessionEnd` a same-uid process
+    /// FORGES for a pane it invented cannot witness against a victim agent that
+    /// sits on a different pane.
+    ///
+    /// The chain this closes, and every step of it is reachable over the
+    /// unauthenticated hook socket: a `SessionStart` for an invented pane id no
+    /// registry claims auto-registers that pane into `managed_pane_ids`
+    /// (`AppState::apply_event`'s startup-race escape hatch); `managed_pane_ids`
+    /// is permanent, so the NEXT event for that pane is admitted by the
+    /// pane-scoped ground without the generation check looking at who sent it;
+    /// and the `SessionEnd` branch then recorded the ended-generation witness
+    /// against whatever `agent_id` the event named. Naming a victim on another
+    /// pane therefore refused that victim's every later unnamed automatic
+    /// delivery for the daemon's remaining lifetime — and registry ids are
+    /// sequential decimals from `"1"`, so the whole id space is one pass.
+    ///
+    /// The witness is now recorded only where the registry confirms the named
+    /// agent holds the named pane — or where no oracle was installed at all,
+    /// the TUI's configuration, which reads this map back nowhere — so the
+    /// forgery records nothing. The forged
+    /// `SessionEnd` is still ADMITTED — narrowing that is `managed_pane_ids`'s
+    /// pre-existing bearer-token shape (#601) and out of scope here — which is
+    /// exactly why this asserts on the witness and on the delivery rather than
+    /// on admission.
+    ///
+    /// Unix-gated: it spawns a real PTY running `/bin/sh`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_forged_cross_pane_session_end_cannot_witness_against_its_victim() {
+        fn frame(
+            pane: &str,
+            session: &str,
+            agent: Option<&str>,
+            event_type: crate::event::EventType,
+            secs: i64,
+        ) -> crate::event::AgentEvent {
+            crate::event::AgentEvent {
+                session_id: session.to_string(),
+                agent_type: crate::event::AgentType::ClaudeCode,
+                event_type,
+                tool_name: None,
+                tool_detail: None,
+                cwd: None,
+                timestamp: chrono::DateTime::<chrono::Utc>::UNIX_EPOCH
+                    + chrono::TimeDelta::seconds(secs),
+                user_prompt: None,
+                metadata: Default::default(),
+                pane_id: Some(pane.to_string()),
+                agent_id: agent.map(|a| a.to_string()),
+                agent_version: None,
+                schema_version: None,
+                live_target: None,
+            }
+        }
+
+        let reg = Arc::new(AgentPtyRegistry::new());
+        let victim_pane = "pane-forged-witness-victim";
+        let invented_pane = "pane-forged-witness-invented";
+        let state: SharedState =
+            Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
+        // The registry IS the ownership authority, and installing it is what
+        // makes this test the daemon's configuration rather than the TUI's — a
+        // bare `AppState` has no oracle, so it cannot tell a forged pane from a
+        // real one and deliberately keeps the historical pane-set rule.
+        {
+            let ownership: Arc<dyn crate::state::AgentOwnership> = reg.clone();
+            let mut guard = state.write().await;
+            guard.set_agent_ownership(Arc::downgrade(&ownership));
+            guard.register_pane(victim_pane.to_string());
+        }
+
+        let victim = reg
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/sh"),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), victim_pane.to_string())],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn the victim agent");
+
+        // Step 1: the forger establishes a pane nothing owns. This is admitted
+        // (the startup-race hatch) and is the pre-existing shape the fix does
+        // not try to close.
+        state.write().await.apply_event(frame(
+            invented_pane,
+            "forged-generation",
+            None,
+            crate::event::EventType::SessionStart,
+            1,
+        ));
+        assert_eq!(
+            state
+                .read()
+                .await
+                .pane_hook_session_id(invented_pane)
+                .as_deref(),
+            Some("forged-generation"),
+            "precondition: the forged SessionStart must have established a generation on the \
+             invented pane — without it the SessionEnd below never reaches the witness at all, \
+             and the test would pass for the wrong reason"
+        );
+
+        // Step 2: end that generation while naming the VICTIM, who sits on a
+        // pane this event never mentions.
+        state.write().await.apply_event(frame(
+            invented_pane,
+            "forged-generation",
+            Some(&victim),
+            crate::event::EventType::SessionEnd,
+            2,
+        ));
+        {
+            let guard = state.read().await;
+            assert!(
+                guard.pane_hook_session_id(invented_pane).is_none(),
+                "precondition: the forged end must have been ADMITTED and cleared its own \
+                 pane's generation — this test is about what it may WITNESS, not about \
+                 admission"
+            );
+            assert_eq!(
+                guard.pane_generation_closures(invented_pane),
+                1,
+                "precondition: the pane-keyed counter still counts it, on the forger's own \
+                 invented pane, which is where a pane-local poison stays"
+            );
+            assert!(
+                !guard.agent_generation_ended(&victim),
+                "a SessionEnd for a pane the named agent does not hold must witness NOTHING \
+                 against that agent"
+            );
+        }
+
+        // And the effect that would have had: the victim never announced a
+        // generation of its own, so it is exactly the sessionless agent the
+        // carve-out protects, and its unnamed automatic delivery must still land.
+        assert_eq!(
+            compute_write_and_submit_outcome(
+                &reg,
+                &state,
+                victim_pane,
+                "printf 'VICTIM-IS-STILL-DELIVERABLE\\n'",
+                &WriteAndSubmitExtras {
+                    expected_agent_id: Some(victim.clone()),
+                    expected_session_id: None,
+                    ..Default::default()
+                },
+            )
+            .await,
+            Ok(crate::event::SendResult::Applied),
+            "a forged end on somebody else's pane must not cost the victim its unnamed \
+             automatic deliveries — permanently, which is what made this worth fixing rather \
+             than documenting"
+        );
+
         reg.shutdown_all();
     }
 

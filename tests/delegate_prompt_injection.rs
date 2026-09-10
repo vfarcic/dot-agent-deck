@@ -14,7 +14,7 @@
 //! `encode_pane_payload` (single-line → no wrap) in isolation. This test
 //! exercises the REAL daemon dispatch wiring end to end — `handle_delegate`
 //! → `dispatch_one_owned` → `compose_delegate_prompt` →
-//! `write_to_pane_and_submit` — and asserts the bytes that actually reach a
+//! `write_and_submit_guarded` — and asserts the bytes that actually reach a
 //! worker pane's PTY plus the contents of the generated task file.
 //!
 //! No LLM and no real agent: the worker pane is a `cat` stub whose PTY
@@ -3590,7 +3590,7 @@ fn delegate_notice_guard_rejects_wrong_agent_rehome_and_closing() {
                 .write_notice_guarded(
                     ORCH_PANE,
                     "WRONG-AGENT-NOTICE",
-                    Some("stale-agent-id"),
+                    "stale-agent-id",
                     || async { true },
                 )
                 .await
@@ -3599,16 +3599,11 @@ fn delegate_notice_guard_rejects_wrong_agent_rehome_and_closing() {
 
             let rehome_registry = Arc::clone(&registry);
             let rehomed = registry
-                .write_notice_guarded(
-                    ORCH_PANE,
-                    "REHOMED-NOTICE",
-                    Some(&agent_id),
-                    || async move {
-                        rehome_registry
-                            .pane_orchestration(ORCH_PANE)
-                            .is_some_and(|membership| membership.name == "original-orchestration")
-                    },
-                )
+                .write_notice_guarded(ORCH_PANE, "REHOMED-NOTICE", &agent_id, || async move {
+                    rehome_registry
+                        .pane_orchestration(ORCH_PANE)
+                        .is_some_and(|membership| membership.name == "original-orchestration")
+                })
                 .await
                 .expect("re-homed guarded notice result");
             assert_eq!(rehomed, GuardedSend::Stale);
@@ -3616,12 +3611,9 @@ fn delegate_notice_guard_rejects_wrong_agent_rehome_and_closing() {
             registry.begin_pane_close(ORCH_PANE);
             let closing_registry = Arc::clone(&registry);
             let closing = registry
-                .write_notice_guarded(
-                    ORCH_PANE,
-                    "CLOSING-NOTICE",
-                    Some(&agent_id),
-                    || async move { !closing_registry.is_pane_closing(ORCH_PANE) },
-                )
+                .write_notice_guarded(ORCH_PANE, "CLOSING-NOTICE", &agent_id, || async move {
+                    !closing_registry.is_pane_closing(ORCH_PANE)
+                })
                 .await
                 .expect("closing guarded notice result");
             assert_eq!(closing, GuardedSend::Stale);

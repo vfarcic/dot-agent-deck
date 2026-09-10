@@ -113,40 +113,136 @@ pub fn seed_fallback_grace() -> std::time::Duration {
         .unwrap_or_else(|| std::time::Duration::from_secs(15))
 }
 
+/// Issue #617 (Greptile P1 on PR #919): the outcome of an identity-scoped
+/// fallback take — see [`AgentPtyRegistry::take_pending_seed_fallback_for`].
+///
+/// A separate type rather than an `Option<String>` because the two empty-handed
+/// cases mean opposite things to the caller: [`Self::Absent`] is the ordinary,
+/// expected no-op (usually because the native pull already delivered), while
+/// [`Self::StrangersSeed`] is the pane-recycled case the identity scoping exists
+/// for, and reporting it as "already delivered natively" would describe a
+/// hand-over as a success.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SeedFallbackTake {
+    /// The expected agent's own pending seed, removed from the store. The
+    /// caller now owns the only copy and must deliver it or drop it.
+    Taken(String),
+    /// The expected agent has no pending seed for this pane: the native
+    /// `get-seed` pull already took it, none was ever stashed, or the record is
+    /// gone (closed or respawned). Nothing was removed.
+    Absent,
+    /// The pane's seed slot is occupied, but by a seed stashed for a DIFFERENT
+    /// agent — the pane changed hands. Left untouched, so its owner's native
+    /// pull and its own fallback can still find it.
+    StrangersSeed,
+}
+
 /// PRD #201: arm the PTY-injection SAFETY NET for a pane the daemon just
 /// stashed a native seed for. Spawns a background task that waits `grace` (see
 /// [`seed_fallback_grace`]) then — only if the seed was NOT already consumed by
 /// the native `get-seed` pull — types it into the PTY. The `take`/`set` on the
 /// registry is atomic, so the extension's pull and this fallback can never both
 /// deliver. A no-op delivery (native already won) is the common, expected case.
+///
+/// Issue #617 (finding 6): `expected_agent_id` is the registry agent id of the
+/// agent the seed was stashed FOR, captured by the caller at spawn/respawn time,
+/// and the injection goes through [`AgentPtyRegistry::write_and_submit_guarded`]
+/// bound to it. This task sleeps for `grace` — 15s by default — holding nothing
+/// but a `pane_id`, and a pane id is a recycled handle: if the pi that owned it
+/// exits inside the window and an unrelated agent inherits the same
+/// `DOT_AGENT_DECK_PANE_ID`, the unguarded write this used to perform typed one
+/// conversation's seed into another's session and pressed Enter on it. A rebind
+/// now yields `WrongSession`/`Stale`/`NoLiveTarget` and zero bytes.
+///
+/// **Issue #617 (Greptile P1 on PR #919): the take is identity-scoped too, not
+/// just the write.** [`AgentPtyRegistry::take_pending_seed_fallback_for`] removes
+/// a seed only when it is `expected_agent_id`'s own. A seed stashed for the
+/// pane's new occupant is left where it is, so that occupant's native `get-seed`
+/// pull — and its own armed fallback — still find it. Gating only the write was
+/// not enough: the pane-keyed take consumed the successor's seed first and the
+/// `WrongSession` refusal then dropped it, costing the successor its opening
+/// task while writing no bytes anywhere.
+///
+/// A seed that IS ours is still NOT restored when the guarded write refuses, and
+/// that stays deliberate: restoring it would leave our bytes stashed under a
+/// pane id whose new occupant could pull them via `get-seed` — re-opening the
+/// same mis-delivery by the native route after the injection route refused it.
+/// Nothing re-arms this fallback, so a refusal means our seed is dropped, which
+/// is the intended failure direction.
 pub fn arm_seed_fallback(
     registry: Arc<AgentPtyRegistry>,
     pane_id: String,
+    expected_agent_id: String,
     grace: std::time::Duration,
 ) {
     tokio::spawn(async move {
         tokio::time::sleep(grace).await;
-        match registry.take_pending_seed_fallback(&pane_id) {
-            Some(seed) => {
+        match registry.take_pending_seed_fallback_for(&pane_id, &expected_agent_id) {
+            SeedFallbackTake::Taken(seed) => {
                 // Native pull did not happen within the grace window — deliver
                 // via the legacy PTY injection so the pane still works.
-                if let Err(e) = registry.write_to_pane_and_submit(&pane_id, &seed).await {
-                    tracing::warn!(
-                        pane_id = %pane_id,
-                        error = %e,
-                        "seed fallback: PTY injection failed"
-                    );
-                } else {
-                    tracing::debug!(
-                        pane_id = %pane_id,
-                        "seed fallback: delivered seed via PTY injection (native pull did not occur)"
-                    );
+                let outcome = registry
+                    .write_and_submit_guarded(&pane_id, &seed, &expected_agent_id, || async {
+                        true
+                    })
+                    .await;
+                match outcome {
+                    Ok(GuardedSend::Applied) => {
+                        tracing::debug!(
+                            pane_id = %pane_id,
+                            agent_id = %expected_agent_id,
+                            "seed fallback: delivered seed via PTY injection (native pull did not occur)"
+                        );
+                    }
+                    // A partial write: some of the seed reached the AUTHORIZED
+                    // agent. Not retried — a retry would append the seed to
+                    // whatever half of it is already sitting in the input box
+                    // and submit both as one turn.
+                    Ok(GuardedSend::Ambiguous) => {
+                        tracing::warn!(
+                            pane_id = %pane_id,
+                            agent_id = %expected_agent_id,
+                            "seed fallback: PTY injection was ambiguous (partial write); not retried"
+                        );
+                    }
+                    Ok(refused) => {
+                        tracing::warn!(
+                            pane_id = %pane_id,
+                            agent_id = %expected_agent_id,
+                            outcome = ?refused,
+                            "seed fallback: identity gate refused the PTY injection (the pane no \
+                             longer belongs to the agent the seed was stashed for); nothing \
+                             written and the seed is dropped"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            pane_id = %pane_id,
+                            agent_id = %expected_agent_id,
+                            error = %e,
+                            "seed fallback: PTY injection failed"
+                        );
+                    }
                 }
             }
-            None => {
+            SeedFallbackTake::StrangersSeed => {
+                // The pane changed hands inside the grace and its new occupant
+                // has stashed a seed of its own. Leaving it is the whole point:
+                // consuming it here would write no bytes (the guarded write
+                // refuses) and still cost the successor its opening task.
                 tracing::debug!(
                     pane_id = %pane_id,
-                    "seed fallback: seed already delivered natively; no injection"
+                    agent_id = %expected_agent_id,
+                    "seed fallback: the pane's stashed seed belongs to another agent (the pane \
+                     changed hands); left untouched and nothing injected"
+                );
+            }
+            SeedFallbackTake::Absent => {
+                tracing::debug!(
+                    pane_id = %pane_id,
+                    agent_id = %expected_agent_id,
+                    "seed fallback: no seed of ours is pending (native pull already took it, or \
+                     the record is gone); no injection"
                 );
             }
         }
@@ -1830,7 +1926,7 @@ async fn deliver_payload_and_submit(
 /// No submit delay because there is nothing to keep the terminator from fusing
 /// to: LF is not an Enter for the agents this project drives, so the pause that
 /// `SUBMIT_DELAY` exists to create has no meaning here (matching
-/// [`AgentPtyRegistry::write_to_pane_notice`]'s unguarded path).
+/// [`AgentPtyRegistry::write_notice_guarded`]'s tail).
 async fn deliver_payload_as_notice(
     w: &mut (dyn std::io::Write + Send),
     payload: &[u8],
@@ -2316,7 +2412,8 @@ struct AutomaticWrite {
     /// Issue #424 H2 (both reviewers): a [`SubmitMode::Notice`] deliberately
     /// does NOT advance it. A notice is LF-terminated, so it accumulates in the
     /// input box *above* whatever the user has typed rather than replacing it —
-    /// the documented [`AgentPtyRegistry::write_to_pane_notice`] contract. An
+    /// the documented notice contract
+    /// ([`AgentPtyRegistry::write_notice_guarded`]). An
     /// any-write clock therefore let an ordinary orchestrator notice landing
     /// between the user's draft and a later blind probe make that draft look
     /// older than our last write, and the probe then submitted draft + notice as
@@ -3169,6 +3266,18 @@ pub enum DelegationRetirement {
         seq: u64,
         /// Superseded delegations still unaccounted for after this one.
         remaining: u32,
+        /// Issue #617 (finding 7): the orchestrator pane and registry agent id
+        /// the still-armed record carries, so a late completion credited to a
+        /// superseded delegation can have its feedback bound to an identity in
+        /// the same way `Retired` can. Copied from the record rather than
+        /// returning it, because the record STAYS in the tracker on this arm and
+        /// so cannot be moved out. Both are needed together: the pane says where
+        /// the feedback would go and the agent id says who must still be there,
+        /// and a caller that resolved the orchestrator pane by a different route
+        /// must not bind that pane to this record's agent without checking the
+        /// two panes agree.
+        orchestrator_pane_id: String,
+        orchestrator_agent_id: String,
     },
 }
 
@@ -3490,10 +3599,14 @@ pub type DeliveryNoticeSink = Arc<dyn Fn(DeliveryNotice) + Send + Sync>;
 
 /// Internal selector for the two public byte-write entrypoints.
 /// `Submit` is the prompt path (payload + `SUBMIT_DELAY` + `\r`);
-/// `Notice` is the visibility path (payload + `\n`, no submit). Kept
-/// private because the public API exposes the two named methods
-/// directly — see [`AgentPtyRegistry::write_to_pane_and_submit`] and
-/// [`AgentPtyRegistry::write_to_pane_notice`].
+/// `Notice` is the visibility path (payload + `\n`, no submit).
+///
+/// Issue #917: it used to select between two PUBLIC unguarded entrypoints.
+/// Both are gone from the production API — `write_to_pane_and_submit` deleted
+/// and `write_to_pane_notice` retained only as a `#[cfg(test)]` PTY fixture
+/// seam — so the modes a production build can reach are exactly the two
+/// [`AgentPtyRegistry::write_and_submit_guarded`] and
+/// [`AgentPtyRegistry::write_notice_guarded`] pass in.
 #[derive(Debug)]
 enum SubmitMode {
     Submit,
@@ -4008,6 +4121,8 @@ impl AgentPtyRegistry {
                 role: record.role.clone(),
                 seq: record.seq,
                 remaining: record.superseded,
+                orchestrator_pane_id: record.orchestrator_pane_id.clone(),
+                orchestrator_agent_id: record.orchestrator_agent_id.clone(),
             };
         }
         DelegationRetirement::Retired(
@@ -4466,7 +4581,7 @@ impl AgentPtyRegistry {
             .write_notice_guarded(
                 &orchestrator_pane_id,
                 &notice,
-                Some(&expected_agent_id),
+                &expected_agent_id,
                 || async move {
                     if revalidate_registry.is_pane_closing(&revalidate_pane) {
                         return false;
@@ -4659,7 +4774,7 @@ impl AgentPtyRegistry {
     /// Residual, deliberately out of scope here and tracked as **issue #544**: a
     /// new, DIFFERENT payload delivered into a pane holding an unsent user draft
     /// still concatenates with it — the long-documented limitation on
-    /// [`Self::write_to_pane_and_submit`] — because the alternative is the brick
+    /// every automatic payload write — because the alternative is the brick
     /// above. Both reviewers ruled it a pre-existing limitation of every
     /// automatic payload rather than a regression introduced here.
     pub fn user_typed_since_writing_payload(&self, pane_id_env: &str, text: &str) -> bool {
@@ -5313,7 +5428,7 @@ impl AgentPtyRegistry {
 
         // CodeRabbit MAJOR (PRD #93 round-9): reject the spawn if
         // another live agent already claims this `pane_id_env`.
-        // `write_to_pane_and_submit` routes by `pane_id_env`, so two agents sharing
+        // Pane-keyed writes route by `pane_id_env`, so two agents sharing
         // one id silently misroute every delegate/work-done write to
         // whichever entry `values().find(...)` happened to visit first.
         // The check sits INSIDE the post-spawn lock acquisition so the
@@ -5328,7 +5443,7 @@ impl AgentPtyRegistry {
         // so a dead-but-not-yet-reaped entry would otherwise block
         // reuse of its pane_id_env forever. The same `exited.load`
         // filter is applied across every operational lookup —
-        // `write_to_pane_and_submit`, `agent_records`, and this dup check —
+        // `writer_target_for_pane`, `agent_records`, and this dup check —
         // so the live/dead boundary stays consistent
         // (round-11 reviewer #A). Cleanup paths (`close_agent`,
         // `shutdown_all`) deliberately still touch exited entries.
@@ -5481,49 +5596,6 @@ impl AgentPtyRegistry {
         Ok(id)
     }
 
-    /// Write `text` as a submitted prompt to the PTY of the agent whose
-    /// `pane_id_env` matches `pane_id`.
-    ///
-    /// PRD #93 round-5: orchestration dispatch (delegate / work-done) now
-    /// lives on the daemon side, and routing happens via this method. The
-    /// caller (typically `AppState::handle_delegate` /
-    /// `AppState::handle_work_done` inside the daemon's hook loop) holds the
-    /// TUI's pane id, not the registry's agent id; we look up by
-    /// `pane_id_env` so the daemon can target panes without keeping a
-    /// separate pane→agent index. Bytes that land in the PTY surface as
-    /// normal terminal output in the pane's scrollback — that's the new
-    /// "journal" surface for orchestration feedback (no separate
-    /// broadcast / file cursor / buffer).
-    ///
-    /// PRD #93 round-6: the daemon must mirror the TUI's submit contract
-    /// (see [`crate::pane_input`] and `EmbeddedPaneController::write_to_pane`
-    /// in `src/embedded_pane.rs`). Just dropping the prompt bytes into the
-    /// PTY leaves them sitting in the agent TUI's input box — the worker
-    /// never starts processing until the user manually presses Enter.
-    /// So: encode the payload (raw for single-line, bracketed paste for
-    /// multi-line), flush, wait [`SUBMIT_DELAY`] so the CR isn't fused with
-    /// the preceding text into "newline-in-input", then write the CR.
-    ///
-    /// PRD #93 round-8: per-pane serialization is now enforced by holding
-    /// the agent's writer mutex across the *entire* payload + sleep + CR
-    /// sequence. Earlier rounds released the lock around the sleep so
-    /// other panes could be written to in parallel — which already worked
-    /// because each agent owns its own writer mutex — but released it for
-    /// the *same* pane too, letting two concurrent calls interleave as
-    /// `payload_A + payload_B + CR + CR` (auditor finding). `tokio::sync::Mutex`
-    /// can be held across `.await` safely, and writes to other panes use
-    /// other writer mutexes, so holding for the ~150ms `SUBMIT_DELAY`
-    /// affects only the offending pane and the deck dispatches at most
-    /// one delegate or work-done per pane at a time in practice.
-    pub async fn write_to_pane_and_submit(
-        &self,
-        pane_id: &str,
-        text: &str,
-    ) -> Result<(), AgentPtyError> {
-        self.write_to_pane_internal(pane_id, text, SubmitMode::Submit)
-            .await
-    }
-
     /// PRD #20 R20-004 (finding #3): a stable fingerprint of a delivery's
     /// identity — the (expected) target agent id, the expected hook SESSION, the
     /// pane, and the exact text. A `delivery_id` is bound to its fingerprint at
@@ -5655,7 +5727,7 @@ impl AgentPtyRegistry {
     /// resolved under the registry lock. Returns the shared writer, the target's
     /// registry id, and its `exited` liveness token so the caller can bind
     /// authorization to the EXACT identity and re-check it after acquiring the
-    /// writer. Skips exited entries (mirrors [`Self::write_to_pane_internal`]).
+    /// writer. Skips exited entries (mirrors every other operational lookup here).
     /// PRD #20 R20-006 (finding #7): the registry id of the live (non-exited)
     /// agent that CURRENTLY owns `pane_id`, or `None` if no live entry does. The
     /// attach input path calls this AFTER acquiring the target writer to
@@ -5676,13 +5748,23 @@ impl AgentPtyRegistry {
 
     /// PRD #20 R20-003 (finding #4): whether a deck client is CURRENTLY attached
     /// to (driving) `pane_id` — i.e. its agent's PTY stream has ≥1 live
-    /// subscriber. The write-and-submit session guard uses this to scope its
-    /// strictest check: a stale prompt that would surface in a LIVE INTERACTIVE
-    /// conversation (an attached pane the user is watching — finding #4's actual
-    /// threat) is refused even when the pane reports NO current hook session,
-    /// whereas a headless, unattached delivery with a confirmed agent identity
-    /// proceeds. In the real deck the TUI is always attached to a pane it drives,
-    /// so the strict guard applies to every real automatic-prompt delivery.
+    /// subscriber.
+    ///
+    /// **Issue #915 (finding 5): no authorization decision reads this any more,
+    /// and none should.** It used to scope the write-and-submit session guard's
+    /// strictest check — a named-generation delivery into a pane reporting NO
+    /// current hook session was refused on an attached pane and allowed on a
+    /// headless one. The value cannot be sampled inside the writer-held
+    /// re-validation barrier, because `subscribe` never acquires the target
+    /// writer, so it was read from the registry before the `AppState` guard and
+    /// could be stale in the PERMISSIVE direction. That refusal is now
+    /// unconditional (`daemon_protocol`'s axis-2 closure), which is why the last
+    /// production consumer went with it.
+    ///
+    /// Kept as a diagnostic/test observable — its remaining callers are the
+    /// `daemon_protocol` tests that pin the new rule holds either way. A new
+    /// authorization call site would be re-opening the stale-read race, not
+    /// reusing a helper.
     pub fn pane_has_live_attach(&self, pane_id: &str) -> bool {
         let inner = self.inner.lock().unwrap();
         inner.agents.values().any(|a| {
@@ -5732,8 +5814,10 @@ impl AgentPtyRegistry {
     /// PRD #20 R20-003/R20-006: atomic write-and-submit that binds delivery to an
     /// EXACT target identity and RE-VALIDATES it after acquiring that target's
     /// writer, immediately before writing — closing the liveness/rebind TOCTOU
-    /// that the plain [`Self::write_to_pane_and_submit`] leaves open (it checks
-    /// liveness, releases the state lock, then awaits a separate writer lookup).
+    /// that the plain, unguarded pane-keyed write left open (it checked liveness,
+    /// released the state lock, then awaited a separate writer lookup). Issue
+    /// #917 removed that write from the production API entirely, so this is no
+    /// longer one of two ways to reach a pane's PTY — it is the way.
     ///
     /// Flow:
     /// 1. Resolve the live target for `pane_id`; `None` → [`GuardedSend::NoLiveTarget`].
@@ -5753,11 +5837,24 @@ impl AgentPtyRegistry {
     /// pane→agent rebind re-check is replaced by an agent-still-present re-check —
     /// mirroring the attach STREAM_IN input loop, which resolves a paneless
     /// target's writer/writability by agent id and skips the pane-owner re-check.
+    ///
+    /// Issue #617: `expected_agent_id` is a `&str`, not an `Option<&str>`. It used
+    /// to be optional and the pre-lock identity gate ran only in the `Some` arm,
+    /// so `None` meant "write to whoever owns this pane right now" — a pane id is
+    /// a recycled handle, so that is the accidental mis-delivery the rest of this
+    /// machinery exists to prevent. Making it a `&str` removes the permissive case
+    /// from the type rather than from a comment: a caller with no identity to
+    /// offer cannot reach this method at all, and must decide at ITS OWN layer
+    /// whether that means "refuse" (`dispatch_one_owned`) or "resolve the pane's
+    /// current owner and let the post-lock re-validation do the work"
+    /// (`handle_work_done`'s unsolicited arm). Two independent reviews of the #608
+    /// fix each found permissive call sites the other missed, which is the
+    /// argument for letting the compiler enumerate them instead.
     pub async fn write_and_submit_guarded<Fut>(
         &self,
         pane_id: &str,
         text: &str,
-        expected_agent_id: Option<&str>,
+        expected_agent_id: &str,
         revalidate: impl FnOnce() -> Fut,
     ) -> Result<GuardedSend, AgentPtyError>
     where
@@ -5780,7 +5877,7 @@ impl AgentPtyRegistry {
         &self,
         pane_id: &str,
         text: &str,
-        expected_agent_id: Option<&str>,
+        expected_agent_id: &str,
         revalidate: impl FnOnce() -> Fut,
     ) -> Result<GuardedSendDetail, AgentPtyError>
     where
@@ -5796,7 +5893,7 @@ impl AgentPtyRegistry {
         .await
     }
 
-    /// PRD #249 M3: [`Self::write_to_pane_notice`] under
+    /// PRD #249 M3: the LF-terminated notice write under
     /// [`Self::write_and_submit_guarded`]'s identity gate — the LF-terminated
     /// visibility path, but bound to an EXACT target identity.
     ///
@@ -5820,7 +5917,7 @@ impl AgentPtyRegistry {
         &self,
         pane_id: &str,
         text: &str,
-        expected_agent_id: Option<&str>,
+        expected_agent_id: &str,
         revalidate: impl FnOnce() -> Fut,
     ) -> Result<GuardedSend, AgentPtyError>
     where
@@ -5848,7 +5945,7 @@ impl AgentPtyRegistry {
         pane_id: &str,
         text: &str,
         mode: SubmitMode,
-        expected_agent_id: Option<&str>,
+        expected_agent_id: &str,
         revalidate: impl FnOnce() -> Fut,
     ) -> Result<GuardedSendDetail, AgentPtyError>
     where
@@ -5856,8 +5953,8 @@ impl AgentPtyRegistry {
     {
         let is_paneless = pane_id == "<no-pane>";
         let target = if is_paneless {
-            // Resolve BY agent identity; no identity → nothing to route to.
-            match expected_agent_id.and_then(|id| self.writer_target_for_agent(id)) {
+            // Resolve BY agent identity.
+            match self.writer_target_for_agent(expected_agent_id) {
                 Some(target) => target,
                 None => return Ok(GuardedSendDetail::Outcome(GuardedSend::NoLiveTarget)),
             }
@@ -5871,10 +5968,13 @@ impl AgentPtyRegistry {
         // than the one that now owns the pane (respawn/rebind before delivery).
         // A paneless target was resolved BY `expected_agent_id`, so it can never
         // mismatch here — skip the gate.
-        if !is_paneless
-            && let Some(expected) = expected_agent_id
-            && expected != target.agent_id
-        {
+        //
+        // Issue #617: this gate is now unconditional on the paned arm. It used to
+        // sit behind `let Some(expected) = expected_agent_id`, so an absent
+        // identity skipped it entirely and the send fell through as an unguarded
+        // write to the pane's entry-time owner. `expected_agent_id` is a `&str`,
+        // so that case no longer exists to be skipped.
+        if !is_paneless && expected_agent_id != target.agent_id {
             return Ok(GuardedSendDetail::Outcome(GuardedSend::WrongSession));
         }
         // Encode before locking so a bad payload doesn't pin the writer.
@@ -5970,7 +6070,7 @@ impl AgentPtyRegistry {
         // `write_to_pane_internal`'s atomic submit contract).
         //
         // PRD #249 review (finding B1): the same `pane_write` byte trace the
-        // unguarded [`Self::write_to_pane_internal`] emits, and for the same
+        // unguarded `write_to_pane_internal` emits, and for the same
         // reason — it is the surface an operator diagnosing a lost delegate is
         // told to turn on (`RUST_LOG=pane_write=trace`), and the delegate task
         // pointer now travels this path instead of that one. Emitted INSIDE the
@@ -6030,12 +6130,38 @@ impl AgentPtyRegistry {
     ///   submitted as a prompt anyway. Observed safe: TODO(M7.1) — populate
     ///   after manual test against each supported agent. Observed unsafe:
     ///   (none confirmed).
-    /// - Subsequent [`AgentPtyRegistry::write_to_pane_and_submit`] calls on
-    ///   the same pane will submit "{notice text}\n{user prompt}" together —
-    ///   the notice bytes accumulate in the agent's stdin line buffer.
+    /// - A subsequent SUBMIT-mode write on the same pane will submit
+    ///   "{notice text}\n{user prompt}" together — the notice bytes accumulate
+    ///   in the agent's stdin line buffer.
     ///
     /// Both limitations point to F11 (bus-push status delivery) as the proper
     /// long-term fix — see `audit/pre-daemon-parity-audit.md`.
+    ///
+    /// # Issue #917: `#[cfg(test)]`, and why this one survived
+    ///
+    /// **No production path may use this, and in a non-test build there is
+    /// nothing here to use.** After #617's guarded-write migration both
+    /// unguarded primitives had zero production callers but stayed `pub`, so
+    /// the type change had removed the permissive ARGUMENT and not the
+    /// permissive API: a future call site could still reach an unguarded pane
+    /// write with no compiler objection. Its sibling
+    /// `write_to_pane_and_submit` was deleted outright. This one is retained
+    /// because a PTY fixture genuinely needs an identity-free write to a pane
+    /// it is about to retire — `prompt/pane-input/034` sends the one
+    /// unsubmitted line that ends a predecessor's `read`, so the predecessor
+    /// leaves by its own front door and its record (and its seed) survive it,
+    /// which is the whole fixture. A guarded write would work there and say
+    /// something this does not: that the write was authorized.
+    ///
+    /// The `#[cfg(test)]` is the seam rather than a warning name, following
+    /// [`Self::take_pending_seed_fallback`]: gating it out of a non-test build
+    /// is what makes "no production path writes to a pane without naming who it
+    /// expects to be there" hold by construction rather than by review. Note
+    /// what that does NOT cover — integration tests under `tests/` compile
+    /// against the lib WITHOUT `cfg(test)`, so they cannot reach this either,
+    /// which is why #917 migrated `tests/e2e_delegate_work_done_chain.rs` to
+    /// the guarded call instead of exempting it.
+    #[cfg(test)]
     pub async fn write_to_pane_notice(
         &self,
         pane_id: &str,
@@ -6045,6 +6171,11 @@ impl AgentPtyRegistry {
             .await
     }
 
+    /// Issue #917: `#[cfg(test)]` with its only caller. Both public unguarded
+    /// entrypoints this served are gone from the production API (see
+    /// [`Self::write_to_pane_notice`]), and a production build reaches the PTY
+    /// only through [`Self::write_guarded`].
+    #[cfg(test)]
     async fn write_to_pane_internal(
         &self,
         pane_id: &str,
@@ -6300,7 +6431,7 @@ impl AgentPtyRegistry {
     ) -> Result<String, AgentPtyError> {
         // Step 1: atomically lift the existing entry out of the
         // registry. Holding the sync lock across the find+remove keeps
-        // a concurrent `write_to_pane_and_submit` from racing in and
+        // a concurrent pane-keyed write from racing in and
         // writing to a PTY whose child we're about to terminate (the
         // writer mutex is per-agent so concurrent writes against the
         // same `pane_id_env` are still serialized, but a write that arrived
@@ -7751,28 +7882,143 @@ impl AgentPtyRegistry {
     /// `pi.sendUserMessage`). Overwrites any previous unconsumed seed (the
     /// freshest seed wins) and resets the native-delivered flag. No-op when the
     /// pane is unknown or the seed is blank. Keyed by `pane_id_env` (linear
-    /// scan) like [`AgentPtyRegistry::set_agent_type`].
+    /// scan) like [`AgentPtyRegistry::set_agent_type`], but restricted to the
+    /// pane's LIVE occupant.
+    ///
+    /// **Issue #617 (Greptile P1 on PR #919): the `exited` filter is what makes
+    /// [`AgentPtyRegistry::take_pending_seed_fallback_for`]'s identity scoping
+    /// worth anything.** An agent that exits without being closed keeps its
+    /// record, and `spawn_agent` lets a successor take the same `pane_id_env`
+    /// once the incumbent is `exited` — so two records can carry this pane id at
+    /// once, and `agents` is a `HashMap`, whose iteration order is unspecified,
+    /// so an unfiltered scan picked between them arbitrarily. Filing the successor's seed on the dead predecessor's
+    /// record put it back within reach of that predecessor's armed fallback,
+    /// which would take it (it IS that record's seed), be refused
+    /// `WrongSession`, and drop it — the exact loss the identity scoping exists
+    /// to prevent, through a different door. Both production callers stash
+    /// immediately after a spawn or respawn that just produced a live agent, and
+    /// a seed filed on an exited record can never reach the agent it was meant
+    /// for — that agent is gone — so the filter costs no legitimate stash.
+    ///
+    /// The matching reader was the other half, and issue #916 closed it in the
+    /// same PR: `take_pending_seed_native` resolved a pane by UNFILTERED scan,
+    /// so a `get-seed` pull could land on a dead predecessor's record and hand
+    /// its stale seed to the pane's new occupant.
+    /// It now applies the same `exited` filter, and additionally scopes the take
+    /// by the caller's own agent id when the caller presents one.
     pub fn set_pending_seed(&self, pane_id_env: &str, seed: &str) {
         if pane_id_env.is_empty() || seed.trim().is_empty() {
             return;
         }
         let mut inner = self.inner.lock().unwrap();
-        if let Some(agent) = inner
-            .agents
-            .values_mut()
-            .find(|a| a.pane_id_env.as_deref() == Some(pane_id_env))
-        {
+        if let Some(agent) = inner.agents.values_mut().find(|a| {
+            a.pane_id_env.as_deref() == Some(pane_id_env) && !a.exited.load(Ordering::SeqCst)
+        }) {
             agent.pending_seed = Some(seed.to_string());
             agent.seed_delivered_native = false;
         }
     }
 
     /// PRD #201: take (clear) the pending seed for `pane_id_env` on behalf of
-    /// the NATIVE `get-seed` pull. Marks the seed as delivered natively so a
+    /// the NATIVE `get-seed` pull, **scoped to the agent asking for it when the
+    /// caller could say who that is**. Marks the seed as delivered natively so a
     /// test can prove the native path ran. Returns `None` when the pane is
     /// unknown or has no pending seed (already delivered, or never set). The
     /// take is atomic under the registry lock, so a race with the fallback
     /// path can only let one of them win.
+    ///
+    /// **Issue #916: the two filters, and they carry different weight.**
+    ///
+    /// The `exited` filter is the load-bearing half and closes the actually
+    /// reachable window. An agent that exits on its OWN keeps its record until
+    /// something reaps it (`close_agent` REMOVES it, so a deliberately-closed
+    /// agent's seed goes with it), while the spawn-side duplicate check lets a
+    /// SUCCESSOR claim the same `pane_id_env` because that check skips exited
+    /// entries. In that window two records carry this pane id, `agents` is a
+    /// `HashMap` with an unspecified iteration order, and the unfiltered scan
+    /// this replaces could hand the successor its predecessor's seed. Skipping
+    /// exited entries is also what every other operational lookup in this
+    /// registry already does — [`Self::writer_target_for_pane`],
+    /// [`Self::pane_current_agent_id`], [`Self::agent_records`] and the
+    /// duplicate check itself — and this path was the outlier.
+    ///
+    /// `expected_agent_id` is defence in depth on top of that, not a
+    /// replacement for it. With the `exited` filter the pane-keyed resolution is
+    /// already UNIQUE: `spawn_agent` refuses a second live agent on a
+    /// `pane_id_env` under the same lock acquisition as the insert, so at most
+    /// one live record ever answers to a pane id. What the identity adds is
+    /// refusing a pull that names an agent which does not hold this pane — a
+    /// stale environment surviving a respawn, or a caller reading somebody
+    /// else's pane id — and making the invariant explicit rather than resting on
+    /// the duplicate check continuing to hold.
+    ///
+    /// **An absent `expected_agent_id` FALLS BACK to the pane's live occupant
+    /// rather than refusing, deliberately.** Refusing would cost a seed for
+    /// every producer the daemon did not inject an id into, and the repo already
+    /// takes this decision the same way one layer over — `generation_ownership`
+    /// keeps the id-less shape working on purpose (PRD #110 / issue #398) and
+    /// answers from the pane alone. The residual exposure is narrow because of
+    /// the uniqueness above: an id-less pull still cannot reach an exited
+    /// record. It is not zero — an id-less caller that presents a pane id it
+    /// does not own is still answered.
+    ///
+    /// Round-2 audit (finding 4) — what requiring an id would actually have
+    /// bought, stated narrowly. It is NOT nothing: a caller presenting its OWN
+    /// true id and a FOREIGN pane is refused by the `Some(id)` arm below, whose
+    /// filter demands the record hold that pane. So requiring an id would have
+    /// raised the bar from "know the victim's pane id" to "know or guess the
+    /// victim's agent id". What limits the value is that registry ids are
+    /// sequential decimal strings from `"1"` and are therefore cheap to guess,
+    /// so the bar it raises is a low one — while the cost, a lost seed for every
+    /// producer the daemon injected no id into, is certain.
+    ///
+    /// The `Option` here is NOT the permissive argument issue #617 removed from
+    /// the write side. There, `None` silently SKIPPED the identity comparison
+    /// and wrote into whichever agent held the pane. Here nothing is skipped:
+    /// both arms apply the `exited` filter, and with that filter the pane
+    /// resolves to at most one live record, so the `None` arm is a complete
+    /// resolution rather than an abandoned check. It is also a read of the
+    /// caller's own pane, not a write into somebody's conversation.
+    ///
+    /// Named `_for` to match [`Self::take_pending_seed_fallback_for`], whose
+    /// pane-keyed predecessor this mirrors. `take_pending_seed_native` is
+    /// retained as the `#[cfg(test)]` probe, for the same reason its sibling
+    /// keeps one. Both names are deliberately unlinked: the probes are
+    /// `#[cfg(test)]`, so a link from here would dangle in rustdoc.
+    pub fn take_pending_seed_native_for(
+        &self,
+        pane_id_env: &str,
+        expected_agent_id: Option<&str>,
+    ) -> Option<String> {
+        let mut inner = self.inner.lock().unwrap();
+        let agent = match expected_agent_id {
+            // Keyed lookup, then confirm the record really holds this pane and
+            // is still live. A record is keyed by agent id for the whole of its
+            // life, so this cannot wander onto a namesake pane's newer occupant.
+            Some(id) => inner.agents.get_mut(id).filter(|a| {
+                a.pane_id_env.as_deref() == Some(pane_id_env) && !a.exited.load(Ordering::SeqCst)
+            })?,
+            None => inner.agents.values_mut().find(|a| {
+                a.pane_id_env.as_deref() == Some(pane_id_env) && !a.exited.load(Ordering::SeqCst)
+            })?,
+        };
+        let seed = agent.pending_seed.take()?;
+        agent.seed_delivered_native = true;
+        Some(seed)
+    }
+
+    /// Test probe for the NATIVE pull, ignoring identity AND liveness: takes
+    /// whatever seed the first record matching `pane_id_env` holds, and marks it
+    /// delivered natively.
+    ///
+    /// `#[cfg(test)]` on purpose, and the reason is
+    /// [`Self::take_pending_seed_fallback`]'s: this is the pane-keyed take that
+    /// issue #916 replaced with [`Self::take_pending_seed_native_for`], kept only
+    /// so tests can observe the pane's slot the way an extension would, and
+    /// gating it out of a non-test build is what makes "no production path hands
+    /// out a seed off an exited record, or off a record the caller does not
+    /// name" hold by construction rather than by review.
+    #[cfg(test)]
     pub fn take_pending_seed_native(&self, pane_id_env: &str) -> Option<String> {
         let mut inner = self.inner.lock().unwrap();
         let agent = inner
@@ -7784,10 +8030,90 @@ impl AgentPtyRegistry {
         Some(seed)
     }
 
+    /// Read-only test probe for ONE agent's seed slot, keyed by agent id and
+    /// consuming nothing.
+    ///
+    /// Issue #916: the pane-keyed probes above are a linear scan over a
+    /// `HashMap`, so while two records carry the same `pane_id_env` — the whole
+    /// window this issue is about — which of them they answer for is
+    /// unspecified. A test that has to establish "the departed agent's seed is
+    /// STILL SITTING THERE", so that a refusal is meaningful rather than vacuous,
+    /// cannot ask a pane-keyed reader that question. This can answer it.
+    #[cfg(test)]
+    pub fn peek_pending_seed_of_agent(&self, agent_id: &str) -> Option<String> {
+        self.inner
+            .lock()
+            .unwrap()
+            .agents
+            .get(agent_id)
+            .and_then(|a| a.pending_seed.clone())
+    }
+
     /// PRD #201: take (clear) the pending seed for `pane_id_env` on behalf of
-    /// the daemon's PTY-injection SAFETY NET. Returns `Some` only if the seed
-    /// was NOT already consumed by the native pull — so the fallback injects
-    /// exactly when (and only when) native delivery did not happen.
+    /// the daemon's PTY-injection SAFETY NET, **scoped to the agent the seed was
+    /// stashed for**. Returns [`SeedFallbackTake::Taken`] only if
+    /// `expected_agent_id`'s own record still holds an unconsumed seed for that
+    /// pane — so the fallback injects exactly when (and only when) native
+    /// delivery did not happen AND the seed is the caller's own.
+    ///
+    /// **Issue #617, Greptile P1 on PR #919 — why this takes an identity.** The
+    /// pane-keyed predecessor of this method resolved `pane_id_env` by linear
+    /// scan and removed whatever seed it found. A pane id is a recycled handle:
+    /// when the pane changed hands inside [`arm_seed_fallback`]'s grace, the
+    /// record that scan landed on could be the SUCCESSOR'S, so the armed timer
+    /// of a departed agent consumed a seed stashed for somebody else. The
+    /// guarded write then refused (`WrongSession`) and the seed was dropped —
+    /// correct about the bytes, but the successor's own native `get-seed` pull
+    /// and its own fallback then both found nothing, and its opening task was
+    /// silently lost. Which of the two records the scan landed on was not even
+    /// specified: `agents` is a `HashMap` with an unspecified iteration order,
+    /// and an agent that exits without being closed keeps its record (flagged
+    /// `exited`) while a successor may hold the same `pane_id_env`, so both were
+    /// reachable.
+    ///
+    /// The identity check and the removal happen under **one** acquisition of
+    /// the registry lock, so there is no take-then-compare window: a seed that
+    /// is not `expected_agent_id`'s is never removed, not even transiently.
+    pub fn take_pending_seed_fallback_for(
+        &self,
+        pane_id_env: &str,
+        expected_agent_id: &str,
+    ) -> SeedFallbackTake {
+        let mut inner = self.inner.lock().unwrap();
+        // `set_pending_seed` files a seed on the pane's LIVE occupant, so a
+        // seed stashed for this agent is on this agent's record, and a record is
+        // keyed by agent id for the whole of its life. A keyed lookup therefore
+        // cannot wander onto a namesake pane's newer occupant the way the linear
+        // scan this replaced could.
+        if let Some(agent) = inner.agents.get_mut(expected_agent_id)
+            && agent.pane_id_env.as_deref() == Some(pane_id_env)
+            && let Some(seed) = agent.pending_seed.take()
+        {
+            return SeedFallbackTake::Taken(seed);
+        }
+        // Nothing of ours. Distinguish "the pane's seed slot is occupied by
+        // somebody else's seed" from "there is no seed here at all" so the
+        // caller can log which of the two it hit; both leave the store as it is.
+        if inner.agents.iter().any(|(id, a)| {
+            id != expected_agent_id
+                && a.pane_id_env.as_deref() == Some(pane_id_env)
+                && a.pending_seed.is_some()
+        }) {
+            SeedFallbackTake::StrangersSeed
+        } else {
+            SeedFallbackTake::Absent
+        }
+    }
+
+    /// Test probe for the pane's seed slot, ignoring identity: takes whatever
+    /// seed the first record matching `pane_id_env` holds.
+    ///
+    /// `#[cfg(test)]` on purpose. This is the pane-keyed take that issue #617
+    /// replaced with [`AgentPtyRegistry::take_pending_seed_fallback_for`]; it is
+    /// kept only so tests can observe the slot, and gating it out of a non-test
+    /// build is what makes "no production path removes a seed it does not own"
+    /// hold by construction rather than by review.
+    #[cfg(test)]
     pub fn take_pending_seed_fallback(&self, pane_id_env: &str) -> Option<String> {
         let mut inner = self.inner.lock().unwrap();
         let agent = inner
@@ -8717,6 +9043,7 @@ mod tests {
 mod spawn_tests {
     use super::*;
     use crate::event::OrchestrationSurfaceRole;
+    use spec::spec;
     use std::time::Duration;
 
     // ---------------------------------------------------------------------
@@ -9023,7 +9350,7 @@ mod spawn_tests {
     #[test]
     fn registry_rejects_duplicate_pane_id_env() {
         // CodeRabbit MAJOR (PRD #93 round-9): two agents must never
-        // share a `pane_id_env`. `write_to_pane_and_submit` keys off
+        // share a `pane_id_env`. A pane-keyed write keys off
         // that string, so a second spawn with the same id would silently misroute
         // every subsequent delegate/work-done write to whichever entry
         // `values().find(...)` happened to hand back first.
@@ -9174,6 +9501,168 @@ mod spawn_tests {
         registry.set_pending_seed("pane-unknown", "orphan");
         assert_eq!(registry.take_pending_seed_native("pane-unknown"), None);
         assert!(!registry.seed_delivered_native("pane-unknown"));
+
+        registry.shutdown_all();
+    }
+
+    /// Issue #916: the NATIVE pull must not hand out a seed off a dead
+    /// predecessor's record, and must not hand out a seed to a caller naming an
+    /// agent that does not hold the pane.
+    ///
+    /// The reachable window is specifically SELF-EXIT then successor.
+    /// `close_agent` REMOVES the record, so a deliberately-closed agent's seed
+    /// goes with it; an agent that exits on its own KEEPS its record flagged
+    /// `exited`, and the spawn-side duplicate check skips exited entries, so a
+    /// successor can claim the same `pane_id_env` while both records still carry
+    /// it. `agents` is a `HashMap` with an unspecified iteration order, so the
+    /// unfiltered scan this replaced picked between them arbitrarily — which is
+    /// why the probe below (which is still unfiltered, deliberately) is used to
+    /// show the predecessor's seed is genuinely still sitting there.
+    #[tokio::test]
+    async fn native_seed_pull_skips_an_exited_record_and_a_stranger() {
+        const PANE: &str = "pane-native-seed-handover";
+        const PREDECESSOR_SEED: &str = "PREDECESSORS-SEED-MUST-NOT-BE-HANDED-OVER-3c17";
+        const SUCCESSOR_SEED: &str = "SUCCESSORS-OWN-SEED-51b8";
+
+        let registry = Arc::new(AgentPtyRegistry::new());
+        // `read` returns when the line below lands, so this agent leaves by its
+        // own front door and RETAINS its record.
+        let predecessor = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("sh -c 'read _line'"),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), PANE.to_string())],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn the predecessor");
+        registry.set_pending_seed(PANE, PREDECESSOR_SEED);
+
+        registry
+            .write_notice_guarded(
+                PANE,
+                "the line that ends the read",
+                &predecessor,
+                || async { true },
+            )
+            .await
+            .expect("the retiring line must reach the predecessor's PTY");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while registry.pane_is_live(PANE) && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            !registry.pane_is_live(PANE),
+            "the fixture needs the predecessor gone before a successor can claim the pane id"
+        );
+        assert!(
+            registry.agent_record_any(&predecessor).is_some(),
+            "…and gone by EXITING, which RETAINS the record holding its seed — a removed \
+             record would make this fixture vacuous"
+        );
+
+        let successor = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/cat"),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), PANE.to_string())],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn the successor");
+        assert_ne!(predecessor, successor, "the hand-over must mint a new id");
+
+        // The seed is still physically in the predecessor's record, so every
+        // refusal below is refused rather than answered-with-nothing. Asserted
+        // by an AGENT-keyed peek: the pane-keyed probe is a linear scan over a
+        // `HashMap`, and with two records carrying this pane id which one it
+        // answers for is unspecified — so it cannot establish this.
+        assert_eq!(
+            registry.peek_pending_seed_of_agent(&predecessor).as_deref(),
+            Some(PREDECESSOR_SEED),
+            "fixture: the exited predecessor must still be holding its seed, or the refusals \
+             below are vacuous"
+        );
+        assert_eq!(
+            registry.peek_pending_seed_of_agent(&successor),
+            None,
+            "fixture: nothing is stashed for the successor yet"
+        );
+
+        // The successor's own pull: nothing is stashed for it yet. Refused by
+        // IDENTITY — the keyed lookup lands on the successor's own record.
+        assert_eq!(
+            registry.take_pending_seed_native_for(PANE, Some(&successor)),
+            None,
+            "the exited predecessor's seed must not be handed to the pane's new occupant"
+        );
+        // The departed agent pulling its OWN seed. Refused by the `exited`
+        // filter and by nothing else: its record still names this pane and still
+        // holds that seed.
+        assert_eq!(
+            registry.take_pending_seed_native_for(PANE, Some(&predecessor)),
+            None,
+            "an exited record must not answer a pull even for the agent that owns it"
+        );
+        // The id-less arm over the same window — the pre-#916 client, and the
+        // case #916 named as reachable: two records carry this pane id, so the
+        // unfiltered linear scan could return either. The `exited` filter is the
+        // whole of what makes this deterministic.
+        assert_eq!(
+            registry.take_pending_seed_native_for(PANE, None),
+            None,
+            "an id-less pull must resolve to the pane's LIVE occupant, which has no seed yet — \
+             never to the exited record that still carries the pane id"
+        );
+        assert!(
+            !registry.seed_delivered_native(PANE),
+            "none of those refusals may mark a delivery"
+        );
+        // …and none of them touched what they refused to hand over.
+        assert_eq!(
+            registry.peek_pending_seed_of_agent(&predecessor).as_deref(),
+            Some(PREDECESSOR_SEED),
+            "a refused pull must leave the seed it refused exactly where it was"
+        );
+
+        // Now a seed of the successor's own, to pin that the refusals are about
+        // WHO is asking and not about the slot being unreadable. `set_pending_seed`
+        // files on the pane's LIVE occupant, so this lands on the successor and the
+        // predecessor keeps holding its own.
+        registry.set_pending_seed(PANE, SUCCESSOR_SEED);
+        assert_eq!(
+            registry.peek_pending_seed_of_agent(&successor).as_deref(),
+            Some(SUCCESSOR_SEED),
+            "fixture: the successor's seed must be on the successor's record"
+        );
+        assert_eq!(
+            registry.take_pending_seed_native_for(PANE, Some(&predecessor)),
+            None,
+            "the departed agent must not be able to pull the successor's seed either"
+        );
+        assert_eq!(
+            registry.take_pending_seed_native_for(PANE, Some("agent-no-such")),
+            None,
+            "an unknown agent id resolves to no record at all"
+        );
+        assert_eq!(
+            registry.take_pending_seed_native_for(PANE, Some(&successor)),
+            Some(SUCCESSOR_SEED.to_string()),
+            "…and none of those refusals may have consumed the successor's own seed"
+        );
+
+        // The id-less arm, positively: answered off the live occupant. Note the
+        // predecessor is STILL holding its own seed at this point, so this also
+        // pins that the id-less arm reaches past an exited record rather than
+        // merely finding it empty.
+        assert_eq!(
+            registry.peek_pending_seed_of_agent(&predecessor).as_deref(),
+            Some(PREDECESSOR_SEED),
+            "fixture: the exited record must still be occupied for the arm below to mean \
+             anything"
+        );
+        registry.set_pending_seed(PANE, "a later opening task");
+        assert_eq!(
+            registry.take_pending_seed_native_for(PANE, None),
+            Some("a later opening task".to_string()),
+            "a caller that could not name itself must still get its own pane's seed"
+        );
 
         registry.shutdown_all();
     }
@@ -9941,12 +10430,17 @@ mod spawn_tests {
     }
 
     #[tokio::test]
-    async fn write_to_pane_and_submit_skips_exited_agent_and_routes_to_live_reuser() {
+    async fn guarded_submit_skips_exited_agent_and_routes_to_live_reuser() {
         // Round-11 reviewer #A: the symmetric guard for the spawn-side
         // exited filter added in round 10. Without filtering on the
-        // WRITE side, `write_to_pane_and_submit(pane_id_env=X)` could
-        // still find the dead entry first and route delegate/work-done
-        // bytes into a closed PTY whose pump thread already saw EOF.
+        // WRITE side, a pane-keyed write could still find the dead entry
+        // first and route delegate/work-done bytes into a closed PTY whose
+        // pump thread already saw EOF.
+        //
+        // Issue #917: migrated off the deleted `write_to_pane_and_submit` onto
+        // the guarded call the production paths use. The property is unchanged
+        // and now pinned where it matters — `write_guarded` resolves the pane
+        // through `writer_target_for_pane`, which applies that same filter.
         let registry = Arc::new(AgentPtyRegistry::new());
         let _dead = registry
             .spawn_agent(SpawnOptions {
@@ -9986,10 +10480,19 @@ mod spawn_tests {
         // nothing" because its writer is gone — but we CAN prove the
         // live one did receive something. The dead agent's writer
         // would error out anyway, so a misroute would surface as Err.
-        registry
-            .write_to_pane_and_submit("reuse-me", "echo round11-routing-marker")
-            .await
-            .expect("write_to_pane_and_submit to a live reuser must succeed");
+        assert_eq!(
+            registry
+                .write_and_submit_guarded(
+                    "reuse-me",
+                    "echo round11-routing-marker",
+                    &live_id,
+                    || async { true }
+                )
+                .await
+                .expect("the guarded write to a live reuser must reach the registry"),
+            GuardedSend::Applied,
+            "the pane's live occupant must be the resolved target, not the exited entry"
+        );
 
         // Allow the PTY to echo the input back into scrollback.
         let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
@@ -10008,7 +10511,7 @@ mod spawn_tests {
         }
         assert!(
             found,
-            "write_to_pane_and_submit must have landed bytes in the LIVE reuser's scrollback, not the exited entry's"
+            "the guarded write must have landed bytes in the LIVE reuser's scrollback, not the exited entry's"
         );
 
         registry.shutdown_all();
@@ -10020,7 +10523,7 @@ mod spawn_tests {
     /// notice so the orchestrator LLM doesn't process the diagnostic
     /// as a user prompt.
     ///
-    /// Timing is the test signal: `write_to_pane_and_submit` waits
+    /// Timing is the test signal: a SUBMIT-mode write waits
     /// the full `SUBMIT_DELAY` (150 ms) between payload and CR, so
     /// the call can't return in less than that. `write_to_pane_notice`
     /// writes payload + `\n` and returns immediately. PTY line
@@ -10031,7 +10534,7 @@ mod spawn_tests {
     #[tokio::test]
     async fn write_to_pane_notice_skips_submit_delay() {
         let registry = Arc::new(AgentPtyRegistry::new());
-        let _id = registry
+        let agent_id = registry
             .spawn_agent(SpawnOptions {
                 command: Some("/bin/cat"),
                 env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), "no-submit".to_string())],
@@ -10052,14 +10555,17 @@ mod spawn_tests {
         );
 
         let start = tokio::time::Instant::now();
-        registry
-            .write_to_pane_and_submit("no-submit", "prompt")
-            .await
-            .expect("write_to_pane_and_submit");
+        assert_eq!(
+            registry
+                .write_and_submit_guarded("no-submit", "prompt", &agent_id, || async { true })
+                .await
+                .expect("guarded submit"),
+            GuardedSend::Applied
+        );
         let submit_elapsed = start.elapsed();
         assert!(
             submit_elapsed >= SUBMIT_DELAY,
-            "write_to_pane_and_submit must wait at least SUBMIT_DELAY before the CR; \
+            "a SUBMIT-mode write must wait at least SUBMIT_DELAY before the CR; \
              took {submit_elapsed:?} (< {SUBMIT_DELAY:?})"
         );
 
@@ -10140,10 +10646,13 @@ mod spawn_tests {
             .write_to_pane_notice("accumulate", "NOTICE-MARKER")
             .await
             .expect("write_to_pane_notice");
-        registry
-            .write_to_pane_and_submit("accumulate", "USER-PROMPT")
-            .await
-            .expect("write_to_pane_and_submit");
+        assert_eq!(
+            registry
+                .write_and_submit_guarded("accumulate", "USER-PROMPT", &agent_id, || async { true })
+                .await
+                .expect("guarded submit"),
+            GuardedSend::Applied
+        );
 
         // Master scrollback should contain the exact byte sequence
         // the daemon wrote: `NOTICE-MARKER\nUSER-PROMPT\r` (raw cat
@@ -10256,10 +10765,10 @@ mod spawn_tests {
     }
 
     #[test]
-    fn registry_write_to_pane_and_submit_routes_to_correct_agent_by_pane_id() {
+    fn registry_pane_keyed_write_routes_to_correct_agent_by_pane_id() {
         // CodeRabbit MAJOR (PRD #93 round-9) regression guard: with
-        // distinct pane_id_envs, `write_to_pane_and_submit(pane_id,
-        // bytes)` must land in *that* agent's PTY and not leak into a sibling.
+        // distinct pane_id_envs, a pane-keyed write must land in *that*
+        // agent's PTY and not leak into a sibling.
         // Mirrors the production routing path delegate/work-done uses.
         // We can't easily read PTY bytes from a `/bin/sh` so we
         // confirm structurally: the registry must contain both agents
@@ -11787,12 +12296,17 @@ mod spawn_tests {
         let guard = target.writer.lock().await;
 
         let reg_for_task = reg.clone();
+        let id_for_task = id.clone();
         let mut task = tokio::spawn(async move {
             reg_for_task
                 .write_and_submit_guarded(
                     "pane-removal-barrier",
                     "printf 'REMOVED-AFTER-AUTH'",
-                    None,
+                    // Issue #617: the pane's own live agent, so the PRE-lock
+                    // identity gate passes and the send really does park on the
+                    // held writer. This used to be `None`, which passed the gate
+                    // by skipping it.
+                    &id_for_task,
                     // Liveness always "ok" — the ONLY thing that must reject is
                     // the removal re-resolution under the held writer.
                     || async { true },
@@ -11824,73 +12338,107 @@ mod spawn_tests {
         reg.shutdown_all();
     }
 
-    /// Pin the PRIMITIVE's documented-permissive `None`
-    /// behavior as an asserted fact, not merely a reader's inference from the
-    /// source. `write_guarded`'s pre-lock identity gate (`if !is_paneless &&
-    /// let Some(expected) = expected_agent_id && ...`) only compares
-    /// identities when `expected_agent_id` is `Some` — passing `None` skips
-    /// the gate entirely, and the call proceeds as an UNGUARDED write to
-    /// whoever currently owns the pane. That is correct at THIS layer: the
-    /// primitive is generic, and it is every caller's job never to pass
-    /// `None` when it needs verified delivery — `dispatch_one_owned`'s own
-    /// refusal (`dispatch_one_owned_refuses_write_when_worker_identity_is_unresolved`
-    /// in `state.rs`) is exactly that caller-side responsibility. Without
-    /// this test, a future reader would have to re-derive the permissive
-    /// semantics from the gate's `if let` shape rather than finding them
-    /// asserted.
+    /// Issue #617: pin the PRIMITIVE's identity gate as an asserted fact for the
+    /// case that used to be permissive — a paned send whose expected agent is not
+    /// the agent that owns the pane right now.
+    ///
+    /// This test replaces `guarded_send_with_no_expected_identity_writes_to_the_live_pane`,
+    /// which asserted the opposite contract: that passing `None` as the expected
+    /// identity WROTE to whoever owned the pane. Its doc comment argued the
+    /// permissiveness was correct at this layer and that withholding `None` was
+    /// every caller's job. Issue #617 overturned that — two independent reviews of
+    /// the #608 fix each found callers that did pass an absent identity, and the
+    /// argument "it is the caller's job" is not a property anything checks. The
+    /// absent case is now unrepresentable (`expected_agent_id: &str`), so it can no
+    /// longer be tested at all; what survives, and what this pins, is the runtime
+    /// property that outlives it: a pane that CHANGES HANDS between the caller
+    /// resolving its target and the write is refused with [`GuardedSend::WrongSession`]
+    /// and zero bytes.
+    ///
+    /// Both halves are asserted. The outcome alone would pass if the write had
+    /// landed anyway, and the byte check alone would pass if the successor's PTY
+    /// were simply slow — so the successor's scrollback is read only after a
+    /// readiness marker proves it is up and echoing.
     #[tokio::test]
-    async fn guarded_send_with_no_expected_identity_writes_to_the_live_pane() {
+    async fn guarded_send_refuses_a_pane_that_changed_hands_before_the_write() {
+        const PANE: &str = "pane-changed-hands-before-write";
+        const MARKER: &str = "must-not-reach-the-successor-marker";
+
         let reg = Arc::new(AgentPtyRegistry::new());
-        // `spawn_agent` returns the REGISTRY's own agent id — a UUID, not the
-        // `pane_id_env` string — and `AgentPtyRegistry::snapshot` reads
-        // scrollback by that agent id, so it has to be captured here rather
-        // than discarded.
-        let agent_id = reg
+        let original = reg
             .spawn_agent(SpawnOptions {
                 command: Some("/bin/sh"),
-                env: vec![(
-                    DOT_AGENT_DECK_PANE_ID.to_string(),
-                    "pane-no-expected-identity".to_string(),
-                )],
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), PANE.to_string())],
                 ..SpawnOptions::default()
             })
-            .expect("spawn agent");
+            .expect("spawn original agent");
+
+        // Hand the pane over: close the incumbent, then spawn a NEW agent onto
+        // the same `DOT_AGENT_DECK_PANE_ID`. The registry routes by that string,
+        // so the successor now owns the pane the caller resolved.
+        reg.close_agent(&original).expect("close original agent");
+        let successor = reg
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/sh"),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), PANE.to_string())],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn successor agent");
+        assert_ne!(
+            original, successor,
+            "the hand-over must produce a NEW agent id"
+        );
 
         let outcome = reg
             .write_and_submit_guarded_detailed(
-                "pane-no-expected-identity",
-                "echo none-identity-permissive-marker",
-                None,
+                PANE,
+                &format!("echo {MARKER}"),
+                &original,
                 || async { true },
             )
             .await
             .expect("guarded send result");
         assert_eq!(
             outcome,
-            GuardedSendDetail::Outcome(GuardedSend::Applied),
-            "a None expected identity must not be refused by the primitive — it is the caller's \
-             job to withhold None when it wants verification"
+            GuardedSendDetail::Outcome(GuardedSend::WrongSession),
+            "a send bound to the pane's PREVIOUS owner must be refused once the pane has \
+             changed hands"
         );
 
-        // Confirm bytes actually reached the live pane, not merely that the
-        // outcome claims `Applied`.
+        // Prove the successor is up and echoing before reading its scrollback,
+        // so "no marker" cannot pass merely because the stub had not started.
+        let ready = reg
+            .write_and_submit_guarded(PANE, "echo SUCCESSOR-READY", &successor, || async { true })
+            .await
+            .expect("readiness write result");
+        assert_eq!(
+            ready,
+            GuardedSend::Applied,
+            "the successor owns the pane, so a send bound to IT must be applied"
+        );
         let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
-        let mut found = false;
+        let mut ready_seen = false;
         while tokio::time::Instant::now() < deadline {
-            let snap = reg.snapshot(&agent_id).unwrap_or_default();
+            let snap = reg.snapshot(&successor).unwrap_or_default();
             if snap
-                .windows(b"none-identity-permissive-marker".len())
-                .any(|w| w == b"none-identity-permissive-marker")
+                .windows(b"SUCCESSOR-READY".len())
+                .any(|w| w == b"SUCCESSOR-READY")
             {
-                found = true;
+                ready_seen = true;
                 break;
             }
             tokio::time::sleep(Duration::from_millis(30)).await;
         }
         assert!(
-            found,
-            "the guarded primitive must have written the payload into the live pane when \
-             expected_agent_id was None"
+            ready_seen,
+            "precondition: the successor's PTY must be echoing before its scrollback is read \
+             for the refused payload"
+        );
+
+        let snap = reg.snapshot(&successor).unwrap_or_default();
+        assert!(
+            !snap.windows(MARKER.len()).any(|w| w == MARKER.as_bytes()),
+            "the refused payload must not appear in the SUCCESSOR's scrollback"
         );
 
         reg.shutdown_all();
@@ -12911,5 +13459,452 @@ mod spawn_tests {
             reaped.iter().all(|r| r.load(Ordering::SeqCst)),
             "every agent must still be reaped, not merely signalled"
         );
+    }
+
+    /// Issue #617 (finding 6). A `tracing` subscriber scoped to this test's
+    /// thread, so the refusal [`arm_seed_fallback`] reports can be asserted as a
+    /// fact rather than inferred: the fallback is a fire-and-forget
+    /// `tokio::spawn` that returns nothing, and "no bytes in the successor"
+    /// alone cannot tell a REFUSED injection apart from one that never reached
+    /// the write.
+    ///
+    /// Deliberately a third copy rather than a shared helper. `mod tests` is
+    /// private to its file, so sharing this with the two that already exist
+    /// (`spawn::tests` and `state::tests`, each for the same reason) means
+    /// making one of them `pub(crate)` and widening a test-only surface across
+    /// the lib to save twenty lines of `MakeWriter` boilerplate.
+    #[derive(Clone, Default)]
+    struct CapturedLog(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLog {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLog {
+        type Writer = CapturedLog;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// Scenario: a pane has a native seed stashed for its occupant and that
+    /// agent's PTY-injection safety net armed; inside the grace the occupant
+    /// exits on its own — keeping its record — and a new agent claims the same
+    /// `DOT_AGENT_DECK_PANE_ID` without stashing a seed of its own. When the
+    /// armed fallback fires it takes the seed it is entitled to (its own), the
+    /// identity gate must refuse the injection as `WrongSession`, and that seed
+    /// must be dropped rather than restored anywhere the new occupant could pull
+    /// it, with none of its bytes reaching the successor — whose scrollback still
+    /// shows a later authorized write.
+    #[spec("prompt/pane-input/034")]
+    #[tokio::test]
+    async fn pane_input_034_seed_fallback_is_refused_when_the_pane_changed_hands() {
+        const PANE: &str = "seed-fallback-handover-pane";
+        const SEED: &str = "STASHED-SEED-MUST-NOT-BE-TYPED-BY-A-STRANGERS-TASK-8e42";
+        const BARRIER: &str = "AUTHORIZED-WRITE-AFTER-THE-REFUSAL-1f56";
+        // Still a PARAMETER, so the 15 s default and its second-granularity
+        // `DOT_AGENT_DECK_SEED_FALLBACK_SECS` env var are both out of the
+        // picture — but an order of magnitude larger than `prompt/pane-input/035`'s,
+        // because this hand-over waits on a child exiting and its reader thread
+        // seeing EOF rather than on a synchronous `close_agent`. The hand-over
+        // must complete inside it; if it ever does not, the two log assertions
+        // below say which side of it the fallback fired on rather than failing
+        // opaquely.
+        const GRACE: Duration = Duration::from_millis(1500);
+
+        let registry = Arc::new(AgentPtyRegistry::new());
+        // The predecessor exits on its OWN — its `read` returns on the line
+        // written below — rather than through `close_agent`, and that is the
+        // whole fixture. `close_agent` REMOVES the record, so the expiring
+        // fallback would find no seed of ITS OWN to take
+        // (`SeedFallbackTake::Absent`) and would never reach the identity gate
+        // at all. A natural exit RETAINS the record flagged `exited`, which is
+        // also what lets a successor claim the same pane id (`spawn_agent`'s
+        // duplicate check skips exited entries), so the seed stashed for the
+        // departed agent is still that agent's own seed when its timer fires.
+        // A write-level refusal needs a predecessor whose record — and so whose
+        // own seed — outlives it; `close_agent` leaves neither.
+        let original = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("sh -c 'read _line'"),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), PANE.to_string())],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn the agent the seed is stashed for");
+        registry.set_pending_seed(PANE, SEED);
+
+        let captured = CapturedLog::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(captured.clone())
+            .with_max_level(tracing_subscriber::filter::LevelFilter::WARN)
+            .with_ansi(false)
+            .finish();
+        let subscriber_guard = tracing::subscriber::set_default(subscriber);
+
+        // Armed for the agent that owns the pane RIGHT NOW, exactly as the two
+        // production callers arm it at spawn/respawn time.
+        arm_seed_fallback(registry.clone(), PANE.to_string(), original.clone(), GRACE);
+
+        // The hand-over, inside the grace. One unsubmitted line ends the
+        // predecessor's `read`, so it leaves by its own front door: no
+        // `close_agent`, no kill, and therefore a record that survives it.
+        registry
+            .write_to_pane_notice(PANE, "the line that ends the predecessor's read")
+            .await
+            .expect("the line that retires the predecessor must reach its PTY");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while registry.pane_is_live(PANE) && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            !registry.pane_is_live(PANE),
+            "the fixture needs the predecessor gone before a successor can claim the pane id"
+        );
+        assert!(
+            registry.agent_record_any(&original).is_some(),
+            "…and it must have gone by EXITING, which retains its record: a removed record holds \
+             no seed, so the fallback would find nothing of its own and never reach the write"
+        );
+
+        let successor = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/cat"),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), PANE.to_string())],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn the agent that inherits the pane id");
+        assert_ne!(
+            original, successor,
+            "the hand-over must produce a NEW registry agent id"
+        );
+        // The successor deliberately stashes NOTHING. The seed the expiring
+        // fallback finds must be the departed agent's own, so the take hands it
+        // over and the refusal happens at the WRITE — which is the half of the
+        // property this test owns. `prompt/pane-input/035` stages the other
+        // half: a successor that HAS stashed one, where the refusal happens at
+        // the take and nothing is removed. The successor's own fallback is
+        // deliberately NOT armed either, so the ONLY thing that could type this
+        // seed into its PTY is the original's armed task.
+
+        // Wait for the armed task to reach a terminal report rather than for a
+        // fixed multiple of the grace.
+        let log_text = || {
+            String::from_utf8(captured.0.lock().unwrap().clone())
+                .expect("captured log must be valid UTF-8")
+        };
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !log_text().contains("seed fallback:") && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        drop(subscriber_guard);
+        let log = log_text();
+        assert!(
+            log.contains("seed fallback: identity gate refused the PTY injection"),
+            "the armed injection must reach its identity gate and be REFUSED there, not merely \
+             fail to write; captured log = {log:?}"
+        );
+        assert!(
+            log.contains("WrongSession"),
+            "the pane has a live agent that is not the one the seed was stashed for, so the \
+             refusal must be WrongSession — anything else means the fixture never got the \
+             hand-over it needed; captured log = {log:?}"
+        );
+        assert_eq!(
+            registry.take_pending_seed_fallback_for(PANE, &original),
+            SeedFallbackTake::Absent,
+            "the refused seed must be DROPPED rather than restored to the record it was stashed \
+             on: nothing re-arms this fallback, so a restored seed is one no delivery path will \
+             ever come back for"
+        );
+        assert_eq!(
+            registry.take_pending_seed_fallback_for(PANE, &successor),
+            SeedFallbackTake::Absent,
+            "and it must not have been re-filed under the pane's NEW occupant either — there it \
+             would be pullable by that occupant's own `get-seed`, re-opening the mis-delivery by \
+             the native route after the injection route refused it"
+        );
+
+        // A barrier, not a sleep: an AUTHORIZED write that has demonstrably
+        // arrived proves the successor's PTY has drained past the point where a
+        // leaked seed would have landed.
+        let barrier = registry
+            .write_and_submit_guarded(PANE, BARRIER, &successor, || async { true })
+            .await
+            .expect("the barrier write must reach the registry");
+        assert_eq!(
+            barrier,
+            GuardedSend::Applied,
+            "the successor owns the pane, so a write bound to IT must be applied — otherwise \
+             this test proves nothing about the refusal above"
+        );
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut snapshot = Vec::new();
+        while tokio::time::Instant::now() < deadline {
+            snapshot = registry.snapshot(&successor).unwrap_or_default();
+            if snapshot
+                .windows(BARRIER.len())
+                .any(|w| w == BARRIER.as_bytes())
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let rendered = String::from_utf8_lossy(&snapshot).into_owned();
+        assert!(
+            rendered.contains(BARRIER),
+            "the barrier write never reached the successor's PTY, so the absence below is \
+             untested; snapshot = {rendered:?}"
+        );
+        assert!(
+            !rendered.contains(SEED),
+            "a stashed seed was typed into — and submitted in — an agent that merely inherited \
+             the pane id of the agent it was stashed for; snapshot = {rendered:?}"
+        );
+
+        registry.shutdown_all();
+    }
+
+    /// Scenario: a pane has a native seed stashed and its PTY-injection safety
+    /// net armed for the agent the seed was stashed for; inside the grace the
+    /// pane changes hands and the NEW occupant stashes an opening task of its
+    /// own. When the departed agent's armed fallback fires it must leave that
+    /// seed exactly where it is, so the successor's own native `get-seed` pull
+    /// still returns it verbatim and its PTY is never typed into.
+    ///
+    /// The other half of `prompt/pane-input/034`, which pins that the armed
+    /// injection writes no bytes. Writing no bytes was never the whole property:
+    /// the take that fed that refusal was keyed by pane id alone, so it removed
+    /// the successor's seed on the way to being refused, and the successor then
+    /// found nothing by either route — a silently lost opening task with no
+    /// mis-delivery to show for it (issue #617, Greptile P1 on PR #919).
+    #[spec("prompt/pane-input/035")]
+    #[tokio::test]
+    async fn pane_input_035_seed_fallback_leaves_a_successors_own_seed_for_the_successor() {
+        const PANE: &str = "seed-fallback-successor-pane";
+        const ORIGINAL_SEED: &str = "ORIGINAL-AGENTS-SEED-MUST-NOT-REACH-THE-SUCCESSOR-b71c";
+        const SUCCESSOR_SEED: &str = "SUCCESSOR-OWN-OPENING-TASK-MUST-SURVIVE-THE-GRACE-4d90";
+        const BARRIER: &str = "AUTHORIZED-WRITE-AFTER-THE-GRACE-9a33";
+        const GRACE: Duration = Duration::from_millis(200);
+
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let original = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/cat"),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), PANE.to_string())],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn the agent the first seed is stashed for");
+        registry.set_pending_seed(PANE, ORIGINAL_SEED);
+
+        // DEBUG, not WARN: the branch under test is a no-op that reports itself
+        // at debug level, and "the fallback left the seed alone" has to be read
+        // as a fact rather than inferred from the seed still being there — an
+        // armed task that never fired would leave it there too.
+        let captured = CapturedLog::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(captured.clone())
+            .with_max_level(tracing_subscriber::filter::LevelFilter::DEBUG)
+            .with_ansi(false)
+            .finish();
+        let subscriber_guard = tracing::subscriber::set_default(subscriber);
+
+        arm_seed_fallback(registry.clone(), PANE.to_string(), original.clone(), GRACE);
+
+        // The hand-over, inside the grace, exactly as `prompt/pane-input/034`
+        // stages it — but with a seed the successor can be asked for afterwards
+        // by content, so "its own seed survived" is distinguishable from "the
+        // original's seed was left lying in its slot".
+        registry
+            .close_agent(&original)
+            .expect("close the agent the first seed was stashed for");
+        let successor = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/cat"),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), PANE.to_string())],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn the agent that inherits the pane id");
+        assert_ne!(
+            original, successor,
+            "the hand-over must produce a NEW registry agent id"
+        );
+        registry.set_pending_seed(PANE, SUCCESSOR_SEED);
+
+        // Wait for the armed task to reach a terminal report rather than for a
+        // fixed multiple of the grace.
+        let log_text = || {
+            String::from_utf8(captured.0.lock().unwrap().clone())
+                .expect("captured log must be valid UTF-8")
+        };
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !log_text().contains("seed fallback:") && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        drop(subscriber_guard);
+        let log = log_text();
+        assert!(
+            log.contains("left untouched and nothing injected"),
+            "the armed task must have fired and taken the leave-it-alone branch; anything else \
+             means it either never ran or consumed a seed that was not its own; captured log = \
+             {log:?}"
+        );
+
+        // THE property, asserted positively and by the route the successor
+        // really uses: its extension's `get-seed` pull still hands it its own
+        // opening task, byte for byte.
+        assert_eq!(
+            registry.take_pending_seed_native(PANE).as_deref(),
+            Some(SUCCESSOR_SEED),
+            "the successor's own seed must survive a predecessor's expiring fallback and still \
+             be pullable natively — consuming it here is a silently lost opening task"
+        );
+        assert!(
+            registry.seed_delivered_native(PANE),
+            "that pull is the native path, so it must be observable as native delivery"
+        );
+
+        // A barrier, not a sleep: an AUTHORIZED write that has demonstrably
+        // arrived proves the successor's PTY has drained past the point where
+        // either seed would have landed had the fallback injected one.
+        let barrier = registry
+            .write_and_submit_guarded(PANE, BARRIER, &successor, || async { true })
+            .await
+            .expect("the barrier write must reach the registry");
+        assert_eq!(
+            barrier,
+            GuardedSend::Applied,
+            "the successor owns the pane, so a write bound to IT must be applied — otherwise the \
+             absences below are untested"
+        );
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut snapshot = Vec::new();
+        while tokio::time::Instant::now() < deadline {
+            snapshot = registry.snapshot(&successor).unwrap_or_default();
+            if snapshot
+                .windows(BARRIER.len())
+                .any(|w| w == BARRIER.as_bytes())
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let rendered = String::from_utf8_lossy(&snapshot).into_owned();
+        assert!(
+            rendered.contains(BARRIER),
+            "the barrier write never reached the successor's PTY, so the absences below are \
+             untested; snapshot = {rendered:?}"
+        );
+        assert!(
+            !rendered.contains(ORIGINAL_SEED),
+            "the departed agent's seed was typed into the agent that merely inherited its pane \
+             id; snapshot = {rendered:?}"
+        );
+        assert!(
+            !rendered.contains(SUCCESSOR_SEED),
+            "the successor's seed was injected into its PTY by a fallback nobody armed for it — \
+             its own native pull is what delivers it; snapshot = {rendered:?}"
+        );
+
+        registry.shutdown_all();
+    }
+
+    /// Issue #617 (Greptile P1 on PR #919): the seed store's arbitration when
+    /// TWO records carry the same `pane_id_env` — the production shape of a
+    /// recycled pane, where the predecessor exits on its own (keeping its
+    /// record, flagged `exited`) instead of being closed.
+    ///
+    /// Pins both halves of the identity scoping in one place, without PTY
+    /// timing: a successor's stash lands on the successor rather than on the
+    /// dead predecessor's record, and each agent's fallback take yields that
+    /// agent's OWN seed and never the other's. `agents` is a `HashMap`, so the
+    /// unfiltered pane-keyed scan these replaced chose between the two records
+    /// at random.
+    #[tokio::test]
+    async fn seed_fallback_take_is_scoped_to_the_agent_the_seed_was_stashed_for() {
+        const PANE: &str = "seed-two-records-pane";
+        const ORIGINAL_SEED: &str = "the departed agent's own opening task";
+        const SUCCESSOR_SEED: &str = "the successor's own opening task";
+
+        let registry = Arc::new(AgentPtyRegistry::new());
+        // Exits on its own the moment it is spawned, so its record survives as
+        // an `exited` entry rather than being removed by `close_agent`.
+        let original = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("sh -c 'exit 0'"),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), PANE.to_string())],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn the agent that will exit on its own");
+        registry.set_pending_seed(PANE, ORIGINAL_SEED);
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while registry.pane_is_live(PANE) && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            !registry.pane_is_live(PANE),
+            "the fixture needs the predecessor flagged `exited` while its record is still present"
+        );
+
+        let successor = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/cat"),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), PANE.to_string())],
+                ..SpawnOptions::default()
+            })
+            .expect("a successor may claim the pane id of an exited incumbent");
+        registry.set_pending_seed(PANE, SUCCESSOR_SEED);
+
+        // The successor's stash landed on the SUCCESSOR, not on the dead
+        // predecessor's record — which is what keeps it out of reach of the
+        // predecessor's armed fallback.
+        assert_eq!(
+            registry.take_pending_seed_fallback_for(PANE, &successor),
+            SeedFallbackTake::Taken(SUCCESSOR_SEED.to_string()),
+            "a stash for a pane must land on that pane's LIVE occupant"
+        );
+        registry.set_pending_seed(PANE, SUCCESSOR_SEED);
+
+        // The predecessor's expiring fallback takes its OWN seed — the one it
+        // is entitled to attempt (and, being refused, to drop) — and leaves the
+        // successor's alone.
+        assert_eq!(
+            registry.take_pending_seed_fallback_for(PANE, &original),
+            SeedFallbackTake::Taken(ORIGINAL_SEED.to_string()),
+            "a fallback armed for the departed agent must still find the seed stashed FOR it"
+        );
+        assert_eq!(
+            registry.take_pending_seed_fallback_for(PANE, &original),
+            SeedFallbackTake::StrangersSeed,
+            "with its own seed consumed, the only seed left under this pane belongs to the \
+             successor and must be reported as such rather than taken"
+        );
+        assert_eq!(
+            registry.take_pending_seed_fallback_for(PANE, &successor),
+            SeedFallbackTake::Taken(SUCCESSOR_SEED.to_string()),
+            "and it must still be there for the successor itself, untouched by the take above"
+        );
+        assert_eq!(
+            registry.take_pending_seed_fallback_for(PANE, &successor),
+            SeedFallbackTake::Absent,
+            "once its owner has taken it there is nothing of anyone's left under this pane"
+        );
+
+        // Deliberately NOT probed through `take_pending_seed_native` here. That
+        // pull is still the pane-keyed scan of issue #916 — no identity, no
+        // `exited` filter — so with the predecessor's record still present it
+        // resolves to whichever of the two the `HashMap` yields first. Measured
+        // while writing this test: it returned `None` at this point although the
+        // successor's seed was demonstrably in the store, asserted two lines up.
+        // `prompt/pane-input/035` probes natively instead, and can, because its
+        // hand-over goes through `close_agent` and leaves exactly one record.
+
+        registry.shutdown_all();
     }
 }

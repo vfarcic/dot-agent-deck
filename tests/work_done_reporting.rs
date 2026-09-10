@@ -32,7 +32,7 @@ use tempfile::TempDir;
 use tokio::sync::broadcast;
 
 use dot_agent_deck::agent_pty::{
-    AgentPtyRegistry, DOT_AGENT_DECK_PANE_ID, SpawnOptions, TabMembership,
+    AgentPtyRegistry, DOT_AGENT_DECK_PANE_ID, GuardedSend, SpawnOptions, TabMembership,
 };
 use dot_agent_deck::event::{BroadcastMsg, DelegateSignal, WorkDoneSignal};
 use dot_agent_deck::state::{AppState, OrchestrationIdentity};
@@ -477,6 +477,154 @@ fn work_done_005_failed_respawn_does_not_leave_a_phantom_commission() {
         assert!(
             !harness.summary_path().exists(),
             "an uncommissioned completion writes no summary file at all"
+        );
+    });
+}
+
+/// A raw, no-echo `cat` successor for the orchestrator pane, carrying the same
+/// registry `TabMembership` a legitimate in-place restart of that role would
+/// carry — so the only thing separating it from its predecessor is the registry
+/// agent id, which is exactly the input under test.
+fn spawn_orchestrator_successor(
+    registry: &std::sync::Arc<AgentPtyRegistry>,
+    cwd: &str,
+    marker: &str,
+) -> String {
+    let command =
+        format!("stty -echo -icanon -icrnl -opost min 1 time 0 && printf {marker} && exec cat -u");
+    registry
+        .spawn_agent(SpawnOptions {
+            command: Some(&command),
+            cwd: Some(cwd),
+            env: vec![
+                (DOT_AGENT_DECK_PANE_ID.to_string(), ORCH_PANE.to_string()),
+                ("SHELL".to_string(), "/bin/sh".to_string()),
+            ],
+            tab_membership: Some(TabMembership::Orchestration {
+                name: ORCHESTRATION.to_string(),
+                role_index: 0,
+                role_name: ORCH_ROLE.to_string(),
+                is_start_role: true,
+                orchestration_cwd: Some(cwd.to_string()),
+                display_title: None,
+                orchestration_id: Some(ORCHESTRATION_INSTANCE.to_string()),
+            }),
+            ..SpawnOptions::default()
+        })
+        .expect("spawn the orchestrator successor stub")
+}
+
+/// The successor's readiness marker, and the barrier written into it after the
+/// refusal. Distinct strings so neither can be mistaken for the other, and
+/// neither is a substring of the feedback the test is proving absent.
+const SUCCESSOR_READY: &str = "SUCCESSOR-ORCH-READY";
+const SUCCESSOR_BARRIER: &str = "AUTHORIZED-WRITE-AFTER-THE-REFUSAL-4d02";
+
+/// Scenario: Delegate to `coder` and let it report `work-done` once, proving this
+/// fixture delivers the completion feedback into the orchestrator pane; then
+/// delegate again and restart the orchestrator in place — the pane keeps its id,
+/// role and orchestration, but a NEW agent owns it — before the worker reports.
+/// The second completion must not be typed into that successor: its scrollback
+/// must still hold its own readiness marker and a later authorized write, and
+/// none of the feedback.
+#[spec("orchestration/work-done/006")]
+#[test]
+fn work_done_006_feedback_is_refused_when_the_orchestrator_pane_changed_hands() {
+    runtime().block_on(async {
+        let harness = WorkDoneHarness::new(None).await;
+
+        // --- Control. The same delegate → work-done pair this test then repeats
+        // across a hand-over, so a later absence cannot be blamed on a fixture
+        // that never delivered anything in the first place.
+        harness.delegate().await;
+        harness
+            .work_done(&format!("Finished the first delegation. {FRESH_SENTINEL}"))
+            .await;
+        let delivered = harness
+            .wait_for_orchestrator(
+                |snapshot| snapshot.contains(POINTER_NEEDLE),
+                Duration::from_secs(5),
+            )
+            .await;
+        assert!(
+            delivered.contains(POINTER_NEEDLE),
+            "control: a commissioned completion must reach the orchestrator that commissioned \
+             it, or the refusal asserted below is not a refusal of anything; snapshot = \
+             {delivered:?}"
+        );
+
+        // --- The race. The commission is issued while the ORIGINAL orchestrator
+        // owns the pane, so the feedback is bound to that agent...
+        harness.delegate().await;
+
+        // ...and then the orchestrator is restarted in place. `close_agent`
+        // removes the record before the child dies, so the EOF sweep does not
+        // run and the outstanding delegation survives the restart — which is
+        // what leaves the identity gate as the only thing standing between the
+        // completion and the new occupant.
+        let cwd = harness.cwd.path().to_string_lossy().into_owned();
+        harness
+            .registry
+            .close_agent(&harness.orchestrator_agent_id)
+            .expect("close the commissioning orchestrator");
+        let successor = spawn_orchestrator_successor(&harness.registry, &cwd, SUCCESSOR_READY);
+        assert_ne!(
+            successor, harness.orchestrator_agent_id,
+            "the restart must produce a NEW registry agent id"
+        );
+        let snapshot_of = |agent_id: &str| {
+            String::from_utf8_lossy(&harness.registry.snapshot(agent_id).unwrap_or_default())
+                .into_owned()
+        };
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !snapshot_of(&successor).contains(SUCCESSOR_READY)
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            snapshot_of(&successor).contains(SUCCESSOR_READY),
+            "precondition: the successor must be up and echoing, or the absence asserted below \
+             proves only that its stub never started; snapshot = {:?}",
+            snapshot_of(&successor)
+        );
+
+        harness
+            .work_done(&format!("Finished the second delegation. {FRESH_SENTINEL}"))
+            .await;
+
+        // A barrier rather than a sleep: an authorized write that has
+        // demonstrably arrived proves the successor's PTY has drained past the
+        // point where leaked feedback would have landed.
+        let barrier = harness
+            .registry
+            .write_and_submit_guarded(ORCH_PANE, SUCCESSOR_BARRIER, &successor, || async { true })
+            .await
+            .expect("the barrier write must reach the registry");
+        assert_eq!(
+            barrier,
+            GuardedSend::Applied,
+            "the successor owns the pane, so a write bound to IT must be applied — otherwise \
+             this test proves nothing about the refusal"
+        );
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !snapshot_of(&successor).contains(SUCCESSOR_BARRIER)
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let snapshot = snapshot_of(&successor);
+        assert!(
+            snapshot.contains(SUCCESSOR_BARRIER),
+            "the barrier write never reached the successor's PTY, so the absence below is \
+             untested; snapshot = {snapshot:?}"
+        );
+        assert!(
+            !snapshot.contains(POINTER_NEEDLE)
+                && !snapshot.contains(UNSOLICITED_NEEDLE)
+                && !snapshot.contains(REPORT_FRAME_NEEDLE),
+            "a previous conversation's completion report was typed into — and submitted in — an \
+             agent that merely inherited the orchestrator's pane id; snapshot = {snapshot:?}"
         );
     });
 }

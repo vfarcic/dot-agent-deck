@@ -36160,6 +36160,16 @@ mod tests {
             _expected_session_id: Option<&str>,
             _delivery_id: Option<&str>,
         ) -> Result<crate::event::SendResult, PaneError> {
+            // Issue #617: mirror the daemon handler's routing resolution. A
+            // request that names no agent is refused there
+            // (`compute_write_and_submit_outcome` maps an absent identity to
+            // `Writable::None` → `SendResult::NoLiveTarget`, issue #608), and the
+            // guarded primitive no longer accepts one at all — so this double
+            // answers `NoLiveTarget` rather than inventing a permissive path the
+            // real controller does not have.
+            let Some(expected_agent_id) = expected_agent_id else {
+                return Ok(crate::event::SendResult::NoLiveTarget);
+            };
             let outcome = self
                 .runtime
                 .block_on(self.registry.write_and_submit_guarded(

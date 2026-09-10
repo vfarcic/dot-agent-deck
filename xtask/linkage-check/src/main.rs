@@ -5,7 +5,7 @@
 //! Subcommands:
 //!
 //! - `linkage-check` (default) — first runs a repository-state preflight
-//!   (issue #557; see [`repo_state`]), then performs the eleven checks
+//!   (issue #557; see [`repo_state`]), then performs the twelve checks
 //!   listed in Decision 7 + Decision 30:
 //!
 //!   The preflight is deliberately not one of the numbered checks: it answers
@@ -49,6 +49,13 @@
 //!      longer than the one `clean-e2e-tmp` derives its dead-owner
 //!      deletion floor from. Issue #679. See
 //!      [`overlong_lifetime_cap_rule`].
+//!  12. No client-side project resolution in the desktop crate's
+//!      PRODUCTION sources — PRD #819's invariant. A regression
+//!      TRIPWIRE, not enforcement and not a security boundary: the
+//!      desktop path-depends on the whole root crate, so a wrapper
+//!      with an innocuous name bypasses it, and only issue #176
+//!      M1.1 makes the invariant compiler-checked. See
+//!      [`desktop_project_boundary`].
 //!
 //!   The numbers are stable identifiers in the failure output, so a
 //!   new rule takes the next one rather than renumbering the others.
@@ -94,6 +101,10 @@ mod clean_tmp;
 /// renders dark mode in CI, so this is the only thing that sees the decay.
 #[cfg(test)]
 mod desktop_palette;
+/// PRD #819 M7: the desktop crate's project-resolution boundary. Unlike the
+/// `#[cfg(test)]` modules around it this one carries a live rule — check 12
+/// below — as well as its own tests.
+mod desktop_project_boundary;
 /// Issue #827: the desktop settings store's credential boundary on the
 /// surfaces `settings.rs`'s own tests cannot reach — the Rust schema's field
 /// TYPES, the TypeScript DTO, the settings normaliser and the `localStorage`
@@ -154,6 +165,12 @@ mod pr_review_verdict;
 #[cfg(test)]
 mod release_workflow_wiring;
 mod repo_state;
+/// Issue #906: `scripts/sample-attribution.sh`'s worktree-attribution rule, the
+/// prefix test that decides which worktree a toolchain process is building for.
+/// Tests only — the rule lives in the script, no CI job runs it, and both ways
+/// it has been wrong produced a plausible number rather than an error.
+#[cfg(test)]
+mod sample_attribution;
 /// PRD #740: `desktop/scripts/prepare-sidecar.sh`'s Windows filename rule.
 /// Tests only, and Unix only — the rule lives in the script, which no CI job
 /// runs today because nothing cuts a Tauri bundle yet.
@@ -975,6 +992,17 @@ fn main() -> ExitCode {
             .map(|v| format!("[9] {v}")),
     );
 
+    // Check 12 (PRD #819 M7): no client-side project resolution in the desktop
+    // crate's production sources. Read straight off `desktop/src-tauri/src/`
+    // rather than folded into the `tests/` + `src/` scan above, because it
+    // covers a different tree entirely — and because the directory going
+    // missing must be reported rather than quietly emptying the rule.
+    failures.extend(
+        desktop_project_boundary::run(&root)
+            .into_iter()
+            .map(|v| format!("[12] {v}")),
+    );
+
     // Check 7 (PRD #77 Decision 30 / M4.3): every #[spec] test has
     // a `/// Scenario:` doc comment with a body AND
     // `cargo xtask docs --tests` succeeds against the current source
@@ -989,7 +1017,7 @@ fn main() -> ExitCode {
 
     if failures.is_empty() {
         println!(
-            "linkage-check: ok ({} catalog ids, {} annotations, {} allowlisted, 11 rules)",
+            "linkage-check: ok ({} catalog ids, {} annotations, {} allowlisted, 12 rules)",
             catalog_ids.len(),
             discovered.len(),
             allowlist.len()

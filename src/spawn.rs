@@ -19,8 +19,10 @@
 //!    retained in the spawn primitive purely for the new-deck dialog, which
 //!    still permits an omitted command.
 //! 3. **Reuses the existing spawn path** ([`AgentPtyRegistry::spawn_agent`]) and
-//!    delivers the prompt through [`AgentPtyRegistry::write_to_pane_and_submit`]
-//!    (payload + CR, routed by `DOT_AGENT_DECK_PANE_ID`), GATED on the spawned
+//!    delivers the prompt through
+//!    [`AgentPtyRegistry::write_and_submit_guarded`] (payload + CR, routed by
+//!    `DOT_AGENT_DECK_PANE_ID` and bound to the spawned agent's registry id),
+//!    GATED on the spawned
 //!    agent's readiness: the fire subscribes to the hook-event broadcast before
 //!    spawning and waits for a `SessionStart` matching the pane's `pane_id` +
 //!    registry `agent_id` before writing, mirroring the daemon delegate path
@@ -766,8 +768,8 @@ pub async fn spawn(
                 // as the seam-level agreement rather than as a second place
                 // where the rule is stated differently. Registering an
                 // unretainable id would be strictly worse than skipping: the
-                // registry stores `pane_id_env = None` for it, so
-                // `write_to_pane_and_submit` could never route to the pane the
+                // registry stores `pane_id_env = None` for it, so a
+                // pane-keyed write could never route to the pane the
                 // role map claimed to have.
                 if let Some(state) = state.filter(|_| {
                     crate::agent_pty::is_valid_pane_id_env(&pane_id) || {
@@ -1376,10 +1378,11 @@ async fn deliver(
         return;
     }
     // Reviewer finding B1: the FIRST write is identity-guarded too. The plain
-    // `write_to_pane_and_submit` resolves whichever agent currently owns the
-    // pane string, and a pane id is just a string an exited agent frees for the
-    // next spawn — so after a multi-second readiness wait it could type this
-    // dispatch prompt into a replacement.
+    // `write_to_pane_and_submit` this replaced resolved whichever agent owned
+    // the pane string at write time, and a pane id is just a string an exited
+    // agent frees for the next spawn — so after a multi-second readiness wait
+    // it could type this dispatch prompt into a replacement. (Issue #917
+    // deleted that primitive, so the contrast is history, not a choice.)
     match guarded_submit(registry, pane_id, agent_id, prompt, deadline).await {
         GuardedOutcome::Written => {}
         // Issue #424 H3/H5: the FIRST write of this delivery was refused because
@@ -1557,12 +1560,10 @@ async fn guarded_submit(
     let closing = Arc::clone(registry);
     // Issue #424 H5: the DETAILED form, because this is the path that owes the
     // user a terminal report and cannot produce one from a flattened `Stale`.
-    let send = registry.write_and_submit_guarded_detailed(
-        pane_id,
-        prompt,
-        Some(agent_id),
-        || async move { !closing.is_pane_closing(pane_id) },
-    );
+    let send =
+        registry.write_and_submit_guarded_detailed(pane_id, prompt, agent_id, || async move {
+            !closing.is_pane_closing(pane_id)
+        });
     match tokio::time::timeout(remaining_before(deadline), send).await {
         Err(_) => GuardedOutcome::Refused("deadline elapsed while writing"),
         Ok(Err(e)) => GuardedOutcome::Failed(e),
@@ -2244,6 +2245,18 @@ struct ConfirmationTask {
     deadline: Instant,
 }
 
+/// One in-flight confirmation watch: the handle that cancels it, and the prompt
+/// whose payload record its [`PayloadRecordRelease`] holds.
+///
+/// Issue #617 (auditor finding 1): the prompt is carried so a canceller can
+/// finish the abort DETERMINISTICALLY — releasing one record of exactly the
+/// bytes this watch was going to release — instead of guessing at "the oldest
+/// matching record on the pane". See [`cancel_prompt_confirmation`].
+struct ConfirmationWatch {
+    handle: tokio::task::AbortHandle,
+    prompt: String,
+}
+
 /// Issue #424, reviewer finding B9 / auditor MEDIUM: the confirmation tasks
 /// currently holding a spawn-time prompt provisional, keyed by pane id.
 ///
@@ -2251,7 +2264,7 @@ struct ConfirmationTask {
 /// rebound agent or a daemon shutdown was noticed only when a later write
 /// happened to fail, and repeated dispatch into one pane could accumulate
 /// tasks. This map gives all of that one home.
-static CONFIRMATION_TASKS: std::sync::LazyLock<Mutex<HashMap<String, tokio::task::AbortHandle>>> =
+static CONFIRMATION_TASKS: std::sync::LazyLock<Mutex<HashMap<String, ConfirmationWatch>>> =
     std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Ceiling on concurrently-live confirmation tasks across the daemon.
@@ -2295,7 +2308,7 @@ fn spawn_confirmation_task(
     // itself: self-deregistration races its own registration (a fast task can
     // finish before the handle is filed) and would leak the entry it could not
     // find. `is_finished` needs no such coordination.
-    tasks.retain(|_, handle| !handle.is_finished());
+    tasks.retain(|_, watch| !watch.handle.is_finished());
     if tasks.len() >= MAX_CONFIRMATION_TASKS && !tasks.contains_key(&pane_id) {
         drop(tasks);
         log_prompt_unconfirmable(
@@ -2327,32 +2340,47 @@ fn spawn_confirmation_task(
     }
     // Held across `tokio::spawn`, which is synchronous — no await, so a `std`
     // mutex is safe here.
+    let prompt = task.prompt.clone();
     let handle = tokio::spawn(confirm_prompt_delivery(registry, rx, task));
-    if let Some(previous) = tasks.insert(pane_id, handle.abort_handle()) {
-        previous.abort();
+    if let Some(previous) = tasks.insert(
+        pane_id,
+        ConfirmationWatch {
+            handle: handle.abort_handle(),
+            prompt,
+        },
+    ) {
+        previous.handle.abort();
     }
 }
 
 /// Cancel the confirmation loop watching `pane_id`, if any. Called when the
 /// pane closes: the prompt's target no longer exists, so neither the retries
 /// nor the abandonment notice have anywhere to go.
-pub fn cancel_prompt_confirmation(pane_id: &str) {
-    if let Some(handle) = CONFIRMATION_TASKS.lock().unwrap().remove(pane_id) {
-        handle.abort();
-    }
+///
+/// Returns the prompt the cancelled watch was delivering, so a caller that
+/// needs the abort to be DETERMINISTIC can release that watch's payload record
+/// itself. `AbortHandle::abort` only schedules the cancellation, so the
+/// [`PayloadRecordRelease`] the watch holds is dropped at the runtime's
+/// convenience — possibly after the caller's own next write has already
+/// consulted the guard. `None` means there was no watch on this pane and the
+/// caller is therefore entitled to release nothing.
+pub fn cancel_prompt_confirmation(pane_id: &str) -> Option<String> {
+    let watch = CONFIRMATION_TASKS.lock().unwrap().remove(pane_id)?;
+    watch.handle.abort();
+    Some(watch.prompt)
 }
 
 /// Cancel every confirmation loop. Called on daemon shutdown, so a prompt watch
 /// cannot outlive the daemon that owns the PTY it is writing into.
 pub fn cancel_all_prompt_confirmations() {
-    let handles: Vec<_> = CONFIRMATION_TASKS
+    let watches: Vec<_> = CONFIRMATION_TASKS
         .lock()
         .unwrap()
         .drain()
-        .map(|(_, handle)| handle)
+        .map(|(_, watch)| watch)
         .collect();
-    for handle in handles {
-        handle.abort();
+    for watch in watches {
+        watch.handle.abort();
     }
 }
 
@@ -2645,11 +2673,26 @@ pub fn new_reuse_registry() -> ReuseRegistry {
     Arc::new(Mutex::new(HashMap::new()))
 }
 
-/// A live tab already recorded for a task name, with its current liveness.
+/// A tab already recorded for a task name, with the identity that makes it
+/// reusable.
+///
+/// Issue #617 (finding 2): `live: bool` used to be the whole answer, computed as
+/// `registry.pane_is_live(&entry.delivery_pane_id)` — i.e. "does SOME live
+/// process own that pane id right now". A pane id is a recycled handle, so a tab
+/// that exited and had its `DOT_AGENT_DECK_PANE_ID` inherited by an unrelated
+/// agent answered `true` and the scheduled prompt was submitted into that
+/// stranger, which may then execute the task with its own tools. The field is now
+/// the resolved AGENT, and it is `Some` only when the pane's current live agent is
+/// one of the ones [`ReuseEntry::agent_ids`] recorded for this task — so
+/// "reusable" and "who to deliver to" are one answer instead of two that can
+/// disagree.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExistingTab {
     pub pane_id: String,
-    pub live: bool,
+    /// The delivery pane's current live registry agent, when it is one this task
+    /// spawned. `None` when the pane is dead OR when a different agent has
+    /// inherited the pane id.
+    pub live_agent_id: Option<String>,
     /// Issue #835: the shape this tab was opened with. `None` for a record made
     /// before the field existed — treated as "unknown", which never blocks reuse.
     pub kind: Option<SpawnKind>,
@@ -2660,13 +2703,17 @@ pub struct ExistingTab {
 pub enum ReuseDecision {
     /// Open a brand-new tab (and, for a reuse task, record it).
     SpawnFresh,
-    /// Re-deliver into the existing pane.
-    Reuse { pane_id: String },
+    /// Re-deliver into the existing pane, bound to the agent resolved at
+    /// DECISION time — carried through the deliver-on-idle wait so the write can
+    /// be identity-guarded rather than pane-keyed.
+    Reuse { pane_id: String, agent_id: String },
 }
 
 /// Decide whether a fire reuses an existing tab or spawns fresh.
 /// `new_tab_per_fire == true` always spawns fresh; otherwise reuse iff a
-/// recorded tab for the name is still live (a stale/closed one → fresh).
+/// recorded tab for the name still has one of its own agents live on its
+/// delivery pane (a stale/closed one, or one whose pane id has been inherited by
+/// an unrelated agent → fresh).
 ///
 /// `requested` (issue #835) is the shape this fire was TOLD to open, i.e.
 /// `Some` only when the task declares a `shape`. When it disagrees with the tab
@@ -2688,17 +2735,19 @@ pub fn decide_reuse(
         return ReuseDecision::SpawnFresh;
     }
     match existing {
-        Some(tab) if tab.live => {
+        Some(ExistingTab {
+            pane_id,
+            live_agent_id: Some(agent_id),
+            kind,
+        }) => {
             // A recorded tab with no `kind` predates the field; "unknown" never
             // blocks reuse, so this can only ever spawn fresh on a KNOWN mismatch.
-            if let (Some(want), Some(have)) = (requested, tab.kind.as_ref())
+            if let (Some(want), Some(have)) = (requested, kind.as_ref())
                 && want != have
             {
                 return ReuseDecision::SpawnFresh;
             }
-            ReuseDecision::Reuse {
-                pane_id: tab.pane_id,
-            }
+            ReuseDecision::Reuse { pane_id, agent_id }
         }
         _ => ReuseDecision::SpawnFresh,
     }
@@ -2799,7 +2848,24 @@ pub async fn spawn_or_reuse(
             // prompt is delivered into (orchestrator role / single-agent pane),
             // NOT "any agent for the task" — otherwise we'd re-deliver into a
             // dead orchestrator pane while a sibling role pane is still alive.
-            live: registry.pane_is_live(&e.delivery_pane_id),
+            //
+            // Issue #617 (finding 2): and on that pane's live agent being one
+            // THIS task spawned. `ReuseEntry` has always stored `agent_ids` and
+            // this decision never consulted them, so a recycled `pane_id_env`
+            // read as "the tab is still alive". Consulting them costs one
+            // `contains` and turns the answer into an identity the delivery can
+            // be bound to.
+            //
+            // The cost, stated plainly: a tab whose agent is legitimately
+            // RESTARTED in place (a new registry agent on the same pane, not
+            // recorded in this entry) is no longer recognised as reusable, and
+            // the next fire opens a fresh tab instead of re-delivering into it.
+            // That is a visible behaviour change and it is the safe direction —
+            // an extra tab, versus a scheduled prompt submitted into a process
+            // that never ran this task.
+            live_agent_id: registry
+                .pane_current_agent_id(&e.delivery_pane_id)
+                .filter(|live| e.agent_ids.iter().any(|recorded| recorded == live)),
         });
         decide_reuse(
             new_tab_per_fire,
@@ -2809,9 +2875,9 @@ pub async fn spawn_or_reuse(
     };
 
     match decision {
-        ReuseDecision::Reuse { pane_id } => {
+        ReuseDecision::Reuse { pane_id, agent_id } => {
             // Re-deliver into the existing pane, honoring deliver-on-idle.
-            deliver_on_idle(registry, &pane_id, &req.prompt, debounce).await;
+            deliver_on_idle(registry, &pane_id, &agent_id, &req.prompt, debounce).await;
             Ok(())
         }
         ReuseDecision::SpawnFresh => {
@@ -2837,14 +2903,31 @@ pub async fn spawn_or_reuse(
 
 /// Deliver `prompt` into `pane_id`, waiting out the deliver-on-idle debounce:
 /// if the user keeps typing the window keeps resetting; once the pane is idle
-/// (no keystroke within `debounce`) the prompt is written via the ungated
-/// `write_to_pane_and_submit`. Skip-if-prior-run-still-active (Phase 1) gives
-/// this single-slot semantics per task — a newer fire while one is queued is
-/// skipped, and since a static schedule's prompt is identical each fire the
-/// delivered prompt is the same regardless.
+/// (no keystroke within `debounce`) the prompt is written through the identity-
+/// guarded [`AgentPtyRegistry::write_and_submit_guarded`], bound to
+/// `expected_agent_id`. Skip-if-prior-run-still-active (Phase 1) gives this
+/// single-slot semantics per task — a newer fire while one is queued is skipped,
+/// and since a static schedule's prompt is identical each fire the delivered
+/// prompt is the same regardless.
+///
+/// Issue #617 (finding 2): this wait is the race. It runs for at least the
+/// debounce ([`DEFAULT_REUSE_DEBOUNCE_MS`], 5s by default) and for as long as
+/// [`REUSE_DELIVERY_HARD_TIMEOUT`] (60s) under continuous typing, and it used to
+/// retain nothing but the pane id and finish through the ungated
+/// `write_to_pane_and_submit`. An agent that exits during the wait frees its
+/// `DOT_AGENT_DECK_PANE_ID` for the next spawn, and the queued prompt was then
+/// submitted into whoever inherited it. `expected_agent_id` is resolved at
+/// DECISION time, before the wait, so a hand-over anywhere inside the window
+/// yields `WrongSession`/`Stale`/`NoLiveTarget` and zero bytes.
+///
+/// A refusal is terminal for this fire and is NOT retried: the next scheduled
+/// fire makes its own reuse decision, and retrying here could only re-target
+/// whichever process now holds the pane — the exact delivery this guard exists
+/// to prevent.
 async fn deliver_on_idle(
     registry: &AgentPtyRegistry,
     pane_id: &str,
+    expected_agent_id: &str,
     prompt: &str,
     debounce: Duration,
 ) {
@@ -2869,8 +2952,87 @@ async fn deliver_on_idle(
             }
         }
     }
-    if let Err(e) = registry.write_to_pane_and_submit(pane_id, prompt).await {
-        tracing::warn!(pane_id, error = %e, "scheduled reuse prompt delivery failed");
+    // Issue #617 + issue #424 H3/S2, and this pairing is the whole reason the
+    // two calls below exist. Moving this delivery onto the guarded primitive
+    // also subjects it, for the first time, to F1's REPEAT-PAYLOAD guard: a
+    // write of bytes identical to ones an earlier automatic write left in this
+    // pane's input box is refused once the user has typed since. A reuse task's
+    // prompt is fixed by configuration and therefore identical on EVERY fire, so
+    // without this the previous fire's record would refuse this one — the exact
+    // "unrelated future delivery of the same bytes" #424 H3 says a record must
+    // not refuse, arriving from the scheduler instead of from a delegate
+    // hand-off.
+    //
+    // Both halves are needed and they are not interchangeable:
+    //
+    // * the CANCEL supersedes the previous fire's confirmation watch, which may
+    //   still be retrying that fire's prompt into this same pane. That is
+    //   `spawn_confirmation_task`'s own per-pane single-flight rule ("a newer
+    //   prompt for the same pane cancels the older watch rather than racing
+    //   it"), applied from the reuse path, which never went through it.
+    // * the RELEASE is the deterministic half OF THAT CANCEL, and nothing more.
+    //   `AbortHandle::abort` only schedules the cancellation, so the
+    //   `PayloadRecordRelease` the aborted watch holds is dropped at the
+    //   runtime's convenience and cannot be relied on to have run by the time
+    //   the write below consults the guard. Doing it here, and letting the
+    //   abort's own RAII release run too, is safe in either order because
+    //   `note_payload_settled` removes exactly ONE record (#424 S2) and is a
+    //   no-op when there is none. It is the CANCEL that makes it safe at all:
+    //   #424 S2's hazard is disarming a guard a still-live delivery is relying
+    //   on, and the delivery this releases for is the one the line above just
+    //   aborted. Narrowly, `note_payload_settled` releases the OLDEST record
+    //   carrying these bytes rather than that watch's own by construction —
+    //   the same record unless some other delivery of the same bytes into this
+    //   same pane is still on record and older.
+    //
+    // Issue #617 (auditor finding 1): the release is CONDITIONAL on this fire
+    // having actually cancelled a watch for THESE bytes, and that condition is
+    // the whole point. An unconditional pre-write release would also remove a
+    // record no watch owns — in particular the one a PREVIOUS fire's
+    // `Ambiguous` write deliberately left standing, whose meaning is "half this
+    // prompt may still be sitting in the input box". Releasing that would let
+    // this fire write and submit the full prompt on top of the leftover bytes
+    // AND whatever the user has typed since, as one turn: exactly the #424 F1
+    // hazard, and exactly the #424 S2 hazard of consuming a record this path
+    // did not create. `deliver_on_idle` registers no watch of its own, so after
+    // an `Ambiguous` fire there is nothing to cancel, `cancelled` is `None`,
+    // the standing record survives, and the next fire is refused with `Stale`
+    // and zero bytes — the same direction `settle_silence_report_payload_record`
+    // takes for the one-shot silence report.
+    //
+    // So this path is NOT exempt from F1: a user draft typed after a fire whose
+    // write did not settle the input box still refuses the next fire.
+    let cancelled = cancel_prompt_confirmation(pane_id);
+    if cancelled.as_deref() == Some(prompt) {
+        registry.note_payload_settled(pane_id, prompt);
+    }
+    match registry
+        .write_and_submit_guarded(pane_id, prompt, expected_agent_id, || async { true })
+        .await
+    {
+        Ok(GuardedSend::Applied) => {
+            // Issue #424 H3: this delivery is ONE-SHOT — nothing above retries it,
+            // the next fire makes its own decision — so the record this write
+            // left guards no retry and can only refuse a later fire of the same
+            // fixed prompt. Released on the same terminal path that made it.
+            registry.note_payload_settled(pane_id, prompt);
+        }
+        // A partial write: some bytes reached the AUTHORIZED agent. Not retried
+        // — a retry would append the prompt to the half already sitting in its
+        // input box and submit both as one turn.
+        Ok(GuardedSend::Ambiguous) => tracing::warn!(
+            pane_id,
+            agent_id = %expected_agent_id,
+            "scheduled reuse prompt delivery was ambiguous (partial write); not retried"
+        ),
+        Ok(refused) => tracing::warn!(
+            pane_id,
+            agent_id = %expected_agent_id,
+            outcome = ?refused,
+            "scheduled reuse prompt refused: the pane no longer belongs to the agent the reuse \
+             decision resolved; nothing written"
+        ),
+        Err(e) => tracing::warn!(pane_id, error = %e, "scheduled reuse prompt delivery failed"),
     }
 }
 
@@ -3665,7 +3827,7 @@ mod tests {
         let agent_id = spawn_byte_target(&registry, pane_id);
         assert_eq!(
             registry
-                .write_and_submit_guarded(pane_id, prompt, Some(&agent_id), || async { true })
+                .write_and_submit_guarded(pane_id, prompt, &agent_id, || async { true })
                 .await
                 .expect("delivery before user newline control"),
             GuardedSend::Applied
@@ -3686,7 +3848,7 @@ mod tests {
             String::from_utf8_lossy(&before)
         );
         let outcome = registry
-            .write_and_submit_guarded(pane_id, prompt, Some(&agent_id), || async { true })
+            .write_and_submit_guarded(pane_id, prompt, &agent_id, || async { true })
             .await
             .expect("replacement after user newline control");
         tokio::time::sleep(Duration::from_millis(75)).await;
@@ -4383,7 +4545,7 @@ mod tests {
             .write_and_submit_guarded(
                 REPLACEMENT_PANE_ID,
                 REPLACEMENT_PROMPT,
-                Some(&replacement_agent),
+                &replacement_agent,
                 || async { true },
             )
             .await
@@ -4534,7 +4696,7 @@ mod tests {
         let agent_id = spawn_byte_target(&registry, PANE_ID);
         assert_eq!(
             registry
-                .write_and_submit_guarded(PANE_ID, PROMPT, Some(&agent_id), || async { true })
+                .write_and_submit_guarded(PANE_ID, PROMPT, &agent_id, || async { true })
                 .await
                 .expect("initial guarded delivery"),
             GuardedSend::Applied
@@ -4560,7 +4722,7 @@ mod tests {
         let retry_agent = agent_id.clone();
         let retry = tokio::spawn(async move {
             retry_registry
-                .write_and_submit_guarded(PANE_ID, PROMPT, Some(&retry_agent), || async { true })
+                .write_and_submit_guarded(PANE_ID, PROMPT, &retry_agent, || async { true })
                 .await
                 .expect("queued guarded replacement")
         });
@@ -4628,9 +4790,7 @@ mod tests {
         let same_agent = spawn_byte_target(&same_registry, SAME_PANE);
         assert_eq!(
             same_registry
-                .write_and_submit_guarded(SAME_PANE, SAME_PROMPT, Some(&same_agent), || async {
-                    true
-                })
+                .write_and_submit_guarded(SAME_PANE, SAME_PROMPT, &same_agent, || async { true })
                 .await
                 .expect("delivery A"),
             GuardedSend::Applied
@@ -4648,7 +4808,7 @@ mod tests {
             .snapshot(&same_agent)
             .expect("before delivery B snapshot");
         let delivery_b = same_registry
-            .write_and_submit_guarded(SAME_PANE, SAME_PROMPT, Some(&same_agent), || async { true })
+            .write_and_submit_guarded(SAME_PANE, SAME_PROMPT, &same_agent, || async { true })
             .await
             .expect("delivery B first attempt");
         tokio::time::sleep(Duration::from_millis(75)).await;
@@ -4663,12 +4823,9 @@ mod tests {
         let replaced_agent = spawn_byte_target(&replaced_registry, REPLACED_PANE);
         assert_eq!(
             replaced_registry
-                .write_and_submit_guarded(
-                    REPLACED_PANE,
-                    DELIVERY_A,
-                    Some(&replaced_agent),
-                    || async { true },
-                )
+                .write_and_submit_guarded(REPLACED_PANE, DELIVERY_A, &replaced_agent, || async {
+                    true
+                },)
                 .await
                 .expect("delivery A first attempt"),
             GuardedSend::Applied
@@ -4684,12 +4841,9 @@ mod tests {
         .await;
         assert_eq!(
             replaced_registry
-                .write_and_submit_guarded(
-                    REPLACED_PANE,
-                    DELIVERY_B,
-                    Some(&replaced_agent),
-                    || async { true },
-                )
+                .write_and_submit_guarded(REPLACED_PANE, DELIVERY_B, &replaced_agent, || async {
+                    true
+                },)
                 .await
                 .expect("independent delivery B"),
             GuardedSend::Applied,
@@ -4705,7 +4859,7 @@ mod tests {
             .snapshot(&replaced_agent)
             .expect("before delivery A retry snapshot");
         let delivery_a_retry = replaced_registry
-            .write_and_submit_guarded(REPLACED_PANE, DELIVERY_A, Some(&replaced_agent), || async {
+            .write_and_submit_guarded(REPLACED_PANE, DELIVERY_A, &replaced_agent, || async {
                 true
             })
             .await
@@ -4723,7 +4877,7 @@ mod tests {
         let paste_agent = spawn_byte_target(&paste_registry, PASTE_PANE);
         assert_eq!(
             paste_registry
-                .write_and_submit_guarded(PASTE_PANE, PASTE_PROMPT, Some(&paste_agent), || async {
+                .write_and_submit_guarded(PASTE_PANE, PASTE_PROMPT, &paste_agent, || async {
                     true
                 },)
                 .await
@@ -4753,9 +4907,7 @@ mod tests {
             String::from_utf8_lossy(&before_paste_retry)
         );
         let paste_retry = paste_registry
-            .write_and_submit_guarded(PASTE_PANE, PASTE_PROMPT, Some(&paste_agent), || async {
-                true
-            })
+            .write_and_submit_guarded(PASTE_PANE, PASTE_PROMPT, &paste_agent, || async { true })
             .await
             .expect("replacement after bracketed paste");
         tokio::time::sleep(Duration::from_millis(75)).await;
@@ -4817,12 +4969,9 @@ mod tests {
         let overlap_agent = spawn_byte_target(&overlap_registry, OVERLAP_PANE);
         assert_eq!(
             overlap_registry
-                .write_and_submit_guarded(
-                    OVERLAP_PANE,
-                    OVERLAP_PROMPT,
-                    Some(&overlap_agent),
-                    || async { true },
-                )
+                .write_and_submit_guarded(OVERLAP_PANE, OVERLAP_PROMPT, &overlap_agent, || async {
+                    true
+                },)
                 .await
                 .expect("overlapping delivery A first write"),
             GuardedSend::Applied
@@ -4834,12 +4983,9 @@ mod tests {
         };
         assert_eq!(
             overlap_registry
-                .write_and_submit_guarded(
-                    OVERLAP_PANE,
-                    OVERLAP_PROMPT,
-                    Some(&overlap_agent),
-                    || async { true },
-                )
+                .write_and_submit_guarded(OVERLAP_PANE, OVERLAP_PROMPT, &overlap_agent, || async {
+                    true
+                },)
                 .await
                 .expect("overlapping delivery B first write"),
             GuardedSend::Applied
@@ -4873,12 +5019,9 @@ mod tests {
             .snapshot(&overlap_agent)
             .expect("before surviving delivery retry snapshot");
         let overlap_retry = overlap_registry
-            .write_and_submit_guarded(
-                OVERLAP_PANE,
-                OVERLAP_PROMPT,
-                Some(&overlap_agent),
-                || async { true },
-            )
+            .write_and_submit_guarded(OVERLAP_PANE, OVERLAP_PROMPT, &overlap_agent, || async {
+                true
+            })
             .await
             .expect("surviving delivery B replacement");
         tokio::time::sleep(Duration::from_millis(75)).await;
@@ -4932,7 +5075,7 @@ mod tests {
         let agent_id = spawn_byte_target(&registry, PANE_ID);
         assert_eq!(
             registry
-                .write_and_submit_guarded(PANE_ID, PROMPT, Some(&agent_id), || async { true })
+                .write_and_submit_guarded(PANE_ID, PROMPT, &agent_id, || async { true })
                 .await
                 .expect("initial detached delivery"),
             GuardedSend::Applied
@@ -5058,7 +5201,13 @@ mod tests {
             let mut tasks = CONFIRMATION_TASKS.lock().unwrap();
             for index in 0..MAX_CONFIRMATION_TASKS {
                 let pending = tokio::spawn(std::future::pending::<()>());
-                tasks.insert(format!("cap-fill-{index}"), pending.abort_handle());
+                tasks.insert(
+                    format!("cap-fill-{index}"),
+                    ConfirmationWatch {
+                        handle: pending.abort_handle(),
+                        prompt: format!("cap-fill-prompt-{index}"),
+                    },
+                );
             }
         }
         let (cap_tx, cap_rx) = broadcast::channel(1);
@@ -5904,7 +6053,7 @@ mod tests {
         // Even with a live recorded tab, new_tab_per_fire=true opens fresh.
         let existing = Some(ExistingTab {
             pane_id: "p1".into(),
-            live: true,
+            live_agent_id: Some("agent-1".into()),
             kind: None,
         });
         assert_eq!(
@@ -5917,13 +6066,14 @@ mod tests {
     fn decide_reuse_reuses_live_tab_by_default() {
         let existing = Some(ExistingTab {
             pane_id: "p1".into(),
-            live: true,
+            live_agent_id: Some("agent-1".into()),
             kind: None,
         });
         assert_eq!(
             decide_reuse(false, existing, None),
             ReuseDecision::Reuse {
-                pane_id: "p1".into()
+                pane_id: "p1".into(),
+                agent_id: "agent-1".into(),
             }
         );
     }
@@ -5933,7 +6083,7 @@ mod tests {
         assert_eq!(decide_reuse(false, None, None), ReuseDecision::SpawnFresh);
         let stale = Some(ExistingTab {
             pane_id: "p1".into(),
-            live: false,
+            live_agent_id: None,
             kind: None,
         });
         assert_eq!(decide_reuse(false, stale, None), ReuseDecision::SpawnFresh);
@@ -5949,7 +6099,7 @@ mod tests {
         let team = || {
             Some(ExistingTab {
                 pane_id: "p1".into(),
-                live: true,
+                live_agent_id: Some("agent-1".into()),
                 kind: Some(SpawnKind::Orchestration {
                     name: "team".into(),
                 }),
@@ -5979,18 +6129,19 @@ mod tests {
     fn decide_reuse_reuses_when_the_requested_shape_matches() {
         let single = Some(ExistingTab {
             pane_id: "p1".into(),
-            live: true,
+            live_agent_id: Some("agent-1".into()),
             kind: Some(SpawnKind::SingleAgent),
         });
         assert_eq!(
             decide_reuse(false, single, Some(&SpawnKind::SingleAgent)),
             ReuseDecision::Reuse {
-                pane_id: "p1".into()
+                pane_id: "p1".into(),
+                agent_id: "agent-1".into(),
             }
         );
         let team = Some(ExistingTab {
             pane_id: "p2".into(),
-            live: true,
+            live_agent_id: Some("agent-1".into()),
             kind: Some(SpawnKind::Orchestration {
                 name: "team".into(),
             }),
@@ -6004,7 +6155,8 @@ mod tests {
                 })
             ),
             ReuseDecision::Reuse {
-                pane_id: "p2".into()
+                pane_id: "p2".into(),
+                agent_id: "agent-1".into(),
             }
         );
     }
@@ -6016,7 +6168,7 @@ mod tests {
     fn decide_reuse_ignores_kind_when_no_shape_was_requested() {
         let team = Some(ExistingTab {
             pane_id: "p1".into(),
-            live: true,
+            live_agent_id: Some("agent-1".into()),
             kind: Some(SpawnKind::Orchestration {
                 name: "team".into(),
             }),
@@ -6024,7 +6176,8 @@ mod tests {
         assert_eq!(
             decide_reuse(false, team, None),
             ReuseDecision::Reuse {
-                pane_id: "p1".into()
+                pane_id: "p1".into(),
+                agent_id: "agent-1".into(),
             }
         );
     }
@@ -6054,6 +6207,28 @@ mod tests {
             SpawnKind::Orchestration {
                 name: "team".into()
             }
+        );
+    }
+
+    /// Issue #617 (finding 2): a recorded tab whose delivery pane is live but
+    /// owned by an agent this task never spawned is NOT reusable. `live_agent_id`
+    /// is `None` in exactly that case — the caller resolves it by intersecting
+    /// the pane's current agent with `ReuseEntry::agent_ids` — so the decision
+    /// falls to `SpawnFresh` rather than re-delivering a scheduled prompt into a
+    /// stranger that inherited the pane id.
+    #[test]
+    fn decide_reuse_spawns_fresh_when_the_pane_id_was_inherited_by_another_agent() {
+        let inherited = Some(ExistingTab {
+            pane_id: "p1".into(),
+            live_agent_id: None,
+            // Issue #835's shape gate is not what refuses this one: the kind
+            // matches what the fire asks for, so the refusal below is the
+            // identity gate and nothing else.
+            kind: Some(SpawnKind::SingleAgent),
+        });
+        assert_eq!(
+            decide_reuse(false, inherited, Some(&SpawnKind::SingleAgent)),
+            ReuseDecision::SpawnFresh
         );
     }
 
@@ -6282,5 +6457,122 @@ mod tests {
                 None => std::env::remove_var("DOT_AGENT_DECK_REUSE_DEBOUNCE_MS"),
             }
         }
+    }
+
+    /// Issue #617 (finding 2). A `tracing` subscriber scoped to this test's
+    /// thread, so the refusal `deliver_on_idle` reports can be asserted as a
+    /// fact rather than inferred. The function returns `()`, and "no bytes in
+    /// the successor" alone cannot tell a REFUSED delivery apart from one that
+    /// never reached the write at all — a debounce loop that spun forever, or a
+    /// target that resolved to nothing — so the outcome has to be read from the
+    /// only place the code publishes it. Same idiom, and the same reason, as
+    /// `state::tests::dispatch_one_owned_refuses_write_when_worker_identity_is_unresolved`.
+    #[derive(Clone, Default)]
+    struct CapturedLog(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLog {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLog {
+        type Writer = CapturedLog;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// Scenario: A scheduled task reuses its tab, and because the user has just
+    /// typed the queued prompt is parked for the whole deliver-on-idle debounce;
+    /// inside that window the agent the reuse decision resolved goes away and an
+    /// unrelated one inherits the same `DOT_AGENT_DECK_PANE_ID`. The delivery
+    /// must be refused as `WrongSession`, and none of the prompt's bytes may
+    /// reach the successor, whose scrollback still shows a later authorized
+    /// write.
+    #[spec("scheduler/reuse/004")]
+    #[tokio::test]
+    async fn reuse_004_a_hand_over_inside_the_debounce_refuses_the_queued_prompt() {
+        const PANE: &str = "reuse-handover-during-debounce";
+        const PROMPT: &str = "SCHEDULED-PROMPT-MUST-NOT-REACH-THE-SUCCESSOR-6a1e";
+        const BARRIER: &str = "AUTHORIZED-WRITE-AFTER-THE-REFUSAL-3c88";
+        const DEBOUNCE: Duration = Duration::from_millis(600);
+
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let original = spawn_byte_target(&registry, PANE);
+
+        // The user typed a moment ago, so `decide_delivery_capped` parks the
+        // delivery for the whole debounce rather than writing immediately. That
+        // wait IS the race window — it is what the fire holds a bare pane id
+        // across — so without this the write happens before anything can change
+        // hands and the test measures nothing.
+        registry.note_user_input(PANE);
+
+        let captured = CapturedLog::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(captured.clone())
+            .with_max_level(tracing_subscriber::filter::LevelFilter::WARN)
+            .with_ansi(false)
+            .finish();
+        let subscriber_guard = tracing::subscriber::set_default(subscriber);
+
+        // Both halves run on this task, not on a spawned one, so the delivery's
+        // `warn!` lands in the thread-local subscriber above.
+        let (_, successor) = tokio::join!(
+            deliver_on_idle(&registry, PANE, &original, PROMPT, DEBOUNCE),
+            async {
+                tokio::time::sleep(DEBOUNCE / 4).await;
+                registry
+                    .close_agent(&original)
+                    .expect("close the agent the reuse decision resolved");
+                spawn_byte_target(&registry, PANE)
+            }
+        );
+        drop(subscriber_guard);
+        assert_ne!(
+            original, successor,
+            "the hand-over must produce a NEW registry agent id"
+        );
+
+        let log = String::from_utf8(captured.0.lock().unwrap().clone())
+            .expect("captured log must be valid UTF-8");
+        assert!(
+            log.contains("scheduled reuse prompt refused"),
+            "the delivery must reach its identity gate and be REFUSED there, not merely fail to \
+             write; captured log = {log:?}"
+        );
+        assert!(
+            log.contains("WrongSession"),
+            "the pane has a live agent that is not the expected one, so the refusal must be \
+             WrongSession — anything else means the fixture never got the hand-over it needed; \
+             captured log = {log:?}"
+        );
+
+        // A barrier, not a sleep: an AUTHORIZED write that has demonstrably
+        // arrived proves the successor's PTY has drained past the point where a
+        // leaked prompt would have landed.
+        let barrier = registry
+            .write_and_submit_guarded(PANE, BARRIER, &successor, || async { true })
+            .await
+            .expect("the barrier write must reach the registry");
+        assert_eq!(
+            barrier,
+            GuardedSend::Applied,
+            "the successor owns the pane, so a write bound to IT must be applied — otherwise \
+             this test proves nothing about the refusal above"
+        );
+        let snapshot = wait_for_detached_payload_echo(&registry, &successor, BARRIER).await;
+        assert!(
+            !String::from_utf8_lossy(&snapshot).contains(PROMPT),
+            "a scheduled task's prompt was submitted into a process that merely inherited the \
+             pane id of the agent the reuse decision resolved; snapshot = {:?}",
+            String::from_utf8_lossy(&snapshot)
+        );
+
+        registry.shutdown_all();
     }
 }

@@ -5,9 +5,11 @@
 //!
 //! * The local TUI's `EmbeddedPaneController::write_to_pane` (the
 //!   user-typed-Enter path).
-//! * The daemon's `AgentPtyRegistry::write_to_pane_and_submit` (the orchestration
+//! * The daemon's `AgentPtyRegistry::write_and_submit_guarded` (the orchestration
 //!   dispatch path — PRD #93 round-5 moved delegate/work-done feedback
-//!   into a direct PTY write from the daemon's async hook loop).
+//!   into a direct PTY write from the daemon's async hook loop; issue #617
+//!   bound it to an expected agent identity and #917 deleted the unguarded
+//!   `write_to_pane_and_submit` it replaced).
 //!
 //! Keeping the encoder + submit delay in one place ensures both writers
 //! produce identical bytes for identical inputs. Drift would mean the

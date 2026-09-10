@@ -197,7 +197,12 @@ const PINNED_TS_FIELDS: [(&str, &str, &str); 5] = [
 /// not this check's. What this check refuses is a **new** one arriving
 /// unnoticed — including one holding a credential, which is the half of PRD
 /// #803's rule that had no enforcement at all.
-const PINNED_STORAGE_KEYS: [(&str, &str, bool); 6] = [
+/// `PROJECTS_STORAGE_KEY` (`dot-agent-deck.desktop.projects.v1`) was the sixth
+/// entry here until PRD #819 M6 moved the project library behind the daemon and
+/// deleted the key. Removing it from the pin is the deliberate edit this check
+/// exists to force: the guard reddened on the merge that brought #827's pin and
+/// #819's deletion together, which is the mechanism working rather than failing.
+const PINNED_STORAGE_KEYS: [(&str, &str, bool); 5] = [
     (
         "FIXTURE_SETTINGS_KEY",
         "dot-agent-deck.desktop-settings",
@@ -206,11 +211,6 @@ const PINNED_STORAGE_KEYS: [(&str, &str, bool); 6] = [
     (
         "OVERVIEW_COLUMNS_STORAGE_KEY",
         "dot-agent-deck.desktop.overview-columns.v1",
-        true,
-    ),
-    (
-        "PROJECTS_STORAGE_KEY",
-        "dot-agent-deck.desktop.projects.v1",
         true,
     ),
     (
