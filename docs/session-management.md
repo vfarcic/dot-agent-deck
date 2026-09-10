@@ -57,7 +57,7 @@ Agent Deck remembers the tab you were on and the pane you had focused in each ta
 
 Your position is checked against what is actually running when you return. A pane you closed in the meantime, or a role whose agent finished while you were away, is simply not restored; that tab falls back to its start role, so you are never dropped into a pane that is no longer there. When Agent Deck has nothing remembered — a first run, or a workspace you have not left a position in — it falls back to the older behaviour: land on the first orchestration tab if you have one, otherwise the dashboard.
 
-There is one case that restores less on purpose. When your agents are gone and Agent Deck is rebuilding your panes from scratch (a fresh machine, or the first launch after a reboot), those panes are new ones, and matching them against a remembered position could put you in front of a *different* agent rather than merely the wrong one. In that case Agent Deck restores which tab you were on and leaves the rest alone.
+There is one case that restores less on purpose. When your agents are gone and Agent Deck is rebuilding your panes from scratch (a fresh machine, or the first launch after a reboot), those panes are new ones, and matching a remembered position against them could quietly put you in front of a *different* agent — which is worse than not restoring the position at all. In that case Agent Deck restores which tab you were on and leaves the rest alone.
 
 The position is stored with the rest of your saved workspace, so it is per-machine and shared by every deck you run under the same account: if you run two at once, the last one you close decides where the next one lands — the same way it already decides which panes come back.
 
