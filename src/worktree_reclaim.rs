@@ -299,14 +299,18 @@ fn check_cleanliness(worktree_path: &Path) -> Cleanliness {
 }
 
 /// Whether the deck can prove it created `worktree_path`: the marker file
-/// [`crate::worktree_owner`] writes at creation time exists in the worktree's
-/// own git metadata dir. Any failure to resolve that dir, or a missing
-/// marker, resolves to `Foreign` — unknown must never resolve to `Ours`.
+/// [`crate::worktree_owner`] writes at creation time exists, and is not
+/// empty, in the worktree's own git metadata dir. Any failure to resolve that
+/// dir, a missing marker, and an empty one all resolve to `Foreign` — unknown
+/// must never resolve to `Ours`.
 ///
-/// An EXISTENCE check, never a parse of the marker's content: the content is
-/// informational (which dispatch created it, when), and gating on it would
-/// mean a future format change silently reclassifies every existing
-/// deck-created worktree as foreign.
+/// Never a parse of the marker's content: the content is informational (which
+/// dispatch created it, when), and gating on it would mean a future format
+/// change silently reclassifies every existing deck-created worktree as
+/// foreign. The non-emptiness half is not a format check either — it is there
+/// so the zero-byte residue of a torn write cannot carry a merged, clean
+/// worktree into `Verdict::Remove`, the one verdict that acts without asking
+/// (issue #946; [`is_marked`] has the mechanism).
 fn ownership_of(worktree_path: &Path) -> Ownership {
     if is_marked(worktree_path) {
         Ownership::Ours

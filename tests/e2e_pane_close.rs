@@ -235,3 +235,96 @@ fn close_confirm_005_vanished_armed_session_closes_nothing() {
         "confirmation for a vanished session must not retarget its replacement placeholder"
     );
 }
+
+/// Scenario: Arm a dashboard card whose session id is Pi's pane-derived `{pane_id}-session` key, then deliver a respawn under that SAME key differing only in `agent_id`. Because the key never goes stale, the armed target still resolves — so Down+Enter must still close nothing, retain the card, and leave the daemon agent alive rather than tearing down the replacement generation the user never pointed at.
+#[spec("prompt/close-confirm/009")]
+#[test]
+fn close_confirm_009_stable_key_respawn_closes_nothing() {
+    let deck = TuiDeck::builder()
+        .with_pty_size(200, 40)
+        .with_continue_session("stable-key-target", "cat")
+        .launch_with_fixture("minimal");
+    deck.wait_for_string("[Command Mode Ctrl+D]");
+    deck.send_keys(b"\x04");
+    deck.wait_for_string("stable-key-target");
+
+    let record = common::agent_records_on(deck.attach_socket_path())
+        .into_iter()
+        .find(|record| record.display_name.as_deref() == Some("stable-key-target"))
+        .expect("continued pane must have a daemon AgentRecord");
+    let pane_id = record
+        .pane_id_env
+        .as_deref()
+        .expect("continued pane must retain its stable pane id");
+
+    // Pi's `agent-event` subcommand derives its producer key from the pane, so
+    // BOTH generations below report under this one id. That is the whole point:
+    // the id cannot go stale, so it cannot be what tells them apart.
+    let producer_key = format!("{pane_id}-session");
+
+    // Generation one, carrying a prompt purely so the card has visible history.
+    // Its disappearance is how this test observes the #284 same-producer
+    // identity refresh land — the card changing hands is what wipes it.
+    let generation_one = serde_json::json!({
+        "session_id": producer_key,
+        "agent_type": "claude_code",
+        "event_type": "session_start",
+        "timestamp": "2026-07-29T12:00:00Z",
+        "pane_id": pane_id,
+        "agent_id": "pi-agent-1",
+        "user_prompt": "generation-one-history-marker",
+    });
+    write_hook_line(deck.hook_socket_path(), &generation_one.to_string())
+        .expect("write generation-one SessionStart hook");
+    deck.wait_for_string("generation-one-history-marker");
+
+    deck.send_keys(b"\x17");
+    deck.wait_for_string("Close selected pane?");
+
+    // Generation two. Identical to generation one in every field the dashboard
+    // renders — same producer key, same agent type, same pane — and differing
+    // ONLY in `agent_id`. That single field is the generation change, and
+    // before issue #317 nothing at the close seam read it: the armed target
+    // resolved straight onto this replacement and confirming closed it.
+    let generation_two = serde_json::json!({
+        "session_id": producer_key,
+        "agent_type": "claude_code",
+        "event_type": "session_start",
+        "timestamp": "2026-07-29T12:05:00Z",
+        "pane_id": pane_id,
+        "agent_id": "pi-agent-2",
+        "user_prompt": "generation-two-history-marker",
+    });
+    write_hook_line(deck.hook_socket_path(), &generation_two.to_string())
+        .expect("write generation-two SessionStart hook");
+    // Wait for generation two's OWN marker rather than for generation one's to
+    // vanish. Both would be satisfied by the same event, but only this one is
+    // satisfied by nothing else: an absence wait also passes if the card were
+    // merely covered or not yet drawn, which would make the barrier a race
+    // dressed as an observation. The marker is history the rebuilt entry could
+    // only have got from the generation-two frame, so seeing it means that
+    // frame has been applied. (The two generations remain indistinguishable in
+    // the field that decides the close — `agent_id` — which is the point; a
+    // prompt is card history, not identity.)
+    deck.wait_for_string("generation-two-history-marker");
+    // And generation one's history is gone with it, which is the #284
+    // same-producer identity refresh landing.
+    deck.wait_for_absence("generation-one-history-marker");
+
+    deck.send_keys(b"\x1b[B");
+    deck.send_keys(b"\r");
+    deck.wait_for_string("Nothing closed");
+    assert!(
+        deck.snapshot_grid().contains("stable-key-target"),
+        "the replacement generation's card must survive a confirmation armed against its predecessor"
+    );
+    assert!(
+        common::wait_for_agent_display_name(
+            deck.attach_socket_path(),
+            "stable-key-target",
+            true,
+            Duration::from_secs(1),
+        ),
+        "a stable-key respawn must not be torn down by a confirmation armed against the generation it replaced"
+    );
+}

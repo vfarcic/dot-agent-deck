@@ -167,7 +167,8 @@ pub(crate) const DELEGATE_READINESS_BUFFER: std::time::Duration =
 /// [`crate::pane_input::SUBMIT_DELAY`], `\r` — against a real
 /// `opencode --model … --auto` 1.18.23 on a pty and reading the rendered grid
 /// back, across **176 runs**: delivery tracks ONE boundary, the instant OpenCode
-/// paints its composer (`Ask anything...`). Written before it, the payload is
+/// paints its composer (`Ask anything`, whose trailing ellipsis is quoted out
+/// here on purpose — see the PRD #234 note below). Written before it, the payload is
 /// gone — not parked, gone. Written after it, every run delivered.
 ///
 /// The failure shape is worth stating because it is not the wrapper's. Only in
@@ -230,9 +231,15 @@ pub(crate) const DELEGATE_READINESS_BUFFER: std::time::Duration =
 /// of the SSE response, never reaches the plugin hook, and says nothing about
 /// input readiness, so do not re-propose it. What the measurement above DOES
 /// hand PRD #234 (screen-state observation for hookless agents) is the target:
-/// for OpenCode the input-readiness boundary is exactly the `Ask anything...`
+/// for OpenCode the input-readiness boundary is exactly the `Ask anything`
 /// paint, which the deck already has on the pane's own PTY, and which
-/// `orchestration/delegate/015` already waits for by hand. Until something
+/// `orchestration/delegate/015` already waits for by hand. **Whatever watches
+/// it must not match the trailing ellipsis.** That glyph has already drifted
+/// once between OpenCode releases — ASCII `...` (`2e 2e 2e`) to a single
+/// U+2026 (`e2 80 a6`) — and `orchestration/delegate/015` spent an unknown
+/// number of months failing its own precondition on the difference, against a
+/// booted and visibly ready agent, because nothing in CI runs that lane
+/// (issues #878/#921). Match `Ask anything` and stop there. Until something
 /// watches it, an interval is the ceiling here.
 pub(crate) const NO_SIGNAL_READINESS_BUFFER: std::time::Duration =
     std::time::Duration::from_millis(8000);
@@ -7246,14 +7253,24 @@ impl AppState {
         //
         // Residual, by construction: because the producer key is STABLE, the one
         // card changing hands means a close target armed against Pi generation N
-        // still RESOLVES after generation N+1 takes over — it now resolves to the
-        // replacement rather than to a stale corpse. Fixing that belongs at the
-        // close-target seam (arm on generation, not on session id alone), not
-        // here: the alternative — deleting the card so the armed id reads as
-        // vanished — would leave ZERO cards on a live pane, which is exactly the
-        // failure `status/supersede/003` forbids one screen up. Distinct-session
-        // supersession is unaffected and still vanishes the armed id
-        // (`status/supersede/002`, `prompt/close-confirm/005`).
+        // still RESOLVES after generation N+1 takes over — it resolves to the
+        // replacement rather than to a stale corpse. That was FIXED at the
+        // close-target seam by issue #317, exactly where this comment said it
+        // belonged: `CloseTarget::Session` now carries the `agent_id` alongside
+        // the session id and `resolve_close_plan` reads a refreshed identity as
+        // vanished (`prompt/close-confirm/009`). It was deliberately not fixed
+        // here — the alternative, deleting the card so the armed id reads as
+        // vanished, would leave ZERO cards on a live pane, which is exactly the
+        // failure `status/supersede/003` forbids one screen up.
+        //
+        // The refresh below is what makes that fix possible, so the two are
+        // coupled: `ui::same_generation` decides on a differing `Some` → `Some`
+        // and on nothing else, which is the SAME test this branch applies. Keep
+        // them in step — a card that changes hands here must read as vanished
+        // there, and a `None` learning an identity must not, or an ordinary
+        // close silently stops working. Distinct-session supersession is
+        // unaffected and still vanishes the armed id (`status/supersede/002`,
+        // `prompt/close-confirm/005`).
         //
         // Issue #321 residual 2: the match ALSO requires that the stored session
         // and the event agree about which pane they are on. This site is the one
