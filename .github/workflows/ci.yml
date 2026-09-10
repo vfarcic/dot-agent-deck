@@ -788,7 +788,7 @@ jobs:
       # claims about the CACHE BACKEND, not about the job: like every other job
       # in this file it still holds the automatic GITHUB_TOKEN, which is what
       # the note above `jobs:` is about.
-      - uses: DeterminateSystems/magic-nix-cache-action@908b263ff629f4cc17666315b7fd3ec127c6244d # v14
+      - uses: DeterminateSystems/magic-nix-cache-action@84c0677f58dcedf3b91f8223ce36a9ea5b3c84b7 # v15
         with:
           # GitHub Actions cache only. Left at its default, this action
           # opportunistically reaches for FlakeHub Cache, which wants an OIDC
