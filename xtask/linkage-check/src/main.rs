@@ -134,6 +134,12 @@ mod pin_lockstep;
 #[cfg(test)]
 mod release_workflow_wiring;
 mod repo_state;
+/// Issue #906: `scripts/sample-attribution.sh`'s worktree-attribution rule, the
+/// prefix test that decides which worktree a toolchain process is building for.
+/// Tests only — the rule lives in the script, no CI job runs it, and both ways
+/// it has been wrong produced a plausible number rather than an error.
+#[cfg(test)]
+mod sample_attribution;
 /// PRD #740: `desktop/scripts/prepare-sidecar.sh`'s Windows filename rule.
 /// Tests only, and Unix only — the rule lives in the script, which no CI job
 /// runs today because nothing cuts a Tauri bundle yet.
