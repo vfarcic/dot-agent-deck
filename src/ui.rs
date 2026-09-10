@@ -4643,6 +4643,7 @@ fn pane_announced_generation(snapshot: &AppState, pane_id: &str) -> Option<Strin
         // Issue #243: EITHER wrapper origin is excluded. Both carry the wrapper's
         // own session id rather than the agent's, so neither is a conversation
         // announcing itself over this pane.
+        //
         .filter(|event| {
             event.event_type == EventType::SessionStart && !event.is_wrapper_session_start()
         })
@@ -36754,6 +36755,149 @@ mod tests {
             lost_seed_records.len() == 1 && lost_role_records.len() == 1,
             "a physically applied write whose response was lost must retain its pre-RPC closure baseline on both TUI paths and never write the old task into a successor; seed_writes={lost_seed_records:?}, orchestrator_writes={lost_role_records:?}"
         );
+    }
+
+    /// Scenario: Spawn a pane whose card is drawn by a start that announces no
+    /// conversation — the daemon's own card-surfacing `SessionStart`, and a
+    /// wrapper's boot-provenance start — then deliver a TUI-owned seed into it
+    /// before the real agent has announced itself. When the agent's genuine
+    /// `SessionStart` arrives, the seed must still be delivered into that
+    /// generation rather than abandoned as "the agent's conversation changed".
+    #[spec("prompt/pane-input/033")]
+    #[test]
+    fn pane_input_033_a_provisional_start_is_not_a_conversation_to_lose() {
+        const PROMPT: &str = "Read the dispatch seed and begin";
+
+        // Both establishing events, replayed as their producers emit them. They
+        // differ only in provenance: `session_id` is the PANE ID for the daemon's
+        // card surface and the WRAPPER'S OWN session for the launcher, and
+        // neither carries an `agent_id`, because both run before any producer has
+        // identified itself.
+        //
+        // The card-surfacing case is the one measured in the field (issue #684's
+        // follow-up): `spawn::surface_spawned_pane` broadcasts it straight to
+        // attached clients and never applies it to the daemon's own `AppState`,
+        // which is why the abandoned deliveries it caused appear in no daemon log.
+        // The wrapper case is the trigger #684 was filed for. One mechanism, two
+        // inputs, so they are cases of one test rather than two tests.
+        let cases: [(&str, &str, &str); 2] = [
+            (
+                "daemon card surface",
+                "surfaced-card-pane",
+                crate::event::CARD_SURFACE_SESSION_START_ORIGIN,
+            ),
+            (
+                "wrapper boot provenance",
+                "wrapper-fork-pane",
+                crate::event::WRAPPER_FORK_SESSION_START_ORIGIN,
+            ),
+        ];
+
+        for (case, pane_id, origin) in cases {
+            let agent_id = format!("{pane_id}-agent");
+            let controller = Arc::new(RecordingPaneController::default());
+            let writes = controller.writes.clone();
+            let pane: Arc<dyn PaneController> = controller;
+            let mut ui = default_ui();
+            ui.pending_seed_prompts
+                .push(ready_seed_prompt(pane_id, PROMPT));
+            let mut snapshot = ready_prompt_snapshot(pane_id, &agent_id);
+
+            let mut metadata = std::collections::HashMap::new();
+            metadata.insert(
+                crate::event::DISPLAY_NAME_METADATA_KEY.to_string(),
+                "dispatcher".to_string(),
+            );
+            metadata.insert(
+                crate::event::SESSION_START_ORIGIN_METADATA_KEY.to_string(),
+                origin.to_string(),
+            );
+            // The card-surfacing start uses the pane id as its session id; the
+            // wrapper uses its own. Neither is a conversation.
+            let provisional_session_id =
+                if origin == crate::event::CARD_SURFACE_SESSION_START_ORIGIN {
+                    pane_id.to_string()
+                } else {
+                    format!("{pane_id}-wrapper-session")
+                };
+            snapshot.apply_event(AgentEvent {
+                session_id: provisional_session_id,
+                agent_type: AgentType::ClaudeCode,
+                event_type: EventType::SessionStart,
+                tool_name: None,
+                tool_detail: None,
+                cwd: None,
+                timestamp: Utc::now(),
+                user_prompt: None,
+                metadata,
+                pane_id: Some(pane_id.into()),
+                agent_id: None,
+                agent_version: None,
+                schema_version: None,
+                live_target: None,
+            });
+            assert_eq!(
+                snapshot.pane_hook_session_id(pane_id),
+                None,
+                "{case}: a start that announces nothing must not establish the \
+                 pane's generation — binding it is what a TUI delivery then loses"
+            );
+
+            // The seed is written while that card is all there is. This is the
+            // ordinary case whenever the agent takes longer to announce itself
+            // than the readiness buffer takes to elapse, which is exactly what a
+            // launcher (`devbox run claude …`) and a slow-booting Claude Code do.
+            process_pending_seed_prompts(&mut ui, &pane, &snapshot);
+            assert_eq!(
+                writes.lock().unwrap().len(),
+                1,
+                "{case}: precondition — the seed reaches the pane before the agent \
+                 announces itself"
+            );
+
+            // The real agent finally announces itself.
+            let genuine = format!("{pane_id}-genuine-generation");
+            apply_generation_event(
+                &mut snapshot,
+                pane_id,
+                &agent_id,
+                &genuine,
+                EventType::SessionStart,
+            );
+
+            ui.send_retry_backoff
+                .get_mut(pane_id)
+                .expect("an unconfirmed write arms retry")
+                .next_attempt_at = std::time::Instant::now();
+            process_pending_seed_prompts(&mut ui, &pane, &snapshot);
+
+            let records = writes.lock().unwrap().clone();
+            assert!(
+                ui.prompt_delivery.contains_key(pane_id),
+                "{case}: the delivery must survive the agent announcing itself — a \
+                 card drawn before any conversation existed is not a conversation \
+                 this prompt could have been lost from. status={:?}",
+                ui.status_message
+            );
+            assert_eq!(
+                records.len(),
+                2,
+                "{case}: the seed must be delivered into the genuine generation; \
+                 writes={records:?}"
+            );
+            assert_eq!(
+                records[1].1.as_deref(),
+                Some(genuine.as_str()),
+                "{case}: the retry must declare the conversation it is entering"
+            );
+            assert_eq!(
+                snapshot.pane_generation_closures(pane_id),
+                0,
+                "{case}: no conversation ended on this pane, so nothing may be \
+                 counted as closed — the closure counter is the other half of the \
+                 target check and abandons the delivery on its own"
+            );
+        }
     }
 
     /// Scenario: Write a seed to a target with no usable prompt-reporting channel, then supply daemon-synthetic evidence beside an untagged legacy hook. Those events must not arm a second physical write into a target that cannot actually confirm submission.

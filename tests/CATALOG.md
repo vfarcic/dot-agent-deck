@@ -1168,6 +1168,13 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** the fix's internal clock-comparison location or the detached spawn watcher (covered by `scheduler/dispatch/018`).
 - **Platform coverage:** mac+linux.
 
+##### prompt/pane-input/033 — A start that announces no conversation does not become one a TUI-owned prompt can be lost from.
+- **Layer:** L1 (in-process seed consumer driving `AppState::apply_event` and the production `process_pending_seed_prompts`, over a recording pane controller).
+- **Agent:** none (synthetic ClaudeCode generations).
+- **Asserts:** for BOTH provisional establishing events — the daemon's card-surfacing `SessionStart` (`CARD_SURFACE_SESSION_START_ORIGIN`, whose `session_id` is the pane id) and a wrapper's boot-provenance `SessionStart` — the pane's hook generation stays unestablished; a seed written while that card is all there is survives the agent's genuine `SessionStart`; the retry is delivered naming that genuine generation; and the pane's generation-closure count stays 0, since the closure counter abandons the delivery on its own even when the bound id happens to match.
+- **Does not assert:** that `spawn::surface_spawned_pane` stamps the marker (this test replays the event rather than calling it — pinned by `surface_spawned_pane_emits_session_start_for_attached_tuis` in `src/spawn.rs`); the #532 residual, where a second producer's NON-announcing frames move the generation; or the daemon-owned delivery paths, which route through `latch_generation` and were never affected.
+- **Platform coverage:** mac+linux.
+
 #### prompt/quit
 
 ##### prompt/quit/001 — `Ctrl+c` from command mode opens the quit confirmation dialog with three options: **Detach** (default), **Stop**, **Cancel**.

@@ -2371,6 +2371,18 @@ fn surface_spawned_pane(
 ) {
     let mut metadata = HashMap::new();
     metadata.insert(DISPLAY_NAME_METADATA_KEY.to_string(), task_name.to_string());
+    // Issue #684: declare that the DAEMON authored this start to draw a card,
+    // rather than a producer announcing a conversation. `session_id` below is the
+    // PANE ID and there is no `agent_id`, so without the marker an attached TUI's
+    // `AppState` established the pane id as the pane's hook GENERATION — a
+    // TUI-owned seed or role prompt bound it, and the agent's genuine
+    // `SessionStart` then read as a rollover and abandoned the prompt with "the
+    // agent's conversation changed". See `CARD_SURFACE_SESSION_START_ORIGIN` and
+    // `prompt/pane-input/033`.
+    metadata.insert(
+        crate::event::SESSION_START_ORIGIN_METADATA_KEY.to_string(),
+        crate::event::CARD_SURFACE_SESSION_START_ORIGIN.to_string(),
+    );
     let event = AgentEvent {
         session_id: pane_id.to_string(),
         agent_type: agent_type
@@ -6087,6 +6099,25 @@ mod tests {
                 .map(String::as_str),
             Some("morning-digest"),
             "the friendly name must ride on the event so the live card titles itself with it"
+        );
+        // Issue #684: and it declares itself DAEMON-AUTHORED, so an attached
+        // TUI's `AppState` does not read it as a conversation announcing itself
+        // over this pane. Without the marker it established the pane's hook
+        // generation — the pane id, since that is this event's `session_id` — a
+        // TUI-owned seed or role prompt bound that as its delivery target, and
+        // the agent's genuine `SessionStart` moments later read as a rollover and
+        // discarded the prompt. Asserted on the PRODUCER because the behavioural
+        // test (`prompt/pane-input/033`) replays this event rather than calling
+        // this function, so nothing else would notice the marker going missing.
+        assert!(
+            e.is_card_surface_session_start(),
+            "the card-surfacing start must carry its origin marker; metadata={:?}",
+            e.metadata
+        );
+        assert!(
+            e.is_daemon_synthetic(),
+            "and must therefore fall in the daemon-authored class, which is what \
+             `AppState::apply_event` and the delivery paths discriminate on"
         );
     }
 
