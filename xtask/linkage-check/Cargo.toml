@@ -15,7 +15,10 @@ path = "src/main.rs"
 [dependencies]
 proc-macro2 = "1"
 regex = "1"
-syn = { version = "3", features = ["full", "parsing"] }
+# PRD #819 M7 (check 12) walks the desktop crate's AST, so it needs `visit`
+# on top of what the `#[spec]` binding already uses. Pure feature — it pulls no
+# new crate into Cargo.lock.
+syn = { version = "3", features = ["full", "parsing", "visit"] }
 xtask-docs = { path = "../docs" }
 
 # `clean-e2e-tmp` needs two libc calls that have no std equivalent:
