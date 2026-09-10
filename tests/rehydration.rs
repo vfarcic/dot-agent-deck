@@ -588,7 +588,7 @@ async fn run_partial_attach_server(listener: UnixListener) {
                     };
                     let _ = write_resp(&mut stream, &resp).await;
                 }
-                AttachRequest::AttachStream { id } => {
+                AttachRequest::AttachStream { id, .. } => {
                     if id == "agent-gone" {
                         // Simulate the race: the agent terminated between
                         // ListAgents and AttachStream. The real daemon
@@ -1733,6 +1733,331 @@ async fn route_002_reattach_rebuilds_two_same_cwd_orchestration_tabs_inner() {
 }
 
 // ---------------------------------------------------------------------------
+// Issue #960 — a DISPATCHED orchestration's run-identifying tab label across a
+// detach/reattach.
+// ---------------------------------------------------------------------------
+// Same tier and the same production chain as `route_002` above, driven from the
+// other end: instead of hand-building the `TabMembership` a producer stamps,
+// this starts at the REAL producer — `crate::spawn::spawn`, the primitive
+// `dot-agent-deck dispatch`, the scheduler and issue-dispatch all call — and
+// asks whether the label it paints live is the label a reattach comes back
+// under.
+//
+// That question had no coverage anywhere, and it is how #960 shipped:
+// `tab.rs`'s `orchestration_010_reattach_preserves_user_title` hand-feeds a
+// title straight into `open_orchestration_tab_with_existing_role_panes`, so it
+// never exercises a producer at all, and every orchestration fixture in this
+// file used `display_title: None`, so the field was never observed surviving
+// anything. `surface_spawned_orchestration` computed the title and put it on
+// the transient `OrchestrationSurface` broadcast ALONE while the role loop
+// stamped `display_title: None`; nothing persists a broadcast, so the live tab
+// read `mixed · issue-950` and the reattached one read bare `mixed`.
+//
+// Three orchestrations in one reattach, because the interesting claim is a
+// comparison rather than a single label:
+//   * `dispatch-team` — DISPATCHED into a worktree-shaped dir whose basename
+//     differs from the orchestration name. The defect's own case.
+//   * `interactive-team` — the CONTROL: the membership shape `tab.rs` stamps
+//     for a `Ctrl+n` orchestration, which has carried its title since #158. It
+//     passed before this fix and must keep passing, so a future regression says
+//     WHICH producer broke rather than just "titles are lost".
+//   * `bare-team` — DISPATCHED into a dir whose basename EQUALS the name, so
+//     there is genuinely no per-run identity to add. The canonical name is the
+//     right answer here, and this is the leg that fails if the fix ever stamps
+//     `Some("")` (which both the hydration fallback and
+//     `validate_tab_membership` read as "no title") instead of `None`.
+//
+// Written as a sync `#[test]` driving an explicit runtime for the same reason as
+// `route_002` and `restore_007`: the linkage-check scanner only recognises a
+// plain `fn` after a `#[spec(...)]`.
+
+/// Surfaces a spawn failure that would otherwise be invisible — the assertions
+/// below would report a missing tab rather than the reason for it.
+struct LoudNotifier;
+impl dot_agent_deck::scheduler::Notifier for LoudNotifier {
+    fn notify(&self, event: dot_agent_deck::scheduler::NotifyEvent) {
+        eprintln!("[spawn notifier] {event:?}");
+    }
+}
+
+/// A two-role orchestration config whose roles are `sleep` stand-ins: enough to
+/// hold a pane open through the reattach, and nothing else.
+fn dispatch_orchestration_config(name: &str) -> String {
+    format!(
+        "[[orchestrations]]\nname = \"{name}\"\n\n\
+         [[orchestrations.roles]]\nname = \"orchestrator\"\ncommand = \"sh -c 'sleep 30'\"\nstart = true\n\n\
+         [[orchestrations.roles]]\nname = \"coder\"\ncommand = \"sh -c 'sleep 30'\"\n"
+    )
+}
+
+/// Bring an orchestration up through the daemon's own dispatch primitive, from
+/// a config on disk at `dir` — the shape `dot-agent-deck dispatch` resolves.
+async fn dispatch_orchestration(
+    registry: &Arc<AgentPtyRegistry>,
+    event_tx: &tokio::sync::broadcast::Sender<BroadcastMsg>,
+    dir: &Path,
+    name: &str,
+) -> dot_agent_deck::spawn::SpawnHandle {
+    std::fs::create_dir_all(dir).expect("create the dispatched orchestration's cwd");
+    std::fs::write(
+        dir.join(".dot-agent-deck.toml"),
+        dispatch_orchestration_config(name),
+    )
+    .expect("write the dispatched orchestration's config");
+    dot_agent_deck::spawn::spawn(
+        dot_agent_deck::spawn::SpawnRequest {
+            task_name: format!("dispatch-{name}"),
+            working_dir: dir.to_string_lossy().into_owned(),
+            command: None,
+            prompt: "coordinate the team".to_string(),
+            // The config on disk decides, exactly as a real dispatch does.
+            resolved_target: None,
+            compose_orchestrator_context: true,
+        },
+        registry,
+        &LoudNotifier,
+        Some(event_tx),
+        // The issue-dispatch / scheduler setting: the prompt-delivery wait runs
+        // detached, so this returns as soon as every role is spawned and
+        // registered.
+        true,
+        None,
+    )
+    .await
+    .unwrap_or_else(|e| panic!("the dispatch spawn primitive must bring `{name}` up: {e:?}"))
+}
+
+/// Scenario: dispatch an orchestration through the daemon's own spawn primitive
+/// into a worktree-shaped directory (`dispatch-team` in `.../issue-960`), then
+/// detach and reattach by hydrating a fresh controller from the warm daemon.
+/// Asserts the rebuilt tab comes back under the run-identifying label the live
+/// broadcast painted (`dispatch-team · issue-960`) rather than the bare config
+/// name, alongside a `Ctrl+n`-shaped control that must keep its own title and a
+/// dispatch with genuinely no per-run identity that must still fall back to the
+/// canonical name.
+#[spec("orchestration/dispatch/005")]
+#[test]
+fn dispatch_005_a_dispatched_orchestration_keeps_its_tab_label_across_reattach() {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("build multi-thread runtime");
+    rt.block_on(
+        dispatch_005_a_dispatched_orchestration_keeps_its_tab_label_across_reattach_inner(),
+    );
+}
+
+async fn dispatch_005_a_dispatched_orchestration_keeps_its_tab_label_across_reattach_inner() {
+    let server = start_real_server().await;
+    let client = DaemonClient::new(server.path.clone());
+
+    // The spawn primitive's own broadcast, subscribed BEFORE any spawn so the
+    // live `OrchestrationSurface` cannot be missed. This is the transient
+    // channel `surface_one_orchestration` paints the live tab from — the one
+    // half of the disagreement #960 is about.
+    let (event_tx, mut event_rx) = tokio::sync::broadcast::channel::<BroadcastMsg>(256);
+
+    // ---- Producer 1: a DISPATCH whose cwd basename is its per-run identity.
+    // `issue-960` stands in for the per-issue worktree issue dispatch creates.
+    let dispatch_cwd = server._dir.path().join("issue-960");
+    let dispatched =
+        dispatch_orchestration(&server.registry, &event_tx, &dispatch_cwd, "dispatch-team").await;
+    let expected_dispatch_title = "dispatch-team · issue-960";
+
+    // ---- Producer 2: a DISPATCH with nothing to add — the cwd basename IS the
+    // orchestration name, so the canonical name is already the whole identity.
+    let bare_cwd = server._dir.path().join("bare-team");
+    let bare = dispatch_orchestration(&server.registry, &event_tx, &bare_cwd, "bare-team").await;
+
+    // ---- Producer 3 (the CONTROL): the membership shape `tab.rs` stamps on
+    // every role pane of an interactive `Ctrl+n` orchestration, title included.
+    let interactive_cwd = server
+        ._dir
+        .path()
+        .join("interactive")
+        .to_string_lossy()
+        .into_owned();
+    std::fs::create_dir_all(&interactive_cwd).expect("create the control's cwd");
+    let interactive_title = "My Custom Run";
+    let mut interactive_ids: Vec<String> = Vec::new();
+    for (role_index, role_name) in ["orchestrator", "coder"].iter().enumerate() {
+        let id = client
+            .start_agent(StartAgentOptions {
+                command: Some("sh -c 'sleep 30'".to_string()),
+                cwd: Some(interactive_cwd.clone()),
+                display_name: Some((*role_name).to_string()),
+                env: vec![(
+                    "DOT_AGENT_DECK_PANE_ID".to_string(),
+                    format!("pane-interactive-{role_name}"),
+                )],
+                tab_membership: Some(TabMembership::Orchestration {
+                    name: "interactive-team".to_string(),
+                    role_index,
+                    role_name: (*role_name).to_string(),
+                    is_start_role: role_index == 0,
+                    orchestration_cwd: Some(interactive_cwd.clone()),
+                    display_title: Some(interactive_title.to_string()),
+                    orchestration_id: Some("orch-inst-interactive".to_string()),
+                }),
+                ..Default::default()
+            })
+            .await
+            .expect("the control's role panes must start");
+        interactive_ids.push(id);
+    }
+
+    // ---- What the LIVE tab was labelled: the broadcast the spawn primitive
+    // published, read through the same `validate_orchestration_surface` gate the
+    // TUI applies before painting it.
+    let mut surfaces: HashMap<String, Option<String>> = HashMap::new();
+    while let Ok(msg) = event_rx.try_recv() {
+        if let BroadcastMsg::OrchestrationSurface(surface) = msg
+            && let Some(surface) =
+                dot_agent_deck::agent_pty::validate_orchestration_surface(surface)
+        {
+            surfaces.insert(surface.name.clone(), surface.display_title.clone());
+        }
+    }
+    assert_eq!(
+        surfaces.get("dispatch-team").cloned(),
+        Some(Some(expected_dispatch_title.to_string())),
+        "precondition: the live surface must carry the run-identifying label; \
+         surfaces = {surfaces:?}"
+    );
+    assert_eq!(
+        surfaces.get("bare-team").cloned(),
+        Some(None),
+        "a dispatch whose cwd basename equals its name has no per-run identity to \
+         add, so the live surface must carry no title at all — an empty `Some` \
+         would defeat the fallback rather than replace it; surfaces = {surfaces:?}"
+    );
+
+    // ---- Detach + reattach: a FRESH controller hydrating from the warm daemon.
+    let ctrl = Arc::new(EmbeddedPaneController::new(
+        server.path.clone(),
+        tokio::runtime::Handle::current(),
+    ));
+    let hydrated = {
+        let ctrl = ctrl.clone();
+        tokio::task::spawn_blocking(move || ctrl.hydrate_from_daemon())
+            .await
+            .unwrap()
+    };
+    assert_eq!(
+        hydrated.len(),
+        6,
+        "all six role panes across the three orchestrations should hydrate; got {hydrated:?}"
+    );
+
+    // The field that actually survives the round trip, per pane: the daemon
+    // echoed each role's `TabMembership` back through `ListAgents` and
+    // `validate_tab_membership`. Pre-fix every DISPATCHED pane arrived here with
+    // `None` — the producer bug, observed one layer below the label.
+    let dispatched_panes: Vec<String> = dispatched
+        .agents
+        .iter()
+        .map(|a| a.pane_id.clone())
+        .collect();
+    for pane_id in &dispatched_panes {
+        let pane = hydrated
+            .iter()
+            .find(|h| &h.pane_id == pane_id)
+            .unwrap_or_else(|| panic!("dispatched role pane {pane_id} did not hydrate"));
+        let Some(TabMembership::Orchestration { display_title, .. }) = &pane.tab_membership else {
+            panic!("dispatched role pane {pane_id} lost its Orchestration membership: {pane:?}");
+        };
+        assert_eq!(
+            display_title.as_deref(),
+            Some(expected_dispatch_title),
+            "EVERY role pane of a dispatched orchestration must carry the run title, not just \
+             whichever one happens to be alive: the partition keeps the first non-`None` value \
+             it sees, so a title on only some panes is lost as soon as those exit (pane {pane_id})"
+        );
+    }
+
+    // ---- Partition: the reattach's tab-reconstruction decision.
+    let partition = partition_hydrated_panes(&hydrated);
+    assert!(
+        partition.dashboard_pane_ids.is_empty(),
+        "no orchestration role pane should fall through to the dashboard; got {:?}",
+        partition.dashboard_pane_ids
+    );
+    assert_eq!(
+        partition.orchestration_buckets.len(),
+        3,
+        "the three orchestrations must rebuild as three buckets; got {:?}",
+        partition
+            .orchestration_buckets
+            .iter()
+            .map(|b| (b.orchestration_name.clone(), b.display_title.clone()))
+            .collect::<Vec<_>>()
+    );
+
+    // ---- Rebuild the tabs, exactly as the hydration loop in `ui.rs` does.
+    // `None` local config → synthesised from the bucket's own role metadata, the
+    // remote-reconnect path; the title argument is independent of that choice,
+    // and the FALLBACK it guards is the harsher one here (the synthesised
+    // config's name).
+    let mut tab_manager = dot_agent_deck::tab::TabManager::new(ctrl.clone());
+    let mut labels: HashMap<String, String> = HashMap::new();
+    for bucket in &partition.orchestration_buckets {
+        let orch_config = resolve_orch_config_for_hydration(None, bucket);
+        let mut role_pane_ids: Vec<Option<String>> = vec![None; orch_config.roles.len()];
+        for slot in &bucket.role_slots {
+            role_pane_ids[slot.role_index] = Some(slot.pane_id.clone());
+        }
+        let (tab_index, _) = tab_manager
+            .open_orchestration_tab_with_existing_role_panes(
+                &orch_config,
+                &bucket.cwd,
+                role_pane_ids,
+                bucket.display_title.as_deref(),
+            )
+            .expect("rebuilding an orchestration tab from its bucket should succeed");
+        labels.insert(
+            bucket.orchestration_name.clone(),
+            tab_manager.tab_labels()[tab_index].clone(),
+        );
+    }
+
+    // ---- The user-visible claim, on the tab strip the user reads.
+    assert_eq!(
+        labels.get("dispatch-team").map(String::as_str),
+        Some(expected_dispatch_title),
+        "the label the live surface painted must survive a detach/reattach. Bare \
+         `dispatch-team` here is issue #960: with N concurrent dispatches every tab \
+         reattaches under the SAME label and the tab strip stops saying which run is \
+         which. labels = {labels:?}"
+    );
+    assert_eq!(
+        labels.get("interactive-team").map(String::as_str),
+        Some(interactive_title),
+        "the CONTROL: the interactive `Ctrl+n` producer has carried its title since #158 \
+         and must keep doing so — a failure HERE means the hydration side broke, not the \
+         dispatch producer. labels = {labels:?}"
+    );
+    assert_eq!(
+        labels.get("bare-team").map(String::as_str),
+        Some("bare-team"),
+        "`resolve_orchestration_name` stays the FALLBACK: a dispatch with no per-run \
+         identity to add is correctly labelled with its canonical name. labels = {labels:?}"
+    );
+
+    drop(tab_manager);
+    drop(ctrl);
+    for id in dispatched
+        .agents
+        .iter()
+        .chain(bare.agents.iter())
+        .map(|a| a.id.clone())
+        .chain(interactive_ids)
+    {
+        let _ = server.registry.close_agent(&id);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // PRD #104 R1 (reviewer): the M4 reproducer in `tests/snapshot_replay_dims.rs`
 // pins `parser_init_dims` in isolation, but a regression that swapped the
 // helper out for hard-coded `24, 80` at the `hydrate_from_daemon` call-site
@@ -1814,12 +2139,13 @@ async fn hydrate_sizes_parser_to_daemon_reported_pty_dims() {
 
 /// Scenario: Spawn three orchestration role agents (orchestrator + coder +
 /// reviewer) on a warm in-process daemon, each tagged with its
-/// `TabMembership::Orchestration` role_index / role_name / is_start_role, then
-/// build a fresh controller and hydrate. Asserts warm-daemon hydration
-/// reproduces every role as a pane, that placing each hydrated pane at its
-/// `role_index` yields the orchestrator + role panes in their saved display
-/// order, and that the start (orchestrator) role — i.e. the `start_role_index`
-/// cursor — is recoverable from `is_start_role`.
+/// `TabMembership::Orchestration` role_index / role_name / is_start_role and the
+/// tab's `display_title`, then build a fresh controller and hydrate. Asserts
+/// warm-daemon hydration reproduces every role as a pane, that placing each
+/// hydrated pane at its `role_index` yields the orchestrator + role panes in
+/// their saved display order, that the start (orchestrator) role — i.e. the
+/// `start_role_index` cursor — is recoverable from `is_start_role`, and that
+/// every pane brings the tab's `display_title` back with it.
 #[spec("session/restore/007")]
 #[test]
 fn restore_007_warm_daemon_hydrates_orchestration_roles_in_order() {
@@ -1838,6 +2164,13 @@ async fn restore_007_warm_daemon_hydrates_orchestration_roles_in_order_inner() {
     let orchestration_name = "tdd-cycle";
     let cwd = server._dir.path().to_string_lossy().into_owned();
     let role_names = ["orchestrator", "coder", "reviewer"];
+    // Issue #960: deliberately NOT `None`. Every orchestration fixture in this
+    // file used to omit the title, so the field was never observed surviving
+    // anything — which is how a producer stamping `None` sat unnoticed. A title
+    // distinct from `orchestration_name` is what makes the round trip
+    // observable: a fallback to the canonical name would read as a pass if the
+    // two were equal.
+    let display_title = "TDD Cycle · run-42";
     let mut spawned_ids: Vec<String> = Vec::new();
     for (role_index, role_name) in role_names.iter().enumerate() {
         let pane_env = format!("pane-{role_name}");
@@ -1853,7 +2186,7 @@ async fn restore_007_warm_daemon_hydrates_orchestration_roles_in_order_inner() {
                     role_name: (*role_name).to_string(),
                     is_start_role: role_index == 0,
                     orchestration_cwd: Some(cwd.clone()),
-                    display_title: None,
+                    display_title: Some(display_title.to_string()),
                     orchestration_id: None,
                 }),
                 ..Default::default()
@@ -1892,6 +2225,7 @@ async fn restore_007_warm_daemon_hydrates_orchestration_roles_in_order_inner() {
             role_index,
             role_name,
             is_start_role,
+            display_title: hydrated_title,
             ..
         }) = &h.tab_membership
         else {
@@ -1900,6 +2234,17 @@ async fn restore_007_warm_daemon_hydrates_orchestration_roles_in_order_inner() {
         assert_eq!(
             name, orchestration_name,
             "hydrated pane must carry the orchestration name"
+        );
+        // Issue #960: the title is a per-TAB value stamped on every role pane,
+        // and the partition keeps the FIRST non-`None` one it finds — so a title
+        // that survives on only some panes is lost the moment those exit
+        // (`agent_records` filters exited agents out). Asserted per pane rather
+        // than once for the bucket for exactly that reason.
+        assert_eq!(
+            hydrated_title.as_deref(),
+            Some(display_title),
+            "pane {} must bring the tab's display_title back through the daemon echo",
+            h.pane_id
         );
         assert!(
             *role_index < role_names.len(),

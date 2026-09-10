@@ -48,6 +48,16 @@ const WORKER_PANE: &str = "recovery-coder";
 const WORKER_ROLE: &str = "coder";
 const ORCHESTRATION: &str = "recovery-orchestration";
 const ORCHESTRATION_ID: &str = "recovery-instance-1";
+/// Issue #960: the tab's run-identifying title, stamped on every role pane by
+/// both producers (`tab.rs` for `Ctrl+n`, `spawn.rs` for a dispatch). Present
+/// here rather than `None` because a `clear = true` delegate that has to
+/// RE-CREATE its worker pane rebuilds that pane's membership from scratch, and
+/// used to rebuild it with `display_title: None` — so the tab kept its label
+/// only while some OTHER title-carrying pane was still live, and lost it
+/// silently once every pane had exited or been re-created this way. Distinct
+/// from `ORCHESTRATION` on purpose: a fallback to the canonical name would read
+/// as a pass if the two were equal.
+const DISPLAY_TITLE: &str = "recovery-orchestration · issue-960";
 const POINTER: &[u8] = b"Read .dot-agent-deck/worker-task-coder.md for your task.";
 
 /// Issue #709: what the SIGTERM-ignoring stand-in prints once — and only once —
@@ -70,7 +80,7 @@ fn membership(role_index: usize, role_name: &str, is_start_role: bool, cwd: &str
         role_name: role_name.to_string(),
         is_start_role,
         orchestration_cwd: Some(cwd.to_string()),
-        display_title: None,
+        display_title: Some(DISPLAY_TITLE.to_string()),
         orchestration_id: Some(ORCHESTRATION_ID.to_string()),
     }
 }
@@ -415,6 +425,49 @@ async fn delegate_022_delegate_during_an_in_flight_close_brings_the_role_back() 
     );
 
     let _ = closing.await;
+
+    // Issue #960's secondary path: the re-created pane's membership. There is no
+    // record left to respawn from here, so the replacement is built from
+    // `PaneRecreateIdentity` — which hardcoded `display_title: None`, silently
+    // dropping the tab's run-identifying label from this pane. It is not
+    // immediately visible, because `partition_hydrated_panes` keeps the first
+    // non-`None` title it finds and the orchestrator pane still has one; the
+    // label is lost once every title-carrying pane has exited or been re-created
+    // this way. Asserted on the RECREATED pane specifically, since that is the
+    // only one whose membership this path authors.
+    let recreated_membership = fx
+        .daemon
+        .registry
+        .agent_records()
+        .into_iter()
+        .find(|r| r.pane_id_env.as_deref() == Some(WORKER_PANE))
+        .and_then(|r| r.tab_membership)
+        .unwrap_or_else(|| {
+            panic!(
+                "the recovered worker pane must have an Orchestration membership; records = {:?}",
+                fx.daemon.registry.agent_records()
+            )
+        });
+    let TabMembership::Orchestration {
+        display_title,
+        role_index,
+        orchestration_id,
+        ..
+    } = &recreated_membership
+    else {
+        panic!("the recovered worker pane left its orchestration tab: {recreated_membership:?}");
+    };
+    assert_eq!(
+        (
+            display_title.as_deref(),
+            *role_index,
+            orchestration_id.as_deref()
+        ),
+        (Some(DISPLAY_TITLE), 1, Some(ORCHESTRATION_ID)),
+        "the re-created worker must rejoin its tab with the tab's own title, index and instance \
+         token — a `None` title here is issue #960's secondary path, and it costs the tab its \
+         label as soon as the last pane that still carries one goes away"
+    );
 
     let state = fx.daemon.state.read().await;
     assert_eq!(

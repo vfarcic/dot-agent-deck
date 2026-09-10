@@ -215,7 +215,7 @@ async fn handle_connection(
                 .await
                 .expect("reply to StartAgent");
         }
-        AttachRequest::AttachStream { id } => {
+        AttachRequest::AttachStream { id, .. } => {
             let present = records.lock().unwrap().iter().any(|record| record.id == id);
             let response = if present {
                 AttachResponse::ok()

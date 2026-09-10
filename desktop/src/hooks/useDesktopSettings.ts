@@ -20,6 +20,27 @@ export interface DesktopSettingsState {
   path?: string;
   /** False until the first load resolves, so the UI can avoid claiming a value it has not read. */
   loaded: boolean;
+  /**
+   * Whether `settings` holds a document somebody actually has — read from disk,
+   * or changed in this session — rather than the placeholder this hook seeds
+   * itself with. False from mount until one of those two happens, which on a
+   * failed read and no interaction is for the life of the hook.
+   *
+   * Distinct from `loaded`, and issue #845 is why. `loaded` answers "has the
+   * read settled"; a consumer that writes to global chrome needs "is this mode
+   * one somebody chose". They part company in both directions:
+   *
+   * - A choice made *while* the read is in flight is chosen but not loaded.
+   *   Gating such a consumer on `loaded` would leave that click unapplied until
+   *   the read lands — the no-restart requirement PRD #743 puts on the
+   *   appearance choice, and the race the `edited` guard below exists for.
+   * - A read that **failed** is loaded but chose nothing. `settings` then holds
+   *   the same placeholder it was seeded with, and treating that as a choice
+   *   would let a transient IPC failure overwrite the palette the user actually
+   *   stored — which this app has already applied, from the same file, before
+   *   this bundle ran.
+   */
+  chosen: boolean;
   /** Set when the last save failed. The change stays applied for this session. */
   saveError?: string;
   save: (next: DesktopSettingsDto) => void;
@@ -30,6 +51,11 @@ export function useDesktopSettings(runtime: DeckRuntimeState): DesktopSettingsSt
   const [settings, setSettings] = useState<DesktopSettingsDto>(DEFAULT_DESKTOP_SETTINGS);
   const [path, setPath] = useState<string>();
   const [loaded, setLoaded] = useState(false);
+  // Whether a document actually came back, which `loaded` does NOT answer:
+  // `loaded` is true once the read has SETTLED, failure included. The two part
+  // company only on the failure path, and that is exactly where the difference
+  // is load-bearing — see `chosen`.
+  const [read, setRead] = useState(false);
   const [saveError, setSaveError] = useState<string>();
   // Whether the user has already changed something. The initial load is async,
   // so without this a choice made before it resolves is silently overwritten by
@@ -57,9 +83,18 @@ export function useDesktopSettings(runtime: DeckRuntimeState): DesktopSettingsSt
         // already moved on from it.
         setPath(snapshot.path);
         if (!edited.current) setSettings(snapshot.settings);
+        setRead(true);
       })
-      // The live bridge already falls back to defaults, so a rejection here is
-      // a bridge that has no settings at all. Defaults keep the app usable.
+      // Swallowed, and `settings` keeps the defaults it was seeded with — a
+      // desktop whose settings could not be read is still usable, and there is
+      // no surface for a read error the way `saveError` is one for a write.
+      //
+      // This is now the ORDINARY failure path rather than an exotic one, and
+      // issue #845 is what moved it: `TauriDeckBridge.getSettings` used to
+      // answer an IPC failure with the same defaults itself, so a rejection
+      // here could only be a bridge with no settings at all. It propagates now,
+      // because a fabricated document saying mode "system" is indistinguishable
+      // from a real one — which is exactly why `read` below is NOT set here.
       .catch(() => undefined)
       .finally(() => { if (!cancelled) setLoaded(true); });
     return () => { cancelled = true; };
@@ -97,5 +132,9 @@ export function useDesktopSettings(runtime: DeckRuntimeState): DesktopSettingsSt
       }));
   }, [saveSettings]);
 
-  return { settings, path, loaded, saveError, save };
+  // `edited` is a ref, and this reads it during render — safe here, and only
+  // here, because it is monotonic (false to true, never back) and every write
+  // to it is paired with a `setSettings` in the same call, so the render that
+  // observes the new value is one React was already going to perform.
+  return { settings, path, loaded, chosen: read || edited.current, saveError, save };
 }

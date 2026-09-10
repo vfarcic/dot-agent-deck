@@ -41,6 +41,8 @@ interface AgentTileProps {
   onTabChange: (tab: PanelTab) => void;
   onTerminalInput: (agentId: string, data: string) => Promise<void>;
   onTerminalResize: (agentId: string, cols: number, rows: number) => Promise<void>;
+  /** PRD #882 — the geometry the daemon has applied for this agent, if known. */
+  appliedGeometry?: { rows: number; cols: number };
   onEvidenceSelect: (id: string) => void;
   onSubmitText: (agentId: string, text: string) => Promise<DeckActionResult>;
   onRename?: (agentId: string, displayName: string) => Promise<void>;
@@ -63,6 +65,7 @@ export function AgentTile({
   onTabChange,
   onTerminalInput,
   onTerminalResize,
+  appliedGeometry,
   onEvidenceSelect,
   onSubmitText,
   onRename,
@@ -210,6 +213,7 @@ export function AgentTile({
               readOnly={agent.status === "queued" || agent.status === "passed" || agent.status === "stopped"}
               onInput={handleInput}
               onResize={handleResize}
+              applied={appliedGeometry}
               onFocus={onSelect}
             />
             <AgentComposer agent={agent} prompts={prompts} focusToken={composerFocusToken} onSubmit={onSubmitText} />
