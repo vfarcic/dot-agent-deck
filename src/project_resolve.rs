@@ -1123,10 +1123,18 @@ pub fn prepare_workflow_for_wire(
         .and_then(crate::prep_token::inode_identity);
 
     // --- compose and publish. Last, and the only step with a side effect.
+    // `Attended` (issue #703): every caller of this verb today is the desktop's
+    // live-loop launch panel, which will not launch without a task prompt AND has
+    // the person who typed it watching the panes it opens. A later off-box or
+    // headless caller (#741) is the point at which this stops being derivable
+    // here and the attendance has to travel on
+    // `AttachRequest::PrepareWorkflow` — a wire change, with CLAUDE.md rule 12's
+    // cross-version test attached to it. It is deliberately not pre-built.
     let prepared = crate::orchestrator_context::prepare_orchestrator_context(
         orch,
         &dir,
         Some(task),
+        crate::orchestrator_context::Attendance::Attended,
     )
     .map_err(|err| {
         warn!(reason = %err, "prepare-workflow refused: the coordinator context was not published");

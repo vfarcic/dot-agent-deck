@@ -269,6 +269,8 @@ For a mode's agent pane the same key lives on `[[modes]]` — see [Workspace Mod
 
 The deck writes the delegation protocol — how to pass a task safely — into the orchestrator's context automatically at launch, so no `prompt_template` below needs to restate it.
 
+You can write your orchestrator's `prompt_template` for the case you have in front of you, including steps that stop and ask you something. When the same team is started in the background by [dispatcher mode](dispatcher-mode.md#a-dispatched-team-knows-nobody-is-watching-it) — where nobody is at the pane to answer — the deck tells its orchestrator so, and tells it that the dispatched task is the approval those steps were waiting for. You do not have to write two templates or branch on anything.
+
 ```toml
 [[orchestrations]]
 name = "code-review"

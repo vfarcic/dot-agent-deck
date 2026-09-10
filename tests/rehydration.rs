@@ -1812,7 +1812,9 @@ async fn dispatch_orchestration(
             prompt: "coordinate the team".to_string(),
             // The config on disk decides, exactly as a real dispatch does.
             resolved_target: None,
-            compose_orchestrator_context: true,
+            compose_orchestrator_context: Some(
+                dot_agent_deck::orchestrator_context::Attendance::Unattended,
+            ),
         },
         registry,
         &LoudNotifier,

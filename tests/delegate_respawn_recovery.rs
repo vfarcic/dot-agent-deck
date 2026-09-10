@@ -670,7 +670,9 @@ async fn dispatch_003_the_dispatch_and_startagent_paths_respawn_identically() {
             command: None,
             prompt: "coordinate the team".to_string(),
             resolved_target: None,
-            compose_orchestrator_context: true,
+            compose_orchestrator_context: Some(
+                dot_agent_deck::orchestrator_context::Attendance::Unattended,
+            ),
         },
         &daemon.registry,
         &SilentNotifier,

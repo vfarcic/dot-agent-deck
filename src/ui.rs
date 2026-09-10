@@ -3173,7 +3173,9 @@ fn filter_sessions<'a>(state: &'a AppState, ui: &UiState) -> Vec<(&'a String, &'
 // path needs the same composition, and two copies is what left a
 // daemon-started orchestration without its delegation protocol. Imported below
 // so this module's call site and tests are unchanged.
-use crate::orchestrator_context::{prepare_orchestrator_prompt, reassert_orchestrator_prompt};
+use crate::orchestrator_context::{
+    Attendance, prepare_orchestrator_prompt, reassert_orchestrator_prompt,
+};
 // ---------------------------------------------------------------------------
 // PRD #76 M2.12: hydration partition
 // ---------------------------------------------------------------------------
@@ -10272,8 +10274,16 @@ fn dispatch_action(
                     let display_title = (!req.name.is_empty()).then(|| req.name.clone());
                     // `None`: the interactive path carries no caller task — the user
                     // types their instructions after the orchestrator acknowledges.
-                    // Output is byte-for-byte the pre-#222 text.
-                    let prompt = prepare_orchestrator_prompt(&orch_config, &dir_str, None);
+                    // `Attended` for the same reason (issue #703): this pane was
+                    // opened by the person now looking at it, so the template's
+                    // user gates mean what they say. `Attended` + no task is
+                    // byte-for-byte the pre-#222 text.
+                    let prompt = prepare_orchestrator_prompt(
+                        &orch_config,
+                        &dir_str,
+                        None,
+                        Attendance::Attended,
+                    );
                     // PRD #89 M2b.2: keep a copy of the prepared prompt for the
                     // capture snapshot below — `prompt` itself is moved into
                     // `open_orchestration_tab`. Empty when the orchestration
@@ -27161,7 +27171,7 @@ mod tests {
 
         let dir = tempdir().unwrap();
         let cwd = dir.path().to_str().unwrap();
-        let prompt = prepare_orchestrator_prompt(&config, cwd, None);
+        let prompt = prepare_orchestrator_prompt(&config, cwd, None, Attendance::Attended);
         assert!(prompt.is_some());
         let prompt = prompt.unwrap();
         // One-liner referencing the file.
