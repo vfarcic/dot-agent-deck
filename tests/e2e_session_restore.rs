@@ -1257,3 +1257,90 @@ fn restore_016_reattach_restores_active_tab_and_focused_pane() {
          remembered the focus across the detach.\nGrid:\n{grid}"
     );
 }
+
+/// Scenario: Hand-stage a `session.toml` that carries BOTH an orchestration
+/// snapshot (so the daemon-empty path rebuilds a 3-role orchestration tab) and a
+/// `[focus]` table remembering the Dashboard as active plus a pane id — and
+/// launch against a brand-new empty daemon, the one path where the restored
+/// panes are freshly allocated rather than adopted from a daemon. The remembered
+/// tab KIND must be honoured (the deck lands on the Dashboard, not on the
+/// rebuilt orchestration tab it would otherwise land on), the remembered pane id
+/// must be IGNORED (nothing hydrated, so the daemon-supplied id set is empty and
+/// a rebuild's counters are not the ids that were remembered — honouring one
+/// could focus a different role), and the deck must be in
+/// command mode rather than the PaneInput the restore block leaves behind — that
+/// mode on a tab with no pane of its own would send keystrokes to a pane that is
+/// not drawn.
+#[spec("session/restore/019")]
+#[test]
+fn restore_019_cold_start_honours_the_remembered_tab_but_not_a_rebuilt_pane_id() {
+    let project_dir = common::race_safe_tempdir();
+    write_orchestration_config(
+        project_dir.path(),
+        "tdd-cycle",
+        &[
+            ("orchestrator", "sleep 600"),
+            ("coder", "sleep 600"),
+            ("reviewer", "sleep 600"),
+        ],
+        0,
+    );
+
+    let session_dir = common::race_safe_tempdir();
+    let session_file = session_dir.path().join("session.toml");
+    stage_orchestration_snapshot(
+        &session_file,
+        project_dir.path(),
+        "orchestrator",
+        "sleep 600",
+        &["orchestrator", "coder", "reviewer"],
+        0,
+        "",
+        "tdd-cycle",
+        project_dir.path(),
+        &[0],
+        None,
+    );
+    // Append the remembered position. `active_pane`/`tab_panes` name "2" — the
+    // id a three-pane rebuild really does mint for its middle role, so this is
+    // the id that WOULD resolve, which is what makes ignoring it observable
+    // rather than vacuous.
+    let mut staged = std::fs::read_to_string(&session_file).expect("read the staged snapshot");
+    staged.push_str("\n[focus]\nversion = 1\ndashboard_active = true\nactive_pane = \"2\"\ntab_panes = [\"2\"]\n");
+    std::fs::write(&session_file, staged).expect("append the [focus] table");
+
+    let deck = TuiDeck::builder()
+        .with_pty_size(160, 45)
+        .with_env(
+            "DOT_AGENT_DECK_SESSION",
+            session_file.to_str().expect("session path is UTF-8"),
+        )
+        .launch_with_fixture("minimal");
+
+    // Precondition: the orchestration tab really was rebuilt, so "the Dashboard
+    // is active" below is a choice between two tabs and not the only option.
+    // Read from the TAB STRIP (`Dashboard │ tdd-cycle [×]`) rather than from a
+    // role card, because the role cards live on that tab and the Dashboard
+    // filters out panes belonging to one — the same reason the restored
+    // overview here reads `0/3 session(s)`, which the predicate below also
+    // requires so the count proves all three roles came back.
+    deck.wait_for_string("tdd-cycle");
+
+    assert!(
+        common::wait_until(Duration::from_secs(15), || {
+            let grid = deck.snapshot_grid();
+            grid.contains("3 session(s)")
+                && dashboard_tab_is_active(&deck)
+                // No role pane is expanded: the Dashboard is what is drawn.
+                && common::role_pane_left_edge(&grid, "orchestrator").is_none()
+                && common::role_pane_left_edge(&grid, "coder").is_none()
+                // And the deck is in command mode, not the PaneInput the
+                // snapshot-restore block leaves behind.
+                && grid.contains("[New Pane Ctrl+N]")
+                && !grid.contains("[Command Mode Ctrl+D]")
+        }),
+        "a cold start must honour the remembered Dashboard, ignore the rebuilt pane id, and \
+         come up in command mode.\nGrid:\n{}",
+        deck.snapshot_grid()
+    );
+}

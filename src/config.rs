@@ -296,22 +296,36 @@ pub struct OrchestrationSnapshot {
 }
 
 /// Issue #949 — where the user was looking when the snapshot was taken, so a
-/// detach/reattach (or a full restart) puts them back there instead of on the
-/// deck's landing default with every tab reset to its fallback role.
+/// detach/reattach puts them back there instead of on the deck's landing
+/// default with every tab reset to its fallback role. A cold start against an
+/// EMPTY daemon deliberately restores less — see [`Self::without_pane_ids`].
 ///
-/// **Everything here is a PANE ID, never a tab index or a tab name.** Tab
+/// **Every locator here is a PANE ID, never a tab index or a tab name.** Tab
 /// indices are not stable across a reattach — warm-daemon hydration rebuilds
 /// tabs in whatever order the daemon's agent list partitions into buckets —
-/// whereas a pane id is: the daemon captures each agent's
+/// whereas a DAEMON-OWNED pane's id is: the daemon captures each agent's
 /// `DOT_AGENT_DECK_PANE_ID` and echoes it back through `list_agents`, and
 /// `EmbeddedPaneController::hydrate_from_daemon` reuses that value verbatim.
 /// A pane also belongs to exactly one tab, so one id locates the tab *and* the
 /// pane inside it, and no tab identity has to be invented or persisted.
+/// Locally-spawned panes get counter ids that are NOT an identity across
+/// processes, which is what [`Self::retain_pane_ids`] filters out on restore.
 ///
 /// Focus is CLIENT-owned state, which is why it lives here rather than on the
 /// wire: two clients attached to one daemon legitimately look at different
-/// things, and a snapshot also survives a daemon restart, which a daemon-held
-/// cursor cannot. See [`SavedSession::focus`].
+/// things, so no client's focus move may relocate another LIVE client's view,
+/// and a snapshot also survives a daemon restart, which a daemon-held cursor
+/// cannot. See [`SavedSession::focus`].
+///
+/// That is a statement about live clients and not about the FILE, which is
+/// single-writer per `$HOME` (or `DOT_AGENT_DECK_SESSION`): two decks running
+/// under one of those overwrite each other's snapshot wholesale, so the last
+/// one to write decides where the NEXT attach lands. Position inherits that
+/// from [`SavedSession::panes`] and [`SavedSession::last_command`] rather than
+/// introducing it, and a daemon-held cursor would not fix it — it would replace
+/// last-writer-wins with a deliberately shared cursor, which is the outcome the
+/// client-owned choice is avoiding. Keying the file per client is the real fix
+/// and belongs to the whole snapshot, not to this field.
 ///
 /// Every field carries `#[serde(default)]` for the same reason
 /// [`OrchestrationSnapshot`]'s do: a malformed or partial `[focus]` table
@@ -345,31 +359,51 @@ pub struct SavedFocus {
 }
 
 impl SavedFocus {
-    /// Issue #949 — drop everything in this position that is a PANE ID, keeping
-    /// only the id-free part: which tab KIND was active.
+    /// Issue #949 — keep only the locators the DAEMON supplied on this startup,
+    /// dropping every other pane id. The id-free part (which tab KIND was
+    /// active) always survives, because it needs no ids at all.
     ///
-    /// **Pane ids are a valid locator only when the DAEMON supplied them.** On a
-    /// reattach they are a real identity: the daemon captured each agent's
+    /// **A pane id is a real identity only for a pane the daemon owns.** For
+    /// those it is genuinely stable: the daemon captured the agent's
     /// `DOT_AGENT_DECK_PANE_ID` at spawn and echoes it back on `list_agents`, so
     /// `EmbeddedPaneController::hydrate_from_daemon` reuses the very same value
-    /// the previous TUI had. On the daemon-EMPTY rebuild path there is no daemon
-    /// to ask: every restored pane's id comes from `allocate_id`, a bare counter
-    /// starting at 1. A rebuild that recreates the same panes in the same order
-    /// happens to reproduce the same numbers, which is worse than useless —
-    /// because a rebuild that does NOT (a pane closed and another created before
-    /// the snapshot was written, so the surviving ids are 2, 3, 4 and the rebuild
-    /// mints 1, 2, 3) reassigns a remembered number to a DIFFERENT role, and
-    /// restores focus to the wrong agent instead of failing to restore it. A
-    /// silent wrong answer is the one outcome worth engineering against here, so
-    /// the rebuild path applies this and keeps only what cannot be wrong.
+    /// the previous TUI had. Every OTHER pane's id comes from `allocate_id`, a
+    /// bare counter, and is reused across processes by coincidence rather than
+    /// by identity. Two such panes exist, and both were reported as one class:
+    ///
+    /// - on the daemon-EMPTY rebuild path, EVERY restored pane (pass an empty
+    ///   set there, and nothing id-shaped is honoured);
+    /// - on the warm-reattach path, a `Tab::Mode`'s SIDE panes, which are not
+    ///   daemon-tracked — `open_mode_tab_with_existing_agent_pane` adopts the
+    ///   hydrated agent pane and spawns the side panes fresh from the project
+    ///   config. The agent pane is daemon-supplied and survives this filter; its
+    ///   side panes do not.
+    ///
+    /// Reusing a counter is worse than useless rather than merely unhelpful: a
+    /// startup that recreates the same panes in the same order happens to
+    /// reproduce the same numbers, but one that does not — a pane closed and
+    /// another created before the snapshot was written, or a mode's side-pane
+    /// list edited between runs — reassigns a remembered number to a DIFFERENT
+    /// pane, and restores focus, and every keystroke after it, to the wrong
+    /// terminal instead of failing to restore. A silent wrong answer is the one
+    /// outcome worth engineering against here.
     ///
     /// [`crate::tab::TabManager::apply_focus_snapshot`] then still honours a
-    /// remembered Dashboard — that answer needs no ids at all — and falls back to
-    /// the rebuild's own landing choice for everything else.
-    pub fn without_pane_ids(&self) -> Self {
+    /// remembered Dashboard and falls back to the startup's own landing choice
+    /// for everything the filter removed.
+    pub fn retain_pane_ids(&self, daemon_pane_ids: &HashSet<String>) -> Self {
         Self {
-            active_pane: None,
-            tab_panes: Vec::new(),
+            active_pane: self
+                .active_pane
+                .as_ref()
+                .filter(|id| daemon_pane_ids.contains(*id))
+                .cloned(),
+            tab_panes: self
+                .tab_panes
+                .iter()
+                .filter(|id| daemon_pane_ids.contains(*id))
+                .cloned()
+                .collect(),
             ..self.clone()
         }
     }

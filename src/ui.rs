@@ -11999,6 +11999,15 @@ pub fn run_tui(
     // landing on every startup.
     let mut preferred_start_tab: usize = 0;
 
+    // Issue #949 — the pane ids the DAEMON supplied on this startup, which is
+    // exactly the set whose ids are a stable identity across processes (the
+    // daemon captured each into its agent's `DOT_AGENT_DECK_PANE_ID` and echoed
+    // it back on `list_agents`). Empty on the daemon-empty path, and it
+    // deliberately excludes a Mode tab's SIDE panes, which the hydration block
+    // below spawns fresh from the project config rather than adopting. Consumed
+    // by `SavedFocus::retain_pane_ids` at the restore seam after both blocks.
+    let mut daemon_pane_ids: HashSet<String> = HashSet::new();
+
     // PRD #76 M2.x / M2.11: in external-daemon mode the daemon may already
     // own live agents from a previous TUI session (the user ssh-disconnected
     // and reconnected via `dot-agent-deck connect`). Ask the daemon for its
@@ -12015,6 +12024,7 @@ pub fn run_tui(
     // metadata intact — no separate persistence file is required.
     if let Some(embedded) = pane.as_any().downcast_ref::<EmbeddedPaneController>() {
         let hydrated = embedded.hydrate_from_daemon();
+        daemon_pane_ids.extend(hydrated.iter().map(|h| h.pane_id.clone()));
         for h in &hydrated {
             let mut st = state.blocking_write();
             st.register_pane(h.pane_id.clone());
@@ -13020,19 +13030,15 @@ pub fn run_tui(
     // tab, because writing each tab's remembered pane is the half that stops a
     // later Tab-away-and-back from dumping the user on that tab's start role.
     //
-    // On the daemon-empty rebuild path the pane ids are dropped first: those
-    // panes were freshly allocated rather than supplied by the daemon, so a
-    // remembered id can silently name a DIFFERENT role there. See
-    // `SavedFocus::without_pane_ids`, which explains why a wrong restore is the
-    // outcome worth engineering against; the id-free half (a remembered
-    // Dashboard) still applies.
-    let saved_focus = saved_focus.map(|focus| {
-        if apply_snapshot {
-            focus.without_pane_ids()
-        } else {
-            focus
-        }
-    });
+    // Only the ids the DAEMON supplied survive into the restore. Every other
+    // pane on screen — all of them on the daemon-empty rebuild path, and a Mode
+    // tab's locally-spawned side panes on the warm one — carries a fresh
+    // `allocate_id` counter that matches a remembered number by coincidence
+    // rather than by identity, so honouring one can focus the WRONG terminal
+    // instead of merely failing to restore. `SavedFocus::retain_pane_ids` has
+    // the full reasoning; the id-free half (a remembered Dashboard) is
+    // unaffected either way.
+    let saved_focus = saved_focus.map(|focus| focus.retain_pane_ids(&daemon_pane_ids));
     if let Some(focus) = saved_focus.as_ref()
         && let Some(index) = tab_manager.apply_focus_snapshot(focus)
     {
@@ -13040,7 +13046,17 @@ pub fn run_tui(
         // The remembered pane is only half-restored until the controller is
         // told: the tab's field drives the rendered highlight, `focus_pane`
         // drives which PTY the keyboard reaches.
-        tab_manager.restore_focus_on_switch_in();
+        let restored = tab_manager.restore_focus_on_switch_in();
+        // The snapshot-restore block above ends by focusing the first pane it
+        // rebuilt and entering PaneInput. If the landing tab focuses no pane of
+        // its own — the Dashboard, whose selection is keyed by session id rather
+        // than a pane id — that mode would keep sending keystrokes to a pane on a
+        // tab that is no longer drawn. Step back to command mode so the deck's
+        // mode matches what is on screen. Reachable only on the daemon-empty
+        // path, since warm hydration never enters PaneInput at startup.
+        if restored.is_none() && ui.mode == UiMode::PaneInput {
+            ui.mode = UiMode::Normal;
+        }
     }
     // Seed the movement baseline from what is actually on screen now, so the
     // first frame does not read the restore itself as a move and immediately

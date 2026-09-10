@@ -3489,10 +3489,12 @@ mod tests {
             "a fully defaulted position must leave the deck's landing choice alone"
         );
 
-        // (d) The daemon-empty rebuild path strips the pane ids before applying,
-        // because there they name freshly allocated counters rather than the
-        // daemon's stable ids — so a remembered number can land on a DIFFERENT
-        // role. What survives is the id-free half.
+        // (d) Only ids the DAEMON supplied are honoured. Everything else on
+        // screen — every pane on the daemon-empty rebuild path, and a Mode
+        // tab's locally-spawned side panes on the warm one — carries a fresh
+        // `allocate_id` counter that matches a remembered number by
+        // coincidence, so honouring one can focus the WRONG pane. `live-coder`
+        // below WOULD resolve, which is what makes dropping it observable.
         if let Tab::Orchestration {
             role_pane_ids,
             focused_role_pane_id,
@@ -3502,11 +3504,12 @@ mod tests {
             role_pane_ids[1] = "live-coder".to_string();
             *focused_role_pane_id = None;
         }
-        let stripped = saved_focus(true, Some("live-coder"), &["live-coder"]).without_pane_ids();
+        let remembered = saved_focus(true, Some("live-coder"), &["live-coder"]);
+        let no_daemon_ids: HashSet<String> = HashSet::new();
         assert_eq!(
-            tm.apply_focus_snapshot(&stripped),
+            tm.apply_focus_snapshot(&remembered.retain_pane_ids(&no_daemon_ids)),
             Some(dashboard_index),
-            "the id-free half of a position must still apply on the rebuild path"
+            "the id-free half of a position must still apply when every id is filtered out"
         );
         assert!(
             matches!(
@@ -3516,8 +3519,25 @@ mod tests {
                     ..
                 }
             ),
-            "no pane id may be written from a stripped position, even one that would \
-             resolve — a rebuild's ids are not the ids that were remembered"
+            "no pane id may be written from a filtered position, even one that would \
+             resolve — a locally allocated counter is not the id that was remembered"
+        );
+
+        // (e) …and the same position with that id in the daemon-supplied set
+        // restores normally, so (d) proves the FILTER rather than something
+        // about the id itself.
+        let daemon_ids: HashSet<String> = ["live-coder".to_string()].into_iter().collect();
+        assert_eq!(
+            tm.apply_focus_snapshot(&remembered.retain_pane_ids(&daemon_ids)),
+            Some(orch_idx),
+            "a daemon-supplied id must still locate its tab"
+        );
+        assert!(
+            matches!(
+                &tm.tabs[orch_idx],
+                Tab::Orchestration { focused_role_pane_id: Some(p), .. } if p == "live-coder"
+            ),
+            "and must still be written as that tab's remembered focus"
         );
     }
 }
