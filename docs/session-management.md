@@ -49,7 +49,17 @@ What you get back depends on whether your agents are still running:
 - **They're still running.** When you close the TUI or disconnect, your agents keep running in the background (see [How it runs](getting-started.md#how-it-runs)), so coming back brings them up exactly as they were, with their live output. Each card is restored with the agent's *real, current* state as well — its status (Working, Thinking, WaitingForInput, Idle, and so on), its agent label, the tool it is mid-run on, its tool count, and its recent prompts — so the reconnected dashboard matches what you saw before you disconnected. It does **not** reset every card to Idle (or show "No agent") and then wait for each agent to emit its next event to become correct. If you reopen your laptop to an agent that has been quietly waiting for input, its card reads **WaitingForInput** straight away. This is the everyday case.
 - **They're gone.** On a fresh machine, the first launch after a reboot, or after an unexpected shutdown, Agent Deck rebuilds your workspace — panes, names, directories, commands, and tabs — and starts the agents fresh. It restores the *shape* of your workspace, not an agent's in-progress work; each agent picks its own conversation back up through its own command (for example, `claude --continue`).
 
-If there's nothing to bring back, you start on a clean, empty dashboard. If your workspace includes orchestration tabs, you land on the first one so you resume where you left off; otherwise you start on the dashboard for an overview. If a saved directory no longer exists, that pane is skipped with a warning.
+If there's nothing to bring back, you start on a clean, empty dashboard. If a saved directory no longer exists, that pane is skipped with a warning.
+
+### You come back where you were
+
+Agent Deck remembers the tab you were on and the pane you had focused in each tab, so reconnecting to agents that are still running puts you back in front of the same agent rather than at the start of the orchestration. Switching to another tab afterwards also lands on the role you left it on, not on that tab's first role. If you were on the dashboard when you disconnected, you come back to the dashboard — that counts as a choice, and it is restored like any other.
+
+Your position is checked against what is actually running when you return. A pane you closed in the meantime, or a role whose agent finished while you were away, is simply not restored; that tab falls back to its start role, so you are never dropped into a pane that is no longer there. When Agent Deck has nothing remembered — a first run, or a workspace you have not left a position in — it falls back to the older behaviour: land on the first orchestration tab if you have one, otherwise the dashboard.
+
+There is one case that restores less on purpose. When your agents are gone and Agent Deck is rebuilding your panes from scratch (a fresh machine, or the first launch after a reboot), those panes are new ones, and matching them against a remembered position could put you in front of a *different* agent rather than merely the wrong one. In that case Agent Deck restores which tab you were on and leaves the rest alone.
+
+The position is stored with the rest of your saved workspace, so it is per-machine and shared by every deck you run under the same account: if you run two at once, the last one you close decides where the next one lands — the same way it already decides which panes come back.
 
 ### Your setup stays up to date
 
