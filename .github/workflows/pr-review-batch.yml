@@ -200,4 +200,7 @@ jobs:
           PR_NUMBER: ${{ matrix.item.number }}
           EXPECTED_SHA: ${{ matrix.item.sha }}
           VOTE_ALLOWED: ${{ matrix.item.vote_allowed }}
+          # Issue #998: the vote job states WHY a sensitive pull request needs a
+          # human, so it needs to know which protected paths were touched.
+          DENIED_PATHS: ${{ toJSON(matrix.item.denied_paths) }}
         run: python3 .github/scripts/pr_review_vote.py

@@ -147,9 +147,13 @@ def main():
 
         denied = touches_denied(repo, number)
         vote_allowed = author in vote_authors and not denied
-        if mode == "vote" and not vote_allowed:
-            reason = denied[:3] if denied else f"author {author} not in VOTE_AUTHORS"
-            skipped.append((number, f"verdict stands but no vote: {reason}"))
+        # A deny-listed pull request is still SELECTED in vote mode (issue #998):
+        # the vote job decides between approving it with a visible attention
+        # marker and declining, based on whether auto-merge is armed. Only an
+        # author outside VOTE_AUTHORS is dropped here, since nothing downstream
+        # would act on it.
+        if mode == "vote" and author not in vote_authors:
+            skipped.append((number, f"author {author} not in VOTE_AUTHORS"))
             continue
 
         items.append({

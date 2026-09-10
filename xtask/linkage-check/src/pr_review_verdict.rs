@@ -184,6 +184,30 @@ fn prose_around_the_block_does_not_hide_it() {
     );
 }
 
+/// Issue #998: the explanation the merger reads must be the SPECIFIC one, not a
+/// generic "protected path". A pull request touching both `src/daemon_protocol.rs`
+/// and `.github/` must be explained by rule 12's unverifiable cross-version test,
+/// which is the harder obligation — not by the CI catch-all that happens to match
+/// too. Ordering in DENY_REASONS is the whole mechanism, so it is worth a test.
+#[test]
+fn the_deny_reason_is_the_most_specific_one() {
+    assert_py_ok(
+        "from pr_review_vote import deny_reason\n\
+         both = deny_reason(['.github/workflows/ci.yml', 'src/daemon_protocol.rs'])\n\
+         assert 'rule 12' in both, both\n\
+         own = deny_reason(['.github/workflows/pr-review-batch.yml'])\n\
+         assert 'my own workflow' in own, own\n\
+         logic = deny_reason(['.github/scripts/pr_review_vote.py'])\n\
+         assert 'my own selection and voting logic' in logic, logic\n\
+         rules = deny_reason(['CLAUDE.md'])\n\
+         assert 'rules I review against' in rules, rules\n\
+         ci = deny_reason(['.github/workflows/ci.yml'])\n\
+         assert 'CI or repository automation' in ci, ci\n\
+         fallback = deny_reason(['some/other/path.rs'])\n\
+         assert 'requires a human approval' in fallback, fallback",
+    );
+}
+
 /// The paths on which a verdict may stand but a vote must not be cast. The
 /// reviewer must not be able to widen its own powers, so its own workflow and
 /// the governance files are excluded.

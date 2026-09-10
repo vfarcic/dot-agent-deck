@@ -82,6 +82,18 @@ def gh(*args, check=True):
     return result.stdout
 
 
+def gh_ok(*args):
+    """Run gh, return True on success. For best-effort calls where a failure
+    must be visible but must not abort the caller — `gh(..., check=False)`
+    returns stdout, and a failed command's stdout is empty, not distinguishable
+    from a successful one that printed nothing."""
+    result = subprocess.run(("gh",) + args, capture_output=True, text=True, check=False)
+    if result.returncode != 0:
+        print(f"gh {' '.join(args)} failed ({result.returncode}): {result.stderr.strip()}")
+        return False
+    return True
+
+
 def gh_json(*args):
     out = gh(*args).strip()
     return json.loads(out) if out else None
