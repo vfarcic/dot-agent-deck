@@ -3036,6 +3036,59 @@ pub fn compose_worker_task_file(prompt_template: Option<&str>, task: &str, role:
     format!("{}\n\n{}", body.trim_end(), work_done_footer(role))
 }
 
+/// Issue #960: the display title the orchestration `identity` is flying under,
+/// read off whichever of its role panes still carries one.
+///
+/// `records` is a live-agent snapshot ([`crate::agent_pty::AgentPtyRegistry::agent_records`],
+/// which filters exited agents out). The title is a per-TAB value stamped
+/// identically on every role pane by both producers (`tab.rs` for `Ctrl+n`,
+/// `spawn.rs` for a dispatch), so the first non-empty one found is the tab's —
+/// order does not matter. `None` means either that this orchestration genuinely
+/// has no title (the canonical name is then correct) or that no title-carrying
+/// pane of it is still alive.
+///
+/// Identity matching mirrors the routing rule rather than inventing a second
+/// one: an `Instance` matches on the per-tab token alone (two tabs of the same
+/// orchestration in the same directory are distinct tabs and must not borrow
+/// each other's titles), and the legacy `NameCwd` variant matches on exactly the
+/// `(name, orchestration_cwd)` pair the daemon already routes that client's
+/// delegates on — so where this could confuse two tabs, `handle_delegate` was
+/// already confusing them (issue #140).
+fn orchestration_display_title_from_live_siblings(
+    records: &[crate::agent_pty::AgentRecord],
+    identity: &OrchestrationIdentity,
+) -> Option<String> {
+    records.iter().find_map(|record| {
+        let crate::agent_pty::TabMembership::Orchestration {
+            name,
+            orchestration_cwd,
+            display_title,
+            orchestration_id,
+            ..
+        } = record.tab_membership.as_ref()?
+        else {
+            return None;
+        };
+        let same_orchestration = match identity {
+            OrchestrationIdentity::Instance { id, .. } => {
+                orchestration_id.as_deref() == Some(id.as_str())
+            }
+            OrchestrationIdentity::NameCwd {
+                name: identity_name,
+                cwd,
+            } => name == identity_name && orchestration_cwd.as_deref() == Some(cwd.as_str()),
+        };
+        if !same_orchestration {
+            return None;
+        }
+        // The same non-empty rule the hydration fallback and
+        // `validate_tab_membership` apply: an empty title is absent, and
+        // propagating `Some("")` would defeat the fallback to the canonical name
+        // rather than carry a title.
+        display_title.clone().filter(|t| !t.is_empty())
+    })
+}
+
 /// Look up the role config for `role_name` inside the orchestration
 /// named `orchestration_name`, by parsing the project config file at
 /// `cwd`, together with the role's INDEX within that orchestration.
@@ -4444,6 +4497,24 @@ async fn dispatch_one_owned(
         // spending its termination grace, or a worker that simply died and was
         // reaped. `clear = true` means "a fresh worker for the next task", so a
         // missing predecessor is a reason to make one, not to fail.
+        // Issue #960 (the secondary path): the tab title this orchestration is
+        // actually flying under, read off a LIVE sibling role pane. A re-created
+        // worker used to be stamped `display_title: None` unconditionally, and
+        // because `partition_hydrated_panes` keeps the first non-`None` title it
+        // sees, the tab kept its label only while some OTHER title-carrying pane
+        // was still live — so the title was lost silently, once every pane had
+        // either exited (`agent_records` filters exited agents out) or been
+        // re-created this way. The recreating code has the orchestration identity
+        // in hand, so the siblings' title is available; carrying it forward keeps
+        // the round trip closed for the interactive `Ctrl+n` path too.
+        let recreated_display_title = match (role_index, orchestration.as_ref()) {
+            (Some(_), Some(identity)) => {
+                orchestration_display_title_from_live_siblings(&registry.agent_records(), identity)
+            }
+            // No role index means no orchestration membership is built at all
+            // below, so there is nothing to carry a title on.
+            _ => None,
+        };
         let recreate_identity = crate::agent_pty::PaneRecreateIdentity {
             cwd: cwd.clone(),
             display_name: Some(target_role.clone()),
@@ -4459,7 +4530,7 @@ async fn dispatch_one_owned(
                     // delegate whose target pane is the orchestrator's own.
                     is_start_role: false,
                     orchestration_cwd: cwd.clone(),
-                    display_title: None,
+                    display_title: recreated_display_title.clone(),
                     orchestration_id: match orchestration.as_ref() {
                         Some(OrchestrationIdentity::Instance { id, .. }) => Some(id.clone()),
                         _ => None,
@@ -7890,6 +7961,125 @@ impl AppState {
 mod tests {
     use super::*;
     use spec::spec;
+
+    /// Issue #960: the sibling-title lookup a `clear = true` respawn uses when
+    /// it has to re-create a worker pane from nothing. Covers both identity
+    /// rules and the four ways there is nothing to carry — an unknown instance
+    /// token, a `NameCwd` half-match, an empty title, and a pane with no
+    /// membership at all — none of which the behavioural test
+    /// (`orchestration/delegate/022`) can reach, since it drives one
+    /// orchestration with one title.
+    #[test]
+    fn a_recreated_pane_borrows_its_title_only_from_its_own_orchestration() {
+        fn role(
+            orchestration_id: Option<&str>,
+            name: &str,
+            cwd: &str,
+            display_title: Option<&str>,
+        ) -> crate::agent_pty::AgentRecord {
+            crate::agent_pty::AgentRecord {
+                id: "1".into(),
+                pane_id_env: None,
+                display_name: None,
+                cwd: Some(cwd.to_string()),
+                tab_membership: Some(crate::agent_pty::TabMembership::Orchestration {
+                    name: name.to_string(),
+                    role_index: 0,
+                    role_name: "orchestrator".into(),
+                    is_start_role: true,
+                    orchestration_cwd: Some(cwd.to_string()),
+                    display_title: display_title.map(str::to_string),
+                    orchestration_id: orchestration_id.map(str::to_string),
+                }),
+                agent_type: None,
+                rows: 24,
+                cols: 80,
+                live: None,
+                spawned_at_ms: None,
+            }
+        }
+        let instance = |id: &str| OrchestrationIdentity::Instance {
+            id: id.to_string(),
+            name: "team".into(),
+        };
+
+        // The per-tab token decides, not `(name, cwd)`: two tabs of the SAME
+        // orchestration in the SAME directory must not borrow each other's
+        // titles, or a re-created worker rejoins its tab under the neighbour's
+        // label (the cross-delivery class PRD #140 closed, in the title layer).
+        let two_tabs = vec![
+            role(Some("tab-a"), "team", "/w", Some("team · run-a")),
+            role(Some("tab-b"), "team", "/w", Some("team · run-b")),
+        ];
+        assert_eq!(
+            orchestration_display_title_from_live_siblings(&two_tabs, &instance("tab-b")),
+            Some("team · run-b".to_string())
+        );
+        assert_eq!(
+            orchestration_display_title_from_live_siblings(&two_tabs, &instance("tab-c")),
+            None,
+            "an unknown token borrows from nobody"
+        );
+
+        // A leading sibling with no title is skipped rather than answering the
+        // question — the same first-non-`None` rule `partition_hydrated_panes`
+        // applies, so the two cannot disagree about which value is the tab's.
+        let partially_titled = vec![
+            role(Some("tab-a"), "team", "/w", None),
+            role(Some("tab-a"), "team", "/w", Some("team · run-a")),
+        ];
+        assert_eq!(
+            orchestration_display_title_from_live_siblings(&partially_titled, &instance("tab-a")),
+            Some("team · run-a".to_string())
+        );
+
+        // An EMPTY title is absent, exactly as the hydration fallback and
+        // `validate_tab_membership` read it. Propagating `Some("")` would stamp
+        // a title that defeats the fallback to the canonical name instead of
+        // replacing it.
+        let empty = vec![role(Some("tab-a"), "team", "/w", Some(""))];
+        assert_eq!(
+            orchestration_display_title_from_live_siblings(&empty, &instance("tab-a")),
+            None
+        );
+
+        // The legacy token-less identity matches on exactly the `(name, cwd)`
+        // pair the daemon already routes that client's delegates on — and on
+        // both halves of it, so a same-named orchestration in another directory
+        // is not a sibling.
+        let legacy = vec![
+            role(None, "team", "/w", Some("team · legacy")),
+            role(None, "team", "/elsewhere", Some("team · elsewhere")),
+        ];
+        assert_eq!(
+            orchestration_display_title_from_live_siblings(
+                &legacy,
+                &OrchestrationIdentity::NameCwd {
+                    name: "team".into(),
+                    cwd: "/elsewhere".into(),
+                }
+            ),
+            Some("team · elsewhere".to_string())
+        );
+        assert_eq!(
+            orchestration_display_title_from_live_siblings(
+                &legacy,
+                &OrchestrationIdentity::NameCwd {
+                    name: "other".into(),
+                    cwd: "/w".into(),
+                }
+            ),
+            None
+        );
+
+        // A dashboard pane (no membership at all) is never a sibling.
+        let mut dashboard = role(Some("tab-a"), "team", "/w", Some("team · run-a"));
+        dashboard.tab_membership = None;
+        assert_eq!(
+            orchestration_display_title_from_live_siblings(&[dashboard], &instance("tab-a")),
+            None
+        );
+    }
 
     /// Issue #424 D2: `AppState`'s pane generation must not be pinnable by a
     /// producer-chosen timestamp either.

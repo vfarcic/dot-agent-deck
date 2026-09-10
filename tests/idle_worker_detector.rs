@@ -1275,8 +1275,32 @@ fn idle_worker_010_delegate_during_close_refuses_to_arm() {
         // Barrier: the delegate below must land strictly INSIDE the close
         // transition, which the SIGTERM-ignoring child holds open for the full
         // three-second grace.
+        //
+        // The ceiling is issue #709's load-scaled [`common::child_boot_budget`]
+        // rather than the flat 5 s it used to be, and this is the same defect
+        // #709 converted the other flat `from_secs(2)`/`from_secs(5)` waits for:
+        // the wait itself was already condition-driven — it returns the instant
+        // the pane is closing — but its CEILING was sized for an idle machine,
+        // and what it is waiting on is a `StopAgent` socket round trip plus a
+        // fork. Starved of either, the barrier expired and reported "the pane
+        // never entered the closing state", which is true and useless: not "the
+        // close finished early" but "the close had not started". Measured on
+        // `build-macos` (2468 fast-tier tests in 152 s on a 3-core runner) at
+        // 5.252 s against the 5 s ceiling, while the whole test is 3.04-3.12 s
+        // here — stable under 16 spinners on 16 cores, because its duration is
+        // dominated by the 3 s SIGTERM grace and not by CPU. `CHILD_BOOT_BASE`
+        // is 8 s, and `machine_load_per_cpu` is `None` on macOS so no
+        // multiplier applies there: the platform that failed gets a flat 8 s.
+        //
+        // Widening a PRECONDITION cannot weaken what this test asserts. The
+        // guard that makes the race real is the assertion AFTER the delegate —
+        // `is_pane_closing` still true when it landed — and that is untouched.
+        // The one cost is that a genuinely-missed window now takes ~8 s to
+        // report instead of 5 s, and that case is unreachable while the
+        // stand-in ignores SIGTERM: the close is held open for the full grace by
+        // construction, so an unobserved window means starvation, not speed.
         let closing_pane = worker_pane("closing-worker");
-        let entered = tokio::time::timeout(Duration::from_secs(5), async {
+        let entered = tokio::time::timeout(common::child_boot_budget(), async {
             while !harness.registry.is_pane_closing(&closing_pane) {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
