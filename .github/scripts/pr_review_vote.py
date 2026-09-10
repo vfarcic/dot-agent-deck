@@ -33,6 +33,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from pr_review_common import (  # noqa: E402
+    DENY_PRECEDENCE,
     checks_green,
     fail,
     gh,
@@ -44,53 +45,57 @@ from pr_review_common import (  # noqa: E402
 ATTENTION_LABEL = "needs-human-eye"
 
 # Why each deny-listed path needs a human, in the words the merger needs to read.
-# Keyed by the prefixes DENY_PATHS uses; first match wins, most specific first.
-DENY_REASONS = (
-    (
-        "src/daemon_protocol.rs",
+#
+# Keyed by prefix, and the PRECEDENCE is DENY_PRECEDENCE in pr_review_common —
+# not this dict's insertion order. Ordering lived here until #1000 review, which
+# is what let it disagree with the selector's truncation of `denied_paths`; the
+# selector now sorts by the same tuple, so one edit moves both. Adding a prefix
+# here without adding it there leaves it unreachable, which
+# `the_deny_reasons_and_the_precedence_cover_each_other` fails on.
+DENY_REASONS = {
+    "src/daemon_protocol.rs": (
         "This changes the TUI↔daemon protocol. **CLAUDE.md rule 12 requires a manual "
         "cross-version test** — a previous-release daemon started *with agents under it*, "
         "then this branch's TUI against it, confirming a delegate still routes and hooks "
         "still arrive. `tests/daemon_protocol.rs` cannot cover that: its 28 tests all "
         "compile from one source tree, so they prove the wire shape is self-consistent, "
         "not that an old and a new build interoperate. Nothing I can read tells me whether "
-        "that test was run.",
+        "that test was run."
     ),
-    (
-        ".github/workflows/pr-review",
+    ".github/workflows/pr-review": (
         "This edits **my own workflow**. I am not a trustworthy reviewer of changes to the "
-        "thing that decides what I may approve.",
+        "thing that decides what I may approve."
     ),
-    (
-        ".github/scripts/pr_review_",
+    ".github/scripts/pr_review_": (
         "This edits **my own selection and voting logic**, including the rules that decide "
-        "which pull requests I may approve.",
+        "which pull requests I may approve."
     ),
-    (
-        "CLAUDE.md",
+    "CLAUDE.md": (
         "This edits the **rules I review against**. Approving it would let a pull request "
-        "change its own criteria.",
+        "change its own criteria."
     ),
-    (
-        "scripts/apply-branch-protection.sh",
+    "scripts/apply-branch-protection.sh": (
         "This edits the script that **reconstructs the branch-protection ruleset**, and "
-        "`apply` is a full PUT that deletes every rule it does not emit.",
+        "`apply` is a full PUT that deletes every rule it does not emit."
     ),
-    ("MAINTAINERS.md", "This edits the **record of who the maintainers are**."),
-    ("greptile.json", "This edits the **other reviewer's configuration**."),
-    (
-        ".github/",
+    "MAINTAINERS.md": "This edits the **record of who the maintainers are**.",
+    "greptile.json": "This edits the **other reviewer's configuration**.",
+    ".github/": (
         "This edits **CI or repository automation**, which is how permissions and gates get "
-        "widened.",
+        "widened."
     ),
-)
+}
 
 
 def deny_reason(paths):
-    """The most specific explanation for why these paths need a human."""
-    for prefix, reason in DENY_REASONS:
+    """The most specific explanation for why these paths need a human.
+
+    Precedence comes from DENY_PRECEDENCE, which the selector also sorts by — so
+    the reason cannot depend on which paths survived its `denied_paths` truncation.
+    """
+    for prefix in DENY_PRECEDENCE:
         if any(p.startswith(prefix) for p in paths):
-            return reason
+            return DENY_REASONS[prefix]
     return "This touches a path that requires a human approval."
 
 

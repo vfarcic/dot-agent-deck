@@ -188,7 +188,13 @@ fn prose_around_the_block_does_not_hide_it() {
 /// generic "protected path". A pull request touching both `src/daemon_protocol.rs`
 /// and `.github/` must be explained by rule 12's unverifiable cross-version test,
 /// which is the harder obligation — not by the CI catch-all that happens to match
-/// too. Ordering in DENY_REASONS is the whole mechanism, so it is worth a test.
+/// too. Ordering — DENY_PRECEDENCE in `pr_review_common` — is the whole mechanism,
+/// so it is worth a test.
+///
+/// This one exercises the ordering in isolation, on hand-picked pairs. That is not
+/// sufficient on its own: it stayed green through the truncation bug below, since
+/// a two-element list never reaches the selector's cap. Read it together with
+/// `the_deny_reason_survives_the_selector_truncation`.
 #[test]
 fn the_deny_reason_is_the_most_specific_one() {
     assert_py_ok(
@@ -205,6 +211,54 @@ fn the_deny_reason_is_the_most_specific_one() {
          assert 'CI or repository automation' in ci, ci\n\
          fallback = deny_reason(['some/other/path.rs'])\n\
          assert 'requires a human approval' in fallback, fallback",
+    );
+}
+
+/// PR #1000 review: `deny_reason` picked the most specific explanation, but the
+/// selector truncated `denied_paths` to five in the GitHub files API's order —
+/// which is alphabetical, putting `.github/` first and `src/daemon_protocol.rs`
+/// LAST of the deny prefixes. So a protocol change touching five `.github/` files
+/// reached the vote job with the protocol path already dropped: the merger read
+/// the CI catch-all, the "Touches:" line never mentioned the protocol, and rule
+/// 12's unverifiable cross-version obligation went unstated. Measured on the real
+/// functions before the fix.
+///
+/// So this drives the real sort at the real truncation width instead of a
+/// hand-picked pair. The middle assertion pins the fixture to the bug: if it stops
+/// reproducing, this test is no longer covering anything and should be re-derived
+/// rather than deleted.
+#[test]
+fn the_deny_reason_survives_the_selector_truncation() {
+    assert_py_ok(
+        "from pr_review_common import deny_sort_key\n\
+         from pr_review_vote import deny_reason\n\
+         api_order = ['.github/workflows/a.yml', '.github/workflows/b.yml',\n\
+        \x20             '.github/workflows/c.yml', '.github/workflows/d.yml',\n\
+        \x20             '.github/workflows/e.yml', 'src/daemon_protocol.rs']\n\
+         assert 'rule 12' in deny_reason(api_order), 'untruncated list regressed'\n\
+         assert 'rule 12' not in deny_reason(api_order[:5]), 'fixture stopped reproducing'\n\
+         kept = sorted(api_order, key=deny_sort_key)[:5]\n\
+         assert kept[0] == 'src/daemon_protocol.rs', kept\n\
+         assert 'rule 12' in deny_reason(kept), kept",
+    );
+}
+
+/// One edit must move both halves. DENY_REASONS is keyed by prefix and takes its
+/// precedence from DENY_PRECEDENCE in the shared module, so a prefix in one and
+/// not the other is either a reason that can never be selected or a `KeyError` at
+/// vote time — and that one raises AFTER the agent has been paid for and the
+/// review read, losing the vote on a pull request that had already earned one.
+/// Every DENY_PATHS prefix must also be reachable, or a protected path gets the
+/// generic fallback instead of its own explanation.
+#[test]
+fn the_deny_reasons_and_the_precedence_cover_each_other() {
+    assert_py_ok(
+        "from pr_review_common import DENY_PRECEDENCE\n\
+         from pr_review_vote import DENY_REASONS\n\
+         drift = set(DENY_REASONS) ^ set(DENY_PRECEDENCE)\n\
+         assert not drift, drift\n\
+         for d in DENY_PATHS:\n\
+        \x20   assert any(p.startswith(d) or d.startswith(p) for p in DENY_PRECEDENCE), d",
     );
 }
 
@@ -230,9 +284,12 @@ fn the_attention_body_follows_the_verdict_not_the_approval_case() {
     );
 }
 
-/// The paths on which a verdict may stand but a vote must not be cast. The
-/// reviewer must not be able to widen its own powers, so its own workflow and
-/// the governance files are excluded.
+/// The paths that need a human to read the change before it merges. Since issue
+/// #998 a vote MAY be cast on them — approved with the reason and a label when
+/// auto-merge is disarmed, declined when it is armed — so what this pins is the
+/// list itself, not an abstention. Its own workflow and the governance files are
+/// on it because the reviewer should not be the only reader of a change to its
+/// own powers.
 #[test]
 fn the_deny_list_covers_the_reviewer_and_governance_paths() {
     assert_py_ok(

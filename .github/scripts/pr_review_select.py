@@ -15,6 +15,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from pr_review_common import (  # noqa: E402
     DENY_PATHS,
     checks_green,
+    deny_sort_key,
     gh_json,
     latest_verdict,
     unresolved_threads,
@@ -42,11 +43,19 @@ def env(name, default=""):
 
 
 def touches_denied(repo, number):
+    """The protected paths this pull request touches, most-specific-reason first.
+
+    Sorted rather than left in the API's order, because `denied_paths` is truncated
+    before it reaches the vote job and that job explains the pull request by the
+    first match. The API returns paths alphabetically, which put `.github/` first
+    and `src/daemon_protocol.rs` last — the exact inverse of how severe they are.
+    """
     files = gh_json(
         "api", f"repos/{repo}/pulls/{number}/files", "--paginate",
         "--jq", "[.[].filename]",
     ) or []
-    return [f for f in files if any(f.startswith(p) for p in DENY_PATHS)]
+    denied = [f for f in files if any(f.startswith(p) for p in DENY_PATHS)]
+    return sorted(denied, key=deny_sort_key)
 
 
 def main():
@@ -160,6 +169,12 @@ def main():
             "number": number,
             "sha": sha,
             "vote_allowed": vote_allowed,
+            # Truncated to keep the matrix payload small, and safe to truncate
+            # ONLY because touches_denied sorted by deny_sort_key: the governing
+            # path is now at index 0, so the vote job's explanation cannot depend
+            # on what fell off the end. It still shortens the "Touches:" line on a
+            # pull request with more than five protected paths, which is a display
+            # limit rather than a lost reason.
             "denied_paths": denied[:5],
         })
         if len(items) >= max_prs:
