@@ -27,7 +27,20 @@ That same success arm does one other thing, for an unrelated reason: it material
 
 The write is **best-effort and never fatal**: a failure warns and is dropped. The cost of a missing marker is one extra confirmation at reclaim time; the cost of propagating the error would be a failed dispatch. It is also **idempotent** — a single whole-file write, so a re-created or re-attached worktree replaces the document instead of accumulating one per creation.
 
-The marker's content records **who** created the worktree (which creation path, and what for), plus the deck version, a timestamp, the pid and the branch. That content is informational. The gate itself is an **existence check** and never parses it, so a future change to the document's shape cannot silently reclassify every existing deck-created worktree as foreign.
+The marker's content records **who** created the worktree (which creation path, and what for), plus the deck version, a timestamp, the pid and the branch. That content is informational. The gate never parses it, so a future change to the document's shape cannot silently reclassify every existing deck-created worktree as foreign. It asks two things of the file and no more: that it **exists**, and that it is **not empty**.
+
+## The failed write, and why the second half of that gate exists
+
+The warning a failed write emits used to promise something it could not deliver, and the promise was false in exactly the case that most commonly emitted it (issue [#946](https://github.com/vfarcic/dot-agent-deck/issues/946)). `std::fs::write` is `File::create` followed by `write_all`, and `File::create` **truncates before the first byte is written** — so a failure in the write half (a full disk, an I/O error, a killed process) leaves a zero-length or partial file where a moment earlier there may have been nothing at all. A presence-only gate reads that residue as a claim, so the worktree resolved to `Ours`, and a merged, clean worktree with `Ours` reaches `Verdict::Remove` — the one verdict that deletes a directory **without** the confirmation the warning had just promised.
+
+Two changes, and they cover different halves of the problem:
+
+- **`write_marker` clears the path it dirtied.** When the write fails, the file it may have created is removed, best-effort. The marker is then genuinely absent, so the worktree genuinely reads as foreign and the confirmation genuinely happens. Note what this is *not*: it is not a write-to-temp-and-rename, which would put a second deck-owned file into git's administrative directory that a crash could strand there. The gate has never read the content, so it has never needed atomicity to say the true thing.
+- **The gate also requires the file to be non-empty.** The cleanup above cannot run in the case where the *process itself* is killed mid-write, and that case leaves exactly a zero-byte file. A length is not a format, so unlike a parse this cannot go stale when the document's shape changes.
+
+Neither is atomicity, and the page should not be read as claiming it: a torn write that got *some* bytes onto disk still reads as a claim. That residue is much rarer than the zero-byte one — `File::create` truncates unconditionally, while a short write needs the failure to land mid-`write_all` on a body small enough to be a single syscall — and closing it costs the rename dance above.
+
+Because the two outcomes lead an operator to different expectations, the failure itself distinguishes them. `MarkerWriteError::Clear` means nothing the gate reads as a claim is left at the marker path, and its warning promises the confirmation; `MarkerWriteError::ClaimRemains` means a file the gate *does* read as a claim survived (a removal that failed, or an earlier valid marker that a failed re-mark left intact), and its warning says so instead. The arm is chosen by **probing the path**, not by deducing it from which step failed — the two disagree in both directions.
 
 ## What is deliberately *not* marked
 
@@ -48,5 +61,10 @@ An orchestrator that provisions a worktree with a plain `git worktree add` and t
 ## Coverage
 
 - `worktree/reclaim/010` (`tests/worktree_reclaim.rs`) — a worktree created through the production creation path reads `owned: true` / `verdict: remove` from `worktree list --json`, while an otherwise-identical hand-made sibling reads `owned: false` / `verdict: ask`.
+- `worktree/reclaim/011` (`tests/worktree_reclaim.rs`) — the same worktree, measured before and after its marker is truncated to zero bytes, goes from `owned: true` / `remove` to `owned: false` / `ask`, and a bare `worktree reclaim` then leaves it on disk.
+- `a_zero_byte_marker_is_not_an_ownership_claim` (`src/worktree_owner.rs`) — the gate itself, in both directions, on one worktree.
+- `a_failed_marker_write_leaves_nothing_that_reads_as_owned` (`src/worktree_owner.rs`) — the write half is failed deterministically through `/dev/full`, and the residue is gone afterwards.
+- `a_failed_write_that_cannot_clear_the_path_reports_the_surviving_claim` (`src/worktree_owner.rs`) — when a real claim survives the failure, the error carries the arm whose warning does *not* promise a confirmation.
+- `a_failure_is_classified_by_what_the_gate_would_see_not_by_what_failed` (`src/worktree_owner.rs`) — an empty leftover still on disk classifies as cleared; a non-empty one does not.
 - `create_worktree_marks_the_worktree_as_deck_owned_without_dirtying_it` (`src/issue_dispatch_run.rs`) — the marker lands in the metadata dir, not the working tree; `git status --porcelain` stays empty; re-marking replaces rather than appends.
 - `create_worktree_never_marks_a_worktree_it_did_not_create` (`src/issue_dispatch_run.rs`) — the already-claimed arm leaves a foreign worktree unmarked.

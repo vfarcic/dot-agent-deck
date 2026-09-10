@@ -1041,3 +1041,134 @@ fn worktree_reclaim_010_worktree_created_by_the_deck_reads_as_owned() {
         "`worktree list` must not remove anything"
     );
 }
+
+/// Scenario: A worktree the deck genuinely created has its ownership marker
+/// truncated to zero bytes — exactly the residue a failed `std::fs::write`
+/// leaves, since `File::create` truncates before the first byte is written.
+/// The same worktree is checked before and after that truncation: it must go
+/// from `owned: true` / `remove` to `owned: false` / `ask`, and a bare
+/// `worktree reclaim` must then leave the directory on disk.
+#[spec("worktree/reclaim/011")]
+#[test]
+#[cfg(unix)]
+fn worktree_reclaim_011_a_zero_byte_marker_is_not_proof_of_ownership() {
+    let fx = Fixture::new();
+
+    // Created the way production creates one, as in `010` — the marker has to
+    // arrive from the creation path, so that truncating it is the only thing
+    // that differs between the two measurements below.
+    let wt = fx._scratch.path().join("wt-torn-marker");
+    let outcome = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime")
+        .block_on(dot_agent_deck::issue_dispatch_run::create_worktree(
+            &fx.repo,
+            &wt,
+            "feat/torn-marker",
+            false,
+            dot_agent_deck::worktree_owner::Creator::dispatch("torn-marker"),
+        ))
+        .expect("the deck's creation path must create the worktree");
+    assert_eq!(
+        outcome,
+        dot_agent_deck::issue_dispatch_run::WorktreeCreation::Created,
+        "fixture precondition: the worktree must have been genuinely CREATED here — the \
+         already-claimed arm is never marked, so nothing would be left to truncate"
+    );
+    fx.set_pr_state("feat/torn-marker", "MERGED");
+
+    let marker = dot_agent_deck::worktree_owner::marker_path(&wt)
+        .expect("the created worktree must have a resolvable git metadata dir");
+    let intact = std::fs::metadata(&marker).expect("the creation path must write a marker");
+    assert!(
+        intact.is_file() && intact.len() > 0,
+        "fixture precondition: the marker must start out a NON-empty file, or the \
+         before/after comparison below measures nothing; len={}",
+        intact.len()
+    );
+
+    // BEFORE: the control. Without it, "foreign after truncation" could equally
+    // mean the worktree was never owned in the first place.
+    let before = verdict_entry(&fx, "wt-torn-marker");
+    assert_eq!(
+        (
+            before.get("owned").and_then(|o| o.as_bool()),
+            before.get("verdict").and_then(|v| v.as_str()),
+        ),
+        (Some(true), Some("remove")),
+        "control: with an intact marker this worktree is MERGED, clean and deck-owned, so it \
+         reclaims unattended; got entry:\n{before}"
+    );
+
+    // The torn write's residue: `std::fs::write` is `File::create` +
+    // `write_all`, and `File::create` truncates first, so a failure in the
+    // write half (ENOSPC, EIO, a killed process) leaves exactly this.
+    std::fs::write(&marker, b"").expect("truncate the marker to zero bytes");
+    assert_eq!(
+        std::fs::metadata(&marker)
+            .expect("marker still present")
+            .len(),
+        0,
+        "fixture precondition: the marker must now be a zero-byte FILE — a removed marker \
+         would be the already-covered plain foreign case, not this one"
+    );
+
+    // AFTER: a file that proves nothing must not resolve to ownership, because
+    // `Ownership::Ours` on a merged, clean worktree is the one verdict that
+    // deletes a directory with no confirmation.
+    let after = verdict_entry(&fx, "wt-torn-marker");
+    assert_eq!(
+        after.get("owned").and_then(|o| o.as_bool()),
+        Some(false),
+        "a zero-byte marker is not proof the deck created this worktree — the ownership gate \
+         must not read it as a claim; got entry:\n{after}"
+    );
+    assert_eq!(
+        after.get("verdict").and_then(|v| v.as_str()),
+        Some("ask"),
+        "an unprovable claim must fall to the branch that ASKS, never to the branch that \
+         removes; got entry:\n{after}"
+    );
+
+    // And the deletion path itself, not only the report: a bare `reclaim` must
+    // leave the directory alone.
+    let out = fx.run(&["worktree", "reclaim"]);
+    assert!(
+        wt.is_dir(),
+        "a worktree whose ownership cannot be proven must survive a bare `reclaim` — {} is \
+         gone\n{}",
+        wt.display(),
+        combined(&out)
+    );
+}
+
+/// The `worktree list --json` entry whose `path` contains `needle`, panicking
+/// with the whole document when it is absent — used by `011` to take the same
+/// measurement twice, before and after the marker is truncated.
+#[cfg(unix)]
+fn verdict_entry(fx: &Fixture, needle: &str) -> serde_json::Value {
+    let out = fx.run(&["worktree", "list", "--json"]);
+    assert!(
+        out.status.success(),
+        "`worktree list --json` must succeed; got {:?} out={}",
+        out.status,
+        combined(&out)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let doc: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("stdout must parse as JSON ({e}); got:\n{stdout}"));
+    doc.get("worktrees")
+        .and_then(|w| w.as_array())
+        .and_then(|entries| {
+            entries
+                .iter()
+                .find(|e| {
+                    e.get("path")
+                        .and_then(|p| p.as_str())
+                        .is_some_and(|p| p.contains(needle))
+                })
+                .cloned()
+        })
+        .unwrap_or_else(|| panic!("no entry for {needle} in:\n{stdout}"))
+}
