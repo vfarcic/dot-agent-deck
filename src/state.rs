@@ -167,7 +167,8 @@ pub(crate) const DELEGATE_READINESS_BUFFER: std::time::Duration =
 /// [`crate::pane_input::SUBMIT_DELAY`], `\r` — against a real
 /// `opencode --model … --auto` 1.18.23 on a pty and reading the rendered grid
 /// back, across **176 runs**: delivery tracks ONE boundary, the instant OpenCode
-/// paints its composer (`Ask anything...`). Written before it, the payload is
+/// paints its composer (`Ask anything`, whose trailing ellipsis is quoted out
+/// here on purpose — see the PRD #234 note below). Written before it, the payload is
 /// gone — not parked, gone. Written after it, every run delivered.
 ///
 /// The failure shape is worth stating because it is not the wrapper's. Only in
@@ -230,9 +231,15 @@ pub(crate) const DELEGATE_READINESS_BUFFER: std::time::Duration =
 /// of the SSE response, never reaches the plugin hook, and says nothing about
 /// input readiness, so do not re-propose it. What the measurement above DOES
 /// hand PRD #234 (screen-state observation for hookless agents) is the target:
-/// for OpenCode the input-readiness boundary is exactly the `Ask anything...`
+/// for OpenCode the input-readiness boundary is exactly the `Ask anything`
 /// paint, which the deck already has on the pane's own PTY, and which
-/// `orchestration/delegate/015` already waits for by hand. Until something
+/// `orchestration/delegate/015` already waits for by hand. **Whatever watches
+/// it must not match the trailing ellipsis.** That glyph has already drifted
+/// once between OpenCode releases — ASCII `...` (`2e 2e 2e`) to a single
+/// U+2026 (`e2 80 a6`) — and `orchestration/delegate/015` spent an unknown
+/// number of months failing its own precondition on the difference, against a
+/// booted and visibly ready agent, because nothing in CI runs that lane
+/// (issues #878/#921). Match `Ask anything` and stop there. Until something
 /// watches it, an interval is the ceiling here.
 pub(crate) const NO_SIGNAL_READINESS_BUFFER: std::time::Duration =
     std::time::Duration::from_millis(8000);

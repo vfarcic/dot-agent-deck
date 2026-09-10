@@ -56,7 +56,28 @@ exec cat > /dev/null
 struct RealDelegateCase<'a> {
     agent_name: &'a str,
     agent_type: AgentType,
-    input_ready_needle: &'a str,
+    /// Grid substrings meaning "this agent's composer is up and listening",
+    /// matched ANY-of: the first one to reach the rendered grid opens the gate.
+    ///
+    /// **Every member must be free of decorative glyphs, and that is the rule
+    /// this field exists to carry rather than a style preference.** Issues #878
+    /// / #921: this was a single `&str` pinned to `"Ask anything..."` — three
+    /// ASCII periods, bytes `2e 2e 2e` — while OpenCode paints `Ask anything…`
+    /// with one U+2026, bytes `e2 80 a6`. The wait underneath is a plain
+    /// `contains`, so the two could never match: `/015` burned its full 120 s
+    /// and died in this PRECONDITION on a run where OpenCode had booted fine
+    /// and was visibly sitting at its composer, having never delegated
+    /// anything. Nothing in CI runs this file (lane 2, CLAUDE.md rule 5), so it
+    /// stayed red from whenever OpenCode changed that one glyph.
+    ///
+    /// Swapping in `"Ask anything…"` would have been exactly as fragile — the
+    /// next upstream composer touch drifts it again, and the run after that is
+    /// another 120 s wait pointing at credentials. So each needle is the part of
+    /// the string that carries the MEANING and the decoration is left out of it.
+    /// The slice is any-of so a future rendering that is *not* a substring of
+    /// the current one can be ADDED here rather than replacing the one that
+    /// still works on someone else's version.
+    input_ready_needles: &'a [&'a str],
     sentinel_name: &'a str,
     sentinel_content: &'a str,
     /// Issue #243: the maximum time this case's worker may take to get from the
@@ -110,7 +131,9 @@ struct RealDelegateCase<'a> {
 /// it has 1 s". That was measured on 2026-08-26, first as a red run of this test
 /// at 1000 ms and then, properly, across **176 runs** against a real
 /// `opencode --model … --auto` 1.18.23 — and the answer is a single observable
-/// boundary: the instant OpenCode paints its `Ask anything...` composer.
+/// boundary: the instant OpenCode paints its `Ask anything` composer.
+/// (Quoted without its trailing ellipsis on purpose — that glyph is not
+/// stable across OpenCode releases, per issues #878/#921.)
 /// Written before it the payload is gone; written after it, every run delivered.
 /// That boundary is **2.5 s on an idle box, 4.5 s with the cores
 /// oversubscribed, and 12 s at 4x oversubscription**, so the replacement's
@@ -237,13 +260,31 @@ fn run_real_clear_true_delegate(deck: TuiDeck, worker_command: &str, case: RealD
     deck.send_bytes(b"\x04");
     deck.wait_for_string("[New Pane Ctrl+N]");
     deck.send_bytes(b"2");
+    // Any-of over `input_ready_needles`, via the existing grid-predicate helper
+    // so this stays in the test file rather than widening shared harness surface.
+    let needles = case.input_ready_needles;
     assert!(
-        deck.wait_for_grid_string_within(case.input_ready_needle, Duration::from_secs(120)),
-        "the REAL interactive {} worker never became visibly input-ready (missing {:?}) \
-         before delegation; this is a boot/auth failure, not a delegate failure.\nFinal grid:\n{}",
-        case.agent_name,
-        case.input_ready_needle,
-        deck.snapshot_grid()
+        deck.wait_for_grid_predicate_within(Duration::from_secs(120), |grid| needles
+            .iter()
+            .any(|needle| grid.contains(needle))),
+        "the REAL interactive {name} worker never showed an input-ready marker within 120 s \
+         (none of {needles:?} reached the rendered grid), so this run stopped in a PRECONDITION \
+         and never delegated anything.\n\
+         \n\
+         Two unrelated causes land on this line and the grid below tells them apart — read it \
+         before concluding either (issues #878/#921 were misdiagnosed for exactly this reason, \
+         because this message used to assert the first cause outright):\n\
+         \n\
+         * The grid carries no {name} UI at all, or a CLI/auth/model error: the agent never \
+         booted. Credentials, the CLI on PATH, or an unreachable model.\n\
+         * The grid shows a live {name} UI sitting at its composer: the agent is FINE and the \
+         marker has drifted upstream. Read `RealDelegateCase::input_ready_needles`' doc comment \
+         before touching it — the repair is not to paste in whatever glyph you now see.\n\
+         \n\
+         Final grid:\n{grid}",
+        name = case.agent_name,
+        needles = needles,
+        grid = deck.snapshot_grid()
     );
 
     // Return to the role-card surface before releasing the orchestrator. The
@@ -373,7 +414,7 @@ fn delegate_014_real_claude_worker_acts_on_clear_true_delegate() {
         RealDelegateCase {
             agent_name: "Claude Code",
             agent_type: AgentType::ClaudeCode,
-            input_ready_needle: "? for shortcuts",
+            input_ready_needles: &["? for shortcuts"],
             sentinel_name: CLAUDE_SENTINEL,
             sentinel_content: CLAUDE_SENTINEL_CONTENT,
             // Deliberately unbounded — see the field's own doc comment. Claude's
@@ -416,7 +457,12 @@ fn delegate_015_real_opencode_worker_acts_on_clear_true_delegate() {
         RealDelegateCase {
             agent_name: "OpenCode",
             agent_type: AgentType::OpenCode,
-            input_ready_needle: "Ask anything...",
+            // Deliberately NOT "Ask anything..." and deliberately NOT
+            // "Ask anything…" — issues #878/#921. The trailing ellipsis is
+            // decoration that has already drifted once between OpenCode
+            // releases, and matching either spelling only re-arms the same
+            // 120 s dead wait. See `RealDelegateCase::input_ready_needles`.
+            input_ready_needles: &["Ask anything"],
             sentinel_name: OPENCODE_SENTINEL,
             sentinel_content: OPENCODE_SENTINEL_CONTENT,
             delegate_to_submit_budget: Some(OPENCODE_DELEGATE_TO_SUBMIT_BUDGET),

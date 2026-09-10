@@ -4806,13 +4806,48 @@ pub fn claude_oauth_usable(oauth: &serde_json::Value, now_ms: i64) -> Result<(),
 /// stricter than the CLI, exactly as claude's was.
 ///
 /// It is offered ONLY for an `anthropic/…` test model, and that restriction is
-/// load-bearing rather than cautious. [`opencode_test_model`] is configurable
-/// and defaults to `openai/gpt-5.4-mini`; `inherit_pass` forwards
+/// load-bearing rather than cautious: `inherit_pass` forwards
 /// `ANTHROPIC_API_KEY` and nothing else, so accepting an Anthropic key for an
 /// OpenAI-backed model would open the gate on a credential the spawned agent
 /// could not use — turning a clean skip into a failure deep in a PTY wait,
-/// which is the outcome this whole family of checks exists to prevent. For any
-/// other provider the gate is unchanged and still wants an `auth.json`.
+/// which is the outcome this whole family of checks exists to prevent. What
+/// changed with issue #922 is only which side of that line the DEFAULT sits on:
+/// [`OPENCODE_TEST_MODEL_DEFAULT`] is now `anthropic/…`, so the env-key path is
+/// open on a default run instead of being the case the provider match exists to
+/// exclude. The match still excludes every `openai/…` and `openrouter/…`
+/// override, which is the whole reason it stays.
+///
+/// # It ends in a live model probe (issue #922)
+///
+/// Mirroring [`check_codex_available`], and closing an asymmetry this
+/// function's own doc comment used to flag as a known gap. A credential FILE on
+/// disk says nothing about whether the configured model is reachable through it,
+/// and the three ways it is not are all ordinary: the login is for another
+/// provider, the id was retired, or a subscription quota is exhausted. Without a
+/// probe every one of those arrives as an assertion failure inside a PTY wait
+/// that never mentions the model — which is exactly what #922 walked into, where
+/// an exhausted `openai/gpt-5.4-mini` quota answered "The usage limit has been
+/// reached", satisfied no assertion, and read as a defect in the deck's
+/// auto-submit path.
+///
+/// With the probe the same condition is a `SKIP:` naming the model, and a skip
+/// is forced back into a failure by `DOT_AGENT_DECK_REQUIRE_REAL_E2E=1` like
+/// every other one — so this buys a clearer diagnosis without buying a new
+/// silent no-coverage state.
+///
+/// **Deliberately NOT done instead: matching the quota reply mid-test.** #922
+/// raised that option. It is the same defect class as the bug filed beside it
+/// (#878/#921): a hardcoded literal matched against another program's prose,
+/// which drifts on its own schedule. It would also have to abort a
+/// half-executed test to skip, and a false positive — an agent that legitimately
+/// mentions usage limits — would silently delete real coverage. A host
+/// capability question belongs in a preflight, and this is the preflight.
+///
+/// Two tests pay the probe — `orchestration/delegate/015` and
+/// `opencode_auto_submits_daemon_injected_prompt` (the only two callers) — each
+/// in its own nextest process, so the cost is two cheap turns per lane-2 run.
+/// [`check_devin_available`] documents the case where that trade goes the other
+/// way.
 pub fn check_opencode_available() -> Result<(), String> {
     install_credential_redaction();
     if !cli_invocable("opencode") {
@@ -4827,19 +4862,112 @@ pub fn check_opencode_available() -> Result<(), String> {
         home.join(".opencode").join("auth.json"),
         home.join(".config").join("opencode").join("auth.json"),
     ];
-    if candidates.iter().any(|p| p.exists()) {
+    // Credential PRESENCE first, so a host with none at all keeps the precise,
+    // free message below instead of paying a probe that cannot succeed.
+    if !candidates.iter().any(|p| p.exists()) && !opencode_env_key_authorises() {
+        // M3.1 auditor S1: redact $HOME in the surfaced path.
+        return Err(format!(
+            "OpenCode credentials not found at ~/.local/share/opencode/auth.json — \
+             log in with `opencode auth login` (or, for an `anthropic/…` \
+             {OPENCODE_TEST_MODEL_ENV}, set {ANTHROPIC_API_KEY_ENV}; the model here \
+             is `{}`)",
+            opencode_test_model()
+        ));
+    }
+    opencode_model_probe()
+}
+
+/// The probe's question, and the answer that means the model actually replied.
+///
+/// The answer token is ABSENT from the prompt on purpose — borrowed from
+/// `opencode_auto_submits_daemon_injected_prompt`, which asks for `4000 plus
+/// 444` for exactly this reason and says so in its own doc comment.
+/// `opencode run` was measured on 2026-09-08 not to echo its prompt,
+/// but a probe whose pass condition survives only while that stays true is a
+/// probe that can silently become vacuous, and a vacuous availability gate is
+/// strictly worse than none: it converts every skip into a confusing failure.
+const OPENCODE_PROBE_PROMPT: &str =
+    "Reply with only the number equal to 4000 plus 444. Do not use tools.";
+const OPENCODE_PROBE_ANSWER: &str = "4444";
+
+/// Upper bound on the [`check_opencode_available`] model probe.
+///
+/// 4.3 s warm, measured 2026-09-08 (`opencode run --model
+/// anthropic/claude-haiku-4-5-20251001` in a virgin HOME), so this is ~14x the
+/// observation — generous, because a cold OpenCode has a provider list to fetch
+/// and this must not become a flake source.
+///
+/// FINITE, which the sibling [`check_codex_available`] probe is not. An
+/// unbounded probe that wedges spends the test's entire nextest kill window
+/// (3 x 60 s by default here, and neither of the two callers has an override),
+/// after which the process is SIGKILLed — producing no skip, no failure message
+/// and no diagnostics whatever. 60 s leaves two thirds of that window for the
+/// scenario the probe is only the gate for.
+const OPENCODE_PROBE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// One bounded, minimal turn against [`opencode_test_model`], so a model these
+/// credentials cannot reach SKIPS with the model named rather than failing deep
+/// inside a PTY wait. See [`check_opencode_available`] for the full rationale.
+fn opencode_model_probe() -> Result<(), String> {
+    let model = opencode_test_model();
+    // Output to a FILE rather than pipes: `try_wait` polling against a pipe can
+    // deadlock if the child outfills the buffer, and the codex probe already
+    // uses `harness_tempfile` for the same job.
+    let sink = harness_tempfile()
+        .map_err(|e| format!("could not create the OpenCode probe output file: {e}"))?;
+    let out = sink
+        .as_file()
+        .try_clone()
+        .map_err(|e| format!("could not open the OpenCode probe output file: {e}"))?;
+    let err = sink
+        .as_file()
+        .try_clone()
+        .map_err(|e| format!("could not open the OpenCode probe output file: {e}"))?;
+    let mut child = std::process::Command::new("opencode")
+        .args(["run", "--model", model, OPENCODE_PROBE_PROMPT])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::from(out))
+        .stderr(std::process::Stdio::from(err))
+        .spawn()
+        .map_err(|e| format!("could not run the OpenCode model probe: {e}"))?;
+
+    let deadline = Instant::now() + OPENCODE_PROBE_TIMEOUT;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) => {}
+            Err(e) => return Err(format!("could not wait on the OpenCode model probe: {e}")),
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+
+    let text = std::fs::read_to_string(sink.path()).unwrap_or_default();
+    if status.is_some_and(|s| s.success()) && text.contains(OPENCODE_PROBE_ANSWER) {
         return Ok(());
     }
-    if opencode_env_key_authorises() {
-        return Ok(());
-    }
-    // M3.1 auditor S1: redact $HOME in the surfaced path.
+
+    // Name what was observed rather than a cause. All three of these arrive
+    // here and they need different fixes; #878/#921 is the cautionary case for
+    // a diagnostic that picked one and asserted it.
+    let observed = match status {
+        None => format!("did not finish within {OPENCODE_PROBE_TIMEOUT:?}"),
+        Some(s) if !s.success() => format!("exited unsuccessfully ({s})"),
+        Some(_) => format!("exited 0 but never answered {OPENCODE_PROBE_ANSWER:?}"),
+    };
     Err(format!(
-        "OpenCode credentials not found at ~/.local/share/opencode/auth.json — \
-         log in with `opencode auth login` (or, for an `anthropic/…` \
-         {OPENCODE_TEST_MODEL_ENV}, set {ANTHROPIC_API_KEY_ENV}; the model here \
-         is `{}`)",
-        opencode_test_model()
+        "OpenCode cannot reach model `{model}` with this host's credentials: the probe \
+         {observed}. An exhausted subscription quota, a login for a different provider, and \
+         a retired model id all land here — read the probe output below. Point \
+         {OPENCODE_TEST_MODEL_ENV} at a model these credentials can reach (e.g. \
+         `openai/gpt-5.4-mini` for a ChatGPT-subscription `opencode auth login`, or an \
+         `openrouter/…` id for an OpenRouter key), or authorise the default with \
+         {ANTHROPIC_API_KEY_ENV} or `opencode auth login`.\nProbe output:\n{}",
+        redact_credentials_for_output(text.trim())
     ))
 }
 
@@ -4929,42 +5057,85 @@ pub fn codex_test_model() -> &'static str {
 /// Compiled-in default cheap model for real-agent OpenCode e2e coverage.
 ///
 /// OpenCode model ids are provider-qualified (`provider/model`); a bare
-/// `gpt-4o-mini` is rejected as "Invalid model format". This default is on the
-/// `openai` provider so it resolves against whatever `opencode auth` holds for
-/// OpenAI — including a **ChatGPT-subscription (oauth)** credential, which is
-/// how the dev boxes here are logged in and which costs nothing per call.
+/// `gpt-4o-mini` is rejected as "Invalid model format". Haiku is the cheap model
+/// CLAUDE.md rule 4 asks real-agent coverage to use, and the same one
+/// `orchestration/delegate/014` runs its Claude arm on.
 ///
 /// This deliberately does *not* route through OpenRouter. It used to: both call
 /// sites hardcoded `openrouter/openai/gpt-4o-mini`, which billed metered
-/// OpenRouter credit for coverage the subscription already pays for, and made
-/// two OpenCode tests skip whenever that balance ran dry — with a skip reason
-/// naming missing *credentials*, which were present the whole time.
+/// OpenRouter credit for coverage a subscription already paid for, and made two
+/// OpenCode tests skip whenever that balance ran dry — with a skip reason naming
+/// missing *credentials*, which were present the whole time.
 ///
-/// **Probed 2026-08-26** (issue #243 round 3), because this shares a model id
-/// with [`codex_test_model`]'s subscription example and a retirement here would
-/// be worse: `check_opencode_available` runs no model probe at all — it only
-/// looks for an `auth.json` — so an unreachable id would not skip
-/// `orchestration/delegate/015` cleanly, it would fail it somewhere inside the
-/// TUI with no mention of the model. `opencode run --model openai/gpt-5.4-mini`
-/// answered `OPENCODE_MODEL_OK` on the subscription credential these boxes hold.
-/// Note the id reaches the model through OpenCode's own provider layer rather
-/// than through codex-cli, so nothing measured about codex-cli's TUI bears on it.
-pub(crate) const OPENCODE_TEST_MODEL_DEFAULT: &str = "openai/gpt-5.4-mini";
+/// **Moved off `openai/gpt-5.4-mini` on 2026-09-08 (issue #922), and NOT because
+/// that id died.** Re-probed the same day: `opencode run --model
+/// openai/gpt-5.4-mini` still returned its requested sentinel on the
+/// ChatGPT-subscription (oauth) credential these boxes hold. What condemned it
+/// is the shape of its failure when the credential runs out rather than the id
+/// itself. #922 caught `opencode_auto_submits_daemon_injected_prompt` red with
+/// the prompt visibly submitted and the model replying **"The usage limit has
+/// been reached"** — a subscription quota, which is a *recurring* condition by
+/// construction, not a one-off. That reply satisfies no assertion, so the test
+/// dies on a missing answer token and reads as a product bug in the deck's
+/// auto-submit path, which is precisely what it is not.
+///
+/// **The trade, stated rather than implied.** The `openai` oauth route cost
+/// nothing per call, which is what originally chose it; this route is metered
+/// Anthropic API billing, at Haiku prices on turns of a few hundred tokens
+/// across two tests. In exchange:
+///
+/// * A metered key has no quota cliff to fall off mid-turn, so the recurring
+///   red above stops recurring.
+/// * It is the only provider the harness can authorise **from the environment
+///   alone**, with no credential file on the host. [`INHERIT_PASS`] is
+///   `["PATH", ANTHROPIC_API_KEY_ENV]` — that key and nothing else crosses the
+///   `TuiDeck` `env_clear` — so with an `anthropic/…` default a host holding
+///   just that key can now RUN this coverage where it previously skipped. See
+///   [`opencode_env_key_authorises`], whose provider match this default now
+///   satisfies instead of being the case it excludes. An `openai/…` or
+///   `openrouter/…` model still reaches its provider only through the imported
+///   `auth.json`.
+/// * A quota or credential problem is now visible to a preflight rather than
+///   discovered mid-turn: [`check_opencode_available`] probes this model, so it
+///   surfaces as a `SKIP:` naming the model (a hard failure under
+///   `DOT_AGENT_DECK_REQUIRE_REAL_E2E=1`).
+///
+/// **A subscription host keeps its old behaviour by exporting
+/// `DOT_AGENT_DECK_OPENCODE_TEST_MODEL=openai/gpt-5.4-mini`** — verified
+/// reachable on 2026-09-08, so this is a live route and not a historical note.
+///
+/// Nothing OpenCode-specific is lost by the provider move. What these two tests
+/// assert is OpenCode's own surface — its composer paint, its auto-submit, its
+/// `session.prompt` event, its plugin bridge — none of which varies by which
+/// vendor answers the turn.
+///
+/// Probed 2026-09-08 in a virgin `HOME` with `ANTHROPIC_API_KEY` as the only
+/// credential: `opencode run --model anthropic/claude-haiku-4-5-20251001`
+/// returned its requested sentinel in 4.3 s and wrote no `auth.json` anywhere,
+/// which is the same third-auth-path measurement #502/#785 recorded on
+/// [`check_opencode_available`]. Both lane-2 OpenCode tests were then run
+/// against this default with `DOT_AGENT_DECK_REQUIRE_REAL_E2E=1` and passed.
+pub(crate) const OPENCODE_TEST_MODEL_DEFAULT: &str = "anthropic/claude-haiku-4-5-20251001";
 
 /// Env var that overrides [`opencode_test_model`] on a host whose OpenCode
-/// credentials cannot reach the default — e.g. one authenticated to OpenRouter
-/// but not OpenAI, which exports
-/// `DOT_AGENT_DECK_OPENCODE_TEST_MODEL=openrouter/openai/gpt-4o-mini`.
+/// credentials cannot reach the default — e.g. one holding a
+/// ChatGPT-subscription `opencode auth` login and no Anthropic key, which
+/// exports `DOT_AGENT_DECK_OPENCODE_TEST_MODEL=openai/gpt-5.4-mini` (the
+/// default until issue #922; still reachable, see
+/// [`OPENCODE_TEST_MODEL_DEFAULT`]), or one authenticated to OpenRouter alone,
+/// which exports `openrouter/openai/gpt-4o-mini`.
 pub const OPENCODE_TEST_MODEL_ENV: &str = "DOT_AGENT_DECK_OPENCODE_TEST_MODEL";
 
 /// Cheap provider-qualified model used by real-agent OpenCode e2e coverage —
 /// [`OPENCODE_TEST_MODEL_DEFAULT`] unless `DOT_AGENT_DECK_OPENCODE_TEST_MODEL`
 /// is set to a non-empty value, which wins.
 ///
-/// Mirrors [`codex_test_model`]. Note the gates are not symmetric:
-/// [`check_opencode_available`] only checks that an `auth.json` exists and does
-/// **not** probe the model, so an unreachable model id here surfaces as a test
-/// failure rather than a skip.
+/// Mirrors [`codex_test_model`], and since issue #922 the two gates are
+/// symmetric as well: [`check_opencode_available`] probes whatever this returns,
+/// so a model these credentials cannot reach SKIPS rather than failing somewhere
+/// inside a PTY wait with no mention of the model. (That asymmetry is what #922
+/// walked into — an exhausted subscription quota reached the assertion as a
+/// missing answer token and read as a defect in the deck.)
 pub fn opencode_test_model() -> &'static str {
     static MODEL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     MODEL.get_or_init(|| {
