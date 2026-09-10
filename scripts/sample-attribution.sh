@@ -64,16 +64,32 @@ while :; do
         printf '%s\t%s\n' "$cwd" "$rss"
       done \
     | awk -v root="$root" '
+        BEGIN {
+          # Match on "<root>/" rather than a bare "<root>", so the prefix test
+          # cannot straddle a path component: with root=/home/u/code, a bare
+          # prefix also matched /home/u/code2/..., folding an unrelated build
+          # into this run under an empty-string key. A silently wrong number is
+          # exactly what this protocol exists to prevent.
+          #
+          # Trailing slashes are stripped first, so the separator is appended
+          # once however the caller spelled --root. The old fixed +2 offset
+          # assumed no trailing slash and ate the first character of the
+          # worktree name when tab-completion supplied one.
+          sub(/\/+$/, "", root)
+          prefix = root "/"
+        }
         {
           wt = $1
           # collapse any path inside a worktree to the worktree root itself
-          if (index(wt, root) == 1) {
-            rest = substr(wt, length(root) + 2)
+          if (substr(wt, 1, length(prefix)) == prefix) {
+            rest = substr(wt, length(prefix) + 1)
             n = index(rest, "/")
             wt = (n ? substr(rest, 1, n - 1) : rest)
           } else {
             wt = "other"
           }
+          # The root itself, and a stray "<root>//x", leave nothing to name.
+          if (wt == "") { wt = "other" }
           procs[wt]++; rss[wt] += $2
         }
         END { for (w in procs) printf "%s\t%s\t%s\n", w, procs[w], rss[w] }' \
