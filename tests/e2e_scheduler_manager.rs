@@ -684,6 +684,40 @@ fn manager_010_blank_default_command_falls_back_to_claude() {
 /// Return the visible synthetic side-pane line markers from a rendered grid.
 /// Comparing the marker sequence isolates pane scrollback from manager-dialog
 /// changes such as moving the selected schedule row.
+/// Sample the visible side-pane markers only once the frame has stopped
+/// changing them.
+///
+/// A single-shot `snapshot_grid()` read is unsound here for the same reason a
+/// single-shot `find_in_grid` is (issues #807/#395): ratatui flushes a frame as
+/// a byte stream and the harness reader consumes it in chunks, so a read can
+/// land mid-repaint. The hazard in this test is specific and worse than a
+/// missing needle -- the centered Scheduled Tasks dialog paints **over** the
+/// side pane and occludes marker rows, so a half-painted overlay yields a
+/// marker set the settled frame does not show. Comparing such a sample against
+/// a settled one then fails an assertion with no defect present, which is
+/// exactly how `manager_016` reddened `e2e-deterministic` on four unrelated
+/// branches -- one of them a pnpm bump carrying no Rust at all.
+///
+/// Two consecutive agreeing reads is a sound settle here because
+/// `wait_until_grid` sleeps 20ms between polls, which is orders of magnitude
+/// longer than a ratatui frame takes to flush.
+///
+/// Deliberately settles on ANY value, including an empty set: a genuine wheel
+/// leak could scroll every marker out of view, and this must then return that
+/// empty set so the caller's assertion reports the leak, rather than spinning
+/// to a wait timeout that says nothing about why.
+fn settled_side_scroll_markers(deck: &TuiDeck, what: &str) -> Vec<String> {
+    let last: std::cell::RefCell<Option<Vec<String>>> = std::cell::RefCell::new(None);
+    deck.wait_until_grid(what, |grid| {
+        let now = visible_side_scroll_markers(grid);
+        let mut prev = last.borrow_mut();
+        let settled = prev.as_ref() == Some(&now);
+        *prev = Some(now);
+        settled
+    });
+    last.into_inner().unwrap_or_default()
+}
+
 fn visible_side_scroll_markers(grid: &str) -> Vec<String> {
     const PREFIX: &str = "SIDE_SCROLL_LINE_";
     grid.lines()
@@ -754,11 +788,17 @@ fn manager_016_wheel_over_dialog_does_not_scroll_side_pane() {
 
     deck.send_keys(b"s");
     deck.wait_for_string("NEXT FIRE");
-    let before = visible_side_scroll_markers(&deck.snapshot_grid());
+    // `NEXT FIRE` is the dialog's HEADER, so it appears before the overlay's
+    // interior is drawn. Wait for the initial selection marker too, then let
+    // the marker set settle -- the baseline this test compares everything
+    // against must come from a fully painted frame.
+    deck.wait_for_string("\u{25b6} alpha");
+    let before =
+        settled_side_scroll_markers(&deck, "the Scheduled Tasks overlay to finish painting");
+    let before_grid = deck.snapshot_grid();
     assert!(
         before.len() >= 5,
-        "precondition: several side-pane markers must remain visible around the centered dialog.\nGrid:\n{}",
-        deck.snapshot_grid()
+        "precondition: several side-pane markers must remain visible around the centered dialog.\nGrid:\n{before_grid}"
     );
 
     // NEXT FIRE sits inside the visible dialog and, in this mode-tab layout,
@@ -777,31 +817,33 @@ fn manager_016_wheel_over_dialog_does_not_scroll_side_pane() {
         .wait_for_grid_predicate_within(Duration::from_secs(2), |grid| {
             grid.contains("\u{25b6} bravo")
         });
-    let after_down_grid = deck.snapshot_grid();
-    let after_down = visible_side_scroll_markers(&after_down_grid);
     assert!(
         selection_moved_down,
-        "wheel-down over the Scheduled Tasks dialog must move the selection from `alpha` to `bravo` before wheel-up is sent.\nGrid after wheel-down:\n{after_down_grid}"
+        "wheel-down over the Scheduled Tasks dialog must move the selection from `alpha` to `bravo` before wheel-up is sent.\nGrid after wheel-down:\n{}",
+        deck.snapshot_grid()
     );
+    let after_down = settled_side_scroll_markers(&deck, "the side pane to settle after wheel-down");
+    let after_down_grid = deck.snapshot_grid();
 
     deck.scroll(wheel_col, dialog_row, false);
     let selection_moved_up = deck.wait_for_grid_predicate_within(Duration::from_secs(2), |grid| {
         grid.contains("\u{25b6} alpha")
     });
-    let after_up_grid = deck.snapshot_grid();
-    let after_up = visible_side_scroll_markers(&after_up_grid);
     assert!(
         selection_moved_up,
-        "wheel-up over the Scheduled Tasks dialog must move the selection from `bravo` back to `alpha`.\nGrid after wheel-up:\n{after_up_grid}"
+        "wheel-up over the Scheduled Tasks dialog must move the selection from `bravo` back to `alpha`.\nGrid after wheel-up:\n{}",
+        deck.snapshot_grid()
     );
+    let after_up = settled_side_scroll_markers(&deck, "the side pane to settle after wheel-up");
+    let after_up_grid = deck.snapshot_grid();
 
     assert_eq!(
         after_down, before,
-        "wheel-down over the Scheduled Tasks dialog leaked into the mode side pane behind it; the visible side-pane scrollback must remain unchanged.\nBefore: {before:?}\nAfter wheel-down: {after_down:?}\nGrid after wheel-down:\n{after_down_grid}"
+        "wheel-down over the Scheduled Tasks dialog leaked into the mode side pane behind it; the visible side-pane scrollback must remain unchanged.\nBefore: {before:?}\nAfter wheel-down: {after_down:?}\nBaseline grid (settled, before the wheel):\n{before_grid}\nGrid after wheel-down:\n{after_down_grid}"
     );
     assert_eq!(
         after_up, before,
-        "wheel-up over the Scheduled Tasks dialog leaked into the mode side pane behind it; the visible side-pane scrollback must remain unchanged.\nBefore: {before:?}\nAfter wheel-up: {after_up:?}\nGrid after wheel-up:\n{after_up_grid}"
+        "wheel-up over the Scheduled Tasks dialog leaked into the mode side pane behind it; the visible side-pane scrollback must remain unchanged.\nBefore: {before:?}\nAfter wheel-up: {after_up:?}\nBaseline grid (settled, before the wheel):\n{before_grid}\nGrid after wheel-up:\n{after_up_grid}"
     );
     drop(scratch);
 }

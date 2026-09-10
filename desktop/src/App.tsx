@@ -543,6 +543,7 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
                   onTabChange={(tab) => setTabs((current) => ({ ...current, [agent.id]: tab }))}
                   onTerminalInput={runtime.sendTerminalInput}
                   onTerminalResize={runtime.resizeTerminal}
+                  appliedGeometry={runtime.appliedGeometry?.[agent.id]}
                   onEvidenceSelect={(id) => { setSelectedEvidenceId(id); setEvidenceOpen(true); }}
                   onSubmitText={submitText}
                   onRename={mode === "live" ? renameAgent : undefined}
