@@ -1,7 +1,6 @@
 use serde::Deserialize;
 
-const GITHUB_RELEASES_URL: &str =
-    "https://api.github.com/repos/vfarcic/dot-agent-deck/releases/latest";
+use crate::repo_identity;
 
 #[derive(Deserialize)]
 struct GitHubRelease {
@@ -32,7 +31,7 @@ async fn fetch_latest_version() -> Option<String> {
         .ok()?;
 
     let resp = client
-        .get(GITHUB_RELEASES_URL)
+        .get(repo_identity::RELEASES_API_URL)
         .header(
             "User-Agent",
             concat!("dot-agent-deck/", env!("DAD_VERSION")),

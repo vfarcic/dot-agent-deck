@@ -11,6 +11,7 @@
     "rustc":                        "1.97.1",
     "cargo":                        "1.97.1",
     "clippy":                       "1.97.1",
+    "mold":                         "2.42.0",
     "rustfmt":                      "1.97.1",
     "path:gcloud#google-cloud-sdk": "",
     "asciinema-agg":                "1.9.0",

@@ -45,9 +45,7 @@ fn open_mode_tab(deck: &TuiDeck) {
     deck.wait_for_string("Mode:"); // form ready (Mode field present)
     deck.send_bytes(b"\x1b[C"); // Right: move Mode selection off "No mode" to `demo`
     deck.wait_for_string("demo mode"); // selection reflected in the title
-    let (scol, srow) = deck
-        .find_in_grid("[Submit]")
-        .expect("new-pane form should render a [Submit] button");
+    let (scol, srow) = deck.wait_for_in_grid("[Submit]");
     deck.click(scol, srow);
     deck.wait_for_string("Dashboard"); // tab strip appears only with ≥2 tabs
 }

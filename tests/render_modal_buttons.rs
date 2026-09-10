@@ -17,6 +17,7 @@
 //! running`, button `[Detach]`), so a `[Label]` substring proves the button
 //! and a list-only phrase proves the list still renders.
 
+use dot_agent_deck::repo_identity;
 use dot_agent_deck::ui::{
     render_config_gen_prompt_to_buffer, render_help_overlay_to_buffer,
     render_quit_confirm_to_buffer, render_star_prompt_to_buffer,
@@ -77,7 +78,7 @@ fn modal_002_buttons_render_alongside_selection_list() {
     // ── Star-prompt: [Star] [Snooze] [Dismiss] alongside the hint line ────
     let star = buffer_text(&render_star_prompt_to_buffer(80, 24));
     assert!(
-        star.contains("github.com/vfarcic/dot-agent-deck"),
+        star.contains(repo_identity::DISPLAY),
         "star-prompt must still render its existing content, got:\n{star}"
     );
     for btn in ["[Star]", "[Snooze]", "[Dismiss]"] {

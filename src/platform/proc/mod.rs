@@ -45,8 +45,9 @@ mod unix;
 mod windows;
 
 pub use scan::{
-    CLAUDE_BASH_TOOL_SHAPE, MEASURED_SHELL_TOOL_SHAPES, ProcessInfo, ShellToolShape,
-    descendant_shell_activity, descendants,
+    CLAUDE_BASH_TOOL_SHAPE, CommandLine, MEASURED_SHELL_TOOL_SHAPES, ProcessInfo, ShellToolShape,
+    command_line_targets, descendant_shell_activity, descendants, detached_descendants,
+    fill_command_lines, shell_tool_candidates,
 };
 
 /// Result of delivering the daemon-stop graceful signal to a PID via

@@ -179,7 +179,7 @@ Two ways to fix a fork, both one-time:
 - **Set the secret** (recommended, and what upstream expects): create a PAT with **Contents: read and write** on the fork and store it as `RELEASE_TOKEN`. On an unprotected fork `main` it needs no admin rights and no bypass — the token only has to be able to push. This also keeps the fork's workflows diff-free against upstream.
 - **Or re-add the fallback locally** as a one-line fork-side patch, accepting that it will conflict on every sync of these files.
 
-The same applies to `scripts/apply-branch-protection.sh` if a fork ever runs it: `REQUIRED_CHECKS` names this repository's own `ci.yml` job ids — four of them as of `main`, against the five the live ruleset now carries (see [step 6](#rollout)) — and requiring a context the fork's CI never produces leaves every pull request unmergeable with nothing red to fix — the #416 trap, self-inflicted. Set `REQUIRED_CHECKS` to the fork's own job names, or, for the pull-request gate with no required checks at all, say so with both variables:
+The same applies to `scripts/apply-branch-protection.sh` if a fork ever runs it: `REQUIRED_CHECKS` names this repository's own `ci.yml` job ids — all five of them as of `main`, matching the live ruleset (see [step 6](#rollout)) — and requiring a context the fork's CI never produces leaves every pull request unmergeable with nothing red to fix — the #416 trap, self-inflicted. Set `REQUIRED_CHECKS` to the fork's own job names, or, for the pull-request gate with no required checks at all, say so with both variables:
 
 ```bash
 REQUIRED_CHECKS= ALLOW_NO_REQUIRED_CHECKS=true scripts/apply-branch-protection.sh apply

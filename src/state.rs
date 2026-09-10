@@ -167,7 +167,8 @@ pub(crate) const DELEGATE_READINESS_BUFFER: std::time::Duration =
 /// [`crate::pane_input::SUBMIT_DELAY`], `\r` — against a real
 /// `opencode --model … --auto` 1.18.23 on a pty and reading the rendered grid
 /// back, across **176 runs**: delivery tracks ONE boundary, the instant OpenCode
-/// paints its composer (`Ask anything...`). Written before it, the payload is
+/// paints its composer (`Ask anything`, whose trailing ellipsis is quoted out
+/// here on purpose — see the PRD #234 note below). Written before it, the payload is
 /// gone — not parked, gone. Written after it, every run delivered.
 ///
 /// The failure shape is worth stating because it is not the wrapper's. Only in
@@ -230,9 +231,15 @@ pub(crate) const DELEGATE_READINESS_BUFFER: std::time::Duration =
 /// of the SSE response, never reaches the plugin hook, and says nothing about
 /// input readiness, so do not re-propose it. What the measurement above DOES
 /// hand PRD #234 (screen-state observation for hookless agents) is the target:
-/// for OpenCode the input-readiness boundary is exactly the `Ask anything...`
+/// for OpenCode the input-readiness boundary is exactly the `Ask anything`
 /// paint, which the deck already has on the pane's own PTY, and which
-/// `orchestration/delegate/015` already waits for by hand. Until something
+/// `orchestration/delegate/015` already waits for by hand. **Whatever watches
+/// it must not match the trailing ellipsis.** That glyph has already drifted
+/// once between OpenCode releases — ASCII `...` (`2e 2e 2e`) to a single
+/// U+2026 (`e2 80 a6`) — and `orchestration/delegate/015` spent an unknown
+/// number of months failing its own precondition on the difference, against a
+/// booted and visibly ready agent, because nothing in CI runs that lane
+/// (issues #878/#921). Match `Ask anything` and stop there. Until something
 /// watches it, an interval is the ceiling here.
 pub(crate) const NO_SIGNAL_READINESS_BUFFER: std::time::Duration =
     std::time::Duration::from_millis(8000);
@@ -1149,6 +1156,14 @@ pub struct AppState {
     /// out-of-order / older-generation event is IGNORED so a delayed prior-event
     /// can neither restore a stale id nor clear a newer one, and a delayed
     /// prior-generation `SessionEnd` cannot wipe the current generation.
+    ///
+    /// Issue #684: an entry only ever exists because a producer ANNOUNCED a
+    /// conversation, or because an ordinary frame carrying a pane id arrived. A
+    /// `SessionStart` that announces nothing — the wrapper's boot provenance, the
+    /// daemon's card-surfacing start — draws its card without establishing one,
+    /// so "this pane has an entry" is not merely "something happened on this
+    /// pane". Consumers that bind this value as a delivery target depend on that:
+    /// see `provisional_start` in [`Self::apply_event`].
     pane_hook_session: HashMap<String, (String, DateTime<Utc>)>,
     /// Issue #424 F2 / H4 (auditor HIGH): how many times each pane's established
     /// hook generation has been CLOSED — ended, or superseded by a different one.
@@ -3021,6 +3036,59 @@ pub fn compose_worker_task_file(prompt_template: Option<&str>, task: &str, role:
     format!("{}\n\n{}", body.trim_end(), work_done_footer(role))
 }
 
+/// Issue #960: the display title the orchestration `identity` is flying under,
+/// read off whichever of its role panes still carries one.
+///
+/// `records` is a live-agent snapshot ([`crate::agent_pty::AgentPtyRegistry::agent_records`],
+/// which filters exited agents out). The title is a per-TAB value stamped
+/// identically on every role pane by both producers (`tab.rs` for `Ctrl+n`,
+/// `spawn.rs` for a dispatch), so the first non-empty one found is the tab's —
+/// order does not matter. `None` means either that this orchestration genuinely
+/// has no title (the canonical name is then correct) or that no title-carrying
+/// pane of it is still alive.
+///
+/// Identity matching mirrors the routing rule rather than inventing a second
+/// one: an `Instance` matches on the per-tab token alone (two tabs of the same
+/// orchestration in the same directory are distinct tabs and must not borrow
+/// each other's titles), and the legacy `NameCwd` variant matches on exactly the
+/// `(name, orchestration_cwd)` pair the daemon already routes that client's
+/// delegates on — so where this could confuse two tabs, `handle_delegate` was
+/// already confusing them (issue #140).
+fn orchestration_display_title_from_live_siblings(
+    records: &[crate::agent_pty::AgentRecord],
+    identity: &OrchestrationIdentity,
+) -> Option<String> {
+    records.iter().find_map(|record| {
+        let crate::agent_pty::TabMembership::Orchestration {
+            name,
+            orchestration_cwd,
+            display_title,
+            orchestration_id,
+            ..
+        } = record.tab_membership.as_ref()?
+        else {
+            return None;
+        };
+        let same_orchestration = match identity {
+            OrchestrationIdentity::Instance { id, .. } => {
+                orchestration_id.as_deref() == Some(id.as_str())
+            }
+            OrchestrationIdentity::NameCwd {
+                name: identity_name,
+                cwd,
+            } => name == identity_name && orchestration_cwd.as_deref() == Some(cwd.as_str()),
+        };
+        if !same_orchestration {
+            return None;
+        }
+        // The same non-empty rule the hydration fallback and
+        // `validate_tab_membership` apply: an empty title is absent, and
+        // propagating `Some("")` would defeat the fallback to the canonical name
+        // rather than carry a title.
+        display_title.clone().filter(|t| !t.is_empty())
+    })
+}
+
 /// Look up the role config for `role_name` inside the orchestration
 /// named `orchestration_name`, by parsing the project config file at
 /// `cwd`, together with the role's INDEX within that orchestration.
@@ -4429,6 +4497,24 @@ async fn dispatch_one_owned(
         // spending its termination grace, or a worker that simply died and was
         // reaped. `clear = true` means "a fresh worker for the next task", so a
         // missing predecessor is a reason to make one, not to fail.
+        // Issue #960 (the secondary path): the tab title this orchestration is
+        // actually flying under, read off a LIVE sibling role pane. A re-created
+        // worker used to be stamped `display_title: None` unconditionally, and
+        // because `partition_hydrated_panes` keeps the first non-`None` title it
+        // sees, the tab kept its label only while some OTHER title-carrying pane
+        // was still live — so the title was lost silently, once every pane had
+        // either exited (`agent_records` filters exited agents out) or been
+        // re-created this way. The recreating code has the orchestration identity
+        // in hand, so the siblings' title is available; carrying it forward keeps
+        // the round trip closed for the interactive `Ctrl+n` path too.
+        let recreated_display_title = match (role_index, orchestration.as_ref()) {
+            (Some(_), Some(identity)) => {
+                orchestration_display_title_from_live_siblings(&registry.agent_records(), identity)
+            }
+            // No role index means no orchestration membership is built at all
+            // below, so there is nothing to carry a title on.
+            _ => None,
+        };
         let recreate_identity = crate::agent_pty::PaneRecreateIdentity {
             cwd: cwd.clone(),
             display_name: Some(target_role.clone()),
@@ -4444,7 +4530,7 @@ async fn dispatch_one_owned(
                     // delegate whose target pane is the orchestrator's own.
                     is_start_role: false,
                     orchestration_cwd: cwd.clone(),
-                    display_title: None,
+                    display_title: recreated_display_title.clone(),
                     orchestration_id: match orchestration.as_ref() {
                         Some(OrchestrationIdentity::Instance { id, .. }) => Some(id.clone()),
                         _ => None,
@@ -7246,14 +7332,24 @@ impl AppState {
         //
         // Residual, by construction: because the producer key is STABLE, the one
         // card changing hands means a close target armed against Pi generation N
-        // still RESOLVES after generation N+1 takes over — it now resolves to the
-        // replacement rather than to a stale corpse. Fixing that belongs at the
-        // close-target seam (arm on generation, not on session id alone), not
-        // here: the alternative — deleting the card so the armed id reads as
-        // vanished — would leave ZERO cards on a live pane, which is exactly the
-        // failure `status/supersede/003` forbids one screen up. Distinct-session
-        // supersession is unaffected and still vanishes the armed id
-        // (`status/supersede/002`, `prompt/close-confirm/005`).
+        // still RESOLVES after generation N+1 takes over — it resolves to the
+        // replacement rather than to a stale corpse. That was FIXED at the
+        // close-target seam by issue #317, exactly where this comment said it
+        // belonged: `CloseTarget::Session` now carries the `agent_id` alongside
+        // the session id and `resolve_close_plan` reads a refreshed identity as
+        // vanished (`prompt/close-confirm/009`). It was deliberately not fixed
+        // here — the alternative, deleting the card so the armed id reads as
+        // vanished, would leave ZERO cards on a live pane, which is exactly the
+        // failure `status/supersede/003` forbids one screen up.
+        //
+        // The refresh below is what makes that fix possible, so the two are
+        // coupled: `ui::same_generation` decides on a differing `Some` → `Some`
+        // and on nothing else, which is the SAME test this branch applies. Keep
+        // them in step — a card that changes hands here must read as vanished
+        // there, and a `None` learning an identity must not, or an ordinary
+        // close silently stops working. Distinct-session supersession is
+        // unaffected and still vanishes the armed id (`status/supersede/002`,
+        // `prompt/close-confirm/005`).
         //
         // Issue #321 residual 2: the match ALSO requires that the stored session
         // and the event agree about which pane they are on. This site is the one
@@ -7465,9 +7561,16 @@ impl AppState {
         // that same value, so both then authorized a retry into a conversation
         // that is over while the agent is really in the successor. Boot
         // provenance is a statement that the real agent has not started yet: it
-        // may ESTABLISH a generation where the pane has none, and refresh the one
-        // it already names, but it is never authority to move a pane that already
-        // has a conversation — in either direction. That also strictly improves
+        // may refresh the generation it already names, but it is never authority
+        // to move a pane that already has a conversation — in either direction.
+        //
+        // Issue #684 removed the third permission this paragraph used to grant.
+        // Boot provenance may no longer ESTABLISH a generation on a pane that has
+        // none either: a TUI-owned delivery binds `pane_hook_session_id` before it
+        // writes, so a generation established by something that announced no
+        // conversation became the target the prompt claimed, and the real agent's
+        // announcement then read as that target being lost. See `provisional_start`
+        // below. That also strictly improves
         // #532: the wrapper's fork-time start can no longer take the generation
         // off the wrapped agent's native session.
         if let Some(ref pane_id) = event.pane_id {
@@ -7475,21 +7578,53 @@ impl AppState {
             // Issue #243: widened to EITHER wrapper origin. The reasoning above is
             // about wrapper provenance, not about the fork moment specifically —
             // an interface-ready event is still the wrapper talking about its own
-            // session id, so it may establish a generation where the pane has none
-            // and refresh the one it already names, but never move a pane that
-            // already has a conversation.
-            let launcher_origin_start =
-                event.event_type == EventType::SessionStart && event.is_wrapper_session_start();
+            // session id, so it may refresh the generation it already names, but
+            // never establish one (issue #684) and never move a pane that already
+            // has a conversation.
+            // Issue #684: a `SessionStart` that announces nothing is
+            // PROVISIONAL. Two producers emit one — the wrapper's boot-provenance
+            // start (PRD #225 M3) and the daemon's own card-surfacing start
+            // (`CARD_SURFACE_SESSION_START_ORIGIN`) — and both exist to draw a
+            // CARD before any conversation exists, not to speak for the pane.
+            //
+            // Widened from `launcher_origin_start`, which named only the wrapper
+            // half. The card-surfacing start carries no origin marker at all
+            // until this issue added one, so it fell through every exclusion here
+            // and was read as a conversation announcing itself; `is_daemon_synthetic`
+            // keeps any future daemon-authored start in the same class by default
+            // rather than needing to be listed here again.
+            let provisional_start = event.event_type == EventType::SessionStart
+                && (event.is_wrapper_session_start() || event.is_daemon_synthetic());
             let announces_generation =
-                event.event_type == EventType::SessionStart && !launcher_origin_start;
+                event.event_type == EventType::SessionStart && !provisional_start;
             let advance = match self.pane_hook_session.get(pane_id) {
-                None => true,
+                // Issue #684: a provisional start may not ESTABLISH a generation
+                // either, which is the half that was missing. Letting it do so
+                // was not merely cosmetic: a TUI-owned delivery binds
+                // `pane_hook_session_id` as its target before it writes, so the
+                // pane id (or the wrapper's own session) became the conversation
+                // the prompt claimed to be entering — and the agent's genuine
+                // announcement moments later was then a DIFFERENT generation
+                // replacing it, i.e. both a `note_generation_closed` below and a
+                // changed target in `crate::ui::delivery_target_changed`. The
+                // prompt was discarded with the pane healthy and idle
+                // (`prompt/pane-input/033`, which pins both provisional
+                // establishing events as cases of the one mechanism).
+                //
+                // Leaving the pane with NO generation until a producer announces
+                // one is what the daemon-side latch already does
+                // (`latch_generation` refuses to bind either wrapper origin), so
+                // this makes the map agree with the latch instead of introducing
+                // a second policy. Non-start frames are untouched and still
+                // establish on any pane id, so a producer whose native hooks emit
+                // no `SessionStart` at all is unaffected.
+                None => !provisional_start,
                 Some((current_id, current_ts)) => {
                     if *current_id == incoming_session_id {
                         // Same generation: keep the id, bump the established
                         // timestamp so subsequent older events stay rejected.
                         incoming_ts > *current_ts
-                    } else if launcher_origin_start {
+                    } else if provisional_start {
                         // Boot provenance never replaces a live conversation.
                         false
                     } else {
@@ -7826,6 +7961,125 @@ impl AppState {
 mod tests {
     use super::*;
     use spec::spec;
+
+    /// Issue #960: the sibling-title lookup a `clear = true` respawn uses when
+    /// it has to re-create a worker pane from nothing. Covers both identity
+    /// rules and the four ways there is nothing to carry — an unknown instance
+    /// token, a `NameCwd` half-match, an empty title, and a pane with no
+    /// membership at all — none of which the behavioural test
+    /// (`orchestration/delegate/022`) can reach, since it drives one
+    /// orchestration with one title.
+    #[test]
+    fn a_recreated_pane_borrows_its_title_only_from_its_own_orchestration() {
+        fn role(
+            orchestration_id: Option<&str>,
+            name: &str,
+            cwd: &str,
+            display_title: Option<&str>,
+        ) -> crate::agent_pty::AgentRecord {
+            crate::agent_pty::AgentRecord {
+                id: "1".into(),
+                pane_id_env: None,
+                display_name: None,
+                cwd: Some(cwd.to_string()),
+                tab_membership: Some(crate::agent_pty::TabMembership::Orchestration {
+                    name: name.to_string(),
+                    role_index: 0,
+                    role_name: "orchestrator".into(),
+                    is_start_role: true,
+                    orchestration_cwd: Some(cwd.to_string()),
+                    display_title: display_title.map(str::to_string),
+                    orchestration_id: orchestration_id.map(str::to_string),
+                }),
+                agent_type: None,
+                rows: 24,
+                cols: 80,
+                live: None,
+                spawned_at_ms: None,
+            }
+        }
+        let instance = |id: &str| OrchestrationIdentity::Instance {
+            id: id.to_string(),
+            name: "team".into(),
+        };
+
+        // The per-tab token decides, not `(name, cwd)`: two tabs of the SAME
+        // orchestration in the SAME directory must not borrow each other's
+        // titles, or a re-created worker rejoins its tab under the neighbour's
+        // label (the cross-delivery class PRD #140 closed, in the title layer).
+        let two_tabs = vec![
+            role(Some("tab-a"), "team", "/w", Some("team · run-a")),
+            role(Some("tab-b"), "team", "/w", Some("team · run-b")),
+        ];
+        assert_eq!(
+            orchestration_display_title_from_live_siblings(&two_tabs, &instance("tab-b")),
+            Some("team · run-b".to_string())
+        );
+        assert_eq!(
+            orchestration_display_title_from_live_siblings(&two_tabs, &instance("tab-c")),
+            None,
+            "an unknown token borrows from nobody"
+        );
+
+        // A leading sibling with no title is skipped rather than answering the
+        // question — the same first-non-`None` rule `partition_hydrated_panes`
+        // applies, so the two cannot disagree about which value is the tab's.
+        let partially_titled = vec![
+            role(Some("tab-a"), "team", "/w", None),
+            role(Some("tab-a"), "team", "/w", Some("team · run-a")),
+        ];
+        assert_eq!(
+            orchestration_display_title_from_live_siblings(&partially_titled, &instance("tab-a")),
+            Some("team · run-a".to_string())
+        );
+
+        // An EMPTY title is absent, exactly as the hydration fallback and
+        // `validate_tab_membership` read it. Propagating `Some("")` would stamp
+        // a title that defeats the fallback to the canonical name instead of
+        // replacing it.
+        let empty = vec![role(Some("tab-a"), "team", "/w", Some(""))];
+        assert_eq!(
+            orchestration_display_title_from_live_siblings(&empty, &instance("tab-a")),
+            None
+        );
+
+        // The legacy token-less identity matches on exactly the `(name, cwd)`
+        // pair the daemon already routes that client's delegates on — and on
+        // both halves of it, so a same-named orchestration in another directory
+        // is not a sibling.
+        let legacy = vec![
+            role(None, "team", "/w", Some("team · legacy")),
+            role(None, "team", "/elsewhere", Some("team · elsewhere")),
+        ];
+        assert_eq!(
+            orchestration_display_title_from_live_siblings(
+                &legacy,
+                &OrchestrationIdentity::NameCwd {
+                    name: "team".into(),
+                    cwd: "/elsewhere".into(),
+                }
+            ),
+            Some("team · elsewhere".to_string())
+        );
+        assert_eq!(
+            orchestration_display_title_from_live_siblings(
+                &legacy,
+                &OrchestrationIdentity::NameCwd {
+                    name: "other".into(),
+                    cwd: "/w".into(),
+                }
+            ),
+            None
+        );
+
+        // A dashboard pane (no membership at all) is never a sibling.
+        let mut dashboard = role(Some("tab-a"), "team", "/w", Some("team · run-a"));
+        dashboard.tab_membership = None;
+        assert_eq!(
+            orchestration_display_title_from_live_siblings(&[dashboard], &instance("tab-a")),
+            None
+        );
+    }
 
     /// Issue #424 D2: `AppState`'s pane generation must not be pinnable by a
     /// producer-chosen timestamp either.

@@ -140,8 +140,16 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
   // than after the disk write, and there is no restart and no second path
   // that could disagree with this one.
   useEffect(() => {
+    // Issue #845: NOT before the mode is one somebody chose. Until then
+    // `settings` holds the unread placeholder — mode "system" — and applying
+    // System is `removeAttribute`, which would erase the attribute the Rust
+    // side put on the root before this bundle ran (`pre_paint_script` in
+    // `src-tauri/src/appearance.rs`) and flash the OS palette on the way to a
+    // value it already had. `chosen` rather than `loaded`, because a choice
+    // made before the read resolves must still apply on the click.
+    if (!settings.chosen) return;
     applyAppearance(settings.settings.appearance.mode);
-  }, [settings.settings.appearance.mode]);
+  }, [settings.chosen, settings.settings.appearance.mode]);
 
   useEffect(() => {
     if (!selectedAgentId || !snapshot.agents.some((agent) => agent.id === selectedAgentId)) {
@@ -543,6 +551,7 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
                   onTabChange={(tab) => setTabs((current) => ({ ...current, [agent.id]: tab }))}
                   onTerminalInput={runtime.sendTerminalInput}
                   onTerminalResize={runtime.resizeTerminal}
+                  appliedGeometry={runtime.appliedGeometry?.[agent.id]}
                   onEvidenceSelect={(id) => { setSelectedEvidenceId(id); setEvidenceOpen(true); }}
                   onSubmitText={submitText}
                   onRename={mode === "live" ? renameAgent : undefined}

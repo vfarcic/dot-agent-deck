@@ -4585,11 +4585,26 @@ fn an_empty_or_whitespace_only_api_key_counts_as_absent() {
 /// into a failure deep in a PTY wait.
 #[test]
 fn the_opencode_env_key_path_is_offered_only_for_an_anthropic_model() {
-    assert_eq!(
-        OPENCODE_TEST_MODEL_DEFAULT.split_once('/').map(|(p, _)| p),
-        Some("openai"),
-        "the default model is the case the provider match exists to exclude"
+    // The invariant the gate actually needs from the default is that it is
+    // provider-QUALIFIED: `opencode` rejects a bare model id with "Invalid
+    // model format", and the predicate below reads the prefix.
+    //
+    // This deliberately does NOT pin which provider that prefix is. It used to
+    // assert `Some("openai")`, described as "the case the provider match exists
+    // to exclude" — which was a convenient illustration rather than a
+    // requirement, and it went red the moment issue #922 moved the default onto
+    // `anthropic/` so a key-only host could run this coverage instead of
+    // skipping it. The exclusion is fully covered by the table below, which
+    // names its cases outright and cannot drift with the default.
+    // Named apart from the loop's own `model` below, which is a different thing.
+    let (default_provider, default_model) = OPENCODE_TEST_MODEL_DEFAULT
+        .split_once('/')
+        .expect("the default OpenCode test model is provider-qualified");
+    assert!(
+        !default_provider.is_empty() && !default_model.is_empty(),
+        "provider-qualified means both halves are non-empty: {OPENCODE_TEST_MODEL_DEFAULT:?}"
     );
+
     // `opencode_test_model` memoises, so drive the pure predicate the gate
     // uses rather than the OnceLock: provider match AND key presence.
     for (model, provider_matches) in [
@@ -4604,6 +4619,156 @@ fn the_opencode_env_key_path_is_offered_only_for_an_anthropic_model() {
             "provider match for {model}"
         );
     }
+}
+
+// -----------------------------------------------------------------------
+// Issue #807/#395 — the grid lookup re-reads, the single-shot one cannot
+// -----------------------------------------------------------------------
+
+/// The two frames of a schedule-form repaint, in the order the harness reader
+/// thread can observe them under PTY contention.
+///
+/// Ratatui flushes a frame as one byte stream and the reader consumes it in
+/// chunks, so a read can land after the modal's `Paragraph` has painted and
+/// before `render_modal_button_row` has drawn over the blank line it reserved.
+/// `MID_REPAINT` is that instant: the title `New Schedule` is on screen and
+/// `[Submit]` is not. `SETTLED` is the same modal one flush later.
+const MID_REPAINT: &str = "\
+ dot-agent-deck — 0 session(s)                 \n\
+    ┌─────────── New Schedule ───────────┐     \n\
+    │ Command: cat                       │     \n\
+    │                                    │     \n\
+    └────────────────────────────────────┘     \n";
+
+const SETTLED: &str = "\
+ dot-agent-deck — 0 session(s)                 \n\
+    ┌─────────── New Schedule ───────────┐     \n\
+    │ Command: cat                       │     \n\
+    │      [Submit]      [Cancel]        │     \n\
+    └────────────────────────────────────┘     \n";
+
+/// Scenario: Scan the mid-repaint frame for the modal's title and for its
+/// `[Submit]` button. The title is there and the button is not — which is the
+/// whole mechanism of issue #807: `wait_for_string("New Schedule")` is
+/// satisfied by a frame that does not yet contain the thing the test then
+/// goes looking for, so a single-shot `find_in_grid("[Submit]").expect(..)`
+/// aborts on a modal that is merely half-painted.
+#[test]
+fn a_mid_repaint_frame_shows_the_title_without_the_button_row() {
+    assert!(
+        grid_find(MID_REPAINT, "New Schedule").is_some(),
+        "the wait's own needle must be present — otherwise the wait would \
+         still be blocked and there would be no race to describe"
+    );
+    assert_eq!(
+        grid_find(MID_REPAINT, "[Submit]"),
+        None,
+        "the reserved button line is still blank in this frame"
+    );
+    assert!(
+        grid_find(SETTLED, "[Submit]").is_some(),
+        "the very next frame paints it — the absence above is transient"
+    );
+}
+
+/// Scenario: Drive the polling lookup over that two-frame sequence — the
+/// first read returns the mid-repaint frame, every later read the settled
+/// one. It must re-read rather than answer from the first frame, and hand
+/// back the coordinates the settled frame actually holds. This is the
+/// property that makes `wait_for_in_grid` a fix and not a reformulation: the
+/// single-shot scan above returned `None` on read 1, and this returns the
+/// button's cell.
+#[test]
+fn polling_the_lookup_survives_a_target_that_appears_after_the_first_read() {
+    let mut reads = 0usize;
+    let found = poll_grid_for(
+        || {
+            reads += 1;
+            if reads == 1 { MID_REPAINT } else { SETTLED }.to_string()
+        },
+        "[Submit]",
+        Duration::from_secs(5),
+        Duration::from_millis(1),
+    );
+
+    assert_eq!(
+        found,
+        Ok(grid_find(SETTLED, "[Submit]").expect("the settled frame holds [Submit]")),
+        "the coordinates must be the settled frame's real ones"
+    );
+    assert!(
+        reads > 1,
+        "it has to have read the grid again — one read saw only {MID_REPAINT:?}"
+    );
+}
+
+/// Scenario: Give the polling lookup a grid that never paints the needle and
+/// a short deadline. It must give up rather than spin forever, and the `Err`
+/// it returns must carry the grid it last read — that string is what
+/// `wait_for_in_grid` puts in its panic message, and it is the diagnostic a
+/// bare `.expect()` does not produce.
+#[test]
+fn the_polling_lookup_gives_up_with_the_grid_it_last_read() {
+    let mut reads = 0usize;
+    let outcome = poll_grid_for(
+        || {
+            reads += 1;
+            MID_REPAINT.to_string()
+        },
+        "[Submit]",
+        Duration::from_millis(60),
+        Duration::from_millis(10),
+    );
+
+    assert_eq!(outcome, Err(MID_REPAINT.to_string()));
+    assert!(
+        reads > 1,
+        "a timeout is only meaningful if it retried on the way there; got {reads} read(s)"
+    );
+}
+
+/// Scenario: Ask the polling lookup for something the very first frame
+/// already contains. It must answer from that read alone — the migration in
+/// issue #807 touches ~40 call sites, so the helper has to cost nothing when
+/// the target is already painted, which is the overwhelmingly common case.
+#[test]
+fn an_already_painted_target_costs_exactly_one_read() {
+    let mut reads = 0usize;
+    let found = poll_grid_for(
+        || {
+            reads += 1;
+            SETTLED.to_string()
+        },
+        "[Submit]",
+        Duration::from_secs(5),
+        // Deliberately longer than the deadline: a second read would blow the
+        // test's own budget, so passing proves there was not one.
+        Duration::from_secs(30),
+    );
+
+    assert!(found.is_ok());
+    assert_eq!(reads, 1, "no re-read when the first frame already has it");
+}
+
+/// Scenario: Locate a needle that sits behind box-drawing characters. The
+/// returned column must be a CHARACTER offset, not a byte offset — the grid
+/// is UTF-8 and every `│`/`─` costs three bytes, so a byte offset would click
+/// well to the right of the button. Pins the arithmetic that moved out of
+/// `TuiDeck::find_in_grid` into `grid_find`.
+#[test]
+fn the_returned_column_counts_characters_not_bytes() {
+    let (col, row) = grid_find(SETTLED, "[Submit]").expect("[Submit] is on the settled frame");
+    let line = SETTLED.lines().nth(row as usize).expect("row is in range");
+    assert_eq!(
+        line.chars().skip(col as usize).take(8).collect::<String>(),
+        "[Submit]",
+        "col must index the line by characters"
+    );
+    assert!(
+        line.find("[Submit]").expect("byte index exists") > col as usize,
+        "the multi-byte box border must make the byte offset differ from the \
+         character offset, or this test is not exercising the conversion"
+    );
 }
 
 /// Issue #709 / PR #907 review: an UNMEASURABLE load must leave the base

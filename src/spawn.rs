@@ -647,6 +647,22 @@ pub async fn spawn(
                 id: orchestration_id.clone(),
                 name: name.clone(),
             };
+            // Issue #960: minted once, before the loop, for the same reason
+            // `orchestration_id` is — every role of one orchestration shares it
+            // — and stamped on every role's membership below so it SURVIVES a
+            // detach/reattach. It used to be computed inside
+            // `surface_spawned_orchestration` and put on the transient broadcast
+            // alone, while this loop hardcoded `display_title: None`. Nothing
+            // persists a broadcast, so on reattach `partition_hydrated_panes`
+            // read `None` off every role pane and
+            // `open_orchestration_tab_with_existing_role_panes` fell back to the
+            // canonical config name: a tab labelled `mixed · issue-950` while
+            // attached came back as bare `mixed`, and N concurrent dispatches all
+            // came back identically labelled — the exact confusion the suffix
+            // exists to prevent. The broadcast now carries THIS value (see the
+            // `surface_spawned_orchestration` call below), so the live label and
+            // the reattached label cannot disagree by construction.
+            let display_title = dispatched_orchestration_display_title(&name, &req.working_dir);
             for (idx, role) in roles.iter().enumerate() {
                 let pane_id = next_pane_id(&req.task_name, Some(role.role_index));
                 let membership = TabMembership::Orchestration {
@@ -655,7 +671,7 @@ pub async fn spawn(
                     role_name: role.role_name.clone(),
                     is_start_role: role.is_start_role,
                     orchestration_cwd: Some(req.working_dir.clone()),
-                    display_title: None,
+                    display_title: display_title.clone(),
                     orchestration_id: Some(orchestration_id.clone()),
                 };
                 let id = spawn_one(
@@ -817,7 +833,16 @@ pub async fn spawn(
             // role's PTY and builds the tab mid-session. Best-effort: `send`
             // errs only when no TUI is attached (the standalone-daemon case).
             if let Some(tx) = event_tx {
-                surface_spawned_orchestration(tx, &name, &req.working_dir, &roles, &agents);
+                surface_spawned_orchestration(
+                    tx,
+                    &name,
+                    &req.working_dir,
+                    // Issue #960: the SAME value the role memberships above were
+                    // stamped with, not a second computation of it.
+                    display_title.clone(),
+                    &roles,
+                    &agents,
+                );
                 // …and give every role card its ROLE NAME, the same way the
                 // single-agent branch names its card: a synthetic `SessionStart`
                 // carrying the friendly name as metadata.
@@ -2371,6 +2396,18 @@ fn surface_spawned_pane(
 ) {
     let mut metadata = HashMap::new();
     metadata.insert(DISPLAY_NAME_METADATA_KEY.to_string(), task_name.to_string());
+    // Issue #684: declare that the DAEMON authored this start to draw a card,
+    // rather than a producer announcing a conversation. `session_id` below is the
+    // PANE ID and there is no `agent_id`, so without the marker an attached TUI's
+    // `AppState` established the pane id as the pane's hook GENERATION — a
+    // TUI-owned seed or role prompt bound it, and the agent's genuine
+    // `SessionStart` then read as a rollover and abandoned the prompt with "the
+    // agent's conversation changed". See `CARD_SURFACE_SESSION_START_ORIGIN` and
+    // `prompt/pane-input/033`.
+    metadata.insert(
+        crate::event::SESSION_START_ORIGIN_METADATA_KEY.to_string(),
+        crate::event::CARD_SURFACE_SESSION_START_ORIGIN.to_string(),
+    );
     let event = AgentEvent {
         session_id: pane_id.to_string(),
         agent_type: agent_type
@@ -2392,6 +2429,39 @@ fn surface_spawned_pane(
     let _ = event_tx.send(BroadcastMsg::Event(event));
 }
 
+/// Issue #960: the run-identifying tab label for a DAEMON-SPAWNED orchestration,
+/// or `None` when there is nothing to add to the canonical `name`.
+///
+/// PRD #120 S1: disambiguate concurrent dispatched orchestration tabs. The
+/// daemon-initiated path carries no user-typed title, so N concurrent issue
+/// dispatches would all paint identically-labelled tabs (the shared
+/// orchestration `name`, e.g. `issue-work`) — indistinguishable in the tab
+/// strip. Append the per-spawn identity: the cwd basename, which for issue
+/// dispatch is the per-issue worktree `issue-<n>`. `name` stays the PREFIX so
+/// the canonical label reads first and survives the tab strip's
+/// trailing-ellipsis truncation. When the basename already equals `name` (an
+/// unnamed orchestration whose name resolved to its own cwd basename) there's
+/// nothing to add — fall back to `None`, i.e. the canonical `name`.
+///
+/// Called ONCE per spawn, before the role loop, and its value goes to both
+/// consumers: every role pane's `TabMembership::Orchestration.display_title`
+/// (which survives a detach/reattach) and the `OrchestrationSurface` broadcast
+/// (which paints the label live). Two computations of the same string is what
+/// issue #960 was — the loop stamped `None` while only the broadcast carried the
+/// title — so keep it one value with one producer.
+///
+/// Never returns `Some("")`: the format string always contains `" · "`, and both
+/// the hydration fallback (`tab.rs`) and `validate_tab_membership` treat an
+/// empty title as absent, so an empty `Some` would defeat the fallback rather
+/// than carry a title.
+fn dispatched_orchestration_display_title(name: &str, cwd: &str) -> Option<String> {
+    Path::new(cwd)
+        .file_name()
+        .map(|b| b.to_string_lossy().into_owned())
+        .filter(|b| b != name)
+        .map(|b| format!("{name} · {b}"))
+}
+
 /// PRD #120: surface a freshly-spawned ORCHESTRATION to attached TUIs by
 /// publishing its structural membership through the daemon's existing
 /// `BroadcastMsg` fan-out as a typed [`BroadcastMsg::OrchestrationSurface`].
@@ -2410,6 +2480,11 @@ fn surface_spawned_orchestration(
     event_tx: &broadcast::Sender<BroadcastMsg>,
     name: &str,
     cwd: &str,
+    // Issue #960: computed by the caller (once, before its role loop) and
+    // stamped on every role pane's membership, so the live label this broadcast
+    // paints and the one a reattach rebuilds are the same value rather than two
+    // computations that can drift apart.
+    display_title: Option<String>,
     roles: &[RoleSpawn],
     agents: &[SpawnedAgent],
 ) {
@@ -2423,21 +2498,6 @@ fn surface_spawned_orchestration(
             is_start_role: role.is_start_role,
         })
         .collect();
-    // PRD #120 S1: disambiguate concurrent dispatched orchestration tabs. The
-    // daemon-initiated path carries no user-typed title, so N concurrent issue
-    // dispatches would all paint identically-labelled tabs (the shared
-    // orchestration `name`, e.g. `issue-work`) — indistinguishable in the tab
-    // strip. Append the per-spawn identity: the cwd basename, which for issue
-    // dispatch is the per-issue worktree `issue-<n>`. `name` stays the PREFIX so
-    // the canonical label reads first and survives the tab strip's
-    // trailing-ellipsis truncation. When the basename already equals `name` (an
-    // unnamed orchestration whose name resolved to its own cwd basename) there's
-    // nothing to add — fall back to `None`, i.e. the canonical `name`.
-    let display_title = Path::new(cwd)
-        .file_name()
-        .map(|b| b.to_string_lossy().into_owned())
-        .filter(|b| b != name)
-        .map(|b| format!("{name} · {b}"));
     let surface = crate::event::OrchestrationSurface {
         name: name.to_string(),
         cwd: cwd.to_string(),
@@ -5700,6 +5760,49 @@ mod tests {
         registry.shutdown_all();
     }
 
+    /// Issue #960: the one producer of a dispatched orchestration's run title,
+    /// at its edges. The two ordinary branches are covered behaviourally by
+    /// `orchestration/dispatch/005`; what is only reachable here is the
+    /// root/empty cwd and the "never `Some(\"\")`" property the fallback depends
+    /// on — both the hydration fallback (`tab.rs`) and
+    /// `validate_tab_membership` read an empty title as absent, so stamping one
+    /// would defeat the fallback to the canonical name rather than replace it.
+    #[test]
+    fn a_dispatched_run_title_is_either_absent_or_a_real_label() {
+        // The ordinary case: the cwd basename is the per-run identity, and
+        // `name` leads so the canonical label survives tab-strip truncation.
+        assert_eq!(
+            dispatched_orchestration_display_title("mixed", "/w/repo-issue-950"),
+            Some("mixed · repo-issue-950".to_string())
+        );
+        // Nothing to add when the basename IS the name (an unnamed orchestration
+        // whose name resolved to its own cwd basename).
+        assert_eq!(
+            dispatched_orchestration_display_title("mixed", "/w/mixed"),
+            None
+        );
+        // No basename to add: a root or empty cwd. `file_name()` is `None` for
+        // both, and for a trailing `..` — none of which can name a run.
+        for cwd in ["/", "", "/w/.."] {
+            assert_eq!(
+                dispatched_orchestration_display_title("mixed", cwd),
+                None,
+                "cwd {cwd:?} has no basename to identify a run by"
+            );
+        }
+        // Whatever it returns, it is never an EMPTY title. Enumerated over the
+        // inputs that could plausibly produce one rather than argued from the
+        // format string, since the fallback's correctness rests on it.
+        for (name, cwd) in [("", "/w/issue-1"), ("mixed", "/w/ "), ("", "/")] {
+            assert_ne!(
+                dispatched_orchestration_display_title(name, cwd).as_deref(),
+                Some(""),
+                "an empty title is read as absent everywhere, so it must never be produced \
+                 (name = {name:?}, cwd = {cwd:?})"
+            );
+        }
+    }
+
     /// Issue #454 review, item 5: the "valid" in this function's contract
     /// includes the byte cap, and a schedule / dispatch task name has no length
     /// bound of its own.
@@ -6087,6 +6190,25 @@ mod tests {
                 .map(String::as_str),
             Some("morning-digest"),
             "the friendly name must ride on the event so the live card titles itself with it"
+        );
+        // Issue #684: and it declares itself DAEMON-AUTHORED, so an attached
+        // TUI's `AppState` does not read it as a conversation announcing itself
+        // over this pane. Without the marker it established the pane's hook
+        // generation — the pane id, since that is this event's `session_id` — a
+        // TUI-owned seed or role prompt bound that as its delivery target, and
+        // the agent's genuine `SessionStart` moments later read as a rollover and
+        // discarded the prompt. Asserted on the PRODUCER because the behavioural
+        // test (`prompt/pane-input/033`) replays this event rather than calling
+        // this function, so nothing else would notice the marker going missing.
+        assert!(
+            e.is_card_surface_session_start(),
+            "the card-surfacing start must carry its origin marker; metadata={:?}",
+            e.metadata
+        );
+        assert!(
+            e.is_daemon_synthetic(),
+            "and must therefore fall in the daemon-authored class, which is what \
+             `AppState::apply_event` and the delivery paths discriminate on"
         );
     }
 

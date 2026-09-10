@@ -13,6 +13,8 @@
     "bundle:app": "tauri build --config src-tauri/tauri.bundle.conf.json --bundles app",
     "test": "vitest run",
     "test:watch": "vitest",
+    "test:browser": "playwright test",
+    "test:browser:types": "tsc -p tsconfig.e2e.json",
     "tauri": "tauri"
   },
   "dependencies": {
@@ -25,9 +27,11 @@
     "react-dom": "^19.2.0"
   },
   "devDependencies": {
+    "@playwright/test": "1.63.0",
     "@tauri-apps/cli": "^2.11.4",
     "@testing-library/jest-dom": "^7.0.0",
     "@testing-library/react": "^16.3.2",
+    "@types/node": "^26.5.0",
     "@types/react": "^19.2.18",
     "@types/react-dom": "^19.2.4",
     "@vitejs/plugin-react": "^6.0.5",
@@ -35,6 +39,6 @@
     "jsdom": "^30.0.0",
     "typescript": "^7.0.2",
     "vite": "^8.2.1",
-    "vitest": "^4.1.10"
+    "vitest": "^5.0.0"
   }
 }

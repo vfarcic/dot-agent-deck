@@ -3,7 +3,7 @@
 //! PRD #80 M6 — L2 synthetic tests for inline-edit + PaneInput mouse parity.
 //!
 //! Spawns the real `dot-agent-deck` binary inside an isolated PTY and drives
-//! the mouse via SGR reports through `TuiDeck::click` / `find_in_grid` /
+//! the mouse via SGR reports through `TuiDeck::click` / `wait_for_in_grid` /
 //! `send_bytes`. Covers the filter-row `[Apply]`/`[Cancel]`, rename-row
 //! `[Save]`/`[Cancel]`, click-in-field focus retention, and the PaneInput
 //! `[Command Mode Ctrl+D]` affordance — each asserted to equal the corresponding
@@ -32,9 +32,7 @@ fn send_session_start(deck: &TuiDeck, session_id: &str, pane_id: &str, cwd: &str
 
 /// Click the button/affordance whose label text is `needle`.
 fn click_button(deck: &TuiDeck, needle: &str) {
-    let (col, row) = deck
-        .find_in_grid(needle)
-        .unwrap_or_else(|| panic!("expected a clickable {needle} affordance on screen"));
+    let (col, row) = deck.wait_for_in_grid(needle);
     deck.click(col, row);
 }
 
@@ -108,60 +106,94 @@ fn inline_001_filter_cancel_abandons() {
     deck.wait_for_string("alpha");
 }
 
-/// Scenario: With a selected card, press `r` to enter rename mode, type a
-/// new name, then click `[Save]`. The rename commits exactly as Enter does —
-/// the new name shows on the card. RED until M6 renders the inline `[Save]`
-/// button.
+/// Scenario: With a selected card backed by a real pane, press `r` to enter
+/// rename mode, type a new name, then click `[Save]`. The rename commits
+/// exactly as Enter does — the new name replaces the pane id in the card's
+/// own title. RED until M6 renders the inline `[Save]` button.
 #[spec("mouse/inline/001")]
 #[test]
 fn inline_001_rename_save_commits() {
     // PRD #127: 200 cols so the Normal-mode bar (reached after Save) renders
     // the FULL `[New Pane Ctrl+N]` label; at 120 it collapses to chips once the
     // always-shown Scheduled Tasks button is included.
+    //
+    // Issue #818: this drives a REAL pane, and that is load-bearing rather
+    // than incidental. A card synthesized by a `session_start` hook line names
+    // a `pane_id` the pane controller does not own, so `rename_pane` resolves
+    // it against `self.panes` and returns `Err(Pane … not found)`
+    // (`embedded_pane.rs`), which `commit_rename` swallows to a `debug!` with
+    // the UI display-name maps left untouched — correct behaviour for a pane
+    // that does not exist. The card was therefore NEVER renamed, and the
+    // assertion below could only ever be satisfied by the `Rename: renamed7`
+    // text still resident in the previous frame. That won the race locally
+    // (2.0s) and lost it on a loaded runner, where the bottom bar repainted
+    // first and the wait burned its full 10s bound.
     let deck = TuiDeck::builder()
         .with_pty_size(200, 40)
+        .with_continue_session("realpane", "sleep 600")
         .launch_with_fixture("minimal");
-    deck.wait_for_string("No active sessions");
-    send_session_start(&deck, "alpha", "pane-alpha", "/tmp");
-    deck.wait_for_string("alpha");
+    // --continue auto-focuses the restored pane → PaneInput; Ctrl+D returns to
+    // the dashboard, where a card is selected and `r` is bound.
+    deck.wait_for_string("[Command Mode Ctrl+D]");
+    deck.send_bytes(b"\x04");
+    deck.wait_for_string("[New Pane Ctrl+N]");
+    deck.wait_for_string("realpane");
 
     deck.send_bytes(b"r"); // enter rename mode for the selected card
     deck.wait_for_string("Rename:");
     deck.send_bytes(b"renamed7");
-    deck.wait_for_string("renamed7");
+    deck.wait_for_string("Rename: renamed7");
 
     click_button(&deck, "[Save]");
 
-    // Committed like Enter: the new name shows on the card.
-    deck.wait_for_string("renamed7");
+    // Committed like Enter: the new name reaches the CARD. Asserted as the
+    // title's `<type> · <name>` shape, which the rename input cannot produce —
+    // a bare `renamed7` would also match the `Rename: renamed7` row this click
+    // is dismissing, which is exactly how this test passed without the rename
+    // ever having happened.
+    deck.wait_for_string("· renamed7");
     deck.wait_for_string("[New Pane Ctrl+N]"); // back to Normal
 }
 
-/// Scenario: With a selected card, press `r` to enter rename mode, type a
-/// new name, then click `[Cancel]`. The rename is abandoned exactly as Esc
-/// does — the card keeps its original `alpha` name and the typed name is not
-/// applied. RED until M6 renders the inline `[Cancel]` button on the rename
-/// row.
+/// Scenario: With a selected card backed by a real pane, press `r` to enter
+/// rename mode, type a new name, then click `[Cancel]`. The rename is
+/// abandoned exactly as Esc does — the card keeps its original `realpane`
+/// title and the typed name is not applied. RED until M6 renders the inline
+/// `[Cancel]` button on the rename row.
 #[spec("mouse/inline/001")]
 #[test]
 fn inline_001_rename_cancel_abandons() {
-    let deck = TuiDeck::launch_with_fixture("minimal");
-    deck.wait_for_string("No active sessions");
-    send_session_start(&deck, "alpha", "pane-alpha", "/tmp");
-    deck.wait_for_string("alpha");
+    // Issue #818: a real pane here too, and for a sharper reason than in
+    // `inline_001_rename_save_commits`. Against a hook-synthesized card the
+    // rename could never apply at all, so "the typed name is not applied"
+    // held whatever `[Cancel]` did — this assertion passed identically if the
+    // click had COMMITTED. With a renameable pane, Cancel and Save are
+    // genuinely distinguishable, which is the contract this pair exists to
+    // pin. 200 cols to match its sibling, so both reach the full Normal bar.
+    let deck = TuiDeck::builder()
+        .with_pty_size(200, 40)
+        .with_continue_session("realpane", "sleep 600")
+        .launch_with_fixture("minimal");
+    // --continue auto-focuses the restored pane → PaneInput; Ctrl+D returns to
+    // the dashboard, where a card is selected and `r` is bound.
+    deck.wait_for_string("[Command Mode Ctrl+D]");
+    deck.send_bytes(b"\x04");
+    deck.wait_for_string("[New Pane Ctrl+N]");
+    deck.wait_for_string("· realpane");
 
     deck.send_bytes(b"r");
     deck.wait_for_string("Rename:");
     deck.send_bytes(b"discarded9");
-    deck.wait_for_string("discarded9");
+    deck.wait_for_string("Rename: discarded9");
 
     click_button(&deck, "[Cancel]");
 
-    // Abandoned like Esc: the rename input is discarded — the typed name
-    // disappears (the alpha card was always visible, so its absence, not
-    // alpha's presence, is the deterministic signal the cancel took effect).
+    // Abandoned like Esc: the rename input is discarded and the card keeps the
+    // title it had. Both halves are asserted — the typed name gone proves the
+    // row was dismissed, and `· realpane` still present proves the click did
+    // not commit, which is what tells Cancel apart from Save.
     deck.wait_for_absence("discarded9");
-    deck.wait_for_string("alpha");
+    deck.wait_for_string("· realpane");
 }
 
 /// Scenario: A real `--continue`-spawned pane (`realpane`, running a long-

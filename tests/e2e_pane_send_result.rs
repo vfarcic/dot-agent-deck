@@ -232,18 +232,35 @@ while IFS= read -r line; do printf '%s\n' "$line" >> orchestrator-prompt.log; do
     deck.send_keys(b"\r");
     deck.send_keys(b"\r");
 
+    // 30s rather than 5s. This wait covers a chain that spawns the pane, runs
+    // the stand-in through a `python3` interpreter, round-trips a
+    // `session_start` over the daemon socket and repaints — and it fails as a
+    // unit when the runner stalls. Measured 2026-09-07: this test took 20.9s on
+    // a `ubuntu-latest` runner against 1.54s on the same tier's green run of
+    // `main` (13.6x its own CI-normal), expiring this budget AND the delivery
+    // budget below before asserting. That is NOT a slower runner: across the
+    // 2653 tests the two reports share, the median CI/local per-test ratio is
+    // 0.96x, and this test is faster on a healthy runner (1.54s) than locally
+    // (1.94s). It is an intermittent stall, and 30s — the modal
+    // `wait_for_grid_string_within` budget in this suite, 19 of 61 uses — rides
+    // it out. The wait returns as soon as the string paints, so a healthy run
+    // pays nothing for the headroom; only a genuine failure waits longer.
     let feedback = deck.wait_for_grid_string_within(
         "History-only session cannot accept live input",
-        Duration::from_secs(5),
+        Duration::from_secs(30),
     );
     let marked_working = deck.snapshot_grid().contains("Working");
     std::fs::write(deck.workdir().join("allow-live-target"), "")
         .expect("allow synthetic role to become live");
+    // 15s rather than 10s, for the same stall: the run above expired this
+    // budget too, so widening only the feedback wait would not have saved it.
+    // 15s is the top of the range this helper already uses across the suite
+    // (10s in 13 places, 15s in 10).
     let delivered = common::wait_for_file_substr_count(
         &deck.workdir().join("orchestrator-prompt.log"),
         DELIVERED_POINTER,
         1,
-        Duration::from_secs(10),
+        Duration::from_secs(15),
     );
     let context = std::fs::read_to_string(
         deck.workdir()
