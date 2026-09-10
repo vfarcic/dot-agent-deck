@@ -28,8 +28,8 @@
 //!   permission sandbox gates `.dot-agent-deck` reads / shell runs
 //!   ("Access external directory …"), which is orthogonal to #187 — so
 //!   rather than configure that sandbox, the OpenCode arm injects a
-//!   purely conversational prompt through the SAME
-//!   `write_to_pane_and_submit` primitive the delegate dispatch uses and
+//!   purely conversational prompt through the SAME guarded write-and-submit
+//!   primitive the delegate dispatch uses and
 //!   asserts the model's reply renders. (Verified 2026-06-22: OpenCode
 //!   does auto-submit; the only thing that blocked the full loop was its
 //!   tool-permission sandbox, not #187, not the account, not PRD #79.)
@@ -40,7 +40,9 @@ use std::time::Duration;
 
 use tempfile::TempDir;
 
-use dot_agent_deck::agent_pty::{AgentPtyRegistry, DOT_AGENT_DECK_PANE_ID, SpawnOptions};
+use dot_agent_deck::agent_pty::{
+    AgentPtyRegistry, DOT_AGENT_DECK_PANE_ID, GuardedSend, SpawnOptions,
+};
 use dot_agent_deck::event::DelegateSignal;
 use spec::spec;
 
@@ -245,9 +247,16 @@ async fn delegate_work_done_chain_claude() {
 /// `.dot-agent-deck` reads and shell runs (it prompts "Access external
 /// directory …" / tool approval), which is orthogonal to #187. Instead we
 /// inject a purely conversational prompt via the SAME
-/// `write_to_pane_and_submit` primitive the delegate dispatch uses, and
+/// `write_and_submit_guarded` primitive the delegate dispatch uses, and
 /// assert the model's reply renders — proving the single-line prompt was
 /// submitted without a manual Enter, with no tool permissions involved.
+///
+/// Issue #917: migrated off the deleted unguarded `write_to_pane_and_submit`.
+/// The injection is now bound to the worker's own registry agent id — which
+/// this test has had in scope all along from its own `spawn_agent` — so it
+/// exercises the primitive production actually uses, and the `Applied`
+/// assertion additionally proves the write was authorized rather than merely
+/// attempted.
 ///
 /// The answer token (`4444`) is absent from the prompt, so finding it in
 /// the rendered pane proves the prompt was submitted and answered, not
@@ -316,13 +325,19 @@ async fn opencode_auto_submits_daemon_injected_prompt() {
     )
     .await;
 
-    registry
-        .write_to_pane_and_submit(
-            WORKER_PANE,
-            "Reply with only the number equal to 4000 plus 444.",
-        )
-        .await
-        .expect("inject prompt into opencode worker");
+    assert_eq!(
+        registry
+            .write_and_submit_guarded(
+                WORKER_PANE,
+                "Reply with only the number equal to 4000 plus 444.",
+                &worker_agent_id,
+                || async { true },
+            )
+            .await
+            .expect("inject prompt into opencode worker"),
+        GuardedSend::Applied,
+        "the guarded injection must be authorized and applied before the reply can be awaited"
+    );
 
     let (ok, screen) = common::wait_for_rendered_agent_text(
         &registry,

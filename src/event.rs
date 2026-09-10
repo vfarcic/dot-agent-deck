@@ -1005,6 +1005,32 @@ pub enum DaemonMessage {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GetSeedRequest {
     pub pane_id: String,
+    /// Issue #916: the registry agent id of the caller, from the
+    /// `DOT_AGENT_DECK_AGENT_ID` the daemon injects at spawn — the same
+    /// provenance [`AgentEvent::agent_id`] carries and the same pattern the
+    /// `agent-event` verb already uses.
+    ///
+    /// The daemon receives only a caller-supplied pane id on this socket and has
+    /// no other route to attribute the connection to an agent: the hook socket
+    /// is a plain JSON-lines Unix socket with no handshake, and the `get-seed`
+    /// process is a CHILD of the agent, so even peer credentials would name the
+    /// CLI rather than the agent. So the caller has to say who it is, which is
+    /// the same "make the invariant a required argument" move issue #617 applied
+    /// to the write side.
+    ///
+    /// **Additive on the hook socket, so it does NOT move
+    /// [`crate::daemon_protocol::PROTOCOL_VERSION`]** — that constant versions
+    /// the ATTACH socket's framed wire, which this message never travels, and
+    /// its own bump policy exempts `#[serde(default,
+    /// skip_serializing_if = "Option::is_none")]` fields regardless. An older
+    /// daemon ignores the unknown field (no `deny_unknown_fields` here) and an
+    /// older CLI omits it, which deserializes to `None`.
+    ///
+    /// `None` therefore means "the caller could not say", not "the caller is
+    /// nobody", and the daemon treats it as such — see
+    /// [`crate::agent_pty::AgentPtyRegistry::take_pending_seed_native_for`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
 }
 
 /// PRD #201: the daemon's reply to a [`DaemonMessage::GetSeed`], written as a
@@ -1698,6 +1724,7 @@ mod tests {
         // it from the fire-and-forget delegate / work-done signals.
         let msg = DaemonMessage::GetSeed(GetSeedRequest {
             pane_id: "pane-7".into(),
+            agent_id: Some("agent-42".into()),
         });
         let json = serde_json::to_string(&msg).unwrap();
         assert!(
@@ -1707,7 +1734,58 @@ mod tests {
         );
         let parsed: DaemonMessage = serde_json::from_str(&json).unwrap();
         match parsed {
-            DaemonMessage::GetSeed(r) => assert_eq!(r.pane_id, "pane-7"),
+            DaemonMessage::GetSeed(r) => {
+                assert_eq!(r.pane_id, "pane-7");
+                assert_eq!(r.agent_id.as_deref(), Some("agent-42"));
+            }
+            _ => panic!("expected GetSeed"),
+        }
+    }
+
+    /// Issue #916: `agent_id` is ADDITIVE on the hook socket, in both
+    /// directions, which is why it moves no `PROTOCOL_VERSION` (a constant that
+    /// versions the ATTACH socket's framed wire — a socket this message never
+    /// travels — and whose own policy exempts optional-with-default fields).
+    ///
+    /// Both halves of the skew are pinned here rather than argued: a NEW client
+    /// omits the field entirely when it has no id to present, so an older daemon
+    /// sees byte-identical JSON to what it always saw; and an OLD client's
+    /// payload, which carries no such key, still deserializes — to `None`, the
+    /// value the daemon reads as "the caller could not say".
+    #[test]
+    fn get_seed_agent_id_is_additive_in_both_directions() {
+        // New client, no id to present → the key is not on the wire at all.
+        let without = serde_json::to_string(&DaemonMessage::GetSeed(GetSeedRequest {
+            pane_id: "pane-7".into(),
+            agent_id: None,
+        }))
+        .unwrap();
+        assert!(
+            !without.contains("agent_id"),
+            "an absent agent id must be omitted, so a pre-#916 daemon receives the payload it \
+             has always received: {without}"
+        );
+
+        // Old client's payload (no `agent_id` key) → deserializes to `None`.
+        let legacy = r#"{"message_type":"get_seed","pane_id":"pane-7"}"#;
+        match serde_json::from_str::<DaemonMessage>(legacy).expect("a pre-#916 payload must parse")
+        {
+            DaemonMessage::GetSeed(r) => {
+                assert_eq!(r.pane_id, "pane-7");
+                assert!(
+                    r.agent_id.is_none(),
+                    "a payload with no agent id must read as `None`, not fail"
+                );
+            }
+            _ => panic!("expected GetSeed"),
+        }
+
+        // And an unknown extra key — what a pre-#916 daemon effectively does
+        // with ours — is ignored rather than refused, in the same direction.
+        let forward = r#"{"message_type":"get_seed","pane_id":"pane-7","agent_id":"a1","unknown_future_field":true}"#;
+        match serde_json::from_str::<DaemonMessage>(forward).expect("unknown keys must be ignored")
+        {
+            DaemonMessage::GetSeed(r) => assert_eq!(r.agent_id.as_deref(), Some("a1")),
             _ => panic!("expected GetSeed"),
         }
     }

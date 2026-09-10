@@ -431,7 +431,7 @@ pub trait PaneController: Send + Sync {
     /// PRD #100: write `text` to `pane_id` and submit atomically — the
     /// daemon side holds its per-agent writer mutex across the full
     /// `payload → SUBMIT_DELAY → CR` sequence, matching the contract
-    /// `AgentPtyRegistry::write_to_pane_and_submit` provides to
+    /// `AgentPtyRegistry::write_and_submit_guarded` provides to
     /// daemon-initiated callers (orchestration delegate / work-done
     /// feedback). The default impl forwards to [`Self::write_to_pane`],
     /// which is the historical two-`STREAM_IN`-frames-with-gap pattern

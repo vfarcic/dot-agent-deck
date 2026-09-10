@@ -463,7 +463,7 @@ impl DaemonClient {
     }
 
     /// PRD #100: route a pane write through the daemon's atomic
-    /// `write_to_pane_and_submit` primitive instead of the
+    /// `write_and_submit_guarded` primitive instead of the
     /// two-`STREAM_IN`-frames-with-gap pattern. Same one-shot connection
     /// shape as `resize_agent` / `stop_agent`. The daemon holds the
     /// per-agent writer mutex across `payload → SUBMIT_DELAY → CR`, so a

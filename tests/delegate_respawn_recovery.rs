@@ -31,10 +31,11 @@
 
 #![cfg(unix)]
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use dot_agent_deck::agent_pty::{
-    AgentPtyRegistry, DOT_AGENT_DECK_PANE_ID, SpawnOptions, TabMembership,
+    AgentPtyRegistry, DOT_AGENT_DECK_PANE_ID, GuardedSend, SpawnOptions, TabMembership,
 };
 use dot_agent_deck::event::{AgentEvent, AgentType, DelegateSignal, EventType};
 use dot_agent_deck::state::OrchestrationIdentity;
@@ -848,4 +849,125 @@ async fn dispatch_003_the_dispatch_and_startagent_paths_respawn_identically() {
          DIFFERENT relaunch parameters. They do not — and a future change that makes them \
          diverge is what this assertion is here to catch"
     );
+}
+
+/// A raw, no-echo `cat` on `pane_id` that prints `marker` once its termios is
+/// already in raw mode. Every byte the daemon submits into the pane afterwards
+/// appears exactly once in the agent's snapshot and nothing else does, which is
+/// what makes "this text was NOT submitted" directly observable — the same stub
+/// `idle_worker_detector.rs` and `work_done_reporting.rs` use for the same
+/// reason.
+fn spawn_raw_cat_observer(
+    registry: &Arc<AgentPtyRegistry>,
+    pane_id: &str,
+    marker: &str,
+    cwd: &str,
+) -> String {
+    let command =
+        format!("stty -echo -icanon -icrnl -opost min 1 time 0 && printf {marker} && exec cat -u");
+    registry
+        .spawn_agent(SpawnOptions {
+            command: Some(&command),
+            cwd: Some(cwd),
+            env: vec![
+                (DOT_AGENT_DECK_PANE_ID.to_string(), pane_id.to_string()),
+                ("SHELL".to_string(), "/bin/sh".to_string()),
+            ],
+            ..SpawnOptions::default()
+        })
+        .unwrap_or_else(|error| panic!("spawn raw-cat observer on {pane_id}: {error}"))
+}
+
+/// Poll `agent_id`'s scrollback until `needle` appears, or the deadline passes.
+/// Returns whatever the last snapshot held so the caller can print it.
+async fn wait_for_snapshot(registry: &AgentPtyRegistry, agent_id: &str, needle: &str) -> String {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let snapshot =
+            String::from_utf8_lossy(&registry.snapshot(agent_id).unwrap_or_default()).into_owned();
+        if snapshot.contains(needle) || tokio::time::Instant::now() >= deadline {
+            return snapshot;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Scenario: An agent asks the daemon to dispatch, and its pane changes hands
+/// while `handle_dispatch` does its worktree-and-spawn work — the caller is
+/// closed and an unrelated agent inherits the same `DOT_AGENT_DECK_PANE_ID`.
+/// Delivering the dispatch result must be refused as `WrongSession`, and none of
+/// the result text may appear in the successor's scrollback even after a later
+/// authorized write to that successor has demonstrably landed.
+#[spec("orchestration/dispatch/005")]
+#[tokio::test]
+async fn dispatch_005_a_dispatch_result_is_refused_when_the_caller_pane_changed_hands() {
+    common::init_test_env();
+    const PANE: &str = "dispatch-result-handover-pane";
+    const RESULT: &str = "DISPATCH-RESULT-MUST-NOT-REACH-THE-SUCCESSOR-2f7c";
+    const BARRIER: &str = "AUTHORIZED-WRITE-AFTER-THE-REFUSAL-9b13";
+
+    let dir = common::race_safe_tempdir();
+    let cwd = dir.path().to_string_lossy().into_owned();
+    let registry = Arc::new(AgentPtyRegistry::new());
+
+    // The agent that asked for the dispatch, and whose registry id the daemon
+    // captures from ONE `AgentRecord` before the slow half runs.
+    let caller = spawn_raw_cat_observer(&registry, PANE, "CALLER-READY", &cwd);
+    let ready = wait_for_snapshot(&registry, &caller, "CALLER-READY").await;
+    assert!(
+        ready.contains("CALLER-READY"),
+        "precondition: the caller stub must be up before it is handed over; snapshot = {ready:?}"
+    );
+
+    // The hand-over: the caller goes away and an unrelated agent takes the pane
+    // id, exactly as a recycled `DOT_AGENT_DECK_PANE_ID` is reissued.
+    registry.close_agent(&caller).expect("close the caller");
+    let successor = spawn_raw_cat_observer(&registry, PANE, "SUCCESSOR-READY", &cwd);
+    assert_ne!(
+        caller, successor,
+        "the hand-over must produce a NEW registry agent id"
+    );
+    let ready = wait_for_snapshot(&registry, &successor, "SUCCESSOR-READY").await;
+    assert!(
+        ready.contains("SUCCESSOR-READY"),
+        "precondition: the successor must be up and echoing, or the absence asserted below \
+         proves only that its stub never started; snapshot = {ready:?}"
+    );
+
+    let outcome =
+        dot_agent_deck::daemon::deliver_dispatch_result(&registry, PANE, &caller, RESULT).await;
+    assert_eq!(
+        outcome,
+        GuardedSend::WrongSession,
+        "a dispatch result bound to the caller must be refused once the caller's pane belongs \
+         to somebody else"
+    );
+
+    // A barrier, not a sleep: an AUTHORIZED write to the successor that has
+    // demonstrably arrived proves the pane has drained past the point where a
+    // leaked result would have landed, so its absence below is a fact rather
+    // than a race the test happened to win.
+    let barrier = registry
+        .write_and_submit_guarded(PANE, BARRIER, &successor, || async { true })
+        .await
+        .expect("the barrier write must reach the registry");
+    assert_eq!(
+        barrier,
+        GuardedSend::Applied,
+        "the successor owns the pane, so a write bound to IT must be applied — otherwise this \
+         test proves nothing about the refusal above"
+    );
+    let snapshot = wait_for_snapshot(&registry, &successor, BARRIER).await;
+    assert!(
+        snapshot.contains(BARRIER),
+        "the barrier write never reached the successor's PTY, so the absence below is untested; \
+         snapshot = {snapshot:?}"
+    );
+    assert!(
+        !snapshot.contains(RESULT),
+        "the dispatch result reached a process that merely inherited the caller's pane id — the \
+         successor may act on it with its own tools; snapshot = {snapshot:?}"
+    );
+
+    registry.shutdown_all();
 }

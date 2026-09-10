@@ -4153,7 +4153,7 @@ impl PaneController for EmbeddedPaneController {
     /// PRD #100: atomic counterpart of [`Self::write_to_pane`]. Routes
     /// through the new `WriteAndSubmit` RPC so the daemon holds its
     /// per-agent writer mutex across `payload → SUBMIT_DELAY → CR`,
-    /// matching the daemon-initiated `write_to_pane_and_submit` contract.
+    /// matching the daemon-initiated `write_and_submit_guarded` contract.
     /// Used at the orchestrator spawn-time role-prompt injection site
     /// in `ui.rs`, where a concurrent daemon-initiated write (e.g.
     /// work-done feedback for a sibling worker) could otherwise

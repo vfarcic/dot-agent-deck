@@ -2089,6 +2089,73 @@ async fn run_shell_activity_monitor_with<S, F>(
     }
 }
 
+/// Issue #617 (finding 3): deliver a dispatch result back to the agent that
+/// asked for it, bound to the registry agent id captured from the caller's
+/// `AgentRecord` *before* the dispatch ran.
+///
+/// The write used to be inline in `run_hook_loop`'s `Dispatch` arm and used the
+/// unguarded `write_to_pane_and_submit(&signal.pane_id, …)`. Between the request
+/// and this delivery sits `handle_dispatch` — a git worktree creation plus an
+/// agent spawn, unbounded and deliberately performed outside any `AppState` lock
+/// — which is one of the widest race windows in the daemon. A pane id is a
+/// recycled handle, so a caller that was closed or respawned during that work had
+/// its dispatch result submitted into whatever process inherited its pane, which
+/// may then act on it with its own tools.
+///
+/// Extracted rather than fixed in place so the delivery has a name and a seam:
+/// the slow half (`handle_dispatch`) was already unit-testable and this half was
+/// not, which is why the only coverage of it was end-to-end.
+///
+/// Every refusal is terminal and none is retried — a retry could only re-target
+/// whichever process now occupies the pane. `Ambiguous` is deliberately NOT
+/// folded in with the refusals: bytes of ours already reached the authorized
+/// caller, so re-sending would duplicate a half-written message rather than
+/// repair it, and the caller is the one place where that distinction is visible.
+pub async fn deliver_dispatch_result(
+    registry: &AgentPtyRegistry,
+    pane_id: &str,
+    expected_agent_id: &str,
+    message: &str,
+) -> crate::agent_pty::GuardedSend {
+    use crate::agent_pty::GuardedSend;
+    match registry
+        .write_and_submit_guarded(pane_id, message, expected_agent_id, || async { true })
+        .await
+    {
+        Ok(GuardedSend::Applied) => GuardedSend::Applied,
+        Ok(GuardedSend::Ambiguous) => {
+            warn!(
+                pane_id = %pane_id,
+                agent_id = %expected_agent_id,
+                "dispatch: result delivery was ambiguous (partial write); not retried"
+            );
+            GuardedSend::Ambiguous
+        }
+        Ok(refused) => {
+            warn!(
+                pane_id = %pane_id,
+                agent_id = %expected_agent_id,
+                outcome = ?refused,
+                "dispatch: identity gate refused the result (the caller pane no longer belongs \
+                 to the agent that requested the dispatch); nothing written"
+            );
+            refused
+        }
+        Err(e) => {
+            warn!(
+                pane_id = %pane_id,
+                agent_id = %expected_agent_id,
+                error = %e,
+                "dispatch: failed to write result into caller pane"
+            );
+            // A transport error, not a refusal: no identity decision was
+            // reached. Reported as `Stale` so callers have one vocabulary, with
+            // the real cause on the `warn!` above.
+            GuardedSend::Stale
+        }
+    }
+}
+
 /// Issue #319: how many hook-socket connections the daemon serves at once.
 ///
 /// **Where the number comes from.** A hook connection is short-lived by
@@ -2459,20 +2526,31 @@ async fn run_hook_loop_with_idle_timeout(
 
                                     use std::path::PathBuf;
 
-                                    // Phase 1: resolve caller cwd from the PTY registry's
-                                    // AgentRecord.cwd, not AppState::pane_cwd_map.
-                                    // pane_cwd_map is only populated for orchestration
-                                    // panes; mode panes (including the dispatcher mode)
-                                    // never get an entry there, which would make every
-                                    // dispatch from a mode pane a silent no-op.
-                                    let cwd = {
+                                    // Phase 1: resolve the caller's (agent id, cwd)
+                                    // from ONE `AgentRecord` in the PTY registry, not
+                                    // from AppState::pane_cwd_map. pane_cwd_map is only
+                                    // populated for orchestration panes; mode panes
+                                    // (including the dispatcher mode) never get an entry
+                                    // there, which would make every dispatch from a mode
+                                    // pane a silent no-op.
+                                    //
+                                    // Issue #617 (finding 3): the agent id is captured
+                                    // HERE, from the same record as the cwd, and carried
+                                    // through the slow phase below so the result can be
+                                    // delivered to the agent that ASKED rather than to
+                                    // whoever holds its pane id when the work finishes.
+                                    // Reading both from one record is what makes them a
+                                    // consistent pair; two lookups could straddle a
+                                    // hand-over and pair one agent's cwd with another's
+                                    // identity.
+                                    let caller = {
                                         let records = pty_registry.agent_records();
                                         records
                                             .iter()
                                             .find(|r| r.pane_id_env.as_deref() == Some(&signal.pane_id))
-                                            .and_then(|r| r.cwd.clone())
+                                            .and_then(|r| r.cwd.clone().map(|cwd| (r.id.clone(), cwd)))
                                     };
-                                    let cwd = match cwd {
+                                    let (caller_agent_id, cwd) = match caller {
                                         Some(c) => c,
                                         None => {
                                             warn!(pane_id = %signal.pane_id, "dispatch from unknown pane");
@@ -2516,18 +2594,15 @@ async fn run_hook_loop_with_idle_timeout(
                                     )
                                     .await;
 
-                                    // Deliver result to the caller pane (doesn't need
-                                    // any AppState lock — uses the PTY registry).
-                                    if let Err(e) = pty_registry
-                                        .write_to_pane_and_submit(&signal.pane_id, &result.message)
-                                        .await
-                                    {
-                                        warn!(
-                                            pane_id = %signal.pane_id,
-                                            error = %e,
-                                            "dispatch: failed to write result into caller pane"
-                                        );
-                                    }
+                                    // Deliver result to the caller (doesn't need any
+                                    // AppState lock — uses the PTY registry).
+                                    deliver_dispatch_result(
+                                        &pty_registry,
+                                        &signal.pane_id,
+                                        &caller_agent_id,
+                                        &result.message,
+                                    )
+                                    .await;
                                 }
                                 DaemonMessage::WorkDone(signal) => {
                                     info!(
@@ -2545,10 +2620,25 @@ async fn run_hook_loop_with_idle_timeout(
                                     // won't also deliver it. `take_..._native`
                                     // marks the delivery as native for the
                                     // real-pi e2e proof. `None` → `{"seed":null}`.
-                                    let seed =
-                                        pty_registry.take_pending_seed_native(&req.pane_id);
+                                    //
+                                    // Issue #916: the pane id is CALLER-SUPPLIED
+                                    // and this socket authenticates nobody, so
+                                    // the take is scoped by the caller's own
+                                    // agent id when it presents one and skips
+                                    // exited records either way — the filtering
+                                    // every other registry lookup applies and
+                                    // this one did not. `req.agent_id` is
+                                    // `None` for a caller the daemon injected no
+                                    // id into, which falls back to the pane's
+                                    // live occupant; the reasoning for that
+                                    // choice is on `take_pending_seed_native_for`.
+                                    let seed = pty_registry.take_pending_seed_native_for(
+                                        &req.pane_id,
+                                        req.agent_id.as_deref(),
+                                    );
                                     info!(
                                         pane_id = %req.pane_id,
+                                        agent_id = ?req.agent_id,
                                         has_seed = seed.is_some(),
                                         "Received get-seed request"
                                     );
@@ -4193,12 +4283,19 @@ mod hook_ingestion_tests {
     /// seed, mark it delivered-native, and clear it — a second request replies
     /// `{"seed":null}`. This is the request/response path the pi extension's
     /// `get-seed` verb rides (the one hook-socket message that reads a reply).
+    ///
+    /// Issue #916 added the identity arms, over the real socket rather than
+    /// against the registry method: a request naming an agent that does not hold
+    /// the pane gets `null` and consumes nothing, a request naming the pane's own
+    /// agent is answered, and a request naming NO agent — the pre-#916 client, and
+    /// any producer the daemon injected no id into — is still answered rather than
+    /// refused.
     #[tokio::test]
     async fn run_hook_loop_answers_get_seed_and_clears_it() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let registry = Arc::new(AgentPtyRegistry::new());
-        registry
+        let agent_gs = registry
             .spawn_agent(SpawnOptions {
                 command: Some("/bin/sh"),
                 env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), "pane-gs".to_string())],
@@ -4227,9 +4324,17 @@ mod hook_ingestion_tests {
         });
 
         // Helper: send one get_seed request line and read the single reply line.
-        async fn ask_get_seed(sock: &std::path::Path, pane_id: &str) -> String {
+        // `agent_id` is what the real CLI reads out of `DOT_AGENT_DECK_AGENT_ID`
+        // (issue #916); `None` is the pre-#916 client, and the shape a producer
+        // the daemon injected no id into still sends.
+        async fn ask_get_seed_as(
+            sock: &std::path::Path,
+            pane_id: &str,
+            agent_id: Option<&str>,
+        ) -> String {
             let req = crate::event::DaemonMessage::GetSeed(crate::event::GetSeedRequest {
                 pane_id: pane_id.to_string(),
+                agent_id: agent_id.map(|a| a.to_string()),
             });
             let line = format!("{}\n", serde_json::to_string(&req).unwrap());
             let mut stream = UnixStream::connect(sock).await.expect("connect");
@@ -4241,8 +4346,24 @@ mod hook_ingestion_tests {
             buf
         }
 
+        // Issue #916: a pull that NAMES an agent which does not hold this pane
+        // is refused, and refused without consuming anything — the seed is still
+        // there for its owner two blocks down. Asserted first for that reason:
+        // after a successful pull there is nothing left to prove it did not eat.
+        let stranger = ask_get_seed_as(&sock, "pane-gs", Some("agent-999")).await;
+        let stranger_resp: crate::event::GetSeedResponse =
+            serde_json::from_str(stranger.trim()).expect("parse stranger get-seed reply");
+        assert!(
+            stranger_resp.seed.is_none(),
+            "a pull naming an agent that does not hold this pane must get nothing"
+        );
+        assert!(
+            !registry.seed_delivered_native("pane-gs"),
+            "…and must not have consumed the seed on its way to being refused"
+        );
+
         // First pull: the daemon returns the seed…
-        let reply = ask_get_seed(&sock, "pane-gs").await;
+        let reply = ask_get_seed_as(&sock, "pane-gs", Some(&agent_gs)).await;
         let resp: crate::event::GetSeedResponse =
             serde_json::from_str(reply.trim()).expect("parse get-seed reply");
         assert_eq!(
@@ -4256,7 +4377,7 @@ mod hook_ingestion_tests {
         );
 
         // Second pull: nothing left — the seed was delivered exactly once.
-        let reply2 = ask_get_seed(&sock, "pane-gs").await;
+        let reply2 = ask_get_seed_as(&sock, "pane-gs", Some(&agent_gs)).await;
         let resp2: crate::event::GetSeedResponse =
             serde_json::from_str(reply2.trim()).expect("parse second get-seed reply");
         assert!(
@@ -4264,11 +4385,31 @@ mod hook_ingestion_tests {
             "seed must be cleared after the first pull"
         );
 
-        // Unknown pane → null, harmless.
-        let reply3 = ask_get_seed(&sock, "pane-unknown").await;
+        // Issue #916: the pre-#916 / id-less client still works. It presents no
+        // agent id, and the take falls back to the pane's LIVE occupant rather
+        // than refusing — the decision recorded on `take_pending_seed_native_for`.
+        registry.set_pending_seed("pane-gs", "a second opening task");
+        let legacy = ask_get_seed_as(&sock, "pane-gs", None).await;
+        let legacy_resp: crate::event::GetSeedResponse =
+            serde_json::from_str(legacy.trim()).expect("parse id-less get-seed reply");
+        assert_eq!(
+            legacy_resp.seed.as_deref(),
+            Some("a second opening task"),
+            "a caller the daemon injected no agent id into must not lose its seed"
+        );
+
+        // Unknown pane → null, harmless, whether or not an id is presented.
+        let reply3 = ask_get_seed_as(&sock, "pane-unknown", None).await;
         let resp3: crate::event::GetSeedResponse =
             serde_json::from_str(reply3.trim()).expect("parse unknown-pane get-seed reply");
         assert!(resp3.seed.is_none());
+        let reply4 = ask_get_seed_as(&sock, "pane-unknown", Some(&agent_gs)).await;
+        let resp4: crate::event::GetSeedResponse =
+            serde_json::from_str(reply4.trim()).expect("parse cross-pane get-seed reply");
+        assert!(
+            resp4.seed.is_none(),
+            "an agent naming a pane it does not hold must get nothing"
+        );
 
         handle.abort();
         let _ = handle.await;
