@@ -1644,7 +1644,11 @@ impl SamplingHealth {
             overruns = self.overruns,
             next_sample_in_ms,
             max_age_ms = MAX_TABLE_AGE.as_millis(),
-            "shell-activity: no usable process table; leaving every pane's status alone and              backing off before the next sample (classifying current pids against a stale table              can misattribute a reused pid, and a wedged `ps` says nothing about the panes). This              line repeats at most every 300s while the condition lasts"
+            "shell-activity: no usable process table; leaving every pane's status \
+             alone and backing off before the next sample (classifying current pids \
+             against a stale table can misattribute a reused pid, and a wedged `ps` \
+             says nothing about the panes). This line repeats at most every 300s \
+             while the condition lasts"
         );
     }
 
