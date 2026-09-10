@@ -242,6 +242,26 @@ fn work_done_004_unsolicited_completion_is_visibly_labelled_in_the_attached_tui(
     // asserts exactly the same thing (the needle must become visible) without
     // pinning WHEN inside the message's own render. The budget is `load_scaled`
     // for the reason issue #709 gives: a fast box still fails fast.
+    //
+    // THE WINDOW IS MEASURED, not inferred. Polling from the instant the PTY
+    // wait above returned, for how long each later needle stayed ABSENT: under a
+    // 96-way CPU load on 16 cores, `SENTINEL` — the last thing painted — was
+    // still absent for a further 27.6ms and 37.4ms in 2 of 5 runs, while
+    // `DAEMON_CLAUSE` and `REPORT_FRAME_NEEDLE` were already there. Read those
+    // two figures only as "a real window exists, of order tens of ms": the
+    // sub-millisecond numbers the same probe reported for the other needles are
+    // dominated by the cost of three sequential `snapshot_grid` calls, so this
+    // measures presence and absence rather than paint latency. A single-shot read
+    // evaluates its predicate roughly one snapshot after that instant, so in
+    // those 2 runs it would have read `SENTINEL` as absent — and a 4-vCPU runner
+    // inside a full tier starves the render loop far harder than a loaded 16-core
+    // box, which is what `e2e-deterministic` hit: the captured grid showed the
+    // framing painted and cut off immediately before the sentinel.
+    //
+    // NOT reproduced as a local red on the old code: 0 of 8 solo runs under the
+    // same load, consistent with a ~2-in-5 window that only fires when the check
+    // lands inside it. The justification is the measured window plus that CI
+    // grid, not a local red-to-green.
     let visible_timeout = common::load_scaled(Duration::from_secs(20));
     assert!(
         wait_for_pane_string(&deck, UNSOLICITED_NEEDLE, visible_timeout),
@@ -262,9 +282,11 @@ fn work_done_004_unsolicited_completion_is_visibly_labelled_in_the_attached_tui(
          data\nFinal grid:\n{}",
         deck.snapshot_grid()
     );
-    // Deliberately NOT a wait: this is a negative window, and every needle above
-    // has already settled, so the whole message is on the grid by now. Widening a
-    // "must NOT appear" check would only make it slower and weaker.
+    // Deliberately NOT a wait: this is a negative check, and polling for an
+    // absence would pass on the first frame that has not painted it yet —
+    // vacuously, and most easily on exactly the starved runner this test keeps
+    // failing on. It is sound as a single read because the three waits above
+    // have just proved this write finished painting.
     assert!(
         !pane_contains(&deck, POINTER_NEEDLE),
         "the orchestrator was pointed at a summary file that was never written — the #433 \
