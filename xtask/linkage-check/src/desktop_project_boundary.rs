@@ -538,10 +538,17 @@ fn impl_item_attrs(item: &syn::ImplItem) -> Option<&[syn::Attribute]> {
 /// Whether these attributes put the item behind a test-only `cfg`.
 ///
 /// `#[cfg(test)]` and `#[cfg(all(test, unix))]` are test-only. `#[cfg(not(test))]`
-/// is **production** and is deliberately NOT skipped — the presence of `not`
-/// anywhere in the predicate makes this answer `false`, which errs toward
-/// scanning. A rule that skipped a production block because it mentioned `test`
-/// would be a hole shaped exactly like the one it exists to close.
+/// is **production** and is deliberately NOT skipped. A rule that skipped a
+/// production block because it merely mentioned `test` would be a hole shaped
+/// exactly like the one it exists to close.
+///
+/// The predicate is walked as a tree rather than flattened to a token string.
+/// The string form was the hole: `list.tokens.to_string()` splits
+/// `feature = "supports-test-mode"` into `["feature", "supports", "test",
+/// "mode"]`, so a hyphenated feature name containing `test` classified a
+/// PRODUCTION block as test-only and silently dropped it from the scan — the
+/// exact fail-open direction this module's docs promise to avoid. Only a bare
+/// `test` **path** counts now; a string literal's contents never do.
 fn cfg_selects_test_only(attrs: &[syn::Attribute]) -> bool {
     attrs.iter().any(|attr| {
         if !attr.path().is_ident("cfg") {
@@ -550,13 +557,43 @@ fn cfg_selects_test_only(attrs: &[syn::Attribute]) -> bool {
         let syn::Meta::List(list) = &attr.meta else {
             return false;
         };
-        let tokens = list.tokens.to_string();
-        let idents: Vec<&str> = tokens
-            .split(|c: char| !c.is_alphanumeric() && c != '_')
-            .filter(|t| !t.is_empty())
-            .collect();
-        idents.contains(&"test") && !idents.contains(&"not")
+        list.parse_args::<syn::Meta>()
+            .is_ok_and(|meta| cfg_meta_is_test_only(&meta))
     })
+}
+
+/// Is this one cfg predicate satisfiable **only** under `cfg(test)`?
+///
+/// Conservative in one direction on purpose: anything not provably test-only
+/// answers `false` and therefore gets scanned.
+fn cfg_meta_is_test_only(meta: &syn::Meta) -> bool {
+    use syn::punctuated::Punctuated;
+    use syn::{Meta, Token};
+
+    match meta {
+        // A bare `test` flag. `unix`, `windows`, `debug_assertions` … are not.
+        Meta::Path(path) => path.is_ident("test"),
+        Meta::List(list) => {
+            let Ok(terms) = list.parse_args_with(Punctuated::<Meta, Token![,]>::parse_terminated)
+            else {
+                return false;
+            };
+            if list.path.is_ident("all") {
+                // `all(..)` holds only where every term holds, so one test-only
+                // term is enough to make the whole conjunction test-only.
+                terms.iter().any(cfg_meta_is_test_only)
+            } else if list.path.is_ident("any") {
+                // `any(..)` is test-only only if it has no non-test way to hold.
+                !terms.is_empty() && terms.iter().all(cfg_meta_is_test_only)
+            } else {
+                // `not(..)`, and any predicate we do not model, are production.
+                false
+            }
+        }
+        // `feature = "…"`, `target_os = "…"` — the value is a string, never a
+        // cfg flag. This arm is what closes the substring hole.
+        Meta::NameValue(_) => false,
+    }
 }
 
 fn rust_sources(dir: &Path) -> Vec<PathBuf> {
@@ -750,6 +787,41 @@ fn resolve() {
             "forbidden-symbol",
             "load_project_config"
         ));
+    }
+
+    /// A cfg predicate whose STRING LITERAL happens to contain `test` is
+    /// production and must be scanned.
+    ///
+    /// This is the substring hole the token-string implementation had:
+    /// `list.tokens.to_string()` on `feature = "supports-test-mode"` split into
+    /// `["feature", "supports", "test", "mode"]`, so the block classified as
+    /// `cfg(test)`-only and was dropped from the scan. Fail-OPEN, and in a rule
+    /// whose whole job is to notice client-side project resolution. Both cases
+    /// below fail against that implementation and pass against the tree walk.
+    #[test]
+    fn a_feature_name_containing_test_is_production_not_a_test_cfg() {
+        let hyphenated = "\
+#[cfg(feature = \"supports-test-mode\")]
+fn resolve() {
+    let _ = dot_agent_deck::project_config::load_project_config;
+}
+";
+        assert!(
+            caught(hyphenated, "forbidden-symbol", "load_project_config"),
+            "a feature flag whose NAME contains `test` does not make the block test-only"
+        );
+
+        // `any(test, ..)` holds outside tests too, so it is production as well.
+        let disjunction = "\
+#[cfg(any(test, feature = \"desktop\"))]
+fn resolve() {
+    let _ = dot_agent_deck::project_config::load_project_config;
+}
+";
+        assert!(
+            caught(disjunction, "forbidden-symbol", "load_project_config"),
+            "`any(test, feature = ..)` is satisfiable without `test`, so it is production"
+        );
     }
 
     #[test]
