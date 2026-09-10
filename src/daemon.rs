@@ -2102,7 +2102,10 @@ async fn run_hook_loop_with_idle_timeout(
                             Err(_elapsed) => {
                                 warn!(
                                     idle_timeout_ms = idle_timeout.as_millis(),
-                                    "hook socket: reclaiming a connection that                                      sent no complete message within the idle                                      window — every shipped producer writes one                                      line and closes, so this is a leaked or                                      stalled peer"
+                                    "hook socket: reclaiming a connection that sent no \
+                                     complete message within the idle window — every \
+                                     shipped producer writes one line and closes, so this \
+                                     is a leaked or stalled peer"
                                 );
                                 break;
                             }
