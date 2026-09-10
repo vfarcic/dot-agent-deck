@@ -1731,9 +1731,12 @@ command = "vim"
     /// "nothing remembered"; and parse a PARTIAL `[focus]` table carrying only
     /// one key, asserting the whole file still parses — the saved panes survive
     /// — and that the missing keys default rather than aborting the parse. That
-    /// last case is the one that matters most: `SavedSession::load` treats a TOML
-    /// error as "no session at all", so a `[focus]` table a newer binary wrote
-    /// with keys this one does not know must never cost the user every pane.
+    /// third case is the one that matters most: `SavedSession::load` treats a
+    /// TOML error as "no session at all", so a `[focus]` table a newer binary
+    /// wrote with keys this one does not know must never cost the user every
+    /// pane. Finally, check the OTHER compatibility direction — deserialize what
+    /// this build writes into a struct carrying only the pre-issue-#949 fields,
+    /// which must still recover the panes and `last_command`.
     #[spec("config/saved-session/002")]
     #[test]
     fn saved_session_002_focus_serde_round_trip_legacy_and_partial() {

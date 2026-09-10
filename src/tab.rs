@@ -3402,15 +3402,19 @@ mod tests {
         );
     }
 
-    /// Scenario: Drive the three degradation cases of applying a remembered
-    /// position to tabs the snapshot has never seen. (a) An id no tab owns — a
-    /// pane the user closed, or a role whose agent died and came back as a
-    /// synthetic dead-slot — yields NO landing tab and leaves the orchestration
-    /// tab's start-role fallback intact, i.e. exactly today's behaviour rather
-    /// than an error. (b) A dead-slot id sitting in a tab's remembered field is
-    /// never captured in the first place, so it can never shadow a live role.
-    /// (c) A remembered Dashboard resolves to the Dashboard tab, located by kind
-    /// rather than by assuming index 0.
+    /// Scenario: Drive every way applying a remembered position to tabs the
+    /// snapshot has never seen can degrade. (a) An id no tab owns — a pane the
+    /// user closed, or a role whose agent died and came back as a synthetic
+    /// dead-slot — yields NO landing tab and leaves the orchestration tab's
+    /// start-role fallback intact, i.e. exactly today's behaviour rather than an
+    /// error. (b) A dead-slot id sitting in a tab's remembered field is never
+    /// captured in the first place, so it can never shadow a live role. (c) A
+    /// remembered Dashboard resolves to the Dashboard tab, located by kind
+    /// rather than by assuming index 0, while a fully defaulted position leaves
+    /// the deck's own landing choice alone. (d) An id the DAEMON did not supply
+    /// is filtered out by `retain_pane_ids` even when it would resolve, and (e)
+    /// the same id with the daemon set populated restores normally — so (d)
+    /// pins the filter rather than something about the id.
     #[spec("session/restore/018")]
     #[test]
     fn restore_018_focus_snapshot_degrades_to_todays_fallback() {
