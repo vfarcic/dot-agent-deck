@@ -1,8 +1,10 @@
 """Shared helpers for the agent PR reviewer (.github/workflows/pr-review-batch.yml).
 
-Kept in one module on purpose: REQUIRED_CONTEXTS and DENY_PATHS must not drift
-between selection and voting. If they did, a pull request could be selected under
-one policy and voted on under another.
+Kept in one module on purpose: REQUIRED_CONTEXTS, DENY_PATHS and DENY_PRECEDENCE
+must not drift between selection and voting. If they did, a pull request could be
+selected under one policy and voted on under another — which is not hypothetical,
+since DENY_PRECEDENCE was added after exactly that happened to the truncated
+`denied_paths` payload.
 """
 
 import json
@@ -23,10 +25,22 @@ REQUIRED_CONTEXTS = (
     "e2e-deterministic",
 )
 
-# Changes touching these need a human approval; the App must never vote on them.
-# Same list as the governance paths in the design discussion: the reviewer must
-# not be able to widen its own powers, and protocol changes carry a
-# cross-version contract obligation (CLAUDE.md rule 12) an agent cannot discharge.
+# Changes touching these need a human to READ them before they merge.
+#
+# Be precise about what that does and does not promise, because this comment used
+# to say "the App must never vote on them" and issue #998 made that false. The App
+# does vote on them now: the vote job approves with the specific reason at the top
+# of the review body plus a `needs-human-eye` label when auto-merge is DISARMED,
+# and declines entirely when it is armed. So the property here is "a human presses
+# merge with the reason in front of them", not "the App abstains" — deliberately
+# weaker, because abstaining left these pull requests waiting on a second
+# maintainer and pushed the author toward an admin bypass that leaves no record at
+# all. Issue #998 has the trade.
+#
+# The reasons differ per path, which is why DENY_PRECEDENCE below exists: the
+# reviewer should not be the only reader of a change to its own powers, CLAUDE.md
+# is the rubric it judges against, and a protocol change carries a cross-version
+# contract obligation (CLAUDE.md rule 12) an agent cannot discharge at all.
 DENY_PATHS = (
     ".github/",
     "scripts/apply-branch-protection.sh",
@@ -35,6 +49,43 @@ DENY_PATHS = (
     "CLAUDE.md",
     "src/daemon_protocol.rs",
 )
+
+# The order in which those paths' explanations take precedence, most specific
+# first. TWO consumers must agree on it, which is why it lives here beside
+# DENY_PATHS rather than next to the prose it selects: the vote job explains a
+# pull request by the FIRST match (`deny_reason`), and the selector sorts by this
+# before truncating `denied_paths`.
+#
+# They disagreed until #1000 review: the selector truncated to five paths in the
+# GitHub files API's alphabetical order, and `src/daemon_protocol.rs` sorts LAST
+# of these prefixes. A protocol change touching five `.github/` files therefore
+# lost the protocol path before the vote job ever saw it, so rule 12's
+# unverifiable cross-version obligation was silently downgraded to the `.github/`
+# catch-all and the "Touches:" line never mentioned the protocol at all.
+DENY_PRECEDENCE = (
+    "src/daemon_protocol.rs",
+    ".github/workflows/pr-review",
+    ".github/scripts/pr_review_",
+    "CLAUDE.md",
+    "scripts/apply-branch-protection.sh",
+    "MAINTAINERS.md",
+    "greptile.json",
+    ".github/",
+)
+
+
+def deny_sort_key(path):
+    """Order a denied path by how specific its explanation is, most specific first.
+
+    Sort by this BEFORE truncating, so the path that governs the explanation is
+    never the one dropped. A path matching no prefix sorts last, and ties break on
+    the path itself so the order is total and the payload is reproducible.
+    """
+    for index, prefix in enumerate(DENY_PRECEDENCE):
+        if path.startswith(prefix):
+            return (index, path)
+    return (len(DENY_PRECEDENCE), path)
+
 
 BAD_CONCLUSIONS = {"failure", "cancelled", "timed_out", "action_required", "stale"}
 
@@ -80,6 +131,18 @@ def gh(*args, check=True):
             f"gh {' '.join(args)} failed ({result.returncode}): {result.stderr.strip()}"
         )
     return result.stdout
+
+
+def gh_ok(*args):
+    """Run gh, return True on success. For best-effort calls where a failure
+    must be visible but must not abort the caller — `gh(..., check=False)`
+    returns stdout, and a failed command's stdout is empty, not distinguishable
+    from a successful one that printed nothing."""
+    result = subprocess.run(("gh",) + args, capture_output=True, text=True, check=False)
+    if result.returncode != 0:
+        print(f"gh {' '.join(args)} failed ({result.returncode}): {result.stderr.strip()}")
+        return False
+    return True
 
 
 def gh_json(*args):

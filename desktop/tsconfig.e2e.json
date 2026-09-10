@@ -1,0 +1,15 @@
+{
+  // The browser tier's own type-check. Playwright transpiles specs without
+  // checking them, so a type error there would run happily and could pass;
+  // `pnpm test:browser:types` is what makes it an error. Separate from
+  // `tsconfig.json` because that one sets `types: ["vitest/globals"]` and
+  // includes only `src` — pulling `@types/node` into the app's compilation
+  // would change what `setTimeout` resolves to under `src/`.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "types": ["node"],
+    "noEmit": true
+  },
+  "include": ["e2e", "playwright.config.ts"],
+  "references": []
+}

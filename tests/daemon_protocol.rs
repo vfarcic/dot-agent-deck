@@ -244,7 +244,16 @@ async fn start_plain_agent_for_pane(server: &Server, command: &str, pane_id: &st
 
 async fn connect_attach(server: &Server, id: &str) -> UnixStream {
     let mut s = UnixStream::connect(&server.path).await.unwrap();
-    write_request(&mut s, &AttachRequest::AttachStream { id: id.into() }).await;
+    write_request(
+        &mut s,
+        &AttachRequest::AttachStream {
+            id: id.into(),
+            rows: None,
+            cols: None,
+            geometry_updates: false,
+        },
+    )
+    .await;
     let resp = read_response(&mut s).await;
     assert!(resp.ok, "attach-stream failed: {:?}", resp.error);
     s
@@ -3822,6 +3831,9 @@ async fn attach_unknown_agent_returns_err() {
         &mut s,
         &AttachRequest::AttachStream {
             id: "missing".into(),
+            rows: None,
+            cols: None,
+            geometry_updates: false,
         },
     )
     .await;
@@ -4045,7 +4057,16 @@ async fn slow_client_dropped_within_bounded_time() {
     // non-reading client. Open the connection raw so we can read the
     // attach OK response without then draining STREAM_OUT.
     let mut slow2 = UnixStream::connect(&server.path).await.unwrap();
-    write_request(&mut slow2, &AttachRequest::AttachStream { id: id.clone() }).await;
+    write_request(
+        &mut slow2,
+        &AttachRequest::AttachStream {
+            id: id.clone(),
+            rows: None,
+            cols: None,
+            geometry_updates: false,
+        },
+    )
+    .await;
     let resp = read_response(&mut slow2).await;
     assert!(resp.ok, "attach-stream failed: {:?}", resp.error);
     assert_eq!(
@@ -4379,6 +4400,7 @@ async fn resize_propagates_to_pty() {
             id: id.clone(),
             rows: 50,
             cols: 200,
+            viewer: None,
         },
     )
     .await;
@@ -4412,6 +4434,7 @@ async fn resize_unknown_agent_returns_err() {
             id: "does-not-exist".into(),
             rows: 50,
             cols: 200,
+            viewer: None,
         },
     )
     .await;
@@ -4436,6 +4459,7 @@ async fn resize_zero_rows_or_cols_returns_err() {
                 id: id.clone(),
                 rows,
                 cols,
+                viewer: None,
             },
         )
         .await;
@@ -4464,6 +4488,7 @@ async fn assert_resize_clamps(rows: u16, cols: u16, expected_rows: u16, expected
             id: id.clone(),
             rows,
             cols,
+            viewer: None,
         },
     )
     .await;

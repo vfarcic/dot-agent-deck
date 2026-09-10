@@ -173,9 +173,7 @@ fn new_pane_008_schedule_authoring_opens_as_dashboard_card() {
 
     // Submit via the [Submit] button (deterministic — the schedule mode still
     // shows a Command field, so an Enter-count would be fragile).
-    let (scol, srow) = deck
-        .find_in_grid("[Submit]")
-        .expect("the new-pane form should render a [Submit] button");
+    let (scol, srow) = deck.wait_for_in_grid("[Submit]");
     deck.click(scol, srow);
 
     // Submitting closes the form; wait for the resulting layout to settle into

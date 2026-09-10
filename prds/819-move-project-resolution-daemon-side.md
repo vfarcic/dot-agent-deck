@@ -63,7 +63,7 @@ Four commitments shape it.
 - **An ownership sweep** — every value the desktop presents or persists, classified as daemon-sourced, client-owned by policy, or computed locally, recorded as a table with a per-value verdict. This is what lets this PRD state its boundary as a verified list instead of "everything except settings", which is the false-absolute shape CLAUDE.md rule 17 exists to stop and which this PRD's own history has already required twice.
 - **Three verbs on the attach socket**: enumerate known projects, resolve one, prepare a launch. Plus the owned projection they carry.
 - **A fourth request variant, `start-prepared-agent`** — not a project verb but the launch's other half: starting one role of a prepared workflow, with the preparation token as a required field. Added late and deliberately, on the deadline argument in [A verb, not a field](#a-verb-not-a-field-and-the-deadline-that-decided-when).
-- **`PROTOCOL_VERSION` 8 → 9**, because new `AttachRequest` variants are on the bump list (`src/daemon_protocol.rs:6-14`).
+- **Rides the `PROTOCOL_VERSION` 8 → 9 bump rather than adding one**, because new `AttachRequest` variants are on the bump list (`src/daemon_protocol.rs:6-14`) but one bump covers every wire change made before 9 ships. PRD #882 spent that bump first (merged in `6932ae2a`); 9 is still unreleased, since `v0.39.4` carries `PROTOCOL_VERSION = 8`.
 - **A bounded, symlink-safe project-config reader**, run off the async runtime's worker threads behind a concurrency bound.
 - **A symlink-safe, atomic, owner-only coordinator-context publish**, performed daemon-side at launch.
 - **Daemon-side enumeration** from what the daemon already holds, with every candidate revalidated before it is offered.

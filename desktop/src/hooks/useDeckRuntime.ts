@@ -157,7 +157,24 @@ export function useDeckRuntime(): DeckRuntimeState {
   const listProjects = useCallback(() => bridge.listProjects(), [bridge]);
   const resolveProject = useCallback((path: string) => bridge.resolveProject(path), [bridge]);
 
+  // PRD #882: the geometry the daemon has applied per agent. Held here rather
+  // than inside each tile because the push is per agent and arrives on one
+  // bridge-wide subscription — and because a tile has to be able to read a
+  // value that was pushed before it mounted (another client can constrain an
+  // agent long before anyone opens a terminal on it here).
+  const [appliedGeometry, setAppliedGeometry] = useState<Record<string, { rows: number; cols: number }>>({});
+  useEffect(() => {
+    return bridge.onTerminalGeometry((agentId, rows, cols) => {
+      setAppliedGeometry((current) => {
+        const existing = current[agentId];
+        if (existing && existing.rows === rows && existing.cols === cols) return current;
+        return { ...current, [agentId]: { rows, cols } };
+      });
+    });
+  }, [bridge]);
+
   return {
+    appliedGeometry,
     mode,
     snapshot,
     terminalData: EMPTY_TERMINAL_DATA,

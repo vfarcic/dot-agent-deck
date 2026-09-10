@@ -100,11 +100,16 @@ Waiters scan slots from a random offset and, when all are busy, block on a rando
 | --- | --- |
 | `DAD_LINK_JOBS=0` | run every link ungated — the kill switch |
 | `DAD_LINK_JOBS=N` | use N link slots instead of the computed default |
-| `DAD_LINKER=clang` | use a different linker driver |
+| `DAD_LINKER=clang` | use a different linker driver. Also suppresses the mold injection below — naming your own driver means getting it unmodified |
+| `DAD_NO_MOLD=1` | keep the default linker even where mold is installed, for bisecting a suspected linker difference. Only the exact value `1` opts out |
 | `DAD_BUILD_GATE_DIR=<path>` | put the pool somewhere else (per-pool subdirectories are created under it). Every build that should share a bound has to agree on this, so set it everywhere or nowhere |
 | `DAD_BUILD_GATE_WAIT=<seconds>` | how long a link may wait for a slot before giving up and running ungated |
 
 `DAD_LINKER` exists because the `linker` key in `.cargo/config.toml` overrides a `linker` set in a personal `~/.cargo/config.toml` — repository config beats `$CARGO_HOME` config — so anyone who had chosen their own linker driver needs it back.
+
+`DAD_NO_MOLD` exists because `link-gate.sh` prepends `-fuse-ld=mold` to rustc's argv when mold is on `PATH` (issue #906) — mold links this workspace's ~130 test binaries with far less I/O and memory, which is the bound #863 measured. **Detected at run time rather than set in `RUSTFLAGS`**, and that is a failure mode rather than a preference: `-C link-arg=-fuse-ld=mold` in `.cargo/config.toml` would hard-fail every build on a host without mold with `cannot find -fuse-ld=mold`, including a plain `cargo build` outside a devbox shell. Detection keeps a mold-less host building exactly as before, which is the same contract every other rung of the gate honours — degrade to working, never fail for a reason the gate invented. `devbox.json` pins mold so a devbox shell and CI share the linker.
+
+The flag is **prepended**, not appended, because `-fuse-ld=` is last-wins: appending would silently override a `-fuse-ld` rustc itself passed instead of deferring to it. All of that is pinned by tests in `xtask/linkage-check/src/build_gate.rs`, which build a `PATH` holding only the tools the scripts use and so decide mold's presence themselves — the ambient `PATH` would otherwise assert the opposite condition inside a devbox shell than outside one.
 
 ## Platform scope
 

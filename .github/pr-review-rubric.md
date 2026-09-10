@@ -58,6 +58,6 @@ Then your summary, then exactly one fenced `json` block, last:
 - `REQUEST_CHANGES` — a specific defect. Name the file and what goes wrong.
 - `INSUFFICIENT` — too large, or too dependent on context you cannot see. Say what you would need.
 
-Whether that verdict actually became a GitHub approval is **not** something you can know or state — a separate job decides, and it declines to vote on pull requests touching protected paths. Say nothing about approvals having been cast; the review on the pull request is the record of that.
+Whether that verdict actually became a GitHub approval is **not** something you can know or state — a separate job decides after you finish, and on a protected path it may approve with a warning attached or decline entirely. Say nothing about approvals having been cast: the review on the pull request is the record of that, and that job explains its own decision there.
 
 `head_sha` must be the SHA you were given. If you cannot determine it, emit `INSUFFICIENT` rather than guessing: a mismatched SHA is discarded and fails the run.

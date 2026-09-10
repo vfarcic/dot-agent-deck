@@ -1,4 +1,3 @@
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use ratatui::buffer::Buffer;
@@ -7,14 +6,8 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Widget};
 
-use crate::agent_pty::clamp_pty_dims;
 use crate::palette;
 use crate::state::SessionStatus;
-
-/// PRD #84 M5 (invariant 3): a process-wide one-shot guard so the release-mode
-/// "PTY size != inner area" fallback logs a single explicit line rather than
-/// spamming one per frame. Debug builds trip the `debug_assert!` instead.
-static SIZE_MISMATCH_LOGGED: AtomicBool = AtomicBool::new(false);
 
 /// PRD #313 M3: the zoom indicator, appended after the role name in the zoomed
 /// pane's border title (`orchestrator [Z]`). tmux marks a zoomed window with a
@@ -291,57 +284,36 @@ impl Widget for TerminalWidget {
         // stale content near the bottom rows" symptom.
         let (screen_rows, screen_cols) = screen.size();
 
-        // Contract guard. When the caller attests the upstream contract held
-        // (a layout-sized pane, `contract_guaranteed`), the PTY screen MUST
-        // already equal the inner area. A mismatch is a contract violation:
-        // loud in debug (`debug_assert!`), and in release a single explicit log
-        // plus the safe `min` fallback below — never a panic in production.
+        // PRD #882 — the invariant-3 equality guard is GONE, and its removal is
+        // a design change rather than a relaxation.
         //
-        // A zero-dimension inner area is exempt: `resize_panes_to_layout` skips
-        // sizing a pane whose target inner area has a zero dimension (its
-        // `rows == 0 || cols == 0` guard), so its PTY legitimately keeps its
-        // prior size. The `min` fallback below renders nothing into a 0-dim
-        // area, so there is nothing to assert.
+        // PRD #84 could assert `screen == inner area` because the client owned
+        // the geometry: `resize_pane_pty` set the parser synchronously, so the
+        // two were the same number by construction and any difference was a bug.
+        // Under PRD #882 the DAEMON owns it. The parser holds the geometry the
+        // daemon applied — the smallest viewport among everyone attached — and
+        // the inner area holds what this client would like to draw. Those two
+        // legitimately differ whenever another client's view of the agent is
+        // smaller,
+        // which is the entire point of the policy.
         //
-        // Issue #747: the expectation is the inner area CLAMPED to
-        // `PTY_RESIZE_DIM_MAX`, not the raw inner area. A PTY cannot be made
-        // larger than that cap — the daemon refuses on principle (a same-uid
-        // peer could otherwise drive an agent to an absurd geometry) — so on a
-        // terminal wider than the cap `resize_panes_to_layout` deliberately
-        // sizes the pane to the cap and the drawn area is legitimately larger.
-        // Asserting against the raw inner area there would turn a correctly
-        // handled edge into a debug-build panic, and asserting nothing would
-        // give the mismatch back its silence.
-        if self.contract_guaranteed && inner.height > 0 && inner.width > 0 {
-            let (expected_rows, expected_cols) = clamp_pty_dims(inner.height, inner.width);
-            debug_assert!(
-                (screen_rows, screen_cols) == (expected_rows, expected_cols),
-                "PRD #84 invariant 3: a layout-sized pane's PTY screen ({screen_rows}x{screen_cols}) \
-                 must equal its inner area capped at PTY_RESIZE_DIM_MAX ({expected_rows}x{expected_cols}, \
-                 from a {}x{} inner area); resize_panes_to_layout must size every drawn \
-                 pane before render (pane {:?})",
-                inner.height,
-                inner.width,
-                self.title,
-            );
-            // Release path (the `debug_assert!` above is compiled out): log once
-            // so the violation is observable without spamming a line per frame.
-            if (screen_rows, screen_cols) != (expected_rows, expected_cols)
-                && !SIZE_MISMATCH_LOGGED.swap(true, Ordering::Relaxed)
-            {
-                tracing::warn!(
-                    screen_rows,
-                    screen_cols,
-                    inner_height = inner.height,
-                    inner_width = inner.width,
-                    expected_rows,
-                    expected_cols,
-                    pane = %self.title,
-                    "TerminalWidget: PTY screen size != inner area (capped at PTY_RESIZE_DIM_MAX) — \
-                     falling back to min(area, screen); see PRD #84 rendering contract (invariant 3)"
-                );
-            }
-        }
+        // Nor can the guard be kept for one direction only. Every request is a
+        // round trip now, so during a shrink the parser is briefly LARGER than
+        // the area and during a grow briefly smaller — both transient, both
+        // indistinguishable from a real defect at this call site, which has no
+        // way to know whether an answer is in flight. An assertion here would
+        // either panic on ordinary operation or say nothing worth hearing.
+        //
+        // The invariant did not disappear; it MOVED to the side that can
+        // actually state it. The daemon computes the applied geometry from the
+        // registered viewers and is where "the PTY is never larger than any
+        // viewer's pane" is enforced and tested. What remains here is the
+        // rendering rule that follows from it, and it is now the designed path
+        // rather than a defense against an upstream failure: draw the screen
+        // 1:1 from the top-left and leave anything past it blank. A pane
+        // narrower or shorter than its box is what a correctly applied policy
+        // looks like from inside a client that is not the smallest one.
+        let _ = self.contract_guaranteed;
 
         // Fall back to `min(area, screen)` from the top-left so an over- or
         // under-sized screen never reads out of bounds. With the contract held

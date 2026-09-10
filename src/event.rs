@@ -509,6 +509,32 @@ pub const SESSION_START_ORIGIN_METADATA_KEY: &str = "session_start_origin";
 /// later.
 pub const WRAPPER_FORK_SESSION_START_ORIGIN: &str = "wrapper_fork";
 
+/// The [`SESSION_START_ORIGIN_METADATA_KEY`] value meaning "the DAEMON authored
+/// this `SessionStart` to draw a spawned pane's card, and no producer has spoken
+/// for this pane yet" (issue #684).
+///
+/// [`crate::spawn`]'s `surface_spawned_pane` broadcasts such an event straight
+/// onto the client fan-out so a spawned pane gets a card immediately instead of
+/// at its first real hook. It never passes through `daemon::ingest_event`, so the
+/// daemon's own `AppState` never applies it — only attached TUIs do. That is why
+/// the defect below appears in no daemon log.
+///
+/// It is a statement ABOUT a pane, not a producer speaking FOR one: its
+/// `session_id` IS the pane id and it carries no `agent_id`. Without this marker
+/// [`crate::state::AppState::apply_event`] read it as a conversation announcing
+/// itself, so a TUI-owned prompt bound the pane id as its generation and the
+/// agent's genuine `SessionStart` then read as a rollover — abandoning the prompt
+/// with "the agent's conversation changed" (`prompt/pane-input/033`).
+///
+/// MARKED rather than inferred from its shape. `session_id == pane_id` with no
+/// `agent_id` also describes a legacy untagged hook, and the permissive
+/// both-absent branch of `apply_event`'s reuse guard exists precisely to keep
+/// serving those — so inferring provenance from the shape would have taken the
+/// generation away from real conversations too. Producer-writable like every
+/// value on this key, and safe in the only direction it can be abused: a forged
+/// marker makes an event LOSE generation standing, never gain any.
+pub const CARD_SURFACE_SESSION_START_ORIGIN: &str = "daemon_card_surface";
+
 /// The [`SESSION_START_ORIGIN_METADATA_KEY`] value meaning "`dot-agent-deck wrap`
 /// watched the wrapped child take the inner PTY OUT OF COOKED MODE" (issue #243).
 ///
@@ -800,6 +826,19 @@ impl AgentEvent {
             .is_some_and(|origin| origin == WRAPPER_FORK_SESSION_START_ORIGIN)
     }
 
+    /// Issue #684: was this `SessionStart` authored by the DAEMON to draw a
+    /// spawned pane's card (see [`CARD_SURFACE_SESSION_START_ORIGIN`])?
+    ///
+    /// `false` for every event without the marker, which includes every event an
+    /// OLDER daemon relays — an old daemon's unmarked surface event therefore
+    /// behaves exactly as it does today rather than being silently reclassified,
+    /// and the fix this predicate gates needs both sides updated to take effect.
+    pub fn is_card_surface_session_start(&self) -> bool {
+        self.metadata
+            .get(SESSION_START_ORIGIN_METADATA_KEY)
+            .is_some_and(|origin| origin == CARD_SURFACE_SESSION_START_ORIGIN)
+    }
+
     /// Issue #770: does this event carry the daemon's ORPHANED-ROLE marker (see
     /// [`ORCHESTRATION_ORPHANED_METADATA_KEY`])? `false` for every event
     /// without it, which is every event an older daemon relays and every event
@@ -880,12 +919,17 @@ impl AgentEvent {
     /// Issue #424 D4: was this event SYNTHESIZED BY THE DAEMON rather than
     /// produced by the pane's agent?
     ///
-    /// The daemon emits identified events of its own through the same pipeline
-    /// real hook events take — [`EventType::ShellBusy`]/[`EventType::ShellIdle`]
-    /// from the shell-activity monitor (PRD #370/#386), and the delivery-notice
-    /// [`EventType::Error`] (issue #424). They carry the pane's registry
-    /// `agent_id` because that is how they land on the right card, and that is
-    /// exactly what made them indistinguishable from producer evidence to
+    /// The daemon emits events of its own through the same pipeline real hook
+    /// events take: [`EventType::ShellBusy`]/[`EventType::ShellIdle`] from the
+    /// shell-activity monitor (PRD #370/#386), the delivery-notice
+    /// [`EventType::Error`] (issue #424), and the card-surfacing `SessionStart`
+    /// (issue #684, [`CARD_SURFACE_SESSION_START_ORIGIN`]).
+    ///
+    /// The first two carry the pane's registry `agent_id` because that is how
+    /// they land on the right card — the card-surfacing start is the exception and
+    /// carries none, since it RUNS BEFORE any producer has identified itself, so
+    /// it is recognized by its origin marker instead. Carrying that identity is
+    /// exactly what made the first two indistinguishable from producer evidence to
     /// `crate::ui::evidence_channel_is_unidentified`: one of them arriving was
     /// enough to conclude the pane has a tagged reporting channel, when it proves
     /// only that the DAEMON can tag its own events. A pane behind a legacy
@@ -901,6 +945,7 @@ impl AgentEvent {
     pub fn is_daemon_synthetic(&self) -> bool {
         matches!(self.event_type, EventType::ShellBusy | EventType::ShellIdle)
             || self.metadata.contains_key(DELIVERY_NOTICE_METADATA_KEY)
+            || self.is_card_surface_session_start()
     }
 }
 
