@@ -295,6 +295,86 @@ pub struct OrchestrationSnapshot {
     pub display_title: Option<String>,
 }
 
+/// Issue #949 — where the user was looking when the snapshot was taken, so a
+/// detach/reattach (or a full restart) puts them back there instead of on the
+/// deck's landing default with every tab reset to its fallback role.
+///
+/// **Everything here is a PANE ID, never a tab index or a tab name.** Tab
+/// indices are not stable across a reattach — warm-daemon hydration rebuilds
+/// tabs in whatever order the daemon's agent list partitions into buckets —
+/// whereas a pane id is: the daemon captures each agent's
+/// `DOT_AGENT_DECK_PANE_ID` and echoes it back through `list_agents`, and
+/// `EmbeddedPaneController::hydrate_from_daemon` reuses that value verbatim.
+/// A pane also belongs to exactly one tab, so one id locates the tab *and* the
+/// pane inside it, and no tab identity has to be invented or persisted.
+///
+/// Focus is CLIENT-owned state, which is why it lives here rather than on the
+/// wire: two clients attached to one daemon legitimately look at different
+/// things, and a snapshot also survives a daemon restart, which a daemon-held
+/// cursor cannot. See [`SavedSession::focus`].
+///
+/// Every field carries `#[serde(default)]` for the same reason
+/// [`OrchestrationSnapshot`]'s do: a malformed or partial `[focus]` table
+/// degrades to a defaulted value rather than failing the WHOLE-file TOML parse
+/// and dropping every saved pane with it. A fully defaulted value reads as
+/// "nothing remembered" and leaves the deck's own landing choice alone — which
+/// is why `dashboard_active` is an explicit flag instead of being implied by an
+/// absent `active_pane`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct SavedFocus {
+    /// Schema version, for future migration. `1` is the initial format.
+    #[serde(default)]
+    pub version: u32,
+    /// Whether the DASHBOARD tab was the active one. A remembered Dashboard is
+    /// a real position, not an absent one — see
+    /// `TabManager::apply_focus_snapshot`.
+    #[serde(default)]
+    pub dashboard_active: bool,
+    /// The pane focused in the tab that was ACTIVE, which doubles as the
+    /// locator for which tab that was. Taken from the pane controller rather
+    /// than from the tab's own field, because a `Tab::Mode` stores `None` to
+    /// mean "the agent pane is focused" and a locator has to be a concrete id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_pane: Option<String>,
+    /// The remembered focused pane of every tab that had one, the active tab's
+    /// included. Restoring these is what stops a later `Tab`-away-and-back from
+    /// dumping the user on each tab's start role — the active tab alone would
+    /// fix only the first screen after a reattach.
+    #[serde(default)]
+    pub tab_panes: Vec<String>,
+}
+
+impl SavedFocus {
+    /// Issue #949 — drop everything in this position that is a PANE ID, keeping
+    /// only the id-free part: which tab KIND was active.
+    ///
+    /// **Pane ids are a valid locator only when the DAEMON supplied them.** On a
+    /// reattach they are a real identity: the daemon captured each agent's
+    /// `DOT_AGENT_DECK_PANE_ID` at spawn and echoes it back on `list_agents`, so
+    /// `EmbeddedPaneController::hydrate_from_daemon` reuses the very same value
+    /// the previous TUI had. On the daemon-EMPTY rebuild path there is no daemon
+    /// to ask: every restored pane's id comes from `allocate_id`, a bare counter
+    /// starting at 1. A rebuild that recreates the same panes in the same order
+    /// happens to reproduce the same numbers, which is worse than useless —
+    /// because a rebuild that does NOT (a pane closed and another created before
+    /// the snapshot was written, so the surviving ids are 2, 3, 4 and the rebuild
+    /// mints 1, 2, 3) reassigns a remembered number to a DIFFERENT role, and
+    /// restores focus to the wrong agent instead of failing to restore it. A
+    /// silent wrong answer is the one outcome worth engineering against here, so
+    /// the rebuild path applies this and keeps only what cannot be wrong.
+    ///
+    /// [`crate::tab::TabManager::apply_focus_snapshot`] then still honours a
+    /// remembered Dashboard — that answer needs no ids at all — and falls back to
+    /// the rebuild's own landing choice for everything else.
+    pub fn without_pane_ids(&self) -> Self {
+        Self {
+            active_pane: None,
+            tab_panes: Vec::new(),
+            ..self.clone()
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SavedSession {
     #[serde(default)]
@@ -308,6 +388,17 @@ pub struct SavedSession {
     /// fallback spawns (schedule / issue-dispatch) are excluded from recording.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_command: Option<String>,
+    /// Issue #949: the user's last position — which tab was active and which
+    /// pane each tab had focused. `Option` + `#[serde(default)]` so a
+    /// `session.toml` written before this field existed (no `[focus]` table)
+    /// loads as `None`, which means "nothing remembered" and leaves the deck's
+    /// own landing choice untouched.
+    ///
+    /// Like [`Self::last_command`] this is GLOBAL state rather than something
+    /// derived from the pane list, so [`Self::snapshot`] leaves it `None` and
+    /// the caller overlays the runtime value before persisting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub focus: Option<SavedFocus>,
 }
 
 impl SavedSession {
@@ -441,6 +532,10 @@ impl SavedSession {
             // overlays the runtime `last_command` before persisting (it is global
             // state, not derived from the pane list).
             last_command: None,
+            // Issue #949: same shape as `last_command` — the focused pane and
+            // active tab are tab state, not pane state, so the caller overlays
+            // them.
+            focus: None,
         }
     }
 }
@@ -1552,6 +1647,7 @@ on_idle = true
                 },
             ],
             last_command: None,
+            focus: None,
         };
         let toml_str = toml::to_string_pretty(&session).unwrap();
         let loaded: SavedSession = toml::from_str(&toml_str).unwrap();
@@ -1573,6 +1669,7 @@ on_idle = true
         let session = SavedSession {
             panes: Vec::new(),
             last_command: Some("claude".to_string()),
+            focus: None,
         };
         let toml_str = toml::to_string_pretty(&session).unwrap();
         let loaded: SavedSession = toml::from_str(&toml_str).unwrap();
@@ -1592,6 +1689,115 @@ command = "vim"
             legacy_loaded.last_command.is_none(),
             "a session.toml with no last_command key must load as None"
         );
+    }
+
+    /// Scenario: Round-trip a populated `[focus]` table through serialize →
+    /// deserialize; parse a `session.toml` written before the field existed (no
+    /// `[focus]` table at all) and assert it loads with `focus == None`, i.e.
+    /// "nothing remembered"; and parse a PARTIAL `[focus]` table carrying only
+    /// one key, asserting the whole file still parses — the saved panes survive
+    /// — and that the missing keys default rather than aborting the parse. That
+    /// last case is the one that matters most: `SavedSession::load` treats a TOML
+    /// error as "no session at all", so a `[focus]` table a newer binary wrote
+    /// with keys this one does not know must never cost the user every pane.
+    #[spec("config/saved-session/002")]
+    #[test]
+    fn saved_session_002_focus_serde_round_trip_legacy_and_partial() {
+        // (a) A populated position round-trips intact.
+        let session = SavedSession {
+            panes: Vec::new(),
+            last_command: None,
+            focus: Some(SavedFocus {
+                version: 1,
+                dashboard_active: true,
+                active_pane: None,
+                tab_panes: vec!["7".to_string(), "9".to_string()],
+            }),
+        };
+        let toml_str = toml::to_string_pretty(&session).unwrap();
+        let loaded: SavedSession = toml::from_str(&toml_str).unwrap();
+        assert_eq!(loaded.focus, session.focus, "TOML: {toml_str}");
+
+        // (b) A session.toml predating the field loads as "nothing remembered",
+        // which leaves the deck's own landing choice alone.
+        let legacy = r#"
+[[panes]]
+dir = "/repo/legacy"
+name = "old-pane"
+command = "vim"
+"#;
+        let legacy_loaded: SavedSession = toml::from_str(legacy).unwrap();
+        assert_eq!(legacy_loaded.panes.len(), 1);
+        assert!(
+            legacy_loaded.focus.is_none(),
+            "a session.toml with no [focus] table must load as None"
+        );
+
+        // (c) A PARTIAL table degrades to defaults for the absent keys and does
+        // not take the panes down with it.
+        let partial = r#"
+[[panes]]
+dir = "/repo/app"
+name = "kept-pane"
+command = "claude"
+
+[focus]
+active_pane = "12"
+"#;
+        let partial_loaded: SavedSession = toml::from_str(partial).unwrap();
+        assert_eq!(
+            partial_loaded.panes.len(),
+            1,
+            "a partial [focus] table must not fail the whole-file parse"
+        );
+        let focus = partial_loaded
+            .focus
+            .expect("a present [focus] table parses even when incomplete");
+        assert_eq!(focus.active_pane.as_deref(), Some("12"));
+        assert_eq!(focus.version, 0, "an absent version defaults");
+        assert!(!focus.dashboard_active, "an absent flag defaults to false");
+        assert!(
+            focus.tab_panes.is_empty(),
+            "an absent list defaults to empty"
+        );
+
+        // (d) The OTHER compatibility direction, and the one the struct's own
+        // shape cannot demonstrate: an OLDER build reading a file THIS one
+        // wrote. `SavedSession` sets no `deny_unknown_fields`, so an unknown
+        // `[focus]` table is ignored rather than fatal — but that is exactly the
+        // kind of claim worth checking rather than asserting, since `load()`
+        // turns any TOML error into "no session at all" and would cost an older
+        // build every pane. Modelled by a local struct with the pre-issue-#949
+        // field set, deserialized from what the new writer emits.
+        #[derive(Deserialize)]
+        struct PreFocusSavedSession {
+            #[serde(default)]
+            panes: Vec<SavedPane>,
+            #[serde(default)]
+            last_command: Option<String>,
+        }
+        let new_writer_output = toml::to_string_pretty(&SavedSession {
+            panes: vec![SavedPane {
+                dir: "/repo/app".to_string(),
+                name: "kept-pane".to_string(),
+                command: "claude".to_string(),
+                mode: None,
+                orchestration: None,
+            }],
+            last_command: Some("claude".to_string()),
+            focus: Some(SavedFocus {
+                version: 1,
+                dashboard_active: false,
+                active_pane: Some("3".to_string()),
+                tab_panes: vec!["3".to_string()],
+            }),
+        })
+        .unwrap();
+        let old_reader: PreFocusSavedSession = toml::from_str(&new_writer_output)
+            .expect("an older build must still parse a session.toml carrying [focus]");
+        assert_eq!(old_reader.panes.len(), 1, "TOML: {new_writer_output}");
+        assert_eq!(old_reader.panes[0].name, "kept-pane");
+        assert_eq!(old_reader.last_command.as_deref(), Some("claude"));
     }
 
     /// Scenario: Build a `SavedSession` whose single pane carries an
@@ -1628,6 +1834,7 @@ command = "vim"
                 }),
             }],
             last_command: None,
+            focus: None,
         };
 
         let toml_str = toml::to_string_pretty(&session).unwrap();
@@ -1706,6 +1913,7 @@ command = "vim"
                 orchestration: None,
             }],
             last_command: None,
+            focus: None,
         };
         session.save().unwrap();
         let loaded = SavedSession::load();
