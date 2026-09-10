@@ -46,6 +46,7 @@ pub mod project_config;
 pub mod prompt_delivery;
 pub mod remote;
 pub mod remote_doctor;
+pub mod repo_identity;
 pub mod schedule_cli;
 pub mod scheduler;
 pub mod spawn;

@@ -21,10 +21,12 @@ use thiserror::Error;
 use crate::untrusted_text::strip_control_and_bidi;
 
 /// GitHub releases base URL used to download `dot-agent-deck` binaries onto
-/// remote hosts. Hard-coded because Cargo doesn't export
-/// `[package.repository]` to the build (and our `Cargo.toml` doesn't set it).
-/// Mirrors the URL in `version.rs`.
-pub const RELEASE_BASE: &str = "https://github.com/vfarcic/dot-agent-deck/releases/download";
+/// remote hosts. Kept as a re-export under this crate-local name because three
+/// call sites already read it; the repo slug it is built from lives in
+/// [`crate::repo_identity`] (issue #945), which `version.rs` derives the
+/// release feed from too. Not read from `[package.repository]`, which Cargo
+/// doesn't export to the build and our `Cargo.toml` doesn't set.
+pub const RELEASE_BASE: &str = crate::repo_identity::RELEASE_DOWNLOAD_BASE;
 
 /// Default ssh port.
 pub const DEFAULT_SSH_PORT: u16 = 22;

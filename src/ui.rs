@@ -37,6 +37,7 @@ use crate::prompt_delivery::{
     pane_confirmation_capability, prompt_submission_accumulated, submission_is_after_watermark,
     unconfirmed_retry_delay,
 };
+use crate::repo_identity;
 use crate::state::{AppState, DashboardStats, SessionState, SessionStatus, SharedState};
 use crate::tab::{OrchestrationRoleStatus, OrchestrationStatus, Tab, TabId, TabManager};
 use crate::tab_layout::fit_tab_labels;
@@ -6850,14 +6851,31 @@ fn handle_stop_confirm_key(key: KeyEvent, ui: &mut UiState) -> Action {
     }
 }
 
+/// Open the project repository in the user's browser and build the status
+/// message for whichever way that went.
+///
+/// Shared by the star prompt's `s` key and its `[Star]` button, which were two
+/// byte-identical copies of this block before issue #945 — so re-pointing the
+/// repo slug had to be done twice, and a change to one message could silently
+/// drift from the other.
+fn star_repo_and_report() -> String {
+    star_message(open::that(repo_identity::URL).is_ok())
+}
+
+/// The status message for a star attempt, split out from the browser call so
+/// the exact bytes are testable without launching anything.
+fn star_message(opened: bool) -> String {
+    if opened {
+        "Thanks for starring! ⭐".to_string()
+    } else {
+        format!("Visit {} to star ⭐", repo_identity::DISPLAY)
+    }
+}
+
 fn handle_star_prompt_key(key: KeyEvent, ui: &mut UiState) -> Action {
     match key.code {
         KeyCode::Char('s') => {
-            let msg = if open::that("https://github.com/vfarcic/dot-agent-deck").is_ok() {
-                "Thanks for starring! ⭐".to_string()
-            } else {
-                "Visit github.com/vfarcic/dot-agent-deck to star ⭐".to_string()
-            };
+            let msg = star_repo_and_report();
             ui.star_prompt_state.dismiss_permanently();
             ui.mode = UiMode::Normal;
             ui.status_message = Some((msg, std::time::Instant::now()));
@@ -10792,11 +10810,7 @@ fn dispatch_action(
         }
         // star-prompt [Star]: open the repo and stop asking (== `s`).
         Action::StarConfirm => {
-            let msg = if open::that("https://github.com/vfarcic/dot-agent-deck").is_ok() {
-                "Thanks for starring! ⭐".to_string()
-            } else {
-                "Visit github.com/vfarcic/dot-agent-deck to star ⭐".to_string()
-            };
+            let msg = star_repo_and_report();
             ui.star_prompt_state.dismiss_permanently();
             ui.mode = UiMode::Normal;
             ui.status_message = Some((msg, std::time::Instant::now()));
@@ -18131,9 +18145,34 @@ fn render_stop_confirm(frame: &mut Frame, selected: usize, agent_count: usize) {
     frame.render_widget(paragraph, popup_area);
 }
 
+/// Width of the star prompt popup.
+///
+/// The historical 50 columns, widened when the repo identity line would not fit
+/// inside them, and always capped by the terminal. Issue #945 made the identity
+/// a one-line seam a fork can re-point, and the one thing this popup must not
+/// do is clip the repository it is asking the user to star — at 50 columns the
+/// two borders and the two-space indent leave 46, so a slug over 35 characters
+/// used to be silently truncated.
+///
+/// Upstream's `github.com/vfarcic/dot-agent-deck` is 33 columns and fits with
+/// room to spare, so this returns the same 50 as before for an upstream build.
+/// A GitHub slug is `[A-Za-z0-9._-]`, so a `chars()` count is its display width.
+fn star_popup_width(area_width: u16, identity: &str) -> u16 {
+    /// The two-space indent the identity line is rendered with.
+    const INDENT: u16 = 2;
+    /// Left + right border of the enclosing `Borders::ALL` block.
+    const BORDERS: u16 = 2;
+
+    let needed = u16::try_from(identity.chars().count())
+        .unwrap_or(u16::MAX)
+        .saturating_add(INDENT)
+        .saturating_add(BORDERS);
+    50u16.max(needed).min(area_width.saturating_sub(4))
+}
+
 fn render_star_prompt(frame: &mut Frame) -> Vec<(Action, Rect)> {
     let area = frame.area();
-    let popup_width = 50u16.min(area.width.saturating_sub(4));
+    let popup_width = star_popup_width(area.width, repo_identity::DISPLAY);
     let popup_height = 10u16.min(area.height.saturating_sub(4));
     let x = (area.width.saturating_sub(popup_width)) / 2;
     let y = (area.height.saturating_sub(popup_height)) / 2;
@@ -18147,7 +18186,7 @@ fn render_star_prompt(frame: &mut Frame) -> Vec<(Action, Rect)> {
         Line::styled("  please consider starring the repo!", text_primary()),
         Line::from(""),
         Line::styled(
-            "  github.com/vfarcic/dot-agent-deck",
+            format!("  {}", repo_identity::DISPLAY),
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::UNDERLINED),
@@ -22625,6 +22664,59 @@ mod tests {
 
     fn default_ui() -> UiState {
         UiState::default()
+    }
+
+    /// Issue #945 made the star prompt's repo identity a one-line seam a fork
+    /// can re-point, so the popup has to fit whatever it is pointed at rather
+    /// than clipping the repository it is asking the user to star. Upstream's
+    /// identity must still produce the historical 50 columns unchanged.
+    #[test]
+    fn star_popup_widens_for_a_long_identity_but_is_unchanged_upstream() {
+        // Upstream: 33 columns of identity fits the historical 50 exactly as
+        // before, at every terminal width wide enough to hold the popup.
+        assert_eq!(
+            star_popup_width(80, "github.com/vfarcic/dot-agent-deck"),
+            50
+        );
+        assert_eq!(
+            star_popup_width(200, "github.com/vfarcic/dot-agent-deck"),
+            50
+        );
+
+        // 35 characters of slug is the last one that fit the old fixed width
+        // (50 - 2 borders - 2 indent = 46, minus the 11-char `github.com/`).
+        let at_the_old_limit = format!("github.com/{}", "s".repeat(35));
+        assert_eq!(star_popup_width(80, &at_the_old_limit), 50);
+
+        // One character more used to be clipped; the popup now grows with it.
+        let over_the_old_limit = format!("github.com/{}", "s".repeat(36));
+        assert_eq!(star_popup_width(80, &over_the_old_limit), 51);
+
+        // The terminal still wins: a popup never grows past `width - 4`.
+        assert_eq!(star_popup_width(40, &over_the_old_limit), 36);
+
+        // A terminal too narrow for any popup degrades rather than underflows.
+        assert_eq!(star_popup_width(3, &over_the_old_limit), 0);
+    }
+
+    /// Issue #945 turned the star prompt's fallback message from a literal
+    /// into a `format!` over `repo_identity::DISPLAY`, so the bytes it renders
+    /// are asserted against the literal it replaced. The success message never
+    /// named the repo and is here only to pin the other branch.
+    #[test]
+    fn star_message_is_byte_identical_to_the_literals_it_replaced() {
+        assert_eq!(star_message(true), "Thanks for starring! ⭐");
+        if repo_identity::SLUG == "vfarcic/dot-agent-deck" {
+            assert_eq!(
+                star_message(false),
+                "Visit github.com/vfarcic/dot-agent-deck to star ⭐"
+            );
+        } else {
+            println!(
+                "SKIP: the repo_identity seam has been re-pointed to {}; upstream byte-identity does not apply",
+                repo_identity::SLUG
+            );
+        }
     }
 
     /// PRD #163 M5: the OSC 52 clipboard escape is built by one shared
