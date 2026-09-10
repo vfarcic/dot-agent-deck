@@ -129,9 +129,7 @@ fn preserve_002_button_short_circuits_miss_falls_through() {
 
     // (2) Short-circuit: clicking the [New Pane Ctrl+N] bar button fires its
     // action (picker opens) and does NOT also act on the cards underneath.
-    let (bcol, brow) = deck
-        .find_in_grid("[New Pane Ctrl+N]")
-        .expect("global button bar should render [New Pane Ctrl+N]");
+    let (bcol, brow) = deck.wait_for_in_grid("[New Pane Ctrl+N]");
     deck.click(bcol, brow);
     deck.wait_for_string("Select Directory");
 
@@ -186,9 +184,7 @@ fn preserve_modal_click_miss_is_consumed() {
     // closes it. If the stray click had leaked/closed the modal, [Cancel]
     // would be gone and this would fail. No copy may have leaked to the pane
     // behind.
-    let (ccol, crow) = deck
-        .find_in_grid("[Cancel]")
-        .expect("quit-confirm modal should still render its [Cancel] button");
+    let (ccol, crow) = deck.wait_for_in_grid("[Cancel]");
     assert!(
         !deck.snapshot_grid().contains("Copied to clipboard"),
         "a modal-interior click must not leak into a text selection/copy behind the popup:\n{}",
@@ -217,9 +213,7 @@ fn preserve_disabled_button_is_inert() {
     deck.wait_for_string("No active sessions");
 
     // The dashboard bar renders [Generate g] dimmed (no cards → disabled).
-    let (col, row) = deck
-        .find_in_grid("Generate")
-        .expect("dashboard bar should render a (dimmed) Generate button");
+    let (col, row) = deck.wait_for_in_grid("Generate");
     deck.click(col, row);
 
     // Anchor: open the help overlay (?). It renders only from Normal mode, so

@@ -38,9 +38,7 @@ fn buttonbar_003_click_new_pane_opens_picker() {
     deck.wait_for_string("No active sessions");
 
     // Find the New Pane button by its on-screen label and click inside it.
-    let (col, row) = deck
-        .find_in_grid("[New Pane")
-        .expect("button bar should render a New Pane button");
+    let (col, row) = deck.wait_for_in_grid("[New Pane");
     deck.click(col + 1, row);
 
     // Ctrl+N's outcome: the directory picker opens. Same action, via click.
@@ -86,9 +84,7 @@ fn buttonbar_004_click_scheduled_tasks_opens_manager() {
     deck.wait_for_string("No active sessions");
 
     // Find the Scheduled Tasks button by its on-screen label and click inside it.
-    let (col, row) = deck
-        .find_in_grid("[Scheduled")
-        .expect("button bar should render a Scheduled Tasks button");
+    let (col, row) = deck.wait_for_in_grid("[Scheduled");
     deck.click(col + 1, row);
 
     // Same outcome as the keyboard open-shortcut: the manager dialog opens,

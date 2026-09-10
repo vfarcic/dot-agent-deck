@@ -54,9 +54,7 @@ fn pane_input_022_ctrl_w_does_not_tear_down_interactive_claude() {
     deck.send_keys(CLAUDE_PANE_NAME_SUFFIX.as_bytes());
     deck.send_keys(b"\t");
     deck.send_keys(format!("claude --model {HAIKU_MODEL} --allowedTools Bash Read").as_bytes());
-    let (submit_col, submit_row) = deck
-        .find_in_grid("[Submit]")
-        .expect("new-pane form should render [Submit]");
+    let (submit_col, submit_row) = deck.wait_for_in_grid("[Submit]");
     deck.click(submit_col, submit_row);
 
     assert!(

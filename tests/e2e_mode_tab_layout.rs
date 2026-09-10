@@ -42,9 +42,7 @@ fn mode_001_side_panes_render_simultaneously_under_stacked_global() {
     deck.wait_for_string("Mode:");
     deck.send_bytes(b"\x1b[C"); // Right: "No mode" -> "demo"
     deck.wait_for_string("demo mode");
-    let (scol, srow) = deck
-        .find_in_grid("[Submit]")
-        .expect("new-pane form should render a [Submit] button");
+    let (scol, srow) = deck.wait_for_in_grid("[Submit]");
     deck.click(scol, srow);
     deck.wait_for_string("Dashboard"); // tab strip appears only with >=2 tabs
 

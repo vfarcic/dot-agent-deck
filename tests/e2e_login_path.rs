@@ -168,9 +168,7 @@ fn login_path_001_new_pane_resolves_login_shell_command() {
 
     // Submit via the [Submit] button (layout-robust: located on the grid, so the
     // PRD #170 agent-command picker addition can't break this drive).
-    let (scol, srow) = deck
-        .find_in_grid("[Submit]")
-        .expect("the new-pane form should render a [Submit] button");
+    let (scol, srow) = deck.wait_for_in_grid("[Submit]");
     deck.click(scol, srow);
 
     assert!(
@@ -283,9 +281,7 @@ fn login_path_003_schedule_authoring_resolves_login_shell_command() {
     // The form's Command is pre-filled with the resolved authoring command — the
     // bare `default_command`. Submit via `[Submit]` to spawn the seeded authoring
     // agent running the bare stub through the daemon spawn primitive.
-    let (scol, srow) = deck
-        .find_in_grid("[Submit]")
-        .expect("the mode-locked schedule form must render a [Submit] button");
+    let (scol, srow) = deck.wait_for_in_grid("[Submit]");
     deck.click(scol, srow); // submit → spawn the authoring agent
 
     assert!(

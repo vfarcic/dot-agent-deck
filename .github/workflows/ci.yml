@@ -425,7 +425,28 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev \
             libayatana-appindicator3-dev librsvg2-dev libxdo-dev
-      - run: cargo test-e2e
+      # Issues #351/#818: a single ~16-21s stall lands on ONE arbitrary test per
+      # run on a `ubuntu-latest` runner, and reddens the tier wherever it hits.
+      # Measured across four reports of the same tree: `pane_input_007` 1.54s /
+      # 20.93s FAIL / 1.59s / 1.59s, `inline_001` 0.25s / 0.23s / 18.26s FAIL /
+      # 0.27s, `manager_016` 0.92s / 1.17s / 1.07s / 16.52s FAIL. Every victim
+      # is fast in every run but the one it failed in, so the stall is a
+      # property of the runner, not of any test: the tier's shape is unchanged
+      # across all four (17-18 tests over 10s, cpu-time 1244-1266s).
+      #
+      # It is NOT slower hardware — the median CI/local per-test ratio is 0.96x
+      # across the 2653 tests two reports share — so widening budgets does not
+      # reach it either: `manager_016` failed an ASSERTION (a mid-repaint
+      # snapshot compare), not a wait.
+      #
+      # `--retries 1` is scoped to CI deliberately. It is not rerun-until-green:
+      # a genuine regression fails BOTH attempts, and nextest reports a
+      # recovered run as FLAKY, so the underlying stall stays visible in this
+      # job's summary rather than being silently absorbed. The same reasoning
+      # and the same value already sit on `dispatch_015` in
+      # `.config/nextest.toml`. Local runs keep `retries = 0` so a developer
+      # still sees the raw signal.
+      - run: cargo test-e2e --retries 1
       # Issue #564: keep THIS attempt's results after a job-level re-run
       # overwrites the conclusion. Full rationale on the identical step in
       # `build-macos`. It matters more here than anywhere else in this file:

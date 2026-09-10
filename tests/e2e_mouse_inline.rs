@@ -3,7 +3,7 @@
 //! PRD #80 M6 — L2 synthetic tests for inline-edit + PaneInput mouse parity.
 //!
 //! Spawns the real `dot-agent-deck` binary inside an isolated PTY and drives
-//! the mouse via SGR reports through `TuiDeck::click` / `find_in_grid` /
+//! the mouse via SGR reports through `TuiDeck::click` / `wait_for_in_grid` /
 //! `send_bytes`. Covers the filter-row `[Apply]`/`[Cancel]`, rename-row
 //! `[Save]`/`[Cancel]`, click-in-field focus retention, and the PaneInput
 //! `[Command Mode Ctrl+D]` affordance — each asserted to equal the corresponding
@@ -32,9 +32,7 @@ fn send_session_start(deck: &TuiDeck, session_id: &str, pane_id: &str, cwd: &str
 
 /// Click the button/affordance whose label text is `needle`.
 fn click_button(deck: &TuiDeck, needle: &str) {
-    let (col, row) = deck
-        .find_in_grid(needle)
-        .unwrap_or_else(|| panic!("expected a clickable {needle} affordance on screen"));
+    let (col, row) = deck.wait_for_in_grid(needle);
     deck.click(col, row);
 }
 
