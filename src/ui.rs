@@ -6358,8 +6358,63 @@ pub enum CloseTarget {
     /// tab-strip reordering and index shifts, unlike the position).
     Tab(TabId),
     /// A dashboard card, keyed by its session id (stable across filtering,
-    /// sorting, and list churn, unlike `selected_index`).
-    Session(String),
+    /// sorting, and list churn, unlike `selected_index`) **plus** the agent
+    /// generation that owned it at arm time.
+    ///
+    /// Issue #317: the session id alone is not an identity. Pi's `agent-event`
+    /// subcommand reports under the pane-derived `{pane_id}-session` key (see
+    /// `src/main.rs`), which is *stable across respawns* — so a target armed on
+    /// the id alone still resolved after the pane changed hands, and the confirm
+    /// landed on whichever generation happened to occupy the pane. That is the
+    /// retargeting this whole type exists to prevent, reached through a key that
+    /// never went stale rather than through a moving selection.
+    ///
+    /// `agent_id` is what makes the generation nameable. It is `None` for a card
+    /// that has no daemon-side agent identity yet (the pre-#284 / spawn-time
+    /// placeholder shape), which is why this is an `Option` rather than a
+    /// required field — see `same_generation` for what that case is allowed to
+    /// mean.
+    Session {
+        session_id: String,
+        agent_id: Option<String>,
+    },
+}
+
+/// Issue #317: is the card under an armed [`CloseTarget::Session`] still the
+/// generation the user pointed at?
+///
+/// **A generation change is a differing `Some` → `Some`, and nothing else.**
+/// That is not a convenience — it is the SAME test `AppState::apply_event` uses
+/// to decide whether a same-producer respawn takes the card away from its
+/// previous owner (`status/supersede/005`). The two seams have to agree on what
+/// a generation *is*: if this one were stricter, a card that merely LEARNED its
+/// agent id between arm and confirm would read as vanished and a perfectly
+/// ordinary close would silently do nothing, on a race the user can neither see
+/// nor control. The state seam already ruled that transition out of scope with
+/// the same words — "an existing `None` learning an identity is not a generation
+/// change" — and a close target that disagreed with it would be arming on a
+/// different notion of generation than the one the card actually changes hands
+/// on.
+///
+/// So the honest reading of each case:
+///
+/// * `Some(a)` vs `Some(b)`, `a != b` — the pane changed hands. **Vanished.**
+///   This is #317's case, and the only one it adds.
+/// * `Some(a)` vs `Some(a)` — same generation. Close it.
+/// * `None` armed — nothing was armed to compare, so this cannot detect a
+///   change and does not pretend to. Treated as the same card, matching the
+///   state seam.
+/// * `Some(a)` vs `None` — treated as the same card. Not reachable through the
+///   refresh path (`apply_event`'s same-key supersede branch requires a `Some`
+///   incoming `agent_id` before it will rebuild the entry), so this arm is a
+///   consequence of the rule above rather than a case anyone designed for; it is
+///   deliberately not given a branch of its own to avoid asserting a safety
+///   property that has not been established.
+fn same_generation(armed: Option<&str>, current: Option<&str>) -> bool {
+    match (armed, current) {
+        (Some(armed), Some(current)) => armed == current,
+        _ => true,
+    }
 }
 
 /// PRD #241 review F1: resolve a [`TabId`] back to its current position, or
@@ -6488,8 +6543,24 @@ fn resolve_close_plan(
         // session that still exists AND still owns a pane. Nothing armed means
         // no card-0 fallback (that fallback is reserved for Enter/Focus), so an
         // unarmed dashboard can never silently close card 0.
-        CloseTarget::Session(sid) => {
-            let pane_id = snapshot.sessions.get(sid)?.pane_id.clone()?;
+        CloseTarget::Session {
+            session_id: sid,
+            agent_id,
+        } => {
+            let session = snapshot.sessions.get(sid)?;
+            // Issue #317: the key resolving is NOT the same question as the
+            // armed thing still being there. Pi's producer key is stable across
+            // respawns, so this lookup succeeds against a replacement
+            // generation just as readily as against the armed one; only the
+            // refreshed `agent_id` can tell them apart (#284 is what made it
+            // refresh in place, and therefore what made this detectable at all).
+            // A generation change reads as "vanished" — the caller says
+            // `Nothing closed` and retargets nothing, exactly as it does for a
+            // session id that went away.
+            if !same_generation(agent_id.as_deref(), session.agent_id.as_deref()) {
+                return None;
+            }
+            let pane_id = session.pane_id.clone()?;
             // The armed card may be the face of a pane that lives inside a
             // Mode/Orchestration tab. Closing it closes the tab — every pane in
             // it — which is exactly why the dialog cannot read the target
@@ -6696,13 +6767,19 @@ fn resolve_close_target(
     }
     ui.selected_index
         .and_then(|i| filtered.get(i))
-        .filter(|(id, _)| {
-            snapshot
-                .sessions
-                .get(*id)
-                .is_some_and(|session| session.pane_id.is_some())
+        // Issue #317: read the card out of the SNAPSHOT rather than trusting the
+        // filtered row, because the pane check and the generation capture must
+        // come from one read of one entry — arming a session id against another
+        // entry's `agent_id` would be a worse identity than no identity.
+        .and_then(|(id, _)| snapshot.sessions.get(*id).map(|session| (*id, session)))
+        .filter(|(_, session)| session.pane_id.is_some())
+        .map(|(id, session)| CloseTarget::Session {
+            session_id: id.clone(),
+            // The generation the user is pointing at. Frozen here with the id
+            // for the same reason the id is frozen: the confirmation applies to
+            // what was armed, never to what later occupies the pane.
+            agent_id: session.agent_id.clone(),
         })
-        .map(|(id, _)| CloseTarget::Session((*id).clone()))
 }
 
 /// PRD #241 M3: key handling for the close confirmation, modelled on
@@ -23427,6 +23504,109 @@ mod tests {
         // nothing to ask about rather than a panic.
         assert!(close_plan_pane_ids(&ClosePlan::Tab { index: 0 }, &tm).is_empty());
         assert!(close_plan_pane_ids(&ClosePlan::Tab { index: 99 }, &tm).is_empty());
+    }
+
+    /// Issue #317: build a plain dashboard card — one session owning a pane
+    /// that belongs to no Mode/Orchestration tab, so it reaches
+    /// `resolve_close_plan`'s one-pane branch.
+    fn state_with_card(session_id: &str, pane_id: &str, agent_id: Option<&str>) -> AppState {
+        let mut state = AppState::default();
+        state.sessions.insert(
+            session_id.to_string(),
+            SessionState {
+                session_id: session_id.to_string(),
+                agent_type: AgentType::ClaudeCode,
+                cwd: None,
+                status: crate::state::SessionStatus::Idle,
+                active_tool: None,
+                started_at: Utc::now(),
+                last_activity: Utc::now(),
+                recent_events: std::collections::VecDeque::new(),
+                tool_count: 0,
+                last_user_prompt: None,
+                first_prompts: Vec::new(),
+                pane_id: Some(pane_id.to_string()),
+                agent_id: agent_id.map(str::to_string),
+                display_name: None,
+                shell_synthetic_working: false,
+                orchestration_orphaned: false,
+            },
+        );
+        state
+    }
+
+    /// Scenario: issue #317 — arm a close against a card under Pi's stable
+    /// `{pane_id}-session` producer key, then hand the pane to a new generation
+    /// by refreshing only `agent_id` (what #284 made happen in place). The
+    /// session id still resolves, because a pane-derived key never goes stale —
+    /// so `resolve_close_plan` must read the generation and report the armed
+    /// target as gone rather than handing back a plan that tears down the
+    /// replacement. The same-generation and same-key control cases confirm it
+    /// refuses only the case it is meant to.
+    #[test]
+    fn resolve_close_plan_treats_a_stable_key_generation_change_as_vanished() {
+        let pc = Arc::new(CapturingPaneController::new());
+        let tm = TabManager::new(pc.clone());
+        let key = "pane-7-session";
+
+        // Control: armed on the generation that still holds the pane. The close
+        // is authorised, and it names the pane the user pointed at.
+        let armed_generation = CloseTarget::Session {
+            session_id: key.to_string(),
+            agent_id: Some("pi-agent-1".to_string()),
+        };
+        assert_eq!(
+            resolve_close_plan(
+                &armed_generation,
+                &tm,
+                &state_with_card(key, "pane-7", Some("pi-agent-1")),
+            ),
+            Some(ClosePlan::Pane {
+                session_id: key.to_string(),
+                pane_id: "pane-7".to_string(),
+            }),
+            "a target armed against the generation still occupying the pane must still close it"
+        );
+
+        // #317 itself: the SAME key, a different generation. Nothing about the
+        // lookup fails — that is the whole trap — so the refusal has to come
+        // from comparing identities.
+        assert_eq!(
+            resolve_close_plan(
+                &armed_generation,
+                &tm,
+                &state_with_card(key, "pane-7", Some("pi-agent-2")),
+            ),
+            None,
+            "a refreshed agent identity under a stable producer key must read as vanished"
+        );
+
+        // Agreement with the state seam (`AppState::apply_event`): a card that
+        // merely LEARNS an identity has not changed hands, and must not cost
+        // the user an ordinary close on a race they cannot see.
+        assert_eq!(
+            resolve_close_plan(
+                &CloseTarget::Session {
+                    session_id: key.to_string(),
+                    agent_id: None,
+                },
+                &tm,
+                &state_with_card(key, "pane-7", Some("pi-agent-2")),
+            ),
+            Some(ClosePlan::Pane {
+                session_id: key.to_string(),
+                pane_id: "pane-7".to_string(),
+            }),
+            "an armed target with no generation cannot detect a change and must not invent one"
+        );
+
+        // The pre-existing vanishing case is untouched: a session id that
+        // genuinely went away still resolves to nothing.
+        assert_eq!(
+            resolve_close_plan(&armed_generation, &tm, &AppState::default()),
+            None,
+            "a session id that is gone must still read as vanished"
+        );
     }
 
     /// Scenario: PRD #336 (post-review inversion) — the split is GLOBAL, not
