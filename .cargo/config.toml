@@ -25,9 +25,9 @@ test-fast = "nextest run --workspace"
 # `[[profile.default.overrides]]`.
 test-e2e = "nextest run --workspace --features e2e"
 # Issue #502 lane 2. NOTE THE SHAPE: enabling BOTH features is a SUPERSET run
-# — all 71 `tests/e2e_*.rs` files, i.e. the 47 deterministic ones `test-e2e`
-# already runs PLUS the 24 credentialed ones. It is NOT a live-only run, and
-# there is deliberately no alias that selects the live subset alone: the 24
+# — every `tests/e2e_*.rs` file, i.e. the deterministic ones `test-e2e`
+# already runs PLUS the credentialed ones. It is NOT a live-only run, and
+# there is deliberately no alias that selects the live subset alone: those
 # files open with `#![cfg(all(feature = "e2e", feature = "e2e-live"))]`, so
 # `e2e-live` without `e2e` compiles every e2e file to an empty crate.
 #

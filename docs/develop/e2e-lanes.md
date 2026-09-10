@@ -8,12 +8,22 @@ Issue #502 split the L2 e2e suite in two by whether a test reaches a **real agen
 | --- | --- | --- |
 | command | `cargo test-e2e` | `cargo test-e2e-live` |
 | cargo features | `e2e` | `e2e,e2e-live` |
-| files | the 47 `tests/e2e_*.rs` that reach no real agent | **all 71** — lane 1 *plus* the 24 that do |
+| files | the `tests/e2e_*.rs` that reach no real agent | **all of them** — lane 1 *plus* the ones that do |
 | where | the `e2e-deterministic` job in `.github/workflows/ci.yml` | **your machine, and nowhere else** |
 | when | every PR | when you touch what it covers |
 | credentials | no agent or test credential (the automatic `GITHUB_TOKEN` is the exception — `ci.yml` has the note) | your own |
 
-`cargo test-e2e-live` is a **superset** run, not a live-only run. The 24 credentialed files open with `#![cfg(all(feature = "e2e", feature = "e2e-live"))]`, so `e2e-live` without `e2e` compiles every e2e file to an empty crate; there is deliberately no live-only alias. Filter it (`cargo test-e2e-live claude_001`) rather than running it whole.
+**How to count the tier, rather than reading a count off a page.** The file counts used to be written into roughly a dozen places across `CLAUDE.md`, `CONTRIBUTING.md`, this page, `tests/CATALOG.md`, `Cargo.toml`, `.cargo/config.toml`, `bacon.toml`, `.github/workflows/ci.yml` and two skills — and by 2026-09-10 they disagreed with each other *and* with the tree three ways at once (71, 73 and the real 79), because every file added to `tests/` falsified all of them silently and nothing anywhere derived them. Issue #900 removed them wherever the size was incidental to the point. Where you actually need the number, measure it — the lane split is a property of the `#![cfg(…)]` attributes, so counting the files IS the definition:
+
+```sh
+ls tests/e2e_*.rs | wc -l                              # the whole tier
+grep -l 'feature = "e2e-live"' tests/e2e_*.rs | wc -l   # lane 2; lane 1 is the difference
+for f in tests/e2e_*.rs; do grep -m1 '^#!\[cfg' "$f"; done | sort | uniq -c   # the full census
+```
+
+At `98683b4b` on 2026-09-10 that read **79 files: 53 lane 1 + 26 lane 2**, the census being 47 bare `#![cfg(feature = "e2e")]`, six adding `unix`, 21 bare `#![cfg(all(feature = "e2e", feature = "e2e-live"))]` and five adding `unix`. Treat that as a dated measurement, not a fact about the tree you are looking at.
+
+`cargo test-e2e-live` is a **superset** run, not a live-only run. The credentialed files open with `#![cfg(all(feature = "e2e", feature = "e2e-live"))]`, so `e2e-live` without `e2e` compiles every e2e file to an empty crate; there is deliberately no live-only alias. Filter it (`cargo test-e2e-live claude_001`) rather than running it whole.
 
 **The aliases are the convenient spelling of each lane, not its definition.** What selects a lane is the cargo **feature set**, because that is what the `#![cfg(…)]` attributes read: `.cargo/config.toml` expands `test-e2e` to `nextest run --workspace --features e2e` and `test-e2e-live` to `nextest run --workspace --features e2e,e2e-live`, and any equivalent invocation enabling the same features — a raw `cargo nextest run --workspace --features e2e,e2e-live <filter>`, say — compiles and selects exactly the same files. So a contributor who ran the raw command has discharged the same obligation and should be able to tell that from the docs. Use the aliases anyway where you can: they are shorter, they carry `--workspace` (issue #489) without your having to remember it, and they are the spelling CI and `bacon.toml` use, so "green here" and "green there" stay the same claim.
 
@@ -27,11 +37,11 @@ Lane 1 is not a required status check. The required set is still `build`, `build
 
 **Frequency is not a mitigation.** The earlier design ran the credentialed lane per-merge on `main` rather than per-PR, behind a `live-e2e` GitHub Environment with a required reviewer and a `run-live-e2e` label. Every one of those controls reduces the *number of exposures*; none of them reduces the *existence of the vulnerability*. Once an API key is a secret on a public repository, it is reachable by whatever can make that workflow run — and the whole point of a pre-merge validation lane is that branch code, including the workflow definitions themselves, executes with it. Running that less often is risk theatre. The fix actually available is to not put the key there.
 
-**The boundary is "reaches a real agent", not "reads a key".** This is the part that makes the classification worth keeping even with no CI job behind it. On a developer's machine the agent CLIs are *pre-authenticated* — `~/.claude/.credentials.json`, the macOS Keychain, `~/.codex/auth.json` — so a test that spawns `claude` and never touches `ANTHROPIC_API_KEY` still spends a credential and still bills someone. Splitting on "does this test read a secret" would have left those in lane 1. The `e2e-live` cargo feature draws the wider line across exactly 24 files, and that is why the feature, the `test-e2e-live` alias, `bacon.toml`'s job and all 24 `#![cfg(all(…))]` attributes stay.
+**The boundary is "reaches a real agent", not "reads a key".** This is the part that makes the classification worth keeping even with no CI job behind it. On a developer's machine the agent CLIs are *pre-authenticated* — `~/.claude/.credentials.json`, the macOS Keychain, `~/.codex/auth.json` — so a test that spawns `claude` and never touches `ANTHROPIC_API_KEY` still spends a credential and still bills someone. Splitting on "does this test read a secret" would have left those in lane 1. The `e2e-live` cargo feature draws the wider line, and that is why the feature, the `test-e2e-live` alias, `bacon.toml`'s job and every one of those `#![cfg(all(…))]` attributes stay.
 
 **Where the deleted workflow went.** `.github/workflows/e2e-live.yml` was removed rather than parked as `workflow_dispatch`-only: an unwired credentialed workflow sitting on `main` is a trap for whoever next registers a secret for an unrelated reason. Git history holds the working implementation — commit `edaa2b4` on `main` (the version merged by PR #800) and `62ba861` on branch `agent/e2e-live-credential-sinks` (the final version, with the credential purge and the inheritance-based containment). Read those if the decision is ever revisited; do not restore them without re-arguing the two reasons above.
 
-**What CI still does for lane 2.** Exactly one thing, and it is load-bearing: `cargo clippy --workspace --all-targets --features e2e,e2e-live -- -D warnings` in the `build` job **type-checks** all 24 files. That is the only CI-side coverage they have. CLAUDE.md rule 2 says the same thing at more length, because "simplify the feature list" is a plausible-looking edit that silently removes a third of the tier from every gate.
+**What CI still does for lane 2.** Exactly one thing, and it is load-bearing: `cargo clippy --workspace --all-targets --features e2e,e2e-live -- -D warnings` in the `build` job **type-checks** every one of them. That is the only CI-side coverage they have. CLAUDE.md rule 2 says the same thing at more length, because "simplify the feature list" is a plausible-looking edit that silently removes a third of the tier from every gate.
 
 **The verification gap is an accepted trade, not an oversight.** Nothing can force a contributor to run lane 2. The only thing that could is CI, and CI has no credentials by design. So real-agent regressions surface when someone happens to run them, not on any schedule. That cost was weighed against holding an API key in a public repository's CI and judged the cheaper side.
 
@@ -47,7 +57,7 @@ You need the agent CLIs the filtered tests drive (`claude`, `opencode`, `codex`,
 
 ### A skip is a pass, so set the flag
 
-Real-agent tests open with `skip_unless!(check_<agent>_available())`. That macro prints `SKIP: [e2e] <reason>` and **returns normally**, so nextest counts the test as **passed**. An absent or unusable credential therefore removes coverage silently rather than reddening the run — and because `cargo test-e2e-live` is a superset run, lane 1's 47 deterministic files carry the result green on their own. "It passed" and "no agent ran" look identical.
+Real-agent tests open with `skip_unless!(check_<agent>_available())`. That macro prints `SKIP: [e2e] <reason>` and **returns normally**, so nextest counts the test as **passed**. An absent or unusable credential therefore removes coverage silently rather than reddening the run — and because `cargo test-e2e-live` is a superset run, lane 1's deterministic files carry the result green on their own. "It passed" and "no agent ran" look identical.
 
 `DOT_AGENT_DECK_REQUIRE_REAL_E2E=1` (`REQUIRE_REAL_E2E_ENV` in `tests/common/mod.rs`) turns every runtime skip into a **panic**. Set it whenever you want "cannot run here" to read as UNVERIFIED rather than as green. Without it, read the `SKIP:` lines rather than the colour:
 
@@ -81,17 +91,17 @@ So an approved key **wins** over a usable OAuth file, and the rejected case is b
 
 **OAuth unusable — a key-only host.** The key is recorded **approved**, because it is the only way in — *unless* the host config already records a **rejection** for this exact key and nothing authorises overriding it. Then the refusal stands, and `check_claude_available` refuses the run naming the reason rather than letting it proceed to a silent bill. `DOT_AGENT_DECK_REQUIRE_REAL_E2E` is the authorisation: set it and the refusal is overridden, because setting it is an explicit statement that this run must reach a real agent. This replaced an unconditional approve-and-drop-the-refusal whose stated justification — that a CI runner would otherwise inherit a developer's refusal — no longer describes anything real, since there is no runner. What is left is the one place the stored "No" is a deliberate human decision: a local key-only host. Ambient key presence is not consent either; this repository's dev environment loads API keys automatically.
 
-Measured across the 24 live files, by preflight and by test function:
+Measured 2026-09-10 across the live files, by preflight and by test function — a count of this shape rots, so read it as a measurement with a date on it rather than as a standing fact (issue #900):
 
 | preflight | test functions | with a real credential set | key-only host |
 | --- | --- | --- | --- |
-| `check_claude_available` | 22 | run | **run** |
+| `check_claude_available` | 24 | run | **run** |
 | `check_codex_available` | 5 | run | **run**, once `~/.codex/auth.json` is provisioned — subject to the model question below |
 | `check_pi_available` | 5 | run | **run** |
 | `check_opencode_available` | 2 | run | **run** — the default test model is `anthropic/…` since #922, so a key-only host is the ordinary case; an `openai/…` or `openrouter/…` override still needs an `auth.json` |
 | `check_devin_available` | 1 | run | **cannot** — no API-key path exists |
 
-Those rows sum to 35 but cover **33 distinct tests**, because two are gated *twice*: `pi_live_002_native_seeded_orchestration_delegates_live` and `chain_smoke_pi_001_orchestrator_delegates_to_real_worker` each call both `check_pi_available()` **and** `check_claude_available()`.
+Those rows sum to 37 but cover **35 distinct tests**, because two are gated *twice*: `pi_live_002_native_seeded_orchestration_delegates_live` and `chain_smoke_pi_001_orchestrator_delegates_to_real_worker` each call both `check_pi_available()` **and** `check_claude_available()`.
 
 Two are worth knowing about before you run a filter that selects them:
 

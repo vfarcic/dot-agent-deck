@@ -7,12 +7,12 @@ default_job = "test-fast"
 # the `xtask/*` members' tests never run.
 #
 # `test-fast` is the per-task gate (CLAUDE.md rule 5) and is the default job
-# above. The other two are the e2e tier's lanes: `test-e2e` is lane 1, the 47
+# above. The other two are the e2e tier's lanes: `test-e2e` is lane 1, the
 # `tests/e2e_*.rs` files needing no agent credential, and `test-e2e-live` is the
-# SUPERSET — all 71, so it needs a working agent credential. Since issue #502
-# neither is a pre-PR obligation: CI runs lane 1 on every PR, and lane 2 runs
-# nowhere but on a developer's machine, because no test that reaches a real
-# agent runs in CI. So those 24 files are exercised only when a person runs
+# SUPERSET — every one of them, so it needs a working agent credential. Since
+# issue #502 neither is a pre-PR obligation: CI runs lane 1 on every PR, and
+# lane 2 runs nowhere but on a developer's machine, because no test that reaches
+# a real agent runs in CI. So the lane-2 files are exercised only when a person runs
 # them — a `bacon test-e2e-live` filtered to what you are touching, or the
 # `cargo test-e2e-live` alias this job mirrors — and by nothing else. In a watch
 # loop you almost always want one of these with a filter appended
@@ -44,7 +44,7 @@ need_stdout = true
 # no-op — both print `Compiling dot-agent-deck` every time, because build.rs
 # watches `.git/index` (PRD #103's build-id freshness rule) and that file moves
 # constantly. On top of that always-dirty root crate, the extra 5.5s is
-# re-linting the 71 `tests/e2e_*.rs` targets `--all-targets --features e2e` adds.
+# re-linting the `tests/e2e_*.rs` targets `--all-targets --features e2e` adds.
 #
 # The part of rule 2's claim that DOES hold is the one that matters here:
 # alternating does not invalidate anything. Run straight after
