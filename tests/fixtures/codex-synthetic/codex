@@ -1,7 +1,20 @@
 #!/bin/sh
+# `codex app-server` stand-in: answers `initialize`, then `hooks/list` from
+# $CODEX_HOOK_LIST_RESPONSE.
+#
+# Two substitutions are applied to that canned reply. `__CODEX_HOME__` becomes
+# the home the deck pinned. `__DECK_COMMAND__` becomes the first hook command in
+# that home's own hooks.json — i.e. the command the install that is asking us
+# just wrote. The second exists because issue #730 narrowed the trust predicate
+# to byte-equality with that command: a stand-in echoing a fixed string yields
+# zero trust records, no config.toml, and a failure that reads like a trust bug.
+# A real Codex reports what is in hooks.json, so this is the stand-in behaving
+# like the thing it stands in for rather than a shortcut.
 if [ "${1:-}" = app-server ]; then
     IFS= read -r _initialize
     printf '%s\n' '{"id":1,"result":{"userAgent":"startup-parity-test","codexHome":"test","platformFamily":"unix","platformOs":"linux"}}'
     IFS= read -r _list
-    printf '%s\n' "$CODEX_HOOK_LIST_RESPONSE" | sed "s|__CODEX_HOME__|$CODEX_HOME|g"
+    deck_command=$(sed -n 's/.*"command"[[:space:]]*:[[:space:]]*"\(.*\)".*/\1/p' "$CODEX_HOME/hooks.json" 2>/dev/null | head -n 1)
+    printf '%s\n' "$CODEX_HOOK_LIST_RESPONSE" \
+        | sed -e "s|__CODEX_HOME__|$CODEX_HOME|g" -e "s|__DECK_COMMAND__|$deck_command|g"
 fi

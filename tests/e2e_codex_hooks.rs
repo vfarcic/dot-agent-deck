@@ -9,6 +9,7 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use common::TuiDeck;
+use dot_agent_deck::codex_hooks_manage::expected_hook_command;
 use dot_agent_deck::event::{AgentType, EventType};
 use serde_json::{Value, json};
 use spec::spec;
@@ -54,7 +55,22 @@ fn hook_list_response(entries: Vec<Value>) -> String {
     .to_string()
 }
 
-fn deck_hook_response() -> String {
+/// Codex's `hooks/list` reply for the deck's ten installed events, every entry
+/// carrying `command`.
+///
+/// **`command` is a parameter, and that is issue #730's doing.** Until this PR
+/// the trust predicate was `DeckCommandMatch::Signature` — anything in our own
+/// `hooks.json` ending in the deck's verb — so a hardcoded
+/// `/opt/dot-agent-deck hook --agent codex` satisfied it whatever the install
+/// had actually written. The predicate is now `Exact`: byte-equality with the
+/// command this install wrote for the durable path it resolved. A stand-in that
+/// echoes a command the deck never wrote therefore yields **zero** trust
+/// records, no `config.toml`, and a failure that looks like a trust bug rather
+/// than a stale fixture. Callers must hand this either
+/// [`expected_hook_command`] for a durable path they seeded, or the
+/// `__DECK_COMMAND__` placeholder the `codex-synthetic` stand-in substitutes out
+/// of the installed `hooks.json`.
+fn deck_hook_response(command: &str) -> String {
     hook_list_response(
         DECK_HOOK_EVENTS
             .iter()
@@ -65,7 +81,7 @@ fn deck_hook_response() -> String {
                     "eventName": event_key,
                     "handlerType": "command",
                     "matcher": null,
-                    "command": "/opt/dot-agent-deck hook --agent codex",
+                    "command": command,
                     "timeoutSec": 600,
                     "statusMessage": null,
                     "sourcePath": "__CODEX_HOME__/hooks.json",
@@ -80,6 +96,26 @@ fn deck_hook_response() -> String {
             })
             .collect(),
     )
+}
+
+/// Seed `<home>/.local/bin/dot-agent-deck` as a symlink to the binary under
+/// test, and return the path the deck's resolver will therefore pin.
+///
+/// The same seeding `tests/common/mod.rs` does for every `TuiDeck` HOME, spelled
+/// locally because this test spawns the binary directly rather than through the
+/// harness. Load-bearing twice over: PRD #381's resolver refuses to pin a
+/// `target/{debug,release}` path, so without a step-2a candidate it walks out to
+/// whatever the developer has at `~/.local/bin/dot-agent-deck` — the host leak
+/// that cost PR #733 a full CI round — and since #730's `Exact` trust predicate
+/// the pinned path is also what the listing below has to echo back.
+#[cfg(unix)]
+fn seed_durable_binary(home: &Path) -> std::path::PathBuf {
+    let bin_dir = home.join(".local").join("bin");
+    std::fs::create_dir_all(&bin_dir).expect("create durable bin dir");
+    let durable = bin_dir.join("dot-agent-deck");
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_dot-agent-deck"), &durable)
+        .expect("seed durable deck symlink");
+    durable
 }
 
 #[cfg(unix)]
@@ -119,6 +155,12 @@ fn trust_state_keys(home: &Path) -> Vec<String> {
 fn codex_hooks_002_script_launch_installs_exact_scoped_trust() {
     let fixture = common::harness_tempdir().expect("create script launch fixture");
     let home = common::harness_tempdir().expect("create isolated Codex home");
+    let deck_home = common::harness_tempdir().expect("create isolated deck HOME");
+    let deck_command = expected_hook_command(
+        seed_durable_binary(deck_home.path())
+            .to_str()
+            .expect("durable path is UTF-8"),
+    );
     let bin_dir = fixture.path().join("bin");
     std::fs::create_dir(&bin_dir).expect("create fixture bin");
     let child_record = fixture.path().join("child.txt");
@@ -138,9 +180,17 @@ fn codex_hooks_002_script_launch_installs_exact_scoped_trust() {
         .args(["wrap", "--agent", "codex", "--"])
         .arg(&launcher)
         .env("PATH", path)
+        // `HOME` pins the resolver's step-2a candidate at the seeded symlink
+        // above, so the command this install writes is `deck_command` and the
+        // listing below is byte-identical to it. Inheriting the developer's
+        // `HOME` would let `~/.local/bin/dot-agent-deck` decide the pin instead.
+        .env("HOME", deck_home.path())
         .env("CODEX_HOME", home.path())
         .env("CODEX_CHILD_RECORD", &child_record)
-        .env("CODEX_HOOK_LIST_RESPONSE", deck_hook_response())
+        .env(
+            "CODEX_HOOK_LIST_RESPONSE",
+            deck_hook_response(&deck_command),
+        )
         .env("DOT_AGENT_DECK_PANE_ID", "script-codex-pane")
         // Pin the hook endpoint at a dead path inside the fixture — see the
         // same guard in `codex_hooks_safety.rs`. The wrapper resolves this at
@@ -192,7 +242,18 @@ fn codex_hooks_003_non_codex_launcher_gets_startup_integration() {
     let deck = TuiDeck::builder()
         .with_pty_size(180, 45)
         .with_env("PATH", path)
-        .with_env("CODEX_HOOK_LIST_RESPONSE", deck_hook_response())
+        // `__DECK_COMMAND__`, not a literal: this deck runs under the harness's
+        // per-test HOME, which does not exist yet at builder time, so the exact
+        // command the startup install will write cannot be spelled here. The
+        // `codex-synthetic` stand-in substitutes it out of the installed
+        // `hooks.json` — which is what a real Codex reports. Command fidelity
+        // itself is asserted by `codex_hooks_002` and by the fast-tier
+        // `codex/trust/002`; what this test is about is that startup
+        // install+trust happens at all for a non-Codex-basename launcher.
+        .with_env(
+            "CODEX_HOOK_LIST_RESPONSE",
+            deck_hook_response("__DECK_COMMAND__"),
+        )
         .with_continue_session("launcher-codex", "/bin/sh startup-parity-launcher.sh")
         .launch_with_fixture("codex-synthetic");
 
