@@ -725,6 +725,67 @@ describe("ControlDeck", () => {
     expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
   });
 
+  /**
+   * Scenario: the stored selection names a deck that is no longer configured,
+   * so the app is on the local deck and connected. The banner appears anyway
+   * and says which of the two reasons it was.
+   *
+   * PRD #741 M7. A `NoRemoteSocket` or `UnknownDeck` fallback leaves the app
+   * CONNECTED, so a banner keyed on `status` alone would hide the one thing the
+   * user needs to know — and acting on the wrong machine's agents is what a
+   * silent substitution costs.
+   */
+  it("says why it is on the local deck when the stored selection could not be honoured", () => {
+    const fellBack = createFixtureSnapshot("connected");
+    fellBack.connection = {
+      ...fellBack.connection,
+      status: "connected",
+      deckKind: "local",
+      selectionFallback: "the selected deck deck0000000000aa has no remote socket path yet; using the local deck",
+    };
+    render(<ControlDeck runtime={runtime({ mode: "live", snapshot: fellBack })} />);
+
+    expect(screen.getByTestId("selection-fallback")).toHaveTextContent("has no remote socket path yet");
+    expect(screen.getByRole("alert")).toHaveTextContent("Using the deck on this machine");
+    // Still a local deck, so the lifecycle controls are still the user's.
+    expect(screen.queryByTestId("remote-deck-notice")).not.toBeInTheDocument();
+  });
+
+  /**
+   * Scenario: the app is talking to a deck on another machine. Stop, Start and
+   * Replace are gone, and the banner says why.
+   *
+   * PRD #741 M7. This is rendering a refusal that already exists:
+   * `Endpoint::require_local` makes the operation unreachable by type, and the
+   * sentence is its own. Over a forwarded socket the consequence of NOT gating
+   * is not a no-op — `run_daemon_stop` resolves its target from the socket's
+   * peer credentials, which name the local `ssh` client, so Stop would tear the
+   * tunnel down and report that a daemon had stopped gracefully.
+   */
+  it("disables the daemon lifecycle controls for a remote deck and says why", () => {
+    const remote = createFixtureSnapshot("disconnected");
+    remote.agents = [];
+    remote.connection = {
+      ...remote.connection,
+      status: "disconnected",
+      deckKind: "remote",
+      daemonDetected: true,
+      runningAgentCount: 0,
+      localOnlyReason:
+        "Stop daemon is not available for the remote deck deploy@build-box: it acts on a process on this machine, which is not the machine that deck runs on",
+    };
+    render(<ControlDeck runtime={runtime({ mode: "live", snapshot: remote })} />);
+
+    expect(screen.queryByTestId("start-daemon")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("replace-daemon")).not.toBeInTheDocument();
+    expect(screen.getByTestId("stop-run")).toBeDisabled();
+    expect(screen.getByTestId("stop-run")).toHaveAttribute(
+      "title",
+      expect.stringContaining("not the machine that deck runs on"),
+    );
+    expect(screen.getByTestId("remote-deck-notice")).toHaveTextContent("acts on a process on this machine");
+  });
+
   it("confirmation-gates an explicit daemon start from the disconnected state", async () => {
     const disconnected = createFixtureSnapshot("disconnected");
     disconnected.agents = [];
