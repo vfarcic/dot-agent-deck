@@ -36,14 +36,19 @@ MESSAGE="${1:-}"
 if [ -z "$MESSAGE" ] && [ ! -t 0 ]; then MESSAGE="$(cat)"; fi
 
 TIMEOUT="${TELEGRAM_TIMEOUT_SECS:-10}"
-LOG="${NOTIFY_LOG:-.dot-agent-deck/notify-log.md}"
+# Resolved from this script's own location, not from $PWD: an agent that calls it
+# from a subdirectory would otherwise scatter notify-log.md around the tree.
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+LOG="${NOTIFY_LOG:-$REPO_ROOT/.dot-agent-deck/notify-log.md}"
 TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
 # Append one line to the expectation log. Best-effort: never delays or blocks.
 log_line() {
   local outcome="$1"
   mkdir -p "$(dirname "$LOG")" 2>/dev/null || return 0
-  printf '| %s | %s | %s |\n' "$TS" "${MESSAGE:0:80}" "$outcome" >>"$LOG" 2>/dev/null || true
+  # Escape pipes: an unescaped one in the message corrupts the table row.
+  local safe="${MESSAGE:0:80}"; safe="${safe//|/\\|}"
+  printf '| %s | %s | %s |\n' "$TS" "$safe" "$outcome" >>"$LOG" 2>/dev/null || true
 }
 
 if [ -z "$MESSAGE" ]; then
