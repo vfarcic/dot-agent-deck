@@ -384,6 +384,9 @@ fn orchestration_session_toml(project_dir: &str, pi_command: &str, directive: &s
         // session with no prior command persists `None` (matches every other
         // `SavedSession` literal — src/config.rs).
         last_command: None,
+        // Issue #949: this staged snapshot is about the orchestration rebuild,
+        // not about where the user was looking.
+        focus: None,
     };
     toml::to_string_pretty(&session).expect("serialize orchestration session.toml")
 }

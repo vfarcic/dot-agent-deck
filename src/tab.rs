@@ -405,7 +405,20 @@ impl TabManager {
     /// store `None` when the agent pane is focused. Dashboard is a no-op
     /// (its selection is keyed by session id, synced from the render loop).
     pub fn record_focus(&mut self, pane_id: &str) {
-        match &mut self.tabs[self.active_index] {
+        self.record_focus_on_tab(self.active_index, pane_id);
+    }
+
+    /// The per-tab half of [`Self::record_focus`], for the one caller that has
+    /// to write a tab OTHER than the active one: issue #949's
+    /// [`Self::apply_focus_snapshot`], which restores every tab's remembered
+    /// pane in one pass at startup and so cannot switch to each in turn.
+    /// Out-of-range indices are ignored rather than panicking, because unlike
+    /// `active_index` the caller's index comes from a search that can miss.
+    pub fn record_focus_on_tab(&mut self, tab_index: usize, pane_id: &str) {
+        let Some(tab) = self.tabs.get_mut(tab_index) else {
+            return;
+        };
+        match tab {
             Tab::Dashboard { .. } => {}
             Tab::Mode {
                 agent_pane_id,
@@ -496,6 +509,129 @@ impl TabManager {
             let _ = self.pane_controller.focus_pane(id);
         }
         target
+    }
+
+    /// Issue #949 — whether `pane_id` is a value worth remembering as focus at
+    /// all. The same three-part predicate `restore_focus_on_switch_in` applies
+    /// to a stored id, minus the per-tab membership term (which a
+    /// [`Self::tab_index_owning_pane`] lookup answers instead): non-empty, and
+    /// not a synthetic dead-slot id.
+    ///
+    /// Filtering at CAPTURE as well as at restore is what keeps the two halves
+    /// consistent — a dead-slot id written to disk would be cleared by
+    /// `restore_focus_on_switch_in` the moment the tab was switched in anyway,
+    /// so storing one buys a fallback dressed up as a restore.
+    fn focus_worth_remembering(pane_id: &str) -> bool {
+        !pane_id.is_empty() && !crate::ui::is_dead_slot_pane_id(pane_id)
+    }
+
+    /// Issue #949 — the tab that owns `pane_id`, across BOTH pane sets a tab
+    /// can have. Neither existing lookup is a complete answer on its own:
+    /// [`Self::tab_index_for_pane`] skips a Mode tab's agent pane (it searches
+    /// `managed_pane_ids`, the side panes), and [`Self::tab_index_for_agent_pane`]
+    /// considers only that agent pane. Orchestration tabs are covered by the
+    /// first, which already rejects empty and dead-slot ids.
+    pub fn tab_index_owning_pane(&self, pane_id: &str) -> Option<usize> {
+        self.tab_index_for_pane(pane_id)
+            .or_else(|| self.tab_index_for_agent_pane(pane_id))
+    }
+
+    /// Issue #949 — snapshot where the user is looking, for
+    /// [`crate::config::SavedFocus`]. Answers `None` when there is nothing worth
+    /// remembering: a deck whose only tab is the Dashboard has no per-tab focus
+    /// to restore and no tab choice to make, and answering `Some` there would
+    /// keep an otherwise-empty `session.toml` alive purely to record that the
+    /// only tab was active.
+    ///
+    /// The ACTIVE tab's entry comes from the pane controller rather than from
+    /// the tab's own field, because a `Tab::Mode` stores `None` to mean "the
+    /// agent pane is focused" — and the value has to double as the locator for
+    /// which tab was active, which `None` cannot do. Every other tab's entry is
+    /// its own remembered field, which is exactly what
+    /// `capture_focus_on_switch_out` put there when the user left it.
+    pub fn capture_focus_snapshot(&self) -> Option<crate::config::SavedFocus> {
+        if self.tabs.len() <= 1 {
+            return None;
+        }
+        let active_pane = self
+            .pane_controller
+            .focused_pane_id()
+            .filter(|id| Self::focus_worth_remembering(id))
+            .filter(|id| self.tab_index_owning_pane(id) == Some(self.active_index));
+        let mut tab_panes: Vec<String> = Vec::new();
+        for (index, tab) in self.tabs.iter().enumerate() {
+            let remembered = match tab {
+                // The Dashboard's selection is keyed by SESSION id, not a pane
+                // id, so it has no entry here; `restore_focus_on_switch_in` is
+                // a no-op for it for the same reason.
+                Tab::Dashboard { .. } => None,
+                Tab::Mode {
+                    focused_pane_id, ..
+                } => focused_pane_id.clone(),
+                Tab::Orchestration {
+                    focused_role_pane_id,
+                    ..
+                } => focused_role_pane_id.clone(),
+            };
+            let entry = if index == self.active_index {
+                active_pane.clone().or(remembered)
+            } else {
+                remembered
+            };
+            if let Some(id) = entry.filter(|id| Self::focus_worth_remembering(id))
+                && !tab_panes.contains(&id)
+            {
+                tab_panes.push(id);
+            }
+        }
+        Some(crate::config::SavedFocus {
+            version: 1,
+            dashboard_active: matches!(self.tabs[self.active_index], Tab::Dashboard { .. }),
+            active_pane,
+            tab_panes,
+        })
+    }
+
+    /// Issue #949 — write a captured [`crate::config::SavedFocus`] back onto
+    /// the live tabs, and answer which tab the deck should land on (`None` =
+    /// leave the caller's own landing choice alone).
+    ///
+    /// **Liveness of a value this process has never seen.** Every id is
+    /// re-resolved against the tabs that exist NOW, and an id no tab owns is
+    /// dropped: a pane the user closed in the meantime, or a role whose agent
+    /// died (hydration gives such a role a synthetic dead-slot id, so the
+    /// remembered real id matches nothing). A dropped id leaves that tab's
+    /// remembered focus untouched, so `restore_focus_on_switch_in` falls back to
+    /// the start role exactly as it does today — a graceful degrade to current
+    /// behaviour, and never a landing on a dead role.
+    ///
+    /// **A remembered Dashboard is a real position, not an absent one.** When
+    /// it is what was recorded, restore it — deliberately overriding PRD #111's
+    /// "land a reconnect on the first rebuilt orchestration tab", which exists
+    /// to stop a reconnect showing an overview the user never chose. When the
+    /// user DID choose the overview, honouring that serves the same intent;
+    /// #111's heuristic stays in force whenever nothing was remembered. The
+    /// Dashboard is located by KIND rather than assumed to be index 0, since
+    /// nothing else here depends on its position.
+    ///
+    /// The Dashboard's own card selection is deliberately not restored: it is
+    /// keyed by session id rather than by a pane id, and the render loop's
+    /// per-frame `reconcile_dashboard_selection` re-arms the highlight from the
+    /// focused pane, so there is nothing here that would not be recomputed.
+    pub fn apply_focus_snapshot(&mut self, snapshot: &crate::config::SavedFocus) -> Option<usize> {
+        for pane_id in &snapshot.tab_panes {
+            if let Some(index) = self.tab_index_owning_pane(pane_id) {
+                self.record_focus_on_tab(index, pane_id);
+            }
+        }
+        match snapshot.active_pane.as_deref() {
+            Some(pane_id) => self.tab_index_owning_pane(pane_id),
+            None if snapshot.dashboard_active => self
+                .tabs
+                .iter()
+                .position(|tab| matches!(tab, Tab::Dashboard { .. })),
+            None => None,
+        }
     }
 
     /// Steer the active tab's focus to the lowest-`role_pane_ids`-order pane
@@ -3121,5 +3257,291 @@ mod tests {
             &tm.tabs[orch_idx],
             Tab::Orchestration { focused_role_pane_id: Some(p), .. } if *p == alpha
         ));
+    }
+
+    /// A `SavedFocus` with `version: 1` and the given parts, so the tests below
+    /// read as the shape being asserted rather than as struct boilerplate.
+    fn saved_focus(
+        dashboard_active: bool,
+        active_pane: Option<&str>,
+        tab_panes: &[&str],
+    ) -> crate::config::SavedFocus {
+        crate::config::SavedFocus {
+            version: 1,
+            dashboard_active,
+            active_pane: active_pane.map(str::to_string),
+            tab_panes: tab_panes.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    /// Scenario: Build a deck with TWO orchestration tabs, park the user on the
+    /// second one with its non-start `coder` role focused while the first tab
+    /// separately remembers its own `coder`, and capture the position. Then
+    /// rebuild the two tabs in a FRESH `TabManager` in the OPPOSITE order — what
+    /// a reattach does, since warm-daemon hydration rebuilds tabs in the
+    /// daemon's bucket order rather than the order the user opened them — and
+    /// apply the capture. It must land on the tab that owns the remembered pane
+    /// (not on an index), focus that pane on the controller, AND leave the other
+    /// tab remembering its own role, so a later switch to it restores that role
+    /// instead of its start role.
+    #[spec("session/restore/017")]
+    #[test]
+    fn restore_017_focus_snapshot_round_trips_by_pane_id_across_a_rebuild() {
+        // --- the deck the user detaches from -------------------------------
+        let pc = Arc::new(MockPaneController::new());
+        let mut before = TabManager::new(pc.clone());
+        let (first_idx, _) = before
+            .open_orchestration_tab_with_existing_role_panes(
+                &orch_config("first"),
+                "/work/first",
+                vec![Some("first-lead".into()), Some("first-coder".into())],
+                None,
+            )
+            .expect("open the first orchestration tab");
+        let (second_idx, _) = before
+            .open_orchestration_tab_with_existing_role_panes(
+                &orch_config("second"),
+                "/work/second",
+                vec![Some("second-lead".into()), Some("second-coder".into())],
+                None,
+            )
+            .expect("open the second orchestration tab");
+
+        // Stamped directly rather than through `record_focus_on_tab`, so the
+        // setup does not depend on the code under test.
+        if let Tab::Orchestration {
+            focused_role_pane_id,
+            ..
+        } = &mut before.tabs[first_idx]
+        {
+            *focused_role_pane_id = Some("first-coder".to_string());
+        }
+        if let Tab::Orchestration {
+            focused_role_pane_id,
+            ..
+        } = &mut before.tabs[second_idx]
+        {
+            *focused_role_pane_id = Some("second-coder".to_string());
+        }
+        assert!(before.switch_to(second_idx));
+        pc.focus_pane("second-coder").expect("focus the live pane");
+
+        let snapshot = before
+            .capture_focus_snapshot()
+            .expect("a deck with three tabs has a position worth remembering");
+        assert!(
+            !snapshot.dashboard_active,
+            "an orchestration tab was active, not the Dashboard: {snapshot:?}"
+        );
+        assert_eq!(
+            snapshot.active_pane.as_deref(),
+            Some("second-coder"),
+            "the active tab's entry comes from the controller's live focus: {snapshot:?}"
+        );
+        assert!(
+            snapshot.tab_panes.contains(&"first-coder".to_string())
+                && snapshot.tab_panes.contains(&"second-coder".to_string()),
+            "every tab that remembers a pane must appear, not just the active one: {snapshot:?}"
+        );
+
+        // --- the deck the user reattaches with ------------------------------
+        let pc2 = Arc::new(MockPaneController::new());
+        let mut after = TabManager::new(pc2.clone());
+        let (rebuilt_second, _) = after
+            .open_orchestration_tab_with_existing_role_panes(
+                &orch_config("second"),
+                "/work/second",
+                vec![Some("second-lead".into()), Some("second-coder".into())],
+                None,
+            )
+            .expect("rebuild the second orchestration tab first");
+        let (rebuilt_first, _) = after
+            .open_orchestration_tab_with_existing_role_panes(
+                &orch_config("first"),
+                "/work/first",
+                vec![Some("first-lead".into()), Some("first-coder".into())],
+                None,
+            )
+            .expect("rebuild the first orchestration tab second");
+        assert_ne!(
+            rebuilt_second, second_idx,
+            "the rebuild must land the remembered tab at a DIFFERENT index, or this test \
+             cannot tell a pane-id locator from a persisted index"
+        );
+        assert!(
+            after.switch_to(0),
+            "start from the Dashboard landing default"
+        );
+
+        assert_eq!(
+            after.apply_focus_snapshot(&snapshot),
+            Some(rebuilt_second),
+            "the landing tab must be resolved from the remembered PANE, wherever the rebuild \
+             put its tab"
+        );
+        assert!(after.switch_to(rebuilt_second));
+        assert_eq!(
+            after.restore_focus_on_switch_in().as_deref(),
+            Some("second-coder"),
+            "the remembered non-start role must win over the start-role fallback"
+        );
+        assert_eq!(
+            pc2.last_focus().as_deref(),
+            Some("second-coder"),
+            "restoring the tab's field is only half of it — the controller has to be told too"
+        );
+
+        // The OTHER tab kept its own remembered role, which is the half the
+        // active tab alone cannot cover.
+        assert!(after.switch_to(rebuilt_first));
+        assert_eq!(
+            after.restore_focus_on_switch_in().as_deref(),
+            Some("first-coder"),
+            "a background tab's remembered role must survive too, else the next Tab press \
+             dumps the user on that tab's start role"
+        );
+    }
+
+    /// Scenario: Drive every way applying a remembered position to tabs the
+    /// snapshot has never seen can degrade. (a) An id no tab owns — a pane the
+    /// user closed, or a role whose agent died and came back as a synthetic
+    /// dead-slot — yields NO landing tab and leaves the orchestration tab's
+    /// start-role fallback intact, i.e. exactly today's behaviour rather than an
+    /// error. (b) A dead-slot id sitting in a tab's remembered field is never
+    /// captured in the first place, so it can never shadow a live role. (c) A
+    /// remembered Dashboard resolves to the Dashboard tab, located by kind
+    /// rather than by assuming index 0, while a fully defaulted position leaves
+    /// the deck's own landing choice alone. (d) An id the DAEMON did not supply
+    /// is filtered out by `retain_pane_ids` even when it would resolve, and (e)
+    /// the same id with the daemon set populated restores normally — so (d)
+    /// pins the filter rather than something about the id.
+    #[spec("session/restore/018")]
+    #[test]
+    fn restore_018_focus_snapshot_degrades_to_todays_fallback() {
+        let pc = Arc::new(MockPaneController::new());
+        let mut tm = TabManager::new(pc.clone());
+        let (orch_idx, _) = tm
+            .open_orchestration_tab_with_existing_role_panes(
+                &orch_config("orch"),
+                "/work",
+                vec![Some("live-lead".into()), Some("live-coder".into())],
+                None,
+            )
+            .expect("open the orchestration tab");
+
+        // (a) Nothing owns these ids, so there is nothing to land on and
+        // nothing to write.
+        let stale = saved_focus(false, Some("closed-pane"), &["closed-pane", "also-gone"]);
+        assert_eq!(
+            tm.apply_focus_snapshot(&stale),
+            None,
+            "a remembered pane no tab owns must not name a landing tab"
+        );
+        assert!(tm.switch_to(orch_idx));
+        assert_eq!(
+            tm.restore_focus_on_switch_in().as_deref(),
+            Some("live-lead"),
+            "with nothing restorable the tab must fall back to its start role — today's \
+             behaviour, not a failure"
+        );
+
+        // (b) A dead-slot id can genuinely reach a tab's remembered field:
+        // hydration puts synthetic ids in `role_pane_ids`, and `record_focus`
+        // accepts any member of that list. Capturing one would write a value
+        // `restore_focus_on_switch_in` clears on the very next switch-in, so
+        // the capture filters it out instead.
+        let dead = format!("{}orch-1", crate::ui::DEAD_SLOT_PREFIX);
+        if let Tab::Orchestration {
+            role_pane_ids,
+            focused_role_pane_id,
+            ..
+        } = &mut tm.tabs[orch_idx]
+        {
+            role_pane_ids[1] = dead.clone();
+            *focused_role_pane_id = Some(dead.clone());
+        }
+        let captured = tm
+            .capture_focus_snapshot()
+            .expect("two tabs still have a position");
+        assert!(
+            !captured.tab_panes.contains(&dead),
+            "a synthetic dead-slot id must never be remembered as focus: {captured:?}"
+        );
+        assert_ne!(
+            captured.active_pane.as_deref(),
+            Some(dead.as_str()),
+            "nor as the active-tab locator: {captured:?}"
+        );
+
+        // (c) A remembered Dashboard is a real position. Located by kind, so
+        // this keeps holding if the Dashboard ever stops being tab 0.
+        let dashboard_index = tm
+            .tabs
+            .iter()
+            .position(|tab| matches!(tab, Tab::Dashboard { .. }))
+            .expect("every deck has a Dashboard");
+        assert_eq!(
+            tm.apply_focus_snapshot(&saved_focus(true, None, &[])),
+            Some(dashboard_index),
+            "a remembered Dashboard must be restored, not treated as 'nothing remembered'"
+        );
+        // And the inverse: neither a pane nor the Dashboard flag means the
+        // caller's own landing choice stands.
+        assert_eq!(
+            tm.apply_focus_snapshot(&saved_focus(false, None, &[])),
+            None,
+            "a fully defaulted position must leave the deck's landing choice alone"
+        );
+
+        // (d) Only ids the DAEMON supplied are honoured. Everything else on
+        // screen — every pane on the daemon-empty rebuild path, and a Mode
+        // tab's locally-spawned side panes on the warm one — carries a fresh
+        // `allocate_id` counter that matches a remembered number by
+        // coincidence, so honouring one can focus the WRONG pane. `live-coder`
+        // below WOULD resolve, which is what makes dropping it observable.
+        if let Tab::Orchestration {
+            role_pane_ids,
+            focused_role_pane_id,
+            ..
+        } = &mut tm.tabs[orch_idx]
+        {
+            role_pane_ids[1] = "live-coder".to_string();
+            *focused_role_pane_id = None;
+        }
+        let remembered = saved_focus(true, Some("live-coder"), &["live-coder"]);
+        let no_daemon_ids: HashSet<String> = HashSet::new();
+        assert_eq!(
+            tm.apply_focus_snapshot(&remembered.retain_pane_ids(&no_daemon_ids)),
+            Some(dashboard_index),
+            "the id-free half of a position must still apply when every id is filtered out"
+        );
+        assert!(
+            matches!(
+                &tm.tabs[orch_idx],
+                Tab::Orchestration {
+                    focused_role_pane_id: None,
+                    ..
+                }
+            ),
+            "no pane id may be written from a filtered position, even one that would \
+             resolve — a locally allocated counter is not the id that was remembered"
+        );
+
+        // (e) …and the same position with that id in the daemon-supplied set
+        // restores normally, so (d) proves the FILTER rather than something
+        // about the id itself.
+        let daemon_ids: HashSet<String> = ["live-coder".to_string()].into_iter().collect();
+        assert_eq!(
+            tm.apply_focus_snapshot(&remembered.retain_pane_ids(&daemon_ids)),
+            Some(orch_idx),
+            "a daemon-supplied id must still locate its tab"
+        );
+        assert!(
+            matches!(
+                &tm.tabs[orch_idx],
+                Tab::Orchestration { focused_role_pane_id: Some(p), .. } if p == "live-coder"
+            ),
+            "and must still be written as that tab's remembered focus"
+        );
     }
 }

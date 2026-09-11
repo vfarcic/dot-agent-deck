@@ -164,6 +164,9 @@ fn real_agent_orchestration_session(
             }),
         }],
         last_command: None,
+        // Issue #949: this staged snapshot is about the orchestration rebuild,
+        // not about where the user was looking.
+        focus: None,
     };
     toml::to_string_pretty(&session).expect("serialize real-agent orchestration session")
 }

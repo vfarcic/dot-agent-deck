@@ -2606,6 +2606,19 @@ struct UiState {
     /// PRD #89 M1.2 — monotonic reference the coalescer's `Duration` clock is
     /// measured from (`session_epoch.elapsed()`), set once at construction.
     session_epoch: std::time::Instant,
+    /// Issue #949 — the user's current position (active tab + each tab's
+    /// focused pane), overlaid onto the saved-session snapshot at both write
+    /// sites the way [`Self::last_command`] is.
+    ///
+    /// Held here rather than recomputed inside `flush_session_snapshot_if_due`
+    /// because that function early-returns while the coalescer's throttle is
+    /// closed, whereas a MOVE is what has to mark the snapshot dirty:
+    /// `track_session_focus` compares this against the live tabs once per frame
+    /// so an abrupt disconnect (a dropped ssh link, a killed terminal) still
+    /// leaves a recent position on disk. The clean detach-quit path is covered
+    /// by the unconditional pre-teardown write; this is what covers the
+    /// un-clean one, which is how the issue was reported.
+    session_focus: Option<config::SavedFocus>,
     /// PRD #196 — the persisted, global "last command": the most recent command
     /// the user spawned an INTERACTIVE agent with from the new-pane flow. Read by
     /// the new-pane form seed (`resolve_seed_command`) when `default_command` is
@@ -2763,6 +2776,7 @@ impl UiState {
             last_pane_keystroke_at: None,
             session_coalescer: config::SnapshotCoalescer::new(SNAPSHOT_COALESCE_INTERVAL),
             session_epoch: std::time::Instant::now(),
+            session_focus: None,
             // PRD #196: restored from the persisted session in `run_tui` before
             // the event loop; defaults to None so a fresh install seeds blank.
             last_command: None,
@@ -11247,6 +11261,10 @@ fn flush_session_snapshot_if_due(ui: &mut UiState, state: &SharedState) {
     // PRD #196: overlay the runtime last-command onto the live-pane snapshot so
     // it persists across restarts (the snapshot builder only knows panes).
     session.last_command = ui.last_command.clone();
+    // Issue #949: same overlay for the user's position — tab state, which the
+    // pane-derived snapshot builder cannot know. `track_session_focus` keeps
+    // `ui.session_focus` current and is what marked this write dirty.
+    session.focus = ui.session_focus.clone();
     // PRD #89 review-fix F10: only mark the write as done (clearing the dirty
     // flag via `record_write`) when the persist actually SUCCEEDED. On a
     // transient disk error we leave the coalescer dirty so the next loop
@@ -11255,13 +11273,20 @@ fn flush_session_snapshot_if_due(ui: &mut UiState, state: &SharedState) {
     // PRD #196: keep the file (don't clear) when there are no live panes but a
     // last_command is set, so closing every pane doesn't discard the recorded
     // command; clear only when BOTH are empty (today's no-state behavior).
-    let result = if session.panes.is_empty() && session.last_command.is_none() {
-        config::SavedSession::clear().map_err(|e| format!("Warning: failed to clear session: {e}"))
-    } else {
-        session
-            .save()
-            .map_err(|e| format!("Warning: failed to save session: {e}"))
-    };
+    // Issue #949: the remembered position joins that condition, so a deck whose
+    // panes all live in mode/orchestration tabs (no `pane_metadata` entry of
+    // their own) does not have its position deleted by the very same write that
+    // was meant to record it. `capture_focus_snapshot` answers `None` for a
+    // Dashboard-only deck, so a genuinely stateless deck still clears the file.
+    let result =
+        if session.panes.is_empty() && session.last_command.is_none() && session.focus.is_none() {
+            config::SavedSession::clear()
+                .map_err(|e| format!("Warning: failed to clear session: {e}"))
+        } else {
+            session
+                .save()
+                .map_err(|e| format!("Warning: failed to save session: {e}"))
+        };
     match result {
         Ok(()) => {
             // PRD #89 review-fix G1: a successful write/clear ends any ongoing
@@ -11280,6 +11305,25 @@ fn flush_session_snapshot_if_due(ui: &mut UiState, state: &SharedState) {
                 ui.session_snapshot_write_failed = true;
             }
         }
+    }
+}
+
+/// Issue #949 — keep [`UiState::session_focus`] current and mark the
+/// saved-session snapshot dirty whenever the user's position moves.
+///
+/// Driven once per main-loop iteration, immediately before
+/// `flush_session_snapshot_if_due`, because the flush is the wrong place to
+/// compute this: it early-returns while the coalescer's throttle is closed, so a
+/// focus move made during a quiet stretch would never mark anything dirty and
+/// would only reach disk if some unrelated change happened to dirty the snapshot
+/// later. Comparing here instead means a move is itself a state change, and the
+/// coalescer bounds how often that reaches the disk exactly as it does for every
+/// other trigger.
+fn track_session_focus(ui: &mut UiState, tab_manager: &TabManager) {
+    let current = tab_manager.capture_focus_snapshot();
+    if current != ui.session_focus {
+        ui.session_focus = current;
+        ui.mark_session_dirty();
     }
 }
 
@@ -11936,7 +11980,16 @@ pub fn run_tui(
     // whole `SavedSession` across the entire daemon-hydration block and threading
     // it into the gated branch — entangling the restore path for a negligible
     // startup disk read. Kept separate on purpose.
-    ui.last_command = config::SavedSession::load().last_command;
+    // Issue #949: the user's last position rides along on this same read. It
+    // is global state with the same gating as `last_command` — unconditional,
+    // because a warm-daemon reattach is precisely the case that needs it and
+    // that case never reaches the gated panes restore below — so folding it in
+    // here keeps the load count at two rather than adding a third. Applied
+    // after BOTH restore blocks (see the `apply_focus_snapshot` call), since it
+    // has to win over whichever landing tab they chose.
+    let restored_session = config::SavedSession::load();
+    ui.last_command = restored_session.last_command;
+    let saved_focus = restored_session.focus;
     let mut tab_manager = TabManager::new(Arc::clone(&pane));
 
     let mut star_state = config::StarPromptState::load();
@@ -11956,6 +12009,15 @@ pub fn run_tui(
     // landing on every startup.
     let mut preferred_start_tab: usize = 0;
 
+    // Issue #949 — the pane ids the DAEMON supplied on this startup, which is
+    // exactly the set whose ids are a stable identity across processes (the
+    // daemon captured each into its agent's `DOT_AGENT_DECK_PANE_ID` and echoed
+    // it back on `list_agents`). Empty on the daemon-empty path, and it
+    // deliberately excludes a Mode tab's SIDE panes, which the hydration block
+    // below spawns fresh from the project config rather than adopting. Consumed
+    // by `SavedFocus::retain_pane_ids` at the restore seam after both blocks.
+    let mut daemon_pane_ids: HashSet<String> = HashSet::new();
+
     // PRD #76 M2.x / M2.11: in external-daemon mode the daemon may already
     // own live agents from a previous TUI session (the user ssh-disconnected
     // and reconnected via `dot-agent-deck connect`). Ask the daemon for its
@@ -11972,6 +12034,7 @@ pub fn run_tui(
     // metadata intact — no separate persistence file is required.
     if let Some(embedded) = pane.as_any().downcast_ref::<EmbeddedPaneController>() {
         let hydrated = embedded.hydrate_from_daemon();
+        daemon_pane_ids.extend(hydrated.iter().map(|h| h.pane_id.clone()));
         for h in &hydrated {
             let mut st = state.blocking_write();
             st.register_pane(h.pane_id.clone());
@@ -12968,6 +13031,48 @@ pub fn run_tui(
         ui.selected_index = Some(0);
     }
 
+    // Issue #949 — put the user back where they were. Runs AFTER both restore
+    // blocks so it wins over their landing choices: the hydration block's PRD
+    // #111 "first rebuilt orchestration tab" and the snapshot block's
+    // `first_restored_orch_tab`/dashboard fallback. Both of those are
+    // heuristics for "we do not know where the user was"; this is the answer
+    // when we do. `apply_focus_snapshot` runs even when it returns no landing
+    // tab, because writing each tab's remembered pane is the half that stops a
+    // later Tab-away-and-back from dumping the user on that tab's start role.
+    //
+    // Only the ids the DAEMON supplied survive into the restore. Every other
+    // pane on screen — all of them on the daemon-empty rebuild path, and a Mode
+    // tab's locally-spawned side panes on the warm one — carries a fresh
+    // `allocate_id` counter that matches a remembered number by coincidence
+    // rather than by identity, so honouring one can focus the WRONG terminal
+    // instead of merely failing to restore. `SavedFocus::retain_pane_ids` has
+    // the full reasoning; the id-free half (a remembered Dashboard) is
+    // unaffected either way.
+    let saved_focus = saved_focus.map(|focus| focus.retain_pane_ids(&daemon_pane_ids));
+    if let Some(focus) = saved_focus.as_ref()
+        && let Some(index) = tab_manager.apply_focus_snapshot(focus)
+    {
+        tab_manager.switch_to(index);
+        // The remembered pane is only half-restored until the controller is
+        // told: the tab's field drives the rendered highlight, `focus_pane`
+        // drives which PTY the keyboard reaches.
+        let restored = tab_manager.restore_focus_on_switch_in();
+        // The snapshot-restore block above ends by focusing the first pane it
+        // rebuilt and entering PaneInput. If the landing tab focuses no pane of
+        // its own — the Dashboard, whose selection is keyed by session id rather
+        // than a pane id — that mode would keep sending keystrokes to a pane on a
+        // tab that is no longer drawn. Step back to command mode so the deck's
+        // mode matches what is on screen. Reachable only on the daemon-empty
+        // path, since warm hydration never enters PaneInput at startup.
+        if restored.is_none() && ui.mode == UiMode::PaneInput {
+            ui.mode = UiMode::Normal;
+        }
+    }
+    // Seed the movement baseline from what is actually on screen now, so the
+    // first frame does not read the restore itself as a move and immediately
+    // write the same position back.
+    ui.session_focus = tab_manager.capture_focus_snapshot();
+
     'outer: loop {
         // Expire stale status messages
         if let Some((_, created)) = &ui.status_message
@@ -12976,6 +13081,11 @@ pub fn run_tui(
             ui.status_message = None;
         }
 
+        // Issue #949 — notice a moved position (active tab / focused pane) and
+        // mark the snapshot dirty, so the flush below has something to write.
+        // Before the flush, not after: otherwise the move is a frame late every
+        // time and a detach on the same frame records the previous position.
+        track_session_focus(&mut ui, &tab_manager);
         // PRD #89 M1.2/M1.3 — keep the saved-session snapshot continuously
         // fresh: if a meaningful state change / detach marked it dirty and the
         // coalescer's throttle window has elapsed, flush it to disk now. This
@@ -14762,7 +14872,15 @@ pub fn run_tui(
         // PRD #196: persist the global last-command alongside the panes so it
         // survives a clean exit/restart; keep the file when only it is set.
         session.last_command = ui.last_command.clone();
-        if session.panes.is_empty() && session.last_command.is_none() {
+        // Issue #949: re-read the position here rather than trusting the last
+        // loop iteration's value. Nothing between the final `track_session_focus`
+        // and the quit-dialog `Enter` moves pane focus, so this is normally a
+        // no-op — but it is the ONE write that a detach is guaranteed to reach,
+        // and reading it a frame late is how a restore silently comes back one
+        // move behind.
+        track_session_focus(&mut ui, &tab_manager);
+        session.focus = ui.session_focus.clone();
+        if session.panes.is_empty() && session.last_command.is_none() && session.focus.is_none() {
             if let Err(e) = config::SavedSession::clear() {
                 ui.session_warnings
                     .push(format!("Warning: failed to clear session: {e}"));
