@@ -16,6 +16,7 @@ use crate::dto::{
     TerminalAttachResult, TerminalState, TerminalStateEvent, safe_message, validate_agent_id,
     validate_dimensions, validate_terminal_input,
 };
+use crate::endpoint_tunnels::EndpointTunnels;
 
 #[derive(Clone)]
 struct TerminalSession {
@@ -64,16 +65,34 @@ pub(crate) struct DesktopState {
     /// `'static` spawned task that outlives any borrow of this state; it holds
     /// its own handle and invalidates through it when its event stream ends.
     pub(crate) daemon: Arc<DaemonLinks>,
+    /// PRD #741 M7: the live `ssh -N -L` children, keyed by endpoint.
+    ///
+    /// **Beside [`DaemonLinks`], never inside it.** A `TrustedDaemon` is
+    /// re-established every `HANDSHAKE_REVALIDATE_INTERVAL` (5 s); a tunnel
+    /// owned by one would re-authenticate ssh every five seconds. The two maps
+    /// share a key and nothing else — see `endpoint_tunnels`'s module docs for
+    /// the ownership and teardown rules M9 and #742 inherit.
+    ///
+    /// An [`Arc`] for the same reason `daemon` is: the snapshot watcher is a
+    /// `'static` task that outlives any borrow of this state.
+    pub(crate) tunnels: Arc<EndpointTunnels>,
 }
 
 impl Default for DesktopState {
     fn default() -> Self {
+        // ONE tunnel map, reachable by two names. `DaemonLinks` needs it
+        // because establishment is where a transport is acquired; the state
+        // needs it because the selection-change and app-exit teardowns are
+        // commands, not handshakes. Cloning the `Arc` is what keeps them the
+        // same map rather than two that drift.
+        let daemon = Arc::new(DaemonLinks::default());
         Self {
             sessions: Mutex::new(HashMap::new()),
             attach_gate: AsyncMutex::new(()),
             next_generation: AtomicU64::new(1),
             watcher_started: AtomicBool::new(false),
-            daemon: Arc::new(DaemonLinks::default()),
+            daemon: Arc::clone(&daemon),
+            tunnels: daemon.tunnels(),
         }
     }
 }

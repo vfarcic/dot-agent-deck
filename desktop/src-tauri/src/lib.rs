@@ -2,6 +2,8 @@ mod agent_view;
 mod appearance;
 mod daemon_bridge;
 mod dto;
+mod endpoint_test;
+mod endpoint_tunnels;
 mod settings;
 mod terminal;
 
@@ -1100,6 +1102,7 @@ async fn desktop_get_settings(
 #[tauri::command]
 async fn desktop_set_settings(
     webview: Webview,
+    state: State<'_, DesktopState>,
     settings: DesktopSettings,
 ) -> Result<DesktopSettings, String> {
     ensure_main_webview(&webview)?;
@@ -1109,7 +1112,70 @@ async fn desktop_set_settings(
         eprintln!("{}", error.detail());
         safe_message(error.public())
     })?;
+    apply_selection(&state, &settings).await;
     Ok(settings)
+}
+
+/// Put a saved document's deck selection into force (PRD #741 M7).
+///
+/// Three things happen and they have to happen together, which is why they are
+/// one function rather than three lines at each call site:
+///
+/// 1. **The selection is applied**, so `selected_endpoint()` — and therefore the
+///    snapshot, the banner and the Stop/Replace gating — name the deck the user
+///    just chose.
+/// 2. **The held handshake for the deck we were talking to is dropped.** A
+///    classification describes one daemon; after a selection change it describes
+///    the wrong one, and holding it would report the old deck's agent count
+///    beside the new deck's name for up to `HANDSHAKE_REVALIDATE_INTERVAL`.
+/// 3. **Every transport except the selected deck's is released** — rule 3 of
+///    `endpoint_tunnels`, and the leak PRD #741 M7 names explicitly: without it
+///    each selection change leaves an authenticated `ssh -N -L` child behind for
+///    the life of the app. A lease already handed out survives this, so nothing
+///    in flight is torn out from under.
+///
+/// The order matters in one place: the links are dropped *before* the tunnels,
+/// so a link cannot be re-established against a transport that is on its way
+/// out.
+async fn apply_selection(state: &DesktopState, settings: &DesktopSettings) {
+    let deck = crate::dto::apply_settings_selection(settings);
+    state.daemon.invalidate_all().await;
+    let live: std::collections::HashSet<String> = [deck.endpoint.describe()].into_iter().collect();
+    state.tunnels.retain(&live).await;
+}
+
+/// Test one endpoint end to end and report a **named state** (PRD #741 M10).
+///
+/// A standalone command rather than a `DesktopAction`, for the same reason the
+/// settings commands are: every `DesktopAction` ends in `refresh_and_emit`, so
+/// routing this through one would make testing a deck the app is *not* talking
+/// to cost a `ListAgents` round trip against the deck it is, and return the
+/// answer inside a snapshot that has nowhere to put it.
+///
+/// It takes the document from the webview rather than re-reading the file,
+/// because the row a user is testing is usually one they have just typed and
+/// the panel saves optimistically — reading the disk would test the previous
+/// value. The document is the same validated `DesktopSettings` the save path
+/// takes, so nothing unvalidated reaches ssh.
+///
+/// **It writes nothing.** A discovered socket path comes back in the report and
+/// the panel puts it in the row; see `endpoint_test`'s module docs for why the
+/// write-back is not made here.
+#[tauri::command]
+async fn desktop_test_endpoint(
+    webview: Webview,
+    state: State<'_, DesktopState>,
+    settings: DesktopSettings,
+    selection: String,
+) -> Result<crate::endpoint_test::EndpointTestReport, String> {
+    ensure_main_webview(&webview)?;
+    if selection.len() > crate::settings::MAX_ENDPOINT_ID_BYTES {
+        return Err(format!(
+            "an endpoint id is at most {} bytes",
+            crate::settings::MAX_ENDPOINT_ID_BYTES
+        ));
+    }
+    Ok(crate::endpoint_test::test_endpoint(&settings, &selection, &state.tunnels).await)
 }
 
 /// Apply a zoom level to the main webview (PRD #744).
@@ -1503,9 +1569,16 @@ pub fn run() {
         // A missing window is not an error. `load_snapshot` never fails, and a
         // default level makes this a no-op rather than a special case.
         .setup(|app| {
-            let level = settings::load_snapshot().settings.zoom.level;
+            let stored = settings::load_snapshot().settings;
+            // PRD #741 M7: the stored deck selection goes into force before the
+            // first snapshot, so the app connects to the deck the user chose
+            // rather than to the local one and then switching. An unresolvable
+            // selection falls back to local **with a reason**, which the
+            // connection banner renders — a silent substitution is how a user
+            // ends up acting on the wrong machine's agents.
+            crate::dto::apply_settings_selection(&stored);
             if let Some(window) = app.get_webview_window("main") {
-                apply_zoom(window.as_ref(), level);
+                apply_zoom(window.as_ref(), stored.zoom.level);
             }
             Ok(())
         })
@@ -1520,6 +1593,7 @@ pub fn run() {
             desktop_terminal_detach,
             desktop_get_settings,
             desktop_set_settings,
+            desktop_test_endpoint,
             desktop_set_zoom,
             desktop_run_action,
         ])
@@ -1531,7 +1605,14 @@ pub fn run() {
             tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit
         ) {
             let state = app_handle.state::<DesktopState>();
-            tauri::async_runtime::block_on(terminal::detach_all(&state));
+            tauri::async_runtime::block_on(async {
+                terminal::detach_all(&state).await;
+                // PRD #741 M7, teardown trigger 4: every `ssh -N -L` child this
+                // process owns dies with the app. `Drop` on the last lease is
+                // what actually signals the process group; this is what drops
+                // the map's handle so there is a last lease to drop.
+                state.tunnels.close_all().await;
+            });
         }
     });
 }

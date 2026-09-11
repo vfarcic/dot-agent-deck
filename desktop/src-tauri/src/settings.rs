@@ -311,14 +311,6 @@ impl Default for DesktopSettings {
     }
 }
 
-// PRD #741 M6 stores endpoints; M7 (the panel) and M9 (the Deck selector) are
-// what read them, and both are fenced out of this milestone. So the storage API
-// below has its tests as its only caller today. The `allow` is the same device
-// `platform::fsperm`'s SITE_AUDIT uses for the same reason — an item whose
-// production consumer is a later milestone — rather than a silent `pub` that
-// looks reachable. Deleting it once M7 lands is the point: if these are still
-// unused then, the milestone did not wire them up.
-#[cfg_attr(not(test), allow(dead_code))]
 impl DesktopSettings {
     /// Which deck this document says to talk to, with the local deck as the
     /// answer whenever the stored selection cannot be honoured.
@@ -390,14 +382,6 @@ pub struct EndpointSettings {
     pub selection: Selection,
 }
 
-// PRD #741 M6 stores endpoints; M7 (the panel) and M9 (the Deck selector) are
-// what read them, and both are fenced out of this milestone. So the storage API
-// below has its tests as its only caller today. The `allow` is the same device
-// `platform::fsperm`'s SITE_AUDIT uses for the same reason — an item whose
-// production consumer is a later milestone — rather than a silent `pub` that
-// looks reachable. Deleting it once M7 lands is the point: if these are still
-// unused then, the milestone did not wire them up.
-#[cfg_attr(not(test), allow(dead_code))]
 impl EndpointSettings {
     /// The row with this id, or `None`.
     pub fn find(&self, id: &EndpointId) -> Option<&RemoteEndpointSettings> {
@@ -566,16 +550,16 @@ fn default_ssh_port() -> u16 {
     RemoteEndpoint::DEFAULT_PORT
 }
 
-// PRD #741 M6 stores endpoints; M7 (the panel) and M9 (the Deck selector) are
-// what read them, and both are fenced out of this milestone. So the storage API
-// below has its tests as its only caller today. The `allow` is the same device
-// `platform::fsperm`'s SITE_AUDIT uses for the same reason — an item whose
-// production consumer is a later milestone — rather than a silent `pub` that
-// looks reachable. Deleting it once M7 lands is the point: if these are still
-// unused then, the milestone did not wire them up.
-#[cfg_attr(not(test), allow(dead_code))]
 impl RemoteEndpointSettings {
     /// A row with the minimum a deck needs: an id and a host.
+    ///
+    /// **Not reached in production, and that is the shape of the app rather
+    /// than an unfinished wire-up.** A row is *constructed* by the settings
+    /// panel and arrives here as a whole document through `desktop_set_settings`,
+    /// where every field is validated by its own `Deserialize`. This
+    /// constructor is what the storage tests build from, and it is the
+    /// definition the panel's row-shape is pinned against.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn new(id: EndpointId, host: Hostname) -> Self {
         Self {
             host,
@@ -586,6 +570,39 @@ impl RemoteEndpointSettings {
             socket: None,
             user: None,
         }
+    }
+
+    /// Everything `ssh` needs to reach this row's host, with the attach socket
+    /// left behind (PRD #741 M10).
+    ///
+    /// The socket is the one field a row may legitimately lack, and reaching
+    /// the host is exactly what `Test connection` does to *discover* it — so
+    /// the probe is written against this rather than against
+    /// [`Self::endpoint`], which cannot exist yet. Both are built from the same
+    /// fields, so a probe and the tunnel it precedes cannot describe different
+    /// hosts.
+    pub fn destination(&self) -> dot_agent_deck::remote_tunnel::SshDestination {
+        dot_agent_deck::remote_tunnel::SshDestination::with_parts(
+            self.host.clone(),
+            self.user.clone(),
+            self.port,
+            self.identity.clone(),
+            self.jump.clone(),
+        )
+    }
+
+    /// [`Self::endpoint`] against a socket path discovery just learned, rather
+    /// than the stored one.
+    ///
+    /// The connection a `Test connection` actually makes goes through this, so
+    /// a deck whose socket was discovered *this run* is testable before the
+    /// document has been written back — which is the order the user does
+    /// things in.
+    pub fn endpoint_at(&self, socket: RemoteSocketPath) -> RemoteEndpoint {
+        let mut row = self.clone();
+        row.socket = Some(socket);
+        row.endpoint()
+            .expect("a row with a socket always yields an endpoint")
     }
 
     /// The connectable endpoint this row describes, or `None` while it has no
@@ -633,14 +650,6 @@ pub const MAX_ENDPOINT_ID_BYTES: usize = 64;
 /// word an [`EndpointId`] may not be.
 pub const LOCAL_SELECTION_TOKEN: &str = "local";
 
-// PRD #741 M6 stores endpoints; M7 (the panel) and M9 (the Deck selector) are
-// what read them, and both are fenced out of this milestone. So the storage API
-// below has its tests as its only caller today. The `allow` is the same device
-// `platform::fsperm`'s SITE_AUDIT uses for the same reason — an item whose
-// production consumer is a later milestone — rather than a silent `pub` that
-// looks reachable. Deleting it once M7 lands is the point: if these are still
-// unused then, the milestone did not wire them up.
-#[cfg_attr(not(test), allow(dead_code))]
 impl EndpointId {
     /// Validate `raw` and wrap it.
     ///
@@ -681,6 +690,16 @@ impl EndpointId {
     /// collide with [`LOCAL_SELECTION_TOKEN`] or with any word a future
     /// [`Selection`] variant would reserve, both of which are shorter and
     /// contain letters that are not hex digits.
+    ///
+    /// **Not reached in production for the same reason [`RemoteEndpointSettings::new`]
+    /// is not**: the panel mints an id when the user adds a deck, because that
+    /// is where a row is built. `desktop/src/lib/endpoints.ts`'s `mintEndpointId`
+    /// is the other copy and produces the same sixteen lowercase hex characters
+    /// from `crypto.getRandomValues`; what keeps the two honest is not that
+    /// they share code but that [`Self::parse`] — which both a save and a
+    /// hand-edited document go through — is the only thing that decides what an
+    /// id may be.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn mint() -> Self {
         Self(format!("{:016x}", unpredictable_suffix()))
     }
@@ -788,8 +807,6 @@ impl serde::de::Visitor<'_> for SelectionVisitor {
 }
 
 /// What [`EndpointSettings::resolve`] answered, and whether it had to fall back.
-// Reached only by its tests until M7 renders it; see `impl EndpointSettings`.
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedEndpoint {
     /// The deck to talk to. Always a usable endpoint — never an error.
@@ -801,8 +818,6 @@ pub struct ResolvedEndpoint {
 
 /// Why a stored selection resolved to the local deck instead of the one it
 /// named.
-// Reached only by its tests until M7 renders it; see `impl EndpointSettings`.
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SelectionFallback {
     /// The selection names a deck this document no longer holds — a row the

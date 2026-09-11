@@ -448,6 +448,151 @@ impl KeyPath {
 }
 
 // ---------------------------------------------------------------------------
+// Where `ssh` is pointed
+// ---------------------------------------------------------------------------
+
+/// Everything `ssh` needs to *reach a host* — and nothing about what is
+/// listening once it gets there.
+///
+/// Split out of [`crate::daemon_client::RemoteEndpoint`] by PRD #741 M10, for a
+/// reason that is a design constraint rather than tidiness: a
+/// `RemoteEndpoint` requires a [`RemoteSocketPath`], and the whole point of M10
+/// is reaching a host whose socket path is **not yet known** in order to
+/// discover it. Without this type that probe would have had to invent a
+/// placeholder socket and hand it to a type whose invariant is "the daemon's
+/// attach socket over there" — a value that would then compile against
+/// `RemoteTunnel::open`.
+///
+/// It is also where `user_host`, the host-key remedy and the unvalidated
+/// [`crate::remote::SshTarget`] conversion now live, so a probe and a tunnel
+/// cannot describe different endpoints. That is the same defect class M5's
+/// audit A5 found, where a remedy built from an `SshTarget` dropped the port
+/// and the bastion and told the user to evaluate a host key for a host the
+/// tunnel never reached.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SshDestination {
+    host: Hostname,
+    user: Option<SshUser>,
+    port: u16,
+    key: Option<KeyPath>,
+    jump: Option<HostAlias>,
+}
+
+impl SshDestination {
+    /// A destination at `host` on the default ssh port.
+    pub fn new(host: Hostname) -> Self {
+        Self {
+            host,
+            user: None,
+            port: crate::remote::DEFAULT_SSH_PORT,
+            key: None,
+            jump: None,
+        }
+    }
+
+    /// All of it at once, for a caller building from a stored row.
+    pub fn with_parts(
+        host: Hostname,
+        user: Option<SshUser>,
+        port: u16,
+        key: Option<KeyPath>,
+        jump: Option<HostAlias>,
+    ) -> Self {
+        Self {
+            host,
+            user,
+            port,
+            key,
+            jump,
+        }
+    }
+
+    pub fn host(&self) -> &Hostname {
+        &self.host
+    }
+
+    pub fn user(&self) -> Option<&SshUser> {
+        self.user.as_ref()
+    }
+
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+
+    pub fn key(&self) -> Option<&KeyPath> {
+        self.key.as_ref()
+    }
+
+    pub fn jump(&self) -> Option<&HostAlias> {
+        self.jump.as_ref()
+    }
+
+    /// The destination argument ssh wants: `user@host`, or `host` when the ssh
+    /// config decides the user.
+    pub fn user_host(&self) -> String {
+        match &self.user {
+            Some(user) => format!("{user}@{}", self.host),
+            None => self.host.to_string(),
+        }
+    }
+
+    /// How this deck is named to a user, and in an error message.
+    ///
+    /// Derived from the address rather than stored as free text, which is not
+    /// only tidiness: a user-chosen label would be exactly the arbitrary
+    /// `String` the settings guard refuses, and it would need its own bidi and
+    /// control-character handling before being rendered. Every byte of this
+    /// string came through a validated ASCII charset, so there is nothing here
+    /// to escape.
+    pub fn describe(&self) -> String {
+        if self.port == crate::remote::DEFAULT_SSH_PORT {
+            self.user_host()
+        } else {
+            format!("{}:{}", self.user_host(), self.port)
+        }
+    }
+
+    /// The command a user should run in a terminal to evaluate this host's key
+    /// themselves, for [`crate::remote::SshError::HostKeyVerificationFailed`].
+    ///
+    /// The flag order matches [`tunnel_args`]' so the two read as the same
+    /// connection. `-i` is omitted for the reason
+    /// [`crate::remote::SshTarget::host_key_remedy`] gives.
+    pub fn host_key_remedy(&self) -> String {
+        let mut command = String::from("ssh");
+        if let Some(jump) = &self.jump {
+            command.push_str(" -J ");
+            command.push_str(jump.as_str());
+        }
+        if self.port != crate::remote::DEFAULT_SSH_PORT {
+            command.push_str(" -p ");
+            command.push_str(&self.port.to_string());
+        }
+        command.push(' ');
+        command.push_str(&self.user_host());
+        command
+    }
+
+    /// The unvalidated [`crate::remote::SshTarget`] the existing ssh helpers
+    /// take — built *from* validated parts, so this is the one direction the
+    /// conversion may go.
+    pub fn ssh_target(&self) -> crate::remote::SshTarget {
+        crate::remote::SshTarget {
+            host: self.host.to_string(),
+            user: self.user.as_ref().map(|user| user.to_string()),
+            port: self.port,
+            key: self.key.as_ref().map(|key| key.as_path().to_path_buf()),
+        }
+    }
+}
+
+impl fmt::Display for SshDestination {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.describe())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // The `ssh` program itself
 // ---------------------------------------------------------------------------
 
@@ -697,7 +842,9 @@ mod tunnel {
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
-    use super::{MAX_UNIX_SOCKET_PATH_BYTES, SHELL_METACHARACTERS, SshProgram, TunnelError};
+    use super::{
+        MAX_UNIX_SOCKET_PATH_BYTES, SHELL_METACHARACTERS, SshDestination, SshProgram, TunnelError,
+    };
     use crate::daemon_client::{Endpoint, LocalEndpoint, RemoteEndpoint};
     use crate::remote::SshError;
 
@@ -1223,6 +1370,26 @@ mod tunnel {
                 Self::Remote(_) => crate::platform::ipc::EndpointPresence::Elsewhere,
             }
         }
+
+        /// Whether the substrate under this endpoint is still there.
+        ///
+        /// A local deck has no substrate of its own — there is no child process
+        /// between the client and the daemon — so it is always [`TunnelHealth::Alive`],
+        /// and that is a statement about the *transport*, never about the
+        /// daemon. Whether a daemon is answering is the handshake's question on
+        /// both arms alike; this one asks only whether the thing that carries
+        /// the bytes has gone away.
+        ///
+        /// PRD #741 M7 is what reads it: the owner that holds tunnels across
+        /// handshakes needs to know when to re-open one, and `Path::exists` on
+        /// the forwarded socket cannot tell it — the local `ssh` client created
+        /// that inode and it outlives a dead far end.
+        pub fn health(&mut self) -> TunnelHealth {
+            match self {
+                Self::Local(_) => TunnelHealth::Alive,
+                Self::Remote(tunnel) => tunnel.health(),
+            }
+        }
     }
 
     /// Build the `ssh -N -L` command.
@@ -1298,20 +1465,250 @@ mod tunnel {
             local_socket.to_string_lossy(),
             endpoint.socket()
         ));
-        args.push("-p".to_string());
-        args.push(endpoint.port().to_string());
-        if let Some(key) = endpoint.key() {
+        args.extend(destination_args(&endpoint.destination()));
+        args
+    }
+
+    /// The address half of an `ssh` argv: port, identity and jump host, then
+    /// `--` and the destination.
+    ///
+    /// Factored out so [`tunnel_args`] and the one-shot probes
+    /// ([`resolved_config_args`], [`remote_command_args`]) cannot end up
+    /// describing different endpoints — which is the same class of defect M5's
+    /// audit A5 found in the host-key remedy, where a `SshTarget` with no jump
+    /// field named a host the tunnel never reached. `--` immediately precedes
+    /// the destination so no value a user stored can be read as an option
+    /// however it begins.
+    fn destination_args(destination: &SshDestination) -> Vec<String> {
+        let mut args = vec!["-p".to_string(), destination.port().to_string()];
+        if let Some(key) = destination.key() {
             args.push("-i".to_string());
             args.push(key.as_str().to_string());
         }
-        if let Some(jump) = endpoint.jump() {
+        if let Some(jump) = destination.jump() {
             args.push("-J".to_string());
             args.push(jump.as_str().to_string());
         }
         args.push("--".to_string());
-        args.push(endpoint.user_host());
+        args.push(destination.user_host());
         args
     }
+
+    // -----------------------------------------------------------------------
+    // One-shot probes (PRD #741 M10)
+    // -----------------------------------------------------------------------
+
+    /// How long a one-shot probe may take before it is killed.
+    ///
+    /// Two probes use it and they are not the same shape: `ssh -G` never opens
+    /// a socket and normally returns in milliseconds, while the discovery probe
+    /// authenticates and runs a command on the far host. The larger of the two
+    /// budgets is used for both because the small one is bounded by `ssh -G`'s
+    /// own behaviour anyway — except where a user's `Match exec` blocks, which
+    /// is precisely the case a deadline exists for.
+    const PROBE_DEADLINE_SECS: u64 = 20;
+
+    /// Bytes captured per stream from a probe before the drainer stops reading.
+    ///
+    /// A remote's login banner, a `Match exec` that prints, and a hostile peer
+    /// that floods are all the same shape here. The values actually wanted are
+    /// a socket path and a few dozen `ssh -G` lines, so this is generous for
+    /// the honest case and small for the other one.
+    const PROBE_CAPTURE_BYTES: usize = 64 * 1024;
+
+    /// The argv for `ssh -G` against `endpoint`: **resolve the configuration
+    /// and print it, without connecting to anything**.
+    ///
+    /// It carries the same `-F` generated config and the same forced options
+    /// the tunnel does, so what it reports is what the tunnel will actually
+    /// inherit rather than what a bare `ssh -G` would resolve. That is the
+    /// whole point of the disclosure PRD #741 M10 adds: the residual `forced_options`
+    /// records under audit **A3** is that the user's `LocalForward`,
+    /// `RemoteForward` and `DynamicForward` are inherited for the tunnel's whole
+    /// life, and this is the one place a user can find out what their own ssh
+    /// config is doing on their behalf.
+    ///
+    /// `-G` deliberately comes first: it is a mode flag, and a reader should
+    /// see immediately that this argv establishes nothing.
+    pub fn resolved_config_args(destination: &SshDestination, config: &Path) -> Vec<String> {
+        let mut args = vec!["-G".to_string()];
+        args.extend(probe_option_args(config));
+        args.extend(destination_args(destination));
+        args
+    }
+
+    /// The argv for a one-shot `ssh` that runs `command` on the far host.
+    ///
+    /// Same config, same forced options, same destination as the tunnel — so a
+    /// probe that authenticates is evidence about the connection the tunnel
+    /// will make, and a probe that fails fails the way the tunnel would. No
+    /// `-N` and no `-L`: this one exists to produce stdout.
+    ///
+    /// `command` is built from this crate's own templates and never from user
+    /// input; it is passed as a single argv entry, which is what keeps the
+    /// remote shell's quoting predictable.
+    pub fn remote_command_args(
+        destination: &SshDestination,
+        config: &Path,
+        command: &str,
+    ) -> Vec<String> {
+        let mut args = probe_option_args(config);
+        args.extend(destination_args(destination));
+        args.push(command.to_string());
+        args
+    }
+
+    /// `-F <config>` plus every forced option, in the order [`tunnel_args`]
+    /// emits them.
+    fn probe_option_args(config: &Path) -> Vec<String> {
+        let mut args = vec!["-F".to_string(), config.to_string_lossy().into_owned()];
+        for option in forced_options() {
+            args.push("-o".to_string());
+            args.push(option);
+        }
+        args
+    }
+
+    /// A generated `-F` config for a one-shot probe, removed when it drops.
+    ///
+    /// The same file [`RemoteTunnel::open_at_within`] writes, with the same
+    /// provenance — inside the `0700` [`tunnel_socket_dir`], named from a path
+    /// [`check_socket_path`] vetted, written owner-only — because a probe that
+    /// resolved a *different* configuration than the tunnel would be reporting
+    /// about a connection nobody is going to make.
+    ///
+    /// The socket path it is derived from is never bound; only the `.conf`
+    /// beside it is written. That keeps the name inside the scheme
+    /// [`reap_orphaned_tunnels`] understands, so a config left behind by a
+    /// SIGKILL during a probe is swept by the next [`RemoteTunnel::open`]
+    /// rather than accumulating.
+    #[derive(Debug)]
+    pub struct ProbeConfig {
+        path: PathBuf,
+    }
+
+    impl ProbeConfig {
+        /// Write a fresh probe config, failing closed.
+        ///
+        /// Failing closed matters for the same reason it does at the tunnel:
+        /// without this file `forced_options` reaches only the direct hop, so a
+        /// probe that ran anyway could resolve — and report — a configuration
+        /// with the user's `ForwardAgent yes` still in force on the jump hop.
+        pub fn create() -> Result<Self, TunnelError> {
+            let dir = tunnel_socket_dir()?;
+            let socket = dir.join(socket_file_name());
+            check_socket_path(&socket)?;
+            let path = config_path_for(&socket);
+            check_tunnel_file_path(&path)?;
+            write_private_file(
+                &path,
+                tunnel_config_text(USER_SSH_CONFIG_INCLUDE, SYSTEM_SSH_CONFIG_INCLUDE).as_bytes(),
+            )
+            .map_err(|source| TunnelError::ConfigFile {
+                path: path.to_string_lossy().into_owned(),
+                source,
+            })?;
+            Ok(Self { path })
+        }
+
+        pub fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for ProbeConfig {
+        fn drop(&mut self) {
+            remove_if_regular_file(&self.path);
+        }
+    }
+
+    /// What a one-shot probe produced.
+    #[derive(Debug, Clone)]
+    pub struct ProbeOutput {
+        /// `None` when the deadline killed the child.
+        pub status: Option<i32>,
+        /// Captured stdout, lossily decoded. Remote-controlled.
+        pub stdout: String,
+        /// Captured stderr, lossily decoded and **raw** — this is the value
+        /// [`crate::remote::classify_ssh_error_with_remedy`] matches against,
+        /// and stripping first could only ever create matches the raw text
+        /// lacked. Render [`Self::stderr_text`] instead.
+        pub stderr: String,
+        /// Either stream reached the cap, so what is here is a prefix.
+        pub truncated: bool,
+        /// The deadline fired.
+        pub timed_out: bool,
+    }
+
+    impl ProbeOutput {
+        /// The probe's stderr, scrubbed of control and bidi bytes — the copy
+        /// that may be **rendered**, exactly as [`RemoteTunnel::stderr_text`]
+        /// is for the tunnel's.
+        pub fn stderr_text(&self) -> String {
+            crate::untrusted_text::strip_control_and_bidi(&self.stderr, true)
+                .trim()
+                .to_string()
+        }
+    }
+
+    /// Run one bounded, non-interactive `ssh` invocation and capture it.
+    ///
+    /// Bounded in both directions by [`crate::remote::run_local_bounded`]: a
+    /// wallclock kill so a stalled child cannot pin the GUI, and a per-stream
+    /// capture cap so a flooding peer cannot grow this process's memory. stdin
+    /// is nulled by that helper, which matters here for the same reason
+    /// `BatchMode=yes` does — a GUI has no terminal for a prompt to reach.
+    pub fn run_probe(ssh: &SshProgram, args: &[String]) -> Result<ProbeOutput, TunnelError> {
+        let mut command = Command::new(ssh.path());
+        for arg in args {
+            command.arg(arg);
+        }
+        let capture = crate::remote::run_local_bounded(
+            &mut command,
+            PROBE_DEADLINE_SECS,
+            PROBE_CAPTURE_BYTES,
+        )
+        .map_err(|source| TunnelError::Spawn {
+            program: ssh.path().to_string_lossy().into_owned(),
+            source,
+        })?;
+        Ok(ProbeOutput {
+            status: capture.status.and_then(|status| status.code()),
+            stdout: String::from_utf8_lossy(&capture.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&capture.stderr).into_owned(),
+            truncated: capture.truncated,
+            timed_out: capture.timed_out,
+        })
+    }
+
+    /// The shell snippet the discovery probe runs on the far host.
+    ///
+    /// It is the remote half of [`crate::platform::paths::attach_socket_path`],
+    /// in the order that function resolves: the explicit override, then
+    /// `$XDG_RUNTIME_DIR`, then the uid-suffixed `/tmp` fallback. **It has to be
+    /// re-stated rather than derived**, because OpenSSH expands neither `~` nor
+    /// an environment variable on the remote side of `-L` and the far host's
+    /// `XDG_RUNTIME_DIR` and uid are not knowable from here — which is the whole
+    /// reason [`crate::remote_tunnel::RemoteSocketPath`] is stored rather than
+    /// computed.
+    ///
+    /// Keep it in step with that function. The two ends drifting shows up as a
+    /// discovered path that never forwards, which reads to the user as a deck
+    /// that is not running.
+    ///
+    /// `id -u` rather than `$UID` because `$UID` is not POSIX and a `dash`
+    /// login shell leaves it unset. `printf` rather than `echo` for the reason
+    /// every portable script uses it. Nothing here interpolates a value from
+    /// this side, so there is no quoting decision to get wrong.
+    pub const REMOTE_SOCKET_PROBE: &str = concat!(
+        "if [ -n \"${DOT_AGENT_DECK_ATTACH_SOCKET:-}\" ]; then ",
+        "printf '%s\\n' \"$DOT_AGENT_DECK_ATTACH_SOCKET\"; ",
+        "elif [ -n \"${XDG_RUNTIME_DIR:-}\" ]; then ",
+        "printf '%s/dot-agent-deck-attach.sock\\n' \"$XDG_RUNTIME_DIR\"; ",
+        "else ",
+        "printf '/tmp/dot-agent-deck-attach-%s.sock\\n' \"$(id -u)\"; ",
+        "fi"
+    );
 
     /// The options forced on every tunnel, in the `Key=Value` spelling both
     /// `-o` and an ssh config file accept.
@@ -2175,10 +2572,11 @@ mod tunnel {
 
 #[cfg(unix)]
 pub use tunnel::{
-    EndpointConnection, RemoteTunnel, SYSTEM_SSH_CONFIG_INCLUDE, TunnelHealth,
-    USER_SSH_CONFIG_INCLUDE, build_tunnel_command, check_socket_path, owner_pid_from_socket_name,
-    reap_orphaned_tunnels, socket_file_name, tunnel_args, tunnel_config_text, tunnel_socket_dir,
-    tunnel_socket_dir_in,
+    EndpointConnection, ProbeConfig, ProbeOutput, REMOTE_SOCKET_PROBE, RemoteTunnel,
+    SYSTEM_SSH_CONFIG_INCLUDE, TunnelHealth, USER_SSH_CONFIG_INCLUDE, build_tunnel_command,
+    check_socket_path, owner_pid_from_socket_name, reap_orphaned_tunnels, remote_command_args,
+    resolved_config_args, run_probe, socket_file_name, tunnel_args, tunnel_config_text,
+    tunnel_socket_dir, tunnel_socket_dir_in,
 };
 
 #[cfg(test)]

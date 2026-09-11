@@ -94,6 +94,48 @@ pub enum ResolvedForward {
     Local { listen: String, destination: String },
 }
 
+impl std::fmt::Display for ResolvedForward {
+    /// One line a user can read, naming the **direction** as well as the ports.
+    ///
+    /// Direction is the part that matters and the part nobody can infer from a
+    /// pair of addresses: a `LocalForward` opens a listener on *this* machine,
+    /// a `RemoteForward` opens one on the *far* machine and points it back
+    /// here, and a dynamic one is a SOCKS proxy over the whole reachable
+    /// network on whichever side it was opened.
+    ///
+    /// Added by PRD #741 M10 for the `Test connection` disclosure. The tunnel
+    /// inherits the user's forwards for its whole life (`remote_tunnel`'s
+    /// audit **A3**) and until now said nothing about it, while `remote doctor`
+    /// refuses to create one at all and calls it a criterion violation. This is
+    /// the one place a user can find out what their own ssh config is doing on
+    /// their behalf.
+    ///
+    /// The values are `ssh -G`'s own output and therefore influenced by a
+    /// planted `~/.ssh/config`; every caller escapes or strips them at its own
+    /// render seam, as `remote doctor` already does.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::RemoteDynamic { listen } => {
+                write!(
+                    f,
+                    "SOCKS proxy on the remote at {listen}, into this network"
+                )
+            }
+            Self::Remote {
+                listen,
+                destination,
+            } => write!(f, "remote {listen} forwarded to {destination}"),
+            Self::Dynamic { listen } => {
+                write!(f, "SOCKS proxy on this machine at {listen}")
+            }
+            Self::Local {
+                listen,
+                destination,
+            } => write!(f, "local {listen} forwarded to {destination}"),
+        }
+    }
+}
+
 /// The subset of resolved client-side ssh configuration used by the doctor.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ResolvedSshConfig {

@@ -379,13 +379,27 @@ impl RemoteEndpoint {
         &self.socket
     }
 
+    /// Everything `ssh` needs to reach this deck's host, with the attach socket
+    /// left behind (PRD #741 M10).
+    ///
+    /// The three methods below delegate to it, so a probe built from a
+    /// [`crate::remote_tunnel::SshDestination`] and a tunnel built from this
+    /// type cannot describe different endpoints — the defect class M5's audit
+    /// A5 found in the host-key remedy.
+    pub fn destination(&self) -> crate::remote_tunnel::SshDestination {
+        crate::remote_tunnel::SshDestination::with_parts(
+            self.host.clone(),
+            self.user.clone(),
+            self.port,
+            self.key.clone(),
+            self.jump.clone(),
+        )
+    }
+
     /// The destination argument ssh wants: `user@host`, or `host` when the ssh
     /// config decides the user.
     pub fn user_host(&self) -> String {
-        match &self.user {
-            Some(user) => format!("{user}@{}", self.host),
-            None => self.host.to_string(),
-        }
+        self.destination().user_host()
     }
 
     /// How this deck is named to a user, and in an error message.
@@ -397,11 +411,7 @@ impl RemoteEndpoint {
     /// string came through a validated ASCII charset, so there is nothing here
     /// to escape.
     pub fn describe(&self) -> String {
-        if self.port == crate::remote::DEFAULT_SSH_PORT {
-            self.user_host()
-        } else {
-            format!("{}:{}", self.user_host(), self.port)
-        }
+        self.destination().describe()
     }
 
     /// The command a user should run in a terminal to evaluate this deck's host
@@ -423,30 +433,14 @@ impl RemoteEndpoint {
     /// read as the same connection. `-i` is omitted for the reason
     /// [`crate::remote::SshTarget::host_key_remedy`] gives.
     pub fn host_key_remedy(&self) -> String {
-        let mut command = String::from("ssh");
-        if let Some(jump) = &self.jump {
-            command.push_str(" -J ");
-            command.push_str(jump.as_str());
-        }
-        if self.port != crate::remote::DEFAULT_SSH_PORT {
-            command.push_str(" -p ");
-            command.push_str(&self.port.to_string());
-        }
-        command.push(' ');
-        command.push_str(&self.user_host());
-        command
+        self.destination().host_key_remedy()
     }
 
     /// The unvalidated [`crate::remote::SshTarget`] the existing ssh helpers
     /// take — built *from* validated parts, so this is the one direction the
     /// conversion may go.
     pub fn ssh_target(&self) -> crate::remote::SshTarget {
-        crate::remote::SshTarget {
-            host: self.host.to_string(),
-            user: self.user.as_ref().map(|user| user.to_string()),
-            port: self.port,
-            key: self.key.as_ref().map(|key| key.as_path().to_path_buf()),
-        }
+        self.destination().ssh_target()
     }
 }
 

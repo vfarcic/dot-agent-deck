@@ -18,24 +18,25 @@ use tokio::sync::Mutex as AsyncMutex;
 use crate::agent_view::AgentView;
 use crate::dto::{
     BootstrapOptions, ConnectionStatus, DesktopConnection, DesktopSnapshot, disconnected_snapshot,
-    map_agent, safe_message, selected_endpoint, socket_path_text,
+    map_agent, safe_message, selected_endpoint, selection_fields, socket_path_text,
 };
+use crate::endpoint_tunnels::{EndpointTunnels, TunnelLease};
 
 const DAEMON_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 #[derive(Debug, Clone)]
-struct HandshakeInfo {
-    status: ConnectionStatus,
-    error: Option<String>,
-    server_protocol_version: Option<u32>,
-    daemon_build_version: Option<String>,
-    daemon_version: Option<String>,
-    running_agent_count: Option<usize>,
+pub(crate) struct HandshakeInfo {
+    pub(crate) status: ConnectionStatus,
+    pub(crate) error: Option<String>,
+    pub(crate) server_protocol_version: Option<u32>,
+    pub(crate) daemon_build_version: Option<String>,
+    pub(crate) daemon_version: Option<String>,
+    pub(crate) running_agent_count: Option<usize>,
     /// The protocol agreed and the two builds' release versions still disagreed
     /// (or one of them could not be read), so an override is legitimate. Never
     /// set when the wire itself is incompatible, and no longer set by a stamp
     /// difference *within* one release — see [`release_versions_are_compatible`].
-    build_stamp_mismatch_only: bool,
+    pub(crate) build_stamp_mismatch_only: bool,
 }
 
 /// An established link to one deck: the handshake that classified it, and a
@@ -55,6 +56,18 @@ pub(crate) struct TrustedDaemon {
     /// seeded and thrown away on every one.
     pub(crate) client: Arc<DaemonClient>,
     connection: DesktopConnection,
+    /// The transport this link was established over (PRD #741 M7).
+    ///
+    /// Held, not borrowed, and that is rule 2 of `endpoint_tunnels`: a lease is
+    /// an `Arc`, so the `ssh` child survives being dropped from the tunnel map
+    /// until its last holder lets go. Without this field a selection change
+    /// would tear the transport out from under a link that is still classified
+    /// `Connected` and still serving requests — the handshake would describe a
+    /// deck whose tunnel had already gone.
+    ///
+    /// Never read. It exists for its `Drop` order, which is why it is named
+    /// with a leading underscore.
+    _transport: Arc<TunnelLease>,
     /// When the handshake behind [`Self::connection`] was taken. Read by
     /// [`DaemonLinks::trusted`] against [`HANDSHAKE_REVALIDATE_INTERVAL`].
     established: Instant,
@@ -190,6 +203,18 @@ pub(crate) const HANDSHAKE_REVALIDATE_INTERVAL: Duration = Duration::from_secs(5
 /// than giving each its own, which is also the better of the two.
 pub(crate) struct DaemonLinks {
     links: AsyncMutex<HashMap<String, Arc<TrustedDaemon>>>,
+    /// The live transports (PRD #741 M7).
+    ///
+    /// **This is a field of `DesktopState`, shared here by `Arc` — it is not a
+    /// field of [`TrustedDaemon`], and that distinction is the whole of M5's
+    /// deferred design decision.** A `TrustedDaemon` is rebuilt every
+    /// [`HANDSHAKE_REVALIDATE_INTERVAL`], so a tunnel owned by one would
+    /// re-authenticate ssh every five seconds; the map outlives every link in
+    /// it. Establishment is simply where a transport happens to be needed, so
+    /// this type holds a handle to the map rather than owning the tunnels'
+    /// lifecycle — the teardown triggers are commands, and they reach the same
+    /// map through `DesktopState::tunnels`.
+    tunnels: Arc<EndpointTunnels>,
     /// Total handshakes performed, for tests and for the milestone's
     /// before/after measurement. Never read by production logic.
     handshakes: AtomicUsize,
@@ -199,6 +224,7 @@ impl Default for DaemonLinks {
     fn default() -> Self {
         Self {
             links: AsyncMutex::new(HashMap::new()),
+            tunnels: Arc::new(EndpointTunnels::default()),
             handshakes: AtomicUsize::new(0),
         }
     }
@@ -220,7 +246,7 @@ impl DaemonLinks {
             return Ok(Arc::clone(held));
         }
         links.remove(&key);
-        let established = Arc::new(establish(endpoint).await?);
+        let established = Arc::new(establish(endpoint, &self.tunnels).await?);
         self.handshakes.fetch_add(1, Ordering::Relaxed);
         // **Only a CONNECTED classification is held.** A refusal is the one
         // verdict you want re-checked rather than cached, and there is a
@@ -241,6 +267,12 @@ impl DaemonLinks {
             links.insert(key, Arc::clone(&established));
         }
         Ok(established)
+    }
+
+    /// The shared transport map, for `DesktopState` and for the commands that
+    /// tear a tunnel down (PRD #741 M7).
+    pub(crate) fn tunnels(&self) -> Arc<EndpointTunnels> {
+        Arc::clone(&self.tunnels)
     }
 
     /// Forget the link for `endpoint`, so the next [`Self::trusted`] handshakes
@@ -507,10 +539,29 @@ fn classify_handshake(
     }
 }
 
+/// [`classify_handshake`] with the process-wide allowance read, for
+/// `endpoint_test`'s pure classification tests.
+///
+/// Test-only and deliberately narrow: `Test connection` must classify a
+/// handshake exactly as the connection banner does, so it reuses this
+/// classifier rather than growing a second one — and the tests that pin the
+/// split it adds have to drive the same function the production path does.
+#[cfg(test)]
+pub(crate) fn classify_handshake_for_test(
+    response: &AttachResponse,
+    client_build: &str,
+) -> HandshakeInfo {
+    classify_handshake(response, client_build, build_mismatch_allowance())
+}
+
 fn connection_from_handshake(handshake: HandshakeInfo) -> DesktopConnection {
+    let (deck_kind, local_only_reason, selection_fallback) = selection_fields();
     DesktopConnection {
         status: handshake.status,
         socket_path: socket_path_text(),
+        deck_kind,
+        local_only_reason,
+        selection_fallback,
         error: handshake.error,
         client_protocol_version: PROTOCOL_VERSION,
         server_protocol_version: handshake.server_protocol_version,
@@ -531,7 +582,7 @@ fn connection_from_handshake(handshake: HandshakeInfo) -> DesktopConnection {
 /// the set here costs nothing, while letting `DaemonClient::capabilities()`
 /// learn it on its own would spend a second `Hello` on a connection whose
 /// handshake reply is already in hand.
-async fn hello(socket_path: &Path) -> Result<(HandshakeInfo, AttachResponse), String> {
+pub(crate) async fn hello(socket_path: &Path) -> Result<(HandshakeInfo, AttachResponse), String> {
     let client_build = dot_agent_deck::build_id::local_build_id();
     let stream = IpcStream::connect(socket_path)
         .await
@@ -558,7 +609,10 @@ async fn hello(socket_path: &Path) -> Result<(HandshakeInfo, AttachResponse), St
 /// batch. Everything in it is per-connection work that was being paid
 /// per-refresh — including the blocking `std::fs::metadata` in the trust check,
 /// which is the "incidental win" PRD #741's `#745` answer names.
-async fn establish(endpoint: &Endpoint) -> Result<TrustedDaemon, String> {
+async fn establish(
+    endpoint: &Endpoint,
+    tunnels: &EndpointTunnels,
+) -> Result<TrustedDaemon, String> {
     // PRD #741 M2: the trust check stays exactly where it was — out of band and
     // BEFORE the first connect, on the inode itself. It is LOCAL-only, and that
     // is a statement about what it can prove rather than an omission: uid +
@@ -581,22 +635,23 @@ async fn establish(endpoint: &Endpoint) -> Result<TrustedDaemon, String> {
             },
         )?;
     }
-    let socket_path = endpoint
-        .connect_address()
-        .map_err(|error| safe_message(error.to_string()))?
-        .to_path_buf();
+    // PRD #741 M7: the address comes from a LEASE on the transport, not from
+    // the endpoint. `Endpoint::connect_address` errors for the `Remote` arm by
+    // design — an endpoint alone has no address until a tunnel exists — so this
+    // is the line that makes a remote deck reachable at all, and the lease is
+    // held on the link below so the tunnel cannot be closed under it.
+    let transport = tunnels.acquire(endpoint).await.map_err(safe_message)?;
     // PRD #741 M3: `hello()` still takes the raw address and still connects with
     // an `IpcStream`, deliberately. Under DECISION 1A a remote deck is reached
     // through a forwarded Unix socket, so the handshake needs no transport of
     // its own — M5 supplies the address, not a different way of opening it.
-    let (info, response) = hello(&socket_path).await?;
+    let (info, response) = hello(transport.address()).await?;
     let connection = connection_from_handshake(info);
-    // Built from the ENDPOINT rather than the address, so the client carries
-    // what a `stat` of that address is allowed to mean. For a local deck this is
-    // exactly `DaemonClient::new(socket_path)`; for a remote one it is the
-    // difference between "the daemon is gone" and "I cannot tell from here".
-    let client =
-        DaemonClient::for_endpoint(endpoint).map_err(|error| safe_message(error.to_string()))?;
+    // Built from the TRANSPORT rather than the address, so the client carries
+    // what a `stat` of that address is allowed to mean. `DaemonClient::new`
+    // would stamp a tunnel's own socket `LocalInode` and put `exists()`-as-health
+    // back on exactly the inode M3's `Elsewhere` protects.
+    let client = transport.client().map_err(safe_message)?;
     // PRD #819 M5/M6: capture the advertised set from THIS reply.
     //
     // Its invalidation rule used to be satisfied structurally by accident —
@@ -610,6 +665,7 @@ async fn establish(endpoint: &Endpoint) -> Result<TrustedDaemon, String> {
     Ok(TrustedDaemon {
         client: Arc::new(client),
         connection,
+        _transport: transport,
         established: Instant::now(),
     })
 }
@@ -1756,6 +1812,13 @@ mod tests {
                 running_agent_count: Some(0),
                 build_stamp_mismatch_only: false,
             }),
+            _transport: tokio::runtime::Runtime::new()
+                .expect("a runtime for the lease")
+                .block_on(
+                    EndpointTunnels::default()
+                        .acquire(&Endpoint::Local(LocalEndpoint::at("/tmp/attach.sock"))),
+                )
+                .expect("a local lease needs no transport to establish"),
             established: Instant::now(),
         };
         let taken = link.established;

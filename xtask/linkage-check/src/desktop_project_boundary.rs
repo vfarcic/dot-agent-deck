@@ -140,8 +140,44 @@ const ALLOWED_ROOT_MODULES: &[&str] = &[
     // which is the endpoint's own connection and the thing PRD #741 exists to
     // give the desktop.
     "remote_tunnel",
+    // PRD #741 M10, argued rather than added quietly. `Test connection` asks
+    // ssh two questions before it opens a tunnel, and both answers are parsed
+    // by code that already exists:
+    //
+    // - `remote::classify_ssh_error_with_remedy` turns ssh's stderr into the
+    //   named states the panel renders — host key unverified, auth refused,
+    //   host unreachable — and `remote::SshError` is the type
+    //   `remote_tunnel::TunnelError::Ssh` already carries, so the alternative
+    //   was a second classifier that could disagree with the tunnel's about the
+    //   same stderr.
+    // - `remote_doctor::parse_ssh_g` reads `ssh -G`'s resolved configuration,
+    //   which is how the panel discloses the `LocalForward`/`RemoteForward`/
+    //   `DynamicForward` directives a user's own ssh config makes the tunnel
+    //   inherit (`remote_tunnel`'s audit A3). Re-parsing that output here would
+    //   be a second copy of ssh's option grammar.
+    //
+    // Both are pure: they take text and return a value. Neither resolves a
+    // project, reads a project state file, names a FORBIDDEN_SYMBOL, or
+    // contains `std::env::current_dir` — checked, both are zero for it.
+    "remote",
+    "remote_doctor",
     "state",
     "ui",
+    // PRD #741 M7, argued rather than added quietly.
+    // `untrusted_text::strip_control_and_bidi` is the policy the connection
+    // footer applies to a settings-supplied endpoint label: `dto::safe_message`
+    // covers general category `Cc` only, so the bidi formatting codepoints
+    // (category `Cf`) walk through it, and a U+202E on the line whose job is
+    // naming the deck is the one place a mis-rendered endpoint has a direct
+    // security consequence.
+    //
+    // Calling the module rather than restating its character set is the whole
+    // point: that module's own header records that the bug class came from two
+    // copies of the policy drifting apart, and `desktop/src/lib/displayText.ts`
+    // is already the second copy this repo maintains deliberately. A pure
+    // `&str -> String`: no project, no filesystem, no FORBIDDEN_SYMBOL, no
+    // `current_dir`.
+    "untrusted_text",
 ];
 
 /// Symbols that are a client-side project read wherever they appear, including
