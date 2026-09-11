@@ -355,7 +355,7 @@ describe("AgentOverview", () => {
     const { container } = renderOverview();
 
     const header = screen.getByTestId("daemon-group");
-    expect(header).toHaveTextContent("Local daemon");
+    expect(header).toHaveTextContent("Local deck");
     // Not shortened, not abbreviated — absent. No segment of the socket path is
     // on screen, and neither is the uid the old label leaked.
     expect(container.textContent ?? "").not.toContain(".sock");
@@ -868,7 +868,7 @@ describe("AgentOverview", () => {
 
     const cell = document.querySelector(".overview-activity");
     expect(cell).toHaveTextContent("2h ago");
-    expect(cell?.getAttribute("title")).toBe(`Last activity reported by the daemon: ${new Date(twoHours).toISOString()}`);
+    expect(cell?.getAttribute("title")).toBe(`Last activity reported by the deck: ${new Date(twoHours).toISOString()}`);
     unmount();
 
     // The RESTARTED-daemon case, and the one that made this field shippable
@@ -921,7 +921,7 @@ describe("AgentOverview", () => {
     const cell = document.querySelector(".overview-uptime");
     expect(cell).toHaveTextContent("3h");
     expect(cell?.textContent).not.toContain("ago");
-    expect(cell?.getAttribute("title")).toBe(`Spawned by the daemon at: ${new Date(threeHours).toISOString()}`);
+    expect(cell?.getAttribute("title")).toBe(`Spawned by the deck at: ${new Date(threeHours).toISOString()}`);
     unmount();
 
     // The case a daemon that did not spawn the agent produces — an id-only
@@ -1331,8 +1331,8 @@ describe("AgentOverview", () => {
 
     const note = screen.getByTestId("overview-disconnected");
     expect(note).toBeVisible();
-    expect(within(note).getByRole("heading", { name: "Daemon disconnected" })).toBeVisible();
-    expect(within(note).getByText(/No dot-agent-deck daemon is listening/)).toBeVisible();
+    expect(within(note).getByRole("heading", { name: "Deck disconnected" })).toBeVisible();
+    expect(within(note).getByText(/No deck is listening/)).toBeVisible();
     expect(screen.queryByTestId("overview-first-run")).not.toBeInTheDocument();
   });
 
@@ -1370,7 +1370,7 @@ describe("AgentOverview", () => {
     renderOverview({ snapshot });
 
     expect(screen.getByTestId("overview-incompatible")).toBeVisible();
-    expect(screen.getByRole("heading", { name: "Incompatible daemon" })).toBeVisible();
+    expect(screen.getByRole("heading", { name: "Incompatible deck" })).toBeVisible();
     expect(screen.getByText(/reports 3 running agents/)).toBeVisible();
     expect(rows(document.body)).toHaveLength(0);
     expect(screen.queryByTestId("overview-first-run")).not.toBeInTheDocument();
@@ -1391,7 +1391,7 @@ describe("AgentOverview", () => {
       ...snapshot.connection,
       daemonDetected: true,
       runningAgentCount: 9,
-      message: "build mismatch: desktop is v0.38.0-50-gf118e99, daemon is v0.39.0. The daemon reports 9 live agents; stop them individually before replacing the daemon, or Connect anyway to keep this one.",
+      message: "build mismatch: desktop is v0.38.0-50-gf118e99, deck is v0.39.0. The deck reports 9 live agents; stop them individually before replacing the deck, or Connect anyway to keep this one.",
       buildStampMismatchOnly: true,
     };
     const runAction = vi.fn(async () => ({ ok: true }) as import("../types").DeckActionResult);
@@ -1416,7 +1416,7 @@ describe("AgentOverview", () => {
       ...snapshot.connection,
       daemonDetected: true,
       runningAgentCount: 3,
-      message: "protocol mismatch: desktop expects 8, daemon reports 7",
+      message: "protocol mismatch: desktop expects 8, deck reports 7",
       buildStampMismatchOnly: false,
     };
     render(<AgentOverview runtime={runtime({ mode: "live", snapshot })} onNavigate={vi.fn()} />);
@@ -1437,7 +1437,7 @@ describe("AgentOverview", () => {
       status: "connected",
       daemonDetected: true,
       runningAgentCount: 9,
-      message: "build mismatch: desktop is v0.38.0-50-gf118e99, daemon is v0.39.0. Connected anyway for this session; protocol 8 matched on both sides.",
+      message: "build mismatch: desktop is v0.38.0-50-gf118e99, deck is v0.39.0. Connected anyway for this session; protocol 8 matched on both sides.",
       buildStampMismatchOnly: true,
     };
     render(<AgentOverview runtime={runtime({ mode: "live", snapshot })} onNavigate={vi.fn()} />);
@@ -1454,14 +1454,14 @@ describe("AgentOverview", () => {
 
   /**
    * Scenario: a healthy connection. The lamp beside the daemon's name is green
-   * and the line that read `Daemon responding` next to it is gone — two
+   * and the line that read `Deck responding` next to it is gone — two
    * renderings of one bit, and the screen narrating its own state (PRD #745).
    */
   it("says nothing beside the lamp when the daemon is simply responding", () => {
     renderOverview();
 
     expect(screen.queryByTestId("daemon-state")).not.toBeInTheDocument();
-    expect(document.body.textContent ?? "").not.toContain("Daemon responding");
+    expect(document.body.textContent ?? "").not.toContain("Deck responding");
     // The lamp is what says it, and it still does.
     expect(screen.getByTestId("daemon-group").querySelector(".connection-lamp.connection-connected")).not.toBeNull();
   });
@@ -1491,7 +1491,7 @@ describe("AgentOverview", () => {
     snapshot.connection = {
       ...snapshot.connection,
       status: "connected",
-      message: "Daemon responding",
+      message: "Deck responding",
       daemonDetected: true,
       runningAgentCount: 9,
       buildStampMismatchOnly: false,
@@ -1502,7 +1502,7 @@ describe("AgentOverview", () => {
 
     expect(screen.queryByTestId("overview-incompatible")).not.toBeInTheDocument();
     expect(screen.queryByTestId("overview-connect-anyway")).not.toBeInTheDocument();
-    expect(screen.queryByRole("heading", { name: "Incompatible daemon" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "Incompatible deck" })).not.toBeInTheDocument();
     expect(rows(document.body).length).toBeGreaterThan(0);
 
     // The connection is healthy, so its message says nothing the lamp does not
@@ -1511,7 +1511,7 @@ describe("AgentOverview", () => {
     // reader can actually find because it is a thing they can see.
     expect(screen.queryByTestId("daemon-state")).not.toBeInTheDocument();
     expect(screen.getByTestId("daemon-identity"))
-      .toHaveAttribute("title", `${FIXTURE_DAEMON_ID} · Built from different commits — desktop 0.39.0-49-ga0165f8, daemon 0.39.0-g1ea0fe7.`);
+      .toHaveAttribute("title", `${FIXTURE_DAEMON_ID} · Built from different commits — desktop 0.39.0-49-ga0165f8, deck 0.39.0-g1ea0fe7.`);
   });
 
   /** Matching stamps have nothing to disclose, so only the socket path is on hover. */
@@ -1520,7 +1520,7 @@ describe("AgentOverview", () => {
     snapshot.connection = {
       ...snapshot.connection,
       status: "connected",
-      message: "Daemon responding",
+      message: "Deck responding",
       daemonDetected: true,
       clientBuildVersion: "0.39.0-g1ea0fe7",
       daemonBuildVersion: "0.39.0-g1ea0fe7",

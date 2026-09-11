@@ -120,7 +120,7 @@ fn order_workflow_roles(
             })?;
         if requested_role.start != config_role.start {
             return Err(format!(
-                "workflow start marker for role {} does not match the orchestration the daemon prepared",
+                "workflow start marker for role {} does not match the orchestration the deck prepared",
                 safe_message(&config_role.name)
             ));
         }
@@ -186,13 +186,13 @@ async fn prepare_workflow_launch<D: WorkflowDaemon + Sync>(
     // close, and the prompt names a project-state file only the daemon wrote.
     if prepared.path.is_empty() {
         return Err(
-            "the daemon prepared the workflow but reported no canonical project path; refusing to spawn against an unconfirmed directory"
+            "the deck prepared the workflow but reported no canonical project path; refusing to spawn against an unconfirmed directory"
                 .into(),
         );
     }
     if prepared.prompt.trim().is_empty() {
         return Err(
-            "the daemon prepared the workflow but reported no coordinator prompt; the context would never be read"
+            "the deck prepared the workflow but reported no coordinator prompt; the context would never be read"
                 .into(),
         );
     }
@@ -245,10 +245,10 @@ fn ensure_daemon_can_prepare(
         return Ok(());
     }
     Err(format!(
-        "{PROJECT_ERR_UNSUPPORTED_PLATFORM}: this daemon offers the project verbs but withholds \
-         `{CAP_PREPARE_WORKFLOW}`, which is what a daemon does when its platform cannot give the \
+        "{PROJECT_ERR_UNSUPPORTED_PLATFORM}: this deck offers the project verbs but withholds \
+         `{CAP_PREPARE_WORKFLOW}`, which is what a deck does when its platform cannot give the \
          published coordinator context an owner-only guarantee. Nothing was started. Launch this \
-         workflow from the TUI on the daemon's own host, or point the app at a Unix daemon."
+         workflow from the TUI on that deck's own host, or point the app at a deck on a Unix host."
     ))
 }
 
@@ -751,7 +751,7 @@ fn ensure_explicit_start_connected(
         .connection
         .error
         .clone()
-        .unwrap_or_else(|| "the local daemon did not become connected".into()))
+        .unwrap_or_else(|| "the local deck did not become connected".into()))
 }
 
 async fn refresh_and_emit(app: &AppHandle, links: &DaemonLinks) -> DesktopSnapshot {
@@ -1500,7 +1500,7 @@ async fn desktop_run_action(
             // the same explanation rather than a failed action.)
             let endpoint = selected_endpoint();
             let local = endpoint
-                .require_local("Stop daemon")
+                .require_local("Stop deck")
                 .map_err(|error| safe_message(error.to_string()))?;
             let outcome = run_daemon_stop(local, force)
                 .await
@@ -1512,9 +1512,9 @@ async fn desktop_run_action(
             state.daemon.invalidate(&endpoint).await;
             terminal::detach_all(&state).await;
             result_message = Some(match outcome {
-                StopOutcome::NoDaemonRunning => "No daemon was running.".into(),
-                StopOutcome::Stopped { pid } => format!("Daemon stopped gracefully (pid {pid})."),
-                StopOutcome::ForceKilled { pid } => format!("Daemon force-killed (pid {pid})."),
+                StopOutcome::NoDaemonRunning => "No deck was running.".into(),
+                StopOutcome::Stopped { pid } => format!("Deck stopped gracefully (pid {pid})."),
+                StopOutcome::ForceKilled { pid } => format!("Deck force-killed (pid {pid})."),
             });
         }
         DesktopAction::RestartDaemon => {
@@ -1524,7 +1524,7 @@ async fn desktop_run_action(
             // then start a LOCAL daemon and report success. Refused by type.
             let endpoint = selected_endpoint();
             let local = endpoint
-                .require_local("Replace daemon")
+                .require_local("Replace deck")
                 .map_err(|error| safe_message(error.to_string()))?;
             run_daemon_stop(local, false)
                 .await
@@ -1550,7 +1550,7 @@ async fn desktop_run_action(
                 agent_ids: Vec::new(),
                 send_result: None,
                 terminal: None,
-                message: Some("Daemon replaced with the desktop's matching bundled build.".into()),
+                message: Some("Deck replaced with the desktop's matching bundled build.".into()),
                 snapshot,
             });
         }

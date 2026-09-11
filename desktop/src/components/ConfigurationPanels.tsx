@@ -51,24 +51,24 @@ export function ProjectsPanel({ open, state, onClose, onConfigureWorkflow }: Pro
   // are true of each. The daemon having nothing live is the first-run state,
   // and it is the only one — there is no second, remembered list behind it.
   const emptyNotice = vanished
-    ? "That project is no longer one this daemon knows — nothing is running there any more. Pick another, or paste its path again below."
+    ? "That project is no longer one this deck knows — nothing is running there any more. Pick another, or paste its path again below."
     : listing === "empty"
-      ? "This daemon has nothing live and its own directory is not a project, so it knows of none to offer. Paste a project's absolute path below; the daemon resolves it on its own machine."
+      ? "This deck has nothing live and its own directory is not a project, so it knows of none to offer. Paste a project's absolute path below; the deck resolves it on its own machine."
       : undefined;
 
   return (
     <div className="sheet-backdrop" role="presentation" onMouseDown={onClose}>
       <section className="config-sheet projects-sheet" role="dialog" aria-modal="true" aria-labelledby="projects-title" data-testid="projects-panel" onMouseDown={(event) => event.stopPropagation()}>
         <header className="sheet-header">
-          <div><span className="eyebrow">PROJECT SELECTION</span><h2 id="projects-title">Projects</h2><p>Choose the project this launch runs in. The daemon answers with what it knows.</p></div>
+          <div><span className="eyebrow">PROJECT SELECTION</span><h2 id="projects-title">Projects</h2><p>Choose the project this launch runs in. The deck answers with what it knows.</p></div>
           <button className="icon-button" aria-label="Close projects" onClick={onClose}><X size={18} /></button>
         </header>
-        <div className="local-only-notice project-notice"><FolderCheck size={15} /><span><strong>From the daemon</strong> — these are the projects the connected daemon can see on its own machine, and nothing is remembered between launches.</span></div>
+        <div className="local-only-notice project-notice"><FolderCheck size={15} /><span><strong>From the deck</strong> — these are the projects the connected deck can see on its own machine, and nothing is remembered between launches.</span></div>
 
         <div className="projects-layout">
           <aside className="project-library">
             <button className="add-project" onClick={() => void state.refresh()} data-testid="refresh-projects"><RefreshCw size={14} /> Refresh</button>
-            <nav aria-label="Daemon projects">
+            <nav aria-label="Deck projects">
               {projects.map((item) => (
                 /*
                  * `path` is the IDENTITY — the key, the selection argument and
@@ -85,8 +85,8 @@ export function ProjectsPanel({ open, state, onClose, onConfigureWorkflow }: Pro
                 </button>
               ))}
             </nav>
-            {listing === "loading" && <div className="project-library-empty"><FolderGit2 size={22} /><span>Asking the daemon…</span></div>}
-            {listing === "unavailable" && <div className="project-library-empty" data-testid="projects-unavailable"><AlertTriangle size={22} /><span>{listingError ?? "The daemon did not answer."}</span></div>}
+            {listing === "loading" && <div className="project-library-empty"><FolderGit2 size={22} /><span>Asking the deck…</span></div>}
+            {listing === "unavailable" && <div className="project-library-empty" data-testid="projects-unavailable"><AlertTriangle size={22} /><span>{listingError ?? "The deck did not answer."}</span></div>}
             {!projects.length && listing !== "loading" && listing !== "unavailable" && <div className="project-library-empty" data-testid="projects-empty"><FolderGit2 size={22} /><span>No projects reported.</span></div>}
           </aside>
 
@@ -97,12 +97,12 @@ export function ProjectsPanel({ open, state, onClose, onConfigureWorkflow }: Pro
             </div>
             <div className="project-fields">
               {emptyNotice && <small className="project-field-note" data-testid="projects-nothing-known">{emptyNotice}</small>}
-              <label><span>Resolve a project by path</span><input aria-label="Project directory" value={pasted} onChange={(event) => setPasted(event.target.value)} placeholder="/Users/you/dev/project" spellCheck={false} /><small>The daemon resolves this on its own filesystem, which may not be this one.</small></label>
+              <label><span>Resolve a project by path</span><input aria-label="Project directory" value={pasted} onChange={(event) => setPasted(event.target.value)} placeholder="/Users/you/dev/project" spellCheck={false} /><small>The deck resolves this on its own filesystem, which may not be this one.</small></label>
               <button type="submit" className="button secondary" disabled={!pasted.trim() || resolving} data-testid="resolve-project">{resolving ? "Resolving…" : "Resolve"}</button>
               {resolveError && <small className="project-field-error" data-testid="project-resolve-error"><AlertTriangle size={12} /> {resolveError}</small>}
               {selected && (
                 <div className="project-fields" data-testid="selected-project">
-                  <label><span>Daemon path</span><input aria-label="Resolved project path" value={selected.displayPath} readOnly spellCheck={false} /><small>The daemon&apos;s own spelling. The launch uses it exactly as the daemon reported it.</small></label>
+                  <label><span>Deck path</span><input aria-label="Resolved project path" value={selected.displayPath} readOnly spellCheck={false} /><small>The deck&apos;s own spelling. The launch uses it exactly as the deck reported it.</small></label>
                   <span>Workflows in this project: {selected.orchestrations.length ? selected.orchestrations.map((orchestration) => orchestration.displayName).join(", ") : "none configured"}</span>
                 </div>
               )}
@@ -476,7 +476,7 @@ export function WorkflowPanel({ open, profiles, order, mode, project, onChoosePr
               daemon's canonical spelling of the chosen project, and the only
               way to change it is to choose a different project.
             */}
-            <label><span>Project directory (from the daemon)</span><input aria-label="Absolute project directory" value={cwdDisplay} readOnly placeholder="Choose a project first" spellCheck={false} data-testid="workflow-project-path" /></label>
+            <label><span>Project directory (from the deck)</span><input aria-label="Absolute project directory" value={cwdDisplay} readOnly placeholder="Choose a project first" spellCheck={false} data-testid="workflow-project-path" /></label>
             <label className="workflow-task-prompt">
               <span className="task-prompt-label">
                 Task prompt
@@ -496,8 +496,8 @@ export function WorkflowPanel({ open, profiles, order, mode, project, onChoosePr
               </span>
               <textarea aria-label="Task prompt" value={taskPrompt} onChange={(event) => setTaskPrompt(event.target.value)} placeholder="Tell the orchestrator what to build, fix, or investigate..." rows={5} />
             </label>
-            {!project && <small data-testid="workflow-needs-project"><AlertTriangle size={12} /> No project chosen. <button type="button" className="link-button" onClick={onChooseProject}>Choose one</button> — the daemon offers the projects it can see, and workflows come from the project.</small>}
-            {project && !orchestrations.length && <small data-testid="workflow-no-orchestrations"><AlertTriangle size={12} /> The daemon resolved this project but it defines no workflow with roles.</small>}
+            {!project && <small data-testid="workflow-needs-project"><AlertTriangle size={12} /> No project chosen. <button type="button" className="link-button" onClick={onChooseProject}>Choose one</button> — the deck offers the projects it can see, and workflows come from the project.</small>}
+            {project && !orchestrations.length && <small data-testid="workflow-no-orchestrations"><AlertTriangle size={12} /> The deck resolved this project but it defines no workflow with roles.</small>}
             {!taskPrompt.trim() && <small><AlertTriangle size={12} /> Add the task you want the coordinator to run.</small>}
             {platformIssue && <small data-testid="workflow-platform-issue"><AlertTriangle size={12} /> {platformIssue}</small>}
             {/* PRD #741 M8: the deck does not advertise the verbs a launch needs. */}

@@ -195,7 +195,7 @@ fn rejection_notice(reason: &[u8]) -> Vec<u8> {
         })
         .collect::<String>();
     let reason = if reason.trim().is_empty() {
-        "daemon refused terminal input"
+        "the deck refused terminal input"
     } else {
         reason.trim()
     };
@@ -385,7 +385,7 @@ pub(crate) async fn attach(
                             generation,
                             state: TerminalState::Error,
                             message: Some(format!(
-                                "unexpected daemon terminal frame kind 0x{kind:02x}"
+                                "unexpected terminal frame kind 0x{kind:02x} from the deck"
                             )),
                         },
                     );

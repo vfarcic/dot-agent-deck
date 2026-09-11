@@ -404,13 +404,13 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
       if (!canControlDaemon) return;
       const liveAgents = snapshot.connection.runningAgentCount;
       setConfirm({
-        title: "Stop the local daemon?",
+        title: "Stop the local deck?",
         body: liveAgents && liveAgents > 0
-          ? `The daemon reports ${liveAgents} live agent${liveAgents === 1 ? "" : "s"}. This safe stop will be refused until those agents are stopped individually.`
-          : "This stops the local Agent Deck daemon. No live agents are reported, so this only shuts down the control service.",
-        label: "Stop daemon",
+          ? `The deck reports ${liveAgents} live agent${liveAgents === 1 ? "" : "s"}. This safe stop will be refused until those agents are stopped individually.`
+          : "This stops the deck running on this machine. No live agents are reported, so this only shuts down the control service.",
+        label: "Stop deck",
         busyLabel: "Stopping…",
-        action: async () => { await perform({ type: "stop_daemon" }, "Local daemon stopped."); },
+        action: async () => { await perform({ type: "stop_daemon" }, "Local deck stopped."); },
       });
       return;
     }
@@ -426,11 +426,11 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
   const requestRestartDaemon = () => {
     if (!snapshot.connection.daemonDetected || snapshot.connection.runningAgentCount !== 0) return;
     setConfirm({
-      title: "Replace the incompatible daemon?",
-      body: "The old daemon reports no live agents. Agent Deck will stop it and start the exact daemon build bundled with this desktop app.",
-      label: "Replace daemon",
+      title: "Replace the incompatible deck?",
+      body: "The deck now running reports no live agents. Agent Deck will stop it and start the exact build bundled with this desktop app.",
+      label: "Replace deck",
       busyLabel: "Replacing…",
-      action: async () => { await perform({ type: "restart_daemon" }, "Matching daemon started and reconnected."); },
+      action: async () => { await perform({ type: "restart_daemon" }, "Matching deck started and reconnected."); },
     });
   };
 
@@ -449,8 +449,8 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
   const requestConnectAnyway = () => {
     if (!snapshot.connection.buildStampMismatchOnly) return;
     setConfirm({
-      title: "Connect to a differently-built daemon?",
-      body: "The wire protocol matched on both sides, so this daemon and this app agree on the shape of everything they exchange. They were built from different commits, and a stamp difference can still mean divergent behaviour behind an identical wire — a field whose meaning changed while its shape did not. Agent Deck will connect and keep the mismatch on screen for the rest of this session; nothing is remembered after you quit the app.",
+      title: "Connect to a differently-built deck?",
+      body: "The wire protocol matched on both sides, so this deck and this app agree on the shape of everything they exchange. They were built from different commits, and a stamp difference can still mean divergent behaviour behind an identical wire — a field whose meaning changed while its shape did not. Agent Deck will connect and keep the mismatch on screen for the rest of this session; nothing is remembered after you quit the app.",
       label: "Connect anyway",
       busyLabel: "Connecting…",
       action: async () => {
@@ -459,7 +459,7 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
           // The allowance is read by the NEXT handshake, so the reconnect is
           // what actually connects; the crate caches no verdict.
           await runtime.reconnect();
-          setNotice("Connected to the differently-built daemon. The mismatch stays in the connection banner for this session.");
+          setNotice("Connected to the differently-built deck. The mismatch stays in the connection banner for this session.");
         } catch (cause) {
           setNotice(cause instanceof Error ? cause.message : String(cause));
         }
@@ -469,14 +469,14 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
 
   const requestStartDaemon = () => {
     setConfirm({
-      title: "Start the local daemon?",
-      body: "Agent Deck will start its local daemon process and reconnect this control room. No agent is launched until you explicitly launch a workflow.",
-      label: "Start daemon",
+      title: "Start the local deck?",
+      body: "Agent Deck will start the deck on this machine and reconnect this control room. No agent is launched until you explicitly launch a workflow.",
+      label: "Start deck",
       busyLabel: "Starting…",
       action: async () => {
         try {
           await runtime.runAction({ type: "start_daemon" });
-          setNotice("Local daemon started and control channel reconnected.");
+          setNotice("Local deck started and control channel reconnected.");
         } catch (cause) {
           setNotice(cause instanceof Error ? cause.message : String(cause));
         }
@@ -523,7 +523,7 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
             void projectState.refresh();
             setWorkflowOpen(false);
             setProjectsOpen(true);
-            setNotice("That project is no longer one this daemon knows — nothing is running there any more. Choose another, or paste its path again.");
+            setNotice("That project is no longer one this deck knows — nothing is running there any more. Choose another, or paste its path again.");
             return;
           }
           /*
@@ -549,8 +549,8 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
           if ((message.includes(PROJECT_STALE_PREPARATION_CODE) || message.includes(PROJECT_STALE_TOKEN_CODE)) && activeProject) {
             void projectState.select(activeProject.path);
             setNotice(message.includes(PROJECT_STALE_PREPARATION_CODE)
-              ? "This launch's prepared coordinator context no longer matches what the daemon approved — another launch in this project replaced it, or the project moved. Nothing was started. The project has been re-read; launch again to prepare a fresh one."
-              : "The daemon no longer holds this launch's preparation — it expired, or the daemon was replaced. Nothing was started. The project has been re-read; launch again to prepare a fresh one.");
+              ? "This launch's prepared coordinator context no longer matches what the deck approved — another launch in this project replaced it, or the project moved. Nothing was started. The project has been re-read; launch again to prepare a fresh one."
+              : "The deck no longer holds this launch's preparation — it expired, or the deck was replaced. Nothing was started. The project has been re-read; launch again to prepare a fresh one.");
             return;
           }
           /*
@@ -646,14 +646,14 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
               className="button secondary compact"
               data-testid="pause-run"
               disabled={mode === "live" || snapshot.connection.status !== "connected"}
-              title={mode === "live" ? "Whole-run pause is not yet exposed by the daemon" : snapshot.paused ? "Resume fixture run" : "Pause fixture run"}
+              title={mode === "live" ? "Whole-run pause is not yet exposed by the deck" : snapshot.paused ? "Resume fixture run" : "Pause fixture run"}
               onClick={() => void perform({ type: snapshot.paused ? "resume_run" : "pause_run" }, snapshot.paused ? "Fixture resumed." : "Fixture paused.")}
             >{snapshot.paused ? <Play size={14} /> : <Pause size={14} />}<span>{snapshot.paused ? "Resume" : "Pause"}</span></button>
             <button
               className="button danger compact"
               data-testid="stop-run"
-              aria-label={selectedAgent ? `Stop ${selectedAgent.role}` : "Stop daemon"}
-              title={selectedAgent ? `Stop ${selectedAgent.role}` : canControlDaemon ? "Stop local daemon" : snapshot.connection.localOnlyReason ?? "Daemon is not connected"}
+              aria-label={selectedAgent ? `Stop ${selectedAgent.role}` : "Stop deck"}
+              title={selectedAgent ? `Stop ${selectedAgent.role}` : canControlDaemon ? "Stop the local deck" : snapshot.connection.localOnlyReason ?? "Deck is not connected"}
               disabled={!selectedAgent && !canControlDaemon}
               onClick={requestStop}
             ><CircleStop size={14} /><span>Stop</span></button>
@@ -679,7 +679,7 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
         {(snapshot.connection.status !== "connected" || snapshot.connection.buildStampMismatchOnly || snapshot.connection.selectionFallback) && (
           <div className={`connection-banner connection-${snapshot.connection.status}`} role="alert">
             {snapshot.connection.status === "loading" ? <RefreshCw className="spin" size={16} /> : <ShieldAlert size={16} />}
-            <div><strong>{snapshot.connection.status === "loading" ? "Establishing control channel" : snapshot.connection.status === "connected" ? (snapshot.connection.selectionFallback ? "Using the deck on this machine" : "Connected to a differently-built daemon") : snapshot.connection.status === "error" ? "Desktop bridge error" : "Daemon disconnected"}</strong><span>{snapshot.connection.message}</span>{/*
+            <div><strong>{snapshot.connection.status === "loading" ? "Establishing control channel" : snapshot.connection.status === "connected" ? (snapshot.connection.selectionFallback ? "Using the deck on this machine" : "Connected to a differently-built deck") : snapshot.connection.status === "error" ? "Desktop bridge error" : "Deck disconnected"}</strong><span>{snapshot.connection.message}</span>{/*
               PRD #741 M7. The stored selection could not be honoured, so the
               app is on the local deck — and it says which of the two reasons it
               was. This is why the banner's condition now includes it: a
@@ -687,7 +687,7 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
               the substitution would be silent, and acting on the wrong machine's
               agents is the outcome that makes it worth a row.
             */}{snapshot.connection.selectionFallback && <span data-testid="selection-fallback">{displayText(snapshot.connection.selectionFallback, DISPLAY_LIMITS.message)}</span>}{/* PRD #741 M7: why Start and Replace are absent, said once, where they would have been. */}{remoteDeck && snapshot.connection.localOnlyReason && <span data-testid="remote-deck-notice">{displayText(snapshot.connection.localOnlyReason, DISPLAY_LIMITS.message)}</span>}</div>
-            {snapshot.connection.status !== "loading" && <div className="connection-actions">{mode === "live" && !remoteDeck && snapshot.connection.status === "disconnected" && <button className="button primary compact" data-testid="start-daemon" onClick={requestStartDaemon}><Play size={13} /> Start daemon</button>}{mode === "live" && !remoteDeck && snapshot.connection.daemonDetected && snapshot.connection.status === "error" && snapshot.connection.runningAgentCount === 0 && <button className="button primary compact" data-testid="replace-daemon" onClick={requestRestartDaemon}><RefreshCw size={13} /> Replace daemon</button>}{mode === "live" && snapshot.connection.status === "error" && snapshot.connection.buildStampMismatchOnly && <button className="button primary compact" data-testid="connect-anyway" onClick={requestConnectAnyway}><ShieldAlert size={13} /> Connect anyway</button>}<button className="button secondary compact" onClick={() => void runtime.reconnect()}><RefreshCw size={13} /> Reconnect</button></div>}
+            {snapshot.connection.status !== "loading" && <div className="connection-actions">{mode === "live" && !remoteDeck && snapshot.connection.status === "disconnected" && <button className="button primary compact" data-testid="start-daemon" onClick={requestStartDaemon}><Play size={13} /> Start deck</button>}{mode === "live" && !remoteDeck && snapshot.connection.daemonDetected && snapshot.connection.status === "error" && snapshot.connection.runningAgentCount === 0 && <button className="button primary compact" data-testid="replace-daemon" onClick={requestRestartDaemon}><RefreshCw size={13} /> Replace deck</button>}{mode === "live" && snapshot.connection.status === "error" && snapshot.connection.buildStampMismatchOnly && <button className="button primary compact" data-testid="connect-anyway" onClick={requestConnectAnyway}><ShieldAlert size={13} /> Connect anyway</button>}<button className="button secondary compact" onClick={() => void runtime.reconnect()}><RefreshCw size={13} /> Reconnect</button></div>}
           </div>
         )}
 
@@ -828,7 +828,7 @@ function LoadingDeck() {
 }
 
 function EmptyDeck({ onReconnect, onProfiles }: { onReconnect: () => void; onProfiles: () => void }) {
-  return <div className="empty-deck"><Blocks size={28} /><h3>No active agent surfaces</h3><p>Connect to a running daemon or prepare agent profiles before starting the loop.</p><div><button className="button secondary" onClick={onProfiles}><Bot size={14} /> Configure agents</button><button className="button primary" onClick={onReconnect}><RefreshCw size={14} /> Reconnect</button></div></div>;
+  return <div className="empty-deck"><Blocks size={28} /><h3>No active agent surfaces</h3><p>Connect to a running deck or prepare agent profiles before starting the loop.</p><div><button className="button secondary" onClick={onProfiles}><Bot size={14} /> Configure agents</button><button className="button primary" onClick={onReconnect}><RefreshCw size={14} /> Reconnect</button></div></div>;
 }
 
 function CommandPalette({ commands, onClose }: { commands: { label: string; hint: string; icon: typeof Bot; run: () => void }[]; onClose: () => void }) {

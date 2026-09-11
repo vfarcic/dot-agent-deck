@@ -646,7 +646,7 @@ function taskLine(agent: DesktopAgentDto): string {
   // neither (PRD #745 M8).
   const reported = agent.lastUserPrompt
     ?? (agent.activeTool ? `Active tool: ${agent.activeTool.name}${agent.activeTool.detail ? ` · ${agent.activeTool.detail}` : ""}` : undefined);
-  return reported === undefined ? "Task metadata unavailable from daemon" : displayText(reported, DISPLAY_LIMITS.prompt);
+  return reported === undefined ? "Task metadata unavailable from the deck" : displayText(reported, DISPLAY_LIMITS.prompt);
 }
 
 function agentFromDto(agent: DesktopAgentDto, index: number, daemonId: string): AgentSession {
@@ -726,12 +726,12 @@ export function modeScopedKey(base: string): string {
  * the same flag the Connect anyway affordance is gated on.
  */
 function fallbackConnectionMessage(connection: DesktopSnapshotDto["connection"]): string {
-  if (connection.status === "connected") return "Daemon responding";
-  if (connection.status !== "incompatible") return "Daemon unavailable";
+  if (connection.status === "connected") return "Deck responding";
+  if (connection.status !== "incompatible") return "Deck unavailable";
   if (connection.buildStampMismatchOnly) {
-    return `Build mismatch: desktop is ${connection.clientBuildVersion}, daemon is ${connection.daemonBuildVersion ?? "unreported"}.`;
+    return `Build mismatch: desktop is ${connection.clientBuildVersion}, deck is ${connection.daemonBuildVersion ?? "unreported"}.`;
   }
-  return `Protocol mismatch: desktop v${connection.clientProtocolVersion}, daemon v${connection.serverProtocolVersion ?? "unknown"}`;
+  return `Protocol mismatch: desktop v${connection.clientProtocolVersion}, deck v${connection.serverProtocolVersion ?? "unknown"}`;
 }
 
 export function mapDesktopSnapshot(dto: DesktopSnapshotDto, previous?: DeckSnapshot, evidence?: EvidenceItem[], handoffs?: HandoffEdge[]): DeckSnapshot {
@@ -758,7 +758,7 @@ export function mapDesktopSnapshot(dto: DesktopSnapshotDto, previous?: DeckSnaps
   }));
 
   return {
-    runId: previous?.runId ?? "live-daemon",
+    runId: previous?.runId ?? "live-deck",
     repo,
     // No branch: nothing daemon-side tracks one, and the literal "Unavailable"
     // this used to carry was a placeholder the topbar printed as if it were the
@@ -995,7 +995,7 @@ class FixtureDeckBridge implements DeckBridge {
    */
   async resolveProject(): Promise<DaemonResolvedProject> {
     await Promise.resolve();
-    throw new Error("The deterministic preview has no daemon, so it can resolve no project. Run against a live daemon to choose one.");
+    throw new Error("The deterministic preview has no deck, so it can resolve no project. Run against a live deck to choose one.");
   }
 
   async dispose(): Promise<void> {
@@ -1534,14 +1534,14 @@ export class TauriDeckBridge implements DeckBridge {
     if (action.type === "start_daemon") {
       const dto = await invoke<DesktopSnapshotDto>("desktop_bootstrap", { options: { startIfMissing: true } });
       if (dto.connection.status !== "connected") {
-        throw new Error(dto.connection.error ?? "The local daemon did not become connected.");
+        throw new Error(dto.connection.error ?? "The local deck did not become connected.");
       }
       // PRD #745 M7: starting the daemon no longer attaches its whole fleet
       // either — this was the third eager call site, and the one reachable
       // without a snapshot event at all.
       return { ok: true };
     }
-    throw new Error("This orchestration control is available in the fixture preview but is not yet exposed by the live daemon.");
+    throw new Error("This orchestration control is available in the fixture preview but is not yet exposed by the live deck.");
   }
 
   /**

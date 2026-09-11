@@ -557,9 +557,9 @@ export function useOverviewClock(intervalMs: number = OVERVIEW_CLOCK_TICK_MS): n
 
 /** What a reported write lease says on hover, in the daemon's own terms. */
 const WRITE_LEASE_TITLE: Record<"read" | "write" | "none", string> = {
-  write: "The daemon holds a live, writable target for this agent — input typed on the deck reaches it.",
-  read: "History-only: the daemon can replay this session but cannot deliver input to it.",
-  none: "View-only: the daemon has no handle it can write to or resume.",
+  write: "The deck holds a live, writable target for this agent — input typed on this screen reaches it.",
+  read: "History-only: the deck can replay this session but cannot deliver input to it.",
+  none: "View-only: the deck has no handle it can write to or resume.",
 };
 
 /**
@@ -646,7 +646,7 @@ export function AgentOverview({ runtime, settings, onNavigate }: { runtime: Deck
   const daemonMessage = connection.message ? displayText(connection.message, DISPLAY_LIMITS.message) : undefined;
   /**
    * Whether the connection message says anything the lamp beside it does not
-   * (PRD #745). A healthy connection's message is literally `Daemon
+   * (PRD #745). A healthy connection's message is literally `Deck
    * responding`, which is the lamp restated in words — two renderings of one
    * bit, and the screen narrating its own state.
    *
@@ -671,7 +671,7 @@ export function AgentOverview({ runtime, settings, onNavigate }: { runtime: Deck
    */
   const buildStampsCaveat = connection.clientBuildVersion && connection.daemonBuildVersion
     && connection.clientBuildVersion !== connection.daemonBuildVersion
-    ? `Built from different commits — desktop ${connection.clientBuildVersion}, daemon ${connection.daemonBuildVersion}.`
+    ? `Built from different commits — desktop ${connection.clientBuildVersion}, deck ${connection.daemonBuildVersion}.`
     : undefined;
   /**
    * Everything hover can say about WHICH daemon this is: its socket path, and
@@ -708,8 +708,8 @@ export function AgentOverview({ runtime, settings, onNavigate }: { runtime: Deck
   const requestConnectAnyway = () => {
     if (mode !== "live" || !connection.buildStampMismatchOnly) return;
     setConfirm({
-      title: "Connect to a differently-built daemon?",
-      body: "The wire protocol matched on both sides, so this daemon and this app agree on the shape of everything they exchange. They were built from different commits, and a stamp difference can still mean divergent behaviour behind an identical wire — a field whose meaning changed while its shape did not. Agent Deck will connect and keep the mismatch on screen for the rest of this session; nothing is remembered after you quit the app.",
+      title: "Connect to a differently-built deck?",
+      body: "The wire protocol matched on both sides, so this deck and this app agree on the shape of everything they exchange. They were built from different commits, and a stamp difference can still mean divergent behaviour behind an identical wire — a field whose meaning changed while its shape did not. Agent Deck will connect and keep the mismatch on screen for the rest of this session; nothing is remembered after you quit the app.",
       label: "Connect anyway",
       busyLabel: "Connecting…",
       action: async () => {
@@ -763,7 +763,7 @@ export function AgentOverview({ runtime, settings, onNavigate }: { runtime: Deck
         {mode === "fixture" && (
           <div className="fixture-bar">
             <span><Sparkles size={13} /> DEMO DATA</span>
-            <p>Deterministic fixture · no daemon is attached and no agent is running.</p>
+            <p>Deterministic fixture · no deck is attached and no agent is running.</p>
           </div>
         )}
 
@@ -782,7 +782,7 @@ export function AgentOverview({ runtime, settings, onNavigate }: { runtime: Deck
                   hover — see `daemonIdentityTitle`, which is also where the
                   build stamps disclose themselves.
                 */}
-                <strong id="daemon-group-title" title={daemonIdentityTitle} data-testid="daemon-identity">Local daemon</strong>
+                <strong id="daemon-group-title" title={daemonIdentityTitle} data-testid="daemon-identity">Local deck</strong>
               </div>
               {/*
                 Only when it says something the lamp does not. The element is
@@ -839,16 +839,16 @@ function DaemonBody({ agents, groups, now, columns, connection, message, overrid
   if (connection.status === "loading") {
     return (
       <OverviewNote testId="overview-loading" icon={<RefreshCw className="spin" size={24} />} title="Establishing control channel">
-        <p>Reading the daemon's agent list. Nothing is attached while this runs.</p>
+        <p>Reading the deck's agent list. Nothing is attached while this runs.</p>
       </OverviewNote>
     );
   }
 
   if (connection.status === "disconnected") {
     return (
-      <OverviewNote testId="overview-disconnected" icon={<ShieldAlert size={24} />} title="Daemon disconnected">
-        <p>{message ?? "No dot-agent-deck daemon is listening on the configured socket."}</p>
-        <p className="overview-note-hint">Nothing can be said about the fleet until a daemon answers, so this list is blank rather than stale. Start a daemon from the deck, then reconnect.</p>
+      <OverviewNote testId="overview-disconnected" icon={<ShieldAlert size={24} />} title="Deck disconnected">
+        <p>{message ?? "No deck is listening on the configured socket."}</p>
+        <p className="overview-note-hint">Nothing can be said about the fleet until a deck answers, so this list is blank rather than stale. Start one from the deck screen, then reconnect.</p>
         <div>
           <button className="button secondary" onClick={onOpenDeck}><SquareTerminal size={14} /> Open deck</button>
           <button className="button primary" onClick={onReconnect}><RefreshCw size={14} /> Reconnect</button>
@@ -859,14 +859,14 @@ function DaemonBody({ agents, groups, now, columns, connection, message, overrid
 
   if (connection.status === "error") {
     return (
-      <OverviewNote testId="overview-incompatible" icon={<ShieldAlert size={24} />} title="Incompatible daemon">
-        <p>{message ?? "A daemon answered but this build cannot speak to it."}</p>
+      <OverviewNote testId="overview-incompatible" icon={<ShieldAlert size={24} />} title="Incompatible deck">
+        <p>{message ?? "A deck answered but this build cannot speak to it."}</p>
         <p className="overview-note-hint">
           {connection.runningAgentCount === undefined
-            ? "A daemon answered the handshake, but this build cannot read its agent list. Nothing is listed rather than guessed."
-            : `A daemon answered the handshake and reports ${connection.runningAgentCount} running ${connection.runningAgentCount === 1 ? "agent" : "agents"}, but this build cannot read them. Nothing is listed rather than guessed.`}
-          {" "}Daemon lifecycle actions live on the deck.
-          {onConnectAnyway && " Only the build stamps differ — the wire protocol agreed — so you can connect to this daemon as it is."}
+            ? "A deck answered the handshake, but this build cannot read its agent list. Nothing is listed rather than guessed."
+            : `A deck answered the handshake and reports ${connection.runningAgentCount} running ${connection.runningAgentCount === 1 ? "agent" : "agents"}, but this build cannot read them. Nothing is listed rather than guessed.`}
+          {" "}Start, stop and replace live on the deck screen.
+          {onConnectAnyway && " Only the build stamps differ — the wire protocol agreed — so you can connect to this deck as it is."}
         </p>
         {overrideError && <p className="overview-note-hint" data-testid="overview-connect-anyway-error">{overrideError}</p>}
         <div>
@@ -881,8 +881,8 @@ function DaemonBody({ agents, groups, now, columns, connection, message, overrid
   if (!agents.length) {
     return (
       <OverviewNote testId="overview-first-run" icon={<Blocks size={26} />} title="No agents are running yet">
-        <p>The daemon is healthy and owns nothing. This is what a fresh install looks like — not a failure.</p>
-        <p className="overview-note-hint">Launch a workflow from the deck's Workflows panel, or start an agent from the CLI in a project directory. Whatever the daemon adopts shows up here on the next snapshot.</p>
+        <p>The deck is healthy and owns nothing. This is what a fresh install looks like — not a failure.</p>
+        <p className="overview-note-hint">Launch a workflow from the deck's Workflows panel, or start an agent from the CLI in a project directory. Whatever the deck adopts shows up here on the next snapshot.</p>
         <div>
           <button className="button primary" onClick={onOpenDeck}><SquareTerminal size={14} /> Open deck</button>
         </div>
@@ -992,7 +992,7 @@ function OverviewColumnPicker({ columns, onChange }: { columns: OverviewColumnId
       </button>
       {open && (
         <div className="overview-columns-menu" data-testid="overview-columns-menu" role="group" aria-label="Columns">
-          <p>Every column the daemon reports. There is nothing else to show.</p>
+          <p>Every column the deck reports. There is nothing else to show.</p>
           {ALL_OVERVIEW_COLUMNS.map((column) => {
             const permanent = column === PERMANENT_COLUMN;
             return (
@@ -1204,7 +1204,7 @@ function OverviewRow({ agent, hoistedCwd, now, columns }: { agent: OverviewAgent
           fabricated "just now" for a far-future stamp is the same lie in nicer
           clothes.
         */
-        return <td className="overview-activity" role="cell" key={column} title={activity && `Last activity reported by the daemon: ${activity.title}`}>{activity?.label ?? ""}</td>;
+        return <td className="overview-activity" role="cell" key={column} title={activity && `Last activity reported by the deck: ${activity.title}`}>{activity?.label ?? ""}</td>;
       case "spawnedAtMs":
         /*
           How long this agent's process has been running (PRD #745 M11) — the
@@ -1219,7 +1219,7 @@ function OverviewRow({ agent, hoistedCwd, now, columns }: { agent: OverviewAgent
           its current iteration; a role nobody has restarted keeps its original
           record, so it reads as its whole lifetime.
         */
-        return <td className="overview-uptime" role="cell" key={column} title={uptime && `Spawned by the daemon at: ${uptime.title}`}>{uptime?.label ?? ""}</td>;
+        return <td className="overview-uptime" role="cell" key={column} title={uptime && `Spawned by the deck at: ${uptime.title}`}>{uptime?.label ?? ""}</td>;
       case "cli":
         /*
           The BINARY this agent runs, resolved from the agent registry rather
@@ -1310,6 +1310,6 @@ function OverviewInstrument({ label, children, testId }: { label: string; childr
  * true when the daemon is unreachable.
  */
 function OverviewCount({ known, value, className }: { known: boolean; value: number; className?: string }) {
-  if (!known) return <strong className="count-unknown" title="Not known — the daemon is not answering, so nothing can be counted.">—</strong>;
+  if (!known) return <strong className="count-unknown" title="Not known — the deck is not answering, so nothing can be counted.">—</strong>;
   return <strong className={className}>{value}</strong>;
 }

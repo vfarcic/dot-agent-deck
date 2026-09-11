@@ -328,7 +328,7 @@ describe("ControlDeck", () => {
     fireEvent.click(screen.getByRole("button", { name: /stale/ }));
 
     await waitFor(() => expect(screen.getByTestId("projects-nothing-known")).toBeVisible());
-    expect(screen.getByTestId("projects-nothing-known")).toHaveTextContent("no longer one this daemon knows");
+    expect(screen.getByTestId("projects-nothing-known")).toHaveTextContent("no longer one this deck knows");
     // Like the empty state: the daemon's refusal text is NOT shown as a fault.
     expect(screen.queryByTestId("project-resolve-error")).toBeNull();
     // And the listing is re-asked, because it is now known to be out of date.
@@ -540,7 +540,7 @@ describe("ControlDeck", () => {
     fireEvent.click(screen.getAllByRole("button", { name: "Launch live loop" }).at(-1)!);
 
     await waitFor(() => {
-      expect(screen.getByRole("status")).toHaveTextContent("no longer matches what the daemon approved");
+      expect(screen.getByRole("status")).toHaveTextContent("no longer matches what the deck approved");
     });
     expect(screen.getByRole("status")).toHaveTextContent("Nothing was started");
     expect(screen.getByRole("status")).toHaveTextContent("launch again");
@@ -559,7 +559,7 @@ describe("ControlDeck", () => {
   it("presents an unsupported-platform refusal without inviting a retry", async () => {
     const live = liveWithProject({
       runAction: vi.fn(async () => {
-        throw new Error("unsupported-platform: this daemon offers the project verbs but withholds `prepare-workflow`. Nothing was started. Launch this workflow from the TUI on the daemon's own host, or point the app at a Unix daemon.");
+        throw new Error("unsupported-platform: this deck offers the project verbs but withholds `prepare-workflow`. Nothing was started. Launch this workflow from the TUI on that deck's own host, or point the app at a deck on a Unix host.");
       }),
     });
     render(<ControlDeck runtime={live} />);
@@ -570,7 +570,7 @@ describe("ControlDeck", () => {
     fireEvent.click(screen.getAllByRole("button", { name: "Launch live loop" }).at(-1)!);
 
     await waitFor(() => {
-      expect(screen.getByRole("status")).toHaveTextContent("Launch this workflow from the TUI on the daemon's own host");
+      expect(screen.getByRole("status")).toHaveTextContent("Launch this workflow from the TUI on that deck's own host");
     });
     expect(screen.queryByTestId("workflow-editor")).toBeNull();
     // No re-resolve: nothing about the project changed, and trying again cannot
@@ -806,7 +806,7 @@ describe("ControlDeck", () => {
       daemonDetected: true,
       runningAgentCount: 0,
       localOnlyReason:
-        "Stop daemon is not available for the remote deck deploy@build-box: it acts on a process on this machine, which is not the machine that deck runs on",
+        "Stop deck is not available for the remote deck deploy@build-box: it acts on a process on this machine, which is not the machine that deck runs on",
     };
     render(<ControlDeck runtime={runtime({ mode: "live", snapshot: remote })} />);
 
@@ -829,7 +829,7 @@ describe("ControlDeck", () => {
     render(<ControlDeck runtime={live} />);
     fireEvent.click(screen.getByTestId("start-daemon"));
     expect(live.runAction).not.toHaveBeenCalled();
-    fireEvent.click(screen.getAllByRole("button", { name: "Start daemon" }).at(-1)!);
+    fireEvent.click(screen.getAllByRole("button", { name: "Start deck" }).at(-1)!);
     expect(screen.getByRole("button", { name: "Starting…" })).toBeDisabled();
     expect(screen.queryByText("Stopping…")).not.toBeInTheDocument();
     releaseStart();
@@ -846,12 +846,12 @@ describe("ControlDeck", () => {
     const live = runtime({ mode: "live", snapshot: connectedNoAgents, runAction });
     render(<ControlDeck runtime={live} />);
 
-    fireEvent.click(screen.getByRole("button", { name: "Stop daemon" }));
+    fireEvent.click(screen.getByRole("button", { name: "Stop deck" }));
     expect(live.runAction).not.toHaveBeenCalled();
-    fireEvent.click(screen.getAllByRole("button", { name: "Stop daemon" }).at(-1)!);
+    fireEvent.click(screen.getAllByRole("button", { name: "Stop deck" }).at(-1)!);
 
     await waitFor(() => expect(live.runAction).toHaveBeenCalledWith({ type: "stop_daemon" }));
-    expect(screen.getByText("Local daemon stopped.")).toBeVisible();
+    expect(screen.getByText("Local deck stopped.")).toBeVisible();
   });
 
   it("replaces an incompatible zero-agent daemon through an explicit confirmation", async () => {
@@ -871,14 +871,14 @@ describe("ControlDeck", () => {
     const live = runtime({ mode: "live", snapshot: incompatible, runAction });
     render(<ControlDeck runtime={live} />);
 
-    expect(screen.getByRole("button", { name: "Stop daemon" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Stop deck" })).toBeEnabled();
     fireEvent.click(screen.getByTestId("replace-daemon"));
     expect(live.runAction).not.toHaveBeenCalled();
-    expect(screen.getByRole("alertdialog")).toHaveTextContent("exact daemon build bundled with this desktop app");
-    fireEvent.click(screen.getAllByRole("button", { name: "Replace daemon" }).at(-1)!);
+    expect(screen.getByRole("alertdialog")).toHaveTextContent("exact build bundled with this desktop app");
+    fireEvent.click(screen.getAllByRole("button", { name: "Replace deck" }).at(-1)!);
 
     await waitFor(() => expect(live.runAction).toHaveBeenCalledWith({ type: "restart_daemon" }));
-    expect(screen.getByText("Matching daemon started and reconnected.")).toBeVisible();
+    expect(screen.getByText("Matching deck started and reconnected.")).toBeVisible();
   });
 
   /**
@@ -895,7 +895,7 @@ describe("ControlDeck", () => {
       status: "error",
       socketPath: "/tmp/dot-agent-deck.sock",
       deckKind: "local",
-      message: "build mismatch: desktop is v0.38.0-50-gf118e99, daemon is v0.39.0. The daemon reports 9 live agents; stop them individually before replacing the daemon, or Connect anyway to keep this one.",
+      message: "build mismatch: desktop is v0.38.0-50-gf118e99, deck is v0.39.0. The deck reports 9 live agents; stop them individually before replacing the deck, or Connect anyway to keep this one.",
       daemonDetected: true,
       runningAgentCount: 9,
       buildStampMismatchOnly: true,
@@ -918,7 +918,7 @@ describe("ControlDeck", () => {
     // The allowance is only read by the NEXT handshake, so the reconnect is
     // what actually connects.
     await waitFor(() => expect(reconnect).toHaveBeenCalled());
-    expect(screen.getByText("Connected to the differently-built daemon. The mismatch stays in the connection banner for this session.")).toBeVisible();
+    expect(screen.getByText("Connected to the differently-built deck. The mismatch stays in the connection banner for this session.")).toBeVisible();
   });
 
   /**
@@ -932,7 +932,7 @@ describe("ControlDeck", () => {
     incompatible.agents = [];
     incompatible.connection = {
       status: "error",
-      message: "protocol mismatch: desktop expects 8, daemon reports 7",
+      message: "protocol mismatch: desktop expects 8, deck reports 7",
       daemonDetected: true,
       runningAgentCount: 0,
       buildStampMismatchOnly: false,
@@ -952,7 +952,7 @@ describe("ControlDeck", () => {
     const connected = createFixtureSnapshot("connected");
     connected.connection = {
       status: "connected",
-      message: "build mismatch: desktop is v0.38.0-50-gf118e99, daemon is v0.39.0. Connected anyway for this session; protocol 8 matched on both sides.",
+      message: "build mismatch: desktop is v0.38.0-50-gf118e99, deck is v0.39.0. Connected anyway for this session; protocol 8 matched on both sides.",
       daemonDetected: true,
       runningAgentCount: 9,
       buildStampMismatchOnly: true,
@@ -960,7 +960,7 @@ describe("ControlDeck", () => {
     render(<ControlDeck runtime={runtime({ mode: "live", snapshot: connected })} />);
 
     const banner = screen.getByRole("alert");
-    expect(banner).toHaveTextContent("Connected to a differently-built daemon");
+    expect(banner).toHaveTextContent("Connected to a differently-built deck");
     expect(banner).toHaveTextContent("Connected anyway for this session");
     // Accepted, not re-offered: the override is already in force.
     expect(screen.queryByTestId("connect-anyway")).not.toBeInTheDocument();
@@ -973,7 +973,7 @@ describe("ControlDeck", () => {
    */
   it("shows no connection banner for a healthy matching daemon", () => {
     const connected = createFixtureSnapshot("connected");
-    connected.connection = { status: "connected", message: "Daemon responding", daemonDetected: true, runningAgentCount: 4, buildStampMismatchOnly: false };
+    connected.connection = { status: "connected", message: "Deck responding", daemonDetected: true, runningAgentCount: 4, buildStampMismatchOnly: false };
     render(<ControlDeck runtime={runtime({ mode: "live", snapshot: connected })} />);
 
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
@@ -989,7 +989,7 @@ describe("ControlDeck", () => {
     const connected = createFixtureSnapshot("connected");
     connected.connection = {
       status: "connected",
-      message: "Daemon responding",
+      message: "Deck responding",
       daemonDetected: true,
       runningAgentCount: 9,
       buildStampMismatchOnly: false,
@@ -1014,7 +1014,7 @@ describe("ControlDeck", () => {
     render(<ControlDeck runtime={runtime({ mode: "live", snapshot: incompatible })} />);
 
     expect(screen.queryByTestId("replace-daemon")).not.toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Stop daemon" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Stop deck" })).toBeEnabled();
   });
 
   it("never reports daemon-start success when the start action fails", async () => {
@@ -1028,11 +1028,11 @@ describe("ControlDeck", () => {
     render(<ControlDeck runtime={live} />);
 
     fireEvent.click(screen.getByTestId("start-daemon"));
-    fireEvent.click(screen.getAllByRole("button", { name: "Start daemon" }).at(-1)!);
+    fireEvent.click(screen.getAllByRole("button", { name: "Start deck" }).at(-1)!);
 
     await waitFor(() => expect(screen.getByText("daemon start timed out")).toBeVisible());
     expect(live.reconnect).not.toHaveBeenCalled();
-    expect(screen.queryByText("Local daemon started and control channel reconnected.")).not.toBeInTheDocument();
+    expect(screen.queryByText("Local deck started and control channel reconnected.")).not.toBeInTheDocument();
   });
 
   it("keeps the mobile summary visible on first load and opens Evidence on demand", () => {
@@ -1410,7 +1410,7 @@ describe("ControlDeck", () => {
     expect(screen.getByText("ATTEMPT").parentElement).toHaveTextContent("—");
     expect(screen.getByTestId("workflow-node-agent-7")).not.toHaveTextContent("att");
     expect(container.querySelector(".agent-attempt strong")?.textContent).toBe("—");
-    expect(container.querySelector(".agent-attempt")).toHaveAttribute("title", "No attempt count is reported by the daemon");
+    expect(container.querySelector(".agent-attempt")).toHaveAttribute("title", "No attempt count is reported by the deck");
 
     // No branch chip at all, and nothing standing in for one.
     expect(container.querySelector(".branch-line svg")).toBeNull();

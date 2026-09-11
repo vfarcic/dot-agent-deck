@@ -258,9 +258,10 @@ export interface DeckChoice {
  * — `Endpoint::local()` resolves it from the platform paths — so this list is
  * never empty and the selector is useful before anything is stored.
  *
- * **Rendered text says Deck, never "daemon".** This is new surface and it is
- * written in the vocabulary the app is moving to; the sweep of the older strings
- * is M15's.
+ * **Rendered text says Deck, never "daemon".** M15 swept the rest of the app
+ * into the same vocabulary, so this is no longer the only surface written in it:
+ * rendered text says Deck everywhere, while code, protocol, CLI, docs, CSS class
+ * names and `data-testid`s deliberately keep `daemon`.
  */
 export function deckChoices(section: EndpointSettingsDto | undefined): DeckChoice[] {
   const choices: DeckChoice[] = [

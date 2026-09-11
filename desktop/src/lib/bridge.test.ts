@@ -69,7 +69,7 @@ describe("TauriDeckBridge", () => {
     expect(mappedIncompatible).toMatchObject({
       health: "failed",
       connection: { status: "error", daemonDetected: true, runningAgentCount: 1 },
-      agents: [{ displayName: "Coder", model: "Unavailable", task: "Task metadata unavailable from daemon" }],
+      agents: [{ displayName: "Coder", model: "Unavailable", task: "Task metadata unavailable from the deck" }],
     });
     // An unreported cwd is ABSENT on the model, not the deck's stand-in word:
     // that word is a directory name the daemon can legitimately report, so a
@@ -329,7 +329,7 @@ describe("TauriDeckBridge", () => {
     const { createDeckBridge } = await import("./bridge");
     const bridge = createDeckBridge("fixture");
     expect(await bridge.listProjects()).toEqual({ projects: [] });
-    await expect(bridge.resolveProject("/anything")).rejects.toThrow("no daemon");
+    await expect(bridge.resolveProject("/anything")).rejects.toThrow("no deck");
     await bridge.dispose();
   });
 
@@ -410,13 +410,13 @@ describe("TauriDeckBridge", () => {
 
     const stampOnly = structuredClone(snapshot);
     stampOnly.connection.status = "incompatible";
-    stampOnly.connection.error = "build mismatch: desktop is a, daemon is b. Connect anyway to keep this one.";
+    stampOnly.connection.error = "build mismatch: desktop is a, deck is b. Connect anyway to keep this one.";
     stampOnly.connection.buildStampMismatchOnly = true;
     expect(mapDesktopSnapshot(stampOnly).connection).toMatchObject({ status: "error", buildStampMismatchOnly: true });
 
     const protocolMismatch = structuredClone(snapshot);
     protocolMismatch.connection.status = "incompatible";
-    protocolMismatch.connection.error = "protocol mismatch: desktop expects 8, daemon reports 7";
+    protocolMismatch.connection.error = "protocol mismatch: desktop expects 8, deck reports 7";
     protocolMismatch.connection.buildStampMismatchOnly = false;
     expect(mapDesktopSnapshot(protocolMismatch).connection.buildStampMismatchOnly).toBe(false);
   });
@@ -459,7 +459,7 @@ describe("TauriDeckBridge", () => {
 
     expect(mapped.connection).toMatchObject({
       status: "connected",
-      message: "Daemon responding",
+      message: "Deck responding",
       buildStampMismatchOnly: false,
       clientBuildVersion: "0.39.0-49-ga0165f8",
       daemonBuildVersion: "0.39.0-g1ea0fe7",
@@ -472,7 +472,7 @@ describe("TauriDeckBridge", () => {
    * The whole point of the override: connected, and STILL saying so. The crate
    * keeps the mismatch in `error` on the bypass path, and this mapping is what
    * would drop it — a `connected` status used to be enough to reach for the
-   * "Daemon responding" fallback, which would have made the caveat invisible
+   * "Deck responding" fallback, which would have made the caveat invisible
    * the moment it mattered.
    */
   it("keeps the build-mismatch caveat visible after connecting anyway", async () => {
@@ -481,7 +481,7 @@ describe("TauriDeckBridge", () => {
     overridden.connection.status = "connected";
     overridden.connection.daemonBuildVersion = "v0.39.0";
     overridden.connection.buildStampMismatchOnly = true;
-    overridden.connection.error = "build mismatch: desktop is v0.38.0-50-gf118e99, daemon is v0.39.0. Connected anyway for this session; protocol 8 matched on both sides.";
+    overridden.connection.error = "build mismatch: desktop is v0.38.0-50-gf118e99, deck is v0.39.0. Connected anyway for this session; protocol 8 matched on both sides.";
 
     const mapped = mapDesktopSnapshot(overridden);
 
@@ -506,13 +506,13 @@ describe("TauriDeckBridge", () => {
     stampOnly.connection.daemonBuildVersion = "v0.39.0";
     stampOnly.connection.buildStampMismatchOnly = true;
     delete stampOnly.connection.error;
-    expect(mapDesktopSnapshot(stampOnly).connection.message).toBe("Build mismatch: desktop is v0.38.0-50-gf118e99, daemon is v0.39.0.");
+    expect(mapDesktopSnapshot(stampOnly).connection.message).toBe("Build mismatch: desktop is v0.38.0-50-gf118e99, deck is v0.39.0.");
 
     const protocolMismatch = structuredClone(snapshot);
     protocolMismatch.connection.status = "incompatible";
     protocolMismatch.connection.serverProtocolVersion = 7;
     delete protocolMismatch.connection.error;
-    expect(mapDesktopSnapshot(protocolMismatch).connection.message).toBe("Protocol mismatch: desktop v6, daemon v7");
+    expect(mapDesktopSnapshot(protocolMismatch).connection.message).toBe("Protocol mismatch: desktop v6, deck v7");
   });
 
   it("carries the daemon identity and the daemon's own tab membership onto the agent model", async () => {

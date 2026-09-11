@@ -27,7 +27,7 @@ export function HandoffRail({ handoffs }: { handoffs: HandoffEdge[] }) {
     <section className="handoff-rail" aria-label="Live handoffs" data-testid="handoff-rail">
       <header>
         <span className="section-kicker">HANDOFFS</span>
-        <small>Delegations live from the daemon — dispatched → delivered → work-done</small>
+        <small>Delegations live from the deck — dispatched → delivered → work-done</small>
       </header>
       <div className="handoff-list">
         {handoffs.slice(0, 12).map((edge) => (

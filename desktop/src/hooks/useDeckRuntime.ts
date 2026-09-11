@@ -37,7 +37,7 @@ export function useDeckRuntime(): DeckRuntimeState {
         agents: [],
         evidence: [],
         handoffs: [],
-        connection: { status: "loading", message: "Connecting to local daemon…" },
+        connection: { status: "loading", message: "Connecting to the local deck…" },
       };
     }
     const initial = createFixtureSnapshot("empty");

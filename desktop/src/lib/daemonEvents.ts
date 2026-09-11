@@ -140,7 +140,7 @@ export function mapDaemonEvent(payload: unknown, sequence: number, resolveAgent?
       from: workDone ? (metadata.from_role || agent?.role || "worker") : "orchestrator",
       to: workDone ? "orchestrator" : (metadata.to_role || ""),
       at: clockFor(event.timestamp),
-      reason: sessionId ? `Delegation ${sessionId}` : "Daemon handoff event",
+      reason: sessionId ? `Delegation ${sessionId}` : "Deck handoff event",
       acknowledged: false,
       agentId: agent?.id ?? agentId,
     };
@@ -154,7 +154,7 @@ export function mapDaemonEvent(payload: unknown, sequence: number, resolveAgent?
     from: agent?.role ?? agentId ?? paneId ?? sessionId ?? "Unattributed agent",
     to: "",
     at: clockFor(event.timestamp),
-    reason: "Live hook event from the daemon event stream.",
+    reason: "Live hook event from the deck event stream.",
     acknowledged: false,
     agentId: agent?.id ?? agentId,
   };

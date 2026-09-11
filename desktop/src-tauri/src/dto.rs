@@ -130,7 +130,7 @@ pub(crate) fn selection_fields() -> (&'static str, Option<String>, Option<String
     };
     let local_only = deck
         .endpoint
-        .require_local("Stop daemon")
+        .require_local("Stop deck")
         .err()
         .map(|error| safe_display_text(error.to_string()));
     (kind, local_only, deck.fallback)
@@ -661,7 +661,7 @@ pub(crate) fn map_resolved_project(project: ResolvedProject) -> DesktopResolvedP
 pub(crate) fn validate_pasted_project_path(path: &str) -> Result<(), String> {
     if !is_valid_orchestration_cwd(path) {
         return Err(
-            "enter an absolute directory path, without control characters, that the daemon can see"
+            "enter an absolute directory path, without control characters, that the deck can see"
                 .into(),
         );
     }
@@ -1166,7 +1166,7 @@ mod tests {
         );
         let reason = local_only.expect("a remote deck must say why Stop and Replace are off");
         assert!(
-            reason.contains("Stop daemon") && reason.contains("deploy@build-box"),
+            reason.contains("Stop deck") && reason.contains("deploy@build-box"),
             "the explanation must name the operation and the deck: {reason}"
         );
         assert!(

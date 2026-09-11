@@ -88,7 +88,7 @@ impl TrustedDaemon {
                 .connection
                 .error
                 .clone()
-                .unwrap_or_else(|| "daemon is not protocol-compatible".into()))
+                .unwrap_or_else(|| "the deck is not protocol-compatible".into()))
         }
     }
 
@@ -619,11 +619,11 @@ fn classify_handshake(
             response
                 .error
                 .clone()
-                .unwrap_or_else(|| "daemon rejected Hello".into()),
+                .unwrap_or_else(|| "the deck rejected Hello".into()),
         )
     } else if server_protocol_version != Some(PROTOCOL_VERSION) {
         Some(format!(
-            "protocol mismatch: desktop expects {PROTOCOL_VERSION}, daemon reports {}",
+            "protocol mismatch: desktop expects {PROTOCOL_VERSION}, deck reports {}",
             server_protocol_version
                 .map(|version| version.to_string())
                 .unwrap_or_else(|| "no version".into())
@@ -640,7 +640,7 @@ fn classify_handshake(
         // between two builds that share a compatibility key (issue #801).
         build_stamp_mismatch_only = true;
         let builds = format!(
-            "build mismatch: desktop is {client_build}, daemon is {}",
+            "build mismatch: desktop is {client_build}, deck is {}",
             daemon_build_version.as_deref().unwrap_or("unreported")
         );
         // PRD #741 M8: for a remote deck the stamp is an informational badge and
@@ -667,12 +667,12 @@ fn classify_handshake(
                 )),
                 BuildMismatchAllowance::Refuse => {
                     let recovery = match running_agent_count {
-                    Some(0) => "No live agents are reported; use Replace daemon to start the matching bundled build, or Connect anyway to keep this one.".into(),
+                    Some(0) => "No live agents are reported; use Replace deck to start the matching bundled build, or Connect anyway to keep this one.".into(),
                     Some(count) => format!(
-                        "The daemon reports {count} live agent{}; stop them individually before replacing the daemon, or Connect anyway to keep this one.",
+                        "The deck reports {count} live agent{}; stop them individually before replacing the deck, or Connect anyway to keep this one.",
                         if count == 1 { "" } else { "s" }
                     ),
-                    None => "The daemon could not report its live-agent count, so automatic replacement is disabled; Connect anyway keeps this one.".into(),
+                    None => "The deck could not report its live-agent count, so automatic replacement is disabled; Connect anyway keeps this one.".into(),
                 };
                     Some(format!("{builds}. {recovery}"))
                 }
@@ -802,7 +802,7 @@ async fn establish(
         dot_agent_deck::platform::fsperm::verify_endpoint_trusted(local.path()).map_err(
             |reason| {
                 safe_message(format!(
-                    "refusing to connect to daemon endpoint {}: {reason}",
+                    "refusing to connect to the deck at {}: {reason}",
                     local.path().to_string_lossy()
                 ))
             },
@@ -1199,7 +1199,7 @@ mod tests {
             "the limit a stamp cannot see is stated rather than implied: {error}"
         );
         assert!(
-            !error.contains("Replace daemon"),
+            !error.contains("Replace deck"),
             "a remedy that cannot be taken is worse than none: {error}"
         );
         assert!(
@@ -1364,7 +1364,7 @@ mod tests {
         assert_eq!(info.status, ConnectionStatus::Incompatible);
         let error = info.error.unwrap();
         assert!(error.contains("build mismatch"));
-        assert!(error.contains("use Replace daemon"));
+        assert!(error.contains("use Replace deck"));
     }
 
     #[test]
