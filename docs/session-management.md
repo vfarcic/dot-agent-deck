@@ -53,7 +53,9 @@ If there's nothing to bring back, you start on a clean, empty dashboard. If a sa
 
 ### You come back where you were
 
-Agent Deck remembers the tab you were on and the pane you had focused in each tab, so reconnecting to agents that are still running puts you back in front of the same agent rather than at the start of the orchestration. Switching to another tab afterwards also lands on the role you left it on, not on that tab's first role. If you were on the dashboard when you disconnected, you come back to the dashboard — that counts as a choice, and it is restored like any other.
+Agent Deck also remembers the tab you were on and the pane you had focused in each tab. In the everyday case above — your agents still running — that means reconnecting drops you straight back in front of the agent you were reading, instead of at the orchestration's start role. Switching to another tab afterwards also lands on the role you left it on, not on that tab's first role. If you were on the dashboard when you disconnected, you come back to the dashboard — that counts as a choice, and it is restored like any other.
+
+This is only about where the deck points you, not about the agents themselves. An agent that kept running was never interrupted, so there is no conversation to bring back: you are re-attaching a view to the same live process, which still has its own context exactly as it was. Agent Deck never restores an agent's conversation in either case — see the two bullets above for what happens when the agents *are* gone.
 
 Your position is checked against what is actually running when you return. A pane you closed in the meantime, or a role whose agent finished while you were away, is simply not restored; that tab falls back to its start role, so you are never dropped into a pane that is no longer there. When Agent Deck has nothing remembered — a first run, or a workspace you have not left a position in — it falls back to the older behaviour: land on the first orchestration tab if you have one, otherwise the dashboard.
 
