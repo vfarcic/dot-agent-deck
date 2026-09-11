@@ -17,8 +17,16 @@
 //!    true.
 //! 2. The local uid+mode trust check is never run against it. A `0o600` inode
 //!    owned by us says only that the local `ssh` client created it; it says
-//!    nothing about who answers on the far end. A remote deck's trust story is
-//!    the ssh host key and ssh user authentication, and that is the whole of it.
+//!    nothing about who answers on the far end. What decides whether the far
+//!    end is the deck the user asked for is the **ssh host key** and **ssh user
+//!    authentication** — and the part this module controls is that the host-key
+//!    check is in force at all: `forced_options` pins
+//!    `StrictHostKeyChecking=yes` through a generated config that wins on every
+//!    hop, so a user's `~/.ssh/config` cannot turn it off underneath us. What
+//!    this module does **not** control is which keys the user's `known_hosts`
+//!    already trusts, or what their `ProxyCommand`/`Match exec`/`KnownHostsCommand`
+//!    does on the way — see `forced_options`'s "what is not here" block for the
+//!    enumerated residue.
 //! 3. Its presence is never read as health. The socket exists because *we*
 //!    created the tunnel, so `Path::exists` would answer "yes" for a tunnel
 //!    whose far-end daemon died an hour ago. [`RemoteTunnel::health`] asks the
@@ -119,6 +127,11 @@ pub enum SshArgumentError {
     UnclosedBracket { field: &'static str },
     #[error("{field} may only use ':' or '%' inside a bracketed IPv6 literal")]
     BareIpv6Separator { field: &'static str },
+    #[error(
+        "{field} has an empty part beside an '@': the UPN spelling is user@realm and both halves \
+         must be present"
+    )]
+    EmptyAtSeparatedPart { field: &'static str },
 }
 
 /// How one argument type is validated. Implemented per newtype so the rules are
@@ -359,6 +372,27 @@ impl SshArgumentRules for SshUser {
     fn byte_allowed(byte: u8) -> bool {
         byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_' | b'@')
     }
+    /// Every `@`-separated part must be non-empty, so `@realm`, `user@` and
+    /// `user@@realm` are refused while the UPN form `user@realm` — the whole
+    /// reason `@` is on the charset — keeps working.
+    ///
+    /// The charset alone accepted a leading `@`, and what that produced is
+    /// worth stating precisely because the audit that found it guessed one step
+    /// wrong. [`RemoteEndpoint::user_host`](crate::daemon_client::RemoteEndpoint::user_host)
+    /// is `{user}@{host}`, so a stored user of `@` yields `@@host` — **not**
+    /// `@host`, which is the value that makes ssh dump its usage. Measured
+    /// against OpenSSH 10.2p1: `ssh -G -- @@host` resolves `user @` and
+    /// `host host`, because OpenSSH splits the destination on its **last** `@`.
+    /// So the real consequence is an authentication attempt as the literal
+    /// login `@`, reported to the user as an auth failure, plus a deck named
+    /// `@@host` in every message [`Self::describe`](crate::daemon_client::RemoteEndpoint::describe)
+    /// builds. Confusing rather than dangerous — and refusable for free.
+    fn check_shape(value: &str) -> Result<(), SshArgumentError> {
+        if value.split('@').any(str::is_empty) {
+            return Err(SshArgumentError::EmptyAtSeparatedPart { field: Self::FIELD });
+        }
+        Ok(())
+    }
 }
 
 impl SshArgumentRules for KeyPath {
@@ -426,8 +460,22 @@ impl KeyPath {
 /// same problem [`crate::login_shell`] exists for, approached from the other
 /// side. Worse than a *short* `PATH` is a *hostile* one: any user-writable
 /// directory earlier in it substitutes a binary that this app would then run
-/// with the user's ssh agent and keys in reach. A fixed list of
-/// root-owned system locations has neither failure mode.
+/// with the user's ssh agent and keys in reach. A fixed list has neither
+/// failure mode.
+///
+/// **What the list guarantees is its ORDER, not that every entry is
+/// root-owned.** An earlier draft of this comment said "a fixed list of
+/// root-owned system locations", and that is false for two entries on the
+/// platforms they exist for: Homebrew chowns `/opt/homebrew` to the installing
+/// user on Apple silicon, and `/usr/local/bin` to the installing user on Intel
+/// macOS. [`is_executable_file`] checks `is_file()` and the execute bits and
+/// **never** the owning uid, so it would accept either. The true claim is the
+/// ordering one: `/usr/bin/ssh` is first, it is root-owned on every platform
+/// this list targets, and on macOS it is always present and SIP-protected — so
+/// resolution never reaches the Homebrew entries there. On Linux `/usr/bin` and
+/// `/bin` both precede `/usr/local/bin`, which is root-owned by distribution
+/// default anyway. If ownership is ever meant to be a *property* rather than a
+/// consequence of the order, it has to be checked in [`is_executable_file`].
 ///
 /// Note what is deliberately absent: `~/.nix-profile/bin`, `~/.local/bin` and
 /// every other per-user prefix. They are the *common* place for a
@@ -578,6 +626,27 @@ pub enum TunnelError {
     )]
     SocketPathHasColon { path: String },
     #[error(
+        "the forwarded socket path {path} contains '%', which ssh expands as a token — both \
+         inside its -L forward specification and inside the ProxyCommand that -J synthesises"
+    )]
+    SocketPathHasPercent { path: String },
+    #[error(
+        "the forwarded socket path {path} is not valid UTF-8, so the bytes that would reach ssh \
+         are not the bytes this directory is named by"
+    )]
+    SocketPathNotUtf8 { path: String },
+    #[error(
+        "the forwarded socket path {path} contains {what}, which ssh would hand to /bin/sh \
+         unquoted inside the ProxyCommand that -J synthesises"
+    )]
+    SocketPathShellUnsafe { path: String, what: String },
+    #[error("could not write the generated ssh config {path} for the tunnel: {source}")]
+    ConfigFile {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error(
         "refusing to use {path} for the forwarded socket: it is a symlink, and replacing it would \
          act on whatever it points at"
     )]
@@ -628,9 +697,9 @@ mod tunnel {
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
-    use super::{MAX_UNIX_SOCKET_PATH_BYTES, SshProgram, TunnelError};
+    use super::{MAX_UNIX_SOCKET_PATH_BYTES, SHELL_METACHARACTERS, SshProgram, TunnelError};
     use crate::daemon_client::{Endpoint, LocalEndpoint, RemoteEndpoint};
-    use crate::remote::{SshError, classify_ssh_error};
+    use crate::remote::SshError;
 
     /// Seconds ssh may spend on DNS, TCP and the ssh handshake before giving
     /// up. Short, because a GUI has a user watching it.
@@ -735,6 +804,11 @@ mod tunnel {
         remote_socket: String,
         socket: PathBuf,
         sidecar: Option<PathBuf>,
+        /// The generated `-F` config. Owned with the same discipline as the
+        /// socket — chosen by us, inside the `0700` directory, removed at
+        /// teardown and swept on the next open — because it is a file this
+        /// module writes and a later `ssh` would read.
+        config: PathBuf,
         child: Child,
         stderr: Arc<Mutex<CappedStderr>>,
         closed: bool,
@@ -789,15 +863,40 @@ mod tunnel {
             ready_timeout: Duration,
         ) -> Result<Self, TunnelError> {
             check_socket_path(&socket)?;
+            let config = config_path_for(&socket);
+            // The config path is the socket path with a different extension, so
+            // the charset half of the check above already covers it — but the
+            // `-F` value reaches a shell through `-J`'s implicit ProxyCommand
+            // and the socket path does not, so the property is asserted here
+            // rather than inferred from the two being siblings.
+            check_tunnel_file_path(&config)?;
             clear_stale_socket(&socket)?;
+            // Written before the spawn and failing closed, because without it
+            // `forced_options` reaches only the direct hop: a tunnel that came
+            // up anyway would be exactly the silent agent-forward this file
+            // exists to prevent.
+            write_private_file(
+                &config,
+                tunnel_config_text(USER_SSH_CONFIG_INCLUDE, SYSTEM_SSH_CONFIG_INCLUDE).as_bytes(),
+            )
+            .map_err(|source| TunnelError::ConfigFile {
+                path: config.to_string_lossy().into_owned(),
+                source,
+            })?;
 
             let deck = endpoint.describe();
             let remote_socket = endpoint.socket().as_str().to_string();
-            let mut command = build_tunnel_command(ssh, endpoint, &socket);
-            let mut child = command.spawn().map_err(|source| TunnelError::Spawn {
-                program: ssh.path().to_string_lossy().into_owned(),
-                source,
-            })?;
+            let mut command = build_tunnel_command(ssh, endpoint, &socket, &config);
+            let mut child = match command.spawn() {
+                Ok(child) => child,
+                Err(source) => {
+                    let _ = std::fs::remove_file(&config);
+                    return Err(TunnelError::Spawn {
+                        program: ssh.path().to_string_lossy().into_owned(),
+                        source,
+                    });
+                }
+            };
 
             let sidecar = write_sidecar(&socket, child.id());
 
@@ -832,6 +931,7 @@ mod tunnel {
                 remote_socket,
                 socket,
                 sidecar,
+                config,
                 child,
                 stderr,
                 closed: false,
@@ -852,17 +952,23 @@ mod tunnel {
                 // health signal — it means the local ssh client bound it. What
                 // is on the far end is the daemon's business and the
                 // handshake's.
-                if std::fs::symlink_metadata(&self.socket).is_ok() {
+                //
+                // `is_socket()` rather than "any inode exists": this was the
+                // one filesystem check in the module without a type guard, and
+                // while `clear_stale_socket` plus the 0700 directory make a
+                // non-socket here near-unreachable, "near-unreachable" is not
+                // the standard every other check in this file is held to.
+                if is_socket(&self.socket) {
                     return Ok(());
                 }
                 match self.child.try_wait() {
                     Ok(Some(status)) => {
                         self.settle_stderr();
-                        let detail = self.stderr_text();
                         return Err(classify_exit(
                             &self.deck,
                             endpoint,
-                            &detail,
+                            &self.stderr_raw_text(),
+                            &self.stderr_text(),
                             status.code(),
                             &self.remote_socket,
                         ));
@@ -968,15 +1074,25 @@ mod tunnel {
             }
         }
 
-        /// ssh's own stderr so far, scrubbed of control and bidi bytes.
+        /// ssh's own stderr so far, exactly as ssh wrote it.
         ///
-        /// Scrubbed at this boundary for the reason
-        /// [`crate::remote::scrub_remote_text`] records: the bytes are written
-        /// by a host we have not yet decided to trust, and this string reaches
-        /// an error message and a log.
-        pub fn stderr_text(&self) -> String {
-            let raw = self
-                .stderr
+        /// **For classification only, and never for rendering.** The matchers
+        /// look for ssh's own fixed phrases, and
+        /// [`crate::remote::classify_ssh_error`]'s contract says so in as many
+        /// words:
+        /// *"Classification matches against the raw stderr while `detail`
+        /// carries the `scrub_remote_text` form."* M5 classified the scrubbed
+        /// text instead, and the consequence runs in the wrong direction —
+        /// stripping only *removes* bytes, so it can only ever **create**
+        /// matches the raw text lacked. A remote's login banner reading
+        /// `Host key verification fai\x01led.` matches nothing raw and matches
+        /// after stripping, and banners precede authentication, so a hostile or
+        /// on-path peer could steer which error category the GUI shows. Every
+        /// steerable category is advisory text, so the cost was misleading
+        /// advice rather than a bypass — but it is exactly the property the
+        /// contract sentence exists to protect.
+        pub fn stderr_raw_text(&self) -> String {
+            self.stderr
                 .lock()
                 .map(|guard| {
                     let mut text = guard.text();
@@ -985,8 +1101,19 @@ mod tunnel {
                     }
                     text
                 })
-                .unwrap_or_default();
-            crate::untrusted_text::strip_control_and_bidi(&raw, true)
+                .unwrap_or_default()
+        }
+
+        /// ssh's own stderr so far, scrubbed of control and bidi bytes.
+        ///
+        /// Scrubbed at this boundary for the reason `remote::scrub_remote_text`
+        /// records (private, so named rather than linked): the bytes are written
+        /// by a host we have not yet decided to trust, and this string reaches
+        /// an error message and a log. This is the value that may be
+        /// **rendered**; [`Self::stderr_raw_text`] is the one that may be
+        /// **matched**.
+        pub fn stderr_text(&self) -> String {
+            crate::untrusted_text::strip_control_and_bidi(&self.stderr_raw_text(), true)
                 .trim()
                 .to_string()
         }
@@ -1026,8 +1153,11 @@ mod tunnel {
             // entirely if anything other than a socket is there.
             remove_if_socket(&self.socket);
             if let Some(sidecar) = &self.sidecar {
-                let _ = std::fs::remove_file(sidecar);
+                remove_if_regular_file(sidecar);
             }
+            // Same discipline as the sidecar: our own name, our own directory,
+            // and only when it is still a regular file.
+            remove_if_regular_file(&self.config);
         }
     }
 
@@ -1075,6 +1205,24 @@ mod tunnel {
                 Self::Remote(tunnel) => tunnel.connect_address(),
             }
         }
+
+        /// What a `stat` of [`Self::connect_address`] is allowed to mean
+        /// (PRD #741 M3).
+        ///
+        /// Carried through the transport rather than re-derived from the path,
+        /// because under DECISION 1A a remote deck's connect address **is** a
+        /// socket on this filesystem and nothing about the path distinguishes
+        /// the two cases. This is what
+        /// [`crate::daemon_client::DaemonClient::for_connection`] reads, and
+        /// together they are the reason a caller holding a tunnel never has to
+        /// reach for `DaemonClient::new` — which would stamp the tunnel's
+        /// socket `LocalInode` and put `exists()`-as-health back.
+        pub fn presence(&self) -> crate::platform::ipc::EndpointPresence {
+            match self {
+                Self::Local(_) => crate::platform::ipc::LOCAL_ENDPOINT_PRESENCE,
+                Self::Remote(_) => crate::platform::ipc::EndpointPresence::Elsewhere,
+            }
+        }
     }
 
     /// Build the `ssh -N -L` command.
@@ -1082,9 +1230,10 @@ mod tunnel {
         ssh: &SshProgram,
         endpoint: &RemoteEndpoint,
         local_socket: &Path,
+        config: &Path,
     ) -> Command {
         let mut cmd = Command::new(ssh.path());
-        for arg in tunnel_args(endpoint, local_socket) {
+        for arg in tunnel_args(endpoint, local_socket, config) {
             cmd.arg(arg);
         }
         // stdin is closed rather than inherited: `BatchMode=yes` already stops
@@ -1116,11 +1265,27 @@ mod tunnel {
     /// property that is not free: every `-o` comes before `--`, and `--`
     /// immediately precedes the destination, so no value a user stored can be
     /// read as an option however it begins.
-    pub fn tunnel_args(endpoint: &RemoteEndpoint, local_socket: &Path) -> Vec<String> {
+    ///
+    /// `-F config` names the generated file [`tunnel_config_text`] builds, and
+    /// it is **not** an alternative to the `-o` flags — both are here. See
+    /// [`forced_options`] for which channel each option is actually enforced
+    /// by; the short version is that `-o` covers the direct hop and `-F` is the
+    /// only thing that reaches the hop `-J` spawns.
+    pub fn tunnel_args(
+        endpoint: &RemoteEndpoint,
+        local_socket: &Path,
+        config: &Path,
+    ) -> Vec<String> {
         let mut args: Vec<String> = Vec::new();
         // No remote command and no session: this child exists to carry a
         // forward and nothing else.
         args.push("-N".to_string());
+
+        // Before the `-o` flags so a reader sees the precedence in the order it
+        // is applied: ssh processes `-o` first, then this file, then (for a
+        // first-value-wins option) keeps the first it saw.
+        args.push("-F".to_string());
+        args.push(config.to_string_lossy().into_owned());
 
         for option in forced_options() {
             args.push("-o".to_string());
@@ -1148,27 +1313,119 @@ mod tunnel {
         args
     }
 
-    /// The `-o` options forced on every tunnel.
+    /// The options forced on every tunnel, in the `Key=Value` spelling both
+    /// `-o` and an ssh config file accept.
     ///
     /// This is [`crate::remote`]'s `apply_observation_options` **minus
     /// `ClearAllForwardings`** — a forward is the entire point here — plus the
-    /// four a long-lived forward needs. Each of the ten inherited ones keeps the
-    /// reason written at that function; the sharp one is `ForwardAgent=no`,
-    /// because a `Host *` block carrying `ForwardAgent yes` would otherwise
-    /// expose the laptop's ssh-agent to the endpoint for the life of the tunnel,
-    /// and a GUI cannot show the user what their own ssh config delegated on
-    /// their behalf.
+    /// ones a long-lived forward needs. `apply_observation_options` has ten, so
+    /// **nine** are inherited; **eight** are added here
+    /// (`BatchMode`, `ExitOnForwardFailure`, `StreamLocalBindUnlink`,
+    /// `StrictHostKeyChecking`, `ConnectTimeout`, `ServerAliveInterval`,
+    /// `ServerAliveCountMax`, and `StreamLocalBindMask` via
+    /// [`forced_last_wins_options`]); 9 + 8 = 17, which is what this function
+    /// and its sibling emit between them. (An earlier version of this comment
+    /// said "ten inherited … plus four", which was wrong twice over.)
     ///
-    /// What is **not** here, and must never be:
+    /// Each inherited one keeps the reason written at that function; the sharp
+    /// one is `ForwardAgent=no`, because a `Host *` block carrying
+    /// `ForwardAgent yes` would otherwise expose the laptop's ssh-agent to the
+    /// endpoint for the life of the tunnel, and a GUI cannot show the user what
+    /// their own ssh config delegated on their behalf.
     ///
-    /// - `StrictHostKeyChecking` in any form. Setting it to `no` or
-    ///   `accept-new` would convert a first-contact decision into silent
-    ///   trust-on-first-use taken by an app that cannot show the user a
-    ///   fingerprint. A host key we have not seen must fail, and
-    ///   [`crate::remote::SshError::HostKeyVerificationFailed`] already carries
-    ///   the remedy (run `ssh <target>` once in a terminal).
-    /// - `UserKnownHostsFile`. Pointing it anywhere is the same decision wearing
-    ///   a different name.
+    /// # Why there are two channels, and why neither alone is enough
+    ///
+    /// `-o` reaches the `ssh` process we spawn and nothing else. When
+    /// `endpoint.jump()` is set, OpenSSH implements `ProxyJump` by synthesising
+    /// an implicit `ProxyCommand` that runs a **fresh `ssh`** carrying only
+    /// `-l`, `-p`, `-J`, `-F` and `-v` — not one `-o` survives. Measured on
+    /// OpenSSH 10.2p1, with `Host * / ForwardAgent yes` in the user's config
+    /// and every option below on the command line, the *jump* hop resolved
+    /// `forwardagent yes`, `batchmode no` and `stricthostkeychecking false`. So
+    /// the user's ssh-agent was forwarded to the bastion for the whole life of
+    /// the tunnel, with the GUI showing nothing — which is precisely the
+    /// condition `ForwardAgent=no` exists to prevent.
+    ///
+    /// `-F` **is** propagated into that implicit `ProxyCommand`, so a generated
+    /// config is the one channel that reaches both hops. [`tunnel_config_text`]
+    /// builds it: a leading `Host *` block carrying these options, then
+    /// `Include`s of the user's and the system's own config, then a trailing
+    /// `Host *` block carrying [`forced_last_wins_options`]. Re-measured with
+    /// that file in place: the jump hop resolves `forwardagent no`,
+    /// `batchmode yes`, `stricthostkeychecking true`, `updatehostkeys false`
+    /// and `streamlocalbindmask 0177`.
+    ///
+    /// The `-o` flags stay because they are what holds if the file is ever
+    /// read differently than we expect, and because they cost nothing: the
+    /// values are identical, so first-value-wins makes the duplication inert.
+    ///
+    /// # Why `StrictHostKeyChecking=yes` is here, when the doctor refuses it
+    ///
+    /// `apply_observation_options` deliberately does not set it, and the reason
+    /// given there does not transfer: a diagnostic is exactly what you reach
+    /// for on a host you have not connected to yet, so failing it closed makes
+    /// the command useless when it is most wanted. A **tunnel** to a host whose
+    /// key is not yet trusted is the opposite — it is a long-lived data channel
+    /// the GUI presents as trusted, carrying agent names, cwd paths, prompts
+    /// and hook payloads. Under a user config `StrictHostKeyChecking no` there
+    /// was no host-key check at all, and an on-path attacker who answered
+    /// instead of the real host got a healthy-looking remote deck; nothing in
+    /// the app could notice, by construction, because the local inode trust
+    /// check is correctly not run against a forwarded socket.
+    ///
+    /// What forcing `yes` actually costs, enumerated rather than asserted:
+    ///
+    /// - against the default `ask`: **nothing**. `BatchMode=yes` is also forced
+    ///   and disables host-key confirmation, so `ask` already fails on an
+    ///   unknown key.
+    /// - against `yes`: nothing.
+    /// - against `accept-new`: an unknown key now fails instead of being
+    ///   silently persisted. The user accepts it by running the command
+    ///   [`crate::remote::SshError::HostKeyVerificationFailed`] names, which
+    ///   their own `accept-new` then makes a one-step operation.
+    /// - against `no`/`off`: the tunnel now refuses a host it cannot verify.
+    ///   That is the whole point.
+    ///
+    /// What is **not** here, and the residue it leaves:
+    ///
+    /// - `UserKnownHostsFile`. Pointing it anywhere decides *which* keys count
+    ///   as trusted on the user's behalf, which is not a decision an app that
+    ///   cannot show a fingerprint should take. So we force that the check
+    ///   happens; the user's `known_hosts` decides what it passes.
+    /// - `ClearAllForwardings`. It clears command-line forwards too, so it
+    ///   would clear our own `-L`, and OpenSSH has no per-direction
+    ///   alternative. **Residual (audit A3):** on the direct hop the user's
+    ///   `RemoteForward`, `DynamicForward` and `LocalForward` are inherited for
+    ///   the whole life of the tunnel. Measured with
+    ///   `Host * { RemoteForward 9999 localhost:22; DynamicForward 1080 }`:
+    ///   both resolve. `remote doctor` refuses to create such a forward at all
+    ///   and calls it a criterion violation
+    ///   ([`crate::remote::apply_observation_options`]'s docs); the tunnel makes
+    ///   the same exposure for orders of magnitude longer and says nothing.
+    ///   `ExitOnForwardFailure=yes` sharpens it in a second, non-obvious way: a
+    ///   config `RemoteForward` that fails to bind now kills the tunnel,
+    ///   because that option applies to **every** requested forward, not only
+    ///   ours. The *jump* hop is exempt and that is measured rather than
+    ///   assumed — `-J` invokes it with `-W`, which sets
+    ///   `clearallforwardings yes`, so the user's forwards reach the direct hop
+    ///   only. PRD #741 M10's `Test connection` is where this becomes visible:
+    ///   `crate::remote_doctor` already parses `ssh -G`'s
+    ///   `localforward`/`remoteforward`/`dynamicforward` lines, so it can show
+    ///   the resolved forwards without new parsing.
+    /// - Anything that would stop the user's config running code. **Residual:**
+    ///   `ProxyCommand`, `Match exec` (which runs at config-parse time on
+    ///   *every* invocation, and is not closed by `PermitLocalCommand=no` —
+    ///   measured), `KnownHostsCommand`, and `PKCS11Provider` /
+    ///   `SecurityKeyProvider` `dlopen`s. None is closable without breaking
+    ///   `ProxyJump`, which DECISION 1A exists to inherit. A config `Hostname`
+    ///   inside a `Host` block likewise silently retargets the connection, so
+    ///   `describe()` can name a different host than ssh reaches.
+    /// - On macOS, nothing here bounds an orphan `ssh` after a force-quit:
+    ///   `process_cmdline_mentions` is Linux-only, so
+    ///   [`reap_orphaned_tunnels`] unlinks the socket and leaves the process
+    ///   running (audit B5). It holds an authenticated session until its
+    ///   keepalives notice a dead link, or indefinitely if the far end stays
+    ///   up. `proc_pidpath` / `sysctl KERN_PROCARGS2` would close it.
     fn forced_options() -> Vec<String> {
         let mut options: Vec<String> = [
             // A GUI has no tty. Without BatchMode ssh tries to read the
@@ -1181,6 +1438,12 @@ mod tunnel {
             // forward, leaving a live child and no socket — a healthy-looking
             // tunnel that carries nothing.
             "ExitOnForwardFailure=yes",
+            // The one control that decides whether the far end is the host the
+            // user asked for. See this function's docs for why the doctor's
+            // reason for omitting it does not transfer to a long-lived tunnel,
+            // and for what forcing `yes` costs against each of the four values
+            // a user config can hold.
+            "StrictHostKeyChecking=yes",
             // StreamLocalBindUnlink defaults to `no`, which means a second
             // tunnel against an existing socket file fails to forward at all
             // rather than replacing it. We also clear the path ourselves before
@@ -1220,6 +1483,163 @@ mod tunnel {
         options
     }
 
+    /// The forced options OpenSSH resolves **last**-value-wins, which therefore
+    /// have to be emitted *after* the `Include`s rather than before them.
+    ///
+    /// # This is not a style choice and getting it wrong is silent
+    ///
+    /// Almost every ssh option is first-value-wins: `readconf.c` assigns only
+    /// when the field is still at its sentinel, which is why a leading `Host *`
+    /// block beats whatever the user's config says later, and why `-o` (parsed
+    /// before any config file) beats both. `StreamLocalBindMask` is parsed with
+    /// an **unconditional** assignment, so for it the *last* value wins and the
+    /// usual reasoning inverts. Measured on OpenSSH 10.2p1, all three cases:
+    ///
+    /// ```text
+    /// ours first in the file, theirs second   -> streamlocalbindmask 00     (theirs)
+    /// theirs first in the file, ours second   -> streamlocalbindmask 0177   (ours)
+    /// -o StreamLocalBindMask=0022, theirs in the config -> 00              (theirs)
+    /// ```
+    ///
+    /// So the audit's suggested fix for this finding — "add
+    /// `StreamLocalBindMask=0177` to `forced_options()`" — does **not** hold:
+    /// on the command line, and in the leading block, the user's config still
+    /// wins. A trailing `Host *` block after the `Include`s is the only channel
+    /// that forces it, which is why this list exists separately instead of
+    /// being folded into [`forced_options`].
+    ///
+    /// # Why it matters
+    ///
+    /// OpenSSH's default is `0177`, giving a `0600` forwarded socket — but it
+    /// is a config option, and where we were silent a user config
+    /// `StreamLocalBindMask 0000` made the socket world-readable and
+    /// world-writable. Nothing in this module checks the mode: the local trust
+    /// check is deliberately not run against a forwarded socket, and
+    /// `await_forward` treats any socket inode as readiness. So the only thing
+    /// keeping a foreign uid off the channel to the remote daemon was the
+    /// `0700` directory [`tunnel_socket_dir_in`] creates — which does hold
+    /// (`ensure_owner_only_dir` fails closed on a foreign-owned squatter), but
+    /// held alone. This restores the second leg.
+    ///
+    /// Kept in the file only, not also on the command line, precisely because
+    /// `-o` is the weaker channel for it and a duplicate there would read as
+    /// though it were doing something.
+    fn forced_last_wins_options() -> Vec<String> {
+        vec!["StreamLocalBindMask=0177".to_string()]
+    }
+
+    /// The default `-F` path, i.e. the user's own ssh config.
+    ///
+    /// The literal `~/.ssh/config` rather than a resolved path: OpenSSH
+    /// tilde-expands an `Include` against `getpwuid()->pw_dir`, which is
+    /// exactly what it uses to find this file when no `-F` is given, so the
+    /// literal form reproduces the default byte for byte and needs no `HOME`
+    /// lookup of our own.
+    pub const USER_SSH_CONFIG_INCLUDE: &str = "~/.ssh/config";
+
+    /// The system-wide ssh config, which `-F` otherwise suppresses entirely.
+    pub const SYSTEM_SSH_CONFIG_INCLUDE: &str = "/etc/ssh/ssh_config";
+
+    /// The generated ssh config passed as `-F`, as text.
+    ///
+    /// Pure so the whole layout can be asserted as data, and parameterised on
+    /// the two include paths so a test can point them at a `tempfile::tempdir()`
+    /// instead of at the developer's real `~/.ssh/config`.
+    ///
+    /// # The layout, and what each part is load-bearing for
+    ///
+    /// ```text
+    /// Host *
+    ///     <forced_options()>                  first-value-wins: must precede the Includes
+    /// Include ~/.ssh/config                   DECISION 1A: the user's config still decides
+    /// Include /etc/ssh/ssh_config             -F suppresses this file, so put it back
+    /// Host *
+    ///     <forced_last_wins_options()>        last-value-wins: must follow the Includes
+    /// ```
+    ///
+    /// Six facts this rests on, each measured on OpenSSH 10.2p1 rather than
+    /// reasoned from the manual:
+    ///
+    /// 1. **`-F` is propagated into the implicit `ProxyCommand`** that `-J`
+    ///    synthesises (`Setting implicit ProxyCommand from ProxyJump: ssh -F
+    ///    <path> -vvv -W '[%h]:%p' bastion`), so this file — and nothing else
+    ///    we can pass — reaches the jump hop.
+    /// 2. **`Include` of a missing file is not an error.** A user with no
+    ///    `~/.ssh/config` resolves cleanly, exit 0. Verified for both the
+    ///    absolute and the tilde spelling.
+    /// 3. **A second `Host *` block after the `Include`s still applies**, and
+    ///    still applies when the included file ends inside a `Match` block.
+    /// 4. **`-F` suppresses `/etc/ssh/ssh_config`** (ssh(1) says so), so
+    ///    without the second `Include` a site config would silently stop being
+    ///    read the moment this file existed. Including it *after* the user's
+    ///    preserves ssh's normal precedence, user over system.
+    /// 5. **A *relative* `Include` inside the user's own config still resolves
+    ///    against `~/.ssh`** even though their file is now reached through
+    ///    ours. Measured with a `~/.ssh/config` whose only line was
+    ///    `Include d/probe.conf`: the nested file was found and its `Port 2299`
+    ///    resolved. The common `Include conf.d/*` pattern therefore survives
+    ///    being nested one level deeper.
+    /// 6. **A `ProxyJump` the *user's* config supplies gets `-F` propagated
+    ///    too** — the interpolation is conditional on `-F` being on the command
+    ///    line, not on `-J` being there. Measured with `Host * / ProxyJump
+    ///    bastion` in the included file and no `-J` of our own: the implicit
+    ///    `ProxyCommand` still carried `-F <path>`. **This is why `-F` is passed
+    ///    unconditionally rather than only when `endpoint.jump()` is set.** The
+    ///    audit named that case separately — "`ProxyJump` in a `Host *` block
+    ///    adds a jump hop with A1's whole problem even when the app passes no
+    ///    `-J`" — and a jump-only `-F` would have left it open.
+    ///
+    /// # The path this file lives at is itself an ssh input
+    ///
+    /// `-F`'s value is interpolated **unquoted** into the `ProxyCommand` string
+    /// OpenSSH hands to `/bin/sh`, and that string is percent-expanded first.
+    /// Measured: a `%` in the path fails the connection with
+    /// `vdollar_percent_expand: unknown key %d` / `percent_expand: failed`,
+    /// which no classifier here names; a space makes the jump hop read
+    /// `-F <first-word>` and treat the rest as a destination. That is why
+    /// [`check_socket_path`] refuses `%`, whitespace and the shell
+    /// metacharacters — the config path is the socket path with a different
+    /// extension, so one check covers both.
+    ///
+    /// The metacharacter half is the one to be careful how you state. With an
+    /// existing config file named `a;touch marker;b.conf`, OpenSSH 10.2 **did**
+    /// build the injection — `Setting implicit ProxyCommand from ProxyJump: ssh
+    /// -F a;touch marker;b.conf -vvv -W '[%h]:%p' bastion` — and then the run
+    /// ended without creating the marker, for a reason this investigation did
+    /// not isolate. So the honest claim is that the *string reaches* the
+    /// `ProxyCommand`, not that 10.2 executes it or that 10.2 refuses it. Since
+    /// the app runs against whatever OpenSSH the user has — this module's
+    /// standing premise — refusing the byte here is the defence either way.
+    pub fn tunnel_config_text(user_include: &str, system_include: &str) -> String {
+        let mut text = String::new();
+        text.push_str(
+            "# Generated by dot-agent-deck for one ssh tunnel (PRD #741 M5). Do not edit:\n\
+             # it is rewritten per connection and deleted when the tunnel closes.\n\
+             #\n\
+             # The ORDER is load-bearing in both directions. See forced_options() and\n\
+             # forced_last_wins_options() in src/remote_tunnel.rs before moving a line.\n",
+        );
+        text.push_str("Host *\n");
+        for option in forced_options() {
+            text.push_str("    ");
+            text.push_str(&option);
+            text.push('\n');
+        }
+        text.push_str("Include ");
+        text.push_str(user_include);
+        text.push('\n');
+        text.push_str("Include ");
+        text.push_str(system_include);
+        text.push('\n');
+        text.push_str("Host *\n");
+        for option in forced_last_wins_options() {
+            text.push_str("    ");
+            text.push_str(&option);
+            text.push('\n');
+        }
+        text
+    }
+
     /// Turn a dead tunnel's exit into the error that says what to do about it.
     ///
     /// Reuses both existing classifiers rather than inventing a third:
@@ -1229,25 +1649,46 @@ mod tunnel {
     /// broken is the misclassification issue #344 already fixed once; then
     /// [`classify_ssh_error`], which already distinguishes host-key failure and
     /// already carries its remedy.
+    ///
+    /// **Two stderr strings, and which one each argument is for is the whole
+    /// point of the signature.** `raw` is matched; `scrubbed` is rendered. See
+    /// [`RemoteTunnel::stderr_raw_text`] for what collapsing them cost.
+    ///
+    /// The host-key remedy is built from the **endpoint**, not from
+    /// [`crate::remote::SshTarget`], and that is audit finding A5.
+    /// `SshTarget::user_host()` is `[user@]host` — the port is dropped and the
+    /// jump host was never in that type — so a tunnel to `deploy@build-box` on
+    /// port 2222 through `-J bastion` told the user to run `ssh
+    /// deploy@build-box`, which goes to port 22 with no bastion. Either it
+    /// fails (dead-end advice) or it succeeds against something unrelated and
+    /// the user accepts a host key for `[build-box]:22` — which, because
+    /// `known_hosts` keys non-default ports as `[host]:port`, does not satisfy
+    /// the tunnel. The app would have induced the user to trust a host key for
+    /// a host it never asked them to evaluate.
     fn classify_exit(
         deck: &str,
         endpoint: &RemoteEndpoint,
-        detail: &str,
+        raw: &str,
+        scrubbed: &str,
         code: Option<i32>,
         remote: &str,
     ) -> TunnelError {
-        if crate::connect::is_forward_failure_detail(detail) {
+        if crate::connect::is_forward_failure_detail(raw) {
             return TunnelError::ForwardFailed {
                 deck: deck.to_string(),
-                detail: detail.to_string(),
+                detail: scrubbed.to_string(),
             };
         }
         // Exit 255 is ssh's own "transport or auth failed". Any other code is
         // ssh exiting for a reason its stderr explains, and `classify_ssh_error`
         // folds anything it cannot name into `Other` with that stderr attached.
         let target = endpoint.ssh_target();
-        let source = classify_ssh_error(&target, detail);
-        if code == Some(255) || !detail.is_empty() {
+        let source = crate::remote::classify_ssh_error_with_remedy(
+            &target,
+            raw,
+            &endpoint.host_key_remedy(),
+        );
+        if code == Some(255) || !raw.is_empty() {
             return TunnelError::Ssh {
                 deck: deck.to_string(),
                 source,
@@ -1333,41 +1774,154 @@ mod tunnel {
         Ok(dir)
     }
 
-    /// A socket file name no other open will ever produce.
+    /// Per-open counter behind the nonce in [`socket_file_name`].
+    ///
+    /// Seeded once from the wall clock and then **incremented**, which is the
+    /// difference that makes the uniqueness claim true rather than likely. The
+    /// original spelling read `SystemTime::now().subsec_nanos()` afresh per
+    /// call and the comment said it "makes the name unique within one process
+    /// so two concurrent tunnels never collide" — but two `open()` calls
+    /// landing on the same clock tick, or either side of a backwards clock
+    /// step, produce the same name, and the consequence is not cosmetic:
+    /// `clear_stale_socket` finds a *socket* at that path, which is exactly the
+    /// case it is written to remove, so it unlinks it and the second ssh binds
+    /// there while the first tunnel's client still holds a path that no longer
+    /// names its listener.
+    ///
+    /// What the counter guarantees, stated at the width it actually holds:
+    /// **unique within one process**, by construction. Across processes the pid
+    /// carries the distinction, and where a pid has been recycled the clock
+    /// seed makes a collision unlikely rather than impossible — which is a
+    /// residual the sweep's own pid handling already owns (a recycled pid reads
+    /// as live and pins its leftover), not one this counter claims to close.
+    static SOCKET_NONCE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+    fn next_socket_nonce() -> u32 {
+        use std::sync::atomic::Ordering;
+        // 0 is the "not seeded yet" marker; a seed that lands on 0 simply gets
+        // seeded again on the next call, which costs nothing.
+        if SOCKET_NONCE.load(Ordering::Relaxed) == 0 {
+            let seed = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_nanos())
+                .unwrap_or(1);
+            // `fetch_max` rather than `store`: two threads racing here must not
+            // be able to hand the later one a *lower* starting point than a
+            // name already minted.
+            SOCKET_NONCE.fetch_max(seed, Ordering::Relaxed);
+        }
+        SOCKET_NONCE.fetch_add(1, Ordering::Relaxed).wrapping_add(1)
+    }
+
+    /// A socket file name no other open in this process will produce.
     ///
     /// Two parts, each doing a different job: the **pid** is what
     /// [`reap_orphaned_tunnels`] reads to decide whether the owning app is
-    /// still alive, and the **nonce** is what makes the name unique within one
-    /// process so two concurrent tunnels never collide. Short because the whole
-    /// path has to fit in `sun_path`.
-    fn socket_file_name() -> String {
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.subsec_nanos())
-            .unwrap_or(0);
+    /// still alive, and the **nonce** — a monotonic counter, see
+    /// [`next_socket_nonce`] — is what makes the name unique within one process
+    /// so two concurrent tunnels cannot collide. Short because the whole path
+    /// has to fit in `sun_path`.
+    ///
+    /// `pub` for the same reason [`owner_pid_from_socket_name`] is: the
+    /// uniqueness property is worth asserting directly, and the alternative —
+    /// driving [`RemoteTunnel::open`] twice — makes the assertion depend on the
+    /// developer's real `$XDG_RUNTIME_DIR` fitting in `sun_path`.
+    pub fn socket_file_name() -> String {
         format!(
             "{TUNNEL_FILE_PREFIX}{}-{:08x}.sock",
             std::process::id(),
-            nonce
+            next_socket_nonce()
         )
+    }
+
+    /// The generated `-F` config beside `socket`.
+    ///
+    /// Derived rather than chosen so it inherits the socket's whole
+    /// provenance — the `0700` directory, the pid the sweep reads, the nonce —
+    /// and so [`check_socket_path`]'s charset rules cover it.
+    fn config_path_for(socket: &Path) -> PathBuf {
+        socket.with_extension("conf")
     }
 
     /// Refuse a socket path the OS or ssh could not use.
     pub fn check_socket_path(socket: &Path) -> Result<(), TunnelError> {
-        let text = socket.to_string_lossy();
-        if text.len() > MAX_UNIX_SOCKET_PATH_BYTES {
+        // Length first, and on the *bytes*, because that is what `sun_path`
+        // holds. Checked before the charset scan so a pathological value costs
+        // a comparison rather than a walk.
+        let byte_len = socket.as_os_str().as_encoded_bytes().len();
+        if byte_len > MAX_UNIX_SOCKET_PATH_BYTES {
             return Err(TunnelError::SocketPathTooLong {
-                actual: text.len(),
+                actual: byte_len,
                 max: MAX_UNIX_SOCKET_PATH_BYTES,
-                path: text.into_owned(),
+                path: socket.to_string_lossy().into_owned(),
             });
         }
-        // ssh splits `-L` on ':'. A colon anywhere in the local path silently
-        // re-interprets the forward specification rather than failing.
+        check_tunnel_file_path(socket)
+    }
+
+    /// The charset and shape rules every path this module hands to `ssh` must
+    /// satisfy, applied to the forwarded socket and to the generated config.
+    ///
+    /// All four refusals are about what `ssh` does to the *text* of a path, and
+    /// each was measured on OpenSSH 10.2p1 rather than reasoned from the
+    /// manual. None of these paths comes from a user's settings: they are built
+    /// from `$XDG_RUNTIME_DIR` or `std::env::temp_dir()`, i.e. from the
+    /// environment a GUI inherited — which is precisely why they are checked
+    /// rather than trusted.
+    ///
+    /// - **Not UTF-8.** Both the `-L` value and the `-F` value are built by
+    ///   lossy conversion, so a non-UTF-8 byte anywhere in the directory makes
+    ///   ssh bind a path that is not `self.socket`. What follows is a full
+    ///   `ForwardTimeout` blaming the remote for a socket that appeared
+    ///   somewhere else.
+    /// - **`:`** — ssh splits `-L` on it, so a colon silently re-interprets the
+    ///   forward specification rather than failing.
+    /// - **`%`** — ssh percent-expands both. `-L '/tmp/tun-%d-x.sock:…'`
+    ///   resolved to `/tmp/tun-/home/vfarcic-x.sock`, a path nothing polls; an
+    ///   unknown token instead kills ssh with `vdollar_percent_expand: unknown
+    ///   key %z` / `percent_expand: failed`, which no classifier here names.
+    ///   The `-F` path is expanded too, inside the `ProxyCommand` that `-J`
+    ///   synthesises. Note the length check above runs *pre*-expansion, so a
+    ///   `%d` could also push the real path past `sun_path`.
+    /// - **Whitespace and the shell metacharacters.** `-F`'s value is
+    ///   interpolated **unquoted** into that `ProxyCommand` string, which
+    ///   OpenSSH hands to `/bin/sh -c`. Measured with a config path containing
+    ///   a space: `Executing proxy command: exec ssh -F gen x.conf -vvv -W …`,
+    ///   and the jump hop then died on `Can't open user config file gen`. A
+    ///   metacharacter is the same shape with a worse ending;
+    ///   [`SHELL_METACHARACTERS`] is reused so there is one list.
+    fn check_tunnel_file_path(path: &Path) -> Result<(), TunnelError> {
+        let Some(text) = path.to_str() else {
+            return Err(TunnelError::SocketPathNotUtf8 {
+                path: path.to_string_lossy().into_owned(),
+            });
+        };
         if text.contains(':') {
             return Err(TunnelError::SocketPathHasColon {
-                path: text.into_owned(),
+                path: text.to_string(),
             });
+        }
+        if text.contains('%') {
+            return Err(TunnelError::SocketPathHasPercent {
+                path: text.to_string(),
+            });
+        }
+        for byte in text.bytes() {
+            let what = if byte.is_ascii_whitespace() {
+                Some(format!("ASCII whitespace (0x{byte:02x})"))
+            } else if SHELL_METACHARACTERS.contains(&byte) {
+                Some(format!("the shell metacharacter '{}'", byte as char))
+            } else if byte.is_ascii_control() || byte == 0x7f {
+                Some(format!("a control byte (0x{byte:02x})"))
+            } else {
+                None
+            };
+            if let Some(what) = what {
+                return Err(TunnelError::SocketPathShellUnsafe {
+                    path: text.to_string(),
+                    what,
+                });
+            }
         }
         Ok(())
     }
@@ -1411,22 +1965,75 @@ mod tunnel {
         })
     }
 
+    /// Whether `path` is a socket right now, without following a symlink.
+    fn is_socket(path: &Path) -> bool {
+        use std::os::unix::fs::FileTypeExt;
+        std::fs::symlink_metadata(path)
+            .map(|metadata| metadata.file_type().is_socket())
+            .unwrap_or(false)
+    }
+
     /// Remove `path` only if it is still a socket. Used at teardown, where a
     /// failure is not worth reporting but following a symlink would be.
     fn remove_if_socket(path: &Path) {
-        use std::os::unix::fs::FileTypeExt;
-        if let Ok(metadata) = std::fs::symlink_metadata(path)
-            && metadata.file_type().is_socket()
+        if is_socket(path) {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    /// Remove `path` only if it is still a regular file. The sidecar's and the
+    /// generated config's counterpart to [`remove_if_socket`], and here for the
+    /// same reason: both are paths *this* object chose inside a directory this
+    /// module created `0700`, and neither deletion should follow a symlink that
+    /// appeared at one of them.
+    fn remove_if_regular_file(path: &Path) {
+        if std::fs::symlink_metadata(path)
+            .map(|metadata| metadata.file_type().is_file())
+            .unwrap_or(false)
         {
             let _ = std::fs::remove_file(path);
         }
+    }
+
+    /// Create `path` with mode `0600` and write `contents`, refusing to follow
+    /// a symlink at the target.
+    ///
+    /// `create_new(true)` is `O_EXCL`, so an existing inode — symlink
+    /// included — makes the create fail rather than write through it. A
+    /// leftover *regular* file is cleared and retried once, because the only
+    /// way one can be there is a pid this process has been given after an
+    /// earlier run died holding it, and refusing forever would pin the tunnel
+    /// on a stale name. Anything else at the path is left alone and reported.
+    ///
+    /// `mode(0o600)` rather than the ambient umask closes the inconsistency the
+    /// audit noted in `write_sidecar` (B7.5): every other filesystem operation
+    /// in this module states its mode or its type, and `std::fs::write` stated
+    /// neither.
+    fn write_private_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+        use std::io::Write;
+        let open = |path: &Path| -> std::io::Result<std::fs::File> {
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            crate::platform::fsperm::set_create_mode_owner_only(&mut options);
+            options.open(path)
+        };
+        let mut file = match open(path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                remove_if_regular_file(path);
+                open(path)?
+            }
+            Err(error) => return Err(error),
+        };
+        file.write_all(contents)?;
+        file.flush()
     }
 
     /// Record the `ssh` child's pid beside its socket so a later run can
     /// terminate an orphan rather than only unlinking its socket.
     fn write_sidecar(socket: &Path, ssh_pid: u32) -> Option<PathBuf> {
         let sidecar = socket.with_extension("ssh");
-        match std::fs::write(&sidecar, ssh_pid.to_string()) {
+        match write_private_file(&sidecar, ssh_pid.to_string().as_bytes()) {
             Ok(()) => Some(sidecar),
             Err(error) => {
                 // Not fatal: without it an orphan's socket is still unlinked
@@ -1477,9 +2084,10 @@ mod tunnel {
     ///      non-Linux host — the process is left running and only the socket is
     ///      unlinked, which is the conservative direction: a stray tunnel costs
     ///      a connection, and killing the wrong process costs something else.
-    ///    - Only the two names this module writes are touched, and only when
-    ///      they are a socket and a regular file respectively. A symlink is
-    ///      never followed.
+    ///    - Only the three names this module writes are touched — the socket,
+    ///      the `.ssh` pid sidecar and the `.conf` generated ssh config — and
+    ///      only when each is a socket, a regular file and a regular file
+    ///      respectively. A symlink is never followed.
     pub fn reap_orphaned_tunnels(dir: &Path) -> usize {
         let Ok(entries) = std::fs::read_dir(dir) else {
             return 0;
@@ -1505,7 +2113,8 @@ mod tunnel {
                 signal_group(ssh_pid, libc::SIGKILL);
             }
             remove_if_socket(&path);
-            let _ = std::fs::remove_file(&sidecar);
+            remove_if_regular_file(&sidecar);
+            remove_if_regular_file(&config_path_for(&path));
             reaped += 1;
         }
         reaped
@@ -1566,8 +2175,9 @@ mod tunnel {
 
 #[cfg(unix)]
 pub use tunnel::{
-    EndpointConnection, RemoteTunnel, TunnelHealth, build_tunnel_command, check_socket_path,
-    owner_pid_from_socket_name, reap_orphaned_tunnels, tunnel_args, tunnel_socket_dir,
+    EndpointConnection, RemoteTunnel, SYSTEM_SSH_CONFIG_INCLUDE, TunnelHealth,
+    USER_SSH_CONFIG_INCLUDE, build_tunnel_command, check_socket_path, owner_pid_from_socket_name,
+    reap_orphaned_tunnels, socket_file_name, tunnel_args, tunnel_config_text, tunnel_socket_dir,
     tunnel_socket_dir_in,
 };
 
@@ -1734,6 +2344,81 @@ mod tests {
         assert_eq!(
             variant_name(&SshUser::parse(&"u".repeat(65)).expect_err("bounded")),
             "TooLong"
+        );
+    }
+
+    /// Every `@`-separated part of a login must be non-empty (M5 audit B7.2).
+    ///
+    /// The charset admits `@` for the UPN case, which meant it also admitted
+    /// `@realm`, `user@` and `user@@realm`. What that produced is worth pinning
+    /// because it is not what the audit predicted: `user_host()` is
+    /// `{user}@{host}`, so a stored user of `@` yields `@@host` — and OpenSSH
+    /// splits a destination on its **last** `@`, so (measured against 10.2p1)
+    /// `ssh -G -- @@host` resolves `user @` and `host host` rather than dumping
+    /// its usage. So the cost was an authentication attempt as the literal
+    /// login `@` and a deck named `@@host` in every message, which is confusing
+    /// rather than dangerous — and refusable for free.
+    #[test]
+    fn an_ssh_user_refuses_an_empty_part_beside_an_at_sign() {
+        for accepted in ["deploy", "viktor@corp.example", "a@b@c"] {
+            assert!(
+                SshUser::parse(accepted).is_ok(),
+                "{accepted:?} must keep working: an interior @ is the UPN case"
+            );
+        }
+        for refused in ["@", "@realm", "user@", "user@@realm", "@@"] {
+            assert_eq!(
+                variant_name(&SshUser::parse(refused).expect_err("must be refused")),
+                "EmptyAtSeparatedPart",
+                "{refused:?}"
+            );
+        }
+    }
+
+    /// The remedy a host-key failure tells the user to run must name the
+    /// endpoint that actually failed (M5 audit A5).
+    ///
+    /// `SshTarget::user_host()` drops the port and `SshTarget` has never had a
+    /// jump host, so the old remedy sent a user whose tunnel failed on port
+    /// 2222 through `-J bastion` to `ssh deploy@build-box` — port 22, no
+    /// bastion, a different endpoint. Because `known_hosts` keys a non-default
+    /// port as `[host]:port`, accepting a key there does not satisfy the
+    /// connection that failed, so the app would have moved the user's trust
+    /// store in a direction it did not intend.
+    #[test]
+    fn a_host_key_remedy_names_the_port_and_the_jump_host() {
+        use crate::daemon_client::RemoteEndpoint;
+
+        let socket = RemoteSocketPath::parse("/run/attach.sock").unwrap();
+        let plain = RemoteEndpoint::new(Hostname::parse("build-box").unwrap(), socket.clone());
+        assert_eq!(
+            plain.host_key_remedy(),
+            "ssh build-box",
+            "the default port stays implicit, exactly as a user would type it"
+        );
+
+        let full = RemoteEndpoint::new(Hostname::parse("build-box").unwrap(), socket)
+            .with_user(SshUser::parse("deploy").unwrap())
+            .with_port(2222)
+            .with_key(KeyPath::parse("~/.ssh/id_ed25519").unwrap())
+            .with_jump(HostAlias::parse("bastion").unwrap());
+        assert_eq!(
+            full.host_key_remedy(),
+            "ssh -J bastion -p 2222 deploy@build-box"
+        );
+        assert!(
+            !full.host_key_remedy().contains("id_ed25519"),
+            "host-key verification precedes authentication, so -i buys nothing and only puts a \
+             key path into a rendered message"
+        );
+
+        // The `remote add` / `remote doctor` path had the same port-dropping
+        // defect and is fixed by the same method on the unvalidated type.
+        let target = crate::remote::SshTarget::parse("deploy@build-box", 2222, None);
+        assert_eq!(target.host_key_remedy(), "ssh -p 2222 deploy@build-box");
+        assert_eq!(
+            crate::remote::SshTarget::parse("build-box", 22, None).host_key_remedy(),
+            "ssh build-box"
         );
     }
 
@@ -2021,6 +2706,7 @@ mod tests {
             SshArgumentError::NotAbsoluteOrTilde { .. } => "NotAbsoluteOrTilde",
             SshArgumentError::UnclosedBracket { .. } => "UnclosedBracket",
             SshArgumentError::BareIpv6Separator { .. } => "BareIpv6Separator",
+            SshArgumentError::EmptyAtSeparatedPart { .. } => "EmptyAtSeparatedPart",
         }
     }
 
@@ -2122,6 +2808,7 @@ mod tunnel_tests {
         tunnel_args(
             endpoint,
             Path::new("/run/user/1000/dot-agent-deck/tun-1-2.sock"),
+            Path::new("/run/user/1000/dot-agent-deck/tun-1-2.conf"),
         )
     }
 
@@ -2181,16 +2868,30 @@ mod tunnel_tests {
         );
     }
 
-    /// Host-key checking is never weakened, in any spelling. `no` or
-    /// `accept-new` would convert a first-contact decision into silent
-    /// trust-on-first-use taken by an app that cannot show a fingerprint;
-    /// pointing `UserKnownHostsFile` elsewhere is the same decision renamed.
+    /// Host-key checking is **forced on** and never weakened, in any spelling.
+    ///
+    /// This test used to assert that `StrictHostKeyChecking` was absent
+    /// entirely, and the M5 audit's finding A2 is why it no longer does: absent
+    /// means the *user's* config decides, and a `Host * /
+    /// StrictHostKeyChecking no` line then leaves a long-lived data channel —
+    /// one the GUI presents as trusted — with no host-key check at all. So the
+    /// forbidden list keeps everything that would weaken the check or move the
+    /// decision (`no`, `accept-new`, a redirected known-hosts file) and the
+    /// value `yes` is now *required*. `forced_options`' docs enumerate what
+    /// that costs against each value a user config can hold; the short version
+    /// is "nothing" against the default, because `BatchMode=yes` already makes
+    /// `ask` fail on an unknown key.
     #[test]
-    fn the_tunnel_argv_never_weakens_host_key_verification() {
+    fn the_tunnel_argv_forces_host_key_verification_and_never_weakens_it() {
         for endpoint in [deck(), full_deck()] {
             let args = args_for(&endpoint);
+            assert!(
+                args.iter().any(|a| a == "StrictHostKeyChecking=yes"),
+                "host-key verification must be forced on, not left to the user's config: {args:?}"
+            );
             for forbidden in [
-                "StrictHostKeyChecking",
+                "StrictHostKeyChecking=no",
+                "StrictHostKeyChecking=off",
                 "UserKnownHostsFile",
                 "GlobalKnownHostsFile",
                 "accept-new",
@@ -2202,6 +2903,342 @@ mod tunnel_tests {
                 );
             }
         }
+    }
+
+    // -- the generated ssh config (M5 audit A1/A2/A4) -----------------------
+
+    /// `-F` is passed, and it is passed **before** `--`.
+    ///
+    /// Without it, `forced_options` reaches only the `ssh` process we spawn.
+    /// OpenSSH implements `ProxyJump` by synthesising an implicit
+    /// `ProxyCommand` that runs a fresh `ssh` carrying only `-l`, `-p`, `-J`,
+    /// `-F` and `-v` — **not one `-o` survives**, measured on 10.2p1. With
+    /// `Host * / ForwardAgent yes` in the user's config the jump hop then
+    /// resolved `forwardagent yes`, `batchmode no` and
+    /// `stricthostkeychecking false`: the user's ssh-agent forwarded to the
+    /// bastion for the whole life of the tunnel, with the GUI showing nothing.
+    /// `-F` is the one channel that reaches both hops.
+    #[test]
+    fn the_tunnel_argv_passes_the_generated_config_because_minus_o_cannot_reach_a_jump_hop() {
+        for endpoint in [deck(), full_deck()] {
+            let args = args_for(&endpoint);
+            let at = args
+                .iter()
+                .position(|a| a == "-F")
+                .expect("the tunnel must pass -F: it is the only channel -J propagates");
+            assert_eq!(
+                args.get(at + 1).map(String::as_str),
+                Some("/run/user/1000/dot-agent-deck/tun-1-2.conf"),
+                "-F must carry the generated config's path: {args:?}"
+            );
+            let dashdash = args.iter().position(|a| a == "--").expect("-- is present");
+            assert!(at < dashdash, "-F must precede the destination: {args:?}");
+        }
+        // `deck()` has no `jump`, and the loop above required `-F` for it
+        // anyway. That is deliberate rather than incidental: OpenSSH's
+        // interpolation of `-F` into the implicit ProxyCommand is conditional
+        // on `-F` being on the command line, **not** on `-J` being there, so a
+        // `ProxyJump` the *user's* config supplies gets the file too. Measured
+        // with `Host * / ProxyJump bastion` in the included config and no `-J`
+        // of our own: `Setting implicit ProxyCommand from ProxyJump: ssh -F
+        // <path> … bastion`. Passing `-F` only when `endpoint.jump()` is set
+        // would leave that case exposed, which the audit named separately.
+        assert!(
+            deck().jump().is_none(),
+            "the row above is only meaningful while this deck has no jump host"
+        );
+    }
+
+    /// The layout, which is load-bearing in **two opposite directions**.
+    ///
+    /// Almost every ssh option is first-value-wins, so the forced block has to
+    /// come *before* the `Include`s or the user's config beats it.
+    /// `StreamLocalBindMask` is parsed with an unconditional assignment, so for
+    /// it the **last** value wins and the same reasoning inverts — it has to
+    /// come *after*. Measured on 10.2p1, all three cases:
+    ///
+    /// ```text
+    /// ours first, theirs second               -> streamlocalbindmask 00    (theirs)
+    /// theirs first, ours second               -> streamlocalbindmask 0177  (ours)
+    /// -o StreamLocalBindMask=0022 + theirs    -> streamlocalbindmask 00    (theirs)
+    /// ```
+    ///
+    /// A reader who "tidies" the two blocks into one silently loses whichever
+    /// half ends up on the wrong side of the `Include`s, and nothing else in
+    /// the suite would notice.
+    #[test]
+    fn the_generated_config_orders_each_option_on_the_side_of_the_includes_that_wins() {
+        let text = tunnel_config_text(USER_SSH_CONFIG_INCLUDE, SYSTEM_SSH_CONFIG_INCLUDE);
+        let lines: Vec<&str> = text.lines().map(str::trim).collect();
+        let first_include = lines
+            .iter()
+            .position(|l| l.starts_with("Include "))
+            .expect("the user's own config is included");
+        let last_include = lines
+            .iter()
+            .rposition(|l| l.starts_with("Include "))
+            .expect("the system config is included");
+
+        // Every first-value-wins option is emitted through `-o` as well, so the
+        // argv is the list this test compares against rather than a third copy
+        // that could drift.
+        let argv = args_for(&deck());
+        let forced: Vec<&String> = argv
+            .iter()
+            .zip(argv.iter().skip(1))
+            .filter(|(flag, _)| *flag == "-o")
+            .map(|(_, value)| value)
+            .collect();
+        assert!(
+            forced.len() >= 15,
+            "the forced set should not have shrunk to {}: {argv:?}",
+            forced.len()
+        );
+        for option in &forced {
+            let at = lines
+                .iter()
+                .position(|l| l == option)
+                .unwrap_or_else(|| panic!("{option} reaches -o but not the config:\n{text}"));
+            assert!(
+                at < first_include,
+                "{option} is first-value-wins, so it must precede the Includes:\n{text}"
+            );
+        }
+
+        let mask_at = lines
+            .iter()
+            .position(|l| *l == "StreamLocalBindMask=0177")
+            .unwrap_or_else(|| panic!("the socket's mode must be forced:\n{text}"));
+        assert!(
+            mask_at > last_include,
+            "StreamLocalBindMask is LAST-value-wins, so it must follow the Includes:\n{text}"
+        );
+        assert!(
+            !forced.iter().any(|o| o.contains("StreamLocalBindMask")),
+            "it must not also ride on -o: measured, the command line LOSES for this option, so a \
+             duplicate there would read as though it were doing something: {argv:?}"
+        );
+    }
+
+    /// DECISION 1A's whole premise — the user's ssh config still decides
+    /// everything we do not force — survives `-F`, which otherwise replaces it.
+    ///
+    /// Both files are included and in ssh's own precedence order, user before
+    /// system. The system one is here because ssh(1) says `-F` makes ssh ignore
+    /// `/etc/ssh/ssh_config` entirely, so without this line a site config would
+    /// silently stop being read the moment we started generating one.
+    #[test]
+    fn the_generated_config_includes_the_users_config_and_then_the_systems() {
+        let text = tunnel_config_text(USER_SSH_CONFIG_INCLUDE, SYSTEM_SSH_CONFIG_INCLUDE);
+        let user_at = text
+            .find(&format!("Include {USER_SSH_CONFIG_INCLUDE}\n"))
+            .expect("the user's own config must still be read");
+        let system_at = text
+            .find(&format!("Include {SYSTEM_SSH_CONFIG_INCLUDE}\n"))
+            .expect("-F suppresses the system config, so it has to be put back");
+        assert!(
+            user_at < system_at,
+            "user before system is ssh's own precedence:\n{text}"
+        );
+        assert_eq!(
+            USER_SSH_CONFIG_INCLUDE, "~/.ssh/config",
+            "the literal tilde reproduces ssh's default -F path: OpenSSH expands an Include \
+             against getpwuid()->pw_dir, which is what it uses to find this file anyway"
+        );
+        // Measured on 10.2p1: `Include` of a missing file is not an error, in
+        // either the absolute or the tilde spelling, so a user with no
+        // ~/.ssh/config still resolves cleanly (exit 0). Nothing to assert
+        // against ssh here without a live run — recorded so the next reader
+        // knows it was checked rather than assumed.
+    }
+
+    /// Host-key checking is forced in the config too, not only through `-o`.
+    ///
+    /// `-o` covers the direct hop; this line is what makes the check hold on
+    /// the hop `-J` spawns, which is where a user's `StrictHostKeyChecking no`
+    /// otherwise wins (M5 audit A2).
+    #[test]
+    fn the_generated_config_forces_host_key_verification_on_every_hop() {
+        let text = tunnel_config_text(USER_SSH_CONFIG_INCLUDE, SYSTEM_SSH_CONFIG_INCLUDE);
+        assert!(
+            text.lines()
+                .any(|l| l.trim() == "StrictHostKeyChecking=yes"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("UserKnownHostsFile") && !text.contains("accept-new"),
+            "forcing that the check happens is not the same as deciding which keys pass it:\n{text}"
+        );
+    }
+
+    /// Whether the system `ssh` can be asked to resolve a config.
+    ///
+    /// `ssh -G` parses configuration and prints the result; it opens no socket
+    /// and resolves no name, so this is a pure parser query costing a few
+    /// milliseconds. Where there is no OpenSSH client the test prints `SKIP:`
+    /// and returns, following `junit_strip.rs`'s precedent — a missing
+    /// interpreter is not a defect in this code.
+    fn system_ssh() -> Option<SshProgram> {
+        let ssh = SshProgram::resolve().ok()?;
+        std::process::Command::new(ssh.path())
+            .arg("-V")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .ok()
+            .filter(|status| status.success())
+            .map(|_| ssh)
+    }
+
+    /// Ask the real `ssh` to resolve `args` and return its `-G` output,
+    /// lowercased keys and all.
+    fn ssh_resolve(ssh: &SshProgram, args: &[&str]) -> String {
+        let out = std::process::Command::new(ssh.path())
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("ssh -G runs");
+        assert!(
+            out.status.success(),
+            "ssh -G {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    fn resolved(dump: &str, key: &str) -> Option<String> {
+        dump.lines()
+            .find(|line| line.split_whitespace().next() == Some(key))
+            .map(|line| line[key.len()..].trim().to_string())
+    }
+
+    /// **The end-to-end check for A1, A2 and A4, against real OpenSSH.**
+    ///
+    /// Everything else here asserts the bytes we generate. This asserts what
+    /// OpenSSH *does* with them, which is the only thing that matters and the
+    /// method the M5 audit used to find the finding in the first place. It
+    /// drives three resolutions through a hostile user config that sets the
+    /// opposite of every forced option:
+    ///
+    /// 1. the **direct hop**, which `-o` alone already covered;
+    /// 2. the **jump host**, resolved through this config — the hop that
+    ///    inherits no `-o` at all;
+    /// 3. the jump hop **as `-J` actually invokes it**, i.e. with `-W`, which
+    ///    is the exact command OpenSSH synthesises.
+    ///
+    /// The user config is a tempdir file rather than the developer's own, and
+    /// `-F` suppresses both real config files, so the resolution is isolated.
+    ///
+    /// It also pins the A3 residual in the direction that keeps the "what is
+    /// not here" block honest: the user's `RemoteForward` IS inherited on the
+    /// direct hop, and is NOT on the jump hop (because `-W` sets
+    /// `ClearAllForwardings`). If a later change closes that, this assertion
+    /// goes red and the comment gets updated with it.
+    #[test]
+    fn real_openssh_resolves_our_forced_options_on_the_jump_hop_too() {
+        let Some(ssh) = system_ssh() else {
+            println!(
+                "SKIP: no OpenSSH client at a standard location, so nothing can resolve a config"
+            );
+            return;
+        };
+        let temp = tempfile::tempdir().expect("tempdir");
+        let user = temp.path().join("user.conf");
+        std::fs::write(
+            &user,
+            "Host bastion\n\
+             \x20   HostName 127.0.0.2\n\
+             \x20   ForwardX11 yes\n\
+             Host *\n\
+             \x20   ForwardAgent yes\n\
+             \x20   BatchMode no\n\
+             \x20   ControlMaster auto\n\
+             \x20   StrictHostKeyChecking no\n\
+             \x20   StreamLocalBindMask 0000\n\
+             \x20   UpdateHostKeys yes\n\
+             \x20   RemoteForward 9999 localhost:22\n",
+        )
+        .expect("write the hostile user config");
+        let empty_system = temp.path().join("system.conf");
+        std::fs::write(&empty_system, "").expect("write an empty system config");
+
+        let generated = temp.path().join("generated.conf");
+        std::fs::write(
+            &generated,
+            tunnel_config_text(&user.to_string_lossy(), &empty_system.to_string_lossy()),
+        )
+        .expect("write the generated config");
+        let cfg = generated.to_string_lossy().into_owned();
+
+        // Every option we force, and the value the hostile config asks for.
+        let must_win = [
+            ("forwardagent", "no"),
+            ("batchmode", "yes"),
+            ("stricthostkeychecking", "true"),
+            ("streamlocalbindmask", "0177"),
+            ("updatehostkeys", "false"),
+            ("controlmaster", "false"),
+            ("forwardx11", "no"),
+            ("forwardx11trusted", "no"),
+            ("gssapidelegatecredentials", "no"),
+            ("addkeystoagent", "false"),
+            ("permitlocalcommand", "no"),
+            ("exitonforwardfailure", "yes"),
+            ("streamlocalbindunlink", "yes"),
+        ];
+
+        for (label, args) in [
+            ("the direct hop", vec!["-F", &cfg, "-G", "build-box"]),
+            // The hop `-J bastion` reaches. It inherits no `-o`: OpenSSH's
+            // implicit ProxyCommand carries only -l, -p, -J, -F and -v.
+            ("the jump hop", vec!["-F", &cfg, "-G", "bastion"]),
+            // And the same hop spelled the way `-J` actually spells it.
+            (
+                "the jump hop as -J invokes it",
+                vec!["-F", &cfg, "-G", "-W", "[build-box]:22", "bastion"],
+            ),
+        ] {
+            let dump = ssh_resolve(&ssh, &args);
+            for (key, expected) in must_win {
+                assert_eq!(
+                    resolved(&dump, key).as_deref(),
+                    Some(expected),
+                    "{key} must resolve to {expected} on {label}, against a user config that \
+                     asks for the opposite"
+                );
+            }
+            assert_eq!(
+                resolved(&dump, "hostname").as_deref(),
+                Some(if args.contains(&"bastion") {
+                    "127.0.0.2"
+                } else {
+                    "build-box"
+                }),
+                "and the user's own Host block must still decide what we do not force ({label})"
+            );
+        }
+
+        // The A3 residual, pinned in both directions so the "what is not here"
+        // block cannot claim an exposure that stopped existing — or miss one
+        // that started.
+        let direct = ssh_resolve(&ssh, &["-F", &cfg, "-G", "build-box"]);
+        assert_eq!(
+            resolved(&direct, "remoteforward").as_deref(),
+            Some("9999 [localhost]:22"),
+            "RESIDUAL A3: ClearAllForwardings would clear our own -L, so the user's reverse \
+             forward is inherited on the direct hop for the tunnel's whole life"
+        );
+        let via_w = ssh_resolve(&ssh, &["-F", &cfg, "-G", "-W", "[build-box]:22", "bastion"]);
+        assert_eq!(
+            resolved(&via_w, "clearallforwardings").as_deref(),
+            Some("yes"),
+            "but -W sets it, so the jump hop is exempt"
+        );
+        assert_eq!(
+            resolved(&via_w, "remoteforward"),
+            None,
+            "and therefore carries none of the user's forwards"
+        );
     }
 
     /// `ClearAllForwardings` is the one option deliberately *dropped* from
@@ -2290,7 +3327,12 @@ mod tunnel_tests {
     #[test]
     fn the_command_runs_the_resolved_absolute_program() {
         let ssh = SshProgram::at("/usr/bin/ssh").unwrap();
-        let command = build_tunnel_command(&ssh, &deck(), Path::new("/tmp/t.sock"));
+        let command = build_tunnel_command(
+            &ssh,
+            &deck(),
+            Path::new("/tmp/t.sock"),
+            Path::new("/tmp/t.conf"),
+        );
         assert_eq!(command.get_program(), std::ffi::OsStr::new("/usr/bin/ssh"));
     }
 
@@ -2311,6 +3353,77 @@ mod tunnel_tests {
             Err(TunnelError::SocketPathHasColon { .. })
         ));
         assert!(check_socket_path(Path::new("/tmp/tun-1-2.sock")).is_ok());
+    }
+
+    /// Every other way the *text* of our own path can change what ssh does
+    /// (M5 audit B1, widened by the `-F` config this milestone now writes).
+    ///
+    /// These paths are built from `$XDG_RUNTIME_DIR` or `std::env::temp_dir()`,
+    /// i.e. from the environment a GUI inherited, which is why they are checked
+    /// rather than trusted. Each row is a measured OpenSSH 10.2p1 behaviour:
+    ///
+    /// - `%` — percent-expanded in both the `-L` value and the `-F` value.
+    ///   `-L '/tmp/tun-%d-x.sock:…'` resolved to
+    ///   `/tmp/tun-/home/vfarcic-x.sock`, a path nothing polls, so
+    ///   `await_forward` burns its full timeout and blames the remote; an
+    ///   *unknown* token instead kills ssh with `percent_expand: failed`, which
+    ///   no classifier here names.
+    /// - whitespace and the shell metacharacters — `-F`'s value is
+    ///   interpolated **unquoted** into the `ProxyCommand` string `-J`
+    ///   synthesises, and OpenSSH hands that to `/bin/sh -c`. Measured with a
+    ///   space: `exec ssh -F gen x.conf -vvv -W …`, and the jump hop died on
+    ///   `Can't open user config file gen`. A metacharacter is the same shape
+    ///   with a worse ending.
+    /// - non-UTF-8 — both values are built by lossy conversion, so ssh would
+    ///   bind a path that is not the one we poll.
+    #[test]
+    fn a_socket_path_that_ssh_would_reinterpret_is_refused_by_name() {
+        assert!(matches!(
+            check_socket_path(Path::new("/tmp/tun-%d-1.sock")),
+            Err(TunnelError::SocketPathHasPercent { .. })
+        ));
+        for unsafe_path in [
+            "/tmp/tun 1.sock",
+            "/tmp/tun\t1.sock",
+            "/tmp/tun;touch-marker;.sock",
+            "/tmp/tun$(id).sock",
+            "/tmp/tun`id`.sock",
+            "/tmp/tun|x.sock",
+            "/tmp/tun&x.sock",
+            "/tmp/tun'x'.sock",
+            "/tmp/tun\\x.sock",
+            "/tmp/tun\u{1}.sock",
+        ] {
+            assert!(
+                matches!(
+                    check_socket_path(Path::new(unsafe_path)),
+                    Err(TunnelError::SocketPathShellUnsafe { .. })
+                ),
+                "{unsafe_path:?} must be refused: -F's value reaches /bin/sh unquoted"
+            );
+        }
+
+        use std::os::unix::ffi::OsStrExt;
+        let not_utf8 = PathBuf::from(std::ffi::OsStr::from_bytes(b"/tmp/tun-\xff-1.sock"));
+        assert!(matches!(
+            check_socket_path(&not_utf8),
+            Err(TunnelError::SocketPathNotUtf8 { .. })
+        ));
+
+        // And the refusal must not have become a blanket one: the names this
+        // module actually mints still pass, config sibling included.
+        assert!(
+            check_socket_path(Path::new(
+                "/run/user/1000/dot-agent-deck/tunnels/tun-9-1a2b.sock"
+            ))
+            .is_ok()
+        );
+        assert!(
+            check_socket_path(Path::new(
+                "/run/user/1000/dot-agent-deck/tunnels/tun-9-1a2b.conf"
+            ))
+            .is_ok()
+        );
     }
 
     /// The directory forwarded sockets live in is created owner-only, and it is
@@ -2641,6 +3754,91 @@ mod tunnel_tests {
         );
     }
 
+    /// And the remedy must name the endpoint that actually failed — the port
+    /// and the bastion included (M5 audit A5).
+    ///
+    /// `classify_ssh_error` alone builds it from `SshTarget`, which drops the
+    /// port and has never held a jump host, so this deck's failure advertised
+    /// `ssh deploy@build-box`: port 22, no bastion, a different endpoint. Since
+    /// `known_hosts` keys a non-default port as `[host]:port`, a key accepted
+    /// there does not satisfy the tunnel — so the advice either dead-ends or
+    /// moves the user's trust store somewhere the app never asked them to
+    /// evaluate.
+    #[test]
+    fn a_host_key_failures_remedy_names_the_port_and_the_bastion_the_tunnel_uses() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let ssh = standin_ssh(
+            temp.path(),
+            "echo 'Host key verification failed.' >&2\nexit 255",
+        );
+        let socket = socket_in(temp.path());
+        let err = RemoteTunnel::open_at(&ssh, &full_deck(), socket.clone())
+            .expect_err("an unverified host key must refuse");
+        // A failed open must not leave its generated config behind either. The
+        // struct exists by the time `await_forward` classifies the exit, so the
+        // cleanup is `Drop`'s rather than `close()`'s on this path — which is
+        // worth asserting because it is the arm no successful run exercises.
+        assert!(
+            !socket.with_extension("conf").exists(),
+            "a tunnel that never came up must still take its generated config with it"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("run `ssh -J bastion -p 2222 deploy@build-box` once"),
+            "the remedy must describe the tunnel's own endpoint: {msg}"
+        );
+        assert!(
+            !msg.contains("run `ssh deploy@build-box` once"),
+            "the port-dropping remedy is the defect, not a fallback: {msg}"
+        );
+    }
+
+    /// Classification runs on the **raw** capture, which is
+    /// `classify_ssh_error`'s documented contract and was not being honoured
+    /// (M5 audit B3).
+    ///
+    /// Stripping only ever *removes* bytes, so classifying the scrubbed text
+    /// can only ever **create** matches the raw text lacked. Here a peer's
+    /// login banner — banners precede authentication, so this needs no
+    /// credential — spells the host-key phrase with a control byte wedged
+    /// inside it. Raw, it matches nothing. Scrubbed, it matches, and the GUI
+    /// would show a host-key remedy for a failure that was not one. Every
+    /// steerable category is advisory text so the cost is misleading advice
+    /// rather than a bypass, but it is exactly the property the contract
+    /// sentence exists to protect.
+    #[test]
+    fn a_peers_banner_cannot_steer_the_classification_by_being_scrubbed_into_a_match() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let ssh = standin_ssh(
+            temp.path(),
+            "printf 'Host key verification fai\\001led.\\n' >&2\nexit 255",
+        );
+        let err = RemoteTunnel::open_at(&ssh, &deck(), socket_in(temp.path()))
+            .expect_err("the stand-in exits 255");
+        let TunnelError::Ssh { source, .. } = &err else {
+            panic!("expected a classified ssh failure, got {err:?}");
+        };
+        assert!(
+            !matches!(
+                source,
+                crate::remote::SshError::HostKeyVerificationFailed { .. }
+            ),
+            "a banner that only matches AFTER scrubbing must not be classified as a host-key \
+             failure: {source:?}"
+        );
+        // The scrubbed form is still what the user is shown, so the control
+        // byte never reaches a terminal.
+        let msg = err.to_string();
+        assert!(
+            !msg.contains('\u{1}'),
+            "the rendered detail must still be scrubbed: {msg:?}"
+        );
+        assert!(
+            msg.contains("failed"),
+            "and it must still carry what the peer said: {msg}"
+        );
+    }
+
     /// "The forward could not bind" and "the host is unreachable" are reported
     /// by ssh identically — exit 255 — and sending a user to debug a network
     /// path that was never broken is the misclassification issue #344 already
@@ -2823,6 +4021,249 @@ mod tunnel_tests {
                 "{foreign} was not written by this module and must not be touched"
             );
         }
+    }
+
+    /// Two opens in one process must never choose the same socket name
+    /// (M5 audit B2).
+    ///
+    /// The nonce used to be `SystemTime::now().subsec_nanos()` read afresh per
+    /// call, under a comment claiming it made the name "unique within one
+    /// process so two concurrent tunnels never collide". Two opens landing on
+    /// the same clock tick — or either side of a backwards clock step — produce
+    /// the same name, and the consequence is a silent data-path break rather
+    /// than a cosmetic clash: `clear_stale_socket` finds a *socket* at that
+    /// path, which is precisely the case it exists to remove, so it unlinks it
+    /// and the second ssh binds there while the first tunnel's client still
+    /// holds a path that no longer names its listener.
+    ///
+    /// A monotonic counter makes the claim true by construction, which is what
+    /// this asserts. It is driven through the public `open` path rather than
+    /// against the private name helper, so it also pins that `open` is what
+    /// mints a fresh one.
+    #[test]
+    fn two_socket_names_from_one_process_are_consecutive_and_never_repeat() {
+        fn nonce_of(name: &str) -> u32 {
+            let rest = name
+                .strip_prefix(&format!("tun-{}-", std::process::id()))
+                .unwrap_or_else(|| panic!("{name} must carry this process's pid"));
+            let hex = rest.strip_suffix(".sock").expect("the .sock suffix");
+            assert_eq!(
+                hex.len(),
+                8,
+                "the nonce is fixed-width so the path stays short"
+            );
+            u32::from_str_radix(hex, 16).expect("hex")
+        }
+
+        let names: Vec<String> = (0..1000).map(|_| socket_file_name()).collect();
+        let unique: std::collections::BTreeSet<&String> = names.iter().collect();
+        assert_eq!(
+            unique.len(),
+            names.len(),
+            "a repeat here unlinks a live tunnel's socket"
+        );
+
+        // **The assertion that a clock read cannot satisfy.** Consecutive
+        // nonces are what makes uniqueness a construction rather than a
+        // probability, and `SystemTime::now().subsec_nanos()` — the original
+        // spelling — is neither consecutive nor monotonic (it wraps every
+        // second). So this is the row that goes red if anyone puts a clock back.
+        for pair in names.windows(2) {
+            let (a, b) = (nonce_of(&pair[0]), nonce_of(&pair[1]));
+            assert_eq!(
+                b,
+                a.wrapping_add(1),
+                "nonces must increment: {} then {}",
+                pair[0],
+                pair[1]
+            );
+        }
+
+        // And the name must still be the one the sweep can read an owner out of.
+        assert_eq!(
+            owner_pid_from_socket_name(&names[0]),
+            Some(std::process::id() as i32)
+        );
+    }
+
+    fn is_socket_at(path: &Path) -> bool {
+        use std::os::unix::fs::FileTypeExt;
+        std::fs::symlink_metadata(path)
+            .map(|m| m.file_type().is_socket())
+            .unwrap_or(false)
+    }
+
+    /// The generated `-F` config is owned with the same discipline as the
+    /// socket: written `0600` inside the `0700` directory, and removed at
+    /// teardown.
+    ///
+    /// It is a file this module writes and a later `ssh` would read, so a
+    /// leftover is not merely untidy — and `close()` is the only thing that
+    /// removes it on the ordinary path.
+    #[test]
+    fn the_generated_config_is_written_owner_only_and_removed_with_the_tunnel() {
+        if !python3_available() {
+            println!("SKIP: python3 is not available, so no stand-in can bind a Unix socket");
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().expect("tempdir");
+        let ssh = binding_standin(temp.path());
+        let socket = socket_in(temp.path());
+        let config = socket.with_extension("conf");
+        let mut tunnel = RemoteTunnel::open_at(&ssh, &deck(), socket.clone()).expect("opens");
+
+        let metadata = std::fs::symlink_metadata(&config).expect("the config must be written");
+        assert!(metadata.file_type().is_file(), "a regular file, not a link");
+        assert_eq!(
+            metadata.permissions().mode() & 0o777,
+            0o600,
+            "mode 0600 rather than the ambient umask"
+        );
+        let text = std::fs::read_to_string(&config).expect("readable");
+        assert!(
+            text.contains("ForwardAgent=no") && text.contains("StreamLocalBindMask=0177"),
+            "the file the jump hop reads must carry the forced options:\n{text}"
+        );
+
+        tunnel.close();
+        assert!(
+            !config.exists(),
+            "the generated config must not outlive its tunnel"
+        );
+    }
+
+    /// A config that cannot be written fails the tunnel **closed**.
+    ///
+    /// Without the file, `forced_options` reaches only the direct hop — so a
+    /// tunnel that came up anyway would be exactly the silent agent-forward to
+    /// a bastion the file exists to prevent. A read-only directory is the
+    /// cheapest way to reach the arm.
+    #[test]
+    fn a_config_that_cannot_be_written_refuses_the_tunnel_rather_than_weakening_it() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().expect("tempdir");
+        let locked = temp.path().join("ro");
+        std::fs::create_dir(&locked).expect("mkdir");
+        let ssh = standin_ssh(temp.path(), "sleep 30");
+        let socket = locked.join("t.sock");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o500))
+            .expect("make it read-only");
+        let err = RemoteTunnel::open_at(&ssh, &deck(), socket).expect_err("must refuse");
+        // Restore before the tempdir's own cleanup runs.
+        let _ = std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700));
+        assert!(
+            matches!(err, TunnelError::ConfigFile { .. }),
+            "the refusal must name the config rather than blaming ssh: {err:?}"
+        );
+    }
+
+    /// A **regular file** appearing at the forward path is not readiness
+    /// (M5 audit B7.1).
+    ///
+    /// `await_forward` accepted any inode, which was the one filesystem check
+    /// in this module without a type guard. The stand-in creates a plain file
+    /// where the socket belongs — which `clear_stale_socket` cannot catch,
+    /// because it runs before the spawn and the path was empty then — and the
+    /// open must time out rather than hand a client an address nothing is
+    /// listening on.
+    #[test]
+    fn a_regular_file_at_the_forward_path_is_not_mistaken_for_a_bound_socket() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let ssh = standin_ssh(temp.path(), "printf x > \"$local_sock\"\nsleep 30");
+        let socket = socket_in(temp.path());
+        let err =
+            RemoteTunnel::open_at_within(&ssh, &deck(), socket.clone(), Duration::from_millis(300))
+                .expect_err("a regular file must not read as a forward");
+        assert!(
+            matches!(err, TunnelError::ForwardTimeout { .. }),
+            "got {err:?}"
+        );
+        assert!(
+            socket.exists() && !is_socket_at(&socket),
+            "the premise: the stand-in did create a non-socket inode there"
+        );
+    }
+
+    /// A client built over a live tunnel must carry
+    /// [`crate::platform::ipc::EndpointPresence::Elsewhere`], not the local
+    /// answer.
+    ///
+    /// This is the seam the M5 audit flagged as blocking for M7.
+    /// `DaemonClient::for_endpoint` **errors** for the `Remote` arm, because an
+    /// `Endpoint` has no address until a tunnel exists, so the only spelling
+    /// available to a caller holding a tunnel was
+    /// `DaemonClient::new(tunnel.connect_address().to_path_buf())` — which
+    /// hard-codes the local presence and thereby restores `exists()`-as-health
+    /// on exactly the socket M3 built `Elsewhere` to protect, re-opening the
+    /// "treat a forwarded socket as a stale daemon inode and `remove_file` it"
+    /// path M2/M3 closed.
+    #[test]
+    fn a_client_over_a_tunnel_never_reads_the_forwarded_socket_as_a_local_inode() {
+        if !python3_available() {
+            println!("SKIP: python3 is not available, so no stand-in can bind a Unix socket");
+            return;
+        }
+        use crate::daemon_client::DaemonClient;
+        use crate::platform::ipc::EndpointPresence;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let ssh = binding_standin(temp.path());
+        let tunnel = RemoteTunnel::open_at(&ssh, &deck(), socket_in(temp.path())).expect("opens");
+        let connection = EndpointConnection::Remote(Box::new(tunnel));
+        assert_eq!(connection.presence(), EndpointPresence::Elsewhere);
+
+        let client = DaemonClient::for_connection(&connection);
+        assert_eq!(client.socket_path(), connection.connect_address());
+        // The observable consequence: a `stat` of that path is not allowed to
+        // answer the health question, so this steps aside rather than voting.
+        assert!(
+            client.ensure_socket_exists().is_ok(),
+            "Elsewhere resolves to Unanswerable, which must not be read as absence"
+        );
+
+        // And a local connection keeps the answer it always had.
+        let local = EndpointConnection::Local(LocalEndpoint::at(temp.path().join("local.sock")));
+        assert_eq!(
+            local.presence(),
+            crate::platform::ipc::LOCAL_ENDPOINT_PRESENCE
+        );
+        assert!(
+            DaemonClient::for_connection(&local)
+                .ensure_socket_exists()
+                .is_err(),
+            "a local endpoint with nothing bound is still genuinely absent"
+        );
+    }
+
+    /// An orphan's generated config is swept with its socket and its sidecar.
+    #[test]
+    fn the_sweep_clears_an_orphans_generated_config_too() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let dir = temp.path();
+        let mut corpse = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("exit 0")
+            .spawn()
+            .expect("spawn");
+        let dead_pid = corpse.id();
+        corpse.wait().expect("reap");
+
+        let socket = dir.join(format!("tun-{dead_pid}-0a1b.sock"));
+        std::os::unix::net::UnixListener::bind(&socket).expect("bind a leftover");
+        let sidecar = socket.with_extension("ssh");
+        std::fs::write(&sidecar, "1").expect("write the sidecar");
+        let config = socket.with_extension("conf");
+        std::fs::write(&config, "Host *\n").expect("write the config");
+
+        assert_eq!(reap_orphaned_tunnels(dir), 1);
+        assert!(!socket.exists(), "the socket goes");
+        assert!(!sidecar.exists(), "the sidecar goes");
+        assert!(
+            !config.exists(),
+            "and so does the generated ssh config, or a leftover a later ssh would read \
+             accumulates forever"
+        );
     }
 
     /// The hygiene half. A leftover whose owning app is **dead** is cleared,

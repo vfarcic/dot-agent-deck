@@ -404,6 +404,39 @@ impl RemoteEndpoint {
         }
     }
 
+    /// The command a user should run in a terminal to evaluate this deck's host
+    /// key themselves, for [`crate::remote::SshError::HostKeyVerificationFailed`].
+    ///
+    /// **Built from this type rather than from [`crate::remote::SshTarget`],
+    /// and that is PRD #741 M5's audit finding A5.** `SshTarget` has no `jump`
+    /// field and `SshTarget::user_host()` drops the port, so the remedy the
+    /// tunnel rendered named a *different endpoint*: a failure on port 2222
+    /// through `-J bastion` told the user to run `ssh deploy@build-box`, which
+    /// reaches port 22 with no bastion. Either that is dead-end advice, or it
+    /// succeeds against something unrelated and the user accepts a host key for
+    /// `[build-box]:22` — which, because `known_hosts` keys a non-default port
+    /// as `[host]:port`, does not satisfy the tunnel. The app would have
+    /// induced the user to trust a host key for a host it never asked them to
+    /// evaluate.
+    ///
+    /// The flag order matches [`crate::remote_tunnel::tunnel_args`]' so the two
+    /// read as the same connection. `-i` is omitted for the reason
+    /// [`crate::remote::SshTarget::host_key_remedy`] gives.
+    pub fn host_key_remedy(&self) -> String {
+        let mut command = String::from("ssh");
+        if let Some(jump) = &self.jump {
+            command.push_str(" -J ");
+            command.push_str(jump.as_str());
+        }
+        if self.port != crate::remote::DEFAULT_SSH_PORT {
+            command.push_str(" -p ");
+            command.push_str(&self.port.to_string());
+        }
+        command.push(' ');
+        command.push_str(&self.user_host());
+        command
+    }
+
     /// The unvalidated [`crate::remote::SshTarget`] the existing ssh helpers
     /// take — built *from* validated parts, so this is the one direction the
     /// conversion may go.
@@ -935,6 +968,35 @@ impl DaemonClient {
             presence: endpoint.presence(),
             capabilities: Arc::new(Mutex::new(None)),
         })
+    }
+
+    /// A client for a deck reached over an established transport (PRD #741 M5).
+    ///
+    /// **This is the seam M7 has to use, and its absence was a trap rather than
+    /// a gap.** The other two constructors cannot serve a tunnel:
+    /// [`Self::for_endpoint`] *errors* for the `Remote` arm, because
+    /// [`Endpoint::connect_address`] returns
+    /// [`EndpointError::RemoteAddressIsTheTunnels`] — an `Endpoint` alone has
+    /// no address until a tunnel exists. So the only spelling available to a
+    /// caller holding a live tunnel was
+    /// `DaemonClient::new(tunnel.connect_address().to_path_buf())`, which
+    /// hard-codes [`LOCAL_ENDPOINT_PRESENCE`] and thereby restores
+    /// `exists()`-as-health on **exactly** the socket PRD #741 M3 built
+    /// `EndpointPresence::Elsewhere` to protect. That would have re-opened the
+    /// path M2 and M3 closed: read a forwarded socket as a stale local daemon
+    /// inode and `remove_file` it.
+    ///
+    /// Infallible, unlike [`Self::for_endpoint`], and that is the point: by the
+    /// time an [`crate::remote_tunnel::EndpointConnection`] exists the
+    /// transport is up, so there is no error arm to tempt a caller back to
+    /// [`Self::new`].
+    #[cfg(unix)]
+    pub fn for_connection(connection: &crate::remote_tunnel::EndpointConnection) -> Self {
+        Self {
+            socket_path: connection.connect_address().to_path_buf(),
+            presence: connection.presence(),
+            capabilities: Arc::new(Mutex::new(None)),
+        }
     }
 
     pub fn socket_path(&self) -> &Path {
