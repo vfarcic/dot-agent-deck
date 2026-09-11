@@ -3328,23 +3328,59 @@ mod tests {
     /// Content-keyed for the same reason as the helpers above: the caller needs
     /// an instant that is provably AFTER a specific write, and "the buffer grew"
     /// only proves that if nothing else can put a byte there.
+    ///
+    /// Only usable where the pane has NOT echoed this payload before — see
+    /// [`wait_for_further_payload_echo`], which this delegates to, for the case
+    /// where it has.
     async fn wait_for_detached_payload_echo(
         registry: &AgentPtyRegistry,
         agent_id: &str,
         payload: &str,
     ) -> Vec<u8> {
+        wait_for_further_payload_echo(registry, agent_id, payload, 0).await
+    }
+
+    /// Copies of `payload` the target's buffer holds.
+    ///
+    /// A delivery normally leaves two — the line discipline's echo and the byte
+    /// target's copy of the finished line — but how many is the platform's
+    /// business, so callers read a floor off their own baseline rather than
+    /// predicting one.
+    fn payload_echoes(bytes: &[u8], payload: &str) -> usize {
+        bytes
+            .windows(payload.len())
+            .filter(|window| *window == payload.as_bytes())
+            .count()
+    }
+
+    /// Block until the target's buffer holds MORE than `floor` copies of
+    /// `payload`, and return the buffer as it stood at that moment.
+    ///
+    /// [`wait_for_detached_payload_echo`] is this with a floor of zero, and a
+    /// floor of zero is the wrong tool whenever the write under observation
+    /// REPEATS a payload the pane has already echoed: an earlier delivery's
+    /// copies match, so the wait returns having waited for nothing and the
+    /// caller is back on the wall clock it was trying to leave. That is issue
+    /// #892's shape at two of its five sites — a retry writes the same bytes its
+    /// first attempt did, by construction, because that is what a retry IS.
+    /// Counting from a floor the caller read off its own baseline keeps the wait
+    /// keyed on content while saying WHICH write it means.
+    async fn wait_for_further_payload_echo(
+        registry: &AgentPtyRegistry,
+        agent_id: &str,
+        payload: &str,
+        floor: usize,
+    ) -> Vec<u8> {
         let deadline = Instant::now() + Duration::from_secs(8);
         loop {
             let snapshot = registry.snapshot(agent_id).expect("byte target snapshot");
-            if snapshot
-                .windows(payload.len())
-                .any(|window| window == payload.as_bytes())
-            {
+            if payload_echoes(&snapshot, payload) > floor {
                 return snapshot;
             }
             assert!(
                 Instant::now() < deadline,
-                "timed out waiting for {payload} to reach the target; snapshot={:?}",
+                "timed out waiting for more than {floor} copy/copies of {payload} to reach \
+                 the target; snapshot={:?}",
                 String::from_utf8_lossy(&snapshot)
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -3483,11 +3519,44 @@ mod tests {
                 .await
                 .expect("a second genuine generation must terminate the delivery")
                 .is_ok();
-            tokio::time::sleep(Duration::from_millis(250)).await;
+            // Close the observation window with a FENCE rather than a wall
+            // clock (issue #892). The delivery task is JOINED on the line above
+            // — the `expect` there panics rather than proceeding if it is not —
+            // so nothing but this fixture can write to the pane any more, and
+            // the only bytes still unaccounted for are the ones an attempt 4
+            // would have issued just before it terminated, still in flight
+            // through the PTY. A fixed 250 ms did not bound those: a short read
+            // silently SHRANK the delta this returns, so a real attempt 4 read
+            // as the empty delta the caller is asserting — a false negative,
+            // which is worse than a flake because it is green.
+            //
+            // The buffer is append-only and the PTY preserves order, so any
+            // byte the delivery wrote is already ahead of this fence's own
+            // echo; waiting for that echo therefore proves the delta below is
+            // complete, whatever the machine was doing. `type_user_bytes`
+            // drains the pane first and waits for quiescence after, so a late
+            // `/bin/cat` copy cannot cut the fence in half, and the user-input
+            // stamp it records reaches nothing: the delivery it could have
+            // disarmed is already over.
+            const REPLAY_FENCE: &str = "ISSUE-666-REPLAY-FENCE";
+            type_user_bytes(
+                &registry,
+                &agent_id,
+                &pane_id,
+                REPLAY_FENCE.as_bytes(),
+                // Attempts 2 and 3 are the lines this pane has completed.
+                2,
+            )
+            .await;
             let after = registry
                 .snapshot(&agent_id)
                 .expect("post-replay byte target snapshot");
-            after_replay = Some(snapshot_delta(&after_attempt_three, &after));
+            let delta = snapshot_delta(&after_attempt_three, &after);
+            let fence_at = delta
+                .windows(REPLAY_FENCE.len())
+                .position(|window| window == REPLAY_FENCE.as_bytes())
+                .expect("the fence this fixture just wrote must sit in its own delta");
+            after_replay = Some(delta[..fence_at].to_vec());
             drop(event_tx);
             registry.shutdown_all();
             return Dispatch016RearmObservation {
@@ -3828,11 +3897,33 @@ mod tests {
         after: Vec<u8>,
     }
 
+    /// What the caller of [`retry_after_user_frame`] is about to assert about
+    /// the replacement delivery, and therefore how its `after` snapshot may be
+    /// taken.
+    ///
+    /// One fixture, two OPPOSITE contracts, and issue #892 is what the single
+    /// wall clock underneath both of them cost. A plain Enter completes the
+    /// user's turn, so the replacement must land and there is an arrival to
+    /// wait for; Ctrl+J and Alt+Enter only extend an unsent draft, so the
+    /// replacement must send nothing and there is no completion to poll for at
+    /// all. The polarity therefore has to travel with the call — it cannot be
+    /// inferred here, and guessing it wrong turns one of the two into either a
+    /// flake or a tautology.
+    #[derive(Clone, Copy)]
+    enum UserFrameRetryExpectation {
+        /// The replacement lands: wait for its own payload echo.
+        Writes,
+        /// The replacement must send nothing: observe for a fixed window,
+        /// because a negative has no arrival to be keyed on.
+        WritesNothing,
+    }
+
     async fn retry_after_user_frame(
         pane_id: &str,
         prompt: &str,
         draft: &str,
         frame: &[u8],
+        expectation: UserFrameRetryExpectation,
     ) -> UserFrameRetry {
         let registry = Arc::new(AgentPtyRegistry::new());
         let agent_id = spawn_byte_target(&registry, pane_id);
@@ -3862,10 +3953,28 @@ mod tests {
             .write_and_submit_guarded(pane_id, prompt, &agent_id, || async { true })
             .await
             .expect("replacement after user newline control");
-        tokio::time::sleep(Duration::from_millis(75)).await;
-        let after = registry
-            .snapshot(&agent_id)
-            .expect("after newline-control retry snapshot");
+        let after = match expectation {
+            UserFrameRetryExpectation::Writes => {
+                // The payload this replacement writes is the SAME text the
+                // delivery above already wrote, so the pane has echoed it
+                // before and the floor has to be read off `before` rather than
+                // assumed to be zero — a plain `wait_for_detached_payload_echo`
+                // here would match the first delivery's copies and return
+                // having waited for nothing.
+                let floor = payload_echoes(&before, prompt);
+                wait_for_further_payload_echo(&registry, &agent_id, prompt, floor).await
+            }
+            UserFrameRetryExpectation::WritesNothing => {
+                // A negative observation window, and the sleep IS the
+                // observation: the contract is that the replacement writes
+                // nothing, so there is no byte whose arrival could end this
+                // wait early. Kept at the 75 ms it has always had.
+                tokio::time::sleep(Duration::from_millis(75)).await;
+                registry
+                    .snapshot(&agent_id)
+                    .expect("after newline-control retry snapshot")
+            }
+        };
         registry.shutdown_all();
         UserFrameRetry {
             outcome,
@@ -4383,10 +4492,15 @@ mod tests {
                 EventType::SessionStart,
             )))
             .expect("send late native capability claim");
-        tokio::time::sleep(Duration::from_millis(750)).await;
-        let spawned_output = spawned_registry
-            .snapshot(&spawned_agent)
-            .expect("deck-spawned target snapshot");
+        // Wait for the payload's own echo rather than betting 750 ms on the
+        // retry loop plus a PTY round trip (issue #892). Unlike the forged twin
+        // above — whose sleep IS its observation, because it asserts the payload
+        // never arrives — this case asserts that it DOES, so there is a byte to
+        // be keyed on and load can make the wait slower instead of wrong.
+        // Nothing wrote this payload to this pane before, so the first copy to
+        // appear is the one under test.
+        let spawned_output =
+            wait_for_detached_payload_echo(&spawned_registry, &spawned_agent, SPAWNED_PROMPT).await;
         spawned_confirmation.abort();
         let _ = spawned_confirmation.await;
         drop(spawned_tx);
@@ -4659,10 +4773,16 @@ mod tests {
             },
         ));
 
-        tokio::time::sleep(Duration::from_millis(800)).await;
-        let before_user_input = registry
-            .snapshot(&agent_id)
-            .expect("replacement payload snapshot");
+        // Attempt 2's own echo, not a fixed 800 ms, is what proves the
+        // replacement payload reached the pane before the user types (issue
+        // #892) — the precondition below is that same condition, restated. This
+        // is the second such wait in this test: #851 converted attempt 1's
+        // precondition on the OTHER pane and left this one on the clock with
+        // ten times the budget, which is why the shape survived here. Attempt 1
+        // is the spawn-time write these fixtures deliberately do not make, so
+        // nothing wrote this payload to this pane before and the first copy to
+        // appear is attempt 2's.
+        let before_user_input = wait_for_detached_payload_echo(&registry, &agent_id, PROMPT).await;
         assert!(
             before_user_input
                 .windows(PROMPT.len())
@@ -4818,14 +4938,22 @@ mod tests {
         let before_delivery_b = same_registry
             .snapshot(&same_agent)
             .expect("before delivery B snapshot");
+        // Delivery B repeats delivery A's payload verbatim — that is the whole
+        // case — so the floor has to be read off the baseline here: a plain
+        // `wait_for_detached_payload_echo` would match A's copies and return
+        // having waited for nothing (issue #892).
+        let delivery_b_floor = payload_echoes(&before_delivery_b, SAME_PROMPT);
         let delivery_b = same_registry
             .write_and_submit_guarded(SAME_PANE, SAME_PROMPT, &same_agent, || async { true })
             .await
             .expect("delivery B first attempt");
-        tokio::time::sleep(Duration::from_millis(75)).await;
-        let after_delivery_b = same_registry
-            .snapshot(&same_agent)
-            .expect("after delivery B snapshot");
+        let after_delivery_b = wait_for_further_payload_echo(
+            &same_registry,
+            &same_agent,
+            SAME_PROMPT,
+            delivery_b_floor,
+        )
+        .await;
 
         const REPLACED_PANE: &str = "different-submit-replaces-digest-pane";
         const DELIVERY_A: &str = "older delivery payload A";
@@ -4936,6 +5064,7 @@ mod tests {
             "automatic payload before Ctrl+J",
             "draft extended with a Ctrl+J newline",
             &ctrl_j_frame,
+            UserFrameRetryExpectation::WritesNothing,
         )
         .await;
 
@@ -4949,6 +5078,7 @@ mod tests {
             "automatic payload before Alt+Enter",
             "Claude draft extended with an Alt+Enter newline",
             &alt_enter_frame,
+            UserFrameRetryExpectation::WritesNothing,
         )
         .await;
 
@@ -4962,6 +5092,7 @@ mod tests {
             "automatic payload before plain Enter",
             "user turn completed with plain Enter",
             &plain_enter_frame,
+            UserFrameRetryExpectation::Writes,
         )
         .await;
         assert!(
