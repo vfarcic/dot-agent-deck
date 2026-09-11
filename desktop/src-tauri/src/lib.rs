@@ -1174,50 +1174,100 @@ async fn desktop_set_settings(
 /// Put a saved document's deck selection into force (PRD #741 M7, completed at
 /// M9).
 ///
-/// Six things happen and they have to happen together, which is why they are one
-/// function rather than six lines at each call site:
+/// # Every settings save reaches here, and most of them changed no deck
+///
+/// The command that calls this is `desktop_set_settings`, which is also how a
+/// theme, a zoom level and every future preference are written. So the work
+/// below is split in two by [`selection_moved`], and getting that split wrong is
+/// not a matter of efficiency: the switch half **detaches every terminal
+/// session**, and running it unconditionally would tear down a user's live
+/// panes because they changed the colour scheme.
+///
+/// # Always, because a save is rare and dropping a held classification is cheap
 ///
 /// 1. **The selection is applied**, so `selected_endpoint()` — and therefore the
-///    snapshot, the banner and the Stop/Replace gating — name the deck the user
-///    just chose.
-/// 2. **Every terminal session is detached.** A session streams from ONE
-///    daemon's PTY; after a selection change every one of them is showing the
-///    deck the user has left. The same pairing `StopDaemon` and `RestartDaemon`
-///    already make — invalidate, then detach — and for the same reason: a tile
-///    left attached to a deck that is no longer selected is a tile whose
-///    keystrokes go to another machine's agent.
-/// 3. **The held handshake for the deck we were talking to is dropped.** A
-///    classification describes one daemon; after a selection change it describes
-///    the wrong one, and holding it would report the old deck's agent count
-///    beside the new deck's name for up to `HANDSHAKE_REVALIDATE_INTERVAL`.
-/// 4. **Every transport except the selected deck's is released** — rule 3 of
+///    snapshot, the banner and the Stop/Replace gating — name the deck the
+///    document now says.
+/// 2. **The held handshake is dropped.** A classification describes one daemon;
+///    after any save it may describe the wrong one, and holding it would report
+///    the old deck's agent count beside the new deck's name for up to
+///    `HANDSHAKE_REVALIDATE_INTERVAL`.
+/// 3. **Every transport except the selected deck's is released** — rule 3 of
 ///    `endpoint_tunnels`, and the leak PRD #741 M7 names explicitly: without it
 ///    each selection change leaves an authenticated `ssh -N -L` child behind for
 ///    the life of the app. A lease already handed out survives this, so nothing
 ///    in flight is torn out from under — which since M9 includes a terminal
 ///    session's own lease, not merely the link's.
+///
+/// # Only when the deck actually moved
+///
+/// 4. **Every terminal session is detached.** A session streams from ONE
+///    daemon's PTY; after a selection change every one of them is showing the
+///    deck the user has left. The same pairing `StopDaemon` and `RestartDaemon`
+///    already make, and for the same reason: a tile left attached to a deck that
+///    is no longer selected is a tile whose keystrokes go to another machine's
+///    agent.
 /// 5. **The watcher is told** (M9). Its event subscription is a connection to
 ///    one daemon and a selection change does not end it, so without this it
 ///    would keep folding the old deck's broadcasts into the view that answers
-///    the new deck's snapshots. See `DesktopState::selection`.
+///    the new deck's snapshots. See [`DesktopState::selection`].
 /// 6. **A snapshot for the new deck is emitted** (M9). The watcher re-subscribes
 ///    within a moment and would emit one of its own on its next event or
-///    reconcile tick, but "within five seconds" is not an answer to a click:
-///    this is what makes the fleet on screen the chosen deck's by the time the
-///    save returns.
+///    reconcile tick, but "within five seconds" is not an answer to a click.
+///    This is also the step that must not run on an ordinary save: against an
+///    unreachable remote deck it costs a full connect timeout, and putting that
+///    in front of a theme change would make the whole settings sheet feel stuck.
 ///
-/// The order matters in two places: the links are dropped *before* the tunnels,
-/// so a link cannot be re-established against a transport that is on its way
-/// out; and the sessions are detached before either, so a detach frame still has
-/// a transport to travel over.
+/// The order matters in two places: the sessions are detached before the tunnels
+/// are released, so a detach frame still has a transport to travel over; and the
+/// links are dropped before the tunnels, so a link cannot be re-established
+/// against a transport that is on its way out.
 async fn apply_selection(app: &AppHandle, state: &DesktopState, settings: &DesktopSettings) {
-    let deck = crate::dto::apply_settings_selection(settings);
-    terminal::detach_all(state).await;
-    state.daemon.invalidate_all().await;
-    let live: std::collections::HashSet<String> = [deck.endpoint.describe()].into_iter().collect();
-    state.tunnels.retain(&live).await;
-    state.selection_changed();
+    if !retarget_selection(state, settings).await {
+        return;
+    }
     refresh_and_emit(app, &state.daemon).await;
+}
+
+/// [`apply_selection`] minus the emit, reporting whether the deck moved.
+///
+/// Split out because everything above the emit is testable and the emit is not —
+/// it needs an `AppHandle`, which means a running Tauri app. The one thing worth
+/// pinning here is exactly the thing a running app makes hard to observe: that an
+/// ordinary settings save does **not** take the switch path.
+async fn retarget_selection(state: &DesktopState, settings: &DesktopSettings) -> bool {
+    let previous = crate::dto::selected_endpoint().describe();
+    let deck = crate::dto::apply_settings_selection(settings);
+    let key = deck.endpoint.describe();
+    let moved = selection_moved(&previous, &key);
+    // Before the tunnels are released, so a DETACH frame still has a transport.
+    if moved {
+        terminal::detach_all(state).await;
+    }
+    state.daemon.invalidate_all().await;
+    let live: std::collections::HashSet<String> = [key].into_iter().collect();
+    state.tunnels.retain(&live).await;
+    if moved {
+        state.selection_changed();
+    }
+    moved
+}
+
+/// Whether a save changed which deck the app is talking to.
+///
+/// Compared by `Endpoint::describe()` — the key both `DaemonLinks` and
+/// `EndpointTunnels` are indexed by — rather than by the stored `Selection`
+/// token, and the difference is load-bearing in both directions. **Editing the
+/// selected deck's address moves the deck without moving the token**, and that
+/// has to count: the tunnel, the link and every terminal on it belong to the old
+/// address. And a *resolved* key is what the app is actually talking to, so a
+/// selection that falls back to the local deck — a row that is gone, a row with
+/// no socket path yet — compares as local, which is what it is.
+///
+/// The converse is the case this exists for: editing a deck the user is **not**
+/// on, or changing a theme, leaves the key identical and takes no switch path.
+fn selection_moved(previous: &str, next: &str) -> bool {
+    previous != next
 }
 
 /// Test one endpoint end to end and report a **named state** (PRD #741 M10).
@@ -1699,6 +1749,56 @@ mod tests {
     use std::collections::VecDeque;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A settings save that changed no deck must NOT take the switch path
+    /// (PRD #741 M9).
+    ///
+    /// Every settings save reaches `apply_selection`, theme and zoom included,
+    /// so this is not an efficiency test: the switch path detaches every
+    /// terminal session, and running it unconditionally would tear down a user's
+    /// live panes because they changed the colour scheme. The selection
+    /// generation is the observable proxy — it is bumped on exactly the path
+    /// that also detaches.
+    #[tokio::test]
+    async fn an_ordinary_settings_save_does_not_retarget_the_deck() {
+        let state = DesktopState::default();
+        let settings = DesktopSettings::default();
+        // The selection in force starts as this document's, so the save below is
+        // the "changed something else" case.
+        retarget_selection(&state, &settings).await;
+        let before = *state.selection.borrow();
+
+        assert!(
+            !retarget_selection(&state, &settings).await,
+            "saving the same document must not read as a deck change"
+        );
+        assert_eq!(
+            *state.selection.borrow(),
+            before,
+            "the watcher must not be told to re-subscribe, and no session detached"
+        );
+    }
+
+    /// The decision is made on the RESOLVED endpoint key, not on the stored
+    /// token (PRD #741 M9).
+    #[test]
+    fn a_deck_moves_when_its_address_moves_even_if_the_token_does_not() {
+        // The key both `DaemonLinks` and `EndpointTunnels` are indexed by. An
+        // edit to the selected deck's address moves the tunnel, the link and
+        // every terminal on it, while leaving the stored token identical — so a
+        // token comparison would miss exactly the case that matters most.
+        assert!(selection_moved(
+            "vf@build-box.example.com",
+            "vf@build-box.example.com:2222"
+        ));
+        assert!(!selection_moved("/run/deck.sock", "/run/deck.sock"));
+        // A selection that falls back to local compares as local, which is what
+        // the app is actually talking to.
+        assert!(selection_moved(
+            "vf@build-box.example.com",
+            "/run/deck.sock"
+        ));
+    }
 
     #[derive(Clone)]
     struct PromptSubmission {
