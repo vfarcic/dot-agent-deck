@@ -4,6 +4,14 @@ use std::sync::{Mutex, MutexGuard};
 
 use serde_json::{Value, json};
 
+use crate::agent_hook_config::{
+    binary_names_match, executables_match, strip_deck_commands, unquote_if_needed,
+};
+// Exercised only by this module's own tests, which drive the platform-convention
+// arithmetic with both hosts' conventions injected (see `binary_names_match_under`).
+#[cfg(test)]
+use crate::agent_hook_config::{binary_names_match_under, strip_suffix_ignoring_ascii_case};
+
 const HOOK_TYPES: &[&str] = &[
     "SessionStart",
     "SessionEnd",
@@ -332,22 +340,6 @@ fn shell_quote_if_needed(path: &str) -> String {
     }
 }
 
-/// Undo [`shell_quote_if_needed`]: strip a single- or double-quoted wrapper
-/// and unescape it back to the raw path, or return `exe` unchanged if it was
-/// never quoted. Tries BOTH quoting forms regardless of platform — not just
-/// the one this platform's writer produces — so a settings file written on
-/// one platform and read on another is not stranded, mirroring `_009`'s
-/// "a historical unquoted rule must still be recognised" principle.
-fn unquote_if_needed(exe: &str) -> std::borrow::Cow<'_, str> {
-    if let Some(inner) = exe.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')) {
-        return std::borrow::Cow::Owned(inner.replace(r"'\''", "'"));
-    }
-    if let Some(inner) = exe.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
-        return std::borrow::Cow::Owned(inner.replace("\\\"", "\""));
-    }
-    std::borrow::Cow::Borrowed(exe)
-}
-
 /// Ensure `settings["hooks"]` is an object and return a mutable reference to it.
 fn ensure_hooks_object(settings: &mut Value) -> &mut serde_json::Map<String, Value> {
     let obj = settings
@@ -513,71 +505,6 @@ fn uninstall_impl(settings: &mut Value) -> UninstallOutcome {
     }
 }
 
-/// Remove every command matching `is_target` from `rules`, dropping a rule
-/// object only once it carries no commands at all — the fix for issue #535.
-///
-/// A rule's `hooks` array is a LIST of commands sharing one matcher, so a user
-/// who put their own hook and the deck's in the same rule object is doing a
-/// normal thing. Removal used to be a `retain` over whole rules keyed on an
-/// `any()` across that list, so one deck command anywhere in a rule deleted the
-/// user's commands with it — measured in #535, where a user's
-/// `/usr/local/bin/my-critical-audit.sh` disappeared on `hooks uninstall` and
-/// nothing said so. Install had the identical granularity and is the more
-/// frequent path, since `auto_install` runs unattended at every dashboard
-/// startup.
-///
-/// Two deliberate conservatisms, both in the "never delete what we did not
-/// write" direction:
-///
-/// - a rule NOTHING matched in is returned untouched, so an already-empty or
-///   command-less rule object is never tidied away as a side effect;
-/// - a rule is dropped only when [`rule_commands`] reports nothing left in it,
-///   which keeps a rule alive on any command the deck does not claim, in either
-///   JSON shape.
-///
-/// Returns the number of individual commands removed.
-fn strip_deck_commands(rules: &mut Vec<Value>, mut is_target: impl FnMut(&str) -> bool) -> usize {
-    let mut removed = 0usize;
-    rules.retain_mut(|rule| {
-        let before = removed;
-
-        // Current shape: `{"hooks": [{"command": …}, …]}` — drop just the
-        // matching command objects and leave the rest of the array, and the
-        // rule's own `matcher`, exactly as the user wrote them.
-        if let Some(hooks) = rule.get_mut("hooks").and_then(Value::as_array_mut) {
-            let len = hooks.len();
-            hooks.retain(|hook| {
-                !hook
-                    .get("command")
-                    .and_then(Value::as_str)
-                    .is_some_and(&mut is_target)
-            });
-            removed += len - hooks.len();
-        }
-
-        // Legacy flat shape: `{"command": …}` — the command IS the rule, so
-        // there is nothing smaller to remove. Take the key out and let the
-        // no-commands-left check below decide the rule's fate, rather than
-        // assuming it carries nothing else.
-        if rule
-            .get("command")
-            .and_then(Value::as_str)
-            .is_some_and(&mut is_target)
-        {
-            if let Some(obj) = rule.as_object_mut() {
-                obj.remove("command");
-            }
-            removed += 1;
-        }
-
-        if removed == before {
-            return true;
-        }
-        rule_commands(rule).next().is_some()
-    });
-    removed
-}
-
 // --- Identify deck rules by command SUFFIX, not by basename ---
 //
 // The old matcher looked for the literal substring "dot-agent-deck" in a rule's
@@ -591,8 +518,10 @@ fn strip_deck_commands(rules: &mut Vec<Value>, mut is_target: impl FnMut(&str) -
 // a coexisting fork/upstream install silently delete each other's rules.
 //
 // The replacement identifies a rule by its command's exact SUFFIX,
-// [`HOOK_COMMAND_SUFFIX`] — mirroring `codex_hooks_manage::command_is_deck_owned`
-// (`:132-137`) and `devin_hooks_manage::command_is_deck_owned` (`:199-204`). No
+// [`HOOK_COMMAND_SUFFIX`] — the same question the Codex and Devin adapters ask,
+// which since issue #730 they ask through the one shared parse,
+// [`crate::agent_hook_config::command_executable`], rather than through their own
+// copies of it. No
 // basename check is layered on top: the suffix `"hook --agent claude-code"` is
 // specific enough on its own that an unrelated `mytool hook` or `git hook` (test
 // 005) does not end with it, and a user hook that merely mentions the deck's
@@ -611,9 +540,7 @@ fn strip_deck_commands(rules: &mut Vec<Value>, mut is_target: impl FnMut(&str) -
 /// (test 008). The returned token may still be shell-quoted; pass it through
 /// [`unquote_if_needed`] before comparing it as a path.
 fn current_format_executable(command: &str) -> Option<&str> {
-    let exe = command.trim_end().strip_suffix(HOOK_COMMAND_SUFFIX)?;
-    let exe = exe.strip_suffix(' ')?;
-    if exe.is_empty() { None } else { Some(exe) }
+    crate::agent_hook_config::command_executable(command, HOOK_COMMAND_SUFFIX)
 }
 
 /// Parse `command` as the LEGACY, pre-fix `<executable> hook` shape — no
@@ -625,80 +552,6 @@ fn legacy_format_executable(command: &str) -> Option<&str> {
     let exe = command.trim_end().strip_suffix("hook")?;
     let exe = exe.strip_suffix(' ')?;
     if exe.is_empty() { None } else { Some(exe) }
-}
-
-/// Whether two executable FILE NAMES name the same binary, judged by the host
-/// platform's own conventions rather than by byte equality.
-///
-/// **Unix: byte equality, unchanged.** [`std::env::consts::EXE_SUFFIX`] is
-/// empty, so [`strip_suffix_ignoring_ascii_case`] is a literal no-op and the
-/// comparison stays exact and case-sensitive. `foo.exe` on Unix is a genuinely different file
-/// name from `foo` and this must keep saying so — which is why the suffix is
-/// taken from `EXE_SUFFIX` and never hardcoded as `".exe"`.
-///
-/// **Windows: the suffix and the case are not part of a program's identity.**
-/// `dot-agent-deck` and `dot-agent-deck.exe` are the same binary — that is
-/// precisely what `PATHEXT` resolution means — and the filesystem is
-/// case-insensitive, so `Dot-Agent-Deck.EXE` is that same binary again.
-///
-/// Review finding H2 introduced this convention for [`is_legacy_deck_rule`]
-/// alone. PR #733's `build-windows` run then showed [`command_is_dead_deck`]
-/// needed it too and had silently missed it: [`durable_binary_path`] always
-/// resolves a name carrying `EXE_SUFFIX`, while [`DEFAULT_BINARY_NAME`] — the
-/// literal the pre-fix code wrote as its fallback, on Windows as much as
-/// anywhere — never does, so comparing raw basenames could never recognise a
-/// legacy Windows pin as ours to repair and issue #536 stayed open on that
-/// platform. Both call sites now share this one helper, so the convention
-/// cannot drift apart again.
-///
-/// [`durable_binary_path`]: crate::platform::paths::durable_binary_path
-fn binary_names_match(a: &str, b: &str) -> bool {
-    binary_names_match_under(a, b, std::env::consts::EXE_SUFFIX, cfg!(windows))
-}
-
-/// [`binary_names_match`] with the host's two conventions injected instead of
-/// read from the target: the executable suffix, and whether file names are
-/// case-insensitive.
-///
-/// Split out **so the arithmetic is testable on any platform**, which is not a
-/// stylistic preference here. PR #733's defect was Windows-only, could not be
-/// reproduced on the machine that had to fix it (`aws-lc-sys` does not
-/// cross-compile), and a `cfg!(windows)` branch covered by no test that runs
-/// where its author works is precisely how the first one shipped green.
-/// Passing `("", false)` reproduces every Unix exactly — an empty suffix makes
-/// [`strip_suffix_ignoring_ascii_case`] the identity, leaving plain `==`.
-fn binary_names_match_under(a: &str, b: &str, exe_suffix: &str, case_insensitive: bool) -> bool {
-    let a = strip_suffix_ignoring_ascii_case(a, exe_suffix);
-    let b = strip_suffix_ignoring_ascii_case(b, exe_suffix);
-    if case_insensitive {
-        a.eq_ignore_ascii_case(b)
-    } else {
-        a == b
-    }
-}
-
-/// `name` without one trailing `suffix`, matched case-insensitively because
-/// Windows spells its executable suffix both `.exe` and `.EXE`. Returns `name`
-/// untouched when `suffix` is empty (every Unix), when it is absent, and when
-/// the name is nothing BUT the suffix — a file called `.exe` is a name in its
-/// own right, not an empty one.
-fn strip_suffix_ignoring_ascii_case<'a>(name: &'a str, suffix: &str) -> &'a str {
-    if suffix.is_empty() {
-        return name;
-    }
-    match name.len().checked_sub(suffix.len()) {
-        // `is_char_boundary` is load-bearing, not defensive: a basename ending
-        // in a multi-byte character can put `cut` inside one, and slicing
-        // there panics.
-        Some(cut)
-            if cut > 0
-                && name.is_char_boundary(cut)
-                && name[cut..].eq_ignore_ascii_case(suffix) =>
-        {
-            &name[..cut]
-        }
-        _ => name,
-    }
 }
 
 /// Whether `command` is a LEGACY deck rule: the bare `<executable> hook` shape,
@@ -718,38 +571,6 @@ fn is_legacy_deck_rule(command: &str) -> bool {
         .and_then(|exe| Path::new(exe).file_name())
         .and_then(|n| n.to_str())
         .is_some_and(|basename| binary_names_match(basename, DEFAULT_BINARY_NAME))
-}
-
-/// Whether `existing` and `installing` (both already unquoted) name the SAME
-/// binary, so a rule for `existing` should be replaced rather than left
-/// alongside a fresh rule for `installing`. Symlinks are resolved first — the
-/// real-world case this exists for: a `dot-agent-deck` symlink pointing at a
-/// renamed `worker-agent-deck` collapses to one rule. Every path here can fail
-/// to resolve (most callers are test fixtures never written to disk), so
-/// resolution failure falls back to a literal string comparison; this never
-/// panics or unwraps on it.
-fn executables_match(existing: &str, installing: &str) -> bool {
-    if let (Ok(existing_real), Ok(installing_real)) = (
-        Path::new(existing).canonicalize(),
-        Path::new(installing).canonicalize(),
-    ) {
-        return existing_real == installing_real;
-    }
-    existing == installing
-}
-
-/// Every command string a rule carries, from either JSON shape: the current
-/// nested `{"hooks": [{"command": ...}]}` or the legacy flat
-/// `{"command": ...}`.
-fn rule_commands(rule: &Value) -> impl Iterator<Item = &str> {
-    let nested = rule
-        .get("hooks")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|hook| hook.get("command").and_then(Value::as_str));
-    let flat = rule.get("command").and_then(Value::as_str).into_iter();
-    nested.chain(flat)
 }
 
 /// Whether `command` is a deck-owned hook command, generically — no specific
@@ -822,24 +643,13 @@ fn command_matches_binary(command: &str, binary_path: &str) -> bool {
 /// already fail to resolve a path for reasons unrelated to the binary's
 /// health. That gap is unchanged by this fix.
 fn command_is_dead_deck(command: &str, binary_path: &str) -> bool {
-    let Some(installing) = Path::new(binary_path)
-        .file_name()
-        .and_then(|name| name.to_str())
-    else {
-        // No basename to compare against (an empty or `..`-terminated
-        // installing path, or a non-UTF-8 one). Fail safe: prune nothing. The
-        // old `Option == Option` comparison treated two `None`s as a MATCH,
-        // which is the one direction that deletes a user's rule off a value
-        // nobody can reason about.
-        return false;
-    };
-    owned_command_executable(command).is_some_and(|exe| {
-        Path::new(&exe)
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|existing| binary_names_match(existing, installing))
-            && crate::platform::paths::pin_is_repairable(&exe)
-    })
+    // The no-basename fail-safe (an empty or `..`-terminated installing path,
+    // or a non-UTF-8 one prunes nothing) lives in `pin_is_dead_sibling`. The
+    // old `Option == Option` comparison treated two `None`s as a MATCH, which
+    // is the one direction that deletes a user's rule off a value nobody can
+    // reason about.
+    owned_command_executable(command)
+        .is_some_and(|exe| crate::agent_hook_config::pin_is_dead_sibling(&exe, binary_path))
 }
 
 /// The literal, unquoted executable path a deck-owned command names, or `None`

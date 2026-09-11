@@ -272,7 +272,10 @@ fn codex_install_resolved(binary_path: Result<String, String>) -> Result<(), Str
         .ok_or_else(|| "no Codex home resolves (CODEX_HOME and HOME are both unset)".to_string())?;
     crate::codex_hooks_manage::install_to(&home, &binary_path).map_err(|e| e.to_string())?;
     let cwd = std::env::current_dir().unwrap_or_else(|_| home.clone());
-    if let Err(e) = crate::codex_hooks_manage::trust_deck_hooks_in(&home, &cwd) {
+    // Trust exactly the command the install above wrote, for the binary path it
+    // validated — never merely "something ending in the deck's verb" (#730).
+    let expected = crate::codex_hooks_manage::expected_hook_command(&binary_path);
+    if let Err(e) = crate::codex_hooks_manage::trust_deck_hooks_in(&home, &cwd, &expected) {
         tracing::warn!("codex hooks install: could not record scoped hook trust: {e}");
     }
     Ok(())

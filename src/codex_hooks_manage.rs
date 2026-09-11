@@ -136,34 +136,64 @@ fn codex_home() -> Option<PathBuf> {
     Some(PathBuf::from(home).join(".codex"))
 }
 
-/// Whether a command string is a deck-authored hook, by EXACT signature: it ends
-/// with [`HOOK_COMMAND_SUFFIX`] (`… hook --agent codex`). A user command that
-/// merely contains `dot-agent-deck` (e.g. `audit-wrapper --watch dot-agent-deck`)
-/// is NOT deck-owned and is preserved (finding #14).
+/// Whether a command string is a deck-authored hook, by EXACT signature: it is
+/// `<executable> ` followed by [`HOOK_COMMAND_SUFFIX`] (`… hook --agent codex`).
+/// A user command that merely contains `dot-agent-deck` (e.g.
+/// `audit-wrapper --watch dot-agent-deck`) is NOT deck-owned and is preserved
+/// (finding #14).
+///
+/// This is the WIDE, binary-agnostic sense of ownership: any deck install's
+/// command, not just this one's. It is the right predicate for uninstall —
+/// whose job is to remove the deck's rules wholesale, whichever install wrote
+/// them — and for the retired-event sweep, and the wrong one for deciding what
+/// a re-install may overwrite (see [`command_is_this_binary`] and
+/// [`command_is_dead_deck`], issue #730).
 fn command_is_deck_owned(command: &str) -> bool {
-    command.trim_end().ends_with(HOOK_COMMAND_SUFFIX)
+    crate::agent_hook_config::command_executable(command, HOOK_COMMAND_SUFFIX).is_some()
 }
 
-/// Whether a hooks.json rule was authored by the deck — i.e. one of its command
-/// handlers is a deck hook by [`command_is_deck_owned`]. Used to strip stale deck
-/// entries before re-adding fresh ones, so re-installs are idempotent and never
-/// touch a user's own hooks.
-fn rule_is_dot_agent_deck(rule: &Value) -> bool {
-    rule.get("hooks")
-        .and_then(|h| h.as_array())
-        .is_some_and(|hooks| {
-            hooks.iter().any(|hook| {
-                hook.get("command")
-                    .and_then(|c| c.as_str())
-                    .is_some_and(command_is_deck_owned)
-            })
-        })
+/// The executable a deck-owned command names, unquoted, or `None` when the
+/// command is not deck-owned at all.
+fn deck_command_executable(command: &str) -> Option<String> {
+    crate::agent_hook_config::command_executable(command, HOOK_COMMAND_SUFFIX)
+        .map(|exe| crate::agent_hook_config::unquote_if_needed(exe).into_owned())
 }
 
-/// Merge the deck's command hooks for `command` into an existing `hooks.json`
-/// value (or `{}`), preserving any user-authored hooks and refreshing (not
-/// duplicating) prior deck entries.
-fn install_impl(root: &mut Value, command: &str) {
+/// Whether `command` is a deck-owned command belonging to the SPECIFIC binary
+/// currently installing, so a re-install should replace it rather than add a
+/// second rule beside it. Symlinks are resolved, so a `dot-agent-deck` symlink
+/// pointing at a renamed build collapses to one rule.
+fn command_is_this_binary(command: &str, binary_path: &str) -> bool {
+    deck_command_executable(command)
+        .is_some_and(|exe| crate::agent_hook_config::executables_match(&exe, binary_path))
+}
+
+/// Whether `command` is a deck-owned command whose pin is POSITIVELY not usable
+/// and which shares the installing binary's own basename — the "repair only
+/// when the target is missing" gate, mirroring `hooks_manage::command_is_dead_deck`.
+///
+/// Issue #730: before this, `install_impl` stripped **every** deck-owned rule by
+/// suffix and re-added its own, so a deck-owned entry naming a different but
+/// still-valid install was repointed on each launch. PRD #381's Open Question 3
+/// answers that case explicitly — leave it alone; the trigger is "the target is
+/// missing", never "the target is not what I would have written" — and Claude
+/// and OpenCode already behaved that way. This is what makes Codex match.
+fn command_is_dead_deck(command: &str, binary_path: &str) -> bool {
+    deck_command_executable(command)
+        .is_some_and(|exe| crate::agent_hook_config::pin_is_dead_sibling(&exe, binary_path))
+}
+
+/// Merge the deck's command hooks for `command` — the command built for
+/// `binary_path` — into an existing `hooks.json` value (or `{}`), preserving any
+/// user-authored hooks and refreshing (not duplicating) this binary's own prior
+/// deck entries.
+///
+/// `binary_path` is passed alongside the already-built `command` because the two
+/// answer different questions: `command` is what gets WRITTEN, `binary_path` is
+/// what decides which existing deck commands may be overwritten.
+fn install_impl(root: &mut Value, command: &str, binary_path: &str) {
+    use crate::agent_hook_config::strip_deck_commands;
+
     if !root.is_object() {
         *root = json!({});
     }
@@ -176,12 +206,16 @@ fn install_impl(root: &mut Value, command: &str) {
         .and_then(Value::as_object_mut)
         .expect("hooks is an object");
 
-    // Strip any stale deck-authored entries from every event so a re-install
-    // normalizes down to exactly one fresh deck rule per event.
+    // Deck entries under an event this deck no longer installs are stale
+    // regardless of which binary wrote them — there is nothing left to fire
+    // them — so those use the wide, binary-agnostic predicate.
     let keys: Vec<String> = hooks.keys().cloned().collect();
     for key in keys {
+        if CODEX_HOOK_EVENTS.contains(&key.as_str()) {
+            continue;
+        }
         if let Some(arr) = hooks.get_mut(&key).and_then(Value::as_array_mut) {
-            arr.retain(|rule| !rule_is_dot_agent_deck(rule));
+            strip_deck_commands(arr, command_is_deck_owned);
         }
     }
 
@@ -193,9 +227,17 @@ fn install_impl(root: &mut Value, command: &str) {
         if !arr.is_array() {
             *arr = json!([]);
         }
-        arr.as_array_mut()
-            .expect("hook event value is an array")
-            .push(entry.clone());
+        let arr = arr.as_array_mut().expect("hook event value is an array");
+        // Normalize down to a single fresh rule, but only for THIS binary —
+        // plus any deck pin that is positively dead and shares its basename,
+        // the shape N worktree builds actually take. A deck rule belonging to a
+        // genuinely different, still-valid install is left in place and the new
+        // rule is added ALONGSIDE it (issue #730), which is what Claude's
+        // `install_impl` has always done.
+        strip_deck_commands(arr, |cmd| {
+            command_is_this_binary(cmd, binary_path) || command_is_dead_deck(cmd, binary_path)
+        });
+        arr.push(entry.clone());
     }
 }
 
@@ -272,7 +314,7 @@ pub fn install_to(codex_home: &Path, binary_path: &str) -> std::io::Result<()> {
 
     let command =
         crate::agent_hook_config::build_command(binary_path, HOOK_COMMAND_SUFFIX, HOOK_SHELL);
-    install_impl(&mut root, &command);
+    install_impl(&mut root, &command, binary_path);
     let contents = serde_json::to_string_pretty(&root)?;
     crate::agent_hook_config::write_atomic(codex_home, &path, contents.as_bytes())
 }
@@ -367,10 +409,13 @@ fn any_foreign_command_hook(root: &Value) -> bool {
 /// boots and discovers them. Failures are swallowed (best-effort, like Claude's
 /// `auto_install`): a missing home or unwritable dir degrades to the coarse
 /// stdout fallback rather than blocking the spawn.
-pub fn auto_install() {
-    let Some(home) = codex_home() else {
-        return;
-    };
+///
+/// Returns the durable binary path the definitions were written for, or `None`
+/// if nothing was written. The caller needs it to build the expected command
+/// [`trust_deck_hooks_in`] compares against (issue #730) — the SAME value, so
+/// install and trust can never be about two different binaries.
+pub fn auto_install() -> Option<String> {
+    let home = codex_home()?;
     // PRD #381: never `current_exe()` directly — a `target/debug` path written
     // here is gone the moment its worktree is pruned, and this write is silent
     // and automatic. A refusal writes nothing and warns; `hooks.json` is left
@@ -379,12 +424,21 @@ pub fn auto_install() {
         Ok(binary_path) => binary_path,
         Err(e) => {
             tracing::warn!("auto-install: {e}");
-            return;
+            return None;
         }
     };
     if let Err(e) = install_to(&home, &binary_path) {
         tracing::warn!("auto-install: failed to write Codex hooks.json: {e}");
+        return None;
     }
+    Some(binary_path)
+}
+
+/// The exact hook command the deck writes for `binary_path` — what
+/// [`trust_deck_hooks_in`] compares a listed entry against, built by the same
+/// call [`install_to`] makes so the two cannot spell it differently.
+pub fn expected_hook_command(binary_path: &str) -> String {
+    crate::agent_hook_config::build_command(binary_path, HOOK_COMMAND_SUFFIX, HOOK_SHELL)
 }
 
 /// Remove the deck's own hook rules from `<codex_home>/hooks.json`, leaving every
@@ -407,7 +461,11 @@ pub fn uninstall_from(codex_home: &Path) -> std::io::Result<()> {
     if let Some(hooks) = root.get_mut("hooks").and_then(Value::as_object_mut) {
         for value in hooks.values_mut() {
             if let Some(arr) = value.as_array_mut() {
-                arr.retain(|rule| !rule_is_dot_agent_deck(rule));
+                // Wide ownership on purpose: uninstall removes the deck's rules
+                // wholesale, whichever install wrote them. Command granularity
+                // is what keeps a user's sibling handler sharing the rule object
+                // from going with them (issue #730).
+                crate::agent_hook_config::strip_deck_commands(arr, command_is_deck_owned);
             }
         }
         hooks.retain(|_, value| !value.as_array().is_some_and(|arr| arr.is_empty()));
@@ -634,24 +692,58 @@ fn parse_hooks_list(response: &Value) -> std::io::Result<Vec<CodexHookEntry>> {
     Ok(entries)
 }
 
+/// How closely a listed entry's command must match for the entry to count as the
+/// deck's — the knob issue #730 adds, because trust and untrust want different
+/// answers and collapsing them to one is what made the suffix a security
+/// predicate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeckCommandMatch<'a> {
+    /// Byte-exactly the command the deck writes for a validated durable path —
+    /// `agent_hook_config::build_command(binary_path, …)`, the same call
+    /// [`install_to`] makes. **This is the one to use for a trust WRITE**, which
+    /// is a grant and must fail closed: the entry has to be the deck invoking
+    /// its own binary, not merely some command ending in the deck's verb.
+    Exact(&'a str),
+    /// Any command carrying the deck signature, whichever install wrote it and
+    /// whatever executable it names ([`command_is_deck_owned`]). **For
+    /// REVOCATION only.** Dropping a trust record is fail-open in the safe
+    /// direction — the worst case is removing a record the deck did not write,
+    /// bounded by conditions 1 and 3 below — whereas narrowing it would leave a
+    /// record behind for an entry a sibling deck install wrote and this
+    /// uninstall is about to delete from `hooks.json`.
+    Signature,
+}
+
 /// **The security predicate — the only path to a trust write.** Keep an entry only
 /// when ALL of the following hold:
 ///
 /// 1. its `source_path` is the PINNED home's own `hooks.json` — the file the deck
 ///    authored and pins on the Codex child, not a project-local, plugin, or
 ///    other-home definition;
-/// 2. its command carries the exact deck signature [`HOOK_COMMAND_SUFFIX`], so a
-///    foreign command in the very same file (or one that merely *mentions*
-///    `dot-agent-deck`) is never selected;
+/// 2. its command satisfies `how` — see [`DeckCommandMatch`], and note that for
+///    a trust write that means the EXACT command built from the validated
+///    durable path, not an arbitrary executable followed by the deck's verb;
 /// 3. it is not `isManaged` — a managed hook is provisioned by root/MDM and is
 ///    never the deck's to trust.
 ///
 /// So the deck records trust ONLY for definitions it wrote itself, one exact hash
 /// at a time. Paths are compared verbatim first and, only if that fails, by
 /// canonicalized form (so a symlinked home still matches the SAME real file).
+///
+/// **Why condition 2 had to be narrowed (issue #730, auditor finding LOW-1).**
+/// It used to be the bare suffix test, and the suffix is a *convention*, not a
+/// capability: a user-authored command that intentionally ends in
+/// `hook --agent codex` is indistinguishable from a deck entry under it. That
+/// left a window — a command placed in the deck's own `hooks.json` that merely
+/// ends with the deck's verb could be handed a `trusted_hash`, which is Codex's
+/// permission to RUN it. Tightening the suffix is not the fix, because there is
+/// no suffix a user cannot also write; comparing against the exact command the
+/// deck itself would emit for the path it validated is, because that names the
+/// deck's own binary and nothing else.
 pub fn deck_owned_entries<'a>(
     entries: &'a [CodexHookEntry],
     home: &Path,
+    how: DeckCommandMatch<'_>,
 ) -> Vec<&'a CodexHookEntry> {
     let ours = home.join("hooks.json");
     let ours_real = ours.canonicalize().ok();
@@ -660,13 +752,29 @@ pub fn deck_owned_entries<'a>(
         .filter(|entry| {
             let same_file = entry.source_path == ours
                 || (ours_real.is_some() && entry.source_path.canonicalize().ok() == ours_real);
-            same_file && command_is_deck_owned(&entry.command) && !entry.is_managed
+            let command_matches = match how {
+                DeckCommandMatch::Exact(expected) => entry.command == expected,
+                DeckCommandMatch::Signature => command_is_deck_owned(&entry.command),
+            };
+            same_file && command_matches && !entry.is_managed
         })
         .collect()
 }
 
 /// Record scoped, hash-pinned trust for the deck's OWN hooks in `home`, returning
 /// how many entries were trusted (PRD #20 §4.1.2).
+///
+/// `expected_command` is the command [`install_to`] just wrote — the caller's own
+/// `agent_hook_config::build_command(binary_path, …)` for the durable path it
+/// resolved and validated — and only entries carrying that exact string are
+/// trusted ([`DeckCommandMatch::Exact`], issue #730). It is a PARAMETER rather
+/// than something resolved here so install and trust cannot disagree about which
+/// binary this run is about, and so a test can drive the predicate with a path it
+/// controls instead of inheriting whatever the host has at
+/// `~/.local/bin/dot-agent-deck`. A caller that could not resolve a durable path
+/// has no expected command and must not call this at all: no trust is the
+/// fail-closed answer, and the definitions it would have trusted were never
+/// written either.
 ///
 /// Asks Codex for the listing ([`list_hooks_in`]), narrows it with
 /// [`deck_owned_entries`], and writes `[hooks.state."<key>"] { enabled = true,
@@ -679,12 +787,17 @@ pub fn deck_owned_entries<'a>(
 /// it is launch-method agnostic (trust lives in the home, not argv), never trusts
 /// a hook the deck didn't author, and fails closed (any error ⇒ the hooks stay
 /// untrusted and events degrade to the coarse stdout classifier).
-pub fn trust_deck_hooks_in(home: &Path, cwd: &Path) -> std::io::Result<usize> {
+pub fn trust_deck_hooks_in(
+    home: &Path,
+    cwd: &Path,
+    expected_command: &str,
+) -> std::io::Result<usize> {
     let entries = list_hooks_in(home, cwd)?;
-    let records: Vec<(String, String)> = deck_owned_entries(&entries, home)
-        .into_iter()
-        .map(|entry| (entry.key.clone(), entry.current_hash.clone()))
-        .collect();
+    let records: Vec<(String, String)> =
+        deck_owned_entries(&entries, home, DeckCommandMatch::Exact(expected_command))
+            .into_iter()
+            .map(|entry| (entry.key.clone(), entry.current_hash.clone()))
+            .collect();
     if records.is_empty() {
         return Ok(0);
     }
@@ -700,15 +813,29 @@ pub fn trust_deck_hooks_in(home: &Path, cwd: &Path) -> std::io::Result<usize> {
 /// Drop the trust records for the deck's own hooks in `home` — the uninstall
 /// counterpart of [`trust_deck_hooks_in`], returning how many were removed.
 ///
-/// Deck ownership is resolved through the SAME predicate as the write
-/// ([`deck_owned_entries`]), so a user's own trust record — including one for a
-/// foreign hook that happens to live in the deck's `hooks.json` — is never
-/// touched. Call it BEFORE removing the definitions, while Codex can still
-/// enumerate them.
+/// Deck ownership is resolved through the same function as the write
+/// ([`deck_owned_entries`]) but at the WIDE [`DeckCommandMatch::Signature`]
+/// setting, so a user's own trust record — including one for a foreign hook that
+/// happens to live in the deck's `hooks.json` — is never touched, while a record
+/// written by a *sibling* deck install still is. Call it BEFORE removing the
+/// definitions, while Codex can still enumerate them.
+///
+/// **The asymmetry with [`trust_deck_hooks_in`] is deliberate (issue #730).** A
+/// trust write is a grant and must fail closed, so it takes the exact command.
+/// An untrust is a revocation and must fail *open in the revoking direction*, so
+/// it takes the signature: [`uninstall_from`] deletes every deck-owned command
+/// from `hooks.json` whichever install wrote it, and a narrower predicate here
+/// would leave the trust record for a sibling install's entry behind after its
+/// definition was gone. Such an orphan is inert — Codex pins trust to the
+/// definition's hash, so a different definition arriving at the same key reads
+/// as `modified` and is refused — but it is still state this uninstall promised
+/// to clear, and the wider predicate is bounded by the same two conditions the
+/// narrow one is: the entry must live in the deck's own `hooks.json` and must
+/// not be managed.
 pub fn untrust_deck_hooks_in(home: &Path) -> std::io::Result<usize> {
     let cwd = std::env::current_dir().unwrap_or_else(|_| home.to_path_buf());
     let entries = list_hooks_in(home, &cwd)?;
-    let keys: Vec<String> = deck_owned_entries(&entries, home)
+    let keys: Vec<String> = deck_owned_entries(&entries, home, DeckCommandMatch::Signature)
         .into_iter()
         .map(|entry| entry.key.clone())
         .collect();
@@ -879,9 +1006,15 @@ pub fn auto_install_and_trust_at_startup() {
         tracing::debug!("codex startup install: skipped (no CODEX_HOME/HOME)");
         return;
     };
-    auto_install();
+    // No durable path means nothing was installed, so there is no command to
+    // trust and no entry of ours in the listing. Fail closed rather than falling
+    // back to a wider predicate (issue #730).
+    let Some(binary_path) = auto_install() else {
+        tracing::debug!("codex startup install: skipped trust (no durable binary path resolved)");
+        return;
+    };
     let cwd = std::env::current_dir().unwrap_or_else(|_| home.clone());
-    match trust_deck_hooks_in(&home, &cwd) {
+    match trust_deck_hooks_in(&home, &cwd, &expected_hook_command(&binary_path)) {
         Ok(count) => {
             tracing::debug!(count, "codex startup install: recorded scoped hook trust")
         }
@@ -962,6 +1095,14 @@ mod tests {
 
         let contents = std::fs::read_to_string(dir.path().join("hooks.json")).unwrap();
         let root: Value = serde_json::from_str(&contents).unwrap();
+        let deck_rules = |event: &str| {
+            root["hooks"][event]
+                .as_array()
+                .unwrap_or_else(|| panic!("{event} array"))
+                .iter()
+                .filter(|r| crate::agent_hook_config::rule_commands(r).any(command_is_deck_owned))
+                .count()
+        };
         let pre = root["hooks"]["PreToolUse"]
             .as_array()
             .expect("PreToolUse array");
@@ -970,11 +1111,56 @@ mod tests {
             .iter()
             .filter(|r| r["hooks"][0]["command"] == json!("/user/own-hook"))
             .count();
-        let deck_rules = pre.iter().filter(|r| rule_is_dot_agent_deck(r)).count();
         assert_eq!(user_rules, 1, "user hook preserved");
+        // Issue #730 narrowed which deck rules a re-install may strip, so the
+        // no-duplication property is now asserted across EVERY event rather than
+        // the one that happened to carry the user's hook: a predicate that
+        // stopped matching this binary's own rules would accumulate a second
+        // copy per event on every launch, and one event cannot show that.
+        for &event in CODEX_HOOK_EVENTS {
+            assert_eq!(
+                deck_rules(event),
+                1,
+                "deck hook present exactly once after re-install ({event})"
+            );
+        }
+    }
+
+    /// Issue #730, the uninstall half: `hooks uninstall --agent codex` must take
+    /// the deck's command out of a rule object the user shares with it without
+    /// taking the user's handler too. Ownership here stays WIDE (any deck
+    /// install's command, by signature) — an uninstall's job is to remove the
+    /// deck's rules wholesale — and only the granularity changes.
+    #[test]
+    fn uninstall_keeps_a_users_sibling_handler_in_a_shared_rule() {
+        let dir = tempfile::tempdir().expect("codex home tempdir");
+        install_to(dir.path(), "/abs/dot-agent-deck").expect("install");
+        // Move the user's handler INTO the deck's own rule object, which is what
+        // a user editing `hooks.json` by hand naturally produces.
+        let path = dir.path().join("hooks.json");
+        let mut root: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        root["hooks"]["PreToolUse"][0]["hooks"]
+            .as_array_mut()
+            .expect("deck rule handlers")
+            .push(json!({ "type": "command", "command": "/usr/local/bin/my-critical-audit.sh" }));
+        std::fs::write(&path, serde_json::to_string_pretty(&root).unwrap()).unwrap();
+
+        uninstall_from(dir.path()).expect("uninstall");
+
+        let root: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let pre = root["hooks"]["PreToolUse"]
+            .as_array()
+            .expect("the shared rule's event key must survive");
+        assert_eq!(pre.len(), 1, "the shared rule must survive: {pre:?}");
         assert_eq!(
-            deck_rules, 1,
-            "deck hook present exactly once after re-install"
+            pre[0]["hooks"].as_array().map(Vec::len),
+            Some(1),
+            "only the deck's command may be removed: {pre:?}"
+        );
+        assert_eq!(
+            pre[0]["hooks"][0]["command"],
+            json!("/usr/local/bin/my-critical-audit.sh")
         );
     }
 

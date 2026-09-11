@@ -3816,9 +3816,9 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 
 ##### codex/trust/002 — Scoped trust selects only pinned-home, unmanaged, deck-owned hook entries (PRD #20 §4.3.1/§4.3.6).
 - **Layer:** L1/fast real-binary subprocess integration with a deterministic `codex app-server` JSON-RPC stand-in, exercised through both bare Codex and a launcher script.
-- **Agent:** synthetic Codex hooks/list response containing one eligible deck hook plus a foreign command, a deck command from a different home, a managed entry, and a user command that merely mentions `dot-agent-deck`.
-- **Asserts:** `[hooks.state]` contains only the eligible entry whose `sourcePath` is the pinned home's `hooks.json`, command ends in `hook --agent codex`, and `isManaged` is false; the global bypass never appears for either launch method.
-- **Does not assert:** byte-preserving config edits or untrust behavior (covered by `codex/trust/003`).
+- **Agent:** synthetic Codex hooks/list response containing one eligible deck hook plus a foreign command, a deck command from a different home, a managed entry, a user command that merely mentions `dot-agent-deck`, and (since #730) a crafted command that ends with the deck's exact `hook --agent codex` signature while naming a different executable.
+- **Asserts:** `[hooks.state]` contains only the eligible entry whose `sourcePath` is the pinned home's `hooks.json`, whose command is byte-exactly the one the install just wrote for the durable binary seeded in this fixture's `$HOME`, and whose `isManaged` is false; the global bypass never appears for either launch method.
+- **Does not assert:** byte-preserving config edits or untrust behavior (covered by `codex/trust/003`); the trust/untrust predicate asymmetry itself (covered by `codex/trust/004`).
 - **Platform coverage:** mac+linux.
 
 ##### codex/trust/003 — Scoped trust config edits preserve user bytes, remain idempotent, and untrust only deck keys (PRD #20 §4.3.2).
@@ -3827,6 +3827,13 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 - **Asserts:** trust appends exactly one hash-pinned deck table while preserving the existing config bytes verbatim; a second write creates no duplicate; Codex hook uninstall removes the deck key and retains the foreign key.
 - **Does not assert:** Codex's runtime trust-status interpretation (covered by the real-agent green-confirm scenario).
 - **Platform coverage:** mac+linux.
+
+##### codex/trust/004 — Only the exact installed deck command is eligible for a trust write, while untrust stays wider (issue #730).
+- **Layer:** L1/fast in-process call of `codex_hooks_manage::deck_owned_entries` over a hand-built listing.
+- **Agent:** none (synthetic `CodexHookEntry` values — the eligible deck command, a crafted look-alike ending in the same `hook --agent codex` signature but naming another executable, and a command that merely mentions `dot-agent-deck`).
+- **Asserts:** under `DeckCommandMatch::Exact` only the entry whose command is byte-exactly the deck's generated command is selected, so a crafted same-suffix command in the deck's own `hooks.json` gets no `trusted_hash`; under `DeckCommandMatch::Signature` — the revocation setting — both deck-signature entries are selected, so an uninstall does not orphan a sibling install's trust record.
+- **Does not assert:** that the wrapper actually writes the record (covered by `codex/trust/002`), or `config.toml` byte preservation (covered by `codex/trust/003`).
+- **Platform coverage:** mac+linux (unix-only test file).
 
 #### codex/spawn
 

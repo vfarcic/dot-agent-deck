@@ -752,18 +752,23 @@ fn codex_spawn_prep(
     let installs_hooks = codex_identity && (program_codex || pane_id.is_some());
     // Resolve the vetted home ONCE, so the SAME path is installed into, trusted,
     // and pinned on the child — they can't drift apart (finding #2).
+    let mut installed_binary = None;
     let pinned_home = if installs_hooks {
-        crate::codex_hooks_manage::auto_install();
+        installed_binary = crate::codex_hooks_manage::auto_install();
         crate::codex_hooks_manage::active_codex_home()
     } else {
         None
     };
 
-    // Scoped trust for the hooks just installed, in the SAME pinned home. The
-    // child's cwd is the wrapper's cwd, which is what Codex resolves hooks for.
-    if let Some(home) = pinned_home.as_deref() {
+    // Scoped trust for the hooks just installed, in the SAME pinned home, for
+    // the exact command the SAME install wrote (issue #730). No durable path
+    // means nothing was installed, so there is nothing of ours to trust — fail
+    // closed rather than trusting by signature alone.
+    // The child's cwd is the wrapper's cwd, which is what Codex resolves hooks for.
+    if let (Some(home), Some(binary_path)) = (pinned_home.as_deref(), installed_binary.as_deref()) {
         let cwd = std::env::current_dir().unwrap_or_else(|_| home.to_path_buf());
-        match crate::codex_hooks_manage::trust_deck_hooks_in(home, &cwd) {
+        let expected = crate::codex_hooks_manage::expected_hook_command(binary_path);
+        match crate::codex_hooks_manage::trust_deck_hooks_in(home, &cwd, &expected) {
             Ok(count) => tracing::debug!(count, "codex: recorded scoped trust for deck hooks"),
             Err(e) => tracing::warn!(
                 "codex: could not record scoped hook trust ({e}); deck events degrade to stdout \
