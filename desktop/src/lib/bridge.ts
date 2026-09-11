@@ -31,6 +31,16 @@ export interface DesktopSnapshotDto {
     localOnlyReason?: string;
     /** Why the app is on the local deck when the stored selection named another. */
     selectionFallback?: string;
+    /**
+     * Why projects and workflows cannot be started against this deck (PRD #741
+     * M8), or absent when they can.
+     *
+     * Derived daemon-side from the `Hello` reply's ADVERTISED capability set,
+     * not from a version digit or a build stamp — which is the point: it answers
+     * "does this deck do what I am about to ask it to" rather than "is this deck
+     * the same build as me".
+     */
+    projectActionsReason?: string;
     error?: string;
     clientProtocolVersion: number;
     serverProtocolVersion?: number;
@@ -766,6 +776,7 @@ export function mapDesktopSnapshot(dto: DesktopSnapshotDto, previous?: DeckSnaps
       deckKind: dto.connection.deckKind === "remote" ? "remote" : "local",
       localOnlyReason: dto.connection.localOnlyReason,
       selectionFallback: dto.connection.selectionFallback,
+      projectActionsReason: dto.connection.projectActionsReason,
     },
     health: dto.connection.status === "incompatible" ? "failed" : dto.connection.status === "disconnected" ? "idle" : agents.some((agent) => agent.status === "failed") ? "failed" : "healthy",
     elapsed: previous?.elapsed ?? "—",

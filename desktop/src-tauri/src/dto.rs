@@ -95,6 +95,24 @@ pub struct DesktopConnection {
     /// user ends up acting on the wrong machine's agents.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub selection_fallback: Option<String>,
+    /// Why the project-aware surfaces — choosing a project, preparing and
+    /// launching a workflow — are unavailable against this daemon (PRD #741 M8).
+    ///
+    /// **The field that replaces the build stamp as the thing a screen acts
+    /// on.** It is derived from what the daemon ADVERTISED in its `Hello` reply,
+    /// through `DaemonCapabilities::supports`, so it answers "can this deck do
+    /// what I am about to ask" rather than "is this deck the same build as me" —
+    /// the distinction issue #801 is about. A daemon that advertises no set at
+    /// all is an older daemon and withholds every verb, which is why absence is
+    /// a reason rather than a grant.
+    ///
+    /// `None` means available. Omitted from the wire when `None`, unlike
+    /// [`Self::deck_kind`] and [`Self::build_stamp_mismatch_only`]: those two
+    /// are branched on to decide whether a control EXISTS, where an absent field
+    /// reading as `false` would be wrong. This one is a sentence to render, and
+    /// "no sentence" is exactly what absence should mean.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_actions_reason: Option<String>,
 }
 
 /// The three endpoint-shaped fields of [`DesktopConnection`], filled from the
@@ -920,6 +938,9 @@ pub(crate) fn disconnected_snapshot(error: impl AsRef<str>) -> DesktopSnapshot {
             deck_kind,
             local_only_reason,
             selection_fallback,
+            // Nothing was advertised because nothing answered. A disconnected
+            // screen is already saying the only thing there is to say.
+            project_actions_reason: None,
         },
         agents: Vec::new(),
         protocol_version: PROTOCOL_VERSION,

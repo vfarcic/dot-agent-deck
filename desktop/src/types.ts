@@ -59,6 +59,17 @@ export interface ConnectionView {
    * local".
    */
   selectionFallback?: string;
+  /**
+   * Why the project-aware surfaces — choosing a project, preparing and launching
+   * a workflow — are unavailable against this deck (PRD #741 M8).
+   *
+   * The daemon's own sentence, derived from what it ADVERTISED in its `Hello`
+   * reply rather than from a version number or a build stamp. Absent means
+   * available, so a screen reads absence as "nothing to say" and not as "unknown
+   * — better disable it": the desktop crate omits the field only when every verb
+   * the launch needs was advertised.
+   */
+  projectActionsReason?: string;
   /** True when a daemon answered Hello but failed protocol/build compatibility. */
   daemonDetected?: boolean;
   /** Honest count reported by Hello; undefined when the daemon could not report it. */

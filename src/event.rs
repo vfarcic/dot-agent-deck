@@ -1404,6 +1404,54 @@ pub enum BroadcastMsg {
     /// it ships with.
     #[serde(rename = "worktree_kept")]
     WorktreeKept(crate::issue_dispatch_run::KeptWorktree),
+    /// A `kind` tag this build has never heard of (issue #801 item 3, applied
+    /// by PRD #741 M8).
+    ///
+    /// # Why a catch-all here is worth more than one anywhere else
+    ///
+    /// This is a **push**. The client never asked for the message, so no
+    /// capability negotiation can help it: `AttachResponse::capabilities`
+    /// answers "may I call this verb", and a broadcast is not a verb. And the
+    /// failure is not confined to the message — `serde_json::from_slice` over a
+    /// `KIND_EVENT` payload with an unknown tag fails the **whole frame**, which
+    /// `EventSubscription::next_event` returns as an `io::Error`, which every
+    /// caller treats as the stream ending. So one unrecognised broadcast took
+    /// the entire event subscription down and left the client reconnecting in a
+    /// loop, on a daemon that was working perfectly.
+    ///
+    /// That is the exact shape of the two bumps this project has already paid
+    /// for — 4 → 5 for `AgentType::Pi` and 6 → 7 for `ShellBusy`/`ShellIdle`,
+    /// both new-daemon/old-client, both a mid-session decode crash rather than a
+    /// missing feature — and both were closed for their own enum by the same
+    /// retrofit. [`AgentType`] and [`EventType`] carry it; the enum that WRAPS
+    /// them did not, so a new *variant* of this type still had the old
+    /// behaviour.
+    ///
+    /// # What a reader should do with one
+    ///
+    /// Nothing, except not die. The variant carries no payload — serde's
+    /// `other` is only available on a unit variant — so there is nothing to act
+    /// on, which is the honest answer: the message meant something this build
+    /// cannot know. A reader that keeps derived state (the desktop's
+    /// `AgentView`, the TUI's `AppState`) should treat it as "something changed
+    /// that I could not interpret" and re-read whatever authoritative list it
+    /// has, rather than assuming nothing happened.
+    ///
+    /// # It is deserialize-only in practice
+    ///
+    /// `#[serde(other)]` governs decoding; nothing in this repo ever constructs
+    /// this variant, so it never reaches the wire. It is not a new message kind
+    /// and `PROTOCOL_VERSION` does not move for it — the change makes this
+    /// client *tolerant* of tags it does not know, which is the opposite of a
+    /// wire change.
+    ///
+    /// # And what it does NOT buy
+    ///
+    /// Nothing for already-released binaries, which predate it — exactly as
+    /// [`AgentType`]'s retrofit bought nothing for pre-Pi readers. It is what
+    /// makes the NEXT `BroadcastMsg` variant additive.
+    #[serde(other)]
+    Unknown,
 }
 
 /// PRD #120: the structural membership of a daemon-spawned orchestration,
@@ -1953,6 +2001,75 @@ mod tests {
             DaemonMessage::GetSeed(r) => assert_eq!(r.agent_id.as_deref(), Some("a1")),
             _ => panic!("expected GetSeed"),
         }
+    }
+
+    /// A `kind` tag this build does not know decodes to
+    /// [`BroadcastMsg::Unknown`] instead of failing the frame (issue #801 item
+    /// 3, PRD #741 M8).
+    ///
+    /// This is the whole of the retrofit's value and it is worth stating what
+    /// used to happen: `serde_json` failed the **entire** payload, which
+    /// `EventSubscription::next_event` returned as an `io::Error`, which every
+    /// caller reads as the stream having ended — so one message a newer daemon
+    /// pushed took the subscription down and put the client into a reconnect
+    /// loop against a daemon that was working perfectly.
+    #[test]
+    fn an_unknown_broadcast_kind_degrades_instead_of_killing_the_frame() {
+        let future = r#"{"kind":"a_kind_from_a_later_daemon","whatever":{"nested":[1,2,3]}}"#;
+        let decoded: BroadcastMsg =
+            serde_json::from_str(future).expect("an unknown kind must not fail the decode");
+        assert!(matches!(decoded, BroadcastMsg::Unknown));
+    }
+
+    /// The catch-all does not swallow the kinds this build DOES know — the
+    /// failure mode a `#[serde(other)]` retrofit has to be checked against.
+    #[test]
+    fn the_broadcast_catch_all_does_not_shadow_a_known_kind() {
+        let event = BroadcastMsg::Event(AgentEvent {
+            session_id: "s".into(),
+            agent_type: AgentType::ClaudeCode,
+            event_type: EventType::SessionStart,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp: Utc::now(),
+            user_prompt: None,
+            metadata: HashMap::new(),
+            pane_id: Some("pane-1".into()),
+            agent_id: None,
+            agent_version: None,
+            schema_version: None,
+            live_target: None,
+        });
+        let json = serde_json::to_string(&event).expect("serialize");
+        assert!(matches!(
+            serde_json::from_str::<BroadcastMsg>(&json).expect("round trip"),
+            BroadcastMsg::Event(_)
+        ));
+
+        let surface =
+            serde_json::to_string(&BroadcastMsg::OrchestrationSurface(OrchestrationSurface {
+                name: "n".into(),
+                cwd: "/tmp".into(),
+                display_title: None,
+                roles: Vec::new(),
+            }))
+            .expect("serialize");
+        assert!(matches!(
+            serde_json::from_str::<BroadcastMsg>(&surface).expect("round trip"),
+            BroadcastMsg::OrchestrationSurface(_)
+        ));
+    }
+
+    /// A payload with no `kind` at all is still a malformed frame, not an
+    /// unknown one.
+    ///
+    /// The distinction matters: `Unknown` says "a newer peer sent something I
+    /// cannot read", and treating garbage as that would hide a genuinely
+    /// corrupt stream behind a benign-looking variant.
+    #[test]
+    fn a_broadcast_with_no_kind_is_still_malformed() {
+        assert!(serde_json::from_str::<BroadcastMsg>(r#"{"no_tag_here":1}"#).is_err());
     }
 
     #[test]

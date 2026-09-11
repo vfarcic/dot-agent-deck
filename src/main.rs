@@ -1738,6 +1738,25 @@ fn spawn_event_subscriber(
                             Ok(Some(BroadcastMsg::WorktreeKept(kept))) => {
                                 state.write().await.queue_worktree_kept(kept);
                             }
+                            // PRD #741 M8 (issue #801 item 3): a `kind` tag this
+                            // build does not know, from a newer daemon. Ignored
+                            // rather than escalated — there is no payload to act
+                            // on, and the TUI's own state is rebuilt from
+                            // `list_agents` at hydration and reconciled by the
+                            // ordinary event flow, so a message it cannot read
+                            // costs it nothing it can name.
+                            //
+                            // What the variant buys is the line above this one:
+                            // before it, such a frame failed its whole decode
+                            // and arrived at the `Err` arm below, which breaks
+                            // the loop and reconnects. A daemon pushing the new
+                            // variant regularly therefore took the TUI's event
+                            // stream down every time it did.
+                            Ok(Some(BroadcastMsg::Unknown)) => {
+                                tracing::debug!(
+                                    "subscribe_events: ignoring a broadcast kind this build does                                      not know"
+                                );
+                            }
                             Ok(None) => break,
                             Err(e) => {
                                 tracing::warn!(

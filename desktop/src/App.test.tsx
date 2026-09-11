@@ -726,6 +726,40 @@ describe("ControlDeck", () => {
   });
 
   /**
+   * Scenario: the connected deck does not advertise the verbs a launch needs, so
+   * the workflow panel says which ones and the Launch button is disabled.
+   *
+   * PRD #741 M8. This is the mechanism the build stamp is demoted in favour of:
+   * the deck is COMPATIBLE — the wire agreed and the app is connected — and it
+   * still cannot do this particular thing, which no version digit or git stamp
+   * can express. The reason is the daemon's own, derived from its advertised
+   * capability set, so the surface and `DaemonClient`'s refusal cannot disagree.
+   */
+  it("explains and disables a launch against a deck that withholds the project verbs", () => {
+    const live = runtime({ mode: "live" });
+    const withheld = {
+      ...live,
+      snapshot: {
+        ...live.snapshot,
+        connection: {
+          ...live.snapshot.connection,
+          projectActionsReason: "This deck does not advertise prepare-workflow, so projects and workflows cannot be started from here. Agents already running on it stay visible and usable.",
+        },
+      },
+    };
+    render(<ControlDeck runtime={withheld} />);
+    fireEvent.click(screen.getByRole("button", { name: "Workflows" }));
+    fireEvent.change(screen.getByLabelText("Task prompt"), { target: { value: "Try to launch against an older deck." } });
+
+    expect(screen.getByTestId("workflow-capability-issue")).toHaveTextContent("does not advertise prepare-workflow");
+    // A degraded deck is not a broken one, and the sentence says so.
+    expect(screen.getByTestId("workflow-capability-issue")).toHaveTextContent("stay visible and usable");
+    expect(screen.getByTestId("launch-live-loop")).toBeDisabled();
+    fireEvent.click(screen.getByTestId("launch-live-loop"));
+    expect(withheld.runAction).not.toHaveBeenCalled();
+  });
+
+  /**
    * Scenario: the stored selection names a deck that is no longer configured,
    * so the app is on the local deck and connected. The banner appears anyway
    * and says which of the two reasons it was.

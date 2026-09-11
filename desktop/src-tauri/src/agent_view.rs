@@ -148,6 +148,16 @@ pub(crate) enum FetchReason {
     /// A dispatched worktree was left on disk, which is emitted *after* the
     /// close that reaped its agents. The registry has certainly changed.
     WorktreeKept,
+    /// A broadcast whose `kind` this build does not know (PRD #741 M8, issue
+    /// #801 item 3).
+    ///
+    /// Its own reason rather than folded into [`Self::Reconcile`], because the
+    /// two say different things to anyone reading the code or a trace: a
+    /// reconcile is the floor doing its job on a quiet stream, and this is a
+    /// *newer daemon* pushing something this client is too old to read. Seeing
+    /// it at all is the signal that the peer is ahead, which is exactly the
+    /// pairing issue #801 is about.
+    UnknownBroadcast,
     /// The periodic reconciliation, which is the only thing that catches a
     /// silent removal.
     Reconcile,
@@ -226,6 +236,20 @@ impl AgentView {
             }
             BroadcastMsg::OrchestrationSurface(_) => self.mark(FetchReason::OrchestrationSurface),
             BroadcastMsg::WorktreeKept(_) => self.mark(FetchReason::WorktreeKept),
+            // PRD #741 M8 (issue #801 item 3): a broadcast kind this build does
+            // not know. It marks a fetch for the same reason the two above do —
+            // this view is a FOLD, and a message it could not read is a hole in
+            // it of unknown size. "Something happened that I cannot interpret"
+            // is answered by re-reading the authoritative list, not by assuming
+            // nothing happened.
+            //
+            // Cheap, and bounded by the same floor as everything else here: the
+            // mark only makes the NEXT refresh fetch, and refreshes are already
+            // coalesced at `SNAPSHOT_COALESCE_INTERVAL`. A newer daemon pushing
+            // an unknown kind in a tight loop therefore costs one `ListAgents`
+            // per coalescing window, which is what an equally busy known kind
+            // costs.
+            BroadcastMsg::Unknown => self.mark(FetchReason::UnknownBroadcast),
         }
     }
 
@@ -672,6 +696,30 @@ mod tests {
             },
         ));
         assert_eq!(view.needs_fetch(now), Some(FetchReason::WorktreeKept));
+    }
+
+    /// Scenario: a newer daemon pushes a broadcast kind this build cannot read.
+    /// The fold cannot interpret it, so it marks a fetch rather than assuming
+    /// nothing happened (PRD #741 M8).
+    ///
+    /// The variant reaching this function at all is the other half of the point:
+    /// before `BroadcastMsg`'s `#[serde(other)]`, such a frame failed its decode
+    /// and took the whole subscription down, so `apply` never saw it and the
+    /// watcher reconnected in a loop instead.
+    #[test]
+    fn an_unreadable_push_marks_a_fetch_rather_than_being_ignored() {
+        let now = Instant::now();
+        let mut view = AgentView::default();
+        view.install(vec![record("7", "pane-7")], now);
+        assert_eq!(view.needs_fetch(now), None, "the install settled the view");
+
+        view.apply(&BroadcastMsg::Unknown);
+
+        assert_eq!(
+            view.needs_fetch(now),
+            Some(FetchReason::UnknownBroadcast),
+            "something changed that this build could not interpret, so re-read the list"
+        );
     }
 
     /// Scenario: two agents share a pane id across a restart — the newer session

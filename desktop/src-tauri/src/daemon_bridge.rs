@@ -37,6 +37,12 @@ pub(crate) struct HandshakeInfo {
     /// set when the wire itself is incompatible, and no longer set by a stamp
     /// difference *within* one release — see [`release_versions_are_compatible`].
     pub(crate) build_stamp_mismatch_only: bool,
+    /// Why the project-aware surfaces are unavailable against this daemon, or
+    /// `None` when they are available (PRD #741 M8).
+    ///
+    /// Derived from what the `Hello` reply **advertised**, never from a version
+    /// digit or a build stamp — see [`project_actions_reason`].
+    pub(crate) project_actions_reason: Option<String>,
 }
 
 /// An established link to one deck: the handshake that classified it, and a
@@ -321,6 +327,125 @@ impl DaemonLinks {
     }
 }
 
+/// What a build-stamp difference MEANS for this kind of deck (PRD #741 M8).
+///
+/// # The three layers, kept apart
+///
+/// Issue #801's framing, adopted here for the `Remote` arm only:
+///
+/// | question | mechanism | this type |
+/// |---|---|---|
+/// | can we decode each other's frames at all? | [`PROTOCOL_VERSION`] | untouched — exact equality, for every deck kind, never bypassable |
+/// | may I use *this* verb? | the `Hello` reply's advertised capability set | [`project_actions_reason`] |
+/// | are we the same build? | the git-describe stamp | **this type** |
+///
+/// # Why the answer differs by deck kind
+///
+/// For a **local** deck the desktop bundles its own sidecar and starts it, so
+/// lockstep is a property the app can actually hold — and **Replace daemon** is
+/// a remedy the user can actually take. Refusing is right there and nothing
+/// about it changes.
+///
+/// For a **remote** deck neither half survives. The remedy `:263-273` offers is
+/// *"use Replace daemon to start the matching bundled build"*, which against a
+/// deck on another host means terminating a daemon someone else may be using —
+/// and PRD #741 M2 made that structurally impossible anyway, so the sentence
+/// names an action whose button is disabled on the same screen that prints it.
+/// **A remedy that cannot be taken is worse than none**: it reads as the user's
+/// fault for not taking it. And the refusal is not rare. A released daemon never
+/// matches a branch build, and the far host's daemon upgrades on its own
+/// cadence, so "refuse on any stamp difference" against a remote deck is
+/// "refuse most of the time".
+///
+/// # What is LOST by demoting it, stated rather than implied
+///
+/// A **semantic break behind a stable wire** — a field whose meaning changed
+/// while its shape did not — is **not mechanically detectable**. No capability
+/// string sees it, because the verb is still advertised and still answers. No
+/// version digit sees it, because `docs/develop/versioning.md` is explicit that
+/// such a break deliberately does not move [`PROTOCOL_VERSION`]. And the stamp
+/// does not see it either, in the case that matters most: a development build's
+/// `git describe` names the **last** release, so a branch carrying an unreleased
+/// semantic break describes as compatible with the release it was cut from (see
+/// [`release_versions_are_compatible`]'s own residual note).
+///
+/// What actually stands between a remote user and a silently wrong field is
+/// CLAUDE.md rule 12's cross-version manual test, run against the previous
+/// release before such a change merges, and the `.breaking.md` fragment its
+/// outcome demands — which is what turns the break into a minor bump that
+/// [`release_versions_are_compatible`] can then see. Before this type there were
+/// two backstops for a remote deck and one of them was noisy; there is now
+/// **one**, and it is a procedure rather than a mechanism. That is the price of
+/// the demotion and it is accepted, not hidden.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StampPolicy {
+    /// `Local`: a stamp difference the release versions do not excuse refuses
+    /// the connection, exactly as it did before this type existed.
+    Enforced,
+    /// `Remote`: a stamp difference is reported and connected through.
+    Informational,
+}
+
+impl StampPolicy {
+    /// The policy for a deck, decided by its kind and by nothing else.
+    ///
+    /// Deliberately a `match` on the endpoint rather than a flag somebody sets:
+    /// the kind is the whole of the argument above, so anything that could set
+    /// it independently would be a way to get the remote policy on a local deck.
+    pub(crate) fn for_endpoint(endpoint: &Endpoint) -> Self {
+        match endpoint {
+            Endpoint::Local(_) => Self::Enforced,
+            Endpoint::Remote(_) => Self::Informational,
+        }
+    }
+}
+
+/// The verbs the desktop's project-aware surfaces need (PRD #819 M6).
+///
+/// All four, because the surface is one flow: list or resolve a project, prepare
+/// its workflow, start the prepared agent. A daemon advertising three of them
+/// can get a user as far as a launch that then fails, which is worse than
+/// saying so first.
+const DESKTOP_PROJECT_CAPABILITIES: [&str; 4] = [
+    dot_agent_deck::daemon_protocol::CAP_LIST_PROJECTS,
+    dot_agent_deck::daemon_protocol::CAP_RESOLVE_PROJECT,
+    dot_agent_deck::daemon_protocol::CAP_PREPARE_WORKFLOW,
+    dot_agent_deck::daemon_protocol::CAP_START_PREPARED_AGENT,
+];
+
+/// Why the project-aware surfaces are unavailable against this daemon, or
+/// `None` when every verb they need was advertised (PRD #741 M8).
+///
+/// **This is the mechanism the build stamp is being demoted in favour of, and it
+/// answers a different question.** A stamp asks "are we the same build"; this
+/// asks "does this daemon do the thing I am about to ask it to do" — which is
+/// the only one of the two a user can act on. It reads the `Hello` reply's
+/// advertised set through [`dot_agent_deck::daemon_client::DaemonCapabilities`], the same capture
+/// `establish()` hands the client, so the UI's verdict and the client's refusal
+/// cannot disagree about the same daemon.
+///
+/// Absence is a withhold, not a grant: a daemon that advertises no set at all is
+/// an older daemon, and [`dot_agent_deck::daemon_client::DaemonCapabilities::supports`] answers `false` for
+/// every verb — which is what makes an old deck degrade to "you can watch the
+/// agents that are running" instead of offering a launch that will fail.
+///
+/// The sentence is the DEGRADATION, so it says what still works. A deck whose
+/// project verbs are missing is not a broken deck.
+fn project_actions_reason(response: &AttachResponse) -> Option<String> {
+    let capabilities = dot_agent_deck::daemon_client::DaemonCapabilities::from_hello(response);
+    let missing: Vec<&str> = DESKTOP_PROJECT_CAPABILITIES
+        .into_iter()
+        .filter(|capability| !capabilities.supports(capability))
+        .collect();
+    if missing.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "This deck does not advertise {}, so projects and workflows cannot be started from here. Agents already running on it stay visible and usable.",
+        missing.join(", ")
+    ))
+}
+
 /// Whether the build-stamp comparison is being relaxed, and by what.
 ///
 /// The handshake refuses a daemon whose git-describe stamp differs from the
@@ -474,6 +599,7 @@ fn classify_handshake(
     response: &AttachResponse,
     client_build: &str,
     allowance: BuildMismatchAllowance,
+    stamps: StampPolicy,
 ) -> HandshakeInfo {
     let server_protocol_version = response.server_version;
     let daemon_build_version = response.build_version.clone();
@@ -513,23 +639,34 @@ fn classify_handshake(
         // because by this project's own bump policy nothing incompatible sits
         // between two builds that share a compatibility key (issue #801).
         build_stamp_mismatch_only = true;
-        let stamps = format!(
+        let builds = format!(
             "build mismatch: desktop is {client_build}, daemon is {}",
             daemon_build_version.as_deref().unwrap_or("unreported")
         );
-        // Whichever switch is armed, the mismatch is kept in `error` (not
-        // dropped) so the caveat stays on screen for the whole session rather
-        // than being silently forgotten.
-        build_mismatch_was_bypassed = allowance.allows();
-        match allowance {
-            BuildMismatchAllowance::Env => Some(format!(
-                "{stamps}. Bypassed by {BUILD_MISMATCH_BYPASS_ENV}; protocol {PROTOCOL_VERSION} matched on both sides. Development only — a stamp difference can still mean divergent behaviour behind an identical wire."
-            )),
-            BuildMismatchAllowance::Session => Some(format!(
-                "{stamps}. Connected anyway for this session; protocol {PROTOCOL_VERSION} matched on both sides. A stamp difference can still mean divergent behaviour behind an identical wire."
-            )),
-            BuildMismatchAllowance::Refuse => {
-                let recovery = match running_agent_count {
+        // PRD #741 M8: for a remote deck the stamp is an informational badge and
+        // never a refusal, so the connection is made and the caveat travels with
+        // it. Checked BEFORE the allowance switches because it is not one of
+        // them — nothing is being bypassed here, and the message must not tell a
+        // user they overrode something they were never offered.
+        if stamps == StampPolicy::Informational {
+            build_mismatch_was_bypassed = true;
+            Some(format!(
+                "{builds}. Connected: protocol {PROTOCOL_VERSION} matched on both sides, and a deck on another host is not this app's to replace. A stamp difference can still mean divergent behaviour behind an identical wire — see the release notes for both builds before trusting a field that looks wrong."
+            ))
+        } else {
+            // Whichever switch is armed, the mismatch is kept in `error` (not
+            // dropped) so the caveat stays on screen for the whole session rather
+            // than being silently forgotten.
+            build_mismatch_was_bypassed = allowance.allows();
+            match allowance {
+                BuildMismatchAllowance::Env => Some(format!(
+                    "{builds}. Bypassed by {BUILD_MISMATCH_BYPASS_ENV}; protocol {PROTOCOL_VERSION} matched on both sides. Development only — a stamp difference can still mean divergent behaviour behind an identical wire."
+                )),
+                BuildMismatchAllowance::Session => Some(format!(
+                    "{builds}. Connected anyway for this session; protocol {PROTOCOL_VERSION} matched on both sides. A stamp difference can still mean divergent behaviour behind an identical wire."
+                )),
+                BuildMismatchAllowance::Refuse => {
+                    let recovery = match running_agent_count {
                     Some(0) => "No live agents are reported; use Replace daemon to start the matching bundled build, or Connect anyway to keep this one.".into(),
                     Some(count) => format!(
                         "The daemon reports {count} live agent{}; stop them individually before replacing the daemon, or Connect anyway to keep this one.",
@@ -537,7 +674,8 @@ fn classify_handshake(
                     ),
                     None => "The daemon could not report its live-agent count, so automatic replacement is disabled; Connect anyway keeps this one.".into(),
                 };
-                Some(format!("{stamps}. {recovery}"))
+                    Some(format!("{builds}. {recovery}"))
+                }
             }
         }
     } else {
@@ -556,6 +694,16 @@ fn classify_handshake(
         daemon_version,
         running_agent_count,
         build_stamp_mismatch_only,
+        // PRD #741 M8: read from the SAME reply, so the surface the UI offers
+        // and the refusal `DaemonClient` would raise come from one capture.
+        // Computed for every classification, including the refused ones —
+        // `disconnected_snapshot` carries `None` and the webview reads an absent
+        // reason as "nothing to say", which on a screen that is already telling
+        // the user the deck is unreachable is the right amount to say.
+        project_actions_reason: response
+            .ok
+            .then(|| project_actions_reason(response))
+            .flatten(),
     }
 }
 
@@ -570,8 +718,9 @@ fn classify_handshake(
 pub(crate) fn classify_handshake_for_test(
     response: &AttachResponse,
     client_build: &str,
+    stamps: StampPolicy,
 ) -> HandshakeInfo {
-    classify_handshake(response, client_build, build_mismatch_allowance())
+    classify_handshake(response, client_build, build_mismatch_allowance(), stamps)
 }
 
 fn connection_from_handshake(handshake: HandshakeInfo) -> DesktopConnection {
@@ -590,6 +739,7 @@ fn connection_from_handshake(handshake: HandshakeInfo) -> DesktopConnection {
         daemon_version: handshake.daemon_version,
         running_agent_count: handshake.running_agent_count,
         build_stamp_mismatch_only: handshake.build_stamp_mismatch_only,
+        project_actions_reason: handshake.project_actions_reason,
     }
 }
 
@@ -602,7 +752,10 @@ fn connection_from_handshake(handshake: HandshakeInfo) -> DesktopConnection {
 /// the set here costs nothing, while letting `DaemonClient::capabilities()`
 /// learn it on its own would spend a second `Hello` on a connection whose
 /// handshake reply is already in hand.
-pub(crate) async fn hello(socket_path: &Path) -> Result<(HandshakeInfo, AttachResponse), String> {
+pub(crate) async fn hello(
+    socket_path: &Path,
+    stamps: StampPolicy,
+) -> Result<(HandshakeInfo, AttachResponse), String> {
     let client_build = dot_agent_deck::build_id::local_build_id();
     let stream = IpcStream::connect(socket_path)
         .await
@@ -618,7 +771,7 @@ pub(crate) async fn hello(socket_path: &Path) -> Result<(HandshakeInfo, AttachRe
     )
     .await
     .map_err(|error| safe_message(error.to_string()))?;
-    let info = classify_handshake(&response, &client_build, build_mismatch_allowance());
+    let info = classify_handshake(&response, &client_build, build_mismatch_allowance(), stamps);
     Ok((info, response))
 }
 
@@ -665,7 +818,7 @@ async fn establish(
     // an `IpcStream`, deliberately. Under DECISION 1A a remote deck is reached
     // through a forwarded Unix socket, so the handshake needs no transport of
     // its own — M5 supplies the address, not a different way of opening it.
-    let (info, response) = hello(transport.address()).await?;
+    let (info, response) = hello(transport.address(), StampPolicy::for_endpoint(endpoint)).await?;
     let connection = connection_from_handshake(info);
     // Built from the TRANSPORT rather than the address, so the client carries
     // what a `stat` of that address is allowed to mean. `DaemonClient::new`
@@ -991,6 +1144,186 @@ mod tests {
         }
     }
 
+    /// A remote deck's build stamp is an informational badge, never a refusal
+    /// (PRD #741 M8).
+    ///
+    /// The same `Hello` that refuses a LOCAL deck below connects here, and the
+    /// pair is the milestone: `Local` keeps today's verdict because the desktop
+    /// bundles its own sidecar and **Replace daemon** is a remedy the user can
+    /// take; `Remote` cannot be replaced from here at all — M2 made it
+    /// impossible by type — so refusing would offer an action that does not
+    /// exist.
+    #[test]
+    fn a_remote_decks_build_stamp_never_refuses_the_connection() {
+        let _guard = AllowanceGuard::acquire();
+        let response = hello_with_build(Some("0.38.0-gdeadbee"));
+
+        let remote = classify_handshake(
+            &response,
+            "0.39.0-gcafe123",
+            BuildMismatchAllowance::Refuse,
+            StampPolicy::Informational,
+        );
+        assert_eq!(remote.status, ConnectionStatus::Connected);
+
+        let local = classify_handshake(
+            &response,
+            "0.39.0-gcafe123",
+            BuildMismatchAllowance::Refuse,
+            StampPolicy::Enforced,
+        );
+        assert_eq!(
+            local.status,
+            ConnectionStatus::Incompatible,
+            "a local deck keeps today's verdict exactly"
+        );
+    }
+
+    /// The stamp is demoted, not hidden: both builds are still named, and the
+    /// sentence is honest about what it cannot rule out (PRD #741 M8).
+    #[test]
+    fn a_remote_decks_stamp_difference_is_disclosed_and_offers_no_impossible_remedy() {
+        let _guard = AllowanceGuard::acquire();
+        let info = classify_handshake(
+            &hello_with_build(Some("0.38.0-gdeadbee")),
+            "0.39.0-gcafe123",
+            BuildMismatchAllowance::Refuse,
+            StampPolicy::Informational,
+        );
+
+        let error = info.error.expect("the caveat travels with the connection");
+        assert!(error.contains("0.38.0-gdeadbee"), "{error}");
+        assert!(error.contains("0.39.0-gcafe123"), "{error}");
+        assert!(
+            error.contains("divergent behaviour behind an identical wire"),
+            "the limit a stamp cannot see is stated rather than implied: {error}"
+        );
+        assert!(
+            !error.contains("Replace daemon"),
+            "a remedy that cannot be taken is worse than none: {error}"
+        );
+        assert!(
+            !error.contains("Bypassed") && !error.contains("anyway"),
+            "nothing was overridden, so the user must not be told they overrode it: {error}"
+        );
+        assert!(
+            info.build_stamp_mismatch_only,
+            "the badge is what the screens key on"
+        );
+    }
+
+    /// `PROTOCOL_VERSION` is the hard floor for **every** deck kind, and the
+    /// remote demotion does not reach it (PRD #741 M8).
+    ///
+    /// This is the one thing no policy, switch or endpoint kind may bypass —
+    /// the order in `classify_handshake` IS the security property.
+    #[test]
+    fn a_remote_deck_is_still_refused_on_a_protocol_mismatch() {
+        let _guard = AllowanceGuard::acquire();
+        set_bypass_env(Some("1"));
+        let response = AttachResponse::hello(PROTOCOL_VERSION + 1);
+
+        let info = classify_handshake(
+            &response,
+            response.build_version.as_deref().unwrap(),
+            build_mismatch_allowance(),
+            StampPolicy::Informational,
+        );
+
+        assert_eq!(info.status, ConnectionStatus::Incompatible);
+        assert!(
+            !info.build_stamp_mismatch_only,
+            "a wire mismatch must never advertise an override"
+        );
+        assert!(info.error.unwrap().contains("protocol mismatch"));
+    }
+
+    /// The policy comes from the endpoint's KIND and from nothing else.
+    #[test]
+    fn the_stamp_policy_follows_the_deck_kind() {
+        assert_eq!(
+            StampPolicy::for_endpoint(&Endpoint::Local(LocalEndpoint::at("/tmp/deck.sock"))),
+            StampPolicy::Enforced
+        );
+        assert_eq!(
+            StampPolicy::for_endpoint(&Endpoint::local()),
+            StampPolicy::Enforced
+        );
+    }
+
+    /// A daemon advertising every project verb offers the project surfaces; one
+    /// advertising none withholds them with a named reason (PRD #741 M8).
+    ///
+    /// The withhold reason is derived from the ADVERTISED SET and not from a
+    /// version digit or a stamp, which is the whole of issue #801's middle
+    /// layer.
+    #[test]
+    fn project_actions_gate_on_the_advertised_capability_set() {
+        let _guard = AllowanceGuard::acquire();
+        let full = AttachResponse::hello(PROTOCOL_VERSION).with_capabilities();
+        assert_eq!(
+            classify_handshake(
+                &full,
+                full.build_version.as_deref().unwrap(),
+                BuildMismatchAllowance::Refuse,
+                StampPolicy::Enforced,
+            )
+            .project_actions_reason,
+            None,
+            "a daemon advertising the full set has nothing to explain"
+        );
+
+        let bare = AttachResponse::hello(PROTOCOL_VERSION);
+        let reason = classify_handshake(
+            &bare,
+            bare.build_version.as_deref().unwrap(),
+            BuildMismatchAllowance::Refuse,
+            StampPolicy::Enforced,
+        )
+        .project_actions_reason
+        .expect("an unadvertised daemon withholds every verb");
+        assert!(
+            reason.contains(dot_agent_deck::daemon_protocol::CAP_LIST_PROJECTS),
+            "the reason names what is missing: {reason}"
+        );
+        assert!(
+            reason.contains("stay visible and usable"),
+            "a degraded deck is not a broken deck: {reason}"
+        );
+    }
+
+    /// A PARTIAL set is withheld too, and names only what is absent.
+    ///
+    /// The four verbs are one flow. A daemon with three of them can get a user
+    /// as far as a launch that then fails, which is worse than saying so first.
+    #[test]
+    fn a_partly_advertised_daemon_withholds_the_project_surfaces() {
+        let _guard = AllowanceGuard::acquire();
+        let mut partial = AttachResponse::hello(PROTOCOL_VERSION);
+        partial.capabilities = Some(vec![
+            dot_agent_deck::daemon_protocol::CAP_LIST_PROJECTS.to_string(),
+            dot_agent_deck::daemon_protocol::CAP_RESOLVE_PROJECT.to_string(),
+        ]);
+
+        let reason = classify_handshake(
+            &partial,
+            partial.build_version.as_deref().unwrap(),
+            BuildMismatchAllowance::Refuse,
+            StampPolicy::Enforced,
+        )
+        .project_actions_reason
+        .expect("three of four is not four");
+
+        assert!(
+            reason.contains(dot_agent_deck::daemon_protocol::CAP_PREPARE_WORKFLOW),
+            "{reason}"
+        );
+        assert!(
+            !reason.contains(dot_agent_deck::daemon_protocol::CAP_LIST_PROJECTS),
+            "what IS advertised is not listed as missing: {reason}"
+        );
+    }
+
     #[test]
     fn matching_hello_is_connected() {
         let response = AttachResponse::hello(PROTOCOL_VERSION);
@@ -998,6 +1331,7 @@ mod tests {
             &response,
             response.build_version.as_deref().unwrap(),
             BuildMismatchAllowance::Refuse,
+            StampPolicy::Enforced,
         );
         assert_eq!(info.status, ConnectionStatus::Connected);
         assert!(info.error.is_none());
@@ -1011,6 +1345,7 @@ mod tests {
             &response,
             response.build_version.as_deref().unwrap(),
             BuildMismatchAllowance::Refuse,
+            StampPolicy::Enforced,
         );
         assert_eq!(info.status, ConnectionStatus::Incompatible);
         assert!(info.error.unwrap().contains("protocol mismatch"));
@@ -1024,6 +1359,7 @@ mod tests {
             &response,
             "desktop-other-build",
             BuildMismatchAllowance::Refuse,
+            StampPolicy::Enforced,
         );
         assert_eq!(info.status, ConnectionStatus::Incompatible);
         let error = info.error.unwrap();
@@ -1042,6 +1378,7 @@ mod tests {
             &response,
             "desktop-other-build",
             BuildMismatchAllowance::Refuse,
+            StampPolicy::Enforced,
         );
         assert_eq!(info.status, ConnectionStatus::Incompatible);
         let error = info.error.unwrap();
@@ -1066,6 +1403,7 @@ mod tests {
             &response,
             "desktop-other-build",
             BuildMismatchAllowance::Env,
+            StampPolicy::Enforced,
         );
         assert_eq!(info.status, ConnectionStatus::Connected);
         let error = info.error.expect("bypass must not swallow the mismatch");
@@ -1088,6 +1426,7 @@ mod tests {
             &response,
             "desktop-other-build",
             BuildMismatchAllowance::Session,
+            StampPolicy::Enforced,
         );
         assert_eq!(info.status, ConnectionStatus::Connected);
         let error = info
@@ -1113,7 +1452,12 @@ mod tests {
     fn bypass_never_rescues_a_protocol_mismatch() {
         let response = AttachResponse::hello(PROTOCOL_VERSION + 1);
         for allowance in [BuildMismatchAllowance::Env, BuildMismatchAllowance::Session] {
-            let info = classify_handshake(&response, "desktop-other-build", allowance);
+            let info = classify_handshake(
+                &response,
+                "desktop-other-build",
+                allowance,
+                StampPolicy::Enforced,
+            );
             assert_eq!(info.status, ConnectionStatus::Incompatible, "{allowance:?}");
             assert!(
                 info.error.unwrap().contains("protocol mismatch"),
@@ -1135,7 +1479,12 @@ mod tests {
             BuildMismatchAllowance::Env,
             BuildMismatchAllowance::Session,
         ] {
-            let info = classify_handshake(&response, "desktop-other-build", allowance);
+            let info = classify_handshake(
+                &response,
+                "desktop-other-build",
+                allowance,
+                StampPolicy::Enforced,
+            );
             assert!(!info.build_stamp_mismatch_only, "{allowance:?}");
         }
     }
@@ -1151,6 +1500,7 @@ mod tests {
             &response,
             response.build_version.as_deref().unwrap(),
             BuildMismatchAllowance::Refuse,
+            StampPolicy::Enforced,
         );
         assert_eq!(info.status, ConnectionStatus::Incompatible);
         assert!(!info.build_stamp_mismatch_only);
@@ -1168,7 +1518,12 @@ mod tests {
             BuildMismatchAllowance::Env,
             BuildMismatchAllowance::Session,
         ] {
-            let info = classify_handshake(&response, "desktop-other-build", allowance);
+            let info = classify_handshake(
+                &response,
+                "desktop-other-build",
+                allowance,
+                StampPolicy::Enforced,
+            );
             assert!(info.build_stamp_mismatch_only, "{allowance:?}");
         }
     }
@@ -1180,7 +1535,12 @@ mod tests {
     fn bypass_covers_an_unreported_daemon_stamp() {
         let mut response = AttachResponse::hello(PROTOCOL_VERSION);
         response.build_version = None;
-        let info = classify_handshake(&response, "desktop-build", BuildMismatchAllowance::Env);
+        let info = classify_handshake(
+            &response,
+            "desktop-build",
+            BuildMismatchAllowance::Env,
+            StampPolicy::Enforced,
+        );
         assert_eq!(info.status, ConnectionStatus::Connected);
         assert!(info.build_stamp_mismatch_only);
         assert!(info.error.unwrap().contains("unreported"));
@@ -1219,7 +1579,12 @@ mod tests {
         assert_eq!(build_mismatch_allowance(), BuildMismatchAllowance::Session);
         let response = AttachResponse::hello(PROTOCOL_VERSION)
             .with_running_agents(RunningAgentsSummary::default());
-        let info = classify_handshake(&response, "desktop-other-build", build_mismatch_allowance());
+        let info = classify_handshake(
+            &response,
+            "desktop-other-build",
+            build_mismatch_allowance(),
+            StampPolicy::Enforced,
+        );
         assert_eq!(info.status, ConnectionStatus::Connected);
     }
 
@@ -1259,15 +1624,23 @@ mod tests {
         let response = AttachResponse::hello(PROTOCOL_VERSION)
             .with_running_agents(RunningAgentsSummary::default());
 
-        let refused =
-            classify_handshake(&response, "desktop-other-build", build_mismatch_allowance());
+        let refused = classify_handshake(
+            &response,
+            "desktop-other-build",
+            build_mismatch_allowance(),
+            StampPolicy::Enforced,
+        );
         assert_eq!(refused.status, ConnectionStatus::Incompatible);
         assert!(refused.build_stamp_mismatch_only);
 
         allow_build_mismatch_this_session();
 
-        let retried =
-            classify_handshake(&response, "desktop-other-build", build_mismatch_allowance());
+        let retried = classify_handshake(
+            &response,
+            "desktop-other-build",
+            build_mismatch_allowance(),
+            StampPolicy::Enforced,
+        );
         assert_eq!(retried.status, ConnectionStatus::Connected);
         assert!(
             retried
@@ -1299,7 +1672,12 @@ mod tests {
                 BuildMismatchAllowance::Session,
             ] {
                 let case = format!("{desktop} vs {daemon} under {allowance:?}");
-                let info = classify_handshake(&hello_with_build(Some(daemon)), desktop, allowance);
+                let info = classify_handshake(
+                    &hello_with_build(Some(daemon)),
+                    desktop,
+                    allowance,
+                    StampPolicy::Enforced,
+                );
                 assert_eq!(info.status, ConnectionStatus::Connected, "{case}");
                 assert!(!info.build_stamp_mismatch_only, "{case}");
                 assert!(info.error.is_none(), "{case}: {:?}", info.error);
@@ -1316,6 +1694,7 @@ mod tests {
             &hello_with_build(Some("0.40.0-g1ea0fe7")),
             "0.39.0-ga0165f8",
             BuildMismatchAllowance::Refuse,
+            StampPolicy::Enforced,
         );
         assert_eq!(info.status, ConnectionStatus::Incompatible);
         assert!(info.build_stamp_mismatch_only);
@@ -1345,6 +1724,7 @@ mod tests {
                 &hello_with_build(daemon),
                 desktop,
                 BuildMismatchAllowance::Refuse,
+                StampPolicy::Enforced,
             );
             assert_eq!(info.status, ConnectionStatus::Incompatible, "{case}");
             assert!(info.build_stamp_mismatch_only, "{case}");
@@ -1406,6 +1786,7 @@ mod tests {
             &hello_with_build(Some("1.9.2-g1ea0fe7")),
             "1.4.0-ga0165f8",
             BuildMismatchAllowance::Refuse,
+            StampPolicy::Enforced,
         );
         assert_eq!(compatible.status, ConnectionStatus::Connected);
         assert!(!compatible.build_stamp_mismatch_only);
@@ -1415,6 +1796,7 @@ mod tests {
             &hello_with_build(Some("2.0.0-g1ea0fe7")),
             "1.9.2-ga0165f8",
             BuildMismatchAllowance::Refuse,
+            StampPolicy::Enforced,
         );
         assert_eq!(broken.status, ConnectionStatus::Incompatible);
         assert!(broken.build_stamp_mismatch_only);
@@ -1511,7 +1893,9 @@ mod tests {
         ]);
         let daemon = tokio::spawn(scripted_daemon(listener, reply));
 
-        let (info, response) = hello(&socket).await.expect("the handshake must complete");
+        let (info, response) = hello(&socket, StampPolicy::Enforced)
+            .await
+            .expect("the handshake must complete");
 
         assert_eq!(info.status, ConnectionStatus::Connected);
         assert!(info.error.is_none(), "{:?}", info.error);
@@ -1549,7 +1933,9 @@ mod tests {
             AttachResponse::hello(PROTOCOL_VERSION + 1),
         ));
 
-        let (info, _response) = hello(&socket).await.expect("the exchange still completes");
+        let (info, _response) = hello(&socket, StampPolicy::Enforced)
+            .await
+            .expect("the exchange still completes");
 
         assert_eq!(info.status, ConnectionStatus::Incompatible);
         let error = info.error.expect("a refusal must say why");
@@ -1571,7 +1957,9 @@ mod tests {
     #[tokio::test]
     async fn hello_reports_a_missing_daemon_as_a_transport_failure() {
         let (dir, socket) = scratch_socket("hello-gone");
-        let error = hello(&socket).await.expect_err("nothing is listening");
+        let error = hello(&socket, StampPolicy::Enforced)
+            .await
+            .expect_err("nothing is listening");
         assert!(!error.is_empty());
         std::fs::remove_dir_all(dir).ok();
     }
@@ -1589,7 +1977,12 @@ mod tests {
             BuildMismatchAllowance::Env,
             BuildMismatchAllowance::Session,
         ] {
-            let info = classify_handshake(&response, "0.39.0-ga0165f8", allowance);
+            let info = classify_handshake(
+                &response,
+                "0.39.0-ga0165f8",
+                allowance,
+                StampPolicy::Enforced,
+            );
             assert_eq!(info.status, ConnectionStatus::Incompatible, "{allowance:?}");
             assert!(!info.build_stamp_mismatch_only, "{allowance:?}");
             assert!(
@@ -1831,6 +2224,7 @@ mod tests {
                 daemon_version: None,
                 running_agent_count: Some(0),
                 build_stamp_mismatch_only: false,
+                project_actions_reason: None,
             }),
             _transport: tokio::runtime::Runtime::new()
                 .expect("a runtime for the lease")

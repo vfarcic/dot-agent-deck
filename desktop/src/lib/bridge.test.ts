@@ -422,6 +422,24 @@ describe("TauriDeckBridge", () => {
   });
 
   /**
+   * PRD #741 M8. The capability reason travels to the connection view, and its
+   * ABSENCE means available rather than unknown.
+   *
+   * The crate omits the field exactly when every verb the launch needs was
+   * advertised, so a screen that read absence as "better disable it" would
+   * withhold the launch against every healthy deck.
+   */
+  it("carries the project-capability reason through, and reads absence as available", async () => {
+    const { mapDesktopSnapshot } = await import("./bridge");
+
+    const withheld = structuredClone(snapshot);
+    withheld.connection.projectActionsReason = "This deck does not advertise prepare-workflow, so projects and workflows cannot be started from here. Agents already running on it stay visible and usable.";
+    expect(mapDesktopSnapshot(withheld).connection.projectActionsReason).toContain("prepare-workflow");
+
+    expect(mapDesktopSnapshot(structuredClone(snapshot)).connection.projectActionsReason).toBeUndefined();
+  });
+
+  /**
    * Issue #801. The new ordinary case: two builds from different commits that
    * name the SAME release. The crate connects with no error at all, so nothing
    * downstream may invent one — no override flag, and the healthy fallback

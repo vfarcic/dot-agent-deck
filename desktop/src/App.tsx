@@ -758,7 +758,7 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
         onRemove={(id) => { removePrompt(id); setNotice("Prompt removed from this device's library."); }}
       />
       <ProfilesPanel open={profilesOpen} profiles={profiles} onClose={() => setProfilesOpen(false)} onUpdate={updateProfile} onReset={resetProfiles} onSaved={() => setNotice("Agent profile draft saved locally. Project TOML is unchanged.")} />
-      <WorkflowPanel key={activeProject?.path ?? "runtime-workflow"} open={workflowOpen} profiles={profiles} order={profileOrder} mode={mode} project={activeProject} onChooseProject={() => { setWorkflowOpen(false); setProjectsOpen(true); }} onClose={() => setWorkflowOpen(false)} onToggle={(id) => { const profile = profiles.find((item) => item.id === id); if (profile) updateProfile(id, { enabled: !profile.enabled }); }} onMove={moveStage} onLaunch={requestLaunch} platformIssue={workflowPlatformIssue} prompts={prompts} />
+      <WorkflowPanel key={activeProject?.path ?? "runtime-workflow"} open={workflowOpen} profiles={profiles} order={profileOrder} mode={mode} project={activeProject} onChooseProject={() => { setWorkflowOpen(false); setProjectsOpen(true); }} onClose={() => setWorkflowOpen(false)} onToggle={(id) => { const profile = profiles.find((item) => item.id === id); if (profile) updateProfile(id, { enabled: !profile.enabled }); }} onMove={moveStage} onLaunch={requestLaunch} platformIssue={workflowPlatformIssue} capabilityIssue={snapshot.connection.projectActionsReason} prompts={prompts} />
       {/*
         PRD #741 M10. The provider is mounted HERE rather than inside the sheet,
         because `SettingsSheet` is a #803-owned rendering component and the

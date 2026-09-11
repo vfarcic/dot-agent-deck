@@ -367,10 +367,26 @@ interface WorkflowPanelProps {
   onMove: (id: string, direction: -1 | 1) => void;
   onLaunch: (config: WorkflowLaunchConfig) => void;
   platformIssue?: string;
+  /**
+   * Why this deck cannot start a workflow at all (PRD #741 M8), or `undefined`
+   * when it can.
+   *
+   * A sibling of `platformIssue` rather than the same field, because the two are
+   * different facts with different remedies: a platform issue is about the
+   * daemon's OS and stays true however the daemon is upgraded, and this is about
+   * the verbs this daemon ADVERTISES — it goes away when the deck over there is
+   * upgraded. Both block the launch and both are shown, so a user who has one is
+   * not told about it and then left to discover the other.
+   *
+   * This is the mechanism issue #801 asks for and the one PRD #741 M8 demotes
+   * the build stamp in favour of: gate on the capability you are about to use,
+   * and degrade with a named reason.
+   */
+  capabilityIssue?: string;
   prompts?: DeckPrompt[];
 }
 
-export function WorkflowPanel({ open, profiles, order, mode, project, onChooseProject, onClose, onToggle, onMove, onLaunch, platformIssue, prompts = [] }: WorkflowPanelProps) {
+export function WorkflowPanel({ open, profiles, order, mode, project, onChooseProject, onClose, onToggle, onMove, onLaunch, platformIssue, capabilityIssue, prompts = [] }: WorkflowPanelProps) {
   const orchestrations = project?.orchestrations ?? [];
   const [name, setName] = useState("");
   const [taskPrompt, setTaskPrompt] = useState("");
@@ -435,7 +451,7 @@ export function WorkflowPanel({ open, profiles, order, mode, project, onChoosePr
     ? `${orchestration.displayName} marks no role as its start role, so there is no coordinator to launch. Mark one of its roles \`start = true\` in the project's .dot-agent-deck.toml.`
     : undefined;
   const allRequiredRolesEnabled = Boolean(orchestration) && !missingRoles.length && !extraRoles.length && !startRoleIssue && roles.some((role) => role.start);
-  const canLaunch = mode === "live" && !platformIssue && Boolean(project) && name.trim().length > 0 && cwd.startsWith("/") && taskPrompt.trim().length > 0 && allRequiredRolesEnabled && invalidCommands.length === 0;
+  const canLaunch = mode === "live" && !platformIssue && !capabilityIssue && Boolean(project) && name.trim().length > 0 && cwd.startsWith("/") && taskPrompt.trim().length > 0 && allRequiredRolesEnabled && invalidCommands.length === 0;
   const customCommandCount = resolved.filter(({ resolution }) => resolution.source === "custom").length;
   const generatedFullAccessCount = resolved.filter(({ profile, resolution }) => resolution.source === "generated" && profile.permissionMode === "full-access").length;
   return (
@@ -484,6 +500,8 @@ export function WorkflowPanel({ open, profiles, order, mode, project, onChoosePr
             {project && !orchestrations.length && <small data-testid="workflow-no-orchestrations"><AlertTriangle size={12} /> The daemon resolved this project but it defines no workflow with roles.</small>}
             {!taskPrompt.trim() && <small><AlertTriangle size={12} /> Add the task you want the coordinator to run.</small>}
             {platformIssue && <small data-testid="workflow-platform-issue"><AlertTriangle size={12} /> {platformIssue}</small>}
+            {/* PRD #741 M8: the deck does not advertise the verbs a launch needs. */}
+            {capabilityIssue && <small data-testid="workflow-capability-issue"><AlertTriangle size={12} /> {capabilityIssue}</small>}
             {orchestration && (missingRoles.length > 0 || extraRoles.length > 0) && <small data-testid="workflow-role-mismatch"><AlertTriangle size={12} /> {orchestration.displayName} defines {requiredRoleLabels.join(", ") || "no roles"}.{missingRoles.length ? ` Enable a profile for: ${missingRoles.join(", ")}.` : ""}{extraRoles.length ? ` Not in this workflow: ${extraRoles.join(", ")}.` : ""}</small>}
             {startRoleIssue && <small data-testid="workflow-no-start-role"><AlertTriangle size={12} /> {startRoleIssue}</small>}
             {invalidCommands.length > 0 && <small><AlertTriangle size={12} /> Fix the launch command for: {invalidCommands.map(({ profile }) => profile.role).join(", ")}.</small>}
