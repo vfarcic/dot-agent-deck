@@ -11,22 +11,28 @@
 # Three rules, all scoped to processes that are BOTH owned by the invoking user
 # AND orphaned (PPid 1). Nothing else is ever a candidate:
 #
-#   spin   (default on)  sustained CPU at or above --cpu across two samples.
-#                        This is what catches a wedged MCP server: measured once
-#                        at ~104% of a core for 36 hours.
-#   mcp    (default on)  a known stdio MCP server command that has been orphaned.
-#                        These are quiet (~63 MB, 0% CPU) but immortal, because
-#                        their polling loop holds the event loop open forever.
-#   stale  (OPT-IN)      any remaining orphan older than --stale-age. Off by
-#                        default: "old and orphaned" alone is a weak signal, and
-#                        this is the rule that could reach something you meant to
-#                        keep. --include-stale turns it on.
+#   mcp    (default on)  a positively identified stdio MCP server that has been
+#                        orphaned. These are quiet (~63 MB, 0% CPU) but immortal,
+#                        because their polling loop holds the event loop open
+#                        forever — and a WEDGED one is caught here too, by shape
+#                        rather than by CPU, so the default rule still covers the
+#                        incident this script was written for.
+#   spin   (OPT-IN)      any orphan sustaining CPU at or above --cpu across two
+#                        samples. OFF by default and NOT used by the timer: it
+#                        cannot tell a wedged agent from a detached build, backup
+#                        or compute job you started on purpose, and the installed
+#                        timer runs with --apply. Interactive diagnosis only.
+#                        --include-spin turns it on.
+#   stale  (OPT-IN)      any remaining orphan older than --stale-age. Off for the
+#                        same reason, only more so: "old and orphaned" alone is a
+#                        weak signal. --include-stale turns it on.
 #
 # Usage:
-#   scripts/reap-orphans.sh                      # dry run, spin + mcp
+#   scripts/reap-orphans.sh                      # dry run, mcp only
 #   scripts/reap-orphans.sh --apply              # actually reap
-#   scripts/reap-orphans.sh --include-stale      # dry run, all three rules
-#   scripts/reap-orphans.sh --cpu 80 --min-age 30 --apply
+#   scripts/reap-orphans.sh --include-spin       # dry run, + the CPU rule
+#   scripts/reap-orphans.sh --include-stale      # dry run, + the age catch-all
+#   scripts/reap-orphans.sh --include-spin --cpu 80 --min-age 30
 
 set -uo pipefail
 
@@ -35,11 +41,13 @@ MIN_AGE_MIN=10        # a candidate must be at least this old
 STALE_AGE_MIN=360     # --include-stale: age for the catch-all rule (6h)
 SAMPLE_SECS=3
 APPLY=0
+INCLUDE_SPIN=0
 INCLUDE_STALE=0
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --apply)         APPLY=1; shift ;;
+    --include-spin)  INCLUDE_SPIN=1; shift ;;
     --include-stale) INCLUDE_STALE=1; shift ;;
     --cpu)           CPU_THRESHOLD="$2"; shift 2 ;;
     --min-age)       MIN_AGE_MIN="$2"; shift 2 ;;
@@ -65,7 +73,14 @@ NEVER_KILL_RE='^(dot-agent-deck|ssh-agent|gpg-agent|dbus.*|systemd.*|pipewire.*|
 # is how this was found.
 
 # Known stdio MCP servers. Orphaned, these never exit on their own.
-MCP_RE='telegram-mcp-bot|coderabbitai-mcp|modelcontextprotocol|mcp-server|npm exec .*mcp'
+#
+# Identification is deliberately two-part: the EXECUTABLE must be a node runtime
+# AND the command line must name a known package. Matching a bare substring like
+# "mcp-server" anywhere in the command line would reap any unrelated script whose
+# path or arguments happen to contain it, at 0% CPU — the same defect class as
+# the never-kill list above, in the opposite direction.
+MCP_EXEC_RE='^(node|npm|npx)$'
+MCP_PKG_RE='(telegram-mcp-bot|coderabbitai-mcp|@modelcontextprotocol/server-|mcp-server-|/mcp-server\.js)'
 
 UID_SELF="$(id -u)"
 NOW_TICKS="$(awk '{print int($1)}' /proc/uptime)"
@@ -131,18 +146,33 @@ sleep "$SAMPLE_SECS"
 
 reap=()
 declare -A why
+declare -A starttime
 for pid in "${candidates[@]}"; do
   [ -r "/proc/$pid/stat" ] || continue
   a="${t0[$pid]:-}"; b="$(cpu_ticks "$pid")"
   [ -z "$a" ] || [ -z "$b" ] && continue
   pct=$(( (b - a) * 100 / (SAMPLE_SECS * HZ) ))
   age="$(proc_age_min "$pid")" || continue
-  cmd="$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null | cut -c1-100)"
+  # MATCH against the FULL command line. Truncating here and matching the
+  # truncated string silently misses any package name that sits past the cut —
+  # and npx cache paths are long, so that is the common case, not the edge one.
+  # Truncation is for DISPLAY only, at the point of printing.
+  cmd="$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null)"
 
-  if [ "$pct" -ge "$CPU_THRESHOLD" ] && [ "$age" -ge "$MIN_AGE_MIN" ]; then
+  is_mcp=0
+  comm="$(cat "/proc/$pid/comm" 2>/dev/null)"
+  argv0base="$(basename "$(printf '%s' "$cmd" | awk '{print $1}')" 2>/dev/null)"
+  if { echo "$comm" | grep -qE "$MCP_EXEC_RE" || echo "$argv0base" | grep -qE "$MCP_EXEC_RE"; } \
+     && echo "$cmd" | grep -qE "$MCP_PKG_RE"; then is_mcp=1; fi
+
+  # Identity token for the escalation below: starttime is stable for the life of
+  # a process and is not reused with the pid.
+  starttime[$pid]="$(stat_field "$pid" 22)"
+
+  if [ "$is_mcp" -eq 1 ] && [ "$age" -ge "$MIN_AGE_MIN" ]; then
+    reap+=("$pid"); why[$pid]="orphaned MCP server (${pct}% cpu), age ${age}m"
+  elif [ "$INCLUDE_SPIN" -eq 1 ] && [ "$pct" -ge "$CPU_THRESHOLD" ] && [ "$age" -ge "$MIN_AGE_MIN" ]; then
     reap+=("$pid"); why[$pid]="spin ${pct}% of a core, age ${age}m"
-  elif echo "$cmd" | grep -qE "$MCP_RE" && [ "$age" -ge "$MIN_AGE_MIN" ]; then
-    reap+=("$pid"); why[$pid]="orphaned MCP server, age ${age}m"
   elif [ "$INCLUDE_STALE" -eq 1 ] && [ "$age" -ge "$STALE_AGE_MIN" ]; then
     reap+=("$pid"); why[$pid]="stale orphan, age ${age}m"
   fi
@@ -173,10 +203,19 @@ for pid in "${reap[@]}"; do
 done
 sleep 5
 for pid in "${reap[@]}"; do
-  if kill -0 "$pid" 2>/dev/null; then
-    kill -KILL "$pid" 2>/dev/null
-    echo "reaped pid $pid (SIGKILL — ignored SIGTERM)"
-  else
+  if ! kill -0 "$pid" 2>/dev/null; then
     echo "reaped pid $pid (SIGTERM)"
+    continue
   fi
+  # A pid alive five seconds later is not necessarily the SAME process: the
+  # original may have exited and the number been reused. SIGKILL is unblockable,
+  # so escalating on the number alone can destroy an innocent bystander. Compare
+  # starttime, which a reused pid does not carry over.
+  now_start="$(stat_field "$pid" 22)"
+  if [ -n "$now_start" ] && [ "$now_start" != "${starttime[$pid]:-}" ]; then
+    echo "skipped pid $pid (pid reused since selection — NOT killed)"
+    continue
+  fi
+  kill -KILL "$pid" 2>/dev/null
+  echo "reaped pid $pid (SIGKILL — ignored SIGTERM)"
 done

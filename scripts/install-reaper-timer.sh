@@ -45,8 +45,17 @@ if [ -f "$REPO/.git" ]; then
 fi
 
 mkdir -p "$UNIT_DIR"
-sed "s|__REPO__|$REPO|g" "$REPO/scripts/systemd/$NAME.service.in" >"$UNIT_DIR/$NAME.service"
-sed "s|__REPO__|$REPO|g" "$REPO/scripts/systemd/$NAME.timer.in"   >"$UNIT_DIR/$NAME.timer"
+
+# $REPO is interpolated into a sed REPLACEMENT, where '\', '&' and the delimiter
+# are all special, and then into a systemd ExecStart, where an unquoted space
+# splits the executable from its arguments. A checkout path containing any of
+# them would corrupt the unit or leave it unable to run — silently, since the
+# failure only shows up in the journal at the next timer tick. Escape for sed
+# here; the templates quote the path for systemd.
+REPO_SED="$(printf '%s' "$REPO" | sed -e 's/[\\&|]/\\&/g')"
+
+sed "s|__REPO__|$REPO_SED|g" "$REPO/scripts/systemd/$NAME.service.in" >"$UNIT_DIR/$NAME.service"
+sed "s|__REPO__|$REPO_SED|g" "$REPO/scripts/systemd/$NAME.timer.in"   >"$UNIT_DIR/$NAME.timer"
 
 systemctl --user daemon-reload
 systemctl --user enable --now "$NAME.timer"

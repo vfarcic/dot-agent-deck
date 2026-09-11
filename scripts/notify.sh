@@ -46,8 +46,12 @@ TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 log_line() {
   local outcome="$1"
   mkdir -p "$(dirname "$LOG")" 2>/dev/null || return 0
-  # Escape pipes: an unescaped one in the message corrupts the table row.
-  local safe="${MESSAGE:0:80}"; safe="${safe//|/\\|}"
+  # The log row is a single-line, pipe-delimited record, but the message may
+  # legitimately contain newlines and pipes (it is --data-urlencode'd on the way
+  # to Telegram). A raw newline splits one record into several and a raw pipe
+  # adds columns, so both are neutralised before the row is written.
+  local safe="${MESSAGE:0:80}"
+  safe="${safe//$'\n'/ }"; safe="${safe//$'\r'/ }"; safe="${safe//|/\\|}"
   printf '| %s | %s | %s |\n' "$TS" "$safe" "$outcome" >>"$LOG" 2>/dev/null || true
 }
 
