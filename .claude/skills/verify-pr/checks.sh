@@ -198,7 +198,7 @@ wanted fmt && { run_step fmt "cargo fmt --check" || true; } || skip fmt "not in 
 # files, which open with
 # `#![cfg(all(feature = "e2e", feature = "e2e-live"))]` and are empty crates
 # under `--features e2e` alone. This gate is where a reviewer catches a break in
-# them, and CI-side it is the only compilation of those 24 there is: they run
+# them, and CI-side it is the only compilation of those files there is: they run
 # in no CI job — no test that reaches a real agent does — and the e2e step below
 # runs lane 1 only even when it is turned on. Locally a developer can still
 # compile them with `cargo test-e2e-live` or `bacon clippy`; this gate is what
@@ -288,7 +288,7 @@ fi
 # as a defect on `main`.
 #
 # Pass --e2e when CI's run is missing, cancelled, or you want it under a
-# --filter. Lane 2 — the 24 files that reach a real agent — is NEVER run here
+# --filter. Lane 2 — the files that reach a real agent — is NEVER run here
 # and runs nowhere in CI either: it needs the reviewer's own agent credentials
 # and spends real tokens on the flakiest signal in the repo. Say so in the
 # report rather than letting a green lane-1 row stand in for it.

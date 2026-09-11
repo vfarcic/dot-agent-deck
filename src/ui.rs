@@ -1902,6 +1902,57 @@ pub fn should_inject_spawn_time_prompt(
     }
 }
 
+/// Issue #1005 — does this pane hold an agent that can actually READ what a
+/// spawn-time delivery is about to write into it?
+///
+/// The three spawn-time gates ([`process_pending_dispatches`],
+/// [`process_pending_seed_prompts`], [`deliver_orchestrator_prompt`]) spelled
+/// this as "some session on this pane has a resolved agent type", and that is a
+/// different question. The daemon draws a card the moment it spawns a pane
+/// (`spawn::surface_spawned_pane`), resolving the type off the COMMAND — so a
+/// `claude` pane satisfied that predicate at spawn time and the first payload
+/// went into a PTY whose program had not started reading. Measured in the field
+/// at 3.7 s before the agent announced itself.
+///
+/// A resolved type is necessary but not sufficient: a producer must ALSO have
+/// announced a conversation. [`AppState::pane_hook_session_id`] is `Some` only
+/// when one did, or when an ordinary frame carrying the pane id arrived — a
+/// `SessionStart` that announces nothing (the wrapper's boot provenance, the
+/// daemon's card-surfacing start) is provisional and establishes no generation
+/// (issue #684). That is exactly the fact this gate wants, and it is the same
+/// value a TUI-owned delivery binds as its target a few lines later.
+///
+/// This narrows the FAST path only. A producer that legitimately announces
+/// nothing — opencode's cold boot (#146), Pi's `NoSignal`, `scheduler/spawn/005`
+/// — is still delivered by each caller's 10-second `timeout_ready` slow path,
+/// which this predicate never gates; the narrowing makes that slow path its
+/// ONLY delivery, which `prompt/pane-input/036` pins as a regression guard.
+///
+/// **The spawn-time PLACEHOLDER does not reach this state, which #1005 asked to
+/// be checked rather than assumed.** [`AppState::insert_placeholder_session`]
+/// takes an `Option<AgentType>` and would satisfy the first conjunct if handed a
+/// known one, but every site that enqueues a spawn-time prompt passes `None`:
+/// the `Action::SpawnPane` arm inserts its placeholder untyped for both the mode
+/// agent pane and the single-agent card (the two `pending_seed_prompts` pushes
+/// live in that same `Ok` arm), and all four orchestration-tab open paths —
+/// interactive, restore, and the two dead-slot loops — do the same before
+/// `orchestration_prompt_anchor_at` is stamped. The restore paths that DO pass a
+/// type (`saved_pane` single panes) enqueue no spawn-time prompt, so they never
+/// consult this. What actually opened these gates early on an interactive spawn
+/// is a PROVISIONAL `SessionStart` — the wrapper's `wrapper_fork` boot
+/// provenance, or the daemon's card surface on a dispatched/scheduled pane —
+/// which sets `SessionState::agent_type` while establishing no generation
+/// (issue #684). That is exactly what the second conjunct now excludes.
+fn spawn_time_agent_ready(snapshot: &AppState, pane_id: &str) -> bool {
+    // A session on this pane has been identified by something running in it…
+    snapshot
+        .sessions
+        .values()
+        .any(|s| s.pane_id.as_deref() == Some(pane_id) && s.agent_type != AgentType::None)
+        // …and a producer has announced the conversation we would be writing into.
+        && snapshot.pane_hook_session_id(pane_id).is_some()
+}
+
 /// Pure policy: does this `SessionStatus` observation for an orchestrator
 /// start-role pane warrant re-asserting the remit pointer? `Compacting` is
 /// the only status the daemon ever derives from `EventType::Compacting`
@@ -1915,9 +1966,12 @@ fn should_reassert_orchestrator_remit(status: &SessionStatus) -> bool {
 
 /// Pure policy: is the orchestrator start-role pane currently `Compacting`,
 /// looked up in an order-independent way? Mirrors the `.any()` pattern
-/// `deliver_orchestrator_prompt`'s own readiness check uses for this exact
-/// pane (`src/ui.rs`, the `agent_ready` computation) rather than `.find()`
-/// over a `HashMap`, whose iteration order is unspecified.
+/// `deliver_orchestrator_prompt`'s own readiness check uses for this exact pane
+/// ([`spawn_time_agent_ready`], which `agent_ready` calls) rather than `.find()`
+/// over a `HashMap`, whose iteration order is unspecified. Only the iteration
+/// shape is shared: this is a placeholder EXCLUSION, not a readiness gate, so
+/// issue #1005's second conjunct (an announced conversation) is deliberately
+/// absent here — a compacting agent has plainly already announced itself.
 /// `AppState::apply_event` (`src/state.rs`) documents that two sessions can
 /// legitimately co-reside on one `pane_id` — a placeholder (`agent_type:
 /// AgentType::None`) alongside the tagged real session — so this also
@@ -2287,13 +2341,22 @@ struct UiState {
     /// because the two answer different questions and only one of them may
     /// drive timing. `SessionState.agent_type` is the OBSERVED identity: it
     /// stays `AgentType::None` until something running in the pane reports, and
-    /// three separate readiness gates read exactly that — `agent_ready` in the
-    /// orchestrator-prompt, mode-seed and dispatch paths all spell "the agent
-    /// has started" as `agent_type != AgentType::None`. Seeding a declaration
-    /// into that field would make all three fire at spawn and type a prompt
-    /// into a launcher that has not started its agent yet — which is precisely
-    /// the population (`devbox run -- codex`) this key exists for, so the
-    /// feature would break delivery for exactly the users it is meant to help.
+    /// three separate readiness gates read it — `agent_ready` in the
+    /// orchestrator-prompt, mode-seed and dispatch paths, all of which route
+    /// through [`spawn_time_agent_ready`]. Seeding a declaration into that field
+    /// would move all three closer to firing at spawn and typing a prompt into a
+    /// launcher that has not started its agent yet — which is precisely the
+    /// population (`devbox run -- codex`) this key exists for, so the feature
+    /// would break delivery for exactly the users it is meant to help.
+    ///
+    /// Issue #1005: those gates now read TWO facts, not one. A resolved
+    /// `agent_type` no longer opens them on its own — the pane must also have an
+    /// announced conversation (`AppState::pane_hook_session_id`), because the
+    /// daemon's card-surfacing `SessionStart` resolves a type off the command at
+    /// spawn time and that is a card, not a reader. So a declaration seeded here
+    /// would today satisfy one half of the gate rather than all of it; the
+    /// reason to keep the two fields apart is unchanged, and the blast radius of
+    /// getting it wrong is smaller than it was.
     ///
     /// A declaration is nonetheless real knowledge, and the whole point of
     /// issue #308 is that the card should show it immediately. So it lands
@@ -2606,6 +2669,19 @@ struct UiState {
     /// PRD #89 M1.2 — monotonic reference the coalescer's `Duration` clock is
     /// measured from (`session_epoch.elapsed()`), set once at construction.
     session_epoch: std::time::Instant,
+    /// Issue #949 — the user's current position (active tab + each tab's
+    /// focused pane), overlaid onto the saved-session snapshot at both write
+    /// sites the way [`Self::last_command`] is.
+    ///
+    /// Held here rather than recomputed inside `flush_session_snapshot_if_due`
+    /// because that function early-returns while the coalescer's throttle is
+    /// closed, whereas a MOVE is what has to mark the snapshot dirty:
+    /// `track_session_focus` compares this against the live tabs once per frame
+    /// so an abrupt disconnect (a dropped ssh link, a killed terminal) still
+    /// leaves a recent position on disk. The clean detach-quit path is covered
+    /// by the unconditional pre-teardown write; this is what covers the
+    /// un-clean one, which is how the issue was reported.
+    session_focus: Option<config::SavedFocus>,
     /// PRD #196 — the persisted, global "last command": the most recent command
     /// the user spawned an INTERACTIVE agent with from the new-pane flow. Read by
     /// the new-pane form seed (`resolve_seed_command`) when `default_command` is
@@ -2763,6 +2839,7 @@ impl UiState {
             last_pane_keystroke_at: None,
             session_coalescer: config::SnapshotCoalescer::new(SNAPSHOT_COALESCE_INTERVAL),
             session_epoch: std::time::Instant::now(),
+            session_focus: None,
             // PRD #196: restored from the persisted session in `run_tui` before
             // the event loop; defaults to None so a fresh install seeds blank.
             last_command: None,
@@ -3173,7 +3250,9 @@ fn filter_sessions<'a>(state: &'a AppState, ui: &UiState) -> Vec<(&'a String, &'
 // path needs the same composition, and two copies is what left a
 // daemon-started orchestration without its delegation protocol. Imported below
 // so this module's call site and tests are unchanged.
-use crate::orchestrator_context::{prepare_orchestrator_prompt, reassert_orchestrator_prompt};
+use crate::orchestrator_context::{
+    Attendance, prepare_orchestrator_prompt, reassert_orchestrator_prompt,
+};
 // ---------------------------------------------------------------------------
 // PRD #76 M2.12: hydration partition
 // ---------------------------------------------------------------------------
@@ -3673,10 +3752,10 @@ fn process_pending_dispatches(
     snapshot: &AppState,
 ) {
     ui.pending_dispatches.retain(|pd| {
-        // Fast path: agent fired SessionStart (e.g., Claude Code).
-        let agent_ready = snapshot.sessions.values().any(|s| {
-            s.pane_id.as_deref() == Some(pd.pane_id.as_str()) && s.agent_type != AgentType::None
-        });
+        // Fast path: a producer announced a conversation on this pane (e.g.
+        // Claude Code's own `SessionStart`). Issue #1005: a resolved agent type
+        // on its own is the card the daemon drew at spawn time, not a reader.
+        let agent_ready = spawn_time_agent_ready(snapshot, &pd.pane_id);
         // Slow path: no SessionStart after 10 seconds (e.g., opencode).
         // The agent is likely running but hasn't signaled — inject anyway.
         let timeout_ready =
@@ -3820,10 +3899,9 @@ fn process_pending_seed_prompts(
             deliveries.remove(&sp.pane_id);
             return false;
         }
-        // Fast path: agent fired SessionStart (agent_type resolved).
-        let agent_ready = snapshot.sessions.values().any(|s| {
-            s.pane_id.as_deref() == Some(sp.pane_id.as_str()) && s.agent_type != AgentType::None
-        });
+        // Fast path: agent fired SessionStart (agent_type resolved AND a
+        // conversation announced — issue #1005; see `spawn_time_agent_ready`).
+        let agent_ready = spawn_time_agent_ready(snapshot, &sp.pane_id);
         // Slow path: no SessionStart after 10s (e.g. opencode) — proceed anyway.
         // Issue #424 (reviewer finding B3): this still decides WHEN to write,
         // exactly as before, but no longer decides whether the write is
@@ -4937,9 +5015,11 @@ fn deliver_orchestrator_prompt(
         return;
     }
 
-    let agent_ready = snapshot.sessions.values().any(|s| {
-        s.pane_id.as_deref() == Some(start_pane_id.as_str()) && s.agent_type != AgentType::None
-    });
+    // Issue #1005: readiness is a resolved agent type AND an announced
+    // conversation — see `spawn_time_agent_ready`. The `timeout_ready` slow path
+    // below is untouched, so a start role whose producer announces nothing still
+    // gets its remit after 10 s.
+    let agent_ready = spawn_time_agent_ready(snapshot, &start_pane_id);
     let timeout_ready = !agent_ready
         && ui
             .orchestration_prompt_anchor_at
@@ -10272,8 +10352,16 @@ fn dispatch_action(
                     let display_title = (!req.name.is_empty()).then(|| req.name.clone());
                     // `None`: the interactive path carries no caller task — the user
                     // types their instructions after the orchestrator acknowledges.
-                    // Output is byte-for-byte the pre-#222 text.
-                    let prompt = prepare_orchestrator_prompt(&orch_config, &dir_str, None);
+                    // `Attended` for the same reason (issue #703): this pane was
+                    // opened by the person now looking at it, so the template's
+                    // user gates mean what they say. `Attended` + no task is
+                    // byte-for-byte the pre-#222 text.
+                    let prompt = prepare_orchestrator_prompt(
+                        &orch_config,
+                        &dir_str,
+                        None,
+                        Attendance::Attended,
+                    );
                     // PRD #89 M2b.2: keep a copy of the prepared prompt for the
                     // capture snapshot below — `prompt` itself is moved into
                     // `open_orchestration_tab`. Empty when the orchestration
@@ -11237,6 +11325,10 @@ fn flush_session_snapshot_if_due(ui: &mut UiState, state: &SharedState) {
     // PRD #196: overlay the runtime last-command onto the live-pane snapshot so
     // it persists across restarts (the snapshot builder only knows panes).
     session.last_command = ui.last_command.clone();
+    // Issue #949: same overlay for the user's position — tab state, which the
+    // pane-derived snapshot builder cannot know. `track_session_focus` keeps
+    // `ui.session_focus` current and is what marked this write dirty.
+    session.focus = ui.session_focus.clone();
     // PRD #89 review-fix F10: only mark the write as done (clearing the dirty
     // flag via `record_write`) when the persist actually SUCCEEDED. On a
     // transient disk error we leave the coalescer dirty so the next loop
@@ -11245,13 +11337,20 @@ fn flush_session_snapshot_if_due(ui: &mut UiState, state: &SharedState) {
     // PRD #196: keep the file (don't clear) when there are no live panes but a
     // last_command is set, so closing every pane doesn't discard the recorded
     // command; clear only when BOTH are empty (today's no-state behavior).
-    let result = if session.panes.is_empty() && session.last_command.is_none() {
-        config::SavedSession::clear().map_err(|e| format!("Warning: failed to clear session: {e}"))
-    } else {
-        session
-            .save()
-            .map_err(|e| format!("Warning: failed to save session: {e}"))
-    };
+    // Issue #949: the remembered position joins that condition, so a deck whose
+    // panes all live in mode/orchestration tabs (no `pane_metadata` entry of
+    // their own) does not have its position deleted by the very same write that
+    // was meant to record it. `capture_focus_snapshot` answers `None` for a
+    // Dashboard-only deck, so a genuinely stateless deck still clears the file.
+    let result =
+        if session.panes.is_empty() && session.last_command.is_none() && session.focus.is_none() {
+            config::SavedSession::clear()
+                .map_err(|e| format!("Warning: failed to clear session: {e}"))
+        } else {
+            session
+                .save()
+                .map_err(|e| format!("Warning: failed to save session: {e}"))
+        };
     match result {
         Ok(()) => {
             // PRD #89 review-fix G1: a successful write/clear ends any ongoing
@@ -11270,6 +11369,25 @@ fn flush_session_snapshot_if_due(ui: &mut UiState, state: &SharedState) {
                 ui.session_snapshot_write_failed = true;
             }
         }
+    }
+}
+
+/// Issue #949 — keep [`UiState::session_focus`] current and mark the
+/// saved-session snapshot dirty whenever the user's position moves.
+///
+/// Driven once per main-loop iteration, immediately before
+/// `flush_session_snapshot_if_due`, because the flush is the wrong place to
+/// compute this: it early-returns while the coalescer's throttle is closed, so a
+/// focus move made during a quiet stretch would never mark anything dirty and
+/// would only reach disk if some unrelated change happened to dirty the snapshot
+/// later. Comparing here instead means a move is itself a state change, and the
+/// coalescer bounds how often that reaches the disk exactly as it does for every
+/// other trigger.
+fn track_session_focus(ui: &mut UiState, tab_manager: &TabManager) {
+    let current = tab_manager.capture_focus_snapshot();
+    if current != ui.session_focus {
+        ui.session_focus = current;
+        ui.mark_session_dirty();
     }
 }
 
@@ -11926,7 +12044,16 @@ pub fn run_tui(
     // whole `SavedSession` across the entire daemon-hydration block and threading
     // it into the gated branch — entangling the restore path for a negligible
     // startup disk read. Kept separate on purpose.
-    ui.last_command = config::SavedSession::load().last_command;
+    // Issue #949: the user's last position rides along on this same read. It
+    // is global state with the same gating as `last_command` — unconditional,
+    // because a warm-daemon reattach is precisely the case that needs it and
+    // that case never reaches the gated panes restore below — so folding it in
+    // here keeps the load count at two rather than adding a third. Applied
+    // after BOTH restore blocks (see the `apply_focus_snapshot` call), since it
+    // has to win over whichever landing tab they chose.
+    let restored_session = config::SavedSession::load();
+    ui.last_command = restored_session.last_command;
+    let saved_focus = restored_session.focus;
     let mut tab_manager = TabManager::new(Arc::clone(&pane));
 
     let mut star_state = config::StarPromptState::load();
@@ -11946,6 +12073,15 @@ pub fn run_tui(
     // landing on every startup.
     let mut preferred_start_tab: usize = 0;
 
+    // Issue #949 — the pane ids the DAEMON supplied on this startup, which is
+    // exactly the set whose ids are a stable identity across processes (the
+    // daemon captured each into its agent's `DOT_AGENT_DECK_PANE_ID` and echoed
+    // it back on `list_agents`). Empty on the daemon-empty path, and it
+    // deliberately excludes a Mode tab's SIDE panes, which the hydration block
+    // below spawns fresh from the project config rather than adopting. Consumed
+    // by `SavedFocus::retain_pane_ids` at the restore seam after both blocks.
+    let mut daemon_pane_ids: HashSet<String> = HashSet::new();
+
     // PRD #76 M2.x / M2.11: in external-daemon mode the daemon may already
     // own live agents from a previous TUI session (the user ssh-disconnected
     // and reconnected via `dot-agent-deck connect`). Ask the daemon for its
@@ -11962,6 +12098,7 @@ pub fn run_tui(
     // metadata intact — no separate persistence file is required.
     if let Some(embedded) = pane.as_any().downcast_ref::<EmbeddedPaneController>() {
         let hydrated = embedded.hydrate_from_daemon();
+        daemon_pane_ids.extend(hydrated.iter().map(|h| h.pane_id.clone()));
         for h in &hydrated {
             let mut st = state.blocking_write();
             st.register_pane(h.pane_id.clone());
@@ -12958,6 +13095,48 @@ pub fn run_tui(
         ui.selected_index = Some(0);
     }
 
+    // Issue #949 — put the user back where they were. Runs AFTER both restore
+    // blocks so it wins over their landing choices: the hydration block's PRD
+    // #111 "first rebuilt orchestration tab" and the snapshot block's
+    // `first_restored_orch_tab`/dashboard fallback. Both of those are
+    // heuristics for "we do not know where the user was"; this is the answer
+    // when we do. `apply_focus_snapshot` runs even when it returns no landing
+    // tab, because writing each tab's remembered pane is the half that stops a
+    // later Tab-away-and-back from dumping the user on that tab's start role.
+    //
+    // Only the ids the DAEMON supplied survive into the restore. Every other
+    // pane on screen — all of them on the daemon-empty rebuild path, and a Mode
+    // tab's locally-spawned side panes on the warm one — carries a fresh
+    // `allocate_id` counter that matches a remembered number by coincidence
+    // rather than by identity, so honouring one can focus the WRONG terminal
+    // instead of merely failing to restore. `SavedFocus::retain_pane_ids` has
+    // the full reasoning; the id-free half (a remembered Dashboard) is
+    // unaffected either way.
+    let saved_focus = saved_focus.map(|focus| focus.retain_pane_ids(&daemon_pane_ids));
+    if let Some(focus) = saved_focus.as_ref()
+        && let Some(index) = tab_manager.apply_focus_snapshot(focus)
+    {
+        tab_manager.switch_to(index);
+        // The remembered pane is only half-restored until the controller is
+        // told: the tab's field drives the rendered highlight, `focus_pane`
+        // drives which PTY the keyboard reaches.
+        let restored = tab_manager.restore_focus_on_switch_in();
+        // The snapshot-restore block above ends by focusing the first pane it
+        // rebuilt and entering PaneInput. If the landing tab focuses no pane of
+        // its own — the Dashboard, whose selection is keyed by session id rather
+        // than a pane id — that mode would keep sending keystrokes to a pane on a
+        // tab that is no longer drawn. Step back to command mode so the deck's
+        // mode matches what is on screen. Reachable only on the daemon-empty
+        // path, since warm hydration never enters PaneInput at startup.
+        if restored.is_none() && ui.mode == UiMode::PaneInput {
+            ui.mode = UiMode::Normal;
+        }
+    }
+    // Seed the movement baseline from what is actually on screen now, so the
+    // first frame does not read the restore itself as a move and immediately
+    // write the same position back.
+    ui.session_focus = tab_manager.capture_focus_snapshot();
+
     'outer: loop {
         // Expire stale status messages
         if let Some((_, created)) = &ui.status_message
@@ -12966,6 +13145,11 @@ pub fn run_tui(
             ui.status_message = None;
         }
 
+        // Issue #949 — notice a moved position (active tab / focused pane) and
+        // mark the snapshot dirty, so the flush below has something to write.
+        // Before the flush, not after: otherwise the move is a frame late every
+        // time and a detach on the same frame records the previous position.
+        track_session_focus(&mut ui, &tab_manager);
         // PRD #89 M1.2/M1.3 — keep the saved-session snapshot continuously
         // fresh: if a meaningful state change / detach marked it dirty and the
         // coalescer's throttle window has elapsed, flush it to disk now. This
@@ -14752,7 +14936,15 @@ pub fn run_tui(
         // PRD #196: persist the global last-command alongside the panes so it
         // survives a clean exit/restart; keep the file when only it is set.
         session.last_command = ui.last_command.clone();
-        if session.panes.is_empty() && session.last_command.is_none() {
+        // Issue #949: re-read the position here rather than trusting the last
+        // loop iteration's value. Nothing between the final `track_session_focus`
+        // and the quit-dialog `Enter` moves pane focus, so this is normally a
+        // no-op — but it is the ONE write that a detach is guaranteed to reach,
+        // and reading it a frame late is how a restore silently comes back one
+        // move behind.
+        track_session_focus(&mut ui, &tab_manager);
+        session.focus = ui.session_focus.clone();
+        if session.panes.is_empty() && session.last_command.is_none() && session.focus.is_none() {
             if let Err(e) = config::SavedSession::clear() {
                 ui.session_warnings
                     .push(format!("Warning: failed to clear session: {e}"));
@@ -27161,7 +27353,7 @@ mod tests {
 
         let dir = tempdir().unwrap();
         let cwd = dir.path().to_str().unwrap();
-        let prompt = prepare_orchestrator_prompt(&config, cwd, None);
+        let prompt = prepare_orchestrator_prompt(&config, cwd, None, Attendance::Attended);
         assert!(prompt.is_some());
         let prompt = prompt.unwrap();
         // One-liner referencing the file.
@@ -35541,6 +35733,16 @@ mod tests {
         }
     }
 
+    /// A pane the deck has drawn a card for: identity and a reporting agent type
+    /// are known, and NOTHING has announced a conversation yet.
+    ///
+    /// Issue #1005: this is the LAUNCHER shape, not the ready one, and the two
+    /// are no longer the same pane. `pane_hook_session_id` is `None` here —
+    /// `prompt/pane-input/030` asserts that directly on this helper's output and
+    /// `/033` asserts it after adding a provisional start to it — so the only
+    /// route that DELIVERS a spawn-time prompt into it is the 10-second
+    /// `timeout_ready` slow path ([`aged_seed_prompt`]). A test whose subject is
+    /// what happens AFTER the bytes land wants [`announced_prompt_snapshot`].
     fn ready_prompt_snapshot(pane_id: &str, agent_id: &str) -> AppState {
         let mut snapshot = AppState::default();
         snapshot.register_pane(pane_id.to_string());
@@ -35553,6 +35755,52 @@ mod tests {
         snapshot
     }
 
+    /// The generation [`announced_prompt_snapshot`] establishes for a pane, and
+    /// the one [`apply_prompt_confirmation`] reports its submission under.
+    ///
+    /// They are deliberately the SAME session: a production `UserPromptSubmit`
+    /// arrives on the agent's own conversation, and a confirmation that invented
+    /// a second session id would move `AppState::pane_hook_session` and be read
+    /// by [`delivery_target_changed`] as the conversation rolling over.
+    fn announced_generation(pane_id: &str) -> String {
+        format!("announced-{pane_id}")
+    }
+
+    /// [`ready_prompt_snapshot`] plus the agent's own `SessionStart` — the event
+    /// that actually announces a conversation, so `pane_hook_session_id` is
+    /// `Some` and issue #1005's fast path opens.
+    ///
+    /// This is what "a ready pane" means for every test whose subject is what a
+    /// spawn-time write does once it has landed: confirmation, retry, backoff,
+    /// rebinding, deadlines. Those tests are not about WHEN the deck may write.
+    fn announced_prompt_snapshot(pane_id: &str, agent_id: &str) -> AppState {
+        let mut snapshot = ready_prompt_snapshot(pane_id, agent_id);
+        apply_generation_event(
+            &mut snapshot,
+            pane_id,
+            agent_id,
+            &announced_generation(pane_id),
+            EventType::SessionStart,
+        );
+        snapshot
+    }
+
+    /// A seed old enough that the 10-second `timeout_ready` slow path delivers
+    /// it — since issue #1005 the only route that WRITES into a pane no producer
+    /// has announced on, the `devbox run claude …` launcher case issue #424
+    /// exists for. (The 60-second hard deadline also reaches such a pane, but it
+    /// abandons rather than delivers.) Mirrors [`ready_seed_prompt`] in every
+    /// other respect.
+    fn aged_seed_prompt(pane_id: &str, prompt: &str) -> PendingSeedPrompt {
+        seed_prompt_created_at(
+            pane_id,
+            prompt,
+            std::time::Instant::now()
+                .checked_sub(std::time::Duration::from_millis(10_100))
+                .expect("aged creation timestamp"),
+        )
+    }
+
     fn apply_prompt_confirmation(
         snapshot: &mut AppState,
         pane_id: &str,
@@ -35560,7 +35808,7 @@ mod tests {
         prompt: &str,
     ) {
         snapshot.apply_event(AgentEvent {
-            session_id: format!("confirmed-{pane_id}"),
+            session_id: announced_generation(pane_id),
             agent_type: AgentType::Codex,
             event_type: EventType::Thinking,
             tool_name: None,
@@ -35646,7 +35894,7 @@ mod tests {
                 now.checked_sub(SPAWN_TIME_READINESS_BUFFER + std::time::Duration::from_millis(1))
                     .expect("ready timestamp"),
             );
-            let mut snapshot = ready_prompt_snapshot(PANE_ID, AGENT_ID);
+            let mut snapshot = announced_prompt_snapshot(PANE_ID, AGENT_ID);
             let mut role_statuses = vec![OrchestrationRoleStatus::Waiting];
             let mut prompt = Some(PROMPT.to_string());
 
@@ -35743,7 +35991,7 @@ mod tests {
                         .expect("ready timestamp"),
                 ),
             });
-            let mut snapshot = ready_prompt_snapshot(PANE_ID, AGENT_ID);
+            let mut snapshot = announced_prompt_snapshot(PANE_ID, AGENT_ID);
 
             process_pending_seed_prompts(&mut ui, &pane, &snapshot);
 
@@ -35841,6 +36089,28 @@ mod tests {
             Some(AgentType::Codex),
             None,
         );
+        // Issue #1005: a conversation IS announced here — the pane just never
+        // carries an agent id, which is the thing under test. Announced without
+        // one, so `delivery_capability` still answers `CannotReport`.
+        unidentified_snapshot.apply_event(AgentEvent {
+            session_id: announced_generation("unidentified-pane"),
+            agent_type: AgentType::Codex,
+            event_type: EventType::SessionStart,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp: Utc::now(),
+            user_prompt: None,
+            metadata: Default::default(),
+            pane_id: Some("unidentified-pane".into()),
+            agent_id: None,
+            agent_version: None,
+            schema_version: None,
+            live_target: Some(crate::event::LiveTarget {
+                kind: crate::event::TargetKind::Pty,
+                writable: crate::event::Writable::Live,
+            }),
+        });
         process_pending_seed_prompts(
             &mut unidentified_ui,
             &unidentified_pane,
@@ -35892,7 +36162,7 @@ mod tests {
                     .pending_seed_prompts
                     .push(ready_seed_prompt("doubled-seed-pane", &seed));
                 let mut doubled_snapshot =
-                    ready_prompt_snapshot("doubled-seed-pane", "doubled-seed-agent");
+                    announced_prompt_snapshot("doubled-seed-pane", "doubled-seed-agent");
 
                 process_pending_seed_prompts(&mut doubled_ui, &doubled_pane, &doubled_snapshot);
                 doubled_ui
@@ -35974,6 +36244,11 @@ mod tests {
     #[derive(Default)]
     struct RecordingPaneController {
         writes: Arc<std::sync::Mutex<Vec<RecordedWrite>>>,
+        /// Issue #1005: `process_pending_dispatches` is the one spawn-time
+        /// delivery site that writes through the plain, identity-free
+        /// [`PaneController::write_to_pane`], so its bytes are invisible in
+        /// `writes`. Recorded as `(pane_id, text)` in call order.
+        plain_writes: Arc<std::sync::Mutex<Vec<(String, String)>>>,
         lose_first_response: bool,
     }
 
@@ -35981,6 +36256,7 @@ mod tests {
         fn losing_first_response() -> Self {
             Self {
                 writes: Arc::default(),
+                plain_writes: Arc::default(),
                 lose_first_response: true,
             }
         }
@@ -36018,7 +36294,11 @@ mod tests {
         fn toggle_layout(&self) -> Result<(), PaneError> {
             Ok(())
         }
-        fn write_to_pane(&self, _pane_id: &str, _text: &str) -> Result<(), PaneError> {
+        fn write_to_pane(&self, pane_id: &str, text: &str) -> Result<(), PaneError> {
+            self.plain_writes
+                .lock()
+                .unwrap()
+                .push((pane_id.to_string(), text.to_string()));
             Ok(())
         }
         fn write_and_submit_to_pane_with_identity(
@@ -36223,7 +36503,7 @@ mod tests {
             .pending_seed_prompts
             .push(ready_seed_prompt(REPLACEMENT_PANE_ID, REPLACEMENT_PROMPT));
         let replacement_snapshot =
-            ready_prompt_snapshot(REPLACEMENT_PANE_ID, &replacement_controller.agent_id);
+            announced_prompt_snapshot(REPLACEMENT_PANE_ID, &replacement_controller.agent_id);
 
         process_pending_seed_prompts(
             &mut replacement_ui,
@@ -36276,7 +36556,7 @@ mod tests {
         let mut ui = default_ui();
         ui.pending_seed_prompts
             .push(ready_seed_prompt(PANE_ID, PROMPT));
-        let snapshot = ready_prompt_snapshot(PANE_ID, &controller.agent_id);
+        let snapshot = announced_prompt_snapshot(PANE_ID, &controller.agent_id);
 
         process_pending_seed_prompts(&mut ui, &pane, &snapshot);
         ui.send_retry_backoff
@@ -36318,10 +36598,12 @@ mod tests {
         let writes = controller.writes.clone();
         let pane: Arc<dyn PaneController> = controller;
         let mut ui = default_ui();
-        ui.pending_seed_prompts
-            .push(ready_seed_prompt(PANE_ID, PROMPT));
         // The launcher shape: identity and a reporting agent type are known, but
-        // nothing has announced a conversation yet.
+        // nothing has announced a conversation yet, so (issue #1005) the only
+        // door into this pane is the 10-second `timeout_ready` fallback — which
+        // is the case this test is named for.
+        ui.pending_seed_prompts
+            .push(aged_seed_prompt(PANE_ID, PROMPT));
         let mut snapshot = ready_prompt_snapshot(PANE_ID, AGENT_ID);
         assert_eq!(
             snapshot.pane_hook_session_id(PANE_ID),
@@ -36426,7 +36708,7 @@ mod tests {
         let mut held_seed_ui = default_ui();
         held_seed_ui
             .pending_seed_prompts
-            .push(ready_seed_prompt(HELD_SEED_PANE, PROMPT));
+            .push(aged_seed_prompt(HELD_SEED_PANE, PROMPT));
         let mut held_seed_snapshot = ready_prompt_snapshot(HELD_SEED_PANE, HELD_SEED_AGENT);
 
         process_pending_seed_prompts(&mut held_seed_ui, &held_seed_pane, &held_seed_snapshot);
@@ -36471,7 +36753,14 @@ mod tests {
         let mut held_role_ui = default_ui();
         held_role_ui
             .orchestration_prompt_anchor_at
-            .insert(tab_id, started);
+            // Aged past the 10-second fallback for the same reason the seed
+            // beside it is: nothing has announced a conversation on this pane.
+            .insert(
+                tab_id,
+                started
+                    .checked_sub(std::time::Duration::from_millis(10_100))
+                    .expect("aged anchor timestamp"),
+            );
         held_role_ui.orchestration_ready_since.insert(
             tab_id,
             started
@@ -36561,7 +36850,7 @@ mod tests {
         let mut burst_seed_ui = default_ui();
         burst_seed_ui
             .pending_seed_prompts
-            .push(ready_seed_prompt(BURST_SEED_PANE, PROMPT));
+            .push(aged_seed_prompt(BURST_SEED_PANE, PROMPT));
         let mut burst_seed_snapshot = ready_prompt_snapshot(BURST_SEED_PANE, BURST_SEED_AGENT);
 
         process_pending_seed_prompts(&mut burst_seed_ui, &burst_seed_pane, &burst_seed_snapshot);
@@ -36604,7 +36893,14 @@ mod tests {
         let mut burst_role_ui = default_ui();
         burst_role_ui
             .orchestration_prompt_anchor_at
-            .insert(burst_tab_id, burst_started);
+            // Aged past the 10-second fallback for the same reason the seed
+            // beside it is: nothing has announced a conversation on this pane.
+            .insert(
+                burst_tab_id,
+                burst_started
+                    .checked_sub(std::time::Duration::from_millis(10_100))
+                    .expect("aged anchor timestamp"),
+            );
         burst_role_ui.orchestration_ready_since.insert(
             burst_tab_id,
             burst_started
@@ -36683,7 +36979,7 @@ mod tests {
         let mut lost_seed_ui = default_ui();
         lost_seed_ui
             .pending_seed_prompts
-            .push(ready_seed_prompt(LOST_SEED_PANE, PROMPT));
+            .push(aged_seed_prompt(LOST_SEED_PANE, PROMPT));
         let mut lost_seed_snapshot = ready_prompt_snapshot(LOST_SEED_PANE, LOST_SEED_AGENT);
 
         process_pending_seed_prompts(&mut lost_seed_ui, &lost_seed_pane, &lost_seed_snapshot);
@@ -36726,7 +37022,14 @@ mod tests {
         let mut lost_role_ui = default_ui();
         lost_role_ui
             .orchestration_prompt_anchor_at
-            .insert(lost_tab_id, lost_started);
+            // Aged past the 10-second fallback for the same reason the seed
+            // beside it is: nothing has announced a conversation on this pane.
+            .insert(
+                lost_tab_id,
+                lost_started
+                    .checked_sub(std::time::Duration::from_millis(10_100))
+                    .expect("aged anchor timestamp"),
+            );
         lost_role_ui.orchestration_ready_since.insert(
             lost_tab_id,
             lost_started
@@ -36796,10 +37099,11 @@ mod tests {
 
     /// Scenario: Spawn a pane whose card is drawn by a start that announces no
     /// conversation — the daemon's own card-surfacing `SessionStart`, and a
-    /// wrapper's boot-provenance start — then deliver a TUI-owned seed into it
-    /// before the real agent has announced itself. When the agent's genuine
-    /// `SessionStart` arrives, the seed must still be delivered into that
-    /// generation rather than abandoned as "the agent's conversation changed".
+    /// wrapper's boot-provenance start — and let the 10-second launcher fallback
+    /// put a TUI-owned seed into it while that card is still all there is. When
+    /// the agent's genuine `SessionStart` finally arrives, the seed must be
+    /// delivered into that generation rather than abandoned as "the agent's
+    /// conversation changed".
     #[spec("prompt/pane-input/033")]
     #[test]
     fn pane_input_033_a_provisional_start_is_not_a_conversation_to_lose() {
@@ -36836,8 +37140,16 @@ mod tests {
             let writes = controller.writes.clone();
             let pane: Arc<dyn PaneController> = controller;
             let mut ui = default_ui();
+            // Issue #1005 re-anchored this fixture's DOOR without touching its
+            // subject. The fast path no longer writes into a pane whose only
+            // start announced nothing, so the ordering this test is about — bytes
+            // in the pane, then the genuine announcement — is now reached the one
+            // way production still reaches it: the 10-second fallback, i.e. the
+            // `devbox run claude …` launcher case issue #424 exists for. What is
+            // under test is unchanged and still load-bearing: a provisional start
+            // is not a conversation the delivery can be LOST from.
             ui.pending_seed_prompts
-                .push(ready_seed_prompt(pane_id, PROMPT));
+                .push(aged_seed_prompt(pane_id, PROMPT));
             let mut snapshot = ready_prompt_snapshot(pane_id, &agent_id);
 
             let mut metadata = std::collections::HashMap::new();
@@ -36880,16 +37192,15 @@ mod tests {
                  pane's generation — binding it is what a TUI delivery then loses"
             );
 
-            // The seed is written while that card is all there is. This is the
-            // ordinary case whenever the agent takes longer to announce itself
-            // than the readiness buffer takes to elapse, which is exactly what a
-            // launcher (`devbox run claude …`) and a slow-booting Claude Code do.
+            // The seed is written while that card is all there is — by the
+            // fallback, ten seconds after the pane came up with nothing but a
+            // card on it.
             process_pending_seed_prompts(&mut ui, &pane, &snapshot);
             assert_eq!(
                 writes.lock().unwrap().len(),
                 1,
-                "{case}: precondition — the seed reaches the pane before the agent \
-                 announces itself"
+                "{case}: precondition — the fallback reaches the pane before the \
+                 agent announces itself"
             );
 
             // The real agent finally announces itself.
@@ -36937,6 +37248,374 @@ mod tests {
         }
     }
 
+    /// A `SessionStart` that DRAWS A CARD without announcing a conversation, as
+    /// the daemon's `spawn::surface_spawned_pane` emits it: `session_id` is the
+    /// pane id, there is no `agent_id`, and the `agent_type` is the one
+    /// `AgentType::from_command` resolved off the command the deck chose to run.
+    ///
+    /// This is the whole input to issue #1005. It makes
+    /// `session.agent_type != AgentType::None` true for the pane at SPAWN time,
+    /// which is all three spawn-time readiness gates currently ask for, while
+    /// `pane_hook_session_id` stays `None` because nothing has announced a
+    /// conversation (`prompt/pane-input/033`).
+    fn apply_card_surface_start(snapshot: &mut AppState, pane_id: &str, display_name: &str) {
+        let mut metadata = std::collections::HashMap::new();
+        metadata.insert(
+            crate::event::DISPLAY_NAME_METADATA_KEY.to_string(),
+            display_name.to_string(),
+        );
+        metadata.insert(
+            crate::event::SESSION_START_ORIGIN_METADATA_KEY.to_string(),
+            crate::event::CARD_SURFACE_SESSION_START_ORIGIN.to_string(),
+        );
+        snapshot.apply_event(AgentEvent {
+            session_id: pane_id.to_string(),
+            agent_type: AgentType::ClaudeCode,
+            event_type: EventType::SessionStart,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp: Utc::now(),
+            user_prompt: None,
+            metadata,
+            pane_id: Some(pane_id.into()),
+            agent_id: None,
+            agent_version: None,
+            schema_version: None,
+            live_target: None,
+        });
+    }
+
+    /// The agent's OWN `SessionStart` — the one that actually announces a
+    /// conversation, so `pane_hook_session_id` becomes `Some`. Same shape as
+    /// [`apply_generation_event`] but Claude Code, so a pane seeded by
+    /// [`apply_card_surface_start`] never carries two different agent types.
+    fn apply_claude_generation_start(
+        snapshot: &mut AppState,
+        pane_id: &str,
+        agent_id: &str,
+        session_id: &str,
+    ) {
+        snapshot.apply_event(AgentEvent {
+            session_id: session_id.to_string(),
+            agent_type: AgentType::ClaudeCode,
+            event_type: EventType::SessionStart,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp: Utc::now(),
+            user_prompt: None,
+            metadata: Default::default(),
+            pane_id: Some(pane_id.to_string()),
+            agent_id: Some(agent_id.to_string()),
+            agent_version: None,
+            schema_version: None,
+            live_target: Some(crate::event::LiveTarget {
+                kind: crate::event::TargetKind::Pty,
+                writable: crate::event::Writable::Live,
+            }),
+        });
+    }
+
+    /// A seed whose readiness buffer has ALREADY elapsed, so the only thing
+    /// standing between it and the PTY is the readiness gate itself. Mirrors
+    /// [`ready_seed_prompt`], but `created_at` is a parameter so the same helper
+    /// builds both the fresh seed (item 1: the gate must hold) and the aged one
+    /// (item 2: the 10 s slow path must still fire).
+    fn seed_prompt_created_at(
+        pane_id: &str,
+        prompt: &str,
+        created_at: std::time::Instant,
+    ) -> PendingSeedPrompt {
+        PendingSeedPrompt {
+            pane_id: pane_id.to_string(),
+            prompt: prompt.to_string(),
+            created_at,
+            ready_since: Some(
+                std::time::Instant::now()
+                    .checked_sub(SPAWN_TIME_READINESS_BUFFER + std::time::Duration::from_millis(1))
+                    .expect("ready timestamp"),
+            ),
+        }
+    }
+
+    /// Scenario: Spawn a pane whose only session is the daemon's card-surfacing
+    /// `SessionStart` — an agent type resolved from the command, no conversation
+    /// announced — and drive the seed consumer with the 500 ms readiness buffer
+    /// already elapsed; nothing may reach the pane. Once the agent's own
+    /// `SessionStart` announces a conversation, exactly one write fires and
+    /// names it. Separately, a pane that announces NOTHING at all must still be
+    /// delivered by the 10-second slow path, so narrowing the fast path does not
+    /// strand a no-signal producer.
+    #[spec("prompt/pane-input/036")]
+    #[test]
+    fn pane_input_036_a_card_is_not_an_agent_that_can_read() {
+        const PROMPT: &str = "Read the dispatch seed and begin";
+
+        // --- The narrowing itself (issue #1005). -----------------------------
+        const PANE_ID: &str = "card-surfaced-only-pane";
+        const AGENT_ID: &str = "card-surfaced-only-agent";
+        let controller = Arc::new(RecordingPaneController::default());
+        let writes = controller.writes.clone();
+        let pane: Arc<dyn PaneController> = controller;
+        let mut ui = default_ui();
+        ui.pending_seed_prompts.push(seed_prompt_created_at(
+            PANE_ID,
+            PROMPT,
+            std::time::Instant::now(),
+        ));
+        let mut snapshot = AppState::default();
+        snapshot.register_pane(PANE_ID.to_string());
+        apply_card_surface_start(&mut snapshot, PANE_ID, "dispatcher");
+
+        // Precondition: the pane looks exactly as it does in the field 3.7
+        // seconds before the agent announces itself — a typed session (so the
+        // bare `agent_type != None` gate is satisfied) with no conversation.
+        assert!(
+            snapshot
+                .sessions
+                .values()
+                .any(|s| s.pane_id.as_deref() == Some(PANE_ID) && s.agent_type != AgentType::None),
+            "precondition: the card-surfacing start must resolve an agent type, \
+             or this test is not exercising the gate at all"
+        );
+        assert_eq!(
+            snapshot.pane_hook_session_id(PANE_ID),
+            None,
+            "precondition: a card-surfacing start announces no conversation"
+        );
+
+        // Two passes, so "not yet" cannot be mistaken for "not this frame".
+        process_pending_seed_prompts(&mut ui, &pane, &snapshot);
+        process_pending_seed_prompts(&mut ui, &pane, &snapshot);
+        let before_announcement = writes.lock().unwrap().clone();
+        assert!(
+            before_announcement.is_empty(),
+            "a card drawn from the command is not an agent that can read: the seed \
+             must not be written until a producer announces a conversation. \
+             writes={before_announcement:?}"
+        );
+        assert_eq!(
+            ui.pending_seed_prompts.len(),
+            1,
+            "the seed is HELD, not dropped — it is delivered the moment the agent \
+             announces itself. status={:?}",
+            ui.status_message
+        );
+
+        // The agent finally announces itself.
+        const GENUINE: &str = "card-surfaced-only-genuine-generation";
+        apply_claude_generation_start(&mut snapshot, PANE_ID, AGENT_ID, GENUINE);
+        process_pending_seed_prompts(&mut ui, &pane, &snapshot);
+
+        let records = writes.lock().unwrap().clone();
+        assert_eq!(
+            records.len(),
+            1,
+            "the announcement releases exactly one write; writes={records:?}"
+        );
+        assert_eq!(
+            records[0].0, PROMPT,
+            "the write that fires carries the seed itself, not a submit probe"
+        );
+        assert_eq!(
+            records[0].1.as_deref(),
+            Some(GENUINE),
+            "the write must declare the conversation it is entering"
+        );
+
+        // --- The slow path the narrowing must not break. ---------------------
+        //
+        // A producer that announces NOTHING (opencode's cold boot, Pi's
+        // `NoSignal`, `scheduler/spawn/005`) is delivered by the 10-second
+        // `timeout_ready` path and nothing else. Narrowing the fast path onto
+        // `pane_hook_session_id` makes that the ONLY path such a pane has, so it
+        // is pinned here rather than left to be discovered by whoever breaks it.
+        for (case, pane_id, surface_card) in [
+            (
+                "card surfaced, never announced",
+                "no-signal-carded-pane",
+                true,
+            ),
+            ("no session at all", "no-signal-bare-pane", false),
+        ] {
+            let controller = Arc::new(RecordingPaneController::default());
+            let writes = controller.writes.clone();
+            let pane: Arc<dyn PaneController> = controller;
+            let mut ui = default_ui();
+            ui.pending_seed_prompts.push(seed_prompt_created_at(
+                pane_id,
+                PROMPT,
+                std::time::Instant::now() - std::time::Duration::from_secs(11),
+            ));
+            let mut snapshot = AppState::default();
+            snapshot.register_pane(pane_id.to_string());
+            if surface_card {
+                apply_card_surface_start(&mut snapshot, pane_id, "no-signal");
+            }
+
+            process_pending_seed_prompts(&mut ui, &pane, &snapshot);
+
+            let records = writes.lock().unwrap().clone();
+            assert_eq!(
+                records.len(),
+                1,
+                "{case}: the 10-second slow path is the only delivery a producer \
+                 that announces nothing ever gets — it must survive the fast \
+                 path's narrowing; writes={records:?}"
+            );
+            assert_eq!(
+                records[0].0, PROMPT,
+                "{case}: the slow path delivers the seed itself"
+            );
+        }
+    }
+
+    /// Scenario: Give a card-surfaced-but-silent pane a pending DISPATCH and,
+    /// separately, an orchestration start-role prompt with the readiness buffer
+    /// already elapsed; neither may put bytes in the pane while no conversation
+    /// has been announced. When the agent's own `SessionStart` arrives, each
+    /// path delivers exactly once, and the orchestrator's write names the
+    /// conversation it entered.
+    #[spec("prompt/pane-input/037")]
+    #[test]
+    fn pane_input_037_the_other_two_spawn_time_gates_wait_for_a_conversation() {
+        const PROMPT: &str = "Read the role remit and begin";
+
+        // --- `process_pending_dispatches` (src/ui.rs, the delegate path). ----
+        //
+        // This site has no readiness buffer at all — `agent_ready` alone puts
+        // the bytes in the pane on the very next frame — so a card-surfacing
+        // start makes it the fastest of the three to write into a launcher that
+        // has not started its agent.
+        const DISPATCH_PANE: &str = "dispatch-card-surfaced-pane";
+        const DISPATCH_AGENT: &str = "dispatch-card-surfaced-agent";
+        let dispatch_controller = Arc::new(RecordingPaneController::default());
+        let dispatch_writes = dispatch_controller.plain_writes.clone();
+        let dispatch_pane: Arc<dyn PaneController> = dispatch_controller;
+        let mut dispatch_ui = default_ui();
+        dispatch_ui.pending_dispatches.push(PendingDispatch {
+            pane_id: DISPATCH_PANE.to_string(),
+            prompt: PROMPT.to_string(),
+            created_at: std::time::Instant::now(),
+        });
+        let mut dispatch_snapshot = AppState::default();
+        dispatch_snapshot.register_pane(DISPATCH_PANE.to_string());
+        apply_card_surface_start(&mut dispatch_snapshot, DISPATCH_PANE, "worker");
+
+        process_pending_dispatches(&mut dispatch_ui, &dispatch_pane, &dispatch_snapshot);
+        process_pending_dispatches(&mut dispatch_ui, &dispatch_pane, &dispatch_snapshot);
+        let dispatch_before_announcement = dispatch_writes.lock().unwrap().clone();
+        assert!(
+            dispatch_before_announcement.is_empty(),
+            "dispatch: a resolved agent type is not a reader — the delegated task \
+             must wait for the agent's own SessionStart; \
+             writes={dispatch_before_announcement:?}"
+        );
+        assert_eq!(
+            dispatch_ui.pending_dispatches.len(),
+            1,
+            "dispatch: the task is held for the announcement, not dropped"
+        );
+
+        apply_claude_generation_start(
+            &mut dispatch_snapshot,
+            DISPATCH_PANE,
+            DISPATCH_AGENT,
+            "dispatch-genuine-generation",
+        );
+        process_pending_dispatches(&mut dispatch_ui, &dispatch_pane, &dispatch_snapshot);
+        let dispatch_after_announcement = dispatch_writes.lock().unwrap().clone();
+        assert_eq!(
+            dispatch_after_announcement.as_slice(),
+            &[(DISPATCH_PANE.to_string(), PROMPT.to_string())],
+            "dispatch: the announcement releases exactly one write of the task"
+        );
+
+        // --- `deliver_orchestrator_prompt` (the start role's spawn-time remit).
+        const ROLE_PANE: &str = "orchestrator-card-surfaced-pane";
+        const ROLE_AGENT: &str = "orchestrator-card-surfaced-agent";
+        let role_controller = Arc::new(RecordingPaneController::default());
+        let role_writes = role_controller.writes.clone();
+        let role_pane: Arc<dyn PaneController> = role_controller;
+        let started = std::time::Instant::now();
+        let tab_id: TabId = 1037;
+        let mut role_ui = default_ui();
+        role_ui
+            .orchestration_prompt_anchor_at
+            .insert(tab_id, started);
+        // The readiness BUFFER is already spent, so the only thing this test can
+        // be observing is the readiness GATE.
+        role_ui.orchestration_ready_since.insert(
+            tab_id,
+            started
+                .checked_sub(SPAWN_TIME_READINESS_BUFFER + std::time::Duration::from_millis(1))
+                .expect("ready timestamp"),
+        );
+        let mut role_snapshot = AppState::default();
+        role_snapshot.register_pane(ROLE_PANE.to_string());
+        apply_card_surface_start(&mut role_snapshot, ROLE_PANE, "orchestrator");
+        let role_panes = [ROLE_PANE.to_string()];
+        let mut role_statuses = vec![OrchestrationRoleStatus::Waiting];
+        let mut role_prompt = Some(PROMPT.to_string());
+
+        for offset in [0, 1] {
+            deliver_orchestrator_prompt(
+                &mut role_ui,
+                role_pane.as_ref(),
+                &role_snapshot,
+                started + std::time::Duration::from_millis(offset),
+                tab_id,
+                &role_panes,
+                0,
+                &mut role_statuses,
+                &mut role_prompt,
+            );
+        }
+        let role_before_announcement = role_writes.lock().unwrap().clone();
+        assert!(
+            role_before_announcement.is_empty(),
+            "orchestrator: the start role's remit must not be typed into a pane \
+             whose only session is the card the daemon drew for it; \
+             writes={role_before_announcement:?}"
+        );
+        assert!(
+            role_prompt.is_some(),
+            "orchestrator: the remit is held for the announcement, not consumed"
+        );
+
+        const ROLE_GENUINE: &str = "orchestrator-genuine-generation";
+        apply_claude_generation_start(&mut role_snapshot, ROLE_PANE, ROLE_AGENT, ROLE_GENUINE);
+        deliver_orchestrator_prompt(
+            &mut role_ui,
+            role_pane.as_ref(),
+            &role_snapshot,
+            started + std::time::Duration::from_millis(2),
+            tab_id,
+            &role_panes,
+            0,
+            &mut role_statuses,
+            &mut role_prompt,
+        );
+
+        let records = role_writes.lock().unwrap().clone();
+        assert_eq!(
+            records.len(),
+            1,
+            "orchestrator: the announcement releases exactly one write; \
+             writes={records:?}"
+        );
+        assert_eq!(
+            records[0].0, PROMPT,
+            "orchestrator: the write carries the remit itself"
+        );
+        assert_eq!(
+            records[0].1.as_deref(),
+            Some(ROLE_GENUINE),
+            "orchestrator: the write must declare the conversation it is entering"
+        );
+    }
+
     /// Scenario: Write a seed to a target with no usable prompt-reporting channel, then supply daemon-synthetic evidence beside an untagged legacy hook. Those events must not arm a second physical write into a target that cannot actually confirm submission.
     #[spec("prompt/pane-input/031")]
     #[test]
@@ -36948,8 +37627,15 @@ mod tests {
         let writes = controller.writes.clone();
         let pane: Arc<dyn PaneController> = controller;
         let mut ui = default_ui();
+        // Issue #1005: nothing has announced a conversation on this pane when the
+        // first write goes in — its producer speaks only through the untagged
+        // legacy hook below, and does so later — so the write arrives by the
+        // 10-second fallback. The delivery state that write leaves behind is
+        // identical either way (`expected_session_id` is `None` at write time on
+        // both paths), which is why the events that follow still say what they
+        // always said.
         ui.pending_seed_prompts
-            .push(ready_seed_prompt(PANE_ID, PROMPT));
+            .push(aged_seed_prompt(PANE_ID, PROMPT));
         let mut snapshot = AppState::default();
         snapshot.register_pane(PANE_ID.to_string());
         snapshot.insert_placeholder_session(
@@ -37042,7 +37728,7 @@ mod tests {
         let mut ui = default_ui();
         ui.pending_seed_prompts
             .push(ready_seed_prompt(PANE_ID, PROMPT));
-        let snapshot = ready_prompt_snapshot(PANE_ID, "caching-ledger-agent");
+        let snapshot = announced_prompt_snapshot(PANE_ID, "caching-ledger-agent");
 
         process_pending_seed_prompts(&mut ui, &pane, &snapshot);
         {
@@ -37121,7 +37807,7 @@ mod tests {
                 .checked_sub(SPAWN_TIME_READINESS_BUFFER + std::time::Duration::from_millis(1))
                 .expect("ready timestamp"),
         );
-        let snapshot = ready_prompt_snapshot(PANE_ID, AGENT_ID);
+        let snapshot = announced_prompt_snapshot(PANE_ID, AGENT_ID);
         let mut role_statuses = vec![OrchestrationRoleStatus::Waiting];
         let mut prompt = Some(PROMPT.to_string());
 
@@ -37307,7 +37993,7 @@ mod tests {
                     .expect("ready timestamp"),
             ),
         });
-        let mut snapshot = ready_prompt_snapshot(PANE_ID, AGENT_ID);
+        let mut snapshot = announced_prompt_snapshot(PANE_ID, AGENT_ID);
         snapshot.register_pane(OTHER_PANE_ID.to_string());
         snapshot.insert_placeholder_session(
             OTHER_PANE_ID.to_string(),
@@ -37325,7 +38011,11 @@ mod tests {
         assert!(ui.send_retry_backoff.contains_key(PANE_ID));
 
         snapshot.apply_event(AgentEvent {
-            session_id: "identity-less-confirmation".into(),
+            // The pane's OWN conversation, reported by a producer that carries
+            // no agent id: the missing identity is what makes this unusable
+            // evidence, and inventing a second session id would instead read as
+            // the conversation rolling over (`delivery_target_changed`).
+            session_id: announced_generation(PANE_ID),
             agent_type: AgentType::Codex,
             event_type: EventType::Thinking,
             tool_name: None,
@@ -37400,7 +38090,8 @@ mod tests {
         stale_ui
             .pending_seed_prompts
             .push(ready_seed_prompt("stale-history-pane", PROMPT));
-        let mut stale_snapshot = ready_prompt_snapshot("stale-history-pane", "stale-history-agent");
+        let mut stale_snapshot =
+            announced_prompt_snapshot("stale-history-pane", "stale-history-agent");
         apply_prompt_confirmation(
             &mut stale_snapshot,
             "stale-history-pane",
@@ -37445,7 +38136,7 @@ mod tests {
         replacement_ui
             .pending_seed_prompts
             .push(ready_seed_prompt("rebound-pane", PROMPT));
-        let mut replacement_snapshot = ready_prompt_snapshot("rebound-pane", "original-agent");
+        let mut replacement_snapshot = announced_prompt_snapshot("rebound-pane", "original-agent");
         process_pending_seed_prompts(
             &mut replacement_ui,
             &replacement_pane,
@@ -37791,14 +38482,7 @@ mod tests {
                         .expect("readiness timestamp"),
                 ),
             });
-            let mut snapshot = AppState::default();
-            snapshot.register_pane("seed-pane".into());
-            snapshot.insert_placeholder_session(
-                "seed-pane".into(),
-                None,
-                Some(AgentType::Codex),
-                Some("seed-agent".into()),
-            );
+            let snapshot = announced_prompt_snapshot("seed-pane", "seed-agent");
             let pane: Arc<dyn PaneController> = Arc::new(SendResultPaneController::new(
                 outcome,
                 Arc::new(AtomicUsize::new(0)),
@@ -37837,14 +38521,7 @@ mod tests {
                     .expect("readiness timestamp"),
             ),
         });
-        let mut snapshot = AppState::default();
-        snapshot.register_pane("backoff-pane".into());
-        snapshot.insert_placeholder_session(
-            "backoff-pane".into(),
-            None,
-            Some(AgentType::Codex),
-            Some("backoff-agent".into()),
-        );
+        let snapshot = announced_prompt_snapshot("backoff-pane", "backoff-agent");
 
         for _ in 0..8 {
             process_pending_seed_prompts(&mut ui, &pane, &snapshot);
@@ -37876,14 +38553,7 @@ mod tests {
                         .expect("readiness timestamp"),
                 ),
             });
-            let mut snapshot = AppState::default();
-            snapshot.register_pane("restart-collision-pane".into());
-            snapshot.insert_placeholder_session(
-                "restart-collision-pane".into(),
-                None,
-                Some(AgentType::Codex),
-                Some("restart-agent".into()),
-            );
+            let snapshot = announced_prompt_snapshot("restart-collision-pane", "restart-agent");
             process_pending_seed_prompts(&mut ui, &pane, &snapshot);
             restart_delivery_ids
                 .lock()
@@ -38002,14 +38672,7 @@ mod tests {
         let now_past_deadline = created
             .checked_add(AUTOMATIC_PROMPT_DEADLINE + std::time::Duration::from_secs(1))
             .expect("future instant");
-        let mut snapshot = AppState::default();
-        snapshot.register_pane("orch-pane".into());
-        snapshot.insert_placeholder_session(
-            "orch-pane".into(),
-            None,
-            Some(AgentType::Codex),
-            Some("orch-agent".into()),
-        );
+        let snapshot = announced_prompt_snapshot("orch-pane", "orch-agent");
         let mut role_statuses = vec![OrchestrationRoleStatus::Waiting];
         let mut prompt = Some("orchestrator prompt".to_string());
         deliver_orchestrator_prompt(
@@ -38046,14 +38709,7 @@ mod tests {
                 .checked_sub(SPAWN_TIME_READINESS_BUFFER + std::time::Duration::from_millis(1))
                 .expect("ready timestamp"),
         );
-        let mut snapshot2 = AppState::default();
-        snapshot2.register_pane("orch-pane-2".into());
-        snapshot2.insert_placeholder_session(
-            "orch-pane-2".into(),
-            None,
-            Some(AgentType::Codex),
-            Some("orch-agent-2".into()),
-        );
+        let snapshot2 = announced_prompt_snapshot("orch-pane-2", "orch-agent-2");
         let mut role_statuses2 = vec![OrchestrationRoleStatus::Waiting];
         let mut prompt2 = Some("orchestrator prompt".to_string());
         deliver_orchestrator_prompt(

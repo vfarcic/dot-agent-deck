@@ -148,25 +148,25 @@ libc = "0.2"
 
 [features]
 # PRD #77 Decision 6: `cargo test-e2e` (alias) enables this feature so
-# the L2 PTY suite compiles in. Every one of the 71 `tests/e2e_*.rs` files
-# opens with a `feature = "e2e"` cfg — 47 in lane 1, of which 44 are
-# exactly `#![cfg(feature = "e2e")]` and three add a `unix` term, and 24 in
-# lane 2, which also require `e2e-live` below.
+# the L2 PTY suite compiles in. Every `tests/e2e_*.rs` file opens with a
+# `feature = "e2e"` cfg — the lane-1 ones with that alone (a minority adding
+# a `unix` term), the lane-2 ones also requiring `e2e-live` below.
 #
 # The original comment here said "CI runs `cargo test-fast` only and never
 # sees these tests". That has been false twice over. Issue #407 put
 # `--all-targets --features e2e` on the `build` job's clippy step, so CI has
 # COMPILED them since then; and issue #502 added the `e2e-deterministic` job,
-# so CI now RUNS the 47 deterministic ones on every PR. The other 24 run only
-# on a developer's machine. CLAUDE.md rule 5 has the three tiers of obligation.
+# so CI now RUNS the deterministic ones on every PR. The credentialed ones run
+# only on a developer's machine. CLAUDE.md rule 5 has the three tiers of
+# obligation.
 e2e = []
 
-# Issue #502 — selects the credentialed SUBSET of the L2 suite. The 24
+# Issue #502 — selects the credentialed SUBSET of the L2 suite. The
 # `tests/e2e_*.rs` files that reach a REAL AGENT to pass (a `check_*_available`
 # preflight, an imported credentials file, or `ANTHROPIC_API_KEY`) open with
-# `#![cfg(all(feature = "e2e", feature = "e2e-live"))]` (21 exactly that, three
-# adding a `unix` term); the other 47 open with `#![cfg(feature = "e2e")]`, 44
-# of them bare and three adding `unix`, and need no credential at all. So
+# `#![cfg(all(feature = "e2e", feature = "e2e-live"))]`; the rest open with
+# `#![cfg(feature = "e2e")]` and need no credential at all. A minority of each
+# group adds a `unix` term. So
 # `cargo test-e2e` is lane 1 (deterministic, every PR in CI) and
 # `cargo test-e2e-live` is lane 1 + lane 2 — enabling both features is a
 # SUPERSET run, not a live-only run.
@@ -182,7 +182,7 @@ e2e = []
 # spawning `claude` spends a credential with no environment variable
 # involved. Credential handling for a LOCAL lane-2 run is issue #785.
 #
-# One CI job does still compile these 24 files, and it is the only one: rule 2's
+# One CI job does still compile these files, and it is the only one: rule 2's
 # `cargo clippy --workspace --all-targets --features e2e,e2e-live -- -D
 # warnings`. Do not "simplify" `e2e-live` out of that command — it is all that
 # stands between these files and a type error nobody sees until someone runs

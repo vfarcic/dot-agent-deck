@@ -9702,6 +9702,296 @@ pub fn claude_session_start_line(bin: &str, session_id: &str) -> String {
     )
 }
 
+/// The [`write_late_announcing_agent`] log line meaning "my PTY input queue was
+/// EMPTY at the instant I announced myself" — i.e. nothing was written before an
+/// agent existed to read it. Its ABSENCE is deliberately not the assertion: the
+/// probe reports `probe-failed|…` rather than degrading to silence, so a test
+/// asserts this line is PRESENT.
+#[allow(dead_code)]
+pub const LATE_ANNOUNCE_CLEAN: &str = "clean";
+
+/// The [`write_late_announcing_agent`] log prefix for bytes that were ALREADY
+/// sitting in the PTY input queue when the agent announced itself — the
+/// user-invisible half of issue #1005, and the thing no existing harness could
+/// observe.
+#[allow(dead_code)]
+pub const LATE_ANNOUNCE_PREMATURE: &str = "premature|";
+
+/// The [`write_late_announcing_agent`] log prefix for a line the agent read
+/// AFTER announcing itself — a payload that reached a running reader.
+#[allow(dead_code)]
+pub const LATE_ANNOUNCE_RECEIVED: &str = "received|";
+
+/// Issue #1006: a stand-in agent whose genuine `SessionStart` lands a
+/// CONTROLLABLE number of seconds after the pane starts, and which REPORTS
+/// whether anything was already in its PTY input queue when it announced.
+///
+/// ## Why this exists
+///
+/// Every spawn-time delivery defect in this area is an ORDERING defect: the deck
+/// writes a payload, and the agent's genuine `SessionStart` arrives after it. No
+/// test here could reach that ordering on purpose — `prompt/new-pane/016` passes
+/// with the seed-delivery bug present because its `claude` boots fast enough to
+/// win the race the test exists to exercise (issue #1006). Both halves of the
+/// ordering are parameters here instead of accidents:
+///
+/// * **when the agent announces** — `announce_after_secs`, so the deck's write
+///   window is unambiguously before it. Keep it under 10 s, or `crate::ui`'s
+///   `timeout_ready` slow path delivers on the timeout instead and the test
+///   proves nothing about the readiness gate.
+/// * **whether anything arrived early** — the script NON-BLOCKINGLY drains its
+///   own tty immediately before announcing (`stty -icanon min 0 time 0`, then a
+///   bounded `dd` loop — see [`late_announce_prologue`]), so bytes queued before
+///   the announcement are labelled
+///   [`LATE_ANNOUNCE_PREMATURE`] and everything after it
+///   [`LATE_ANNOUNCE_RECEIVED`]. A blocking read cannot tell those apart: a PTY
+///   BUFFERS a premature write and hands it over the moment the agent starts
+///   reading, so the payload's text survives the failure and "it arrived" is true
+///   either way. That is exactly why #1006 asks for the acted-upon fact rather
+///   than the on-screen one.
+///
+/// ## Shape
+///
+/// Named `claude` on purpose, as `scheduler/dispatch/014`'s stand-in is: the deck
+/// resolves `AgentType::from_command` over the command it was given, so this is
+/// the ordinary production shape rather than an anonymous script the deck can
+/// vouch for nothing about.
+///
+/// It emits TWO `SessionStart`s, which is the whole point:
+///
+/// 1. a `wrapper_fork`-origin one at exec, which RESOLVES AN AGENT TYPE for the
+///    pane without announcing a conversation — the same standing the daemon's own
+///    card-surfacing start confers (`CARD_SURFACE_SESSION_START_ORIGIN`), and all
+///    that today's `agent_type != AgentType::None` readiness gates ask for;
+/// 2. the genuine one after the delay — the first event that actually establishes
+///    `AppState::pane_hook_session_id` for the pane.
+///
+/// After announcing it reads stdin forever, logging each line and reporting it
+/// back as a `UserPromptSubmit`, so a delivery can genuinely CONFIRM and the
+/// card's prompt history becomes the user-altitude evidence.
+///
+/// `log_name` is written relative to the agent's CWD — pass a bare filename and
+/// read it back under the deck's workdir. Returns the executable's path.
+///
+/// [`write_late_announcing_real_agent`] is the same fixture with a REAL agent as
+/// its tail; everything up to the handover is [`late_announce_prologue`], shared
+/// between them.
+#[cfg(unix)]
+#[allow(dead_code)]
+pub fn write_late_announcing_agent(
+    dir: &Path,
+    log_name: &str,
+    announce_after_secs: u64,
+) -> PathBuf {
+    let genuine_start = late_announce_hook(
+        r#"{"hook_event_name":"SessionStart","session_id":"genuine-%s"}"#,
+        "\"$DOT_AGENT_DECK_PANE_ID\"",
+        98,
+    );
+    let submitted = late_announce_hook(
+        r#"{"hook_event_name":"UserPromptSubmit","session_id":"genuine-%s","prompt":"%s"}"#,
+        "\"$DOT_AGENT_DECK_PANE_ID\" \"$json_line\"",
+        99,
+    );
+    write_late_announcing_script(
+        dir,
+        &format!(
+            "{prologue}\
+             {genuine_start}\
+             while IFS= read -r line; do\n\
+             \x20 printf 'received|%s\\n' \"$line\" >> \"$log\"\n\
+             \x20 {json_escape}\n\
+             \x20 {submitted}\
+             done\n",
+            prologue = late_announce_prologue(log_name, announce_after_secs),
+            json_escape = LATE_ANNOUNCE_JSON_ESCAPE,
+        ),
+    )
+}
+
+/// Issue #1006: the same fixture with a REAL agent as its tail — the shape the
+/// field environment has (`devbox run agent` → init hooks → `claude`), and the
+/// one `prompt/new-pane/016` needs in order to be able to fail at all.
+///
+/// Identical to [`write_late_announcing_agent`] up to the handover: it declares
+/// its agent type at exec, waits `announce_after_secs`, drains and records
+/// whatever the deck had already typed, and only THEN `exec`s `command`. It
+/// emits no genuine `SessionStart` of its own — the real agent's own hook does
+/// that, which is what makes the announcement genuinely late rather than
+/// simulated.
+///
+/// The drain is what gives the test teeth. Without it a premature payload simply
+/// sits in the PTY buffer until the real agent starts reading, so the agent acts
+/// on it and every user-visible fact looks correct; consuming it is
+/// `scheduler/dispatch/015`'s discipline (`write_bootstrap_swallowing_real_claude`),
+/// here made non-blocking so the fixture does not hang when — as after issue
+/// #1005's fix — there is nothing early to consume.
+///
+/// **`command` is interpolated RAW into the `exec` line, so the caller owns its
+/// quoting.** Raw is deliberate: this is a command LINE, not a filename, and it
+/// has to be able to carry arguments — quoting it here would make that
+/// impossible. The cost is that a path interpolated into it needs the POSIX
+/// single-quote escape (`format!("'{}'", s.replace('\'', r"'\''"))`, the same
+/// one [`late_announce_hook`] applies to the binary path): an unescaped `'`, a
+/// backtick or a `$` in a resolved path — `/home/o'brien/…`, a vendor dir, an
+/// `asdf`/`mise` shim under a branch-named directory — turns this line into
+/// arbitrary shell running as the test user in the pane.
+#[cfg(unix)]
+#[allow(dead_code)]
+pub fn write_late_announcing_real_agent(
+    dir: &Path,
+    log_name: &str,
+    announce_after_secs: u64,
+    command: &str,
+) -> PathBuf {
+    write_late_announcing_script(
+        dir,
+        &format!(
+            "{prologue}exec {command}\n",
+            prologue = late_announce_prologue(log_name, announce_after_secs),
+        ),
+    )
+}
+
+/// Shell that rewrites `$line` into `$json_line`, safe to interpolate into a
+/// JSON **string value**.
+///
+/// `$line` is agent-visible input, and [`late_announce_hook`] spends it as a
+/// `printf` ARGUMENT — which makes it safe as shell (no format interpretation,
+/// no word splitting) and says nothing about JSON. A `"`, a `\` or a control
+/// character produces a malformed document, and `dot-agent-deck hook` answers a
+/// malformed payload by exiting **0** and dropping it silently — so the `|| exit
+/// 99` guard cannot see it and the delivery vanishes without a trace. The
+/// failure then surfaces one assertion later as "the agent never reported
+/// SUBMITTING the seed", pointing at the delivery gate rather than at the
+/// fixture that ate the confirmation.
+///
+/// Escapes `\` then `"` (that order, or the inserted backslashes are escaped
+/// twice) and strips control characters, which JSON would require as `\u00XX`
+/// and no caller needs. `read -r` already rules out a newline. Structure, not
+/// just content: without it a crafted prompt reaches the JSON `session_id` as
+/// well as the `prompt` value. Same escape shape as
+/// `e2e_dispatcher_mode::write_default_command_config`'s for TOML.
+#[cfg(unix)]
+const LATE_ANNOUNCE_JSON_ESCAPE: &str = r#"json_line=$(printf '%s' "$line" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/[[:cntrl:]]//g')"#;
+
+/// One `dot-agent-deck hook` invocation for the late-announcing fixtures.
+///
+/// The JSON is printf's FORMAT string here (not its argument, as in
+/// [`claude_hook_line`]) so each payload can carry the pane id the daemon
+/// injected. The `|| exit` is [`claude_hook_line`]'s discipline and matters for
+/// the same reason: `handle_hook` exits 0 on every path it reaches, so a nonzero
+/// exit can only be `clap` refusing the argument shape — the fixture then dies
+/// loudly instead of quietly becoming a test that proves nothing.
+///
+/// **The caller owns the JSON safety of every `%s` argument.** `printf`
+/// substitutes them verbatim, so a `"` or a `\` in one yields a malformed
+/// document — which `dot-agent-deck hook` answers by exiting 0 and dropping it,
+/// so the `|| exit` above cannot see it either. Runtime values go through
+/// [`LATE_ANNOUNCE_JSON_ESCAPE`] first; `$DOT_AGENT_DECK_PANE_ID` is the deck's
+/// own identifier and needs nothing.
+#[cfg(unix)]
+fn late_announce_hook(json: &str, args: &str, code: u16) -> String {
+    let bin = env!("CARGO_BIN_EXE_dot-agent-deck");
+    let quoted_bin = format!("'{}'", bin.replace('\'', r"'\''"));
+    format!(
+        "printf '{json}' {args} | {quoted_bin} hook --agent claude-code >/dev/null 2>&1 \
+         || {{ echo 'dot-agent-deck hook rejected the fixture payload' >&2; exit {code}; }}\n"
+    )
+}
+
+/// The shared body of both late-announcing fixtures, up to (but not including)
+/// the handover to a reader.
+///
+/// Three steps, in order: declare the agent type with a `wrapper_fork`-origin
+/// `SessionStart` (which resolves `AgentType` for the pane while announcing NO
+/// conversation — the same standing the daemon's card-surfacing start confers),
+/// wait `announce_after_secs`, then NON-BLOCKINGLY drain the pane's own input
+/// queue and record the verdict: [`LATE_ANNOUNCE_PREMATURE`] with the bytes, or
+/// [`LATE_ANNOUNCE_CLEAN`].
+///
+/// The drain is bounded and best-effort: a tty holds ~4 KiB, so a payload larger
+/// than that leaves the writer blocked and the loop re-reads until it comes up
+/// empty or hits its cap. It never needs to be exhaustive — one non-empty chunk
+/// already proves the ordering was wrong, which is the only thing a caller
+/// asserts on.
+///
+/// What it detects is early **non-newline** bytes, which is narrower than "any
+/// early byte": command substitution strips all trailing newlines and POSIX
+/// shells drop NULs, so a premature write made up entirely of line terminators —
+/// a bare submit `\r` with no payload behind it — is reported as
+/// [`LATE_ANNOUNCE_CLEAN`]. Measured, not inferred: queueing `\r\n\r\n` reports
+/// `clean`. Every caller today queues kilobytes of prompt text, so the blind
+/// spot is out of reach from here; a future caller pinning the ordering of the
+/// submit keystroke ALONE would need a different probe.
+///
+/// The tty mode is restored on every exit path, not only the reported one: the
+/// `trap … EXIT INT TERM` is armed the moment `$saved` exists, so a probe
+/// failure (`exit 9x`) or a signal — the harness reaper's `killpg`, a pane
+/// close, the lifetime backstop — still leaves the pane's tty canonical. Without
+/// it a reader inheriting `-icanon min 0 time 0` gets an immediate-and-forever
+/// return on an empty tty and spins.
+#[cfg(unix)]
+fn late_announce_prologue(log_name: &str, announce_after_secs: u64) -> String {
+    let fork_start = late_announce_hook(
+        &format!(
+            r#"{{"hook_event_name":"SessionStart","session_id":"boot-%s","metadata":{{"{key}":"{origin}"}}}}"#,
+            key = dot_agent_deck::event::SESSION_START_ORIGIN_METADATA_KEY,
+            origin = dot_agent_deck::event::WRAPPER_FORK_SESSION_START_ORIGIN,
+        ),
+        "\"$DOT_AGENT_DECK_PANE_ID\"",
+        97,
+    );
+    // The caller's `log_name` reaches a shell, so it is single-quoted with the
+    // POSIX escape rather than interpolated raw — the same treatment
+    // `late_announce_hook` gives the binary path. Both callers pass a literal
+    // today, but the natural next one is a `format!("late-{…}.log")` over a
+    // path component, and a `'` in one would end the string and run the rest as
+    // shell in the pane. Every later use of `$log` is already quoted.
+    let quoted_log = format!("'{}'", log_name.replace('\'', r"'\''"));
+    format!(
+        "#!/bin/sh\n\
+         log={quoted_log}\n\
+         {fork_start}\
+         sleep {announce_after_secs}\n\
+         saved=$(stty -g) || {{ printf 'probe-failed|stty -g\\n' >> \"$log\"; exit 90; }}\n\
+         trap 'stty \"$saved\" 2>/dev/null' EXIT INT TERM\n\
+         stty -icanon min 0 time 0 || {{ printf 'probe-failed|stty raw\\n' >> \"$log\"; exit 91; }}\n\
+         early=''\n\
+         chunks=0\n\
+         while [ \"$chunks\" -lt 16 ]; do\n\
+         \x20 chunk=$(dd bs=4096 count=1 2>/dev/null) \
+         || {{ printf 'probe-failed|dd\\n' >> \"$log\"; exit 92; }}\n\
+         \x20 [ -n \"$chunk\" ] || break\n\
+         \x20 early=\"$early$chunk\"\n\
+         \x20 chunks=$((chunks + 1))\n\
+         done\n\
+         stty \"$saved\" || {{ printf 'probe-failed|stty restore\\n' >> \"$log\"; exit 93; }}\n\
+         if [ -n \"$early\" ]; then\n\
+         \x20 printf 'premature|%s\\n' \"$early\" >> \"$log\"\n\
+         else\n\
+         \x20 printf 'clean\\n' >> \"$log\"\n\
+         fi\n"
+    )
+}
+
+/// Write `body` as an executable named `claude`, so `AgentType::from_command`
+/// resolves it exactly as it resolves a production `default_command`.
+///
+/// `0o700`, not `0o755`: only the owner ever execs it, and the harness hardened
+/// its temp tree to owner-only for issue #358's reason (474 of 521 leftovers
+/// were world-traversable). The `0o700` parent already makes the file
+/// unreachable by anyone else, so this costs nothing and keeps one rule.
+#[cfg(unix)]
+fn write_late_announcing_script(dir: &Path, body: &str) -> PathBuf {
+    let path = dir.join("claude");
+    std::fs::write(&path, body).expect("write late-announcing fixture");
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
+        .expect("chmod late-announcing fixture");
+    path
+}
+
 /// The recorder line the deck's own Codex metadata probe produces.
 ///
 /// PRD #20 §4.2.1: the deck records SCOPED, hash-pinned trust for its own Codex

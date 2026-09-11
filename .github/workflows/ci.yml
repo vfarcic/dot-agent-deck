@@ -375,7 +375,7 @@ jobs:
       #
       # `e2e-live` (issue #502): the credentialed subset of the L2 suite now
       # opens with `#![cfg(all(feature = "e2e", feature = "e2e-live"))]`, so
-      # under `--features e2e` alone those 24 files compile to empty crates —
+      # under `--features e2e` alone those files compile to empty crates —
       # exactly the #407 hole above, reopened for a third of the tier. Measured
       # the same way #407 was: with an E0308 injected into
       # tests/e2e_dispatcher_mode.rs, `--features e2e` exited 0 and
@@ -388,7 +388,7 @@ jobs:
       # registered on this repository (the separately credentialed Codex
       # issue-labeler is out of scope; see the e2e-deterministic job's comment
       # and docs/develop/issue-labeling.md) — which makes this step the ONLY
-      # thing in CI that compiles those 24 files. Drop `e2e-live` from this
+      # thing in CI that compiles the lane-2 files. Drop `e2e-live` from this
       # line and they go back to being checked by nothing until a developer
       # runs them.
       - run: cargo clippy --workspace --all-targets --features e2e,e2e-live -- -D warnings
@@ -451,8 +451,8 @@ jobs:
   # broken on main across 12 commits.
   #
   # `cargo test-e2e` is the alias in `.cargo/config.toml`. It enables the `e2e`
-  # cargo feature ALONE, which selects the 47 `tests/e2e_*.rs` files needing no
-  # agent credential; the other 24 open with
+  # cargo feature ALONE, which selects the `tests/e2e_*.rs` files needing no
+  # agent credential; the rest open with
   # `#![cfg(all(feature = "e2e", feature = "e2e-live"))]` and compile to empty
   # crates here, so they are never even built into this job. The credentialed
   # superset is lane 2, and lane 2 runs ONLY on a developer's machine — no e2e
@@ -522,7 +522,8 @@ jobs:
     #     runs a nested `cargo build` into its own CARGO_TARGET_DIR and pays a
     #     cold ~10-minute dependency build on a machine that has never run it.
     #     Every fresh runner is exactly that machine.
-    #   * the tier compiles 47 test binaries on top of what `build` compiles.
+    #   * the tier compiles one test binary per lane-1 `tests/e2e_*.rs` file on
+    #     top of what `build` compiles.
     #   * the remaining PTY scenarios sit at the default 3 x 60s kill window,
     #     and they contend with each other on 4 vCPUs.
     #
@@ -651,19 +652,15 @@ jobs:
   #     to Unix at the source level (#![cfg(unix)]), so they compile to empty
   #     crates here;
   #   * the L2 PTY e2e suite is excluded because this job runs `cargo nextest
-  #     run` WITHOUT either e2e feature — every one of the 71 `tests/e2e_*.rs`
-  #     files opens with a `feature = "e2e"` cfg (47 in lane 1 — 44 exactly
-  #     that attribute, three adding a `unix` term — and 24 in lane 2, which
-  #     also require `feature = "e2e-live"` since issue #502, 21 exactly and
-  #     three adding `unix`), so none of them is compiled
+  #     run` WITHOUT either e2e feature — every `tests/e2e_*.rs` file opens
+  #     with a `feature = "e2e"` cfg (the lane-2 ones also requiring
+  #     `feature = "e2e-live"` since issue #502), so none of them is compiled
   #     here at all rather than compiled-and-emptied. Note this is a DIFFERENT
-  #     mechanism from the first bullet even for the six of the 71 that DO
-  #     carry a `unix` term (e2e_hook_binary_path, e2e_remote_doctor,
-  #     e2e_tab_close_regressions, and the live-gated e2e_card_layout,
-  #     e2e_prompt_delivery_confirmation, e2e_shell_activity_real_agent): the
-  #     missing feature already excludes them, so the `unix` term never gets a
-  #     chance to. Nothing about this job changes with #502 — it names no e2e
-  #     feature, so all 71 stay out however they are gated, and that is correct.
+  #     mechanism from the first bullet even for the minority that DO carry a
+  #     `unix` term: the missing feature already excludes them, so the `unix`
+  #     term never gets a chance to. Nothing about this job changes with #502 —
+  #     it names no e2e feature, so they all stay out however they are gated,
+  #     and that is correct.
   # That second point is why `scripts/windows-cross-check.sh --features e2e` is
   # red locally and is not a gate (issue #368). Porting the harness to Windows
   # named pipes + ConPTY and running full integration/e2e on a Windows VM is

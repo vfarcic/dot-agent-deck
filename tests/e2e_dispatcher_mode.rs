@@ -24,6 +24,112 @@ use dot_agent_deck::event::SendResult;
 use dot_agent_deck::state::{DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS, SessionStatus};
 use spec::spec;
 
+/// The opening words of `ui::DISPATCHER_SEED_PROMPT` (private to `src/ui.rs`).
+/// Distinctive enough that an unseeded agent cannot produce it, and near enough
+/// the front of the seed to survive the hook's `USER_PROMPT_MAX_LEN` truncation.
+const DISPATCHER_SEED_OPENING: &str = "You are an ordinary assistant";
+
+/// Where `new_pane_016`'s launcher records what it found in the pane's input
+/// queue at handover, relative to the pane's own cwd.
+const LAUNCHER_LOG: &str = "late-announce.log";
+
+/// How long `new_pane_016`'s launcher withholds the real agent.
+///
+/// Issue #1006: the field environment was `devbox run agent` → devbox init hooks
+/// → `claude`, announcing ~4.2 s after spawn, while the harness exec'd `claude`
+/// directly and announced fast enough to win the race. Three seconds is
+/// comfortably past the 500 ms `SPAWN_TIME_READINESS_BUFFER` the broken gate
+/// writes on, and leaves the real agent room to announce inside the 10 s
+/// `timeout_ready` slow path — which would deliver the seed for an unrelated
+/// reason and weaken what a green run proves.
+const LAUNCHER_DELAY_SECS: u64 = 3;
+
+/// The absolute path of the REAL `claude`, resolved off the host PATH.
+///
+/// Baked into the launcher rather than left to PATH lookup because the launcher
+/// is itself named `claude` (so `AgentType::from_command` resolves it as the deck
+/// resolves a production `default_command`), and a bare `exec claude` would be
+/// one PATH change away from re-executing the launcher forever.
+///
+/// Resolves by the same rule as the skip guard in front of it, deliberately.
+/// `check_claude_available` gates on `Command::new("claude")`, i.e. `execvp(3)`,
+/// which needs execute permission for THIS user; `mode & 0o111 != 0` asks a
+/// different question and accepts, say, a `--x------` `claude` owned by someone
+/// else. The guard would then pass on a later candidate while this picked the
+/// unusable earlier one, and the launcher's `exec` would die with a permission
+/// error — reported as "the fixture itself did not run", which names the wrong
+/// thing.
+fn real_claude_path() -> PathBuf {
+    let path = std::env::var("PATH").unwrap_or_default();
+    std::env::split_paths(&path)
+        .map(|dir| dir.join("claude"))
+        .find(|candidate| this_user_can_exec(candidate))
+        .expect("`claude` on PATH — `check_claude_available` already passed")
+}
+
+/// Whether `candidate` is a regular file this user can actually execute — the
+/// question `execvp(3)` answers, asked with `access(2)` as
+/// `platform::paths::is_executable_file` asks it.
+///
+/// `is_file()` stays in front because `access(X_OK)` alone accepts a directory:
+/// every traversable one answers `X_OK`. `access(2)` tests the real uid/gid
+/// rather than the effective one, which is the same answer here — nothing in
+/// this harness runs setuid or setgid.
+fn this_user_can_exec(candidate: &Path) -> bool {
+    if !candidate.is_file() {
+        return false;
+    }
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt as _;
+
+    // An interior NUL cannot name a real file, so it cannot be executable.
+    let Ok(c_path) = CString::new(candidate.as_os_str().as_bytes()) else {
+        return false;
+    };
+    // SAFETY: `c_path` is a valid NUL-terminated C string that outlives the
+    // call, and `access(2)` only reads through the pointer.
+    unsafe { libc::access(c_path.as_ptr(), libc::X_OK) == 0 }
+}
+
+/// A deck config whose `default_command` is `command`.
+///
+/// The dispatcher option hides the new-pane form's Command field, so the only
+/// way to put a launcher in front of its agent is the deck-wide default — which
+/// is also the shape the field report had. Mirrors
+/// `e2e_prompt_delivery_confirmation::write_default_command_config`.
+fn write_default_command_config(command: &str) -> tempfile::TempDir {
+    let dir = common::harness_tempdir().expect("config tempdir");
+    let escaped = command.replace('\\', "\\\\").replace('"', "\\\"");
+    std::fs::write(
+        dir.path().join("config.toml"),
+        format!("default_command = \"{escaped}\"\n"),
+    )
+    .expect("write dispatcher default-command config");
+    dir
+}
+
+/// What the launcher recorded, or a placeholder when it wrote nothing at all.
+fn launcher_log(deck: &TuiDeck) -> String {
+    std::fs::read_to_string(deck.workdir().join(LAUNCHER_LOG))
+        .unwrap_or_else(|_| "<the launcher wrote no log>".to_string())
+}
+
+/// Whether any live card on this deck reports the dispatcher seed as its last
+/// submitted prompt — the "the agent ACTED on it" fact, read from the daemon's
+/// own registry rather than from the screen.
+///
+/// Issue #1006: the seed's text on the grid is an adjacent artefact. A premature
+/// write still reaches the PTY, which buffers it, so its bytes show up whether or
+/// not the delivery was sound; only a `UserPromptSubmit` reported back by the
+/// agent says the agent took it as a prompt.
+fn seed_is_in_a_card_prompt_history(deck: &TuiDeck) -> bool {
+    common::agent_records_on(deck.attach_socket_path())
+        .into_iter()
+        .filter_map(|record| record.live)
+        .filter_map(|live| live.last_user_prompt)
+        .any(|prompt| prompt.contains(DISPATCHER_SEED_OPENING))
+}
+
 /// Removes a dispatch worktree on drop, including on panic.
 ///
 /// Dispatch worktrees are SIBLINGS of the fixture dir, so they land outside the
@@ -413,17 +519,49 @@ fn open_orchestration_tab(deck: &TuiDeck, orch: &str) {
 }
 
 /// Scenario: Launch the deck in the minimal fixture with real Claude credentials
-/// imported and NO experimental flag set. Open the new-pane form (Ctrl+N →
-/// Space confirms the dir), cycle the Mode field to the "dispatcher" option
-/// (the last cycler slot after `schedule: issues`), and click [Submit] —
-/// the dispatcher must surface live as a dashboard card. Then type a goal asking
-/// for one unit named `probe-unit`; the seeded agent runs
-/// `dot-agent-deck dispatch probe-unit` itself and the daemon creates the sibling
-/// worktree `../<repo>-dispatch-probe-unit`, which the test waits for on disk.
+/// imported, NO experimental flag set, and its real Claude behind a launcher that
+/// withholds the agent for three seconds and reports whatever the deck typed
+/// early. Open the new-pane form (Ctrl+N → Space confirms the dir), cycle the
+/// Mode field to the "dispatcher" option (the last cycler slot after
+/// `schedule: issues`), and click [Submit] — the dispatcher must surface live as a
+/// dashboard card, nothing may have been typed before the agent existed, and the
+/// seed must reach the card's prompt history. Then type a goal asking for one unit
+/// named `probe-unit`; the seeded agent runs `dot-agent-deck dispatch probe-unit`
+/// itself and the daemon creates the sibling worktree
+/// `../<repo>-dispatch-probe-unit`, which the test waits for on disk.
 #[spec("prompt/new-pane/016")]
 #[test]
 fn new_pane_016_dispatcher_opens_dashboard_card_with_real_agent() {
     skip_unless!(common::check_claude_available());
+
+    // Issue #1006: route the real agent behind a LAUNCHER, because without one
+    // this test cannot reach the ordering it exists to exercise. The harness
+    // exec'd `claude` directly with a pre-seeded HOME and it announced fast enough
+    // to win the race, so the test reported green on a broken product; the field
+    // environment was `devbox run agent` → devbox init hooks → `claude`,
+    // announcing ~4.2 s after spawn. The launcher declares the agent TYPE at exec
+    // (a `wrapper_fork`-origin `SessionStart`, the same standing the daemon's card
+    // confers and all the pre-#1005 gate asked for), waits, drains and records
+    // whatever the deck typed in the meantime, and only then `exec`s Claude.
+    //
+    // It reaches the agent through `default_command` rather than the form's
+    // Command field, which the dispatcher option hides — and that is the field
+    // shape too. The dispatched unit inherits it, which costs it the same three
+    // seconds and is harmless: its seed rides the DAEMON path, which waits for the
+    // agent's native `SessionStart` (`state::wait_for_session_start`) rather than
+    // on this gate.
+    let staging = common::harness_tempdir().expect("launcher staging dir");
+    // `command` is interpolated raw into the launcher's `exec` line (it has to
+    // carry arguments), so the quoting is this caller's job — single quotes plus
+    // the POSIX escape for a `'` inside the resolved path.
+    let real_claude = real_claude_path();
+    let launcher = common::write_late_announcing_real_agent(
+        staging.path(),
+        LAUNCHER_LOG,
+        LAUNCHER_DELAY_SECS,
+        &format!("'{}'", real_claude.to_string_lossy().replace('\'', r"'\''")),
+    );
+    let config = write_default_command_config(&launcher.to_string_lossy());
 
     let deck = TuiDeck::builder()
         .with_imported_claude_credentials()
@@ -431,6 +569,10 @@ fn new_pane_016_dispatcher_opens_dashboard_card_with_real_agent() {
         // graduated out of the flag, so reaching it from a default deck is part of
         // what this test pins. Setting the flag here would hide a regression that
         // put the option back behind it.
+        .with_env(
+            "DOT_AGENT_DECK_CONFIG",
+            config.path().join("config.toml").to_string_lossy(),
+        )
         // The branch build must win over any host-installed `dot-agent-deck`, or
         // the agent cannot see the `dispatch` verb at all.
         .with_env("PATH", path_with_binary_dir())
@@ -510,17 +652,61 @@ fn new_pane_016_dispatcher_opens_dashboard_card_with_real_agent() {
         deck.snapshot_grid()
     );
 
+    // Issue #1006, first half: nothing may have been typed into the pane before an
+    // agent existed to read it. The launcher publishes its verdict at handover, so
+    // wait for it to have run at all before reading it — otherwise a launcher that
+    // never started reads exactly like a clean one.
+    assert!(
+        common::wait_until(SURFACE_WAIT, || {
+            let log = launcher_log(&deck);
+            log.contains(common::LATE_ANNOUNCE_CLEAN)
+                || log.contains(common::LATE_ANNOUNCE_PREMATURE)
+                || log.contains("probe-failed|")
+        }),
+        "the launcher never reached its handover within {}s — the fixture itself did not \
+         run, so nothing below would mean anything.\nlauncher log:\n{}\nFinal grid:\n{}",
+        SURFACE_WAIT.as_secs(),
+        launcher_log(&deck),
+        deck.snapshot_grid()
+    );
+    let handover = launcher_log(&deck);
+    assert!(
+        handover.contains(common::LATE_ANNOUNCE_CLEAN),
+        "the seed was already sitting in the pane's PTY when the launcher handed over to \
+         Claude — written {LAUNCHER_DELAY_SECS}s early, into a program that had not started \
+         reading (issue #1005). A resolved agent type is not an agent that can read. The \
+         probe reports `probe-failed|…` if it could not run at all, so read the log before \
+         assuming a premature write.\nlauncher log:\n{handover}"
+    );
+
     // The seed really reached the pane — the delivery that makes this a
     // *dispatcher* rather than a bare agent. The card's `Prmt:` line echoes the
     // seed's opening words, so an unseeded pane cannot pass this.
     assert!(
         common::wait_until(SURFACE_WAIT, || deck
             .snapshot_grid()
-            .contains("You are an ordinary assistant")),
+            .contains(DISPATCHER_SEED_OPENING)),
         "the dispatcher seed never appeared on the card within {}s — without it the agent \
          has not been taught the `dispatch` verb at all.\n\
          Final grid:\n{}",
         SURFACE_WAIT.as_secs(),
+        deck.snapshot_grid()
+    );
+
+    // Issue #1006, second half: the seed must have been ACTED UPON, not merely
+    // rendered. The bytes are written before a delivery goes wrong and a PTY
+    // buffers them, so the seed's text on the grid survives the failure — it is an
+    // adjacent artefact. A `UserPromptSubmit` reported back by the agent is not:
+    // it says the agent took those bytes as a prompt. Read from the daemon's
+    // registry, and BEFORE the goal is typed, since `last_user_prompt` holds only
+    // the newest one.
+    assert!(
+        common::wait_until(SURFACE_WAIT, || seed_is_in_a_card_prompt_history(&deck)),
+        "the dispatcher agent never reported SUBMITTING the seed within {}s, so no card's \
+         prompt history carries it — the payload may have reached the PTY without being \
+         acted upon.\nlauncher log:\n{}\nFinal grid:\n{}",
+        SURFACE_WAIT.as_secs(),
+        launcher_log(&deck),
         deck.snapshot_grid()
     );
 

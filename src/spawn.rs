@@ -118,11 +118,21 @@ pub struct SpawnRequest {
     /// config-derived behaviour untouched.
     pub resolved_target: Option<SpawnTarget>,
     /// Compose the ORCHESTRATOR CONTEXT (roles + delegation protocol + this
-    /// request's prompt as a task) instead of delivering `prompt` verbatim.
+    /// request's prompt as a task) instead of delivering `prompt` verbatim, and
+    /// declare whether a human is attending the pane it opens.
     ///
-    /// `true` only for PRD #220 `dispatch`. Without it a dispatched orchestration's
-    /// orchestrator is never told that it IS one, so it works alone while every
-    /// worker waits for a delegation that cannot arrive.
+    /// `Some` only for PRD #220 `dispatch`. Without it a dispatched
+    /// orchestration's orchestrator is never told that it IS one, so it works
+    /// alone while every worker waits for a delegation that cannot arrive.
+    ///
+    /// Issue #703 folded the [`crate::orchestrator_context::Attendance`] into
+    /// this field rather than adding a
+    /// second one beside it: the two cannot be answered independently, because
+    /// composing a context without saying who is watching the pane is exactly
+    /// the gap that let a dispatched coordinator inherit an interactive
+    /// template's "STOP and wait for approval" step. `None` keeps its own
+    /// meaning — deliver the prompt verbatim, compose nothing — so a path that
+    /// composes nothing is never asked a question it has no answer for.
     ///
     /// Deliberately NOT enabled for the scheduler (#127) or issue-dispatch (#120),
     /// even though both have the identical defect and the composition is now shared.
@@ -131,7 +141,7 @@ pub struct SpawnRequest {
     /// three #120/#127 e2e tests assert that text arriving verbatim (a `cat`-based
     /// stub never reads the file). That is #222's job to do deliberately, with those
     /// tests updated as part of it — not a side effect of the dispatcher PR.
-    pub compose_orchestrator_context: bool,
+    pub compose_orchestrator_context: Option<crate::orchestrator_context::Attendance>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -890,11 +900,12 @@ pub async fn spawn(
             // not submit reliably through a PTY and task text is arbitrary. If the
             // file cannot be written we fall back to the bare task rather than
             // delivering nothing — a degraded orchestrator still beats a silent one.
-            let prompt = if req.compose_orchestrator_context {
+            let prompt = if let Some(attendance) = req.compose_orchestrator_context {
                 crate::orchestrator_context::prepare_orchestrator_prompt(
                     &orch_config,
                     &req.working_dir,
                     Some(req.prompt.as_str()),
+                    attendance,
                 )
                 .unwrap_or_else(|| req.prompt.clone())
             } else {
@@ -5866,7 +5877,7 @@ mod tests {
                     }],
                 }),
             }),
-            compose_orchestrator_context: false,
+            compose_orchestrator_context: None,
         };
 
         let result = spawn(req, &registry, &SilentNotifier, None, false, Some(&state)).await;

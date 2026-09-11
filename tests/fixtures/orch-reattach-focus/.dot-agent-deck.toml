@@ -1,0 +1,27 @@
+# Fixture for issue #949's reattach-focus test (`session/restore/016`): one
+# orchestration with THREE roles, so the test can park focus on a role that is
+# neither the start role nor merely the next one after it — a two-role fixture
+# cannot tell "restored the remembered role" from "moved one down".
+#
+# Each role prints a unique sentinel and then sleeps, so the ONE expanded
+# role-pane box (`PaneLayout::Stacked` draws only the focused role's pane)
+# identifies the focused role by its border title AND its content, and the
+# content additionally proves the role's process is genuinely live rather than
+# an empty rebuilt frame. `sleep` rather than a real agent: focus has nothing to
+# do with what runs in the pane, so no LLM tokens are spent (Agent: none, so
+# this stays in lane 1 and CI runs it).
+[[orchestrations]]
+name = "reattach-orch"
+
+[[orchestrations.roles]]
+name = "lead"
+command = "printf 'LEAD_SENTINEL\\n'; sleep 600"
+start = true
+
+[[orchestrations.roles]]
+name = "helper"
+command = "printf 'HELPER_SENTINEL\\n'; sleep 600"
+
+[[orchestrations.roles]]
+name = "scout"
+command = "printf 'SCOUT_SENTINEL\\n'; sleep 600"

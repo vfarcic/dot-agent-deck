@@ -442,7 +442,12 @@ pub async fn handle_dispatch(
         prompt,
         resolved_target: Some(resolved_target),
         // PRD #222 parity, dispatch-only for now — see the field's docs.
-        compose_orchestrator_context: true,
+        //
+        // `Unattended` (issue #703): `dispatch` is fire-and-forget with no return
+        // edge, so nobody has been asked to watch the pane this opens and a
+        // coordinator that takes its template's "STOP and wait for approval" step
+        // literally parks its whole team for the life of the run, silently.
+        compose_orchestrator_context: Some(crate::orchestrator_context::Attendance::Unattended),
     };
 
     let notifier = StderrNotifier;
@@ -1314,6 +1319,22 @@ mod tests {
         assert!(
             content.contains("## Your task") && content.contains("Verify PR #232"),
             "the caller's task must ride inside the context file:\n{content}"
+        );
+        // Issue #703, on the real dispatch path rather than on the composer
+        // alone: `dispatch` is fire-and-forget with no return edge, so the
+        // composed file must say that nobody is watching the pane — otherwise a
+        // coordinator inheriting an interactive template's "STOP and wait for
+        // explicit approval" step parks its whole team for the life of the run,
+        // silently — and must say which half wins when that template and this
+        // task disagree.
+        assert!(
+            content.contains("## Unattended run")
+                && content.contains("nobody has been asked to watch this pane"),
+            "a dispatched orchestration must be told it is unattended:\n{content}"
+        );
+        assert!(
+            content.contains("## Task precedence") && content.contains("WHEN to stop"),
+            "the composed file must arbitrate between the template and the task:\n{content}"
         );
     }
 

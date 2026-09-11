@@ -1054,3 +1054,293 @@ fn restore_015_flushed_warning_escapes_control_characters_in_pane_name() {
          forged an extra line of deck output.\nWarning line:\n{warning_line:?}\nStream:\n{stream:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Issue #949 — reattach lands the user back where they were.
+// ---------------------------------------------------------------------------
+
+/// Launch a real TUI in a PTY pointed at `daemon`'s hook + attach sockets, with
+/// its saved-session snapshot redirected to `session_file`.
+///
+/// Both overrides are load-bearing for a reattach test. The sockets make the
+/// deck reuse the already-running external daemon instead of lazy-spawning one
+/// inside its own tempdir — which is also what lets the daemon and its agents
+/// outlive the first deck. The session-file override is what models production:
+/// two attaches by the same user on the same machine read one
+/// `~/.config/dot-agent-deck/session.toml`, whereas the harness mints a fresh
+/// `HOME` per launch purely for isolation, so without this the second deck
+/// would read a snapshot no deck ever wrote.
+fn launch_deck_against(daemon: &common::DaemonProc, session_file: &Path) -> TuiDeck {
+    TuiDeck::builder()
+        .with_pty_size(160, 45)
+        .with_env(
+            "DOT_AGENT_DECK_ATTACH_SOCKET",
+            daemon.attach_socket.to_string_lossy().to_string(),
+        )
+        .with_env(
+            "DOT_AGENT_DECK_SOCKET",
+            daemon.hook_socket.to_string_lossy().to_string(),
+        )
+        .with_env(
+            "DOT_AGENT_DECK_SESSION",
+            session_file.to_str().expect("session path is UTF-8"),
+        )
+        .launch_with_fixture("orch-reattach-focus")
+}
+
+/// The role name fused into the top border of the ONE expanded role-pane box.
+/// `PaneLayout::Stacked` draws only the FOCUSED role's pane (PRD #311), so this
+/// answers "which role is the deck focused on", and `None` means no
+/// orchestration role pane is expanded at all (the Dashboard tab).
+fn focused_role_pane(grid: &str) -> Option<&'static str> {
+    ["lead", "helper", "scout"]
+        .into_iter()
+        .find(|role| common::role_pane_left_edge(grid, role).is_some())
+}
+
+/// Whether the tab strip is highlighting the `Dashboard` tab. `render_tab_strip`
+/// marks the ACTIVE tab by inverting the terminal's own fg/bg in place
+/// (`Modifier::REVERSED`) and adds no text marker, so the styled cells under the
+/// label are the only thing that says which tab the user is looking at.
+fn dashboard_tab_is_active(deck: &TuiDeck) -> bool {
+    deck.visible_text_cell_styles("Dashboard")
+        .is_some_and(|cells| cells.iter().all(|c| c.inverse))
+}
+
+/// Scenario: Start one external daemon and open the `orch-reattach-focus`
+/// fixture's 3-role orchestration (`lead` start role, plus `helper` and
+/// `scout`) in a real PTY deck. Put the deck where a user would actually leave
+/// it: focus walked off the start role onto `scout`, then switched back to the
+/// Dashboard tab to supervise. Detach-quit (agents and daemon survive), then
+/// launch a FRESH deck against the same daemon and the same `session.toml` and
+/// assert it comes back to exactly that position — the Dashboard tab is the
+/// highlighted one, and stepping Right onto the orchestration tab expands
+/// `scout`'s pane carrying its live sentinel. Pre-fix RED on both halves,
+/// because nothing persists focus and nothing carries it on attach: the
+/// reattach lands on the orchestration tab (PRD #111's
+/// first-rebuilt-orchestration landing, which knows nothing about where the
+/// user was) and that tab focuses its own start role `lead` through
+/// `restore_focus_on_switch_in`'s fallback — a different agent than the one the
+/// user left.
+#[spec("session/restore/016")]
+#[test]
+fn restore_016_reattach_restores_active_tab_and_focused_pane() {
+    let daemon = common::spawn_daemon_serve(None, "0");
+    // Owned by the test, not by either deck: it has to outlive the first deck's
+    // tempdir, since it is the whole channel between the two attaches.
+    let shared = common::race_safe_tempdir();
+    let session_file = shared.path().join("session.toml");
+
+    let mut first = launch_deck_against(&daemon, &session_file);
+    first.wait_for_string("No active sessions");
+
+    // Open the orchestration. With no `[[modes]]` in the fixture the mode-chip
+    // row is `[No mode] [Orch: reattach-orch] [schedule]`, so ONE Right selects
+    // it; selecting an orchestration hides the Command field, so a second Enter
+    // submits the form.
+    first.send_bytes(b"\x0e"); // Ctrl+n -> directory picker
+    first.send_bytes(b" "); // Space -> confirm current dir -> new-pane form
+    first.wait_for_string("No mode");
+    first.send_bytes(b"\x1b[C"); // Right -> [Orch: reattach-orch]
+    first.send_bytes(b"\r"); // Mode -> Name
+    first.send_bytes(b"\r"); // submit
+    first.wait_for_string("scout"); // 3rd role card -> the tab is up
+    first.wait_for_string("LEAD_SENTINEL"); // the start role is the expanded one
+
+    // Walk focus off the start role, two roles down. `j` in command mode moves
+    // the orchestration deck's focused/expanded role pane.
+    first.send_bytes(b"\x04"); // Ctrl+D -> command mode
+    first.send_bytes(b"j"); // lead -> helper
+    first.send_bytes(b"j"); // helper -> scout
+    first.wait_until_grid("focus walked onto the non-start `scout` role", |grid| {
+        focused_role_pane(grid) == Some("scout")
+    });
+
+    // Then step back to the Dashboard to supervise — this is the position the
+    // reattach has to reproduce.
+    first.send_bytes(b"\x1b[D"); // Left -> previous tab -> Dashboard
+    first.wait_until_grid("deck switched back to the Dashboard tab", |grid| {
+        focused_role_pane(grid).is_none()
+    });
+    assert!(
+        dashboard_tab_is_active(&first),
+        "the Dashboard tab must be the highlighted one before the detach, otherwise the \
+         post-reattach tab assertion proves nothing.\nGrid:\n{}",
+        first.snapshot_grid()
+    );
+
+    // Detach-quit: agents and daemon survive, and the clean teardown is what
+    // flushes the final saved-session snapshot to `session_file`.
+    first.send_bytes(b"\x03"); // Ctrl+C -> quit-confirm modal
+    first.wait_for_string("Quit dot-agent-deck?");
+    first.send_bytes(b"\r"); // Enter -> Detach (default)
+    let exited = first.wait_for_exit_within(Duration::from_secs(30));
+    assert_eq!(
+        exited,
+        Some(true),
+        "the first deck did not exit cleanly after the detach-quit ({exited:?}; None = still \
+         running at the 30s ceiling), so no final snapshot was flushed.\nGrid:\n{}",
+        first.snapshot_grid()
+    );
+    // NOTE: `first` is deliberately NOT dropped. Its process is gone, but the
+    // struct owns the tempdir holding the fixture the daemon recorded as each
+    // role's `orchestration_cwd`; dropping it would delete that directory and
+    // send the second deck down PRD #111's synthesised-config path instead of
+    // the ordinary one a real reattach takes.
+
+    // Guard against a vacuous pass from the other direction: the position has to
+    // be ON DISK before a second deck could possibly restore it. Reading the
+    // file the deck just wrote also pins WHERE the fix lives — `session.toml`,
+    // not the attach handshake — so a future change that moved the mechanism
+    // onto the wire would redden here rather than pass quietly.
+    let written =
+        std::fs::read_to_string(&session_file).expect("the detaching deck wrote a snapshot");
+    assert!(
+        written.contains("[focus]") && written.contains("dashboard_active = true"),
+        "the detach must have flushed a `[focus]` table recording the Dashboard as the active \
+         tab; without one the reattach assertions below could only pass by accident.\n\
+         session.toml:\n{written}"
+    );
+
+    // All three role agents outlived the detach — otherwise the reattach has
+    // nothing to land on and the assertions below would be about a rebuild
+    // failure rather than about focus.
+    let records = daemon.wait_for_agent_count(3, Duration::from_secs(10));
+    assert_eq!(
+        records.len(),
+        3,
+        "all three role agents must survive the detach; got {records:?}"
+    );
+
+    let second = launch_deck_against(&daemon, &session_file);
+
+    // Half 1 — the ACTIVE TAB. The remembered Dashboard is a real position, so
+    // it wins over PRD #111's land-on-the-orchestration-tab default.
+    //
+    // The header's `N/M session(s)` count is the precondition, not the claim:
+    // it says all three roles hydrated (M == 3) before anything is asserted
+    // about which tab is highlighted. The Dashboard filters out panes that
+    // belong to a mode/orchestration tab, so `0/3` is what a faithfully
+    // restored Dashboard looks like on a deck whose every pane lives in the
+    // orchestration tab — the same empty overview the user was looking at when
+    // they detached, which is exactly the position being restored.
+    assert!(
+        common::wait_until(Duration::from_secs(15), || {
+            let grid = second.snapshot_grid();
+            grid.contains("3 session(s)")
+                && dashboard_tab_is_active(&second)
+                && focused_role_pane(&grid).is_none()
+        }),
+        "reattach must come back on the Dashboard tab the user left; pre-fix it lands on the \
+         rebuilt orchestration tab instead (PRD #111), which is why a role pane is expanded \
+         here.\nGrid:\n{}",
+        second.snapshot_grid()
+    );
+
+    // Half 2 — the PER-TAB focused pane. Stepping onto the orchestration tab
+    // must restore `scout`, not the start role the fallback would pick. This is
+    // the half the active tab alone cannot cover: the tab was not active at
+    // detach, so its remembered pane only survives if every tab's focus was
+    // captured, not just the visible one.
+    second.send_bytes(b"\x1b[C"); // Right -> next tab -> the orchestration
+    second.wait_for_string("scout"); // the rebuilt tab's third role card
+    second.wait_until_grid(
+        "the orchestration tab comes back focused on the remembered `scout` role",
+        |grid| focused_role_pane(grid) == Some("scout"),
+    );
+    let grid = second.snapshot_grid();
+    assert_eq!(
+        focused_role_pane(&grid),
+        Some("scout"),
+        "the rebuilt orchestration tab must restore the role the user left (`scout`); `lead` \
+         here is `restore_focus_on_switch_in`'s start-role fallback winning because nothing \
+         remembered the focus across the detach.\nGrid:\n{grid}"
+    );
+}
+
+/// Scenario: Hand-stage a `session.toml` that carries BOTH an orchestration
+/// snapshot (so the daemon-empty path rebuilds a 3-role orchestration tab) and a
+/// `[focus]` table remembering the Dashboard as active plus a pane id — and
+/// launch against a brand-new empty daemon, the one path where the restored
+/// panes are freshly allocated rather than adopted from a daemon. The remembered
+/// tab KIND must be honoured (the deck lands on the Dashboard, not on the
+/// rebuilt orchestration tab it would otherwise land on), the remembered pane id
+/// must be IGNORED (nothing hydrated, so the daemon-supplied id set is empty and
+/// a rebuild's counters are not the ids that were remembered — honouring one
+/// could focus a different role), and the deck must be in
+/// command mode rather than the PaneInput the restore block leaves behind — that
+/// mode on a tab with no pane of its own would send keystrokes to a pane that is
+/// not drawn.
+#[spec("session/restore/019")]
+#[test]
+fn restore_019_cold_start_honours_the_remembered_tab_but_not_a_rebuilt_pane_id() {
+    let project_dir = common::race_safe_tempdir();
+    write_orchestration_config(
+        project_dir.path(),
+        "tdd-cycle",
+        &[
+            ("orchestrator", "sleep 600"),
+            ("coder", "sleep 600"),
+            ("reviewer", "sleep 600"),
+        ],
+        0,
+    );
+
+    let session_dir = common::race_safe_tempdir();
+    let session_file = session_dir.path().join("session.toml");
+    stage_orchestration_snapshot(
+        &session_file,
+        project_dir.path(),
+        "orchestrator",
+        "sleep 600",
+        &["orchestrator", "coder", "reviewer"],
+        0,
+        "",
+        "tdd-cycle",
+        project_dir.path(),
+        &[0],
+        None,
+    );
+    // Append the remembered position. `active_pane`/`tab_panes` name "2" — the
+    // id a three-pane rebuild really does mint for its middle role, so this is
+    // the id that WOULD resolve, which is what makes ignoring it observable
+    // rather than vacuous.
+    let mut staged = std::fs::read_to_string(&session_file).expect("read the staged snapshot");
+    staged.push_str("\n[focus]\nversion = 1\ndashboard_active = true\nactive_pane = \"2\"\ntab_panes = [\"2\"]\n");
+    std::fs::write(&session_file, staged).expect("append the [focus] table");
+
+    let deck = TuiDeck::builder()
+        .with_pty_size(160, 45)
+        .with_env(
+            "DOT_AGENT_DECK_SESSION",
+            session_file.to_str().expect("session path is UTF-8"),
+        )
+        .launch_with_fixture("minimal");
+
+    // Precondition: the orchestration tab really was rebuilt, so "the Dashboard
+    // is active" below is a choice between two tabs and not the only option.
+    // Read from the TAB STRIP (`Dashboard │ tdd-cycle [×]`) rather than from a
+    // role card, because the role cards live on that tab and the Dashboard
+    // filters out panes belonging to one — the same reason the restored
+    // overview here reads `0/3 session(s)`, which the predicate below also
+    // requires so the count proves all three roles came back.
+    deck.wait_for_string("tdd-cycle");
+
+    assert!(
+        common::wait_until(Duration::from_secs(15), || {
+            let grid = deck.snapshot_grid();
+            grid.contains("3 session(s)")
+                && dashboard_tab_is_active(&deck)
+                // No role pane is expanded: the Dashboard is what is drawn.
+                && common::role_pane_left_edge(&grid, "orchestrator").is_none()
+                && common::role_pane_left_edge(&grid, "coder").is_none()
+                // And the deck is in command mode, not the PaneInput the
+                // snapshot-restore block leaves behind.
+                && grid.contains("[New Pane Ctrl+N]")
+                && !grid.contains("[Command Mode Ctrl+D]")
+        }),
+        "a cold start must honour the remembered Dashboard, ignore the rebuilt pane id, and \
+         come up in command mode.\nGrid:\n{}",
+        deck.snapshot_grid()
+    );
+}
