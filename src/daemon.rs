@@ -910,8 +910,10 @@ fn make_schedule_callback(
         // registration. See the resolution block there for why.
         resolved_target: None,
         // Unchanged behaviour: the prompt is delivered verbatim. Giving this path
-        // the orchestrator context is #222's work, not this PR's.
-        compose_orchestrator_context: false,
+        // the orchestrator context is #222's work, not this PR's — and when it is
+        // done, the value that belongs here is `Unattended`: a scheduled task
+        // fires with no one at the pane (issue #703).
+        compose_orchestrator_context: None,
     };
     let new_tab_per_fire = task.new_tab_per_fire;
     // Issue #835: the task's declared spawn shape, `None` for every task that does

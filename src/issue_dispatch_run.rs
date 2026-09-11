@@ -632,8 +632,10 @@ async fn dispatch_one_issue(
         // own config, exactly as before the PRD #220 selector existed.
         resolved_target: None,
         // Unchanged behaviour: the prompt is delivered verbatim. Giving this path
-        // the orchestrator context is #222's work, not this PR's.
-        compose_orchestrator_context: false,
+        // the orchestrator context is #222's work, not this PR's — and when it is
+        // done, the value that belongs here is `Unattended`: a scheduled per-issue
+        // dispatch has no one at the pane either (issue #703).
+        compose_orchestrator_context: None,
     };
     if let Err(e) = spawn(req, registry, notifier, event_tx, true, state).await {
         // The spawn failed after the worktree was created/recorded: no agent

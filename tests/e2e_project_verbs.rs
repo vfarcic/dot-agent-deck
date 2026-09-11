@@ -201,10 +201,12 @@ fn project_resolve_001_enumeration_offers_only_projects_that_resolve() {
 /// Scenario: Start a headless daemon and ask it to prepare a workflow against a
 /// real project, then check both halves of the answer — the coordinator context
 /// is published at `<project>/.dot-agent-deck/orchestrator-context.md` carrying
-/// the configured prompt template, the worker's description and the task, and
-/// the reply's own `context_path` names that same file. Then ask it to prepare
-/// an orchestration the project does not define, and check that the refusal
-/// publishes no context and leaves the daemon holding zero panes.
+/// the configured prompt template, the worker's description, the task and the
+/// `## Task precedence` statement but NOT the unattended notice (this verb's
+/// caller is the desktop's launch panel, where the person who typed the task is
+/// watching), and the reply's own `context_path` names that same file. Then ask
+/// it to prepare an orchestration the project does not define, and check that
+/// the refusal publishes no context and leaves the daemon holding zero panes.
 #[spec("project/launch/001")]
 #[test]
 fn project_launch_001_publishes_the_context_and_a_failed_preparation_starts_no_roles() {
@@ -276,6 +278,12 @@ fn project_launch_001_publishes_the_context_and_a_failed_preparation_starts_no_r
         "## Delegation protocol",
         "## Your task",
         TASK,
+        // Issue #703: two documents reach the coordinator in one file and only
+        // their ORDERING used to say which wins. A task that says to open a PR
+        // and stop against a template step that releases both landed on the
+        // same place by luck; a template step that said "merge" would have
+        // overridden the task's stop condition silently.
+        "## Task precedence",
     ] {
         assert!(
             context.contains(needle),
@@ -284,6 +292,19 @@ fn project_launch_001_publishes_the_context_and_a_failed_preparation_starts_no_r
             expected_context.display()
         );
     }
+    // The other half of #703, and the reason the attendance is a caller
+    // declaration rather than an inference from "a task was supplied": this
+    // verb's caller is the desktop's live-loop panel, which will not launch
+    // without a task prompt AND has the operator who typed it watching the
+    // panes. Inferring unattendedness from the task would tell that run nobody
+    // was there and strip the one gate its operator was present to answer.
+    assert!(
+        !context.contains("## Unattended run"),
+        "a prepared workflow's operator is watching it; the published context ({} bytes at {}) \
+         must not tell the coordinator otherwise",
+        context.len(),
+        expected_context.display()
+    );
 
     let roles: Vec<(&str, bool)> = prepared
         .roles
