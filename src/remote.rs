@@ -157,10 +157,15 @@ fn scrub_remote_text(s: &str) -> String {
 /// `SshError` variant. Extracted from `SystemSshExecutor::run` so it can be
 /// unit-tested without spawning a process.
 ///
+/// Public since PRD #741 M5, which reuses it rather than growing a third
+/// classifier: the `ssh -N -L` tunnel's child dies with the same stderr and the
+/// same exit 255, and `HostKeyVerificationFailed` already carries the remedy a
+/// GUI has to show (run `ssh <target>` once in a terminal).
+///
 /// Classification matches against the **raw** stderr while `detail` carries the
 /// [`scrub_remote_text`] form: the matcher looks for ssh's own fixed phrases,
 /// and scrubbing first could only ever change what it sees.
-fn classify_ssh_error(target: &SshTarget, stderr: &str) -> SshError {
+pub fn classify_ssh_error(target: &SshTarget, stderr: &str) -> SshError {
     let lower = stderr.to_ascii_lowercase();
     let detail = scrub_remote_text(stderr);
     if lower.contains("connection refused")

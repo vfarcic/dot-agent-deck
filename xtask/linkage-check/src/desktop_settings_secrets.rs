@@ -101,7 +101,7 @@ const DESKTOP_SRC: &str = "desktop/src";
 /// so `String`, `Option<String>`, `PathBuf`, `Vec<String>` and any map do not
 /// belong on it, whatever the field is called. If PRD #802 needs a credential,
 /// the answer is the `SecretStore` seam, not a row here.
-const ALLOWED_FIELD_TYPES: [(&str, FieldKind, &str); 5] = [
+const ALLOWED_FIELD_TYPES: [(&str, FieldKind, &str); 10] = [
     (
         "u32",
         FieldKind::Scalar,
@@ -122,6 +122,61 @@ const ALLOWED_FIELD_TYPES: [(&str, FieldKind, &str); 5] = [
         FieldKind::Scalar,
         "a newtype over f64 whose deserializer snaps to ZOOM_LEVELS, so the \
          value this crate reads out and writes back is one of ten numbers",
+    ),
+    // PRD #741 M5/M6: the remote-deck address. Five validating newtypes over
+    // `String`, defined in `src/remote_tunnel.rs`, each of whose `Deserialize`
+    // runs the same check its constructor does — so a hand-edited
+    // `desktop.toml` cannot smuggle past what a settings form applies. Read the
+    // reasons as narrow claims, because they are: each says what the charset
+    // and the bound make unrepresentable, not that the field is proof against
+    // every secret anyone could think of. What rules a credential out of these
+    // rows is that every one of them is *used* as an ssh argument — a token
+    // stored in any of them reaches no authentication surface — and PRD #802's
+    // `SecretStore` is still the answer if a credential ever genuinely needs
+    // storing.
+    (
+        "Hostname",
+        FieldKind::Scalar,
+        "a newtype over String whose deserializer bounds it at 253 bytes and \
+         accepts only ASCII alphanumerics, '.', '-', '_' and the bracketed-IPv6 \
+         punctuation, refusing whitespace, NUL, every control byte, every \
+         non-ASCII byte, a leading '-' and every shell metacharacter",
+    ),
+    (
+        "SshUser",
+        FieldKind::Scalar,
+        "a newtype over String bounded at 64 bytes and restricted to ASCII \
+         alphanumerics, '.', '-', '_' and '@' — too narrow for a PEM block, a \
+         base64 blob or anything carrying padding, and refusing the same \
+         universal bytes Hostname does",
+    ),
+    (
+        "KeyPath",
+        FieldKind::Scalar,
+        "a newtype over String holding a path to a private key, never key \
+         material: bounded at PATH_MAX, restricted to ASCII alphanumerics, \
+         '.', '-', '_', '/' and '~', required to start '/' or '~/', and \
+         refusing whitespace, control bytes, non-ASCII bytes and shell \
+         metacharacters — so a multi-line PEM block, the credential shape this \
+         field sits next to, cannot be represented. A single-line token would \
+         fit this charset; what rules it out is that the value is handed to \
+         `ssh -i` as a filename and reaches no authentication surface as text",
+    ),
+    (
+        "HostAlias",
+        FieldKind::Scalar,
+        "a newtype over String naming a Host block in the user's ~/.ssh/config, \
+         bounded at 253 bytes and restricted to ASCII alphanumerics, '.', '-' \
+         and '_' — the jump host's own address, port, user and key stay in that \
+         config rather than being copied here",
+    ),
+    (
+        "RemoteSocketPath",
+        FieldKind::Scalar,
+        "a newtype over String bounded at 104 bytes — the smaller of the two \
+         sun_path limits — restricted to ASCII alphanumerics, '.', '-', '_' and \
+         '/', and required to be absolute; ':' is refused because ssh parses \
+         its -L forward specification by splitting on it",
     ),
     (
         "AppearanceSettings",

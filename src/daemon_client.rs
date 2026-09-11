@@ -16,6 +16,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite};
 
@@ -23,6 +24,7 @@ use crate::platform::ipc::{
     EndpointAvailability, EndpointPresence, IpcStream, LOCAL_ENDPOINT_PRESENCE,
 };
 use crate::platform::transport::{AttachTransport, TransportReadHalf, TransportWriteHalf};
+use crate::remote_tunnel::{HostAlias, Hostname, KeyPath, RemoteSocketPath, SshUser};
 
 pub use crate::agent_pty::{
     AgentRecord, TabMembership, validate_orchestration_surface, validate_tab_membership,
@@ -115,8 +117,8 @@ impl Endpoint {
     pub fn connect_address(&self) -> Result<&Path, EndpointError> {
         match self {
             Self::Local(local) => Ok(local.path()),
-            Self::Remote(remote) => Err(EndpointError::RemoteTransportUnavailable {
-                deck: remote.label().to_string(),
+            Self::Remote(remote) => Err(EndpointError::RemoteAddressIsTheTunnels {
+                deck: remote.describe(),
             }),
         }
     }
@@ -142,7 +144,7 @@ impl Endpoint {
     pub fn describe(&self) -> String {
         match self {
             Self::Local(local) => local.path().to_string_lossy().into_owned(),
-            Self::Remote(remote) => remote.label().to_string(),
+            Self::Remote(remote) => remote.describe(),
         }
     }
 }
@@ -256,48 +258,184 @@ impl AsRef<Path> for LocalEndpoint {
     }
 }
 
-/// A daemon on another machine (PRD #741 M5/M6).
+/// A daemon on another machine (PRD #741 M5).
 ///
-/// **A placeholder, deliberately.** M2 adds no transport and no settings, so
-/// this carries only enough to *name* a deck in a refusal message. M6 designs
-/// what is actually stored — host, optional user, port, optional key *path*,
-/// optional jump-host name, each a validating newtype, and never a secret — and
-/// M5 gives it a transport. Do not grow it here: a schema invented now would be
-/// the one M6 has to migrate away from.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Every field is a **validating newtype** rather than a `String`, and the
+/// reason is two reasons that happen to want the same code:
+///
+/// 1. **Nothing validates an ssh argument today.**
+///    [`crate::remote::SshTarget::parse`] splits `[user@]host` on the first `@`
+///    and stores both halves verbatim — no length bound, no charset, no
+///    rejection of a leading `-`, of whitespace, or of a NUL. `--` and
+///    `Command::arg` stop a hostile value being read as an *option* or reaching
+///    a local shell directly, and both existing ssh call sites do that
+///    correctly; neither stops it reaching the user's own `~/.ssh/config`, where
+///    `ProxyCommand`/`LocalCommand` interpolate `%h`/`%r` into a string OpenSSH
+///    hands to a shell. That is CVE-2023-51385's class, fixed in OpenSSH 9.6 —
+///    and a bundled desktop app runs against whatever OpenSSH the user has.
+/// 2. **`String` is not available in the settings schema.**
+///    `xtask/linkage-check`'s `ALLOWED_FIELD_TYPES` allowlists five types and
+///    `String` is deliberately absent, so M6 putting this struct in
+///    `desktop.toml` with a `String` field reddens a **required** CI check.
+///
+/// The storage policy the fields encode: **never store a secret.** Reference
+/// the user's ssh config and agent by name only — host, optional user, port,
+/// optional key *path*, optional jump-host *name*. `remotes.toml` has proved
+/// that sufficient since PRD #76.
+///
+/// [`Self::socket`] is the one field the PRD's list did not anticipate, and it
+/// is required rather than derived; [`crate::remote_tunnel::RemoteSocketPath`]
+/// records why OpenSSH leaves us no way to compute it from here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RemoteEndpoint {
-    label: String,
+    host: Hostname,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    user: Option<SshUser>,
+    #[serde(default = "default_ssh_port")]
+    port: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    key: Option<KeyPath>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    jump: Option<HostAlias>,
+    socket: RemoteSocketPath,
+}
+
+fn default_ssh_port() -> u16 {
+    crate::remote::DEFAULT_SSH_PORT
 }
 
 impl RemoteEndpoint {
-    /// Name a remote deck. The label is display text only — it addresses
-    /// nothing and reaches nothing until M5.
-    pub fn named(label: impl Into<String>) -> Self {
+    /// A remote deck at `host`, reached on the default ssh port, whose daemon
+    /// listens on `socket` over there.
+    pub fn new(host: Hostname, socket: RemoteSocketPath) -> Self {
         Self {
-            label: label.into(),
+            host,
+            user: None,
+            port: crate::remote::DEFAULT_SSH_PORT,
+            key: None,
+            jump: None,
+            socket,
         }
     }
 
-    /// The deck's display name.
-    pub fn label(&self) -> &str {
-        &self.label
+    /// Log in as `user` rather than whatever the ssh config resolves.
+    pub fn with_user(mut self, user: SshUser) -> Self {
+        self.user = Some(user);
+        self
+    }
+
+    /// Connect on a non-default port.
+    pub fn with_port(mut self, port: u16) -> Self {
+        self.port = port;
+        self
+    }
+
+    /// Offer a specific private key (`ssh -i`). A key **path** — never key
+    /// material, and never a passphrase.
+    pub fn with_key(mut self, key: KeyPath) -> Self {
+        self.key = Some(key);
+        self
+    }
+
+    /// Reach the host through a jump host named in the user's `~/.ssh/config`
+    /// (`ssh -J`). A *name*, so the jump host's own address, port, user and key
+    /// stay in the config where they already are.
+    pub fn with_jump(mut self, jump: HostAlias) -> Self {
+        self.jump = Some(jump);
+        self
+    }
+
+    pub fn host(&self) -> &Hostname {
+        &self.host
+    }
+
+    pub fn user(&self) -> Option<&SshUser> {
+        self.user.as_ref()
+    }
+
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+
+    pub fn key(&self) -> Option<&KeyPath> {
+        self.key.as_ref()
+    }
+
+    pub fn jump(&self) -> Option<&HostAlias> {
+        self.jump.as_ref()
+    }
+
+    /// The daemon's attach socket path **on the remote host**.
+    pub fn socket(&self) -> &RemoteSocketPath {
+        &self.socket
+    }
+
+    /// The destination argument ssh wants: `user@host`, or `host` when the ssh
+    /// config decides the user.
+    pub fn user_host(&self) -> String {
+        match &self.user {
+            Some(user) => format!("{user}@{}", self.host),
+            None => self.host.to_string(),
+        }
+    }
+
+    /// How this deck is named to a user, and in an error message.
+    ///
+    /// Derived from the address rather than stored as free text, which is not
+    /// only tidiness: a user-chosen label would be exactly the arbitrary
+    /// `String` the settings guard refuses, and it would need its own bidi and
+    /// control-character handling before being rendered. Every byte of this
+    /// string came through a validated ASCII charset, so there is nothing here
+    /// to escape.
+    pub fn describe(&self) -> String {
+        if self.port == crate::remote::DEFAULT_SSH_PORT {
+            self.user_host()
+        } else {
+            format!("{}:{}", self.user_host(), self.port)
+        }
+    }
+
+    /// The unvalidated [`crate::remote::SshTarget`] the existing ssh helpers
+    /// take — built *from* validated parts, so this is the one direction the
+    /// conversion may go.
+    pub fn ssh_target(&self) -> crate::remote::SshTarget {
+        crate::remote::SshTarget {
+            host: self.host.to_string(),
+            user: self.user.as_ref().map(|user| user.to_string()),
+            port: self.port,
+            key: self.key.as_ref().map(|key| key.as_path().to_path_buf()),
+        }
+    }
+}
+
+impl std::fmt::Display for RemoteEndpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.describe())
     }
 }
 
 /// Why an operation could not be performed against an [`Endpoint`].
 ///
 /// Both variants are *errors returned*, not panics: a caller that reaches a
-/// remote deck before M5 lands gets a message it can render, which is the
-/// difference between an unfinished milestone and a crash.
+/// remote deck gets a message it can render, which is the difference between a
+/// seam not yet wired and a crash.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum EndpointError {
-    /// The endpoint is remote and the remote transport has not landed yet
-    /// (PRD #741 M5).
+    /// A remote deck has no connect address of its own: the address is the
+    /// `ssh -N -L` tunnel's, and comes into existence when the tunnel does.
+    ///
+    /// PRD #741 M5 replaced the earlier `RemoteTransportUnavailable`, which said
+    /// the transport did not exist. It does now
+    /// ([`crate::remote_tunnel::RemoteTunnel`]); what an [`Endpoint`] alone
+    /// cannot do is *name* an address, because nothing has been established
+    /// yet. [`crate::remote_tunnel::EndpointConnection`] is the type that can,
+    /// and it hands back a bare `&Path` for the same reason
+    /// [`Endpoint::connect_address`] does.
     #[error(
-        "cannot connect to the remote deck {deck}: connecting to a daemon on another machine is \
-         not supported yet"
+        "the remote deck {deck} is reached through its own ssh tunnel, so it has no address until \
+         one is open: establish an EndpointConnection and ask that for the address"
     )]
-    RemoteTransportUnavailable { deck: String },
+    RemoteAddressIsTheTunnels { deck: String },
     /// The operation acts on a local process or a local inode, so it has no
     /// meaning against a daemon on another machine. PRD #741 M7 renders this as
     /// a disabled control rather than a failed action.
@@ -1912,6 +2050,16 @@ mod tests {
     /// build, so there is nothing here to assert about it — and what it pins is
     /// that the *accessor* keeps returning `None` rather than being "helpfully"
     /// widened later to hand back some substitute local endpoint.
+    /// A remote deck for the endpoint tests: the host name they already assert
+    /// on, plus the remote attach socket PRD #741 M5 made a required field.
+    fn remote_deck() -> RemoteEndpoint {
+        RemoteEndpoint::new(
+            Hostname::parse("build-box").expect("a plain host name is valid"),
+            RemoteSocketPath::parse("/run/user/1000/dot-agent-deck-attach.sock")
+                .expect("an absolute remote socket path is valid"),
+        )
+    }
+
     #[test]
     fn a_remote_endpoint_yields_no_local_endpoint() {
         let local = Endpoint::Local(LocalEndpoint::at("/tmp/attach.sock"));
@@ -1921,7 +2069,7 @@ mod tests {
             "a local deck must hand back the endpoint the local-only operations take"
         );
 
-        let remote = Endpoint::Remote(RemoteEndpoint::named("build-box"));
+        let remote = Endpoint::Remote(remote_deck());
         assert!(
             remote.as_local().is_none(),
             "a remote deck must yield NO local endpoint — this is what makes \
@@ -1935,7 +2083,7 @@ mod tests {
     /// reporting a bare failure. M7 turns this text into a disabled control.
     #[test]
     fn require_local_refuses_a_remote_deck_by_name() {
-        let remote = Endpoint::Remote(RemoteEndpoint::named("build-box"));
+        let remote = Endpoint::Remote(remote_deck());
         let err = remote
             .require_local("Stop daemon")
             .expect_err("a remote deck must refuse a local-only operation");
@@ -1961,24 +2109,28 @@ mod tests {
         );
     }
 
-    /// The connect path for a remote deck returns a message, not a panic: M5 has
-    /// not landed, and a `todo!()` here would crash the app on the first
-    /// selection rather than explain itself.
+    /// An [`Endpoint`] alone still names no address for a remote deck, and that
+    /// is the property rather than a gap: under PRD #741 M5's DECISION 1A the
+    /// address is the `ssh -N -L` tunnel's forwarded socket, which does not
+    /// exist until a tunnel is open. The refusal points at the type that can
+    /// answer instead of reporting a broken deck.
     #[test]
-    fn connecting_to_a_remote_deck_errors_rather_than_panicking() {
-        let remote = Endpoint::Remote(RemoteEndpoint::named("build-box"));
+    fn a_remote_deck_has_no_address_until_its_tunnel_is_open() {
+        let remote = Endpoint::Remote(remote_deck());
         let err = remote
             .connect_address()
-            .expect_err("M5 has not landed; connecting must refuse");
+            .expect_err("a remote deck names no address of its own");
         assert_eq!(
             err,
-            EndpointError::RemoteTransportUnavailable {
+            EndpointError::RemoteAddressIsTheTunnels {
                 deck: "build-box".to_string(),
             }
         );
+        let msg = err.to_string();
+        assert!(msg.contains("ssh tunnel"), "name the transport: {msg}");
         assert!(
-            err.to_string().contains("not supported yet"),
-            "the refusal must read as unfinished work, not as a broken deck: {err}"
+            msg.contains("EndpointConnection"),
+            "point at the type that can answer: {msg}"
         );
     }
 
@@ -2013,10 +2165,7 @@ mod tests {
             Endpoint::Local(LocalEndpoint::at("/tmp/attach.sock")).describe(),
             "/tmp/attach.sock"
         );
-        assert_eq!(
-            Endpoint::Remote(RemoteEndpoint::named("build-box")).describe(),
-            "build-box"
-        );
+        assert_eq!(Endpoint::Remote(remote_deck()).describe(), "build-box");
     }
 
     /// Unix only since PRD #741 M3, and the gate is the fix rather than a
@@ -2086,7 +2235,7 @@ mod tests {
         assert_eq!(from_endpoint.presence, from_path.presence);
         assert_eq!(from_path.presence, LOCAL_ENDPOINT_PRESENCE);
 
-        let remote = Endpoint::Remote(RemoteEndpoint::named("build-box"));
+        let remote = Endpoint::Remote(remote_deck());
         assert_eq!(
             remote.presence(),
             EndpointPresence::Elsewhere,
@@ -2094,7 +2243,8 @@ mod tests {
         );
         assert!(
             DaemonClient::for_endpoint(&remote).is_err(),
-            "M5 has not landed; building a client for a remote deck must refuse"
+            "a client is built from an address, and a remote deck has none until \
+             its tunnel is open"
         );
     }
 
