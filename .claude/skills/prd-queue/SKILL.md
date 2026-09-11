@@ -440,7 +440,7 @@ GATES — CLAUDE.md is the authority, this is the summary:
 - Before EVERY commit: `cargo fmt --check` and
   `cargo clippy --workspace --all-targets --features e2e,e2e-live -- -D
   warnings`. All four clippy flags are load-bearing; `e2e-live` is the ONLY
-  thing anywhere in CI that type-checks the 24 real-agent e2e files, which are
+  thing anywhere in CI that type-checks the real-agent e2e files, which are
   empty crates without it.
 - Per task: `cargo test-fast`, PLUS the tests covering what the task touched —
   any tier, credentialed included. Find them via tests/CATALOG.md, the `#[spec]`
@@ -450,7 +450,7 @@ GATES — CLAUDE.md is the authority, this is the summary:
   rather than reproducing it. Say this explicitly in the unit, because an agent
   reading an older PRD will otherwise run the full tier for tens of minutes on
   its own initiative.
-- Lane 2 — the 24 files that reach a real agent, `cargo test-e2e-live <filter>`
+- Lane 2 — the files that reach a real agent, `cargo test-e2e-live <filter>`
   — runs on NO runner anywhere: no test that reaches a real agent runs in CI.
   Where the PRD touches a real-agent path, the unit runs those tests itself with
   its own credentials, or reports that surface as UNVERIFIED. Nothing else will

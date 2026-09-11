@@ -43,8 +43,8 @@ E2e tier — two lanes since issue #502, split by whether a test reaches a **rea
 
 | Lane | Command | Contents | Runs |
 | --- | --- | --- | --- |
-| 1 — deterministic | `cargo test-e2e` | the 47 `tests/e2e_*.rs` files that reach no real agent | in CI, on every PR (the `e2e-deterministic` job) |
-| 2 — real agent | `cargo test-e2e-live` | a **superset**: all 71 files, so lane 1 plus the 24 credentialed ones | **your machine only — never CI** |
+| 1 — deterministic | `cargo test-e2e` | the `tests/e2e_*.rs` files that reach no real agent | in CI, on every PR (the `e2e-deterministic` job) |
+| 2 — real agent | `cargo test-e2e-live` | a **superset**: every `tests/e2e_*.rs` file, so lane 1 plus the credentialed ones | **your machine only — never CI** |
 | 3 — local | either alias with a filter | the test you are debugging, then its module | your machine |
 
 The `Command` column is the convenient spelling, not the definition. A lane is selected by the cargo **features** its files' `#![cfg(…)]` attributes read, so a raw `cargo nextest run --workspace --features e2e,e2e-live <filter>` runs lane 2 exactly as `cargo test-e2e-live <filter>` does. The aliases in [`.cargo/config.toml`](.cargo/config.toml) are worth using anyway — they are shorter and carry `--workspace` for you — but running the raw command counts.
