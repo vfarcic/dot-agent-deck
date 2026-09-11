@@ -219,9 +219,9 @@ fn devin_present_on_path() -> bool {
 /// This is the WIDE, binary-agnostic sense of ownership: any deck install's
 /// command, not just this one's. It is the right predicate for uninstall —
 /// whose job is to remove the deck's rules wholesale, whichever install wrote
-/// them — and for the retired-event sweep, and the wrong one for deciding what
-/// a re-install may overwrite (see [`command_is_this_binary`] and
-/// [`command_is_dead_deck`], issue #730).
+/// them — and the wrong one for deciding what a re-install may overwrite,
+/// including under a retired event (see [`command_is_replaceable`], issue
+/// #730).
 fn command_is_deck_owned(command: &str) -> bool {
     crate::agent_hook_config::command_executable(command, HOOK_COMMAND_SUFFIX).is_some()
 }
@@ -257,6 +257,16 @@ fn command_is_dead_deck(command: &str, binary_path: &str) -> bool {
         .is_some_and(|exe| crate::agent_hook_config::pin_is_dead_sibling(&exe, binary_path))
 }
 
+/// Whether a re-install by `binary_path` may REPLACE `command`: it is either
+/// this binary's own prior deck command, or a deck command whose pin is
+/// positively dead and shares this binary's basename. The union of
+/// [`command_is_this_binary`] and [`command_is_dead_deck`], named once because
+/// [`install_impl`] applies it in two places — the installed events and the
+/// retired-event sweep — and the two must not drift apart (issue #730).
+fn command_is_replaceable(command: &str, binary_path: &str) -> bool {
+    command_is_this_binary(command, binary_path) || command_is_dead_deck(command, binary_path)
+}
+
 /// Merge the deck's command hooks for `command` — the command built for
 /// `binary_path` — into an existing config value (or `{}`), preserving every
 /// unrelated setting and every user-authored hook, and refreshing (not
@@ -280,18 +290,35 @@ fn install_impl(root: &mut Value, command: &str, binary_path: &str) {
         .and_then(Value::as_object_mut)
         .expect("hooks is an object");
 
-    // Strip deck entries from events no longer in `DEVIN_HOOK_EVENTS` so a
-    // re-install after this list changes leaves no orphaned deck rule behind,
-    // and drop any event key left empty as a result. Such an entry is stale
-    // regardless of which binary wrote it — nothing is left to fire it — so this
-    // sweep uses the wide, binary-agnostic predicate.
+    // Clear THIS install's leftovers under an event no longer in
+    // `DEVIN_HOOK_EVENTS`, so a re-install after that list changes orphans none
+    // of its own rules. Same predicate as the installed-event sweep below,
+    // deliberately: a deck command under a retired event is NOT dead merely
+    // because this deck stopped installing that event. `DEVIN_HOOK_EVENTS` says
+    // what this deck writes, not what the agent runs — measured on Codex 0.149.0,
+    // whose adapter carries the identical sweep, and which accepts and
+    // enumerates a hook under an event that deck does not install. So a wide
+    // sweep here can delete a live hook belonging to a user or to a newer
+    // sibling install. That is issue #730's own defect one door along.
+    //
+    // The consequence, stated rather than left to be discovered: nothing cleans
+    // a FOREIGN install's retired-event rule during install. That is the same
+    // tradeoff already accepted for the installed events, and `uninstall_impl`
+    // still clears every deck-signature command wide.
+    //
+    // An event key left empty IS dropped by this INSTALL sweep, while Codex's
+    // install sweep leaves it. (Both adapters' `uninstall` drop emptied keys;
+    // the asymmetry is install-side only.) It is pre-existing on both sides and
+    // left deliberately: each adapter keeps the shape its own users' files
+    // already have. Do not "fix" one into the other without deciding which is
+    // right.
     let keys: Vec<String> = hooks.keys().cloned().collect();
     for key in keys {
         if DEVIN_HOOK_EVENTS.contains(&key.as_str()) {
             continue;
         }
         if let Some(arr) = hooks.get_mut(&key).and_then(Value::as_array_mut) {
-            strip_deck_commands(arr, command_is_deck_owned);
+            strip_deck_commands(arr, |cmd| command_is_replaceable(cmd, binary_path));
             if arr.is_empty() {
                 hooks.remove(&key);
             }
@@ -313,9 +340,7 @@ fn install_impl(root: &mut Value, command: &str, binary_path: &str) {
         // genuinely different, still-valid install is left in place and the new
         // rule is added ALONGSIDE it (issue #730), which is what Claude's
         // `install_impl` has always done.
-        strip_deck_commands(arr, |cmd| {
-            command_is_this_binary(cmd, binary_path) || command_is_dead_deck(cmd, binary_path)
-        });
+        strip_deck_commands(arr, |cmd| command_is_replaceable(cmd, binary_path));
         arr.push(entry.clone());
     }
 }
@@ -553,6 +578,24 @@ mod tests {
         serde_json::from_str(&contents).expect("parse config.json")
     }
 
+    /// Write a real, executable file at `path` (creating its directory) and
+    /// return its path as a string — a pin `pin_is_repairable` will call alive.
+    fn seed_executable(path: &Path) -> String {
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("create dir");
+        std::fs::write(path, b"#!/bin/sh\nexit 0\n").expect("write seeded binary");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        }
+        path.to_str().expect("seeded path is UTF-8").to_string()
+    }
+
+    /// The deck command this adapter writes for `binary`.
+    fn command_for(binary: &str) -> String {
+        crate::agent_hook_config::build_command(binary, HOOK_COMMAND_SUFFIX, HOOK_SHELL)
+    }
+
     fn deck_commands_for(root: &Value, event: &str) -> Vec<String> {
         root["hooks"][event]
             .as_array()
@@ -775,23 +818,9 @@ mod tests {
     #[test]
     fn install_leaves_a_valid_foreign_pin_alone_and_repairs_a_dead_one() {
         let fixture = crate::test_temp::tempdir().expect("devin fixture tempdir");
-        let seed = |path: &Path| -> String {
-            std::fs::create_dir_all(path.parent().expect("parent")).expect("create dir");
-            std::fs::write(path, b"#!/bin/sh\nexit 0\n").expect("write seeded binary");
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
-                    .expect("chmod");
-            }
-            path.to_str().expect("seeded path is UTF-8").to_string()
-        };
-        let command_for = |binary: &str| {
-            crate::agent_hook_config::build_command(binary, HOOK_COMMAND_SUFFIX, HOOK_SHELL)
-        };
-
-        let installing = seed(&fixture.path().join("this-install").join("dot-agent-deck"));
-        let other = seed(&fixture.path().join("other-install").join("dot-agent-deck"));
+        let installing =
+            seed_executable(&fixture.path().join("this-install").join("dot-agent-deck"));
+        let other = seed_executable(&fixture.path().join("other-install").join("dot-agent-deck"));
 
         // Arm 1 — a different but still-valid deck install.
         let valid = fixture.path().join("valid-config");
@@ -849,32 +878,110 @@ mod tests {
         );
     }
 
-    /// A re-install after `DEVIN_HOOK_EVENTS` shrinks must not orphan a deck rule
-    /// under an event we no longer install, and must not leave an empty key.
+    /// A re-install after `DEVIN_HOOK_EVENTS` shrinks must not orphan THIS
+    /// install's own deck rule under an event we no longer install, and must not
+    /// leave the emptied key behind. It must equally not reach a deck rule
+    /// belonging to a different, still-valid install: `DEVIN_HOOK_EVENTS` says
+    /// what this deck writes, not what the agent runs, so a deck command under a
+    /// retired event is not dead, it is someone else's (issue #730).
     #[test]
-    fn install_cleans_up_deck_rules_for_retired_events() {
-        let dir = tempfile::tempdir().expect("config tempdir");
-        let stale = json!({
-            "hooks": {
-                "RetiredEvent": [
-                    { "hooks": [
-                        { "type": "command", "command": "/old/deck hook --agent devin" }
-                    ] }
-                ]
-            }
-        });
+    fn install_cleans_up_only_its_own_deck_rules_for_retired_events() {
+        let fixture = crate::test_temp::tempdir().expect("devin fixture tempdir");
+        let installing =
+            seed_executable(&fixture.path().join("this-install").join("dot-agent-deck"));
+        let other = seed_executable(&fixture.path().join("other-install").join("dot-agent-deck"));
+
+        // Arm 1 — our own leftover under a retired event: swept, key dropped.
+        let ours = fixture.path().join("ours");
+        std::fs::create_dir_all(&ours).expect("create config dir");
         std::fs::write(
-            config_path(dir.path()),
-            serde_json::to_vec_pretty(&stale).unwrap(),
+            config_path(&ours),
+            serde_json::to_vec_pretty(&json!({
+                "hooks": {
+                    "RetiredEvent": [
+                        { "hooks": [ { "type": "command", "command": command_for(&installing) } ] }
+                    ]
+                }
+            }))
+            .unwrap(),
         )
         .unwrap();
 
-        install_to(dir.path(), "/abs/dot-agent-deck").expect("install");
+        install_to(&ours, &installing).expect("install over our own retired-event rule");
 
-        let root = read_back(dir.path());
+        let root = read_back(&ours);
         assert!(
             root["hooks"].get("RetiredEvent").is_none(),
-            "an emptied retired event key must be dropped: {root:?}"
+            "our own retired-event rule must be swept and the emptied key dropped: {root:?}"
+        );
+
+        // Arm 2 — a different install's still-valid rule under the same retired
+        // event. It shares our basename deliberately, so `pin_is_repairable`
+        // saying "the target is still there" is the only thing standing between
+        // it and deletion.
+        let theirs = fixture.path().join("theirs");
+        std::fs::create_dir_all(&theirs).expect("create config dir");
+        std::fs::write(
+            config_path(&theirs),
+            serde_json::to_vec_pretty(&json!({
+                "hooks": {
+                    "RetiredEvent": [
+                        { "hooks": [ { "type": "command", "command": command_for(&other) } ] }
+                    ]
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        install_to(&theirs, &installing).expect("install over a foreign retired-event rule");
+
+        let root = read_back(&theirs);
+        assert_eq!(
+            deck_commands_for(&root, "RetiredEvent"),
+            vec![command_for(&other)],
+            "another install's still-valid rule under a retired event must survive: {root:?}"
+        );
+    }
+
+    /// The other half of the retired-event sweep: a deck pin that is positively
+    /// gone and shares this binary's basename IS swept, even under an event we
+    /// no longer install — otherwise the pruned-worktree residue #730's repair
+    /// gate exists for would accumulate under retired keys forever.
+    #[test]
+    fn install_sweeps_a_dead_sibling_pin_under_a_retired_event() {
+        let fixture = crate::test_temp::tempdir().expect("devin fixture tempdir");
+        let installing =
+            seed_executable(&fixture.path().join("this-install").join("dot-agent-deck"));
+        let dead = fixture
+            .path()
+            .join("pruned-worktree")
+            .join("dot-agent-deck");
+        assert!(!dead.exists(), "the dead path must genuinely not exist");
+
+        let dir = fixture.path().join("config");
+        std::fs::create_dir_all(&dir).expect("create config dir");
+        std::fs::write(
+            config_path(&dir),
+            serde_json::to_vec_pretty(&json!({
+                "hooks": {
+                    "RetiredEvent": [
+                        { "hooks": [ { "type": "command", "command":
+                            command_for(dead.to_str().expect("dead path is UTF-8")) } ] }
+                    ]
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        install_to(&dir, &installing).expect("install over a dead retired-event pin");
+
+        let root = read_back(&dir);
+        assert!(
+            root["hooks"].get("RetiredEvent").is_none(),
+            "a dead sibling pin under a retired event must be swept and the key \
+             dropped: {root:?}"
         );
     }
 

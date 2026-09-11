@@ -274,9 +274,16 @@ fn codex_install_resolved(binary_path: Result<String, String>) -> Result<(), Str
     let cwd = std::env::current_dir().unwrap_or_else(|_| home.clone());
     // Trust exactly the command the install above wrote, for the binary path it
     // validated — never merely "something ending in the deck's verb" (#730).
-    let expected = crate::codex_hooks_manage::expected_hook_command(&binary_path);
-    if let Err(e) = crate::codex_hooks_manage::trust_deck_hooks_in(&home, &cwd, &expected) {
-        tracing::warn!("codex hooks install: could not record scoped hook trust: {e}");
+    // The count is reported rather than discarded: a silent zero here is how a
+    // Codex that stopped echoing our command byte-for-byte would look, and
+    // `hooks install` used to exit 0 saying nothing about trust either way.
+    match crate::codex_hooks_manage::trust_deck_hooks_in(&home, &cwd, &binary_path) {
+        Ok(0) => println!(
+            "Trusted hooks: none (Codex reported no deck hook to trust; events fall back to \
+             stdout classification)"
+        ),
+        Ok(count) => println!("Trusted hooks: {count}"),
+        Err(e) => tracing::warn!("codex hooks install: could not record scoped hook trust: {e}"),
     }
     Ok(())
 }
