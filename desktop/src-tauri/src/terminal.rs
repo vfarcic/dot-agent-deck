@@ -6,7 +6,7 @@ use dot_agent_deck::daemon_protocol::{
     KIND_DETACH, KIND_GEOMETRY, KIND_STREAM_END, KIND_STREAM_IN, KIND_STREAM_OUT,
     KIND_STREAM_REJECT, parse_geometry_frame, read_frame, write_frame,
 };
-use dot_agent_deck::platform::ipc::IpcWriteHalf;
+use dot_agent_deck::platform::transport::TransportWriteHalf;
 use tauri::ipc::{Channel, Response};
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::Mutex as AsyncMutex;
@@ -22,7 +22,19 @@ struct TerminalSession {
     agent_id: String,
     channel_id: u32,
     generation: u64,
-    writer: Arc<AsyncMutex<IpcWriteHalf>>,
+    /// PRD #741 M3: a boxed transport half, not the IPC backend's concrete one.
+    ///
+    /// This is the site that decided the seam's shape. `TerminalSession` lives
+    /// in a `HashMap` inside `DesktopState`, a Tauri-managed singleton every
+    /// command reaches, so a type parameter here propagates to the registry, to
+    /// `DesktopState` and to every command signature — and still could not hold
+    /// a local and a remote session in the same map. The box costs one vtable
+    /// dispatch per `KIND_STREAM_IN` frame (one per keystroke batch), which is
+    /// invisible next to the syscall it precedes.
+    ///
+    /// Its `Drop` still half-closes, which is what tells the daemon this viewer
+    /// is gone when a tile closes without an explicit DETACH.
+    writer: Arc<AsyncMutex<TransportWriteHalf>>,
     /// PRD #882 — the viewer token this session's attach was given, sent back on
     /// every resize so the request updates THIS tile's constraint. Two tiles can
     /// show the same agent, so the token is what tells them apart — the process
@@ -446,7 +458,12 @@ mod tests {
     async fn registry_keeps_only_one_session_per_agent() {
         fn fixture_session(agent_id: &str, generation: u64) -> TerminalSession {
             let (stream, _peer) = tokio::net::UnixStream::pair().unwrap();
+            // PRD #741 M3: the native split then boxed, matching what
+            // `AttachConnection::into_split` hands production — a
+            // `tokio::io::split` half here would be a fixture whose teardown
+            // differs from the real one.
             let (_, writer) = stream.into_split();
+            let writer = TransportWriteHalf::new(writer);
             TerminalSession {
                 agent_id: agent_id.into(),
                 channel_id: generation as u32,

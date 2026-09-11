@@ -14,7 +14,7 @@ use dot_agent_deck::platform::ipc::IpcStream;
 
 use crate::dto::{
     BootstrapOptions, ConnectionStatus, DesktopConnection, DesktopSnapshot, disconnected_snapshot,
-    map_agent, safe_message, socket_path_text,
+    map_agent, safe_message, selected_endpoint, socket_path_text,
 };
 
 const DAEMON_POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -336,16 +336,39 @@ async fn hello(socket_path: &Path) -> Result<(HandshakeInfo, AttachResponse), St
 }
 
 pub(crate) async fn trusted_daemon() -> Result<TrustedDaemon, String> {
-    let socket_path = dot_agent_deck::config::attach_socket_path();
-    dot_agent_deck::platform::fsperm::verify_endpoint_trusted(&socket_path).map_err(|reason| {
-        safe_message(format!(
-            "refusing to connect to daemon endpoint {}: {reason}",
-            socket_path.to_string_lossy()
-        ))
-    })?;
+    let endpoint = selected_endpoint();
+    // PRD #741 M2: the trust check stays exactly where it was — out of band and
+    // BEFORE the first connect, on the inode itself. It is LOCAL-only, and that
+    // is a statement about what it can prove rather than an omission: uid +
+    // 0o600 on an inode says nothing about a daemon on another machine, whose
+    // trust rests on ssh host-key and user authentication instead (M5). Moving
+    // it inside connect would change the Unix semantics it exists for.
+    if let Some(local) = endpoint.as_local() {
+        dot_agent_deck::platform::fsperm::verify_endpoint_trusted(local.path()).map_err(
+            |reason| {
+                safe_message(format!(
+                    "refusing to connect to daemon endpoint {}: {reason}",
+                    local.path().to_string_lossy()
+                ))
+            },
+        )?;
+    }
+    let socket_path = endpoint
+        .connect_address()
+        .map_err(|error| safe_message(error.to_string()))?
+        .to_path_buf();
+    // PRD #741 M3: `hello()` still takes the raw address and still connects with
+    // an `IpcStream`, deliberately. Under DECISION 1A a remote deck is reached
+    // through a forwarded Unix socket, so the handshake needs no transport of
+    // its own — M5 supplies the address, not a different way of opening it.
     let (info, response) = hello(&socket_path).await?;
     let connection = connection_from_handshake(info);
-    let client = DaemonClient::new(socket_path);
+    // Built from the ENDPOINT rather than the address, so the client carries
+    // what a `stat` of that address is allowed to mean. For a local deck this is
+    // exactly `DaemonClient::new(socket_path)`; for a remote one it is the
+    // difference between "the daemon is gone" and "I cannot tell from here".
+    let client =
+        DaemonClient::for_endpoint(&endpoint).map_err(|error| safe_message(error.to_string()))?;
     // PRD #819 M5/M6: capture the advertised set from THIS reply. Every
     // `trusted_daemon()` builds a fresh client, so the capture is per call and
     // never outlives the connection it describes — which is the invalidation
@@ -454,11 +477,18 @@ pub(crate) async fn bootstrap(options: &BootstrapOptions) -> DesktopSnapshot {
         return current;
     }
 
-    let socket_path = dot_agent_deck::config::attach_socket_path();
+    // PRD #741 M2: lazy-spawn starts a daemon process on THIS machine, so it is
+    // reachable only from a local endpoint. A remote deck that is not answering
+    // is reported as such — starting a local daemon in its place is the exact
+    // silently-wrong outcome the endpoint split exists to prevent.
+    let endpoint = selected_endpoint();
+    let Some(local) = endpoint.as_local() else {
+        return current;
+    };
     let state_dir = dot_agent_deck::config::state_dir();
     let state_dir_for_spawn = state_dir.clone();
     let start_result = ensure_daemon_running(
-        &socket_path,
+        local,
         &state_dir,
         move || {
             let executable = resolve_daemon_executable()

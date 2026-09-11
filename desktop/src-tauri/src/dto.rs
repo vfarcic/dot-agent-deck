@@ -8,6 +8,7 @@ use dot_agent_deck::agent_pty::{
     is_valid_orchestration_cwd, is_valid_pane_id_env,
 };
 use dot_agent_deck::agent_registry;
+use dot_agent_deck::daemon_client::Endpoint;
 use dot_agent_deck::daemon_protocol::PROTOCOL_VERSION;
 use dot_agent_deck::event::{
     AgentType, ProjectListing, ProjectOrchestration, ResolvedProject, SendResult, Writable,
@@ -733,12 +734,22 @@ pub(crate) fn safe_message(message: impl AsRef<str>) -> String {
         .collect()
 }
 
+/// The deck this app is talking to (PRD #741 M2).
+///
+/// Always the local one today: M6 brings the stored endpoint list and M7 the
+/// panel that selects among them. It is a function rather than a constant so
+/// that the selection has exactly one source, and so the call sites that must
+/// refuse a remote deck — the Stop and Replace actions — are already written
+/// against an [`Endpoint`] rather than against a path.
+pub(crate) fn selected_endpoint() -> Endpoint {
+    Endpoint::local()
+}
+
+/// How the selected deck is named in the connection banner. For a local deck
+/// that is its socket path, which is exactly what this reported before the
+/// endpoint type existed.
 pub(crate) fn socket_path_text() -> String {
-    safe_message(
-        dot_agent_deck::config::attach_socket_path()
-            .to_string_lossy()
-            .as_ref(),
-    )
+    safe_message(selected_endpoint().describe())
 }
 
 pub(crate) fn disconnected_snapshot(error: impl AsRef<str>) -> DesktopSnapshot {

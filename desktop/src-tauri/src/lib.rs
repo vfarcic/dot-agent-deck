@@ -10,7 +10,6 @@ use std::time::Duration;
 use dot_agent_deck::agent_pty::{
     DOT_AGENT_DECK_PANE_ID, TabMembership, is_valid_display_name, mint_orchestration_id,
 };
-use dot_agent_deck::config::attach_socket_path;
 use dot_agent_deck::daemon_client::{DaemonClient, EventSubscription, StartAgentOptions};
 use dot_agent_deck::daemon_stop::{StopOutcome, run_daemon_stop};
 use dot_agent_deck::event::{
@@ -36,7 +35,7 @@ use crate::dto::{
     BootstrapOptions, COMMAND_MAX_BYTES, ConnectionStatus, DesktopAction, DesktopActionResult,
     DesktopProjectListing, DesktopResolvedProject, DesktopSnapshot, TerminalAttachResult,
     WorkflowRoleInput, ensure_desktop_workflow_platform_supported, map_project_listing,
-    map_resolved_project, mint_desktop_pane_id, safe_message, validate_agent_id,
+    map_resolved_project, mint_desktop_pane_id, safe_message, selected_endpoint, validate_agent_id,
     validate_pasted_project_path, validate_start_fields, validate_workflow_shape,
 };
 use crate::settings::DesktopSettings;
@@ -1173,7 +1172,16 @@ async fn desktop_run_action(
             result_agent_id = Some(agent_id);
         }
         DesktopAction::StopDaemon { force } => {
-            let outcome = run_daemon_stop(&attach_socket_path(), force)
+            // PRD #741 M2: `run_daemon_stop` takes a `LocalEndpoint`, so this
+            // cannot reach a remote deck even by accident — `require_local`
+            // is the only way to produce one and it refuses, naming the deck
+            // and the reason. (M7 renders this as a disabled button carrying
+            // the same explanation rather than a failed action.)
+            let endpoint = selected_endpoint();
+            let local = endpoint
+                .require_local("Stop daemon")
+                .map_err(|error| safe_message(error.to_string()))?;
+            let outcome = run_daemon_stop(local, force)
                 .await
                 .map_err(|error| safe_message(error.to_string()))?;
             terminal::detach_all(&state).await;
@@ -1184,7 +1192,15 @@ async fn desktop_run_action(
             });
         }
         DesktopAction::RestartDaemon => {
-            run_daemon_stop(&attach_socket_path(), false)
+            // Replace daemon is Stop plus a lazy-spawn of the desktop's own
+            // bundled build. Both halves are local acts, and on a remote deck
+            // the pair would be worse than either: terminate the ssh tunnel,
+            // then start a LOCAL daemon and report success. Refused by type.
+            let endpoint = selected_endpoint();
+            let local = endpoint
+                .require_local("Replace daemon")
+                .map_err(|error| safe_message(error.to_string()))?;
+            run_daemon_stop(local, false)
                 .await
                 .map_err(|error| safe_message(error.to_string()))?;
             terminal::detach_all(&state).await;

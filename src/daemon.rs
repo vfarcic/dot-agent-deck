@@ -513,7 +513,15 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
     // block. Nothing is lost — the singleton guard there is
     // `first_pipe_instance(true)` inside `IpcListener::bind`, which reports
     // `AddrInUse` for exactly the case this branch exists to catch.
-    if crate::platform::ipc::stale_endpoint_artifact(socket_path) {
+    //
+    // PRD #741 M3: the presence is named rather than derived from the platform.
+    // A daemon binds the endpoint it serves on, so it is always the LOCAL one —
+    // there is no arm of this function that could be handed a remote deck's
+    // address, and naming the constant says so at the call site.
+    if crate::platform::ipc::stale_endpoint_artifact(
+        crate::platform::ipc::LOCAL_ENDPOINT_PRESENCE,
+        socket_path,
+    ) {
         if probe_socket_alive(socket_path).await {
             return Err(DaemonError::Io(io::Error::new(
                 io::ErrorKind::AddrInUse,

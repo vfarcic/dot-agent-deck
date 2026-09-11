@@ -39,32 +39,145 @@
 //! Unix, a `\\.\pipe\dot-agent-deck-{user}-{hook|attach}` name on Windows);
 //! callers pass the resolved [`std::path::Path`] in and this layer consumes it
 //! opaquely.
+//!
+//! PRD #741 M3 adds two things on top, both about a daemon that is **not** on
+//! this machine. [`IpcStream`] implements
+//! [`AttachTransport`](crate::platform::transport::AttachTransport), so the
+//! client's connection types name a boxed transport rather than this backend;
+//! and [`EndpointPresence`] replaces the old `ENDPOINT_IS_FILESYSTEM_PATH`
+//! boolean with a three-valued answer, because "there is a path and it is not
+//! the daemon's" is a case neither of the two booleans described.
 
 #[cfg(unix)]
 mod unix;
 #[cfg(windows)]
 mod windows;
 
+use crate::platform::transport::{AttachTransport, TransportReadHalf, TransportWriteHalf};
+
 #[cfg(unix)]
 pub use unix::{IpcClient, IpcListener, IpcReadHalf, IpcStream, IpcWriteHalf};
 #[cfg(windows)]
 pub use windows::{IpcClient, IpcListener, IpcReadHalf, IpcStream, IpcWriteHalf};
 
-/// Whether an endpoint's *presence* can be observed on the filesystem.
+/// PRD #741 M3: the attach protocol runs over an [`IpcStream`] on both
+/// backends, and each backend's `into_split` is what carries the drop semantics
+/// the seam depends on — Unix's native `SHUT_WR`-on-drop half, Windows' pair
+/// that closes the pipe when both drop. Neither is [`tokio::io::split`] over the
+/// stream, which is the regression `HalfCloseOnDrop` exists to keep out.
+impl AttachTransport for IpcStream {
+    fn split_transport(self) -> (TransportReadHalf, TransportWriteHalf) {
+        let (rd, wr) = self.into_split();
+        (TransportReadHalf::new(rd), TransportWriteHalf::new(wr))
+    }
+}
+
+/// What an endpoint's address can be asked about on **this** filesystem.
 ///
-/// `true` on Unix: the endpoint is a socket file, so `Path::exists()` is a
-/// meaningful (if not authoritative) liveness hint — the daemon does not unlink
-/// its socket on exit, but a missing file definitely means no daemon.
+/// This used to be a `bool` (`ENDPOINT_IS_FILESYSTEM_PATH`) keyed off the
+/// platform, and a `bool` was right while every daemon was a process on this
+/// machine. PRD #741 adds a third case that neither value describes, so the
+/// answer became three-valued rather than acquiring a caller-side special case
+/// per predicate.
 ///
-/// `false` on Windows: a `\\.\pipe\…` name has no filesystem presence at all
-/// (`GetFileAttributesW` answers `ERROR_BAD_PATHNAME`), so `exists()` is
-/// permanently `false` whether or not a daemon is serving. Any code that treats
-/// "path missing" as "daemon gone" must therefore consult this first and fall
-/// back to an actual connect attempt — see
-/// [`crate::build_version_handshake`]'s `poll_daemon_gone`, where an
-/// unconditional `exists()` check would declare *every* live Windows daemon gone
-/// on the first poll (PRD #163: "`poll_daemon_gone` path-existence check").
-pub const ENDPOINT_IS_FILESYSTEM_PATH: bool = cfg!(unix);
+/// The three are genuinely different questions, which is why the callers cannot
+/// share one: [`Self::LocalInode`] means a `stat` tells you something about the
+/// daemon; [`Self::NoFilesystemName`] means there is nothing to `stat`;
+/// [`Self::Elsewhere`] means there may well be something to `stat` and it is
+/// **not the daemon's** — which is the case a `bool` could not express and the
+/// one that is silently wrong if you guess.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EndpointPresence {
+    /// The address is an inode on this filesystem, and that inode belongs to the
+    /// daemon we are talking to. Unix, local daemon.
+    ///
+    /// `Path::exists()` is a meaningful (if not authoritative) liveness hint —
+    /// the daemon does not unlink its socket on exit, but a missing file
+    /// definitely means no daemon — and the stale-inode dance applies: a
+    /// leftover here is ours to probe and unlink.
+    LocalInode,
+    /// The address is a name with no filesystem presence at all — a Windows
+    /// `\\.\pipe\…`, where `GetFileAttributesW` answers `ERROR_BAD_PATHNAME`
+    /// so `exists()` is permanently `false` whether or not a daemon is serving.
+    ///
+    /// Any code that treats "path missing" as "daemon gone" must consult this
+    /// and fall back to a connect attempt — see
+    /// [`crate::build_version_handshake`]'s `poll_daemon_gone`, where an
+    /// unconditional `exists()` would declare *every* live Windows daemon gone
+    /// on the first poll (PRD #163: "`poll_daemon_gone` path-existence check").
+    NoFilesystemName,
+    /// The daemon is on another machine (PRD #741 M5).
+    ///
+    /// **Not the same as "no path".** Under DECISION 1A the connect address is a
+    /// forwarded socket on *this* filesystem, so `exists()` answers — it just
+    /// answers about the tunnel. Reading it as the daemon's health reports a
+    /// live deck for a dead one, and unlinking it deletes the transport's own
+    /// endpoint. Both are silently wrong rather than loud, which is why this
+    /// variant exists before the transport that produces it does.
+    Elsewhere,
+}
+
+impl EndpointPresence {
+    /// Is the address an inode that belongs to the daemon — so that its
+    /// presence is a liveness hint and its leftover is ours to clear?
+    ///
+    /// `true` for [`Self::LocalInode`] only. The two other answers are `false`
+    /// for different reasons (nothing to observe; observable but not the
+    /// daemon's), which is exactly why callers ask this rather than matching on
+    /// `!= NoFilesystemName`.
+    pub fn is_daemon_owned_inode(self) -> bool {
+        matches!(self, Self::LocalInode)
+    }
+
+    /// What a `stat` of `address` says about whether the daemon is reachable.
+    ///
+    /// Never authoritative in the affirmative — a present inode may be a crash
+    /// leftover — and for two of the three variants it says nothing at all. See
+    /// [`EndpointAvailability`].
+    pub fn availability(self, address: &std::path::Path) -> EndpointAvailability {
+        match self {
+            Self::LocalInode => {
+                if address.exists() {
+                    EndpointAvailability::Present
+                } else {
+                    EndpointAvailability::Absent
+                }
+            }
+            Self::NoFilesystemName | Self::Elsewhere => EndpointAvailability::Unanswerable,
+        }
+    }
+}
+
+/// The third answer [`EndpointPresence::availability`] needs, so "I cannot tell
+/// from here" stops being spelled as "absent".
+///
+/// Spelling it as absent is what made [`crate::daemon_client::DaemonClient`]'s
+/// `ensure_socket_exists` report a missing daemon for every live Windows one;
+/// it never bit because that method has no production caller, and PRD #741 M5
+/// would have given it a second way to be wrong.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EndpointAvailability {
+    /// An inode is there. The daemon may still be dead — only a connect decides.
+    Present,
+    /// The inode is definitely not there, so there is definitely no daemon.
+    Absent,
+    /// Nothing local can answer; connect and find out.
+    Unanswerable,
+}
+
+/// This platform's presence answer **for a local endpoint** — the replacement
+/// for the old `ENDPOINT_IS_FILESYSTEM_PATH` boolean.
+///
+/// A daemon's *own* endpoint is always local: a daemon binds on the machine it
+/// runs on. So bind-side callers name this constant directly, while client-side
+/// callers ask the endpoint they hold
+/// ([`crate::daemon_client::Endpoint::presence`]), which is the only thing that
+/// can return [`EndpointPresence::Elsewhere`].
+pub const LOCAL_ENDPOINT_PRESENCE: EndpointPresence = if cfg!(unix) {
+    EndpointPresence::LocalInode
+} else {
+    EndpointPresence::NoFilesystemName
+};
 
 /// Is there a **filesystem artifact** at `endpoint` that a bind would collide
 /// with — i.e. is the Unix stale-inode dance applicable at all? (PRD #163 M4,
@@ -83,10 +196,20 @@ pub const ENDPOINT_IS_FILESYSTEM_PATH: bool = cfg!(unix);
 /// never fires), and if it somehow did, `remove_file` on a pipe name would error
 /// rather than clear anything.
 ///
-/// A compile-time platform split, so the Unix code path is bit-identical to
+/// **A remote deck: always `false`, and this is the third answer PRD #741 M3
+/// added** ([`EndpointPresence::Elsewhere`]). It is not the Windows answer
+/// arrived at twice — there an inode genuinely cannot exist, whereas under
+/// DECISION 1A a remote deck's connect address *is* a local socket, so
+/// `exists()` would answer `true` and the old boolean would have unlinked the
+/// ssh tunnel's own endpoint. The predicate now takes the presence rather than
+/// deriving it from the platform, so a caller has to say which kind of endpoint
+/// it is holding; both bind-side callers hold a daemon's own endpoint, which is
+/// local by construction, and name [`LOCAL_ENDPOINT_PRESENCE`].
+///
+/// With [`LOCAL_ENDPOINT_PRESENCE`] the Unix code path is bit-identical to
 /// before.
-pub fn stale_endpoint_artifact(endpoint: &std::path::Path) -> bool {
-    ENDPOINT_IS_FILESYSTEM_PATH && endpoint.exists()
+pub fn stale_endpoint_artifact(presence: EndpointPresence, endpoint: &std::path::Path) -> bool {
+    presence.is_daemon_owned_inode() && endpoint.exists()
 }
 
 /// Remove a stale endpoint artifact before binding, where the platform has one.
@@ -94,8 +217,11 @@ pub fn stale_endpoint_artifact(endpoint: &std::path::Path) -> bool {
 /// [`stale_endpoint_artifact`]; used by
 /// [`crate::daemon_protocol::bind_attach_listener`], whose singleton protection
 /// comes from the caller's spawn lock rather than a probe.
-pub fn remove_stale_endpoint(endpoint: &std::path::Path) -> std::io::Result<()> {
-    if stale_endpoint_artifact(endpoint) {
+pub fn remove_stale_endpoint(
+    presence: EndpointPresence,
+    endpoint: &std::path::Path,
+) -> std::io::Result<()> {
+    if stale_endpoint_artifact(presence, endpoint) {
         return std::fs::remove_file(endpoint);
     }
     Ok(())
@@ -329,13 +455,84 @@ mod tests {
         let real_file = dir.path().join("dot-agent-deck.sock");
         std::fs::write(&real_file, b"").expect("create the stand-in endpoint file");
 
-        assert_eq!(stale_endpoint_artifact(&real_file), cfg!(unix));
-        assert!(!stale_endpoint_artifact(&dir.path().join("absent.sock")));
+        assert_eq!(
+            stale_endpoint_artifact(LOCAL_ENDPOINT_PRESENCE, &real_file),
+            cfg!(unix)
+        );
+        assert!(!stale_endpoint_artifact(
+            LOCAL_ENDPOINT_PRESENCE,
+            &dir.path().join("absent.sock")
+        ));
         // A pipe name is never an artifact — including on Unix, where it is just
         // an odd relative path that does not exist.
-        assert!(!stale_endpoint_artifact(std::path::Path::new(
-            r"\\.\pipe\dot-agent-deck-S-1-5-21-1-2-3-4-hook"
-        )));
+        assert!(!stale_endpoint_artifact(
+            LOCAL_ENDPOINT_PRESENCE,
+            std::path::Path::new(r"\\.\pipe\dot-agent-deck-S-1-5-21-1-2-3-4-hook")
+        ));
+    }
+
+    /// PRD #741 M3's third answer, and the one a boolean could not give: a
+    /// remote deck's connect address is a **real local inode** under DECISION
+    /// 1A's `ssh -L` — the forwarded socket — so `exists()` answers `true` for
+    /// it. The old `ENDPOINT_IS_FILESYSTEM_PATH && exists()` would therefore
+    /// have called it a stale artifact and unlinked the tunnel's own endpoint.
+    ///
+    /// Runs on both platforms: the file is a stand-in for the forwarded socket
+    /// everywhere, and the answer must be `false` for a reason that has nothing
+    /// to do with which platform is asking.
+    #[test]
+    fn a_remote_deck_never_has_a_stale_artifact_even_when_a_file_is_there() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let forwarded = dir.path().join("forwarded.sock");
+        std::fs::write(&forwarded, b"").expect("stand in for the forwarded socket");
+
+        assert!(
+            forwarded.exists(),
+            "the premise: a remote deck's connect address IS a local path"
+        );
+        assert!(
+            !stale_endpoint_artifact(EndpointPresence::Elsewhere, &forwarded),
+            "a remote deck's address must never be read as a stale daemon inode"
+        );
+        remove_stale_endpoint(EndpointPresence::Elsewhere, &forwarded)
+            .expect("a remote deck's address is never an error to leave alone");
+        assert!(
+            forwarded.exists(),
+            "and it must never be unlinked — that would delete the ssh tunnel's endpoint"
+        );
+    }
+
+    /// The three presences answer availability three different ways, and the
+    /// middle one is the whole point: `Unanswerable` is not `Absent`.
+    #[test]
+    fn availability_separates_absent_from_unanswerable() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let present = dir.path().join("there.sock");
+        std::fs::write(&present, b"").expect("create the stand-in endpoint file");
+        let absent = dir.path().join("not-there.sock");
+
+        assert_eq!(
+            EndpointPresence::LocalInode.availability(&present),
+            EndpointAvailability::Present
+        );
+        assert_eq!(
+            EndpointPresence::LocalInode.availability(&absent),
+            EndpointAvailability::Absent
+        );
+        // A pipe name: nothing to stat, so nothing is claimed either way.
+        assert_eq!(
+            EndpointPresence::NoFilesystemName.availability(&absent),
+            EndpointAvailability::Unanswerable
+        );
+        // A remote deck: something to stat, and it says nothing about the daemon.
+        assert_eq!(
+            EndpointPresence::Elsewhere.availability(&present),
+            EndpointAvailability::Unanswerable
+        );
+        assert_eq!(
+            EndpointPresence::Elsewhere.availability(&absent),
+            EndpointAvailability::Unanswerable
+        );
     }
 
     /// Removal is a no-op wherever there is no artifact, and never an error — the
@@ -347,13 +544,16 @@ mod tests {
         let real_file = dir.path().join("dot-agent-deck.sock");
         std::fs::write(&real_file, b"").expect("create the stand-in endpoint file");
 
-        remove_stale_endpoint(&real_file).expect("clearing an artifact must succeed");
+        remove_stale_endpoint(LOCAL_ENDPOINT_PRESENCE, &real_file)
+            .expect("clearing an artifact must succeed");
         assert_eq!(real_file.exists(), !cfg!(unix));
 
-        remove_stale_endpoint(&dir.path().join("absent.sock")).expect("absent is not an error");
-        remove_stale_endpoint(std::path::Path::new(
-            r"\\.\pipe\dot-agent-deck-S-1-5-21-1-2-3-4-hook",
-        ))
+        remove_stale_endpoint(LOCAL_ENDPOINT_PRESENCE, &dir.path().join("absent.sock"))
+            .expect("absent is not an error");
+        remove_stale_endpoint(
+            LOCAL_ENDPOINT_PRESENCE,
+            std::path::Path::new(r"\\.\pipe\dot-agent-deck-S-1-5-21-1-2-3-4-hook"),
+        )
         .expect("a pipe name must never be unlinked");
     }
 }

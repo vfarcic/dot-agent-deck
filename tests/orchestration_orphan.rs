@@ -46,7 +46,7 @@ use std::time::Duration;
 
 use chrono::Utc;
 use dot_agent_deck::agent_pty::{AgentPtyRegistry, DOT_AGENT_DECK_PANE_ID, SpawnOptions};
-use dot_agent_deck::daemon_client::issue_command;
+use dot_agent_deck::daemon_client::{LocalEndpoint, issue_command};
 use dot_agent_deck::daemon_protocol::{
     AttachRequest, bind_attach_listener, serve_attach_with_counter,
 };
@@ -408,7 +408,7 @@ async fn orphan_003_inner() {
     // socket is the test process itself. If the guard goes away, this test does
     // not merely fail its assertion — it gets SIGTERMed. That is a loud red,
     // not a flake.
-    let err = run_daemon_stop(&server.path, false)
+    let err = run_daemon_stop(&LocalEndpoint::at(server.path.clone()), false)
         .await
         .expect_err("a daemon holding live orchestration roles must refuse to stop");
     let StopError::LiveOrchestrations { roles } = err else {

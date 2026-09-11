@@ -11,7 +11,7 @@ use dot_agent_deck::build_version_handshake;
 use dot_agent_deck::config::{DashboardConfig, attach_socket_path, socket_path};
 use dot_agent_deck::daemon::{Daemon, run_daemon_with};
 use dot_agent_deck::daemon_attach::ensure_external_daemon_or_die;
-use dot_agent_deck::daemon_client::DaemonClient;
+use dot_agent_deck::daemon_client::{DaemonClient, LocalEndpoint};
 use dot_agent_deck::embedded_pane::EmbeddedPaneController;
 use dot_agent_deck::hook::handle_hook;
 use dot_agent_deck::pane::PaneController;
@@ -1542,14 +1542,18 @@ async fn run_tui_session() -> ExitCode {
     dot_agent_deck::features::init_and_watch(&launch_project_dir());
 
     let state = Arc::new(RwLock::new(AppState::default()));
-    let attach_path = attach_socket_path();
+    // PRD #741 M2: the TUI always talks to the daemon on this machine, so it
+    // names it as one. `attach_path` stays the same value it always was — the
+    // endpoint's address — for the messages and the subscriber below.
+    let endpoint = LocalEndpoint::from_config();
+    let attach_path = endpoint.path().to_path_buf();
 
     // If the attach socket is missing, `ensure_external_daemon_or_die`
     // fork-execs `dot-agent-deck daemon serve` detached under
     // flock-serialized contention (so two simultaneous TUIs can't both
     // win the bind — M1.3) and trust-checks any existing socket
     // (uid + 0o600 + is-socket) before the TUI's DaemonClient touches it.
-    if let Err(e) = ensure_external_daemon_or_die(&attach_path).await {
+    if let Err(e) = ensure_external_daemon_or_die(&endpoint).await {
         eprintln!(
             "failed to connect to daemon at {}: {e}",
             attach_path.display()
@@ -1578,7 +1582,7 @@ async fn run_tui_session() -> ExitCode {
     // Errors are already user-visible inside the helper, so we render no
     // further message here.
     let handshake_outcome =
-        match build_version_handshake::ensure_compatible_daemon_or_die(&attach_path).await {
+        match build_version_handshake::ensure_compatible_daemon_or_die(&endpoint).await {
             Ok(outcome) => outcome,
             Err(build_version_handshake::HandshakeError::MismatchAborted) => {
                 return ExitCode::FAILURE;
@@ -1598,7 +1602,7 @@ async fn run_tui_session() -> ExitCode {
     if matches!(
         handshake_outcome,
         build_version_handshake::HandshakeOutcome::Recovered
-    ) && let Err(e) = ensure_external_daemon_or_die(&attach_path).await
+    ) && let Err(e) = ensure_external_daemon_or_die(&endpoint).await
     {
         eprintln!(
             "failed to re-spawn daemon at {} after version-mismatch recovery: {e}",
@@ -2020,8 +2024,8 @@ async fn run_daemon_status_cli(json: bool) -> ExitCode {
 /// only translates outcomes into stdout/stderr text and exit codes.
 #[tokio::main]
 async fn run_daemon_stop_cli(force: bool) -> ExitCode {
-    let attach_path = attach_socket_path();
-    match dot_agent_deck::daemon_stop::run_daemon_stop(&attach_path, force).await {
+    let endpoint = LocalEndpoint::from_config();
+    match dot_agent_deck::daemon_stop::run_daemon_stop(&endpoint, force).await {
         Ok(dot_agent_deck::daemon_stop::StopOutcome::NoDaemonRunning) => {
             println!("no daemon running");
             ExitCode::SUCCESS
@@ -2061,8 +2065,8 @@ async fn run_daemon_stop_cli(force: bool) -> ExitCode {
 /// `daemon stop`.
 #[tokio::main]
 async fn run_daemon_restart_cli(force: bool) -> ExitCode {
-    let attach_path = attach_socket_path();
-    match dot_agent_deck::daemon_stop::run_daemon_restart(&attach_path, force).await {
+    let endpoint = LocalEndpoint::from_config();
+    match dot_agent_deck::daemon_stop::run_daemon_restart(&endpoint, force).await {
         Ok(dot_agent_deck::daemon_stop::StopOutcome::NoDaemonRunning) => {
             println!("no daemon running; next invocation will spawn one");
             ExitCode::SUCCESS
