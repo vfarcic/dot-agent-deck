@@ -2129,6 +2129,66 @@ mod tests {
         drop(rd);
     }
 
+    /// PRD #741 M4(a): **a request connection answers exactly one request and
+    /// is then closed by the daemon.** Pinned here because three later pieces of
+    /// work rest on it and none of them can see it from where they sit.
+    ///
+    /// `handle_connection` reads one frame at the top, dispatches it, writes the
+    /// reply and returns — so the socket closes with the function. That makes
+    /// "hold a request connection open and reuse it" unreachable from the
+    /// client at any cost: the desktop's M4(a) link therefore holds the
+    /// *handshake* rather than a socket, #745's connection model is sized
+    /// against one connection per request rather than one per session, and any
+    /// future multiplexing has to begin with a daemon-side request loop.
+    ///
+    /// The assertion is deliberately on the SECOND request rather than on the
+    /// first reply: a daemon that looped would answer both, and nothing else
+    /// about the exchange would look different. Both failure shapes are
+    /// accepted — the write can fail with `EPIPE` if the close has already
+    /// landed, or succeed into a socket buffer and the read then hit EOF — since
+    /// which one occurs is a timing detail of the peer's close, not a property
+    /// of the protocol. What is asserted is that no second **reply** ever
+    /// arrives, and the control below proves the server is still healthy so the
+    /// failure is the connection's and not the daemon's.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_request_connection_answers_once_and_is_then_closed() {
+        let (_dir, path, _registry) = spawn_test_server().await;
+        let client = DaemonClient::new(path.clone());
+
+        let (mut rd, mut wr) = client.connect().await.expect("connect");
+        let first = issue_command(&mut rd, &mut wr, &AttachRequest::ListAgents)
+            .await
+            .expect("the first request on a fresh connection is answered");
+        assert!(first.ok);
+
+        // The property. Same halves, same socket.
+        let second = async {
+            send_request(&mut wr, &AttachRequest::ListAgents).await?;
+            read_response(&mut rd).await
+        }
+        .await;
+        let Err(error) = second else {
+            panic!(
+                "a second request on an already-answered connection must NOT be \
+                 served — if this starts passing, the daemon has learned to loop \
+                 and PRD #741 M4(a)'s whole shape is revisitable"
+            );
+        };
+        assert!(
+            matches!(error, ClientError::Io(_) | ClientError::Malformed(_)),
+            "the failure must be the connection going away, not a server-level \
+             refusal: {error}"
+        );
+
+        // The control: the daemon is fine, it is the connection that is spent.
+        let fresh = DaemonClient::new(path);
+        fresh
+            .list_agents()
+            .await
+            .expect("a fresh connection is still served");
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn start_list_stop_round_trip() {

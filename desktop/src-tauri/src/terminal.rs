@@ -11,7 +11,7 @@ use tauri::ipc::{Channel, Response};
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::Mutex as AsyncMutex;
 
-use crate::daemon_bridge::trusted_daemon;
+use crate::daemon_bridge::{DaemonLinks, trusted_daemon};
 use crate::dto::{
     TerminalAttachResult, TerminalState, TerminalStateEvent, safe_message, validate_agent_id,
     validate_dimensions, validate_terminal_input,
@@ -47,6 +47,17 @@ pub(crate) struct DesktopState {
     attach_gate: AsyncMutex<()>,
     next_generation: AtomicU64,
     pub(crate) watcher_started: AtomicBool,
+    /// PRD #741 M4(a): the established daemon links, keyed by endpoint.
+    ///
+    /// This is the field the milestone is about. Before it, nothing in this
+    /// process owned a daemon connection of any kind — every `trusted_daemon()`
+    /// took a fresh handshake and dropped it, so a `get_snapshot()` cost two
+    /// connections and the watcher paid that up to 6.667 times a second.
+    ///
+    /// An [`Arc`] rather than a plain field because the snapshot watcher is a
+    /// `'static` spawned task that outlives any borrow of this state; it holds
+    /// its own handle and invalidates through it when its event stream ends.
+    pub(crate) daemon: Arc<DaemonLinks>,
 }
 
 impl Default for DesktopState {
@@ -56,6 +67,7 @@ impl Default for DesktopState {
             attach_gate: AsyncMutex::new(()),
             next_generation: AtomicU64::new(1),
             watcher_started: AtomicBool::new(false),
+            daemon: Arc::new(DaemonLinks::default()),
         }
     }
 }
@@ -148,7 +160,7 @@ pub(crate) async fn attach(
         });
     }
     detach_agent(state, &agent_id).await;
-    let daemon = trusted_daemon().await?;
+    let daemon = trusted_daemon(&state.daemon).await?;
     daemon.require_compatible()?;
     // PRD #882: a half-measured tile (one axis zero) declares nothing rather
     // than a geometry it does not mean — under a smallest-wins policy a bogus
@@ -372,7 +384,7 @@ pub(crate) async fn resize(
         .get(session_id)
         .map(|session| (session.agent_id.clone(), session.viewer.clone()))
         .ok_or_else(|| format!("terminal session not found: {}", safe_message(session_id)))?;
-    let daemon = trusted_daemon().await?;
+    let daemon = trusted_daemon(&state.daemon).await?;
     daemon.require_compatible()?;
     // PRD #882: name this tile's viewer so the request updates its constraint
     // rather than overriding every other client's. The daemon answers with what

@@ -5,6 +5,7 @@ mod settings;
 mod terminal;
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::time::Duration;
 
 use dot_agent_deck::agent_pty::{
@@ -29,7 +30,7 @@ use tauri::ipc::{Channel, Response};
 use tauri::{AppHandle, Emitter, Manager, State, Webview};
 
 use crate::daemon_bridge::{
-    allow_build_mismatch_this_session, bootstrap, get_snapshot, trusted_daemon,
+    DaemonLinks, allow_build_mismatch_this_session, bootstrap, get_snapshot, trusted_daemon,
 };
 use crate::dto::{
     BootstrapOptions, COMMAND_MAX_BYTES, ConnectionStatus, DesktopAction, DesktopActionResult,
@@ -748,8 +749,8 @@ fn ensure_explicit_start_connected(
         .unwrap_or_else(|| "the local daemon did not become connected".into()))
 }
 
-async fn refresh_and_emit(app: &AppHandle) -> DesktopSnapshot {
-    let snapshot = get_snapshot().await;
+async fn refresh_and_emit(app: &AppHandle, links: &DaemonLinks) -> DesktopSnapshot {
+    let snapshot = get_snapshot(links).await;
     emit_snapshot(app, &snapshot);
     snapshot
 }
@@ -759,12 +760,19 @@ fn ensure_snapshot_watcher(app: &AppHandle, state: &DesktopState) {
         return;
     }
     let app = app.clone();
+    // PRD #741 M4(a): the watcher holds its own handle on the link store. It is
+    // the loop this milestone exists for — it is the thing that was paying two
+    // connections per refresh at up to 6.667 refreshes a second — and it is
+    // also the only place that can observe a daemon being replaced, because its
+    // event subscription is the one connection the desktop holds open across
+    // refreshes. Hence the `invalidate_all` below.
+    let links = Arc::clone(&state.daemon);
     tauri::async_runtime::spawn(async move {
         loop {
-            let daemon = match trusted_daemon().await {
+            let daemon = match trusted_daemon(&links).await {
                 Ok(daemon) if daemon.require_compatible().is_ok() => daemon,
                 _ => {
-                    let snapshot = get_snapshot().await;
+                    let snapshot = get_snapshot(&links).await;
                     emit_snapshot(&app, &snapshot);
                     tokio::time::sleep(WATCH_RETRY_DELAY).await;
                     continue;
@@ -773,7 +781,10 @@ fn ensure_snapshot_watcher(app: &AppHandle, state: &DesktopState) {
             let mut subscription = match daemon.client.subscribe_events().await {
                 Ok(subscription) => subscription,
                 Err(_) => {
-                    let snapshot = get_snapshot().await;
+                    // Could not even subscribe against a link that just said it
+                    // was compatible: drop it rather than retry through it.
+                    links.invalidate_all().await;
+                    let snapshot = get_snapshot(&links).await;
                     emit_snapshot(&app, &snapshot);
                     tokio::time::sleep(WATCH_RETRY_DELAY).await;
                     continue;
@@ -788,19 +799,31 @@ fn ensure_snapshot_watcher(app: &AppHandle, state: &DesktopState) {
                         tokio::time::sleep(SNAPSHOT_COALESCE_INTERVAL - elapsed).await;
                     }
                 }
-                let snapshot = get_snapshot().await;
+                let snapshot = get_snapshot(&links).await;
                 emit_snapshot(&app, &snapshot);
                 last_refresh = Some(tokio::time::Instant::now());
             }
+            // PRD #741 M4(a): the event stream ended. That is the desktop's
+            // ONE long-lived connection to the daemon going away, and a daemon
+            // cannot be replaced without the old process dying and taking this
+            // socket with it — so this is the signal that the held handshake may
+            // now describe a process that no longer exists. Drop every link
+            // before reconnecting; the loop's next `trusted_daemon` handshakes
+            // against whatever is actually there now.
+            links.invalidate_all().await;
             tokio::time::sleep(WATCH_RETRY_DELAY).await;
         }
     });
 }
 
 #[tauri::command]
-async fn desktop_get_snapshot(app: AppHandle, webview: Webview) -> Result<DesktopSnapshot, String> {
+async fn desktop_get_snapshot(
+    app: AppHandle,
+    webview: Webview,
+    state: State<'_, DesktopState>,
+) -> Result<DesktopSnapshot, String> {
     ensure_main_webview(&webview)?;
-    Ok(refresh_and_emit(&app).await)
+    Ok(refresh_and_emit(&app, &state.daemon).await)
 }
 
 /// PRD #819 M6: the projects THIS DAEMON knows about.
@@ -811,9 +834,12 @@ async fn desktop_get_snapshot(app: AppHandle, webview: Webview) -> Result<Deskto
 /// its startup cwd is not a project" — and the webview renders its
 /// paste-a-path surface for it rather than an error.
 #[tauri::command]
-async fn desktop_list_projects(webview: Webview) -> Result<DesktopProjectListing, String> {
+async fn desktop_list_projects(
+    webview: Webview,
+    state: State<'_, DesktopState>,
+) -> Result<DesktopProjectListing, String> {
     ensure_main_webview(&webview)?;
-    let daemon = trusted_daemon().await?;
+    let daemon = trusted_daemon(&state.daemon).await?;
     daemon.require_compatible()?;
     let listing = daemon
         .client
@@ -834,11 +860,12 @@ async fn desktop_list_projects(webview: Webview) -> Result<DesktopProjectListing
 #[tauri::command]
 async fn desktop_resolve_project(
     webview: Webview,
+    state: State<'_, DesktopState>,
     path: String,
 ) -> Result<DesktopResolvedProject, String> {
     ensure_main_webview(&webview)?;
     validate_pasted_project_path(&path)?;
-    let daemon = trusted_daemon().await?;
+    let daemon = trusted_daemon(&state.daemon).await?;
     daemon.require_compatible()?;
     let project = daemon
         .client
@@ -857,7 +884,7 @@ async fn desktop_bootstrap(
 ) -> Result<DesktopSnapshot, String> {
     ensure_main_webview(&webview)?;
     let options = options.unwrap_or_default();
-    let snapshot = bootstrap(&options).await;
+    let snapshot = bootstrap(&options, &state.daemon).await;
     emit_snapshot(&app, &snapshot);
     ensure_snapshot_watcher(&app, &state);
     ensure_explicit_start_connected(options.start_if_missing, &snapshot)?;
@@ -1046,7 +1073,7 @@ async fn desktop_run_action(
     match action {
         DesktopAction::Refresh => {}
         DesktopAction::Bootstrap { start_if_missing } => {
-            let snapshot = bootstrap(&BootstrapOptions { start_if_missing }).await;
+            let snapshot = bootstrap(&BootstrapOptions { start_if_missing }, &state.daemon).await;
             emit_snapshot(&app, &snapshot);
             ensure_snapshot_watcher(&app, &state);
             ensure_explicit_start_connected(start_if_missing, &snapshot)?;
@@ -1076,7 +1103,7 @@ async fn desktop_run_action(
             )?;
             let agent_type = AgentType::from_command(command.as_deref());
             let pane_id = mint_desktop_pane_id();
-            let daemon = trusted_daemon().await?;
+            let daemon = trusted_daemon(&state.daemon).await?;
             daemon.require_compatible()?;
             let id = daemon
                 .client
@@ -1118,11 +1145,11 @@ async fn desktop_run_action(
             // The supported non-Pi coordinator still uses the readiness-gated,
             // identity-bound retry path in `launch_workflow`; Pi is rejected
             // inside the preparation, before anything is spawned.
-            let daemon = trusted_daemon().await?;
+            let daemon = trusted_daemon(&state.daemon).await?;
             daemon.require_compatible()?;
             ensure_daemon_can_prepare(daemon.client.cached_capabilities().as_ref())?;
             let (roles, prepared) = prepare_workflow_launch(
-                &daemon.client,
+                daemon.client.as_ref(),
                 &name,
                 &cwd,
                 &task_prompt,
@@ -1132,7 +1159,7 @@ async fn desktop_run_action(
             .await?;
             let orchestration_id = mint_orchestration_id();
             let launched = launch_workflow(
-                &daemon.client,
+                daemon.client.as_ref(),
                 &name,
                 // The daemon's CANONICAL spelling, not the one that was sent.
                 // An alias or a symlink resolves elsewhere, canonicalising
@@ -1157,7 +1184,7 @@ async fn desktop_run_action(
         }
         DesktopAction::StopAgent { agent_id } => {
             validate_agent_id(&agent_id)?;
-            let daemon = trusted_daemon().await?;
+            let daemon = trusted_daemon(&state.daemon).await?;
             daemon.require_compatible()?;
             daemon
                 .client
@@ -1184,6 +1211,11 @@ async fn desktop_run_action(
             let outcome = run_daemon_stop(local, force)
                 .await
                 .map_err(|error| safe_message(error.to_string()))?;
+            // PRD #741 M4(a): the daemon this link was established against is
+            // being terminated, so the handshake held for it describes a
+            // process that is going away. Drop it here rather than waiting for
+            // the watcher to notice its stream end.
+            state.daemon.invalidate(&endpoint).await;
             terminal::detach_all(&state).await;
             result_message = Some(match outcome {
                 StopOutcome::NoDaemonRunning => "No daemon was running.".into(),
@@ -1203,10 +1235,17 @@ async fn desktop_run_action(
             run_daemon_stop(local, false)
                 .await
                 .map_err(|error| safe_message(error.to_string()))?;
+            // Same as Stop: the held handshake describes the daemon just
+            // terminated, and the `bootstrap` below is about to start a
+            // different one at the same address.
+            state.daemon.invalidate(&endpoint).await;
             terminal::detach_all(&state).await;
-            let snapshot = bootstrap(&BootstrapOptions {
-                start_if_missing: true,
-            })
+            let snapshot = bootstrap(
+                &BootstrapOptions {
+                    start_if_missing: true,
+                },
+                &state.daemon,
+            )
             .await;
             emit_snapshot(&app, &snapshot);
             ensure_snapshot_watcher(&app, &state);
@@ -1229,6 +1268,12 @@ async fn desktop_run_action(
             // at the tail of this function does unconditionally, and which is
             // why nothing here may cache a verdict.
             allow_build_mismatch_this_session();
+            // PRD #741 M4(a): this action's ENTIRE effect is that the handshake
+            // must be classified again — the comment above says so, and since
+            // the classification is now held it has to be dropped explicitly.
+            // Without this the flag would be set and the banner would keep
+            // reporting the refusal it just lifted.
+            state.daemon.invalidate_all().await;
             result_message = Some(
                 "Build-stamp mismatch accepted for this session; the caveat stays in the connection banner."
                     .into(),
@@ -1245,7 +1290,7 @@ async fn desktop_run_action(
                         .into(),
                 );
             }
-            let daemon = trusted_daemon().await?;
+            let daemon = trusted_daemon(&state.daemon).await?;
             daemon.require_compatible()?;
             let existing_cwd = daemon
                 .client
@@ -1286,7 +1331,7 @@ async fn desktop_run_action(
                     "text must be 1..={COMMAND_MAX_BYTES} bytes and contain no NUL"
                 ));
             }
-            let daemon = trusted_daemon().await?;
+            let daemon = trusted_daemon(&state.daemon).await?;
             daemon.require_compatible()?;
             let record = daemon
                 .client
@@ -1310,7 +1355,7 @@ async fn desktop_run_action(
         }
     }
 
-    let snapshot = refresh_and_emit(&app).await;
+    let snapshot = refresh_and_emit(&app, &state.daemon).await;
     let action_ok = action_result_ok(result_send.as_ref());
     Ok(DesktopActionResult {
         // Preserve the daemon's honest delivery semantics: a successfully

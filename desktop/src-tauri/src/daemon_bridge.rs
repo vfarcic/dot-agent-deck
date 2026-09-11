@@ -1,16 +1,19 @@
+use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 use dot_agent_deck::daemon_attach::{
     DAEMON_START_POLL_TIMEOUT, ensure_daemon_running, spawn_daemon_serve_detached_with_exe,
 };
-use dot_agent_deck::daemon_client::{DaemonClient, issue_command};
+use dot_agent_deck::daemon_client::{DaemonClient, Endpoint, issue_command};
 #[cfg(test)]
 use dot_agent_deck::daemon_protocol::RunningAgentsSummary;
 use dot_agent_deck::daemon_protocol::{AttachRequest, AttachResponse, PROTOCOL_VERSION};
 use dot_agent_deck::platform::ipc::IpcStream;
+use tokio::sync::Mutex as AsyncMutex;
 
 use crate::dto::{
     BootstrapOptions, ConnectionStatus, DesktopConnection, DesktopSnapshot, disconnected_snapshot,
@@ -34,9 +37,26 @@ struct HandshakeInfo {
     build_stamp_mismatch_only: bool,
 }
 
+/// An established link to one deck: the handshake that classified it, and a
+/// client that will issue requests against it.
+///
+/// **PRD #741 M4(a): this is now HELD rather than rebuilt per call**, which is
+/// the whole milestone. Before it, every `trusted_daemon()` ran the trust
+/// `stat`, opened a connection, exchanged a `Hello`, dropped that connection and
+/// minted a throwaway [`DaemonClient`] — so a `get_snapshot()` cost **two**
+/// connections and the capability set captured from the handshake was discarded
+/// a few microseconds later. See [`DaemonLinks`] for what is held and for what
+/// is deliberately NOT held.
+#[derive(Debug)]
 pub(crate) struct TrustedDaemon {
-    pub(crate) client: DaemonClient,
+    /// Shared, so the capability cache inside it (`Arc<Mutex<…>>` since PRD
+    /// #819 M5) actually survives from one call to the next instead of being
+    /// seeded and thrown away on every one.
+    pub(crate) client: Arc<DaemonClient>,
     connection: DesktopConnection,
+    /// When the handshake behind [`Self::connection`] was taken. Read by
+    /// [`DaemonLinks::trusted`] against [`HANDSHAKE_REVALIDATE_INTERVAL`].
+    established: Instant,
 }
 
 impl TrustedDaemon {
@@ -50,6 +70,201 @@ impl TrustedDaemon {
                 .clone()
                 .unwrap_or_else(|| "daemon is not protocol-compatible".into()))
         }
+    }
+
+    /// The classified handshake, for a caller assembling a snapshot from it.
+    pub(crate) fn connection(&self) -> DesktopConnection {
+        self.connection.clone()
+    }
+
+    fn is_fresh(&self, now: Instant) -> bool {
+        now.duration_since(self.established) < HANDSHAKE_REVALIDATE_INTERVAL
+    }
+}
+
+/// How long a held handshake is trusted before it is taken again.
+///
+/// **A backstop, not the primary mechanism.** What actually detects a daemon
+/// being replaced is the desktop's own persistent event subscription: a daemon
+/// cannot be replaced without the old process dying, and its death breaks that
+/// socket, which drops the watcher into its reconnect leg — and that leg calls
+/// [`DaemonLinks::invalidate_all`] before it re-subscribes. Every route to a
+/// replaced daemon passes through that death, whether the replacement came from
+/// this app's Replace button, a `dot-agent-deck daemon restart` in a terminal,
+/// or a crash plus some other client's lazy-spawn.
+///
+/// This interval exists because that argument depends on the watcher running
+/// and on every invalidation site being wired, and neither is something a
+/// reader should have to take on trust. With it, the strongest claim needed is
+/// the bounded one: **the classification is never more than five seconds old**.
+///
+/// Five seconds against the watcher's 150 ms coalesce floor means the handshake
+/// stops being ~6.7 connections/second and becomes 0.2 — a 97% cut — and it can
+/// hold stale only fields that change when the daemon is replaced. The two that
+/// would have been user-visible are both excluded rather than argued about:
+/// `running_agent_count` is refreshed from the `ListAgents` reply that
+/// `get_snapshot` already fetches (see there), and a **refused** classification
+/// is not held at all (see [`DaemonLinks::trusted`]).
+pub(crate) const HANDSHAKE_REVALIDATE_INTERVAL: Duration = Duration::from_secs(5);
+
+/// The established links, keyed by endpoint — PRD #741 M4(a), held in
+/// `DesktopState`.
+///
+/// # What is held, and what a connection here is NOT
+///
+/// **Not a socket.** The obvious reading of "hold the connection open" is a
+/// request socket kept alive across calls, and that is not reachable from the
+/// client at all: the daemon's `handle_connection` reads exactly ONE frame,
+/// dispatches it, writes the reply and returns, so the connection closes.
+/// Measured rather than read off the source — a second `KIND_REQ` on an
+/// already-answered connection gets `EPIPE` on the write and EOF on the read,
+/// with the daemon's own concurrent-client gauge already back at zero. A held
+/// request socket therefore needs `handle_connection` to LOOP, which is a
+/// same-wire/different-meaning protocol change and out of this milestone.
+///
+/// **So what is held is the handshake**, which is the part that was being
+/// re-done per request batch rather than per connection — the thing a handshake
+/// is for. Concretely, per endpoint: the classified [`DesktopConnection`], the
+/// capability set captured from the `Hello` reply, and the trust `stat` that
+/// precedes both. A `get_snapshot()` goes from **two** connections to **one**;
+/// measured at ten refreshes in
+/// `tests::ten_refreshes_cost_one_handshake_and_ten_listings`, which reports 11
+/// connections against the 20 the same test reports with reuse disabled.
+///
+/// And only a **connected** classification is held — see [`Self::trusted`].
+///
+/// # Why keyed by endpoint when only one is selectable
+///
+/// PRD #741 M9 makes the endpoint a user choice and #742 shows several decks at
+/// once. Keying now costs one `HashMap` and means neither of those is a
+/// retrofit of this type; a single held link would have to be torn out.
+///
+/// # The multiplexing decision, which is issue #745's deliverable
+///
+/// **Decided: the two streaming structs are NOT multiplexed, and ssh is the
+/// reason that is affordable.** `EventSubscription` and `AttachConnection` keep
+/// one connection each, so a desktop showing N terminal tiles holds N+1
+/// long-lived connections plus one short-lived one per refresh. Four things
+/// decided it:
+///
+/// 1. **The population of one.** There is exactly one `EventSubscription` per
+///    desktop process — `DesktopState::start_watcher_once` guarantees a single
+///    watcher — so half the muxing target is a set with one member in it.
+///
+/// 2. **Muxing attach streams is a WIRE change, not a refactor.** The frame
+///    header is five bytes: one kind byte and a four-byte big-endian length
+///    (`daemon_protocol::read_frame`). There is no stream id, so two attaches
+///    sharing a socket could not be told apart. Adding one means a new header
+///    shape, a `PROTOCOL_VERSION` bump and a compatibility break for every
+///    client/daemon pair — categorically larger than the whole of M4(a).
+///
+/// 3. **It would need the daemon-side request loop anyway.** The same
+///    `handle_connection` fact above applies: a connection is dedicated to one
+///    attach for the life of that attach.
+///
+/// 4. **And the remote case, which is the one this PRD is for, already has
+///    multiplexing underneath.** Under DECISION 1A a remote deck is reached
+///    through `ssh -L` forwarding a Unix socket. Each connection to a forwarded
+///    socket opens a new SSH *channel* on the existing SSH transport, not a new
+///    TCP connection — the SSH protocol multiplexes channels over one connection
+///    by construction. So N attach streams cost N channels over one TCP session
+///    and one authentication, not N round trips of setup. Re-implementing
+///    multiplexing at the attach-protocol layer would buy a channel count and
+///    pay for it with a wire break.
+///
+/// **What that costs, stated rather than waved at.** A fleet view showing many
+/// agents at once (#742) holds one connection per visible tile, and the daemon
+/// holds one `handle_connection` task per tile with it. That is a file-descriptor
+/// and task cost linear in tiles on both sides, and it is the number to watch if
+/// #742 ever shows tens of live terminals. It is not a *latency* cost, which is
+/// what M4 was opened about: the streams are established once and then carry
+/// frames, so nothing about them is paid per refresh.
+///
+/// # Concurrency
+///
+/// One async mutex over the whole map, held across establishment. That
+/// serialises concurrent first-uses into ONE handshake instead of N, which is
+/// the point; the cache-hit path is an uncontended lock acquire. A deck that is
+/// not answering queues the other callers behind one connect timeout rather
+/// than giving each its own, which is also the better of the two.
+pub(crate) struct DaemonLinks {
+    links: AsyncMutex<HashMap<String, Arc<TrustedDaemon>>>,
+    /// Total handshakes performed, for tests and for the milestone's
+    /// before/after measurement. Never read by production logic.
+    handshakes: AtomicUsize,
+}
+
+impl Default for DaemonLinks {
+    fn default() -> Self {
+        Self {
+            links: AsyncMutex::new(HashMap::new()),
+            handshakes: AtomicUsize::new(0),
+        }
+    }
+}
+
+impl DaemonLinks {
+    /// The link for `endpoint`, establishing one if there is none or the held
+    /// one has aged past [`HANDSHAKE_REVALIDATE_INTERVAL`].
+    ///
+    /// A failed establishment removes any held link first, so a stale
+    /// classification is never returned after the deck behind it stopped
+    /// answering.
+    pub(crate) async fn trusted(&self, endpoint: &Endpoint) -> Result<Arc<TrustedDaemon>, String> {
+        let key = endpoint.describe();
+        let mut links = self.links.lock().await;
+        if let Some(held) = links.get(&key)
+            && held.is_fresh(Instant::now())
+        {
+            return Ok(Arc::clone(held));
+        }
+        links.remove(&key);
+        let established = Arc::new(establish(endpoint).await?);
+        self.handshakes.fetch_add(1, Ordering::Relaxed);
+        // **Only a CONNECTED classification is held.** A refusal is the one
+        // verdict you want re-checked rather than cached, and there is a
+        // user-visible reason as well as a principled one: on the incompatible
+        // path the snapshot's `running_agent_count` comes from the handshake
+        // (there is no `ListAgents` to read it off), and it is what gates the
+        // **Replace daemon** button — the webview shows it only once the old
+        // daemon reports zero live agents. Holding that number would make the
+        // button appear up to `HANDSHAKE_REVALIDATE_INTERVAL` late instead of
+        // within the watcher's 1 s retry, which is exactly the kind of
+        // user-visible change PRD #741's M1–M4 are not supposed to make.
+        //
+        // Nothing is lost. The refusal paths refresh at the watcher's 1 s
+        // `WATCH_RETRY_DELAY`, not at the 150 ms coalesce floor, so they were
+        // never what this milestone was about; the connected path is the one
+        // running 6.667 times a second and it is held in full.
+        if established.connection.status == ConnectionStatus::Connected {
+            links.insert(key, Arc::clone(&established));
+        }
+        Ok(established)
+    }
+
+    /// Forget the link for `endpoint`, so the next [`Self::trusted`] handshakes
+    /// again.
+    pub(crate) async fn invalidate(&self, endpoint: &Endpoint) {
+        self.links.lock().await.remove(&endpoint.describe());
+    }
+
+    /// Forget every link. Used where the reason to distrust the held state is
+    /// not specific to one deck — the watcher losing its event stream, and the
+    /// in-app build-mismatch allowance, whose entire effect is that the
+    /// handshake must be classified again.
+    pub(crate) async fn invalidate_all(&self) {
+        self.links.lock().await.clear();
+    }
+
+    /// How many handshakes have been performed since this store was created.
+    ///
+    /// Test-only, and deliberately: it is how the reuse tests assert that a
+    /// held link did not re-handshake, and no production path has a reason to
+    /// ask. The counter itself is unconditional so the field's cost is the same
+    /// in both builds.
+    #[cfg(test)]
+    pub(crate) fn handshake_count(&self) -> usize {
+        self.handshakes.load(Ordering::Relaxed)
     }
 }
 
@@ -335,14 +550,26 @@ async fn hello(socket_path: &Path) -> Result<(HandshakeInfo, AttachResponse), St
     Ok((info, response))
 }
 
-pub(crate) async fn trusted_daemon() -> Result<TrustedDaemon, String> {
-    let endpoint = selected_endpoint();
+/// Take one handshake against `endpoint` and build the link behind it.
+///
+/// PRD #741 M4(a): this is the **establishment** path, reached once per
+/// endpoint per [`HANDSHAKE_REVALIDATE_INTERVAL`] rather than once per request
+/// batch. Everything in it is per-connection work that was being paid
+/// per-refresh — including the blocking `std::fs::metadata` in the trust check,
+/// which is the "incidental win" PRD #741's `#745` answer names.
+async fn establish(endpoint: &Endpoint) -> Result<TrustedDaemon, String> {
     // PRD #741 M2: the trust check stays exactly where it was — out of band and
     // BEFORE the first connect, on the inode itself. It is LOCAL-only, and that
     // is a statement about what it can prove rather than an omission: uid +
     // 0o600 on an inode says nothing about a daemon on another machine, whose
     // trust rests on ssh host-key and user authentication instead (M5). Moving
     // it inside connect would change the Unix semantics it exists for.
+    //
+    // M4(a) moves it off the per-refresh path by moving the whole of this
+    // function there — it is still the first thing that happens, and still
+    // happens before anything connects, which is the property M2 pinned. What
+    // changed is only how often: once per establishment rather than once per
+    // `get_snapshot()`.
     if let Some(local) = endpoint.as_local() {
         dot_agent_deck::platform::fsperm::verify_endpoint_trusted(local.path()).map_err(
             |reason| {
@@ -368,24 +595,53 @@ pub(crate) async fn trusted_daemon() -> Result<TrustedDaemon, String> {
     // exactly `DaemonClient::new(socket_path)`; for a remote one it is the
     // difference between "the daemon is gone" and "I cannot tell from here".
     let client =
-        DaemonClient::for_endpoint(&endpoint).map_err(|error| safe_message(error.to_string()))?;
-    // PRD #819 M5/M6: capture the advertised set from THIS reply. Every
-    // `trusted_daemon()` builds a fresh client, so the capture is per call and
-    // never outlives the connection it describes — which is the invalidation
-    // rule `DaemonClient` states, satisfied structurally rather than by
-    // remembering to call `invalidate_capabilities`.
+        DaemonClient::for_endpoint(endpoint).map_err(|error| safe_message(error.to_string()))?;
+    // PRD #819 M5/M6: capture the advertised set from THIS reply.
+    //
+    // Its invalidation rule used to be satisfied structurally by accident —
+    // every `trusted_daemon()` built a fresh client, so the capture could not
+    // outlive the connection it described because the client did not either.
+    // PRD #741 M4(a) holds the client, so the rule is now satisfied
+    // deliberately instead: the capture and the handshake it came from are the
+    // same object, and [`DaemonLinks::invalidate`] drops both together. There
+    // is no path that replaces one without the other.
     client.store_capabilities_from_hello(&response);
-    Ok(TrustedDaemon { client, connection })
+    Ok(TrustedDaemon {
+        client: Arc::new(client),
+        connection,
+        established: Instant::now(),
+    })
 }
 
-pub(crate) async fn get_snapshot() -> DesktopSnapshot {
-    let daemon = match trusted_daemon().await {
+/// The link for the selected deck, establishing one if needed.
+///
+/// PRD #741 M4(a): takes the store because the link is HELD in `DesktopState`
+/// rather than rebuilt here. The endpoint is still
+/// [`selected_endpoint`]'s — M9 is what makes that a user choice — so this
+/// remains the one function every desktop call site goes through.
+pub(crate) async fn trusted_daemon(links: &DaemonLinks) -> Result<Arc<TrustedDaemon>, String> {
+    links.trusted(&selected_endpoint()).await
+}
+
+pub(crate) async fn get_snapshot(links: &DaemonLinks) -> DesktopSnapshot {
+    snapshot_of(&selected_endpoint(), links).await
+}
+
+/// [`get_snapshot`] against a named deck rather than the selected one.
+///
+/// Split out at M4(a) so the snapshot path can be driven against a scripted
+/// socket without reaching for the process-global
+/// `DOT_AGENT_DECK_ATTACH_SOCKET`, and because PRD #741 M9 makes the selection a
+/// parameter in earnest.
+async fn snapshot_of(endpoint: &Endpoint, links: &DaemonLinks) -> DesktopSnapshot {
+    let daemon = match links.trusted(endpoint).await {
         Ok(daemon) => daemon,
         Err(error) => return disconnected_snapshot(error),
     };
-    if daemon.connection.status != ConnectionStatus::Connected {
+    let connection = daemon.connection();
+    if connection.status != ConnectionStatus::Connected {
         return DesktopSnapshot {
-            connection: daemon.connection,
+            connection,
             agents: Vec::new(),
             protocol_version: PROTOCOL_VERSION,
             source: "daemon",
@@ -394,12 +650,33 @@ pub(crate) async fn get_snapshot() -> DesktopSnapshot {
 
     match daemon.client.list_agents().await {
         Ok(records) => DesktopSnapshot {
-            connection: daemon.connection,
+            // PRD #741 M4(a): the count comes from THIS reply rather than from
+            // the held handshake, and it is the same number from the same
+            // source — the daemon answers `Hello`'s `running_agents` with
+            // `RunningAgentsSummary::from_records(&registry.agent_records())`
+            // and answers `ListAgents` with `registry.agent_records()`, so the
+            // count is `records.len()` either way. Reading it here rather than
+            // off the handshake is what keeps the one user-visible number the
+            // handshake carries at least as fresh as it was before the link was
+            // held — it feeds the "the daemon reports N live agents" line in the
+            // Stop-daemon confirmation.
+            connection: DesktopConnection {
+                running_agent_count: Some(records.len()),
+                ..connection
+            },
             agents: records.into_iter().map(map_agent).collect(),
             protocol_version: PROTOCOL_VERSION,
             source: "daemon",
         },
-        Err(error) => disconnected_snapshot(error.to_string()),
+        Err(error) => {
+            // The held link just failed to carry a request. Whatever is at the
+            // other end is not the daemon this handshake classified, so the
+            // classification goes with the connection — the next call
+            // handshakes again rather than reporting a verdict it can no longer
+            // support.
+            links.invalidate(endpoint).await;
+            disconnected_snapshot(error.to_string())
+        }
     }
 }
 
@@ -471,8 +748,8 @@ fn resolve_daemon_executable() -> Result<PathBuf, String> {
     )
 }
 
-pub(crate) async fn bootstrap(options: &BootstrapOptions) -> DesktopSnapshot {
-    let current = get_snapshot().await;
+pub(crate) async fn bootstrap(options: &BootstrapOptions, links: &DaemonLinks) -> DesktopSnapshot {
+    let current = get_snapshot(links).await;
     if current.connection.status != ConnectionStatus::Disconnected || !options.start_if_missing {
         return current;
     }
@@ -501,7 +778,13 @@ pub(crate) async fn bootstrap(options: &BootstrapOptions) -> DesktopSnapshot {
     .await;
 
     match start_result {
-        Ok(()) => get_snapshot().await,
+        Ok(()) => {
+            // A daemon process was just started at this address, so nothing
+            // held about the one that was not answering a moment ago describes
+            // it. Drop the link before the snapshot that will re-establish it.
+            links.invalidate(&endpoint).await;
+            get_snapshot(links).await
+        }
         Err(error) => disconnected_snapshot(error.to_string()),
     }
 }
@@ -509,6 +792,7 @@ pub(crate) async fn bootstrap(options: &BootstrapOptions) -> DesktopSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use dot_agent_deck::daemon_client::LocalEndpoint;
     use std::sync::{Mutex, MutexGuard};
 
     /// The env var and the session flag are both process-global, so the tests
@@ -1171,5 +1455,450 @@ mod tests {
                 "{allowance:?}"
             );
         }
+    }
+    // -----------------------------------------------------------------------
+    // PRD #741 M4(a) — the held link
+    // -----------------------------------------------------------------------
+
+    /// Bind a scripted daemon's socket at a mode the trust check accepts.
+    ///
+    /// `establish()` runs `verify_endpoint_trusted` on the inode before it
+    /// connects (M2's property 2, which M4(a) moves off the per-refresh path
+    /// without moving it out of the way), so a fixture socket left at the
+    /// ambient umask would be refused before any handshake happened. Restating
+    /// 0o600 afterwards rather than borrowing `IpcListener::bind`'s
+    /// umask-before-bind dance, for the reason `scripted_daemon` already gives:
+    /// that dance flips a PROCESS-global umask.
+    #[cfg(unix)]
+    fn bind_trusted(socket: &std::path::Path) -> tokio::net::UnixListener {
+        use std::os::unix::fs::PermissionsExt;
+        let listener = tokio::net::UnixListener::bind(socket).expect("bind the scripted daemon");
+        std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o600))
+            .expect("restate 0o600 on the socket inode");
+        listener
+    }
+
+    /// A scripted daemon that answers `replies.len()` connections, one request
+    /// each, in order — and then returns how many it accepted.
+    ///
+    /// One request each is not a simplification: the real daemon's
+    /// `handle_connection` reads exactly ONE frame, dispatches it and returns,
+    /// which is the finding that decided this milestone's shape. A helper that
+    /// looped on one connection would be modelling a daemon that does not
+    /// exist.
+    #[cfg(unix)]
+    async fn scripted_daemon_sequence(
+        listener: tokio::net::UnixListener,
+        replies: Vec<AttachResponse>,
+    ) -> usize {
+        use dot_agent_deck::daemon_protocol::{KIND_REQ, KIND_RESP, read_frame, write_frame};
+        let mut accepted = 0usize;
+        for reply in replies {
+            let (stream, _peer) = listener.accept().await.expect("accept one client");
+            accepted += 1;
+            let (mut reader, mut writer) = stream.into_split();
+            let (kind, _payload) = read_frame(&mut reader)
+                .await
+                .expect("read the request frame")
+                .expect("the client sent a frame");
+            assert_eq!(kind, KIND_REQ);
+            let encoded = serde_json::to_vec(&reply).expect("serialize the reply");
+            write_frame(&mut writer, KIND_RESP, &encoded)
+                .await
+                .expect("answer the client");
+        }
+        accepted
+    }
+
+    /// One row in a `ListAgents` reply. Only the fields the snapshot mapping
+    /// reads are populated; the rest is what a freshly-spawned agent carries.
+    #[cfg(unix)]
+    fn listed_agent(id: &str, pane_id: &str) -> dot_agent_deck::daemon_client::AgentRecord {
+        dot_agent_deck::daemon_client::AgentRecord {
+            id: id.into(),
+            pane_id_env: Some(pane_id.into()),
+            display_name: None,
+            cwd: None,
+            tab_membership: None,
+            agent_type: None,
+            rows: 24,
+            cols: 80,
+            live: None,
+            spawned_at_ms: None,
+        }
+    }
+
+    /// A `Hello` reply this build classifies as `Connected`.
+    #[cfg(unix)]
+    fn matching_hello() -> AttachResponse {
+        let mut reply = AttachResponse::hello(PROTOCOL_VERSION)
+            .with_running_agents(RunningAgentsSummary::default());
+        reply.build_version = Some(dot_agent_deck::build_id::local_build_id());
+        reply
+    }
+
+    /// **The milestone.** Two `trusted()` calls against one endpoint take ONE
+    /// handshake and open ONE connection — before M4(a) they took two of each,
+    /// and the watcher took them up to 6.667 times a second.
+    ///
+    /// The scripted daemon is told to answer exactly one connection, so a
+    /// regression that re-handshakes does not merely fail a counter: the second
+    /// `trusted()` finds nothing accepting and reports a transport error.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_held_link_is_reused_and_costs_one_handshake() {
+        let (dir, socket) = scratch_socket("m4a-reuse");
+        let listener = bind_trusted(&socket);
+        let daemon = tokio::spawn(scripted_daemon_sequence(listener, vec![matching_hello()]));
+
+        let links = DaemonLinks::default();
+        let endpoint = Endpoint::Local(LocalEndpoint::at(&socket));
+
+        let first = links.trusted(&endpoint).await.expect("first establishment");
+        let second = links.trusted(&endpoint).await.expect("the held link");
+
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "the second call must hand back the SAME link, not an equal one"
+        );
+        assert_eq!(
+            links.handshake_count(),
+            1,
+            "a held link must not re-handshake"
+        );
+        assert_eq!(
+            daemon.await.expect("the scripted daemon must not panic"),
+            1,
+            "exactly one connection must have reached the daemon"
+        );
+        first.require_compatible().expect("classified as connected");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Invalidation is the other half: after it the next call handshakes again,
+    /// against whatever is at the address now. This is what every replacement
+    /// route goes through — the watcher losing its event stream, Stop, Replace,
+    /// and the in-app build-mismatch allowance.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn invalidating_a_link_makes_the_next_call_handshake_again() {
+        let (dir, socket) = scratch_socket("m4a-invalidate");
+        let listener = bind_trusted(&socket);
+        let daemon = tokio::spawn(scripted_daemon_sequence(
+            listener,
+            vec![matching_hello(), matching_hello()],
+        ));
+
+        let links = DaemonLinks::default();
+        let endpoint = Endpoint::Local(LocalEndpoint::at(&socket));
+
+        let first = links.trusted(&endpoint).await.expect("first establishment");
+        links.invalidate(&endpoint).await;
+        let second = links
+            .trusted(&endpoint)
+            .await
+            .expect("re-establishment after invalidation");
+
+        assert!(
+            !Arc::ptr_eq(&first, &second),
+            "an invalidated link must not survive as the same object"
+        );
+        assert_eq!(links.handshake_count(), 2);
+        assert_eq!(
+            daemon.await.expect("the scripted daemon must not panic"),
+            2,
+            "the re-establishment must really have reconnected"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// `invalidate_all` is the whole-store form, used where the reason to
+    /// distrust what is held is not specific to one deck.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn invalidate_all_drops_every_held_link() {
+        let (dir, socket) = scratch_socket("m4a-invalidate-all");
+        let listener = bind_trusted(&socket);
+        let daemon = tokio::spawn(scripted_daemon_sequence(
+            listener,
+            vec![matching_hello(), matching_hello()],
+        ));
+
+        let links = DaemonLinks::default();
+        let endpoint = Endpoint::Local(LocalEndpoint::at(&socket));
+
+        links.trusted(&endpoint).await.expect("establish");
+        links.invalidate_all().await;
+        links.trusted(&endpoint).await.expect("re-establish");
+
+        assert_eq!(links.handshake_count(), 2);
+        assert_eq!(daemon.await.expect("no panic"), 2);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A failed re-establishment must not resurrect the link it was replacing.
+    ///
+    /// The failure direction matters more than the success one: a store that
+    /// kept the old entry when the new handshake failed would keep reporting a
+    /// deck as connected after it stopped answering, which is the one outcome a
+    /// held classification must never produce.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_failed_re_establishment_leaves_nothing_held() {
+        let (dir, socket) = scratch_socket("m4a-fail");
+        let listener = bind_trusted(&socket);
+        let daemon = tokio::spawn(scripted_daemon_sequence(listener, vec![matching_hello()]));
+
+        let links = DaemonLinks::default();
+        let endpoint = Endpoint::Local(LocalEndpoint::at(&socket));
+        links.trusted(&endpoint).await.expect("establish");
+        assert_eq!(daemon.await.expect("no panic"), 1);
+
+        // The daemon is gone and so is its socket: the trust check now fails on
+        // the missing inode, before anything connects.
+        std::fs::remove_file(&socket).expect("remove the endpoint");
+        links.invalidate(&endpoint).await;
+        let err = links
+            .trusted(&endpoint)
+            .await
+            .expect_err("a deck that is not there must not establish");
+        assert!(err.contains("refusing to connect"), "{err}");
+
+        // And the next call must still try rather than serve a stale verdict.
+        let err = links
+            .trusted(&endpoint)
+            .await
+            .expect_err("nothing may be held after a failed establishment");
+        assert!(err.contains("refusing to connect"), "{err}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The revalidation backstop, at the predicate rather than through a
+    /// five-second sleep. A link is fresh the instant it is taken and stale once
+    /// [`HANDSHAKE_REVALIDATE_INTERVAL`] has passed, so a held classification is
+    /// bounded in age even if every explicit invalidation site were removed.
+    #[test]
+    fn a_held_handshake_goes_stale_after_the_revalidate_interval() {
+        let link = TrustedDaemon {
+            client: Arc::new(DaemonClient::new("/tmp/attach.sock".into())),
+            connection: connection_from_handshake(HandshakeInfo {
+                status: ConnectionStatus::Connected,
+                error: None,
+                server_protocol_version: Some(PROTOCOL_VERSION),
+                daemon_build_version: None,
+                daemon_version: None,
+                running_agent_count: Some(0),
+                build_stamp_mismatch_only: false,
+            }),
+            established: Instant::now(),
+        };
+        let taken = link.established;
+
+        assert!(link.is_fresh(taken), "fresh the instant it is taken");
+        assert!(
+            link.is_fresh(taken + HANDSHAKE_REVALIDATE_INTERVAL - Duration::from_millis(1)),
+            "still fresh a millisecond before the interval elapses"
+        );
+        assert!(
+            !link.is_fresh(taken + HANDSHAKE_REVALIDATE_INTERVAL),
+            "stale once the interval has elapsed — the bound is what makes a \
+             held classification defensible without trusting every invalidation site"
+        );
+        assert!(!link.is_fresh(taken + Duration::from_secs(60)));
+    }
+
+    /// The one user-visible number the handshake carries stays fresh, which is
+    /// what keeps M4(a) inside the PRD's "M1–M4 change no user-visible
+    /// behaviour" property.
+    ///
+    /// `running_agent_count` feeds the Stop-daemon confirmation's "the daemon
+    /// reports N live agents" line, so a value held for up to five seconds would
+    /// be a real regression. `get_snapshot` reads it off the `ListAgents` reply
+    /// instead — the same `registry.agent_records()` the daemon answers `Hello`
+    /// from, only taken later. Here the handshake claims 7 and the listing
+    /// carries 2; the snapshot must say 2.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_snapshots_agent_count_comes_from_the_listing_not_the_held_handshake() {
+        let (dir, socket) = scratch_socket("m4a-count");
+        let listener = bind_trusted(&socket);
+        let mut stale_hello = matching_hello();
+        stale_hello.running_agents = Some(RunningAgentsSummary {
+            count: 7,
+            names: vec!["ghost".into(); 7],
+        });
+        let listing = AttachResponse::agent_records(vec![
+            listed_agent("agent-a", "pane-a"),
+            listed_agent("agent-b", "pane-b"),
+        ]);
+        let daemon = tokio::spawn(scripted_daemon_sequence(
+            listener,
+            vec![stale_hello, listing],
+        ));
+
+        let links = DaemonLinks::default();
+        let snapshot = snapshot_of(&Endpoint::Local(LocalEndpoint::at(&socket)), &links).await;
+
+        assert_eq!(snapshot.connection.status, ConnectionStatus::Connected);
+        assert_eq!(snapshot.agents.len(), 2);
+        assert_eq!(
+            snapshot.connection.running_agent_count,
+            Some(2),
+            "the count must come from the listing that was just fetched, not \
+             from the handshake that may be up to five seconds old"
+        );
+        assert_eq!(daemon.await.expect("no panic"), 2);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+    /// **The milestone's measurement, taken as a test so it also guards the
+    /// property.**
+    ///
+    /// Ten refreshes through the real snapshot path against a daemon that
+    /// counts connections and sorts them by request kind. Before M4(a) this was
+    /// `hello` + `list_agents` every time — **20 connections, 2.0 per refresh**,
+    /// which is the row in PRD #741's baseline table. Held, it is **11
+    /// connections, 1.1 per refresh**: one handshake for the ten, and the
+    /// listing that is the refresh itself.
+    ///
+    /// Ten fits inside [`HANDSHAKE_REVALIDATE_INTERVAL`] by a wide margin, so
+    /// the single handshake is the establishment and not a revalidation. At the
+    /// watcher's sustained 6.667 refreshes/second the backstop adds 0.2
+    /// handshakes/second, i.e. 1.03 connections per refresh rather than 1.0 —
+    /// stated here because a figure that ignored the revalidation would not be
+    /// comparable to the baseline it is quoted against.
+    ///
+    /// What this does NOT claim is that the listing connection could also have
+    /// been held. It could not: the daemon's `handle_connection` answers exactly
+    /// one request per connection and then returns, so 1.0 is the floor a client
+    /// can reach on its own.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ten_refreshes_cost_one_handshake_and_ten_listings() {
+        use dot_agent_deck::daemon_protocol::{KIND_REQ, KIND_RESP, read_frame, write_frame};
+
+        const REFRESHES: usize = 10;
+
+        let (dir, socket) = scratch_socket("m4a-measure");
+        let listener = bind_trusted(&socket);
+        let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
+
+        let daemon = tokio::spawn(async move {
+            let (mut hellos, mut listings) = (0usize, 0usize);
+            loop {
+                tokio::select! {
+                    _ = &mut stop_rx => return (hellos, listings),
+                    accepted = listener.accept() => {
+                        let (stream, _peer) = accepted.expect("accept one client");
+                        let (mut rd, mut wr) = stream.into_split();
+                        let (kind, payload) = read_frame(&mut rd)
+                            .await
+                            .expect("read the request frame")
+                            .expect("the client sent a frame");
+                        assert_eq!(kind, KIND_REQ);
+                        let request: AttachRequest =
+                            serde_json::from_slice(&payload).expect("decode the request");
+                        let reply = match request {
+                            AttachRequest::Hello { .. } => {
+                                hellos += 1;
+                                matching_hello()
+                            }
+                            AttachRequest::ListAgents => {
+                                listings += 1;
+                                AttachResponse::agent_records(vec![listed_agent("a", "pane-a")])
+                            }
+                            other => panic!("the snapshot path sent an unexpected request: {other:?}"),
+                        };
+                        let encoded = serde_json::to_vec(&reply).expect("serialize the reply");
+                        write_frame(&mut wr, KIND_RESP, &encoded)
+                            .await
+                            .expect("answer the client");
+                    }
+                }
+            }
+        });
+
+        let links = DaemonLinks::default();
+        let endpoint = Endpoint::Local(LocalEndpoint::at(&socket));
+        for refresh in 0..REFRESHES {
+            let snapshot = snapshot_of(&endpoint, &links).await;
+            assert_eq!(
+                snapshot.connection.status,
+                ConnectionStatus::Connected,
+                "refresh {refresh} must be connected"
+            );
+            assert_eq!(snapshot.agents.len(), 1);
+        }
+        let _ = stop_tx.send(());
+        let (hellos, listings) = daemon.await.expect("the scripted daemon must not panic");
+
+        assert_eq!(
+            listings, REFRESHES,
+            "every refresh still fetches the agent list — holding the LISTING is \
+             M4(b)'s incremental work, not this milestone's"
+        );
+        assert_eq!(
+            hellos, 1,
+            "the handshake must be paid ONCE for the whole run, not once per refresh"
+        );
+        assert_eq!(
+            hellos + listings,
+            REFRESHES + 1,
+            "{REFRESHES} refreshes must cost {} connections, not {}",
+            REFRESHES + 1,
+            REFRESHES * 2
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+    /// The refusal paths are deliberately NOT held, so a daemon that is
+    /// answering but incompatible is re-classified on every call exactly as it
+    /// was before M4(a).
+    ///
+    /// This is the one user-visible thing a held classification could have
+    /// broken. On that path the snapshot's `running_agent_count` comes from the
+    /// handshake — there is no `ListAgents` to read it off — and the webview
+    /// shows **Replace daemon** only once it reads zero. Here the daemon reports
+    /// two live agents and then none; the second refresh must see the zero
+    /// rather than a number held from the first.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_incompatible_daemon_is_reclassified_on_every_refresh() {
+        let (dir, socket) = scratch_socket("m4a-incompat");
+        let listener = bind_trusted(&socket);
+
+        let mut busy = AttachResponse::hello(PROTOCOL_VERSION);
+        busy.build_version = Some("0.1.0-gdeadbee".into());
+        busy.running_agents = Some(RunningAgentsSummary {
+            count: 2,
+            names: vec!["a".into(), "b".into()],
+        });
+        let mut drained = busy.clone();
+        drained.running_agents = Some(RunningAgentsSummary::default());
+        let daemon = tokio::spawn(scripted_daemon_sequence(listener, vec![busy, drained]));
+
+        let links = DaemonLinks::default();
+        let endpoint = Endpoint::Local(LocalEndpoint::at(&socket));
+
+        let first = snapshot_of(&endpoint, &links).await;
+        assert_ne!(
+            first.connection.status,
+            ConnectionStatus::Connected,
+            "the fixture must actually be refused, or this test proves nothing"
+        );
+        assert_eq!(first.connection.running_agent_count, Some(2));
+
+        let second = snapshot_of(&endpoint, &links).await;
+        assert_eq!(
+            second.connection.running_agent_count,
+            Some(0),
+            "a refused classification must be taken again, not held — the \
+             Replace-daemon button is gated on this number reaching zero"
+        );
+        assert_eq!(
+            links.handshake_count(),
+            2,
+            "both refusals must have cost their own handshake"
+        );
+        assert_eq!(daemon.await.expect("no panic"), 2);
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
