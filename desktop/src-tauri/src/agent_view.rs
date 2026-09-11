@@ -50,12 +50,22 @@
 //!   assumed: `AgentRecord`s come from `AgentPtyRegistry::agent_records()`,
 //!   which filters on the `exited` flag the PTY reader sets at EOF, and no
 //!   broadcast is sent from that path — the `BroadcastMsg` senders in `src/` are
-//!   the hook-socket ingest, the delivery-notice sink, the orchestration surface,
-//!   the prompt-watch synthetics and `WorktreeKept`, and none of them fires on a
+//!   the hook-socket ingest (`daemon::ingest_event`), the delivery-notice sink
+//!   (`daemon::install_delivery_notice_sink`), the card surface a daemon-spawned
+//!   pane paints (`spawn::surface_spawned_pane`), the orchestration surface, the
+//!   prompt-watch synthetics and `WorktreeKept`, and none of them fires on a
 //!   child exiting. A cooperative agent's final `SessionEnd` retires its
 //!   *session*, which is a different thing from its *record*. So **every**
 //!   disappearance is silent, not merely a crash, and only a periodic re-read
 //!   can catch one.
+//!
+//!   What a `SessionEnd` *does* buy is a head start, and the fold takes it:
+//!   because the event says a session is over, it marks a fetch due the way a
+//!   `SessionStart` does, so a **cooperative** exit is reconciled in one
+//!   round trip instead of waiting out [`RECONCILE_INTERVAL`]. It is an
+//!   optimisation and never a replacement — see [`FetchReason::SessionEnd`] for
+//!   the millisecond-scale reason a fetch it triggers can still see the record
+//!   present, which is why the floor stays exactly as wide as it was.
 //!
 //! [`AppState::apply_event`]: dot_agent_deck::state::AppState::apply_event
 //! [`AppState::attach_live_sessions`]: dot_agent_deck::state::AppState::attach_live_sessions
@@ -114,6 +124,24 @@ pub(crate) enum FetchReason {
     Resubscribed,
     /// A `SessionStart`: a row exists that events cannot complete.
     SessionStart,
+    /// A `SessionEnd`: a session retired, and its *record* may be about to go
+    /// with it.
+    ///
+    /// The symmetric counterpart of [`Self::SessionStart`] and equally cheap —
+    /// once per agent lifetime — but it buys something weaker, and the
+    /// difference is worth keeping straight. A `SessionEnd` does not remove a
+    /// record; the record goes when the PTY reader sets `exited` at EOF, which
+    /// broadcasts nothing (see the module docs). The two are milliseconds
+    /// apart in a cooperative exit and in that order, so **the fetch this
+    /// reason triggers may well still see the record present** and the removal
+    /// is then caught by the next reconcile anyway.
+    ///
+    /// So it is an optimisation on the common case, not a signal to lean on:
+    /// it closes a cooperative removal well inside the floor, and the floor
+    /// keeps covering the case it was sized for — a crash, where no
+    /// `SessionEnd` is emitted at all. Nothing about this reason justifies
+    /// widening [`RECONCILE_INTERVAL`].
+    SessionEnd,
     /// An orchestration was spawned while attached — same metadata gap as
     /// `SessionStart`, plus tab membership.
     OrchestrationSurface,
@@ -182,15 +210,16 @@ impl AgentView {
     pub(crate) fn apply(&mut self, msg: &BroadcastMsg) {
         match msg {
             BroadcastMsg::Event(event) => {
-                if event.event_type == EventType::SessionStart {
-                    // Unconditional rather than "only for an id we do not hold".
-                    // A `SessionStart` is once per agent lifetime (or per
-                    // `/clear`), so the saving from being clever is nil, and the
-                    // conditional version has to be right about what "the same
-                    // agent" means across a restart that mints a new registry
-                    // id on the same pane. One connection, rarely, buys not
-                    // having to be right about that.
-                    self.mark(FetchReason::SessionStart);
+                // Unconditional rather than "only for an id we do not hold".
+                // Both are once per agent lifetime (or per `/clear`), so the
+                // saving from being clever is nil, and the conditional version
+                // has to be right about what "the same agent" means across a
+                // restart that mints a new registry id on the same pane. One
+                // connection, rarely, buys not having to be right about that.
+                match event.event_type {
+                    EventType::SessionStart => self.mark(FetchReason::SessionStart),
+                    EventType::SessionEnd => self.mark(FetchReason::SessionEnd),
+                    _ => {}
                 }
                 self.fold.apply_event(event.clone());
                 self.folded += 1;
@@ -233,27 +262,35 @@ impl AgentView {
     /// hydration), which is also what mints the `agent_id` that lets a later
     /// `SessionStart` remap onto this session instead of forking a second one.
     ///
-    /// # The one event a full fetch can swallow
+    /// # What a full fetch does to an event that straddles it
     ///
     /// The fold is **replaced**, not merged, because a reply is the daemon's
     /// whole answer and merging would let a session the daemon has retired
     /// survive in the client. The cost is a narrow race, named rather than
-    /// engineered around: the daemon broadcasts an event *before* applying it to
-    /// its own state (`daemon.rs`'s hook ingest is `event_tx.send(..)` then
-    /// `state.apply_event(..)`, and the two take different locks), so a client
-    /// that folds a message in that window and then installs a reply built in it
-    /// discards a transition the reply did not contain.
+    /// engineered around — and it is worth stating precisely, because the
+    /// obvious version of it is the wrong way round.
     ///
-    /// It costs one status transition, it self-heals at the next event for that
-    /// agent, and it is bounded by [`RECONCILE_INTERVAL`] in the worst case.
+    /// **An event cannot be swallowed.** `daemon::ingest_event` takes the
+    /// `AppState` write lock *before* the broadcast and holds it across both
+    /// `event_tx.send(..)` and `state.apply_event(..)`, and the `ListAgents`
+    /// handler's read lock therefore serialises after it. So every reply that
+    /// could reach a client already contains every event that reached it first:
+    /// there is no window in which the daemon has sent a transition and not yet
+    /// applied it to the state a reply is built from.
+    ///
+    /// The residual is the **opposite sign — a double-apply.** The refresh loop
+    /// drains the reader's channel before it issues the fetch, so an event that
+    /// arrives *during* the request is folded on the next pass while the reply
+    /// it is also reflected in has already been installed. For a status that is
+    /// idempotent — which is every transition `apply_event` sets — applying it
+    /// twice is invisible. For the one **monotonic** field, `tool_count`, it
+    /// over-counts by one until the next reconcile re-seeds the fold from a
+    /// fresh reply, which is bounded by [`RECONCILE_INTERVAL`].
+    ///
     /// Closing it properly needs the reply to carry a position in the event
     /// stream — a sequence number on the wire — which is a `PROTOCOL_VERSION`
-    /// change and out of M4(b) by its scope fence.
-    ///
-    /// The watcher's own ordering does not widen it: events that arrive while a
-    /// fetch is in flight are still sitting in the reader's channel and are
-    /// folded on the next pass, so only a message folded *before* the request
-    /// was written is a candidate at all.
+    /// change and out of M4(b) by its scope fence. A transient +1 on a tool
+    /// tally does not buy a wire break.
     pub(crate) fn install(&mut self, records: Vec<AgentRecord>, now: Instant) {
         let mut fold = AppState::default();
         for record in &records {
@@ -456,6 +493,37 @@ mod tests {
             view.needs_fetch(now),
             Some(FetchReason::SessionStart),
             "gap 1 is closed by a targeted fetch, not by waiting for the floor"
+        );
+    }
+
+    /// Scenario: install one agent, fold a `SessionEnd` for it, and check that
+    /// a fetch falls due at once rather than at the floor. A cooperative exit
+    /// is the common removal and this is what reconciles it in one round trip;
+    /// the record itself is still present, which is the point — the fetch is
+    /// what finds out whether it has gone.
+    #[test]
+    fn a_session_end_makes_a_fetch_fall_due_at_once() {
+        let now = Instant::now();
+        let mut view = AgentView::default();
+        view.install(vec![record("7", "pane-7")], now);
+        assert_eq!(view.needs_fetch(now), None);
+
+        view.apply(&BroadcastMsg::Event(event(
+            "pane-7",
+            "7",
+            EventType::SessionEnd,
+        )));
+
+        assert_eq!(
+            view.needs_fetch(now),
+            Some(FetchReason::SessionEnd),
+            "a cooperative exit must not wait out the floor"
+        );
+        assert_eq!(
+            view.records().len(),
+            1,
+            "the record is still there: SessionEnd retires a session, not a record, \
+             which is why this reason is an optimisation and not a removal signal"
         );
     }
 
