@@ -45,13 +45,19 @@ pub(crate) enum HookShell {
     /// **Codex.** Its hooks engine
     /// (`codex-rs/hooks/src/engine/command_runner.rs`, read at 0.149.0) hands
     /// the whole command string to `%COMSPEC%` else `cmd.exe` with `/C` on
-    /// Windows, and to `$SHELL` else `/bin/sh` with `-lc` otherwise. There is
-    /// no per-entry override to write: measured on 0.149.0, a handler's
-    /// `shell`, `cwd`, `env` and `timeoutSec` are silently dropped and do not
-    /// even reach `currentHash`, so that default is what runs every deck hook
-    /// and the interpreter really does follow the host — and `codex_home`
-    /// honours `$CODEX_HOME` on every platform, which is what makes the Windows
-    /// arm reachable rather than theoretical.
+    /// Windows, and to `$SHELL` else `/bin/sh` with `-lc` otherwise. **The deck
+    /// writes no per-entry `shell` override**, so that default is what runs
+    /// every deck hook and the interpreter really does follow the host — and
+    /// there would be nothing to gain by writing one: measured on 0.149.0, a
+    /// handler's `shell`, `cwd`, `env` and `timeoutSec` are silently dropped and
+    /// do not even reach `currentHash`. (The load-bearing claim is the first
+    /// one, about this project's own writer, which [`build_command`] below makes
+    /// verifiable here. The measurement is four field names from one version of
+    /// somebody else's schema, and is kept as corroboration only — read as a
+    /// claim about Codex's whole schema it would be an absolute standing on far
+    /// less than it needs, CLAUDE.md rule 17.) `codex_home` honours
+    /// `$CODEX_HOME` on every platform, which is what makes the Windows arm
+    /// reachable rather than theoretical.
     Native,
     /// A POSIX shell, whatever the host is.
     ///
@@ -579,9 +585,15 @@ pub(crate) fn executables_match(existing: &str, installing: &str) -> bool {
 /// and its pin is positively known not to be usable
 /// ([`crate::platform::paths::pin_is_repairable`]).
 ///
-/// This is the "repair only when the target is **positively missing**" gate PRD
-/// #381 Open Question 3 settles on, and the whole of its conservatism lives in
-/// those two conjuncts. The basename half is what keeps a deck rule for a
+/// This is the repair gate PRD #381 Open Question 3 settles on, and the whole of
+/// its conservatism lives in those two conjuncts. #381 spelt it "repair only
+/// when the target is **positively missing**", which was accurate for the
+/// `try_exists`-only check of the day; [`crate::platform::paths::pin_is_repairable`]
+/// has since widened it to the whole "is this a pin the deck would write"
+/// question, so a bare or relative pin, a non-executable file and a
+/// `target/{debug,release}` path are replaceable too — two of them while naming
+/// a file that exists. The conservatism is unchanged in direction, but do not
+/// read "missing" as the boundary. The basename half is what keeps a deck rule for a
 /// genuinely *different-looking* binary out of it — most hook fixtures name
 /// fictional paths that were never on disk, and they must not be swept up just
 /// because they do not exist. The `pin_is_repairable` half is what keeps a
@@ -1244,9 +1256,15 @@ mod tests {
     }
 
     /// A command that is NOTHING BUT the suffix names some program called
-    /// `hook` on the agent's own `$PATH`. This project has never written one,
-    /// so claiming it would be claiming a stranger's command — and at the Codex
-    /// trust seam, handing it a grant.
+    /// `hook` on the agent's own `$PATH`. Neither of this project's two command
+    /// builders can produce one: [`build_command`] (the Codex, Devin and
+    /// OpenCode installers) and `hooks_manage::make_rule` (Claude's) both
+    /// prefix the executable token, and the quoters behind them both quote the
+    /// empty string rather than emitting nothing. So claiming it would be
+    /// claiming a stranger's command — and at the Codex trust seam, handing it
+    /// a grant. (That is the checkable form of what this used to say, "this
+    /// project has never written one", which is a claim over the whole history
+    /// of the repository and not one anybody can verify.)
     #[test]
     fn command_executable_rejects_a_command_that_is_only_the_suffix() {
         assert_eq!(command_executable("hook --agent codex", CODEX), None);
@@ -1431,9 +1449,18 @@ mod tests {
         ));
     }
 
-    /// Branch 3, the only one that prunes: positively reported missing by the
-    /// OS, under this binary's own basename — the pruned-worktree residue PRD
-    /// #381's repair gate exists for.
+    /// Branch 3 — the one of this function's four branches that prunes, here
+    /// exercised with a pin the OS positively reports missing, under this
+    /// binary's own basename: the pruned-worktree residue PRD #381's repair gate
+    /// exists for.
+    ///
+    /// "The branch that prunes" is about `pin_is_dead_sibling`, not about the
+    /// pruned set: [`crate::platform::paths::pin_is_repairable`] behind it
+    /// returns `true` on four conditions, and a positively-absent path is only
+    /// one of them — a bare or relative pin, a non-executable file and a
+    /// `target/{debug,release}` path are equally replaceable, two of them while
+    /// naming a file that exists. Those are covered by that function's own tests
+    /// in `platform::paths`; this one is about the basename conjunct.
     #[test]
     fn pin_is_dead_sibling_repairs_a_positively_absent_sibling() {
         let dir = crate::test_temp::tempdir().expect("pin tempdir");

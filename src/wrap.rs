@@ -773,7 +773,13 @@ fn codex_spawn_prep(
     if let (Some(home), Some(binary_path)) = (pinned_home.as_deref(), installed_binary.as_deref()) {
         let cwd = std::env::current_dir().unwrap_or_else(|_| home.to_path_buf());
         match crate::codex_hooks_manage::trust_deck_hooks_in(home, &cwd, binary_path) {
-            Ok(count) => tracing::debug!(count, "codex: recorded scoped trust for deck hooks"),
+            // A zero that means "our own entry was unrecognisable" has already
+            // warned from inside `trust_deck_hooks_in`; nothing here reports to a
+            // user, so the count is all this path needs.
+            Ok(outcome) => tracing::debug!(
+                count = outcome.trusted(),
+                "codex: recorded scoped trust for deck hooks"
+            ),
             Err(e) => tracing::warn!(
                 "codex: could not record scoped hook trust ({e}); deck events degrade to stdout \
                  classification"

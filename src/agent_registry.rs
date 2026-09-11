@@ -274,16 +274,42 @@ fn codex_install_resolved(binary_path: Result<String, String>) -> Result<(), Str
     let cwd = std::env::current_dir().unwrap_or_else(|_| home.clone());
     // Trust exactly the command the install above wrote, for the binary path it
     // validated — never merely "something ending in the deck's verb" (#730).
-    // The count is reported rather than discarded: a silent zero here is how a
+    // The outcome is reported rather than discarded: a silent zero here is how a
     // Codex that stopped echoing our command byte-for-byte would look, and
     // `hooks install` used to exit 0 saying nothing about trust either way.
+    //
+    // **Each branch prints only what it knows** (issue #730, auditor S-C). This
+    // one line is the whole of what a user sees about trust, so it may not name
+    // a cause the code has not established: the old text said "Codex reported no
+    // deck hook to trust" on *both* zeros, which is false on the one where Codex
+    // reported one and `Exact` did not match it — the very case
+    // `codex_hooks_manage`'s warn exists to surface. `TrustOutcome` carries that
+    // distinction out precisely so this does not have to guess.
+    use crate::codex_hooks_manage::TrustOutcome;
     match crate::codex_hooks_manage::trust_deck_hooks_in(&home, &cwd, &binary_path) {
-        Ok(0) => println!(
+        Ok(TrustOutcome::NothingListed) => println!(
             "Trusted hooks: none (Codex reported no deck hook to trust; events fall back to \
              stdout classification)"
         ),
-        Ok(count) => println!("Trusted hooks: {count}"),
-        Err(e) => tracing::warn!("codex hooks install: could not record scoped hook trust: {e}"),
+        Ok(TrustOutcome::Unrecognised { listed }) => println!(
+            "Trusted hooks: none (Codex reported {listed} deck-signature {}, but none carries \
+             the command this install just wrote, so nothing could be trusted; events fall back \
+             to stdout classification. Set DOT_AGENT_DECK_LOG to log the expected command.)",
+            if listed == 1 { "entry" } else { "entries" }
+        ),
+        Ok(TrustOutcome::Trusted(count)) => println!("Trusted hooks: {count}"),
+        // Say it on stderr as well as in the log. This is the one arm that
+        // printed nothing at all, so the user got no trust line whatsoever and
+        // exit 0 — and the log half needs `DOT_AGENT_DECK_LOG` to have been set
+        // before the run. The definitions are written either way, which is why
+        // this is not a failure.
+        Err(e) => {
+            tracing::warn!("codex hooks install: could not record scoped hook trust: {e}");
+            eprintln!(
+                "Warning: hook definitions were installed, but scoped hook trust could not be \
+                 recorded ({e}); Codex events fall back to stdout classification"
+            );
+        }
     }
     Ok(())
 }

@@ -244,25 +244,46 @@ fn command_is_this_binary(command: &str, binary_path: &str) -> bool {
 
 /// Whether `command` is a deck-owned command whose pin is POSITIVELY not usable
 /// and which shares the installing binary's own basename — the "repair only when
-/// the target is missing" gate, mirroring `hooks_manage::command_is_dead_deck`.
+/// the target is not one the deck would write" gate, mirroring
+/// `hooks_manage::command_is_dead_deck`.
+///
+/// [`crate::platform::paths::pin_is_repairable`] is what "not usable" means, and
+/// it is not the same as "missing": a bare or relative pin and a
+/// `target/{debug,release}` path are both unusable-and-replaceable while naming
+/// a file that may exist and run (issue #536's read side). A stat error on a
+/// well-formed absolute pin is the one case that keeps the benefit of the doubt.
 ///
 /// Issue #730: before this, `install_impl` stripped **every** deck-owned rule by
 /// suffix and re-added its own, so a deck-owned entry naming a different but
 /// still-valid install was repointed on each launch. PRD #381's Open Question 3
-/// answers that case explicitly — leave it alone; the trigger is "the target is
-/// missing", never "the target is not what I would have written" — and Claude
-/// and OpenCode already behaved that way. This is what makes Devin match.
+/// answers that case explicitly — leave it alone; the trigger is never "the
+/// target is not what I would have written" — and Claude and OpenCode already
+/// behaved that way. (#381 spelt the positive half of that trigger "the target
+/// is missing", which was accurate for the `try_exists`-only gate it was written
+/// against and is narrower than [`crate::platform::paths::pin_is_repairable`]
+/// asks today; the paragraph above is the current reading.) This is what makes
+/// Devin match.
 fn command_is_dead_deck(command: &str, binary_path: &str) -> bool {
     deck_command_executable(command)
         .is_some_and(|exe| crate::agent_hook_config::pin_is_dead_sibling(&exe, binary_path))
 }
 
 /// Whether a re-install by `binary_path` may REPLACE `command`: it is either
-/// this binary's own prior deck command, or a deck command whose pin is
-/// positively dead and shares this binary's basename. The union of
+/// this binary's own prior deck command, or a deck command naming a pin the deck
+/// cannot use — missing, bare or relative, non-executable, or a build-artifact
+/// path — under this binary's basename. The union of
 /// [`command_is_this_binary`] and [`command_is_dead_deck`], named once because
 /// [`install_impl`] applies it in two places — the installed events and the
 /// retired-event sweep — and the two must not drift apart (issue #730).
+///
+/// "Cannot use" is [`crate::platform::paths::pin_is_repairable`]'s question and
+/// it is wider than "the OS says the file is gone": of its four true-cases, two
+/// can fire for a pin that names a file which exists and runs — a bare or
+/// relative pin (#536's own shape, resolved through the *agent's* `$PATH`, or
+/// against its cwd, at hook-fire time) and a `target/{debug,release}` path. That
+/// is deliberate and is the whole point of #536's read side, so do not describe
+/// this as pruning only what is positively gone; it prunes what the deck would
+/// refuse to write.
 fn command_is_replaceable(command: &str, binary_path: &str) -> bool {
     command_is_this_binary(command, binary_path) || command_is_dead_deck(command, binary_path)
 }
@@ -295,11 +316,14 @@ fn install_impl(root: &mut Value, command: &str, binary_path: &str) {
     // of its own rules. Same predicate as the installed-event sweep below,
     // deliberately: a deck command under a retired event is NOT dead merely
     // because this deck stopped installing that event. `DEVIN_HOOK_EVENTS` says
-    // what this deck writes, not what the agent runs — measured on Codex 0.149.0,
-    // whose adapter carries the identical sweep, and which accepts and
-    // enumerates a hook under an event that deck does not install. So a wide
-    // sweep here can delete a live hook belonging to a user or to a newer
-    // sibling install. That is issue #730's own defect one door along.
+    // what this deck writes, not what the agent runs — which is true by
+    // construction of this list for any agent, and so needs no per-agent
+    // measurement. The corroborating measurement we do have is of CODEX, not of
+    // Devin: Codex 0.149.0, whose adapter carries the identical sweep, accepts
+    // and enumerates a hook under an event that deck does not install. Nothing
+    // here has been measured against a real Devin. So a wide sweep here can
+    // delete a live hook belonging to a user or to a newer sibling install.
+    // That is issue #730's own defect one door along.
     //
     // The consequence, stated rather than left to be discovered: nothing cleans
     // a FOREIGN install's retired-event rule during install. That is the same
@@ -335,11 +359,12 @@ fn install_impl(root: &mut Value, command: &str, binary_path: &str) {
         }
         let arr = arr.as_array_mut().expect("hook event value is an array");
         // Normalize down to a single fresh rule, but only for THIS binary —
-        // plus any deck pin that is positively dead and shares its basename,
-        // the shape N worktree builds actually take. A deck rule belonging to a
-        // genuinely different, still-valid install is left in place and the new
-        // rule is added ALONGSIDE it (issue #730), which is what Claude's
-        // `install_impl` has always done.
+        // plus any deck pin sharing its basename that the deck would not
+        // itself write (missing, bare or relative, non-executable, or a
+        // build-artifact path), the shape N worktree builds actually take. A
+        // deck rule belonging to a genuinely different, still-valid install is
+        // left in place and the new rule is added ALONGSIDE it (issue #730),
+        // which is what Claude's `install_impl` has always done.
         strip_deck_commands(arr, |cmd| command_is_replaceable(cmd, binary_path));
         arr.push(entry.clone());
     }
@@ -594,6 +619,20 @@ mod tests {
     /// The deck command this adapter writes for `binary`.
     fn command_for(binary: &str) -> String {
         crate::agent_hook_config::build_command(binary, HOOK_COMMAND_SUFFIX, HOOK_SHELL)
+    }
+
+    /// Every command under `event`, deck-owned or not — the unfiltered twin of
+    /// [`deck_commands_for`], which cannot see a user's own hook and so cannot
+    /// assert that one survived (issue #730, auditor N-H). Mirrors the Codex
+    /// adapter's `commands_for`.
+    fn commands_for(root: &Value, event: &str) -> Vec<String> {
+        root["hooks"][event]
+            .as_array()
+            .unwrap_or(&Vec::new())
+            .iter()
+            .flat_map(crate::agent_hook_config::rule_commands)
+            .map(str::to_string)
+            .collect()
     }
 
     fn deck_commands_for(root: &Value, event: &str) -> Vec<String> {
@@ -881,9 +920,15 @@ mod tests {
     /// A re-install after `DEVIN_HOOK_EVENTS` shrinks must not orphan THIS
     /// install's own deck rule under an event we no longer install, and must not
     /// leave the emptied key behind. It must equally not reach a deck rule
-    /// belonging to a different, still-valid install: `DEVIN_HOOK_EVENTS` says
-    /// what this deck writes, not what the agent runs, so a deck command under a
-    /// retired event is not dead, it is someone else's (issue #730).
+    /// belonging to a different, still-valid install, nor a hook of the user's
+    /// own sharing that rule object: `DEVIN_HOOK_EVENTS` says what this deck
+    /// writes, not what the agent runs, so a deck command under a retired event
+    /// is not dead, it is someone else's (issue #730).
+    ///
+    /// Three of the four cases the Codex adapter asserts in one rule are here
+    /// (ours swept, a foreign live install kept, a user's hook kept); the
+    /// fourth, a dead sibling pin swept, is the test below. Arm 2's assertion is
+    /// deliberately unfiltered so the user's hook is inside what it compares.
     #[test]
     fn install_cleans_up_only_its_own_deck_rules_for_retired_events() {
         let fixture = crate::test_temp::tempdir().expect("devin fixture tempdir");
@@ -916,9 +961,13 @@ mod tests {
         );
 
         // Arm 2 — a different install's still-valid rule under the same retired
-        // event. It shares our basename deliberately, so `pin_is_repairable`
+        // event, plus a hook of the user's own sharing that rule object. The
+        // foreign binary shares our basename deliberately, so `pin_is_repairable`
         // saying "the target is still there" is the only thing standing between
-        // it and deletion.
+        // it and deletion; the user's hook is here because the assertion is
+        // UNFILTERED (issue #730, auditor N-H — it used to run through
+        // `deck_commands_for`, which cannot see a non-deck command, so this half
+        // was asserted on the Codex side only).
         let theirs = fixture.path().join("theirs");
         std::fs::create_dir_all(&theirs).expect("create config dir");
         std::fs::write(
@@ -926,7 +975,10 @@ mod tests {
             serde_json::to_vec_pretty(&json!({
                 "hooks": {
                     "RetiredEvent": [
-                        { "hooks": [ { "type": "command", "command": command_for(&other) } ] }
+                        { "hooks": [
+                            { "type": "command", "command": command_for(&other) },
+                            { "type": "command", "command": "/usr/local/bin/my-audit.sh" }
+                        ] }
                     ]
                 }
             }))
@@ -938,9 +990,13 @@ mod tests {
 
         let root = read_back(&theirs);
         assert_eq!(
-            deck_commands_for(&root, "RetiredEvent"),
-            vec![command_for(&other)],
-            "another install's still-valid rule under a retired event must survive: {root:?}"
+            commands_for(&root, "RetiredEvent"),
+            vec![
+                command_for(&other),
+                "/usr/local/bin/my-audit.sh".to_string()
+            ],
+            "another install's still-valid rule and the user's own hook beside it must both \
+             survive under a retired event: {root:?}"
         );
     }
 

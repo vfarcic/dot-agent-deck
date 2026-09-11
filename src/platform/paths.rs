@@ -1178,10 +1178,14 @@ fn cmd_quote_if_needed(path: &str) -> String {
 /// - **Codex** (`codex-rs/hooks/src/engine/command_runner.rs`, read at 0.149.0)
 ///   hands the whole command string to a shell. Its `default_shell_command` is
 ///   `%COMSPEC%` else `cmd.exe` with `/C` on Windows, and `$SHELL` else
-///   `/bin/sh` with `-lc` otherwise; there is no per-entry `shell` override to
-///   write — measured on 0.149.0, a handler's `shell`, `cwd`, `env` and
-///   `timeoutSec` are silently dropped and are not even hashed into
-///   `currentHash` — so that default is what runs them. The Windows arm passes the
+///   `/bin/sh` with `-lc` otherwise; **the deck writes no `shell` override into
+///   its entries**, so that default is what runs them — and writing one would
+///   buy nothing anyway, since a handler's `shell`, `cwd`, `env` and
+///   `timeoutSec` were measured on 0.149.0 to be silently dropped and not even
+///   hashed into `currentHash`. (The first half is the claim that matters and it
+///   is about this deck's own writer; the measurement corroborates it and is not
+///   a statement about Codex's whole schema — see
+///   [`crate::agent_hook_config::HookShell::Native`].) The Windows arm passes the
 ///   line through `raw_arg` wrapped in one extra pair of double quotes, i.e.
 ///   `cmd.exe /C ""<our line>""`. That is the standard idiom and it composes
 ///   with the quoting here: with four quote characters on the line `cmd.exe`'s
