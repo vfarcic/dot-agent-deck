@@ -788,6 +788,10 @@ fn ensure_snapshot_watcher(app: &AppHandle, state: &DesktopState) {
     // event subscription is the one connection the desktop holds open across
     // refreshes. Hence the `invalidate_all` below.
     let links = Arc::clone(&state.daemon);
+    // PRD #741 M9: the selection signal. Subscribed here rather than inside the
+    // task so the first observed generation is the one in force when the
+    // watcher started, not whatever it happens to be when the task is polled.
+    let mut selection = state.selection.subscribe();
     tauri::async_runtime::spawn(async move {
         // PRD #741 M4(b): the incremental agent list. It belongs to this task
         // and to nothing else — it is only ever correct while this task's
@@ -822,8 +826,13 @@ fn ensure_snapshot_watcher(app: &AppHandle, state: &DesktopState) {
             // size, so everything held is discarded and the first refresh under
             // this stream re-fetches. Called before the first event can arrive.
             view.resubscribed();
+            // PRD #741 M9: anything announced before this subscription existed
+            // is already accounted for by the establishment above, so the arm
+            // starts from here rather than firing once on a stale edge.
+            selection.mark_unchanged();
             let reader = spawn_event_reader(subscription);
-            watch_one_subscription(&app, &links, &mut view, reader).await;
+            let ended =
+                watch_one_subscription(&app, &links, &mut view, reader, &mut selection).await;
             // PRD #741 M4(a): the event stream ended. That is the desktop's
             // ONE long-lived connection to the daemon going away, and a daemon
             // cannot be replaced without the old process dying and taking this
@@ -831,7 +840,20 @@ fn ensure_snapshot_watcher(app: &AppHandle, state: &DesktopState) {
             // now describe a process that no longer exists. Drop every link
             // before reconnecting; the loop's next `trusted_daemon` handshakes
             // against whatever is actually there now.
+            //
+            // A selection change reaches the same place for a different reason:
+            // the link is not stale, it simply describes a deck the user has
+            // left. `apply_selection` has already invalidated it, and the call
+            // below is a no-op in that case rather than a second mechanism.
             links.invalidate_all().await;
+            // PRD #741 M9: the retry delay is a backoff for a deck that is not
+            // answering. A selection change is a user's click, and there is a
+            // healthy deck waiting at the other end of it, so it re-subscribes
+            // straight away — a second of dead air after choosing a deck is the
+            // whole of what the user would see.
+            if ended == SubscriptionEnd::SelectionChanged {
+                continue;
+            }
             tokio::time::sleep(WATCH_RETRY_DELAY).await;
         }
     });
@@ -857,17 +879,33 @@ fn spawn_event_reader(
     rx
 }
 
+/// Why [`watch_one_subscription`] returned (PRD #741 M9).
+///
+/// The two are not the same event and must not share a retry policy: a stream
+/// that ended is a deck that may be gone, and backing off is right; a selection
+/// change is a click, and backing off is a second of dead air the user reads as
+/// the app ignoring them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SubscriptionEnd {
+    /// The daemon's event stream ended — EOF, an error, or a replaced daemon.
+    Ended,
+    /// The user chose a different deck, so this subscription is against the
+    /// wrong one.
+    SelectionChanged,
+}
+
 /// The refresh loop for one subscription: fold what arrives, re-emit at the
 /// coalesce floor, and wake on the reconciliation timer even when nothing
 /// arrives at all.
 ///
-/// Returns when the subscription ends.
+/// Returns when the subscription ends, or when the selected deck changes.
 async fn watch_one_subscription(
     app: &AppHandle,
     links: &DaemonLinks,
     view: &mut AgentView,
     mut events: tokio::sync::mpsc::Receiver<BroadcastMsg>,
-) {
+    selection: &mut tokio::sync::watch::Receiver<u64>,
+) -> SubscriptionEnd {
     let mut reconcile = tokio::time::interval(RECONCILE_INTERVAL);
     reconcile.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // `interval` fires immediately on its first tick; the refresh below already
@@ -884,9 +922,25 @@ async fn watch_one_subscription(
                     view.apply(&msg);
                 }
                 // The reader task is gone, so the subscription ended.
-                None => return,
+                None => return SubscriptionEnd::Ended,
             },
             _ = reconcile.tick() => view.mark_reconcile_due(),
+            // PRD #741 M9: returns BEFORE the refresh below, deliberately. The
+            // fold under this arm was built from the deck the user has just
+            // left, and `snapshot_with` would answer the new deck's snapshot
+            // out of it — one machine's agents under another machine's name.
+            // Returning discards the fold with the subscription that filled it:
+            // the caller re-establishes, and `view.resubscribed()` runs before
+            // the next stream can deliver anything.
+            //
+            // `changed()` errors only when every sender is gone, which cannot
+            // happen while `DesktopState` is alive; treated as "no more
+            // selection changes" rather than as a reason to end the watch.
+            changed = selection.changed() => {
+                if changed.is_ok() {
+                    return SubscriptionEnd::SelectionChanged;
+                }
+            }
         }
         // Everything already queued is applied to THIS refresh rather than
         // costing one of its own. Before M4(b) each event cost a full
@@ -1101,6 +1155,7 @@ async fn desktop_get_settings(
 /// framework parses before this signature is reached.
 #[tauri::command]
 async fn desktop_set_settings(
+    app: AppHandle,
     webview: Webview,
     state: State<'_, DesktopState>,
     settings: DesktopSettings,
@@ -1112,36 +1167,57 @@ async fn desktop_set_settings(
         eprintln!("{}", error.detail());
         safe_message(error.public())
     })?;
-    apply_selection(&state, &settings).await;
+    apply_selection(&app, &state, &settings).await;
     Ok(settings)
 }
 
-/// Put a saved document's deck selection into force (PRD #741 M7).
+/// Put a saved document's deck selection into force (PRD #741 M7, completed at
+/// M9).
 ///
-/// Three things happen and they have to happen together, which is why they are
-/// one function rather than three lines at each call site:
+/// Six things happen and they have to happen together, which is why they are one
+/// function rather than six lines at each call site:
 ///
 /// 1. **The selection is applied**, so `selected_endpoint()` — and therefore the
 ///    snapshot, the banner and the Stop/Replace gating — name the deck the user
 ///    just chose.
-/// 2. **The held handshake for the deck we were talking to is dropped.** A
+/// 2. **Every terminal session is detached.** A session streams from ONE
+///    daemon's PTY; after a selection change every one of them is showing the
+///    deck the user has left. The same pairing `StopDaemon` and `RestartDaemon`
+///    already make — invalidate, then detach — and for the same reason: a tile
+///    left attached to a deck that is no longer selected is a tile whose
+///    keystrokes go to another machine's agent.
+/// 3. **The held handshake for the deck we were talking to is dropped.** A
 ///    classification describes one daemon; after a selection change it describes
 ///    the wrong one, and holding it would report the old deck's agent count
 ///    beside the new deck's name for up to `HANDSHAKE_REVALIDATE_INTERVAL`.
-/// 3. **Every transport except the selected deck's is released** — rule 3 of
+/// 4. **Every transport except the selected deck's is released** — rule 3 of
 ///    `endpoint_tunnels`, and the leak PRD #741 M7 names explicitly: without it
 ///    each selection change leaves an authenticated `ssh -N -L` child behind for
 ///    the life of the app. A lease already handed out survives this, so nothing
-///    in flight is torn out from under.
+///    in flight is torn out from under — which since M9 includes a terminal
+///    session's own lease, not merely the link's.
+/// 5. **The watcher is told** (M9). Its event subscription is a connection to
+///    one daemon and a selection change does not end it, so without this it
+///    would keep folding the old deck's broadcasts into the view that answers
+///    the new deck's snapshots. See `DesktopState::selection`.
+/// 6. **A snapshot for the new deck is emitted** (M9). The watcher re-subscribes
+///    within a moment and would emit one of its own on its next event or
+///    reconcile tick, but "within five seconds" is not an answer to a click:
+///    this is what makes the fleet on screen the chosen deck's by the time the
+///    save returns.
 ///
-/// The order matters in one place: the links are dropped *before* the tunnels,
+/// The order matters in two places: the links are dropped *before* the tunnels,
 /// so a link cannot be re-established against a transport that is on its way
-/// out.
-async fn apply_selection(state: &DesktopState, settings: &DesktopSettings) {
+/// out; and the sessions are detached before either, so a detach frame still has
+/// a transport to travel over.
+async fn apply_selection(app: &AppHandle, state: &DesktopState, settings: &DesktopSettings) {
     let deck = crate::dto::apply_settings_selection(settings);
+    terminal::detach_all(state).await;
     state.daemon.invalidate_all().await;
     let live: std::collections::HashSet<String> = [deck.endpoint.describe()].into_iter().collect();
     state.tunnels.retain(&live).await;
+    state.selection_changed();
+    refresh_and_emit(app, &state.daemon).await;
 }
 
 /// Test one endpoint end to end and report a **named state** (PRD #741 M10).

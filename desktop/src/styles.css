@@ -372,6 +372,37 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .branch-line { gap: 5px; margin-top: 6px; color: var(--muted); font-family: "JetBrains Mono", monospace; font-size: 9.5px; }
 .branch-line span { max-width: 180px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .branch-line i { width: 3px; height: 3px; border-radius: 50%; background: var(--line-strong); }
+/* PRD #741 M9 — the Deck selector, in the top bar's `.repo-context` on both
+   the deck and the overview.
+
+   `position: relative` on the root and the menu absolutely positioned under it,
+   the same shape `.overview-columns-picker` uses, so the menu cannot widen the
+   top bar. That matters here more than there: `.repo-context` is the topbar's
+   FIRST grid column at `minmax(210px, 1fr)`, so an in-flow menu would push the
+   instruments and the actions sideways at a narrow window — the 900px case the
+   browser tier measures. Every text node in the trigger is
+   `text-overflow: ellipsis` for the same reason: a deck is named `user@host`
+   and a long one must shorten rather than shove. */
+.deck-selector { position: relative; margin-top: 6px; min-width: 0; }
+.deck-selector-trigger { max-width: 100%; padding: 2px 6px 2px 4px; display: flex; align-items: center; gap: 5px; border: 1px solid var(--line); border-radius: 3px; background: none; color: var(--muted); font-size: 9.5px; cursor: pointer; }
+.deck-selector-trigger:hover { color: var(--ink); background: var(--paper-strong); }
+.deck-selector-trigger strong { min-width: 0; overflow: hidden; color: var(--ink); font-family: "JetBrains Mono", monospace; font-size: 9.5px; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
+.deck-selector-state { margin-top: 4px; display: flex; align-items: center; gap: 4px; min-width: 0; color: var(--muted); font-size: 9px; line-height: 1.35; }
+.deck-selector-state.is-problem { color: var(--status-warn); }
+.deck-selector-state span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.deck-selector-state svg { flex: none; }
+.deck-selector-menu { position: absolute; top: calc(100% + 6px); left: 0; z-index: 30; min-width: 204px; max-width: min(320px, 80vw); padding: 8px; display: flex; flex-direction: column; gap: 1px; border: 1px solid var(--line-strong); border-radius: var(--radius); background: var(--paper); box-shadow: 0 10px 26px rgb(var(--scrim-rgb) / .13); }
+/* A `<span>` with an id, read by the radiogroup's `aria-labelledby`. NOT a
+   `<legend>`: WebKit forces a rendered legend's `float` to `none` (#1032), and
+   the app ships on WebKit. */
+.deck-selector-menu-label { margin-bottom: 5px; color: var(--faint); font-size: 8px; letter-spacing: .08em; text-transform: uppercase; }
+.deck-selector-menu p { margin: 6px 0 0; padding-top: 6px; border-top: 1px solid var(--line); color: var(--faint); font-size: 9px; line-height: 1.45; }
+.deck-selector-option { width: 100%; padding: 4px 5px; display: flex; align-items: center; gap: 6px; border: 0; border-radius: 3px; background: none; color: var(--ink); font-size: 10px; text-align: left; cursor: pointer; }
+.deck-selector-option:hover { background: var(--paper-strong); }
+.deck-selector-option span { min-width: 0; overflow: hidden; font-family: "JetBrains Mono", monospace; text-overflow: ellipsis; white-space: nowrap; }
+.deck-selector-option svg { margin-left: auto; flex: none; color: var(--status-ok); }
+.deck-selector-option.is-selected { background: var(--paper-strong); font-weight: 600; }
+
 .run-instruments { display: flex; align-self: stretch; border-inline: 1px solid var(--line); }
 .instrument { min-width: 62px; padding: 0 11px; display: flex; flex-direction: column; justify-content: center; gap: 4px; border-right: 1px solid var(--line); }
 .instrument:last-child { border-right: 0; }

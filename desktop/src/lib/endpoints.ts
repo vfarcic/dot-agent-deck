@@ -18,7 +18,7 @@
  * comment on each names the impl it mirrors.
  */
 
-import type { RemoteEndpointDto } from "./bridge";
+import type { EndpointSettingsDto, RemoteEndpointDto } from "./bridge";
 import { DEFAULT_SSH_PORT, LOCAL_ENDPOINT_SELECTION } from "./bridge";
 import { sanitizeText } from "./displayText";
 
@@ -193,3 +193,95 @@ export function describeEndpoint(row: RemoteEndpointDto): string {
 export function blankEndpoint(): RemoteEndpointDto {
   return { host: "", id: mintEndpointId(), port: DEFAULT_SSH_PORT };
 }
+
+/**
+ * Which deck the app is talking to, on the webview's side (PRD #741 M9).
+ *
+ * # Why this is a union and not a string
+ *
+ * The *stored* form is one token — `local`, or a row's id — and `Selection` in
+ * `settings.rs` is the authority on it. What travels through the screens is this
+ * union, for exactly the reason M6 made the Rust side an enum rather than an
+ * `Option<EndpointId>`: [#742](https://github.com/vfarcic/dot-agent-deck/issues/742)
+ * adds **All Decks** to this selector, and that has to be *additive*. With a
+ * union it is one variant plus one arm in each of three places —
+ * {@link parseSelection}, {@link selectionToken} and {@link deckChoices}. With a
+ * bare id threaded through the components it would be a change to every prop
+ * that carries a selection, and a `""`-means-all convention in each of them.
+ *
+ * So: no component below this file handles a raw endpoint id, and none of them
+ * needs to know that `local` is a reserved word.
+ */
+export type DeckSelection =
+  | { kind: "local" }
+  | { kind: "one"; id: string };
+
+/** The default, and what an unrecognised token degrades to. */
+export const LOCAL_DECK_SELECTION: DeckSelection = { kind: "local" };
+
+/**
+ * Read a stored token.
+ *
+ * An unknown token — including one a *newer* build wrote, such as #742's `all`
+ * — parses as `One`, finds no row, and is therefore rendered as the local deck
+ * with the fallback the Rust side already reports. That is the same degradation
+ * `Selection`'s own deserializer performs, and it is why nothing here throws:
+ * the document is hand-editable and may have been written by a build with more
+ * variants than this one.
+ */
+export function parseSelection(token: string): DeckSelection {
+  return token === LOCAL_ENDPOINT_SELECTION ? LOCAL_DECK_SELECTION : { kind: "one", id: token };
+}
+
+/** The token to store. The inverse of {@link parseSelection}. */
+export function selectionToken(selection: DeckSelection): string {
+  return selection.kind === "local" ? LOCAL_ENDPOINT_SELECTION : selection.id;
+}
+
+/** Whether two selections name the same deck. */
+export function sameSelection(left: DeckSelection, right: DeckSelection): boolean {
+  return selectionToken(left) === selectionToken(right);
+}
+
+/** One entry in the Deck selector: what it is, and how it is named on screen. */
+export interface DeckChoice {
+  /** Stable per entry, and what the selector keys and test ids use. */
+  token: string;
+  selection: DeckSelection;
+  label: string;
+}
+
+/**
+ * Every deck the user can choose, local first.
+ *
+ * The local deck leads and is always present because it needs no configuration
+ * — `Endpoint::local()` resolves it from the platform paths — so this list is
+ * never empty and the selector is useful before anything is stored.
+ *
+ * **Rendered text says Deck, never "daemon".** This is new surface and it is
+ * written in the vocabulary the app is moving to; the sweep of the older strings
+ * is M15's.
+ */
+export function deckChoices(section: EndpointSettingsDto | undefined): DeckChoice[] {
+  const choices: DeckChoice[] = [
+    { token: LOCAL_ENDPOINT_SELECTION, selection: LOCAL_DECK_SELECTION, label: "This machine" },
+  ];
+  for (const row of section?.remote ?? []) {
+    choices.push({
+      token: row.id,
+      selection: { kind: "one", id: row.id },
+      label: describeEndpoint(row) || "New deck",
+    });
+  }
+  return choices;
+}
+
+/**
+ * How the CHOSEN deck is named when it is not one of the listed ones.
+ *
+ * Reachable in one ordinary way: the stored selection names a row this build
+ * cannot see — removed by hand, or written by a newer build. The app is then on
+ * the local deck and says so through `connection.selectionFallback`; this is
+ * only the label on the trigger while that sentence is on screen.
+ */
+export const UNKNOWN_DECK_LABEL = "Unknown deck";

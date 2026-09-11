@@ -36,6 +36,7 @@ import {
 import { AgentOverview } from "./components/AgentOverview";
 import { AgentTile } from "./components/AgentTile";
 import { ConfirmDialog, type ConfirmState } from "./components/ConfirmDialog";
+import { DeckSelector } from "./components/DeckSelector";
 import { HandoffRail } from "./components/HandoffRail";
 import { ProfilesPanel, ProjectsPanel, PromptLibraryPanel, WorkflowPanel } from "./components/ConfigurationPanels";
 import { SettingsSheet } from "./components/SettingsSheet";
@@ -133,7 +134,7 @@ export function DeckShell({ runtime, workflowPlatformIssue, initialView = { kind
    */
   const settings = useDesktopSettings(runtime);
   useZoom(runtime, settings);
-  if (view.kind === "overview") return <AgentOverview runtime={runtime} onNavigate={setView} />;
+  if (view.kind === "overview") return <AgentOverview runtime={runtime} settings={settings} onNavigate={setView} />;
   return <DeckSurface runtime={runtime} settings={settings} workflowPlatformIssue={workflowPlatformIssue} onNavigate={setView} />;
 }
 
@@ -623,6 +624,13 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
               for what goes back to the daemon (PRD #819 audit fix).
             */}
             <div className="branch-line">{snapshot.branch && <><GitBranch size={12} /><span>{snapshot.branch}</span><i /> </>}<span title={activeProject?.displayPath || snapshot.worktree}>{activeProject?.displayPath || snapshot.worktree}</span></div>
+            {/*
+              PRD #741 M9: the Deck selector, here rather than in a corner
+              because this block is what the instruments beside it are about —
+              and in the same place on the overview, so it reads as one control
+              across both screens.
+            */}
+            <DeckSelector settings={settings} connection={snapshot.connection} />
           </div>
           <div className="run-instruments">
             <Instrument label="HEALTH" testId="run-health"><span className={`health-value health-${snapshot.health}`}><i />{snapshot.health}</span></Instrument>

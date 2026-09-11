@@ -3,6 +3,8 @@ import { Blocks, Boxes, Columns3, LayoutList, Layers, Network, RefreshCw, Rotate
 import type { AgentSession, AgentStatus, ConnectionView, DeckRuntimeState, DeckView } from "../types";
 import { modeScopedKey } from "../lib/bridge";
 import { ConfirmDialog, type ConfirmState } from "./ConfirmDialog";
+import { DeckSelector } from "./DeckSelector";
+import type { DesktopSettingsState } from "../hooks/useDesktopSettings";
 import { DISPLAY_LIMITS, displayActivity, displayIdentity, displayPath, displayText, displayTitle, displayUptime, domIdentity, rendersBlank } from "../lib/displayText";
 
 /**
@@ -575,7 +577,18 @@ const WRITE_LEASE_TITLE: Record<"read" | "write" | "none", string> = {
  * because bounding is what it needs and truncating a key is not: the raw value
  * stays the key, and only the copy React sees is clamped.
  */
-export function AgentOverview({ runtime, onNavigate }: { runtime: DeckRuntimeState; onNavigate: (view: DeckView) => void }) {
+/**
+ * `settings` is OPTIONAL, and its absence is what removes the Deck selector
+ * rather than rendering a broken one (PRD #741 M9).
+ *
+ * The alternative — falling back to a `useDesktopSettings` of this screen's own
+ * — is the trap `ControlDeck`'s doc comment describes: two live settings
+ * instances in one tree, one of them rendered by nothing, so a save against the
+ * wrong one writes state no screen reads. `DeckShell` owns the one instance and
+ * passes it to whichever view is mounted; a caller that renders this screen
+ * standalone gets everything except the control that needs a document.
+ */
+export function AgentOverview({ runtime, settings, onNavigate }: { runtime: DeckRuntimeState; settings?: DesktopSettingsState; onNavigate: (view: DeckView) => void }) {
   const { snapshot, mode, setShownTerminals } = runtime;
   /**
    * The screen's whole claim, stated to the bridge rather than merely printed in
@@ -730,6 +743,8 @@ export function AgentOverview({ runtime, onNavigate }: { runtime: DeckRuntimeSta
         <header className="topbar">
           <div className="repo-context">
             <div className="repo-line"><LayoutList size={15} /><strong>Agent overview</strong></div>
+            {/* PRD #741 M9: the same control, in the same block, as the deck's. */}
+            {settings && <DeckSelector settings={settings} connection={connection} />}
           </div>
           <div className="run-instruments">
             <OverviewInstrument label="AGENTS" testId="overview-count-agents"><OverviewCount known={connected} value={agents.length} /></OverviewInstrument>

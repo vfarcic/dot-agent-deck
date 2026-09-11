@@ -65,8 +65,8 @@ pub(crate) struct TrustedDaemon {
     /// `Connected` and still serving requests — the handshake would describe a
     /// deck whose tunnel had already gone.
     ///
-    /// Never read. It exists for its `Drop` order, which is why it is named
-    /// with a leading underscore.
+    /// Read only by [`Self::transport`], and otherwise held for its `Drop`
+    /// order — which is why it keeps the leading underscore.
     _transport: Arc<TunnelLease>,
     /// When the handshake behind [`Self::connection`] was taken. Read by
     /// [`DaemonLinks::trusted`] against [`HANDSHAKE_REVALIDATE_INTERVAL`].
@@ -89,6 +89,26 @@ impl TrustedDaemon {
     /// The classified handshake, for a caller assembling a snapshot from it.
     pub(crate) fn connection(&self) -> DesktopConnection {
         self.connection.clone()
+    }
+
+    /// A lease on the transport this link was established over (PRD #741 M9).
+    ///
+    /// # Why a caller may need one of its own
+    ///
+    /// A link is re-established every [`HANDSHAKE_REVALIDATE_INTERVAL`] and
+    /// dropped outright on a selection change, so "the link held the tunnel
+    /// while I was borrowing it" is an argument about timing rather than a
+    /// guarantee. Anything that opens a **long-lived stream** over the
+    /// transport — a terminal attach, whose write half outlives the request
+    /// that created it by the life of the tile — has to hold the lease itself,
+    /// or a selection change tears the `ssh` child out from under a session
+    /// that is still streaming.
+    ///
+    /// PRD #741 M7 named that as a residual and left the argument standing; M9
+    /// is the milestone that puts several tiles on a remote deck, so it becomes
+    /// a type here. `terminal::TerminalSession` is the one holder.
+    pub(crate) fn transport(&self) -> Arc<TunnelLease> {
+        Arc::clone(&self._transport)
     }
 
     fn is_fresh(&self, now: Instant) -> bool {
