@@ -19,15 +19,36 @@
 //!   the session registry, to `DesktopState`, and to the three connection types
 //!   here ([`crate::daemon_client::EventSubscription`],
 //!   [`crate::daemon_client::AttachConnection`], and `DaemonClient` itself, since
-//!   `connect()` is what produces the halves). A single registry cannot then hold
-//!   a local and a remote session at once without an enum or a box anyway — which
-//!   is the shape PRD #741 M9's Deck selector asks for.
+//!   `connect()` is what produces the halves).
 //! - **What boxing costs, named.** One vtable dispatch per `poll_write`/
 //!   `poll_read` call. On the PTY path that is per **frame**, not per byte:
 //!   `write_input` emits one `KIND_STREAM_IN` frame per keystroke batch, and the
 //!   output side reads one `KIND_STREAM_OUT` frame per daemon write. An indirect
 //!   call is single-digit nanoseconds next to a syscall and a tokio wake-up, so
 //!   the cost is unmeasurable against the work it sits on.
+//!
+//! **What does *not* justify the box, though an earlier draft of these docs said
+//! it did.** That draft argued a single registry could not hold a local and a
+//! remote session at once without an enum or a box. Under PRD #741's DECISION 1A
+//! that is **false**: a remote deck is reached through an `ssh -N -L` *forwarded
+//! Unix socket*, so both sessions are a
+//! [`crate::platform::ipc::IpcStream`] and one type parameter would hold them
+//! both without complaint. The registry is homogeneous, and M5 does not change
+//! that.
+//!
+//! So the box is retained for three reasons, none of which is 1A:
+//!
+//! 1. The cost-of-change above — a `T` threaded through a Tauri-managed
+//!    singleton, for a seam with no second concrete type to justify it.
+//! 2. It puts the [`HalfCloseOnDrop`] guard at **one** constructor,
+//!    [`TransportWriteHalf::new`], rather than at every site that names the
+//!    half's type. (A generic version could carry the same bound; what the box
+//!    buys is that there is a single place to carry it.)
+//! 3. It makes the transports that *would* be genuine second implementors cheap
+//!    to add later without touching a signature: DECISION 1B (`proxy-stdio`,
+//!    deferred — its halves are a child process's `ChildStdin`/`ChildStdout`,
+//!    see [`HalfCloseOnDrop`] for why that one is not merely a boxing question)
+//!    and a non-socket Windows path.
 //!
 //! # The half-close, which is the trap this module is shaped around
 //!
@@ -62,10 +83,17 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 /// A connection the attach protocol can run over.
 ///
-/// Implemented for [`crate::platform::ipc::IpcStream`] today; PRD #741 M5's
-/// forwarded-socket transport is the second implementor. The contract is a
-/// **split**, not a stream, because every client call site splits immediately —
-/// see [`Self::split_transport`].
+/// Implemented for [`crate::platform::ipc::IpcStream`], and — under PRD #741's
+/// DECISION 1A — **that is the only implementor M5 needs**. A remote deck is
+/// reached through an `ssh -N -L` forwarded Unix socket, which is an `IpcStream`
+/// like any other, so M5 adds no second `impl` here. Do not go looking for one:
+/// the seam exists so the client's long-lived structs stop *naming* the IPC
+/// backend's half types, not because a second backend is queued behind it. The
+/// candidates that would be a second implementor are both deferred — DECISION
+/// 1B's `proxy-stdio` and a non-socket Windows path.
+///
+/// The contract is a **split**, not a stream, because every client call site
+/// splits immediately — see [`Self::split_transport`].
 pub trait AttachTransport: Send + 'static {
     /// Split into owned halves.
     ///
@@ -98,6 +126,27 @@ pub trait AttachTransport: Send + 'static {
 /// What does **not** qualify is a wrapper that discards a half-close the
 /// underlying transport does have. [`tokio::io::split`] over a Unix socket is
 /// precisely that, and has no `impl` here.
+///
+/// **And what this trait cannot check at all: a half that ends at a different
+/// machine than the daemon does.** The two answers above are both about *this*
+/// process's relationship to *the* peer, which holds while the write half is one
+/// end of a single connection. If PRD #741's deferred DECISION 1B
+/// (`proxy-stdio`) is ever picked up, that stops being true: its write half is
+/// the `ChildStdin` of a local `ssh` child, and
+/// `impl HalfCloseOnDrop for ChildStdin` **would compile while being wrong**.
+/// Dropping it closes the local child's stdin, which is a half-close of the
+/// *ssh hop*; the daemon at the far end sees EOF only if the remote
+/// `proxy-stdio` process notices its own stdin closing and propagates it as a
+/// half-close on the socket it holds. That is a property of a program on another
+/// host, and nothing here — not the type, not `Drop`, not the bound — can
+/// verify it.
+///
+/// So for a cross-hop half an `impl` is an assertion about the **far end's**
+/// behaviour rather than about this type's drop glue, and it earns its place
+/// only once that propagation is implemented and tested end to end. Writing one
+/// because it compiles is how [`crate::platform::ipc`]'s recorded regression
+/// gets back in by a longer route: the client would close, the daemon would keep
+/// the session live, and nothing local would look wrong.
 pub trait HalfCloseOnDrop: AsyncWrite + Send + 'static {}
 
 /// Owned read half of an [`AttachTransport`].

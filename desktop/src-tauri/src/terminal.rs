@@ -27,10 +27,16 @@ struct TerminalSession {
     /// This is the site that decided the seam's shape. `TerminalSession` lives
     /// in a `HashMap` inside `DesktopState`, a Tauri-managed singleton every
     /// command reaches, so a type parameter here propagates to the registry, to
-    /// `DesktopState` and to every command signature — and still could not hold
-    /// a local and a remote session in the same map. The box costs one vtable
+    /// `DesktopState` and to every command signature. The box costs one vtable
     /// dispatch per `KIND_STREAM_IN` frame (one per keystroke batch), which is
     /// invisible next to the syscall it precedes.
+    ///
+    /// **Not** because a local and a remote session could not share one map: an
+    /// earlier version of this comment said so and it is false under PRD #741's
+    /// DECISION 1A, where a remote deck is an `ssh -L` forwarded Unix socket and
+    /// therefore the *same* concrete transport. M5 adds no second
+    /// `AttachTransport` impl. See `platform::transport`'s module docs for the
+    /// three reasons that do hold.
     ///
     /// Its `Drop` still half-closes, which is what tells the daemon this viewer
     /// is gone when a tile closes without an explicit DETACH.

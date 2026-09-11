@@ -179,6 +179,46 @@ impl Endpoint {
 /// deliberately asserts a wrong one. That is why [`Endpoint::connect_address`]
 /// returns a bare `&Path`: the one value most likely to be wrapped by mistake —
 /// M5's forwarded socket — never arrives here already wearing this type.
+///
+/// # Signature stability — the reversion that would pass every test
+///
+/// Every function that takes one must keep taking `&LocalEndpoint` and must
+/// never revert to `&Path`. At the time of writing that is **seven** — six
+/// public entry points ([`crate::daemon_stop::run_daemon_stop`],
+/// [`crate::daemon_stop::run_daemon_restart`],
+/// [`crate::build_version_handshake::ensure_compatible_daemon_or_die`],
+/// [`crate::build_version_handshake::terminate_daemon_graceful`],
+/// [`crate::daemon_attach::ensure_daemon_running`] and
+/// [`crate::daemon_attach::ensure_external_daemon_or_die`]) plus
+/// `build_version_handshake::terminate_and_recover`, which is private and
+/// reached only from the first of those. Count them with
+/// `grep -rn '&LocalEndpoint' src/` rather than trusting this number, which is a
+/// snapshot. The parameter type **is** the guarantee: widening it back deletes
+/// "a remote deck cannot terminate a daemon, unlink an inode or lazy-spawn"
+/// while leaving the whole suite green, because every existing caller already
+/// holds a local endpoint and would keep compiling and passing. There is no
+/// assertion to fail — the property was only ever enforced by the compiler
+/// refusing a call nobody currently writes.
+///
+/// **The posture is review plus grep, and that is a decision rather than an
+/// oversight.** A `trybuild` harness would pin it — assert that
+/// `run_daemon_stop(&Endpoint::Remote(…))` fails to compile — but this repo has
+/// no `trybuild` harness at all, and DECISION 1's audit reasoning (a new
+/// dependency is weighed against a currently-clean required `security` gate)
+/// argues against adding one, plus its `dev-dependencies` closure and its
+/// notoriously toolchain-sensitive expected-output files, for this single
+/// property. So the enforcement is human:
+///
+/// - `grep -n 'LocalEndpoint' src/` names every site that holds the guarantee;
+///   `grep -rn 'LocalEndpoint::at' src/ desktop/` names every site that asserts
+///   one, which is the short list a reviewer actually has to read.
+/// - A diff that turns a `&LocalEndpoint` parameter into `&Path`, or that adds a
+///   `LocalEndpoint::at` call on a value a transport produced, is the change to
+///   refuse. Both are one grep away and neither is visible as a test failure.
+///
+/// M2's verification was exactly this, done by hand: a deliberate
+/// `run_daemon_stop(&Endpoint::Remote(…))` was compiled, the `E0308` read, and
+/// the probe reverted.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalEndpoint {
     path: PathBuf,
