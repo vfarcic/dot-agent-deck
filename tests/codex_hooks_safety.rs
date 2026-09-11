@@ -540,7 +540,7 @@ fn codex_trust_004_only_the_exact_generated_command_is_trust_eligible() {
         source_path: source_path.clone(),
         current_hash: format!("sha256:{key}"),
         trust_status: "untrusted".to_string(),
-        is_managed: false,
+        is_managed: Some(false),
     };
     // The class, not an exploit: the deck's verb is a convention anything able
     // to write into `hooks.json` can also end a command with, so under the old
@@ -580,6 +580,61 @@ fn codex_trust_004_only_the_exact_generated_command_is_trust_eligible() {
         revocable,
         vec!["deck", "crafted"],
         "untrust must still reach any deck-signature command in the deck's own hooks.json"
+    );
+}
+
+/// Issue #730 / auditor item 2: an entry whose listing carried NO `isManaged`
+/// field is resolved per DIRECTION, not by one shared default.
+///
+/// Condition 3 of the trust predicate is fail-**closed** for the grant and
+/// fail-**open** for the revocation, so the absent field cannot have a single
+/// answer: `Exact` must drop the entry (never hand a `trusted_hash` to something
+/// that might be root-provisioned) while `Signature` must keep it (an untrust
+/// that narrows here leaves records behind after `hooks uninstall` deleted the
+/// definitions, which `untrust_deck_hooks_in`'s own doc forbids). The old
+/// `.unwrap_or(false)` decoder got the grant wrong; a blanket `.unwrap_or(true)`
+/// would have got the revocation wrong.
+///
+/// Scope of the claim being defended: `isManaged` was present on every entry of
+/// every listing **codex-cli 0.149.0** produced, across four entry shapes, so
+/// `None` is protocol drift rather than an expected state today. That is a
+/// measurement about 0.149.0, not about Codex in general — which is precisely
+/// why the drift case gets a deliberate answer instead of a default.
+#[test]
+fn codex_trust_an_absent_is_managed_field_resolves_per_direction() {
+    let home = test_temp::tempdir().expect("create Codex home");
+    let source_path = home.path().join("hooks.json");
+    let deck_command = expected_hook_command(DECK_BINARY);
+    let entry = |key: &str, is_managed: Option<bool>| CodexHookEntry {
+        key: key.to_string(),
+        command: deck_command.clone(),
+        source_path: source_path.clone(),
+        current_hash: format!("sha256:{key}"),
+        trust_status: "untrusted".to_string(),
+        is_managed,
+    };
+    let entries = vec![
+        entry("present-false", Some(false)),
+        entry("absent", None),
+        entry("present-true", Some(true)),
+    ];
+
+    let selected = |how: DeckCommandMatch<'_>| -> Vec<&str> {
+        deck_owned_entries(&entries, home.path(), how)
+            .into_iter()
+            .map(|entry| entry.key.as_str())
+            .collect()
+    };
+
+    assert_eq!(
+        selected(DeckCommandMatch::Exact(&deck_command)),
+        vec!["present-false"],
+        "a grant must refuse an entry whose isManaged the listing did not carry"
+    );
+    assert_eq!(
+        selected(DeckCommandMatch::Signature),
+        vec!["present-false", "absent"],
+        "a revocation must still reach an entry whose isManaged the listing did not carry"
     );
 }
 

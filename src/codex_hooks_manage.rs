@@ -53,8 +53,10 @@
 //!   remove privilege, and the trust write never does. There is also one
 //!   read-only use — [`warn_if_our_own_entry_was_unrecognisable`], which reaches
 //!   for it to tell a benign zero from a broken one and writes nothing.
-//! - [`trust_deck_hooks_in`] records `[hooks.state."<key>"] { enabled,
-//!   trusted_hash }` in `<home>/config.toml` for exactly those keys.
+//! - [`trust_deck_hooks_in`] records `[hooks.state."<key>"] { trusted_hash }` in
+//!   `<home>/config.toml` for exactly those keys — `trusted_hash` and nothing
+//!   else, because the sibling `enabled` key is a USER knob and not part of
+//!   trust at all (see [`upsert_trust_record`]).
 //!
 //! The result is strictly narrower than the old bypass and launch-method
 //! agnostic: trust lives in the home (not argv), so `codex`, `devbox run
@@ -579,8 +581,36 @@ pub struct CodexHookEntry {
     pub current_hash: String,
     /// `untrusted` | `trusted` | `modified` — Codex's verdict for this entry.
     pub trust_status: String,
-    /// `true` for a managed (root/MDM-provisioned) hook. Never deck-owned.
-    pub is_managed: bool,
+    /// `Some(true)` for a managed (root/MDM-provisioned) hook — never
+    /// deck-owned. `None` means the listing did not carry `isManaged` at all,
+    /// which [`deck_owned_entries`] resolves **per direction** rather than with
+    /// one default (issue #730).
+    ///
+    /// **Why an `Option` and not a `bool`.** The field was decoded
+    /// `.unwrap_or(false)`, i.e. "absent ⇒ not managed", which is the
+    /// fail-**open** answer for the trust write's condition 3. Flipping the
+    /// default instead would have silently narrowed the revocation, which needs
+    /// the opposite answer. Keeping "absent" distinguishable is what lets each
+    /// caller pick its own safe side; see [`deck_owned_entries`].
+    ///
+    /// **What was measured, scoped to the version.** Across four entry shapes
+    /// under **codex-cli 0.149.0** — an ordinary user command hook, a
+    /// deck-shaped one, a second handler inside a rule, and an `mcp_tool`
+    /// handler whose entry carries a *different field set* entirely (no
+    /// `command`, no `async`) — `isManaged` was present on **every** entry,
+    /// always a real JSON bool. That last shape is the useful evidence: the
+    /// field survives a handler-type variant that drops other fields, so it is
+    /// a plain `bool` on the outer struct rather than something conditionally
+    /// serialized. This is a claim about 0.149.0, not about Codex in general, so
+    /// `None` is protocol drift rather than an expected state today.
+    ///
+    /// **An `isManaged: true` entry was NOT measured.** Managed hooks come from
+    /// `/etc/codex/managed_config.toml`, which needs root, and the binary
+    /// exposes no env override (`$CODEX_HOME/managed_config.toml` was tried and
+    /// contributes nothing to the listing). That a struct which emits `false`
+    /// will also emit `true` is a **serde argument** — a field serialized
+    /// unconditionally has no `skip_serializing_if` — and not a measurement.
+    pub is_managed: Option<bool>,
 }
 
 /// Ask Codex itself for every hook it would load for `cwd` under `home`.
@@ -747,10 +777,11 @@ fn parse_hooks_list(response: &Value) -> std::io::Result<Vec<CodexHookEntry>> {
                 source_path: PathBuf::from(string("sourcePath").unwrap_or_default()),
                 current_hash,
                 trust_status: string("trustStatus").unwrap_or_else(|| "unknown".into()),
-                is_managed: hook
-                    .get("isManaged")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false),
+                // Absent stays ABSENT rather than collapsing to `false` here
+                // (issue #730): the two callers of `deck_owned_entries` need
+                // opposite defaults, so the decision belongs there and not in
+                // the decoder. See `CodexHookEntry::is_managed`.
+                is_managed: hook.get("isManaged").and_then(Value::as_bool),
             });
         }
     }
@@ -818,7 +849,12 @@ pub enum DeckCommandMatch<'a> {
 ///    a trust write that means the EXACT command built from the validated
 ///    durable path, not an arbitrary executable followed by the deck's verb;
 /// 3. it is not `isManaged` — a managed hook is provisioned by root/MDM and is
-///    never the deck's to trust.
+///    never the deck's to trust. Where the listing OMITS the field, the answer
+///    is resolved from `how` rather than from one shared default: `Exact`
+///    (a grant) treats an absent field as managed and drops the entry, while
+///    `Signature` (the revocation) treats it as unmanaged and keeps it. See the
+///    comment on `managed_if_absent` in the body, and
+///    [`CodexHookEntry::is_managed`] for what 0.149.0 was measured to emit.
 ///
 /// So the deck records trust ONLY for COMMANDS it wrote itself, one exact hash
 /// at a time. Paths are compared verbatim first and, only if that fails, by
@@ -857,11 +893,21 @@ pub fn deck_owned_entries<'a>(
         .filter(|entry| {
             let same_file = entry.source_path == ours
                 || (ours_real.is_some() && entry.source_path.canonicalize().ok() == ours_real);
-            let command_matches = match how {
-                DeckCommandMatch::Exact(expected) => entry.command == expected,
-                DeckCommandMatch::Signature => command_is_deck_owned(&entry.command),
+            // `managed_if_absent` is condition 3's answer when the listing did
+            // not carry `isManaged` at all, and it differs BY DIRECTION (issue
+            // #730). A grant must assume the entry IS managed — fail closed,
+            // never hand a `trusted_hash` to something that might be
+            // root-provisioned. A revocation must assume it is NOT — fail open
+            // in the revoking direction, as `untrust_deck_hooks_in`'s own doc
+            // requires, because assuming "managed" there would leave trust
+            // records behind after `hooks uninstall` deleted the definitions.
+            // One shared default cannot be both, which is why the field is an
+            // `Option` (see `CodexHookEntry::is_managed`).
+            let (command_matches, managed_if_absent) = match how {
+                DeckCommandMatch::Exact(expected) => (entry.command == expected, true),
+                DeckCommandMatch::Signature => (command_is_deck_owned(&entry.command), false),
             };
-            same_file && command_matches && !entry.is_managed
+            same_file && command_matches && !entry.is_managed.unwrap_or(managed_if_absent)
         })
         .collect()
 }
@@ -932,9 +978,11 @@ impl TrustOutcome {
 /// answer, and the definitions it would have trusted were never written either.
 ///
 /// Asks Codex for the listing ([`list_hooks_in`]), narrows it with
-/// [`deck_owned_entries`], and writes `[hooks.state."<key>"] { enabled = true,
-/// trusted_hash = "<current_hash>" }` for exactly those keys into
-/// `<home>/config.toml`. The edit is format-preserving and the publish is atomic
+/// [`deck_owned_entries`], and writes `[hooks.state."<key>"] { trusted_hash =
+/// "<current_hash>" }` for exactly those keys into `<home>/config.toml` — the
+/// hash and nothing else, so a user's `enabled = false` toggle on the deck's own
+/// hook survives every subsequent spawn ([`upsert_trust_record`] has the
+/// measurements). The edit is format-preserving and the publish is atomic
 /// under [`INSTALL_LOCK`], so a concurrent deck writer can't interleave and the
 /// user's comments/settings survive byte-intact.
 ///
@@ -1171,26 +1219,53 @@ fn edit_trust_state(home: &Path, edit: impl FnOnce(&mut toml_edit::Table)) -> st
     crate::agent_hook_config::write_atomic(home, &path, doc.to_string().as_bytes())
 }
 
-/// Insert or refresh one `[hooks.state."<key>"] { enabled, trusted_hash }` record.
+/// Insert or refresh one `[hooks.state."<key>"] { trusted_hash }` record.
 ///
 /// An existing record for `key` is updated IN PLACE — as a table or as an inline
 /// table, whichever the user (or a previous run) already wrote — so repeated
 /// trust writes are idempotent and never duplicate the table.
+///
+/// **`trusted_hash` and NOTHING else, which is a deliberate narrowing** (issue
+/// #730). This used to also write `enabled = true`, on every arm — including
+/// into a record it was merely *updating*. Measured against codex-cli 0.149.0,
+/// `enabled` is a **user knob** and is fully orthogonal to trust:
+///
+/// - It is a first-class affordance in Codex's own `/hooks` browser ("Turn hooks
+///   on or off. Your changes are saved automatically."), where `toggle` is a
+///   **separate action from `trust`**.
+/// - All four combinations of `enabled` × `trusted_hash` exist and behave
+///   independently. An entry with `enabled: false` and a correct hash still
+///   reports `trustStatus: trusted` and is **still enumerated** by `hooks/list`;
+///   distrust is expressed by an absent or stale `trusted_hash`, surfacing as
+///   `trustStatus: untrusted` / `modified`. So `enabled = false` is never a
+///   distrust marker, and respecting it cannot strand the deck after a
+///   legitimate reinstall.
+/// - An **absent** `enabled` key defaults to `true` — measured: a record
+///   carrying only `trusted_hash` reported back `enabled: true, trustStatus:
+///   trusted`, which is exactly the record shape this function now produces.
+/// - Codex's own trust write targets `trusted_hash` alone: the 0.149.0 binary's
+///   string table holds exactly one `hooks.state."` format fragment and the
+///   piece after it is `".trusted_hash`, with no `".enabled` fragment anywhere
+///   in the binary.
+///
+/// Writing it unconditionally therefore silently reverted an explicit user
+/// choice on **every** wrapped Codex spawn. Dropping it from the create arm too,
+/// rather than only from the two update arms, is the same outcome with one fewer
+/// code path: a created record without the key already reads as `enabled: true`,
+/// so the write bought nothing, and this way the deck's record is identical in
+/// shape to Codex's own.
 fn upsert_trust_record(state: &mut toml_edit::Table, key: &str, hash: &str) {
     use toml_edit::{Item, Table, Value as TomlValue, value};
 
     match state.get_mut(key) {
         Some(Item::Table(existing)) => {
-            existing.insert("enabled", value(true));
             existing.insert("trusted_hash", value(hash));
         }
         Some(Item::Value(TomlValue::InlineTable(existing))) => {
-            existing.insert("enabled", TomlValue::from(true));
             existing.insert("trusted_hash", TomlValue::from(hash));
         }
         _ => {
             let mut record = Table::new();
-            record.insert("enabled", value(true));
             record.insert("trusted_hash", value(hash));
             state.insert(key, Item::Table(record));
         }
@@ -1450,7 +1525,7 @@ mod tests {
             source_path: source,
             current_hash: "sha256:deadbeef".to_string(),
             trust_status: "untrusted".to_string(),
-            is_managed: false,
+            is_managed: Some(false),
         };
         let ours = home.path().join("hooks.json");
         let expected = expected_hook_command("/abs/dot-agent-deck");
@@ -1514,6 +1589,71 @@ mod tests {
             warned.contains(&format!("reported_len={}", mangled.len()))
                 && warned.contains("reported_agreeing_prefix="),
             "the warning must still say how far the two commands diverge: {warned:?}"
+        );
+    }
+
+    /// Issue #730 / auditor item 1: `enabled` in `[hooks.state."<key>"]` is a
+    /// USER knob (Codex's `/hooks` browser toggles it, and `toggle` is a
+    /// separate action from `trust`), it is orthogonal to trust, and an absent
+    /// key reads as `true`. A trust write must therefore touch `trusted_hash`
+    /// and nothing else, or every wrapped Codex spawn silently reverts a
+    /// deliberate "turn this hook off".
+    ///
+    /// Both update arms are covered because the record shape is the USER's
+    /// choice, not ours: a hand-edited `config.toml` may spell it either as a
+    /// `[hooks.state."k"]` table or as an inline `"k" = { … }`.
+    #[test]
+    fn a_trust_write_records_only_the_hash_and_leaves_a_users_enabled_alone() {
+        let upsert = |original: &str, key: &str, hash: &str| -> String {
+            let mut doc = original
+                .parse::<toml_edit::DocumentMut>()
+                .expect("fixture is valid TOML");
+            let state = doc["hooks"]["state"]
+                .as_table_mut()
+                .expect("fixture has a [hooks.state] table");
+            upsert_trust_record(state, key, hash);
+            doc.to_string()
+        };
+
+        // Create arm: a brand-new record carries the hash alone. Codex reports
+        // `enabled: true, trustStatus: trusted` for exactly this shape (0.149.0,
+        // measured), so the key buys nothing and writing it would only be one
+        // more place to revert a later toggle from.
+        let created = upsert("[hooks.state]\n", "deck-key", "sha256:deck");
+        assert!(
+            created.contains("trusted_hash = \"sha256:deck\""),
+            "a created record must carry Codex's own hash: {created:?}"
+        );
+        assert!(
+            !created.contains("enabled"),
+            "a created trust record must not write the user's `enabled` knob: {created:?}"
+        );
+
+        // Update arm, `Item::Table`: the user turned our hook off and we are
+        // re-recording a fresh hash over a stale one. The hash moves, the
+        // toggle does not.
+        let table = upsert(
+            "[hooks.state.\"deck-key\"]\nenabled = false\ntrusted_hash = \"sha256:stale\"\n",
+            "deck-key",
+            "sha256:fresh",
+        );
+        assert!(
+            table.contains("enabled = false") && table.contains("trusted_hash = \"sha256:fresh\""),
+            "a table-shaped record must keep `enabled = false` while the hash refreshes: \
+             {table:?}"
+        );
+
+        // Update arm, `Value::InlineTable`: same claim, the other spelling.
+        let inline = upsert(
+            "[hooks.state]\n\"deck-key\" = { enabled = false, trusted_hash = \"sha256:stale\" }\n",
+            "deck-key",
+            "sha256:fresh",
+        );
+        assert!(
+            inline.contains("enabled = false")
+                && inline.contains("trusted_hash = \"sha256:fresh\""),
+            "an inline-table record must keep `enabled = false` while the hash refreshes: \
+             {inline:?}"
         );
     }
 
