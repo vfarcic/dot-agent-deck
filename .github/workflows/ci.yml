@@ -331,7 +331,7 @@ jobs:
           toolchain: 1.97.1
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-      - uses: taiki-e/install-action@fa23953489c080190314742a9b907f8e97c6767c # v2
+      - uses: taiki-e/install-action@9534c84618278caac52cb373bb164ed464dbd8af # v2
         with:
           tool: cargo-nextest@0.9.143
       # Tauri's Linux build deps, needed because clippy/nextest below run with
@@ -540,7 +540,7 @@ jobs:
         with:
           toolchain: 1.97.1
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-      - uses: taiki-e/install-action@fa23953489c080190314742a9b907f8e97c6767c # v2
+      - uses: taiki-e/install-action@9534c84618278caac52cb373bb164ed464dbd8af # v2
         with:
           tool: cargo-nextest@0.9.143
       # The same Tauri Linux deps the `build` job installs, for the same reason:
@@ -715,7 +715,7 @@ jobs:
           targets: x86_64-pc-windows-msvc
           components: clippy
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-      - uses: taiki-e/install-action@fa23953489c080190314742a9b907f8e97c6767c # v2
+      - uses: taiki-e/install-action@9534c84618278caac52cb373bb164ed464dbd8af # v2
         with:
           tool: cargo-nextest@0.9.143
       - run: cargo build
@@ -777,7 +777,7 @@ jobs:
           toolchain: 1.97.1
           components: clippy
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-      - uses: taiki-e/install-action@fa23953489c080190314742a9b907f8e97c6767c # v2
+      - uses: taiki-e/install-action@9534c84618278caac52cb373bb164ed464dbd8af # v2
         with:
           tool: cargo-nextest@0.9.143
       - run: cargo build
