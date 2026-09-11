@@ -634,6 +634,16 @@ pub(crate) fn pin_is_dead_sibling(exe: &str, binary_path: &str) -> bool {
 /// Every command string a rule carries, from either JSON shape: the current
 /// nested `{"hooks": [{"command": ...}]}` or the legacy flat
 /// `{"command": ...}`.
+///
+/// **Test-only since PR #1029, and the gate is a deliberate speed bump rather
+/// than tidying.** Its one production caller was [`strip_deck_commands`]'s
+/// emptiness check, and that was the P1: "does this rule still carry a COMMAND"
+/// is a narrower question than "does it still carry a HANDLER", and answering
+/// the first deleted user handlers that answer only the second. Every remaining
+/// caller is an assertion, where reading the commands back IS the question. If a
+/// production path ever needs this, un-gating it is the moment to check which of
+/// the two questions is actually being asked — see [`rule_retains_a_handler`].
+#[cfg(test)]
 pub(crate) fn rule_commands(rule: &Value) -> impl Iterator<Item = &str> {
     let nested = rule
         .get("hooks")
@@ -645,8 +655,40 @@ pub(crate) fn rule_commands(rule: &Value) -> impl Iterator<Item = &str> {
     nested.chain(flat)
 }
 
+/// Whether a rule object still carries a HANDLER of any kind — the emptiness
+/// question [`strip_deck_commands`] drops a rule on, asked AFTER the strip.
+///
+/// Deliberately not `rule_commands(rule).next().is_some()`, which is what the
+/// check was until Greptile found the gap on PR #1029. `rule_commands` yields
+/// only handlers carrying a **string** `command`, so a sibling handler with no
+/// `command` key, or with a non-string one, survives the `retain` in
+/// [`strip_deck_commands`] and is then invisible to the emptiness test — and the
+/// rule was dropped, taking that handler and the user's `matcher` with it. Codex
+/// accepts such handler objects (`validate_structure` there requires only that
+/// each event VALUE be an array; it says nothing about the objects inside one),
+/// so this was issue #730's own harm reached through a narrower door, and it
+/// applied to all four adapters because this helper is shared.
+///
+/// So the question here is "is anything left?", not "is a command left?":
+///
+/// - a `hooks` value that is a non-empty array means a handler survived,
+///   whatever shape that handler is;
+/// - a `hooks` value that is not an array at all is something this module does
+///   not understand, so it counts as content rather than as emptiness;
+/// - a surviving `command` key of ANY type means the legacy flat rule still
+///   carries one — [`strip_deck_commands`] removes that key only when its value
+///   is a string it claimed, so whatever is still there is not the deck's.
+///
+/// Every arm errs toward keeping, which is the direction this whole helper is
+/// written in: never delete what we did not write.
+fn rule_retains_a_handler(rule: &Value) -> bool {
+    rule.get("hooks")
+        .is_some_and(|hooks| hooks.as_array().is_none_or(|list| !list.is_empty()))
+        || rule.get("command").is_some()
+}
+
 /// Remove every command matching `is_target` from `rules`, dropping a rule
-/// object only once it carries no commands at all — the fix for issue #535
+/// object only once it carries no handler at all — the fix for issue #535
 /// (Claude) and, for the Codex and Devin adapters, for issue #730.
 ///
 /// A rule's `hooks` array is a LIST of commands sharing one matcher, so a user
@@ -664,9 +706,10 @@ pub(crate) fn rule_commands(rule: &Value) -> impl Iterator<Item = &str> {
 ///
 /// - a rule NOTHING matched in is returned untouched, so an already-empty or
 ///   command-less rule object is never tidied away as a side effect;
-/// - a rule is dropped only when [`rule_commands`] reports nothing left in it,
-///   which keeps a rule alive on any command the deck does not claim, in either
-///   JSON shape.
+/// - a rule is dropped only when [`rule_retains_a_handler`] reports nothing
+///   left in it at all — not merely no *command*, which is a narrower question
+///   that used to delete a user's command-less handler along with their
+///   `matcher`.
 ///
 /// Returns the number of individual commands removed.
 pub(crate) fn strip_deck_commands(
@@ -693,8 +736,8 @@ pub(crate) fn strip_deck_commands(
 
         // Legacy flat shape: `{"command": …}` — the command IS the rule, so
         // there is nothing smaller to remove. Take the key out and let the
-        // no-commands-left check below decide the rule's fate, rather than
-        // assuming it carries nothing else.
+        // nothing-left check below decide the rule's fate, rather than assuming
+        // it carries nothing else.
         if rule
             .get("command")
             .and_then(Value::as_str)
@@ -709,7 +752,7 @@ pub(crate) fn strip_deck_commands(
         if removed == before {
             return true;
         }
-        rule_commands(rule).next().is_some()
+        rule_retains_a_handler(rule)
     });
     removed
 }
@@ -1364,6 +1407,57 @@ mod tests {
             rules,
             vec![json!({ "matcher": "Bash", "hooks": [] }), json!({})],
             "only the emptied rule goes; untouched rules stay as the user wrote them"
+        );
+    }
+
+    /// Greptile P1 on PR #1029: the emptiness test used to be "does any COMMAND
+    /// remain", which is narrower than "does any HANDLER remain". A handler
+    /// object with no string `command` survives the per-command `retain` but was
+    /// invisible to that test, so the rule was dropped — deleting the user's
+    /// handler and the `matcher` they wrote it under, which is exactly the harm
+    /// #535 and #730 exist to prevent, one door along. The helper is shared, so
+    /// this covers all four adapters.
+    ///
+    /// Both shapes a command-less handler can take are here: no `command` key at
+    /// all, and a `command` whose value is not a string.
+    #[test]
+    fn strip_deck_commands_keeps_a_handler_that_carries_no_string_command() {
+        let mut rules = vec![json!({
+            "matcher": "Bash",
+            "hooks": [
+                { "type": "command", "command": "/abs/dot-agent-deck hook --agent codex" },
+                { "type": "audit", "script": "/usr/local/bin/my-critical-audit.sh" },
+                { "type": "command", "command": { "argv": ["/usr/local/bin/other"] } }
+            ]
+        })];
+
+        let removed =
+            strip_deck_commands(&mut rules, |cmd| command_executable(cmd, CODEX).is_some());
+
+        assert_eq!(removed, 1, "only the deck's own command is removed");
+        assert_eq!(
+            rules.len(),
+            1,
+            "the rule object must survive on its command-less handlers alone: {rules:?}"
+        );
+        assert_eq!(
+            rules[0]["matcher"],
+            json!("Bash"),
+            "the user's matcher survives with it"
+        );
+        assert_eq!(
+            rules[0]["hooks"],
+            json!([
+                { "type": "audit", "script": "/usr/local/bin/my-critical-audit.sh" },
+                { "type": "command", "command": { "argv": ["/usr/local/bin/other"] } }
+            ]),
+            "both command-less handlers survive byte-for-byte"
+        );
+        assert_eq!(
+            rule_commands(&rules[0]).count(),
+            0,
+            "and none of them is a command — which is why the old \
+             `rule_commands(rule).next().is_some()` test dropped this rule"
         );
     }
 

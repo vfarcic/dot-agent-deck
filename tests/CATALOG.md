@@ -1873,6 +1873,13 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** the wording of the refusal message or the tracing/stderr surface it is reported on.
 - **Platform coverage:** linux.
 
+##### hooks/install/006 — The unattended startup install leaves a user's sibling handler, their `matcher`, and a still-valid foreign deck pin exactly as it found them.
+- **Layer:** L2.
+- **Agent:** none (a stub `codex` on `PATH` makes the Codex installer fire; two stub executables stand in for the launching install and a second one).
+- **Asserts:** with `~/.codex/hooks.json` seeded BEFORE launch so the real binary's startup install is what rewrites it, under both an installed event (`PreToolUse`) and one the deck does not install (`SessionEnd`, which reaches `install_impl`'s retired-event sweep): a rule holding the deck's own command next to a user handler carrying no string `command` keeps both that handler and its `matcher`, with the deck's stale command refreshed out into its own rule; and a deck-owned rule pinning a different, absolute, executable, non-`target/` `dot-agent-deck` is left byte-identical rather than repointed. The retired event gains no fresh deck rule. Issue #730, plus the Greptile P1 on PR #1029 — the emptiness test that dropped a rule whose only survivor carried no string `command`.
+- **Does not assert:** the Claude, OpenCode or Devin writers (the strip is shared and unit-covered for all four in `agent_hook_config`'s `mod tests`); the trust write, which needs a `codex app-server` the stub does not implement; that a repointed pin would actually have been detected by Codex.
+- **Platform coverage:** linux.
+
 ### Pane / agent lifecycle
 
 #### lifecycle/start

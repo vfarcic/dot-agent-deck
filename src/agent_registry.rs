@@ -285,11 +285,19 @@ fn codex_install_resolved(binary_path: Result<String, String>) -> Result<(), Str
     // reported one and `Exact` did not match it — the very case
     // `codex_hooks_manage`'s warn exists to surface. `TrustOutcome` carries that
     // distinction out precisely so this does not have to guess.
+    //
+    // The `NothingListed` arm says "no ELIGIBLE deck hook" for the same reason
+    // (Greptile P2 on PR #1029). `deck_owned_entries` rejects a deck-signature
+    // entry that is `isManaged` or whose `source_path` is not this home's own
+    // `hooks.json`, and a listing containing only those lands here — so "Codex
+    // reported no deck hook" would again assert a cause this branch cannot know.
+    // Which of the three it was is not worth a fourth `TrustOutcome` variant;
+    // not claiming the wrong one is.
     use crate::codex_hooks_manage::TrustOutcome;
     match crate::codex_hooks_manage::trust_deck_hooks_in(&home, &cwd, &binary_path) {
         Ok(TrustOutcome::NothingListed) => println!(
-            "Trusted hooks: none (Codex reported no deck hook to trust; events fall back to \
-             stdout classification)"
+            "Trusted hooks: none (Codex reported no eligible deck hook to trust; events fall \
+             back to stdout classification)"
         ),
         Ok(TrustOutcome::Unrecognised { listed }) => println!(
             "Trusted hooks: none (Codex reported {listed} deck-signature {}, but none carries \

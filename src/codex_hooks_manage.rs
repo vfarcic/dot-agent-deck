@@ -882,9 +882,16 @@ pub fn deck_owned_entries<'a>(
 pub enum TrustOutcome {
     /// `n` entries were trusted, `n >= 1`.
     Trusted(usize),
-    /// Codex enumerated no entry of the deck's at all — not installed, nothing
-    /// of ours in the listing, or a listing the deck's conditions all rejected.
-    /// Quiet by design.
+    /// Nothing in Codex's listing was ELIGIBLE for a trust write — which is
+    /// wider than "Codex enumerated no entry of the deck's" and must not be
+    /// reported as that (Greptile P2 on PR #1029). Three ways in: the deck's
+    /// hooks are not installed; Codex listed nothing carrying the deck's
+    /// signature; or it listed deck-signature entries that
+    /// [`deck_owned_entries`] rejected on one of its OTHER conditions — an
+    /// `isManaged` entry, or one whose `source_path` is not this home's own
+    /// `hooks.json`. This variant cannot tell the three apart, so no caller of
+    /// it may name a cause. Quiet by design: the first is the ordinary one and
+    /// happens on every launch on a machine without Codex hooks.
     NothingListed,
     /// Codex enumerated `listed` deck-signature entries out of the deck's own
     /// `hooks.json` and none of them carried the command this install wrote, so
