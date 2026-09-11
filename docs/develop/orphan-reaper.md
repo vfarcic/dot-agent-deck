@@ -66,3 +66,5 @@ scripts/install-reaper-timer.sh --remove
 ```
 
 The units are generated from templates in `scripts/systemd/` at install time, because a systemd unit needs an absolute path and this repo can live anywhere. If you move or re-clone the checkout, re-run the installer — the old unit will point at a path that no longer exists.
+
+**Installing from a linked git worktree is the case that actually catches people**, because trying it out from a feature branch is the natural thing to do. The unit will point at the worktree and break silently — into the journal — the moment that worktree is removed. The installer warns when it detects this and installs anyway; re-run it from the main checkout once the branch is merged.

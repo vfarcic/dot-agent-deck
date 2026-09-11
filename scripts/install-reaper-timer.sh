@@ -32,6 +32,18 @@ esac
 
 command -v systemctl >/dev/null 2>&1 || { echo "systemd not available on this host" >&2; exit 1; }
 
+# A systemd unit holds an absolute path, so installing from a linked worktree
+# produces a timer that breaks the moment that worktree is removed — and it
+# fails quietly, into the journal, which is not where anyone looks. Warn loudly;
+# this is still allowed, because installing from a worktree to try it out is a
+# reasonable thing to do.
+if [ -f "$REPO/.git" ]; then
+  echo "WARNING: $REPO is a linked git worktree." >&2
+  echo "         The unit will point at it, and will break when it is removed." >&2
+  echo "         Re-run this installer from the main checkout once merged." >&2
+  echo >&2
+fi
+
 mkdir -p "$UNIT_DIR"
 sed "s|__REPO__|$REPO|g" "$REPO/scripts/systemd/$NAME.service.in" >"$UNIT_DIR/$NAME.service"
 sed "s|__REPO__|$REPO|g" "$REPO/scripts/systemd/$NAME.timer.in"   >"$UNIT_DIR/$NAME.timer"
