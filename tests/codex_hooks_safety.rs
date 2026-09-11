@@ -818,13 +818,7 @@ fn codex_trust_003_config_edits_are_preserving_idempotent_and_scoped() {
         fixture.path().display(),
         std::env::var("PATH").unwrap_or_default()
     );
-    let uninstall = Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
-        .args(["hooks", "uninstall", "--agent", "codex"])
-        .env("PATH", path)
-        .env("CODEX_HOME", home.path())
-        .env("CODEX_HOOK_LIST_RESPONSE", &response)
-        .output()
-        .expect("uninstall Codex hooks");
+    let uninstall = run_cli_uninstall(home.path(), &path, &response);
     assert!(
         uninstall.status.success(),
         "Codex hook uninstall failed: {}",
@@ -837,6 +831,113 @@ fn codex_trust_003_config_edits_are_preserving_idempotent_and_scoped() {
     );
 }
 
+/// The `$PATH` a CLI fixture hands the child: the stand-in `codex` first, then
+/// only the system directories its `sed` needs.
+///
+/// Never the inherited `$PATH`. A `dot-agent-deck` the host happens to have
+/// installed would otherwise be a candidate the resolver could pin, which is
+/// exactly what let `codex_hooks_004` pass on a dev box and fail on every CI
+/// runner at once (PR #733).
+fn fixture_path(fixture_dir: &std::path::Path) -> String {
+    format!("{}:/usr/bin:/bin", fixture_dir.display())
+}
+
+/// Drive the real `hooks install --agent codex` CLI against an isolated Codex
+/// home, an isolated `$HOME` holding a seeded durable deck, and a `codex`
+/// app-server stand-in that answers `hooks/list` with `hook_response`.
+///
+/// Both environment pins are load-bearing, for the reason [`fixture_path`]
+/// records: `HOME` anchors the resolver's durable candidate at the seeded one,
+/// and a `PATH` built by [`fixture_path`] keeps the host out of the outcome.
+/// `hook_response` is the one input that decides which `TrustOutcome` the
+/// command reports, which is what `codex_hooks_005` varies; `path` is the other
+/// one, since a `PATH` with no `codex` on it reaches the error arm instead
+/// (`codex_hooks_006`).
+fn run_cli_install(
+    codex_home: &std::path::Path,
+    deck_home: &std::path::Path,
+    path: &str,
+    hook_response: &str,
+) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
+        .args(["hooks", "install", "--agent", "codex"])
+        .env("PATH", path)
+        .env("HOME", deck_home)
+        .env("CODEX_HOME", codex_home)
+        .env("CODEX_HOOK_LIST_RESPONSE", hook_response)
+        .output()
+        .expect("install Codex hooks from CLI")
+}
+
+/// Drive the real `hooks uninstall --agent codex` CLI against `codex_home`.
+///
+/// `path` is the child's whole `$PATH`, because whether a `codex` is reachable
+/// on it is the variable: with the fixture directory the stand-in answers
+/// `hooks/list` and the trust records are dropped; without it the spawn fails
+/// with `NotFound` and the command takes its error arm, which is the shape
+/// `codex_hooks_006` needs.
+fn run_cli_uninstall(codex_home: &std::path::Path, path: &str, hook_response: &str) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
+        .args(["hooks", "uninstall", "--agent", "codex"])
+        .env("PATH", path)
+        .env("CODEX_HOME", codex_home)
+        .env("CODEX_HOOK_LIST_RESPONSE", hook_response)
+        .output()
+        .expect("uninstall Codex hooks from CLI")
+}
+
+/// The single `Trusted hooks: …` line `hooks install --agent codex` prints, for
+/// a run whose `hooks/list` stand-in returns `entries(&deck_command)`.
+///
+/// The closure receives the exact command the install is about to write, spelled
+/// from the durable path seeded inside this fixture — the same value
+/// `trust_deck_hooks_in` compares a listed entry against — so a caller can build
+/// a listing that matches it, one that deliberately does not, or none at all.
+fn install_trust_line(entries: impl FnOnce(&str) -> Vec<Value>) -> String {
+    let fixture = test_temp::tempdir().expect("create CLI fixture");
+    let home = test_temp::tempdir().expect("create Codex home");
+    let deck_home = test_temp::tempdir().expect("create isolated deck HOME");
+    write_fake_codex(fixture.path());
+    let deck_command = expected_hook_command(
+        seed_durable_binary(deck_home.path())
+            .to_str()
+            .expect("durable path is UTF-8"),
+    );
+    let response = hook_list_response(entries(&deck_command));
+
+    let output = run_cli_install(
+        home.path(),
+        deck_home.path(),
+        &fixture_path(fixture.path()),
+        &response,
+    );
+
+    assert!(
+        output.status.success(),
+        "hook install must report a trust outcome without failing; stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    stdout
+        .lines()
+        .find(|line| line.starts_with("Trusted hooks:"))
+        .unwrap_or_else(|| panic!("hook install printed no trust line at all:\n{stdout}"))
+        .to_string()
+}
+
+/// A listed entry out of the pinned home's own `hooks.json`, unmanaged, carrying
+/// `command` — the shape [`deck_owned_entries`] accepts before it looks at the
+/// command at all.
+fn own_home_entry(command: &str, index: usize, hash: &str) -> Value {
+    hook_entry(
+        &format!("__CODEX_HOME__/hooks.json:pre_tool_use:0:{index}"),
+        command,
+        "__CODEX_HOME__/hooks.json",
+        hash,
+        false,
+    )
+}
+
 /// Scenario: Run the documented Codex hook installation command against an isolated home, an isolated `$HOME` holding a seeded durable deck, and a deterministic app-server stand-in. The command must succeed, materialize Codex hook definitions, and pin the seeded durable binary rather than anything the host happens to have installed.
 #[spec("codex/hooks/004")]
 #[test]
@@ -846,22 +947,13 @@ fn codex_hooks_004_cli_install_succeeds() {
     let deck_home = test_temp::tempdir().expect("create isolated deck HOME");
     write_fake_codex(fixture.path());
     let durable = seed_durable_binary(deck_home.path());
-    // Both halves are load-bearing. `HOME` anchors the resolver's durable
-    // candidate at the seeded one above; the pinned `PATH` carries only the
-    // fake `codex` plus the system directories the stand-in's `sed` needs, so
-    // no `dot-agent-deck` the host happens to have on `$PATH` can decide the
-    // outcome. Inheriting `$PATH` here is exactly what let this test pass on a
-    // machine with `~/.local/bin/dot-agent-deck` and fail on every CI runner.
-    let path = format!("{}:/usr/bin:/bin", fixture.path().display());
 
-    let output = Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
-        .args(["hooks", "install", "--agent", "codex"])
-        .env("PATH", path)
-        .env("HOME", deck_home.path())
-        .env("CODEX_HOME", home.path())
-        .env("CODEX_HOOK_LIST_RESPONSE", hook_list_response(Vec::new()))
-        .output()
-        .expect("install Codex hooks from CLI");
+    let output = run_cli_install(
+        home.path(),
+        deck_home.path(),
+        &fixture_path(fixture.path()),
+        &hook_list_response(Vec::new()),
+    );
 
     assert!(
         output.status.success(),
@@ -877,5 +969,184 @@ fn codex_hooks_004_cli_install_succeeds() {
         written.contains(durable.to_str().expect("durable path is UTF-8")),
         "the install pinned something other than the durable binary seeded in this fixture, so \
          the test's outcome is being decided by host state:\n{written}"
+    );
+}
+
+/// Scenario: Run `dot-agent-deck hooks install --agent codex` three times against fresh isolated homes, varying only what the `codex` app-server stand-in returns from `hooks/list` — the exact command the install just wrote, a deck-signature command that is not it, and nothing at all. The one trust line the command prints must name a different one of the three outcomes each time, and the two zero-trust lines must not be interchangeable.
+#[spec("codex/hooks/005")]
+#[test]
+fn codex_hooks_005_cli_trust_line_names_which_outcome_occurred() {
+    // The listing carries the exact command this install wrote, so `Exact`
+    // matches it and a trust record is written.
+    let trusted =
+        install_trust_line(|deck_command| vec![own_home_entry(deck_command, 0, "sha256:deck")]);
+    // The listing carries a command out of the deck's own hooks.json ending in
+    // the deck's verb — `Signature` finds it, `Exact` does not. Issue #730's own
+    // premise: the verb is a convention anyone can write, so this is what "we
+    // installed and then could not recognise our own entry" looks like from the
+    // CLI.
+    let unrecognised = install_trust_line(|_| {
+        vec![own_home_entry(
+            "/usr/local/bin/not-the-deck hook --agent codex",
+            0,
+            "sha256:crafted",
+        )]
+    });
+    // Nothing listed at all — the ordinary cause, and the one every machine
+    // without Codex hooks hits.
+    let nothing = install_trust_line(|_| Vec::new());
+
+    // Trusted: the substance is a non-zero count, so read it back as a number
+    // rather than pinning the three-word line.
+    let count: usize = trusted
+        .trim_start_matches("Trusted hooks:")
+        .trim()
+        .parse()
+        .unwrap_or_else(|_| panic!("the trusted branch must report a bare count, got {trusted:?}"));
+    assert_eq!(
+        count, 1,
+        "exactly the one exact-matching entry should have been trusted: {trusted:?}"
+    );
+
+    // Unrecognised: names THAT cause, with the count of entries Codex did list,
+    // and does not borrow the other zero's sentence. Greptile's finding 3 on PR
+    // #1029 was precisely this message naming the wrong cause.
+    assert!(
+        unrecognised.contains("deck-signature"),
+        "the unrecognised branch must name the entries Codex did list as carrying the deck's \
+         signature: {unrecognised:?}"
+    );
+    assert!(
+        unrecognised.contains('1'),
+        "the unrecognised branch must carry the count of listed deck-signature entries: \
+         {unrecognised:?}"
+    );
+    assert!(
+        !unrecognised.contains("no eligible deck hook"),
+        "the unrecognised branch must not claim Codex reported nothing eligible — it reported \
+         something, and that is the whole difference: {unrecognised:?}"
+    );
+
+    // NothingListed: `eligible` is load-bearing (Greptile P2 on PR #1029). The
+    // branch cannot tell "Codex listed nothing of ours" from "it listed only
+    // entries `deck_owned_entries` rejected", so it may not name either.
+    assert!(
+        nothing.contains("no eligible deck hook"),
+        "the nothing-listed branch must say no ELIGIBLE deck hook, since it cannot know which \
+         of its three causes produced the zero: {nothing:?}"
+    );
+    assert!(
+        !nothing.contains("deck-signature"),
+        "the nothing-listed branch must not claim Codex listed deck-signature entries: \
+         {nothing:?}"
+    );
+
+    // And the point of `TrustOutcome` existing at all: three branches, three
+    // distinguishable lines.
+    assert!(
+        trusted != unrecognised && unrecognised != nothing && trusted != nothing,
+        "the three trust outcomes must be distinguishable from the CLI alone:\n  \
+         trusted={trusted:?}\n  unrecognised={unrecognised:?}\n  nothing={nothing:?}"
+    );
+}
+
+/// Scenario: Install Codex hooks with a stand-in that reports the exact command the install wrote, so one scoped trust record exists, then run install and uninstall again with a `PATH` carrying no `codex` at all. Both commands must exit 0 and say on stderr that scoped hook trust could not be reached, and the uninstall must still delete the deck's hook definitions — leaving the trust record behind as the orphan its warning is about.
+#[spec("codex/hooks/006")]
+#[test]
+fn codex_hooks_006_unreachable_trust_is_reported_on_both_arms() {
+    let fixture = test_temp::tempdir().expect("create CLI fixture");
+    let home = test_temp::tempdir().expect("create Codex home");
+    let deck_home = test_temp::tempdir().expect("create isolated deck HOME");
+    write_fake_codex(fixture.path());
+    let deck_command = expected_hook_command(
+        seed_durable_binary(deck_home.path())
+            .to_str()
+            .expect("durable path is UTF-8"),
+    );
+    let deck_key_template = "__CODEX_HOME__/hooks.json:pre_tool_use:0:0";
+    let deck_key = deck_key_template.replace("__CODEX_HOME__", &home.path().display().to_string());
+    let response = hook_list_response(vec![own_home_entry(&deck_command, 0, "sha256:deck")]);
+
+    // Phase 1: an ordinary install with the stand-in reachable, so there IS a
+    // scoped trust record for the uninstall below to fail to drop.
+    let installed = run_cli_install(
+        home.path(),
+        deck_home.path(),
+        &fixture_path(fixture.path()),
+        &response,
+    );
+    assert!(
+        installed.status.success(),
+        "seeding install failed: {}",
+        String::from_utf8_lossy(&installed.stderr)
+    );
+    assert_eq!(
+        trust_state_keys(home.path()),
+        vec![deck_key.clone()],
+        "the seeding install must leave exactly one deck trust record to orphan"
+    );
+
+    // A `PATH` with nothing on it at all: `Command::new("codex")` then fails
+    // with `NotFound`, which is how both trust steps look on a machine where
+    // Codex is not installed. An empty directory rather than `/usr/bin:/bin`
+    // because a developer may genuinely have `codex` in a system directory, and
+    // nothing on either path needs a `PATH` lookup — the deck binary is invoked
+    // absolutely and the durable candidate is found through `$HOME`.
+    let empty = fixture.path().join("no-codex");
+    std::fs::create_dir_all(&empty).expect("create codex-free PATH dir");
+    let no_codex = empty.display().to_string();
+
+    // Phase 2: the install-side error arm. Exit 0, because the definitions —
+    // what the command promises — were written; the trust failure reaches the
+    // user on stderr instead of only through a `tracing::warn!` nobody has a
+    // subscriber for.
+    let install_err = run_cli_install(home.path(), deck_home.path(), &no_codex, &response);
+    assert!(
+        install_err.status.success(),
+        "a trust failure must not fail the documented install: {}",
+        String::from_utf8_lossy(&install_err.stderr)
+    );
+    let install_stderr = String::from_utf8_lossy(&install_err.stderr).into_owned();
+    assert!(
+        install_stderr.contains("scoped hook trust could not be recorded"),
+        "the install error arm must say on stderr that trust was not recorded: \
+         {install_stderr:?}"
+    );
+    assert!(
+        !String::from_utf8_lossy(&install_err.stdout).contains("Trusted hooks:"),
+        "the error arm has no trust outcome to report on stdout — it is not a zero, it is an \
+         unknown"
+    );
+
+    // Phase 3: the uninstall-side error arm, fourteen lines away in the same
+    // file and silent until issue #1027 item 4. Same exit code, same channel,
+    // and the definitions still go.
+    let uninstalled = run_cli_uninstall(home.path(), &no_codex, &response);
+    assert!(
+        uninstalled.status.success(),
+        "a trust-drop failure must not fail the documented uninstall: {}",
+        String::from_utf8_lossy(&uninstalled.stderr)
+    );
+    let uninstall_stderr = String::from_utf8_lossy(&uninstalled.stderr).into_owned();
+    assert!(
+        uninstall_stderr.contains("scoped hook trust could not be dropped"),
+        "the uninstall error arm must say on stderr that trust was not dropped: \
+         {uninstall_stderr:?}"
+    );
+    let remaining =
+        std::fs::read_to_string(hooks_path(home.path())).expect("read hooks.json after uninstall");
+    assert!(
+        !remaining.contains(DECK_COMMAND_SUFFIX),
+        "uninstall must still remove the deck's hook definitions:\n{remaining}"
+    );
+    // The residue the warning exists to name: definitions gone, trust row still
+    // there. Asserted because it is why the message is worth printing, not
+    // because it is desirable — if the orphan collection #1027's first item
+    // describes ever lands, this is the assertion to change.
+    assert_eq!(
+        trust_state_keys(home.path()),
+        vec![deck_key],
+        "the trust record the uninstall could not reach is left behind, which is exactly what \
+         the warning tells the user"
     );
 }

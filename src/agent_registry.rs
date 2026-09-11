@@ -327,8 +327,29 @@ fn codex_install_resolved(binary_path: Result<String, String>) -> Result<(), Str
 fn codex_uninstall() -> Result<(), String> {
     let home = crate::codex_hooks_manage::active_codex_home()
         .ok_or_else(|| "no Codex home resolves (CODEX_HOME and HOME are both unset)".to_string())?;
+    // The same two channels, and the same exit code, as the install arm above
+    // (issue #1027, item 4). Fixing one of two identical arms and leaving the
+    // other is not scoping: this arm reported through `tracing::warn!` and
+    // nothing else, so on a machine without `DOT_AGENT_DECK_LOG` set the whole
+    // of what the user saw was exit 0 and silence — while the command went on to
+    // delete the definitions regardless. That leaves `[hooks.state]` rows whose
+    // definitions are gone, which nothing in the deck currently collects.
+    //
+    // Not a failure, for the same reason the install arm is not: the primary
+    // operation is the DEFINITIONS, and removing them still succeeds (or reports
+    // its own error below). So this warns and the command continues, exiting 0
+    // on an otherwise clean uninstall.
+    //
+    // Worded in the present tense on purpose — at this point the removal has not
+    // happened yet and `uninstall_from` may still fail, so the message must not
+    // claim it succeeded.
     if let Err(e) = crate::codex_hooks_manage::untrust_deck_hooks_in(&home) {
         tracing::warn!("codex hooks uninstall: could not drop scoped hook trust: {e}");
+        eprintln!(
+            "Warning: scoped hook trust could not be dropped ({e}); removal of the hook \
+             definitions continues, so stale [hooks.state] records may be left behind in \
+             Codex's config.toml"
+        );
     }
     crate::codex_hooks_manage::uninstall_from(&home).map_err(|e| e.to_string())
 }

@@ -598,19 +598,43 @@ fn command_matches_binary(command: &str, binary_path: &str) -> bool {
 /// — [`binary_names_match`], so the host platform's executable-suffix and
 /// case conventions decide what "same basename" means, which is what took this
 /// from "closed on Unix by the coincidence of an empty `EXE_SUFFIX`" to closed
-/// everywhere — whose executable is POSITIVELY KNOWN not to be a usable
-/// durable pin — see
+/// everywhere — whose executable is not a pin the deck would write — see
 /// [`crate::platform::paths::pin_is_repairable`] for what that means and for
 /// the one case that still gets the benefit of the doubt.
+///
+/// **"Not a pin the deck would write" is deliberately not "POSITIVELY KNOWN not
+/// to be a usable durable pin"**, which is what this said until issue #1027
+/// (item 6) checked it against
+/// [`crate::platform::paths::pin_is_repairable`]'s four true-cases. Only one of
+/// the four — an absolute path the OS answers `Ok(false)` for — is a positive
+/// determination about the file. A bare or relative pin is judged with no
+/// filesystem access at all, and is replaceable because it is *cwd-dependent*,
+/// not because it fails to run: issue #536 is about such a pin running, through
+/// the agent's `$PATH`, as a binary nobody chose. A live `target/{debug,release}`
+/// path works this minute and is replaceable for not being durable. The
+/// direction of the gate is unchanged; the epistemic claim was one notch too
+/// strong, and [`crate::agent_hook_config::pin_is_dead_sibling`] carries the
+/// same correction so the two read alike.
+///
 /// `owned_command_executable` returns `None` for any command that is not
-/// deck-owned by either shape, so this can never prune a user's own hook —
-/// only a rule the deck itself would recognise as its own, and only when it
-/// looks like a stale sibling of the binary currently installing (same
-/// basename, different — now-dead — path). A deck rule for a genuinely
-/// different-looking binary is left to
-/// [`command_matches_binary`]/[`is_legacy_deck_rule`] instead, since most of
-/// this file's own fixtures are fictional paths that were never on disk to
-/// begin with and must not be swept up just because they don't exist.
+/// deck-owned by either shape, so what reaches the predicate is only a rule the
+/// deck itself would recognise as its own, and only when it looks like a stale
+/// sibling of the binary currently installing (same basename, different — now
+/// unusable — path). A deck rule for a genuinely different-looking binary is
+/// left to [`command_matches_binary`]/[`is_legacy_deck_rule`] instead, since
+/// most of this file's own fixtures are fictional paths that were never on disk
+/// to begin with and must not be swept up just because they don't exist.
+///
+/// **That is the narrow claim, and the wide one — "this can never prune a
+/// user's own hook" — would be false.** It is the same overstatement PR #1029
+/// narrowed on [`crate::agent_hook_config::pin_is_dead_sibling`], the shared
+/// helper this function's own gate became, and the two are written to read
+/// alike on purpose. Ownership upstream is the *suffix*, and the suffix is a
+/// convention, not a capability: a user-authored command that deliberately ends
+/// in the deck's verb is indistinguishable from a deck entry under it — which is
+/// the whole premise of issue #730. Such a command, under this binary's own
+/// basename, with a pin `pin_is_repairable` rejects, IS pruned here. The two
+/// conjuncts keep that case rare rather than impossible.
 ///
 /// Review finding: pruning on a bare `exists()` conflates "confirmed absent"
 /// with "could not determine" — a working binary behind an unmounted volume,

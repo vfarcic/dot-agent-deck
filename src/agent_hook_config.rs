@@ -582,7 +582,7 @@ pub(crate) fn executables_match(existing: &str, installing: &str) -> bool {
 /// — is a STALE SIBLING of the binary currently installing: it shares that
 /// binary's own basename ([`binary_names_match`], so the host's
 /// executable-suffix and case conventions decide what "same basename" means)
-/// and its pin is positively known not to be usable
+/// and its pin is not one the deck would write
 /// ([`crate::platform::paths::pin_is_repairable`]).
 ///
 /// This is the repair gate PRD #381 Open Question 3 settles on, and the whole of
@@ -593,10 +593,23 @@ pub(crate) fn executables_match(existing: &str, installing: &str) -> bool {
 /// question, so a bare or relative pin, a non-executable file and a
 /// `target/{debug,release}` path are replaceable too — two of them while naming
 /// a file that exists. The conservatism is unchanged in direction, but do not
-/// read "missing" as the boundary. The basename half is what keeps a deck rule for a
-/// genuinely *different-looking* binary out of it — most hook fixtures name
-/// fictional paths that were never on disk, and they must not be swept up just
-/// because they do not exist. The `pin_is_repairable` half is what keeps a
+/// read "missing" as the boundary.
+///
+/// **Nor "positively known" as the standard**, which is what this conjunct said
+/// until issue #1027 (item 6) checked it against those four true-cases. Only one
+/// of them — an absolute path the OS answers `Ok(false)` for — is a positive
+/// determination about the file. A bare or relative pin is judged with no
+/// filesystem access at all, and is replaceable because it is *cwd-dependent*,
+/// not because it fails to run: #536 is about such a pin running, through the
+/// agent's `$PATH`, as a binary nobody chose. A live `target/{debug,release}`
+/// path works this minute and is replaceable for not being durable. The claim
+/// this makes is "not a pin the deck would write", and that is the one it can
+/// carry.
+///
+/// The basename half is what keeps a deck rule for a genuinely
+/// *different-looking* binary out of it — most hook fixtures name fictional
+/// paths that were never on disk, and they must not be swept up just because
+/// they do not exist. The `pin_is_repairable` half is what keeps a
 /// working binary behind an unmounted volume, or one this process cannot
 /// `stat`, out of it: a stat error on a well-formed absolute pin means "leave
 /// alone", because deleting a working user's hook is worse than leaving a stale

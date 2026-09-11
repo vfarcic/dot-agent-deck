@@ -3960,6 +3960,20 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 - **Does not assert:** uninstall scoping (covered by `codex/trust/003`) or dashboard rendering.
 - **Platform coverage:** mac+linux.
 
+##### codex/hooks/005 — The install CLI's trust line names which of the three trust outcomes occurred (issue #730 auditor S-C, Greptile P2 on PR #1029).
+- **Layer:** L1/fast real-binary subprocess integration with isolated homes and a deterministic Codex app-server stand-in.
+- **Agent:** synthetic Codex installation environment; the `hooks/list` response is the only variable.
+- **Asserts:** across three runs differing only in what the stand-in lists — the exact command the install wrote, a deck-signature command that is not it, and nothing — `hooks install --agent codex` prints one trust line per run and the three are pairwise distinct: the first reports a non-zero count, the second names the listed deck-signature entries and their count without borrowing the other zero's sentence, and the third says no **eligible** deck hook without claiming Codex listed deck-signature entries.
+- **Does not assert:** that the trust record is written to `config.toml` (covered by `codex/trust/002`–`003`), or the error arm where the trust step could not run at all (`codex/hooks/006`).
+- **Platform coverage:** mac+linux.
+
+##### codex/hooks/006 — Both the install and uninstall CLI arms report an unreachable trust step on stderr and still exit 0 (issue #1027 item 4).
+- **Layer:** L1/fast real-binary subprocess integration with isolated homes and a deterministic Codex app-server stand-in.
+- **Agent:** synthetic Codex installation environment, then a `PATH` with no `codex` on it at all so the trust step fails with `NotFound`.
+- **Asserts:** after a seeding install leaves exactly one scoped trust record, a re-install with no reachable `codex` exits 0, says on stderr that scoped hook trust could not be recorded, and prints no trust line on stdout; an uninstall under the same conditions exits 0, says on stderr that scoped hook trust could not be dropped, still removes every deck hook definition from `hooks.json`, and leaves the unreachable trust record behind — the orphan the warning names.
+- **Does not assert:** that the orphan record is ever collected (it is not today — issue #1027 item 1), or the three non-error trust outcomes (`codex/hooks/005`).
+- **Platform coverage:** mac+linux.
+
 #### codex/live
 
 ##### codex/live/001 — A real interactive cheap-model Codex run launched through the normal new-pane flow works visibly and reports live status (PRD #20, rule 4 / finding 16). [reel]
