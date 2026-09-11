@@ -305,6 +305,15 @@ fn default_ssh_port() -> u16 {
 }
 
 impl RemoteEndpoint {
+    /// The ssh port a remote deck is reached on when nothing says otherwise.
+    ///
+    /// Exposed on the type because a *stored* endpoint needs the same default
+    /// its constructor applies, and the two agreeing is the property worth
+    /// naming: PRD #741 M6's `RemoteEndpointSettings` fills a document with no
+    /// `port` key from this, so a row saved without one and a row saved with
+    /// `port = 22` describe the same deck.
+    pub const DEFAULT_PORT: u16 = crate::remote::DEFAULT_SSH_PORT;
+
     /// A remote deck at `host`, reached on the default ssh port, whose daemon
     /// listens on `socket` over there.
     pub fn new(host: Hostname, socket: RemoteSocketPath) -> Self {

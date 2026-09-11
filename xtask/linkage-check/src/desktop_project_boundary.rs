@@ -123,6 +123,23 @@ const ALLOWED_ROOT_MODULES: &[&str] = &[
     "event",
     "platform",
     "prompt_delivery",
+    // PRD #741 M6, argued rather than added quietly. The desktop's settings
+    // schema is built from this module's validating ssh-argument newtypes
+    // (`Hostname`, `SshUser`, `KeyPath`, `HostAlias`, `RemoteSocketPath`), and
+    // it has to be: `desktop_settings_secrets`'s ALLOWED_FIELD_TYPES refuses
+    // `String`, so an endpoint field can only be a type whose `Deserialize`
+    // bounds and charset-checks it. Two required gates therefore point at each
+    // other, and this entry is what lets the schema satisfy both.
+    //
+    // It crosses none of the four things this rule looks for: the module
+    // resolves no project, reads no project state file, names no
+    // FORBIDDEN_SYMBOL, and contains no `std::env::current_dir` — and the
+    // `cwd-fallback` finding still applies to anything the desktop crate itself
+    // writes, since this rule scans `desktop/src-tauri/src` and not `src/`.
+    // What it does contain beyond the newtypes is the `ssh -N -L` transport,
+    // which is the endpoint's own connection and the thing PRD #741 exists to
+    // give the desktop.
+    "remote_tunnel",
     "state",
     "ui",
 ];

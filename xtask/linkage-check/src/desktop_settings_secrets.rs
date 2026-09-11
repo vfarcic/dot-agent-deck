@@ -13,16 +13,26 @@
 //!
 //! 1. **Every field in the Rust settings schema has a type from a pinned
 //!    allowlist.** This is the boundary. It constrains the *types* a field may
-//!    have rather than its name: none of `u32`, `AppearanceMode` or `ZoomLevel`
-//!    can carry arbitrary text, so a credential has no field to sit in whatever
-//!    anybody calls it. It is also the check
-//!    that closes the "field serde omits" gap — an omitted field still has to
-//!    have an allowlisted type — and the one that will go red when PRD #802
-//!    adds a `String`, which is exactly the moment somebody has to route it
-//!    through the `SecretStore` seam instead. A serde attribute that hides a
-//!    field from the serialised document (`skip`, `flatten`) is refused for the
-//!    same reason: `settings.rs`'s sentinel sweep walks that document, so a
-//!    field missing from it is a field nothing follows a value through.
+//!    have rather than its name, and the strength of that varies by type — a
+//!    distinction PRD #741 M6 made load-bearing rather than pedantic. `u32`,
+//!    `u16`, `AppearanceMode`, `ZoomLevel` and `Selection` cannot carry
+//!    arbitrary text at all. The five ssh-argument newtypes #741 stores
+//!    (`Hostname`, `SshUser`, `KeyPath`, `HostAlias`, `RemoteSocketPath`) and
+//!    `EndpointId` **bound and charset-restrict** it, which is weaker: measured,
+//!    a 45-byte `sk-…`-shaped token parses as a `Hostname`. Each row on the
+//!    allowlist says which of the two it is; read them, because "it is on the
+//!    list" no longer means one single thing. What the list still does
+//!    unconditionally is force the conversation: a new type is a deliberate
+//!    edit with a written reason, and `String` is not on it.
+//!
+//!    It is also the check that closes the "field serde omits" gap — an omitted
+//!    field still has to have an allowlisted type — and the one that will go
+//!    red when PRD #802 adds a `String`, which is exactly the moment somebody
+//!    has to route it through the `SecretStore` seam instead. A serde attribute
+//!    that hides a field from the serialised document (`skip`, `flatten`) is
+//!    refused for the same reason: `settings.rs`'s sentinel sweep walks that
+//!    document, so a field missing from it is a field nothing follows a value
+//!    through.
 //! 2. **The TypeScript DTO's declared shape is pinned, field by field, with its
 //!    types.** The Rust tripwire cannot see `bridge.ts` at all, so a
 //!    frontend-only `apiKey` on `DesktopSettingsDto` was declared where
@@ -67,10 +77,18 @@
 //!
 //! **What none of this proves.** There is no `SecretStore` yet — PRD #803 M5
 //! named the seam and deliberately did not build it — so "a credential can
-//! only enter through `SecretStore`" is not assertable here. What is assertable
-//! is stronger while it holds and weaker in scope: *no route in exists at all*.
-//! When #802 builds the store, check 1 is what forces the credential to go
-//! through it.
+//! only enter through `SecretStore`" is not assertable here.
+//!
+//! What used to stand in for it was *no route in exists at all*, and **PRD #741
+//! M6 retired that claim rather than restating it.** It was true while every
+//! field was an integer, a three-token enum or a snapped float; it stopped
+//! being true when the schema gained a 253-byte hostname. A single-line token
+//! now has somewhere it would fit. What is assertable instead is narrower and
+//! still worth having: **nothing in this schema is free text** — every field is
+//! bounded and charset-restricted by a deserializer, no field can hold a PEM
+//! block or a padded base64 blob, and adding one that could means editing
+//! `ALLOWED_FIELD_TYPES` in a required gate. When #802 builds the store, check
+//! 1 is what forces the credential to go through it.
 //!
 //! **Fails closed**, like `desktop_palette`: every filesystem error fails the
 //! test rather than removing a file from the scan, and a symlink is refused
@@ -93,19 +111,39 @@ const BRIDGE_TS: &str = "desktop/src/lib/bridge.ts";
 /// The frontend tree the `localStorage` scan walks.
 const DESKTOP_SRC: &str = "desktop/src";
 
-/// A field type a settings struct may use, and why it cannot carry a
-/// credential.
+/// A field type a settings struct may use, and why a credential does not belong
+/// in it.
 ///
 /// **Read this list as the boundary, not as bookkeeping.** Adding an entry is
-/// the act of asserting that values of that type cannot hold arbitrary text —
-/// so `String`, `Option<String>`, `PathBuf`, `Vec<String>` and any map do not
-/// belong on it, whatever the field is called. If PRD #802 needs a credential,
-/// the answer is the `SecretStore` seam, not a row here.
-const ALLOWED_FIELD_TYPES: [(&str, FieldKind, &str); 10] = [
+/// the act of asserting, in writing, what values of that type can and cannot
+/// be — so `String`, `Option<String>`, `PathBuf`, `Vec<String>` and any map do
+/// not belong on it, whatever the field is called. If PRD #802 needs a
+/// credential, the answer is the `SecretStore` seam, not a row here.
+///
+/// **The entries are not all the same strength, and the reason column is where
+/// that is recorded.** Some say *no text is representable* (`u32`, `u16`,
+/// `AppearanceMode`, `ZoomLevel`, `Selection`). The ssh-argument newtypes and
+/// `EndpointId` say something weaker and true: *this charset and this bound*,
+/// plus what that makes unrepresentable. Do not summarise a row you have not
+/// read.
+///
+/// Entries name the **element** type, not the container: a field is resolved
+/// through [`allowlisted_as`] first, which strips one `Option<…>` or `Vec<…>`
+/// layer. That is why `Option<String>` and `Vec<String>` still have no way in —
+/// they resolve to `String`, which is absent — and why there is no row for each
+/// container shape.
+const ALLOWED_FIELD_TYPES: [(&str, FieldKind, &str); 15] = [
     (
         "u32",
         FieldKind::Scalar,
         "an integer; there is no text for a credential to be",
+    ),
+    (
+        "u16",
+        FieldKind::Scalar,
+        "an integer; there is no text for a credential to be. It is the ssh \
+         port, and the type is the bound — 0..=65535 and nothing else is \
+         representable",
     ),
     (
         "AppearanceMode",
@@ -178,10 +216,40 @@ const ALLOWED_FIELD_TYPES: [(&str, FieldKind, &str); 10] = [
          '/', and required to be absolute; ':' is refused because ssh parses \
          its -L forward specification by splitting on it",
     ),
+    // PRD #741 M6: the endpoint list's own identity and selection tokens.
+    (
+        "EndpointId",
+        FieldKind::Scalar,
+        "a newtype over String naming a row in this document, bounded at \
+         MAX_ENDPOINT_ID_BYTES (64) and restricted to ASCII alphanumerics, '-' \
+         and '_' by a deserializer that runs the constructor's own check. It is \
+         not a secret and nothing authenticates with it — it is minted locally \
+         and names a row in a file the user owns",
+    ),
+    (
+        "Selection",
+        FieldKind::Scalar,
+        "a closed enum serialised as one token: the reserved word 'local', or \
+         an EndpointId, which carries that type's charset and bound. There is \
+         no free-text arm — an unrecognised token becomes an EndpointId or the \
+         deserializer errors",
+    ),
     (
         "AppearanceSettings",
         FieldKind::Section,
         "a section struct, whose own fields this check walks",
+    ),
+    (
+        "EndpointSettings",
+        FieldKind::Section,
+        "a section struct, whose own fields this check walks",
+    ),
+    (
+        "RemoteEndpointSettings",
+        FieldKind::Section,
+        "a section struct — one stored remote deck — whose own fields this \
+         check walks. It appears as a Vec, which changes nothing: see \
+         `allowlisted_as`",
     ),
     (
         "ZoomSettings",
@@ -189,6 +257,42 @@ const ALLOWED_FIELD_TYPES: [(&str, FieldKind, &str); 10] = [
         "a section struct, whose own fields this check walks",
     ),
 ];
+
+/// The type an allowlist lookup is really performed on: one `Option<…>` or
+/// `Vec<…>` layer removed, and nothing else.
+///
+/// # Why unwrapping does not weaken the boundary
+///
+/// A container of `T` carries exactly the values `T` carries and no others, so
+/// `Option<KeyPath>` is as incapable of holding a credential as `KeyPath` is.
+/// Crucially the unwrap is **not an escape hatch**: it resolves to the inner
+/// type and that type still has to be on [`ALLOWED_FIELD_TYPES`], so
+/// `Option<String>` resolves to `String` — which is deliberately absent — and
+/// is refused exactly as a bare `String` is. Pinned by
+/// [`tests::the_field_type_scan_catches_a_free_text_field_however_it_is_named`].
+///
+/// # What is deliberately *not* unwrapped
+///
+/// Only these two, and only one layer. A map is not unwrapped at all: its key
+/// is a name the schema does not fix, which is a different question from what a
+/// value may hold, so `HashMap<String, ZoomLevel>` stays unlisted and therefore
+/// refused. `Vec<Vec<String>>` unwraps once to `Vec<String>`, which is not on
+/// the list either. The allowlist's doc comment says `Option<String>`,
+/// `Vec<String>` and any map do not belong on it, and this function is what
+/// keeps that true without needing a row per container shape.
+fn allowlisted_as(ty: &str) -> &str {
+    for wrapper in ["Option<", "Vec<"] {
+        if let Some(inner) = ty.strip_prefix(wrapper).and_then(|r| r.strip_suffix('>')) {
+            // One type parameter only. A comma means something this function
+            // cannot reason about, so it is handed back whole and lands as an
+            // unlisted type.
+            if !inner.contains(',') {
+                return inner;
+            }
+        }
+    }
+    ty
+}
 
 /// Whether an allowlisted type is a leaf or another struct in the same file.
 ///
@@ -828,8 +932,14 @@ fn namespaced_literals(source: &str) -> BTreeSet<String> {
 mod tests {
     use super::*;
 
-    /// Check 1, and the boundary this whole module exists for: **no field in
-    /// the settings schema has a type that can carry arbitrary text.**
+    /// Check 1, and the boundary this whole module exists for: **every field
+    /// in the settings schema has a type from [`ALLOWED_FIELD_TYPES`], and no
+    /// field is free text.**
+    ///
+    /// That sentence used to read "no field has a type that can carry arbitrary
+    /// text", which PRD #741 M6 falsified — a `Hostname` carries 253 bytes of
+    /// `[A-Za-z0-9._-]`. Read the module docs for the two-part claim that
+    /// survives; the mechanism this test enforces is unchanged.
     ///
     /// This is the check that makes "a credential cannot be stored here" a
     /// statement about types rather than about names, and the one PRD #802
@@ -860,9 +970,13 @@ mod tests {
             ));
         }
         for field in &fields {
+            // One `Option<…>`/`Vec<…>` layer off, for the reason
+            // `allowlisted_as` gives: a container carries exactly what its
+            // element carries, and the element still has to be on the list.
+            let resolved = allowlisted_as(&field.ty);
             let allowed = ALLOWED_FIELD_TYPES
                 .iter()
-                .find(|(ty, _, _)| *ty == field.ty);
+                .find(|(ty, _, _)| *ty == resolved);
             match allowed {
                 None => offenders.push(format!(
                     "{SETTINGS_RS}:{}: {}.{} is a `{}`, which is not on ALLOWED_FIELD_TYPES",
@@ -938,6 +1052,55 @@ pub struct VoiceSettings {
             assert!(
                 fields.iter().any(|f| f.attrs.contains(fragment)),
                 "the fixture should exercise `{fragment}`"
+            );
+        }
+    }
+
+    /// The container unwrap, and specifically that it is **not** a way past the
+    /// allowlist (PRD #741 M6).
+    ///
+    /// `Option<KeyPath>` has to resolve, because a stored endpoint's identity
+    /// file is optional and an `Option` carries exactly what its element
+    /// carries. The same step must leave `Option<String>` and `Vec<String>`
+    /// exactly as refused as a bare `String` — which is the property that makes
+    /// the unwrap safe to have at all, and the one a careless generalisation
+    /// would lose.
+    #[test]
+    fn a_container_resolves_to_its_element_and_cannot_launder_a_free_text_type() {
+        for (ty, expected) in [
+            ("KeyPath", "KeyPath"),
+            ("Option<KeyPath>", "KeyPath"),
+            ("Vec<RemoteEndpointSettings>", "RemoteEndpointSettings"),
+            // Refused, and by resolving rather than by failing to resolve:
+            // these land on a name that is deliberately absent from the list.
+            ("String", "String"),
+            ("Option<String>", "String"),
+            ("Vec<String>", "String"),
+            // Not unwrapped at all: two parameters, so nothing is claimed.
+            ("HashMap<String, String>", "HashMap<String, String>"),
+            ("BTreeMap<String, ZoomLevel>", "BTreeMap<String, ZoomLevel>"),
+            // One layer only.
+            ("Vec<Vec<String>>", "Vec<String>"),
+            // Not a container at all.
+            ("PathBuf", "PathBuf"),
+            ("Optional", "Optional"),
+        ] {
+            assert_eq!(allowlisted_as(ty), expected, "resolving `{ty}`");
+        }
+
+        for refused in [
+            "String",
+            "Option<String>",
+            "Vec<String>",
+            "PathBuf",
+            "Option<PathBuf>",
+            "HashMap<String, String>",
+            "Vec<Vec<String>>",
+        ] {
+            let resolved = allowlisted_as(refused);
+            assert!(
+                !ALLOWED_FIELD_TYPES.iter().any(|(ty, _, _)| *ty == resolved),
+                "`{refused}` resolved to `{resolved}`, which must not be allowlisted"
             );
         }
     }
