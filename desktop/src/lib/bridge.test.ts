@@ -20,6 +20,7 @@ const snapshot: DesktopSnapshotDto = {
   connection: {
     status: "connected",
     socketPath: "/tmp/deck.sock",
+    deckKind: "local",
     clientProtocolVersion: 6,
     serverProtocolVersion: 6,
     clientBuildVersion: "0.1.0",
@@ -1767,6 +1768,69 @@ describe("desktop settings (PRD 803)", () => {
     expect(normalizeDesktopSettings({ zoom: { level: 1.3 } }).zoom.level).toBe(1.25);
     expect(normalizeDesktopSettings({ zoom: { level: 99 } }).zoom.level).toBe(3);
   });
+
+  /**
+   * PRD #741 M7 — the frontend half of
+   * `a_client_that_cannot_render_endpoints_cannot_delete_them`, and the reason
+   * it needs a test of its own: getting it wrong is **silent data loss**, not a
+   * visible bug.
+   *
+   * `normalizeDesktopSettings` builds a fresh object with a fixed key set, so a
+   * section it does not read is gone before any panel spreads the document, and
+   * `desktop_set_settings` then merges the decoded struct over the file. If an
+   * absent `[endpoints]` section normalised to `{ remote: [], selection:
+   * "local" }`, changing the theme would write that empty table over every
+   * remote deck the user had.
+   *
+   * So absence stays absence, and presence round-trips.
+   */
+  it("round-trips the endpoints section and never fabricates one", async () => {
+    const { normalizeDesktopSettings } = await import("./bridge");
+
+    // Absent in, absent out — across every shape a document can arrive in.
+    for (const document of [{}, { appearance: { mode: "dark" } }, { endpoints: null }, { endpoints: "nonsense" }]) {
+      expect(normalizeDesktopSettings(document).endpoints).toBeUndefined();
+    }
+
+    // Present in, present out, field for field.
+    const stored = {
+      appearance: { mode: "dark" },
+      endpoints: {
+        remote: [
+          { host: "build-box", id: "deck0000000000aa", port: 2222, user: "deploy", identity: "~/.ssh/id_ed25519", jump: "bastion", socket: "/run/user/1000/dot-agent-deck-attach.sock" },
+          { host: "ci-box", id: "deck0000000000bb", port: 22 },
+        ],
+        selection: "deck0000000000aa",
+      },
+      zoom: { level: 1.25 },
+    };
+    expect(normalizeDesktopSettings(stored).endpoints).toEqual(stored.endpoints);
+
+    // A save made from ANOTHER panel carries the section through untouched,
+    // which is the actual failure mode: the theme row is what a user is most
+    // likely to change, and it spreads the document this function produced.
+    const loaded = normalizeDesktopSettings(stored);
+    const afterAppearanceChange = { ...loaded, appearance: { mode: "light" as const } };
+    expect(normalizeDesktopSettings(afterAppearanceChange).endpoints).toEqual(stored.endpoints);
+
+    // A row missing what makes it a row is dropped rather than repaired: Rust
+    // refuses the whole document over a row with no host or no id, and a
+    // fabricated one would be a deck the user never configured.
+    const partial = normalizeDesktopSettings({
+      endpoints: { remote: [{ host: "build-box" }, { id: "deck0000000000cc" }, { host: "ci-box", id: "deck0000000000dd" }], selection: "local" },
+    });
+    expect(partial.endpoints?.remote.map((row) => row.id)).toEqual(["deck0000000000dd"]);
+    // And a row with no port reads as 22, the same default `RemoteEndpoint::DEFAULT_PORT`
+    // fills a document with no `port` key from.
+    expect(partial.endpoints?.remote[0].port).toBe(22);
+
+    // An unrecognised selection token is written back UNCHANGED, so an older
+    // build degrades to the local deck without destroying a newer build's
+    // selection.
+    expect(normalizeDesktopSettings({ endpoints: { remote: [], selection: "all" } }).endpoints?.selection).toBe("all");
+    // And an empty or missing token reads as the reserved local word.
+    expect(normalizeDesktopSettings({ endpoints: { remote: [] } }).endpoints?.selection).toBe("local");
+  });
 });
 
 /**
@@ -1830,7 +1894,17 @@ describe("desktop settings hold no credential (issue 827)", () => {
       expect(JSON.stringify(normalized)).not.toContain(SENTINEL);
       // And the result is always a complete, valid document rather than a
       // partial one: dropping the unknown field must not drop the known ones.
-      expect(Object.keys(normalized).sort()).toEqual(["appearance", "version", "zoom"]);
+      //
+      // `endpoints` is in the key set with the value `undefined` (PRD #741 M7).
+      // That is the shape "unspecified" has to take on this side — the key
+      // cannot be omitted conditionally without a spread, and a spread is
+      // exactly what the structural guard forbids here — and it is what Rust's
+      // `Option<EndpointSettings>` reads as `None`, because `JSON.stringify`
+      // drops an `undefined` value on the way to the bridge. The assertion
+      // below pins that it carries no *value*.
+      expect(Object.keys(normalized).sort()).toEqual(["appearance", "endpoints", "version", "zoom"]);
+      expect(normalized.endpoints).toBeUndefined();
+      expect(JSON.parse(JSON.stringify(normalized))).not.toHaveProperty("endpoints");
     }
     // A wrongly-typed known field falls back rather than propagating, the same
     // way `AppearanceMode::from_str_lossy` does Rust-side.

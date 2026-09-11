@@ -39,6 +39,8 @@ import { ConfirmDialog, type ConfirmState } from "./components/ConfirmDialog";
 import { HandoffRail } from "./components/HandoffRail";
 import { ProfilesPanel, ProjectsPanel, PromptLibraryPanel, WorkflowPanel } from "./components/ConfigurationPanels";
 import { SettingsSheet } from "./components/SettingsSheet";
+import { SettingsBridgeProvider } from "./lib/settingsBridge";
+import { DISPLAY_LIMITS, displayText } from "./lib/displayText";
 import { useAgentProfiles } from "./hooks/useAgentProfiles";
 import { useDeckRuntime } from "./hooks/useDeckRuntime";
 import { useDaemonProjects } from "./hooks/useDaemonProjects";
@@ -168,6 +170,9 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [notice, setNotice] = useState<string>();
   const [confirm, setConfirm] = useState<ConfirmState>();
+  // Memoised so the context value is stable across renders; `runtime.testEndpoint`
+  // is itself stable for the lifetime of the bridge.
+  const settingsBridge = useMemo(() => ({ testEndpoint: runtime.testEndpoint }), [runtime.testEndpoint]);
   const { profiles, updateProfile, resetProfiles } = useAgentProfiles(snapshot.profiles);
   /*
    * PRD #819 M6: the projects come from the daemon and nothing is remembered.
@@ -310,7 +315,20 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
   const orderedStages = snapshot.stages;
   const selectedAgent = snapshot.agents.find((agent) => agent.id === selectedAgentId);
   const selectedEvidence = snapshot.evidence.find((item) => item.id === selectedEvidenceId);
-  const canControlDaemon = snapshot.connection.status === "connected" || snapshot.connection.daemonDetected === true;
+  /**
+   * PRD #741 M7. Stop and Replace act on a process on **this** machine, so they
+   * are unavailable for a remote deck — and this gate is rendering a refusal
+   * that already exists rather than inventing one: `Endpoint::require_local`
+   * makes the operation unreachable by type, and `connection.localOnlyReason`
+   * is its own sentence.
+   *
+   * Over a forwarded socket the consequence of not gating is not a no-op:
+   * `run_daemon_stop` resolves its target from the socket's peer credentials,
+   * which name the local `ssh` client, so Stop would tear the tunnel down and
+   * report that a daemon had stopped gracefully.
+   */
+  const remoteDeck = snapshot.connection.deckKind === "remote";
+  const canControlDaemon = !remoteDeck && (snapshot.connection.status === "connected" || snapshot.connection.daemonDetected === true);
 
   const coordinator = snapshot.agents.find((agent) => agent.isStartRole);
 
@@ -627,7 +645,7 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
               className="button danger compact"
               data-testid="stop-run"
               aria-label={selectedAgent ? `Stop ${selectedAgent.role}` : "Stop daemon"}
-              title={selectedAgent ? `Stop ${selectedAgent.role}` : canControlDaemon ? "Stop local daemon" : "Daemon is not connected"}
+              title={selectedAgent ? `Stop ${selectedAgent.role}` : canControlDaemon ? "Stop local daemon" : snapshot.connection.localOnlyReason ?? "Daemon is not connected"}
               disabled={!selectedAgent && !canControlDaemon}
               onClick={requestStop}
             ><CircleStop size={14} /><span>Stop</span></button>
@@ -653,8 +671,8 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
         {(snapshot.connection.status !== "connected" || snapshot.connection.buildStampMismatchOnly) && (
           <div className={`connection-banner connection-${snapshot.connection.status}`} role="alert">
             {snapshot.connection.status === "loading" ? <RefreshCw className="spin" size={16} /> : <ShieldAlert size={16} />}
-            <div><strong>{snapshot.connection.status === "loading" ? "Establishing control channel" : snapshot.connection.status === "connected" ? "Connected to a differently-built daemon" : snapshot.connection.status === "error" ? "Desktop bridge error" : "Daemon disconnected"}</strong><span>{snapshot.connection.message}</span></div>
-            {snapshot.connection.status !== "loading" && <div className="connection-actions">{mode === "live" && snapshot.connection.status === "disconnected" && <button className="button primary compact" data-testid="start-daemon" onClick={requestStartDaemon}><Play size={13} /> Start daemon</button>}{mode === "live" && snapshot.connection.daemonDetected && snapshot.connection.status === "error" && snapshot.connection.runningAgentCount === 0 && <button className="button primary compact" data-testid="replace-daemon" onClick={requestRestartDaemon}><RefreshCw size={13} /> Replace daemon</button>}{mode === "live" && snapshot.connection.status === "error" && snapshot.connection.buildStampMismatchOnly && <button className="button primary compact" data-testid="connect-anyway" onClick={requestConnectAnyway}><ShieldAlert size={13} /> Connect anyway</button>}<button className="button secondary compact" onClick={() => void runtime.reconnect()}><RefreshCw size={13} /> Reconnect</button></div>}
+            <div><strong>{snapshot.connection.status === "loading" ? "Establishing control channel" : snapshot.connection.status === "connected" ? "Connected to a differently-built daemon" : snapshot.connection.status === "error" ? "Desktop bridge error" : "Daemon disconnected"}</strong><span>{snapshot.connection.message}</span>{/* PRD #741 M7: why Start and Replace are absent, said once, where they would have been. */}{remoteDeck && snapshot.connection.localOnlyReason && <span data-testid="remote-deck-notice">{displayText(snapshot.connection.localOnlyReason, DISPLAY_LIMITS.message)}</span>}</div>
+            {snapshot.connection.status !== "loading" && <div className="connection-actions">{mode === "live" && !remoteDeck && snapshot.connection.status === "disconnected" && <button className="button primary compact" data-testid="start-daemon" onClick={requestStartDaemon}><Play size={13} /> Start daemon</button>}{mode === "live" && !remoteDeck && snapshot.connection.daemonDetected && snapshot.connection.status === "error" && snapshot.connection.runningAgentCount === 0 && <button className="button primary compact" data-testid="replace-daemon" onClick={requestRestartDaemon}><RefreshCw size={13} /> Replace daemon</button>}{mode === "live" && snapshot.connection.status === "error" && snapshot.connection.buildStampMismatchOnly && <button className="button primary compact" data-testid="connect-anyway" onClick={requestConnectAnyway}><ShieldAlert size={13} /> Connect anyway</button>}<button className="button secondary compact" onClick={() => void runtime.reconnect()}><RefreshCw size={13} /> Reconnect</button></div>}
           </div>
         )}
 
@@ -726,16 +744,26 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
       />
       <ProfilesPanel open={profilesOpen} profiles={profiles} onClose={() => setProfilesOpen(false)} onUpdate={updateProfile} onReset={resetProfiles} onSaved={() => setNotice("Agent profile draft saved locally. Project TOML is unchanged.")} />
       <WorkflowPanel key={activeProject?.path ?? "runtime-workflow"} open={workflowOpen} profiles={profiles} order={profileOrder} mode={mode} project={activeProject} onChooseProject={() => { setWorkflowOpen(false); setProjectsOpen(true); }} onClose={() => setWorkflowOpen(false)} onToggle={(id) => { const profile = profiles.find((item) => item.id === id); if (profile) updateProfile(id, { enabled: !profile.enabled }); }} onMove={moveStage} onLaunch={requestLaunch} platformIssue={workflowPlatformIssue} prompts={prompts} />
-      <SettingsSheet
-        open={settingsOpen}
-        onClose={() => setSettingsOpen(false)}
-        settings={settings.settings}
-        onSave={settings.save}
-        saveError={settings.saveError}
-        path={settings.path}
-        loaded={settings.loaded}
-        mode={mode}
-      />
+      {/*
+        PRD #741 M10. The provider is mounted HERE rather than inside the sheet,
+        because `SettingsSheet` is a #803-owned rendering component and the
+        contract it keeps is that a feature adding a section never opens it. The
+        deck already holds the runtime, so this is where the bridge is; see
+        `lib/settingsBridge.tsx` for why it is a context and not a fifth panel
+        prop.
+      */}
+      <SettingsBridgeProvider value={settingsBridge}>
+        <SettingsSheet
+          open={settingsOpen}
+          onClose={() => setSettingsOpen(false)}
+          settings={settings.settings}
+          onSave={settings.save}
+          saveError={settings.saveError}
+          path={settings.path}
+          loaded={settings.loaded}
+          mode={mode}
+        />
+      </SettingsBridgeProvider>
       {paletteOpen && <CommandPalette commands={commandItems} onClose={() => setPaletteOpen(false)} />}
       {helpOpen && <ShortcutHelp onClose={() => setHelpOpen(false)} />}
       {confirm && <ConfirmDialog state={confirm} onClose={() => setConfirm(undefined)} />}

@@ -47,6 +47,19 @@ function runtime(overrides: Partial<DeckRuntimeState> = {}): DeckRuntimeState {
     listProjects: vi.fn(async () => ({ projects: [] })),
     resolveProject: vi.fn(async () => { throw new Error("unresolved: no such project"); }),
     setZoom: vi.fn(async (level: number) => level),
+    // PRD #741 M10: no deck is reachable from a test runtime, and the state that
+    // says so is the same one the browser preview reports.
+    testEndpoint: vi.fn(async (_settings, selection: string) => ({
+      endpointId: selection,
+      deck: selection,
+      state: "ssh_unavailable" as const,
+      ok: false,
+      message: "No deck is reachable from this test runtime.",
+      forwardsKnown: false,
+      forwards: [],
+      clientProtocolVersion: 0,
+      clientBuildVersion: "test",
+    })),
     getSettings: settings.getSettings,
     saveSettings: settings.saveSettings,
     ...overrides,
@@ -754,6 +767,7 @@ describe("ControlDeck", () => {
     incompatible.connection = {
       status: "error",
       socketPath: "/tmp/dot-agent-deck.sock",
+      deckKind: "local",
       message: "build mismatch",
       daemonDetected: true,
       runningAgentCount: 0,
@@ -785,6 +799,7 @@ describe("ControlDeck", () => {
     incompatible.connection = {
       status: "error",
       socketPath: "/tmp/dot-agent-deck.sock",
+      deckKind: "local",
       message: "build mismatch: desktop is v0.38.0-50-gf118e99, daemon is v0.39.0. The daemon reports 9 live agents; stop them individually before replacing the daemon, or Connect anyway to keep this one.",
       daemonDetected: true,
       runningAgentCount: 9,
@@ -991,8 +1006,8 @@ describe("ControlDeck", () => {
     // still that the real registry reaches the real sheet. The column's own two
     // states stay pinned with stub sections in
     // `components/SettingsSheet.test.tsx`, so this does not become their only
-    // coverage.
-    expect(SETTINGS_SECTIONS).toHaveLength(2);
+    // coverage. PRD #741's Decks row took it to three.
+    expect(SETTINGS_SECTIONS).toHaveLength(3);
     expect(screen.getByTestId("settings-layout")).not.toHaveClass("is-single");
     expect(screen.getByRole("navigation", { name: "Settings sections" })).toBeVisible();
 
@@ -1288,7 +1303,7 @@ describe("ControlDeck", () => {
   it("asserts no attempt count and no branch in live mode", async () => {
     const { mapDesktopSnapshot } = await import("./lib/bridge");
     const snapshot = mapDesktopSnapshot({
-      connection: { status: "connected", socketPath: "/tmp/deck.sock", clientProtocolVersion: 8, serverProtocolVersion: 8, clientBuildVersion: "0.1.0", daemonBuildVersion: "0.1.0" },
+      connection: { status: "connected", socketPath: "/tmp/deck.sock", deckKind: "local", clientProtocolVersion: 8, serverProtocolVersion: 8, clientBuildVersion: "0.1.0", daemonBuildVersion: "0.1.0" },
       agents: [{ id: "7", displayName: "Coder", cwd: "/tmp/project", rows: 32, cols: 120, agentType: "claude_code", status: "working", toolCount: 3, tab: { kind: "dashboard" } }],
       protocolVersion: 8,
       source: "daemon",
@@ -1339,7 +1354,7 @@ describe("ControlDeck", () => {
     // become one DOM text node, once per agent, on every refreshed snapshot.
     const hostile = `${stripped.join("")}${"p".repeat(64 * 1024)}`;
     const snapshot = mapDesktopSnapshot({
-      connection: { status: "connected", socketPath: "/tmp/deck.sock", clientProtocolVersion: 8, serverProtocolVersion: 8, clientBuildVersion: "0.1.0", daemonBuildVersion: "0.1.0" },
+      connection: { status: "connected", socketPath: "/tmp/deck.sock", deckKind: "local", clientProtocolVersion: 8, serverProtocolVersion: 8, clientBuildVersion: "0.1.0", daemonBuildVersion: "0.1.0" },
       agents: [{ id: "7", displayName: "Coder", cwd: "/tmp/project", rows: 32, cols: 120, agentType: "claude_code", status: "working", toolCount: 3, lastUserPrompt: hostile, tab: { kind: "dashboard" } }],
       protocolVersion: 8,
       source: "daemon",
@@ -1369,7 +1384,7 @@ describe("ControlDeck", () => {
   it("prints the deck's own stand-in for a working directory the daemon did not report", async () => {
     const { mapDesktopSnapshot } = await import("./lib/bridge");
     const agent = { id: "7", displayName: "Coder", rows: 32, cols: 120, agentType: "claude_code" as const, status: "working" as const, toolCount: 3, tab: { kind: "dashboard" as const } };
-    const connection = { status: "connected" as const, socketPath: "/tmp/deck.sock", clientProtocolVersion: 8, serverProtocolVersion: 8, clientBuildVersion: "0.1.0", daemonBuildVersion: "0.1.0" };
+    const connection = { status: "connected" as const, socketPath: "/tmp/deck.sock", deckKind: "local", clientProtocolVersion: 8, serverProtocolVersion: 8, clientBuildVersion: "0.1.0", daemonBuildVersion: "0.1.0" };
 
     const absent = render(<ControlDeck runtime={runtime({ mode: "live", snapshot: mapDesktopSnapshot({ connection, agents: [agent], protocolVersion: 8, source: "daemon" }) })} />);
     expect(absent.container.querySelector(".agent-footer span:nth-child(2)")?.textContent).toBe("Unavailable");

@@ -142,6 +142,15 @@ export function useDeckRuntime(): DeckRuntimeState {
   // on every render.
   const setZoom = useCallback((level: number) => bridge.setZoom(level), [bridge]);
   const saveSettings = useCallback((settings: DesktopSettingsDto) => bridge.saveSettings(settings), [bridge]);
+  // PRD #741 M10. Not wrapped in the `setError` bookkeeping `runAction` uses,
+  // for the same reason `listProjects` is not: every outcome here is a
+  // classified report the panel renders in place, and routing an unreachable
+  // deck into the deck's global error toast would present a settings answer as
+  // a fault of the screen behind it.
+  const testEndpoint = useCallback(
+    (settings: DesktopSettingsDto, selection: string) => bridge.testEndpoint(settings, selection),
+    [bridge],
+  );
 
   const sendTerminalInput = useCallback((agentId: string, data: string) => bridge.sendTerminalInput(agentId, data), [bridge]);
   const resizeTerminal = useCallback((agentId: string, cols: number, rows: number) => bridge.resizeTerminal(agentId, cols, rows), [bridge]);
@@ -189,6 +198,7 @@ export function useDeckRuntime(): DeckRuntimeState {
     resolveProject,
     getSettings,
     saveSettings,
+    testEndpoint,
     setZoom,
   };
 }

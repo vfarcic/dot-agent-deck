@@ -71,6 +71,19 @@ function runtime(overrides: Partial<DeckRuntimeState> = {}): DeckRuntimeState {
     listProjects: vi.fn(async () => ({ projects: [] })),
     resolveProject: vi.fn(async () => { throw new Error("unresolved: the overview resolves no project"); }),
     setZoom: vi.fn(async (level: number) => level),
+    // PRD #741 M10: no deck is reachable from a test runtime, and the state that
+    // says so is the same one the browser preview reports.
+    testEndpoint: vi.fn(async (_settings, selection: string) => ({
+      endpointId: selection,
+      deck: selection,
+      state: "ssh_unavailable" as const,
+      ok: false,
+      message: "No deck is reachable from this test runtime.",
+      forwardsKnown: false,
+      forwards: [],
+      clientProtocolVersion: 0,
+      clientBuildVersion: "test",
+    })),
     // PRD #803 made the settings pair part of the runtime contract, and the
     // DeckShell cases below mount the whole app, so the hook calls these. The
     // overview itself reads no setting; these only have to resolve.

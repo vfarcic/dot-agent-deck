@@ -324,14 +324,36 @@ const KEYLESS_MEMBERS: [&str; 3] = ["clear", "key", "length"];
 /// name scan on this side would repeat the mistake #827 is about: `endpoint:
 /// string` passes any name check and is a free-text field. A diff here is the
 /// review prompt.
-const PINNED_TS_FIELDS: [(&str, &str, &str); 5] = [
+const PINNED_TS_FIELDS: [(&str, &str, &str); 15] = [
     ("DesktopSettingsDto", "version", "number"),
     (
         "DesktopSettingsDto",
         "appearance",
         "{ mode: AppearanceMode }",
     ),
+    // PRD #741 M6/M7. `?` is load-bearing: the Rust field is an
+    // `Option<EndpointSettings>` whose `None` means *unspecified*, which is what
+    // stops a build whose UI cannot render endpoints from writing an empty
+    // section over a user's decks. A required field here would make the
+    // normaliser fabricate one.
+    ("DesktopSettingsDto", "endpoints?", "EndpointSettingsDto"),
     ("DesktopSettingsDto", "zoom", "{ level: number }"),
+    // The two nested interfaces are scanned as well, and that is the point of
+    // adding them rather than letting `EndpointSettingsDto` be an opaque name:
+    // a credential riding into the document through a nested shape would
+    // otherwise be invisible to this pin. Every field below is a reference —
+    // a host, a login name, a port, a key *path*, a jump-host *name*, a socket
+    // path — and the Rust counterpart of each is a validating newtype on
+    // `ALLOWED_FIELD_TYPES`.
+    ("EndpointSettingsDto", "remote", "RemoteEndpointDto[]"),
+    ("EndpointSettingsDto", "selection", "string"),
+    ("RemoteEndpointDto", "host", "string"),
+    ("RemoteEndpointDto", "id", "string"),
+    ("RemoteEndpointDto", "identity?", "string"),
+    ("RemoteEndpointDto", "jump?", "string"),
+    ("RemoteEndpointDto", "port", "number"),
+    ("RemoteEndpointDto", "socket?", "string"),
+    ("RemoteEndpointDto", "user?", "string"),
     (
         "DesktopSettingsSnapshotDto",
         "settings",
@@ -1190,7 +1212,12 @@ pub struct VoiceSettings {
     fn the_typescript_settings_dtos_carry_exactly_the_pinned_fields() {
         let source = read(BRIDGE_TS);
         let mut found = Vec::new();
-        for interface in ["DesktopSettingsDto", "DesktopSettingsSnapshotDto"] {
+        for interface in [
+            "DesktopSettingsDto",
+            "EndpointSettingsDto",
+            "RemoteEndpointDto",
+            "DesktopSettingsSnapshotDto",
+        ] {
             let body = block_after(&source, &format!("export interface {interface} "))
                 .unwrap_or_else(|| {
                     panic!("no `export interface {interface}` block in {BRIDGE_TS}")
@@ -1226,21 +1253,33 @@ pub struct VoiceSettings {
     #[test]
     fn the_settings_normaliser_constructs_its_result_and_never_spreads_its_input() {
         let source = read(BRIDGE_TS);
+        // PRD #741 M7 added two helpers the normaliser delegates to, and the
+        // fixed-key-set property now rests on all three: a spread inside
+        // `normalizeEndpointSettings` would carry an undeclared field into the
+        // document just as surely as one in the parent, and a spread inside
+        // `normalizeRemoteEndpoint` would carry one into a stored row.
+        for signature in [
+            "export function normalizeDesktopSettings(value: unknown): DesktopSettingsDto ",
+            "function normalizeEndpointSettings(value: unknown): EndpointSettingsDto | undefined ",
+            "function normalizeRemoteEndpoint(value: unknown): RemoteEndpointDto | undefined ",
+        ] {
+            let body = block_after(&source, signature)
+                .unwrap_or_else(|| panic!("no `{signature}` in {BRIDGE_TS}"));
+            assert!(
+                !body.contains("..."),
+                "`{signature}` gained a spread, which would make it a passthrough for any \
+                 field its caller was handed — including a credential (issue #827). Name \
+                 every field it returns:\n{body}"
+            );
+        }
+
         let body = block_after(
             &source,
             "export function normalizeDesktopSettings(value: unknown): DesktopSettingsDto ",
         )
-        .unwrap_or_else(|| panic!("no `normalizeDesktopSettings` in {BRIDGE_TS}"));
-
-        assert!(
-            !body.contains("..."),
-            "`normalizeDesktopSettings` gained a spread, which would make it a \
-             passthrough for any field its caller was handed — including a credential \
-             (issue #827). Name every field it returns:\n{body}"
-        );
-
+        .expect("checked above");
         // And the object it does return carries exactly the pinned key set, so
-        // a fourth key is a diff here as well as in PINNED_TS_FIELDS.
+        // a fifth key is a diff here as well as in PINNED_TS_FIELDS.
         let returned = block_after(&body, "return ")
             .unwrap_or_else(|| panic!("`normalizeDesktopSettings` has no object literal return"));
         let mut keys: Vec<&str> = returned
@@ -1251,7 +1290,7 @@ pub struct VoiceSettings {
         keys.sort();
         assert_eq!(
             keys,
-            ["appearance", "version", "zoom"],
+            ["appearance", "endpoints", "version", "zoom"],
             "unexpected normaliser result shape:\n{returned}"
         );
     }
