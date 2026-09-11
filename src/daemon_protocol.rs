@@ -2289,23 +2289,14 @@ async fn handle_connection(
             // identical `last_activity` would otherwise resolve by hash order.
             // Break that tie on the (unique) `session_id` so the same input
             // always selects the same snapshot.
+            //
+            // PRD #741 M4(b): the join itself lives on `AppState` as
+            // [`crate::state::AppState::attach_live_sessions`], because the
+            // desktop now runs the same fold against its own copy of this state
+            // and a second spelling of the pick is how the two would drift.
             {
                 let guard = state.read().await;
-                for record in &mut records {
-                    record.live = guard
-                        .sessions
-                        .values()
-                        .filter(|s| {
-                            s.agent_id.as_deref() == Some(record.id.as_str())
-                                && s.pane_id == record.pane_id_env
-                        })
-                        .max_by(|a, b| {
-                            a.last_activity
-                                .cmp(&b.last_activity)
-                                .then_with(|| a.session_id.cmp(&b.session_id))
-                        })
-                        .map(|s| s.live_snapshot());
-                }
+                guard.attach_live_sessions(&mut records);
             }
             // Issue #770: report the orchestration role registrations whose pane
             // still has a live agent, so `daemon stop` can refuse to destroy
@@ -3453,21 +3444,7 @@ async fn project_candidates(
     let mut records = registry.agent_records();
     {
         let guard = state.read().await;
-        for record in &mut records {
-            record.live = guard
-                .sessions
-                .values()
-                .filter(|s| {
-                    s.agent_id.as_deref() == Some(record.id.as_str())
-                        && s.pane_id == record.pane_id_env
-                })
-                .max_by(|a, b| {
-                    a.last_activity
-                        .cmp(&b.last_activity)
-                        .then_with(|| a.session_id.cmp(&b.session_id))
-                })
-                .map(|s| s.live_snapshot());
-        }
+        guard.attach_live_sessions(&mut records);
     }
     crate::project_resolve::collect_candidates(
         crate::project_resolve::daemon_startup_cwd().as_deref(),

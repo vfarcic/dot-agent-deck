@@ -15,6 +15,7 @@ use dot_agent_deck::daemon_protocol::{AttachRequest, AttachResponse, PROTOCOL_VE
 use dot_agent_deck::platform::ipc::IpcStream;
 use tokio::sync::Mutex as AsyncMutex;
 
+use crate::agent_view::AgentView;
 use crate::dto::{
     BootstrapOptions, ConnectionStatus, DesktopConnection, DesktopSnapshot, disconnected_snapshot,
     map_agent, safe_message, selected_endpoint, socket_path_text,
@@ -634,12 +635,40 @@ pub(crate) async fn get_snapshot(links: &DaemonLinks) -> DesktopSnapshot {
 /// `DOT_AGENT_DECK_ATTACH_SOCKET`, and because PRD #741 M9 makes the selection a
 /// parameter in earnest.
 async fn snapshot_of(endpoint: &Endpoint, links: &DaemonLinks) -> DesktopSnapshot {
+    snapshot_with(endpoint, links, None).await
+}
+
+/// [`get_snapshot`] answered from the watcher's incremental view where it can be
+/// (PRD #741 M4(b)).
+///
+/// The split is deliberately narrow: **only the watcher passes a view**, so
+/// every other caller — `desktop_get_snapshot`, `bootstrap`, and the
+/// `refresh_and_emit` that tails every `DesktopAction` — still fetches the whole
+/// list exactly as it did at M4(a). Those are user-initiated and rare, they
+/// follow acts that just changed the registry, and making them cached would have
+/// traded the milestone's own no-user-visible-change rule for a saving of
+/// nothing.
+///
+/// The view decides; this function only obeys. When it asks for a fetch the
+/// reply is installed into it and rendered from it, so the fetch path and the
+/// cached path render through the same code and cannot disagree about the
+/// mapping.
+pub(crate) async fn snapshot_with(
+    endpoint: &Endpoint,
+    links: &DaemonLinks,
+    view: Option<&mut AgentView>,
+) -> DesktopSnapshot {
     let daemon = match links.trusted(endpoint).await {
         Ok(daemon) => daemon,
         Err(error) => return disconnected_snapshot(error),
     };
     let connection = daemon.connection();
     if connection.status != ConnectionStatus::Connected {
+        // Unchanged, and deliberately never cached: on this path
+        // `running_agent_count` comes from the handshake and gates the
+        // **Replace daemon** button. M4(a) kept it off the held-link path for
+        // that reason and M4(b) keeps it off the held-*list* path for the same
+        // one.
         return DesktopSnapshot {
             connection,
             agents: Vec::new(),
@@ -648,26 +677,28 @@ async fn snapshot_of(endpoint: &Endpoint, links: &DaemonLinks) -> DesktopSnapsho
         };
     }
 
+    if let Some(view) = view {
+        if view.needs_fetch(tokio::time::Instant::now()).is_none() {
+            let records = view.records();
+            return connected_snapshot(connection, records);
+        }
+        return match daemon.client.list_agents().await {
+            Ok(records) => {
+                view.install(records, tokio::time::Instant::now());
+                connected_snapshot(connection, view.records())
+            }
+            Err(error) => {
+                // The fetch failed, so the view's demand stands: it was never
+                // cleared, and the next refresh will try again rather than
+                // promoting whatever it was holding into an answer.
+                links.invalidate(endpoint).await;
+                disconnected_snapshot(error.to_string())
+            }
+        };
+    }
+
     match daemon.client.list_agents().await {
-        Ok(records) => DesktopSnapshot {
-            // PRD #741 M4(a): the count comes from THIS reply rather than from
-            // the held handshake, and it is the same number from the same
-            // source — the daemon answers `Hello`'s `running_agents` with
-            // `RunningAgentsSummary::from_records(&registry.agent_records())`
-            // and answers `ListAgents` with `registry.agent_records()`, so the
-            // count is `records.len()` either way. Reading it here rather than
-            // off the handshake is what keeps the one user-visible number the
-            // handshake carries at least as fresh as it was before the link was
-            // held — it feeds the "the daemon reports N live agents" line in the
-            // Stop-daemon confirmation.
-            connection: DesktopConnection {
-                running_agent_count: Some(records.len()),
-                ..connection
-            },
-            agents: records.into_iter().map(map_agent).collect(),
-            protocol_version: PROTOCOL_VERSION,
-            source: "daemon",
-        },
+        Ok(records) => connected_snapshot(connection, records),
         Err(error) => {
             // The held link just failed to carry a request. Whatever is at the
             // other end is not the daemon this handshake classified, so the
@@ -677,6 +708,41 @@ async fn snapshot_of(endpoint: &Endpoint, links: &DaemonLinks) -> DesktopSnapsho
             links.invalidate(endpoint).await;
             disconnected_snapshot(error.to_string())
         }
+    }
+}
+
+/// The connected snapshot for a set of agent records.
+///
+/// PRD #741 M4(a): the count comes from THESE RECORDS rather than from the held
+/// handshake, and it is the same number from the same source — the daemon
+/// answers `Hello`'s `running_agents` with
+/// `RunningAgentsSummary::from_records(&registry.agent_records())` and answers
+/// `ListAgents` with `registry.agent_records()`, so the count is `records.len()`
+/// either way. Reading it here rather than off the handshake is what keeps the
+/// one user-visible number the handshake carries at least as fresh as it was
+/// before the link was held — it feeds the "the daemon reports N live agents"
+/// line in the Stop-daemon confirmation.
+///
+/// **M4(b) makes `records` sometimes the cached list rather than a fresh reply,
+/// and the count stays derived from it on purpose.** The alternative — a fresh
+/// count beside a cached list — would let the banner and the tiles disagree,
+/// which is a worse failure than both being up to
+/// [`crate::agent_view::RECONCILE_INTERVAL`] old together. The number is
+/// advisory in any case: the refusal that actually protects a live orchestration
+/// is made daemon-side by `run_daemon_stop` (issue #770), not by this figure,
+/// and every `DesktopAction` — Stop included — tails a full `refresh_and_emit`.
+fn connected_snapshot(
+    connection: DesktopConnection,
+    records: Vec<dot_agent_deck::daemon_client::AgentRecord>,
+) -> DesktopSnapshot {
+    DesktopSnapshot {
+        connection: DesktopConnection {
+            running_agent_count: Some(records.len()),
+            ..connection
+        },
+        agents: records.into_iter().map(map_agent).collect(),
+        protocol_version: PROTOCOL_VERSION,
+        source: "daemon",
     }
 }
 
@@ -1849,6 +1915,308 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(dir);
     }
+    /// A scripted daemon that answers `Hello` and `ListAgents` for as long as it
+    /// is asked to, counting each.
+    ///
+    /// Unlike `scripted_daemon_sequence` it is not told in advance how many
+    /// connections to expect, because the whole point of the M4(b) tests is that
+    /// the number is no longer one per refresh.
+    #[cfg(unix)]
+    async fn counting_daemon(
+        listener: tokio::net::UnixListener,
+        records: Vec<dot_agent_deck::daemon_client::AgentRecord>,
+        mut stop: tokio::sync::oneshot::Receiver<()>,
+    ) -> (usize, usize) {
+        use dot_agent_deck::daemon_protocol::{KIND_REQ, KIND_RESP, read_frame, write_frame};
+        let (mut hellos, mut listings) = (0usize, 0usize);
+        loop {
+            tokio::select! {
+                _ = &mut stop => return (hellos, listings),
+                accepted = listener.accept() => {
+                    let (stream, _peer) = accepted.expect("accept one client");
+                    let (mut rd, mut wr) = stream.into_split();
+                    let (kind, payload) = read_frame(&mut rd)
+                        .await
+                        .expect("read the request frame")
+                        .expect("the client sent a frame");
+                    assert_eq!(kind, KIND_REQ);
+                    let request: AttachRequest =
+                        serde_json::from_slice(&payload).expect("decode the request");
+                    let reply = match request {
+                        AttachRequest::Hello { .. } => {
+                            hellos += 1;
+                            matching_hello()
+                        }
+                        AttachRequest::ListAgents => {
+                            listings += 1;
+                            AttachResponse::agent_records(records.clone())
+                        }
+                        other => panic!("the snapshot path sent an unexpected request: {other:?}"),
+                    };
+                    let encoded = serde_json::to_vec(&reply).expect("serialize the reply");
+                    write_frame(&mut wr, KIND_RESP, &encoded)
+                        .await
+                        .expect("answer the client");
+                }
+            }
+        }
+    }
+
+    /// One `ToolStart` for the agent the fixtures list.
+    #[cfg(unix)]
+    fn fixture_tool_event(n: usize) -> dot_agent_deck::event::BroadcastMsg {
+        use dot_agent_deck::event::{AgentEvent, AgentType, BroadcastMsg, EventType};
+        BroadcastMsg::Event(AgentEvent {
+            session_id: "pane-a-session".into(),
+            agent_type: AgentType::ClaudeCode,
+            event_type: EventType::ToolStart,
+            tool_name: Some(format!("Tool{n}")),
+            tool_detail: None,
+            cwd: None,
+            timestamp: chrono::Utc::now(),
+            user_prompt: None,
+            metadata: std::collections::HashMap::new(),
+            pane_id: Some("pane-a".into()),
+            agent_id: Some("a".into()),
+            agent_version: None,
+            schema_version: None,
+            live_target: None,
+        })
+    }
+
+    /// **The M4(b) measurement, taken as a test so it also guards the property.**
+    ///
+    /// Ten refreshes, each driven by a folded daemon event exactly as the
+    /// watcher drives them, cost **one** handshake and **one** listing — two
+    /// connections for the whole run. The same ten cost 11 at M4(a) and 20
+    /// before it.
+    ///
+    /// The scripted daemon counts; it is not told how many connections to
+    /// expect, so a regression that re-fetches shows up as a number rather than
+    /// as a hang.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ten_folded_refreshes_cost_one_handshake_and_one_listing() {
+        const REFRESHES: usize = 10;
+
+        let (dir, socket) = scratch_socket("m4b-measure");
+        let listener = bind_trusted(&socket);
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let daemon = tokio::spawn(counting_daemon(
+            listener,
+            vec![listed_agent("a", "pane-a")],
+            stop_rx,
+        ));
+
+        let links = DaemonLinks::default();
+        let endpoint = Endpoint::Local(LocalEndpoint::at(&socket));
+        let mut view = AgentView::default();
+
+        for refresh in 0..REFRESHES {
+            let snapshot = snapshot_with(&endpoint, &links, Some(&mut view)).await;
+            assert_eq!(
+                snapshot.connection.status,
+                ConnectionStatus::Connected,
+                "refresh {refresh} must be connected"
+            );
+            assert_eq!(snapshot.agents.len(), 1);
+            if refresh > 0 {
+                assert_eq!(
+                    snapshot.agents[0].status, "working",
+                    "refresh {refresh} must render the FOLDED status, or the cache is saving connections by showing nothing"
+                );
+            }
+            // The watcher's order: an event arrives, is folded, and THEN the
+            // refresh runs. The first refresh is the one with nothing folded
+            // yet, which is exactly why it is the one that fetches.
+            view.apply(&fixture_tool_event(refresh));
+        }
+
+        let _ = stop_tx.send(());
+        let (hellos, listings) = daemon.await.expect("the scripted daemon must not panic");
+
+        assert_eq!(hellos, 1, "the handshake is still paid once for the run");
+        assert_eq!(
+            listings, 1,
+            "only the FIRST refresh may fetch — the other nine are served from              the fold"
+        );
+        assert_eq!(
+            hellos + listings,
+            2,
+            "{REFRESHES} refreshes must cost 2 connections, not {} (M4(a)) and              not {} (baseline)",
+            REFRESHES + 1,
+            REFRESHES * 2
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A `SessionStart` names an agent whose `display_name`, `tab_membership`,
+    /// `rows`/`cols` and `spawned_at_ms` are registry facts no event carries, so
+    /// it must cost a fetch **at once** rather than waiting for the floor.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_session_start_spends_a_connection_to_complete_the_new_row() {
+        use dot_agent_deck::event::{AgentEvent, AgentType, BroadcastMsg, EventType};
+
+        let (dir, socket) = scratch_socket("m4b-gap1");
+        let listener = bind_trusted(&socket);
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let daemon = tokio::spawn(counting_daemon(
+            listener,
+            vec![listed_agent("a", "pane-a")],
+            stop_rx,
+        ));
+
+        let links = DaemonLinks::default();
+        let endpoint = Endpoint::Local(LocalEndpoint::at(&socket));
+        let mut view = AgentView::default();
+
+        let _ = snapshot_with(&endpoint, &links, Some(&mut view)).await;
+        // A folded tool event costs nothing...
+        view.apply(&fixture_tool_event(0));
+        let _ = snapshot_with(&endpoint, &links, Some(&mut view)).await;
+        // ...and a SessionStart costs exactly one listing.
+        view.apply(&BroadcastMsg::Event(AgentEvent {
+            session_id: "pane-b-session".into(),
+            agent_type: AgentType::ClaudeCode,
+            event_type: EventType::SessionStart,
+            tool_name: None,
+            tool_detail: None,
+            cwd: Some("/home/dev/project".into()),
+            timestamp: chrono::Utc::now(),
+            user_prompt: None,
+            metadata: std::collections::HashMap::new(),
+            pane_id: Some("pane-b".into()),
+            agent_id: Some("b".into()),
+            agent_version: None,
+            schema_version: None,
+            live_target: None,
+        }));
+        let _ = snapshot_with(&endpoint, &links, Some(&mut view)).await;
+
+        let _ = stop_tx.send(());
+        let (hellos, listings) = daemon.await.expect("no panic");
+        assert_eq!(hellos, 1);
+        assert_eq!(
+            listings, 2,
+            "the first refresh and the SessionStart fetch; the folded tool event              in between must not"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A subscription that ends must not leave a confidently-wrong list on
+    /// screen: the view refuses to answer, and a refresh whose fetch then FAILS
+    /// reports the failure rather than re-rendering what it was holding.
+    ///
+    /// This is the milestone's sharpest failure mode — the event stream is now
+    /// the correctness spine, so "the stream died" has to fail closed.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_dead_subscription_can_never_leave_a_confident_list_on_screen() {
+        let (dir, socket) = scratch_socket("m4b-spine");
+        let listener = bind_trusted(&socket);
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let daemon = tokio::spawn(counting_daemon(
+            listener,
+            vec![listed_agent("a", "pane-a")],
+            stop_rx,
+        ));
+
+        let links = DaemonLinks::default();
+        let endpoint = Endpoint::Local(LocalEndpoint::at(&socket));
+        let mut view = AgentView::default();
+
+        let first = snapshot_with(&endpoint, &links, Some(&mut view)).await;
+        assert_eq!(first.agents.len(), 1, "the fixture must list one agent");
+
+        // The stream ended. Take the daemon away at the same moment, which is
+        // the realistic pairing: the process that was serving the subscription
+        // is the one that just went.
+        view.resubscribed();
+        let _ = stop_tx.send(());
+        let _ = daemon.await.expect("no panic");
+        let _ = std::fs::remove_file(&socket);
+
+        let after = snapshot_with(&endpoint, &links, Some(&mut view)).await;
+        assert_ne!(
+            after.connection.status,
+            ConnectionStatus::Connected,
+            "a failed re-fetch must report the failure"
+        );
+        assert!(
+            after.agents.is_empty(),
+            "the stale list must not be re-rendered as though it were current"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// On the cached path the banner's agent count and the rendered rows come
+    /// from the same list, so they can be up to a reconciliation interval old
+    /// TOGETHER but can never disagree with each other.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_cached_count_and_the_cached_rows_always_agree() {
+        let (dir, socket) = scratch_socket("m4b-count");
+        let listener = bind_trusted(&socket);
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let daemon = tokio::spawn(counting_daemon(
+            listener,
+            vec![listed_agent("a", "pane-a"), listed_agent("b", "pane-b")],
+            stop_rx,
+        ));
+
+        let links = DaemonLinks::default();
+        let endpoint = Endpoint::Local(LocalEndpoint::at(&socket));
+        let mut view = AgentView::default();
+
+        for _ in 0..3 {
+            view.apply(&fixture_tool_event(0));
+            let snapshot = snapshot_with(&endpoint, &links, Some(&mut view)).await;
+            assert_eq!(
+                snapshot.connection.running_agent_count,
+                Some(snapshot.agents.len()),
+                "the count the Stop-daemon confirmation shows must describe the                  rows the deck shows"
+            );
+            assert_eq!(snapshot.agents.len(), 2);
+        }
+
+        let _ = stop_tx.send(());
+        let (_, listings) = daemon.await.expect("no panic");
+        assert_eq!(listings, 1, "three refreshes, one listing");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Passing no view is the unchanged path, and every caller but the watcher
+    /// takes it: three refreshes, three listings, exactly as M4(a) left them.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_caller_with_no_view_still_fetches_every_time() {
+        let (dir, socket) = scratch_socket("m4b-noview");
+        let listener = bind_trusted(&socket);
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let daemon = tokio::spawn(counting_daemon(
+            listener,
+            vec![listed_agent("a", "pane-a")],
+            stop_rx,
+        ));
+
+        let links = DaemonLinks::default();
+        let endpoint = Endpoint::Local(LocalEndpoint::at(&socket));
+        for _ in 0..3 {
+            let snapshot = snapshot_of(&endpoint, &links).await;
+            assert_eq!(snapshot.agents.len(), 1);
+        }
+
+        let _ = stop_tx.send(());
+        let (hellos, listings) = daemon.await.expect("no panic");
+        assert_eq!(hellos, 1);
+        assert_eq!(
+            listings, 3,
+            "`desktop_get_snapshot`, `bootstrap` and every action's              `refresh_and_emit` must be as fresh as they were at M4(a)"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     /// The refusal paths are deliberately NOT held, so a daemon that is
     /// answering but incompatible is re-classified on every call exactly as it
     /// was before M4(a).

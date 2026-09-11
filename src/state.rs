@@ -5993,6 +5993,57 @@ impl AppState {
             .unwrap_or(Writable::Live)
     }
 
+    /// PRD #162's `ListAgents` join, for ONE registry record: the live,
+    /// event-derived session this state holds for `(agent_id, pane_id)`, or
+    /// `None` when it holds none.
+    ///
+    /// Matching is on **both** keys — a `/clear` restart can leave a stale
+    /// session sharing one of them — and ties on an identical `last_activity`
+    /// break on the (unique) `session_id`, because `HashMap::values()` yields an
+    /// unspecified order and the pick has to be total and deterministic.
+    ///
+    /// # Why this is a method rather than a loop at each call site
+    ///
+    /// It was a loop at each call site, twice, character for character
+    /// ([`crate::daemon_protocol`]'s `ListAgents` handler and its
+    /// `project_candidates`). PRD #741 M4(b) adds a **third** caller that is not
+    /// in this process at all: the desktop app folds the daemon's own broadcast
+    /// into its own [`AppState`] and re-joins the records it already holds,
+    /// instead of re-fetching the whole list on every event. That client and
+    /// this daemon disagreeing about which session is "the" live one for a
+    /// record is precisely the failure mode that would put a wrong status on
+    /// screen, so the join is one function and all three callers run it.
+    pub fn live_session_for(
+        &self,
+        agent_id: &str,
+        pane_id: Option<&str>,
+    ) -> Option<SessionSnapshot> {
+        self.sessions
+            .values()
+            .filter(|s| s.agent_id.as_deref() == Some(agent_id) && s.pane_id.as_deref() == pane_id)
+            .max_by(|a, b| {
+                a.last_activity
+                    .cmp(&b.last_activity)
+                    .then_with(|| a.session_id.cmp(&b.session_id))
+            })
+            .map(|s| s.live_snapshot())
+    }
+
+    /// [`Self::live_session_for`] over a whole `ListAgents` reply, writing each
+    /// answer onto its record's `live` field.
+    ///
+    /// **Unconditional, including the `None` case**, which is what the two
+    /// daemon-side call sites have always done: a record whose session this
+    /// state does not hold reports no live state rather than keeping whatever
+    /// was on the record. A caller that has a better previous answer — the
+    /// desktop's cache, which holds the last full reply — must therefore keep
+    /// its own fallback rather than expecting this to preserve one.
+    pub fn attach_live_sessions(&self, records: &mut [crate::agent_pty::AgentRecord]) {
+        for record in records {
+            record.live = self.live_session_for(&record.id, record.pane_id_env.as_deref());
+        }
+    }
+
     /// Register a pane ID as managed by our app.
     pub fn register_pane(&mut self, pane_id: String) {
         self.managed_pane_ids.insert(pane_id);

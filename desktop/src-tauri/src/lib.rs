@@ -1,3 +1,4 @@
+mod agent_view;
 mod appearance;
 mod daemon_bridge;
 mod dto;
@@ -29,8 +30,10 @@ use dot_agent_deck::ui::{describe_send_result, is_terminal_send_result, send_ret
 use tauri::ipc::{Channel, Response};
 use tauri::{AppHandle, Emitter, Manager, State, Webview};
 
+use crate::agent_view::{AgentView, RECONCILE_INTERVAL};
 use crate::daemon_bridge::{
-    DaemonLinks, allow_build_mismatch_this_session, bootstrap, get_snapshot, trusted_daemon,
+    DaemonLinks, allow_build_mismatch_this_session, bootstrap, get_snapshot, snapshot_with,
+    trusted_daemon,
 };
 use crate::dto::{
     BootstrapOptions, COMMAND_MAX_BYTES, ConnectionStatus, DesktopAction, DesktopActionResult,
@@ -755,6 +758,22 @@ async fn refresh_and_emit(app: &AppHandle, links: &DaemonLinks) -> DesktopSnapsh
     snapshot
 }
 
+/// Queue depth between the subscription reader and the refresh loop.
+///
+/// PRD #741 M4(b) split the two because [`EventSubscription::next_event`] is
+/// **not cancel-safe** — `read_frame` accumulates a five-byte header across
+/// awaits into a local buffer, so a `select!` arm that drops the future mid-read
+/// loses those bytes and desynchronises the stream. An `mpsc::Receiver::recv` is
+/// cancel-safe and an `Interval::tick` is, so the reader owns the subscription
+/// exclusively and the loop selects on the channel instead.
+///
+/// Bounded rather than unbounded: a refresh loop that stalls must apply
+/// backpressure to the socket rather than grow without limit. 512 is generous
+/// against what it replaces — before this split the loop read at most one event
+/// per full `get_snapshot()`, i.e. ~6.667/s, so any depth at all is an
+/// improvement in how fast the desktop drains the daemon's broadcast.
+const EVENT_QUEUE_DEPTH: usize = 512;
+
 fn ensure_snapshot_watcher(app: &AppHandle, state: &DesktopState) {
     if !state.start_watcher_once() {
         return;
@@ -768,21 +787,28 @@ fn ensure_snapshot_watcher(app: &AppHandle, state: &DesktopState) {
     // refreshes. Hence the `invalidate_all` below.
     let links = Arc::clone(&state.daemon);
     tauri::async_runtime::spawn(async move {
+        // PRD #741 M4(b): the incremental agent list. It belongs to this task
+        // and to nothing else — it is only ever correct while this task's
+        // subscription is the one feeding it, so a second holder could not be
+        // told whether its contents were live.
+        let mut view = AgentView::default();
         loop {
             let daemon = match trusted_daemon(&links).await {
                 Ok(daemon) if daemon.require_compatible().is_ok() => daemon,
                 _ => {
+                    view.resubscribed();
                     let snapshot = get_snapshot(&links).await;
                     emit_snapshot(&app, &snapshot);
                     tokio::time::sleep(WATCH_RETRY_DELAY).await;
                     continue;
                 }
             };
-            let mut subscription = match daemon.client.subscribe_events().await {
+            let subscription = match daemon.client.subscribe_events().await {
                 Ok(subscription) => subscription,
                 Err(_) => {
                     // Could not even subscribe against a link that just said it
                     // was compatible: drop it rather than retry through it.
+                    view.resubscribed();
                     links.invalidate_all().await;
                     let snapshot = get_snapshot(&links).await;
                     emit_snapshot(&app, &snapshot);
@@ -790,19 +816,12 @@ fn ensure_snapshot_watcher(app: &AppHandle, state: &DesktopState) {
                     continue;
                 }
             };
-            let mut last_refresh: Option<tokio::time::Instant> = None;
-            while let Ok(Some(event)) = subscription.next_event().await {
-                let _ = app.emit("desktop://daemon-event", &event);
-                if let Some(previous) = last_refresh {
-                    let elapsed = previous.elapsed();
-                    if elapsed < SNAPSHOT_COALESCE_INTERVAL {
-                        tokio::time::sleep(SNAPSHOT_COALESCE_INTERVAL - elapsed).await;
-                    }
-                }
-                let snapshot = get_snapshot(&links).await;
-                emit_snapshot(&app, &snapshot);
-                last_refresh = Some(tokio::time::Instant::now());
-            }
+            // A NEW subscription means the fold has a hole in it of unknown
+            // size, so everything held is discarded and the first refresh under
+            // this stream re-fetches. Called before the first event can arrive.
+            view.resubscribed();
+            let reader = spawn_event_reader(subscription);
+            watch_one_subscription(&app, &links, &mut view, reader).await;
             // PRD #741 M4(a): the event stream ended. That is the desktop's
             // ONE long-lived connection to the daemon going away, and a daemon
             // cannot be replaced without the old process dying and taking this
@@ -814,6 +833,89 @@ fn ensure_snapshot_watcher(app: &AppHandle, state: &DesktopState) {
             tokio::time::sleep(WATCH_RETRY_DELAY).await;
         }
     });
+}
+
+/// Drain one subscription into a channel until it ends.
+///
+/// A task of its own so nothing can cancel a partially-read frame — see
+/// [`EVENT_QUEUE_DEPTH`].
+fn spawn_event_reader(
+    mut subscription: EventSubscription,
+) -> tokio::sync::mpsc::Receiver<BroadcastMsg> {
+    let (tx, rx) = tokio::sync::mpsc::channel(EVENT_QUEUE_DEPTH);
+    tauri::async_runtime::spawn(async move {
+        while let Ok(Some(msg)) = subscription.next_event().await {
+            if tx.send(msg).await.is_err() {
+                break;
+            }
+        }
+        // Dropping `tx` here is what tells the refresh loop the stream ended,
+        // and it happens after every already-read event has been delivered.
+    });
+    rx
+}
+
+/// The refresh loop for one subscription: fold what arrives, re-emit at the
+/// coalesce floor, and wake on the reconciliation timer even when nothing
+/// arrives at all.
+///
+/// Returns when the subscription ends.
+async fn watch_one_subscription(
+    app: &AppHandle,
+    links: &DaemonLinks,
+    view: &mut AgentView,
+    mut events: tokio::sync::mpsc::Receiver<BroadcastMsg>,
+) {
+    let mut reconcile = tokio::time::interval(RECONCILE_INTERVAL);
+    reconcile.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // `interval` fires immediately on its first tick; the refresh below already
+    // fetches because a fresh view demands it, so consume that one here rather
+    // than paying for it twice.
+    reconcile.tick().await;
+
+    let mut last_refresh: Option<tokio::time::Instant> = None;
+    loop {
+        tokio::select! {
+            msg = events.recv() => match msg {
+                Some(msg) => {
+                    let _ = app.emit("desktop://daemon-event", &msg);
+                    view.apply(&msg);
+                }
+                // The reader task is gone, so the subscription ended.
+                None => return,
+            },
+            _ = reconcile.tick() => view.mark_reconcile_due(),
+        }
+        // Everything already queued is applied to THIS refresh rather than
+        // costing one of its own. Before M4(b) each event cost a full
+        // `ListAgents` and a 150 ms wait, so a burst of N drained at 6.667/s;
+        // now a burst of N is N folds and one emit.
+        drain_pending(app, view, &mut events);
+        if let Some(previous) = last_refresh {
+            let elapsed = previous.elapsed();
+            if elapsed < SNAPSHOT_COALESCE_INTERVAL {
+                tokio::time::sleep(SNAPSHOT_COALESCE_INTERVAL - elapsed).await;
+                // The sleep is the coalescing window: whatever landed during it
+                // belongs to the snapshot about to be emitted.
+                drain_pending(app, view, &mut events);
+            }
+        }
+        let snapshot = snapshot_with(&selected_endpoint(), links, Some(view)).await;
+        emit_snapshot(app, &snapshot);
+        last_refresh = Some(tokio::time::Instant::now());
+    }
+}
+
+/// Apply every event already queued, without waiting for another.
+fn drain_pending(
+    app: &AppHandle,
+    view: &mut AgentView,
+    events: &mut tokio::sync::mpsc::Receiver<BroadcastMsg>,
+) {
+    while let Ok(msg) = events.try_recv() {
+        let _ = app.emit("desktop://daemon-event", &msg);
+        view.apply(&msg);
+    }
 }
 
 #[tauri::command]
