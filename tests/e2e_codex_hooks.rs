@@ -15,6 +15,24 @@ use serde_json::{Value, json};
 use spec::spec;
 
 const HOOK_SENTINEL_NAME: &str = "codex_hooks_sentinel_f42e71.txt";
+/// Codex's empty-composer placeholder, used here as the "this pane is ready to
+/// accept a keystroke" gate.
+///
+/// It is a sound gate because nothing the DECK renders carries this string —
+/// `grep -rn 'Ask Codex' src/` finds one unrelated doc comment in
+/// `codex_hooks_manage.rs` and nothing in any render path — so a match on the
+/// pane's grid is Codex's own TUI painting its composer.
+///
+/// Quoted **without** the `›` gutter glyph that precedes it on screen and
+/// without any trailing decoration, which is the rule issues #878/#921 wrote
+/// into `RealDelegateCase::input_ready_needles` over in
+/// `tests/e2e_delegate_respawn_readiness.rs` rather than a style preference:
+/// that test pinned OpenCode's placeholder as `Ask anything...` (ASCII `2e 2e
+/// 2e`) while OpenCode had started painting `Ask anything…` (one U+2026), and
+/// since nothing in CI runs lane 2 it spent months burning its full timeout on
+/// runs where the agent had booted fine. Match the part that carries the
+/// meaning; leave the decoration out.
+const CODEX_COMPOSER_READY: &str = "Ask Codex to do anything";
 const HOOK_SENTINEL_CONTENT: &str = "CODEX_HOOKS_OK";
 const TRUST_BYPASS_FLAG: &str = "--dangerously-bypass-hook-trust";
 const DECK_HOOK_EVENTS: &[(&str, &str)] = &[
@@ -274,9 +292,11 @@ fn codex_hooks_003_non_codex_launcher_gets_startup_integration() {
 }
 
 /// Scenario: Launch a real cheap-model Codex through a PATH launcher script and
-/// the normal wrapped pane seam, then submit a directive that runs one shell
-/// command. With no global trust bypass or manual review, deck-installed hooks in
-/// the isolated home must show prompt/tool detail and Idle while Codex stays live.
+/// the normal wrapped pane seam, wait for its composer to paint, then type a
+/// directive that runs one shell command, press Enter, and confirm the composer
+/// emptied so the turn really started. With no global trust bypass or manual
+/// review, deck-installed hooks in the isolated home must show prompt/tool detail
+/// and Idle while Codex stays live.
 #[spec("codex/hooks/001")]
 #[test]
 #[cfg(unix)]
@@ -331,15 +351,138 @@ fn codex_hooks_001_real_interactive_turn_reaches_idle_without_exit() {
     deck.send_keys(b"\r");
     deck.send_keys(b"\r");
     deck.wait_for_string("[Command Mode Ctrl+D]");
-    assert!(
-        deck.wait_for_grid_string_within(common::codex_test_model(), Duration::from_secs(30)),
-        "the wrapped interactive Codex UI never became ready:\n{}",
-        deck.snapshot_grid()
-    );
+    // Wait for Codex's COMPOSER to paint, not for its model name to appear.
+    //
+    // This gate used to be `wait_for_grid_string_within(codex_test_model(), 30s)`
+    // and it proved nothing: traced byte-for-byte through the whole input chain
+    // (TUI keystroke → attach `STREAM_IN` → daemon → pane PTY → `wrap` → inner
+    // PTY), the model-name needle matched **5.6 ms** after the new-pane form's
+    // last Enter was handled, while the `dot-agent-deck wrap` process that hosts
+    // Codex had not yet FORKED — its `wrapper_fork` `SessionStart` landed 225 ms
+    // later, at the same instant it first put the pane PTY into raw mode. So the
+    // prompt below was being typed into a pane that had no agent in it at all.
+    //
+    // What that costs is PRD #225 Defect 1, and every symptom of it is silent.
+    // With no agent yet holding the terminal the pane PTY is still in COOKED
+    // mode, so:
+    //   * the line discipline ECHOED the typed prompt straight back, and that
+    //     echo — not Codex's composer — is what satisfied the
+    //     `wait_for_string(HOOK_SENTINEL_NAME)` below; and
+    //   * `ICANON` held the whole line until the CR arrived and `ICRNL` rewrote
+    //     that CR to LF, which ERASES the 150 ms gap `ui::SUBMIT_DEBOUNCE`
+    //     deliberately puts between the last typed byte and the Enter: `wrap`'s
+    //     very first read returned all 192 bytes with one LF fused onto the tail.
+    //     Codex reads a newline fused to its preceding text as newline-in-input,
+    //     so the prompt sat in the composer unsubmitted, no turn began, and — as
+    //     Codex's interactive hooks fire at TURN start, not at process start — no
+    //     hook fired at all. That is the whole of `codex_hooks_001`'s red, at an
+    //     observed submission rate of 1 in 5.
+    //
+    // The placeholder is Codex's own paint (see the constant), and it is the same
+    // boundary `state::NO_SIGNAL_READINESS_BUFFER` measured across 176 real runs
+    // for OpenCode's `Ask anything`: written before the composer paints the
+    // payload is gone, written after it every run delivered. Gating
+    // here removes the race rather than sleeping past it. The dropped model-name
+    // check is not lost coverage — the launcher record asserted at the end of
+    // this test already pins `--model {codex_test_model()}`.
+    if !deck.wait_for_grid_string_within(CODEX_COMPOSER_READY, Duration::from_secs(90)) {
+        // Separate "Codex never booted" from "the needle above drifted": the
+        // wrapper's interface-ready `SessionStart` is a protocol fact rather
+        // than an upstream UI string, so if it is present and the needle is not,
+        // the needle is what to fix — do not read this failure as credentials.
+        let wrapper_ready = events
+            .try_wait_for(
+                |event| event.is_wrapper_interface_ready_session_start(),
+                Duration::ZERO,
+            )
+            .is_some();
+        panic!(
+            "Codex's composer never painted {CODEX_COMPOSER_READY:?} within 90s \
+             (wrapper interface-ready observed: {wrapper_ready}):\n{}",
+            deck.snapshot_grid()
+        );
+    }
 
     deck.send_keys(prompt.as_bytes());
+    // Now that Codex owns the terminal in raw mode this genuinely observes its
+    // composer holding the text; before the gate above it could be satisfied by
+    // the cooked-mode terminal echo of a pane with no agent in it.
     deck.wait_for_string(HOOK_SENTINEL_NAME);
-    deck.send_keys(b"\r");
+
+    // Press Enter until Codex VISIBLY takes the composer's contents into a turn,
+    // rather than pressing it once and hoping.
+    //
+    // The placeholder comes back only once the composer has been emptied, so its
+    // return is this test's proof that the Enter was honoured as a submit — and
+    // asserting it here, before `Ctrl+D` moves the view off the pane, turns an
+    // unsubmitted prompt into a failure that names its own cause instead of a
+    // 120 s wait for hook events that cannot arrive.
+    //
+    // **Why a retry and not a single press.** A run with the readiness gate above
+    // in place, traced byte for byte, delivered the `\r` to Codex's inner PTY as
+    // its own 1-byte write 150 ms after the last prompt byte — `ui::SUBMIT_DEBOUNCE`
+    // doing exactly its job — and Codex ignored it: the prompt sat in the composer
+    // and the pane emitted nothing at all for the next 28 s. So the deck's input
+    // chain is not implicated; reproduced against a real `codex` 0.149.0 driven
+    // directly on a pty (with a stub model provider, so no credential), the submit
+    // survived every write shape this test can produce — byte-at-a-time and one
+    // bulk write, through `dot-agent-deck wrap` and without it — and across a
+    // sweep of 0/20/50/100/150/500 ms the only gap that lost it was **0 ms**. So
+    // Codex's paste-burst window is under 20 ms, over 7x clear of the deck's
+    // 150 ms, and is not the cause here.
+    //
+    // What that leaves is Codex's own initialisation, and this part is INFERRED
+    // rather than measured: with a real backend it paints its composer (and
+    // accepts typed text into it) while an online models-cache refresh, a
+    // remote-control websocket connect and plugin loading are still in flight,
+    // and a submit arriving in that window is dropped. It is consistent with the
+    // one earlier run that did take a turn, which had a second Enter ~13 s behind
+    // the first.
+    //
+    // **And it is systematic, not a flake, which is why this loop is load-bearing
+    // in every run rather than defensive padding.** Across the five consecutive
+    // runs that validated this change, the counter below reported the SAME number
+    // every time: exactly one Enter ignored, submitted on attempt 2, whole test
+    // 13.2-17.7 s. Nobody has found the on-screen marker for that second boundary
+    // — if you do, gate on it and delete this loop; the fixed count is the clue to
+    // start from. Until then this retries on the OUTCOME, the same shape
+    // `prompt_delivery`'s bounded, evidence-gated resubmits take in production.
+    //
+    // Safe to repeat, which `send_keys_until_grid_string_within`'s doc warns is
+    // the precondition for this pattern: an Enter that arrives after the submit
+    // lands on an EMPTY composer, where Codex does nothing. The swallowed Enters
+    // observed were DROPPED rather than converted — the failing grid held the
+    // prompt on two rows because it wraps at the pane width, with no newline
+    // inserted, and every validation run went on to match `user_prompt` byte for
+    // byte below. That byte-exact match is also the guard: a retry that ever did
+    // smuggle a `\n` into the prompt would fail there rather than pass quietly.
+    let submit_deadline = std::time::Instant::now() + Duration::from_secs(60);
+    let mut attempts = 0_usize;
+    let submitted = loop {
+        deck.send_keys(b"\r");
+        attempts += 1;
+        if deck.wait_for_grid_string_within(CODEX_COMPOSER_READY, Duration::from_secs(2)) {
+            break true;
+        }
+        if std::time::Instant::now() >= submit_deadline {
+            break false;
+        }
+    };
+    assert!(
+        submitted,
+        "after {attempts} Enter(s) over 60s the prompt is still sitting unsubmitted \
+         in Codex's composer, so no turn started and no hook can fire:\n{}",
+        deck.snapshot_grid()
+    );
+    if attempts > 1 {
+        // Visible only under `--no-capture`, and worth printing: it is the one
+        // number that says whether the inference above is still live.
+        eprintln!(
+            "codex_hooks_001: Codex ignored {} Enter(s) after painting its composer; \
+             submitted on attempt {attempts}",
+            attempts - 1
+        );
+    }
     deck.send_bytes(b"\x04");
     deck.wait_for_string("Dir:");
     assert!(
