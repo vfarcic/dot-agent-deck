@@ -188,12 +188,23 @@ pub struct EndpointTestReport {
     pub daemon_build_version: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub running_agent_count: Option<usize>,
+    /// The build-stamp policy [`Self::state`] was classified under, carried so
+    /// [`Self::sealed`] can stamp [`Self::ok`] without deciding it a second time
+    /// (PRD #741 M8).
+    ///
+    /// Not serialised: it is an input to `ok`, which is what the panel reads.
+    /// Written only by [`apply_handshake`], which is the only producer of the
+    /// only state whose verdict consults it — so on every path that never
+    /// handshakes this holds the placeholder [`StampPolicy::Enforced`] that
+    /// [`Self::new`] wrote, and is never read.
+    #[serde(skip)]
+    stamps: StampPolicy,
 }
 
 impl EndpointTestReport {
     /// Bring [`Self::ok`] into step with [`Self::state`]. The one exit.
-    fn sealed(mut self, stamps: StampPolicy) -> Self {
-        self.ok = self.state.is_ok(stamps);
+    fn sealed(mut self) -> Self {
+        self.ok = self.state.is_ok(self.stamps);
         self
     }
 
@@ -212,6 +223,11 @@ impl EndpointTestReport {
             remedy: None,
             detail: None,
             discovered_socket: None,
+            // Never consulted unless `apply_handshake` overwrites it — no
+            // other path can reach the one state that reads it. `Enforced` is
+            // the fail-safe of the two, so a future state that did consult it
+            // would withhold a green tick rather than invent one.
+            stamps: StampPolicy::Enforced,
             forwards_known: false,
             forwards: Vec::new(),
             client_protocol_version: PROTOCOL_VERSION,
@@ -327,8 +343,16 @@ fn message_for(state: EndpointTestState, deck: &str, info: Option<&HandshakeInfo
     }
 }
 
-/// Fill a report's handshake half from a classified `Hello`.
-fn apply_handshake(report: &mut EndpointTestReport, info: &HandshakeInfo) {
+/// Fill a report's handshake half from a classified `Hello`, under the policy
+/// `stamps` — the same value the `hello` that produced `info` was given.
+///
+/// The policy travels with the handshake rather than being re-derived at the
+/// exit because this is the only place [`EndpointTestState::BuildStampDiffers`]
+/// can be produced, and that is the only state whose verdict reads the policy
+/// (PRD #741 M8). Taking it here is what lets [`EndpointTestReport::sealed`]
+/// stamp `ok` without a second copy of the local/remote decision.
+fn apply_handshake(report: &mut EndpointTestReport, info: &HandshakeInfo, stamps: StampPolicy) {
+    report.stamps = stamps;
     report.state = state_from_handshake(info);
     report.message = message_for(report.state, &report.deck, Some(info));
     report.server_protocol_version = info.server_protocol_version;
@@ -347,16 +371,13 @@ pub(crate) async fn test_endpoint(
     selection: &str,
     tunnels: &EndpointTunnels,
 ) -> EndpointTestReport {
-    // PRD #741 M8: the same split [`unsealed`] makes on its first line, and
-    // deliberately made from the same value rather than from the report — a
-    // report that never got as far as a handshake has no deck kind on it, and
-    // the token always does.
-    let stamps = if selection.eq_ignore_ascii_case(LOCAL_SELECTION_TOKEN) {
-        StampPolicy::Enforced
-    } else {
-        StampPolicy::Informational
-    };
-    unsealed(settings, selection, tunnels).await.sealed(stamps)
+    // PRD #741 M8: no policy is decided here. It was, from the selection token,
+    // which made this a third spelling of a rule [`StampPolicy::for_endpoint`]
+    // already owns — the same one-implementation-three-callers shape M4(b) took
+    // out of the daemon's session attach. The two arms below each hold a real
+    // endpoint and ask `for_endpoint` about it; the report carries the answer up
+    // to `sealed`.
+    unsealed(settings, selection, tunnels).await.sealed()
 }
 
 /// [`test_endpoint`] before [`EndpointTestReport::sealed`] stamps the derived
@@ -410,13 +431,14 @@ async fn test_local(tunnels: &EndpointTunnels) -> EndpointTestReport {
     // A local deck has no forwards to disclose, and saying so is an answer:
     // `forwards_known` without `forwards` is what the panel renders as "none".
     report.forwards_known = true;
+    // PRD #741 M8: asked of the endpoint rather than written out, because
+    // `Test connection` must classify a handshake exactly as the connection
+    // banner does and the banner asks the same function. Writing `Enforced` here
+    // would be a second copy of the rule that could drift from it.
+    let stamps = StampPolicy::for_endpoint(&endpoint);
     match tunnels.acquire(&endpoint).await {
-        // PRD #741 M8: the local policy, because this IS the local deck —
-        // `Test connection` classifies a handshake exactly as the connection
-        // banner does, and the banner's verdict for a local deck enforces the
-        // stamp.
-        Ok(lease) => match hello(lease.address(), StampPolicy::Enforced).await {
-            Ok((info, _)) => apply_handshake(&mut report, &info),
+        Ok(lease) => match hello(lease.address(), stamps).await {
+            Ok((info, _)) => apply_handshake(&mut report, &info, stamps),
             Err(error) => {
                 report.state = EndpointTestState::DeckNotAnswering;
                 report.detail = Some(safe_display_text(error));
@@ -489,6 +511,11 @@ async fn test_remote(
     };
 
     let endpoint = Endpoint::Remote(row.endpoint_at(socket));
+    // PRD #741 M8, as in `test_local`: the policy is the endpoint's to state. A
+    // probe that refused where the banner would connect would be telling the
+    // user the deck is unusable when it is about to work, and the way to keep
+    // the two screens agreeing is to have them consult one function.
+    let stamps = StampPolicy::for_endpoint(&endpoint);
     let lease = match tunnels.acquire(&endpoint).await {
         Ok(lease) => lease,
         Err(error) => {
@@ -506,12 +533,8 @@ async fn test_remote(
         }
     };
 
-    // PRD #741 M8: a remote deck, so the stamp is informational here exactly as
-    // it is on the connection banner. A probe that refused where the banner
-    // would connect would be telling the user the deck is unusable when it is
-    // about to work.
-    match hello(lease.address(), StampPolicy::Informational).await {
-        Ok((info, _)) => apply_handshake(&mut report, &info),
+    match hello(lease.address(), stamps).await {
+        Ok((info, _)) => apply_handshake(&mut report, &info, stamps),
         Err(error) => {
             report.state = EndpointTestState::DeckNotAnswering;
             report.detail = Some(safe_display_text(error));
@@ -806,7 +829,7 @@ mod tests {
             EndpointTestState::TransportFailed,
             String::new(),
         );
-        apply_handshake(&mut report, &classified);
+        apply_handshake(&mut report, &classified, StampPolicy::Enforced);
         assert_eq!(report.state, EndpointTestState::ProtocolRefused);
         assert_eq!(report.client_protocol_version, PROTOCOL_VERSION);
         assert_eq!(report.server_protocol_version, Some(PROTOCOL_VERSION + 1));
@@ -814,6 +837,55 @@ mod tests {
             report.message.contains(&PROTOCOL_VERSION.to_string()),
             "the sentence must name the version: {}",
             report.message
+        );
+    }
+
+    /// The verdict a report seals with is the policy its HANDSHAKE was
+    /// classified under — the wiring that replaced `test_endpoint`'s own copy of
+    /// the local/remote split (PRD #741 M8).
+    ///
+    /// Both directions on one state, because one stamp difference reading two
+    /// ways by deck kind is the entire behaviour, and `sealed` taking no
+    /// argument is what stops that rule being spelled a third time. The remote
+    /// half is the one nothing else covers: `test_remote` needs ssh, so this is
+    /// where the `Informational` path through `sealed` is pinned.
+    #[test]
+    fn a_report_seals_under_the_policy_its_handshake_used() {
+        // Classified AND sealed under the same policy, which is the only
+        // pairing production makes: both call sites now derive one `stamps`
+        // from `for_endpoint` and hand that same value to `hello` and to
+        // `apply_handshake`.
+        let seal = |stamps| {
+            let classified = crate::daemon_bridge::classify_handshake_for_test(
+                &hello_with_build(Some("0.1.0-gfeedface")),
+                "0.39.0-gabc1234",
+                stamps,
+            );
+            let mut report = EndpointTestReport::new(
+                "deck1",
+                "deploy@build-box".into(),
+                EndpointTestState::TransportFailed,
+                String::new(),
+            );
+            apply_handshake(&mut report, &classified, stamps);
+            report.sealed()
+        };
+
+        let remote = seal(StampPolicy::Informational);
+        assert_eq!(remote.state, EndpointTestState::BuildStampDiffers);
+        assert!(
+            remote.ok,
+            "a remote deck's stamp difference must seal as usable: the banner is about to connect \
+             to it, and the two screens disagreeing about one daemon is what this module exists \
+             to avoid"
+        );
+
+        let local = seal(StampPolicy::Enforced);
+        assert_eq!(local.state, EndpointTestState::BuildStampDiffers);
+        assert!(
+            !local.ok,
+            "the same state under the local policy is not a clean pass — the override is a \
+             judgement the user makes on the connection screen"
         );
     }
 
@@ -1106,6 +1178,11 @@ mod tests {
         daemon.await.expect("no panic");
 
         assert_eq!(report.state, EndpointTestState::BuildStampDiffers);
+        assert!(
+            !report.ok,
+            "the local policy must survive the whole probe: `test_endpoint` no longer decides it, \
+             so this is the end-to-end check that `for_endpoint`'s answer reaches `sealed`"
+        );
         assert_eq!(
             report.daemon_build_version.as_deref(),
             Some("0.1.0-gfeedface")

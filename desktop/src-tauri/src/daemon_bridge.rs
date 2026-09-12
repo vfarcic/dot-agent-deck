@@ -357,6 +357,31 @@ impl DaemonLinks {
 /// cadence, so "refuse on any stamp difference" against a remote deck is
 /// "refuse most of the time".
 ///
+/// # When this type is consulted at all — read this before testing it by hand
+///
+/// [`classify_handshake`] reaches the stamp branch only when the protocol
+/// versions are **equal** and [`release_versions_are_compatible`] says `false`,
+/// so two conditions must hold at once and the obvious hand test satisfies
+/// neither. Building two commits of the same branch gives two stamps like
+/// `0.39.4-g…`, [`compatibility_key`] maps both to `(0, 39)`, and the
+/// classification falls through to `Connected` **for both deck kinds without
+/// consulting this type** — which looks exactly like the remote demotion
+/// working. It is not: a tester who concludes M8 works from that has tested
+/// nothing, and would see the same result with this type deleted.
+///
+/// Two situations do reach it. A **released pair whose compatibility keys
+/// differ** — while `0.x`, a minor bump, which by CLAUDE.md rule 12's bump
+/// policy is exactly what a compatibility break is versioned as — provided the
+/// two builds still agree on [`PROTOCOL_VERSION`], since the protocol check
+/// returns first otherwise. And the **unreadable-stamp fail-safe**: a stamp
+/// absent or unparseable on either side makes `release_versions_are_compatible`
+/// return `false` on no positive evidence, which is the cheaper of the two to
+/// stage by hand. Note the corollary for the current tree — protocol 9 is
+/// unreleased, so no released build pairs with it across a key difference, and
+/// the fail-safe is the only route there is today. The assertion in
+/// `the_stamp_policy_follows_the_deck_kind` is therefore what pins the policy;
+/// an end-to-end hand test is not a substitute for it.
+///
 /// # What is LOST by demoting it, stated rather than implied
 ///
 /// A **semantic break behind a stable wire** — a field whose meaning changed
@@ -1087,7 +1112,8 @@ pub(crate) async fn bootstrap(options: &BootstrapOptions, links: &DaemonLinks) -
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dot_agent_deck::daemon_client::LocalEndpoint;
+    use dot_agent_deck::daemon_client::{LocalEndpoint, RemoteEndpoint};
+    use dot_agent_deck::remote_tunnel::{Hostname, RemoteSocketPath};
     use std::sync::{Mutex, MutexGuard};
 
     /// The env var and the session flag are both process-global, so the tests
@@ -1239,6 +1265,18 @@ mod tests {
     }
 
     /// The policy comes from the endpoint's KIND and from nothing else.
+    ///
+    /// **The `Remote` arm is the assertion that matters**, and it was the one
+    /// missing: `Enforced` for a local deck is the behaviour that existed before
+    /// this type did, so a refactor that regressed to it would leave the local
+    /// cases green while silently restoring the refusal M8 removed.
+    ///
+    /// Other tests pin what `Informational` *does* once something has chosen it
+    /// — the classifier's own arm, and the probe's verdict. This is the only one
+    /// that pins **which deck kind gets it**, which is why it is the one the
+    /// mutation reaches: `for_endpoint` returning `Enforced` unconditionally
+    /// reddens here and nowhere else in the crate's 204 tests, measured both
+    /// before and after this assertion was added.
     #[test]
     fn the_stamp_policy_follows_the_deck_kind() {
         assert_eq!(
@@ -1249,6 +1287,23 @@ mod tests {
             StampPolicy::for_endpoint(&Endpoint::local()),
             StampPolicy::Enforced
         );
+        assert_eq!(
+            StampPolicy::for_endpoint(&Endpoint::Remote(remote_deck())),
+            StampPolicy::Informational,
+            "a remote deck's stamp is informational: this is the whole of M8, and the branch that \
+             makes a remote deck connect through a stamp difference is pinned by this assertion \
+             alone"
+        );
+    }
+
+    /// A remote deck to decide a policy about. The host and socket are the ones
+    /// the endpoint tests already use; nothing here connects to either.
+    fn remote_deck() -> RemoteEndpoint {
+        RemoteEndpoint::new(
+            Hostname::parse("build-box").expect("a plain host name is valid"),
+            RemoteSocketPath::parse("/run/user/1000/dot-agent-deck-attach.sock")
+                .expect("an absolute remote socket path is valid"),
+        )
     }
 
     /// A daemon advertising every project verb offers the project surfaces; one
