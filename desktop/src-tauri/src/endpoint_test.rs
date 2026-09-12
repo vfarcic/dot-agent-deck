@@ -29,7 +29,7 @@
 //!    in Rust would be the two-process race [#828](https://github.com/vfarcic/dot-agent-deck/issues/828)
 //!    tracks, created on purpose.
 //!
-//! 2. **The forwards disclosure.** `remote_tunnel`'s audit **A3** is a residual
+//! 2. **The `ssh -G` disclosure.** `remote_tunnel`'s audit **A3** is a residual
 //!    the argv cannot close: `ClearAllForwardings` would clear our own `-L`, and
 //!    OpenSSH has no per-direction alternative, so the user's `LocalForward`,
 //!    `RemoteForward` and `DynamicForward` are inherited for the tunnel's whole
@@ -37,6 +37,15 @@
 //!    criterion violation; the tunnel makes the same exposure for orders of
 //!    magnitude longer and has said nothing. This is the one place a user can
 //!    find out what their own ssh config is doing on their behalf.
+//!
+//!    The **host-key sources** ride the same resolution (PRD #741 final audit
+//!    **F2**). `forced_options` forces `StrictHostKeyChecking=yes` onto both
+//!    hops, which forces the *check*; `KnownHostsCommand`, `UserKnownHostsFile`
+//!    and `GlobalKnownHostsFile` are inherited, so where ssh looks for the key
+//!    it is strict about stays the user's config's to decide. Forcing those
+//!    too was measured to work and deliberately not done — it breaks the CA and
+//!    inventory fleets `KnownHostsCommand` exists for — so the answer is the
+//!    same one A3 got: disclose it. The `ssh -G` run was already happening.
 //!
 //! 3. **`SelectionFallback`, reported honestly.** See above.
 //!
@@ -133,9 +142,21 @@ impl EndpointTestState {
 
 /// What a `Test connection` reports back.
 ///
-/// Every text field is scrubbed through [`safe_display_text`] — control **and**
-/// bidi — because three of them (`detail`, and the forwards) carry bytes a
-/// remote host or a planted `~/.ssh/config` wrote.
+/// Every text field that carries bytes this app did not write is scrubbed
+/// through [`safe_display_text`] — control **and** bidi. Enumerated, because
+/// the wider claim that used to stand here ("every text field") was false for
+/// two of them and a reader would have used it to judge a *new* render site
+/// safe (PRD #741 final audit **F4**):
+///
+/// - `deck`, `detail`, `forwards`, `known_hosts`, `message` and
+///   `daemon_build_version` — scrubbed at every assignment. The last two carry
+///   the **remote** daemon's `build_version`, which is an unvalidated
+///   `Option<String>` on the wire, so they need it most and had it least.
+/// - `remedy` is built from validated ASCII newtypes, and `discovered_socket`
+///   is a `RemoteSocketPath` whose charset is `[A-Za-z0-9._/-]`. Neither can
+///   hold a control or bidi byte, so neither is scrubbed.
+/// - `endpoint_id`, the versions and the counts are not text this app renders
+///   as prose.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EndpointTestReport {
@@ -172,14 +193,32 @@ pub struct EndpointTestReport {
     /// write-back is not made here.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub discovered_socket: Option<String>,
-    /// Whether [`Self::forwards`] is an answer or an absence. `false` means the
-    /// resolution did not run or could not be read — which is not the same
-    /// claim as "there are none", and the panel must not render it as one.
-    pub forwards_known: bool,
+    /// Whether [`Self::forwards`] and [`Self::known_hosts`] are answers or
+    /// absences. `false` means the `ssh -G` resolution did not run or could not
+    /// be read — which is not the same claim as "there are none", and the panel
+    /// must not render it as one.
+    ///
+    /// One flag for both lists because there is one fact behind them: a single
+    /// `ssh -G` either ran and parsed or it did not. A second boolean written
+    /// from the same expression is a derived field kept in step by hand, which
+    /// is the shape [`Self::ok`] above exists to avoid.
+    pub disclosure_known: bool,
     /// The forwards this endpoint's tunnel will inherit from the user's ssh
-    /// config, one readable line each. Empty **and** `forwards_known` is the
+    /// config, one readable line each. Empty **and** `disclosure_known` is the
     /// only combination that means "none".
+    ///
+    /// Complete as of PRD #741 final audit **F1**: `parse_ssh_g` keeps a
+    /// forward line it cannot split rather than dropping it, so this list is
+    /// never quietly shorter than what ssh resolved.
     pub forwards: Vec<String>,
+    /// Where ssh resolved the host keys it checks this endpoint against, one
+    /// readable line each (PRD #741 final audit **F2**).
+    ///
+    /// Additive context rather than a claim: an empty list under
+    /// `disclosure_known` means ssh named no source — which for a local deck
+    /// means no `ssh -G` was run at all — and the panel renders nothing rather
+    /// than asserting that no host-key file is configured.
+    pub known_hosts: Vec<String>,
     pub client_protocol_version: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub server_protocol_version: Option<u32>,
@@ -228,8 +267,9 @@ impl EndpointTestReport {
             // the fail-safe of the two, so a future state that did consult it
             // would withhold a green tick rather than invent one.
             stamps: StampPolicy::Enforced,
-            forwards_known: false,
+            disclosure_known: false,
             forwards: Vec::new(),
+            known_hosts: Vec::new(),
             client_protocol_version: PROTOCOL_VERSION,
             server_protocol_version: None,
             client_build_version: dot_agent_deck::build_id::local_build_id(),
@@ -354,9 +394,20 @@ fn message_for(state: EndpointTestState, deck: &str, info: Option<&HandshakeInfo
 fn apply_handshake(report: &mut EndpointTestReport, info: &HandshakeInfo, stamps: StampPolicy) {
     report.stamps = stamps;
     report.state = state_from_handshake(info);
-    report.message = message_for(report.state, &report.deck, Some(info));
+    // Scrubbed here rather than trusted from `HandshakeInfo` (PRD #741 final
+    // audit **F4**). Three of the states below take their sentence verbatim
+    // from `info.error`, which `daemon_bridge` builds with `safe_message` —
+    // general category `Cc` only — around the **remote** daemon's
+    // `build_version`, an unvalidated `Option<String>` on the wire. `Cf`, the
+    // bidi controls, passes straight through that. For a remote deck the
+    // stamp-mismatch sentence is the ordinary path, not an edge case: a
+    // released daemon never matches a branch build.
+    //
+    // `strip_control_and_bidi` removes rather than escapes, so scrubbing a
+    // string that is already scrubbed — `deck` is — changes nothing.
+    report.message = safe_display_text(message_for(report.state, &report.deck, Some(info)));
     report.server_protocol_version = info.server_protocol_version;
-    report.daemon_build_version = info.daemon_build_version.clone();
+    report.daemon_build_version = info.daemon_build_version.as_deref().map(safe_display_text);
     report.running_agent_count = info.running_agent_count;
 }
 
@@ -428,9 +479,10 @@ async fn test_local(tunnels: &EndpointTunnels) -> EndpointTestReport {
         EndpointTestState::DeckNotAnswering,
         String::new(),
     );
-    // A local deck has no forwards to disclose, and saying so is an answer:
-    // `forwards_known` without `forwards` is what the panel renders as "none".
-    report.forwards_known = true;
+    // A local deck has nothing to disclose — no ssh runs, so there are no
+    // inherited forwards and no host-key source — and saying so is an answer:
+    // `disclosure_known` with empty lists is what the panel renders as "none".
+    report.disclosure_known = true;
     // PRD #741 M8: asked of the endpoint rather than written out, because
     // `Test connection` must classify a handshake exactly as the connection
     // banner does and the banner asks the same function. Writing `Enforced` here
@@ -449,7 +501,7 @@ async fn test_local(tunnels: &EndpointTunnels) -> EndpointTestReport {
         },
         Err(error) => {
             report.state = EndpointTestState::DeckNotAnswering;
-            report.detail = Some(safe_display_text(error));
+            report.detail = Some(safe_display_text(error.to_string()));
             report.message = format!(
                 "No deck answered at {deck}. Start Agent Deck on this machine, then test again."
             );
@@ -486,12 +538,27 @@ async fn test_remote(
         }
     };
 
-    // The disclosure first, and never fatal: it resolves configuration and
-    // connects to nothing, so it is the cheapest thing here and the one piece
-    // of the report that is still worth having when the connection fails.
-    let (forwards_known, forwards) = resolve_forwards(&ssh, &destination).await;
-    report.forwards_known = forwards_known;
-    report.forwards = forwards;
+    // The disclosure first, and never fatal: it is the cheapest thing here and
+    // the one piece of the report that is still worth having when the
+    // connection fails.
+    //
+    // **`ssh -G` opens no network connection, and that is the narrow claim**
+    // (PRD #741 final audit **F7**). It is not inert locally: a `Match exec` in
+    // the user's own config *runs* under `-G` — measured, the marker file was
+    // created — and `PermitLocalCommand=no` does not reach it, because that
+    // option governs `LocalCommand`, a different mechanism. `remote_tunnel`'s
+    // `PROBE_DEADLINE_SECS` already names `Match exec` as the case its deadline
+    // exists for, which is what bounds this.
+    //
+    // Running it first is still right, and no longer rests on that sentence:
+    // every step below — `discover_socket`, then `acquire` — spawns ssh against
+    // the same config and runs the same `Match exec`, so the disclosure adds no
+    // local execution the button press did not already authorise. It changes
+    // the order, not the set.
+    let disclosure = resolve_disclosure(&ssh, &destination).await;
+    report.disclosure_known = disclosure.known;
+    report.forwards = disclosure.forwards;
+    report.known_hosts = disclosure.known_hosts;
 
     let socket = match row.socket.clone() {
         Some(socket) => socket,
@@ -519,16 +586,28 @@ async fn test_remote(
     let lease = match tunnels.acquire(&endpoint).await {
         Ok(lease) => lease,
         Err(error) => {
-            // `acquire` has already flattened the typed error to a string, so
-            // the classification is re-derived from the tunnel the same way the
-            // discovery probe's is: by asking `TunnelError` itself. The
-            // round-trip through a string is the cost of one seam for both
-            // kinds of endpoint, and it is bounded — every state below is
-            // reachable through the text ssh itself wrote.
-            report.state = EndpointTestState::TransportFailed;
-            report.detail = Some(safe_display_text(&error));
-            report.message = message_for(report.state, &deck, None);
-            reclassify_from_detail(&mut report, &destination, &error, &deck);
+            // Classified from the TYPED error, which is the whole reason
+            // `acquire` hands one over (PRD #741 final audit **F3**). The
+            // verdict inside it was derived by `classify_exit` from ssh's RAW
+            // stderr; re-deriving it from the flattened string would be
+            // matching text `scrub_remote_text` had already rewritten, and
+            // stripping can only create matches the raw bytes lacked. The
+            // forward cases land on `DeckNotAnswering` through
+            // `state_from_tunnel_error`'s own arms rather than through a
+            // substring search of `TunnelError`'s prose.
+            let (state, remedy) = match &error {
+                crate::endpoint_tunnels::AcquireError::Tunnel(tunnel) => {
+                    state_from_tunnel_error(tunnel)
+                }
+                // Nothing about the far host: no ssh here, or a task that died.
+                crate::endpoint_tunnels::AcquireError::Local(_) => {
+                    (EndpointTestState::TransportFailed, None)
+                }
+            };
+            report.state = state;
+            report.remedy = remedy;
+            report.detail = Some(safe_display_text(error.to_string()));
+            report.message = message_for(state, &deck, None);
             return report;
         }
     };
@@ -667,53 +746,35 @@ async fn discover_socket(
     })
 }
 
-/// Re-derive a transport state from the message `acquire` flattened.
+/// What one `ssh -G` run disclosed about the resolved configuration.
+///
+/// `known` is `false` whenever the resolution did not run or could not be read,
+/// and that is **not** the same claim as "there are none" — a disclosure that
+/// quietly says "no forwards" when it could not look is worse than one that
+/// says it does not know. Both lists are gated by it because both come from the
+/// one run.
 #[cfg(unix)]
-fn reclassify_from_detail(
-    report: &mut EndpointTestReport,
-    destination: &dot_agent_deck::remote_tunnel::SshDestination,
-    detail: &str,
-    deck: &str,
-) {
-    let classified = dot_agent_deck::remote::classify_ssh_error_with_remedy(
-        &destination.ssh_target(),
-        detail,
-        &destination.host_key_remedy(),
-    );
-    let (state, remedy) =
-        state_from_tunnel_error(&dot_agent_deck::remote_tunnel::TunnelError::Ssh {
-            deck: destination.describe(),
-            source: classified,
-        });
-    if state != EndpointTestState::TransportFailed {
-        report.state = state;
-        report.remedy = remedy;
-        report.message = message_for(state, deck, None);
-        return;
-    }
-    // `TunnelError`'s own `Display` names the forward cases in words this
-    // classifier does not look for, so they are matched here rather than left
-    // as a generic transport failure.
-    let lower = detail.to_ascii_lowercase();
-    if lower.contains("did not produce a forwarded socket")
-        || lower.contains("the forward could not be established")
-    {
-        report.state = EndpointTestState::DeckNotAnswering;
-        report.message = message_for(report.state, deck, None);
-    }
+#[derive(Default)]
+struct ConfigDisclosure {
+    known: bool,
+    forwards: Vec<String>,
+    known_hosts: Vec<String>,
 }
 
-/// Resolve what the tunnel will inherit from the user's ssh config.
+/// Resolve what the tunnel will inherit from the user's ssh config: the
+/// forwards it will carry, and the host keys it will be checked against.
 ///
-/// Returns `(known, forwards)`. `known` is `false` whenever the resolution did
-/// not run or could not be read, and that is **not** the same claim as "there
-/// are none" — a disclosure that quietly says "no forwards" when it could not
-/// look is worse than one that says it does not know.
+/// **Nothing ssh printed is dropped on the way here** (PRD #741 final audit
+/// **F1**). `parse_ssh_g` keeps a forward line whose value it cannot split as a
+/// `ResolvedForward::Unsplit` rather than skipping it, so a `LocalForward`
+/// whose path contains a space — a macOS home directory is enough, no adversary
+/// needed — reaches this list instead of vanishing into a `(true, [])` that the
+/// panel would have rendered as silence.
 #[cfg(unix)]
-async fn resolve_forwards(
+async fn resolve_disclosure(
     ssh: &dot_agent_deck::remote_tunnel::SshProgram,
     destination: &dot_agent_deck::remote_tunnel::SshDestination,
-) -> (bool, Vec<String>) {
+) -> ConfigDisclosure {
     use dot_agent_deck::remote_doctor::parse_ssh_g;
     use dot_agent_deck::remote_tunnel::{ProbeConfig, resolved_config_args, run_probe};
 
@@ -727,20 +788,25 @@ async fn resolve_forwards(
     .await;
 
     let Ok(Ok(output)) = probe else {
-        return (false, Vec::new());
+        return ConfigDisclosure::default();
     };
     if output.status != Some(0) || output.truncated {
-        return (false, Vec::new());
+        return ConfigDisclosure::default();
     }
     let resolved = parse_ssh_g(&output.stdout);
-    (
-        true,
-        resolved
+    ConfigDisclosure {
+        known: true,
+        forwards: resolved
             .forwards
             .iter()
             .map(|forward| safe_display_text(forward.to_string()))
             .collect(),
-    )
+        known_hosts: resolved
+            .known_hosts_lines()
+            .into_iter()
+            .map(safe_display_text)
+            .collect(),
+    }
 }
 
 // The tunnel is Unix-only (`remote_tunnel`'s `mod tunnel` is `#[cfg(unix)]`),
@@ -759,7 +825,7 @@ async fn test_remote(
         EndpointTestState::SshUnavailable,
         "Remote decks are not supported on this platform yet.".to_string(),
     );
-    report.forwards_known = false;
+    report.disclosure_known = false;
     report
 }
 
@@ -786,6 +852,86 @@ mod tests {
             .with_running_agents(RunningAgentsSummary::default());
         reply.build_version = build.map(str::to_string);
         reply
+    }
+
+    /// PRD #741 final audit **F4**: the handshake sentence and the daemon's own
+    /// build stamp are the two fields that carry the REMOTE daemon's
+    /// unvalidated `build_version`, and `safe_message` (category `Cc`) lets the
+    /// bidi controls straight through. A right-to-left override in a stamp
+    /// reverses everything the banner prints after it.
+    #[test]
+    fn a_handshake_scrubs_the_remote_stamp_of_bidi_as_well_as_control() {
+        let hostile = "0.38.0-g5a56361\u{202e}drowssap";
+        let response = hello_with_build(Some(hostile));
+        let classified = info(&response, "0.39.0-gabc1234");
+        let mut report = EndpointTestReport::new(
+            "deck1",
+            "deploy@build-box".into(),
+            EndpointTestState::TransportFailed,
+            String::new(),
+        );
+
+        apply_handshake(&mut report, &classified, StampPolicy::Enforced);
+
+        assert_eq!(report.state, EndpointTestState::BuildStampDiffers);
+        assert!(
+            !report.message.contains('\u{202e}'),
+            "the sentence still carries the override: {:?}",
+            report.message
+        );
+        assert!(
+            !report
+                .daemon_build_version
+                .as_deref()
+                .unwrap_or_default()
+                .contains('\u{202e}'),
+            "the stamp still carries the override: {:?}",
+            report.daemon_build_version
+        );
+        assert!(
+            report.daemon_build_version.as_deref() == Some("0.38.0-g5a56361drowssap"),
+            "scrubbing must strip the control and keep the rest: {:?}",
+            report.daemon_build_version
+        );
+    }
+
+    /// PRD #741 final audit **F3**: classify the TYPED tunnel error, never the
+    /// flattened string. `SshError`'s `detail` is `scrub_remote_text`-ed, and
+    /// stripping can only CREATE matches the raw bytes lacked — so a peer that
+    /// writes `Host key verification fai\x01led.` onto the local client's stderr
+    /// must not be able to promote an unrelated failure into a host-key verdict
+    /// carrying a copy-paste `ssh` remedy.
+    #[test]
+    fn a_scrubbed_detail_cannot_promote_a_failure_into_a_host_key_verdict() {
+        use dot_agent_deck::remote::SshError;
+        use dot_agent_deck::remote_tunnel::TunnelError;
+
+        // What the flattening produced: the raw bytes classified as `Other`,
+        // and the scrubbed copy inside the message reading as the host-key
+        // sentence.
+        let error = TunnelError::Ssh {
+            deck: "deploy@build-box".into(),
+            source: SshError::Other {
+                target: "build-box".into(),
+                detail: "Host key verification failed.".into(),
+            },
+        };
+
+        let (state, remedy) = state_from_tunnel_error(&error);
+
+        assert_eq!(
+            state,
+            EndpointTestState::TransportFailed,
+            "the typed verdict is `Other`, so the report must not claim a host-key failure"
+        );
+        assert!(
+            remedy.is_none(),
+            "a remedy the user would paste into a terminal must follow the typed verdict"
+        );
+        assert!(
+            error.to_string().contains("Host key verification failed."),
+            "the flattened string is exactly what a substring classifier would have matched"
+        );
     }
 
     /// A matching build and a matching wire is the one state that reads as ok.
@@ -1130,8 +1276,12 @@ mod tests {
         assert!(report.ok);
         assert_eq!(report.server_protocol_version, Some(PROTOCOL_VERSION));
         assert!(
-            report.forwards_known && report.forwards.is_empty(),
+            report.disclosure_known && report.forwards.is_empty(),
             "a local deck inherits no ssh forwards, and saying so is an answer rather than an              absence"
+        );
+        assert!(
+            report.known_hosts.is_empty(),
+            "a local deck runs no ssh, so it has no resolved host-key source to name"
         );
         let _ = std::fs::remove_dir_all(dir);
     }

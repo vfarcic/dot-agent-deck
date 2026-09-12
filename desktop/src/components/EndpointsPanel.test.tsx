@@ -21,8 +21,9 @@ function report(overrides: Partial<EndpointTestReportDto> = {}): EndpointTestRep
     state: "reachable",
     ok: true,
     message: "build-box answered and is compatible with this app.",
-    forwardsKnown: true,
+    disclosureKnown: true,
     forwards: [],
+    knownHosts: [],
     clientProtocolVersion: 9,
     clientBuildVersion: "0.39.0-gabc1234",
     ...overrides,
@@ -282,7 +283,7 @@ describe("EndpointsPanel", () => {
   it("discloses the forwards the tunnel will inherit", async () => {
     const testEndpoint = vi.fn(async () =>
       report({
-        forwardsKnown: true,
+        disclosureKnown: true,
         forwards: ["SOCKS proxy on this machine at 1080", "remote 9999 forwarded to localhost:22"],
       }),
     );
@@ -300,12 +301,14 @@ describe("EndpointsPanel", () => {
 
   /**
    * Scenario: the probe could not read the resolved configuration. The panel
-   * says nothing about forwards rather than rendering "none" — "I could not
-   * look" and "there are none" are different claims, and this is the disclosure
-   * where the difference matters most.
+   * SAYS it could not look, rather than rendering nothing — "I could not look"
+   * and "there are none" are different claims, and a blank screen is how the
+   * second one gets made by accident (PRD #741 final audit F1).
    */
-  it("says nothing about forwards it could not resolve", async () => {
-    const testEndpoint = vi.fn(async () => report({ forwardsKnown: false, forwards: [] }));
+  it("says it could not read the ssh config rather than showing nothing", async () => {
+    const testEndpoint = vi.fn(async () =>
+      report({ disclosureKnown: false, forwards: [], knownHosts: [] }),
+    );
     renderPanel(
       { endpoints: { remote: [deck()], selection: "deck0000000000aa" } },
       { testEndpoint },
@@ -314,7 +317,90 @@ describe("EndpointsPanel", () => {
     fireEvent.click(screen.getByTestId("test-connection"));
 
     await waitFor(() => expect(screen.getByTestId("deck-result")).toBeInTheDocument());
-    expect(screen.queryByTestId("deck-result-forwards")).toBeNull();
+    expect(screen.getByTestId("deck-result-forwards-unknown")).toHaveTextContent(
+      "could not read your resolved ssh config",
+    );
+    expect(screen.queryByTestId("deck-result-no-forwards")).toBeNull();
+    expect(screen.queryByTestId("deck-result-forward-list")).toBeNull();
+  });
+
+  /**
+   * Scenario: the probe read the config and it genuinely holds no forwards. The
+   * panel says so in words, so that the silence a truncated or unreadable
+   * resolution produces can never be mistaken for this answer.
+   */
+  it("says none inherited when it read the config and found none", async () => {
+    const testEndpoint = vi.fn(async () =>
+      report({ disclosureKnown: true, forwards: [], knownHosts: [] }),
+    );
+    renderPanel(
+      { endpoints: { remote: [deck()], selection: "deck0000000000aa" } },
+      { testEndpoint },
+    );
+
+    fireEvent.click(screen.getByTestId("test-connection"));
+
+    await waitFor(() => expect(screen.getByTestId("deck-result")).toBeInTheDocument());
+    expect(screen.getByTestId("deck-result-no-forwards")).toHaveTextContent("no forwards");
+    expect(screen.queryByTestId("deck-result-forwards-unknown")).toBeNull();
+  });
+
+  /**
+   * Scenario: a forward whose value `ssh -G` printed unquoted — a macOS home
+   * directory with a space is enough — reaches the panel as an unreadable line
+   * rather than being dropped in the parser. This is F1's whole point: the
+   * tunnel carries that forward either way, so the screen must show it.
+   */
+  it("lists a forward whose endpoints could not be split", async () => {
+    const testEndpoint = vi.fn(async () =>
+      report({
+        disclosureKnown: true,
+        forwards: [
+          "a local forward, which this build could not split into endpoints — ssh printed `/Users/First Last/db.sock /var/run/pg.sock`",
+        ],
+      }),
+    );
+    renderPanel(
+      { endpoints: { remote: [deck()], selection: "deck0000000000aa" } },
+      { testEndpoint },
+    );
+
+    fireEvent.click(screen.getByTestId("test-connection"));
+
+    await waitFor(() => expect(screen.getByTestId("deck-result-forward-list")).toBeInTheDocument());
+    expect(screen.getByTestId("deck-result-forward-list")).toHaveTextContent("a local forward");
+    expect(screen.getByTestId("deck-result-forward-list")).toHaveTextContent("/Users/First Last/db.sock");
+    expect(screen.queryByTestId("deck-result-no-forwards")).toBeNull();
+  });
+
+  /**
+   * Scenario: the resolved config redirects where host keys are checked. The
+   * tunnel forces the host-key CHECK and inherits the TRUST ANCHOR, so a
+   * `KnownHostsCommand` that answers with whatever key the server presents
+   * satisfies the forced `yes` against any host — and this row is the only
+   * place a user can see that their config chose one (PRD #741 final audit F2).
+   */
+  it("discloses where host keys are checked", async () => {
+    const testEndpoint = vi.fn(async () =>
+      report({
+        disclosureKnown: true,
+        forwards: [],
+        knownHosts: [
+          "host keys come from the command `/bin/inventory-keys %H`, not from a file",
+          "your known-hosts file: /dev/null",
+        ],
+      }),
+    );
+    renderPanel(
+      { endpoints: { remote: [deck()], selection: "deck0000000000aa" } },
+      { testEndpoint },
+    );
+
+    fireEvent.click(screen.getByTestId("test-connection"));
+
+    await waitFor(() => expect(screen.getByTestId("deck-result-known-hosts")).toBeInTheDocument());
+    expect(screen.getByTestId("deck-result-known-hosts")).toHaveTextContent("/bin/inventory-keys %H");
+    expect(screen.getByTestId("deck-result-known-hosts")).toHaveTextContent("/dev/null");
   });
 
   /**

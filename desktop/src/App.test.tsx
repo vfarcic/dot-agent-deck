@@ -55,8 +55,9 @@ function runtime(overrides: Partial<DeckRuntimeState> = {}): DeckRuntimeState {
       state: "ssh_unavailable" as const,
       ok: false,
       message: "No deck is reachable from this test runtime.",
-      forwardsKnown: false,
+      disclosureKnown: false,
       forwards: [],
+      knownHosts: [],
       clientProtocolVersion: 0,
       clientBuildVersion: "test",
     })),
@@ -1466,6 +1467,53 @@ describe("ControlDeck", () => {
     // A run one longer than the budget can only come from an unclamped copy —
     // the clamp itself can never produce one, wherever on the screen it sits.
     expect(rendered).not.toContain("p".repeat(DISPLAY_LIMITS.prompt + 1));
+  });
+
+  /**
+   * Scenario: a REMOTE deck answers with a build stamp carrying a
+   * right-to-left override, and the connection banner is up because the two
+   * builds differ — which for a remote deck is the ordinary session, not an
+   * edge case: a released daemon never matches a branch build. The banner's
+   * sentence and the rail lamp's hover both render `connection.message`, which
+   * embeds that stamp; before PRD #741 final audit F5 both rendered it raw
+   * while the two siblings inside the same JSX element did not.
+   *
+   * The neighbouring prompt test covers this class for a `connected` snapshot
+   * with no error, where the banner does not render at all — so this path was
+   * uncovered rather than covered elsewhere.
+   */
+  it("puts no raw daemon build stamp in the connection banner or the rail lamp", async () => {
+    const { mapDesktopSnapshot } = await import("./lib/bridge");
+    const stripped = ["\u202e", "\u2066", "\u200f", "\u001b", "\u0000", "\u009b"];
+    const hostileStamp = `0.38.0-g5a56361${stripped.join("")}drowssap`;
+    const snapshot = mapDesktopSnapshot({
+      connection: {
+        status: "connected",
+        socketPath: "/tmp/deck.sock",
+        deckKind: "remote",
+        clientProtocolVersion: 8,
+        serverProtocolVersion: 8,
+        clientBuildVersion: "0.39.0-gabc1234",
+        daemonBuildVersion: hostileStamp,
+        buildStampMismatchOnly: true,
+        error: `deploy@build-box answered; it was built from ${hostileStamp}.`,
+      },
+      agents: [],
+      protocolVersion: 8,
+      source: "daemon",
+    });
+
+    const { container } = render(<ControlDeck runtime={runtime({ mode: "live", snapshot })} />);
+
+    // The banner is up — otherwise this asserts nothing.
+    expect(screen.getByTestId("connection-banner-message")).toBeInTheDocument();
+    const rendered = [
+      container.textContent ?? "",
+      ...Array.from(container.querySelectorAll("[title]")).map((node) => node.getAttribute("title") ?? ""),
+    ].join(" ~ ");
+    for (const codepoint of stripped) expect(rendered).not.toContain(codepoint);
+    // The stamp itself still reaches the user; it is the controls that do not.
+    expect(screen.getByTestId("connection-banner-message")).toHaveTextContent("0.38.0-g5a56361");
   });
 
   /**

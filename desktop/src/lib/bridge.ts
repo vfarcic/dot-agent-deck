@@ -440,13 +440,31 @@ export interface EndpointTestReportDto {
   /** A socket path the probe learned. The panel writes it into the row. */
   discoveredSocket?: string;
   /**
-   * Whether `forwards` is an answer or an absence. `false` means the resolution
-   * did not run or could not be read, which is **not** the same claim as "there
-   * are none" — so the panel must not render it as one.
+   * Whether `forwards` and `knownHosts` are answers or absences. `false` means
+   * the one `ssh -G` resolution behind both did not run or could not be read,
+   * which is **not** the same claim as "there are none" — so the panel must not
+   * render it as one, and must not render it as nothing either.
    */
-  forwardsKnown: boolean;
-  /** What this deck's tunnel inherits from the user's own ssh config. */
+  disclosureKnown: boolean;
+  /**
+   * What this deck's tunnel inherits from the user's own ssh config.
+   *
+   * Complete as of PRD #741 final audit F1: a forward line whose value `ssh -G`
+   * printed unquoted — a path with a space is enough — is reported as
+   * unreadable rather than dropped, so this is never quietly shorter than the
+   * user's config.
+   */
   forwards: string[];
+  /**
+   * Where ssh resolved the host keys it checks this deck against (PRD #741
+   * final audit F2). The tunnel forces the host-key *check* and inherits the
+   * *trust anchor*, so this is the only place a user can see which one their
+   * config chose.
+   *
+   * Additive context, never a claim: empty means ssh named no source, and the
+   * panel renders nothing rather than asserting there is none.
+   */
+  knownHosts: string[];
   clientProtocolVersion: number;
   serverProtocolVersion?: number;
   clientBuildVersion: string;
@@ -960,8 +978,9 @@ class FixtureDeckBridge implements DeckBridge {
       message: row || selection === LOCAL_ENDPOINT_SELECTION
         ? "Browser preview — it has no way to reach a deck, so nothing was tested."
         : "That deck is no longer in this settings document.",
-      forwardsKnown: false,
+      disclosureKnown: false,
       forwards: [],
+      knownHosts: [],
       clientProtocolVersion: 0,
       clientBuildVersion: "browser-preview",
     };

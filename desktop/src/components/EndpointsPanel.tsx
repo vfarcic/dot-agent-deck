@@ -145,8 +145,9 @@ export function EndpointsPanel({ settings, onSave, saveError, mode }: SettingsPa
           state: "transport_failed",
           ok: false,
           message: cause instanceof Error ? cause.message : String(cause),
-          forwardsKnown: false,
+          disclosureKnown: false,
           forwards: [],
+          knownHosts: [],
           clientProtocolVersion: 0,
           clientBuildVersion: "",
         },
@@ -386,20 +387,57 @@ function TestResult({ report, mode }: { report: EndpointTestReportDto | undefine
           {displayText(report.detail, DISPLAY_LIMITS.message)}
         </p>
       )}
-      {/* The forwards disclosure. `forwardsKnown` is the difference between an
+      {/* The `ssh -G` disclosure. `disclosureKnown` is the difference between an
           answer and an absence, and rendering an unknown as "none" would be the
           one claim this block must not make: the tunnel inherits these for its
-          whole life, and nothing else in the app says so. */}
-      {report.forwardsKnown && report.forwards.length > 0 && (
-        <div className="deck-result-forwards" data-testid="deck-result-forwards">
-          <p>This deck's tunnel will also carry, from your ssh config:</p>
-          <ul>
-            {report.forwards.map((forward) => (
-              <li key={forward}>{displayText(forward, DISPLAY_LIMITS.path)}</li>
-            ))}
-          </ul>
-        </div>
-      )}
+          whole life, and nothing else in the app says so.
+
+          All THREE cases render, which is the PRD #741 final audit's F1 fix on
+          this side of the seam. Rendering only the non-empty list made "could
+          not look" and "there are none" both come out as an empty screen —
+          exactly the conflation the paragraph above forbids, arrived at from
+          the render rather than from the parse. */}
+      <div className="deck-result-forwards" data-testid="deck-result-forwards">
+        {report.disclosureKnown ? (
+          <>
+            {report.forwards.length > 0 ? (
+              <>
+                <p>This deck's tunnel will also carry, from your ssh config:</p>
+                {/* Keyed by position, not by text: `ssh -G` accumulates
+                    forwards, so two matching `Host` blocks carrying the same
+                    directive print the same line twice — and two unreadable
+                    lines of the same shape collapse to the same text too. */}
+                <ul data-testid="deck-result-forward-list">
+                  {report.forwards.map((forward, index) => (
+                    <li key={`${index}-${forward}`}>{displayText(forward, DISPLAY_LIMITS.path)}</li>
+                  ))}
+                </ul>
+              </>
+            ) : (
+              <p data-testid="deck-result-no-forwards">Your ssh config adds no forwards to this deck's tunnel.</p>
+            )}
+            {/* Additive, so absence asserts nothing: ssh naming no host-key
+                source at all is what a local deck looks like, and claiming
+                "none is configured" there would be the same over-reach in the
+                other direction. */}
+            {report.knownHosts.length > 0 && (
+              <>
+                <p>Host keys for this deck are checked against:</p>
+                <ul data-testid="deck-result-known-hosts">
+                  {report.knownHosts.map((source, index) => (
+                    <li key={`${index}-${source}`}>{displayText(source, DISPLAY_LIMITS.path)}</li>
+                  ))}
+                </ul>
+              </>
+            )}
+          </>
+        ) : (
+          <p data-testid="deck-result-forwards-unknown">
+            This test could not read your resolved ssh config, so it cannot say what forwards this deck's
+            tunnel will inherit or where its host keys are checked.
+          </p>
+        )}
+      </div>
       {mode === "fixture" && (
         <p className="settings-hint">Open the packaged app to reach a deck.</p>
       )}
