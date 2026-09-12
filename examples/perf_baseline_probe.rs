@@ -23,18 +23,42 @@
 //!
 //! Run: cargo run --release --example perf_baseline_probe
 //! (release so timing is representative; the byte counts are build-independent.)
+//!
+//! # Unix-only, per item rather than per file
+//!
+//! It drives a real attach server over a **Unix domain socket** and spawns real
+//! PTY agents, neither of which Windows has, so every item below is
+//! `#[cfg(unix)]` and there is a `not(unix)` `main` that says so. A file-level
+//! `#![cfg(unix)]` would be the tidier spelling and does not work here: it would
+//! remove `main` too, and the example would fail on Windows with `main function
+//! not found` instead of compiling to a stub.
+//!
+//! `cargo nextest run --workspace` builds examples, so `build-windows` compiles
+//! this file — which is how it broke that job while
+//! `scripts/windows-cross-check.sh` stayed green: the script checked `--tests`
+//! and not `--examples`. It checks both now.
 
+#[cfg(unix)]
 use std::sync::Arc;
+#[cfg(unix)]
 use std::sync::atomic::{AtomicUsize, Ordering};
+#[cfg(unix)]
 use std::time::{Duration, Instant};
 
+#[cfg(unix)]
 use dot_agent_deck::agent_pty::{AgentPtyRegistry, AgentRecord, DOT_AGENT_DECK_PANE_ID};
+#[cfg(unix)]
 use dot_agent_deck::daemon_client::{DaemonClient, StartAgentOptions};
+#[cfg(unix)]
 use dot_agent_deck::daemon_protocol::{AttachResponse, run_attach_server_with_counter};
+#[cfg(unix)]
 use dot_agent_deck::event::{AgentEvent, AgentType, BroadcastMsg, EventType};
+#[cfg(unix)]
 use dot_agent_deck::state::AppState;
+#[cfg(unix)]
 use tokio::sync::{RwLock, broadcast};
 
+#[cfg(unix)]
 fn realistic_thinking_event(pane_id: &str, agent_id: &str, cwd: &str, n: usize) -> AgentEvent {
     let mut metadata = std::collections::HashMap::new();
     metadata.insert("card_title".to_string(), format!("worker-{n}"));
@@ -60,6 +84,7 @@ fn realistic_thinking_event(pane_id: &str, agent_id: &str, cwd: &str, n: usize) 
     }
 }
 
+#[cfg(unix)]
 async fn wire_bytes(records: &[AgentRecord]) -> usize {
     // The exact JSON payload the daemon writes in the KIND_RESP frame for
     // `ListAgents` is `serde_json::to_vec(&AttachResponse::agent_records(records))`.
@@ -68,6 +93,7 @@ async fn wire_bytes(records: &[AgentRecord]) -> usize {
     serde_json::to_vec(&resp).unwrap().len()
 }
 
+#[cfg(unix)]
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -222,4 +248,12 @@ async fn main() {
     registry.shutdown_all();
     server.abort();
     println!("\nOK");
+}
+
+#[cfg(not(unix))]
+fn main() {
+    eprintln!(
+        "perf_baseline_probe is Unix-only: it drives a real attach server over a Unix domain \
+         socket and spawns real PTY agents."
+    );
 }
