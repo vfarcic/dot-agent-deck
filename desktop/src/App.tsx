@@ -598,7 +598,13 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
         </nav>
         <div className="rail-bottom">
           <button aria-label="Keyboard shortcuts" title="Keyboard shortcuts" onClick={() => setHelpOpen(true)}><Keyboard size={18} /></button>
-          <span className={`connection-lamp connection-${snapshot.connection.status}`} title={snapshot.connection.message} />
+          {/* PRD #741 final audit F5: `connection.message` is daemon-supplied —
+              it embeds the REMOTE daemon's `build_version`, which is an
+              unvalidated string on the wire — and `safe_message` on the Rust
+              side covers category `Cc` only, so the bidi controls reach here
+              intact. Same seam treatment as every other daemon string on this
+              screen. */}
+          <span className={`connection-lamp connection-${snapshot.connection.status}`} title={snapshot.connection.message && displayText(snapshot.connection.message, DISPLAY_LIMITS.message)} />
         </div>
       </aside>
 
@@ -679,7 +685,7 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
         {(snapshot.connection.status !== "connected" || snapshot.connection.buildStampMismatchOnly || snapshot.connection.selectionFallback) && (
           <div className={`connection-banner connection-${snapshot.connection.status}`} role="alert">
             {snapshot.connection.status === "loading" ? <RefreshCw className="spin" size={16} /> : <ShieldAlert size={16} />}
-            <div><strong>{snapshot.connection.status === "loading" ? "Establishing control channel" : snapshot.connection.status === "connected" ? (snapshot.connection.selectionFallback ? "Using the deck on this machine" : "Connected to a differently-built deck") : snapshot.connection.status === "error" ? "Desktop bridge error" : "Deck disconnected"}</strong><span>{snapshot.connection.message}</span>{/*
+            <div><strong>{snapshot.connection.status === "loading" ? "Establishing control channel" : snapshot.connection.status === "connected" ? (snapshot.connection.selectionFallback ? "Using the deck on this machine" : "Connected to a differently-built deck") : snapshot.connection.status === "error" ? "Desktop bridge error" : "Deck disconnected"}</strong><span data-testid="connection-banner-message">{snapshot.connection.message && displayText(snapshot.connection.message, DISPLAY_LIMITS.message)}</span>{/*
               PRD #741 M7. The stored selection could not be honoured, so the
               app is on the local deck — and it says which of the two reasons it
               was. This is why the banner's condition now includes it: a

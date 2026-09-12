@@ -838,7 +838,10 @@ async fn establish(
     // design — an endpoint alone has no address until a tunnel exists — so this
     // is the line that makes a remote deck reachable at all, and the lease is
     // held on the link below so the tunnel cannot be closed under it.
-    let transport = tunnels.acquire(endpoint).await.map_err(safe_message)?;
+    let transport = tunnels
+        .acquire(endpoint)
+        .await
+        .map_err(|error| safe_message(error.to_string()))?;
     // PRD #741 M3: `hello()` still takes the raw address and still connects with
     // an `IpcStream`, deliberately. Under DECISION 1A a remote deck is reached
     // through a forwarded Unix socket, so the handshake needs no transport of

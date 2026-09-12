@@ -1037,7 +1037,13 @@ mod tunnel {
             let mut child = match command.spawn() {
                 Ok(child) => child,
                 Err(source) => {
-                    let _ = std::fs::remove_file(&config);
+                    // The lstat-and-type guard every other deletion in this
+                    // module carries (PRD #741 final audit F9). `create_new`
+                    // made this file microseconds ago so the window is small,
+                    // but "small" is not the property the rest of the module
+                    // holds, and a lone bare `remove_file` is what a later
+                    // reader copies.
+                    remove_if_regular_file(&config);
                     return Err(TunnelError::Spawn {
                         program: ssh.path().to_string_lossy().into_owned(),
                         source,
@@ -1581,7 +1587,10 @@ mod tunnel {
     /// beside it is written. That keeps the name inside the scheme
     /// [`reap_orphaned_tunnels`] understands, so a config left behind by a
     /// SIGKILL during a probe is swept by the next [`RemoteTunnel::open`]
-    /// rather than accumulating.
+    /// rather than accumulating — which became true only with PRD #741's final
+    /// audit (**F6**): the sweep used to start from `.sock` entries alone, and
+    /// a probe binds no socket, so every probe leftover was skipped forever
+    /// while this sentence already claimed otherwise.
     #[derive(Debug)]
     pub struct ProbeConfig {
         path: PathBuf,
@@ -1785,10 +1794,22 @@ mod tunnel {
     ///
     /// What is **not** here, and the residue it leaves:
     ///
-    /// - `UserKnownHostsFile`. Pointing it anywhere decides *which* keys count
-    ///   as trusted on the user's behalf, which is not a decision an app that
-    ///   cannot show a fingerprint should take. So we force that the check
-    ///   happens; the user's `known_hosts` decides what it passes.
+    /// - `UserKnownHostsFile`, `GlobalKnownHostsFile` and `KnownHostsCommand`.
+    ///   Pointing any of them anywhere decides *which* keys count as trusted on
+    ///   the user's behalf, which is not a decision an app that cannot show a
+    ///   fingerprint should take — and `KnownHostsCommand` in particular is how
+    ///   CA- and inventory-driven fleets legitimately distribute host keys. So
+    ///   we force that the check happens; the user's config decides what it
+    ///   passes. **Residual (PRD #741 final audit F2):** all three are
+    ///   inherited on both hops, measured, so a config carrying a
+    ///   `KnownHostsCommand` that answers with whatever key the server presents
+    ///   satisfies the forced `yes` against any host, and a
+    ///   `UserKnownHostsFile /dev/null` costs availability instead (no key,
+    ///   strict, `BatchMode` — the tunnel refuses). All three *are* forceable
+    ///   first-value-wins from the leading block; the trade was judged the
+    ///   wrong way round. PRD #741 M10's `Test connection` discloses the
+    ///   resolved source beside the inherited forwards, which is the same
+    ///   answer A3 got.
     /// - `ClearAllForwardings`. It clears command-line forwards too, so it
     ///   would clear our own `-L`, and OpenSSH has no per-direction
     ///   alternative. **Residual (audit A3):** on the direct hop the user's
@@ -1835,11 +1856,26 @@ mod tunnel {
             // forward, leaving a live child and no socket — a healthy-looking
             // tunnel that carries nothing.
             "ExitOnForwardFailure=yes",
-            // The one control that decides whether the far end is the host the
-            // user asked for. See this function's docs for why the doctor's
-            // reason for omitting it does not transfer to a long-lived tunnel,
-            // and for what forcing `yes` costs against each of the four values
-            // a user config can hold.
+            // Forces the host-key CHECK to happen. It does not decide what the
+            // check is anchored to — `KnownHostsCommand`, `UserKnownHostsFile`
+            // and `GlobalKnownHostsFile` are all inherited, measured on both
+            // hops, and a `KnownHostsCommand` that emits whatever key the
+            // server presents satisfies a forced `yes` against any host (PRD
+            // #741 final audit **F2**; this comment used to call forcing `yes`
+            // "the one control that decides whether the far end is the host the
+            // user asked for", which is one quantifier too wide).
+            //
+            // Those three are forceable — measured, `KnownHostsCommand none`
+            // from the leading block wins — and deliberately not forced: they
+            // are how CA- and inventory-driven fleets distribute host keys, and
+            // a per-project `UserKnownHostsFile` is ordinary. This is inside
+            // DECISION 1A's trust boundary, so the answer is the same one the
+            // inherited forwards got — disclose it, in `Test connection`.
+            //
+            // See this function's docs for why the doctor's reason for omitting
+            // it does not transfer to a long-lived tunnel, and for what forcing
+            // `yes` costs against each of the four values a user config can
+            // hold.
             "StrictHostKeyChecking=yes",
             // StreamLocalBindUnlink defaults to `no`, which means a second
             // tunnel against an existing socket file fails to forward at all
@@ -2402,6 +2438,20 @@ mod tunnel {
     /// earlier run died holding it, and refusing forever would pin the tunnel
     /// on a stale name. Anything else at the path is left alone and reported.
     ///
+    /// **The retry is a check-then-use, and the residual is a refusal rather
+    /// than a write** (PRD #741 final audit **F9**). `remove_if_regular_file`
+    /// lstats and unlinks, then `open` creates: a same-uid actor who wins the
+    /// gap between the two can plant an inode at the path. Enumerated over what
+    /// they could plant, every one of them lands on the second `open`'s
+    /// `O_EXCL` — a symlink, a regular file, a FIFO, a directory all return
+    /// `AlreadyExists` (or `IsADirectory`) and the `?` fails the tunnel closed.
+    /// So the race buys a denial of service inside a `0700` directory this
+    /// process created, which a same-uid actor has cheaper ways to cause, and
+    /// it never buys a write through a planted inode. That is why this is left
+    /// as it stands rather than anchored on an `openat` of a held directory
+    /// descriptor: the anchoring would close a window whose far side is already
+    /// a closed door.
+    ///
     /// `mode(0o600)` rather than the ambient umask closes the inconsistency the
     /// audit noted in `write_sidecar` (B7.5): every other filesystem operation
     /// in this module states its mode or its type, and `std::fs::write` stated
@@ -2485,48 +2535,86 @@ mod tunnel {
     ///      the `.ssh` pid sidecar and the `.conf` generated ssh config — and
     ///      only when each is a socket, a regular file and a regular file
     ///      respectively. A symlink is never followed.
+    ///    - **A leftover is found by any of its three names, not only by its
+    ///      socket** (PRD #741 final audit **F6**). A [`ProbeConfig`] never
+    ///      binds a socket — it writes the `.conf` and nothing else — so a
+    ///      sweep that started from `.sock` entries alone skipped every probe
+    ///      leftover forever, while two comments said otherwise. Grouping by
+    ///      stem is also what keeps the count honest: one leftover is one
+    ///      reap, however many of its three files survived.
     pub fn reap_orphaned_tunnels(dir: &Path) -> usize {
         let Ok(entries) = std::fs::read_dir(dir) else {
             return 0;
         };
-        let mut reaped = 0;
+        // Stem -> owner pid. `BTreeMap` rather than `HashMap` so the sweep
+        // visits leftovers in a stable order, which makes a failing test
+        // reproducible.
+        let mut leftovers: std::collections::BTreeMap<String, i32> =
+            std::collections::BTreeMap::new();
         for entry in entries.flatten() {
             let path = entry.path();
             let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
                 continue;
             };
-            let Some(owner) = owner_pid_from_socket_name(name) else {
+            let Some((owner, stem)) = owner_pid_from_tunnel_name(name) else {
                 continue;
             };
+            leftovers.insert(stem.to_string(), owner);
+        }
+        let mut reaped = 0;
+        for (stem, owner) in leftovers {
             if pid_is_live(owner) {
                 continue;
             }
-            let sidecar = path.with_extension("ssh");
+            let socket = dir.join(format!("{stem}.sock"));
+            let sidecar = socket.with_extension("ssh");
             if let Some(ssh_pid) = read_sidecar_pid(&sidecar)
                 && pid_is_live(ssh_pid)
-                && process_cmdline_mentions(ssh_pid, &path.to_string_lossy())
+                && process_cmdline_mentions(ssh_pid, &socket.to_string_lossy())
             {
                 signal_group(ssh_pid, libc::SIGTERM);
                 signal_group(ssh_pid, libc::SIGKILL);
             }
-            remove_if_socket(&path);
+            remove_if_socket(&socket);
             remove_if_regular_file(&sidecar);
-            remove_if_regular_file(&config_path_for(&path));
+            remove_if_regular_file(&config_path_for(&socket));
             reaped += 1;
         }
         reaped
     }
 
-    /// Pull the owning pid out of `tun-<pid>-<nonce>.sock`. `None` for anything
-    /// this module did not write.
-    pub fn owner_pid_from_socket_name(name: &str) -> Option<i32> {
-        let rest = name.strip_prefix(TUNNEL_FILE_PREFIX)?;
-        let rest = rest.strip_suffix(".sock")?;
+    /// Pull the owning pid and the shared stem out of any of the three names
+    /// this module writes: `tun-<pid>-<nonce>.sock`, `.ssh` or `.conf`.
+    ///
+    /// `None` for anything this module did not write. The stem is what the
+    /// three share, so the sweep can reconstruct all three from whichever one
+    /// it happened to see.
+    fn owner_pid_from_tunnel_name(name: &str) -> Option<(i32, &str)> {
+        let (stem, extension) = name.rsplit_once('.')?;
+        if !matches!(extension, "sock" | "ssh" | "conf") {
+            return None;
+        }
+        let rest = stem.strip_prefix(TUNNEL_FILE_PREFIX)?;
         let (pid, nonce) = rest.split_once('-')?;
         if nonce.is_empty() || !nonce.chars().all(|c| c.is_ascii_hexdigit()) {
             return None;
         }
-        pid.parse::<i32>().ok().filter(|pid| *pid > 0)
+        let pid = pid.parse::<i32>().ok().filter(|pid| *pid > 0)?;
+        Some((pid, stem))
+    }
+
+    /// Pull the owning pid out of `tun-<pid>-<nonce>.sock`. `None` for anything
+    /// this module did not write, **including its own `.ssh` and `.conf`
+    /// siblings** — this is the socket-only question, and it stays that way
+    /// because the daemon-side callers that ask it are asking about a bound
+    /// listener. The sweep asks the wider question through
+    /// [`owner_pid_from_tunnel_name`], which this delegates to so the two
+    /// cannot disagree about what a well-formed name is.
+    pub fn owner_pid_from_socket_name(name: &str) -> Option<i32> {
+        match owner_pid_from_tunnel_name(name) {
+            Some((pid, _)) if name.ends_with(".sock") => Some(pid),
+            _ => None,
+        }
     }
 
     fn read_sidecar_pid(sidecar: &Path) -> Option<i32> {
@@ -4662,6 +4750,81 @@ mod tunnel_tests {
             "and so does the generated ssh config, or a leftover a later ssh would read \
              accumulates forever"
         );
+    }
+
+    /// A `ProbeConfig` orphan — a `.conf` and **no socket at all**, which is
+    /// what a SIGKILL during `Test connection` leaves — is swept.
+    ///
+    /// PRD #741 final audit **F6**: the sweep used to key on
+    /// `owner_pid_from_socket_name`, which requires a `.sock` suffix, and a
+    /// probe never binds a socket — so every probe leftover was skipped
+    /// forever while two comments said it was cleared. The test above looks
+    /// like it covered this and does not: it writes a real `.sock`.
+    #[test]
+    fn the_sweep_clears_a_probe_config_that_never_had_a_socket() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let dir = temp.path();
+        let mut corpse = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("exit 0")
+            .spawn()
+            .expect("spawn");
+        let dead_pid = corpse.id();
+        corpse.wait().expect("reap");
+
+        let config = dir.join(format!("tun-{dead_pid}-0a1b.conf"));
+        std::fs::write(&config, "Host *\n").expect("write the probe config");
+        let foreign = dir.join("not-ours.conf");
+        std::fs::write(&foreign, "Host *\n").expect("write a file we did not name");
+
+        assert_eq!(reap_orphaned_tunnels(dir), 1);
+        assert!(
+            !config.exists(),
+            "a probe's orphaned config binds no socket, and is still ours to clear"
+        );
+        assert!(
+            foreign.exists(),
+            "a name this module never writes is not touched"
+        );
+    }
+
+    /// A live owner's probe config is left alone at any age, exactly as a live
+    /// owner's socket is — the sweep widened to `.conf` must not widen what it
+    /// is willing to delete out from under a running process.
+    #[test]
+    fn the_sweep_never_clears_a_live_owners_probe_config() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let dir = temp.path();
+        let config = dir.join(format!("tun-{}-0a1b.conf", std::process::id()));
+        std::fs::write(&config, "Host *\n").expect("write the probe config");
+
+        assert_eq!(reap_orphaned_tunnels(dir), 0);
+        assert!(
+            config.exists(),
+            "this process is alive, so its probe config stays"
+        );
+    }
+
+    /// One leftover is one reap however many of its three names survived, so
+    /// the count the caller logs stays a count of leftovers.
+    #[test]
+    fn the_sweep_counts_a_leftover_once_however_many_of_its_names_remain() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let dir = temp.path();
+        let mut corpse = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("exit 0")
+            .spawn()
+            .expect("spawn");
+        let dead_pid = corpse.id();
+        corpse.wait().expect("reap");
+
+        let socket = dir.join(format!("tun-{dead_pid}-0a1b.sock"));
+        std::os::unix::net::UnixListener::bind(&socket).expect("bind a leftover");
+        std::fs::write(socket.with_extension("ssh"), "1").expect("write the sidecar");
+        std::fs::write(socket.with_extension("conf"), "Host *\n").expect("write the config");
+
+        assert_eq!(reap_orphaned_tunnels(dir), 1);
     }
 
     /// The hygiene half. A leftover whose owning app is **dead** is cleared,

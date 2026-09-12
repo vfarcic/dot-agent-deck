@@ -135,6 +135,35 @@ impl TunnelLease {
     }
 }
 
+/// Why [`EndpointTunnels::acquire`] could not hand back a lease.
+///
+/// Two arms because there are two kinds of caller need. A classifier wants the
+/// *typed* tunnel error, so it can read the verdict `classify_exit` already
+/// derived from ssh's raw stderr rather than re-deriving it from scrubbed
+/// text. A caller that only has a banner to fill wants a sentence, and gets one
+/// from [`Display`].
+#[cfg(unix)]
+#[derive(Debug)]
+pub(crate) enum AcquireError {
+    /// The tunnel itself refused. Boxed because `TunnelError` is much the
+    /// larger arm and `clippy::result_large_err` would otherwise object.
+    Tunnel(Box<dot_agent_deck::remote_tunnel::TunnelError>),
+    /// Everything before the tunnel could be attempted: no `ssh` program on
+    /// this machine, or a blocking task that did not come back. Neither says
+    /// anything about the far host, so neither is worth classifying.
+    Local(String),
+}
+
+#[cfg(unix)]
+impl std::fmt::Display for AcquireError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Tunnel(error) => error.fmt(f),
+            Self::Local(message) => f.write_str(message),
+        }
+    }
+}
+
 /// The live transports, keyed by [`Endpoint::describe`] — the same key
 /// [`DaemonLinks`] uses, so the two maps can be reasoned about together.
 ///
@@ -155,7 +184,22 @@ impl EndpointTunnels {
     /// ONE ssh authentication instead of N, and a deck that is not answering
     /// queues the other callers behind one connect attempt rather than giving
     /// each its own.
-    pub(crate) async fn acquire(&self, endpoint: &Endpoint) -> Result<Arc<TunnelLease>, String> {
+    ///
+    /// The error is **typed**, and that is a security property rather than
+    /// tidiness (PRD #741 final audit **F3**). This used to flatten
+    /// `TunnelError` with `to_string()`, and `SshError`'s `detail` by then
+    /// already holds `scrub_remote_text(stderr)` — so a caller re-classifying
+    /// the flattened string was substring-matching text the scrubber had
+    /// *rewritten*. Stripping can only create matches the raw bytes lacked, so
+    /// a peer writing `Host key verification fai\x01led.` could promote an
+    /// unrelated failure into a host-key verdict carrying a copy-paste `ssh`
+    /// remedy. `TunnelError` already carries the verdict `classify_exit` derived
+    /// from the **raw** stderr; handing it over means nobody has to re-derive it
+    /// from a lossy copy.
+    pub(crate) async fn acquire(
+        &self,
+        endpoint: &Endpoint,
+    ) -> Result<Arc<TunnelLease>, AcquireError> {
         let key = endpoint.describe();
         let mut tunnels = self.tunnels.lock().await;
         if let Some(held) = tunnels.get(&key) {
@@ -166,7 +210,7 @@ impl EndpointTunnels {
             // be holding a lease, and its `Drop` is what tears the child down.
             tunnels.remove(&key);
         }
-        let ssh = SshProgram::resolve().map_err(|error| error.to_string())?;
+        let ssh = SshProgram::resolve().map_err(|error| AcquireError::Local(error.to_string()))?;
         let endpoint = endpoint.clone();
         // `EndpointConnection::open` is blocking — it spawns `ssh` and polls for
         // the forwarded socket for up to `FORWARD_READY_TIMEOUT`. Off the async
@@ -174,8 +218,10 @@ impl EndpointTunnels {
         let connection =
             tokio::task::spawn_blocking(move || EndpointConnection::open(&endpoint, &ssh))
                 .await
-                .map_err(|error| format!("the endpoint transport task failed: {error}"))?
-                .map_err(|error| error.to_string())?;
+                .map_err(|error| {
+                    AcquireError::Local(format!("the endpoint transport task failed: {error}"))
+                })?
+                .map_err(|error| AcquireError::Tunnel(Box::new(error)))?;
         let lease = Arc::new(TunnelLease {
             address: connection.connect_address().to_path_buf(),
             connection: Mutex::new(connection),
