@@ -1373,7 +1373,23 @@ mod tests {
     #[test]
     fn project_actions_gate_on_the_advertised_capability_set() {
         let _guard = AllowanceGuard::acquire();
-        let full = AttachResponse::hello(PROTOCOL_VERSION).with_capabilities();
+        // Built from `DESKTOP_PROJECT_CAPABILITIES` — the set this gate reads —
+        // rather than from `AttachResponse::with_capabilities()`, which
+        // advertises whatever the LOCAL platform's daemon can do.
+        // `DAEMON_CAPABILITIES` is deliberately shorter on Windows (PRD #819
+        // strikes `prepare-workflow` and `start-prepared-agent` there, for want
+        // of a DACL implementation), so "the full set" and "everything the
+        // desktop needs" are the same list on Unix and different lists on
+        // Windows — and this test is about the second one. It failed on
+        // `build-windows` for exactly that reason, and only became visible once
+        // the crate compiled there again.
+        let mut full = AttachResponse::hello(PROTOCOL_VERSION);
+        full.capabilities = Some(
+            DESKTOP_PROJECT_CAPABILITIES
+                .iter()
+                .map(|capability| capability.to_string())
+                .collect(),
+        );
         assert_eq!(
             classify_handshake(
                 &full,

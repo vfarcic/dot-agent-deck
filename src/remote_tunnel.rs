@@ -3332,9 +3332,20 @@ mod tests {
 
     /// An explicitly chosen ssh must still be absolute: a relative one resolves
     /// against a working directory a GUI never chose.
+    ///
+    /// The accepted value is per-platform because `Path::is_absolute` is:
+    /// `/usr/bin/ssh` is absolute on Unix and **not** on Windows, which wants a
+    /// drive prefix. Written as two `#[cfg]` statements rather than gating the
+    /// whole test to Unix, because the half that matters — a bare name is
+    /// refused — holds everywhere and is worth running everywhere. It failed on
+    /// `build-windows` on the Unix literal, and only became visible once the
+    /// workspace compiled there again.
     #[test]
     fn an_explicitly_chosen_ssh_must_be_absolute() {
+        #[cfg(unix)]
         assert!(SshProgram::at("/usr/bin/ssh").is_ok());
+        #[cfg(windows)]
+        assert!(SshProgram::at(r"C:\Windows\System32\OpenSSH\ssh.exe").is_ok());
         let err = SshProgram::at("ssh").expect_err("a bare name is refused");
         assert!(matches!(err, TunnelError::SshPathNotAbsolute { .. }));
     }
