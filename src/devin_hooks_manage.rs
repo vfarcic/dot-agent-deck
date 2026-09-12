@@ -211,31 +211,94 @@ fn devin_present_on_path() -> bool {
     })
 }
 
-/// Whether a command string is a deck-authored Devin hook, by EXACT signature.
-/// A user command that merely contains `dot-agent-deck` (e.g.
+/// Whether a command string is a deck-authored Devin hook, by EXACT signature:
+/// it is `<executable> ` followed by [`HOOK_COMMAND_SUFFIX`]. A user command
+/// that merely contains `dot-agent-deck` (e.g.
 /// `audit-wrapper --watch dot-agent-deck`) is NOT deck-owned and is preserved.
+///
+/// This is the WIDE, binary-agnostic sense of ownership: any deck install's
+/// command, not just this one's. It is the right predicate for uninstall —
+/// whose job is to remove the deck's rules wholesale, whichever install wrote
+/// them — and the wrong one for deciding what a re-install may overwrite,
+/// including under a retired event (see [`command_is_replaceable`], issue
+/// #730).
 fn command_is_deck_owned(command: &str) -> bool {
-    command.trim_end().ends_with(HOOK_COMMAND_SUFFIX)
+    crate::agent_hook_config::command_executable(command, HOOK_COMMAND_SUFFIX).is_some()
 }
 
-/// Whether a hook rule was authored by the deck — i.e. one of its command
-/// handlers is a deck hook by [`command_is_deck_owned`].
-fn rule_is_dot_agent_deck(rule: &Value) -> bool {
-    rule.get("hooks")
-        .and_then(Value::as_array)
-        .is_some_and(|hooks| {
-            hooks.iter().any(|hook| {
-                hook.get("command")
-                    .and_then(Value::as_str)
-                    .is_some_and(command_is_deck_owned)
-            })
-        })
+/// The executable a deck-owned command names, unquoted, or `None` when the
+/// command is not deck-owned at all.
+fn deck_command_executable(command: &str) -> Option<String> {
+    crate::agent_hook_config::command_executable(command, HOOK_COMMAND_SUFFIX)
+        .map(|exe| crate::agent_hook_config::unquote_if_needed(exe).into_owned())
 }
 
-/// Merge the deck's command hooks for `command` into an existing config value
-/// (or `{}`), preserving every unrelated setting and every user-authored hook,
-/// and refreshing (not duplicating) prior deck entries.
-fn install_impl(root: &mut Value, command: &str) {
+/// Whether `command` is a deck-owned command belonging to the SPECIFIC binary
+/// currently installing, so a re-install should replace it rather than add a
+/// second rule beside it. Symlinks are resolved, so a `dot-agent-deck` symlink
+/// pointing at a renamed build collapses to one rule.
+fn command_is_this_binary(command: &str, binary_path: &str) -> bool {
+    deck_command_executable(command)
+        .is_some_and(|exe| crate::agent_hook_config::executables_match(&exe, binary_path))
+}
+
+/// Whether `command` is a deck-owned command whose pin is POSITIVELY not usable
+/// and which shares the installing binary's own basename — the "repair only when
+/// the target is not one the deck would write" gate, mirroring
+/// `hooks_manage::command_is_dead_deck`.
+///
+/// [`crate::platform::paths::pin_is_repairable`] is what "not usable" means, and
+/// it is not the same as "missing": a bare or relative pin and a
+/// `target/{debug,release}` path are both unusable-and-replaceable while naming
+/// a file that may exist and run (issue #536's read side). A stat error on a
+/// well-formed absolute pin is the one case that keeps the benefit of the doubt.
+///
+/// Issue #730: before this, `install_impl` stripped **every** deck-owned rule by
+/// suffix and re-added its own, so a deck-owned entry naming a different but
+/// still-valid install was repointed on each launch. PRD #381's Open Question 3
+/// answers that case explicitly — leave it alone; the trigger is never "the
+/// target is not what I would have written" — and Claude and OpenCode already
+/// behaved that way. (#381 spelt the positive half of that trigger "the target
+/// is missing", which was accurate for the `try_exists`-only gate it was written
+/// against and is narrower than [`crate::platform::paths::pin_is_repairable`]
+/// asks today; the paragraph above is the current reading.) This is what makes
+/// Devin match.
+fn command_is_dead_deck(command: &str, binary_path: &str) -> bool {
+    deck_command_executable(command)
+        .is_some_and(|exe| crate::agent_hook_config::pin_is_dead_sibling(&exe, binary_path))
+}
+
+/// Whether a re-install by `binary_path` may REPLACE `command`: it is either
+/// this binary's own prior deck command, or a deck command naming a pin the deck
+/// cannot use — missing, bare or relative, non-executable, or a build-artifact
+/// path — under this binary's basename. The union of
+/// [`command_is_this_binary`] and [`command_is_dead_deck`], named once because
+/// [`install_impl`] applies it in two places — the installed events and the
+/// retired-event sweep — and the two must not drift apart (issue #730).
+///
+/// "Cannot use" is [`crate::platform::paths::pin_is_repairable`]'s question and
+/// it is wider than "the OS says the file is gone": of its four true-cases, two
+/// can fire for a pin that names a file which exists and runs — a bare or
+/// relative pin (#536's own shape, resolved through the *agent's* `$PATH`, or
+/// against its cwd, at hook-fire time) and a `target/{debug,release}` path. That
+/// is deliberate and is the whole point of #536's read side, so do not describe
+/// this as pruning only what is positively gone; it prunes what the deck would
+/// refuse to write.
+fn command_is_replaceable(command: &str, binary_path: &str) -> bool {
+    command_is_this_binary(command, binary_path) || command_is_dead_deck(command, binary_path)
+}
+
+/// Merge the deck's command hooks for `command` — the command built for
+/// `binary_path` — into an existing config value (or `{}`), preserving every
+/// unrelated setting and every user-authored hook, and refreshing (not
+/// duplicating) this binary's own prior deck entries.
+///
+/// `binary_path` is passed alongside the already-built `command` because the two
+/// answer different questions: `command` is what gets WRITTEN, `binary_path` is
+/// what decides which existing deck commands may be overwritten.
+fn install_impl(root: &mut Value, command: &str, binary_path: &str) {
+    use crate::agent_hook_config::strip_deck_commands;
+
     if !root.is_object() {
         *root = json!({});
     }
@@ -248,14 +311,39 @@ fn install_impl(root: &mut Value, command: &str) {
         .and_then(Value::as_object_mut)
         .expect("hooks is an object");
 
-    // Strip stale deck entries from EVERY event — including events no longer in
-    // `DEVIN_HOOK_EVENTS` — so a re-install after this list changes leaves no
-    // orphaned deck rule behind, and drop any event key left empty as a result.
+    // Clear THIS install's leftovers under an event no longer in
+    // `DEVIN_HOOK_EVENTS`, so a re-install after that list changes orphans none
+    // of its own rules. Same predicate as the installed-event sweep below,
+    // deliberately: a deck command under a retired event is NOT dead merely
+    // because this deck stopped installing that event. `DEVIN_HOOK_EVENTS` says
+    // what this deck writes, not what the agent runs — which is true by
+    // construction of this list for any agent, and so needs no per-agent
+    // measurement. The corroborating measurement we do have is of CODEX, not of
+    // Devin: Codex 0.149.0, whose adapter carries the identical sweep, accepts
+    // and enumerates a hook under an event that deck does not install. Nothing
+    // here has been measured against a real Devin. So a wide sweep here can
+    // delete a live hook belonging to a user or to a newer sibling install.
+    // That is issue #730's own defect one door along.
+    //
+    // The consequence, stated rather than left to be discovered: nothing cleans
+    // a FOREIGN install's retired-event rule during install. That is the same
+    // tradeoff already accepted for the installed events, and `uninstall_impl`
+    // still clears every deck-signature command wide.
+    //
+    // An event key left empty IS dropped by this INSTALL sweep, while Codex's
+    // install sweep leaves it. (Both adapters' `uninstall` drop emptied keys;
+    // the asymmetry is install-side only.) It is pre-existing on both sides and
+    // left deliberately: each adapter keeps the shape its own users' files
+    // already have. Do not "fix" one into the other without deciding which is
+    // right.
     let keys: Vec<String> = hooks.keys().cloned().collect();
     for key in keys {
+        if DEVIN_HOOK_EVENTS.contains(&key.as_str()) {
+            continue;
+        }
         if let Some(arr) = hooks.get_mut(&key).and_then(Value::as_array_mut) {
-            arr.retain(|rule| !rule_is_dot_agent_deck(rule));
-            if arr.is_empty() && !DEVIN_HOOK_EVENTS.contains(&key.as_str()) {
+            strip_deck_commands(arr, |cmd| command_is_replaceable(cmd, binary_path));
+            if arr.is_empty() {
                 hooks.remove(&key);
             }
         }
@@ -269,9 +357,16 @@ fn install_impl(root: &mut Value, command: &str) {
         if !arr.is_array() {
             *arr = json!([]);
         }
-        arr.as_array_mut()
-            .expect("hook event value is an array")
-            .push(entry.clone());
+        let arr = arr.as_array_mut().expect("hook event value is an array");
+        // Normalize down to a single fresh rule, but only for THIS binary —
+        // plus any deck pin sharing its basename that the deck would not
+        // itself write (missing, bare or relative, non-executable, or a
+        // build-artifact path), the shape N worktree builds actually take. A
+        // deck rule belonging to a genuinely different, still-valid install is
+        // left in place and the new rule is added ALONGSIDE it (issue #730),
+        // which is what Claude's `install_impl` has always done.
+        strip_deck_commands(arr, |cmd| command_is_replaceable(cmd, binary_path));
+        arr.push(entry.clone());
     }
 }
 
@@ -292,9 +387,11 @@ fn uninstall_impl(root: &mut Value) -> Vec<String> {
     let keys: Vec<String> = hooks.keys().cloned().collect();
     for key in keys {
         if let Some(arr) = hooks.get_mut(&key).and_then(Value::as_array_mut) {
-            let before = arr.len();
-            arr.retain(|rule| !rule_is_dot_agent_deck(rule));
-            if arr.len() < before {
+            // Wide ownership on purpose: uninstall removes the deck's rules
+            // wholesale, whichever install wrote them. Command granularity is
+            // what keeps a user's sibling handler sharing the rule object from
+            // going with them (issue #730).
+            if crate::agent_hook_config::strip_deck_commands(arr, command_is_deck_owned) > 0 {
                 removed.push(key.clone());
             }
             if arr.is_empty() {
@@ -385,7 +482,7 @@ pub fn install_to(config_dir: &Path, binary_path: &str) -> io::Result<()> {
 
     let command =
         crate::agent_hook_config::build_command(binary_path, HOOK_COMMAND_SUFFIX, HOOK_SHELL);
-    install_impl(&mut root, &command);
+    install_impl(&mut root, &command, binary_path);
     let contents = serde_json::to_string_pretty(&root)?;
     crate::agent_hook_config::write_atomic(config_dir, &path, contents.as_bytes())
 }
@@ -506,12 +603,44 @@ mod tests {
         serde_json::from_str(&contents).expect("parse config.json")
     }
 
+    /// Write a real, executable file at `path` (creating its directory) and
+    /// return its path as a string — a pin `pin_is_repairable` will call alive.
+    fn seed_executable(path: &Path) -> String {
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("create dir");
+        std::fs::write(path, b"#!/bin/sh\nexit 0\n").expect("write seeded binary");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        }
+        path.to_str().expect("seeded path is UTF-8").to_string()
+    }
+
+    /// The deck command this adapter writes for `binary`.
+    fn command_for(binary: &str) -> String {
+        crate::agent_hook_config::build_command(binary, HOOK_COMMAND_SUFFIX, HOOK_SHELL)
+    }
+
+    /// Every command under `event`, deck-owned or not — the unfiltered twin of
+    /// [`deck_commands_for`], which cannot see a user's own hook and so cannot
+    /// assert that one survived (issue #730, auditor N-H). Mirrors the Codex
+    /// adapter's `commands_for`.
+    fn commands_for(root: &Value, event: &str) -> Vec<String> {
+        root["hooks"][event]
+            .as_array()
+            .unwrap_or(&Vec::new())
+            .iter()
+            .flat_map(crate::agent_hook_config::rule_commands)
+            .map(str::to_string)
+            .collect()
+    }
+
     fn deck_commands_for(root: &Value, event: &str) -> Vec<String> {
         root["hooks"][event]
             .as_array()
             .unwrap_or(&Vec::new())
             .iter()
-            .filter(|rule| rule_is_dot_agent_deck(rule))
+            .filter(|rule| crate::agent_hook_config::rule_commands(rule).any(command_is_deck_owned))
             .map(|rule| rule["hooks"][0]["command"].as_str().unwrap().to_string())
             .collect()
     }
@@ -620,32 +749,295 @@ mod tests {
         assert_eq!(deck_commands_for(&root, "PreToolUse").len(), 1);
     }
 
-    /// A re-install after `DEVIN_HOOK_EVENTS` shrinks must not orphan a deck rule
-    /// under an event we no longer install, and must not leave an empty key.
+    /// Issue #730: a user who puts their own handler and the deck's in ONE rule
+    /// object is doing a normal thing — the `hooks` array is a list of commands
+    /// sharing a matcher. Removal used to be a `retain` over whole rules keyed
+    /// on an `any()` across that list, so the automatic startup re-install
+    /// deleted the user's handler along with the deck's.
     #[test]
-    fn install_cleans_up_deck_rules_for_retired_events() {
+    fn install_keeps_a_users_sibling_handler_in_a_shared_rule() {
         let dir = tempfile::tempdir().expect("config tempdir");
-        let stale = json!({
+        let deck_command = crate::agent_hook_config::build_command(
+            "/abs/dot-agent-deck",
+            HOOK_COMMAND_SUFFIX,
+            HOOK_SHELL,
+        );
+        let user_config = json!({
             "hooks": {
-                "RetiredEvent": [
-                    { "hooks": [
-                        { "type": "command", "command": "/old/deck hook --agent devin" }
+                "PreToolUse": [
+                    { "matcher": "^exec$", "hooks": [
+                        { "type": "command", "command": deck_command },
+                        { "type": "command", "command": "/usr/local/bin/my-critical-audit.sh" },
                     ] }
                 ]
             }
         });
         std::fs::write(
             config_path(dir.path()),
-            serde_json::to_vec_pretty(&stale).unwrap(),
+            serde_json::to_vec_pretty(&user_config).unwrap(),
         )
         .unwrap();
 
         install_to(dir.path(), "/abs/dot-agent-deck").expect("install");
 
         let root = read_back(dir.path());
+        let pre = root["hooks"]["PreToolUse"].as_array().expect("rules");
+        let shared = pre
+            .iter()
+            .find(|rule| rule["matcher"] == json!("^exec$"))
+            .unwrap_or_else(|| panic!("the shared rule object was deleted: {pre:?}"));
+        assert_eq!(
+            shared["hooks"].as_array().map(Vec::len),
+            Some(1),
+            "only the deck's own command may leave a shared rule: {shared:?}"
+        );
+        assert_eq!(
+            shared["hooks"][0]["command"],
+            json!("/usr/local/bin/my-critical-audit.sh"),
+            "the user's sibling handler must survive: {shared:?}"
+        );
+        assert_eq!(
+            deck_commands_for(&root, "PreToolUse").len(),
+            1,
+            "the deck's rule must be refreshed exactly once: {pre:?}"
+        );
+    }
+
+    /// The same granularity on the uninstall side, which is where issue #535
+    /// was originally measured for Claude: `hooks uninstall --agent devin` must
+    /// take the deck's command out of a shared rule without taking the user's
+    /// with it.
+    #[test]
+    fn uninstall_keeps_a_users_sibling_handler_in_a_shared_rule() {
+        let dir = tempfile::tempdir().expect("config tempdir");
+        install_to(dir.path(), "/abs/dot-agent-deck").expect("install");
+        // Move the user's handler INTO the deck's own rule object, which is what
+        // a user editing the file by hand naturally produces.
+        let mut root = read_back(dir.path());
+        root["hooks"]["PreToolUse"][0]["hooks"]
+            .as_array_mut()
+            .expect("deck rule handlers")
+            .push(json!({ "type": "command", "command": "/usr/local/bin/my-critical-audit.sh" }));
+        std::fs::write(
+            config_path(dir.path()),
+            serde_json::to_vec_pretty(&root).unwrap(),
+        )
+        .unwrap();
+
+        let removed = uninstall_from(dir.path()).expect("uninstall");
+        assert!(removed.contains(&"PreToolUse".to_string()));
+
+        let root = read_back(dir.path());
+        let pre = root["hooks"]["PreToolUse"].as_array().expect("rules");
+        assert_eq!(pre.len(), 1, "the shared rule must survive: {pre:?}");
+        assert_eq!(
+            pre[0]["hooks"].as_array().map(Vec::len),
+            Some(1),
+            "only the deck's command may be removed: {pre:?}"
+        );
+        assert_eq!(
+            pre[0]["hooks"][0]["command"],
+            json!("/usr/local/bin/my-critical-audit.sh")
+        );
+        assert!(
+            deck_commands_for(&root, "PreToolUse").is_empty(),
+            "the deck's own command must be gone: {pre:?}"
+        );
+    }
+
+    /// PRD #381 Open Question 3, for Devin (issue #730): repair only when the
+    /// target is POSITIVELY missing, never merely because it differs from what
+    /// this install would have written.
+    ///
+    /// Both arms or the test proves nothing — a predicate that never prunes
+    /// anything passes the first on its own. The valid foreign install
+    /// deliberately shares the installing binary's basename, so
+    /// `pin_is_repairable` saying "the target is still there" is the only thing
+    /// standing between it and deletion.
+    #[test]
+    fn install_leaves_a_valid_foreign_pin_alone_and_repairs_a_dead_one() {
+        let fixture = crate::test_temp::tempdir().expect("devin fixture tempdir");
+        let installing =
+            seed_executable(&fixture.path().join("this-install").join("dot-agent-deck"));
+        let other = seed_executable(&fixture.path().join("other-install").join("dot-agent-deck"));
+
+        // Arm 1 — a different but still-valid deck install.
+        let valid = fixture.path().join("valid-config");
+        std::fs::create_dir_all(&valid).expect("create config dir");
+        std::fs::write(
+            config_path(&valid),
+            serde_json::to_vec_pretty(&json!({
+                "hooks": {
+                    "SessionStart": [
+                        { "hooks": [ { "type": "command", "command": command_for(&other) } ] }
+                    ]
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        install_to(&valid, &installing).expect("install over a valid foreign pin");
+
+        assert_eq!(
+            deck_commands_for(&read_back(&valid), "SessionStart"),
+            vec![command_for(&other), command_for(&installing)],
+            "a deck pin that still works is left alone and the fresh rule is added \
+             ALONGSIDE it, never repointed"
+        );
+
+        // Arm 2 — the same shape, but the binary is positively gone.
+        let dead = fixture
+            .path()
+            .join("pruned-worktree")
+            .join("dot-agent-deck");
+        assert!(!dead.exists(), "the dead path must genuinely not exist");
+        let gone = fixture.path().join("dead-config");
+        std::fs::create_dir_all(&gone).expect("create config dir");
+        std::fs::write(
+            config_path(&gone),
+            serde_json::to_vec_pretty(&json!({
+                "hooks": {
+                    "SessionStart": [
+                        { "hooks": [ { "type": "command", "command":
+                            command_for(dead.to_str().expect("dead path is UTF-8")) } ] }
+                    ]
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        install_to(&gone, &installing).expect("install over a dead pin");
+
+        assert_eq!(
+            deck_commands_for(&read_back(&gone), "SessionStart"),
+            vec![command_for(&installing)],
+            "a deck pin whose binary is positively missing must still be repaired away"
+        );
+    }
+
+    /// A re-install after `DEVIN_HOOK_EVENTS` shrinks must not orphan THIS
+    /// install's own deck rule under an event we no longer install, and must not
+    /// leave the emptied key behind. It must equally not reach a deck rule
+    /// belonging to a different, still-valid install, nor a hook of the user's
+    /// own sharing that rule object: `DEVIN_HOOK_EVENTS` says what this deck
+    /// writes, not what the agent runs, so a deck command under a retired event
+    /// is not dead, it is someone else's (issue #730).
+    ///
+    /// Three of the four cases the Codex adapter asserts in one rule are here
+    /// (ours swept, a foreign live install kept, a user's hook kept); the
+    /// fourth, a dead sibling pin swept, is the test below. Arm 2's assertion is
+    /// deliberately unfiltered so the user's hook is inside what it compares.
+    #[test]
+    fn install_cleans_up_only_its_own_deck_rules_for_retired_events() {
+        let fixture = crate::test_temp::tempdir().expect("devin fixture tempdir");
+        let installing =
+            seed_executable(&fixture.path().join("this-install").join("dot-agent-deck"));
+        let other = seed_executable(&fixture.path().join("other-install").join("dot-agent-deck"));
+
+        // Arm 1 — our own leftover under a retired event: swept, key dropped.
+        let ours = fixture.path().join("ours");
+        std::fs::create_dir_all(&ours).expect("create config dir");
+        std::fs::write(
+            config_path(&ours),
+            serde_json::to_vec_pretty(&json!({
+                "hooks": {
+                    "RetiredEvent": [
+                        { "hooks": [ { "type": "command", "command": command_for(&installing) } ] }
+                    ]
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        install_to(&ours, &installing).expect("install over our own retired-event rule");
+
+        let root = read_back(&ours);
         assert!(
             root["hooks"].get("RetiredEvent").is_none(),
-            "an emptied retired event key must be dropped: {root:?}"
+            "our own retired-event rule must be swept and the emptied key dropped: {root:?}"
+        );
+
+        // Arm 2 — a different install's still-valid rule under the same retired
+        // event, plus a hook of the user's own sharing that rule object. The
+        // foreign binary shares our basename deliberately, so `pin_is_repairable`
+        // saying "the target is still there" is the only thing standing between
+        // it and deletion; the user's hook is here because the assertion is
+        // UNFILTERED (issue #730, auditor N-H — it used to run through
+        // `deck_commands_for`, which cannot see a non-deck command, so this half
+        // was asserted on the Codex side only).
+        let theirs = fixture.path().join("theirs");
+        std::fs::create_dir_all(&theirs).expect("create config dir");
+        std::fs::write(
+            config_path(&theirs),
+            serde_json::to_vec_pretty(&json!({
+                "hooks": {
+                    "RetiredEvent": [
+                        { "hooks": [
+                            { "type": "command", "command": command_for(&other) },
+                            { "type": "command", "command": "/usr/local/bin/my-audit.sh" }
+                        ] }
+                    ]
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        install_to(&theirs, &installing).expect("install over a foreign retired-event rule");
+
+        let root = read_back(&theirs);
+        assert_eq!(
+            commands_for(&root, "RetiredEvent"),
+            vec![
+                command_for(&other),
+                "/usr/local/bin/my-audit.sh".to_string()
+            ],
+            "another install's still-valid rule and the user's own hook beside it must both \
+             survive under a retired event: {root:?}"
+        );
+    }
+
+    /// The other half of the retired-event sweep: a deck pin that is positively
+    /// gone and shares this binary's basename IS swept, even under an event we
+    /// no longer install — otherwise the pruned-worktree residue #730's repair
+    /// gate exists for would accumulate under retired keys forever.
+    #[test]
+    fn install_sweeps_a_dead_sibling_pin_under_a_retired_event() {
+        let fixture = crate::test_temp::tempdir().expect("devin fixture tempdir");
+        let installing =
+            seed_executable(&fixture.path().join("this-install").join("dot-agent-deck"));
+        let dead = fixture
+            .path()
+            .join("pruned-worktree")
+            .join("dot-agent-deck");
+        assert!(!dead.exists(), "the dead path must genuinely not exist");
+
+        let dir = fixture.path().join("config");
+        std::fs::create_dir_all(&dir).expect("create config dir");
+        std::fs::write(
+            config_path(&dir),
+            serde_json::to_vec_pretty(&json!({
+                "hooks": {
+                    "RetiredEvent": [
+                        { "hooks": [ { "type": "command", "command":
+                            command_for(dead.to_str().expect("dead path is UTF-8")) } ] }
+                    ]
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        install_to(&dir, &installing).expect("install over a dead retired-event pin");
+
+        let root = read_back(&dir);
+        assert!(
+            root["hooks"].get("RetiredEvent").is_none(),
+            "a dead sibling pin under a retired event must be swept and the key \
+             dropped: {root:?}"
         );
     }
 

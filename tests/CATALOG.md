@@ -1873,6 +1873,13 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** the wording of the refusal message or the tracing/stderr surface it is reported on.
 - **Platform coverage:** linux.
 
+##### hooks/install/006 — The unattended startup install leaves a user's sibling handler, their `matcher`, and a still-valid foreign deck pin exactly as it found them.
+- **Layer:** L2.
+- **Agent:** none (a stub `codex` on `PATH` makes the Codex installer fire; two stub executables stand in for the launching install and a second one).
+- **Asserts:** with `~/.codex/hooks.json` seeded BEFORE launch so the real binary's startup install is what rewrites it, under both an installed event (`PreToolUse`) and one the deck does not install (`SessionEnd`, which reaches `install_impl`'s retired-event sweep): a rule holding the deck's own command next to a user handler carrying no string `command` keeps both that handler and its `matcher`, with the deck's stale command refreshed out into its own rule; and a deck-owned rule pinning a different, absolute, executable, non-`target/` `dot-agent-deck` is left byte-identical rather than repointed. The retired event gains no fresh deck rule. Issue #730, plus the Greptile P1 on PR #1029 — the emptiness test that dropped a rule whose only survivor carried no string `command`.
+- **Does not assert:** the Claude, OpenCode or Devin writers (the strip is shared and unit-covered for all four in `agent_hook_config`'s `mod tests`); the trust write, which needs a `codex app-server` the stub does not implement; that a repointed pin would actually have been detected by Codex.
+- **Platform coverage:** linux.
+
 ### Pane / agent lifecycle
 
 #### lifecycle/start
@@ -3816,9 +3823,9 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 
 ##### codex/trust/002 — Scoped trust selects only pinned-home, unmanaged, deck-owned hook entries (PRD #20 §4.3.1/§4.3.6).
 - **Layer:** L1/fast real-binary subprocess integration with a deterministic `codex app-server` JSON-RPC stand-in, exercised through both bare Codex and a launcher script.
-- **Agent:** synthetic Codex hooks/list response containing one eligible deck hook plus a foreign command, a deck command from a different home, a managed entry, and a user command that merely mentions `dot-agent-deck`.
-- **Asserts:** `[hooks.state]` contains only the eligible entry whose `sourcePath` is the pinned home's `hooks.json`, command ends in `hook --agent codex`, and `isManaged` is false; the global bypass never appears for either launch method.
-- **Does not assert:** byte-preserving config edits or untrust behavior (covered by `codex/trust/003`).
+- **Agent:** synthetic Codex hooks/list response containing one eligible deck hook plus a foreign command, a deck command from a different home, a managed entry, a user command that merely mentions `dot-agent-deck`, and (since #730) a crafted command that ends with the deck's exact `hook --agent codex` signature while naming a different executable.
+- **Asserts:** `[hooks.state]` contains only the eligible entry whose `sourcePath` is the pinned home's `hooks.json`, whose command is byte-exactly the one the install just wrote for the durable binary seeded in this fixture's `$HOME`, and whose `isManaged` is false; the global bypass never appears for either launch method.
+- **Does not assert:** byte-preserving config edits or untrust behavior (covered by `codex/trust/003`); the trust/untrust predicate asymmetry itself (covered by `codex/trust/004`).
 - **Platform coverage:** mac+linux.
 
 ##### codex/trust/003 — Scoped trust config edits preserve user bytes, remain idempotent, and untrust only deck keys (PRD #20 §4.3.2).
@@ -3827,6 +3834,13 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 - **Asserts:** trust appends exactly one hash-pinned deck table while preserving the existing config bytes verbatim; a second write creates no duplicate; Codex hook uninstall removes the deck key and retains the foreign key.
 - **Does not assert:** Codex's runtime trust-status interpretation (covered by the real-agent green-confirm scenario).
 - **Platform coverage:** mac+linux.
+
+##### codex/trust/004 — Only the exact installed deck command is eligible for a trust write, while untrust stays wider (issue #730).
+- **Layer:** L1/fast in-process call of `codex_hooks_manage::deck_owned_entries` over a hand-built listing.
+- **Agent:** none (synthetic `CodexHookEntry` values — the eligible deck command, a crafted look-alike ending in the same `hook --agent codex` signature but naming another executable, and a command that merely mentions `dot-agent-deck`).
+- **Asserts:** under `DeckCommandMatch::Exact` only the entry whose command is byte-exactly the deck's generated command is selected, so a crafted same-suffix command in the deck's own `hooks.json` gets no `trusted_hash`; under `DeckCommandMatch::Signature` — the revocation setting — both deck-signature entries are selected, so an uninstall does not orphan a sibling install's trust record.
+- **Does not assert:** that the wrapper actually writes the record (covered by `codex/trust/002`), or `config.toml` byte preservation (covered by `codex/trust/003`).
+- **Platform coverage:** mac+linux (unix-only test file).
 
 #### codex/spawn
 
@@ -3920,7 +3934,8 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 ##### codex/hooks/001 — A real launcher-script interactive Codex turn reports native prompt/tool detail and becomes Idle without process exit (PRD #20 W1, R20-013/R20-014, §4.3.7). [reel]
 - **Layer:** L2 PTY-attached (`TuiDeck`, reel-eligible); runtime-skipped unless `check_codex_available` verifies the binary, persisted auth, and a live model request.
 - **Agent:** real interactive Codex on the cheap test model, launched through a recorder script named `codex` ahead of PATH with isolated credentials and a fresh Codex home, workspace-write sandbox, no approvals, network-enabled sandbox configuration, and low reasoning effort; launch passes through the normal Wrapper strategy seam.
-- **Asserts:** the launcher handles both the deck's `app-server` trust probe and the interactive agent without receiving `--dangerously-bypass-hook-trust`; the fresh home trusts exactly the deck's ten scoped hook keys; those hooks emit a prompt-bearing Thinking event, shell ToolStart/ToolEnd events with sentinel command detail, and Stop-hook Idle; the dashboard visibly retains prompt/tool detail and shows Idle, the requested sentinel contains exact known content, and the Codex pane is still alive because the test never sends `/exit`.
+- **Asserts:** the launcher handles both the deck's `app-server` trust probe and the interactive agent without receiving `--dangerously-bypass-hook-trust`; the fresh home trusts exactly the deck's ten scoped hook keys; the prompt is typed only after Codex's own composer placeholder paints, and the Enter is confirmed to have been taken as a submit (the placeholder returns) before any hook assertion begins; those hooks emit a prompt-bearing Thinking event, shell ToolStart/ToolEnd events with sentinel command detail, and Stop-hook Idle; the dashboard visibly retains prompt/tool detail and shows Idle, the requested sentinel contains exact known content, and the Codex pane is still alive because the test never sends `/exit`.
+- **Readiness gate (issue #730).** Until 2026-09-12 the pre-typing gate was the model name on the grid, which is not a Codex signal: traced byte-for-byte through the input chain it matched 5.6 ms after the new-pane form closed, 225 ms *before* the `wrap` process hosting Codex had even forked. The prompt was therefore typed into a pane whose PTY was still in cooked mode, so the line discipline echoed it back (satisfying the prompt-visible wait) and `ICANON`/`ICRNL` fused the whole 192-byte line onto a single LF, erasing `ui::SUBMIT_DEBOUNCE`'s 150 ms gap; Codex read that as newline-in-input, no turn started, and — since its interactive hooks fire at turn start — nothing fired. Observed submission rate 1 in 5. The gate is now Codex's composer placeholder, the same boundary `state::NO_SIGNAL_READINESS_BUFFER` measured for OpenCode. The Enter is additionally retried until the composer visibly empties: with the gate in place the deck was traced delivering a clean standalone `\r` 150 ms after the last prompt byte and Codex still ignored it, and a real `codex` 0.149.0 driven directly on a pty submits at every gap from 20 ms up, so the residual loss is Codex's own post-composer initialisation rather than anything in the deck's input chain.
 - **Does not assert:** stdout JSONL classification (covered by `codex/wrap/001`) or exact model prose.
 - **Platform coverage:** mac+linux (real-agent tier is local-only).
 - **Cost note:** one minimal mini-model availability probe plus one short interactive shell-tool turn.
@@ -3944,6 +3959,20 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 - **Agent:** synthetic Codex installation environment.
 - **Asserts:** `dot-agent-deck hooks install --agent codex` exits successfully and creates `hooks.json` instead of reporting `No hook installer for agent Codex`.
 - **Does not assert:** uninstall scoping (covered by `codex/trust/003`) or dashboard rendering.
+- **Platform coverage:** mac+linux.
+
+##### codex/hooks/005 — The install CLI's trust line names which of the three trust outcomes occurred (issue #730 auditor S-C, Greptile P2 on PR #1029).
+- **Layer:** L1/fast real-binary subprocess integration with isolated homes and a deterministic Codex app-server stand-in.
+- **Agent:** synthetic Codex installation environment; the `hooks/list` response is the only variable.
+- **Asserts:** across three runs differing only in what the stand-in lists — the exact command the install wrote, a deck-signature command that is not it, and nothing — `hooks install --agent codex` prints one trust line per run and the three are pairwise distinct: the first reports a non-zero count, the second names the listed deck-signature entries and their count without borrowing the other zero's sentence, and the third says no **eligible** deck hook without claiming Codex listed deck-signature entries.
+- **Does not assert:** that the trust record is written to `config.toml` (covered by `codex/trust/002`–`003`), or the error arm where the trust step could not run at all (`codex/hooks/006`).
+- **Platform coverage:** mac+linux.
+
+##### codex/hooks/006 — Both the install and uninstall CLI arms report an unreachable trust step on stderr and still exit 0 (issue #1027 item 4).
+- **Layer:** L1/fast real-binary subprocess integration with isolated homes and a deterministic Codex app-server stand-in.
+- **Agent:** synthetic Codex installation environment, then a `PATH` with no `codex` on it at all so the trust step fails with `NotFound`.
+- **Asserts:** after a seeding install leaves exactly one scoped trust record, a re-install with no reachable `codex` exits 0, says on stderr that scoped hook trust could not be recorded, and prints no trust line on stdout; an uninstall under the same conditions exits 0, says on stderr that scoped hook trust could not be dropped, still removes every deck hook definition from `hooks.json`, and leaves the unreachable trust record behind — the orphan the warning names.
+- **Does not assert:** that the orphan record is ever collected (it is not today — issue #1027 item 1), or the three non-error trust outcomes (`codex/hooks/005`).
 - **Platform coverage:** mac+linux.
 
 #### codex/live

@@ -272,8 +272,52 @@ fn codex_install_resolved(binary_path: Result<String, String>) -> Result<(), Str
         .ok_or_else(|| "no Codex home resolves (CODEX_HOME and HOME are both unset)".to_string())?;
     crate::codex_hooks_manage::install_to(&home, &binary_path).map_err(|e| e.to_string())?;
     let cwd = std::env::current_dir().unwrap_or_else(|_| home.clone());
-    if let Err(e) = crate::codex_hooks_manage::trust_deck_hooks_in(&home, &cwd) {
-        tracing::warn!("codex hooks install: could not record scoped hook trust: {e}");
+    // Trust exactly the command the install above wrote, for the binary path it
+    // validated — never merely "something ending in the deck's verb" (#730).
+    // The outcome is reported rather than discarded: a silent zero here is how a
+    // Codex that stopped echoing our command byte-for-byte would look, and
+    // `hooks install` used to exit 0 saying nothing about trust either way.
+    //
+    // **Each branch prints only what it knows** (issue #730, auditor S-C). This
+    // one line is the whole of what a user sees about trust, so it may not name
+    // a cause the code has not established: the old text said "Codex reported no
+    // deck hook to trust" on *both* zeros, which is false on the one where Codex
+    // reported one and `Exact` did not match it — the very case
+    // `codex_hooks_manage`'s warn exists to surface. `TrustOutcome` carries that
+    // distinction out precisely so this does not have to guess.
+    //
+    // The `NothingListed` arm says "no ELIGIBLE deck hook" for the same reason
+    // (Greptile P2 on PR #1029). `deck_owned_entries` rejects a deck-signature
+    // entry that is `isManaged` or whose `source_path` is not this home's own
+    // `hooks.json`, and a listing containing only those lands here — so "Codex
+    // reported no deck hook" would again assert a cause this branch cannot know.
+    // Which of the three it was is not worth a fourth `TrustOutcome` variant;
+    // not claiming the wrong one is.
+    use crate::codex_hooks_manage::TrustOutcome;
+    match crate::codex_hooks_manage::trust_deck_hooks_in(&home, &cwd, &binary_path) {
+        Ok(TrustOutcome::NothingListed) => println!(
+            "Trusted hooks: none (Codex reported no eligible deck hook to trust; events fall \
+             back to stdout classification)"
+        ),
+        Ok(TrustOutcome::Unrecognised { listed }) => println!(
+            "Trusted hooks: none (Codex reported {listed} deck-signature {}, but none carries \
+             the command this install just wrote, so nothing could be trusted; events fall back \
+             to stdout classification. Set DOT_AGENT_DECK_LOG to log the expected command.)",
+            if listed == 1 { "entry" } else { "entries" }
+        ),
+        Ok(TrustOutcome::Trusted(count)) => println!("Trusted hooks: {count}"),
+        // Say it on stderr as well as in the log. This is the one arm that
+        // printed nothing at all, so the user got no trust line whatsoever and
+        // exit 0 — and the log half needs `DOT_AGENT_DECK_LOG` to have been set
+        // before the run. The definitions are written either way, which is why
+        // this is not a failure.
+        Err(e) => {
+            tracing::warn!("codex hooks install: could not record scoped hook trust: {e}");
+            eprintln!(
+                "Warning: hook definitions were installed, but scoped hook trust could not be \
+                 recorded ({e}); Codex events fall back to stdout classification"
+            );
+        }
     }
     Ok(())
 }
@@ -283,8 +327,29 @@ fn codex_install_resolved(binary_path: Result<String, String>) -> Result<(), Str
 fn codex_uninstall() -> Result<(), String> {
     let home = crate::codex_hooks_manage::active_codex_home()
         .ok_or_else(|| "no Codex home resolves (CODEX_HOME and HOME are both unset)".to_string())?;
+    // The same two channels, and the same exit code, as the install arm above
+    // (issue #1027, item 4). Fixing one of two identical arms and leaving the
+    // other is not scoping: this arm reported through `tracing::warn!` and
+    // nothing else, so on a machine without `DOT_AGENT_DECK_LOG` set the whole
+    // of what the user saw was exit 0 and silence — while the command went on to
+    // delete the definitions regardless. That leaves `[hooks.state]` rows whose
+    // definitions are gone, which nothing in the deck currently collects.
+    //
+    // Not a failure, for the same reason the install arm is not: the primary
+    // operation is the DEFINITIONS, and removing them still succeeds (or reports
+    // its own error below). So this warns and the command continues, exiting 0
+    // on an otherwise clean uninstall.
+    //
+    // Worded in the present tense on purpose — at this point the removal has not
+    // happened yet and `uninstall_from` may still fail, so the message must not
+    // claim it succeeded.
     if let Err(e) = crate::codex_hooks_manage::untrust_deck_hooks_in(&home) {
         tracing::warn!("codex hooks uninstall: could not drop scoped hook trust: {e}");
+        eprintln!(
+            "Warning: scoped hook trust could not be dropped ({e}); removal of the hook \
+             definitions continues, so stale [hooks.state] records may be left behind in \
+             Codex's config.toml"
+        );
     }
     crate::codex_hooks_manage::uninstall_from(&home).map_err(|e| e.to_string())
 }

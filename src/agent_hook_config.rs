@@ -26,6 +26,8 @@
 use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 
+use serde_json::Value;
+
 /// Which shell will actually EXECUTE the hook command line the deck writes, and
 /// therefore which dialect [`build_command`] quotes for. It is a property of
 /// the **consuming agent**, not of the machine the deck was compiled on (issue
@@ -43,11 +45,19 @@ pub(crate) enum HookShell {
     /// **Codex.** Its hooks engine
     /// (`codex-rs/hooks/src/engine/command_runner.rs`, read at 0.149.0) hands
     /// the whole command string to `%COMSPEC%` else `cmd.exe` with `/C` on
-    /// Windows, and to `$SHELL` else `/bin/sh` with `-lc` otherwise. The deck
-    /// writes no per-entry `shell` override, so that default is what runs every
-    /// deck hook and the interpreter really does follow the host — and
-    /// `codex_home` honours `$CODEX_HOME` on every platform, which is what
-    /// makes the Windows arm reachable rather than theoretical.
+    /// Windows, and to `$SHELL` else `/bin/sh` with `-lc` otherwise. **The deck
+    /// writes no per-entry `shell` override**, so that default is what runs
+    /// every deck hook and the interpreter really does follow the host — and
+    /// there would be nothing to gain by writing one: measured on 0.149.0, a
+    /// handler's `shell`, `cwd`, `env` and `timeoutSec` are silently dropped and
+    /// do not even reach `currentHash`. (The load-bearing claim is the first
+    /// one, about this project's own writer, which [`build_command`] below makes
+    /// verifiable here. The measurement is four field names from one version of
+    /// somebody else's schema, and is kept as corroboration only — read as a
+    /// claim about Codex's whole schema it would be an absolute standing on far
+    /// less than it needs, CLAUDE.md rule 17.) `codex_home` honours
+    /// `$CODEX_HOME` on every platform, which is what makes the Windows arm
+    /// reachable rather than theoretical.
     Native,
     /// A POSIX shell, whatever the host is.
     ///
@@ -427,9 +437,343 @@ fn temp_path(dir: &Path, name: &str) -> PathBuf {
     ))
 }
 
+// ---------------------------------------------------------------------------
+// Which hook commands the deck owns, and at what granularity they are removed
+// ---------------------------------------------------------------------------
+//
+// [`crate::hooks_manage`] (Claude) worked this out first, over issues #535,
+// #536, #733 and PRD #381, and then kept it to itself: the Codex and Devin
+// adapters each carried a one-line `ends_with(SUFFIX)` predicate and a
+// **whole-rule** `retain` on top of it. Issue #730 is the two defects that
+// follow from the difference — a user's sibling handler sharing a rule object
+// with a deck command is deleted along with it, and a deck rule naming a
+// different but perfectly valid install is repointed on every launch.
+//
+// These are the parts all three adapters need, parameterized by the caller's
+// own `HOOK_COMMAND_SUFFIX` so the three predicates cannot drift apart again.
+// What stays per-adapter is what genuinely differs: Claude's LEGACY
+// (`<path> hook`, no `--agent`) rule shape, which Codex and Devin never wrote
+// and must not start recognising, and which hook events each installs.
+
+/// Parse `command` as `<executable> <suffix>` — the shape
+/// [`build_command`] produces — recovering the executable by parsing from the
+/// RIGHT (`strip_suffix`), not by counting whitespace-split tokens, so a quoted
+/// (or historically unquoted) executable path containing spaces still
+/// round-trips. Returns `None` for a command that is not deck-owned at all, and
+/// for one that is nothing *but* the suffix: `hook --agent codex` names some
+/// program called `hook` on the agent's `$PATH`, which is not a command this
+/// project has ever written.
+///
+/// The returned token may still be shell-quoted; pass it through
+/// [`unquote_if_needed`] before comparing it as a path.
+pub(crate) fn command_executable<'a>(command: &'a str, suffix: &str) -> Option<&'a str> {
+    let exe = command.trim_end().strip_suffix(suffix)?;
+    let exe = exe.strip_suffix(' ')?;
+    if exe.is_empty() { None } else { Some(exe) }
+}
+
+/// Undo the quoting [`build_command`] applies: strip a single- or
+/// double-quoted wrapper and unescape it back to the raw path, or return `exe`
+/// unchanged if it was never quoted. Tries BOTH quoting forms regardless of
+/// platform — not just the one this platform's writer produces — so a config
+/// written on one platform and read on another is not stranded.
+pub(crate) fn unquote_if_needed(exe: &str) -> std::borrow::Cow<'_, str> {
+    if let Some(inner) = exe.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')) {
+        return std::borrow::Cow::Owned(inner.replace(r"'\''", "'"));
+    }
+    if let Some(inner) = exe.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
+        return std::borrow::Cow::Owned(inner.replace("\\\"", "\""));
+    }
+    std::borrow::Cow::Borrowed(exe)
+}
+
+/// Whether two executable FILE NAMES name the same binary, judged by the host
+/// platform's own conventions rather than by byte equality.
+///
+/// **Unix: byte equality, unchanged.** [`std::env::consts::EXE_SUFFIX`] is
+/// empty, so [`strip_suffix_ignoring_ascii_case`] is a literal no-op and the
+/// comparison stays exact and case-sensitive. `foo.exe` on Unix is a genuinely
+/// different file name from `foo` and this must keep saying so — which is why
+/// the suffix is taken from `EXE_SUFFIX` and never hardcoded as `".exe"`.
+///
+/// **Windows: the suffix and the case are not part of a program's identity.**
+/// `dot-agent-deck` and `dot-agent-deck.exe` are the same binary — that is
+/// precisely what `PATHEXT` resolution means — and the filesystem is
+/// case-insensitive, so `Dot-Agent-Deck.EXE` is that same binary again.
+///
+/// PR #733's `build-windows` run is what proved both call sites needed it:
+/// `durable_binary_path` always resolves a name carrying `EXE_SUFFIX` while
+/// `DEFAULT_BINARY_NAME` never does, so comparing raw basenames could not
+/// recognise a legacy Windows pin as ours to repair and issue #536 stayed open
+/// on that platform.
+pub(crate) fn binary_names_match(a: &str, b: &str) -> bool {
+    binary_names_match_under(a, b, std::env::consts::EXE_SUFFIX, cfg!(windows))
+}
+
+/// [`binary_names_match`] with the host's two conventions injected instead of
+/// read from the target: the executable suffix, and whether file names are
+/// case-insensitive.
+///
+/// Split out **so the arithmetic is testable on any platform**, which is not a
+/// stylistic preference here. PR #733's defect was Windows-only, could not be
+/// reproduced on the machine that had to fix it (`aws-lc-sys` does not
+/// cross-compile), and a `cfg!(windows)` branch covered by no test that runs
+/// where its author works is precisely how the first one shipped green.
+/// Passing `("", false)` reproduces every Unix exactly — an empty suffix makes
+/// [`strip_suffix_ignoring_ascii_case`] the identity, leaving plain `==`.
+pub(crate) fn binary_names_match_under(
+    a: &str,
+    b: &str,
+    exe_suffix: &str,
+    case_insensitive: bool,
+) -> bool {
+    let a = strip_suffix_ignoring_ascii_case(a, exe_suffix);
+    let b = strip_suffix_ignoring_ascii_case(b, exe_suffix);
+    if case_insensitive {
+        a.eq_ignore_ascii_case(b)
+    } else {
+        a == b
+    }
+}
+
+/// `name` without one trailing `suffix`, matched case-insensitively because
+/// Windows spells its executable suffix both `.exe` and `.EXE`. Returns `name`
+/// untouched when `suffix` is empty (every Unix), when it is absent, and when
+/// the name is nothing BUT the suffix — a file called `.exe` is a name in its
+/// own right, not an empty one.
+pub(crate) fn strip_suffix_ignoring_ascii_case<'a>(name: &'a str, suffix: &str) -> &'a str {
+    if suffix.is_empty() {
+        return name;
+    }
+    match name.len().checked_sub(suffix.len()) {
+        // `is_char_boundary` is load-bearing, not defensive: a basename ending
+        // in a multi-byte character can put `cut` inside one, and slicing
+        // there panics.
+        Some(cut)
+            if cut > 0
+                && name.is_char_boundary(cut)
+                && name[cut..].eq_ignore_ascii_case(suffix) =>
+        {
+            &name[..cut]
+        }
+        _ => name,
+    }
+}
+
+/// Whether `existing` and `installing` (both already unquoted) name the SAME
+/// binary, so a rule for `existing` should be replaced rather than left
+/// alongside a fresh rule for `installing`. Symlinks are resolved first — the
+/// real-world case this exists for: a `dot-agent-deck` symlink pointing at a
+/// renamed `worker-agent-deck` collapses to one rule. Every path here can fail
+/// to resolve (most fixtures are never written to disk), so resolution failure
+/// falls back to a literal string comparison; this never panics or unwraps on
+/// it.
+pub(crate) fn executables_match(existing: &str, installing: &str) -> bool {
+    if let (Ok(existing_real), Ok(installing_real)) = (
+        Path::new(existing).canonicalize(),
+        Path::new(installing).canonicalize(),
+    ) {
+        return existing_real == installing_real;
+    }
+    existing == installing
+}
+
+/// Whether `exe` — the executable a deck-owned command names, already unquoted
+/// — is a STALE SIBLING of the binary currently installing: it shares that
+/// binary's own basename ([`binary_names_match`], so the host's
+/// executable-suffix and case conventions decide what "same basename" means)
+/// and its pin is not one the deck would write
+/// ([`crate::platform::paths::pin_is_repairable`]).
+///
+/// This is the repair gate PRD #381 Open Question 3 settles on, and the whole of
+/// its conservatism lives in those two conjuncts. #381 spelt it "repair only
+/// when the target is **positively missing**", which was accurate for the
+/// `try_exists`-only check of the day; [`crate::platform::paths::pin_is_repairable`]
+/// has since widened it to the whole "is this a pin the deck would write"
+/// question, so a bare or relative pin, a non-executable file and a
+/// `target/{debug,release}` path are replaceable too — two of them while naming
+/// a file that exists. The conservatism is unchanged in direction, but do not
+/// read "missing" as the boundary.
+///
+/// **Nor "positively known" as the standard**, which is what this conjunct said
+/// until issue #1027 (item 6) checked it against those four true-cases. Only one
+/// of them — an absolute path the OS answers `Ok(false)` for — is a positive
+/// determination about the file. A bare or relative pin is judged with no
+/// filesystem access at all, and is replaceable because it is *cwd-dependent*,
+/// not because it fails to run: #536 is about such a pin running, through the
+/// agent's `$PATH`, as a binary nobody chose. A live `target/{debug,release}`
+/// path works this minute and is replaceable for not being durable. The claim
+/// this makes is "not a pin the deck would write", and that is the one it can
+/// carry.
+///
+/// The basename half is what keeps a deck rule for a genuinely
+/// *different-looking* binary out of it — most hook fixtures name fictional
+/// paths that were never on disk, and they must not be swept up just because
+/// they do not exist. The `pin_is_repairable` half is what keeps a
+/// working binary behind an unmounted volume, or one this process cannot
+/// `stat`, out of it: a stat error on a well-formed absolute pin means "leave
+/// alone", because deleting a working user's hook is worse than leaving a stale
+/// rule.
+///
+/// Callers must have established deck ownership already — pass only the
+/// executable of a command [`command_executable`] (or an adapter's legacy
+/// equivalent) claimed. So this never sees a command that fails the suffix
+/// test, which is what keeps an ordinary user hook out of it.
+///
+/// **That is the narrow claim, and the wide one would be false.** Ownership
+/// upstream is the *suffix*, and the suffix is a convention, not a capability:
+/// a user-authored command that deliberately ends in `hook --agent codex` is
+/// indistinguishable from a deck entry under it — which is the whole premise of
+/// issue #730. Such a command, under this binary's own basename, with a pin the
+/// OS positively reports missing, IS pruned here. The two conjuncts above are
+/// what keep that case rare rather than impossible; nothing at this layer makes
+/// it impossible.
+pub(crate) fn pin_is_dead_sibling(exe: &str, binary_path: &str) -> bool {
+    let Some(installing) = Path::new(binary_path)
+        .file_name()
+        .and_then(|name| name.to_str())
+    else {
+        // No basename to compare against (an empty or `..`-terminated
+        // installing path, or a non-UTF-8 one). Fail safe: prune nothing.
+        return false;
+    };
+    Path::new(exe)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|existing| binary_names_match(existing, installing))
+        && crate::platform::paths::pin_is_repairable(exe)
+}
+
+/// Every command string a rule carries, from either JSON shape: the current
+/// nested `{"hooks": [{"command": ...}]}` or the legacy flat
+/// `{"command": ...}`.
+///
+/// **Test-only since PR #1029, and the gate is a deliberate speed bump rather
+/// than tidying.** Its one production caller was [`strip_deck_commands`]'s
+/// emptiness check, and that was the P1: "does this rule still carry a COMMAND"
+/// is a narrower question than "does it still carry a HANDLER", and answering
+/// the first deleted user handlers that answer only the second. Every remaining
+/// caller is an assertion, where reading the commands back IS the question. If a
+/// production path ever needs this, un-gating it is the moment to check which of
+/// the two questions is actually being asked — see [`rule_retains_a_handler`].
+#[cfg(test)]
+pub(crate) fn rule_commands(rule: &Value) -> impl Iterator<Item = &str> {
+    let nested = rule
+        .get("hooks")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|hook| hook.get("command").and_then(Value::as_str));
+    let flat = rule.get("command").and_then(Value::as_str).into_iter();
+    nested.chain(flat)
+}
+
+/// Whether a rule object still carries a HANDLER of any kind — the emptiness
+/// question [`strip_deck_commands`] drops a rule on, asked AFTER the strip.
+///
+/// Deliberately not `rule_commands(rule).next().is_some()`, which is what the
+/// check was until Greptile found the gap on PR #1029. `rule_commands` yields
+/// only handlers carrying a **string** `command`, so a sibling handler with no
+/// `command` key, or with a non-string one, survives the `retain` in
+/// [`strip_deck_commands`] and is then invisible to the emptiness test — and the
+/// rule was dropped, taking that handler and the user's `matcher` with it. Codex
+/// accepts such handler objects (`validate_structure` there requires only that
+/// each event VALUE be an array; it says nothing about the objects inside one),
+/// so this was issue #730's own harm reached through a narrower door, and it
+/// applied to all four adapters because this helper is shared.
+///
+/// So the question here is "is anything left?", not "is a command left?":
+///
+/// - a `hooks` value that is a non-empty array means a handler survived,
+///   whatever shape that handler is;
+/// - a `hooks` value that is not an array at all is something this module does
+///   not understand, so it counts as content rather than as emptiness;
+/// - a surviving `command` key of ANY type means the legacy flat rule still
+///   carries one — [`strip_deck_commands`] removes that key only when its value
+///   is a string it claimed, so whatever is still there is not the deck's.
+///
+/// Every arm errs toward keeping, which is the direction this whole helper is
+/// written in: never delete what we did not write.
+fn rule_retains_a_handler(rule: &Value) -> bool {
+    rule.get("hooks")
+        .is_some_and(|hooks| hooks.as_array().is_none_or(|list| !list.is_empty()))
+        || rule.get("command").is_some()
+}
+
+/// Remove every command matching `is_target` from `rules`, dropping a rule
+/// object only once it carries no handler at all — the fix for issue #535
+/// (Claude) and, for the Codex and Devin adapters, for issue #730.
+///
+/// A rule's `hooks` array is a LIST of commands sharing one matcher, so a user
+/// who put their own hook and the deck's in the same rule object is doing a
+/// normal thing. Removal used to be a `retain` over whole rules keyed on an
+/// `any()` across that list, so one deck command anywhere in a rule deleted the
+/// user's commands with it — measured in #535, where a user's
+/// `/usr/local/bin/my-critical-audit.sh` disappeared on `hooks uninstall` and
+/// nothing said so. Install has the identical granularity and is the more
+/// frequent path, since every adapter's auto-install runs unattended at
+/// startup.
+///
+/// Two deliberate conservatisms, both in the "never delete what we did not
+/// write" direction:
+///
+/// - a rule NOTHING matched in is returned untouched, so an already-empty or
+///   command-less rule object is never tidied away as a side effect;
+/// - a rule is dropped only when [`rule_retains_a_handler`] reports nothing
+///   left in it at all — not merely no *command*, which is a narrower question
+///   that used to delete a user's command-less handler along with their
+///   `matcher`.
+///
+/// Returns the number of individual commands removed.
+pub(crate) fn strip_deck_commands(
+    rules: &mut Vec<Value>,
+    mut is_target: impl FnMut(&str) -> bool,
+) -> usize {
+    let mut removed = 0usize;
+    rules.retain_mut(|rule| {
+        let before = removed;
+
+        // Current shape: `{"hooks": [{"command": …}, …]}` — drop just the
+        // matching command objects and leave the rest of the array, and the
+        // rule's own `matcher`, exactly as the user wrote them.
+        if let Some(hooks) = rule.get_mut("hooks").and_then(Value::as_array_mut) {
+            let len = hooks.len();
+            hooks.retain(|hook| {
+                !hook
+                    .get("command")
+                    .and_then(Value::as_str)
+                    .is_some_and(&mut is_target)
+            });
+            removed += len - hooks.len();
+        }
+
+        // Legacy flat shape: `{"command": …}` — the command IS the rule, so
+        // there is nothing smaller to remove. Take the key out and let the
+        // nothing-left check below decide the rule's fate, rather than assuming
+        // it carries nothing else.
+        if rule
+            .get("command")
+            .and_then(Value::as_str)
+            .is_some_and(&mut is_target)
+        {
+            if let Some(obj) = rule.as_object_mut() {
+                obj.remove("command");
+            }
+            removed += 1;
+        }
+
+        if removed == before {
+            return true;
+        }
+        rule_retains_a_handler(rule)
+    });
+    removed
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn build_command_appends_the_agent_suffix_and_quotes_only_when_needed() {
@@ -919,6 +1263,357 @@ mod tests {
                 & 0o777,
             0o600,
             "a fresh backup must be owner-only"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // The shared ownership predicates (issue #730).
+    //
+    // These gate a privilege GRANT for Codex (`trust_deck_hooks_in` builds on
+    // `command_executable`) and DELETION for all four adapters, so they are
+    // tested here directly rather than only through whichever adapter happens
+    // to exercise them. A regression then localises to this module instead of
+    // surfacing as a puzzling failure in one adapter's suite.
+    // ---------------------------------------------------------------------
+
+    const CODEX: &str = "hook --agent codex";
+    const DEVIN: &str = "hook --agent devin";
+    const CLAUDE: &str = "hook --agent claude";
+
+    /// The suffix is a PARAMETER, and it is the whole of ownership at this
+    /// layer. One adapter must not claim another's command — that is what keeps
+    /// `hooks uninstall --agent codex` from deleting the Claude adapter's rules
+    /// out of a file both happen to write.
+    #[test]
+    fn command_executable_claims_only_its_own_agents_suffix() {
+        assert_eq!(
+            command_executable("/abs/dot-agent-deck hook --agent codex", CODEX),
+            Some("/abs/dot-agent-deck")
+        );
+        assert_eq!(
+            command_executable("/abs/dot-agent-deck hook --agent codex", CLAUDE),
+            None,
+            "a Claude suffix must not claim a Codex command"
+        );
+        assert_eq!(
+            command_executable("/abs/dot-agent-deck hook --agent claude", CODEX),
+            None,
+            "a Codex suffix must not claim a Claude command"
+        );
+        assert_eq!(
+            command_executable("/abs/dot-agent-deck hook --agent devin", DEVIN),
+            Some("/abs/dot-agent-deck")
+        );
+        assert_eq!(
+            command_executable("/abs/dot-agent-deck hook --agent devin", CODEX),
+            None,
+            "`--agent devin` and `--agent codex` are different agents"
+        );
+    }
+
+    /// A command that is NOTHING BUT the suffix names some program called
+    /// `hook` on the agent's own `$PATH`. Neither of this project's two command
+    /// builders can produce one: [`build_command`] (the Codex, Devin and
+    /// OpenCode installers) and `hooks_manage::make_rule` (Claude's) both
+    /// prefix the executable token, and the quoters behind them both quote the
+    /// empty string rather than emitting nothing. So claiming it would be
+    /// claiming a stranger's command — and at the Codex trust seam, handing it
+    /// a grant. (That is the checkable form of what this used to say, "this
+    /// project has never written one", which is a claim over the whole history
+    /// of the repository and not one anybody can verify.)
+    #[test]
+    fn command_executable_rejects_a_command_that_is_only_the_suffix() {
+        assert_eq!(command_executable("hook --agent codex", CODEX), None);
+        assert_eq!(command_executable(" hook --agent codex", CODEX), None);
+        assert_eq!(command_executable("hook --agent codex   ", CODEX), None);
+    }
+
+    /// Trailing whitespace is trimmed before the suffix test, so a config
+    /// hand-edited into `"… hook --agent codex "` is still recognised as the
+    /// deck's own on the way back in. Note the deliberate asymmetry with the
+    /// Codex TRUST predicate, which compares byte-exactly and does NOT trim:
+    /// Codex 0.149.0 echoes a trailing space verbatim and hashes the trimmed
+    /// and untrimmed forms differently, so an entry differing only by
+    /// whitespace is a genuinely different definition, not a spelling of ours.
+    /// Liberal for a mutation, exact for a grant, on purpose (issue #730).
+    #[test]
+    fn command_executable_trims_trailing_whitespace_but_not_leading() {
+        assert_eq!(
+            command_executable("/abs/dot-agent-deck hook --agent codex  \t\n", CODEX),
+            Some("/abs/dot-agent-deck")
+        );
+        assert_eq!(
+            command_executable("  /abs/dot-agent-deck hook --agent codex", CODEX),
+            Some("  /abs/dot-agent-deck"),
+            "leading whitespace belongs to the executable token and is left for \
+             `unquote_if_needed` and the path comparison to deal with"
+        );
+        assert_eq!(
+            command_executable("/abs/dot-agent-deckhook --agent codex", CODEX),
+            None,
+            "the space before the suffix is required — no substring match"
+        );
+    }
+
+    /// Both JSON shapes an agent config can carry, so `strip_deck_commands`
+    /// sees every command a rule actually holds.
+    #[test]
+    fn rule_commands_reads_the_nested_and_the_legacy_flat_shape() {
+        let nested = json!({
+            "matcher": "Bash",
+            "hooks": [ { "command": "a" }, { "command": "b" }, { "type": "command" } ]
+        });
+        assert_eq!(rule_commands(&nested).collect::<Vec<_>>(), vec!["a", "b"]);
+
+        let flat = json!({ "command": "c" });
+        assert_eq!(rule_commands(&flat).collect::<Vec<_>>(), vec!["c"]);
+
+        let both = json!({ "command": "c", "hooks": [ { "command": "a" } ] });
+        assert_eq!(rule_commands(&both).collect::<Vec<_>>(), vec!["a", "c"]);
+
+        assert_eq!(rule_commands(&json!({})).count(), 0);
+        assert_eq!(rule_commands(&json!("not an object")).count(), 0);
+    }
+
+    /// Issue #535/#730: a rule is a list of commands sharing one matcher, so
+    /// removal is per COMMAND. The user's sibling handler survives, and so does
+    /// the matcher they wrote it under.
+    #[test]
+    fn strip_deck_commands_keeps_a_sibling_handler_and_its_matcher() {
+        let mut rules = vec![json!({
+            "matcher": "Bash",
+            "hooks": [
+                { "type": "command", "command": "/abs/dot-agent-deck hook --agent codex" },
+                { "type": "command", "command": "/usr/local/bin/my-critical-audit.sh" }
+            ]
+        })];
+
+        let removed =
+            strip_deck_commands(&mut rules, |cmd| command_executable(cmd, CODEX).is_some());
+
+        assert_eq!(removed, 1);
+        assert_eq!(rules.len(), 1, "the rule object must survive: {rules:?}");
+        assert_eq!(rules[0]["matcher"], json!("Bash"));
+        assert_eq!(
+            rule_commands(&rules[0]).collect::<Vec<_>>(),
+            vec!["/usr/local/bin/my-critical-audit.sh"]
+        );
+    }
+
+    /// A rule is dropped only once NOTHING is left in it, in either shape — and
+    /// a rule the predicate matched nothing in is returned untouched, so an
+    /// already-empty or command-less rule object is never tidied away as a side
+    /// effect of installing.
+    #[test]
+    fn strip_deck_commands_drops_a_rule_only_when_no_command_is_left() {
+        let mut rules = vec![
+            json!({ "hooks": [ { "command": "/abs/dot-agent-deck hook --agent codex" } ] }),
+            json!({ "matcher": "Bash", "hooks": [] }),
+            json!({}),
+        ];
+
+        let removed =
+            strip_deck_commands(&mut rules, |cmd| command_executable(cmd, CODEX).is_some());
+
+        assert_eq!(removed, 1);
+        assert_eq!(
+            rules,
+            vec![json!({ "matcher": "Bash", "hooks": [] }), json!({})],
+            "only the emptied rule goes; untouched rules stay as the user wrote them"
+        );
+    }
+
+    /// Greptile P1 on PR #1029: the emptiness test used to be "does any COMMAND
+    /// remain", which is narrower than "does any HANDLER remain". A handler
+    /// object with no string `command` survives the per-command `retain` but was
+    /// invisible to that test, so the rule was dropped — deleting the user's
+    /// handler and the `matcher` they wrote it under, which is exactly the harm
+    /// #535 and #730 exist to prevent, one door along. The helper is shared, so
+    /// this covers all four adapters.
+    ///
+    /// Both shapes a command-less handler can take are here: no `command` key at
+    /// all, and a `command` whose value is not a string.
+    #[test]
+    fn strip_deck_commands_keeps_a_handler_that_carries_no_string_command() {
+        let mut rules = vec![json!({
+            "matcher": "Bash",
+            "hooks": [
+                { "type": "command", "command": "/abs/dot-agent-deck hook --agent codex" },
+                { "type": "audit", "script": "/usr/local/bin/my-critical-audit.sh" },
+                { "type": "command", "command": { "argv": ["/usr/local/bin/other"] } }
+            ]
+        })];
+
+        let removed =
+            strip_deck_commands(&mut rules, |cmd| command_executable(cmd, CODEX).is_some());
+
+        assert_eq!(removed, 1, "only the deck's own command is removed");
+        assert_eq!(
+            rules.len(),
+            1,
+            "the rule object must survive on its command-less handlers alone: {rules:?}"
+        );
+        assert_eq!(
+            rules[0]["matcher"],
+            json!("Bash"),
+            "the user's matcher survives with it"
+        );
+        assert_eq!(
+            rules[0]["hooks"],
+            json!([
+                { "type": "audit", "script": "/usr/local/bin/my-critical-audit.sh" },
+                { "type": "command", "command": { "argv": ["/usr/local/bin/other"] } }
+            ]),
+            "both command-less handlers survive byte-for-byte"
+        );
+        assert_eq!(
+            rule_commands(&rules[0]).count(),
+            0,
+            "and none of them is a command — which is why the old \
+             `rule_commands(rule).next().is_some()` test dropped this rule"
+        );
+    }
+
+    /// The legacy FLAT shape: the command IS the rule, so there is nothing
+    /// smaller to remove — but the key is taken out and the rule kept whenever
+    /// it still carries a command in the other shape, rather than the whole
+    /// object being assumed to hold nothing else.
+    #[test]
+    fn strip_deck_commands_handles_the_legacy_flat_shape() {
+        let mut lone = vec![json!({ "command": "/abs/dot-agent-deck hook --agent codex" })];
+        assert_eq!(
+            strip_deck_commands(&mut lone, |cmd| command_executable(cmd, CODEX).is_some()),
+            1
+        );
+        assert!(
+            lone.is_empty(),
+            "a flat rule with nothing left goes: {lone:?}"
+        );
+
+        let mut mixed = vec![json!({
+            "command": "/abs/dot-agent-deck hook --agent codex",
+            "hooks": [ { "command": "/usr/local/bin/my-critical-audit.sh" } ]
+        })];
+        assert_eq!(
+            strip_deck_commands(&mut mixed, |cmd| command_executable(cmd, CODEX).is_some()),
+            1
+        );
+        assert_eq!(mixed.len(), 1, "a command survives in the nested shape");
+        assert!(mixed[0].get("command").is_none(), "{mixed:?}");
+        assert_eq!(
+            rule_commands(&mixed[0]).collect::<Vec<_>>(),
+            vec!["/usr/local/bin/my-critical-audit.sh"]
+        );
+    }
+
+    /// Two spellings of one binary are the same binary — the real case being a
+    /// `dot-agent-deck` symlink pointing at a renamed build, which must collapse
+    /// to one rule rather than accumulate a second every launch.
+    #[cfg(unix)]
+    #[test]
+    fn executables_match_resolves_symlinks_and_falls_back_to_string_equality() {
+        let dir = crate::test_temp::tempdir().expect("exe tempdir");
+        let real = dir.path().join("worker-agent-deck");
+        std::fs::write(&real, b"#!/bin/sh\nexit 0\n").expect("seed binary");
+        let link = dir.path().join("dot-agent-deck");
+        std::os::unix::fs::symlink(&real, &link).expect("plant symlink");
+
+        assert!(executables_match(
+            link.to_str().expect("utf-8"),
+            real.to_str().expect("utf-8")
+        ));
+        assert!(
+            executables_match("/nowhere/dot-agent-deck", "/nowhere/dot-agent-deck"),
+            "neither path resolves, so the comparison falls back to the strings"
+        );
+        assert!(!executables_match(
+            "/nowhere/dot-agent-deck",
+            "/elsewhere/dot-agent-deck"
+        ));
+    }
+
+    /// Fail-safe branch 1: the INSTALLING path has no basename to compare
+    /// against (empty, `..`-terminated, or non-UTF-8). Prune nothing.
+    #[test]
+    fn pin_is_dead_sibling_prunes_nothing_without_a_basename_to_compare() {
+        assert!(!pin_is_dead_sibling("/nowhere/dot-agent-deck", ""));
+        assert!(!pin_is_dead_sibling("/nowhere/dot-agent-deck", "/opt/.."));
+        assert!(
+            !pin_is_dead_sibling("/opt/..", "/abs/dot-agent-deck"),
+            "a pin with no basename is not a sibling of anything either"
+        );
+    }
+
+    /// Fail-safe branch 2 (the basename half): a deck pin naming a
+    /// DIFFERENT-looking binary is left alone however absent it is. Most hook
+    /// fixtures name fictional paths that were never on disk, and they must not
+    /// be swept up just for not existing.
+    #[test]
+    fn pin_is_dead_sibling_needs_the_installing_binarys_own_basename() {
+        assert!(!pin_is_dead_sibling(
+            "/nowhere/some-other-tool",
+            "/abs/dot-agent-deck"
+        ));
+    }
+
+    /// Branch 3 — the one of this function's four branches that prunes, here
+    /// exercised with a pin the OS positively reports missing, under this
+    /// binary's own basename: the pruned-worktree residue PRD #381's repair gate
+    /// exists for.
+    ///
+    /// "The branch that prunes" is about `pin_is_dead_sibling`, not about the
+    /// pruned set: [`crate::platform::paths::pin_is_repairable`] behind it
+    /// returns `true` on four conditions, and a positively-absent path is only
+    /// one of them — a bare or relative pin, a non-executable file and a
+    /// `target/{debug,release}` path are equally replaceable, two of them while
+    /// naming a file that exists. Those are covered by that function's own tests
+    /// in `platform::paths`; this one is about the basename conjunct.
+    #[test]
+    fn pin_is_dead_sibling_repairs_a_positively_absent_sibling() {
+        let dir = crate::test_temp::tempdir().expect("pin tempdir");
+        let gone = dir.path().join("pruned").join("dot-agent-deck");
+        assert!(!gone.exists(), "the dead path must genuinely not exist");
+        assert!(pin_is_dead_sibling(
+            gone.to_str().expect("utf-8"),
+            "/abs/dot-agent-deck"
+        ));
+    }
+
+    /// Fail-safe branch 4: a pin this process cannot STAT — permission denied,
+    /// an unmounted or stale mount — is well-formed and might well be a working
+    /// binary, so it is left alone. Deleting a working user's hook is worse than
+    /// leaving a stale rule (PRD #381 Open Question 3).
+    #[cfg(unix)]
+    #[test]
+    fn pin_is_dead_sibling_leaves_a_pin_it_cannot_stat_alone() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = crate::test_temp::tempdir().expect("pin tempdir");
+        let locked = dir.path().join("locked");
+        std::fs::create_dir(&locked).expect("create locked dir");
+        let hidden = locked.join("dot-agent-deck");
+        let hidden = hidden.to_str().expect("utf-8").to_string();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000))
+            .expect("close the directory");
+
+        let unstatable = Path::new(&hidden).try_exists().is_err();
+        let verdict = pin_is_dead_sibling(&hidden, "/abs/dot-agent-deck");
+
+        // Reopen before asserting, so a failure does not also leave the
+        // tempdir undeletable.
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700))
+            .expect("reopen the directory");
+
+        if !unstatable {
+            println!(
+                "SKIP: this user can stat through a 0o000 directory (root?), so the \
+                 unstatable-pin branch is unreachable here"
+            );
+            return;
+        }
+        assert!(
+            !verdict,
+            "a pin we cannot stat must be left alone, not repaired away"
         );
     }
 

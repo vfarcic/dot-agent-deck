@@ -750,21 +750,36 @@ fn codex_spawn_prep(
     let program_codex = program_is_codex(program);
     let codex_identity = *agent_type == AgentType::Codex;
     let installs_hooks = codex_identity && (program_codex || pane_id.is_some());
-    // Resolve the vetted home ONCE, so the SAME path is installed into, trusted,
-    // and pinned on the child — they can't drift apart (finding #2).
+    // One vetted home for the install, the trust write and the child's pin
+    // (finding #2). `codex_home()` is in fact consulted twice — `auto_install()`
+    // calls it, and `active_codex_home()` calls it again — but both reads happen
+    // in this process from the same environment, so they agree. The BINARY half
+    // is the one that is structurally pinned: `auto_install()` returns the very
+    // path it installed with, and that value is what reaches the trust write
+    // below (issue #730).
+    let mut installed_binary = None;
     let pinned_home = if installs_hooks {
-        crate::codex_hooks_manage::auto_install();
+        installed_binary = crate::codex_hooks_manage::auto_install();
         crate::codex_hooks_manage::active_codex_home()
     } else {
         None
     };
 
-    // Scoped trust for the hooks just installed, in the SAME pinned home. The
-    // child's cwd is the wrapper's cwd, which is what Codex resolves hooks for.
-    if let Some(home) = pinned_home.as_deref() {
+    // Scoped trust for the hooks just installed, in the SAME pinned home, for
+    // the exact command the SAME install wrote (issue #730). No durable path
+    // means nothing was installed, so there is nothing of ours to trust — fail
+    // closed rather than trusting by signature alone.
+    // The child's cwd is the wrapper's cwd, which is what Codex resolves hooks for.
+    if let (Some(home), Some(binary_path)) = (pinned_home.as_deref(), installed_binary.as_deref()) {
         let cwd = std::env::current_dir().unwrap_or_else(|_| home.to_path_buf());
-        match crate::codex_hooks_manage::trust_deck_hooks_in(home, &cwd) {
-            Ok(count) => tracing::debug!(count, "codex: recorded scoped trust for deck hooks"),
+        match crate::codex_hooks_manage::trust_deck_hooks_in(home, &cwd, binary_path) {
+            // A zero that means "our own entry was unrecognisable" has already
+            // warned from inside `trust_deck_hooks_in`; nothing here reports to a
+            // user, so the count is all this path needs.
+            Ok(outcome) => tracing::debug!(
+                count = outcome.trusted(),
+                "codex: recorded scoped trust for deck hooks"
+            ),
             Err(e) => tracing::warn!(
                 "codex: could not record scoped hook trust ({e}); deck events degrade to stdout \
                  classification"

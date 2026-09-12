@@ -724,6 +724,22 @@ fn main() -> ExitCode {
             handle_hook(agent_str)
         }
         Some(Commands::Hooks { action }) => {
+            // Issue #730 (auditor S-C): the hook installers LOG. Until this call
+            // they did not — this branch never installed a subscriber, so every
+            // `tracing::warn!` on the install and uninstall paths was dropped on
+            // the floor by the no-op global subscriber (the same failure mode
+            // documented for `wrap` below). That silenced both halves of the
+            // Codex trust diagnosis: the "we could not recognise our own entry"
+            // warning and the "trust write failed" arm, each of which otherwise
+            // reaches the user only as an exit 0 with nothing said.
+            //
+            // Safe for a CLI whose stdout is the documented output.
+            // `init_logging_from_env` installs a subscriber ONLY when
+            // `DOT_AGENT_DECK_LOG` is set, and the subscriber it installs writes
+            // only to that file — so this command's own stdout is unchanged
+            // whether logging is on or off, and nothing a hook installer logs
+            // can end up in what a caller parses.
+            init_logging_from_env();
             // PRD #20 finding #15: dispatch through the SPEC's own handler rather
             // than a strategy-keyed hardcoded incumbent. Behaviour is unchanged
             // for the two CLI agents — ClaudeCode installs its native hooks,
@@ -1436,9 +1452,15 @@ fn main() -> ExitCode {
             // delegate that never got its prompt meant reading the wire.
             //
             // Safe in a pane. `init_logging_from_env` installs a subscriber ONLY
-            // when `DOT_AGENT_DECK_LOG` is set, and only ever writes to that
-            // file — never to stdout or stderr — so a wrapper whose descriptors
-            // ARE the agent's terminal cannot paint a log line into it. The
+            // when `DOT_AGENT_DECK_LOG` is set, and that subscriber only ever
+            // writes to that file — never to stdout or stderr — so a wrapper
+            // whose descriptors ARE the agent's terminal cannot paint a LOG LINE
+            // into it. (The setup itself has exactly one stderr line, `Warning:
+            // failed to open log file …`, on a log path it cannot open; so the
+            // claim is about the log stream, not about the call being incapable
+            // of writing to the terminal at all. Narrowed under issue #730's
+            // rule-17 sweep, which added the same call to the `Hooks` branch
+            // above.) The
             // daemon fork-execs `dot-agent-deck wrap` without clearing the
             // environment, so an operator who enabled the daemon's log gets the
             // wrapper's half of the story in the same file, correlated by

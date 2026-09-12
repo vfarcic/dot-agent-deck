@@ -14,12 +14,17 @@ mod test_temp;
 use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::process::{Command, Output, Stdio};
 
-use dot_agent_deck::codex_hooks_manage::install_to;
+use dot_agent_deck::codex_hooks_manage::{
+    CodexHookEntry, DeckCommandMatch, deck_owned_entries, expected_hook_command, install_to,
+};
 use serde_json::{Value, json};
 use spec::spec;
 
 const DECK_BINARY: &str = "/opt/dot-agent-deck/bin/dot-agent-deck";
 const TRUST_BYPASS_FLAG: &str = "--dangerously-bypass-hook-trust";
+/// The signature every deck-authored Codex hook command ends with. Spelled here
+/// so a test can recognise a deck command without reproducing the writer.
+const DECK_COMMAND_SUFFIX: &str = "hook --agent codex";
 
 fn hooks_path(home: &std::path::Path) -> std::path::PathBuf {
     home.join("hooks.json")
@@ -101,6 +106,44 @@ fn seed_durable_binary(home: &std::path::Path) -> std::path::PathBuf {
     durable
 }
 
+/// Seed an executable regular file at `path`, creating its parents.
+///
+/// Stands for "a second, perfectly valid deck install": absolute, present,
+/// executable and outside any `target/{debug,release}` directory, which is the
+/// whole of what `platform::paths::pin_is_repairable` asks before deciding a pin
+/// must be left alone. Never executed — only stat'd.
+fn seed_executable(path: &std::path::Path) -> String {
+    std::fs::create_dir_all(path.parent().expect("seeded binary has a parent"))
+        .expect("create seeded binary dir");
+    std::fs::write(path, "#!/bin/sh\nexit 0\n").expect("write seeded binary");
+    let mut permissions = std::fs::metadata(path)
+        .expect("stat seeded binary")
+        .permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(path, permissions).expect("make seeded binary executable");
+    path.to_str()
+        .expect("seeded binary path is UTF-8")
+        .to_string()
+}
+
+/// Every deck-owned command under `event`, in file order.
+fn deck_commands_for(home: &std::path::Path, event: &str) -> Vec<String> {
+    read_hooks(home)["hooks"][event]
+        .as_array()
+        .unwrap_or(&Vec::new())
+        .iter()
+        .flat_map(|rule| {
+            rule["hooks"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+        })
+        .filter_map(|handler| handler["command"].as_str().map(str::to_string))
+        .filter(|command| command.ends_with(DECK_COMMAND_SUFFIX))
+        .collect()
+}
+
 fn write_fake_program(path: &std::path::Path) {
     std::fs::copy(path.parent().expect("program parent").join("codex"), path)
         .expect("copy fake program");
@@ -152,10 +195,23 @@ fn hook_list_response(entries: Vec<Value>) -> String {
     .to_string()
 }
 
+/// Run the wrapper against a fake Codex, with the deck's own `$HOME` pinned at
+/// `deck_home`.
+///
+/// **`deck_home` is load-bearing, not hygiene** (issue #730). Since the trust
+/// predicate narrowed to the exact command the install just wrote, the value
+/// `platform::paths::durable_binary_path` resolves decides which listed entry is
+/// trust-eligible — and step 2a of that resolver hangs off `$HOME`. Inheriting
+/// the developer's real one would let `~/.local/bin/dot-agent-deck` (present on
+/// a dev box, absent on every CI runner) pick the outcome, which is the leak
+/// `codex_hooks_004`'s comment already records costing PR #733 a full CI round.
+/// Seed it with [`seed_durable_binary`] and spell the expected command from the
+/// path it returns.
 fn run_wrapped_program(
     program: &std::path::Path,
     codex_home: &std::path::Path,
     fixture_dir: &std::path::Path,
+    deck_home: &std::path::Path,
     hook_response: &str,
 ) -> (Output, Vec<String>, String) {
     let args_record = fixture_dir.join("args.txt");
@@ -169,6 +225,7 @@ fn run_wrapped_program(
         .args(["wrap", "--agent", "codex", "--"])
         .arg(program)
         .env("PATH", path)
+        .env("HOME", deck_home)
         .env("CODEX_HOME", codex_home)
         .env("CODEX_ARGS_RECORD", &args_record)
         .env("CODEX_HOME_RECORD", &home_record)
@@ -357,6 +414,230 @@ fn codex_hooks_install_006_write_is_atomic_replacement() {
     );
 }
 
+/// Scenario: Seed a Codex hooks.json whose single PreToolUse rule object carries both a deck command and the user's own audit handler under one matcher, then reinstall from that same deck path. The user's handler and the rule's matcher must survive with only the deck's command taken out of it, and the refreshed deck rule added beside it.
+#[test]
+fn codex_hooks_install_007_a_mixed_rule_keeps_the_users_sibling_handler() {
+    let home = test_temp::tempdir().expect("create Codex home");
+    let user_command = "/usr/local/bin/my-critical-audit.sh";
+    let deck_command = expected_hook_command(DECK_BINARY);
+    write_hooks(
+        home.path(),
+        &json!({
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": "Bash",
+                    "hooks": [
+                        { "type": "command", "command": deck_command },
+                        { "type": "command", "command": user_command },
+                    ]
+                }]
+            }
+        }),
+    );
+
+    install_to(home.path(), DECK_BINARY).expect("install deck hooks");
+
+    let rules = read_hooks(home.path())["hooks"]["PreToolUse"]
+        .as_array()
+        .expect("PreToolUse rules")
+        .clone();
+    let shared = rules
+        .iter()
+        .find(|rule| rule["matcher"] == json!("Bash"))
+        .unwrap_or_else(|| {
+            panic!("the rule object the user shared with the deck was deleted: {rules:?}")
+        });
+    assert_eq!(
+        shared["hooks"].as_array().map(Vec::len),
+        Some(1),
+        "only the deck's own command may be removed from a shared rule: {shared:?}"
+    );
+    assert_eq!(
+        shared["hooks"][0]["command"],
+        json!(user_command),
+        "the user's sibling handler must survive the reinstall: {shared:?}"
+    );
+    assert_eq!(
+        deck_commands_for(home.path(), "PreToolUse"),
+        vec![deck_command],
+        "the deck's own rule must be refreshed exactly once: {rules:?}"
+    );
+}
+
+/// Scenario: Reinstall Codex hooks over a deck-owned rule pinned at a second, still-valid deck install, and separately over one whose binary is positively gone. The valid foreign pin must be left in place with the fresh rule added beside it; the dead one must be repaired away, leaving a single deck rule.
+#[test]
+fn codex_hooks_install_008_a_valid_foreign_pin_survives_and_a_dead_one_is_repaired() {
+    let fixture = test_temp::tempdir().expect("create install fixture");
+    let installing = seed_executable(&fixture.path().join("this-install").join("dot-agent-deck"));
+    let installing_command = expected_hook_command(&installing);
+
+    // Arm 1 — a DIFFERENT but still-valid install, deliberately sharing the
+    // installing binary's own basename so the only thing standing between it and
+    // deletion is `pin_is_repairable` saying the target is still there.
+    let other = seed_executable(&fixture.path().join("other-install").join("dot-agent-deck"));
+    let other_command = expected_hook_command(&other);
+    let valid = test_temp::tempdir().expect("create Codex home");
+    write_hooks(
+        valid.path(),
+        &json!({
+            "hooks": {
+                "SessionStart": [
+                    { "hooks": [ { "type": "command", "command": other_command } ] }
+                ]
+            }
+        }),
+    );
+
+    install_to(valid.path(), &installing).expect("install over a valid foreign pin");
+
+    assert_eq!(
+        deck_commands_for(valid.path(), "SessionStart"),
+        vec![other_command.clone(), installing_command.clone()],
+        "PRD #381 Open Question 3: a deck pin that still works is left alone and the fresh \
+         rule is added ALONGSIDE it, never repointed"
+    );
+
+    // Arm 2 — the same shape, but the pin is positively gone. Without this arm
+    // the first one proves nothing: a predicate that never prunes anything would
+    // pass it.
+    let dead = fixture
+        .path()
+        .join("pruned-worktree")
+        .join("dot-agent-deck");
+    assert!(!dead.exists(), "the dead path must genuinely not exist");
+    let dead_command = expected_hook_command(dead.to_str().expect("dead path is UTF-8"));
+    let gone = test_temp::tempdir().expect("create Codex home");
+    write_hooks(
+        gone.path(),
+        &json!({
+            "hooks": {
+                "SessionStart": [
+                    { "hooks": [ { "type": "command", "command": dead_command } ] }
+                ]
+            }
+        }),
+    );
+
+    install_to(gone.path(), &installing).expect("install over a dead pin");
+
+    assert_eq!(
+        deck_commands_for(gone.path(), "SessionStart"),
+        vec![installing_command],
+        "a deck pin whose binary is positively missing must still be repaired away"
+    );
+}
+
+/// Scenario: Build a Codex hooks/list reply carrying the exact command the deck installs beside a crafted look-alike that merely ends with the same `hook --agent codex` verb, both unmanaged and both sourced from the deck's own hooks.json. Only the exact command may be selected for a trust write, while the wider revocation predicate still claims both.
+#[spec("codex/trust/004")]
+#[test]
+fn codex_trust_004_only_the_exact_generated_command_is_trust_eligible() {
+    let home = test_temp::tempdir().expect("create Codex home");
+    let source_path = home.path().join("hooks.json");
+    let deck_command = expected_hook_command(DECK_BINARY);
+    let entry = |key: &str, command: &str| CodexHookEntry {
+        key: key.to_string(),
+        command: command.to_string(),
+        source_path: source_path.clone(),
+        current_hash: format!("sha256:{key}"),
+        trust_status: "untrusted".to_string(),
+        is_managed: Some(false),
+    };
+    // The class, not an exploit: the deck's verb is a convention anything able
+    // to write into `hooks.json` can also end a command with, so under the old
+    // suffix test a command naming some OTHER executable was indistinguishable
+    // from a deck entry — and a `trusted_hash` record is Codex's permission to
+    // run it. Tightening the suffix cannot fix that; comparing against the exact
+    // command the deck emits for the path it validated can.
+    let entries = vec![
+        entry("deck", &deck_command),
+        entry("crafted", "/usr/local/bin/not-the-deck hook --agent codex"),
+        entry("mention", "/usr/local/bin/audit --watch dot-agent-deck"),
+    ];
+
+    let trustable: Vec<&str> = deck_owned_entries(
+        &entries,
+        home.path(),
+        DeckCommandMatch::Exact(&deck_command),
+    )
+    .into_iter()
+    .map(|entry| entry.key.as_str())
+    .collect();
+    assert_eq!(
+        trustable,
+        vec!["deck"],
+        "only the exact installed deck command may be handed a trusted_hash"
+    );
+
+    // The revocation predicate is deliberately the wider one: an uninstall
+    // deletes every deck-owned command from `hooks.json` whichever install wrote
+    // it, so narrowing here would orphan that entry's trust record.
+    let revocable: Vec<&str> =
+        deck_owned_entries(&entries, home.path(), DeckCommandMatch::Signature)
+            .into_iter()
+            .map(|entry| entry.key.as_str())
+            .collect();
+    assert_eq!(
+        revocable,
+        vec!["deck", "crafted"],
+        "untrust must still reach any deck-signature command in the deck's own hooks.json"
+    );
+}
+
+/// Issue #730 / auditor item 2: an entry whose listing carried NO `isManaged`
+/// field is resolved per DIRECTION, not by one shared default.
+///
+/// Condition 3 of the trust predicate is fail-**closed** for the grant and
+/// fail-**open** for the revocation, so the absent field cannot have a single
+/// answer: `Exact` must drop the entry (never hand a `trusted_hash` to something
+/// that might be root-provisioned) while `Signature` must keep it (an untrust
+/// that narrows here leaves records behind after `hooks uninstall` deleted the
+/// definitions, which `untrust_deck_hooks_in`'s own doc forbids). The old
+/// `.unwrap_or(false)` decoder got the grant wrong; a blanket `.unwrap_or(true)`
+/// would have got the revocation wrong.
+///
+/// Scope of the claim being defended: `isManaged` was present on every entry of
+/// every listing **codex-cli 0.149.0** produced, across four entry shapes, so
+/// `None` is protocol drift rather than an expected state today. That is a
+/// measurement about 0.149.0, not about Codex in general — which is precisely
+/// why the drift case gets a deliberate answer instead of a default.
+#[test]
+fn codex_trust_an_absent_is_managed_field_resolves_per_direction() {
+    let home = test_temp::tempdir().expect("create Codex home");
+    let source_path = home.path().join("hooks.json");
+    let deck_command = expected_hook_command(DECK_BINARY);
+    let entry = |key: &str, is_managed: Option<bool>| CodexHookEntry {
+        key: key.to_string(),
+        command: deck_command.clone(),
+        source_path: source_path.clone(),
+        current_hash: format!("sha256:{key}"),
+        trust_status: "untrusted".to_string(),
+        is_managed,
+    };
+    let entries = vec![
+        entry("present-false", Some(false)),
+        entry("absent", None),
+        entry("present-true", Some(true)),
+    ];
+
+    let selected = |how: DeckCommandMatch<'_>| -> Vec<&str> {
+        deck_owned_entries(&entries, home.path(), how)
+            .into_iter()
+            .map(|entry| entry.key.as_str())
+            .collect()
+    };
+
+    assert_eq!(
+        selected(DeckCommandMatch::Exact(&deck_command)),
+        vec!["present-false"],
+        "a grant must refuse an entry whose isManaged the listing did not carry"
+    );
+    assert_eq!(
+        selected(DeckCommandMatch::Signature),
+        vec!["present-false", "absent"],
+        "a revocation must still reach an entry whose isManaged the listing did not carry"
+    );
+}
+
 /// Scenario: Wrap a direct executable named codex while explicitly declaring the agent as Claude. The wrapper must neither install Codex hooks nor inject Codex's hook-trust bypass flag.
 #[test]
 fn codex_hooks_trust_001_direct_codex_requires_codex_identity() {
@@ -376,13 +657,19 @@ fn codex_hooks_trust_001_direct_codex_requires_codex_identity() {
     );
 }
 
-/// Scenario: Launch a bare Codex stand-in and a launcher with a mixed hooks/list response from the pinned home. Only the unmanaged deck command from that home's hooks.json may receive a scoped trust record; foreign, differently sourced, managed, and merely name-mentioning commands must remain untrusted.
+/// Scenario: Launch a bare Codex stand-in and a launcher with a mixed hooks/list response from the pinned home. Only the unmanaged entry whose command is exactly the one the deck just installed may receive a scoped trust record; foreign, differently sourced, managed, merely name-mentioning, and crafted same-suffix commands must all remain untrusted.
 #[spec("codex/trust/002")]
 #[test]
 fn codex_trust_002_only_pinned_unmanaged_deck_entries_are_trusted() {
     for launcher in [false, true] {
         let fixture = test_temp::tempdir().expect("create wrapper fixture");
         let home = test_temp::tempdir().expect("create Codex home");
+        let deck_home = test_temp::tempdir().expect("create isolated deck HOME");
+        let deck_command = expected_hook_command(
+            seed_durable_binary(deck_home.path())
+                .to_str()
+                .expect("durable path is UTF-8"),
+        );
         let fake_codex = write_fake_codex(fixture.path());
         write_hooks(
             home.path(),
@@ -408,7 +695,7 @@ fn codex_trust_002_only_pinned_unmanaged_deck_entries_are_trusted() {
         let response = hook_list_response(vec![
             hook_entry(
                 good_key,
-                "/opt/dot-agent-deck hook --agent codex",
+                &deck_command,
                 "__CODEX_HOME__/hooks.json",
                 "sha256:deck",
                 false,
@@ -441,10 +728,28 @@ fn codex_trust_002_only_pinned_unmanaged_deck_entries_are_trusted() {
                 "sha256:mention",
                 false,
             ),
+            // Issue #730 / auditor finding LOW-1: the deck's verb is a
+            // CONVENTION, not a capability — anything able to write into the
+            // deck's own hooks.json can end a command with it and be
+            // indistinguishable from a deck entry under a suffix test. A trust
+            // record is Codex's permission to RUN the command, so the predicate
+            // compares against the exact command the install just wrote instead.
+            hook_entry(
+                "__CODEX_HOME__/hooks.json:pre_tool_use:0:4",
+                "/usr/local/bin/not-the-deck hook --agent codex",
+                "__CODEX_HOME__/hooks.json",
+                "sha256:crafted",
+                false,
+            ),
         ]);
 
-        let (output, args, _) =
-            run_wrapped_program(&program, home.path(), fixture.path(), &response);
+        let (output, args, _) = run_wrapped_program(
+            &program,
+            home.path(),
+            fixture.path(),
+            deck_home.path(),
+            &response,
+        );
 
         assert!(output.status.success(), "wrapper failed: {output:?}");
         assert!(
@@ -454,7 +759,8 @@ fn codex_trust_002_only_pinned_unmanaged_deck_entries_are_trusted() {
         assert_eq!(
             trust_state_keys(home.path()),
             vec![good_key.replace("__CODEX_HOME__", &home.path().display().to_string())],
-            "only the pinned home's unmanaged deck-owned entry may be trusted (launcher={launcher})"
+            "only the pinned home's unmanaged entry carrying the exact installed deck command \
+             may be trusted (launcher={launcher})"
         );
         drop(fake_codex);
     }
@@ -467,6 +773,8 @@ fn codex_trust_001_no_program_form_receives_global_bypass() {
     for program_name in ["codex", "absolute-codex", "launcher.sh", "devbox"] {
         let fixture = test_temp::tempdir().expect("create Codex launcher fixture");
         let home = test_temp::tempdir().expect("create pinned Codex home");
+        let deck_home = test_temp::tempdir().expect("create isolated deck HOME");
+        seed_durable_binary(deck_home.path());
         let fake_codex = write_fake_codex(fixture.path());
         let program = match program_name {
             "codex" => std::path::PathBuf::from("codex"),
@@ -486,6 +794,7 @@ fn codex_trust_001_no_program_form_receives_global_bypass() {
             &program,
             home.path(),
             fixture.path(),
+            deck_home.path(),
             &hook_list_response(Vec::new()),
         );
 
@@ -511,6 +820,12 @@ fn codex_trust_001_no_program_form_receives_global_bypass() {
 fn codex_trust_003_config_edits_are_preserving_idempotent_and_scoped() {
     let fixture = test_temp::tempdir().expect("create wrapper fixture");
     let home = test_temp::tempdir().expect("create Codex home");
+    let deck_home = test_temp::tempdir().expect("create isolated deck HOME");
+    let deck_command = expected_hook_command(
+        seed_durable_binary(deck_home.path())
+            .to_str()
+            .expect("durable path is UTF-8"),
+    );
     write_fake_codex(fixture.path());
     let original = "# user comment must survive\nmodel = \"gpt-user-choice\"\n\n[hooks.state.\"foreign-key\"]\nenabled = true\ntrusted_hash = \"sha256:foreign\"\n";
     std::fs::write(home.path().join("config.toml"), original).expect("seed Codex config");
@@ -518,7 +833,7 @@ fn codex_trust_003_config_edits_are_preserving_idempotent_and_scoped() {
     let deck_key = deck_key_template.replace("__CODEX_HOME__", &home.path().display().to_string());
     let response = hook_list_response(vec![hook_entry(
         deck_key_template,
-        "/opt/dot-agent-deck hook --agent codex",
+        &deck_command,
         "__CODEX_HOME__/hooks.json",
         "sha256:deck",
         false,
@@ -529,6 +844,7 @@ fn codex_trust_003_config_edits_are_preserving_idempotent_and_scoped() {
             std::path::Path::new("codex"),
             home.path(),
             fixture.path(),
+            deck_home.path(),
             &response,
         );
         assert!(output.status.success(), "wrapper failed: {output:?}");
@@ -557,13 +873,7 @@ fn codex_trust_003_config_edits_are_preserving_idempotent_and_scoped() {
         fixture.path().display(),
         std::env::var("PATH").unwrap_or_default()
     );
-    let uninstall = Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
-        .args(["hooks", "uninstall", "--agent", "codex"])
-        .env("PATH", path)
-        .env("CODEX_HOME", home.path())
-        .env("CODEX_HOOK_LIST_RESPONSE", &response)
-        .output()
-        .expect("uninstall Codex hooks");
+    let uninstall = run_cli_uninstall(home.path(), &path, &response);
     assert!(
         uninstall.status.success(),
         "Codex hook uninstall failed: {}",
@@ -576,6 +886,113 @@ fn codex_trust_003_config_edits_are_preserving_idempotent_and_scoped() {
     );
 }
 
+/// The `$PATH` a CLI fixture hands the child: the stand-in `codex` first, then
+/// only the system directories its `sed` needs.
+///
+/// Never the inherited `$PATH`. A `dot-agent-deck` the host happens to have
+/// installed would otherwise be a candidate the resolver could pin, which is
+/// exactly what let `codex_hooks_004` pass on a dev box and fail on every CI
+/// runner at once (PR #733).
+fn fixture_path(fixture_dir: &std::path::Path) -> String {
+    format!("{}:/usr/bin:/bin", fixture_dir.display())
+}
+
+/// Drive the real `hooks install --agent codex` CLI against an isolated Codex
+/// home, an isolated `$HOME` holding a seeded durable deck, and a `codex`
+/// app-server stand-in that answers `hooks/list` with `hook_response`.
+///
+/// Both environment pins are load-bearing, for the reason [`fixture_path`]
+/// records: `HOME` anchors the resolver's durable candidate at the seeded one,
+/// and a `PATH` built by [`fixture_path`] keeps the host out of the outcome.
+/// `hook_response` is the one input that decides which `TrustOutcome` the
+/// command reports, which is what `codex_hooks_005` varies; `path` is the other
+/// one, since a `PATH` with no `codex` on it reaches the error arm instead
+/// (`codex_hooks_006`).
+fn run_cli_install(
+    codex_home: &std::path::Path,
+    deck_home: &std::path::Path,
+    path: &str,
+    hook_response: &str,
+) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
+        .args(["hooks", "install", "--agent", "codex"])
+        .env("PATH", path)
+        .env("HOME", deck_home)
+        .env("CODEX_HOME", codex_home)
+        .env("CODEX_HOOK_LIST_RESPONSE", hook_response)
+        .output()
+        .expect("install Codex hooks from CLI")
+}
+
+/// Drive the real `hooks uninstall --agent codex` CLI against `codex_home`.
+///
+/// `path` is the child's whole `$PATH`, because whether a `codex` is reachable
+/// on it is the variable: with the fixture directory the stand-in answers
+/// `hooks/list` and the trust records are dropped; without it the spawn fails
+/// with `NotFound` and the command takes its error arm, which is the shape
+/// `codex_hooks_006` needs.
+fn run_cli_uninstall(codex_home: &std::path::Path, path: &str, hook_response: &str) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
+        .args(["hooks", "uninstall", "--agent", "codex"])
+        .env("PATH", path)
+        .env("CODEX_HOME", codex_home)
+        .env("CODEX_HOOK_LIST_RESPONSE", hook_response)
+        .output()
+        .expect("uninstall Codex hooks from CLI")
+}
+
+/// The single `Trusted hooks: …` line `hooks install --agent codex` prints, for
+/// a run whose `hooks/list` stand-in returns `entries(&deck_command)`.
+///
+/// The closure receives the exact command the install is about to write, spelled
+/// from the durable path seeded inside this fixture — the same value
+/// `trust_deck_hooks_in` compares a listed entry against — so a caller can build
+/// a listing that matches it, one that deliberately does not, or none at all.
+fn install_trust_line(entries: impl FnOnce(&str) -> Vec<Value>) -> String {
+    let fixture = test_temp::tempdir().expect("create CLI fixture");
+    let home = test_temp::tempdir().expect("create Codex home");
+    let deck_home = test_temp::tempdir().expect("create isolated deck HOME");
+    write_fake_codex(fixture.path());
+    let deck_command = expected_hook_command(
+        seed_durable_binary(deck_home.path())
+            .to_str()
+            .expect("durable path is UTF-8"),
+    );
+    let response = hook_list_response(entries(&deck_command));
+
+    let output = run_cli_install(
+        home.path(),
+        deck_home.path(),
+        &fixture_path(fixture.path()),
+        &response,
+    );
+
+    assert!(
+        output.status.success(),
+        "hook install must report a trust outcome without failing; stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    stdout
+        .lines()
+        .find(|line| line.starts_with("Trusted hooks:"))
+        .unwrap_or_else(|| panic!("hook install printed no trust line at all:\n{stdout}"))
+        .to_string()
+}
+
+/// A listed entry out of the pinned home's own `hooks.json`, unmanaged, carrying
+/// `command` — the shape [`deck_owned_entries`] accepts before it looks at the
+/// command at all.
+fn own_home_entry(command: &str, index: usize, hash: &str) -> Value {
+    hook_entry(
+        &format!("__CODEX_HOME__/hooks.json:pre_tool_use:0:{index}"),
+        command,
+        "__CODEX_HOME__/hooks.json",
+        hash,
+        false,
+    )
+}
+
 /// Scenario: Run the documented Codex hook installation command against an isolated home, an isolated `$HOME` holding a seeded durable deck, and a deterministic app-server stand-in. The command must succeed, materialize Codex hook definitions, and pin the seeded durable binary rather than anything the host happens to have installed.
 #[spec("codex/hooks/004")]
 #[test]
@@ -585,22 +1002,13 @@ fn codex_hooks_004_cli_install_succeeds() {
     let deck_home = test_temp::tempdir().expect("create isolated deck HOME");
     write_fake_codex(fixture.path());
     let durable = seed_durable_binary(deck_home.path());
-    // Both halves are load-bearing. `HOME` anchors the resolver's durable
-    // candidate at the seeded one above; the pinned `PATH` carries only the
-    // fake `codex` plus the system directories the stand-in's `sed` needs, so
-    // no `dot-agent-deck` the host happens to have on `$PATH` can decide the
-    // outcome. Inheriting `$PATH` here is exactly what let this test pass on a
-    // machine with `~/.local/bin/dot-agent-deck` and fail on every CI runner.
-    let path = format!("{}:/usr/bin:/bin", fixture.path().display());
 
-    let output = Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
-        .args(["hooks", "install", "--agent", "codex"])
-        .env("PATH", path)
-        .env("HOME", deck_home.path())
-        .env("CODEX_HOME", home.path())
-        .env("CODEX_HOOK_LIST_RESPONSE", hook_list_response(Vec::new()))
-        .output()
-        .expect("install Codex hooks from CLI");
+    let output = run_cli_install(
+        home.path(),
+        deck_home.path(),
+        &fixture_path(fixture.path()),
+        &hook_list_response(Vec::new()),
+    );
 
     assert!(
         output.status.success(),
@@ -616,5 +1024,184 @@ fn codex_hooks_004_cli_install_succeeds() {
         written.contains(durable.to_str().expect("durable path is UTF-8")),
         "the install pinned something other than the durable binary seeded in this fixture, so \
          the test's outcome is being decided by host state:\n{written}"
+    );
+}
+
+/// Scenario: Run `dot-agent-deck hooks install --agent codex` three times against fresh isolated homes, varying only what the `codex` app-server stand-in returns from `hooks/list` — the exact command the install just wrote, a deck-signature command that is not it, and nothing at all. The one trust line the command prints must name a different one of the three outcomes each time, and the two zero-trust lines must not be interchangeable.
+#[spec("codex/hooks/005")]
+#[test]
+fn codex_hooks_005_cli_trust_line_names_which_outcome_occurred() {
+    // The listing carries the exact command this install wrote, so `Exact`
+    // matches it and a trust record is written.
+    let trusted =
+        install_trust_line(|deck_command| vec![own_home_entry(deck_command, 0, "sha256:deck")]);
+    // The listing carries a command out of the deck's own hooks.json ending in
+    // the deck's verb — `Signature` finds it, `Exact` does not. Issue #730's own
+    // premise: the verb is a convention anyone can write, so this is what "we
+    // installed and then could not recognise our own entry" looks like from the
+    // CLI.
+    let unrecognised = install_trust_line(|_| {
+        vec![own_home_entry(
+            "/usr/local/bin/not-the-deck hook --agent codex",
+            0,
+            "sha256:crafted",
+        )]
+    });
+    // Nothing listed at all — the ordinary cause, and the one every machine
+    // without Codex hooks hits.
+    let nothing = install_trust_line(|_| Vec::new());
+
+    // Trusted: the substance is a non-zero count, so read it back as a number
+    // rather than pinning the three-word line.
+    let count: usize = trusted
+        .trim_start_matches("Trusted hooks:")
+        .trim()
+        .parse()
+        .unwrap_or_else(|_| panic!("the trusted branch must report a bare count, got {trusted:?}"));
+    assert_eq!(
+        count, 1,
+        "exactly the one exact-matching entry should have been trusted: {trusted:?}"
+    );
+
+    // Unrecognised: names THAT cause, with the count of entries Codex did list,
+    // and does not borrow the other zero's sentence. Greptile's finding 3 on PR
+    // #1029 was precisely this message naming the wrong cause.
+    assert!(
+        unrecognised.contains("deck-signature"),
+        "the unrecognised branch must name the entries Codex did list as carrying the deck's \
+         signature: {unrecognised:?}"
+    );
+    assert!(
+        unrecognised.contains('1'),
+        "the unrecognised branch must carry the count of listed deck-signature entries: \
+         {unrecognised:?}"
+    );
+    assert!(
+        !unrecognised.contains("no eligible deck hook"),
+        "the unrecognised branch must not claim Codex reported nothing eligible — it reported \
+         something, and that is the whole difference: {unrecognised:?}"
+    );
+
+    // NothingListed: `eligible` is load-bearing (Greptile P2 on PR #1029). The
+    // branch cannot tell "Codex listed nothing of ours" from "it listed only
+    // entries `deck_owned_entries` rejected", so it may not name either.
+    assert!(
+        nothing.contains("no eligible deck hook"),
+        "the nothing-listed branch must say no ELIGIBLE deck hook, since it cannot know which \
+         of its three causes produced the zero: {nothing:?}"
+    );
+    assert!(
+        !nothing.contains("deck-signature"),
+        "the nothing-listed branch must not claim Codex listed deck-signature entries: \
+         {nothing:?}"
+    );
+
+    // And the point of `TrustOutcome` existing at all: three branches, three
+    // distinguishable lines.
+    assert!(
+        trusted != unrecognised && unrecognised != nothing && trusted != nothing,
+        "the three trust outcomes must be distinguishable from the CLI alone:\n  \
+         trusted={trusted:?}\n  unrecognised={unrecognised:?}\n  nothing={nothing:?}"
+    );
+}
+
+/// Scenario: Install Codex hooks with a stand-in that reports the exact command the install wrote, so one scoped trust record exists, then run install and uninstall again with a `PATH` carrying no `codex` at all. Both commands must exit 0 and say on stderr that scoped hook trust could not be reached, and the uninstall must still delete the deck's hook definitions — leaving the trust record behind as the orphan its warning is about.
+#[spec("codex/hooks/006")]
+#[test]
+fn codex_hooks_006_unreachable_trust_is_reported_on_both_arms() {
+    let fixture = test_temp::tempdir().expect("create CLI fixture");
+    let home = test_temp::tempdir().expect("create Codex home");
+    let deck_home = test_temp::tempdir().expect("create isolated deck HOME");
+    write_fake_codex(fixture.path());
+    let deck_command = expected_hook_command(
+        seed_durable_binary(deck_home.path())
+            .to_str()
+            .expect("durable path is UTF-8"),
+    );
+    let deck_key_template = "__CODEX_HOME__/hooks.json:pre_tool_use:0:0";
+    let deck_key = deck_key_template.replace("__CODEX_HOME__", &home.path().display().to_string());
+    let response = hook_list_response(vec![own_home_entry(&deck_command, 0, "sha256:deck")]);
+
+    // Phase 1: an ordinary install with the stand-in reachable, so there IS a
+    // scoped trust record for the uninstall below to fail to drop.
+    let installed = run_cli_install(
+        home.path(),
+        deck_home.path(),
+        &fixture_path(fixture.path()),
+        &response,
+    );
+    assert!(
+        installed.status.success(),
+        "seeding install failed: {}",
+        String::from_utf8_lossy(&installed.stderr)
+    );
+    assert_eq!(
+        trust_state_keys(home.path()),
+        vec![deck_key.clone()],
+        "the seeding install must leave exactly one deck trust record to orphan"
+    );
+
+    // A `PATH` with nothing on it at all: `Command::new("codex")` then fails
+    // with `NotFound`, which is how both trust steps look on a machine where
+    // Codex is not installed. An empty directory rather than `/usr/bin:/bin`
+    // because a developer may genuinely have `codex` in a system directory, and
+    // nothing on either path needs a `PATH` lookup — the deck binary is invoked
+    // absolutely and the durable candidate is found through `$HOME`.
+    let empty = fixture.path().join("no-codex");
+    std::fs::create_dir_all(&empty).expect("create codex-free PATH dir");
+    let no_codex = empty.display().to_string();
+
+    // Phase 2: the install-side error arm. Exit 0, because the definitions —
+    // what the command promises — were written; the trust failure reaches the
+    // user on stderr instead of only through a `tracing::warn!` nobody has a
+    // subscriber for.
+    let install_err = run_cli_install(home.path(), deck_home.path(), &no_codex, &response);
+    assert!(
+        install_err.status.success(),
+        "a trust failure must not fail the documented install: {}",
+        String::from_utf8_lossy(&install_err.stderr)
+    );
+    let install_stderr = String::from_utf8_lossy(&install_err.stderr).into_owned();
+    assert!(
+        install_stderr.contains("scoped hook trust could not be recorded"),
+        "the install error arm must say on stderr that trust was not recorded: \
+         {install_stderr:?}"
+    );
+    assert!(
+        !String::from_utf8_lossy(&install_err.stdout).contains("Trusted hooks:"),
+        "the error arm has no trust outcome to report on stdout — it is not a zero, it is an \
+         unknown"
+    );
+
+    // Phase 3: the uninstall-side error arm, fourteen lines away in the same
+    // file and silent until issue #1027 item 4. Same exit code, same channel,
+    // and the definitions still go.
+    let uninstalled = run_cli_uninstall(home.path(), &no_codex, &response);
+    assert!(
+        uninstalled.status.success(),
+        "a trust-drop failure must not fail the documented uninstall: {}",
+        String::from_utf8_lossy(&uninstalled.stderr)
+    );
+    let uninstall_stderr = String::from_utf8_lossy(&uninstalled.stderr).into_owned();
+    assert!(
+        uninstall_stderr.contains("scoped hook trust could not be dropped"),
+        "the uninstall error arm must say on stderr that trust was not dropped: \
+         {uninstall_stderr:?}"
+    );
+    let remaining =
+        std::fs::read_to_string(hooks_path(home.path())).expect("read hooks.json after uninstall");
+    assert!(
+        !remaining.contains(DECK_COMMAND_SUFFIX),
+        "uninstall must still remove the deck's hook definitions:\n{remaining}"
+    );
+    // The residue the warning exists to name: definitions gone, trust row still
+    // there. Asserted because it is why the message is worth printing, not
+    // because it is desirable — if the orphan collection #1027's first item
+    // describes ever lands, this is the assertion to change.
+    assert_eq!(
+        trust_state_keys(home.path()),
+        vec![deck_key],
+        "the trust record the uninstall could not reach is left behind, which is exactly what \
+         the warning tells the user"
     );
 }
