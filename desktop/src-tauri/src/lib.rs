@@ -3,6 +3,11 @@ mod appearance;
 mod daemon_bridge;
 mod dto;
 mod endpoint_test;
+// Tests only: the shared endpoint-validation table, read from here and from
+// `desktop/src/lib/endpoints.test.ts`. No item outside `#[cfg(test)]`, so it
+// adds nothing to a normal build.
+#[cfg(test)]
+mod endpoint_field_parity;
 mod endpoint_tunnels;
 mod settings;
 mod terminal;

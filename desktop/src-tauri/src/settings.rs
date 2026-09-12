@@ -81,8 +81,10 @@
 //!    build's schema has no field that can carry arbitrary text*. That was true
 //!    of `u32`, [`AppearanceMode`] and [`ZoomLevel`] — an integer, three tokens
 //!    and ten numbers — and it is **not** true of the ssh-argument newtypes
-//!    #741 added. `Hostname` is 253 bytes of `[A-Za-z0-9._-]`, `SshUser` 64,
-//!    `HostAlias` 253 and [`EndpointId`] 64; measured, the 45-byte
+//!    #741 added. `Hostname` is 253 bytes of `[A-Za-z0-9._-]` plus the
+//!    `[`, `]`, `:` and `%` a bracketed IPv6 literal and its zone id need,
+//!    `SshUser` 64 of `[A-Za-z0-9._@-]`, `HostAlias` 253 of `[A-Za-z0-9._-]`
+//!    and [`EndpointId`] 64; measured, the 45-byte
 //!    `sk-…`-shaped sentinel below **parses** as all four. They *bound and
 //!    restrict*, which is a real property and a weaker one than "cannot carry
 //!    text", and `ALLOWED_FIELD_TYPES`' own entries have said so since M5.

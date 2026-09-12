@@ -61,6 +61,7 @@ import { DISPLAY_LIMITS, displayText } from "../lib/displayText";
 import {
   blankEndpoint,
   describeEndpoint,
+  FIELD_PLACEHOLDERS,
   hostProblem,
   identityProblem,
   jumpProblem,
@@ -208,7 +209,7 @@ export function EndpointsPanel({ settings, onSave, saveError, mode }: SettingsPa
             id={`deck-host-${selected.id}`}
             label="Host"
             value={selected.host}
-            placeholder="build-box.example.com"
+            placeholder={FIELD_PLACEHOLDERS.host}
             problem={hostProblem(selected.host)}
             onChange={(host) => editDeck(selected.id, { host })}
           />
@@ -216,7 +217,7 @@ export function EndpointsPanel({ settings, onSave, saveError, mode }: SettingsPa
             id={`deck-user-${selected.id}`}
             label="User"
             value={selected.user ?? ""}
-            placeholder="from your ssh config"
+            placeholder={FIELD_PLACEHOLDERS.user}
             problem={userProblem(selected.user ?? "")}
             onChange={(user) => editDeck(selected.id, { user: user || undefined })}
           />
@@ -237,7 +238,7 @@ export function EndpointsPanel({ settings, onSave, saveError, mode }: SettingsPa
             id={`deck-identity-${selected.id}`}
             label="Key file"
             value={selected.identity ?? ""}
-            placeholder="~/.ssh/id_ed25519"
+            placeholder={FIELD_PLACEHOLDERS.identity}
             problem={identityProblem(selected.identity ?? "")}
             onChange={(identity) => editDeck(selected.id, { identity: identity || undefined })}
           />
@@ -245,7 +246,7 @@ export function EndpointsPanel({ settings, onSave, saveError, mode }: SettingsPa
             id={`deck-jump-${selected.id}`}
             label="Jump host"
             value={selected.jump ?? ""}
-            placeholder="a Host block in ~/.ssh/config"
+            placeholder={FIELD_PLACEHOLDERS.jump}
             problem={jumpProblem(selected.jump ?? "")}
             onChange={(jump) => editDeck(selected.id, { jump: jump || undefined })}
           />
@@ -253,7 +254,7 @@ export function EndpointsPanel({ settings, onSave, saveError, mode }: SettingsPa
             id={`deck-socket-${selected.id}`}
             label="Deck socket"
             value={selected.socket ?? ""}
-            placeholder="found by Test connection"
+            placeholder={FIELD_PLACEHOLDERS.socket}
             problem={socketProblem(selected.socket ?? "")}
             onChange={(socket) => editDeck(selected.id, { socket: socket || undefined })}
           />
