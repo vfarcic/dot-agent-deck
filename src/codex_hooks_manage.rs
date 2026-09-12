@@ -692,44 +692,92 @@ pub fn list_hooks_in(home: &Path, cwd: &Path) -> std::io::Result<Vec<CodexHookEn
                 }
             }
         });
-        let deadline = Instant::now() + HOOKS_LIST_TIMEOUT;
-        loop {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                return Err(io::Error::new(
-                    ErrorKind::TimedOut,
-                    "codex app-server: hooks/list did not answer in time",
-                ));
-            }
-            match rx.recv_timeout(remaining) {
-                // Only the `id: 2` reply carries the hook listing; the
-                // `initialize` reply (and any notification) is skipped.
-                Ok(line) => match serde_json::from_str::<Value>(&line) {
-                    Ok(value) if value.get("id").and_then(Value::as_i64) == Some(2) => {
-                        return parse_hooks_list(&value);
-                    }
-                    _ => continue,
-                },
-                Err(mpsc::RecvTimeoutError::Timeout) => {
-                    return Err(io::Error::new(
-                        ErrorKind::TimedOut,
-                        "codex app-server: hooks/list did not answer in time",
-                    ));
-                }
-                Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    return Err(io::Error::new(
-                        ErrorKind::UnexpectedEof,
-                        "codex app-server: exited without answering hooks/list",
-                    ));
-                }
-            }
-        }
+        read_hooks_list_reply(&rx, Instant::now() + HOOKS_LIST_TIMEOUT)
     });
 
     drop(stdin);
     let _ = child.kill();
     let _ = child.wait();
     response
+}
+
+/// Is this line the `hooks/list` **response**, as opposed to some other message
+/// that happens to carry `id: 2`?
+///
+/// Three conditions, and the last two are the fix for issue #1033. A JSON-RPC
+/// peer numbers its OWN requests from its OWN counter, so a server→client
+/// *request* — `codex app-server` advertises several, e.g.
+/// `account/chatgptAuthTokens/refresh`, `item/tool/requestUserInput`,
+/// `mcpServer/elicitation/request` — can carry `id: 2` while being nothing to do
+/// with the request the deck sent. Matching on the id alone therefore handed
+/// [`parse_hooks_list`] a message with neither `result` nor `error`, which it
+/// correctly rejected as `hooks/list reply carried no result`; and because the
+/// old arm `return`ed, that ended the whole attempt with the genuine reply still
+/// unread on the stream. So:
+///
+/// - `id == 2` — the id the deck itself sent for `hooks/list`;
+/// - **no `method`** — a message carrying one is a request or a notification,
+///   never a response (an explicit `method: null` is tolerated as absent, which
+///   errs toward accepting a genuine reply);
+/// - **`result` or `error` present** — the two shapes a JSON-RPC response can
+///   take, and exactly what [`parse_hooks_list`] needs.
+///
+/// This is the defect stated from the code, not from any diagnosis of why a
+/// particular host sees a particular stray message; the caller `continue`s past
+/// anything this rejects, so being wrong about *which* messages arrive costs a
+/// loop iteration rather than the call.
+fn is_hooks_list_response(value: &Value) -> bool {
+    let is_request_or_notification = value.get("method").is_some_and(|m| !m.is_null());
+    value.get("id").and_then(Value::as_i64) == Some(2)
+        && !is_request_or_notification
+        && (value.get("result").is_some() || value.get("error").is_some())
+}
+
+/// Drain `rx` until the `hooks/list` response arrives or `deadline` passes.
+///
+/// Split out of [`list_hooks_in`] so the matching can be driven from a synthetic
+/// stream with no `codex` on the box (issue #1033). Everything that is not the
+/// response — the `initialize` reply, notifications, and any server→client
+/// request, including one that happens to reuse `id: 2` — is skipped rather than
+/// returned on, so no single stray message can poison the call.
+///
+/// **The skipping is bounded by `deadline` and nothing else**, which is what
+/// keeps `continue` from being a way to spin: `remaining` is recomputed every
+/// iteration and is both the `recv_timeout` bound and, once zero, the exit. A
+/// peer that floods messages makes the loop iterate faster, not for longer —
+/// each iteration consumes one message and the total wait is still capped at
+/// [`HOOKS_LIST_TIMEOUT`].
+fn read_hooks_list_reply(
+    rx: &mpsc::Receiver<String>,
+    deadline: Instant,
+) -> std::io::Result<Vec<CodexHookEntry>> {
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(io::Error::new(
+                ErrorKind::TimedOut,
+                "codex app-server: hooks/list did not answer in time",
+            ));
+        }
+        match rx.recv_timeout(remaining) {
+            Ok(line) => match serde_json::from_str::<Value>(&line) {
+                Ok(value) if is_hooks_list_response(&value) => return parse_hooks_list(&value),
+                _ => continue,
+            },
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                return Err(io::Error::new(
+                    ErrorKind::TimedOut,
+                    "codex app-server: hooks/list did not answer in time",
+                ));
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(io::Error::new(
+                    ErrorKind::UnexpectedEof,
+                    "codex app-server: exited without answering hooks/list",
+                ));
+            }
+        }
+    }
 }
 
 /// Decode the `id: 2` `hooks/list` reply into entries, tolerating both the
@@ -1873,6 +1921,90 @@ mod tests {
         assert!(
             contents.contains("model = \"gpt-5\""),
             "trust edit must preserve unrelated config; got {contents}"
+        );
+    }
+
+    /// A stray `id: 2` message must not swallow the `hooks/list` reply — issue
+    /// #1033, driven from a synthetic stream so it needs no `codex` on the box.
+    ///
+    /// The stream is the exact sequence the defect mishandled: the `initialize`
+    /// reply, then a server→client **request** carrying `id: 2` (a `method`, no
+    /// `result`, no `error` — the id comes from the server's own counter, so a
+    /// collision with ours is ordinary), then the genuine reply behind it. The
+    /// old arm matched on the id alone and `return`ed, so the request was handed
+    /// to `parse_hooks_list`, failed its `result` check, and ended the attempt
+    /// with the real listing still unread.
+    #[test]
+    fn a_stray_id_2_request_does_not_swallow_the_hooks_list_reply() {
+        let (tx, rx) = mpsc::channel::<String>();
+        for line in [
+            json!({"jsonrpc": "2.0", "id": 1, "result": {"userAgent": "codex"}}),
+            json!({"jsonrpc": "2.0", "method": "codex/event", "params": {}}),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "account/chatgptAuthTokens/refresh",
+                "params": {"reason": "expired"}
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": {"data": [{
+                    "cwd": "/w",
+                    "warnings": [],
+                    "errors": [],
+                    "hooks": [{
+                        "key": "/h/hooks.json:session_start:0:0",
+                        "eventName": "session_start",
+                        "command": "/abs/dot-agent-deck hook --agent codex",
+                        "sourcePath": "/h/hooks.json",
+                        "isManaged": false,
+                        "enabled": true,
+                        "currentHash": "abc123",
+                        "trustStatus": "untrusted"
+                    }]
+                }]}
+            }),
+        ] {
+            tx.send(line.to_string()).expect("queue a line");
+        }
+        drop(tx);
+
+        let entries = read_hooks_list_reply(&rx, Instant::now() + HOOKS_LIST_TIMEOUT)
+            .expect("the genuine hooks/list reply sits behind the stray request and must be read");
+        assert_eq!(
+            entries.len(),
+            1,
+            "the reply's single entry must survive a preceding stray id-2 request"
+        );
+        assert_eq!(entries[0].key, "/h/hooks.json:session_start:0:0");
+        assert_eq!(entries[0].current_hash, "abc123");
+    }
+
+    /// The response test above must not be passing because the predicate demands
+    /// a `result`: a JSON-RPC **error** reply is a response too, and skipping it
+    /// would turn an immediate, named failure into a five-second timeout whose
+    /// message names the wrong cause.
+    #[test]
+    fn an_id_2_error_reply_is_matched_rather_than_skipped() {
+        let (tx, rx) = mpsc::channel::<String>();
+        tx.send(
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "error": {"code": -32601, "message": "method not found"}
+            })
+            .to_string(),
+        )
+        .expect("queue a line");
+        drop(tx);
+
+        let err = read_hooks_list_reply(&rx, Instant::now() + HOOKS_LIST_TIMEOUT)
+            .expect_err("an error reply must fail the call");
+        let message = err.to_string();
+        assert!(
+            message.contains("hooks/list failed"),
+            "an error reply must be reported as itself, not as a timeout; got {message}"
         );
     }
 }
