@@ -139,7 +139,9 @@ use dot_agent_deck::platform::paths::config_dir;
 // types whose `Deserialize` bounds and charset-checks them — which is exactly
 // what these are. See `xtask/linkage-check/src/desktop_project_boundary.rs` for
 // why `remote_tunnel` is on that rule's allowlist.
-use dot_agent_deck::remote_tunnel::{HostAlias, Hostname, KeyPath, RemoteSocketPath, SshUser};
+use dot_agent_deck::remote_tunnel::{
+    HostAlias, Hostname, KeyPath, RemoteSocketPath, SshPort, SshUser,
+};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 /// Overrides the whole settings path, mirroring `DOT_AGENT_DECK_CONFIG`
@@ -503,8 +505,16 @@ pub struct RemoteEndpointSettings {
     /// and key stay in that config rather than being copied here.
     #[serde(default)]
     pub jump: Option<HostAlias>,
+    /// The ssh port.
+    ///
+    /// An [`SshPort`] rather than a `u16` (PRD #741, Greptile P2 on #1035): a
+    /// `u16` admits `0`, the webview's own predicate does not, and a
+    /// hand-edited `port = 0` therefore loaded and reached OpenSSH as `-p 0`,
+    /// which it refuses. Port was the one field of this row that stayed a
+    /// primitive when the other five became validating newtypes, so it was also
+    /// the one the validator-parity work could not cover.
     #[serde(default = "default_ssh_port")]
-    pub port: u16,
+    pub port: SshPort,
     /// The daemon's attach socket path **on the remote host**.
     ///
     /// # Optional in storage, and this is the milestone's answer to it
@@ -545,11 +555,13 @@ pub struct RemoteEndpointSettings {
 
 /// The ssh port a row with no `port` key means.
 ///
-/// Taken from [`RemoteEndpoint::DEFAULT_PORT`] rather than written as `22`, so
-/// a row stored without a port and a row built by `RemoteEndpoint::new` can
-/// never describe different decks.
-fn default_ssh_port() -> u16 {
-    RemoteEndpoint::DEFAULT_PORT
+/// Taken from [`SshPort::DEFAULT`] rather than written as `22`, so a row stored
+/// without a port and a row built by `RemoteEndpoint::new` can never describe
+/// different decks — the assertion below is what keeps the two definitions from
+/// drifting apart now that they are separate constants.
+fn default_ssh_port() -> SshPort {
+    debug_assert_eq!(SshPort::DEFAULT.get(), RemoteEndpoint::DEFAULT_PORT);
+    SshPort::DEFAULT
 }
 
 impl RemoteEndpointSettings {
@@ -587,7 +599,7 @@ impl RemoteEndpointSettings {
         dot_agent_deck::remote_tunnel::SshDestination::with_parts(
             self.host.clone(),
             self.user.clone(),
-            self.port,
+            self.port.get(),
             self.identity.clone(),
             self.jump.clone(),
         )
@@ -611,7 +623,7 @@ impl RemoteEndpointSettings {
     /// remote socket path — see [`Self::socket`].
     pub fn endpoint(&self) -> Option<RemoteEndpoint> {
         let mut endpoint =
-            RemoteEndpoint::new(self.host.clone(), self.socket.clone()?).with_port(self.port);
+            RemoteEndpoint::new(self.host.clone(), self.socket.clone()?).with_port(self.port.get());
         if let Some(user) = &self.user {
             endpoint = endpoint.with_user(user.clone());
         }
@@ -2850,7 +2862,7 @@ forms it is.";
                     id: EndpointId::parse("deck1").unwrap(),
                     identity: Some(KeyPath::parse("~/.ssh/id_ed25519").unwrap()),
                     jump: Some(HostAlias::parse("bastion").unwrap()),
-                    port: 2222,
+                    port: SshPort::parse(2222).unwrap(),
                     socket: Some(
                         RemoteSocketPath::parse("/run/user/1000/dot-agent-deck-attach.sock")
                             .unwrap(),
@@ -3866,6 +3878,47 @@ level = 1.0
                 "{field} = {value:?} must be refused, not stored"
             );
         }
+    }
+
+    /// Scenario: hand-edit a deck row to `port = 0` and load the document. It
+    /// is refused by [`SshPort`]'s deserializer and takes the same
+    /// malformed-document route every other field's hostile value does (PRD
+    /// #741, Greptile P2 on #1035).
+    ///
+    /// It is a case of its own rather than a row of the list above because the
+    /// value is a TOML *integer*, not a string. And it is here at all because
+    /// the field used to be a bare `u16`: the webview refuses `0`, a `u16` does
+    /// not, and the gap was not inert — the value loaded, reached
+    /// `tunnel_args`, and was handed to OpenSSH as `-p 0`, which it refuses
+    /// with a message about nothing the user had typed.
+    #[test]
+    fn a_hand_edited_port_of_zero_is_refused_rather_than_handed_to_ssh() {
+        let row = |port: &str| {
+            format!(
+                "version = 1\n\n[[endpoints.remote]]\nhost = \"h\"\nid = \"d\"\nport = {port}\n"
+            )
+        };
+        for refused in ["0", "65536", "-1"] {
+            assert!(
+                toml::from_str::<DesktopSettings>(&row(refused)).is_err(),
+                "port = {refused} must be refused, not stored"
+            );
+        }
+        for accepted in ["1", "22", "65535"] {
+            let parsed = toml::from_str::<DesktopSettings>(&row(accepted))
+                .unwrap_or_else(|error| panic!("port = {accepted} must load: {error}"));
+            assert_eq!(
+                parsed.endpoints.expect("a section").remote[0].port.get(),
+                accepted.parse::<u16>().expect("a test constant"),
+            );
+        }
+        // And the whole document falls back to defaults rather than launching
+        // with a half-read one, which is `load_from`'s contract for every other
+        // malformed value.
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = dir.path().join("desktop.toml");
+        std::fs::write(&path, row("0")).expect("write the hand-edited document");
+        assert_eq!(load_from(&path), DesktopSettings::default());
     }
 
     /// Scenario: a row missing its host, and a row missing its id. Neither is a

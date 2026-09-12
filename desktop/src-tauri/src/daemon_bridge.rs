@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use dot_agent_deck::daemon_attach::{
     DAEMON_START_POLL_TIMEOUT, ensure_daemon_running, spawn_daemon_serve_detached_with_exe,
 };
-use dot_agent_deck::daemon_client::{DaemonClient, Endpoint, issue_command};
+use dot_agent_deck::daemon_client::{DaemonClient, Endpoint, EndpointIdentity, issue_command};
 #[cfg(test)]
 use dot_agent_deck::daemon_protocol::RunningAgentsSummary;
 use dot_agent_deck::daemon_protocol::{AttachRequest, AttachResponse, PROTOCOL_VERSION};
@@ -228,7 +228,7 @@ pub(crate) const HANDSHAKE_REVALIDATE_INTERVAL: Duration = Duration::from_secs(5
 /// not answering queues the other callers behind one connect timeout rather
 /// than giving each its own, which is also the better of the two.
 pub(crate) struct DaemonLinks {
-    links: AsyncMutex<HashMap<String, Arc<TrustedDaemon>>>,
+    links: AsyncMutex<HashMap<EndpointIdentity, Arc<TrustedDaemon>>>,
     /// The live transports (PRD #741 M7).
     ///
     /// **This is a field of `DesktopState`, shared here by `Arc` — it is not a
@@ -264,7 +264,7 @@ impl DaemonLinks {
     /// classification is never returned after the deck behind it stopped
     /// answering.
     pub(crate) async fn trusted(&self, endpoint: &Endpoint) -> Result<Arc<TrustedDaemon>, String> {
-        let key = endpoint.describe();
+        let key = endpoint.identity();
         let mut links = self.links.lock().await;
         if let Some(held) = links.get(&key)
             && held.is_fresh(Instant::now())
@@ -304,7 +304,7 @@ impl DaemonLinks {
     /// Forget the link for `endpoint`, so the next [`Self::trusted`] handshakes
     /// again.
     pub(crate) async fn invalidate(&self, endpoint: &Endpoint) {
-        self.links.lock().await.remove(&endpoint.describe());
+        self.links.lock().await.remove(&endpoint.identity());
     }
 
     /// Forget every link. Used where the reason to distrust the held state is
@@ -618,6 +618,61 @@ fn release_versions_are_compatible(client_build: &str, daemon_build: Option<&str
         (Some(client), Some(daemon)) => client == daemon,
         _ => false,
     }
+}
+
+/// A daemon build stamp that THIS build is guaranteed to classify as
+/// incompatible, whatever this build happens to be stamped with.
+///
+/// # Why this exists, rather than a literal in each test
+///
+/// A test driving the live handshake — [`hello`], and everything above it —
+/// supplies only the *daemon* half of the comparison. The client half is
+/// [`dot_agent_deck::build_id::local_build_id`], i.e. whatever `build.rs`
+/// baked in, and that is decided by the build ENVIRONMENT: `build.rs`'s
+/// resolution order is injected env -> git tag -> `CARGO_PKG_VERSION`, and
+/// `CARGO_PKG_VERSION` is the `0.1.0` placeholder. So a checkout with tags
+/// stamps `0.39.x-g…` and a checkout without them stamps `0.1.0-g…` — and
+/// `actions/checkout` sets no `fetch-depth`, so CI is the second kind.
+///
+/// A literal fixture stamp therefore encodes an assumption about the machine.
+/// `0.1.0-gdeadbee` and `0.1.0-gfeedface` both did: they refused locally and,
+/// on CI, shared the placeholder's `(0, 1)` [`compatibility_key`] with the
+/// client, so [`release_versions_are_compatible`] said `true`, the stamp branch
+/// was never entered, and two tests asserting a refusal got `Connected`
+/// instead. This is exactly the trap [`StampPolicy`]'s own doc comment warns a
+/// hand-tester about, reached from the other direction.
+///
+/// So the fixture is DERIVED: it takes the client's own compatibility key and
+/// moves the digit that key reads — the minor while `0.x`, the major from `1.0`
+/// on — which puts the pair on opposite sides of the rule by construction, at
+/// `0.1.0` and at `0.39.4` alike. The two `assert!`s below are the point of the
+/// helper as much as the arithmetic is: they re-check both halves of the
+/// condition [`classify_handshake`]'s stamp branch is guarded by, so a fixture
+/// that stops reaching that branch fails HERE, naming the reason, instead of
+/// letting a caller's `assert_eq!` pass for the wrong reason.
+#[cfg(test)]
+pub(crate) fn stamp_incompatible_with_this_build(sha: &str) -> String {
+    let client = dot_agent_deck::build_id::local_build_id();
+    let candidate = match release_core(&client) {
+        Some((0, minor, _)) => format!("0.{}.0-g{sha}", minor + 1),
+        Some((major, _, _)) => format!("{}.0.0-g{sha}", major + 1),
+        // An unreadable client stamp makes `release_versions_are_compatible`
+        // answer `false` against every daemon stamp, so any value that differs
+        // textually reaches the branch. `0.0.0` is not a version this project
+        // can ever have released, which keeps the `assert_ne!` below honest.
+        None => format!("0.0.0-g{sha}"),
+    };
+    assert_ne!(
+        candidate, client,
+        "the fixture must differ from this build's own stamp, or the stamp \
+         branch is never entered"
+    );
+    assert!(
+        !release_versions_are_compatible(&client, Some(&candidate)),
+        "the fixture must be release-INcompatible with this build's own stamp \
+         ({client}), or the stamp branch is never entered: {candidate}"
+    );
+    candidate
 }
 
 fn classify_handshake(
@@ -2769,7 +2824,10 @@ mod tests {
         let listener = bind_trusted(&socket);
 
         let mut busy = AttachResponse::hello(PROTOCOL_VERSION);
-        busy.build_version = Some("0.1.0-gdeadbee".into());
+        // Derived from this build's own stamp rather than written out, so the
+        // refusal this test is about happens on a tagless CI checkout too —
+        // see `stamp_incompatible_with_this_build`.
+        busy.build_version = Some(stamp_incompatible_with_this_build("deadbee"));
         busy.running_agents = Some(RunningAgentsSummary {
             count: 2,
             names: vec!["a".into(), "b".into()],

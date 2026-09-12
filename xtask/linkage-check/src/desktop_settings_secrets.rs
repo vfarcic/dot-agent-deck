@@ -139,11 +139,14 @@ const ALLOWED_FIELD_TYPES: [(&str, FieldKind, &str); 15] = [
         "an integer; there is no text for a credential to be",
     ),
     (
-        "u16",
+        "SshPort",
         FieldKind::Scalar,
         "an integer; there is no text for a credential to be. It is the ssh \
-         port, and the type is the bound — 0..=65535 and nothing else is \
-         representable",
+         port, and the type is the bound — a newtype over NonZeroU16, so \
+         1..=65535 and nothing else is representable. It replaced a bare `u16` \
+         (PRD #741, Greptile P2 on #1035): that admitted 0, the webview's own \
+         predicate did not, and a hand-edited `port = 0` reached OpenSSH as \
+         `-p 0`",
     ),
     (
         "AppearanceMode",

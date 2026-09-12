@@ -961,10 +961,48 @@ async fn watch_one_subscription(
                 drain_pending(app, view, &mut events);
             }
         }
+        // PRD #741, Greptile P1 on #1035: the `select!` arm above observes a
+        // selection change only while this loop is PARKED in it. Everything
+        // from there to the emit runs outside it — `drain_pending`, and above
+        // all the coalescing sleep, which is up to `SNAPSHOT_COALESCE_INTERVAL`
+        // of wall clock — so a change landing in that stretch went unseen until
+        // the next iteration, by which time the emit had already happened. It
+        // would have paired the NEW deck's `selected_endpoint()` with a `view`
+        // folded from the OLD one: one machine's agents under another machine's
+        // name, and a later action on one of those rows sending an old agent id
+        // to the new deck. Exactly the defect M9 fixed for the subscription,
+        // surviving in the sleep.
+        if selection_moved_since_last_seen(selection) {
+            return SubscriptionEnd::SelectionChanged;
+        }
         let snapshot = snapshot_with(&selected_endpoint(), links, Some(view)).await;
         emit_snapshot(app, &snapshot);
         last_refresh = Some(tokio::time::Instant::now());
     }
+}
+
+/// Has the selection moved since this receiver last observed it?
+///
+/// A named function rather than the one call inlined, because the two things
+/// worth pinning about it are both decisions and neither is visible at the call
+/// site (PRD #741, Greptile P1 on #1035).
+///
+/// **Polled rather than a second `select!` arm on the sleep**, and that is the
+/// stronger of the two: an arm would only cover the window it is racing, while
+/// one poll immediately before the emit covers *everything* since the last
+/// observation — the drain, the sleep, and the snapshot decision itself.
+///
+/// **An error reads as `false`, not as a reason to end the watch.**
+/// [`tokio::sync::watch::Receiver::has_changed`] errors only when every sender
+/// is gone, which cannot happen while `DesktopState` is alive; and an arm that
+/// took the error as "changed" would complete immediately and forever, spinning
+/// the loop instead of coalescing it.
+///
+/// Returning without marking the value seen is correct: the caller runs
+/// `selection.mark_unchanged()` before the next subscription, so the next
+/// `watch_one_subscription` starts from the generation actually in force.
+fn selection_moved_since_last_seen(selection: &tokio::sync::watch::Receiver<u64>) -> bool {
+    selection.has_changed().unwrap_or(false)
 }
 
 /// Apply every event already queued, without waiting for another.
@@ -1241,16 +1279,17 @@ async fn apply_selection(app: &AppHandle, state: &DesktopState, settings: &Deskt
 /// pinning here is exactly the thing a running app makes hard to observe: that an
 /// ordinary settings save does **not** take the switch path.
 async fn retarget_selection(state: &DesktopState, settings: &DesktopSettings) -> bool {
-    let previous = crate::dto::selected_endpoint().describe();
+    let previous = crate::dto::selected_endpoint().identity();
     let deck = crate::dto::apply_settings_selection(settings);
-    let key = deck.endpoint.describe();
+    let key = deck.endpoint.identity();
     let moved = selection_moved(&previous, &key);
     // Before the tunnels are released, so a DETACH frame still has a transport.
     if moved {
         terminal::detach_all(state).await;
     }
     state.daemon.invalidate_all().await;
-    let live: std::collections::HashSet<String> = [key].into_iter().collect();
+    let live: std::collections::HashSet<dot_agent_deck::daemon_client::EndpointIdentity> =
+        [key].into_iter().collect();
     state.tunnels.retain(&live).await;
     if moved {
         state.selection_changed();
@@ -1260,18 +1299,29 @@ async fn retarget_selection(state: &DesktopState, settings: &DesktopSettings) ->
 
 /// Whether a save changed which deck the app is talking to.
 ///
-/// Compared by `Endpoint::describe()` — the key both `DaemonLinks` and
-/// `EndpointTunnels` are indexed by — rather than by the stored `Selection`
-/// token, and the difference is load-bearing in both directions. **Editing the
-/// selected deck's address moves the deck without moving the token**, and that
-/// has to count: the tunnel, the link and every terminal on it belong to the old
-/// address. And a *resolved* key is what the app is actually talking to, so a
-/// selection that falls back to the local deck — a row that is gone, a row with
-/// no socket path yet — compares as local, which is what it is.
+/// Compared by [`dot_agent_deck::daemon_client::EndpointIdentity`] — the key
+/// both `DaemonLinks` and `EndpointTunnels` are indexed by — rather than by the
+/// stored `Selection` token, and the difference is load-bearing in both
+/// directions. **Editing the selected deck's address moves the deck without
+/// moving the token**, and that has to count: the tunnel, the link and every
+/// terminal on it belong to the old address. And a *resolved* key is what the
+/// app is actually talking to, so a selection that falls back to the local deck
+/// — a row that is gone, a row with no socket path yet — compares as local,
+/// which is what it is.
 ///
 /// The converse is the case this exists for: editing a deck the user is **not**
 /// on, or changing a theme, leaves the key identical and takes no switch path.
-fn selection_moved(previous: &str, next: &str) -> bool {
+///
+/// It compared `Endpoint::describe()` until PRD #741's Greptile P1 review: that
+/// string omits the remote socket path, the identity file and the jump host, so
+/// editing any of the three on the selected deck moved the deck without moving
+/// the comparison — no detach, no tunnel teardown, and the held link stayed
+/// pointed at the old route. The identity type is what closes it here and in
+/// the two maps at once.
+fn selection_moved(
+    previous: &dot_agent_deck::daemon_client::EndpointIdentity,
+    next: &dot_agent_deck::daemon_client::EndpointIdentity,
+) -> bool {
     previous != next
 }
 
@@ -1784,25 +1834,114 @@ mod tests {
         );
     }
 
+    /// A remote deck at `host` whose daemon listens on `socket` over there,
+    /// with every optional field left off.
+    fn deck_at(host: &str, socket: &str) -> dot_agent_deck::daemon_client::RemoteEndpoint {
+        use dot_agent_deck::remote_tunnel::{Hostname, RemoteSocketPath};
+        dot_agent_deck::daemon_client::RemoteEndpoint::new(
+            Hostname::parse(host).expect("a valid hostname"),
+            RemoteSocketPath::parse(socket).expect("a valid remote socket path"),
+        )
+    }
+
     /// The decision is made on the RESOLVED endpoint key, not on the stored
     /// token (PRD #741 M9).
     #[test]
     fn a_deck_moves_when_its_address_moves_even_if_the_token_does_not() {
+        use dot_agent_deck::daemon_client::{Endpoint, LocalEndpoint};
+
         // The key both `DaemonLinks` and `EndpointTunnels` are indexed by. An
         // edit to the selected deck's address moves the tunnel, the link and
         // every terminal on it, while leaving the stored token identical — so a
         // token comparison would miss exactly the case that matters most.
-        assert!(selection_moved(
-            "vf@build-box.example.com",
-            "vf@build-box.example.com:2222"
-        ));
-        assert!(!selection_moved("/run/deck.sock", "/run/deck.sock"));
+        let box_22 = Endpoint::Remote(deck_at("build-box.example.com", "/run/deck.sock"));
+        let box_2222 =
+            Endpoint::Remote(deck_at("build-box.example.com", "/run/deck.sock").with_port(2222));
+        let local = Endpoint::Local(LocalEndpoint::at("/run/deck.sock"));
+        assert!(selection_moved(&box_22.identity(), &box_2222.identity()));
+        assert!(!selection_moved(&local.identity(), &local.identity()));
         // A selection that falls back to local compares as local, which is what
         // the app is actually talking to.
-        assert!(selection_moved(
-            "vf@build-box.example.com",
-            "/run/deck.sock"
-        ));
+        assert!(selection_moved(&box_22.identity(), &local.identity()));
+    }
+
+    /// The emit must not be reached with a selection change already pending
+    /// (PRD #741, Greptile P1 on #1035).
+    ///
+    /// The composition — that this is polled immediately before
+    /// `snapshot_with` — is read rather than asserted, because the emit needs
+    /// an `AppHandle` and therefore a running Tauri app. What is pinned here is
+    /// the decision the call site cannot show: a change from ANY point since
+    /// the last observation counts, and a dead sender is not one.
+    #[test]
+    fn a_selection_change_is_seen_after_the_coalescing_sleep_too() {
+        let (tx, rx) = tokio::sync::watch::channel(0u64);
+        assert!(
+            !selection_moved_since_last_seen(&rx),
+            "a fresh receiver has seen the generation in force"
+        );
+
+        // What the M9 `select!` arm cannot see: the change lands while the loop
+        // is in `drain_pending` or the coalescing sleep rather than parked in
+        // the arm.
+        tx.send(1).expect("the receiver is alive");
+        assert!(
+            selection_moved_since_last_seen(&rx),
+            "the emit must not pair the new deck with the old fold"
+        );
+
+        // Observing it clears it, so one change ends one subscription.
+        let mut rx = rx;
+        rx.mark_unchanged();
+        assert!(!selection_moved_since_last_seen(&rx));
+
+        // Every sender gone is not a selection change. Taking it as one would
+        // spin the refresh loop instead of coalescing it.
+        drop(tx);
+        assert!(
+            !selection_moved_since_last_seen(&rx),
+            "a dead sender must not read as a deck switch"
+        );
+    }
+
+    /// The three fields `Endpoint::describe()` does not render (PRD #741,
+    /// Greptile P1 on #1035).
+    ///
+    /// Each names a different daemon, or a different ssh route to one, while
+    /// leaving `user@host[:port]` byte-identical — so while the comparison was
+    /// a display string, editing any of them on the selected deck took the
+    /// no-op path: nothing detached, no tunnel was released, and the held link
+    /// kept talking through the route the user had just replaced.
+    #[test]
+    fn a_deck_moves_when_a_field_describe_does_not_render_moves() {
+        use dot_agent_deck::daemon_client::Endpoint;
+        use dot_agent_deck::remote_tunnel::{HostAlias, KeyPath};
+
+        let base = deck_at("build-box.example.com", "/run/deck.sock");
+        let others = [
+            // A different daemon on the same host.
+            deck_at("build-box.example.com", "/run/other.sock"),
+            // A different key, so a different ssh identity.
+            base.clone()
+                .with_key(KeyPath::parse("~/.ssh/id_ed25519").expect("key path")),
+            // A different route to the same host.
+            base.clone()
+                .with_jump(HostAlias::parse("bastion").expect("jump alias")),
+        ];
+        for other in others {
+            assert_eq!(
+                base.describe(),
+                other.describe(),
+                "the premise of this test is that `describe()` cannot tell these apart"
+            );
+            assert!(
+                selection_moved(
+                    &Endpoint::Remote(base.clone()).identity(),
+                    &Endpoint::Remote(other.clone()).identity()
+                ),
+                "a field that changes the connection must move the deck: {other:?}"
+            );
+        }
     }
 
     #[derive(Clone)]

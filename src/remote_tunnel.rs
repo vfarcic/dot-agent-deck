@@ -50,6 +50,7 @@
 //!   cannot be told so by this module.
 
 use std::fmt;
+use std::num::NonZeroU16;
 use std::path::Path;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -132,6 +133,11 @@ pub enum SshArgumentError {
          must be present"
     )]
     EmptyAtSeparatedPart { field: &'static str },
+    /// The one value a `u16` can hold and a TCP port cannot. Its own variant
+    /// rather than a `ForbiddenByte`, because [`SshPort`] validates a number
+    /// and the other variants all describe bytes of text.
+    #[error("the port must be between 1 and 65535: ssh refuses '-p 0'")]
+    PortZero,
 }
 
 /// How one argument type is validated. Implemented per newtype so the rules are
@@ -330,6 +336,80 @@ ssh_argument! {
     /// `-L` is parsed by splitting on `:`, so a colon here would silently
     /// re-interpret the forward spec.
     RemoteSocketPath
+}
+
+/// The TCP port `ssh` connects to, which is never zero.
+///
+/// The sixth field of a stored deck row, and the one that stayed a bare `u16`
+/// while the other five became validating newtypes (PRD #741, Greptile P2 on
+/// #1035). A `u16` bounds the value at `0..=65535` and the webview's own
+/// predicate at `1..=65535`, so the two disagreed on exactly one value — and
+/// that value is not inert: a hand-edited `desktop.toml` carrying `port = 0`
+/// deserialized, reached `tunnel_args` and was handed to OpenSSH as `-p 0`,
+/// which it refuses. The failure surfaced as an opaque ssh error against a
+/// document the app had accepted.
+///
+/// Backed by [`NonZeroU16`], so the refusal is the *type* rather than a check
+/// somebody remembered to write: there is no value of this type that is zero,
+/// and [`Self::get`] hands back a `u16` every existing ssh call site already
+/// takes.
+///
+/// It is **not** an [`ssh_argument!`] newtype, because that macro is over
+/// `String` and validates a charset; there is no text here for a credential to
+/// be, which is what its `ALLOWED_FIELD_TYPES` row records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SshPort(NonZeroU16);
+
+impl SshPort {
+    /// The port a deck is reached on when nothing says otherwise.
+    pub const DEFAULT: Self = match NonZeroU16::new(crate::remote::DEFAULT_SSH_PORT) {
+        Some(port) => Self(port),
+        // `DEFAULT_SSH_PORT` is 22. A `const` panic here would be a compile
+        // error, which is the right time to find out.
+        None => panic!("DEFAULT_SSH_PORT must not be zero"),
+    };
+
+    /// Validate `raw` and wrap it. The only constructor: there is no
+    /// `From<u16>`, deliberately, so no call site can skip the check by
+    /// reaching for a cheaper conversion.
+    pub fn parse(raw: u16) -> Result<Self, SshArgumentError> {
+        NonZeroU16::new(raw)
+            .map(Self)
+            .ok_or(SshArgumentError::PortZero)
+    }
+
+    /// The validated value, for the ssh call sites that take a `u16`.
+    pub fn get(self) -> u16 {
+        self.0.get()
+    }
+}
+
+impl Default for SshPort {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
+impl fmt::Display for SshPort {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl Serialize for SshPort {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_u16(self.0.get())
+    }
+}
+
+impl<'de> Deserialize<'de> for SshPort {
+    /// Deserialize through `u16` and then validate, exactly as the five string
+    /// newtypes do — so a hand-edited document cannot smuggle a value past the
+    /// check a settings form applies.
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = u16::deserialize(deserializer)?;
+        Self::parse(raw).map_err(serde::de::Error::custom)
+    }
 }
 
 impl SshArgumentRules for Hostname {
@@ -3193,6 +3273,7 @@ mod tests {
             SshArgumentError::UnclosedBracket { .. } => "UnclosedBracket",
             SshArgumentError::BareIpv6Separator { .. } => "BareIpv6Separator",
             SshArgumentError::EmptyAtSeparatedPart { .. } => "EmptyAtSeparatedPart",
+            SshArgumentError::PortZero => "PortZero",
         }
     }
 

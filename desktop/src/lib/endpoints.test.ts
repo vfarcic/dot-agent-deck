@@ -245,8 +245,12 @@ describe("the placeholders the fields display", () => {
 });
 
 describe("portProblem", () => {
-  // The only field with no newtype behind it: the stored value is a `u16` and
-  // the input is `type="number"`, so this is the whole check.
+  // The sixth field's rule is a numeric range rather than a charset, so it is
+  // not a row of the shared table — its Rust counterpart is `SshPort`, pinned
+  // by `the_port_rule_this_side_applies_is_the_one_ssh_can_use` in
+  // `endpoint_field_parity.rs`. The two must accept the SAME set: `port = 0`
+  // used to pass Rust (a bare `u16`) and fail here, and it reached OpenSSH as
+  // `-p 0` (PRD #741, Greptile P2 on #1035).
   it("takes 1 through 65535 and nothing else", () => {
     const refusal = "A port is a whole number from 1 to 65535.";
     expect(portProblem(22)).toBeUndefined();

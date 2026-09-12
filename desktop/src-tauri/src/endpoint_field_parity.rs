@@ -236,6 +236,55 @@ mod tests {
     /// field as unset" is the other half of this pair, and the shared table
     /// carries no empty row because a row would have to claim one verdict for
     /// both.
+    /// The sixth field, whose rule is a numeric range rather than a charset
+    /// (PRD #741, Greptile P2 on #1035).
+    ///
+    /// **Not a row of the shared table, and that is a shape argument rather
+    /// than an omission**: every row there is a string handed to a `String`
+    /// deserializer, and the port is a `u16` handed to a `type="number"` input.
+    /// The two sides are held together by this test and by `portProblem`'s in
+    /// `endpoints.test.ts`, which name the same four boundary values in the
+    /// same terms.
+    ///
+    /// What it is here to stop coming back: `port` was a bare `u16` until this
+    /// milestone, so Rust accepted `0` and the webview did not — the only value
+    /// the two disagreed on, and not an inert one, since a hand-edited
+    /// `desktop.toml` carrying it reached OpenSSH as `-p 0`.
+    #[test]
+    fn the_port_rule_this_side_applies_is_the_one_ssh_can_use() {
+        use dot_agent_deck::remote_tunnel::SshPort;
+
+        for accepted in [1u16, 22, 2222, 65535] {
+            assert!(
+                SshPort::parse(accepted).is_ok(),
+                "the panel offers {accepted}, so this side must take it"
+            );
+            assert_eq!(
+                serde_json::from_str::<SshPort>(&accepted.to_string())
+                    .expect("a stored port in range must load")
+                    .get(),
+                accepted,
+                "a hand-written document must round-trip the value it holds"
+            );
+        }
+
+        assert!(
+            SshPort::parse(0).is_err(),
+            "the webview refuses 0 and ssh refuses `-p 0`, so this side must refuse it too"
+        );
+        let refused = serde_json::from_str::<SshPort>("0")
+            .expect_err("a stored `port = 0` must not load at all");
+        assert!(
+            refused.to_string().contains("1 and 65535"),
+            "the refusal must name the range a user can act on: {refused}"
+        );
+        // 65536 is unrepresentable in the underlying `u16`, so the deserializer
+        // refuses it before `SshPort` is consulted — the same verdict by a
+        // different route, which is why there is no `parse` case for it.
+        assert!(serde_json::from_str::<SshPort>("65536").is_err());
+        assert_eq!(SshPort::DEFAULT.get(), 22);
+    }
+
     #[test]
     fn the_empty_string_is_refused_here_while_the_panel_reads_it_as_unset() {
         for field in FIELDS {

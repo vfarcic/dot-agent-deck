@@ -64,7 +64,7 @@ pub enum ClientError {
 /// obtain one from an `Endpoint`, and it returns `None` for [`Self::Remote`] —
 /// so those operations cannot be *reached* from a remote deck and the caller is
 /// made to decide what to do instead.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Endpoint {
     /// A daemon process on this machine. Byte-identical in behaviour to
     /// everything that came before this type: same path, same trust check, same
@@ -141,13 +141,63 @@ impl Endpoint {
     /// How this endpoint is named in a message to the user. For a local deck
     /// that is its address, which is what the desktop's connection banner has
     /// always shown.
+    ///
+    /// **A label, and never a key.** Two decks that differ only in remote
+    /// socket path, identity file or jump host describe *identically* — see
+    /// [`EndpointIdentity`], which is what anything caching a connection must
+    /// index by instead.
     pub fn describe(&self) -> String {
         match self {
             Self::Local(local) => local.path().to_string_lossy().into_owned(),
             Self::Remote(remote) => remote.describe(),
         }
     }
+
+    /// What makes two decks the **same connection**, for anything that caches
+    /// one.
+    pub fn identity(&self) -> EndpointIdentity {
+        EndpointIdentity(self.clone())
+    }
 }
+
+/// The key a cached connection to a deck is indexed by.
+///
+/// # Why this is not `Endpoint::describe()`
+///
+/// It was, and that was a defect (PRD #741, Greptile P1 on #1035).
+/// [`Endpoint::describe`] renders a remote deck as `user@host[:port]` — a
+/// sentence for a human — and **three** of [`RemoteEndpoint`]'s six fields do
+/// not appear in it: the remote socket path, the identity file, and the jump
+/// host. Each of those changes which daemon the app ends up talking to, or how
+/// it gets there:
+///
+/// * `socket` names a *different daemon on the same host*;
+/// * `key` and `jump` name a different ssh route to it.
+///
+/// So two rows differing only in one of them collapsed onto one key, and
+/// `DaemonLinks` and `EndpointTunnels` handed the second row the first row's
+/// held link and live `ssh` child. The user-visible shape: edit the jump host
+/// of the deck you are on, save, and the app stays connected through the
+/// bastion you just removed while telling you it is on the new route.
+///
+/// # Why a newtype over the whole endpoint
+///
+/// Structural, derived equality over the entire [`Endpoint`] rather than a
+/// rendered string or a hand-picked tuple of fields, because those are the two
+/// ways this defect comes back. A rendering has to be *remembered* — the one
+/// that broke was a perfectly good display string that nobody had asked to be
+/// an identity — and a hand-picked tuple has to be *updated* when a field is
+/// added. A derive cannot be forgotten: a new field on [`RemoteEndpoint`] joins
+/// the key the moment it is declared, and a field that genuinely should not
+/// (there is none today) would have to be argued for explicitly by writing
+/// `Hash`/`PartialEq` by hand.
+///
+/// It is deliberately opaque — no `Display`, no `as_str`. The only thing a
+/// caller may do with one is compare it, hash it, or put it in a map, which is
+/// the whole point: a key that could be *printed* is a key someone will
+/// eventually build by printing.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct EndpointIdentity(Endpoint);
 
 /// A daemon running on **this machine**, addressed by the OS name a client
 /// connects to: a Unix domain socket path, or a `\\.\pipe\…` name on Windows
@@ -221,7 +271,7 @@ impl Endpoint {
 /// M2's verification was exactly this, done by hand: a deliberate
 /// `run_daemon_stop(&Endpoint::Remote(…))` was compiled, the `E0308` read, and
 /// the probe reverted.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct LocalEndpoint {
     path: PathBuf,
 }
@@ -286,7 +336,7 @@ impl AsRef<Path> for LocalEndpoint {
 /// [`Self::socket`] is the one field the PRD's list did not anticipate, and it
 /// is required rather than derived; [`crate::remote_tunnel::RemoteSocketPath`]
 /// records why OpenSSH leaves us no way to compute it from here.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct RemoteEndpoint {
     host: Hostname,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2052,6 +2102,78 @@ impl AttachConnection {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every [`RemoteEndpoint`] field that changes the connection changes the
+    /// [`EndpointIdentity`] — including the three [`Endpoint::describe`] does
+    /// not render (PRD #741, Greptile P1 on #1035).
+    ///
+    /// The `describe()` assertion in each case is the premise rather than
+    /// decoration: it is what shows the pair really is indistinguishable to the
+    /// old key, so a future change that made `describe()` render the socket
+    /// path would turn this test vacuous loudly instead of quietly.
+    #[test]
+    fn every_connection_bearing_field_is_part_of_the_identity() {
+        use crate::remote_tunnel::{HostAlias, Hostname, KeyPath, RemoteSocketPath, SshUser};
+
+        let deck = |host: &str, socket: &str| {
+            RemoteEndpoint::new(
+                Hostname::parse(host).expect("hostname"),
+                RemoteSocketPath::parse(socket).expect("remote socket path"),
+            )
+        };
+        let base = deck("build-box.example.com", "/run/deck.sock");
+
+        // Rendered by `describe()`, so the old string key saw these two.
+        let visible = [
+            deck("other-box.example.com", "/run/deck.sock"),
+            base.clone()
+                .with_user(SshUser::parse("deploy").expect("user")),
+            base.clone().with_port(2222),
+        ];
+        // NOT rendered by `describe()`. Each names a different daemon, or a
+        // different ssh route to one.
+        let invisible = [
+            deck("build-box.example.com", "/run/other.sock"),
+            base.clone()
+                .with_key(KeyPath::parse("~/.ssh/id_ed25519").expect("key path")),
+            base.clone()
+                .with_jump(HostAlias::parse("bastion").expect("jump alias")),
+        ];
+
+        for other in visible.iter().chain(invisible.iter()) {
+            assert_ne!(
+                Endpoint::Remote(base.clone()).identity(),
+                Endpoint::Remote(other.clone()).identity(),
+                "a field that changes the connection must change the key: {other:?}"
+            );
+        }
+        for other in &invisible {
+            assert_eq!(
+                base.describe(),
+                other.describe(),
+                "this case only means something while `describe()` cannot tell the two apart"
+            );
+        }
+
+        // And the same deck twice is one key, or nothing would ever be cached.
+        assert_eq!(
+            Endpoint::Remote(base.clone()).identity(),
+            Endpoint::Remote(deck("build-box.example.com", "/run/deck.sock")).identity()
+        );
+        // A local deck is keyed by its address, and never equal to a remote one.
+        assert_eq!(
+            Endpoint::Local(LocalEndpoint::at("/run/deck.sock")).identity(),
+            Endpoint::Local(LocalEndpoint::at("/run/deck.sock")).identity()
+        );
+        assert_ne!(
+            Endpoint::Local(LocalEndpoint::at("/run/deck.sock")).identity(),
+            Endpoint::Local(LocalEndpoint::at("/run/other.sock")).identity()
+        );
+        assert_ne!(
+            Endpoint::Local(LocalEndpoint::at("/run/deck.sock")).identity(),
+            Endpoint::Remote(base).identity()
+        );
+    }
     // `spec::spec` is needed cross-platform by `pane_input_011` (a pure serde
     // decode test that stays cross-platform below).
     use spec::spec;

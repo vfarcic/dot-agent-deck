@@ -639,8 +639,17 @@ async fn test_remote(
 /// as long as the old link stayed fresh. Testing the deck you are connected to
 /// would cost a duplicate authenticated session, which is the same defect this
 /// function exists to avoid, arrived at from the other side.
+///
+/// Compared by [`dot_agent_deck::daemon_client::EndpointIdentity`], not by
+/// `describe()`, and this is the sharp direction of PRD #741's Greptile P1: a
+/// display string omits the remote socket path, the identity file and the jump
+/// host, so a probe of a deck differing from the selection only in one of those
+/// read as "this IS the selection" and **kept** its transport. Nothing else
+/// closes one, so every such click leaked an authenticated `ssh` child — the
+/// exact leak this function exists to prevent, reached by mistaking two decks
+/// for one.
 async fn release_if_not_selected(tunnels: &EndpointTunnels, endpoint: &Endpoint) {
-    if endpoint.describe() != crate::dto::selected_endpoint().describe() {
+    if endpoint.identity() != crate::dto::selected_endpoint().identity() {
         tunnels.release(endpoint).await;
     }
 }
@@ -901,6 +910,10 @@ mod tests {
     /// writes `Host key verification fai\x01led.` onto the local client's stderr
     /// must not be able to promote an unrelated failure into a host-key verdict
     /// carrying a copy-paste `ssh` remedy.
+    ///
+    /// `#[cfg(unix)]` because `state_from_tunnel_error` is: the tunnel is
+    /// Unix-only, so on Windows there is no such function to call.
+    #[cfg(unix)]
     #[test]
     fn a_scrubbed_detail_cannot_promote_a_failure_into_a_host_key_verdict() {
         use dot_agent_deck::remote::SshError;
@@ -1319,9 +1332,15 @@ mod tests {
     async fn a_stamp_difference_over_a_real_socket_is_not_a_wire_disagreement() {
         let (dir, socket) = scratch_socket("stamp");
         let listener = bind_trusted(&socket);
+        // Derived from this build's own stamp rather than written out: the
+        // client half of the comparison is whatever `build.rs` baked in, and a
+        // literal that differs from a tagged checkout can still SHARE a
+        // compatibility key with a tagless one. See
+        // `daemon_bridge::stamp_incompatible_with_this_build`.
+        let daemon_stamp = crate::daemon_bridge::stamp_incompatible_with_this_build("feedface");
         let daemon = tokio::spawn(scripted_daemon(
             listener,
-            vec![hello_with_build(Some("0.1.0-gfeedface"))],
+            vec![hello_with_build(Some(&daemon_stamp))],
         ));
 
         let report = against_local_socket(&socket).await;
@@ -1335,7 +1354,7 @@ mod tests {
         );
         assert_eq!(
             report.daemon_build_version.as_deref(),
-            Some("0.1.0-gfeedface")
+            Some(daemon_stamp.as_str())
         );
         assert_eq!(report.server_protocol_version, Some(PROTOCOL_VERSION));
         let _ = std::fs::remove_dir_all(dir);

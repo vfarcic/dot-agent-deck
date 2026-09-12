@@ -48,7 +48,7 @@
  * what their ssh config is doing on their behalf. Explanation of *why* the app
  * is built this way is in `docs/` and in the PRD, per that document's text rule.
  */
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { AlertTriangle, Check, Plug, Plus, Trash2 } from "lucide-react";
 import type {
   DesktopSettingsDto,
@@ -85,9 +85,46 @@ export function EndpointsPanel({ settings, onSave, saveError, mode }: SettingsPa
   const onTest = useSettingsBridge()?.testEndpoint;
   const section = sectionOf(settings);
   const selection = section.selection;
-  const selected = section.remote.find((row) => row.id === selection);
   const [reports, setReports] = useState<Record<string, EndpointTestReportDto>>({});
   const [testing, setTesting] = useState<string>();
+  /**
+   * A deck being added, held HERE until it is storable (PRD #741, Greptile P2
+   * on #1035).
+   *
+   * `addDeck` used to write the blank row straight into the document. Rust's
+   * `Hostname` refuses an empty string, so `desktop_set_settings` rejected the
+   * whole document — which meant the row lived only in this component's
+   * optimistic state and vanished on restart, AND that **every unrelated save
+   * failed for as long as it was there**: an appearance change made while a
+   * half-filled deck row sat in the list could not be persisted either.
+   *
+   * A draft is not in the document, so it cannot be named by
+   * `section.selection` either — {@link shown} is what the panel focuses
+   * instead, and the stored selection only moves when the row commits.
+   */
+  const [draft, setDraft] = useState<RemoteEndpointDto>();
+
+  /**
+   * The document as of the latest render, for a write-back that happens after
+   * an `await` (PRD #741, Greptile P1 on #1035).
+   *
+   * `runTest` closes over `settings` at call time and an ssh probe takes
+   * seconds, so anything the user edits in the meantime is in a NEWER document
+   * that the closure cannot see. Spreading the captured one over it reverted
+   * those edits — and, where the row had been removed, put it back.
+   */
+  const latest = useRef(settings);
+  useEffect(() => {
+    latest.current = settings;
+  }, [settings]);
+
+  // The row whose fields are on screen: a draft while one is being filled in,
+  // otherwise the deck the document selects.
+  const shown = draft ? draft.id : selection;
+  const selected = draft ?? section.remote.find((row) => row.id === shown);
+  // What the chooser offers: every stored deck, plus an unsaved draft at the
+  // end so a user filling one in can see the row they are typing into.
+  const rows = draft ? [...section.remote, draft] : section.remote;
 
   /**
    * Write a new endpoint section back. The whole document goes, with `settings`
@@ -96,26 +133,63 @@ export function EndpointsPanel({ settings, onSave, saveError, mode }: SettingsPa
   const saveSection = (next: EndpointSettingsDto) => onSave({ ...settings, endpoints: next });
 
   const addDeck = () => {
-    const row = blankEndpoint();
-    // Selected on creation: an added deck the user then has to select is two
-    // steps for one intent, and the fields below are the chosen deck's.
-    saveSection({ remote: [...section.remote, row], selection: row.id });
+    // Focused on creation, but NOT stored and NOT selected: an added deck the
+    // user then has to select is two steps for one intent, and a deck with no
+    // host is not one the app can be pointed at yet.
+    setDraft(blankEndpoint());
   };
 
-  const removeDeck = (id: string) => {
-    const remote = section.remote.filter((row) => row.id !== id);
-    // Removing the deck in use falls back to local rather than to another
-    // remote one: the app always has a deck, and choosing a different remote
-    // one on the user's behalf is a decision they did not make.
-    saveSection({ remote, selection: selection === id ? LOCAL_ENDPOINT_SELECTION : selection });
+  /**
+   * Point the app at a stored deck. Abandons an unfinished draft, visibly — a
+   * draft becomes a stored deck the moment it is valid, so the only thing that
+   * can be lost here is a row that could not have been saved anyway.
+   *
+   * Clicking the draft's own radio is a no-op rather than a selection: it is
+   * already the row on screen, and writing its id into `selection` would name a
+   * deck the document does not contain, which `EndpointSettings::resolve`
+   * answers with the local fallback.
+   */
+  const chooseDeck = (id: string) => {
+    if (draft?.id === id) return;
+    setDraft(undefined);
+    saveSection({ ...section, selection: id });
+  };
+
+  const forgetReport = (id: string) =>
     setReports((current) => {
       const next = { ...current };
       delete next[id];
       return next;
     });
+
+  const removeDeck = (id: string) => {
+    if (draft?.id === id) {
+      setDraft(undefined);
+      forgetReport(id);
+      return;
+    }
+    const remote = section.remote.filter((row) => row.id !== id);
+    // Removing the deck in use falls back to local rather than to another
+    // remote one: the app always has a deck, and choosing a different remote
+    // one on the user's behalf is a decision they did not make.
+    saveSection({ remote, selection: selection === id ? LOCAL_ENDPOINT_SELECTION : selection });
+    forgetReport(id);
   };
 
   const editDeck = (id: string, change: Partial<RemoteEndpointDto>) => {
+    if (draft?.id === id) {
+      const next = { ...draft, ...change };
+      // The moment it is storable it stops being a draft: it goes into the
+      // document and becomes the selection, which is what clicking "Add a deck"
+      // was always asking for. Until then nothing is written, so no save fails.
+      if (rowProblems(next).length === 0) {
+        setDraft(undefined);
+        saveSection({ remote: [...section.remote, next], selection: next.id });
+      } else {
+        setDraft(next);
+      }
+      return;
+    }
     saveSection({
       ...section,
       remote: section.remote.map((row) => (row.id === id ? { ...row, ...change } : row)),
@@ -132,9 +206,28 @@ export function EndpointsPanel({ settings, onSave, saveError, mode }: SettingsPa
       // so the document has one writer: `useDesktopSettings` already serialises
       // this side's read-modify-write. Only when the row still lacks one — a
       // probe never overwrites a path the user typed.
+      //
+      // Read off `latest`, never off the `settings`/`section` this call closed
+      // over: the probe has been running for seconds and the user may have
+      // typed, added or removed decks throughout it. Spreading the captured
+      // document would revert every one of those edits, and a row removed
+      // mid-probe would come back — the `find` below is what refuses that,
+      // because a deck that is no longer in the document has no socket to
+      // learn.
       if (report.discoveredSocket && id !== LOCAL_ENDPOINT_SELECTION) {
-        const row = section.remote.find((candidate) => candidate.id === id);
-        if (row && !row.socket) editDeck(id, { socket: report.discoveredSocket });
+        const current = sectionOf(latest.current);
+        const row = current.remote.find((candidate) => candidate.id === id);
+        if (row && !row.socket) {
+          onSave({
+            ...latest.current,
+            endpoints: {
+              ...current,
+              remote: current.remote.map((candidate) =>
+                candidate.id === id ? { ...candidate, socket: report.discoveredSocket } : candidate,
+              ),
+            },
+          });
+        }
       }
     } catch (cause) {
       setReports((current) => ({
@@ -185,16 +278,16 @@ export function EndpointsPanel({ settings, onSave, saveError, mode }: SettingsPa
           <DeckChoice
             id={LOCAL_ENDPOINT_SELECTION}
             label="This machine"
-            selected={selection === LOCAL_ENDPOINT_SELECTION}
-            onSelect={() => saveSection({ ...section, selection: LOCAL_ENDPOINT_SELECTION })}
+            selected={shown === LOCAL_ENDPOINT_SELECTION}
+            onSelect={() => chooseDeck(LOCAL_ENDPOINT_SELECTION)}
           />
-          {section.remote.map((row) => (
+          {rows.map((row) => (
             <DeckChoice
               key={row.id}
               id={row.id}
               label={displayText(describeEndpoint(row) || "New deck", DISPLAY_LIMITS.name)}
-              selected={selection === row.id}
-              onSelect={() => saveSection({ ...section, selection: row.id })}
+              selected={shown === row.id}
+              onSelect={() => chooseDeck(row.id)}
               onRemove={() => removeDeck(row.id)}
             />
           ))}
@@ -271,11 +364,11 @@ export function EndpointsPanel({ settings, onSave, saveError, mode }: SettingsPa
               testing !== undefined
               || (selected ? rowProblems(selected).length > 0 : false)
             }
-            onClick={() => void runTest(selection)}
+            onClick={() => void runTest(shown)}
           >
-            <Plug size={13} /> {testing === selection ? "Testing…" : "Test connection"}
+            <Plug size={13} /> {testing === shown ? "Testing…" : "Test connection"}
           </button>
-          <TestResult report={reports[selection]} mode={mode} />
+          <TestResult report={reports[shown]} mode={mode} />
         </div>
       )}
 

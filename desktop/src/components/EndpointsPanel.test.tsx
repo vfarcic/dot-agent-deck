@@ -48,12 +48,28 @@ function renderPanel(
       mode={options.mode ?? "live"}
     />
   );
-  render(
+  const wrap = (element: React.ReactElement) =>
     options.testEndpoint
-      ? <SettingsBridgeProvider value={{ testEndpoint: options.testEndpoint }}>{panel}</SettingsBridgeProvider>
-      : panel,
-  );
-  return { onSave, settings };
+      ? <SettingsBridgeProvider value={{ testEndpoint: options.testEndpoint }}>{element}</SettingsBridgeProvider>
+      : element;
+  const { rerender } = render(wrap(panel));
+  /**
+   * Hand the panel a NEWER document, the way the app does after a save — the
+   * harness holds `settings` fixed otherwise, so nothing else here can model an
+   * edit that lands while an async probe is in flight.
+   */
+  const update = (next: DesktopSettingsDto) =>
+    rerender(
+      wrap(
+        <EndpointsPanel
+          settings={next}
+          onSave={onSave}
+          saveError={options.saveError}
+          mode={options.mode ?? "live"}
+        />,
+      ),
+    );
+  return { onSave, settings, update };
 }
 
 describe("EndpointsPanel", () => {
@@ -73,23 +89,59 @@ describe("EndpointsPanel", () => {
   });
 
   /**
-   * Scenario: press "Add a deck". A row appears with a freshly minted id, and
-   * it is selected — an added deck the user then has to select is two steps for
-   * one intent, and the fields below belong to the chosen deck.
+   * Scenario: press "Add a deck". A row appears, focused, with its fields ready
+   * to fill in — and **nothing is saved yet**, because a deck with no host is
+   * not a document Rust will accept (PRD #741, Greptile P2 on #1035). Writing
+   * it immediately meant the row lived only in this component's optimistic
+   * state and that every unrelated settings save failed while it sat there.
    */
-  it("adds a deck, mints its id, and selects it", () => {
+  it("adds a deck as a local draft, saving nothing until it is valid", () => {
+    const { onSave } = renderPanel({}, { testEndpoint: async () => report() });
+    fireEvent.click(screen.getByTestId("add-deck"));
+
+    expect(onSave).not.toHaveBeenCalled();
+    // Present, focused, and named for what it is until it has a host.
+    expect(screen.getByTestId("deck-detail")).toBeInTheDocument();
+    expect(screen.getByLabelText("Host")).toHaveValue("");
+    expect(screen.getByText("New deck")).toBeInTheDocument();
+    // And it cannot be probed while it is unusable.
+    expect(screen.getByTestId("test-connection")).toBeDisabled();
+  });
+
+  /**
+   * Scenario: fill the draft's Host in. The moment the row is storable it stops
+   * being a draft — it goes into the document with a freshly minted id and
+   * becomes the selection, which is what pressing "Add a deck" was asking for.
+   */
+  it("stores a draft and selects it as soon as it is valid", () => {
     const { onSave } = renderPanel();
     fireEvent.click(screen.getByTestId("add-deck"));
+    fireEvent.change(screen.getByLabelText("Host"), { target: { value: "build-box" } });
 
     const saved = onSave.mock.calls[0][0] as DesktopSettingsDto;
     expect(saved.endpoints?.remote).toHaveLength(1);
     const added = saved.endpoints!.remote[0];
     expect(added.id).toMatch(/^[0-9a-f]{16}$/);
+    expect(added.host).toBe("build-box");
     expect(added.port).toBe(22);
     expect(saved.endpoints?.selection).toBe(added.id);
     // The whole document travels, not just this section.
     expect(saved.appearance).toEqual(DEFAULT_DESKTOP_SETTINGS.appearance);
     expect(saved.zoom).toEqual(DEFAULT_DESKTOP_SETTINGS.zoom);
+  });
+
+  /**
+   * Scenario: press "Add a deck" and then remove the row again without typing
+   * anything. Nothing was ever written, so nothing has to be unwritten.
+   */
+  it("drops an abandoned draft without touching the document", () => {
+    const { onSave } = renderPanel();
+    fireEvent.click(screen.getByTestId("add-deck"));
+    const remove = screen.getByLabelText("Remove New deck");
+    fireEvent.click(remove);
+
+    expect(onSave).not.toHaveBeenCalled();
+    expect(screen.queryByTestId("deck-detail")).toBeNull();
   });
 
   /**
@@ -246,6 +298,63 @@ describe("EndpointsPanel", () => {
     await waitFor(() => expect(onSave).toHaveBeenCalled());
     const saved = onSave.mock.calls[0][0] as DesktopSettingsDto;
     expect(saved.endpoints?.remote[0].socket).toBe("/run/user/1000/dot-agent-deck-attach.sock");
+  });
+
+  /**
+   * Scenario: a probe is running — ssh takes seconds — and the user edits
+   * another field of the same deck while it runs. When the probe's socket
+   * write-back lands it must build on the document as it is NOW, not on the one
+   * the click closed over (PRD #741, Greptile P1 on #1035): spreading the
+   * captured copy silently reverted every edit made during the probe.
+   */
+  it("writes a discovered socket back onto the document as it is when the probe lands", async () => {
+    let settle: (value: EndpointTestReportDto) => void = () => {};
+    const testEndpoint = vi.fn(
+      () => new Promise<EndpointTestReportDto>((resolve) => { settle = resolve; }),
+    );
+    const { onSave, settings, update } = renderPanel(
+      { endpoints: { remote: [deck()], selection: "deck0000000000aa" } },
+      { testEndpoint },
+    );
+
+    fireEvent.click(screen.getByTestId("test-connection"));
+    await waitFor(() => expect(testEndpoint).toHaveBeenCalled());
+    // The user types a port while ssh is still out there.
+    const edited: DesktopSettingsDto = {
+      ...settings,
+      endpoints: { remote: [deck({ port: 2222 })], selection: "deck0000000000aa" },
+    };
+    update(edited);
+    settle(report({ discoveredSocket: "/run/user/1000/dot-agent-deck-attach.sock" }));
+
+    await waitFor(() => expect(onSave).toHaveBeenCalled());
+    const saved = onSave.mock.calls[0][0] as DesktopSettingsDto;
+    expect(saved.endpoints?.remote[0].socket).toBe("/run/user/1000/dot-agent-deck-attach.sock");
+    expect(saved.endpoints?.remote[0].port).toBe(2222);
+  });
+
+  /**
+   * Scenario: the user removes the deck while its probe is still running. The
+   * write-back must not resurrect it — a deck that is no longer in the document
+   * has no socket to learn (PRD #741, Greptile P1 on #1035).
+   */
+  it("does not resurrect a deck removed while its probe was running", async () => {
+    let settle: (value: EndpointTestReportDto) => void = () => {};
+    const testEndpoint = vi.fn(
+      () => new Promise<EndpointTestReportDto>((resolve) => { settle = resolve; }),
+    );
+    const { onSave, settings, update } = renderPanel(
+      { endpoints: { remote: [deck()], selection: "deck0000000000aa" } },
+      { testEndpoint },
+    );
+
+    fireEvent.click(screen.getByTestId("test-connection"));
+    await waitFor(() => expect(testEndpoint).toHaveBeenCalled());
+    update({ ...settings, endpoints: { remote: [], selection: "local" } });
+    settle(report({ discoveredSocket: "/run/user/1000/dot-agent-deck-attach.sock" }));
+
+    await waitFor(() => expect(testEndpoint).toHaveBeenCalled());
+    expect(onSave).not.toHaveBeenCalled();
   });
 
   /**

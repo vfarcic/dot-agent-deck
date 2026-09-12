@@ -70,7 +70,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use dot_agent_deck::daemon_client::Endpoint;
+use dot_agent_deck::daemon_client::{Endpoint, EndpointIdentity};
 use tokio::sync::Mutex as AsyncMutex;
 
 #[cfg(unix)]
@@ -171,7 +171,7 @@ impl std::fmt::Display for AcquireError {
 #[cfg(unix)]
 #[derive(Default)]
 pub(crate) struct EndpointTunnels {
-    tunnels: AsyncMutex<HashMap<String, Arc<TunnelLease>>>,
+    tunnels: AsyncMutex<HashMap<EndpointIdentity, Arc<TunnelLease>>>,
 }
 
 #[cfg(unix)]
@@ -200,7 +200,7 @@ impl EndpointTunnels {
         &self,
         endpoint: &Endpoint,
     ) -> Result<Arc<TunnelLease>, AcquireError> {
-        let key = endpoint.describe();
+        let key = endpoint.identity();
         let mut tunnels = self.tunnels.lock().await;
         if let Some(held) = tunnels.get(&key) {
             if held.alive() {
@@ -232,7 +232,7 @@ impl EndpointTunnels {
 
     /// Drop the map's handle on `endpoint`'s transport.
     pub(crate) async fn release(&self, endpoint: &Endpoint) {
-        self.tunnels.lock().await.remove(&endpoint.describe());
+        self.tunnels.lock().await.remove(&endpoint.identity());
     }
 
     /// Drop the map's handle on every transport except the ones `live` names.
@@ -240,7 +240,7 @@ impl EndpointTunnels {
     /// The selection-change teardown. Takes the keys rather than the endpoints
     /// because the caller already has the new selection in hand and the key is
     /// what the map is indexed by.
-    pub(crate) async fn retain(&self, live: &HashSet<String>) {
+    pub(crate) async fn retain(&self, live: &HashSet<EndpointIdentity>) {
         self.tunnels
             .lock()
             .await
@@ -288,7 +288,7 @@ impl TunnelLease {
 #[cfg(not(unix))]
 #[derive(Default)]
 pub(crate) struct EndpointTunnels {
-    tunnels: AsyncMutex<HashMap<String, Arc<TunnelLease>>>,
+    tunnels: AsyncMutex<HashMap<EndpointIdentity, Arc<TunnelLease>>>,
 }
 
 #[cfg(not(unix))]
@@ -298,7 +298,7 @@ impl EndpointTunnels {
             .connect_address()
             .map_err(|error| error.to_string())?
             .to_path_buf();
-        let key = endpoint.describe();
+        let key = endpoint.identity();
         let mut tunnels = self.tunnels.lock().await;
         if let Some(held) = tunnels.get(&key) {
             return Ok(Arc::clone(held));
@@ -309,10 +309,10 @@ impl EndpointTunnels {
     }
 
     pub(crate) async fn release(&self, endpoint: &Endpoint) {
-        self.tunnels.lock().await.remove(&endpoint.describe());
+        self.tunnels.lock().await.remove(&endpoint.identity());
     }
 
-    pub(crate) async fn retain(&self, live: &HashSet<String>) {
+    pub(crate) async fn retain(&self, live: &HashSet<EndpointIdentity>) {
         self.tunnels
             .lock()
             .await
@@ -394,7 +394,7 @@ mod tests {
             .expect("lease the deck about to be deselected");
         assert_eq!(tunnels.held().await, 2);
 
-        let live: HashSet<String> = [kept.describe()].into_iter().collect();
+        let live: HashSet<EndpointIdentity> = [kept.identity()].into_iter().collect();
         tunnels.retain(&live).await;
 
         assert_eq!(tunnels.held().await, 1);
