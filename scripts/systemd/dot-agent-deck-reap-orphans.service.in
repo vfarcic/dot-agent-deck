@@ -1,0 +1,18 @@
+[Unit]
+Description=Reap orphaned agent-tooling processes (dot-agent-deck issue #1015)
+Documentation=file://__REPO__/docs/develop/orphan-reaper.md
+# NOTE: the timer runs the DEFAULT rules only — positively identified orphaned
+# MCP servers. --include-spin is deliberately absent: it cannot tell a wedged
+# agent from a detached build you started on purpose, and this runs --apply.
+
+[Service]
+Type=oneshot
+# --apply is deliberate here: a timer that only ever dry-runs reports nothing to
+# anyone. Read `journalctl --user -u dot-agent-deck-reap-orphans` for what it did.
+# The catch-all --include-stale rule stays OFF; see the docs for why.
+# The path is quoted so a checkout directory containing spaces still resolves
+# to one executable rather than being split into arguments.
+ExecStart="__REPO__/scripts/reap-orphans.sh" --apply
+# Never let the reaper itself become the runaway it exists to clean up.
+TimeoutStartSec=120
+Nice=10

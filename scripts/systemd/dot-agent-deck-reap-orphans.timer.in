@@ -1,0 +1,13 @@
+[Unit]
+Description=Periodically reap orphaned agent-tooling processes
+
+[Timer]
+# First run shortly after login, then every 15 minutes. A spinning orphan costs
+# a core continuously, so the window that matters is minutes, not hours.
+OnStartupSec=5min
+OnUnitActiveSec=15min
+# No Persistent= here: systemd honours it only for OnCalendar= timers, so on a
+# monotonic timer like this one it is a silent no-op that reads like a promise.
+
+[Install]
+WantedBy=timers.target
