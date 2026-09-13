@@ -358,7 +358,7 @@ Ordered by dependency. **M1–M4 change no user-visible behaviour**; that is del
 - [x] **M10 — Test connection.** Per endpoint, in settings. Each outcome is a **distinct named state** rather than one "failed": reachable, refused at the handshake (protocol version named), stamp difference, unreachable, host-key unverified with the run-`ssh`-once remedy. Exercises the whole transport stack without any screen having to work first, which is what makes it the early user-testable milestone.
 - [x] **M11 — Docs and changelog.** `docs/develop/desktop-gui.md` gains the endpoint section, the trust-by-kind split, the transport decision **and its rejected alternatives** (1B and russh, with the measurements), the naming rule, and the manual remote walk. The ownership table gains the endpoint rows. Changelog fragment via `dot-ai-changelog-fragment`.
 - [x] **M12 — Rule 12 cross-version manual test**, with the eleven-variable sandbox and the three traps named in Technical Approach, evidence in the Work Log.
-- [ ] **M13 — Remote proven, on a second machine.** Discharges #819's M10. The user runs the desktop app on their laptop against this machine's daemon. If it cannot be run, this stays unticked and is reported UNVERIFIED rather than substituted by a local run or a loopback `ssh`.
+- [ ] **M13 — Remote proven, on a second machine. PARTIAL — the mechanism is demonstrated, the display assertion is not. Still unticked; see the 2026-09-13 Work Log entry.** Discharges #819's M10. The user runs the desktop app on their laptop against this machine's daemon. If it cannot be run, this stays unticked and is reported UNVERIFIED rather than substituted by a local run or a loopback `ssh`.
 - [x] **M14 — Record the seam on #742.** A comment naming the selector, the `Selection` shape, the "All Decks" option it grows, and the two retrofits this PRD deliberately leaves it (`DesktopState` → keyed map, `ConnectionStatus` → per-endpoint), so #742 inherits them rather than rediscovering them.
 - [x] **M15 — The naming sweep: the UI says Deck.** Every user-facing string, per the rule in Technical Approach — rendered text becomes Deck, while code, protocol, CLI, docs, CSS classes and testids keep `daemon`. ~40 strings across 22 non-test files with 12 test files asserting on them; a copy pass rather than a find-replace, since several strings distinguish the app from the process it manages. Last because it touches files every other milestone also touches, and rebasing a rename is miserable.
 
@@ -591,3 +591,29 @@ The rekey turned up **a fourth site the finding did not name**, and it is the sh
 The other four: a deck switch could pair a fresh selection with a stale view **during the coalescing sleep** (the class M9 fixed for the subscription, surviving one layer down); a probe's write-back could **resurrect a removed deck**; `addDeck()` wrote a row with an empty `host` that Rust's `Hostname` rejects, so the row lived only in optimistic UI state *and blocked every unrelated settings save*; and `port` was the one field the validator-parity work left as a bare `u16`, so a hand-edited `port = 0` reached OpenSSH as `-p 0`. Its `ALLOWED_FIELD_TYPES` reason — *"the type is the bound"* — was a true sentence documenting the defect.
 
 **Three claims this document and `docs/develop/desktop-gui.md` asserted were falsified by this round and corrected rather than left standing**: the `describe()` key, twice, and the port row.
+
+### 2026-09-13 — M13: the mechanism is proven against a real second machine; the display half is not, so it stays unticked
+
+**A desktop on a Mac drove a workflow launch against a deck on the Linux dev box, over `ssh -L`, and a real agent read the context the daemon published.** That is the first evidence this line of work has ever had for its own premise — #819 left its M10 unticked for want of exactly this — and it is deliberately **not** enough to tick M13.
+
+**The setup.** A second daemon from this branch on an isolated endpoint (`/var/tmp/dad-branch/attach.sock`, own hook socket, state dir and log, `DOT_AGENT_DECK_IDLE_SHUTDOWN_SECS=0`), alongside the released daemon serving this orchestration — verified non-interfering by inode: the live socket was inode 651 before and after. The Mac connected as `Endpoint::Remote` with `host=100.72.120.48`, `user=vfarcic`, `identity=~/.ssh/id_ed25519_mini`, and the remote socket path typed by hand.
+
+**What the daemon's own log records**, pane `-0` being the coordinator:
+
+```
+02:32:26.892  SessionStart   pane -0   agent_type=ClaudeCode
+02:32:30.148  Thinking       pane -0
+02:32:37.775  ToolStart Read /home/vfarcic/code/dot-agent-deck/.dot-agent-deck/orchestrator-context.md
+02:32:37.794  ToolEnd   Read
+02:32:40.580  ToolStart Bash "date -u"
+02:32:42.815  Idle
+02:39:05.790  SessionEnd     pane -0
+```
+
+**What that establishes.** A launch driven from a machine with no access to this filesystem caused the daemon to resolve a project here, compose and publish `orchestrator-context.md` here, spawn a real agent here, and that agent read the published file. Five roles started; the agents were real — `ClaudeCode` on panes `-0` and `-5`, `Codex` on `-3` and `-4` — not stand-ins, which is the bar CLAUDE.md rule 4 sets. Preserved at `/var/tmp/dad-branch-m13-evidence.log`.
+
+**What it does NOT establish, and why the milestone stays open.** The user did not look at the header while connected, so the *visible* assertion is unverified: that the project header and the agent panes both name `/home/vfarcic/…` and never `/Users/viktorfarcic/…`. **That is the symptom the 2026-08-29 measurement actually reported** — a local `/Users/...` path in the header beside the remote's `/home/...` panes — so it is the half a reader will assume M13 covers. It is not covered. A log proves the daemon did the right thing; it says nothing about what the client rendered.
+
+**Ticking this on the mechanism alone would be the reframing #819 refused**, and the same reframing this document warned against in its own scope section. It costs one look at a connected window to close, and until someone takes that look the honest state is PARTIAL.
+
+**Everything else in the walk worked**, and is worth recording because it is the first end-to-end use by a human: the endpoint form accepted a `~/`-prefixed key path (the defect the final review caught, fixed in `161ec00a`, confirmed by use rather than only by the parity table); Test connection reported real named states; selecting the deck switched the fleet; and the tunnel carried five live PTYs. Nine issues were filed from that session, six of them found by driving the app rather than by reading it — [#1041](https://github.com/vfarcic/dot-agent-deck/issues/1041), [#1042](https://github.com/vfarcic/dot-agent-deck/issues/1042), [#1044](https://github.com/vfarcic/dot-agent-deck/issues/1044), [#1045](https://github.com/vfarcic/dot-agent-deck/issues/1045), [#1046](https://github.com/vfarcic/dot-agent-deck/issues/1046), [#1047](https://github.com/vfarcic/dot-agent-deck/issues/1047), [#1048](https://github.com/vfarcic/dot-agent-deck/issues/1048), [#1049](https://github.com/vfarcic/dot-agent-deck/issues/1049). None of them is a defect in this branch; all are pre-existing, and every one was invisible to four review and audit passes because the code does exactly what it says.
