@@ -3548,9 +3548,10 @@ impl SessionStartWait {
 /// Returns a [`SessionStartWait`] describing everything the window observed;
 /// `ready` is false on timeout or on sender closure. The delegate path asks only
 /// whether readiness fired (`.ready`) and writes the prompt regardless, matching
-/// the baseline `process_pending_dispatches` semantics. Issue #424's spawn path
-/// needs the other two answers as well — which PRODUCER owns the pane, and which
-/// GENERATION the prompt is going into — and both were being thrown away here.
+/// the baseline `2fc39c3:src/ui.rs::process_pending_dispatches` semantics.
+/// Issue #424's spawn path needs the other two answers as well — which PRODUCER
+/// owns the pane, and which GENERATION the prompt is going into — and both were
+/// being thrown away here.
 /// See [`SessionStartWait`] for why all three are separate questions.
 ///
 /// PRD #127: also reused by the scheduler spawn primitive

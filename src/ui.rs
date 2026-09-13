@@ -1905,10 +1905,10 @@ pub fn should_inject_spawn_time_prompt(
 /// Issue #1005 — does this pane hold an agent that can actually READ what a
 /// spawn-time delivery is about to write into it?
 ///
-/// The three spawn-time gates ([`process_pending_dispatches`],
-/// [`process_pending_seed_prompts`], [`deliver_orchestrator_prompt`]) spelled
-/// this as "some session on this pane has a resolved agent type", and that is a
-/// different question. The daemon draws a card the moment it spawns a pane
+/// The spawn-time gates ([`process_pending_seed_prompts`],
+/// [`deliver_orchestrator_prompt`]) spelled this as "some session on this pane
+/// has a resolved agent type", and that is a different question. The daemon
+/// draws a card the moment it spawns a pane
 /// (`spawn::surface_spawned_pane`), resolving the type off the COMMAND — so a
 /// `claude` pane satisfied that predicate at spawn time and the first payload
 /// went into a PTY whose program had not started reading. Measured in the field
@@ -2068,14 +2068,6 @@ fn submit_debounce_duration(
     };
     let elapsed = now.saturating_duration_since(prev);
     SUBMIT_DEBOUNCE.checked_sub(elapsed).unwrap_or_default()
-}
-
-/// A prompt queued for injection into a pane once its agent is ready.
-/// Used by M5 delegation dispatch when `clear = true` restarts a pane.
-struct PendingDispatch {
-    pane_id: String,
-    prompt: String,
-    created_at: std::time::Instant,
 }
 
 /// PRD #127 M3.1: a mode's `seed_prompt` queued for delivery to its agent pane,
@@ -2341,13 +2333,13 @@ struct UiState {
     /// because the two answer different questions and only one of them may
     /// drive timing. `SessionState.agent_type` is the OBSERVED identity: it
     /// stays `AgentType::None` until something running in the pane reports, and
-    /// three separate readiness gates read it — `agent_ready` in the
-    /// orchestrator-prompt, mode-seed and dispatch paths, all of which route
-    /// through [`spawn_time_agent_ready`]. Seeding a declaration into that field
-    /// would move all three closer to firing at spawn and typing a prompt into a
-    /// launcher that has not started its agent yet — which is precisely the
-    /// population (`devbox run -- codex`) this key exists for, so the feature
-    /// would break delivery for exactly the users it is meant to help.
+    /// two separate readiness gates read it — `agent_ready` in the
+    /// orchestrator-prompt and mode-seed paths, both of which route through
+    /// [`spawn_time_agent_ready`]. Seeding a declaration into that field would
+    /// move both closer to firing at spawn and typing a prompt into a launcher
+    /// that has not started its agent yet — which is precisely the population
+    /// (`devbox run -- codex`) this key exists for, so the feature would break
+    /// delivery for exactly the users it is meant to help.
     ///
     /// Issue #1005: those gates now read TWO facts, not one. A resolved
     /// `agent_type` no longer opens them on its own — the pane must also have an
@@ -2624,11 +2616,9 @@ struct UiState {
     /// submit-CR-aware mode on slower environments. Cleared when the
     /// prompt finally fires (entry never re-added).
     orchestration_ready_since: HashMap<TabId, std::time::Instant>,
-    /// Prompts waiting to be injected into panes once their agent is ready (M5 dispatch).
-    pending_dispatches: Vec<PendingDispatch>,
     /// PRD #127 M3.1: mode `seed_prompt`s waiting for their agent pane to be
-    /// ready before the gated atomic submit. Parallel to `pending_dispatches`
-    /// but uses the spawn-time readiness buffer + `write_and_submit_to_pane`.
+    /// ready before the gated atomic submit. Gated on the spawn-time readiness
+    /// buffer, then delivered with `write_and_submit_to_pane`.
     pending_seed_prompts: Vec<PendingSeedPrompt>,
     /// PRD #20 R20-005: per-pane retry-backoff for automatic prompts (seed +
     /// orchestrator role prompts). Keyed by pane id; entry present ⇒ a prior
@@ -2826,7 +2816,6 @@ impl UiState {
             orchestration_prompt_anchor_at: HashMap::new(),
             orchestration_remit_abandoned: HashSet::new(),
             orchestration_ready_since: HashMap::new(),
-            pending_dispatches: Vec::new(),
             pending_seed_prompts: Vec::new(),
             send_retry_backoff: HashMap::new(),
             prompt_delivery: HashMap::new(),
@@ -3722,55 +3711,6 @@ pub fn fill_dead_slots_with_placeholders(
     for synthetic in assigned {
         state.insert_placeholder_session(synthetic, Some(cwd.to_string()), None, None);
     }
-}
-
-// ---------------------------------------------------------------------------
-// M5 (PRD #93 round-5): delegation dispatch lives in the daemon now.
-//
-// Earlier rounds had the TUI drain `AppState.delegate_events` /
-// `AppState.work_done_events`, build a per-role prompt (file + one-liner),
-// optionally restart `clear=true` worker panes, and route the prompt
-// through the pane controller. The daemon's hook loop now writes that
-// prompt directly into the worker pane's PTY (see
-// [`crate::state::AppState::handle_delegate`] /
-// [`crate::state::AppState::handle_work_done`]), so the TUI is out of the
-// dispatch business.
-//
-// Two features that previously rode this path are deliberately not
-// reimplemented daemon-side and are surfaced here as a follow-up: per-role
-// `prompt_template` wrapping and `clear=true` pane restart on delegate.
-// They depended on the TUI's `OrchestrationConfig`; pulling that into the
-// daemon would re-introduce the cross-process config-load coupling the
-// PRD #93 redesign aims to remove. They can be re-added as opt-ins once
-// the new dispatch surface settles.
-// ---------------------------------------------------------------------------
-
-/// Process pending dispatches — inject prompt once the agent in the pane is ready.
-fn process_pending_dispatches(
-    ui: &mut UiState,
-    pane: &Arc<dyn PaneController>,
-    snapshot: &AppState,
-) {
-    ui.pending_dispatches.retain(|pd| {
-        // Fast path: a producer announced a conversation on this pane (e.g.
-        // Claude Code's own `SessionStart`). Issue #1005: a resolved agent type
-        // on its own is the card the daemon drew at spawn time, not a reader.
-        let agent_ready = spawn_time_agent_ready(snapshot, &pd.pane_id);
-        // Slow path: no SessionStart after 10 seconds (e.g., opencode).
-        // The agent is likely running but hasn't signaled — inject anyway.
-        let timeout_ready =
-            !agent_ready && pd.created_at.elapsed() > std::time::Duration::from_secs(10);
-        if agent_ready || timeout_ready {
-            let _ = pane.write_to_pane(&pd.pane_id, &pd.prompt);
-            return false;
-        }
-        // Hard timeout after 60 seconds — give up.
-        if pd.created_at.elapsed() > std::time::Duration::from_secs(60) {
-            tracing::warn!(pane_id = %pd.pane_id, "dispatch: timed out waiting for agent");
-            return false;
-        }
-        true
-    });
 }
 
 /// PRD #127 M3.1: deliver a mode's `seed_prompt` to its agent pane once the
@@ -13934,11 +13874,14 @@ pub fn run_tui(
         // ran here in earlier rounds — they drained delegate/work-done
         // signals from `AppState` and wrote prompts via the pane controller.
         // That entire flow now lives daemon-side; the daemon writes the
-        // file-backed prompt and the one-liner directly into the target
-        // PTY, so the TUI just renders the bytes as they arrive in the
-        // pane scrollback. `process_pending_dispatches` still ferries the
-        // orchestrator's *initial* prompt across the agent-ready gate.
-        process_pending_dispatches(&mut ui, &pane, &snapshot);
+        // file-backed prompt and the one-liner directly into the target PTY
+        // (see `AppState::handle_delegate` / `AppState::handle_work_done`), so
+        // the TUI just renders the bytes as they arrive in the pane scrollback.
+        // A `process_pending_dispatches` drain outlived that move with no
+        // producer left to feed it and was removed in issue #1012; the comment
+        // here used to credit it with ferrying the orchestrator's *initial*
+        // prompt across the agent-ready gate, which is the job of
+        // `deliver_orchestrator_prompt`, called a few lines above.
         // PRD #127 M3.1: deliver any mode `seed_prompt`s whose agent pane has
         // become ready (gated, like orchestrations).
         process_pending_seed_prompts(&mut ui, &pane, &snapshot);
@@ -33571,47 +33514,6 @@ mod tests {
         assert!(matches!(result, Action::Continue));
     }
 
-    #[test]
-    fn pending_dispatch_timeout() {
-        let pane_ctrl =
-            Arc::new(crate::embedded_pane::EmbeddedPaneController::for_render_only_tests());
-        let pane: Arc<dyn PaneController> = pane_ctrl;
-        let snapshot = AppState::default();
-        let mut ui = default_ui();
-
-        // Add a pending dispatch with an expired timeout.
-        ui.pending_dispatches.push(PendingDispatch {
-            pane_id: "999".to_string(),
-            prompt: "Do work".to_string(),
-            created_at: std::time::Instant::now() - std::time::Duration::from_secs(60),
-        });
-
-        process_pending_dispatches(&mut ui, &pane, &snapshot);
-
-        // Should be removed due to timeout.
-        assert!(ui.pending_dispatches.is_empty());
-    }
-
-    #[test]
-    fn pending_dispatch_waits_for_agent_ready() {
-        let pane_ctrl =
-            Arc::new(crate::embedded_pane::EmbeddedPaneController::for_render_only_tests());
-        let pane: Arc<dyn PaneController> = pane_ctrl;
-        let snapshot = AppState::default(); // No sessions → agent not ready
-        let mut ui = default_ui();
-
-        ui.pending_dispatches.push(PendingDispatch {
-            pane_id: "1".to_string(),
-            prompt: "Do work".to_string(),
-            created_at: std::time::Instant::now(),
-        });
-
-        process_pending_dispatches(&mut ui, &pane, &snapshot);
-
-        // Should still be pending — agent not ready and not timed out.
-        assert_eq!(ui.pending_dispatches.len(), 1);
-    }
-
     // PRD #93 Phase 2 / M4.2: the quit dialog collapsed from a
     // mode-dependent (Quit-or-Detach) action to a single Detach
     // confirmation. Pin that Enter on index 0 always returns
@@ -36244,11 +36146,6 @@ mod tests {
     #[derive(Default)]
     struct RecordingPaneController {
         writes: Arc<std::sync::Mutex<Vec<RecordedWrite>>>,
-        /// Issue #1005: `process_pending_dispatches` is the one spawn-time
-        /// delivery site that writes through the plain, identity-free
-        /// [`PaneController::write_to_pane`], so its bytes are invisible in
-        /// `writes`. Recorded as `(pane_id, text)` in call order.
-        plain_writes: Arc<std::sync::Mutex<Vec<(String, String)>>>,
         lose_first_response: bool,
     }
 
@@ -36256,7 +36153,6 @@ mod tests {
         fn losing_first_response() -> Self {
             Self {
                 writes: Arc::default(),
-                plain_writes: Arc::default(),
                 lose_first_response: true,
             }
         }
@@ -36294,11 +36190,7 @@ mod tests {
         fn toggle_layout(&self) -> Result<(), PaneError> {
             Ok(())
         }
-        fn write_to_pane(&self, pane_id: &str, text: &str) -> Result<(), PaneError> {
-            self.plain_writes
-                .lock()
-                .unwrap()
-                .push((pane_id.to_string(), text.to_string()));
+        fn write_to_pane(&self, _pane_id: &str, _text: &str) -> Result<(), PaneError> {
             Ok(())
         }
         fn write_and_submit_to_pane_with_identity(
@@ -37471,65 +37363,67 @@ mod tests {
         }
     }
 
-    /// Scenario: Give a card-surfaced-but-silent pane a pending DISPATCH and,
-    /// separately, an orchestration start-role prompt with the readiness buffer
-    /// already elapsed; neither may put bytes in the pane while no conversation
-    /// has been announced. When the agent's own `SessionStart` arrives, each
-    /// path delivers exactly once, and the orchestrator's write names the
-    /// conversation it entered.
+    /// Scenario: Ask the readiness predicate every spawn-time delivery site
+    /// shares about a pane whose only session is the card the daemon drew from
+    /// its command, and separately drive an orchestration start-role prompt with
+    /// the readiness buffer already elapsed against the same shape of pane.
+    /// Neither may treat that card as an agent that can read; when the agent's
+    /// own `SessionStart` arrives the predicate opens and the remit is written
+    /// exactly once, naming the conversation it entered.
     #[spec("prompt/pane-input/037")]
     #[test]
-    fn pane_input_037_the_other_two_spawn_time_gates_wait_for_a_conversation() {
+    fn pane_input_037_the_shared_gate_and_the_orchestrator_wait_for_a_conversation() {
         const PROMPT: &str = "Read the role remit and begin";
 
-        // --- `process_pending_dispatches` (src/ui.rs, the delegate path). ----
+        // --- `spawn_time_agent_ready` itself (the gate every site shares). ---
         //
-        // This site has no readiness buffer at all — `agent_ready` alone puts
-        // the bytes in the pane on the very next frame — so a card-surfacing
-        // start makes it the fastest of the three to write into a launcher that
-        // has not started its agent.
-        const DISPATCH_PANE: &str = "dispatch-card-surfaced-pane";
-        const DISPATCH_AGENT: &str = "dispatch-card-surfaced-agent";
-        let dispatch_controller = Arc::new(RecordingPaneController::default());
-        let dispatch_writes = dispatch_controller.plain_writes.clone();
-        let dispatch_pane: Arc<dyn PaneController> = dispatch_controller;
-        let mut dispatch_ui = default_ui();
-        dispatch_ui.pending_dispatches.push(PendingDispatch {
-            pane_id: DISPATCH_PANE.to_string(),
-            prompt: PROMPT.to_string(),
-            created_at: std::time::Instant::now(),
-        });
-        let mut dispatch_snapshot = AppState::default();
-        dispatch_snapshot.register_pane(DISPATCH_PANE.to_string());
-        apply_card_surface_start(&mut dispatch_snapshot, DISPATCH_PANE, "worker");
-
-        process_pending_dispatches(&mut dispatch_ui, &dispatch_pane, &dispatch_snapshot);
-        process_pending_dispatches(&mut dispatch_ui, &dispatch_pane, &dispatch_snapshot);
-        let dispatch_before_announcement = dispatch_writes.lock().unwrap().clone();
+        // Issue #1005 narrowed the PREDICATE; each delivery site is one of its
+        // callers. This half used to reach it through a third caller,
+        // `process_pending_dispatches`, which issue #1012 removed — no
+        // production code had pushed to its queue since PRD #93 round-5 moved
+        // delegation dispatch into the daemon. Pinning the predicate directly
+        // is what that half was really asserting, and it keeps the guard
+        // standing for a caller added later rather than only for the two that
+        // happen to exist today.
+        const GATE_PANE: &str = "gate-card-surfaced-pane";
+        const GATE_AGENT: &str = "gate-card-surfaced-agent";
+        let mut gate_snapshot = AppState::default();
         assert!(
-            dispatch_before_announcement.is_empty(),
-            "dispatch: a resolved agent type is not a reader — the delegated task \
-             must wait for the agent's own SessionStart; \
-             writes={dispatch_before_announcement:?}"
+            !spawn_time_agent_ready(&gate_snapshot, GATE_PANE),
+            "gate: a pane with no session at all is not a reader"
+        );
+
+        gate_snapshot.register_pane(GATE_PANE.to_string());
+        apply_card_surface_start(&mut gate_snapshot, GATE_PANE, "worker");
+        assert!(
+            gate_snapshot
+                .sessions
+                .values()
+                .any(|s| s.pane_id.as_deref() == Some(GATE_PANE)
+                    && s.agent_type != AgentType::None),
+            "precondition: the card-surfacing start must resolve an agent type, \
+             or this half is not exercising the narrowing at all"
         );
         assert_eq!(
-            dispatch_ui.pending_dispatches.len(),
-            1,
-            "dispatch: the task is held for the announcement, not dropped"
+            gate_snapshot.pane_hook_session_id(GATE_PANE),
+            None,
+            "precondition: a card-surfacing start announces no conversation"
+        );
+        assert!(
+            !spawn_time_agent_ready(&gate_snapshot, GATE_PANE),
+            "gate: a resolved agent type on its own is the card the daemon drew \
+             at spawn time, not an agent that has started reading its PTY"
         );
 
         apply_claude_generation_start(
-            &mut dispatch_snapshot,
-            DISPATCH_PANE,
-            DISPATCH_AGENT,
-            "dispatch-genuine-generation",
+            &mut gate_snapshot,
+            GATE_PANE,
+            GATE_AGENT,
+            "gate-genuine-generation",
         );
-        process_pending_dispatches(&mut dispatch_ui, &dispatch_pane, &dispatch_snapshot);
-        let dispatch_after_announcement = dispatch_writes.lock().unwrap().clone();
-        assert_eq!(
-            dispatch_after_announcement.as_slice(),
-            &[(DISPATCH_PANE.to_string(), PROMPT.to_string())],
-            "dispatch: the announcement releases exactly one write of the task"
+        assert!(
+            spawn_time_agent_ready(&gate_snapshot, GATE_PANE),
+            "gate: the producer's own announcement is what opens it"
         );
 
         // --- `deliver_orchestrator_prompt` (the start role's spawn-time remit).
