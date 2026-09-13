@@ -1,0 +1,237 @@
+# PRD #742: Connect the desktop GUI to several decks at once — the fleet view
+
+**Status**: Plan drafted 2026-09-13, awaiting the step-1 gate. Four decisions already taken by the user and recorded in Technical Approach; the reconnaissance corrected the issue's own framing of the central retrofit, which is the first thing to read.
+**Priority**: High — [#741](https://github.com/vfarcic/dot-agent-deck/issues/741) built the seam for it and named it as the thing that inherits it, and #742's own body argues this is the strongest case for the desktop app existing at all.
+**Created**: 2026-09-13
+**Issue**: [#742](https://github.com/vfarcic/dot-agent-deck/issues/742) — a deliberate **placeholder**: intent and constraints only, with the plan to be written when work starts.
+**Related**: [#741](https://github.com/vfarcic/dot-agent-deck/issues/741) (connect to any daemon — prerequisite, closed, `8f5e8e72` / PR [#1035](https://github.com/vfarcic/dot-agent-deck/pull/1035)), [#819](https://github.com/vfarcic/dot-agent-deck/issues/819) (daemon-side project resolution — the long pole, closed `14e2f034`), [#803](https://github.com/vfarcic/dot-agent-deck/issues/803) (the settings surface endpoints are stored in, closed `2957b70f`), [#801](https://github.com/vfarcic/dot-agent-deck/issues/801) (compatibility from the contract rather than a git tag — open, and a fleet legitimately spans builds), [#953](https://github.com/vfarcic/dot-agent-deck/issues/953) (no driver-level desktop tier — the reason this PRD's headline claim is manual), [#1046](https://github.com/vfarcic/dot-agent-deck/issues/1046) (the toast cannot clear a daemon error — open, and it gets worse with N decks), [#1048](https://github.com/vfarcic/dot-agent-deck/issues/1048) (projects are deck-scoped and nothing remembers them), [#1049](https://github.com/vfarcic/dot-agent-deck/issues/1049) (no wire verb stops a deck — why per-deck lifecycle is out of scope), [#745](https://github.com/vfarcic/dot-agent-deck/issues/745) (the agent overview as landing screen — the screen this PRD merges into), [#802](https://github.com/vfarcic/dot-agent-deck/issues/802) (voice control — its capability registry needs the deck dimension in its shape from the start).
+
+## Problem Statement
+
+The desktop app talks to exactly one deck at a time. PRD #741 turned the deck from a constant into a **choice** — an `Endpoint` whose kind is in the type, stored in `desktop.toml`, reached over an app-managed `ssh -N -L` child, picked from a **Deck selector** — but a choice is still one at a time. A user running agents on a laptop and two build boxes has three windows' worth of fleet and one window that shows a third of it.
+
+That is a gap with a measurement behind it rather than a hypothesis. On 2026-08-29 a single remote host was observed running three distinct long-lived daemons — an installed release plus two from separate dispatch worktrees — alongside roughly 166 short-lived test-scoped ones from a `cargo test-e2e` run. Nothing could see that whole, and nothing can today.
+
+**Why this is the desktop app's job and not the TUI's.** A TUI is one terminal attached to one daemon; it cannot show a second machine's fleet by construction. PRD #176 justifies the desktop app with a *single* deck's agent-communication graph, which is a weaker answer to "why a GUI" than this one. The division the fleet view establishes is that the TUI is the **working** surface — one repo, dense, keyboard-driven, `ssh`-able, you are *in* it with an agent — and the desktop is the **supervisory** surface, where you are deciding *where to look*.
+
+## What the reconnaissance changed, and read this before the rest
+
+Two read-only recon passes ran before this document was written (a reviewer on client architecture, an auditor on trust, lifecycle and resources; neither modified a file). The reviewer's pass **corrected the central claim this issue and #741 have both been carrying for months**, and the correction changes what the work is.
+
+**The retrofit everyone named is already done. The one nobody named is the actual work.** Both this issue's body and #741's hand-off say the central change is `DesktopState` becoming a keyed map of bridges. It is not, because the two maps that matter are **already keyed**: `DaemonLinks` is a `HashMap<EndpointIdentity, Arc<TrustedDaemon>>` (`desktop/src-tauri/src/daemon_bridge.rs:236`) and `EndpointTunnels` is a `HashMap<EndpointIdentity, Arc<TunnelLease>>` (`desktop/src-tauri/src/endpoint_tunnels.rs:181`), both with a working `retain(&HashSet<EndpointIdentity>)`. What is actually hardwired to one deck is a **process-global**: `static SELECTED_DECK: RwLock<Option<SelectedDeck>>` at `desktop/src-tauri/src/dto.rs:846`, read through `selected_deck()` (`:892`) and `selected_endpoint()` (`:905`), written only by `apply_settings_selection()` (`:875`). Every call site that asks "which deck do I mean" and has no endpoint argument resolves it through that global — including `trusted_daemon()` (`daemon_bridge.rs:930`) and `get_snapshot()` (`daemon_bridge.rs:936`), whose already-parameterised siblings `links.trusted(endpoint)` and `snapshot_with(endpoint, …)` exist and are simply not what the callers reach for.
+
+This is good news twice over. The plumbing for N decks is present rather than absent, and the single-deck assumption is **concentrated in one global rather than scattered across a struct's call sites** — so the work is to add a parallel merged read path that iterates an observed set, not to rewrite every consumer.
+
+**The risk nobody had written down is a lock, and it contradicts this PRD's headline requirement.** `DaemonLinks` holds **one async mutex over the whole map, held across connection establishment** (`daemon_bridge.rs:232`, whose own doc at `:227` says "A deck that is not answering queues the other callers behind one connect timeout"). `EndpointTunnels::acquire` has the same whole-map lock (`endpoint_tunnels.rs:200`). With one selected deck that serialisation is a **feature** — it collapses concurrent first-uses of the same deck into one handshake. With N decks it means **an unreachable deck's connect attempt blocks every other deck's handshake for the duration of the timeout**, which is precisely the "one endpoint being unreachable must not degrade the others" property this PRD exists to deliver. It is invisible at every call site. Addressing it is not optional polish; it is the requirement.
+
+## Solution Overview
+
+The **agent overview** — the read-mostly supervisory screen — gains an **All Decks** option on the Deck selector that #741 already built, and renders every configured deck as a sibling group with its own connection state, merging their agents into one screen. The **deck screen** — tiles with live terminals — stays one deck at a time.
+
+That split is the user's decision and it is also what the costs argue for. Attach streams are deliberately **not multiplexed**: the frame header is five bytes, one kind byte plus a four-byte big-endian length, with **no stream id** (`src/daemon_protocol.rs:649-666`), so muxing would be a wire change and a `PROTOCOL_VERSION` bump rather than a refactor. The cost of a live terminal is therefore one connection and one daemon-side task **per visible tile**, linear in tiles. Putting N decks of terminals on one screen multiplies the one cost in the system that is already linear; putting N decks of *rows* on one screen does not.
+
+The frontend is already built for this and says so in its own comments. Agents are keyed by a composite `(daemonId, agentId)` from day one — `AgentOverview.tsx`'s `agentKey` doc says "any bare-id key is wrong the moment #742 connects a second daemon" — and the `daemon-group` `<section>` is already the outer unit, with a comment reading "#742's second daemon becomes a sibling here and changes no inner component." The overview's grouping (`groupAgents`) buckets *within* a deck by tab membership and needs no change at all.
+
+## Scope
+
+### In Scope
+
+- **`Selection::All`** — one variant on the Rust enum (`desktop/src-tauri/src/settings.rs:773`) and the TS union (`desktop/src/lib/endpoints.ts:381`), the `all` token, and the **All Decks** option on the Deck selector.
+- **An observed-endpoint set**, and keeping N decks' tunnels and handshakes alive concurrently — `EndpointTunnels::retain` over the whole observed set rather than over a one-element live set.
+- **Per-deck connection state.** `ConnectionStatus` (`dto.rs:141`) and the four fields #741 added beside it (`deckKind`, `localOnlyReason`, `selectionFallback`, `projectActionsReason`) stop describing "the selected deck" and describe *a* deck, one per observed endpoint.
+- **Per-deck watchers with isolated folds**, so one deck's broadcasts can never be folded into another's view or emitted under another's identity, and so **one unreachable deck does not degrade the others** — including the whole-map-mutex contention above.
+- **The merged read view**: the overview renders one group per observed deck with that deck's agents and that deck's connection state, plus a fleet-wide aggregate in the header that is honest about partial connectivity.
+- **A multi-deck fixture**, without which neither the vitest tier nor the Playwright browser tier can assert any of this.
+- **A real two-deck run**, local plus the remote Linux box, in one window — see Verification.
+
+### Out of Scope
+
+- **Cross-deck attach and terminals.** The deck screen stays single-deck; a tile never attaches to a deck other than the selected one. This is the largest deliberate exclusion and it is the follow-up PRD's subject.
+- **Cross-deck workflow launch**, and anything that mutates a non-selected deck's project state.
+- **Per-deck lifecycle buttons.** Partly a scoping choice and partly impossible today: [#1049](https://github.com/vfarcic/dot-agent-deck/issues/1049) records that **no wire verb stops a deck** — lifecycle is `peer_pid`-based and therefore local-only by type — so "Stop deck" for a remote deck cannot ship whatever this PRD decides.
+- **Attach-stream multiplexing**, and therefore any `PROTOCOL_VERSION` change. See Cross-version safety.
+- **The `experimental` flag.** See DECISION 4.
+- **A group view or a single-agent drill-in**, and promoting the overview to the landing screen — that is [#745](https://github.com/vfarcic/dot-agent-deck/issues/745).
+
+## Technical Approach
+
+### DECISION 1 — the fleet shape: the overview merges, the deck screen stays single-deck
+
+**DECIDED by the user.** The issue names this as the thing to decide early — "worth deciding early whether agents from different daemons ever appear in one view or stay segregated" — and the answer is *both, on different screens*, which neither of the two options in the issue's framing captures.
+
+The overview merges: one list, every deck's agents, each row carrying its deck. The deck screen does not: it keeps the Deck selector's single choice, and a tile's terminal is always the selected deck's. The reasoning is the per-tile linear cost above, and the fact that the two screens answer different questions — the overview answers "where should I look", the deck screen is where you then look.
+
+Within the merged view, **deck is a grouping rather than only a column**, because the `daemon-group` outer unit already exists and lifting it from one hardcoded section to a `.map` over observed decks changes no inner component. A `daemonId`-backed column is additive on top and type-legal (`daemonId` is already an `OverviewAgent` field), so it can be offered through the existing column picker rather than designed separately.
+
+### DECISION 2 — scope: observe only, and the control half is a named follow-up
+
+**DECIDED by the user**, and it matches the issue's own suggested phasing: "Observe first, control second. The read-mostly subset (list, attach, watch events, stop) is exactly what already works remotely."
+
+One deviation from that sentence, deliberately: the issue's read-mostly subset includes **attach** and **stop**, and this PRD excludes both. Attach is excluded because of the per-tile linear cost and because DECISION 1 keeps terminals on the single-deck screen; stop is excluded because #1049 makes it impossible remotely. What ships is list, watch events, and per-deck health.
+
+A follow-up issue is filed at the end of this PRD for the control half, carrying the seams this document names rather than leaving them to be rediscovered — which is the service #741 performed for this PRD and the reason it was cheap to plan.
+
+### DECISION 3 — the verification is a real two-deck run, and it is in scope
+
+**DECIDED by the user.** The reasoning is in Verification below. In short: a fleet view whose entire premise is "several machines at once" has never had two decks running at once, and no automated tier in this repository can produce one.
+
+### DECISION 4 — no `experimental` flag (CLAUDE.md rule 9)
+
+**DECIDED by the user: no.** This is not a fresh judgement — it is the third time the same mechanical reason has decided it. #803 Open Question 1 and #741 DECISION 2 both said no because **the flag does not reach the desktop app by any route**: nothing under `desktop/` mentions it, it is not on the daemon protocol, and the desktop crate never calls `features::init_and_watch`, so `experimental_enabled()` would read its `false` default forever whatever the TOML or the environment said. Gating this would mean building the flag's Tauri delivery mechanism as part of this PRD, and would raise "against which project directory?" for a packaged build — a question the desktop app has no good answer to. `prds/176-desktop-gui.md` decision 6 holds the prior: a separate GUI binary has no such seam, because the act of building and running it is the opt-in, with maturity handled by packaging (the bundles are unsigned alphas).
+
+### The `all` token, and the one collision worth knowing about
+
+The stored selection is a single string: the reserved word `local`, or an endpoint id. `Selection::All` adds `all`, and the schema was built anticipating exactly this — `EndpointId::mint()`'s doc comment (`settings.rs:698-706`) says sixteen hex characters "cannot collide with `LOCAL_SELECTION_TOKEN` or with any word a future `Selection` variant would reserve."
+
+**The forward-compatibility half already works and is a genuine asset.** Verified end to end by the recon: an older build meeting a stored `all` parses it through `EndpointId::parse` into `Selection::One(EndpointId("all"))` (`settings.rs:815`), finds no matching row, resolves to the local deck with `SelectionFallback::UnknownDeck` reported on screen rather than swallowed (`settings.rs:415-421`), and **writes the token back unchanged**. `desktop/src/lib/endpoints.test.ts:90-93` already asserts that round trip. So shipping `All` does not break an older build's document, and an older build does not destroy a newer build's selection.
+
+**The residual collision is narrow and needs a decision.** `EndpointId::parse` (`settings.rs:672-695`) reserves `local` case-insensitively and nothing else, so `all` is currently a **legal endpoint id**. A minted id can never be `all` (sixteen hex characters), so this is reachable only by hand-editing `desktop.toml` — but `Deserialize` runs the same check as the constructor, so reserving `all` would make a hand-written `id = "all"` refuse to load. The recommendation is to **reserve `all` exactly as `local` is reserved**, accepting that refusal, because the alternative — a selection token that is ambiguous between "the fleet" and "that row" — is worse than a named parse error. The milestone that does it carries the test.
+
+### Per-deck watchers, not a merged watcher — and the fold isolation that depends on it
+
+#741 hit a **stale fold**: the watcher's event subscription is a connection to exactly one daemon, nothing about a selection change ended it, and the previous deck's broadcasts went on being folded into the `AgentView` answering the new deck's snapshots and re-emitted under the new deck's name — one machine's fleet shown as another machine's. The fix was a `tokio::sync::watch` generation on `DesktopState` (`terminal.rs:121`), with `watch_one_subscription` returning on that arm **before** its refresh (`lib.rs:961-976`) so the stale fold is discarded along with the subscription that filled it, and a distinct return reason (`SubscriptionEnd::{Ended, SelectionChanged}`, `lib.rs:903`) so the two do not share a retry policy.
+
+With N decks that hazard generalises rather than going away, and it gets worse: the subscriptions are now **concurrent** rather than sequential. `BroadcastMsg` carries no deck id and `desktop://daemon-event` is emitted raw (`lib.rs:927`, `:947`), so "which subscription is this event from" is today answerable **only** by "there is exactly one."
+
+**The design is one watcher task per observed deck, each owning its own `AgentView`, each stamping its own `EndpointIdentity` on what it emits.** That makes the isolation structural rather than a rule someone has to remember: a fold cannot reach another deck's view because it is in another task's `AgentView`, and it cannot be emitted under another deck's name because the identity comes from the task's own endpoint rather than from `selected_endpoint()`. A single merged watcher would reintroduce the #741 hazard at N-way scale, with the mislabel now possible **between two live decks** rather than only across a selection change.
+
+This also settles coalescing. `SNAPSHOT_COALESCE_INTERVAL` (150ms) is applied per watcher loop (`lib.rs:970-981`) and is per-connection today only because there is one connection. Per-deck watchers coalesce independently, producing up to N emits per window, and the frontend merges them — which it is already built to do, since it keys by `(daemonId, agentId)`. The alternative, a global coalescer over N inbound streams, shares the window across decks and reintroduces the cross-deck stall.
+
+**The one thing the frontend cannot fix.** `daemonId` is derived from `connection.socketPath` (`desktop/src/lib/bridge.ts:759`), and the DTO carries exactly **one** `connection`. Any Rust-side merge that emits N decks' agents under `selected_endpoint()` would collapse every agent under one `daemonId` and silently merge two fleets into one — the #741 mislabel, arriving through a different door. The deck identity has to be attached at the **Rust emit seam**.
+
+### The whole-map mutex, and why it is a milestone rather than a note
+
+Restated from the recon because it is the requirement rather than a nicety: `DaemonLinks.trusted` (`daemon_bridge.rs:232`) and `EndpointTunnels::acquire` (`endpoint_tunnels.rs:200`) each hold **one async mutex over the entire map, across establishment**. An unreachable deck therefore queues every other deck's handshake behind its connect timeout. Per-deck watcher tasks alone do **not** fix this — the tasks are separate but they contend on the same lock — so this needs a deliberate change (finer-grained locking, or establishment moved out of the lock), and it needs a test that asserts the property rather than the shape.
+
+This is the one place #741's design actively works against this PRD's headline requirement, and it was invisible at every call site, which is why it is called out here rather than left to be found during implementation.
+
+### What a live deck costs, and the fact that nothing bounds how many there are
+
+Measured from the code by the audit pass, per **live remote** deck in the observe-only scope:
+
+| resource | per deck | evidence |
+| --- | --- | --- |
+| `ssh -N -L` child process | 1 | `src/remote_tunnel.rs:1117` — one `command.spawn()` per `EndpointConnection::open` |
+| detached OS thread draining its stderr | 1 | `src/remote_tunnel.rs:1144` — a `std::thread::spawn` that is **never joined**, one thread blocked in `read` per tunnel |
+| forwarded Unix socket, plus client fds | 1 + n | the `-L` socket created per tunnel |
+| held daemon connections | 1 long-lived event stream + #741's 2 per refresh ⇒ **2N** | `daemon_bridge.rs` establish/watcher |
+| tokio task, client side | 1 watcher per observed deck | per-deck watchers, above |
+| tokio task, daemon side | 1 per held connection | the daemon serves each connection independently |
+
+A **local** deck costs the same minus the `ssh` child, the stderr thread and the forwarded socket.
+
+**Nothing bounds the number of configured or live endpoints.** `MAX_ENDPOINT_ID_BYTES` (64) bounds an id and `MAX_SETTINGS_BYTES` (256 KiB, `settings.rs:1081`) bounds the file, so the only ceiling is accidental and sits around a thousand rows — not a bound anyone designed. Twenty configured decks is twenty `ssh` children, twenty never-joined threads, roughly forty held connections and twenty watcher tasks, every one of them established through the whole-map mutex above, which is what turns "twenty decks" into a serial connect storm rather than merely a lot of decks.
+
+**The first thing to hurt is not the one the #741 baseline would suggest.** Of that baseline's three numbers, bandwidth (~644 B/agent) scales with total fleet agents and is mild, and 2-connections-per-refresh becomes 2N as gradual fd pressure — but the **≤6.667/s coalesce ceiling is per watcher**, so with per-deck watchers the aggregate emit rate into the webview becomes **N × 6.667/s**, and the frontend merges every one of them. That is client-side IPC and CPU pressure that scales with **deck count regardless of how few agents each deck has**, which is the opposite of the intuition that a small fleet is cheap. Separately, the first hard OS ceiling is the `ssh` child and fd count, which is unbounded and reaped only by `retain`/`close_all`.
+
+Whether a soft cap or a warning is wanted is an open question below rather than a decision taken here.
+
+### A fourth local-only gate, which #741's list of three did not name
+
+#741 names three operations that are local-only because `Endpoint::as_local()` returns `None` for the remote arm — `peer_pid` termination, the stale-inode `remove_file`, and lazy-spawn — and its own Risks section warns that "`peer_pid` is not the only locality assumption, only the one that was found." The audit enumerated every production call site of `as_local()` and `require_local()` and **the warning was right: there is a fourth.**
+
+It is the **filesystem trust check itself**, at `desktop/src-tauri/src/daemon_bridge.rs:881`, gated by `if let Some(local) = endpoint.as_local()`. For a remote deck `verify_endpoint_trusted` — the uid plus exactly-`0o600` inode predicate — **never runs at all**, and trust rests instead on ssh host-key and user authentication.
+
+**This is by design and is documented** (`daemon_bridge.rs:869-884`, `daemon_client.rs:88-97`, and the **Trust is a property of the deck's kind** section of `docs/develop/desktop-gui.md`): a uid-and-mode test on a socket the local `ssh` client created proves only that the local `ssh` process is ours, and says nothing about who is on the far end. Running it anyway would be exactly the disguise #741 exists to remove.
+
+**The reason it belongs in this document is that it is a different *shape* from the other three, and the difference is the dangerous part.** The three that were named **refuse** for a remote deck — a disabled button with a reason. This one **silently substitutes a different trust basis**. Nothing in the flow says "this deck was trusted differently"; it simply was. For the observe-only scope that is not a leak — each remote deck's ssh trust is per-connection and keyed by `EndpointIdentity` — but with N decks in one view it becomes newly easy for a reader to assume every group in the fleet cleared the same gate, and none of the local ones and all of the remote ones did not. M6 records this in `docs/develop/desktop-gui.md` beside the existing trust section.
+
+### Cross-version safety (CLAUDE.md rule 12)
+
+**Confirmed by the audit pass rather than assumed: this PRD does not touch the TUI↔daemon contract. `PROTOCOL_VERSION` stays 9 (`src/daemon_protocol.rs:346`) and no `changelog.d/742.breaking.md` fragment is needed.** The wire shape does not move — N decks is N connections each speaking the existing wire, with no new frame kind, no new verb and no added field, and the one change that *would* have touched the wire, attach-stream multiplexing, is explicitly out of scope. The daemon is queried N times over the same `Hello`, snapshot and event verbs it already serves, and **cannot tell a fleet client from a single-deck client**.
+
+**The distinction that makes that answer correct is worth stating, because there genuinely is a semantic change and it would be easy to misfile.** `ConnectionStatus` and the four fields beside it going from "the selected deck" to "*a* deck, one per endpoint" **is** a same-shape/different-meaning change — but it lives entirely on the **desktop's own Tauri IPC and DTO surface** (`desktop://daemon-event`, `DesktopSnapshot`, `dto.rs:44` and `:141`), which is the client's internal contract between its Rust half and its webview. Rule 12 governs the TUI↔daemon protocol, and that surface is not it. The rule's manual cross-version test still applies and folds into the two-deck run, where the two decks are deliberately different builds — a verification, not a version bump.
+
+One caveat carried forward: [#801](https://github.com/vfarcic/dot-agent-deck/issues/801) is the adjacent open item, and if a fleet spanning builds trips a **tag-based** refusal path that should have been capability-based, that is a bug to fix and still not a `PROTOCOL_VERSION` move.
+
+**A fleet legitimately spans builds**, which is the part that is genuinely new. #741 settled that a remote deck's build stamp is an **informational badge and never a refusal**, because the remedy a refusal offers — replace the daemon — is not available on a host you do not own; `PROTOCOL_VERSION` stays the hard floor for every deck kind, and what a screen acts on is the capability set that deck advertised in its own `Hello` reply. With N decks that policy is exercised for the first time in its intended form: N stamps and N capability sets in one view, and any code that assumes one capability set becomes wrong. [#801](https://github.com/vfarcic/dot-agent-deck/issues/801) (compatibility classified from a git tag rather than the contract) is adjacent and open; whether it becomes a blocker here is an open question below.
+
+The rule-12 manual cross-version test still applies and is folded into the two-deck run, which is the natural place for it: the two decks can deliberately be different builds.
+
+## Verification, and what cannot be verified here
+
+**No automated tier in this repository can reach a real second daemon.** There is no `tauri-driver` and no WebDriver session anywhere in the tree ([#953](https://github.com/vfarcic/dot-agent-deck/issues/953)), so real Tauri IPC, real PTYs and a genuinely-connected remote deck are exercised by manual smoke and by nothing else. The three tiers that do run prove the merge and fold *logic* against fixtures:
+
+| tier | what it is | what it can assert here |
+| --- | --- | --- |
+| Rust unit (`desktop/src-tauri`, in `cargo test-fast`) | `#[cfg(test)]` in `settings.rs`, `daemon_bridge.rs`, `endpoint_tunnels.rs`, `agent_view.rs`, `dto.rs`, `lib.rs` | `Selection::All` round-trip and the `all` reservation; `retain` over an N-deck observed set; fold isolation and deck-stamped emit; the lock-contention property |
+| vitest (jsdom, `pnpm test`) | components and libs | per-deck `ConnectionView`, the deck grouping, the aggregate header instruments, the selector option |
+| Playwright browser tier (`pnpm test:browser`, `desktop/e2e/*.spec.ts`) | the production `pnpm build` bundle under Chromium and WebKit, through `?fixture=1&state=…` | the same, as a reader sees it — `overview-grouping`, `overview-rows`, `connection-states` and `decks` specs already exist to extend |
+
+**The multi-deck fixture is a prerequisite for two of those three, and it is the biggest test-infrastructure lift in the PRD.** `FIXTURE_DAEMON_ID` is a single hardcoded identity (`desktop/src/data/fixture.ts:9`), `createFixtureSnapshot` returns one `DeckSnapshot` with one `connection`, and the `DeckBridge` contract itself has **one** `getSnapshot` — so "one deck" is baked into the contract, not just into the data. A new `FixtureState` (e.g. `"fleet"`) carrying at least two distinct `daemonId`s requires widening that contract.
+
+### The two-deck run, which is this PRD's real done-condition
+
+**Nothing has ever run two decks at once**, and a fleet view that has not been seen with two decks has not been seen at all. This run is therefore in scope by the user's decision rather than deferred, and it discharges a second debt at the same time.
+
+That debt: `docs/develop/desktop-gui.md`'s **Current milestone limits** says a remote deck is unverified end to end and that a loopback `ssh` is not a substitute, because locally the client's filesystem *is* the daemon's and every path assertion passes whichever side resolved it. **That bullet is now partly stale and this PRD should correct it.** #741's own Work Log entry of 2026-09-13 records that M13 *did* run: a desktop on a Mac drove a workflow launch against a deck on the Linux dev box over `ssh -L`, the daemon resolved a project here, published `orchestrator-context.md` here, and five real agents ran (`ClaudeCode` on two panes, `Codex` on two more), with the daemon's own log preserved at `/var/tmp/dad-branch-m13-evidence.log`. What stayed unticked is the **display** half: nobody looked at the connected window to confirm that the project header and the agent panes name `/home/vfarcic/…` and never `/Users/viktorfarcic/…`, which is the exact symptom the 2026-08-29 measurement reported. A log proves what the daemon did; it says nothing about what the client rendered.
+
+The run this PRD owes, then, is one session covering both:
+
+1. A local deck and the remote Linux box both configured, **All Decks** selected, both groups populated in one window.
+2. The remote deck's rows and header naming the **daemon's** paths — `/home/vfarcic/…`, never `/Users/viktorfarcic/…`. (Closes #741 M13's display half.)
+3. One deck killed while the other keeps working: the killed deck's group degrades on its own, the surviving deck's agents keep updating, and the header aggregate says which of N are up. **Timed** — an unreachable deck must not stall the other's handshake, which is the whole-map-mutex property above and the one most likely to fail.
+4. The two decks deliberately on **different builds**, which is both the fleet-spans-builds case and rule 12's cross-version manual test.
+
+Recorded in this PRD's Work Log and in `docs/develop/desktop-gui.md`. Per CLAUDE.md rule 5 the tests covering what was touched are named in the report rather than claimed generically.
+
+## Success Criteria
+
+1. **All Decks** is selectable, and selecting it shows every configured deck's agents in one overview, each row attributable to its deck.
+2. **One unreachable deck does not degrade the others** — measurably: the other decks' agents keep updating and their handshakes are not queued behind the unreachable one's connect timeout.
+3. **No agent is ever shown under the wrong deck.** Asserted structurally (per-deck `AgentView`, deck-stamped emit) and by test, not by inspection.
+4. The header is honest about partial connectivity: agent counts are computed over **connected** decks, a disconnected deck is visible as a degraded group rather than as zero agents, and the number of decks up out of the total is stated.
+5. An older build meeting a stored `all` still degrades to the local deck, says so, and preserves the token.
+6. `PROTOCOL_VERSION` is unchanged at 9 with no compatibility fragment — confirmed by the audit pass at planning time, and to be re-confirmed against the finished diff rather than assumed to have held.
+7. The two-deck run above has happened and is recorded.
+
+## Milestones
+
+Ordering follows the recon's recommendation, which puts the risky correctness work under the user-visible payoff rather than beside it. The **first milestone that changes what a user sees is M4**; M1 is visible only as an inert selector option, and M2, M3 and M6 change no user-visible behaviour at all. That matters for the PR-splitting question in Open Questions.
+
+| # | milestone | user-visible | why here |
+| --- | --- | --- | --- |
+| M1 | `Selection::All` + the `all` reservation + the selector option (Rust enum, TS union, `DeckSelector`) | selector option only, inert until M4 | smallest, highest-confidence change; the degradation path already protects older builds |
+| M2 | The observed-endpoint set; `retain` over it so N decks' tunnels and handshakes stay alive concurrently | no | per-deck lifetime must be correct before N streams run, or one deck's teardown corrupts another's |
+| M3 | Per-deck watchers, isolated folds, deck-stamped emit — **and the whole-map-mutex contention** | no | the correctness core and the riskiest piece; proven by Rust unit tests before any UI depends on it |
+| M4 | Multi-deck snapshot on the wire, frontend merge, overview deck grouping, per-deck `ConnectionView`, honest aggregate header | **yes — the fleet appears** | the payoff; needs M1–M3 underneath |
+| M5 | Multi-deck fixture + `DeckBridge` contract widening; vitest and Playwright coverage | no (test-only) | needs the shapes M1–M4 settle on, though it can move earlier if the plan prefers TDD |
+| M6 | Docs: the **Decks** section and **Current milestone limits** in `docs/develop/desktop-gui.md`, including correcting the now-stale remote-verification bullet | no | the stale bullet is a correction this PRD owes regardless of the rest |
+| M7 | The two-deck run (Verification), recorded | no | the real done-condition; inherently manual per #953 |
+| M8 | File the control-half follow-up issue, carrying the seams this document names | no | the service #741 performed for this PRD |
+
+## Risks
+
+- **The whole-map mutex is the one that can make this PRD fail its own headline.** `DaemonLinks.trusted` and `EndpointTunnels::acquire` each hold one lock across establishment, so an unreachable deck queues every other deck's handshake. It is invisible at the call sites and it will not fail a compile. Mitigation: M3 owns it, and success criterion 2 is a measurement rather than a claim.
+- **A merged emit under `selected_endpoint()` would silently merge two fleets into one.** The frontend's composite key protects against a *bare-id* collision but not against N decks arriving tagged with one `socketPath`. This fails silently and plausibly — the screen looks right. Mitigation: deck identity attached at the Rust emit seam, and a test that two decks' agents never share a `daemonId`.
+- **The `DeckBridge` contract is single-deck**, so the two tiers that could assert the user-visible half cannot assert anything until the fixture and the contract are widened. Risk of the UI landing with only Rust-side coverage. Mitigation: M5, pulled earlier if the plan prefers.
+- **The headline claim is manual-only and always will be**, given #953. A regression in the fleet view after this PRD ships surfaces when somebody next runs two decks, which is not on a schedule. This is the same accepted trade CLAUDE.md rule 5 names for lane 2, restated for the desktop.
+- **N decks change an existing open defect's severity class.** [#1046](https://github.com/vfarcic/dot-agent-deck/issues/1046), confirmed at `desktop/src/App.tsx:791`: the toast renders on `notice || runtime.error` but its dismiss button is wired to `setNotice(undefined)` only, so `runtime.error` — a single App-level value from one `useDeckRuntime` — can never be cleared. With one deck that is an annoyance. With N it is a **masking bug**: one dead deck's stale error sits undismissable in the shared toast over a healthy deck's later message. The audit rates it a strong should-fix rather than a hard blocker, because per-deck `ConnectionView` state covers the *health display* independently and the fix itself is a few lines. Open question below.
+- **Resource cost is linear and genuinely unbounded**, and the shape of it is counter-intuitive: nothing caps the endpoint count, each live deck costs an `ssh` child plus a **never-joined** stderr thread plus ~2 held connections plus tasks on both sides, and the first thing to saturate is the **N × 6.667/s aggregate emit rate into the webview**, which scales with deck count even when every deck is nearly idle. The risk is that "it works with two" is read as "it works."
+
+## Open Questions
+
+1. **Does the whole-map mutex get split, or does establishment move out of the lock?** Both fix the contention; they differ in blast radius on #741's code. To be settled at M3 with the implementer.
+2. **Merged single emit, or N per-deck emits?** The recon recommends N per-deck emits with the frontend merging by `(daemonId, agentId)`, since that is already the frontend's key and it avoids both a shared coalescer and the cross-deck stall. Recorded as a recommendation rather than a decision.
+3. **Does `resolve()` get an `All` arm, or does a new `observed_endpoints()` sit beside it?** The recon recommends the latter — `resolve()` keeps answering the deck screen's single target, which is what DECISION 1 wants — because an `All` arm on a function returning a single `Endpoint` has no honest answer.
+4. **Does [#801](https://github.com/vfarcic/dot-agent-deck/issues/801) become a blocker?** A fleet spanning builds is the first real exercise of classifying compatibility from a git tag rather than from the contract. Adjacent today; the two-deck run on deliberately different builds is what would tell us.
+5. **Does [#1046](https://github.com/vfarcic/dot-agent-deck/issues/1046) get pulled in?** The audit's recommendation is **yes** — it is the one item it most wanted a decision on before merge, because N decks move it from annoyance to masking bug, and the fix is a few lines. Recommended for inclusion; the user's call.
+6. **One PR or two?** M1–M3 and M5–M6 change no user-visible behaviour; M4 is the whole payoff. #741 DECISION 4 chose one PR on the reasoning that **a PR whose behaviour cannot be validated is a PR approved on trust**, with the milestones landing as separate commits to keep a usable bisect. The same reasoning applies here and the same answer is recommended, but it is the user's call.
+7. **Should there be a bound on configured decks?** The factual half is now answered: **nothing bounds it today** beyond an accidental ~1000-row ceiling from the 256 KiB settings-file cap. What is open is whether this PRD adds a soft cap, a warning past some N, or neither — and the honest input to that decision is a measurement at N=10 (fd and process count) rather than a guess.
+8. **Is `#[spec]`-style catalog coverage wanted for any of this?** Today the desktop's three test tiers are catalogued nowhere — `tests/CATALOG.md` covers only the Rust e2e tier. This PRD does not change that, but it is the largest desktop feature yet to ship with no catalog entry, and if that should change, this is the moment to say so rather than after.
+
+## Work Log
+
+### 2026-09-13 — Written from the placeholder issue plus two read-only reconnaissance passes
+
+Written by the orchestrator from #742's body and all three comments (the third, dated 2026-09-11, is a deliberate hand-off from #741), `prds/741-desktop-connect-any-daemon.md`, and the **Decks** section of `docs/develop/desktop-gui.md` — plus two read-only recon passes, one on client architecture, state shape, the overview's data path and test tiers, and one on trust, lifecycle, resources and cross-version safety. Neither modified a file. Full reports at `.dot-agent-deck/prd742-recon-reviewer-report.md` and `.dot-agent-deck/prd742-audit-half2-report.md`.
+
+*(Process note, recorded because it cost an hour and will recur: the second pass was briefed to the **auditor** role twice and produced nothing both times — the delegation was accepted, a fresh agent spawned, and the pane went `Idle` with no report file and no `work-done` signal. It was rerouted to the reviewer and completed normally. Nothing about the task was auditor-specific; the same brief succeeded verbatim elsewhere.)*
+
+**Four details in the inherited hand-off had drifted and were re-verified at `4a7ae532` before planning:** `DesktopState` is at `desktop/src-tauri/src/terminal.rs:74` rather than in `lib.rs` (one `.manage()` at `lib.rs:1725`); the two maps are keyed by `EndpointIdentity` (`src/daemon_client.rs:200`) rather than by `Endpoint::describe()`, which is the safer key and was changed under review on PR #1035 for exactly this PRD's case; `PROTOCOL_VERSION` is 9 rather than 7; and "one variant plus one arm in exactly three places" is the TypeScript half only, the Rust `Selection` having roughly a dozen occurrences across three files — of which, the recon then established, only two are production matches needing a decision.
+
+**The reconnaissance corrected the central framing**, which is recorded at the top of this document rather than buried here: the `DesktopState`-becomes-a-keyed-map retrofit that both #742 and #741 name is already done, and the actual single-deck hardwiring is a process-global at `dto.rs:846`. It also found the whole-map mutex that contradicts this PRD's headline requirement and that no prior document mentions.
+
+**The second pass found a fourth local-only gate** — the filesystem trust check at `daemon_bridge.rs:881`, which for a remote deck does not refuse but silently substitutes ssh authentication for the inode predicate. #741's Risks section had explicitly warned that its list of three was "the one that was found" rather than the complete set, and that warning is now discharged. It also confirmed the rule-12 answer with evidence (`PROTOCOL_VERSION` stays 9), established that **nothing bounds the endpoint count**, and established that the first resource to saturate is the aggregate emit rate into the webview at N × 6.667/s rather than bandwidth or connection count — which is the opposite of what the #741 baseline's headline numbers suggest.
+
+**Four decisions taken by the user at planning time**, before any implementation was delegated: the overview merges while the deck screen stays single-deck; the scope is observe-only with the control half as a named follow-up; the two-deck verification run is in scope; and no `experimental` flag.
