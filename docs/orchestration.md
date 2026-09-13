@@ -586,7 +586,9 @@ The deck creates `.dot-agent-deck/` owner-only (`0700`) and writes every coordin
 
 A directory that already exists is treated more carefully, because it may be one you created. The deck clears **group and other write** from it before publishing — the equivalent of `chmod go-w`, and nothing more — and leaves read and execute exactly as they were, so a shared group can still list a directory it legitimately lists. It has to clear those bits: a `0600` file is only as protected as the directory holding it, and an account that can write the directory can replace the coordinator's brief with one of its own after the deck has written it.
 
-If that cannot be done — the directory belongs to another account, or the filesystem is read-only — the launch is refused rather than published into, and the message names the directory, its mode and the command to run:
+Neither `.dot-agent-deck/` nor a file inside it is followed through a symlink. A coordination file that is a link to something else would otherwise have that target truncated, rewritten and re-permissioned by the next delegation. When a coordination file is refused for this or any other reason the worker is handed its task inline instead, so the run continues.
+
+If the directory's write bits cannot be cleared — it belongs to another account, or the filesystem is read-only — the launch is refused rather than published into, and the message names the directory, its mode and the command to run:
 
 ```
 publish-failed: /home/you/project/.dot-agent-deck is mode 0775, which grants write to

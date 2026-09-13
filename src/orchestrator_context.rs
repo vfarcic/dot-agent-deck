@@ -749,7 +749,8 @@ impl ContextPublishError {
                 "{dir} is mode {mode:04o}, which grants write to group or other — another local \
                  account could replace the coordinator context's directory entry after it is \
                  published. The deck tried to clear those bits and could not, so publishing is \
-                 refused. On the machine running the deck, run: chmod go-w '{dir}'"
+                 refused. On the machine running the deck, run: chmod go-w {}",
+                posix_single_quote(&dir)
             ),
             Self::ContextDirUnusable(_) => {
                 format!("{dir} could not be created or opened as a directory")
@@ -762,6 +763,25 @@ impl ContextPublishError {
             }
         }
     }
+}
+
+/// Wrap `text` in POSIX single quotes so it is one shell word whatever it
+/// contains.
+///
+/// Greptile P1 on PR #1067, and the finding is exact: escaping a path for
+/// *display* is not the same as quoting it for a *shell*.
+/// `escape_multiline_for_terminal` neutralises control and bidi codepoints and
+/// leaves an apostrophe alone — correct for its job, and not enough here,
+/// because the remedy sentence hands the user a command to paste. A directory
+/// component is free to contain `'`, and a checkout carrying one named
+/// `x';touch PWNED;'` would turn one `chmod` into three commands the moment
+/// somebody followed the deck's own advice.
+///
+/// The standard construction: close the quote, emit an escaped `'`, reopen. A
+/// single-quoted POSIX string has no other escape, so this is the whole rule and
+/// there is no second case to get wrong.
+fn posix_single_quote(text: &str) -> String {
+    format!("'{}'", text.replace('\'', "'\\''"))
 }
 
 /// The directory every [`ContextPublishError::client_sentence`] is about, for a
@@ -996,6 +1016,16 @@ fn context_dir_unchanged(_guard: &ContextDirGuard, _dir: &std::path::Path) -> bo
 ///   reproduces in every repository is not a signal, and the one thing it
 ///   reliably named was a wall the user had to leave the app to climb.
 ///
+/// **No working configuration is taken away by this, and that is the answer to
+/// the obvious objection.** "What about a group that shares a `.dot-agent-deck`
+/// on purpose?" — such a setup has not worked since PRD #819: this function's
+/// only caller is [`publish_orchestrator_context`], which refused that directory
+/// outright rather than publishing into it. So the repair replaces a hard
+/// failure with a success, never a collaboration with a lockout. The delegate
+/// and work-done writers reach the same directory by a different path
+/// ([`write_coordination_file`]) and deliberately do **not** re-permission an
+/// existing one.
+///
 /// The claim this function makes is therefore exactly: *no group- or
 /// world-writable directory is published into*, unchanged — and, added, *a
 /// directory this process can repair is repaired rather than refused*.
@@ -1053,11 +1083,22 @@ fn ensure_context_dir_owner_writable_only(
 /// The whole predicate, and the thing the repair has to make false. Write bits
 /// only: see [`ensure_context_dir_owner_writable_only`] for why read and execute
 /// are tolerated.
+///
+/// **This and the two functions below carry `allow(dead_code)` off Unix**, and
+/// the reason is a gate rather than a shrug: they are pure arithmetic over a
+/// mode, unit-tested on every host, but their only non-test caller is the
+/// `cfg(unix)` arm above — and `build-windows` runs the bare
+/// `cargo clippy -- -D warnings`, which compiles no test target (CLAUDE.md rule
+/// 2). `cfg(unix)`-gating them instead would take the tests with them, which is
+/// the opposite of what is wanted: the decision these encode is exactly the part
+/// that should stay checkable everywhere.
+#[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) const fn grants_group_or_other_write(mode: u32) -> bool {
     mode & 0o022 != 0
 }
 
 /// `mode` with group and other write removed — what `chmod go-w` produces.
+#[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) const fn without_group_or_other_write(mode: u32) -> u32 {
     mode & !0o022
 }
@@ -1075,6 +1116,7 @@ pub(crate) const fn without_group_or_other_write(mode: u32) -> u32 {
 ///
 /// Fails closed at every step: a `chmod` that errors, a re-read that errors, and
 /// a re-read that still finds the write bits are all refusals.
+#[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) fn repair_context_dir_mode(
     mode: u32,
     chmod: impl FnOnce(u32) -> std::io::Result<()>,
@@ -1285,19 +1327,65 @@ pub fn publish_orchestrator_context(
 ///
 /// The permissions are applied before the first content byte, so the window in
 /// which the file exists wider than `0o600` never contains any of the text.
+///
+/// **Neither the directory nor the file is followed through a symlink**
+/// (Greptile P1 on PR #1067). The re-assert above is what made that urgent: a
+/// `.dot-agent-deck/worker-task-coder.md` that is a link to `../Cargo.toml`
+/// would have had the target truncated and the task written into it *before*
+/// this change too, and would now additionally have its mode set to `0o600`. So
+/// the open carries `O_NOFOLLOW` and the type is confirmed from the resulting
+/// handle. Refusing is safe to do here in a way it would not be elsewhere: both
+/// callers treat a write failure as "inline the task body instead", so a refused
+/// symlink degrades to a worker that gets its task directly rather than to a
+/// broken run.
 pub fn write_coordination_file(
     cwd: &std::path::Path,
     name: &str,
     content: &str,
 ) -> std::io::Result<std::path::PathBuf> {
     let dir = context_dir_of(cwd);
+    let refuse = |what: &str| {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("refusing to write a coordination file: {what}"),
+        ))
+    };
+    // The directory first. `create_owner_only_dir` is `create_dir_all`-shaped
+    // and would happily resolve a symlinked `.dot-agent-deck` and write through
+    // it, which is the same redirection [`open_context_dir`]'s
+    // `O_NOFOLLOW | O_DIRECTORY` refuses on the publish path. Nothing is lost by
+    // matching it: the publish refuses such a project outright, so no
+    // orchestration with a symlinked context directory has been able to start
+    // since PRD #819.
+    if std::fs::symlink_metadata(&dir).is_ok_and(|m| m.file_type().is_symlink()) {
+        return refuse("its directory is a symlink");
+    }
     crate::platform::fsperm::create_owner_only_dir(&dir)?;
     let path = dir.join(name);
 
     let mut options = std::fs::OpenOptions::new();
     options.create(true).write(true).truncate(true);
     crate::platform::fsperm::set_create_mode_owner_only(&mut options);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        // Greptile P1 on PR #1067. These names are reused on every delegation,
+        // so the open finds whatever is at the path — and a checkout can ship
+        // `.dot-agent-deck/worker-task-coder.md` as a symlink to `../Cargo.toml`.
+        // Without `O_NOFOLLOW` the truncate, the `set_file_owner_only` chmod and
+        // the task text all land on the link's target, and the delegation
+        // reports success. `O_NONBLOCK` for `read_config_file`'s reason: a plain
+        // open of a FIFO blocks inside the open, before any check could run.
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
     let mut file = options.open(&path)?;
+    // `O_NOFOLLOW` refuses a symlink and nothing else, so the type is confirmed
+    // from the open handle — an `fstat` on the descriptor already held, not a
+    // second path lookup. This is also what carries the property to a platform
+    // with no such flag, where it is the only check there is.
+    if !file.metadata()?.file_type().is_file() {
+        return refuse("the path is not a regular file");
+    }
     crate::platform::fsperm::set_file_owner_only(&file)?;
 
     use std::io::Write as _;
@@ -1329,9 +1417,34 @@ pub const COORDINATION_RETENTION_ENV: &str = "DOT_AGENT_DECK_COORDINATION_RETENT
 ///
 /// A bound rather than a `read_dir` to exhaustion, for the same reason every
 /// other read in this daemon is bounded: the directory's contents are written by
-/// agents, and an unbounded walk is a stall waiting for one to produce enough
-/// entries. Overshooting it simply defers the rest to the next publish.
+/// agents, and the publish that calls this is on a launch path.
 const MAX_SWEEP_ENTRIES: usize = 10_000;
+
+/// Where the next bounded sweep starts.
+///
+/// Greptile P2 on PR #1067: a window that always starts at entry zero is not a
+/// deferral, it is a starvation. `read_dir` order is the filesystem's, not
+/// creation order, so in a directory larger than [`MAX_SWEEP_ENTRIES`] the same
+/// young prefix can be re-examined on every publish while genuinely aged files
+/// beyond it are never visited and the retention window never takes effect.
+///
+/// So the window rotates: each sweep resumes where the last one stopped, and
+/// resets to zero as soon as a window runs short, which is how the end of the
+/// directory announces itself without a second `read_dir` to count it.
+///
+/// **The reset is what guarantees coverage; the advance is only what stops the
+/// same prefix being re-examined.** `read_dir` promises no ordering and none
+/// across calls, so no offset arithmetic can promise "every entry exactly once".
+/// What it can promise is that the offset either advances or the sweep starts
+/// over, so no entry can be skipped indefinitely — which is the property the
+/// retention window actually needs.
+///
+/// Process-global rather than per-directory, deliberately. Interleaving the
+/// rotation across projects costs a few more cycles to cover a large directory
+/// and needs no map keyed by a path that may be renamed underneath it; what it
+/// preserves is the only property that matters — the offset always advances, so
+/// every entry is visited within a bounded number of publishes.
+static SWEEP_OFFSET: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// The retention window in force, from the environment or the default.
 pub fn coordination_retention() -> Option<std::time::Duration> {
@@ -1422,11 +1535,38 @@ pub fn sweep_coordination_files(
     keep: std::time::Duration,
     now: std::time::SystemTime,
 ) -> SweepReport {
+    use std::sync::atomic::Ordering;
+    let offset = SWEEP_OFFSET.load(Ordering::Relaxed);
+    let (report, next) = sweep_window(dir, keep, now, MAX_SWEEP_ENTRIES, offset);
+    SWEEP_OFFSET.store(next, Ordering::Relaxed);
+    report
+}
+
+/// One window of [`sweep_coordination_files`], with the bound and the starting
+/// offset supplied.
+///
+/// Split out so the rotation is testable against a window of two entries rather
+/// than of ten thousand. Answers the report and the offset the **next** window
+/// should start from: one window further on, or back to zero when this window
+/// ran short — which means `read_dir` was exhausted inside it and there is
+/// nothing beyond.
+fn sweep_window(
+    dir: &std::path::Path,
+    keep: std::time::Duration,
+    now: std::time::SystemTime,
+    window: usize,
+    offset: usize,
+) -> (SweepReport, usize) {
     let mut report = SweepReport::default();
     let Ok(entries) = std::fs::read_dir(dir) else {
-        return report;
+        // Nothing was examined, so nothing is beyond the window either: start
+        // the next sweep from the beginning rather than advancing past a
+        // directory that could not be opened at all.
+        return (report, 0);
     };
-    for entry in entries.take(MAX_SWEEP_ENTRIES) {
+    let mut examined = 0usize;
+    for entry in entries.skip(offset).take(window) {
+        examined += 1;
         let Ok(entry) = entry else {
             report.failed += 1;
             continue;
@@ -1466,7 +1606,19 @@ pub fn sweep_coordination_files(
             Err(_) => report.failed += 1,
         }
     }
-    report
+    // Advance by the entries that SURVIVED the window, not by the window. A
+    // removal vacates its position, so everything after it shifts down by one;
+    // adding the full window would step over exactly `removed` unexamined
+    // entries each time. `offset + (examined - removed)` lands on the first one
+    // this window did not look at. The regression is
+    // `a_bounded_sweep_rotates_so_no_entry_is_starved`, which removed three of
+    // four files in four windows before this line was right.
+    let next = if examined < window {
+        0
+    } else {
+        offset.saturating_add(examined - report.removed)
+    };
+    (report, next)
 }
 
 /// What [`ensure_git_excludes_context_dir`] found or did.
@@ -1499,6 +1651,15 @@ pub enum GitExcludeOutcome {
 /// find it; deriving it from the `worktrees/<name>` shape would guess at a
 /// layout git does not promise.
 ///
+/// **The search walks up**, because the directory an orchestration runs in is
+/// not always the repository root — a package inside a monorepo is the ordinary
+/// case. An `info/exclude` pattern with no leading slash matches at every depth,
+/// so one `.dot-agent-deck/` line at the root covers a nested one too, and this
+/// is the same discovery git itself performs when it decides whether a file is
+/// tracked-eligible at all. The walk is bounded rather than unbounded: a
+/// project genuinely outside any repository must not end up appending to
+/// whatever repository happens to sit near the top of the tree.
+///
 /// Symlinks are refused at `.git` rather than followed: appending to a file
 /// through a link the daemon did not place is a write to somewhere it never
 /// decided to write.
@@ -1506,8 +1667,20 @@ pub(crate) fn git_common_dir(project_dir: &std::path::Path) -> Option<std::path:
     /// A `gitdir:` pointer file is a single short line; anything larger is not
     /// one and is not read.
     const MAX_GITDIR_FILE_BYTES: u64 = 4 * 1024;
+    /// How far up the tree a repository is looked for.
+    const MAX_DISCOVERY_DEPTH: usize = 64;
 
-    let dot_git = project_dir.join(".git");
+    let (dot_git, project_dir) =
+        project_dir
+            .ancestors()
+            .take(MAX_DISCOVERY_DEPTH)
+            .find_map(|dir| {
+                let candidate = dir.join(".git");
+                candidate
+                    .symlink_metadata()
+                    .is_ok()
+                    .then_some((candidate, dir))
+            })?;
     let metadata = std::fs::symlink_metadata(&dot_git).ok()?;
     let file_type = metadata.file_type();
     if file_type.is_symlink() {
@@ -2439,6 +2612,135 @@ mod hygiene_tests {
         }
     }
 
+    /// The remedy is a command the user is invited to paste, so the path in it
+    /// is **shell-quoted**, not merely display-escaped (Greptile P1, PR #1067).
+    ///
+    /// `escape_multiline_for_terminal` leaves an apostrophe alone, which is
+    /// right for its job and wrong for this one: a directory named
+    /// `x';touch PWNED;'` would close the quote and turn one `chmod` into three
+    /// commands the moment somebody followed the deck's own advice.
+    #[test]
+    fn the_remedy_command_shell_quotes_a_path_containing_an_apostrophe() {
+        assert_eq!(posix_single_quote("plain"), "'plain'");
+        assert_eq!(posix_single_quote("it's"), r#"'it'\''s'"#);
+        assert_eq!(posix_single_quote("'"), r#"''\'''"#);
+        assert_eq!(posix_single_quote(""), "''");
+
+        let hostile = std::path::Path::new("/tmp/x';touch PWNED;'").join(CONTEXT_DIR_NAME);
+        let sentence = ContextPublishError::ContextDirGroupOrWorldWritable {
+            mode: 0o775,
+            repair: None,
+        }
+        .client_sentence(&hostile);
+        let command = sentence
+            .rsplit_once("chmod go-w ")
+            .expect("the remedy names a command")
+            .1;
+        assert_eq!(
+            command, r#"'/tmp/x'\'';touch PWNED;'\''/.dot-agent-deck'"#,
+            "the whole path must stay one shell word: {sentence}"
+        );
+        // Proven by running it, rather than by reading the quoting: `printf %s`
+        // echoes exactly one argument back if and only if the quoting held.
+        let echoed = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("printf %s {command}"))
+            .output()
+            .expect("run sh");
+        assert_eq!(
+            String::from_utf8_lossy(&echoed.stdout),
+            hostile.display().to_string(),
+            "the shell must see one word and no commands"
+        );
+        assert!(
+            !std::path::Path::new("PWNED").exists(),
+            "and must not have executed the payload"
+        );
+    }
+
+    /// Neither the coordination directory nor the file is followed through a
+    /// symlink (Greptile P1, PR #1067).
+    ///
+    /// The role filenames are reused on every delegation, so a checkout can ship
+    /// `.dot-agent-deck/worker-task-coder.md` as a link to a tracked file. Before
+    /// the refusal, the target was truncated, written into and — once #329 added
+    /// the owner-only re-assert — chmodded to `0600`, with the delegation
+    /// reporting success. Refusing is safe here because both callers inline the
+    /// task body when the write fails.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_coordination_file_or_directory_is_refused_and_never_written_through() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path().join("project");
+        std::fs::create_dir_all(context_dir_of(&cwd)).unwrap();
+        let victim = cwd.join("Cargo.toml");
+        std::fs::write(&victim, "[package]\n").unwrap();
+        std::os::unix::fs::symlink(&victim, context_dir_of(&cwd).join("worker-task-coder.md"))
+            .unwrap();
+
+        write_coordination_file(&cwd, "worker-task-coder.md", "do the thing")
+            .expect_err("a symlinked coordination file must be refused");
+        assert_eq!(
+            std::fs::read_to_string(&victim).unwrap(),
+            "[package]\n",
+            "the link's target must be untouched"
+        );
+
+        // …and the same for a symlinked `.dot-agent-deck` itself.
+        let linked = tmp.path().join("linked");
+        std::fs::create_dir(&linked).unwrap();
+        let elsewhere = tmp.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, context_dir_of(&linked)).unwrap();
+
+        write_coordination_file(&linked, "work-done-coder.md", "report")
+            .expect_err("a symlinked context directory must be refused");
+        assert!(
+            !elsewhere.join("work-done-coder.md").exists(),
+            "nothing may be written through the directory link"
+        );
+    }
+
+    /// The bounded sweep **rotates** rather than restarting at entry zero
+    /// (Greptile P2, PR #1067).
+    ///
+    /// A window fixed at the start of the directory is not a deferral but a
+    /// starvation: `read_dir` order is the filesystem's, so in a directory
+    /// larger than the window the same prefix can be re-examined forever while
+    /// aged files beyond it are never visited. Four aged files and a window of
+    /// one: every file must be gone within four sweeps, whatever order the
+    /// filesystem hands them back, and the offset must return to zero once the
+    /// directory is exhausted.
+    #[test]
+    fn a_bounded_sweep_rotates_so_no_entry_is_starved() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join(CONTEXT_DIR_NAME);
+        std::fs::create_dir(&dir).unwrap();
+        for n in 0..4 {
+            std::fs::write(dir.join(format!("task-{n}.md")), "x").unwrap();
+        }
+        let now = SystemTime::now() + Duration::from_secs(86_400);
+
+        let mut offset = 0usize;
+        let mut removed = 0usize;
+        for _ in 0..4 {
+            let (report, next) = sweep_window(&dir, Duration::from_secs(1), now, 1, offset);
+            removed += report.removed;
+            offset = next;
+        }
+        assert_eq!(removed, 4, "every entry is reached within four windows");
+        assert_eq!(
+            std::fs::read_dir(&dir).unwrap().count(),
+            0,
+            "so the directory empties instead of stalling on a prefix"
+        );
+
+        // A window that runs short means `read_dir` was exhausted inside it, so
+        // the next sweep starts over rather than advancing past the end.
+        let (_, next) = sweep_window(&dir, Duration::from_secs(1), now, 8, 0);
+        assert_eq!(next, 0);
+    }
+
     #[test]
     fn the_retention_window_defaults_and_is_disabled_only_by_a_literal_zero() {
         let day = 24 * 60 * 60;
@@ -2711,6 +3013,44 @@ mod hygiene_tests {
         assert!(
             !worktree_gitdir.join("info/exclude").exists(),
             "and not in the per-worktree gitdir, where git would not read it"
+        );
+    }
+
+    /// A project **inside** a repository rather than at its root still gets the
+    /// rule, and the rule goes in the repository's own exclude file.
+    ///
+    /// The directory an orchestration runs in is not always the repository root
+    /// — a package inside a monorepo is the ordinary case, and a nested
+    /// `.dot-agent-deck/` is every bit as tracked-eligible as one at the top. An
+    /// `info/exclude` pattern with no leading slash matches at every depth, so
+    /// one line at the root covers the nested directory too.
+    #[test]
+    fn a_project_nested_inside_a_repository_excludes_through_the_repository_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir(root.join(".git")).unwrap();
+        let nested = root.join("packages/worker");
+        std::fs::create_dir_all(&nested).unwrap();
+
+        assert_eq!(
+            ensure_git_excludes_context_dir(&nested).unwrap(),
+            GitExcludeOutcome::Added
+        );
+        assert!(
+            std::fs::read_to_string(root.join(".git/info/exclude"))
+                .unwrap()
+                .lines()
+                .any(|l| l.trim() == ".dot-agent-deck/"),
+            "the rule belongs to the repository, not to the package directory"
+        );
+        assert!(
+            !nested.join(".git").exists(),
+            "and no .git is invented in the package directory"
+        );
+        // Idempotent from the nested directory too.
+        assert_eq!(
+            ensure_git_excludes_context_dir(&nested).unwrap(),
+            GitExcludeOutcome::AlreadyExcluded
         );
     }
 
