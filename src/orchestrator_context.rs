@@ -1187,11 +1187,12 @@ fn temp_context_file_name() -> String {
 ///   arm; the non-Unix arm applies no mode or DACL at all, which is why the
 ///   daemon verb is refused there rather than claiming otherwise (see
 ///   [`open_context_dir`]).
-/// * **Swept.** After a successful publish, coordination files left in the same
-///   directory past the retention window are removed and `.dot-agent-deck/` is
-///   added to the clone-local `.git/info/exclude` (issue #329 §§2-3). Both are
-///   best-effort housekeeping that cannot fail the publish; see
-///   [`sweep_coordination_files`] and [`ensure_git_excludes_context_dir`].
+/// * **Tidied.** After a successful publish, `.dot-agent-deck/` is added to the
+///   clone-local `.git/info/exclude`, and — only where an operator has asked for
+///   a retention window ([`COORDINATION_RETENTION_ENV`]) — coordination files
+///   past it are removed (issue #329 §§2-3). Both are best-effort housekeeping
+///   that cannot fail the publish; see [`ensure_git_excludes_context_dir`] and
+///   [`sweep_coordination_files`].
 /// * **Atomic with respect to a reader.** The bytes go to a `create_new`
 ///   temp file in the SAME directory and reach the destination by `rename(2)`,
 ///   so a concurrent reader sees either the previous context or the new one and
@@ -1397,20 +1398,25 @@ pub fn write_coordination_file(
 // Issue #329 §§2-3: keeping `.dot-agent-deck` out of git, and out of the way
 // ---------------------------------------------------------------------------
 
-/// How long a coordination file left in `.dot-agent-deck` survives, in days
-/// (issue #329 §3).
+/// The env var that turns the coordination-file sweep on, and sets its window in
+/// days. Unset — the default — means **no sweep at all**.
 ///
-/// **Fourteen days, and the number is chosen to be boring.** The files this
-/// sweeps are a handoff medium — a task written for a worker that read it
-/// minutes later, a report written for a coordinator that consumed it in the
-/// same run — so anything still there after a fortnight belongs to a line of
-/// work that ended. Short enough that a repository does not accumulate a year of
-/// other people's task text; long enough that no plausible in-flight run loses a
-/// file out from under it, including one parked over a holiday.
-pub const DEFAULT_COORDINATION_RETENTION_DAYS: u64 = 14;
-
-/// The env var that overrides [`DEFAULT_COORDINATION_RETENTION_DAYS`]. `0`
-/// disables the sweep entirely.
+/// **Off by default, and the reason is whose files these are.** The deck's own
+/// coordination artifacts do not accumulate: `orchestrator-context.md` is one
+/// per project, `worker-task-<role>.md` and `work-done-<role>.md` are one per
+/// role, and all three are overwritten in place. What #329 §3 measured piling up
+/// is the slug-keyed `<task-slug>.md` an **orchestrator** invents per delegation
+/// — a file the deck did not write, and one the delegation protocol already
+/// instructs its author to delete once the dispatch has succeeded (#303).
+///
+/// A deck that swept those by default would be deleting another party's files to
+/// enforce a rule that party was already given. So the mechanism is here, tested
+/// and documented, and an operator with a checkout that has genuinely
+/// accumulated turns it on: `DOT_AGENT_DECK_COORDINATION_RETENTION_DAYS=14`.
+///
+/// The one thing this leaves uncleaned is a publish temp file leaked by a process
+/// killed between the `create_new` and the `rename` — hidden, tiny, and rare
+/// enough not to justify a `read_dir` on every publish.
 pub const COORDINATION_RETENTION_ENV: &str = "DOT_AGENT_DECK_COORDINATION_RETENTION_DAYS";
 
 /// At most this many directory entries are examined in one sweep.
@@ -1462,7 +1468,7 @@ const MAX_SWEEP_ENTRIES: usize = 512;
 /// every entry is visited within a bounded number of publishes.
 static SWEEP_OFFSET: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-/// The retention window in force, from the environment or the default.
+/// The retention window the operator asked for, if any.
 pub fn coordination_retention() -> Option<std::time::Duration> {
     retention_from_raw(std::env::var(COORDINATION_RETENTION_ENV).ok().as_deref())
 }
@@ -1470,19 +1476,13 @@ pub fn coordination_retention() -> Option<std::time::Duration> {
 /// [`coordination_retention`]'s decision, with the environment read out of it so
 /// every branch is testable without mutating a process-global.
 ///
-/// An unparseable value takes the default rather than disabling the sweep: "the
-/// operator typed something wrong" and "the operator asked for no sweep" are
-/// different intentions, and only the literal `0` expresses the second. A value
-/// that would overflow the multiplication is likewise not a request for no
-/// sweep, so it saturates at the longest window rather than wrapping into one.
+/// **Every answer but a positive integer is "do not sweep."** Unset, empty,
+/// unparseable and `0` all mean no deletion — which is the fail-safe direction
+/// for a typo, and the whole reason this reads as an opt-in rather than as a
+/// window with an off switch. A value large enough to overflow the seconds
+/// multiplication saturates rather than wrapping into a short window.
 pub(crate) fn retention_from_raw(raw: Option<&str>) -> Option<std::time::Duration> {
-    let days = match raw {
-        Some(raw) => raw
-            .trim()
-            .parse::<u64>()
-            .unwrap_or(DEFAULT_COORDINATION_RETENTION_DAYS),
-        None => DEFAULT_COORDINATION_RETENTION_DAYS,
-    };
+    let days = raw?.trim().parse::<u64>().ok()?;
     (days > 0).then(|| std::time::Duration::from_secs(days.saturating_mul(24 * 60 * 60)))
 }
 
@@ -1832,6 +1832,10 @@ pub fn ensure_git_excludes_context_dir(
 /// Runs **after** the rename, never before: a refused publish must not delete
 /// anything, and a project that fails the mode check has not consented to having
 /// its git config appended to either.
+///
+/// The sweep half runs only where an operator has set a window — see
+/// [`COORDINATION_RETENTION_ENV`] for why deleting by default is not this
+/// deck's call. With none set, `read_dir` is not even reached.
 fn tidy_context_dir(project_dir: &std::path::Path, dir: &std::path::Path) {
     if let Some(keep) = coordination_retention() {
         let report = sweep_coordination_files(dir, keep, std::time::SystemTime::now());
@@ -2778,38 +2782,39 @@ mod hygiene_tests {
         assert_eq!(next, 0);
     }
 
+    /// The sweep is **opt-in**: every answer but a positive integer means no
+    /// deletion.
+    ///
+    /// Unset is the shipped default and the case that matters most — a deck
+    /// nobody has configured deletes nothing. Empty, unparseable and `0` land in
+    /// the same place, which is the fail-safe direction for a typo: mistyping a
+    /// window must not be the thing that starts removing files.
     #[test]
-    fn the_retention_window_defaults_and_is_disabled_only_by_a_literal_zero() {
+    fn the_sweep_is_off_unless_an_operator_asks_for_a_window() {
         let day = 24 * 60 * 60;
         assert_eq!(
             retention_from_raw(None),
-            Some(Duration::from_secs(
-                DEFAULT_COORDINATION_RETENTION_DAYS * day
-            ))
+            None,
+            "a deck nobody configured must delete nothing"
         );
+        for raw in ["", "   ", "0", "nonsense", "-1", "3.5", "0x10", "14d"] {
+            assert_eq!(
+                retention_from_raw(Some(raw)),
+                None,
+                "{raw:?} is not a window, so it must not start a sweep"
+            );
+        }
+
         assert_eq!(
             retention_from_raw(Some("1")),
             Some(Duration::from_secs(day))
         );
         assert_eq!(
-            retention_from_raw(Some(" 3 ")),
-            Some(Duration::from_secs(3 * day))
+            retention_from_raw(Some(" 14 ")),
+            Some(Duration::from_secs(14 * day))
         );
-        assert_eq!(retention_from_raw(Some("0")), None, "0 disables the sweep");
-        // "The operator typed something wrong" is not "the operator asked for no
-        // sweep", so a garbage value takes the default rather than silently
-        // turning retention off.
-        for raw in ["", "nonsense", "-1", "3.5", "0x10"] {
-            assert_eq!(
-                retention_from_raw(Some(raw)),
-                Some(Duration::from_secs(
-                    DEFAULT_COORDINATION_RETENTION_DAYS * day
-                )),
-                "{raw:?} must fall back to the default"
-            );
-        }
-        // A value large enough to overflow the seconds multiplication must
-        // saturate rather than wrap into a short window.
+        // A value large enough to overflow the seconds multiplication saturates
+        // rather than wrapping into a short window.
         assert!(retention_from_raw(Some(&u64::MAX.to_string())).is_some());
     }
 
