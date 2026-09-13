@@ -150,6 +150,45 @@ def gh_json(*args):
     return json.loads(out) if out else None
 
 
+def concat_json_documents(text):
+    """Parse a stream of back-to-back JSON documents into one flat list.
+
+    `gh api --paginate --jq FILTER` applies the filter to EACH PAGE and
+    concatenates the results, so a request that spans pages emits several JSON
+    documents rather than one and a single `json.loads` raises `Extra data`.
+
+    The page size is **100** — `gh` appends `per_page=100` to a paginated request
+    unless the caller sets it, verified with `GH_DEBUG=api`. Not 30, which is
+    GitHub's default for an unpaginated call and the number this comment said
+    before it was measured; the distinction decides whether a 70-file pull request
+    is near the boundary or past it.
+
+    `--slurp` is gh's own answer to this and cannot be used here: it is refused in
+    combination with `--jq` ("the `--slurp` option is not supported with `--jq` or
+    `--template`"), and dropping `--jq` would pull entire comment and review
+    bodies through for every pull request on every sweep.
+
+    A single-page response has exactly one document and comes back unchanged,
+    which is what makes this safe at the call sites that have never yet paged.
+    """
+    text = (text or "").strip()
+    if not text:
+        return []
+    decoder = json.JSONDecoder()
+    items, index = [], 0
+    while index < len(text):
+        value, index = decoder.raw_decode(text, index)
+        items.extend(value if isinstance(value, list) else [value])
+        while index < len(text) and text[index] in " \t\r\n":
+            index += 1
+    return items
+
+
+def gh_json_paginated(*args):
+    """`gh_json` for a `--paginate --jq '[...]'` call. See concat_json_documents."""
+    return concat_json_documents(gh(*args))
+
+
 def checks_green(repo, sha):
     """True when every required context succeeded and nothing else failed.
 
@@ -158,8 +197,10 @@ def checks_green(repo, sha):
     to the ruleset without updating REQUIRED_CONTEXTS fails closed rather than
     open. A context that produced no check run at all is NOT success.
     """
-    runs = gh_json("api", f"repos/{repo}/commits/{sha}/check-runs", "--paginate",
-                   "--jq", "[.check_runs[] | {name, status, conclusion}]") or []
+    runs = gh_json_paginated(
+        "api", f"repos/{repo}/commits/{sha}/check-runs", "--paginate",
+        "--jq", "[.check_runs[] | {name, status, conclusion}]",
+    )
     by_name = {}
     for run in runs:
         # Keep the newest entry per name; re-runs append.
@@ -230,16 +271,108 @@ def latest_verdict(repo, pr_number):
     authoritative nor raise. A malformed verdict from the trusted author still
     raises — that is a broken reviewer and must be loud, not silently skipped.
     """
-    comments = gh_json(
+    comments = gh_json_paginated(
         "api", f"repos/{repo}/issues/{pr_number}/comments", "--paginate",
         "--jq", "[.[] | {id, body, created_at, user: {login: .user.login}}]",
-    ) or []
+    )
     trusted = [c for c in comments if _is_trusted_verdict_comment(c)]
     for comment in sorted(trusted, key=lambda c: c["created_at"], reverse=True):
         verdict = parse_verdict(comment.get("body"))
         if verdict is not None:
             return verdict
     return None
+
+
+# The marker every no-vote notice carries, so the job can recognise its own.
+#
+# Both notices (an INSUFFICIENT verdict, and a deny-listed pull request whose
+# auto-merge is armed) open with this, and both quote the short head SHA. Author
+# plus marker plus SHA is what makes a notice identifiable as ALREADY POSTED FOR
+# THIS HEAD, which is the whole question `already_noticed_at` answers.
+NO_VOTE_MARKER = "**No vote cast**"
+
+
+def already_reviewed_at(reviews, sha, app_login):
+    """True when `app_login` has already cast a review on this exact head.
+
+    This is the bound that was missing (issue #1050). The vote pass is selected on
+    "has a current verdict" and deliberately NOT on "has not been reviewed" — that
+    is what keeps a verdict from an earlier run votable and a transiently-failed
+    vote retryable — so without a per-SHA guard the daily sweep re-cast the same
+    approval twice a day for as long as the head sat still.
+
+    Keyed on `commit_id` and NOT on review state, which decides two cases:
+
+      * a push moves the head, so the old reviews carry an old `commit_id` and the
+        new head is votable. That is the case that must keep working, and it is
+        the reason a SHA is the right key rather than a timestamp.
+      * a review the App cast and a human then DISMISSED still counts as cast.
+        Re-casting it would fight the human who dismissed it, and this job is a
+        second opinion rather than an authority over one.
+
+    An empty `app_login` returns False — fail OPEN, deliberately. The failure mode
+    of fail-open is a duplicate approval, which is the noise this fixes; the
+    failure mode of fail-closed is a reviewer that silently approves nothing,
+    which blocks every merge it was added to unblock. The caller says so loudly.
+    """
+    if not app_login:
+        return False
+    return any(
+        (review.get("user") or {}).get("login") == app_login
+        and review.get("commit_id") == sha
+        for review in reviews or ()
+    )
+
+
+def already_noticed_at(comments, sha, app_login):
+    """True when `app_login` has already posted a no-vote notice for this head.
+
+    The comment-only outcomes re-posted on the same cadence and for the same
+    reason as the duplicate reviews, so they take the same key: author, marker,
+    and the short SHA the notice itself quotes.
+
+    Note which branch this must NOT suppress. The armed-auto-merge notice tells
+    the reader to disarm auto-merge and re-run, so it has to stay re-runnable
+    INTO A VOTE. It does, because that path re-reads the armed state first and
+    only consults this predicate while still armed; once disarmed the job falls
+    through to voting, where no review exists at this SHA and `already_reviewed_at`
+    lets it through. Fail-open on an empty login, as above.
+    """
+    if not app_login:
+        return False
+    short = (sha or "")[:8]
+    if not short:
+        return False
+    return any(
+        (comment.get("user") or {}).get("login") == app_login
+        and NO_VOTE_MARKER in (comment.get("body") or "")
+        and short in (comment.get("body") or "")
+        for comment in comments or ()
+    )
+
+
+def pr_reviews(repo, pr_number):
+    """Every review on a pull request, paginated.
+
+    `--paginate` is load-bearing, and so is parsing its output as a STREAM. The
+    endpoint pages at 100 under `gh --paginate`, and a pull request that collects
+    that many reviews would otherwise push the App's own past votes off the first
+    page — silently defeating the guard on exactly the long-lived pull requests it
+    matters most on. Past that boundary `gh` emits one document per page, which is
+    why this goes through `gh_json_paginated` rather than `gh_json`.
+    """
+    return gh_json_paginated(
+        "api", f"repos/{repo}/pulls/{pr_number}/reviews", "--paginate",
+        "--jq", "[.[] | {commit_id, state, user: {login: .user.login}}]",
+    )
+
+
+def pr_comments(repo, pr_number):
+    """Every issue comment on a pull request, paginated. Same paging reason."""
+    return gh_json_paginated(
+        "api", f"repos/{repo}/issues/{pr_number}/comments", "--paginate",
+        "--jq", "[.[] | {body, user: {login: .user.login}}]",
+    )
 
 
 def fail(message):
