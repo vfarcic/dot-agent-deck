@@ -150,6 +150,45 @@ def gh_json(*args):
     return json.loads(out) if out else None
 
 
+def concat_json_documents(text):
+    """Parse a stream of back-to-back JSON documents into one flat list.
+
+    `gh api --paginate --jq FILTER` applies the filter to EACH PAGE and
+    concatenates the results, so a request that spans pages emits several JSON
+    documents rather than one and a single `json.loads` raises `Extra data`.
+
+    The page size is **100** — `gh` appends `per_page=100` to a paginated request
+    unless the caller sets it, verified with `GH_DEBUG=api`. Not 30, which is
+    GitHub's default for an unpaginated call and the number this comment said
+    before it was measured; the distinction decides whether a 70-file pull request
+    is near the boundary or past it.
+
+    `--slurp` is gh's own answer to this and cannot be used here: it is refused in
+    combination with `--jq` ("the `--slurp` option is not supported with `--jq` or
+    `--template`"), and dropping `--jq` would pull entire comment and review
+    bodies through for every pull request on every sweep.
+
+    A single-page response has exactly one document and comes back unchanged,
+    which is what makes this safe at the call sites that have never yet paged.
+    """
+    text = (text or "").strip()
+    if not text:
+        return []
+    decoder = json.JSONDecoder()
+    items, index = [], 0
+    while index < len(text):
+        value, index = decoder.raw_decode(text, index)
+        items.extend(value if isinstance(value, list) else [value])
+        while index < len(text) and text[index] in " \t\r\n":
+            index += 1
+    return items
+
+
+def gh_json_paginated(*args):
+    """`gh_json` for a `--paginate --jq '[...]'` call. See concat_json_documents."""
+    return concat_json_documents(gh(*args))
+
+
 def checks_green(repo, sha):
     """True when every required context succeeded and nothing else failed.
 
@@ -158,8 +197,10 @@ def checks_green(repo, sha):
     to the ruleset without updating REQUIRED_CONTEXTS fails closed rather than
     open. A context that produced no check run at all is NOT success.
     """
-    runs = gh_json("api", f"repos/{repo}/commits/{sha}/check-runs", "--paginate",
-                   "--jq", "[.check_runs[] | {name, status, conclusion}]") or []
+    runs = gh_json_paginated(
+        "api", f"repos/{repo}/commits/{sha}/check-runs", "--paginate",
+        "--jq", "[.check_runs[] | {name, status, conclusion}]",
+    )
     by_name = {}
     for run in runs:
         # Keep the newest entry per name; re-runs append.
@@ -230,10 +271,10 @@ def latest_verdict(repo, pr_number):
     authoritative nor raise. A malformed verdict from the trusted author still
     raises — that is a broken reviewer and must be loud, not silently skipped.
     """
-    comments = gh_json(
+    comments = gh_json_paginated(
         "api", f"repos/{repo}/issues/{pr_number}/comments", "--paginate",
         "--jq", "[.[] | {id, body, created_at, user: {login: .user.login}}]",
-    ) or []
+    )
     trusted = [c for c in comments if _is_trusted_verdict_comment(c)]
     for comment in sorted(trusted, key=lambda c: c["created_at"], reverse=True):
         verdict = parse_verdict(comment.get("body"))
@@ -313,23 +354,25 @@ def already_noticed_at(comments, sha, app_login):
 def pr_reviews(repo, pr_number):
     """Every review on a pull request, paginated.
 
-    `--paginate` is load-bearing: the endpoint pages at 30, and a pull request
-    that has collected a few rounds of Greptile and maintainer reviews pushes the
-    App's own past votes off the first page — which would silently defeat the
-    guard on exactly the long-lived pull requests it matters most on.
+    `--paginate` is load-bearing, and so is parsing its output as a STREAM. The
+    endpoint pages at 100 under `gh --paginate`, and a pull request that collects
+    that many reviews would otherwise push the App's own past votes off the first
+    page — silently defeating the guard on exactly the long-lived pull requests it
+    matters most on. Past that boundary `gh` emits one document per page, which is
+    why this goes through `gh_json_paginated` rather than `gh_json`.
     """
-    return gh_json(
+    return gh_json_paginated(
         "api", f"repos/{repo}/pulls/{pr_number}/reviews", "--paginate",
         "--jq", "[.[] | {commit_id, state, user: {login: .user.login}}]",
-    ) or []
+    )
 
 
 def pr_comments(repo, pr_number):
     """Every issue comment on a pull request, paginated. Same paging reason."""
-    return gh_json(
+    return gh_json_paginated(
         "api", f"repos/{repo}/issues/{pr_number}/comments", "--paginate",
         "--jq", "[.[] | {body, user: {login: .user.login}}]",
-    ) or []
+    )
 
 
 def fail(message):

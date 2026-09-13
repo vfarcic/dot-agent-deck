@@ -17,6 +17,7 @@ from pr_review_common import (  # noqa: E402
     checks_green,
     deny_sort_key,
     gh_json,
+    gh_json_paginated,
     latest_verdict,
     unresolved_threads,
 )
@@ -50,10 +51,15 @@ def touches_denied(repo, number):
     first match. The API returns paths alphabetically, which put `.github/` first
     and `src/daemon_protocol.rs` last — the exact inverse of how severe they are.
     """
-    files = gh_json(
+    # Streamed, not `gh_json`: past 100 files `gh --paginate` emits one JSON
+    # document per page and a single `json.loads` raises. This is the call site
+    # closest to that boundary — PR #1035 carries 70 files — and it raises out of
+    # the selection loop, so it would take the WHOLE sweep down rather than one
+    # pull request. Issue #1050 review.
+    files = gh_json_paginated(
         "api", f"repos/{repo}/pulls/{number}/files", "--paginate",
         "--jq", "[.[].filename]",
-    ) or []
+    )
     denied = [f for f in files if any(f.startswith(p) for p in DENY_PATHS)]
     return sorted(denied, key=deny_sort_key)
 
