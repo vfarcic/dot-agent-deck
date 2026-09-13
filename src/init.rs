@@ -59,5 +59,18 @@ pub fn run_init(path: &Path) -> ExitCode {
     }
 
     println!("Created {}", file_path.display());
+
+    // Issue #329 §2: the ignore rule the generated advice needs, in the one
+    // place that is per-clone and never committed. Best-effort and reported
+    // rather than fatal — `init` succeeded at what it was asked to do, and a
+    // project that is not a git repository has nothing to exclude from.
+    match crate::orchestrator_context::ensure_git_excludes_context_dir(path) {
+        Ok(crate::orchestrator_context::GitExcludeOutcome::Added) => {
+            println!("Excluded .dot-agent-deck/ in .git/info/exclude");
+        }
+        Ok(_) => {}
+        Err(e) => eprintln!("Could not update .git/info/exclude: {e}"),
+    }
+
     ExitCode::SUCCESS
 }

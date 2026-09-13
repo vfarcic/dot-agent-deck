@@ -617,11 +617,26 @@ pub enum ContextPublishError {
     /// The final `.dot-agent-deck` component is a symlink. Refused; see
     /// [`open_context_dir`].
     ContextDirIsSymlink,
-    /// An existing `.dot-agent-deck` grants **write** to group or other, so
-    /// publishing into it cannot deliver the owner-only promise. Refused; see
-    /// [`refuse_a_writable_context_dir`]. The `u32` is the offending mode's
-    /// permission bits, for the daemon-local diagnostic only.
-    ContextDirGroupOrWorldWritable(u32),
+    /// An existing `.dot-agent-deck` grants **write** to group or other **and
+    /// the in-place repair could not take those bits away**, so publishing into
+    /// it cannot deliver the owner-only promise. Refused; see
+    /// [`ensure_context_dir_owner_writable_only`].
+    ///
+    /// Reaching this variant is now a much narrower fact than it was when the
+    /// publish simply refused every such directory: the repair handles the mode
+    /// a stock `umask 002` host produces, so what is left here is a directory
+    /// this process does not own, a read-only or exotic filesystem, or another
+    /// account re-widening the mode between the `fchmod` and the re-read.
+    ContextDirGroupOrWorldWritable {
+        /// The offending permission bits as last observed — before the repair
+        /// when the `fchmod` failed, after it when the re-read still found
+        /// them.
+        mode: u32,
+        /// The `fchmod`'s own error, when that is what failed. `None` for the
+        /// re-widened case, which has no OS error to report. Daemon-local: it
+        /// never reaches [`ContextPublishError::client_sentence`].
+        repair: Option<std::io::Error>,
+    },
     /// `.dot-agent-deck` could not be created or opened as a directory — it is a
     /// regular file, the project directory does not exist, or the permissions
     /// forbid it.
@@ -651,11 +666,19 @@ impl ContextPublishError {
                 "{CONTEXT_DIR_NAME} is a symlink; the coordinator context must be published into \
                  a real directory in the project itself"
             ),
-            Self::ContextDirGroupOrWorldWritable(mode) => format!(
-                "{CONTEXT_DIR_NAME} is mode {mode:04o}, which grants write to group or other; \
-                 another local account could replace the coordinator context's directory entry \
-                 after it is published, so publishing is refused — `chmod go-w` the directory"
-            ),
+            Self::ContextDirGroupOrWorldWritable { mode, repair } => {
+                let why = match repair {
+                    Some(e) => format!("the deck could not chmod it: {e}"),
+                    None => "the deck cleared those bits and something put them straight back"
+                        .to_string(),
+                };
+                format!(
+                    "{CONTEXT_DIR_NAME} is mode {mode:04o}, which grants write to group or other; \
+                     another local account could replace the coordinator context's directory \
+                     entry after it is published, and {why}, so publishing is refused — \
+                     `chmod go-w` the directory"
+                )
+            }
             Self::ContextDirUnusable(e) => {
                 format!("{CONTEXT_DIR_NAME} could not be created or opened as a directory: {e}")
             }
@@ -668,42 +691,88 @@ impl ContextPublishError {
         }
     }
 
-    /// The sentence that may cross the wire.
+    /// The sentence that may cross the wire, **naming the directory it is
+    /// about** (issue #1047 §2).
     ///
-    /// It names no path and carries no raw OS error, which is the same rule
-    /// [`crate::project_resolve::generic_refusal`] follows. It is deliberately
-    /// **not** the single uniform sentence that one is, though, and the reason
-    /// is that the two protect different things: a resolve refusal must not
-    /// distinguish "no such directory" from "no config there" for an arbitrary
-    /// pasted path, whereas every case here is reached only *after* that path
-    /// has already resolved as a project — so the caller has already learned the
-    /// directory exists and holds a config, and naming the shape of the
-    /// obstruction discloses nothing further while being the only way the
-    /// operator can fix it.
-    pub fn client_sentence(&self) -> &'static str {
+    /// It carries no raw OS error — that stays in [`Self::detail`] — but it does
+    /// name the path, the offending mode and the exact remedy, and the change
+    /// from the `&'static str` this used to return is the whole of #1047's
+    /// second half. Three consecutive launch failures were diagnosed with a
+    /// `find` across the filesystem, because the user had moved on to a
+    /// *different* project between attempts and nothing on either side would say
+    /// which directory was being refused.
+    ///
+    /// **Naming the path here discloses nothing the caller cannot already
+    /// obtain, and that is checkable rather than a judgement call.** Every
+    /// variant is reached only *after* the caller's path canonicalised and
+    /// resolved as a project — [`crate::project_resolve::prepare_workflow_for_wire`]
+    /// publishes last, after the resolve, the revision gate and the orchestration
+    /// lookup have all passed. A caller that reached this point can send the same
+    /// path to `ResolveProject` and get the canonical spelling back in
+    /// [`crate::event::ResolvedProject::path`], which is exactly the directory
+    /// named here with `.dot-agent-deck` appended; on success the same string
+    /// comes back as [`crate::event::PreparedWorkflow::path`]. So the disclosure
+    /// boundary this respects is unchanged — it is
+    /// [`crate::project_resolve::generic_refusal`]'s, and that one guards
+    /// **resolve failures**, where an arbitrary pasted path must not learn
+    /// whether a directory exists. A publish failure is not a resolve failure.
+    ///
+    /// **Which is why there is no deck-kind branch.** #1047 proposed making the
+    /// disclosure depend on whether the deck is local or remote, on the
+    /// reasoning that a remote peer should not probe someone else's filesystem.
+    /// That guard is real for a path that did not resolve and is already
+    /// enforced one layer up; for a path that did, a remote caller holds the
+    /// canonical directory too, so withholding it from that caller costs the
+    /// same three failed attempts and buys nothing. The remedy sentence says
+    /// *which machine* to run `chmod` on instead, which is the part a remote
+    /// operator genuinely needs and which no split would have given them.
+    pub fn client_sentence(&self, context_dir: &std::path::Path) -> String {
+        // The path is escaped for exactly the reason
+        // `ProjectResolveError::detail` escapes its own strings: this sentence is
+        // printed to a terminal by the TUI and rendered in a toast by the
+        // desktop, and a directory name is free to contain control or bidi
+        // codepoints. A sentence that names a path has to be safe to *show*, not
+        // merely true.
+        let dir = crate::config_validation::escape_multiline_for_terminal(
+            &context_dir.display().to_string(),
+        );
         match self {
-            Self::ContextTooLarge(_) => {
-                "the composed coordinator context exceeds this daemon's size limit"
-            }
-            Self::ContextDirIsSymlink => {
-                "the project's `.dot-agent-deck` directory is a symlink, which is refused"
-            }
-            Self::ContextDirGroupOrWorldWritable(_) => {
-                "the project's `.dot-agent-deck` directory is writable by group or other, which \
-                 is refused; remove those write bits and retry"
-            }
+            Self::ContextTooLarge(n) => format!(
+                "the composed coordinator context is {n} bytes; at most {MAX_CONTEXT_BYTES} can \
+                 be published"
+            ),
+            Self::ContextDirIsSymlink => format!(
+                "{dir} is a symlink, which is refused; the coordinator context must be published \
+                 into a real directory in the project itself"
+            ),
+            Self::ContextDirGroupOrWorldWritable { mode, .. } => format!(
+                "{dir} is mode {mode:04o}, which grants write to group or other — another local \
+                 account could replace the coordinator context's directory entry after it is \
+                 published. The deck tried to clear those bits and could not, so publishing is \
+                 refused. On the machine running the deck, run: chmod go-w '{dir}'"
+            ),
             Self::ContextDirUnusable(_) => {
-                "the project's `.dot-agent-deck` directory could not be created"
+                format!("{dir} could not be created or opened as a directory")
             }
             Self::ContextDirReplaced => {
-                "the project's `.dot-agent-deck` directory changed while the context was being \
-                 written"
+                format!("{dir} was replaced while the coordinator context was being written")
             }
             Self::TempCreate(_) | Self::TempWrite(_) | Self::Publish(_) => {
-                "the coordinator context could not be written"
+                format!("the coordinator context could not be written to {dir}")
             }
         }
     }
+}
+
+/// The directory every [`ContextPublishError::client_sentence`] is about, for a
+/// project at `project_dir`.
+///
+/// One function so the daemon's refusal, the publish itself and any client
+/// composing its own remedy cannot disagree about which directory is at stake —
+/// the disagreement that would put a `chmod` command in front of a user naming a
+/// path that is not the one refused.
+pub fn context_dir_of(project_dir: &std::path::Path) -> std::path::PathBuf {
+    project_dir.join(CONTEXT_DIR_NAME)
 }
 
 impl std::fmt::Display for ContextPublishError {
@@ -732,17 +801,19 @@ struct ContextDirGuard;
 /// a umask only *removes* bits, so the result is `0o700 & !umask`, which is
 /// owner-only or narrower whatever the caller's umask is.
 ///
-/// **A directory that already exists is left exactly as it is** — this function
-/// re-permissions nothing. Publishing is not the operation that gets to
-/// re-permission a directory the operator created, and every `.dot-agent-deck`
-/// in every existing checkout predates this rule. So the owner-only claim here
-/// is about directories this function *creates*, and no wider.
+/// **A directory that already exists is left exactly as it is by THIS
+/// function** — it re-permissions nothing, so the owner-only claim here is about
+/// directories it *creates*, and no wider. Every `.dot-agent-deck` in every
+/// existing checkout predates the rule.
 ///
 /// **What an existing directory is nonetheless required to satisfy** lives one
-/// step later, in [`refuse_a_writable_context_dir`]: the publish refuses outright
-/// when the existing directory grants write to group or other. That split is
-/// deliberate — accepting an unsafe directory and accepting it *silently* are
-/// different failures, and only the second was PRD #819's audit finding.
+/// step later, in [`ensure_context_dir_owner_writable_only`]: group or other
+/// **write** is not published into. Since issues #1047/#329 that step *repairs*
+/// the directory in place — `chmod go-w` and nothing more, on the descriptor
+/// already held — and refuses only when the repair cannot take those bits away.
+/// The split is still deliberate: creation and repair are different operations
+/// with different evidence available to them, and only the repair holds an open
+/// descriptor to make the change unredirectable.
 ///
 /// Non-recursive on purpose: the project directory is the caller's to establish
 /// (the daemon verb canonicalises it first, which proves it exists), and
@@ -780,8 +851,8 @@ fn create_context_dir(dir: &std::path::Path) -> Result<(), ContextPublishError> 
 /// stated rather than papered over: the check is a separate `symlink_metadata`
 /// lookup from the write, so a component swapped between the two is not caught,
 /// no mode bits are applied at all (the Windows protected-DACL equivalent is
-/// not implemented), and [`refuse_a_writable_context_dir`] has nothing to
-/// inspect.
+/// not implemented), and [`ensure_context_dir_owner_writable_only`] has nothing
+/// to inspect or repair.
 ///
 /// **The premise that used to excuse that was false, and PRD #819's audit was
 /// right to catch it.** This doc claimed the daemon is Unix-only, citing
@@ -866,76 +937,168 @@ fn context_dir_unchanged(_guard: &ContextDirGuard, _dir: &std::path::Path) -> bo
     true
 }
 
-/// Refuse to publish into a `.dot-agent-deck` that grants **write** to group or
-/// other.
+/// Do not publish into a `.dot-agent-deck` that grants **write** to group or
+/// other — **repair it in place first, and refuse only when that fails**
+/// (issues #1047 §1, #329 §1).
 ///
-/// **This is PRD #819's audit finding, and the argument that used to excuse it
-/// does not transfer.** [`create_context_dir`] applies `0o700` only to a
-/// directory it creates and leaves an existing one alone, which was pinned as
-/// deliberate on the reasoning that whoever can write the *parent* already
-/// controls `.dot-agent-deck.toml` — whose `command` strings this daemon
-/// executes — so nothing is gained by policing the child. That argument is
-/// sound about the parent and says nothing about the child: a `.dot-agent-deck`
-/// can be group-writable while the project root is not, and a **file's** mode
-/// does not protect its **directory entry**. So another local account with write
-/// on that directory can rename or replace an `orchestrator-context.md`
+/// **The property is PRD #819's audit finding and is unchanged.** A file's mode
+/// does not protect its **directory entry**: a `.dot-agent-deck` can be
+/// group-writable while the project root is not, so another local account with
+/// write on that directory can rename or replace an `orchestrator-context.md`
 /// published at `0o600`, and the next coordinator reads attacker-controlled
-/// instructions.
+/// instructions. Nothing below weakens that. What changed is what happens when
+/// the property does not hold.
 ///
-/// Refusing rather than re-permissioning is the deliberate half. `chmod`-ing a
-/// directory the operator created is a side effect a publish has no business
-/// having, it would race the very attacker it is aimed at
-/// (`crate::platform::fsperm`'s own `ensure_owner_only_dir` documents that
-/// residual window), and it would hide the misconfiguration instead of naming
-/// it. The error sentence says which mode and what to run.
+/// **Refusing was measured to refuse the default Linux configuration, in every
+/// project on the machine.** `mkdir` under `umask 002` — the Debian/Ubuntu
+/// default, for hosts that give each user a private group — produces `0o775`,
+/// so a `.dot-agent-deck` left by a `git checkout`, an operator's `mkdir`, an
+/// agent writing a task file, or this deck's own pre-#819 `create_dir_all`
+/// carries it. #1047 enumerated four out of four projects on the development
+/// box at `0o775`, group `vfarcic`, a group whose only member is the owner. The
+/// only way out was a `chmod` run outside the app, and the same refusal reached
+/// `dispatch --orchestration` silently, degrading a six-agent team to a lone
+/// agent with no role template (#1065).
 ///
-/// **Write bits only, and that is the whole check.** Group/other *read* and
-/// *execute* are tolerated: `0o755` is what a `.dot-agent-deck` looks like in an
-/// ordinary checkout under a default umask, refusing those would refuse nearly
-/// every existing project, and reading a directory is not what lets someone
-/// replace an entry in it. The published file is `0o600` regardless, so its
-/// contents are not exposed by a readable directory.
+/// **The obvious narrowing is not available**, which is why the fix is here and
+/// not in the predicate: "only refuse when the group has other members" is
+/// unreliable, because `getgrgid`'s member list omits users whose *primary* gid
+/// is that group, and NSS/LDAP makes it worse. The mode check stays exactly as
+/// strict as it was.
 ///
-/// **Ownership is deliberately not checked**, having been considered: an
-/// existing directory owned by another account either denies this process the
-/// temp-file create outright — the OS refuses, and the publish fails with
-/// `TempCreate` — or this process is `root`, for whom no mode or owner check
-/// means anything at all. Adding one would buy nothing and would newly refuse
-/// `sudo`-in-a-user-checkout, which works today. The claim this function makes
-/// is therefore exactly: *no group- or world-writable directory is published
-/// into*, and nothing wider.
+/// **So the answer is to satisfy the check rather than to relax it.** The mode
+/// the user is asked for is `chmod go-w`, and that is precisely what this does —
+/// nothing more. Group and other **read** and **execute** are left alone: `0o755`
+/// is what a `.dot-agent-deck` looks like in an ordinary checkout, reading a
+/// directory is not what lets someone replace an entry in it, the published file
+/// is `0o600` regardless, and tightening those bits on a directory the operator
+/// created is exactly the surprise #329's own "Care needed" warns about. `0o775`
+/// becomes `0o755`; `0o770` becomes `0o750`; `0o707` becomes `0o705`.
 ///
-/// The mode comes from an `fstat` on the handle [`open_context_dir`] already
-/// holds, not from a second path lookup, so there is no check-then-open pair to
-/// race and no chance of inspecting a different directory than the one written
-/// to.
+/// **Three arguments used to be recorded here against repairing, and this is
+/// what became of each.**
+///
+/// * *"`chmod`-ing a directory the operator created is a side effect a publish
+///   has no business having."* Narrowed rather than accepted: clearing `go-w` is
+///   the remedy the refusal itself has been printing since #819, so the side
+///   effect is the one the operator was already being told to perform, applied
+///   to a directory this deck is at that moment writing into.
+/// * *"It would race the very attacker it is aimed at."* This is the argument the
+///   implementation answers rather than the prose. The repair is an `fchmod(2)`
+///   on the descriptor [`open_context_dir`] already holds — **not** a path
+///   `chmod` — so it cannot be redirected onto another directory by a swapped
+///   name, and the confirmation is a second `fstat` on that same descriptor. A
+///   racing account that re-widens the mode between the two is *detected* and
+///   refused. `crate::platform::fsperm::ensure_owner_only_dir`, whose residual
+///   window the old note cited, is path-based; this is strictly narrower.
+/// * *"It would hide the misconfiguration instead of naming it."* True, and
+///   accepted deliberately: a misconfiguration that every stock Linux install
+///   reproduces in every repository is not a signal, and the one thing it
+///   reliably named was a wall the user had to leave the app to climb.
+///
+/// The claim this function makes is therefore exactly: *no group- or
+/// world-writable directory is published into*, unchanged — and, added, *a
+/// directory this process can repair is repaired rather than refused*.
+///
+/// Everything is read from the handle rather than from a second path lookup, so
+/// there is no check-then-open pair to race and no chance of inspecting or
+/// chmodding a different directory than the one written to.
 #[cfg(unix)]
-fn refuse_a_writable_context_dir(guard: &ContextDirGuard) -> Result<(), ContextPublishError> {
+fn ensure_context_dir_owner_writable_only(
+    guard: &ContextDirGuard,
+) -> Result<(), ContextPublishError> {
     use std::os::unix::fs::PermissionsExt as _;
-    let mode = guard
-        .metadata()
-        .map_err(ContextPublishError::ContextDirUnusable)?
-        .permissions()
-        .mode()
-        & 0o7777;
-    if mode & 0o022 != 0 {
-        return Err(ContextPublishError::ContextDirGroupOrWorldWritable(mode));
-    }
-    Ok(())
+    use std::os::unix::io::AsRawFd as _;
+
+    let mode_of = |g: &ContextDirGuard| -> std::io::Result<u32> {
+        Ok(g.metadata()?.permissions().mode() & 0o7777)
+    };
+    let mode = mode_of(guard).map_err(ContextPublishError::ContextDirUnusable)?;
+    repair_context_dir_mode(
+        mode,
+        |target| {
+            // SAFETY: `guard` is an open directory descriptor that outlives this
+            // call, and `fchmod(2)` only reads the descriptor and the mode. The
+            // descriptor, not a path, is what makes the repair unredirectable.
+            let rc = unsafe { libc::fchmod(guard.as_raw_fd(), target as libc::mode_t) };
+            if rc == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        },
+        || mode_of(guard),
+    )
 }
 
 /// The non-Unix arm, and it is a **no-op rather than an equivalent**.
 ///
-/// There is no mode model to inspect here; the analogue is a protected DACL, and
-/// this module implements none (see [`open_context_dir`]). Rather than let that
-/// gap sit behind a claim it does not support, the daemon verb that would expose
-/// this write to a peer is refused outright on non-Unix — see
+/// There is no mode model to inspect or repair here; the analogue is a protected
+/// DACL, and this module implements none (see [`open_context_dir`]). Rather than
+/// let that gap sit behind a claim it does not support, the daemon verb that
+/// would expose this write to a peer is refused outright on non-Unix — see
 /// [`crate::daemon_protocol::PROJECT_ERR_UNSUPPORTED_PLATFORM`]. What still
 /// reaches this line on such a platform is the in-process TUI publish, whose
 /// project directory comes from this process's own config rather than from
 /// another party.
 #[cfg(not(unix))]
-fn refuse_a_writable_context_dir(_guard: &ContextDirGuard) -> Result<(), ContextPublishError> {
+fn ensure_context_dir_owner_writable_only(
+    _guard: &ContextDirGuard,
+) -> Result<(), ContextPublishError> {
+    Ok(())
+}
+
+/// Whether `mode` lets group or other **write**.
+///
+/// The whole predicate, and the thing the repair has to make false. Write bits
+/// only: see [`ensure_context_dir_owner_writable_only`] for why read and execute
+/// are tolerated.
+pub(crate) const fn grants_group_or_other_write(mode: u32) -> bool {
+    mode & 0o022 != 0
+}
+
+/// `mode` with group and other write removed — what `chmod go-w` produces.
+pub(crate) const fn without_group_or_other_write(mode: u32) -> u32 {
+    mode & !0o022
+}
+
+/// The repair decision, with the two filesystem operations injected.
+///
+/// Split from [`ensure_context_dir_owner_writable_only`] so every branch is
+/// reachable in a unit test on any host. The refusal arms need an `fchmod` that
+/// fails — a directory owned by another account — and a mode that is re-widened
+/// between the repair and the re-read, and a test process can construct neither
+/// without a second account and a cooperating attacker. As injected operations
+/// the rule is exhaustively testable, the same disposition
+/// [`crate::platform::fsperm::endpoint_owner_is_trusted`] takes for the same
+/// reason.
+///
+/// Fails closed at every step: a `chmod` that errors, a re-read that errors, and
+/// a re-read that still finds the write bits are all refusals.
+pub(crate) fn repair_context_dir_mode(
+    mode: u32,
+    chmod: impl FnOnce(u32) -> std::io::Result<()>,
+    reread: impl FnOnce() -> std::io::Result<u32>,
+) -> Result<(), ContextPublishError> {
+    if !grants_group_or_other_write(mode) {
+        return Ok(());
+    }
+    if let Err(e) = chmod(without_group_or_other_write(mode)) {
+        return Err(ContextPublishError::ContextDirGroupOrWorldWritable {
+            mode,
+            repair: Some(e),
+        });
+    }
+    // Confirmed from the descriptor, never assumed from the `chmod`'s exit
+    // status: the one attacker this check is aimed at is an account that can
+    // write the directory, and such an account can also widen it straight back.
+    let now = reread().map_err(ContextPublishError::ContextDirUnusable)?;
+    if grants_group_or_other_write(now) {
+        return Err(ContextPublishError::ContextDirGroupOrWorldWritable {
+            mode: now,
+            repair: None,
+        });
+    }
     Ok(())
 }
 
@@ -974,13 +1137,19 @@ fn temp_context_file_name() -> String {
 ///   is no window in which either exists wider than that. A permissive umask
 ///   only removes bits and a permissive parent directory grants nothing here,
 ///   because neither is consulted for the new inode's mode. An **existing**
-///   directory is not re-permissioned — and, since PRD #819's audit, is
-///   *refused* when it grants group or other write, because a `0o600` file's
-///   directory entry is only as safe as the directory holding it
-///   ([`refuse_a_writable_context_dir`]). All of this is the **Unix** arm; the
-///   non-Unix arm applies no mode or DACL at all, which is why the daemon verb
-///   is refused there rather than claiming otherwise (see
+///   directory keeps its read and execute bits, but group or other **write** is
+///   cleared in place before anything is written — and the publish is refused if
+///   that cannot be done — because a `0o600` file's directory entry is only as
+///   safe as the directory holding it
+///   ([`ensure_context_dir_owner_writable_only`]). All of this is the **Unix**
+///   arm; the non-Unix arm applies no mode or DACL at all, which is why the
+///   daemon verb is refused there rather than claiming otherwise (see
 ///   [`open_context_dir`]).
+/// * **Swept.** After a successful publish, coordination files left in the same
+///   directory past the retention window are removed and `.dot-agent-deck/` is
+///   added to the clone-local `.git/info/exclude` (issue #329 §§2-3). Both are
+///   best-effort housekeeping that cannot fail the publish; see
+///   [`sweep_coordination_files`] and [`ensure_git_excludes_context_dir`].
 /// * **Atomic with respect to a reader.** The bytes go to a `create_new`
 ///   temp file in the SAME directory and reach the destination by `rename(2)`,
 ///   so a concurrent reader sees either the previous context or the new one and
@@ -1013,9 +1182,10 @@ pub fn publish_orchestrator_context(
     create_context_dir(&dir)?;
     let guard = open_context_dir(&dir)?;
     // Before anything is created inside it: an existing directory that group or
-    // other can write is refused outright, because a 0600 file's directory entry
-    // is only as protected as the directory holding it.
-    refuse_a_writable_context_dir(&guard)?;
+    // other can write has those bits cleared on the descriptor we hold, and is
+    // refused only if that fails — because a 0600 file's directory entry is only
+    // as protected as the directory holding it.
+    ensure_context_dir_owner_writable_only(&guard)?;
 
     let final_path = dir.join(CONTEXT_FILE_NAME);
     let temp_path = dir.join(temp_context_file_name());
@@ -1062,10 +1232,13 @@ pub fn publish_orchestrator_context(
     })();
 
     match outcome {
-        Ok(identity) => Ok(PublishedContext {
-            path: final_path,
-            identity,
-        }),
+        Ok(identity) => {
+            tidy_context_dir(project_dir, &dir);
+            Ok(PublishedContext {
+                path: final_path,
+                identity,
+            })
+        }
         Err(e) => {
             // Best effort, and deliberately not reported: the publish already
             // failed for a reason the caller is about to be told, and a leftover
@@ -1075,6 +1248,424 @@ pub fn publish_orchestrator_context(
             let _ = std::fs::remove_file(&temp_path);
             Err(e)
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Issue #329 §1: the coordination files the daemon itself writes
+// ---------------------------------------------------------------------------
+
+/// Write `name` into `<cwd>/.dot-agent-deck/` **owner-only**, creating the
+/// directory owner-only if it is not there (issue #329 §1).
+///
+/// Replaces the `create_dir_all` + `std::fs::write` pair that the delegate and
+/// work-done paths used. That pair applied the ambient umask, and #329 measured
+/// what it produced on a live worktree: the directory at `0o775` and
+/// `worker-task-<role>.md` / `work-done-<role>.md` at `0o664`. So any local
+/// account could read a delegated task or a worker's report, and a same-group
+/// account could rewrite one — local sensitive-data exposure, made worse by
+/// #303's corrected guidance, which institutionalises writing task and summary
+/// text to these files by design.
+///
+/// **The `set_file_owner_only` after the open is load-bearing, not belt and
+/// braces.** `OpenOptions::mode()` applies only to a file the call *creates*, and
+/// both of these names are written repeatedly in the same project — so every
+/// coordination file left at `0o664` by a deck that predates this change would
+/// keep that mode forever without the explicit re-assert. It is also what
+/// carries the property to Windows, where the DACL cannot be supplied at create
+/// time and `set_create_mode_owner_only` exists to put `WRITE_DAC` on the handle
+/// for exactly this call (PRD #163 M4).
+///
+/// **Owner-only re-assertion here is narrower than the directory rule**, and the
+/// difference is deliberate. These are files this deck writes, owns and
+/// overwrites; tightening one surprises nobody. The *directory* may be one the
+/// operator created, so [`ensure_context_dir_owner_writable_only`] clears only
+/// the write bits there and leaves read and execute alone — which is #329's own
+/// "Care needed" warning, about a shared box, applied where it bites.
+///
+/// The permissions are applied before the first content byte, so the window in
+/// which the file exists wider than `0o600` never contains any of the text.
+pub fn write_coordination_file(
+    cwd: &std::path::Path,
+    name: &str,
+    content: &str,
+) -> std::io::Result<std::path::PathBuf> {
+    let dir = context_dir_of(cwd);
+    crate::platform::fsperm::create_owner_only_dir(&dir)?;
+    let path = dir.join(name);
+
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).write(true).truncate(true);
+    crate::platform::fsperm::set_create_mode_owner_only(&mut options);
+    let mut file = options.open(&path)?;
+    crate::platform::fsperm::set_file_owner_only(&file)?;
+
+    use std::io::Write as _;
+    file.write_all(content.as_bytes())?;
+    Ok(path)
+}
+
+// ---------------------------------------------------------------------------
+// Issue #329 §§2-3: keeping `.dot-agent-deck` out of git, and out of the way
+// ---------------------------------------------------------------------------
+
+/// How long a coordination file left in `.dot-agent-deck` survives, in days
+/// (issue #329 §3).
+///
+/// **Fourteen days, and the number is chosen to be boring.** The files this
+/// sweeps are a handoff medium — a task written for a worker that read it
+/// minutes later, a report written for a coordinator that consumed it in the
+/// same run — so anything still there after a fortnight belongs to a line of
+/// work that ended. Short enough that a repository does not accumulate a year of
+/// other people's task text; long enough that no plausible in-flight run loses a
+/// file out from under it, including one parked over a holiday.
+pub const DEFAULT_COORDINATION_RETENTION_DAYS: u64 = 14;
+
+/// The env var that overrides [`DEFAULT_COORDINATION_RETENTION_DAYS`]. `0`
+/// disables the sweep entirely.
+pub const COORDINATION_RETENTION_ENV: &str = "DOT_AGENT_DECK_COORDINATION_RETENTION_DAYS";
+
+/// At most this many directory entries are examined in one sweep.
+///
+/// A bound rather than a `read_dir` to exhaustion, for the same reason every
+/// other read in this daemon is bounded: the directory's contents are written by
+/// agents, and an unbounded walk is a stall waiting for one to produce enough
+/// entries. Overshooting it simply defers the rest to the next publish.
+const MAX_SWEEP_ENTRIES: usize = 10_000;
+
+/// The retention window in force, from the environment or the default.
+pub fn coordination_retention() -> Option<std::time::Duration> {
+    retention_from_raw(std::env::var(COORDINATION_RETENTION_ENV).ok().as_deref())
+}
+
+/// [`coordination_retention`]'s decision, with the environment read out of it so
+/// every branch is testable without mutating a process-global.
+///
+/// An unparseable value takes the default rather than disabling the sweep: "the
+/// operator typed something wrong" and "the operator asked for no sweep" are
+/// different intentions, and only the literal `0` expresses the second. A value
+/// that would overflow the multiplication is likewise not a request for no
+/// sweep, so it saturates at the longest window rather than wrapping into one.
+pub(crate) fn retention_from_raw(raw: Option<&str>) -> Option<std::time::Duration> {
+    let days = match raw {
+        Some(raw) => raw
+            .trim()
+            .parse::<u64>()
+            .unwrap_or(DEFAULT_COORDINATION_RETENTION_DAYS),
+        None => DEFAULT_COORDINATION_RETENTION_DAYS,
+    };
+    (days > 0).then(|| std::time::Duration::from_secs(days.saturating_mul(24 * 60 * 60)))
+}
+
+/// What one [`sweep_coordination_files`] did.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct SweepReport {
+    /// Files removed.
+    pub removed: usize,
+    /// Entries left alone — too young, not a coordination file, or not a
+    /// regular file at all.
+    pub kept: usize,
+    /// Files that matched but could not be removed. Never fatal.
+    pub failed: usize,
+}
+
+/// Whether `name` is a coordination artifact this sweep is entitled to remove.
+///
+/// **The entitlement is the whole safety property, so it is spelled out rather
+/// than inferred.** Two shapes qualify:
+///
+/// * a plain `*.md` directly in `.dot-agent-deck/` — the delegation protocol's
+///   `<task-slug>.md`, and the deck's own `worker-task-<role>.md` /
+///   `work-done-<role>.md`. These are what #329 §3 observed accumulating
+///   indefinitely: the role-keyed ones are overwritten in place, but the
+///   slug-keyed ones the protocol tells a coordinator to invent are not.
+/// * this publish's own leftover temp files, `.orchestrator-context.md.<pid>.<seq>.tmp`,
+///   which are removed on a failed publish but survive a process killed between
+///   the create and the rename.
+///
+/// [`CONTEXT_FILE_NAME`] is excluded by name: it is the live coordinator context,
+/// republished rather than accumulated, and an orchestration reads it long after
+/// its mtime stops moving.
+///
+/// Every other dotfile is excluded, which is what keeps the sweep out of
+/// anything a user or another tool parks there under a leading dot, and nothing
+/// without an `.md` extension is touched at all.
+pub(crate) fn is_sweepable_coordination_name(name: &str) -> bool {
+    if name == CONTEXT_FILE_NAME {
+        return false;
+    }
+    if let Some(rest) = name.strip_prefix('.') {
+        return rest.starts_with(&format!("{CONTEXT_FILE_NAME}.")) && rest.ends_with(".tmp");
+    }
+    name.ends_with(".md")
+}
+
+/// Remove coordination files in `dir` last modified more than `keep` before
+/// `now` (issue #329 §3).
+///
+/// **This deletes files, so what it will not touch is stated as rules and
+/// asserted at runtime rather than left to reading.** It is non-recursive (one
+/// `read_dir`, no descent); it consults `symlink_metadata` and acts only on
+/// **regular files**, so a directory is never removed and a symlink is never
+/// followed *or* removed; it removes only names
+/// [`is_sweepable_coordination_name`] accepts; it never removes
+/// [`CONTEXT_FILE_NAME`]; and it removes nothing whose mtime is inside the
+/// window or unreadable. A file whose mtime is in the future is kept — a clock
+/// that ran backwards must not read as "ancient".
+///
+/// **Best-effort by construction.** Every failure is counted and none is
+/// returned: the caller has just published a coordinator context successfully,
+/// and housekeeping that could not run is not a reason to fail a launch that
+/// did.
+pub fn sweep_coordination_files(
+    dir: &std::path::Path,
+    keep: std::time::Duration,
+    now: std::time::SystemTime,
+) -> SweepReport {
+    let mut report = SweepReport::default();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return report;
+    };
+    for entry in entries.take(MAX_SWEEP_ENTRIES) {
+        let Ok(entry) = entry else {
+            report.failed += 1;
+            continue;
+        };
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            report.kept += 1;
+            continue;
+        };
+        if !is_sweepable_coordination_name(name) {
+            report.kept += 1;
+            continue;
+        }
+        let path = entry.path();
+        // `symlink_metadata`, so a symlink reports as a symlink rather than as
+        // whatever it points at. Anything that is not a regular file is kept,
+        // which covers directories, symlinks, FIFOs and devices in one rule.
+        let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+            report.kept += 1;
+            continue;
+        };
+        if !metadata.file_type().is_file() {
+            report.kept += 1;
+            continue;
+        }
+        let old_enough = metadata
+            .modified()
+            .ok()
+            .and_then(|mtime| now.duration_since(mtime).ok())
+            .is_some_and(|age| age > keep);
+        if !old_enough {
+            report.kept += 1;
+            continue;
+        }
+        match std::fs::remove_file(&path) {
+            Ok(()) => report.removed += 1,
+            Err(_) => report.failed += 1,
+        }
+    }
+    report
+}
+
+/// What [`ensure_git_excludes_context_dir`] found or did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GitExcludeOutcome {
+    /// No `.git` at the project root, so there is nothing to exclude from.
+    NotAGitRepo,
+    /// A rule for `.dot-agent-deck/` was already there.
+    AlreadyExcluded,
+    /// The rule was appended.
+    Added,
+}
+
+/// The git directory whose `info/exclude` governs `project_dir`, when there is
+/// one.
+///
+/// Three layouts, and the second and third are why this is not a one-line
+/// `join(".git")`:
+///
+/// * an ordinary clone — `.git` is a directory and is itself the answer;
+/// * a **linked worktree** — `.git` is a *file* holding `gitdir: <path>`,
+///   pointing at `<common>/worktrees/<name>`. This repository's own dispatch
+///   flow creates one per unit, so it is the case a fix for #329 §2 most has to
+///   get right;
+/// * a submodule — same `gitdir:` file, pointing into the superproject.
+///
+/// In the linked cases `info/exclude` lives in the **common** directory, not in
+/// the per-worktree one, and git records where that is in a `commondir` file
+/// beside the worktree's gitdir. Reading `commondir` is the documented way to
+/// find it; deriving it from the `worktrees/<name>` shape would guess at a
+/// layout git does not promise.
+///
+/// Symlinks are refused at `.git` rather than followed: appending to a file
+/// through a link the daemon did not place is a write to somewhere it never
+/// decided to write.
+pub(crate) fn git_common_dir(project_dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    /// A `gitdir:` pointer file is a single short line; anything larger is not
+    /// one and is not read.
+    const MAX_GITDIR_FILE_BYTES: u64 = 4 * 1024;
+
+    let dot_git = project_dir.join(".git");
+    let metadata = std::fs::symlink_metadata(&dot_git).ok()?;
+    let file_type = metadata.file_type();
+    if file_type.is_symlink() {
+        return None;
+    }
+    let absolute = |raw: &str, base: &std::path::Path| -> std::path::PathBuf {
+        let candidate = std::path::Path::new(raw);
+        if candidate.is_absolute() {
+            candidate.to_path_buf()
+        } else {
+            base.join(candidate)
+        }
+    };
+
+    let git_dir = if file_type.is_dir() {
+        dot_git
+    } else if file_type.is_file() {
+        if metadata.len() > MAX_GITDIR_FILE_BYTES {
+            return None;
+        }
+        let pointer = std::fs::read_to_string(&dot_git).ok()?;
+        let target = pointer
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("gitdir:"))?
+            .trim();
+        if target.is_empty() {
+            return None;
+        }
+        absolute(target, project_dir)
+    } else {
+        return None;
+    };
+
+    // `commondir` is present in a linked worktree's gitdir and absent in an
+    // ordinary clone, so its absence is the answer rather than a failure.
+    match std::fs::read_to_string(git_dir.join("commondir")) {
+        Ok(raw) => {
+            let common = raw.trim();
+            (!common.is_empty()).then(|| absolute(common, &git_dir))
+        }
+        Err(_) => Some(git_dir),
+    }
+}
+
+/// Put `.dot-agent-deck/` in the clone-local `.git/info/exclude` (issue #329 §2).
+///
+/// **The committed `.gitignore` is deliberately not touched.** It is the
+/// project's file and may be under review by people who never ran this deck;
+/// `info/exclude` is per-clone, uncommitted, and exists for exactly this.
+///
+/// **What this does and does not buy, because #329 turned out to be about the
+/// difference.** It stops a coordination file becoming *newly* tracked in a
+/// project whose `.gitignore` says nothing about `.dot-agent-deck/` — which is
+/// every project receiving #303's generated advice, since `crate::init` installs
+/// no ignore rule. It does **nothing** for a path already tracked: an ignore rule
+/// of any kind is inert against one, which is how this repository shipped two
+/// PRD #20 worker task files into every checkout for a year. Those were untracked
+/// by hand in the same change; nothing here would have done it for them.
+///
+/// Idempotent: an existing rule for the directory, in any of its spellings, is
+/// left alone. Best-effort at every step, and a symlinked `exclude` is refused
+/// rather than appended to.
+///
+/// **The idempotence is a read followed by an append, so two publishes racing in
+/// linked worktrees of one repository can both decide to add the rule.** The
+/// cost is a duplicate line in a file where git treats duplicates as the same
+/// pattern, and the next call sees the rule and stops — so the state is
+/// self-correcting rather than accumulating. Locking a file in the user's git
+/// directory to avoid a harmless repeated line would be the larger imposition.
+pub fn ensure_git_excludes_context_dir(
+    project_dir: &std::path::Path,
+) -> std::io::Result<GitExcludeOutcome> {
+    /// An `info/exclude` larger than this is not read or appended to. It is a
+    /// hand-maintained list of glob lines; a megabyte of them is not one.
+    const MAX_EXCLUDE_BYTES: u64 = 1024 * 1024;
+
+    let Some(common) = git_common_dir(project_dir) else {
+        return Ok(GitExcludeOutcome::NotAGitRepo);
+    };
+    let info = common.join("info");
+    let exclude = info.join("exclude");
+
+    let existing = match std::fs::symlink_metadata(&exclude) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("{} is a symlink; refusing to append", exclude.display()),
+            ));
+        }
+        Ok(metadata) if metadata.len() > MAX_EXCLUDE_BYTES => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "{} is larger than {MAX_EXCLUDE_BYTES} bytes",
+                    exclude.display()
+                ),
+            ));
+        }
+        Ok(_) => std::fs::read_to_string(&exclude)?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e),
+    };
+
+    let bare = CONTEXT_DIR_NAME.trim_end_matches('/');
+    if existing.lines().any(|line| {
+        let line = line.trim();
+        line == bare || line == format!("{bare}/") || line == format!("/{bare}/")
+    }) {
+        return Ok(GitExcludeOutcome::AlreadyExcluded);
+    }
+
+    std::fs::create_dir_all(&info)?;
+    let mut appended = String::new();
+    if !existing.is_empty() && !existing.ends_with('\n') {
+        appended.push('\n');
+    }
+    appended.push_str(&format!(
+        "# dot-agent-deck coordination files — per-clone, never committed (issue #329).\n{bare}/\n"
+    ));
+
+    use std::io::Write as _;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&exclude)?;
+    file.write_all(appended.as_bytes())?;
+    Ok(GitExcludeOutcome::Added)
+}
+
+/// The housekeeping a successful publish performs on the directory it just wrote
+/// into (issue #329 §§2-3).
+///
+/// Runs **after** the rename, never before: a refused publish must not delete
+/// anything, and a project that fails the mode check has not consented to having
+/// its git config appended to either.
+fn tidy_context_dir(project_dir: &std::path::Path, dir: &std::path::Path) {
+    if let Some(keep) = coordination_retention() {
+        let report = sweep_coordination_files(dir, keep, std::time::SystemTime::now());
+        if report.removed > 0 || report.failed > 0 {
+            tracing::info!(
+                dir = %dir.display(),
+                removed = report.removed,
+                failed = report.failed,
+                "swept coordination files past the retention window"
+            );
+        }
+    }
+    match ensure_git_excludes_context_dir(project_dir) {
+        Ok(GitExcludeOutcome::Added) => tracing::info!(
+            project = %project_dir.display(),
+            "added {CONTEXT_DIR_NAME}/ to the clone-local git exclude"
+        ),
+        Ok(_) => {}
+        Err(e) => tracing::debug!(
+            project = %project_dir.display(),
+            error = %e,
+            "could not record {CONTEXT_DIR_NAME}/ in the clone-local git exclude"
+        ),
     }
 }
 
@@ -1651,5 +2242,559 @@ mod tests {
             !c.contains("dot-agent-deck work-done --done"),
             "a hardcoded literal must not appear in the work-done examples, got: {c}"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Issues #1047 / #329: the permission policy, the sweep, and the git exclude
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod hygiene_tests {
+    use std::time::{Duration, SystemTime};
+
+    use super::*;
+
+    /// The accepting arm: a mode with no group/other write bit is left entirely
+    /// alone, and neither filesystem operation is reached.
+    ///
+    /// The two `unreachable!` closures are the assertion. A repair that ran on
+    /// an already-acceptable directory would be a `chmod` the publish has no
+    /// reason to perform, which is the side effect PRD #819 objected to and the
+    /// one thing this change is not entitled to do.
+    #[test]
+    fn an_acceptable_mode_is_neither_chmodded_nor_re_read() {
+        for mode in [0o700, 0o750, 0o755, 0o705, 0o500, 0o000] {
+            repair_context_dir_mode(
+                mode,
+                |_| unreachable!("mode {mode:04o} must not be chmodded"),
+                || unreachable!("mode {mode:04o} must not be re-read"),
+            )
+            .unwrap_or_else(|e| panic!("mode {mode:04o} must be accepted as it is: {e}"));
+        }
+    }
+
+    /// The repairing arm: exactly `go-w` is requested, and the publish proceeds
+    /// once the re-read confirms it.
+    ///
+    /// The target mode is asserted inside the injected `chmod`, so this pins
+    /// *what is asked of the filesystem* rather than what the filesystem happens
+    /// to do — the read and execute bits a shared-group checkout relies on
+    /// survive, and only the write bits go.
+    #[test]
+    fn a_group_or_other_writable_mode_is_repaired_to_exactly_go_minus_w() {
+        for (mode, expected) in [
+            (0o775, 0o755),
+            (0o777, 0o755),
+            (0o770, 0o750),
+            (0o707, 0o705),
+            (0o772, 0o750),
+            (0o702, 0o700),
+            (0o720, 0o700),
+        ] {
+            let mut asked = None;
+            repair_context_dir_mode(
+                mode,
+                |target| {
+                    asked = Some(target);
+                    Ok(())
+                },
+                || Ok(expected),
+            )
+            .unwrap_or_else(|e| panic!("mode {mode:04o} must be repaired: {e}"));
+            assert_eq!(
+                asked,
+                Some(expected),
+                "mode {mode:04o}: the repair must ask for go-w and nothing else"
+            );
+        }
+    }
+
+    /// The two refusing arms, which are the halves the filesystem cannot show us.
+    ///
+    /// A `chmod` that fails is the directory owned by another account, or a
+    /// read-only mount — the case that used to be the *only* behaviour and is now
+    /// the exception. A `chmod` that reports success while the re-read still
+    /// finds the write bits is the racing widener: an account that can write the
+    /// directory can also re-widen it, which is the objection the old prose
+    /// raised against repairing at all, and it is answered by detecting it rather
+    /// than by not trying. Both refuse, and the error names the mode the operator
+    /// will see with `ls`.
+    #[test]
+    fn the_repair_refuses_when_the_chmod_fails_or_the_mode_is_re_widened() {
+        let err = repair_context_dir_mode(
+            0o775,
+            |_| Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+            || unreachable!("a failed chmod must not be followed by a re-read"),
+        )
+        .expect_err("a chmod that fails must refuse");
+        match err {
+            ContextPublishError::ContextDirGroupOrWorldWritable { mode, repair } => {
+                assert_eq!(
+                    mode, 0o775,
+                    "the mode as it still stands is what is reported"
+                );
+                assert!(repair.is_some(), "the OS error is kept for the daemon log");
+            }
+            other => panic!("expected ContextDirGroupOrWorldWritable, got {other:?}"),
+        }
+
+        let err = repair_context_dir_mode(0o770, |_| Ok(()), || Ok(0o777))
+            .expect_err("a mode re-widened under the repair must refuse");
+        match err {
+            ContextPublishError::ContextDirGroupOrWorldWritable { mode, repair } => {
+                assert_eq!(
+                    mode, 0o777,
+                    "the re-read mode is what is reported, not the original"
+                );
+                assert!(
+                    repair.is_none(),
+                    "there is no OS error in the re-widened case"
+                );
+            }
+            other => panic!("expected ContextDirGroupOrWorldWritable, got {other:?}"),
+        }
+
+        // A re-read that cannot be performed is not a grant either.
+        let err = repair_context_dir_mode(
+            0o775,
+            |_| Ok(()),
+            || Err(std::io::Error::from(std::io::ErrorKind::NotFound)),
+        )
+        .expect_err("an unreadable mode must refuse rather than be assumed repaired");
+        assert!(
+            matches!(err, ContextPublishError::ContextDirUnusable(_)),
+            "got {err:?}"
+        );
+    }
+
+    /// The refusal that does cross the wire names the directory, the mode and
+    /// the command to run (issue #1047 §2).
+    ///
+    /// Three consecutive launches failed in #1047 because the user had moved to
+    /// a *different* project between attempts and neither the daemon's wire
+    /// sentence nor the desktop would say which directory was refused;
+    /// diagnosing it needed a `find` across the filesystem. The raw OS error
+    /// still stays daemon-local, which is the one thing the old bounded sentence
+    /// was actually protecting.
+    #[test]
+    fn the_client_sentence_names_the_directory_the_mode_and_the_remedy() {
+        let dir = std::path::Path::new("/home/dev/proj").join(CONTEXT_DIR_NAME);
+        let err = ContextPublishError::ContextDirGroupOrWorldWritable {
+            mode: 0o775,
+            repair: Some(std::io::Error::other("chmod: Operation not permitted")),
+        };
+        let sentence = err.client_sentence(&dir);
+        assert!(
+            sentence.contains("/home/dev/proj/.dot-agent-deck"),
+            "{sentence}"
+        );
+        assert!(sentence.contains("0775"), "{sentence}");
+        assert!(
+            sentence.contains("chmod go-w '/home/dev/proj/.dot-agent-deck'"),
+            "the remedy must be a command the operator can paste: {sentence}"
+        );
+        assert!(
+            sentence.contains("machine running the deck"),
+            "a remote operator must be told WHICH machine to run it on: {sentence}"
+        );
+        assert!(
+            !sentence.contains("Operation not permitted"),
+            "the raw OS error stays daemon-local: {sentence}"
+        );
+        assert!(
+            err.detail().contains("Operation not permitted"),
+            "…and the daemon log keeps it: {}",
+            err.detail()
+        );
+
+        // A project directory is free to contain control or bidi codepoints, and
+        // this sentence is printed to a terminal and rendered in a toast. Naming
+        // the path is only safe if naming it cannot repaint the surface it is
+        // shown on.
+        let hostile = std::path::Path::new("/tmp/\u{1b}[31mPWNED\u{202e}").join(CONTEXT_DIR_NAME);
+        let sentence = ContextPublishError::ContextDirIsSymlink.client_sentence(&hostile);
+        assert!(
+            !sentence.contains('\u{1b}') && !sentence.contains('\u{202e}'),
+            "the path must be escaped before it is shown: {sentence:?}"
+        );
+
+        // Every other variant names the directory too — a publish refusal the
+        // user cannot locate is the defect, whatever caused it.
+        for err in [
+            ContextPublishError::ContextDirIsSymlink,
+            ContextPublishError::ContextDirReplaced,
+            ContextPublishError::ContextDirUnusable(std::io::Error::other("nope")),
+            ContextPublishError::TempWrite(std::io::Error::other("nope")),
+        ] {
+            let sentence = err.client_sentence(&dir);
+            assert!(
+                sentence.contains("/home/dev/proj/.dot-agent-deck"),
+                "{err:?} must name the directory: {sentence}"
+            );
+            assert!(
+                !sentence.contains("nope"),
+                "{err:?} leaked an OS error: {sentence}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_retention_window_defaults_and_is_disabled_only_by_a_literal_zero() {
+        let day = 24 * 60 * 60;
+        assert_eq!(
+            retention_from_raw(None),
+            Some(Duration::from_secs(
+                DEFAULT_COORDINATION_RETENTION_DAYS * day
+            ))
+        );
+        assert_eq!(
+            retention_from_raw(Some("1")),
+            Some(Duration::from_secs(day))
+        );
+        assert_eq!(
+            retention_from_raw(Some(" 3 ")),
+            Some(Duration::from_secs(3 * day))
+        );
+        assert_eq!(retention_from_raw(Some("0")), None, "0 disables the sweep");
+        // "The operator typed something wrong" is not "the operator asked for no
+        // sweep", so a garbage value takes the default rather than silently
+        // turning retention off.
+        for raw in ["", "nonsense", "-1", "3.5", "0x10"] {
+            assert_eq!(
+                retention_from_raw(Some(raw)),
+                Some(Duration::from_secs(
+                    DEFAULT_COORDINATION_RETENTION_DAYS * day
+                )),
+                "{raw:?} must fall back to the default"
+            );
+        }
+        // A value large enough to overflow the seconds multiplication must
+        // saturate rather than wrap into a short window.
+        assert!(retention_from_raw(Some(&u64::MAX.to_string())).is_some());
+    }
+
+    #[test]
+    fn only_coordination_documents_and_this_publishs_own_temp_files_are_sweepable() {
+        for name in [
+            "prd-20-w1-redtests.md",
+            "worker-task-coder.md",
+            "work-done-reviewer.md",
+            ".orchestrator-context.md.1234.0.tmp",
+        ] {
+            assert!(
+                is_sweepable_coordination_name(name),
+                "{name} should be sweepable"
+            );
+        }
+        for name in [
+            CONTEXT_FILE_NAME,
+            "notes.txt",
+            "state.json",
+            ".gitignore",
+            ".hidden.md",
+            "README",
+            "archive.md.bak",
+        ] {
+            assert!(
+                !is_sweepable_coordination_name(name),
+                "{name} must be left alone"
+            );
+        }
+    }
+
+    /// The sweep removes aged coordination documents and **nothing else** — the
+    /// safety envelope, asserted rather than described (issue #329 §3).
+    ///
+    /// This is a deletion tool, so each rule gets a fixture that would be
+    /// destroyed if the rule were dropped: a fresh file (inside the window), a
+    /// non-`.md` file, a subdirectory, a symlink pointing at a file outside the
+    /// directory, and the live coordinator context itself.
+    #[test]
+    fn the_sweep_removes_only_aged_coordination_documents() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join(CONTEXT_DIR_NAME);
+        std::fs::create_dir(&dir).unwrap();
+
+        let outside = tmp.path().join("precious.md");
+        std::fs::write(&outside, "must survive").unwrap();
+
+        let write = |name: &str| {
+            let path = dir.join(name);
+            std::fs::write(&path, "x").unwrap();
+            path
+        };
+        let aged = write("prd-99-handoff.md");
+        let aged_task = write("worker-task-coder.md");
+        let aged_temp = write(".orchestrator-context.md.999.0.tmp");
+        let live_context = write(CONTEXT_FILE_NAME);
+        let not_markdown = write("scratch.txt");
+        let fresh = dir.join("fresh.md");
+        std::fs::write(&fresh, "x").unwrap();
+        std::fs::create_dir(dir.join("nested.md")).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside, dir.join("link.md")).unwrap();
+
+        // Everything above is seconds old. Age the files that should go by
+        // asking for a window narrower than their age, and keep `fresh.md`
+        // inside it by writing it with a NOW mtime and sweeping against a `now`
+        // one hour on.
+        let now = SystemTime::now() + Duration::from_secs(3600);
+        let age = |path: &std::path::Path, by: Duration| {
+            std::fs::File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_modified(SystemTime::now() - by)
+                .unwrap();
+        };
+        age(&fresh, Duration::from_secs(0));
+        for path in [&aged, &aged_task, &aged_temp, &live_context, &not_markdown] {
+            age(path, Duration::from_secs(86_400));
+        }
+
+        let report = sweep_coordination_files(&dir, Duration::from_secs(7200), now);
+        assert_eq!(
+            report.removed, 3,
+            "the three aged coordination files: {report:?}"
+        );
+        assert_eq!(report.failed, 0, "{report:?}");
+
+        assert!(!aged.exists(), "an aged slug-keyed task file is swept");
+        assert!(!aged_task.exists(), "…and an aged role-keyed one");
+        assert!(!aged_temp.exists(), "…and a leftover publish temp file");
+        assert!(
+            live_context.exists(),
+            "the live coordinator context is never swept"
+        );
+        assert!(not_markdown.exists(), "a non-.md file is never swept");
+        assert!(fresh.exists(), "a file inside the window is never swept");
+        assert!(
+            dir.join("nested.md").is_dir(),
+            "a directory is never removed"
+        );
+        #[cfg(unix)]
+        {
+            assert!(
+                std::fs::symlink_metadata(dir.join("link.md")).is_ok(),
+                "a symlink is never removed"
+            );
+            assert!(
+                outside.exists(),
+                "…and is never followed to something outside"
+            );
+        }
+    }
+
+    /// A sweep of a directory that is not there is a no-op, not a panic — the
+    /// publish that calls it has just succeeded and must not be undone by
+    /// housekeeping.
+    #[test]
+    fn a_sweep_of_a_missing_directory_reports_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let report = sweep_coordination_files(
+            &tmp.path().join("absent"),
+            Duration::from_secs(1),
+            SystemTime::now(),
+        );
+        assert_eq!(report, SweepReport::default());
+    }
+
+    /// An ordinary clone: the rule lands in `.git/info/exclude`, and a second
+    /// call adds nothing (issue #329 §2).
+    #[test]
+    fn the_git_exclude_is_written_once_into_an_ordinary_clone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path();
+        std::fs::create_dir(project.join(".git")).unwrap();
+
+        assert_eq!(
+            ensure_git_excludes_context_dir(project).unwrap(),
+            GitExcludeOutcome::Added
+        );
+        let exclude = project.join(".git/info/exclude");
+        let body = std::fs::read_to_string(&exclude).unwrap();
+        assert!(body.contains(".dot-agent-deck/"), "{body}");
+        assert!(
+            body.contains("issue #329"),
+            "the rule says where it came from: {body}"
+        );
+
+        assert_eq!(
+            ensure_git_excludes_context_dir(project).unwrap(),
+            GitExcludeOutcome::AlreadyExcluded
+        );
+        assert_eq!(
+            std::fs::read_to_string(&exclude).unwrap(),
+            body,
+            "a second call must not append a duplicate"
+        );
+    }
+
+    /// An existing `exclude` is appended to rather than replaced, a missing
+    /// trailing newline does not glue the rule onto somebody else's pattern, and
+    /// a rule already present in any of its spellings is recognised.
+    #[test]
+    fn an_existing_exclude_file_is_appended_to_and_its_own_spellings_are_honoured() {
+        for existing in ["*.log\n# a comment", "*.log\n"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let project = tmp.path();
+            std::fs::create_dir_all(project.join(".git/info")).unwrap();
+            std::fs::write(project.join(".git/info/exclude"), existing).unwrap();
+
+            assert_eq!(
+                ensure_git_excludes_context_dir(project).unwrap(),
+                GitExcludeOutcome::Added
+            );
+            let body = std::fs::read_to_string(project.join(".git/info/exclude")).unwrap();
+            assert!(
+                body.starts_with(existing),
+                "the existing rules survive: {body}"
+            );
+            assert!(
+                body.lines().any(|l| l.trim() == ".dot-agent-deck/"),
+                "the rule is on a line of its own: {body:?}"
+            );
+        }
+
+        for spelling in [".dot-agent-deck", ".dot-agent-deck/", "/.dot-agent-deck/"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let project = tmp.path();
+            std::fs::create_dir_all(project.join(".git/info")).unwrap();
+            std::fs::write(
+                project.join(".git/info/exclude"),
+                format!("*.log\n  {spelling}  \n"),
+            )
+            .unwrap();
+            assert_eq!(
+                ensure_git_excludes_context_dir(project).unwrap(),
+                GitExcludeOutcome::AlreadyExcluded,
+                "{spelling} is already an exclusion"
+            );
+        }
+    }
+
+    /// A **linked worktree** — `.git` is a file, and `info/exclude` lives in the
+    /// common directory the `commondir` file names, not beside the worktree's
+    /// own gitdir.
+    ///
+    /// This is the layout that matters most for #329 on this repository: the
+    /// dispatch flow cuts one worktree per unit, so getting it wrong would write
+    /// the rule into a per-worktree directory git never consults for it.
+    #[test]
+    fn a_linked_worktree_excludes_through_its_common_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let common = tmp.path().join("main/.git");
+        let worktree_gitdir = common.join("worktrees/unit");
+        std::fs::create_dir_all(&worktree_gitdir).unwrap();
+        // git writes `commondir` relative to the worktree gitdir.
+        std::fs::write(worktree_gitdir.join("commondir"), "../..\n").unwrap();
+
+        let project = tmp.path().join("linked");
+        std::fs::create_dir(&project).unwrap();
+        std::fs::write(
+            project.join(".git"),
+            format!("gitdir: {}\n", worktree_gitdir.display()),
+        )
+        .unwrap();
+
+        assert_eq!(
+            ensure_git_excludes_context_dir(&project).unwrap(),
+            GitExcludeOutcome::Added
+        );
+        assert!(
+            std::fs::read_to_string(common.join("info/exclude"))
+                .unwrap()
+                .contains(".dot-agent-deck/"),
+            "the rule belongs in the COMMON dir, which every linked worktree shares"
+        );
+        assert!(
+            !worktree_gitdir.join("info/exclude").exists(),
+            "and not in the per-worktree gitdir, where git would not read it"
+        );
+    }
+
+    /// Everything this refuses to touch, in one place: a directory that is not a
+    /// git repository at all, and a symlinked `exclude` or `.git`.
+    ///
+    /// The symlink arms are why this is a refusal rather than a plain append:
+    /// following one would have the daemon write into a file it never decided to
+    /// write into, which is the same shape as the directory-entry substitution
+    /// the publish's own `O_NOFOLLOW` exists to stop.
+    #[test]
+    fn the_git_exclude_refuses_a_non_repo_and_never_follows_a_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(
+            ensure_git_excludes_context_dir(tmp.path()).unwrap(),
+            GitExcludeOutcome::NotAGitRepo,
+            "a project that is not a git clone has nothing to exclude from"
+        );
+
+        #[cfg(unix)]
+        {
+            let tmp = tempfile::tempdir().unwrap();
+            let project = tmp.path().join("proj");
+            std::fs::create_dir_all(project.join(".git/info")).unwrap();
+            let elsewhere = tmp.path().join("elsewhere");
+            std::fs::write(&elsewhere, "not ours\n").unwrap();
+            std::os::unix::fs::symlink(&elsewhere, project.join(".git/info/exclude")).unwrap();
+
+            assert!(
+                ensure_git_excludes_context_dir(&project).is_err(),
+                "a symlinked exclude must be refused"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&elsewhere).unwrap(),
+                "not ours\n",
+                "and nothing written through it"
+            );
+
+            let linked = tmp.path().join("linked");
+            std::fs::create_dir(&linked).unwrap();
+            std::os::unix::fs::symlink(project.join(".git"), linked.join(".git")).unwrap();
+            assert_eq!(
+                ensure_git_excludes_context_dir(&linked).unwrap(),
+                GitExcludeOutcome::NotAGitRepo,
+                "a symlinked .git is not followed either"
+            );
+        }
+    }
+
+    /// The coordination files the daemon writes are owner-only, **including one
+    /// an older deck already left at `0o664`** (issue #329 §1).
+    ///
+    /// The re-assert on an existing file is the half `OpenOptions::mode()` cannot
+    /// do: it applies only at creation, and these names are rewritten on every
+    /// delegation, so without it a file created before this change would keep its
+    /// group- and world-readable mode for the life of the project.
+    #[test]
+    fn coordination_files_and_their_directory_are_written_owner_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_coordination_file(tmp.path(), "worker-task-coder.md", "do the thing")
+            .expect("write the task file");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "do the thing");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode =
+                |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o7777;
+            assert_eq!(mode(&path), 0o600, "the file is owner-only");
+            assert_eq!(
+                mode(&context_dir_of(tmp.path())),
+                0o700,
+                "and so is the directory this created"
+            );
+
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o664)).unwrap();
+            write_coordination_file(tmp.path(), "worker-task-coder.md", "second delegation")
+                .expect("rewrite the task file");
+            assert_eq!(
+                mode(&path),
+                0o600,
+                "a file an older deck left at 0664 is tightened on the next write"
+            );
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "second delegation");
+        }
     }
 }

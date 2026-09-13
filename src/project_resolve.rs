@@ -1138,7 +1138,7 @@ pub fn prepare_workflow_for_wire(
     )
     .map_err(|err| {
         warn!(reason = %err, "prepare-workflow refused: the coordinator context was not published");
-        publish_refusal(&err)
+        publish_refusal(&err, &dir)
     })?;
 
     // --- bind the record to what was just approved.
@@ -1727,16 +1727,25 @@ pub fn no_such_orchestration_refusal() -> String {
 }
 
 /// The refusal a failed publish gets: the stable code plus the publish error's
-/// own client-safe sentence.
+/// own client-safe sentence, **for the directory it is about**.
 ///
-/// [`crate::orchestrator_context::ContextPublishError::client_sentence`] names
-/// no path and no raw OS error; see its doc for why it is allowed to be more
-/// specific than [`generic_refusal`] is.
-pub fn publish_refusal(err: &crate::orchestrator_context::ContextPublishError) -> String {
+/// `project_dir` is the daemon-canonical directory the preparation resolved to,
+/// which is what makes naming the path here disclose nothing new — the caller
+/// can get the same string from `ResolveProject`, and does on the way here. See
+/// [`crate::orchestrator_context::ContextPublishError::client_sentence`] for the
+/// full argument and for why there is no local/remote split.
+///
+/// The raw OS error still never crosses the wire; it stays in
+/// [`crate::orchestrator_context::ContextPublishError::detail`], which is what
+/// the daemon logs.
+pub fn publish_refusal(
+    err: &crate::orchestrator_context::ContextPublishError,
+    project_dir: &Path,
+) -> String {
     format!(
         "{}: {}",
         crate::daemon_protocol::PROJECT_ERR_PUBLISH_FAILED,
-        err.client_sentence()
+        err.client_sentence(&crate::orchestrator_context::context_dir_of(project_dir))
     )
 }
 

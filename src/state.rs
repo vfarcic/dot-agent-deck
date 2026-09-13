@@ -4259,24 +4259,21 @@ fn resolve_delegate_task_body(
     };
 
     let safe_name = sanitize_role_name(target_role);
-    let dir = std::path::Path::new(cwd).join(".dot-agent-deck");
-    // Not fatal on its own: the directory may already exist, and if it genuinely
-    // cannot be created the `write` below fails too and takes the inline path.
-    if let Err(e) = std::fs::create_dir_all(&dir) {
-        warn!(
-            dir = %dir.display(),
-            role = %target_role,
-            pane_id = %pane_id,
-            error = %e,
-            "delegate: failed to create task directory"
-        );
-    }
-    let file_path = dir.join(format!("worker-task-{safe_name}.md"));
-    match std::fs::write(&file_path, &file_content) {
-        Ok(()) => format!("Read .dot-agent-deck/worker-task-{safe_name}.md for your task."),
+    let file_name = format!("worker-task-{safe_name}.md");
+    // Issue #329 §1: owner-only, directory and file. A delegated task is exactly
+    // the content #303 warns about parking on disk, and `create_dir_all` +
+    // `fs::write` left it at 0664 under a 002 umask for any local account to
+    // read. A failure still takes the inline path, for the reason above.
+    match crate::orchestrator_context::write_coordination_file(
+        std::path::Path::new(cwd),
+        &file_name,
+        &file_content,
+    ) {
+        Ok(_) => format!("Read .dot-agent-deck/{file_name} for your task."),
         Err(e) => {
             warn!(
-                path = %file_path.display(),
+                file = %file_name,
+                cwd = %cwd,
                 role = %target_role,
                 pane_id = %pane_id,
                 error = %e,
@@ -4323,18 +4320,19 @@ fn write_work_done_summary(
         );
         return false;
     };
-    let dir = std::path::Path::new(cwd).join(".dot-agent-deck");
-    // Not fatal on its own: the directory may already exist, and if it genuinely
-    // cannot be created the `write` below fails too and reports it.
-    if let Err(e) = std::fs::create_dir_all(&dir) {
-        warn!(dir = %dir.display(), role = %role, error = %e, "failed to create work-done directory");
-    }
-    let file_path = dir.join(format!("work-done-{safe_role}.md"));
-    match std::fs::write(&file_path, summary) {
-        Ok(()) => true,
+    let file_name = format!("work-done-{safe_role}.md");
+    // Issue #329 §1: owner-only, directory and file — a worker's report is as
+    // sensitive as the task that produced it, and this pair used to land at 0664.
+    match crate::orchestrator_context::write_coordination_file(
+        std::path::Path::new(cwd),
+        &file_name,
+        summary,
+    ) {
+        Ok(_) => true,
         Err(e) => {
             warn!(
-                path = %file_path.display(),
+                file = %file_name,
+                cwd = %cwd,
                 role = %role,
                 error = %e,
                 "failed to write work-done summary — the report is inlined into the \
