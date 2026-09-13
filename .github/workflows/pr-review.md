@@ -49,8 +49,15 @@ network:
 #
 # Raising it is only half the fix, because a ceiling that is hit still yields
 # nothing. The other half is in the prompt body: the agent is told the budget,
-# told that overrunning produces NO verdict, and told to post its verdict BEFORE
-# deep-diving so an overrun degrades to a shallow verdict instead of silence.
+# told that overrunning produces NO verdict, and given a BOUNDED amount of work
+# — a risk ranking, ~10 deep-read files, one pass, at most two subagents — so it
+# finishes and emits inside the budget rather than discovering the edge.
+#
+# Deliberately NOT "post a provisional verdict then refine it" (Greptile P1 on
+# #1058): `add-comment` is capped at 1, the agent has `edit: false` and read-only
+# GitHub access, so it cannot revise. A provisional verdict would simply BE the
+# verdict, and the vote job would act on a pre-investigation read — trading a
+# missing review for a wrong one.
 #
 # Spend is still bounded where bounding is free: by SHA-idempotence (each head is
 # reviewed once), by the eligibility filter, and by max_prs on the caller.
@@ -132,12 +139,16 @@ You have **10000 AI credits** for this run, and a 20-minute wall clock. Both are
 
 **Overrunning produces NO verdict at all — not a shallow one, nothing.** The comment is the only artefact of this run, so an overrun before you write it means the pull request is treated as unreviewed and nobody is told why. A shallow verdict always beats silence. This is not hypothetical: on 2026-09-13 a review of a 70-file pull request died at 1011 credits having written nothing.
 
-So, in order:
+**Your verdict is final the moment you emit it, and you get exactly one.** `add-comment` is capped at 1, you have no edit tool, and your GitHub access is read-only — so there is no revising a first draft later, and the vote job acts on whatever you emitted. Do not post a shallow placeholder intending to improve it.
 
-1. **Write your verdict comment early — before any deep reading.** Read the diff summary and changed-file list, form a genuine provisional verdict, and post it. You may revise it afterwards by editing that same comment; you may not post a second one.
-2. **Then deepen, highest risk first.** Spend what remains where a defect would cost most — protocol and daemon changes, anything touching credentials, deletion or process termination, security-relevant paths — not evenly across the diff.
-3. **Stop and finalise while you still have budget.** If you estimate less than ~15% remaining, stop reading and make sure the comment reflects what you actually concluded.
+That leaves one honest strategy: **bound the work, then emit once.** You cannot see your own credit meter, so budget the work instead, which you can count:
 
-**Subagents are the largest single cost and the easiest way to overrun.** Each carries its own context over the same diff, so a fan-out of four on a large pull request can spend the whole budget before any of them reports. Do not delegate by default. Use at most **two**, only on a diff above roughly 40 changed files, and only with a tightly scoped brief — and never before the provisional verdict is posted.
+1. **Read the diff summary and changed-file list first**, and decide where the risk is — protocol and daemon changes, credentials, deletion or process termination, security-relevant paths. Rank before reading.
+2. **Deep-read the top of that ranking only**, roughly the ten highest-risk files. Do not read the whole diff evenly; on a large pull request that alone can exhaust the budget.
+3. **Emit the verdict as your final action, and make it the only pass.** There is no second, deeper sweep — if you find yourself planning one, you have already spent what it would have cost.
+
+If your coverage was thin, say so in `reasons` and weigh `INSUFFICIENT` rather than reporting confidence you do not have.
+
+**Subagents are the largest single cost and the easiest way to overrun.** Each carries its own context over the same diff, so a fan-out of four on a large pull request can spend the whole budget before any of them reports — which is exactly how the 2026-09-13 run died. Do not delegate by default. Use at most **two**, only on a diff above roughly 40 changed files, and only with a brief scoped to specific files rather than a whole area.
 
 A verdict of `INSUFFICIENT` is the honest answer when you could not review confidently within budget. Say what you did and did not cover in `reasons`. It is a legitimate outcome and far more useful than an optimistic `APPROVE` or a run that dies silently.
