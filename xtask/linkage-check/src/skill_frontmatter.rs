@@ -82,6 +82,19 @@ mod tests {
         out
     }
 
+    /// Read a file with CRLF normalised to LF.
+    ///
+    /// `.gitattributes` does not pin the working-tree line ending for `.md`, so
+    /// a Windows checkout gets `\r\n` and the `---` fence below would not match.
+    /// `build-windows` runs `cargo nextest run --workspace`, so this is load
+    /// bearing rather than theoretical — it is what `issue_labeler_memory.rs`
+    /// and `issue_labeler_policy.rs` already do for the same reason.
+    fn read_lf(path: &Path) -> String {
+        std::fs::read_to_string(path)
+            .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()))
+            .replace("\r\n", "\n")
+    }
+
     /// Split the `---`-delimited frontmatter block off the top of a `SKILL.md`.
     ///
     /// Returns `Err` with a human-readable reason rather than panicking, so the
@@ -116,8 +129,7 @@ mod tests {
     fn every_skill_frontmatter_is_valid_yaml() {
         let mut bad: Vec<String> = Vec::new();
         for (dir, path) in skill_files() {
-            let src = std::fs::read_to_string(&path)
-                .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+            let src = read_lf(&path);
             let doc = match frontmatter(&src).and_then(parse) {
                 Ok(d) => d,
                 Err(why) => {
@@ -203,7 +215,7 @@ mod tests {
     fn skill_name_matches_its_directory() {
         let mut bad: Vec<String> = Vec::new();
         for (dir, path) in skill_files() {
-            let src = std::fs::read_to_string(&path).expect("readable");
+            let src = read_lf(&path);
             let Ok(doc) = frontmatter(&src).and_then(parse) else {
                 continue; // attributed by `every_skill_frontmatter_is_valid_yaml`
             };
@@ -255,5 +267,29 @@ mod tests {
             .and_then(Yaml::as_str)
             .expect("description is a string");
         assert_eq!(got, wording, "quoting must not alter the wording");
+    }
+
+    /// A CRLF checkout parses identically to an LF one.
+    ///
+    /// Pins the `read_lf` normalisation above: without it every skill on a
+    /// Windows working tree reports `does not open with a `---` frontmatter
+    /// fence`, turning the whole gate into a platform-specific false alarm.
+    #[test]
+    fn a_crlf_checkout_parses_the_same_as_lf() {
+        let lf = "---\nname: demo\ndescription: 'holds a: colon'\n---\n\n# body\n";
+        let crlf = lf.replace('\n', "\r\n");
+
+        let from_lf = parse(frontmatter(lf).expect("LF fence is found")).expect("LF parses");
+        let normalised = crlf.replace("\r\n", "\n");
+        let from_crlf =
+            parse(frontmatter(&normalised).expect("CRLF fence is found once normalised"))
+                .expect("CRLF parses");
+
+        assert_eq!(from_lf, from_crlf, "line endings must not change the parse");
+        assert!(
+            frontmatter(&crlf).is_err(),
+            "un-normalised CRLF must NOT match the fence — if this ever passes, \
+             `read_lf` has stopped being load bearing and this fixture is lying"
+        );
     }
 }
