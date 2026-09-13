@@ -157,9 +157,7 @@ fn shell_activity_005_real_claude_bash_child_trips_the_descendant_scan() {
     deck.send_keys(PANE_NAME_SUFFIX.as_bytes());
     deck.send_keys(b"\t");
     deck.send_keys(format!("claude --model {HAIKU_MODEL} --allowedTools Bash").as_bytes());
-    let (submit_col, submit_row) = deck
-        .find_in_grid("[Submit]")
-        .expect("new-pane form should render [Submit]");
+    let (submit_col, submit_row) = deck.wait_for_in_grid("[Submit]");
     deck.click(submit_col, submit_row);
 
     assert!(
@@ -321,9 +319,7 @@ fn shell_activity_006_real_claude_bash_call_crossing_the_cap_keeps_the_badge_wor
     deck.send_keys(PANE_NAME_SUFFIX_006.as_bytes());
     deck.send_keys(b"\t");
     deck.send_keys(format!("claude --model {HAIKU_MODEL} --allowedTools Bash").as_bytes());
-    let (submit_col, submit_row) = deck
-        .find_in_grid("[Submit]")
-        .expect("new-pane form should render [Submit]");
+    let (submit_col, submit_row) = deck.wait_for_in_grid("[Submit]");
     deck.click(submit_col, submit_row);
 
     assert!(
@@ -557,9 +553,7 @@ fn shell_activity_007_real_claude_idle_with_live_mcp_servers_stays_idle() {
     deck.send_keys(PANE_NAME_SUFFIX_007.as_bytes());
     deck.send_keys(b"\t");
     deck.send_keys(format!("claude --model {HAIKU_MODEL} --allowedTools Bash").as_bytes());
-    let (submit_col, submit_row) = deck
-        .find_in_grid("[Submit]")
-        .expect("new-pane form should render [Submit]");
+    let (submit_col, submit_row) = deck.wait_for_in_grid("[Submit]");
     deck.click(submit_col, submit_row);
 
     assert!(
