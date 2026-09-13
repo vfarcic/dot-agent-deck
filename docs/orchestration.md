@@ -576,13 +576,9 @@ So when you select an orchestration whose directory already hosts a live one, th
 
 The warning is non-blocking: press `Enter` and the tab opens as usual. It exists to make the shared files and the shared tree explicit at the moment they start to matter, so proceeding is a deliberate choice rather than a surprise. If the two orchestrations genuinely need to run at once, a worktree per orchestration is the isolated alternative.
 
-## The `.dot-agent-deck` directory
+## Coordination files are cleaned up after 14 days
 
-Coordination files — the coordinator's brief, the per-role task and report files, and any task file an orchestrator writes — live in `.dot-agent-deck/` at the root of the directory the orchestration runs in. It is working state, not a record.
-
-Two things the deck does to that directory are worth knowing about, because both are changes to your own filesystem. It keeps the files owner-only, which means clearing group and other **write** from the directory when they are set — the equivalent of `chmod go-w`, and nothing else. And it adds `.dot-agent-deck/` to the clone-local `.git/info/exclude` the first time it publishes there, so coordination files never show up as untracked; your committed `.gitignore` is left alone.
-
-Coordination files older than **14 days** are deleted when a workflow next publishes into that directory. Only `*.md` files directly inside `.dot-agent-deck/` are eligible — never a subdirectory, and never the live `orchestrator-context.md`. Set `DOT_AGENT_DECK_COORDINATION_RETENTION_DAYS` to change the window, or to `0` to turn it off.
+The files an orchestration writes into `.dot-agent-deck/` — the coordinator's brief, the per-role task and report files, and any task file an orchestrator hands over — are working state, not a record. Ones older than **14 days** are deleted when a workflow next publishes into that directory; the brief the running orchestration is using is never touched. Set `DOT_AGENT_DECK_COORDINATION_RETENTION_DAYS` to change the window, or to `0` to turn it off.
 
 ## Troubleshooting
 
