@@ -2,12 +2,12 @@
 
 ## What the repo tracks
 
-35 paths in this repository are committed as symlinks (git mode `120000`), in three families:
+Three paths in this repository are committed as symlinks (git mode `120000`), one per family:
 
 | Path | Target | What it is for |
 |---|---|---|
 | `AGENTS.md` | `CLAUDE.md` | The file Codex and OpenCode read for the project's conventions |
-| `.agents/skills/<name>` (33) | `../../.claude/skills/<name>` | The same skills tree Claude gets, exposed to Codex/OpenCode |
+| `.agents/skills` | `../.claude/skills` | The same skills tree Claude gets, exposed to Codex/OpenCode |
 | `docs/img` | `../site/static/img` | The docs' image directory, shared with the Docusaurus site |
 
 The first two exist so that **one** `CLAUDE.md` and **one** skills directory reach every agent the deck supports, instead of three near-copies drifting apart. That is a deliberately good design, and it is worth keeping — the whole point of this page is what it costs on one platform and how that cost is contained.
@@ -19,7 +19,7 @@ Git only creates symlinks on checkout when `core.symlinks` is on. On Windows it 
 With it off, git does not fail and does not warn. It writes each symlink as **a plain text file whose entire content is the link target**:
 
 - `AGENTS.md` becomes a **9-byte file containing the string `CLAUDE.md`**. Codex and OpenCode read it, find nine bytes of nothing in particular, and proceed with **no project instructions at all**.
-- The 33 entries under `.agents/skills/` become one-line text files, so the whole skills tree resolves to nothing.
+- The `.agents/skills` link becomes a one-line text file, so the whole skills tree resolves to nothing.
 - `docs/img` stops being a directory, so anything resolving image paths through it breaks.
 
 The failure mode that matters is not the breakage, it is the **silence**. Every file exists and is readable. An agent running with no instructions is indistinguishable, from the outside, from a correctly configured agent that happens to have nothing to follow — so the symptom shows up later as an agent that ignores conventions nobody can see it was never given.
@@ -40,7 +40,7 @@ git checkout -- .
 
 The second command is enough on its own once the first is in place — no need to delete the placeholder files by hand. With `core.symlinks` on, git sees a regular file where the index says `120000`, treats it as modified, and rewrites it as a link.
 
-Verified on `windows-latest`, not inferred from Linux: a clone made deliberately with `git clone -c core.symlinks=false` produced a 9-byte `AGENTS.md`, the checker below rejected it 35 of 35, and after these two commands `AGENTS.md` was a symlink resolving to 29,875 bytes of `CLAUDE.md` with the checker reporting all 35 materialised.
+Verified on `windows-latest`, not inferred from Linux: a clone made deliberately with `git clone -c core.symlinks=false` produced a 9-byte `AGENTS.md`, the checker below rejected every one of them, and after these two commands `AGENTS.md` was a symlink resolving to 29,875 bytes of `CLAUDE.md` with the checker reporting them all materialised. (That run measured 35 links, because `.agents/skills` was then 33 per-skill entries rather than the single directory link it is now; the check is count-agnostic, so the result stands.)
 
 ## The check
 
@@ -58,7 +58,7 @@ Three details are deliberate:
 - **It refuses to pass on an empty set.** Zero tracked symlinks would otherwise read as success both when the repo genuinely has none and when git reported nothing (wrong directory, unreadable index) — and the second reading turns the whole check into a green light that means nothing. Zero exits 2.
 - **It carries its own negative control.** `--self-test` writes the index into a temp directory with `core.symlinks=false` — the exact state a Windows clone lands in — and asserts that the checker rejects that tree *for the materialisation reason specifically*, not merely that it exits non-zero. This is what keeps a green result honest, and it works on any platform: `core.symlinks` is a git config, not a Windows feature, so Linux and macOS can reproduce the Windows breakage faithfully and locally.
 
-That the check discriminates was confirmed on Windows itself and not only through the self-test's stand-in. On a `windows-latest` runner, a deliberately broken clone (`git clone -c core.symlinks=false`) gave the real thing — a 9-byte `AGENTS.md` written by real git on a real NTFS working tree — and the checker exited 1 naming all 35, while the same script on the same runner exited 0 against the job's own checkout seconds earlier. Both cases, one machine, opposite results.
+That the check discriminates was confirmed on Windows itself and not only through the self-test's stand-in. On a `windows-latest` runner, a deliberately broken clone (`git clone -c core.symlinks=false`) gave the real thing — a 9-byte `AGENTS.md` written by real git on a real NTFS working tree — and the checker exited 1 naming every link, while the same script on the same runner exited 0 against the job's own checkout seconds earlier. Both cases, one machine, opposite results.
 
 Both need nothing but git and coreutils. On Linux the pair runs in ~0.45s; on the Windows runner it is 7–11s across runs, two thirds of that the self-test writing the whole index out — Windows process spawn dominates, and it is still an order of magnitude cheaper than anything else in that job.
 
@@ -74,7 +74,7 @@ What it structurally cannot see is the case the issue was actually about: a **co
 
 The alternative is to stop relying on a symlink for `AGENTS.md` — copy it, or generate it. That was considered and rejected:
 
-- It fixes **one** of the 35. The 33 skill entries are directories and `docs/img` is a directory; duplicating a whole skills tree is worse than duplicating one file, so the Windows exposure would remain for the larger part of the set while the cleanest part of the design was given up.
+- It fixes **one** of the three. `.agents/skills` and `docs/img` are directory links; duplicating a whole skills tree is worse than duplicating one file, so the Windows exposure would remain for the larger part of the set while the cleanest part of the design was given up.
 - A copy can go stale, and a copy that goes stale fails the *same silent way* — an agent reading conventions that no longer match. Preventing that means a generator plus a CI drift check, which is more machinery than the check this page describes, guarding a weaker property.
 - The blast radius is small. **No Windows binaries are released** — `release.yml` builds `x86_64`/`aarch64` for `apple-darwin` and `unknown-linux-gnu` only — so no end user is exposed. The population is Windows *contributors* building from source, for whom a one-time setting is a proportionate fix.
 

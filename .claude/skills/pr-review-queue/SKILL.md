@@ -13,7 +13,7 @@ Several PRs are open and the question is *which of these are waiting on me, and 
 Not this skill:
 
 - **One PR, named** → `/verify-pr` directly. Dispatching a single unit just adds a worktree between you and the answer.
-- **Your own in-flight work that has no PR yet** → `/prd-done`.
+- **Your own in-flight work that has no PR yet** → `/pr-create`.
 - **A quick static read** → the built-in `/review`.
 
 ## What this skill does NOT do

@@ -13,7 +13,7 @@
 #     Codex and OpenCode read AGENTS.md for the project's conventions, so they
 #     get NO project instructions and behave like a correctly configured agent
 #     that simply has nothing to follow.
-#   * The 33 entries under `.agents/skills/` become one-line text files, so the
+#   * The `.agents/skills` link becomes a one-line text file, so the
 #     whole skills tree resolves to nothing.
 #   * `docs/img` stops being the site's image directory.
 #
@@ -94,12 +94,12 @@ diagnose() {
 
 # 0 = every tracked symlink resolves to its target in $1; 1 = at least one does
 # not; 2 = nothing was checked (see the vacuity guard below). Prints one line
-# per offender, so a broken tree names all 35 rather than stopping at the first.
+# per offender, so a broken tree names every one rather than stopping at the first.
 check_tree() {
     local tree="$1"
     local path target link expected here checked=0 broken=0
 
-    # Without this, a mistyped directory reports all 35 links as dangling — a
+    # Without this, a mistyped directory reports every link as dangling — a
     # true statement that points at the wrong problem.
     if [ ! -d "$tree" ]; then
         echo "no such directory: $tree" >&2

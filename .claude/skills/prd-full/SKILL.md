@@ -1,5 +1,5 @@
 ---
-name: dot-ai-prd-full
+name: prd-full
 description: Run a PRD end-to-end autonomously — start, iterate until done, create a PR, and wait for its CI + bot reviews to settle before reporting. Stops before merge for manual validation.
 user-invocable: true
 ---
@@ -26,11 +26,12 @@ Standard harness guardrails for genuinely destructive actions still apply.
    - run `/prd-next`, including implementing the recommended task in the same turn,
    - run `/prd-update-progress`,
    - if the PRD is 100% complete, exit the loop; otherwise repeat.
-4. **Finish:** run `/prd-done` **only up to and including PR creation**. Do **not** merge, close the issue, or clean up the branch/worktree — the user validates and merges manually.
-5. **Do not stop at PR creation — wait for the PR to settle, then report the settled state.** After the PR is open, poll until **both** the CI / GitHub Actions workflows **and** the automated bot reviews have finished (success or failure). Per CLAUDE.md rule 8, Greptile publishes a `Greptile Review` **check-run** that goes pending and then completes, so `gh pr checks <n>` tells you when the review is done — no timed polling of comments needed. Then **fetch the inline findings**: `gh api repos/{owner}/{repo}/pulls/<n>/comments`. That endpoint is the only place the P1/P2 findings live — the summary comment (`gh pr view <n> --json comments`) and the review state do not carry them, so a green check is NOT the review. Report the findings, not just the check states. When delegating this step to a worker (e.g. `release`), the worker must perform this wait-and-report and then hand the result back — never instruct it to stop at PR creation.
+4. **Finish:** mark the PRD complete and move it to `prds/done/`, then run `/pr-create`. The archival is PRD-specific so it lives here rather than in `/pr-create`, which is not PRD-only; commit it with the rest of the work so it rides the same PR. It owns everything from pushing the branch to a verified PR and stops before merge by design, so there is nothing here to hold it back from — do not merge, close the issue, or clean up the branch/worktree.
+5. **Do not stop at PR creation — `/pr-create` settles the PR and hands back.** It waits for CI and the automated review, fetches the inline findings, answers them, and **resolves the threads**; its wait is bounded, so a reviewer that never reports ends the step with "no automated review was obtained" rather than hanging. When you delegate this to a worker (e.g. `release`), the worker performs that settle and hands the result back — never instruct it to stop at PR creation.
+
 6. **Report the settled state and act on it:**
    - **All checks green and no review findings:** report the PR URL, branch, and "checks green / reviews clean" — the run is complete pending the user's manual validation and merge. Stop.
-   - **Failing checks or review findings:** report the PR URL, branch, the specific failing workflows, and the review findings, then resolve them (delegate the fixes, push, and re-poll until the checks + reviews settle green) **before** stopping. Do not conclude the run while the PR is red or has unresolved findings.
+   - **Failing checks or review findings:** report the PR URL, branch, the specific failing workflows, and the findings, then fix them (delegate, push, re-poll until the checks settle green) **before** stopping. Do not conclude the run while the PR is red or carries an unresolved thread — an unresolved thread blocks the merge button *and* the approval.
 
    Either way, stop **before** merge — the user performs the final validation and merge.
 

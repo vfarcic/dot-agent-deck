@@ -13,7 +13,7 @@ Someone else's PR is open and a decision is needed on it. "Someone else" include
 Not this skill:
 
 - **Several PRs, or no PR named** → `/pr-review-queue`, which builds the queue of open PRs where the ball is in your court and dispatches one isolated unit per PR. *"Review the open PRs on this repo"* or *"what is waiting on me"* is that skill, not this one — it matches this description on every content word, so check for a number before assuming.
-- **Your own in-flight work** → `/prd-done` owns that path.
+- **Your own in-flight work** → `/pr-create` owns that path.
 - **A quick static read with no build** → the built-in `/review`.
 - **Your uncommitted working diff** → `/code-review`.
 
