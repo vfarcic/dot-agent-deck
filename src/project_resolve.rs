@@ -1137,7 +1137,18 @@ pub fn prepare_workflow_for_wire(
         crate::orchestrator_context::Attendance::Attended,
     )
     .map_err(|err| {
-        warn!(reason = %err, "prepare-workflow refused: the coordinator context was not published");
+        // The directory is named in the daemon-local log as well as in the
+        // refusal (issue #1047 §2: "No path, anywhere"). The log line already
+        // carried the mode and the remedy and still left an operator running
+        // `find` across the filesystem to learn WHICH project it was about —
+        // which is the whole diagnosis cost the issue measured, and it is not
+        // paid for by the wire sentence alone, since an operator reading the
+        // daemon log is usually not the person who saw the toast.
+        warn!(
+            project = %dir.display(),
+            reason = %err,
+            "prepare-workflow refused: the coordinator context was not published"
+        );
         publish_refusal(&err, &dir)
     })?;
 
