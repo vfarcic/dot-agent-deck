@@ -22,21 +22,37 @@ from pr_review_common import (  # noqa: E402
     unresolved_threads,
 )
 
-# Authors whose pull requests are only eligible when they carry a specific label.
+# Authors ranked BEHIND the maintainers inside the `max_prs` cap.
 #
-# Renovate labels its own pull requests `manual-review` at open time when they are
-# NOT in an automerge group — i.e. exactly when a human has to look. (Verified: the
-# label comes from renovate[bot], not from the adaptive labeler, which explicitly
-# blocks it.) Reviewing the rest would spend tokens on pull requests that merge
-# without anyone reading them: measured over 40 merged Renovate PRs, 27 carried no
-# such label and merged at a 14h mean.
+# This is an ordering, not a gate. It used to be one — Renovate pull requests were
+# eligible only when they carried `manual-review` — and that gate is gone (issue
+# #1050 review). What it was reaching for was sound: do not spend tokens reviewing
+# pull requests that merge without anyone reading them, measured at the time as 27
+# of 40 merged Renovate PRs carrying no such label, at a 14h mean.
 #
-# An elapsed-time gate was considered and rejected on measurement: only 2 of those
-# 40 ever reached 48h, and the labelled set merged no slower than the unlabelled
-# one (15.6h vs 14.3h mean), so time does not select the set that needs review.
-AUTHOR_REQUIRED_LABEL = {
-    "app/renovate": "manual-review",
-}
+# The label was a PROXY for "a human has to look at this", and the proxy had a
+# false-negative class nobody had measured. It is applied by explicit `labels:`
+# arrays on individual `renovate.json` packageRules, NOT — as the comment here
+# used to claim — by a pull request "not being in an automerge group". npm updates
+# outside `site/**` are in no automerge group AND carry no such label, so they were
+# held for a human and skipped by the reviewer at the same time: #1018, #1037 and
+# #1039 sat for days with green CI and no review, while #1039's sibling #1038 —
+# the identical React 19.3.0 bump against `site/package-lock.json` — automerged
+# itself the same day.
+#
+# There is no direct signal to replace the proxy with. Renovate merges through its
+# own API call rather than GitHub auto-merge, so `autoMergeRequest` is null on
+# every Renovate pull request whether it will automerge or not (measured across
+# #1038, #1036, #1017, #1007, #1002 and #1001: zero `auto_merge_enabled` events on
+# any of them). So the choice was an inaccurate proxy or no proxy, and no proxy
+# wins: the cost of reviewing a pull request that would have merged anyway is one
+# model call on a lockfile diff, and the cost of skipping one that would not is
+# what those three pull requests did for days.
+#
+# The ordering survives because dropping the gate makes it MORE load-bearing, not
+# less: bot pull requests now reach selection in bulk, and without this they could
+# crowd maintainer pull requests out of `max_prs`.
+DEPRIORITISED_AUTHORS = {"app/renovate"}
 
 
 def env(name, default=""):
@@ -104,12 +120,12 @@ def main():
     owner = repo.split("/")[0]
     prs = gh_json(
         "pr", "list", "--repo", repo, "--state", "open", "--limit", "100",
-        "--json", "number,author,isDraft,headRefOid,headRepositoryOwner,reviewDecision,labels",
+        "--json", "number,author,isDraft,headRefOid,headRepositoryOwner,reviewDecision",
     ) or []
 
     # Maintainer pull requests first, so a burst of bot pull requests can never
     # crowd them out of the max_prs cap.
-    prs.sort(key=lambda p: p["author"]["login"] in AUTHOR_REQUIRED_LABEL)
+    prs.sort(key=lambda p: p["author"]["login"] in DEPRIORITISED_AUTHORS)
 
     items, skipped = [], []
     for pr in prs:
@@ -127,13 +143,6 @@ def main():
         if (pr.get("headRepositoryOwner") or {}).get("login") != owner:
             skipped.append((number, "fork"))
             continue
-
-        required_label = AUTHOR_REQUIRED_LABEL.get(author)
-        if required_label:
-            names = [label["name"] for label in pr.get("labels", [])]
-            if required_label not in names:
-                skipped.append((number, f"{author} pull request without {required_label!r}"))
-                continue
 
         if pr.get("reviewDecision") == "CHANGES_REQUESTED":
             skipped.append((number, "changes requested by a reviewer"))

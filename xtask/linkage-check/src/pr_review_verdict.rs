@@ -475,3 +475,31 @@ fn whitespace_between_pages_is_skipped() {
          assert [x['a'] for x in concat_json_documents(stream)] == [1, 2]",
     );
 }
+
+/// Issue #1050 review: Renovate pull requests are eligible on the same terms as
+/// anyone else's, with no label gate.
+///
+/// The gate keyed on `manual-review`, which is applied by explicit `labels:`
+/// arrays on individual `renovate.json` packageRules — not, as the comment there
+/// claimed, by a pull request "not being in an automerge group". npm updates
+/// outside `site/**` are in neither set, so #1018, #1037 and #1039 were held for
+/// a human and skipped by the reviewer simultaneously. There is no signal to
+/// replace the proxy with (Renovate merges via its own API call, so
+/// `autoMergeRequest` is null whether it will automerge or not), so the gate is
+/// gone rather than re-keyed. The deprioritisation it shared a constant with is
+/// NOT gone, and is load-bearing now that bot pull requests reach selection in
+/// bulk: it keeps them from crowding maintainers out of `max_prs`.
+#[test]
+fn renovate_pull_requests_are_eligible_without_a_label_but_rank_last() {
+    assert_py_ok(
+        "import pr_review_select as sel\n\
+         assert not hasattr(sel, 'AUTHOR_REQUIRED_LABEL'), \\\n\
+        \x20   'the label gate is back; #1018/#1037/#1039 are skipped again'\n\
+         assert sel.DEPRIORITISED_AUTHORS == {'app/renovate'}, sel.DEPRIORITISED_AUTHORS\n\
+         prs = [{'author': {'login': 'app/renovate'}}, {'author': {'login': 'vfarcic'}},\n\
+        \x20       {'author': {'login': 'app/renovate'}}, {'author': {'login': 'prageethw'}}]\n\
+         prs.sort(key=lambda p: p['author']['login'] in sel.DEPRIORITISED_AUTHORS)\n\
+         assert [p['author']['login'] for p in prs] == \\\n\
+        \x20   ['vfarcic', 'prageethw', 'app/renovate', 'app/renovate'], prs",
+    );
+}
