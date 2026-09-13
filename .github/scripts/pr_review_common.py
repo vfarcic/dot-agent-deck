@@ -242,6 +242,96 @@ def latest_verdict(repo, pr_number):
     return None
 
 
+# The marker every no-vote notice carries, so the job can recognise its own.
+#
+# Both notices (an INSUFFICIENT verdict, and a deny-listed pull request whose
+# auto-merge is armed) open with this, and both quote the short head SHA. Author
+# plus marker plus SHA is what makes a notice identifiable as ALREADY POSTED FOR
+# THIS HEAD, which is the whole question `already_noticed_at` answers.
+NO_VOTE_MARKER = "**No vote cast**"
+
+
+def already_reviewed_at(reviews, sha, app_login):
+    """True when `app_login` has already cast a review on this exact head.
+
+    This is the bound that was missing (issue #1050). The vote pass is selected on
+    "has a current verdict" and deliberately NOT on "has not been reviewed" — that
+    is what keeps a verdict from an earlier run votable and a transiently-failed
+    vote retryable — so without a per-SHA guard the daily sweep re-cast the same
+    approval twice a day for as long as the head sat still.
+
+    Keyed on `commit_id` and NOT on review state, which decides two cases:
+
+      * a push moves the head, so the old reviews carry an old `commit_id` and the
+        new head is votable. That is the case that must keep working, and it is
+        the reason a SHA is the right key rather than a timestamp.
+      * a review the App cast and a human then DISMISSED still counts as cast.
+        Re-casting it would fight the human who dismissed it, and this job is a
+        second opinion rather than an authority over one.
+
+    An empty `app_login` returns False — fail OPEN, deliberately. The failure mode
+    of fail-open is a duplicate approval, which is the noise this fixes; the
+    failure mode of fail-closed is a reviewer that silently approves nothing,
+    which blocks every merge it was added to unblock. The caller says so loudly.
+    """
+    if not app_login:
+        return False
+    return any(
+        (review.get("user") or {}).get("login") == app_login
+        and review.get("commit_id") == sha
+        for review in reviews or ()
+    )
+
+
+def already_noticed_at(comments, sha, app_login):
+    """True when `app_login` has already posted a no-vote notice for this head.
+
+    The comment-only outcomes re-posted on the same cadence and for the same
+    reason as the duplicate reviews, so they take the same key: author, marker,
+    and the short SHA the notice itself quotes.
+
+    Note which branch this must NOT suppress. The armed-auto-merge notice tells
+    the reader to disarm auto-merge and re-run, so it has to stay re-runnable
+    INTO A VOTE. It does, because that path re-reads the armed state first and
+    only consults this predicate while still armed; once disarmed the job falls
+    through to voting, where no review exists at this SHA and `already_reviewed_at`
+    lets it through. Fail-open on an empty login, as above.
+    """
+    if not app_login:
+        return False
+    short = (sha or "")[:8]
+    if not short:
+        return False
+    return any(
+        (comment.get("user") or {}).get("login") == app_login
+        and NO_VOTE_MARKER in (comment.get("body") or "")
+        and short in (comment.get("body") or "")
+        for comment in comments or ()
+    )
+
+
+def pr_reviews(repo, pr_number):
+    """Every review on a pull request, paginated.
+
+    `--paginate` is load-bearing: the endpoint pages at 30, and a pull request
+    that has collected a few rounds of Greptile and maintainer reviews pushes the
+    App's own past votes off the first page — which would silently defeat the
+    guard on exactly the long-lived pull requests it matters most on.
+    """
+    return gh_json(
+        "api", f"repos/{repo}/pulls/{pr_number}/reviews", "--paginate",
+        "--jq", "[.[] | {commit_id, state, user: {login: .user.login}}]",
+    ) or []
+
+
+def pr_comments(repo, pr_number):
+    """Every issue comment on a pull request, paginated. Same paging reason."""
+    return gh_json(
+        "api", f"repos/{repo}/issues/{pr_number}/comments", "--paginate",
+        "--jq", "[.[] | {body, user: {login: .user.login}}]",
+    ) or []
+
+
 def fail(message):
     print(f"::error title=Agent PR review::{message}", file=sys.stderr)
     sys.exit(1)

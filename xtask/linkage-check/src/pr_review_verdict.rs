@@ -57,12 +57,18 @@ fn run_py(body: &str) -> Output {
     let root = repo_root();
     let script = format!(
         "import sys\nsys.path.insert(0, {scripts:?})\n\
-         from pr_review_common import _is_trusted_verdict_comment, parse_verdict, DENY_PATHS\n\
+         from pr_review_common import (_is_trusted_verdict_comment, parse_verdict,\n\
+        \x20    DENY_PATHS, already_reviewed_at, already_noticed_at, NO_VOTE_MARKER)\n\
          SHA = '0' * 40\n\
          BLOCK = ('```json\\n{{\"schema\":\"pr-review/v1\",\"pr\":1,\"head_sha\":\"' + SHA +\n\
          '\",\"verdict\":\"APPROVE\",\"reasons\":[]}}\\n```')\n\
          MARKER = '\\n<!-- gh-aw-agentic-workflow: Review one pull request, workflow_id: pr-review -->'\n\
          def comment(login, body):\n    return {{'user': {{'login': login}}, 'body': body}}\n\
+         def review(login, commit_id, state='APPROVED'):\n\
+        \x20   return {{'user': {{'login': login}}, 'commit_id': commit_id, 'state': state}}\n\
+         APP = 'dot-agent-deck-reviewer[bot]'\n\
+         def notice(sha, login=APP):\n\
+        \x20   return comment(login, NO_VOTE_MARKER + ' for `' + sha[:8] + '` — reasons')\n\
          {body}\n",
         scripts = root.join(".github/scripts").to_string_lossy(),
         body = body,
@@ -298,5 +304,114 @@ fn the_deny_list_covers_the_reviewer_and_governance_paths() {
          for p in required:\n\
         \x20   assert p in DENY_PATHS, p + ' fell out of DENY_PATHS'\n\
          assert any('.github/workflows/pr-review.md'.startswith(d) for d in DENY_PATHS)",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Issue #1050: the vote pass is idempotent per head SHA.
+//
+// The selector deliberately does NOT key on "already reviewed" — that is what
+// keeps a verdict from an earlier run votable and a failed vote retryable — so
+// the only thing standing between the daily sweep and a second identical
+// approval is `already_reviewed_at`. It is a runtime property in the same sense
+// as the verdict boundary above: nothing compiles it, and its failure mode is
+// silent, so it belongs in `cargo test-fast`.
+// ---------------------------------------------------------------------------
+
+/// The regression. #1029 sat on head `1263627a` from 00:29Z to 20:27Z and the
+/// 05:00 and 17:00 sweeps both approved it, because nothing asked whether the
+/// App had already voted on that exact head.
+#[test]
+fn a_head_the_app_already_reviewed_is_not_voted_on_twice() {
+    assert_py_ok(
+        "reviews = [review(APP, '1263627a')]\n\
+         assert already_reviewed_at(reviews, '1263627a', APP)",
+    );
+}
+
+/// The property that must survive the guard: a push moves the head, and the new
+/// head is votable. Keying on the SHA rather than on "has this PR been reviewed"
+/// is what buys this, and it is the reason the guard lives in the vote job
+/// rather than being folded into the selector's verdict test.
+#[test]
+fn a_push_makes_the_new_head_votable_again() {
+    assert_py_ok(
+        "reviews = [review(APP, '1263627a')]\n\
+         assert not already_reviewed_at(reviews, '455719d4', APP)",
+    );
+}
+
+/// Another reviewer's review at this head is not mine. Greptile reviews every
+/// pull request once when it opens, so on a repository with a second reviewer a
+/// guard that ignored the author would suppress the App's first and only vote.
+#[test]
+fn another_reviewers_review_does_not_suppress_our_vote() {
+    assert_py_ok(
+        "reviews = [review('greptile-apps[bot]', '1263627a', 'COMMENTED'),\n\
+        \x20          review('vfarcic', '1263627a', 'COMMENTED')]\n\
+         assert not already_reviewed_at(reviews, '1263627a', APP)",
+    );
+}
+
+/// A review the App cast and a human then dismissed still counts as cast. The
+/// key is `commit_id`, never the state: re-casting an approval a maintainer
+/// deliberately dismissed would fight them, and this job is a second opinion
+/// rather than an authority over one. `DISMISSED` is the state GitHub leaves on
+/// our own past votes, so getting this wrong would re-open the whole bug.
+#[test]
+fn a_dismissed_review_still_counts_as_already_cast() {
+    assert_py_ok(
+        "for state in ('DISMISSED', 'APPROVED', 'CHANGES_REQUESTED'):\n\
+        \x20   assert already_reviewed_at([review(APP, 'deadbeef', state)], 'deadbeef', APP), state",
+    );
+}
+
+/// Fail OPEN on an unknown identity, deliberately, and pinned here so it cannot
+/// drift into fail-closed by accident. A reviewer that cannot name itself and
+/// therefore approves nothing blocks every merge it exists to unblock; one that
+/// votes twice is noise. The caller emits a `::warning::` so the degraded run is
+/// visible rather than silent.
+#[test]
+fn an_unknown_app_identity_fails_open_rather_than_blocking_every_merge() {
+    assert_py_ok(
+        "assert not already_reviewed_at([review(APP, 'deadbeef')], 'deadbeef', '')\n\
+         assert not already_reviewed_at([review(APP, 'deadbeef')], 'deadbeef', None)\n\
+         assert not already_noticed_at([notice('deadbeef')], 'deadbeef', '')",
+    );
+}
+
+/// An empty review list is the ordinary first-vote case, and the retry case: a
+/// vote that failed transiently left no review at that SHA, so the next sweep
+/// must cast it. That retry is one of the two reasons the selector does not key
+/// on "already reviewed", so the guard has to preserve it.
+#[test]
+fn a_failed_vote_leaves_nothing_behind_and_is_retried() {
+    assert_py_ok(
+        "assert not already_reviewed_at([], 'deadbeef', APP)\n\
+         assert not already_reviewed_at(None, 'deadbeef', APP)",
+    );
+}
+
+/// The comment-only outcomes take the same key. An `INSUFFICIENT` verdict is
+/// fixed for its SHA, so re-posting the notice every twelve hours adds nothing.
+#[test]
+fn a_no_vote_notice_is_said_once_per_head() {
+    assert_py_ok(
+        "assert already_noticed_at([notice('1263627a')], '1263627a', APP)\n\
+         assert not already_noticed_at([notice('1263627a')], '455719d4', APP)\n\
+         assert not already_noticed_at([notice('1263627a', 'vfarcic')], '1263627a', APP)",
+    );
+}
+
+/// An ordinary comment from the App is not a no-vote notice. Without the marker
+/// term, any comment it posts mentioning the short SHA would suppress the real
+/// notice — and the verdict comment itself quotes the full SHA, which contains
+/// the short one as a prefix.
+#[test]
+fn an_ordinary_app_comment_is_not_mistaken_for_a_notice() {
+    assert_py_ok(
+        "sha = 'deadbeef' + '0' * 32\n\
+         plain = comment(APP, 'Automated review (`APPROVE`) for `' + sha + '`.')\n\
+         assert not already_noticed_at([plain], sha, APP)",
     );
 }

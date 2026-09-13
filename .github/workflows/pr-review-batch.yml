@@ -196,6 +196,11 @@ jobs:
         env:
           # The App token, and ONLY here — never in a job the agent runs in.
           GH_TOKEN: ${{ steps.app.outputs.token }}
+          # Issue #1050: who the App is, so the vote job can recognise its OWN past
+          # votes and not re-cast them on an unchanged head. Taken from the token
+          # step rather than written out, so renaming the App cannot silently
+          # un-key the guard — an empty value fails open with a loud warning.
+          APP_LOGIN: "${{ steps.app.outputs.app-slug }}[bot]"
           REPO: ${{ github.repository }}
           PR_NUMBER: ${{ matrix.item.number }}
           EXPECTED_SHA: ${{ matrix.item.sha }}

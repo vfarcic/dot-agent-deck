@@ -25,6 +25,18 @@ It now depends on whether a human will be the one merging:
 Either way the job now SAYS what it did. Before #998 the reason lived in a
 `print()` that went to the workflow log, so a green verdict with no approval
 looked like a bug and could only be explained by reading the run.
+
+Issue #1050 - idempotence, which lives HERE and not in the selector. The vote
+pass is selected on "has a current verdict", deliberately: that is what keeps a
+verdict from an earlier run votable and a transiently-failed vote retryable. The
+missing half was a bound, so the daily sweep re-cast the same approval on an
+unchanged head twice a day. Every outcome below is now keyed on the head SHA -
+the job asks whether it has already acted on THIS head before acting again. It
+belongs in this job because the App's own identity is only known here, from the
+token step's `app-slug`; the selector holds no App credential and cannot ask who
+it is. Cost of that placement is one cheap `gh`-only matrix leg per already-voted
+pull request, which is also what preserves the retry: a vote that failed left no
+review at that SHA, so the next sweep sees nothing and casts it.
 """
 
 import json
@@ -34,12 +46,16 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from pr_review_common import (  # noqa: E402
     DENY_PRECEDENCE,
+    already_noticed_at,
+    already_reviewed_at,
     checks_green,
     fail,
     gh,
     gh_json,
     gh_ok,
     latest_verdict,
+    pr_comments,
+    pr_reviews,
 )
 
 ATTENTION_LABEL = "needs-human-eye"
@@ -180,6 +196,9 @@ def main():
     repo = os.environ["REPO"]
     pr_number = os.environ["PR_NUMBER"]
     expected_sha = os.environ["EXPECTED_SHA"]
+    # The App's own login, as `<app-slug>[bot]`. Supplied by the token step rather
+    # than hardcoded, so renaming the App cannot silently un-key the guards below.
+    app_login = (os.environ.get("APP_LOGIN") or "").strip()
     vote_allowed = os.environ.get("VOTE_ALLOWED", "").lower() == "true"
     try:
         denied_paths = json.loads(os.environ.get("DENIED_PATHS") or "[]")
@@ -209,13 +228,36 @@ def main():
         print(f"#{pr_number}: a reviewer requested changes during review; not voting.")
         return
 
-    # 2. The gates must still be green, checked here and not taken on trust.
+    if not app_login:
+        # Fail OPEN and say so. Refusing to vote here would block every merge this
+        # reviewer exists to unblock; voting twice is merely noise. See
+        # already_reviewed_at() for why that is the right way round.
+        print(
+            f"::warning title=Agent PR review::#{pr_number}: APP_LOGIN is empty, so I "
+            "cannot tell my own past votes apart from anyone else's. Voting without the "
+            "per-SHA guard - this may duplicate an approval (issue #1050). Check the "
+            "`app-slug` output on the token step."
+        )
+
+    # 2. I must not already have voted on this exact head (issue #1050).
+    #
+    # Before the gates, because it is the cheapest way out and because a head I
+    # have already voted on needs no re-verification: the vote that stands was
+    # cast against these same contexts at this same SHA.
+    if already_reviewed_at(pr_reviews(repo, pr_number), expected_sha, app_login):
+        print(
+            f"#{pr_number}: already reviewed {expected_sha[:8]}; not voting again. "
+            "A push moves the head and makes it votable once more."
+        )
+        return
+
+    # 3. The gates must still be green, checked here and not taken on trust.
     green, why = checks_green(repo, expected_sha)
     if not green:
         print(f"#{pr_number}: not voting - {why}")
         return
 
-    # 3. There must be a verdict, and it must be for this exact SHA.
+    # 4. There must be a verdict, and it must be for this exact SHA.
     try:
         verdict = latest_verdict(repo, pr_number)
     except ValueError as exc:
@@ -242,6 +284,14 @@ def main():
     reasons = "\n".join(f"- {r}" for r in verdict.get("reasons", [])) or "- (none given)"
 
     if decision == "INSUFFICIENT":
+        # Say it once per head. The verdict is fixed for this SHA, so a re-post
+        # carries no new information and only teaches the reader to scroll past it.
+        if already_noticed_at(pr_comments(repo, pr_number), expected_sha, app_login):
+            print(
+                f"#{pr_number}: verdict INSUFFICIENT and already said so for "
+                f"{expected_sha[:8]}; not repeating it."
+            )
+            return
         comment(
             repo,
             pr_number,
@@ -252,12 +302,22 @@ def main():
         print(f"#{pr_number}: verdict INSUFFICIENT - no vote cast, human review needed.")
         return
 
-    # 4. Sensitive paths: whether a human will be the one merging decides this.
+    # 5. Sensitive paths: whether a human will be the one merging decides this.
     if not vote_allowed:
         reason = deny_reason(denied_paths)
         touched = ", ".join(f"`{p}`" for p in denied_paths[:5]) or "a protected path"
         # Read this last, not from the step-1 snapshot: see auto_merge_armed().
         if auto_merge_armed(repo, pr_number):
+            # Only suppress the repeat while auto-merge is STILL armed, which is
+            # what keeps the notice's own instruction honest: disarming drops out
+            # of this branch entirely and the job votes. Reached only when armed,
+            # so the guard can never strand a pull request the reader has acted on.
+            if already_noticed_at(pr_comments(repo, pr_number), expected_sha, app_login):
+                print(
+                    f"#{pr_number}: deny-listed, auto-merge still armed, and already said "
+                    f"so for {expected_sha[:8]}; not repeating it."
+                )
+                return
             comment(
                 repo,
                 pr_number,
@@ -284,7 +344,7 @@ def main():
         )
         return
 
-    # 5. The ordinary case. Nothing protected is touched at this SHA, so an
+    # 6. The ordinary case. Nothing protected is touched at this SHA, so an
     # attention marker from an earlier one is now a lie the pull request list tells.
     clear_label(repo, pr_number)
     body = (
