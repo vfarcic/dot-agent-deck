@@ -82,8 +82,23 @@ NEVER_KILL_RE='^(dot-agent-deck|ssh-agent|gpg-agent|dbus.*|systemd.*|pipewire.*|
 MCP_EXEC_RE='^(node|npm|npx)$'
 MCP_PKG_RE='(telegram-mcp-bot|coderabbitai-mcp|@modelcontextprotocol/server-|mcp-server-|/mcp-server\.js)'
 
-UID_SELF="$(id -u)"
-NOW_TICKS="$(awk '{print int($1)}' /proc/uptime)"
+# TEST SEAMS. Both default to production behaviour and exist because every
+# safety property below is a RUNTIME one — the never-kill list, the two-part MCP
+# identification, the /proc/<pid>/stat parsing and the pid-reuse check are all
+# invisible to any compile step, which is the same argument CLAUDE.md rule 5
+# makes for clean_tmp.rs and junit_strip.rs. xtask/linkage-check/src/reap_orphans.rs
+# drives this script against a synthetic PROC_ROOT and records signals through
+# REAP_KILL_CMD rather than sending them, so the tests can assert what WOULD be
+# killed without a test ever signalling a real process.
+#
+# Neither widens what an attacker can do: setting REAP_KILL_CMD requires the
+# ability to set this process's environment, and anyone with that can simply run
+# `kill` themselves.
+PROC_ROOT="${PROC_ROOT:-/proc}"
+REAP_KILL_CMD="${REAP_KILL_CMD:-kill}"
+
+UID_SELF="${REAP_UID_SELF:-$(id -u)}"
+NOW_TICKS="$(awk '{print int($1)}' "$PROC_ROOT/uptime")"
 HZ="$(getconf CLK_TCK 2>/dev/null || echo 100)"
 
 # /proc/<pid>/stat's SECOND field is the comm wrapped in parentheses, and it can
@@ -93,7 +108,7 @@ HZ="$(getconf CLK_TCK 2>/dev/null || echo 100)"
 # process whose comm held a space returned the STATE ('S') instead of the PPID.
 # Everything after the LAST ')' splits safely, so read every field from there.
 stat_after_comm() {
-  local line; line="$(cat "/proc/$1/stat" 2>/dev/null)" || return 1
+  local line; line="$(cat "$PROC_ROOT/$1/stat" 2>/dev/null)" || return 1
   [ -z "$line" ] && return 1
   printf '%s' "${line##*) }"
 }
@@ -118,15 +133,15 @@ proc_age_min() {
 }
 
 candidates=()
-for pid in $(ls /proc 2>/dev/null | grep -E '^[0-9]+$'); do
-  [ -r "/proc/$pid/stat" ] || continue
+for pid in $(ls "$PROC_ROOT" 2>/dev/null | grep -E '^[0-9]+$'); do
+  [ -r "$PROC_ROOT/$pid/stat" ] || continue
   # own processes only
-  [ "$(stat -c %u "/proc/$pid" 2>/dev/null)" = "$UID_SELF" ] || continue
+  [ "$(stat -c %u "$PROC_ROOT/$pid" 2>/dev/null)" = "$UID_SELF" ] || continue
   # orphans only
   [ "$(proc_ppid "$pid")" = "1" ] || continue
-  cmd="$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null)"
+  cmd="$(tr '\0' ' ' <"$PROC_ROOT/$pid/cmdline" 2>/dev/null)"
   [ -z "$cmd" ] && continue
-  comm="$(cat "/proc/$pid/comm" 2>/dev/null)"
+  comm="$(cat "$PROC_ROOT/$pid/comm" 2>/dev/null)"
   argv0base="$(basename "$(printf '%s' "$cmd" | awk '{print $1}')" 2>/dev/null)"
   echo "$comm" | grep -qE "$NEVER_KILL_RE" && continue
   echo "$argv0base" | grep -qE "$NEVER_KILL_RE" && continue
@@ -148,7 +163,7 @@ reap=()
 declare -A why
 declare -A starttime
 for pid in "${candidates[@]}"; do
-  [ -r "/proc/$pid/stat" ] || continue
+  [ -r "$PROC_ROOT/$pid/stat" ] || continue
   a="${t0[$pid]:-}"; b="$(cpu_ticks "$pid")"
   [ -z "$a" ] || [ -z "$b" ] && continue
   pct=$(( (b - a) * 100 / (SAMPLE_SECS * HZ) ))
@@ -157,10 +172,10 @@ for pid in "${candidates[@]}"; do
   # truncated string silently misses any package name that sits past the cut —
   # and npx cache paths are long, so that is the common case, not the edge one.
   # Truncation is for DISPLAY only, at the point of printing.
-  cmd="$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null)"
+  cmd="$(tr '\0' ' ' <"$PROC_ROOT/$pid/cmdline" 2>/dev/null)"
 
   is_mcp=0
-  comm="$(cat "/proc/$pid/comm" 2>/dev/null)"
+  comm="$(cat "$PROC_ROOT/$pid/comm" 2>/dev/null)"
   argv0base="$(basename "$(printf '%s' "$cmd" | awk '{print $1}')" 2>/dev/null)"
   if { echo "$comm" | grep -qE "$MCP_EXEC_RE" || echo "$argv0base" | grep -qE "$MCP_EXEC_RE"; } \
      && echo "$cmd" | grep -qE "$MCP_PKG_RE"; then is_mcp=1; fi
@@ -186,7 +201,7 @@ fi
 echo "Matched ${#reap[@]} of ${#candidates[@]} orphaned process(es):"
 for pid in "${reap[@]}"; do
   printf '  pid %-8s %-34s %s\n' "$pid" "${why[$pid]}" \
-    "$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null | cut -c1-70)"
+    "$(tr '\0' ' ' <"$PROC_ROOT/$pid/cmdline" 2>/dev/null | cut -c1-70)"
 done
 
 if [ "$APPLY" -ne 1 ]; then
@@ -199,11 +214,11 @@ for pid in "${reap[@]}"; do
   # SIGTERM first. A wedged event loop cannot run its own handler, which is
   # exactly why the escalation is not optional: the observed spinner ignored
   # SIGTERM and needed SIGKILL.
-  kill -TERM "$pid" 2>/dev/null
+  "$REAP_KILL_CMD" -TERM "$pid" 2>/dev/null
 done
 sleep 5
 for pid in "${reap[@]}"; do
-  if ! kill -0 "$pid" 2>/dev/null; then
+  if ! "$REAP_KILL_CMD" -0 "$pid" 2>/dev/null; then
     echo "reaped pid $pid (SIGTERM)"
     continue
   fi
@@ -216,6 +231,6 @@ for pid in "${reap[@]}"; do
     echo "skipped pid $pid (pid reused since selection — NOT killed)"
     continue
   fi
-  kill -KILL "$pid" 2>/dev/null
+  "$REAP_KILL_CMD" -KILL "$pid" 2>/dev/null
   echo "reaped pid $pid (SIGKILL — ignored SIGTERM)"
 done
