@@ -1092,6 +1092,21 @@ describe("ControlDeck", () => {
     unmount();
   });
 
+  // Issue #826: the handler used to compute `editing` eagerly, by asserting
+  // `event.target` into an `HTMLElement` and calling `matches` on it. A keydown
+  // dispatched on `window` has an `EventTarget` that is not an element, so the
+  // call threw before Escape was ever reached and nothing closed. Every other
+  // keyboard test here targets `document.body`, which is an element, so none of
+  // them could see it. This one dispatches on `window` on purpose.
+  it("closes an overlay on Escape dispatched at window, whose target is not an element", async () => {
+    render(<ControlDeck runtime={runtime()} />);
+    fireEvent.click(screen.getByTestId("open-settings"));
+    expect(screen.getByTestId("settings-panel")).toBeVisible();
+
+    fireEvent.keyDown(window, { key: "Escape" });
+    await waitFor(() => expect(screen.queryByTestId("settings-panel")).not.toBeInTheDocument());
+  });
+
   it("renders the registry's active section, with the column its two sections earn", () => {
     render(<ControlDeck runtime={runtime()} />);
     fireEvent.click(screen.getByTestId("open-settings"));

@@ -359,8 +359,6 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
-      const target = event.target as HTMLElement | null;
-      const editing = target?.matches("input, textarea, select, [contenteditable='true'], .xterm-helper-textarea");
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") {
         event.preventDefault();
         setPaletteOpen((open) => !open);
@@ -370,7 +368,14 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
         setPaletteOpen(false); setHelpOpen(false); setProjectsOpen(false); setProfilesOpen(false); setPromptsOpen(false); setWorkflowOpen(false); setSettingsOpen(false); setConfirm(undefined);
         return;
       }
-      if (editing) return;
+      // Asked here rather than at the top, because the two branches above do not
+      // need it: `event.target` is an `EventTarget`, which the DOM does not
+      // guarantee is an element — a keydown dispatched on `window` has no
+      // `matches` at all. Narrowed with `instanceof` rather than asserted into
+      // an `HTMLElement`, so the type system checks this call and whatever is
+      // added beside it (#826).
+      const target = event.target;
+      if (target instanceof Element && target.matches("input, textarea, select, [contenteditable='true'], .xterm-helper-textarea")) return;
       if (event.key === "?") { event.preventDefault(); setHelpOpen(true); return; }
       if (/^[1-4]$/.test(event.key)) {
         const agent = snapshot.agents[Number(event.key) - 1];

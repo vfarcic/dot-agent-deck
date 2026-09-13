@@ -10,13 +10,14 @@ import type { DeckRuntimeState } from "../types";
  * The hook is driven in isolation rather than through a mounted `ControlDeck`,
  * and that is deliberate rather than convenient.
  *
- * `App.tsx`'s own `keydown` listener computes `editing` from
- * `event.target as HTMLElement` on every keydown, ahead of every branch, so a
- * keydown dispatched at `window` — which has no `.matches` — throws inside it.
- * That is issue #826, it is not this PRD's to fix, and mounting the deck here
- * would make these tests fail for a reason that has nothing to do with zoom.
- * The hook itself never reads `event.target`, which is why driving it directly
- * is honest and not a dodge.
+ * When these tests were written, `App.tsx`'s own `keydown` listener computed
+ * `editing` from `event.target as HTMLElement` on every keydown, ahead of every
+ * branch, so a keydown dispatched at `window` — which has no `.matches` — threw
+ * inside it, and mounting the deck here would have failed these tests for a
+ * reason that has nothing to do with zoom. Issue #826 has since narrowed that
+ * call, so the obstacle is gone. The level is still right without it: the hook
+ * never reads `event.target`, so driving it directly tests the hook rather than
+ * the deck's listener.
  */
 /**
  * A settings state that behaves like the real `useDesktopSettings`, which
