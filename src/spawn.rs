@@ -141,6 +141,12 @@ pub struct SpawnRequest {
     /// three #120/#127 e2e tests assert that text arriving verbatim (a `cat`-based
     /// stub never reads the file). That is #222's job to do deliberately, with those
     /// tests updated as part of it — not a side effect of the dispatcher PR.
+    ///
+    /// **`Some` also makes the context a PRECONDITION of the spawn** (issue
+    /// #1065): if it cannot be published, [`spawn`] returns
+    /// [`SpawnError::OrchestratorContext`] and starts no role at all, rather than
+    /// starting the team with the orchestrator holding the bare task. `None` is
+    /// unaffected — a path that composes nothing has no precondition to fail.
     pub compose_orchestrator_context: Option<crate::orchestrator_context::Attendance>,
 }
 
@@ -150,6 +156,19 @@ pub enum SpawnError {
     WorkingDir { path: String, message: String },
     #[error("failed to spawn agent: {0}")]
     Agent(String),
+    /// Issue #1065: an orchestration was asked to compose a coordinator context
+    /// (`SpawnRequest::compose_orchestrator_context`) and the publish failed, so
+    /// **no role was started**.
+    ///
+    /// Carries the publish error itself rather than a flattened `String` so a
+    /// caller can choose its rendering: this variant's `Display` is the
+    /// daemon-local [`detail`](crate::orchestrator_context::ContextPublishError::detail)
+    /// — which is what `dispatch` wants, since it is the sentence that names the
+    /// remedy — while a caller answering a narrower audience has
+    /// [`client_sentence`](crate::orchestrator_context::ContextPublishError::client_sentence)
+    /// available on the same value.
+    #[error("refused to start the orchestration: {0}")]
+    OrchestratorContext(crate::orchestrator_context::ContextPublishError),
 }
 
 /// What [`spawn`] opened. `SingleAgent` = one card; `Orchestration` = a tab of
@@ -240,7 +259,7 @@ pub enum SpawnTarget {
     /// spawn can compose the orchestrator's context (roles + delegation protocol)
     /// without re-finding it by name — re-resolution is what let the listing and
     /// the spawn disagree in the first place. See
-    /// [`crate::orchestrator_context::prepare_orchestrator_prompt`].
+    /// [`crate::orchestrator_context::prepare_orchestrator_context`].
     Orchestration {
         name: String,
         roles: Vec<RoleSpawn>,
@@ -637,6 +656,84 @@ pub async fn spawn(
             config: orch_config,
         } => {
             let orch_idx = orchestrator_role_index(&roles);
+            // PRD #222 parity: compose the ORCHESTRATOR CONTEXT, exactly as the
+            // interactive `Ctrl+n` path does, instead of delivering the caller's
+            // task on its own.
+            //
+            // Without this the orchestrator was never told that it IS an
+            // orchestrator, which roles exist, or how to `delegate` — so it acted
+            // on the task alone and every worker sat idle waiting for a delegation
+            // that could not arrive. In a six-role repo that is one working agent
+            // and five idle ones, and it looks like it worked.
+            //
+            // The caller's task is folded INTO the context file rather than
+            // concatenated onto the pointer line, because a multi-line prompt does
+            // not submit reliably through a PTY and task text is arbitrary.
+            //
+            // **Issue #1065: a failed publish REFUSES the spawn.** This used to be
+            // `prepare_orchestrator_prompt(…).unwrap_or_else(|| req.prompt.clone())`
+            // — one `warn!` in the daemon log, and then the team started with the
+            // orchestrator holding the bare task text and no role template, no
+            // `## Available agents`, no `## Delegation protocol`. It looks healthy
+            // from every angle a user has: the pane labels, the role cards and
+            // `daemon status` are indistinguishable from a working team, so the
+            // first role implements the whole task solo while the rest idle. The
+            // fallback is defensible where it came from — for a single agent the
+            // prompt IS the whole story — but for an orchestration the wrapper is
+            // the instruction, so delivering the task without it produces an agent
+            // doing the opposite of what the shape was chosen for. Measured twice
+            // on PRD #742.
+            //
+            // Composed HERE, before the role loop, rather than where the old
+            // fallback sat (after it, just above the delivery): that is what makes
+            // the refusal cost nothing. No role has been spawned yet, so there is
+            // nothing for `roll_back_partial_orchestration` to tear down, and
+            // `dispatch`'s own rollback reclaims the worktree and the branch
+            // against a tree nothing ever occupied. It also fits the invariant
+            // issue #600 already established for this branch — `Err` from `spawn`
+            // means "nothing is running" — instead of inventing a second,
+            // half-started outcome beside it.
+            let prompt = match req.compose_orchestrator_context {
+                Some(attendance) => {
+                    crate::orchestrator_context::prepare_orchestrator_context(
+                        &orch_config,
+                        Path::new(&req.working_dir),
+                        Some(req.prompt.as_str()),
+                        attendance,
+                    )
+                    .map_err(|e| {
+                        // `error!`, not `warn!`: the old `warn!` inside
+                        // `prepare_orchestrator_prompt` was the ONLY trace of a
+                        // degradation that cost a whole PRD's worth of agent time,
+                        // and it was one line in a log nobody reads during a
+                        // fire-and-forget dispatch.
+                        tracing::error!(
+                            orchestration = %name,
+                            dir = %req.working_dir,
+                            reason = %e,
+                            "spawn: refusing to start the orchestration — the coordinator \
+                             context could not be published"
+                        );
+                        // The same notification a failed `spawn_agent` raises, so
+                        // every door that already reports an abandoned spawn
+                        // reports this one too rather than needing to learn a new
+                        // variant.
+                        notifier.notify(NotifyEvent::SpawnFailed {
+                            task: req.task_name.clone(),
+                            message: format!(
+                                "refused to start orchestration '{name}': {}",
+                                e.detail()
+                            ),
+                        });
+                        SpawnError::OrchestratorContext(e)
+                    })?
+                    .prompt
+                }
+                // #120 / #127: unchanged — the prompt is delivered verbatim, and
+                // nothing is composed, so there is nothing to refuse. See
+                // `compose_orchestrator_context` for why this is not flipped here.
+                None => req.prompt.clone(),
+            };
             let mut agents = Vec::with_capacity(roles.len());
             // PRD #127 readiness gate: SUBSCRIBE before any pane is spawned so
             // the orchestrator pane's `SessionStart` can't be missed regardless
@@ -885,34 +982,6 @@ pub async fn spawn(
                     );
                 }
             }
-            // PRD #222 parity: compose the ORCHESTRATOR CONTEXT, exactly as the
-            // interactive `Ctrl+n` path does, instead of delivering the caller's
-            // task on its own.
-            //
-            // Without this the orchestrator was never told that it IS an
-            // orchestrator, which roles exist, or how to `delegate` — so it acted
-            // on the task alone and every worker sat idle waiting for a delegation
-            // that could not arrive. In a six-role repo that is one working agent
-            // and five idle ones, and it looks like it worked.
-            //
-            // The caller's task is folded INTO the context file rather than
-            // concatenated onto the pointer line, because a multi-line prompt does
-            // not submit reliably through a PTY and task text is arbitrary. If the
-            // file cannot be written we fall back to the bare task rather than
-            // delivering nothing — a degraded orchestrator still beats a silent one.
-            let prompt = if let Some(attendance) = req.compose_orchestrator_context {
-                crate::orchestrator_context::prepare_orchestrator_prompt(
-                    &orch_config,
-                    &req.working_dir,
-                    Some(req.prompt.as_str()),
-                    attendance,
-                )
-                .unwrap_or_else(|| req.prompt.clone())
-            } else {
-                // #120 / #127: unchanged — the prompt is delivered verbatim. See
-                // `compose_orchestrator_context` for why this is not flipped here.
-                req.prompt.clone()
-            };
             // Deliver the prompt to the orchestrator role pane, gated on that
             // pane's readiness (its registry agent_id is the gate's match key).
             let delivery_pane_id = agents[orch_idx].pane_id.clone();
@@ -6057,6 +6126,277 @@ mod tests {
             guard.pane_orchestration_map
         );
         drop(guard);
+
+        registry.shutdown_all();
+    }
+
+    // --- issue #1065: an unpublishable coordinator context refuses the spawn ---
+
+    /// Build an orchestration `SpawnRequest` rooted at `cwd` that asks for a
+    /// composed coordinator context, with `template` as the start role's own
+    /// `prompt_template`.
+    ///
+    /// Both role commands are ones that WOULD start — `/bin/sh` is what the
+    /// partial-spawn test above uses for its successful role. That is the point:
+    /// these tests assert the refusal beat the role loop to it, so a live pane
+    /// afterwards means the refusal landed too late rather than that a command
+    /// was bad.
+    fn unpublishable_orchestration_request(cwd: &Path, template: Option<String>) -> SpawnRequest {
+        use crate::project_config::{OrchestrationConfig, OrchestrationRoleConfig};
+
+        let declared = |name: &str, start: bool, tpl: Option<String>| OrchestrationRoleConfig {
+            agent: None,
+            name: name.to_string(),
+            command: "/bin/sh".to_string(),
+            start,
+            description: Some("Does the work".to_string()),
+            prompt_template: tpl,
+            clear: false,
+        };
+        SpawnRequest {
+            task_name: "dispatch-refusal-1065".to_string(),
+            working_dir: cwd.to_string_lossy().into_owned(),
+            command: None,
+            prompt: "Implement PRD #742 end to end.".to_string(),
+            resolved_target: Some(SpawnTarget::Orchestration {
+                name: "refusal-1065".to_string(),
+                roles: vec![
+                    RoleSpawn {
+                        agent_type: None,
+                        role_index: 0,
+                        role_name: "orchestrator".to_string(),
+                        command: "/bin/sh".to_string(),
+                        is_start_role: true,
+                    },
+                    RoleSpawn {
+                        agent_type: None,
+                        role_index: 1,
+                        role_name: "worker".to_string(),
+                        command: "/bin/sh".to_string(),
+                        is_start_role: false,
+                    },
+                ],
+                config: Box::new(OrchestrationConfig {
+                    default: false,
+                    name: "refusal-1065".to_string(),
+                    roles: vec![
+                        declared("orchestrator", true, template),
+                        declared("worker", false, None),
+                    ],
+                }),
+            }),
+            compose_orchestrator_context: Some(crate::orchestrator_context::Attendance::Unattended),
+        }
+    }
+
+    /// A [`Notifier`] that records what it was told, so a test can assert the
+    /// refusal was ANNOUNCED and not only returned.
+    #[derive(Default)]
+    struct RecordingNotifier(std::sync::Mutex<Vec<NotifyEvent>>);
+
+    impl Notifier for RecordingNotifier {
+        fn notify(&self, event: NotifyEvent) {
+            self.0.lock().expect("notifier mutex").push(event);
+        }
+    }
+
+    /// Issue #1065: an orchestration whose coordinator context cannot be
+    /// published is REFUSED — no role is started, nothing is registered, and the
+    /// caller is handed the reason.
+    ///
+    /// This used to spawn the whole team and hand the orchestrator
+    /// `req.prompt` verbatim: no role template, no `## Available agents`, no
+    /// `## Delegation protocol`. Every surface a user has — the pane labels, the
+    /// role cards, `daemon status` — looked exactly like a working team while
+    /// the first role implemented the task solo and the rest idled. One `warn!`
+    /// in the daemon log was the entire signal.
+    ///
+    /// **The trigger here is deliberately not the mode-0775 condition the field
+    /// report hit** (issue #1047 / #329 §2, being fixed in parallel). Verifying
+    /// this against a directory mode would stop reproducing the moment that
+    /// lands, while proving nothing about the fallback, which is reachable
+    /// through every other `ContextPublishError`. A `.dot-agent-deck` that is a
+    /// regular FILE takes `open_context_dir`'s `O_DIRECTORY` branch and is
+    /// independent of every permission bit.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_unpublishable_coordinator_context_refuses_the_spawn_and_starts_no_role() {
+        let dir = crate::test_temp::tempdir().expect("tempdir for the orchestration cwd");
+        // `.dot-agent-deck` occupied by a regular file: the publish can neither
+        // create the directory nor open what is there as one.
+        std::fs::write(dir.path().join(".dot-agent-deck"), b"not a directory")
+            .expect("occupy the context dir path");
+
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let state: crate::state::SharedState =
+            Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
+        let notifier = RecordingNotifier::default();
+
+        // `SpawnHandle` carries a `Box<dyn FnOnce>` and so cannot be `Debug`;
+        // matched rather than `expect_err`'d for that reason alone.
+        let err = match spawn(
+            unpublishable_orchestration_request(dir.path(), None),
+            &registry,
+            &notifier,
+            None,
+            false,
+            Some(&state),
+        )
+        .await
+        {
+            Ok(_) => {
+                registry.shutdown_all();
+                panic!(
+                    "an orchestration with no publishable context must be refused, not spawned \
+                     with the orchestrator holding the bare task"
+                );
+            }
+            Err(e) => e,
+        };
+
+        assert!(
+            matches!(
+                err,
+                SpawnError::OrchestratorContext(
+                    crate::orchestrator_context::ContextPublishError::ContextDirUnusable(_)
+                )
+            ),
+            "the refusal must carry the publish cause so the caller can name the remedy, got: \
+             {err:?}"
+        );
+
+        // Nothing started. Distinct from the partial-spawn test above, which
+        // asserts the same emptiness after a TEARDOWN: here the refusal precedes
+        // the role loop, so a live record would mean the check landed too late.
+        let live = registry.agent_records();
+        assert!(
+            live.is_empty(),
+            "no role may start when the coordinator context was refused; still live: {:?}",
+            live.iter()
+                .map(|r| r.display_name.clone())
+                .collect::<Vec<_>>()
+        );
+        let guard = state.read().await;
+        assert!(
+            guard.pane_role_map.is_empty()
+                && guard.orchestrator_pane_ids.is_empty()
+                && guard.pane_orchestration_map.is_empty(),
+            "a refused orchestration must register nothing: roles {:?}, orchestrators {:?}, \
+             routing {:?}",
+            guard.pane_role_map,
+            guard.orchestrator_pane_ids,
+            guard.pane_orchestration_map
+        );
+        drop(guard);
+
+        // …and it was ANNOUNCED, through the same notification an abandoned
+        // spawn already uses, rather than only returned.
+        let seen = notifier.0.lock().expect("notifier mutex").clone();
+        let announced = seen.iter().any(|e| {
+            matches!(
+                e,
+                NotifyEvent::SpawnFailed { task, message }
+                    if task == "dispatch-refusal-1065" && message.contains("refused to start")
+            )
+        });
+        assert!(
+            announced,
+            "the refusal must reach the notifier, not only the return value: {seen:?}"
+        );
+
+        registry.shutdown_all();
+    }
+
+    /// Issue #1065, the trigger-independence half: the refusal is a property of
+    /// the PUBLISH failing, not of any one filesystem condition.
+    ///
+    /// `ContextTooLarge` is checked before a filesystem is touched at all — the
+    /// composed context is simply bigger than `MAX_CONTEXT_BYTES`, here because
+    /// the start role's own `prompt_template` is. So this reaches the same
+    /// refusal with no directory, no mode and no symlink involved, which is what
+    /// keeps the guarantee from being read as "the 0775 case is handled".
+    #[tokio::test]
+    async fn a_context_too_large_to_publish_refuses_the_spawn_just_as_a_bad_directory_does() {
+        let dir = crate::test_temp::tempdir().expect("tempdir for the orchestration cwd");
+        let oversized = "x".repeat(crate::orchestrator_context::MAX_CONTEXT_BYTES + 1);
+
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let notifier = RecordingNotifier::default();
+
+        let err = match spawn(
+            unpublishable_orchestration_request(dir.path(), Some(oversized)),
+            &registry,
+            &notifier,
+            None,
+            false,
+            None,
+        )
+        .await
+        {
+            Ok(_) => {
+                registry.shutdown_all();
+                panic!("a context over the size cap must refuse the spawn too");
+            }
+            Err(e) => e,
+        };
+
+        assert!(
+            matches!(
+                err,
+                SpawnError::OrchestratorContext(
+                    crate::orchestrator_context::ContextPublishError::ContextTooLarge(_)
+                )
+            ),
+            "expected the size refusal, got: {err:?}"
+        );
+        assert!(
+            registry.agent_records().is_empty(),
+            "no role may start for a context that was never publishable"
+        );
+        assert!(
+            !dir.path().join(".dot-agent-deck").exists(),
+            "the size cap is checked before a filesystem is touched, so nothing should have \
+             been created"
+        );
+
+        registry.shutdown_all();
+    }
+
+    /// Issue #1065's boundary: a producer that composes NOTHING
+    /// (`compose_orchestrator_context: None` — the #120 issue-dispatch and #127
+    /// scheduler paths) is untouched by the refusal.
+    ///
+    /// Those paths deliver `prompt` verbatim and never publish a context, so
+    /// there is no precondition for them to fail. Pinned because the obvious
+    /// over-reach of this fix — refusing whenever a context file is absent —
+    /// would break two shipped features that correctly have no context file at
+    /// all. Same occupied `.dot-agent-deck` as the refusal test above, so the
+    /// ONLY difference between green here and refused there is the field.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_producer_that_composes_no_context_is_unaffected_by_the_refusal() {
+        let dir = crate::test_temp::tempdir().expect("tempdir for the orchestration cwd");
+        std::fs::write(dir.path().join(".dot-agent-deck"), b"not a directory")
+            .expect("occupy the context dir path");
+
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let notifier = RecordingNotifier::default();
+
+        let mut req = unpublishable_orchestration_request(dir.path(), None);
+        req.compose_orchestrator_context = None;
+
+        // `detach_delivery: true` (what the #120 issue-dispatch producer itself
+        // passes): the assertion is about the spawn being ALLOWED, and awaiting
+        // the readiness gate for two `/bin/sh` panes would buy nothing but wall
+        // clock in the fast tier.
+        let handle = spawn(req, &registry, &notifier, None, true, None)
+            .await
+            .expect("a producer that composes no context must still spawn");
+        assert_eq!(handle.agents.len(), 2, "both roles must have started");
+        assert!(
+            notifier.0.lock().expect("notifier mutex").is_empty(),
+            "nothing was refused, so nothing should have been announced"
+        );
 
         registry.shutdown_all();
     }

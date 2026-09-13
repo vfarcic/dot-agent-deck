@@ -1338,6 +1338,152 @@ mod tests {
         );
     }
 
+    /// Issue #1065 — the other half of the test above, at the same altitude: the
+    /// context CANNOT be published, so the dispatch must be REFUSED rather than
+    /// quietly starting the team with the orchestrator holding the bare task.
+    ///
+    /// The test above pins the happy path — the context file lands in the
+    /// worktree carrying the template, the agent list, the delegation protocol
+    /// and the task. Nothing pinned what happens when the publish fails, and
+    /// what happened was: one `warn!`, then six agents whose orchestrator had
+    /// been told none of it. Five sat idle while the first implemented the whole
+    /// PRD solo, and the pane labels, role cards and `daemon status` were
+    /// indistinguishable from a working team throughout. Measured twice on PRD
+    /// #742.
+    ///
+    /// **The trigger is deliberately NOT the mode-0775 condition the field
+    /// report hit** (issue #1047, and the tracked `.dot-agent-deck` files of
+    /// #329 §2 that produce it in a dispatch worktree). Those are being fixed
+    /// separately, and a test keyed to them would stop reproducing the moment
+    /// they land while proving nothing about the fallback — which stays
+    /// reachable through every other `ContextPublishError`. A committed
+    /// `.dot-agent-deck` SYMLINK is checked out into the worktree by `git
+    /// worktree add` and takes `open_context_dir`'s `O_NOFOLLOW` refusal, so it
+    /// depends on no permission bit anywhere.
+    ///
+    /// What this asserts beyond the refusal itself is that the refusal costs
+    /// nothing: the context is composed BEFORE the role loop, so no role ever
+    /// started, and the rollback reclaims the worktree and its branch — the
+    /// dispatch name is free to retry once the operator fixes the directory.
+    // Unix: `core.symlinks` and the `O_NOFOLLOW` refusal are both POSIX-shaped,
+    // and the fast tier runs on Windows CI too, where git would check the entry
+    // out as a plain file and the test would pass for a different reason.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_dispatch_whose_coordinator_context_cannot_be_published_is_refused_not_degraded() {
+        let tmp = crate::test_temp::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        init_repo(&repo);
+        std::fs::write(
+            repo.join(".dot-agent-deck.toml"),
+            "[[orchestrations]]\nname = \"refused-orch\"\n\n\
+             [[orchestrations.roles]]\nname = \"orchestrator\"\ncommand = \"cat\"\nstart = true\n\n\
+             [[orchestrations.roles]]\nname = \"worker\"\ncommand = \"cat\"\ndescription = \"Does the work\"\n",
+        )
+        .unwrap();
+        // The obstruction: `.dot-agent-deck` is a symlink in the committed tree,
+        // so the worktree `git worktree add` cuts has one too, and the publish
+        // refuses to write the coordinator context through it. Dangling on
+        // purpose — `open_context_dir` refuses the final component by its own
+        // `O_NOFOLLOW`, never by consulting the target.
+        std::os::unix::fs::symlink("nowhere", repo.join(".dot-agent-deck"))
+            .expect("plant the symlinked context dir");
+        // The shape is resolved from the CALLER's repo, but the roles run in a
+        // HEAD checkout, so both the config and the symlink have to be committed.
+        git_in(&repo, &["add", "-A"]);
+        git_in(
+            &repo,
+            &[
+                "commit",
+                "-qm",
+                "add orchestration and a symlinked context dir",
+            ],
+        );
+
+        let (event_tx, _rx) = tokio::sync::broadcast::channel(64);
+        let state: crate::state::SharedState =
+            Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
+        let ctx = DispatchContext {
+            working_dir: repo.clone(),
+            registry: Arc::new(AgentPtyRegistry::new()),
+            event_tx,
+            worktrees: new_worktree_registry(),
+            default_command: None,
+            state: Some(state.clone()),
+        };
+
+        let result = handle_dispatch(
+            &ctx,
+            "refused-unit",
+            "Implement PRD #742 end to end.",
+            Some(&crate::event::DispatchShape::Orchestration { name: None }),
+        )
+        .await;
+
+        // Reclaim the sibling worktree regardless of the assertions below.
+        struct Guard(std::path::PathBuf, Arc<AgentPtyRegistry>);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                self.1.shutdown_all();
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _guard = Guard(result.worktree_dir.clone(), ctx.registry.clone());
+
+        assert!(
+            !result.success,
+            "an unpublishable coordinator context must fail the dispatch, not degrade it: {}",
+            result.message
+        );
+        // The dispatcher relays this message to the user verbatim, and for a
+        // fire-and-forget dispatch it is the only return edge there is — so it
+        // has to say both that the orchestration was refused and what to fix.
+        assert!(
+            result
+                .message
+                .contains("refused to start the orchestration"),
+            "the reply must say the orchestration was refused: {}",
+            result.message
+        );
+        assert!(
+            result.message.contains(".dot-agent-deck") && result.message.contains("symlink"),
+            "…and name the obstruction the operator has to clear: {}",
+            result.message
+        );
+
+        // Nothing was started, and nothing is left to clean up by hand. This is
+        // stronger than the #600 teardown the sibling test asserts: the context
+        // is composed before the role loop, so no role was ever forked.
+        let live = ctx.registry.agent_records();
+        assert!(
+            live.is_empty(),
+            "a refused dispatch must start no role at all; found {} live: {:?}",
+            live.len(),
+            live.iter()
+                .map(|r| (r.display_name.clone(), r.cwd.clone()))
+                .collect::<Vec<_>>()
+        );
+        let guard = state.read().await;
+        assert!(
+            guard.pane_role_map.is_empty() && guard.orchestrator_pane_ids.is_empty(),
+            "…and register nothing: roles {:?}, orchestrators {:?}",
+            guard.pane_role_map,
+            guard.orchestrator_pane_ids
+        );
+        drop(guard);
+
+        // …so the rollback reclaims the tree and the branch, and the dispatch
+        // name is free to retry the moment the operator fixes the directory.
+        assert!(
+            !result.worktree_dir.exists(),
+            "with nothing live in it, the worktree must be reclaimed"
+        );
+        assert!(
+            !branch_exists(&repo, "agent/dispatch-refused-unit"),
+            "…and its branch deleted, so the name is not wedged"
+        );
+    }
+
     /// Issues #575 and #600 — the partial-orchestration dispatch, at the altitude
     /// the user meets it: one role's command is wrong, the dispatch reports
     /// failure, and the roles that DID start are left running as orphans in a

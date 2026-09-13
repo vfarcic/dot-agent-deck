@@ -434,13 +434,21 @@ pub fn prepare_orchestrator_context(
 /// Write the orchestrator context to a file and return a one-liner to inject.
 /// Multi-line prompts don't submit in Claude Code via PTY, so we use a file reference.
 ///
-/// The `Option` return is kept for the three pre-existing callers — the
-/// interactive `Ctrl+n` path (`crate::ui`), the daemon spawn path
-/// (`crate::spawn`) and the desktop's launch flow — each of which already has a
-/// degraded behaviour for "no context file" and no way to act on a cause. The
-/// cause is no longer *lost*, though: it is logged here, and a caller that needs
-/// it calls [`prepare_orchestrator_context`] instead. PRD #819's daemon verb is
-/// that caller.
+/// The `Option` return is kept for the INTERACTIVE path and nothing else: the
+/// `Ctrl+n` new-pane flow in `crate::ui`, and the re-arm
+/// [`reassert_orchestrator_prompt`] performs for it on compaction or `/clear`.
+/// A person is at that keyboard, the pane is on screen, and the degraded
+/// outcome — an orchestrator holding no pointer line — is one they can see and
+/// answer.
+///
+/// **Issue #1065 took the daemon spawn path off this function.** `crate::spawn`
+/// called it and did `.unwrap_or_else(|| req.prompt.clone())`, which turned a
+/// publish failure into a team whose orchestrator silently held the bare task
+/// text — fire-and-forget, with nobody watching the pane and one `warn!` in the
+/// daemon log as the only trace. It now calls
+/// [`prepare_orchestrator_context`] and refuses the spawn on `Err`. PRD #819's
+/// daemon verb (`crate::project_resolve`) is the other `Result` caller, and
+/// refuses for the same reason.
 pub fn prepare_orchestrator_prompt(
     config: &OrchestrationConfig,
     cwd: &str,
