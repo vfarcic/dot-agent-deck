@@ -165,7 +165,12 @@ mod pr_review_verdict;
 /// one that no compile step sees. Same argument rule 5 records for
 /// `clean_tmp.rs`. Tests only; driven against a synthetic `PROC_ROOT` with
 /// signals recorded rather than sent, so no test ever signals a real process.
-#[cfg(test)]
+///
+/// Linux-only by `#[cfg]`, not by a runtime SKIP: the script reads `/proc` and
+/// uses GNU `stat -c`, so there is nothing for it to be correct about on macOS
+/// or Windows and a vacuous pass there would be worse than an absent test. The
+/// installed systemd timer is Linux-only for the same reason.
+#[cfg(all(test, target_os = "linux"))]
 mod reap_orphans;
 /// PRD #740: the job-graph properties in `release.yml` that keep a desktop
 /// bundler failure off the CLI release. Tests only — nothing can run that
