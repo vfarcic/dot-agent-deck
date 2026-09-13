@@ -41,7 +41,7 @@ Three rules about sequencing, each of which exists because of a specific ruleset
 - **Resolve every review thread.** `required_review_thread_resolution: true` is what turns "read Greptile's inline comments" from a habit into something the merge button enforces — see [What is gated](#what-is-gated).
 - **The author merges after approval, or arms auto-merge.** Nothing in the ruleset constrains who presses the button (`require_last_push_approval` is `false`), and the approving maintainer is under no obligation to. Reviewer-merges is a Prow/Kubernetes convention in which a *bot* merges on `/lgtm`; the GitHub-native equivalent is auto-merge, queued by the author. **Auto-merge was enabled on 2026-08-11** (`allow_auto_merge: true`), so an author may arm a pull request and let GitHub land it when the ruleset is satisfied. The objection previously recorded here — that arming it early lets the author "never return to the pull request" — does not survive the two rules above: auto-merge waits for the required approval, so a human still reads and judges, and `required_review_thread_resolution: true` means an armed pull request cannot merge while Greptile's threads sit unresolved. Someone must still clear them by hand. **That safety rests entirely on the ruleset being in force**, though, because `allow_auto_merge` is a repository setting the ruleset knows nothing about: lift the gate with an armed pull request outstanding and it lands unreviewed on the spot. [Emergency override](#emergency-override) therefore disarms before it deletes.
 
-**Never merge your own unapproved pull request.** For the owner it will succeed — the admin bypass makes it silent rather than blocked — and that silence is precisely the decay this arrangement exists to prevent. An automated flow whose last step is a merge (`/prd-done`, `/prd-full`) may arm auto-merge and hand off, since that cannot land anything unapproved, but it must never merge directly.
+**Never merge your own unapproved pull request.** For the owner it will succeed — the admin bypass makes it silent rather than blocked — and that silence is precisely the decay this arrangement exists to prevent. An automated flow whose last step is a merge (`/pr-create`, `/prd-full`) may arm auto-merge and hand off, since that cannot land anything unapproved, but it must never merge directly.
 
 ## Why CI has to change first
 
@@ -130,7 +130,28 @@ The `required_review_thread_resolution` rule is not a problem here in practice �
 
 Everything that lands on `main`, uniformly: one approving review from a maintainer, all review threads resolved, no deletion, no force-push. There is no path scoping — see [Who counts as a maintainer](#who-counts-as-a-maintainer) for why, and for the round-trip-on-a-typo cost that comes with it.
 
-The requirement that review threads resolve before merge is doing specific work. Greptile reviews every pull request and re-reviews on each push, and its actual findings live in the inline comments rather than in the check-run or the summary — a green check has accompanied real P1 defects here before (CLAUDE.md rule 8). Thread resolution is what turns "read the inline comments" from a habit into something the merge button enforces.
+The requirement that review threads resolve before merge is doing specific work. Greptile reviews every pull request **once, when it opens** — `greptile.json` sets `triggerOnUpdates: false`, so it does not re-review after you push fixes — and its actual findings live in the inline comments rather than in the check-run or the summary: a green check has accompanied real P1 defects here before. See [The automated reviewer](#the-automated-reviewer). Thread resolution is what turns "read the inline comments" from a habit into something the merge button enforces.
+
+## The automated reviewer
+
+Greptile is the only automated reviewer active on this repository. CodeRabbit is **not** — it posts neither a review nor a pending placeholder, so any wait that requires a CodeRabbit signal hangs to its full timeout on every run.
+
+It publishes on four surfaces, and the one that matters is the last:
+
+| surface | how to read it |
+|---|---|
+| a `Greptile Review` **check-run** | `gh pr checks <n>` — goes pending, then completes. This is how you know it is done. |
+| a summary issue comment by `greptile-apps` | `gh pr view <n> --json comments` — an overview and a confidence score |
+| a review object, usually `COMMENTED` | `gh pr view <n> --json reviews` |
+| **the inline findings** | `gh api repos/{owner}/{repo}/pulls/<n>/comments --paginate` |
+
+**A green check-run is not the review.** The findings live only in the inline comments; a `COMMENTED` review with a passing check can still carry real P1 defects — verified on #286, where a passing check accompanied two valid findings, one of which shipped and needed the follow-up #287. Keep `--paginate`: replies count toward the page, so a busy pull request silently truncates the findings you are about to certify as read.
+
+**It is deliberately not a required check.** An approval is a judgment call, and deliberately waiving a Greptile finding is a legitimate approval — gating on the reviewer would turn advice into a veto. Judgment-bearing signals stay unrequired; the objective ones are listed under [What is gated](#what-is-gated).
+
+**Silence usually means the monthly quota, not a broken integration — and it looks identical to the app being uninstalled.** An exhausted quota creates **no check-run at all**, with no message anywhere in the repository. Measured 2026-08-23: it reviewed every pull request through #597 and then stopped dead — zero comments *and* zero check-runs afterwards — with the dashboard reading exactly 300 used. The cause was `triggerOnUpdates: true`, which spent the cap on re-reviews (94 pull requests at ~3.4 commits each is ~320 triggers against a 300 cap), buying deep coverage of the first ~88 and nothing for the rest. Setting it `false` costs the re-review after you push fixes — a small loss, since `dismiss_stale_reviews_on_push` already forces a human to look again — and buys every pull request a review with headroom.
+
+Two consequences for anything that waits on it. **Never block a merge on the reviewer**: an exhausted month is indistinguishable from an uninstalled app from inside the repository, so check the dashboard before concluding the integration broke. And **bound the wait**: a wait keyed on "the check-run appears" never terminates when no check-run is ever created. The [`pr-create`](../../.claude/skills/pr-create/SKILL.md) skill does this — after its budget it proceeds and reports that no automated review was obtained, which is a result rather than a pass.
 
 ## Making the gate bind the owner too
 

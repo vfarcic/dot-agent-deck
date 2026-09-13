@@ -417,13 +417,13 @@ Two things `/prd-full` cannot supply on its own, both of which the task must:
 Run PRD #<n> end to end in this worktree.
 
 Execute the /prd-full skill with prdNumber=<n> and mode=branch. Its instructions
-are at .claude/skills/dot-ai-prd-full/SKILL.md in this worktree. Read CLAUDE.md
+are at .claude/skills/prd-full/SKILL.md in this worktree. Read CLAUDE.md
 first — it governs the gates below and overrides anything that conflicts with it.
 
 YOU ARE ALREADY ISOLATED. dot-agent-deck cut this worktree for you and you are
 already on branch agent/dispatch-prd-<n>. So mode is `branch`, and you SKIP every
 branch-or-worktree creation step in the lifecycle: /prd-full step 1, /prd-start's
-branch creation, and /prd-done's "Create feature branch". Stay on
+branch creation, and /pr-create's "Create feature branch". Stay on
 agent/dispatch-prd-<n> and open the PR from it. Do NOT run /worktree-prd — it
 would cut a second worktree off local `main`, outside this pane's cwd.
 
@@ -505,10 +505,15 @@ greptile.json sets triggerOnUpdates: false, so do NOT wait for a re-review
 after you push fixes. Its findings live ONLY at
 `gh api repos/<owner>/<repo>/pulls/<pr>/comments --paginate`; the green
 `Greptile Review` check and the summary comment carry none of them. Keep the
---paginate: that endpoint pages at 30 and replies count toward the 30, so
-without it a busy PR silently truncates the findings you are about to answer. Fetch that endpoint once the
-check-run completes and reply on each thread — what you fixed, or why you did
-not — BEFORE you notify and stop. Do not defer it to the merge: this run stops
+--paginate: replies count toward the page, so without it a busy PR silently
+truncates the findings you are about to answer. Fetch that endpoint once the
+check-run completes, reply on each thread — what you fixed, or why you did
+not — AND RESOLVE THE THREAD, BEFORE you notify and stop. Resolving is half
+the job: an unresolved thread blocks the merge button AND the approval the
+merge needs, so a PR with every finding fixed still sits (PR #1035 sat a day
+that way). Bound the wait: a reviewer that is out of quota produces no
+check-run at all, so "wait until it appears" never returns — after a
+reasonable budget, proceed and report that no review was obtained. Do not defer it to the merge: this run stops
 before merge, and an armed auto-merge PR lands the moment the approval arrives,
 so a finding left for "before merging" is read by nobody. Measured on PR #869:
 five findings, two P1, unanswered through 3h45m of further commits.
@@ -557,7 +562,7 @@ lifecycle, and it covers what /prd-full does not.
 
 - You are already isolated. dot-agent-deck cut this worktree and you are on
   branch agent/dispatch-prd-<n>. Neither you nor any worker creates a branch or
-  a worktree: skip /prd-done's "Create feature branch" step and open the PR from
+  a worktree: skip /pr-create's "Create feature branch" step and open the PR from
   agent/dispatch-prd-<n>. Do not delegate /worktree-prd to anyone.
 - Nobody is watching this pane. `dispatch` is fire-and-forget with no return
   edge, so your notifications are the only channel out of this unit — treat the

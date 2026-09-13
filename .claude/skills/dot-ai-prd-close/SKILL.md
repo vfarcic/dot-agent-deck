@@ -17,7 +17,7 @@ Close a PRD that is already implemented (in previous work or external projects) 
 - ✅ No new code implementation is needed in this repository
 
 **DO NOT use `/prd-close` when:**
-- ❌ You just finished implementing the PRD (use `/prd-done` instead)
+- ❌ You just finished implementing the PRD (use `/pr-create` instead)
 - ❌ PRD has active implementation work in progress
 - ❌ There are uncommitted code changes that need to be part of a PR
 

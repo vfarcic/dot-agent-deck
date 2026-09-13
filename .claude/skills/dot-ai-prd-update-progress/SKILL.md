@@ -314,7 +314,7 @@ To continue working on this PRD:
 
 To finalize:
 1. Clear/reset the conversation context
-2. Run `/prd-done` to move the PRD to the done folder and close the GitHub issue
+2. Run `/pr-create` to open the pull request. The PRD moves to `prds/done/` as part of that branch's work, and the issue closes on merge via `Closes #N`.
 
 ---
 

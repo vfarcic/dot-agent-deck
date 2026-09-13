@@ -673,8 +673,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-      # Issue #552 — the 35 tracked symlinks (AGENTS.md -> CLAUDE.md, the 33
-      # entries under .agents/skills/, docs/img) have to come out of a checkout
+      # Issue #552 — the tracked symlinks (AGENTS.md -> CLAUDE.md,
+      # .agents/skills -> ../.claude/skills, docs/img) have to come out of a checkout
       # as LINKS. Where they do not, git writes each one as a plain text file
       # containing the target path, so AGENTS.md becomes a 9-byte file reading
       # "CLAUDE.md" and Codex/OpenCode — which read AGENTS.md for the project's

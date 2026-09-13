@@ -78,5 +78,5 @@ On success, tell the user:
 
 - **Same sha → no-op**: re-running on a SHA that's already published is harmless — the workflow pushes the same image bytes and the `values.yaml` diff is empty, so no commit happens.
 - **`:latest` is untouched**: manual runs never push or move the `:latest` tag. That tag follows formal releases only.
-- **Not for release flows**: do not run this inside `/prd-done`, `/dot-ai-prd-full`, or any release skill — it would interfere with the release path's own docs publish step.
+- **Not for release flows**: do not run this inside `/pr-create`, `/prd-full`, or any release skill — it would interfere with the release path's own docs publish step.
 - **No changelog fragment**: a docs-only publish is not a release, so no entry in `changelog.d/` is needed.
