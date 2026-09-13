@@ -60,6 +60,7 @@ function runtime(overrides: Partial<DeckRuntimeState> = {}): DeckRuntimeState {
     mode: "fixture",
     snapshot: createFixtureSnapshot("crowded"),
     terminalData: {},
+    clearError: vi.fn(),
     runAction: vi.fn(async () => ({ ok: true }) as import("../types").DeckActionResult),
     sendTerminalInput: vi.fn(async () => undefined),
     resizeTerminal: vi.fn(async () => undefined),

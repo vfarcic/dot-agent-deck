@@ -631,6 +631,15 @@ export interface DeckRuntimeState {
   /** Direct PTY-byte path that bypasses React state; absent in tests/fixture. */
   terminalFeed?: TerminalFeed;
   error?: string;
+  /**
+   * Drop the last action's error (issue #1046).
+   *
+   * Required rather than optional: the deck's one toast renders on
+   * `notice || error`, so a runtime that cannot clear `error` produces a toast
+   * whose dismiss button silently does nothing — which is exactly the bug this
+   * closes, and a fake that omits this member should stop type-checking.
+   */
+  clearError: () => void;
   runAction: (action: DeckAction) => Promise<DeckActionResult>;
   sendTerminalInput: (agentId: string, data: string) => Promise<void>;
   resizeTerminal: (agentId: string, cols: number, rows: number) => Promise<void>;

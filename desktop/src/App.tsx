@@ -788,7 +788,7 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
       {paletteOpen && <CommandPalette commands={commandItems} onClose={() => setPaletteOpen(false)} />}
       {helpOpen && <ShortcutHelp onClose={() => setHelpOpen(false)} />}
       {confirm && <ConfirmDialog state={confirm} onClose={() => setConfirm(undefined)} />}
-      {(notice || runtime.error) && <div className="toast" role="status"><AlertTriangle size={15} /><span>{notice ?? runtime.error}</span><button aria-label="Dismiss message" onClick={() => setNotice(undefined)}><X size={14} /></button></div>}
+      {(notice || runtime.error) && <div className="toast" role="status"><AlertTriangle size={15} /><span>{notice ?? runtime.error}</span><button aria-label="Dismiss message" onClick={() => { setNotice(undefined); runtime.clearError(); }}><X size={14} /></button></div>}
     </div>
   );
 }

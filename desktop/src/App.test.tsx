@@ -1,4 +1,5 @@
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { useMemo, useState } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createFixtureSnapshot } from "./data/fixture";
 import { WINDOWS_WORKFLOW_BLOCK_REASON } from "./lib/platform";
@@ -36,6 +37,7 @@ function runtime(overrides: Partial<DeckRuntimeState> = {}): DeckRuntimeState {
     mode: "fixture",
     snapshot: createFixtureSnapshot("connected"),
     terminalData: {},
+    clearError: vi.fn(),
     runAction: vi.fn(async () => ({ ok: true }) as import("./types").DeckActionResult),
     sendTerminalInput: vi.fn(async () => undefined),
     resizeTerminal: vi.fn(async () => undefined),
@@ -1538,6 +1540,57 @@ describe("ControlDeck", () => {
     // that name reaches the footer as the reported path it is, hover included.
     const reported = render(<ControlDeck runtime={runtime({ mode: "live", snapshot: mapDesktopSnapshot({ connection, agents: [{ ...agent, cwd: "Unavailable" }], protocolVersion: 8, source: "daemon" }) })} />);
     expect(reported.container.querySelector(".agent-footer span:nth-child(2)")).toHaveAttribute("title", "Unavailable");
+  });
+
+  /**
+   * Issue #1046: a deck whose `error` is real state, cleared by the same
+   * `clearError` the button calls — which is what `useDeckRuntime` gives the
+   * app. A fake whose `clearError` were only a spy would let the assertion
+   * below pass while the toast stayed on screen for a user, since the toast
+   * renders on `notice || error` and re-renders from whatever `error` still is.
+   */
+  function DeckWithClearableError({ message }: { message: string }) {
+    const base = useMemo(() => runtime({ mode: "live" }), []);
+    const [error, setError] = useState<string | undefined>(message);
+    return <ControlDeck runtime={{ ...base, error, clearError: () => setError(undefined) }} />;
+  }
+
+  /**
+   * Scenario: a daemon-side failure fills the toast through `runtime.error`
+   * rather than through the deck's own `notice`, and the user clicks the X. The
+   * toast goes. It used to stay: the handler cleared `notice` — which was
+   * already undefined — and left the error that was actually on screen, so the
+   * button was inoperative for every error-sourced message and the two sources
+   * were indistinguishable to whoever clicked.
+   */
+  it("dismisses a toast that came from the runtime's error, not only one from a notice", async () => {
+    const message = "daemon returned error: publish-failed: the project's .dot-agent-deck directory is writable by group or other";
+    render(<DeckWithClearableError message={message} />);
+    expect(await screen.findByText(message)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByLabelText("Dismiss message"));
+
+    await waitFor(() => expect(screen.queryByText(message)).not.toBeInTheDocument());
+  });
+
+  /**
+   * The other half of the same click: the deck's own notices still clear, and
+   * they clear through `setNotice` rather than through the runtime — so a
+   * runtime that never errored is not asked to do anything on its behalf.
+   */
+  it("still dismisses a notice the deck raised itself", async () => {
+    const started = "Local deck started and control channel reconnected.";
+    const disconnected = createFixtureSnapshot("disconnected");
+    disconnected.agents = [];
+    render(<ControlDeck runtime={runtime({ mode: "live", snapshot: disconnected })} />);
+
+    fireEvent.click(screen.getByTestId("start-daemon"));
+    fireEvent.click(screen.getAllByRole("button", { name: "Start deck" }).at(-1)!);
+    expect(await screen.findByText(started)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByLabelText("Dismiss message"));
+
+    await waitFor(() => expect(screen.queryByText(started)).not.toBeInTheDocument());
   });
 
   /**
