@@ -1358,8 +1358,9 @@ mod tests {
     /// they land while proving nothing about the fallback — which stays
     /// reachable through every other `ContextPublishError`. A committed
     /// `.dot-agent-deck` SYMLINK is checked out into the worktree by `git
-    /// worktree add` and takes `open_context_dir`'s `O_NOFOLLOW` refusal, so it
-    /// depends on no permission bit anywhere.
+    /// worktree add` and takes `open_context_dir`'s `O_NOFOLLOW` refusal, which
+    /// lands before `refuse_a_writable_context_dir` — the mode check #1047 is
+    /// about — is consulted at all.
     ///
     /// What this asserts beyond the refusal itself is that the refusal costs
     /// nothing: the context is composed BEFORE the role loop, so no role ever

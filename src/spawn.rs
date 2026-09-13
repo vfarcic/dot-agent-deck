@@ -674,10 +674,10 @@ pub async fn spawn(
             // `prepare_orchestrator_prompt(…).unwrap_or_else(|| req.prompt.clone())`
             // — one `warn!` in the daemon log, and then the team started with the
             // orchestrator holding the bare task text and no role template, no
-            // `## Available agents`, no `## Delegation protocol`. It looks healthy
-            // from every angle a user has: the pane labels, the role cards and
-            // `daemon status` are indistinguishable from a working team, so the
-            // first role implements the whole task solo while the rest idle. The
+            // `## Available agents`, no `## Delegation protocol`. It also LOOKS
+            // healthy: the pane labels, the role cards and the `daemon status`
+            // rows are indistinguishable from a working team, so the first role
+            // implements the whole task solo while the rest idle. The
             // fallback is defensible where it came from — for a single agent the
             // prompt IS the whole story — but for an orchestration the wrapper is
             // the instruction, so delivering the task without it produces an agent
@@ -685,10 +685,10 @@ pub async fn spawn(
             // on PRD #742.
             //
             // Composed HERE, before the role loop, rather than where the old
-            // fallback sat (after it, just above the delivery): that is what makes
-            // the refusal cost nothing. No role has been spawned yet, so there is
-            // nothing for `roll_back_partial_orchestration` to tear down, and
-            // `dispatch`'s own rollback reclaims the worktree and the branch
+            // fallback sat (after it, just above the delivery): that is what
+            // keeps the refusal from spending an agent. No role has been spawned
+            // yet, so there is nothing for `roll_back_partial_orchestration` to
+            // tear down, and `dispatch`'s rollback reclaims the worktree and branch
             // against a tree nothing ever occupied. It also fits the invariant
             // issue #600 already established for this branch — `Err` from `spawn`
             // means "nothing is running" — instead of inventing a second,
@@ -703,10 +703,11 @@ pub async fn spawn(
                     )
                     .map_err(|e| {
                         // `error!`, not `warn!`: the old `warn!` inside
-                        // `prepare_orchestrator_prompt` was the ONLY trace of a
-                        // degradation that cost a whole PRD's worth of agent time,
-                        // and it was one line in a log nobody reads during a
-                        // fire-and-forget dispatch.
+                        // `prepare_orchestrator_prompt` was the only thing the
+                        // daemon log said about a degradation that cost a whole
+                        // PRD's worth of agent time — one line, in a log nobody
+                        // reads during a fire-and-forget dispatch, while the reply
+                        // written into the caller's pane said the spawn worked.
                         tracing::error!(
                             orchestration = %name,
                             dir = %req.working_dir,
@@ -6206,18 +6207,19 @@ mod tests {
     ///
     /// This used to spawn the whole team and hand the orchestrator
     /// `req.prompt` verbatim: no role template, no `## Available agents`, no
-    /// `## Delegation protocol`. Every surface a user has — the pane labels, the
-    /// role cards, `daemon status` — looked exactly like a working team while
-    /// the first role implemented the task solo and the rest idled. One `warn!`
-    /// in the daemon log was the entire signal.
+    /// `## Delegation protocol`. The surfaces a user reads — the pane labels,
+    /// the role cards, `daemon status` — looked exactly like a working team
+    /// while the first role implemented the task solo and the rest idled, and
+    /// the daemon log said it in one `warn!` line.
     ///
     /// **The trigger here is deliberately not the mode-0775 condition the field
     /// report hit** (issue #1047 / #329 §2, being fixed in parallel). Verifying
     /// this against a directory mode would stop reproducing the moment that
     /// lands, while proving nothing about the fallback, which is reachable
     /// through every other `ContextPublishError`. A `.dot-agent-deck` that is a
-    /// regular FILE takes `open_context_dir`'s `O_DIRECTORY` branch and is
-    /// independent of every permission bit.
+    /// regular FILE fails `open_context_dir`'s `O_DIRECTORY` open, so
+    /// `refuse_a_writable_context_dir` — the mode check #1047 is about — is never
+    /// reached at all.
     #[cfg(unix)]
     #[tokio::test]
     async fn an_unpublishable_coordinator_context_refuses_the_spawn_and_starts_no_role() {
