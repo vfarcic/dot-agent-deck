@@ -578,35 +578,11 @@ The warning is non-blocking: press `Enter` and the tab opens as usual. It exists
 
 ## The `.dot-agent-deck` directory
 
-Everything an orchestration needs to hand work between agents lands in `.dot-agent-deck/` at the root of the directory the orchestration runs in: the coordinator's own brief (`orchestrator-context.md`), the per-role task and report files described above, and any `<slug>.md` an orchestrator writes when it hands a task over as a file. It is working state, not a record — nothing in it is meant to outlive the run that wrote it.
+Coordination files — the coordinator's brief, the per-role task and report files, and any task file an orchestrator writes — live in `.dot-agent-deck/` at the root of the directory the orchestration runs in. It is working state, not a record.
 
-### Permissions
+Two things the deck does to that directory are worth knowing about, because both are changes to your own filesystem. It keeps the files owner-only, which means clearing group and other **write** from the directory when they are set — the equivalent of `chmod go-w`, and nothing else. And it adds `.dot-agent-deck/` to the clone-local `.git/info/exclude` the first time it publishes there, so coordination files never show up as untracked; your committed `.gitignore` is left alone.
 
-The deck creates `.dot-agent-deck/` owner-only (`0700`) and writes every coordination file owner-only (`0600`). Task text and worker reports routinely carry the contents of an issue, a diff or a plan, and on a machine with other accounts on it the default `umask` would otherwise leave them world-readable.
-
-A directory that already exists is treated more carefully, because it may be one you created. The deck clears **group and other write** from it before publishing — the equivalent of `chmod go-w`, and nothing more — and leaves read and execute exactly as they were, so a shared group can still list a directory it legitimately lists. It has to clear those bits: a `0600` file is only as protected as the directory holding it, and an account that can write the directory can replace the coordinator's brief with one of its own after the deck has written it.
-
-Neither `.dot-agent-deck/` nor a file inside it is followed through a symlink. A coordination file that is a link to something else would otherwise have that target truncated, rewritten and re-permissioned by the next delegation. When a coordination file is refused for this or any other reason the worker is handed its task inline instead, so the run continues.
-
-If the directory's write bits cannot be cleared — it belongs to another account, or the filesystem is read-only — the launch is refused rather than published into, and the message names the directory, its mode and the command to run:
-
-```
-publish-failed: /home/you/project/.dot-agent-deck is mode 0775, which grants write to
-group or other — another local account could replace the coordinator context's directory
-entry after it is published. The deck tried to clear those bits and could not, so
-publishing is refused. On the machine running the deck, run:
-chmod go-w '/home/you/project/.dot-agent-deck'
-```
-
-### Keeping it out of git
-
-Coordination files hold whatever you and your agents put in them, so committing one is rarely what you want. The deck adds `.dot-agent-deck/` to the clone-local `.git/info/exclude` — per-clone and never committed — the first time it publishes into a project, and `dot-agent-deck init` does the same. Your own `.gitignore` is left alone; it is the project's file, not the deck's.
-
-One thing no ignore rule can do is un-track a file that is **already** tracked. If a coordination file was committed before the rule existed, git keeps offering its changes until you run `git rm --cached` on it.
-
-### Retention
-
-Coordination files older than **14 days** are removed when a workflow next publishes into that directory. Only `*.md` files directly inside `.dot-agent-deck/` are eligible, plus the deck's own leftover temp files; subdirectories, symlinks, anything without an `.md` extension, and the live `orchestrator-context.md` are never touched, and nothing inside the window is either. Set `DOT_AGENT_DECK_COORDINATION_RETENTION_DAYS` to change the window, or to `0` to turn the sweep off entirely.
+Coordination files older than **14 days** are deleted when a workflow next publishes into that directory. Only `*.md` files directly inside `.dot-agent-deck/` are eligible — never a subdirectory, and never the live `orchestrator-context.md`. Set `DOT_AGENT_DECK_COORDINATION_RETENTION_DAYS` to change the window, or to `0` to turn it off.
 
 ## Troubleshooting
 
