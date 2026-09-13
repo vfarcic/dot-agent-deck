@@ -1417,8 +1417,22 @@ pub const COORDINATION_RETENTION_ENV: &str = "DOT_AGENT_DECK_COORDINATION_RETENT
 ///
 /// A bound rather than a `read_dir` to exhaustion, for the same reason every
 /// other read in this daemon is bounded: the directory's contents are written by
-/// agents, and the publish that calls this is on a launch path.
-const MAX_SWEEP_ENTRIES: usize = 10_000;
+/// agents, so its size is not this process's to assume.
+///
+/// **512 rather than something roomier, because a publish is not always a
+/// launch.** `crate::ui`'s `/clear` and compaction re-arm calls
+/// [`reassert_orchestrator_prompt`], which publishes, and it does so **on the
+/// render thread** — rate-floored at 250 ms per pending edge
+/// (`CLEAR_REASSERT_RETRY_FLOOR`), so a persistently failing re-arm can reach
+/// 4 Hz. A few hundred `lstat`s at that rate is lost in a frame; ten thousand
+/// would be a visible stutter in the TUI.
+///
+/// Nothing is given up by the smaller number, because the window rotates
+/// ([`SWEEP_OFFSET`]): a directory larger than this is covered across
+/// successive publishes rather than in one, and the thing being waited for is a
+/// **14-day** retention window. Even a 10 000-entry directory is swept through
+/// in ~20 publishes.
+const MAX_SWEEP_ENTRIES: usize = 512;
 
 /// Where the next bounded sweep starts.
 ///
@@ -1427,6 +1441,8 @@ const MAX_SWEEP_ENTRIES: usize = 10_000;
 /// creation order, so in a directory larger than [`MAX_SWEEP_ENTRIES`] the same
 /// young prefix can be re-examined on every publish while genuinely aged files
 /// beyond it are never visited and the retention window never takes effect.
+/// This is what lets that bound be set for the *cost* of one sweep rather than
+/// for the size of any directory anyone might have.
 ///
 /// So the window rotates: each sweep resumes where the last one stopped, and
 /// resets to zero as soon as a window runs short, which is how the end of the
