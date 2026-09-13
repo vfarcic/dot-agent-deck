@@ -191,8 +191,6 @@ Task text passed inline goes through the orchestrator's own shell before dot-age
 
 That default assumes the agent is *authorized* to write a file, which is not the same as having a file-writing tool: a role launched with a restricted tool allowlist — `claude --allowedTools Bash Read`, say — hits an interactive approval prompt instead, and an unattended pane parks there forever. The protocol has a fallback for that case, but it cannot grant itself the tool. That part is yours: if a role is expected to take the primary path, add the file-writing tool to its `command`'s allowlist (e.g. `--allowedTools Bash Read Write`) so it never meets the prompt.
 
-Those files stay where they are written — the deck does not delete them, and an orchestrator is expected to remove its own task file once the delegation has gone through. If a long-lived checkout has accumulated ones nobody cleaned up, set `DOT_AGENT_DECK_COORDINATION_RETENTION_DAYS=14` and files older than that are removed the next time a workflow publishes into that directory.
-
 ### Use a tracking file
 
 The most effective pattern is to give the orchestrator a spec or task file — a PRD, a checklist, whatever suits your workflow — and tell it to read the file and keep it updated as work progresses. You can do this in the orchestrator's `prompt_template`, in your opening message to it, or both.
