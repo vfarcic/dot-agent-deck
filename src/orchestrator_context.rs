@@ -2568,19 +2568,21 @@ mod hygiene_tests {
     /// was actually protecting.
     #[test]
     fn the_client_sentence_names_the_directory_the_mode_and_the_remedy() {
+        // Built with `join` and compared against `display`, never against a
+        // hard-coded `/…` spelling: `build-windows` runs this whole module, and
+        // a separator baked into an assertion fails there for a reason that has
+        // nothing to do with what the test is about.
         let dir = std::path::Path::new("/home/dev/proj").join(CONTEXT_DIR_NAME);
+        let shown = dir.display().to_string();
         let err = ContextPublishError::ContextDirGroupOrWorldWritable {
             mode: 0o775,
             repair: Some(std::io::Error::other("chmod: Operation not permitted")),
         };
         let sentence = err.client_sentence(&dir);
-        assert!(
-            sentence.contains("/home/dev/proj/.dot-agent-deck"),
-            "{sentence}"
-        );
+        assert!(sentence.contains(&shown), "{sentence}");
         assert!(sentence.contains("0775"), "{sentence}");
         assert!(
-            sentence.contains("chmod go-w '/home/dev/proj/.dot-agent-deck'"),
+            sentence.contains(&format!("chmod go-w '{shown}'")),
             "the remedy must be a command the operator can paste: {sentence}"
         );
         assert!(
@@ -2618,7 +2620,7 @@ mod hygiene_tests {
         ] {
             let sentence = err.client_sentence(&dir);
             assert!(
-                sentence.contains("/home/dev/proj/.dot-agent-deck"),
+                sentence.contains(&shown),
                 "{err:?} must name the directory: {sentence}"
             );
             assert!(
@@ -2641,7 +2643,25 @@ mod hygiene_tests {
         assert_eq!(posix_single_quote("it's"), r#"'it'\''s'"#);
         assert_eq!(posix_single_quote("'"), r#"''\'''"#);
         assert_eq!(posix_single_quote(""), "''");
+        assert_eq!(
+            posix_single_quote("';touch PWNED;'"),
+            r#"''\'';touch PWNED;'\'''"#
+        );
+    }
 
+    /// …and the quoting is wired into the sentence, proven by handing the
+    /// command to a real shell rather than by reading it.
+    ///
+    /// Unix-only, and not merely because a `\`-separated path would need a
+    /// different expected string. The remedy is a POSIX command, and off Unix
+    /// the check that produces this variant is a no-op —
+    /// [`ensure_context_dir_owner_writable_only`] has no mode model to inspect
+    /// there, and `PrepareWorkflow` is refused outright with
+    /// `unsupported-platform` — so there is no Windows path on which this
+    /// sentence is generated at all.
+    #[cfg(unix)]
+    #[test]
+    fn the_remedy_command_survives_being_handed_to_a_shell() {
         let hostile = std::path::Path::new("/tmp/x';touch PWNED;'").join(CONTEXT_DIR_NAME);
         let sentence = ContextPublishError::ContextDirGroupOrWorldWritable {
             mode: 0o775,
@@ -2652,24 +2672,25 @@ mod hygiene_tests {
             .rsplit_once("chmod go-w ")
             .expect("the remedy names a command")
             .1;
-        assert_eq!(
-            command, r#"'/tmp/x'\'';touch PWNED;'\''/.dot-agent-deck'"#,
-            "the whole path must stay one shell word: {sentence}"
-        );
-        // Proven by running it, rather than by reading the quoting: `printf %s`
-        // echoes exactly one argument back if and only if the quoting held.
+
+        // The proof is the round trip, not the spelling: `printf %s` echoes
+        // exactly one argument back if and only if the quoting held. Run from a
+        // scratch directory, so a payload that DID execute lands somewhere this
+        // test can see rather than in the repository.
+        let scratch = tempfile::tempdir().unwrap();
         let echoed = std::process::Command::new("sh")
             .arg("-c")
             .arg(format!("printf %s {command}"))
+            .current_dir(scratch.path())
             .output()
             .expect("run sh");
         assert_eq!(
             String::from_utf8_lossy(&echoed.stdout),
             hostile.display().to_string(),
-            "the shell must see one word and no commands"
+            "the shell must see one word and no commands: {command}"
         );
         assert!(
-            !std::path::Path::new("PWNED").exists(),
+            !scratch.path().join("PWNED").exists(),
             "and must not have executed the payload"
         );
     }
