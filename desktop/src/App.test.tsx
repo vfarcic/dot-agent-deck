@@ -1108,11 +1108,15 @@ describe("ControlDeck", () => {
     expect(screen.getByRole("navigation", { name: "Settings sections" })).toBeVisible();
 
     expect(screen.getByTestId(`settings-panel-${SETTINGS_SECTIONS[0].id}`)).toBeVisible();
-    expect(screen.getByRole("group", { name: "Appearance" })).toBeVisible();
+    // A `radiogroup` rather than a `group`, because the row's label is a
+    // `<span>` named through `aria-labelledby` rather than a `<legend>` (issue
+    // #1032, and the test below for why). The accessible name is the property
+    // being asserted, and it is unchanged.
+    expect(screen.getByRole("radiogroup", { name: "Appearance" })).toBeVisible();
 
     // One row of chrome, then the setting (PRD #803, and the heading rule in
     // `docs/develop/desktop-gui.md`). The sheet carries exactly one heading —
-    // its own title — and the panel carries none: the row's legend is already
+    // its own title — and the panel carries none: the row's label is already
     // its visible label AND its accessible group name, which is what the
     // assertion above rides on, so a heading over it was the word "Appearance"
     // on screen twice. There are no eyebrows left on the surface either.
@@ -1120,6 +1124,25 @@ describe("ControlDeck", () => {
     expect(within(sheet).getAllByRole("heading").map((h) => h.textContent)).toEqual(["Settings"]);
     expect(within(screen.getByTestId(`settings-panel-${SETTINGS_SECTIONS[0].id}`)).queryByRole("heading")).not.toBeInTheDocument();
     expect(sheet.querySelectorAll(".eyebrow, .form-heading")).toHaveLength(0);
+  });
+
+  it("labels the Appearance row with a span, never a legend (issue 1032)", () => {
+    render(<ControlDeck runtime={runtime()} />);
+    fireEvent.click(screen.getByTestId("open-settings"));
+
+    // WebKit forces a rendered legend's `float` to `none`, so the floated-legend
+    // form this row used to take collapsed the 132px label column on the engine
+    // the app actually ships on. jsdom computes no layout, so what this tier can
+    // pin is the FORM; `e2e/settings-rows.spec.ts` measures the geometry in both
+    // engines, which is where the defect was visible at all.
+    const panel = screen.getByTestId(`settings-panel-${SETTINGS_SECTIONS[0].id}`);
+    expect(panel.querySelector("legend")).toBeNull();
+    expect(panel.querySelector("fieldset")).toBeNull();
+    // And the accessible group name still comes from somewhere — dropping the
+    // legend without `aria-labelledby` would leave an unnamed group that reads
+    // as nothing to a screen reader.
+    expect(screen.getByRole("radiogroup")).toHaveAccessibleName("Appearance");
+    expect(panel.querySelector(".settings-row > .settings-row-label")).toHaveTextContent("Appearance");
   });
 
   it("applies each appearance choice to the document root, and System CLEARS the attribute", async () => {

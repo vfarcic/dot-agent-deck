@@ -258,19 +258,21 @@ export function EndpointsPanel({ settings, onSave, saveError, mode }: SettingsPa
 
         **A `role="radiogroup"` rather than a `<fieldset>`/`<legend>`, and that
         is a WebKit finding rather than a preference.** The house convention
-        makes the legend a grid item by floating it, which disqualifies it from
-        being the fieldset's *rendered* legend. Chromium honours that; WebKit
-        forces the rendered legend's `float` to `none` — measured on this tier,
-        `getComputedStyle(legend).float` is `"left"` in Chromium and `"none"` in
-        WebKit — so the legend never becomes a grid item there, the control
-        lands in column ONE beside the label, and the 132px column is wasted.
-        The app ships on WebKit (WebKitGTK under Tauri on Linux, WKWebView on
-        macOS), so the fieldset form is the one that does not hold where it
-        matters. `aria-labelledby` on a radiogroup gives the same accessible
-        group name in both engines and lays out the same in both. The Appearance
-        and Zoom rows still use the fieldset form and still diverge; that is
-        recorded rather than changed here, because their markup belongs to PRDs
-        #743 and #744.
+        used to make the legend a grid item by floating it, which disqualifies
+        it from being the fieldset's *rendered* legend. Chromium honours that;
+        WebKit forces the rendered legend's `float` to `none` — measured on this
+        tier, `getComputedStyle(legend).float` is `"left"` in Chromium and
+        `"none"` in WebKit — so the legend never becomes a grid item there, the
+        control lands in column ONE beside the label, and the 132px column is
+        wasted. The app ships on WebKit (WebKitGTK under Tauri on Linux,
+        WKWebView on macOS), so the fieldset form is the one that does not hold
+        where it matters. `aria-labelledby` on a radiogroup gives the same
+        accessible group name in both engines and lays out the same in both.
+        This panel was written in that form from the start; issue #1032 then
+        converted the one row that had the fieldset — Appearance — and
+        `e2e/settings-rows.spec.ts` now measures every panel in both engines.
+        (The Zoom row was never affected: a single control is a plain
+        `<label for>`, which is an ordinary grid item in both engines.)
       */}
       <div className="settings-row">
         <span className="settings-row-label" id="deck-chooser-label">Deck</span>
