@@ -238,6 +238,7 @@ Three things this role must get right, because they are where it has gone wrong 
 
 - **Resolve every thread you answered, not just reply to it.** An unresolved thread blocks the merge button AND the approval the merge needs, so a PR whose findings are all fixed can still sit for days. Measured on PR #1035: a full day with 14 green checks and every one of five findings already fixed, because nobody clicked resolve.
 - **Do not wait forever for the automated review.** A reviewer that is out of quota produces no check-run at all, with no message anywhere — indistinguishable from it being uninstalled. /pr-create bounds the wait; honour that bound and report "no automated review was obtained" rather than hanging.
+- **Do NOT arm auto-merge.** /pr-create arms it only when nothing downstream gates the merge, and here two things do: the demo reel (step 6) and the user's explicit merge go-ahead (step 7). An armed PR lands the moment the approval arrives, which would jump both — and re-running the skill cannot un-arm it.
 - **Report back and STOP before merge.** Hand back via work-done with the PR URL, the check status, and each finding with what you did about it. Do not notify the user and do not wait on the user — the orchestrator is the only agent that does either. Merge only when the orchestrator re-delegates with an explicit instruction to continue.
 
 If any step fails (failing CI, merge conflicts, or a CHANGES_REQUESTED review state), report the exact error and stop — do not diagnose or fix. The orchestrator will re-delegate to coder.

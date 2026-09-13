@@ -134,7 +134,7 @@ The requirement that review threads resolve before merge is doing specific work.
 
 ## The automated reviewer
 
-Greptile is the only automated reviewer active on this repository. CodeRabbit is **not** — it posts neither a review nor a pending placeholder, so any wait that requires a CodeRabbit signal hangs to its full timeout on every run.
+Greptile is the only third-party review **app** active on this repository — not the only automated reviewer, which it shares with this repo's own agent PR reviewer (`.github/workflows/pr-review-batch.yml`), a scheduled sweep that reads a pull request against the repo rubric and casts a real approving or changes-requested review as `dot-agent-deck-reviewer[bot]`. The two are independent: Greptile posts inline findings and never votes; the agent reviewer votes and posts no inline findings. What follows is about Greptile. CodeRabbit is **not** active — it posts neither a review nor a pending placeholder, so any wait that requires a CodeRabbit signal hangs to its full timeout on every run.
 
 It publishes on four surfaces, and the one that matters is the last:
 
