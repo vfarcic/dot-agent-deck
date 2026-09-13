@@ -28,7 +28,10 @@ tokio = { version = "1", features = ["sync", "time"] }
 # property of what ANOTHER crate happens to enable, not a declaration this crate
 # makes. Declaring them means a change over there cannot silently take this
 # crate's tests out.
-tokio = { version = "1", features = ["macros", "net", "rt-multi-thread"] }
+# Issue #1028's regression test writes a PARTIAL frame header by hand — the
+# protocol crate's `write_frame` can only write whole frames — so it needs
+# `AsyncWriteExt`, which lives behind `io-util`.
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread"] }
 # PRD #803: every settings test drives an explicit path inside a temp dir so
 # none of them can touch the developer's real ~/.config/dot-agent-deck.
 tempfile = "3"
