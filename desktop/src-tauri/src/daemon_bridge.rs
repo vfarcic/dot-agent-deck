@@ -17,8 +17,8 @@ use tokio::sync::Mutex as AsyncMutex;
 
 use crate::agent_view::AgentView;
 use crate::dto::{
-    BootstrapOptions, ConnectionStatus, DesktopConnection, DesktopSnapshot, disconnected_snapshot,
-    map_agent, safe_message, selected_endpoint, selection_fields, socket_path_text,
+    BootstrapOptions, ConnectionStatus, DesktopConnection, DesktopSnapshot, deck_path_text,
+    disconnected_snapshot, map_agent, safe_message, selected_endpoint, selection_fields,
 };
 use crate::endpoint_tunnels::{EndpointTunnels, TunnelLease};
 
@@ -187,9 +187,14 @@ pub(crate) const HANDSHAKE_REVALIDATE_INTERVAL: Duration = Duration::from_secs(5
 /// long-lived connections plus one short-lived one per refresh. Four things
 /// decided it:
 ///
-/// 1. **The population of one.** There is exactly one `EventSubscription` per
-///    desktop process — `DesktopState::start_watcher_once` guarantees a single
-///    watcher — so half the muxing target is a set with one member in it.
+/// 1. **The population of one, which PRD #742 M3 makes a population of N — per
+///    DECK, not per stream.** There is one `EventSubscription` per *observed
+///    deck* (`DesktopState::start_watcher_once_for` guarantees one watcher per
+///    deck, and `retain_watchers` ends a departed deck's), and each one is a
+///    connection to a **different daemon**. Multiplexing is a thing you do to
+///    several streams sharing one peer, so a set of one-per-peer is exactly as
+///    un-muxable at N decks as it was at one; what grows is the connection count
+///    this doc comment already prices below, not the muxing case.
 ///
 /// 2. **Muxing attach streams is a WIRE change, not a refactor.** The frame
 ///    header is five bytes: one kind byte and a four-byte big-endian length
@@ -220,15 +225,43 @@ pub(crate) const HANDSHAKE_REVALIDATE_INTERVAL: Duration = Duration::from_secs(5
 /// what M4 was opened about: the streams are established once and then carry
 /// frames, so nothing about them is paid per refresh.
 ///
-/// # Concurrency
+/// # Concurrency — one gate per deck, and the map lock held across nothing
 ///
-/// One async mutex over the whole map, held across establishment. That
-/// serialises concurrent first-uses into ONE handshake instead of N, which is
-/// the point; the cache-hit path is an uncontended lock acquire. A deck that is
-/// not answering queues the other callers behind one connect timeout rather
-/// than giving each its own, which is also the better of the two.
+/// **This inverted at PRD #742 M3, and the old comment said so in advance.** It
+/// used to be one async mutex over the whole map, *held across establishment*,
+/// and its own justification ended "a deck that is not answering queues the
+/// other callers behind one connect timeout rather than giving each its own,
+/// which is also the better of the two". That is true while the queued callers
+/// are other users of the *same* deck. At N decks the callers queued behind an
+/// unreachable deck's connect are **other decks**, and the desktop's whole fleet
+/// stops updating because one machine is down — PRD #742 success criterion 2,
+/// and the one risk the PRD says can make it fail its own headline.
+///
+/// So establishment is serialised **per deck** instead, by a gate keyed the same
+/// way the map is, and the map's own lock is now held only for the two lookups
+/// around it. Both halves of the original property survive:
+///
+/// - *Concurrent first-uses of ONE deck still collapse into ONE handshake.* The
+///   second caller waits on that deck's gate, and by the time it gets in the
+///   first caller has already published its link, so it takes the cache-hit path
+///   rather than handshaking again.
+/// - *Two callers on DIFFERENT decks never wait for each other*, because they
+///   hold different gates and neither holds the map across a connect.
+///
+/// Pinned by [`tests::an_unresponsive_deck_does_not_queue_another_decks_handshake`]
+/// and [`tests::a_held_link_is_reused_and_costs_one_handshake`] respectively.
+///
+/// The gate map is a **`std::sync::Mutex`** and is never held across an `await`:
+/// it hands out an `Arc` and is released. That is what keeps `clippy::await_holding_lock`
+/// honest here rather than allowed.
 pub(crate) struct DaemonLinks {
     links: AsyncMutex<HashMap<EndpointIdentity, Arc<TrustedDaemon>>>,
+    /// One establishment gate per deck — see this type's *Concurrency* section.
+    ///
+    /// Empty of state by design: the gate carries nothing, it only says whose
+    /// turn it is to handshake for that deck. Which is why [`Self::gate`] may
+    /// drop any gate nobody is holding without coordinating with anyone.
+    gates: std::sync::Mutex<HashMap<EndpointIdentity, Arc<AsyncMutex<()>>>>,
     /// The live transports (PRD #741 M7).
     ///
     /// **This is a field of `DesktopState`, shared here by `Arc` — it is not a
@@ -250,6 +283,7 @@ impl Default for DaemonLinks {
     fn default() -> Self {
         Self {
             links: AsyncMutex::new(HashMap::new()),
+            gates: std::sync::Mutex::new(HashMap::new()),
             tunnels: Arc::new(EndpointTunnels::default()),
             handshakes: AtomicUsize::new(0),
         }
@@ -263,17 +297,29 @@ impl DaemonLinks {
     /// A failed establishment removes any held link first, so a stale
     /// classification is never returned after the deck behind it stopped
     /// answering.
+    ///
+    /// PRD #742 M3: serialised **per deck** rather than over the whole map — see
+    /// this type's *Concurrency* section for what that keeps and what it fixes.
     pub(crate) async fn trusted(&self, endpoint: &Endpoint) -> Result<Arc<TrustedDaemon>, String> {
         let key = endpoint.identity();
-        let mut links = self.links.lock().await;
-        if let Some(held) = links.get(&key)
-            && held.is_fresh(Instant::now())
+        // Held across the establishment below, and it is this deck's alone.
+        let gate = self.gate(&key);
+        let _establishing = gate.lock().await;
         {
-            return Ok(Arc::clone(held));
+            let mut links = self.links.lock().await;
+            if let Some(held) = links.get(&key)
+                && held.is_fresh(Instant::now())
+            {
+                return Ok(Arc::clone(held));
+            }
+            // Removed BEFORE the handshake and while nothing else can be
+            // establishing for this deck, so a stale classification is never
+            // readable during the window in which it is being replaced.
+            links.remove(&key);
         }
-        links.remove(&key);
         let established = Arc::new(establish(endpoint, &self.tunnels).await?);
         self.handshakes.fetch_add(1, Ordering::Relaxed);
+        let mut links = self.links.lock().await;
         // **Only a CONNECTED classification is held.** A refusal is the one
         // verdict you want re-checked rather than cached, and there is a
         // user-visible reason as well as a principled one: on the incompatible
@@ -293,6 +339,29 @@ impl DaemonLinks {
             links.insert(key, Arc::clone(&established));
         }
         Ok(established)
+    }
+
+    /// This deck's establishment gate, minting one if it has none.
+    ///
+    /// A `std::sync::Mutex` held for exactly this lookup and released before the
+    /// caller awaits on what it returns — the gate is the thing awaited, never
+    /// the map that stores it.
+    ///
+    /// **It also forgets gates nobody is holding**, which is what keeps this map
+    /// bounded by the decks currently in play rather than by every address a
+    /// user has ever typed into the endpoints panel (each edit mints a new
+    /// [`EndpointIdentity`]). Safe without coordinating with anyone, and for a
+    /// reason that is a property rather than a hope: a gate whose `Arc` strong
+    /// count is 1 is held by this map alone, so no caller is waiting on it or
+    /// inside it — and no caller can be *taking* a clone concurrently, because
+    /// cloning happens here, under this same lock.
+    fn gate(&self, key: &EndpointIdentity) -> Arc<AsyncMutex<()>> {
+        let mut gates = self
+            .gates
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        gates.retain(|held, gate| held == key || Arc::strong_count(gate) > 1);
+        Arc::clone(gates.entry(key.clone()).or_default())
     }
 
     /// The shared transport map, for `DesktopState` and for the commands that
@@ -803,11 +872,23 @@ pub(crate) fn classify_handshake_for_test(
     classify_handshake(response, client_build, build_mismatch_allowance(), stamps)
 }
 
-fn connection_from_handshake(handshake: HandshakeInfo) -> DesktopConnection {
-    let (deck_kind, local_only_reason, selection_fallback) = selection_fields();
+/// The classified handshake as a [`DesktopConnection`], stamped with the deck it
+/// was taken against.
+///
+/// **PRD #742 M3 added the endpoint, and that one parameter is the whole of
+/// test-plan items 8 and 9.** `snapshot_with` has taken the deck as an argument
+/// since #741 M4(a) and this function dropped it at the one place the identity
+/// is written, reading `socket_path_text()` and `selection_fields()` off the
+/// process-global selection instead. So every deck in a fleet was emitted under
+/// the *selected* deck's name — and since the frontend derives `daemonId` from
+/// `connection.socketPath` and keys agents by `(daemonId, agentId)`, two decks
+/// arriving under one identity do not render an error, they render one fleet
+/// where there were two.
+fn connection_from_handshake(endpoint: &Endpoint, handshake: HandshakeInfo) -> DesktopConnection {
+    let (deck_kind, local_only_reason, selection_fallback) = selection_fields(endpoint);
     DesktopConnection {
         status: handshake.status,
-        socket_path: socket_path_text(),
+        socket_path: deck_path_text(endpoint),
         deck_kind,
         local_only_reason,
         selection_fallback,
@@ -902,7 +983,7 @@ async fn establish(
     // through a forwarded Unix socket, so the handshake needs no transport of
     // its own — M5 supplies the address, not a different way of opening it.
     let (info, response) = hello(transport.address(), StampPolicy::for_endpoint(endpoint)).await?;
-    let connection = connection_from_handshake(info);
+    let connection = connection_from_handshake(endpoint, info);
     // Built from the TRANSPORT rather than the address, so the client carries
     // what a `stat` of that address is allowed to mean. `DaemonClient::new`
     // would stamp a tunnel's own socket `LocalInode` and put `exists()`-as-health
@@ -972,7 +1053,7 @@ pub(crate) async fn snapshot_with(
 ) -> DesktopSnapshot {
     let daemon = match links.trusted(endpoint).await {
         Ok(daemon) => daemon,
-        Err(error) => return disconnected_snapshot(error),
+        Err(error) => return disconnected_snapshot(endpoint, error),
     };
     let connection = daemon.connection();
     if connection.status != ConnectionStatus::Connected {
@@ -1004,7 +1085,7 @@ pub(crate) async fn snapshot_with(
                 // cleared, and the next refresh will try again rather than
                 // promoting whatever it was holding into an answer.
                 links.invalidate(endpoint).await;
-                disconnected_snapshot(error.to_string())
+                disconnected_snapshot(endpoint, error.to_string())
             }
         };
     }
@@ -1018,7 +1099,7 @@ pub(crate) async fn snapshot_with(
             // handshakes again rather than reporting a verdict it can no longer
             // support.
             links.invalidate(endpoint).await;
-            disconnected_snapshot(error.to_string())
+            disconnected_snapshot(endpoint, error.to_string())
         }
     }
 }
@@ -1163,7 +1244,7 @@ pub(crate) async fn bootstrap(options: &BootstrapOptions, links: &DaemonLinks) -
             links.invalidate(&endpoint).await;
             get_snapshot(links).await
         }
-        Err(error) => disconnected_snapshot(error.to_string()),
+        Err(error) => disconnected_snapshot(&endpoint, error.to_string()),
     }
 }
 
@@ -2239,6 +2320,58 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// The property the whole-map lock existed for, kept after PRD #742 M3 split
+    /// it: **two callers racing on the SAME deck still cost one handshake.**
+    ///
+    /// Its sibling above drives the two calls sequentially, so it measures the
+    /// held-link cache and not the collapse — it would pass just as well with no
+    /// serialisation at all. This one is the half M3 could break: the map lock is
+    /// no longer held across establishment, so what stops a concurrent first-use
+    /// from opening a second connection is the per-deck gate and nothing else.
+    /// Without it both callers would miss the empty map and handshake, which is
+    /// N ssh authentications for N tiles arriving at once on a remote deck.
+    ///
+    /// The script offers **two** replies while the assertion demands one
+    /// connection, so a broken collapse fails on the count rather than hanging;
+    /// a working one leaves the daemon waiting for a second client that never
+    /// comes, which is why it is aborted rather than awaited.
+    ///
+    /// The cross-deck half — two callers on DIFFERENT decks never waiting for
+    /// each other — is
+    /// [`tests::an_unresponsive_deck_does_not_queue_another_decks_handshake`].
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn concurrent_first_uses_of_one_deck_still_collapse_into_one_handshake() {
+        let (dir, socket) = scratch_socket("m3-collapse");
+        let listener = bind_trusted(&socket);
+        let daemon = tokio::spawn(scripted_daemon_sequence(
+            listener,
+            vec![matching_hello(), matching_hello()],
+        ));
+
+        let links = DaemonLinks::default();
+        let endpoint = Endpoint::Local(LocalEndpoint::at(&socket));
+
+        let (first, second) = tokio::join!(links.trusted(&endpoint), links.trusted(&endpoint));
+        let first = first.expect("the racing caller that established");
+        let second = second.expect("the racing caller that waited");
+
+        daemon.abort();
+        let _ = std::fs::remove_dir_all(dir);
+
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "both racers must hold the SAME link, not two equal ones"
+        );
+        assert_eq!(
+            links.handshake_count(),
+            1,
+            "concurrent first-uses of one deck must collapse into ONE handshake \
+             — the per-deck gate is all that keeps this true now that the map \
+             lock is not held across establishment"
+        );
+    }
+
     /// Invalidation is the other half: after it the next call handshakes again,
     /// against whatever is at the address now. This is what every replacement
     /// route goes through — the watcher losing its event stream, Stop, Replace,
@@ -2345,16 +2478,19 @@ mod tests {
     fn a_held_handshake_goes_stale_after_the_revalidate_interval() {
         let link = TrustedDaemon {
             client: Arc::new(DaemonClient::new("/tmp/attach.sock".into())),
-            connection: connection_from_handshake(HandshakeInfo {
-                status: ConnectionStatus::Connected,
-                error: None,
-                server_protocol_version: Some(PROTOCOL_VERSION),
-                daemon_build_version: None,
-                daemon_version: None,
-                running_agent_count: Some(0),
-                build_stamp_mismatch_only: false,
-                project_actions_reason: None,
-            }),
+            connection: connection_from_handshake(
+                &Endpoint::Local(LocalEndpoint::at("/tmp/attach.sock")),
+                HandshakeInfo {
+                    status: ConnectionStatus::Connected,
+                    error: None,
+                    server_protocol_version: Some(PROTOCOL_VERSION),
+                    daemon_build_version: None,
+                    daemon_version: None,
+                    running_agent_count: Some(0),
+                    build_stamp_mismatch_only: false,
+                    project_actions_reason: None,
+                },
+            ),
             _transport: tokio::runtime::Runtime::new()
                 .expect("a runtime for the lease")
                 .block_on(

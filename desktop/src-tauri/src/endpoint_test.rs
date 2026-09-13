@@ -636,28 +636,47 @@ async fn test_remote(
 /// Give a probe's transport back unless the app is actually using it
 /// (`endpoint_tunnels` rule 3, teardown trigger 3).
 ///
-/// A deck that is **not** the selection is released, because a tunnel per
+/// A deck the fleet does **not** observe is released, because a tunnel per
 /// Test-connection click is exactly the process leak this milestone is about and
 /// nothing would otherwise close it until the app exits.
 ///
-/// A deck that **is** the selection keeps its transport, and that is the more
+/// A deck the fleet **does** observe keeps its transport, and that is the more
 /// interesting half. Releasing it would only drop the *map's* handle — a live
 /// link still holds a lease, so the child would survive — and the next
 /// `establish()` would then open a **second** `ssh` child beside the first for
-/// as long as the old link stayed fresh. Testing the deck you are connected to
+/// as long as the old link stayed fresh. Testing a deck you are connected to
 /// would cost a duplicate authenticated session, which is the same defect this
 /// function exists to avoid, arrived at from the other side.
+///
+/// # The predicate is "observed", not "selected" (PRD #742 M3)
+///
+/// It compared against `selected_endpoint()` until M3, and the name it still
+/// carries is that version's. The two agreed for every selection but
+/// [`crate::settings::Selection::All`], under which the resolved deck is the
+/// **local** one — so **Test connection** on any remote deck in a fleet read as
+/// "not the selection" and released the transport of a deck the app was actively
+/// watching. Inert while nothing held a lease on a non-selected deck, and a
+/// duplicate `ssh` child the moment M3's per-deck watchers do: the watcher keeps
+/// the child alive through its own lease while the next `establish()` opens a
+/// second one beside it. The converse still has to hold, and the same test pins
+/// it — a fix that simply stopped releasing would trade one leak for another.
+///
+/// Sourced from the **applied** observed set (`crate::dto::deck_is_observed`)
+/// rather than from the settings document this command was handed, which is
+/// optimistic: the panel saves as the user types, so the document can name a
+/// deck no watcher has been started for yet. What must not be released is a deck
+/// something is *currently* holding, and that is what the applied set describes.
 ///
 /// Compared by [`dot_agent_deck::daemon_client::EndpointIdentity`], not by
 /// `describe()`, and this is the sharp direction of PRD #741's Greptile P1: a
 /// display string omits the remote socket path, the identity file and the jump
-/// host, so a probe of a deck differing from the selection only in one of those
-/// read as "this IS the selection" and **kept** its transport. Nothing else
+/// host, so a probe of a deck differing from an observed one only in one of
+/// those read as "this one IS observed" and **kept** its transport. Nothing else
 /// closes one, so every such click leaked an authenticated `ssh` child — the
 /// exact leak this function exists to prevent, reached by mistaking two decks
 /// for one.
 async fn release_if_not_selected(tunnels: &EndpointTunnels, endpoint: &Endpoint) {
-    if endpoint.identity() != crate::dto::selected_endpoint().identity() {
+    if !crate::dto::deck_is_observed(endpoint) {
         tunnels.release(endpoint).await;
     }
 }

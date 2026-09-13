@@ -1,7 +1,9 @@
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::collections::HashSet;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use dot_agent_deck::daemon_client::EndpointIdentity;
 use dot_agent_deck::daemon_protocol::{
     KIND_DETACH, KIND_GEOMETRY, KIND_STREAM_END, KIND_STREAM_IN, KIND_STREAM_OUT,
     KIND_STREAM_REJECT, parse_geometry_frame, read_frame, write_frame,
@@ -75,7 +77,34 @@ pub(crate) struct DesktopState {
     sessions: Mutex<HashMap<String, TerminalSession>>,
     attach_gate: AsyncMutex<()>,
     next_generation: AtomicU64,
-    pub(crate) watcher_started: AtomicBool,
+    /// The snapshot watchers, one per **observed deck** (PRD #742 M3).
+    ///
+    /// # Why this replaced an `AtomicBool`
+    ///
+    /// It was `watcher_started: AtomicBool` — one claim per *process*, because
+    /// there was one watcher per process. The N-deck form of exactly that is one
+    /// claim per *deck*: two watchers on one deck would fold the same broadcast
+    /// twice and emit two snapshots per coalescing window for it, and a watcher
+    /// left running for a deck the user has dropped from the fleet goes on
+    /// emitting that deck's records into a view that no longer has a group for
+    /// them.
+    ///
+    /// # The value is the handle, and the `Option` is the claim/spawn gap
+    ///
+    /// [`DesktopState::start_watcher_once_for`] claims the slot (`None`) and the
+    /// caller spawns the task and hands the handle back through
+    /// [`DesktopState::register_watcher`]. Claiming before spawning rather than
+    /// after is what makes the claim atomic: two callers racing to start the
+    /// same deck's watcher cannot both win, which is the property the
+    /// `AtomicBool`'s `swap` had.
+    ///
+    /// # A `std::sync::Mutex`, deliberately
+    ///
+    /// [`tauri::async_runtime::JoinHandle::abort`] is sync and every method here
+    /// is sync, so an async mutex would buy nothing and would put
+    /// `clippy::await_holding_lock` in front of the `retain_watchers` call site
+    /// inside `retarget_selection`.
+    watchers: Mutex<HashMap<EndpointIdentity, Option<tauri::async_runtime::JoinHandle<()>>>>,
     /// PRD #741 M4(a): the established daemon links, keyed by endpoint.
     ///
     /// This is the field the milestone is about. Before it, nothing in this
@@ -102,14 +131,29 @@ pub(crate) struct DesktopState {
     ///
     /// # Why the watcher needs telling, rather than noticing
     ///
-    /// The snapshot watcher's event subscription is a connection to **one
-    /// daemon**, opened once and read until it ends. Nothing about a selection
-    /// change ends it: the old deck is still there, still healthy, still
-    /// pushing. So without this signal the watcher would go on folding the
-    /// *previous* deck's broadcasts into the agent view that answers snapshots
-    /// for the *new* one, and go on re-emitting them to the webview as
-    /// `desktop://daemon-event` — the fleet of one machine under the name of
-    /// another, which is the outcome PRD #741 exists to make impossible.
+    /// A watcher's event subscription is a connection to **one daemon**, opened
+    /// once and read until it ends. Nothing about a selection change ends it:
+    /// the old deck is still there, still healthy, still pushing.
+    ///
+    /// **What that used to mean, and what PRD #742 M3 changed.** With one
+    /// watcher following the selection, missing this signal meant folding the
+    /// *previous* deck's broadcasts into the agent view that answered snapshots
+    /// for the *new* one and re-emitting them as `desktop://daemon-event` — one
+    /// machine's fleet under another machine's name, the outcome PRD #741 exists
+    /// to make impossible. That is no longer how it is prevented: there is a
+    /// watcher per observed deck now, each pinned to its own endpoint for its
+    /// whole life, so the fold and the label cannot come from different decks
+    /// whether or not this signal ever arrives. The isolation is structural, and
+    /// this is not what carries it.
+    ///
+    /// It is still the signal that a watcher's held link has been **invalidated
+    /// under it** — `retarget_selection` calls `DaemonLinks::invalidate_all` —
+    /// so the watcher re-establishes at once rather than on its next stream
+    /// event, and, through `SubscriptionEnd::SelectionChanged`, without the
+    /// backoff a genuinely dead deck earns.
+    ///
+    /// A departed deck is a different signal with a different mechanism:
+    /// [`Self::retain_watchers`] ends its watcher outright.
     ///
     /// A [`tokio::sync::watch`] rather than a `Notify`: `changed()` is
     /// cancel-safe *and* edge-tracking per receiver, so a change that lands
@@ -131,7 +175,7 @@ impl Default for DesktopState {
             sessions: Mutex::new(HashMap::new()),
             attach_gate: AsyncMutex::new(()),
             next_generation: AtomicU64::new(1),
-            watcher_started: AtomicBool::new(false),
+            watchers: Mutex::new(HashMap::new()),
             daemon: Arc::clone(&daemon),
             tunnels: daemon.tunnels(),
             selection: tokio::sync::watch::Sender::new(0),
@@ -146,8 +190,83 @@ impl DesktopState {
             .map_err(|_| "desktop terminal session registry lock was poisoned".to_string())
     }
 
-    pub(crate) fn start_watcher_once(&self) -> bool {
-        !self.watcher_started.swap(true, Ordering::AcqRel)
+    /// The watcher registry, poison-tolerant.
+    ///
+    /// Recovered rather than refused, unlike [`Self::sessions`]: the map holds
+    /// deck keys and abort handles, so a panic elsewhere cannot leave it in a
+    /// state a later caller would misread — and refusing here would mean a
+    /// panicked watcher permanently stopping every *other* deck from getting
+    /// one.
+    fn watchers(
+        &self,
+    ) -> MutexGuard<'_, HashMap<EndpointIdentity, Option<tauri::async_runtime::JoinHandle<()>>>>
+    {
+        self.watchers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Claim the watcher for one deck. `true` if this call is the one that must
+    /// start it (PRD #742 M3).
+    ///
+    /// The N-deck form of the `AtomicBool` swap this replaced — one claim per
+    /// deck rather than one per process. The caller that gets `true` spawns the
+    /// task and hands its handle to [`Self::register_watcher`].
+    pub(crate) fn start_watcher_once_for(&self, deck: &EndpointIdentity) -> bool {
+        let mut watchers = self.watchers();
+        if watchers.contains_key(deck) {
+            return false;
+        }
+        watchers.insert(deck.clone(), None);
+        true
+    }
+
+    /// Hand the spawned task's handle to the claim [`Self::start_watcher_once_for`]
+    /// made, so [`Self::retain_watchers`] can end it.
+    ///
+    /// A handle arriving for a claim that is **gone** is aborted on the spot: the
+    /// deck left the observed set between the claim and the spawn, and the task
+    /// it belongs to is already watching a deck nobody asked about. Without this
+    /// the task would run untracked and unstoppable for the life of the process.
+    pub(crate) fn register_watcher(
+        &self,
+        deck: &EndpointIdentity,
+        handle: tauri::async_runtime::JoinHandle<()>,
+    ) {
+        match self.watchers().get_mut(deck) {
+            Some(slot) => *slot = Some(handle),
+            None => handle.abort(),
+        }
+    }
+
+    /// End the watcher for every deck `observed` no longer names (PRD #742 M3).
+    ///
+    /// The sibling of the `EndpointTunnels::retain` on the line above its call
+    /// site: the transport half of a departed deck's teardown was already a set
+    /// difference, and so is this one.
+    ///
+    /// **What `abort` does and does not buy.** A watcher parked in its
+    /// `select!` stops before its next emit; one already inside `snapshot_with`
+    /// is cancelled at its next await, so it may have an emit in flight. The
+    /// stronger property — the watcher ends *before* any further record from
+    /// that deck reaches the webview — needs a running Tauri app to observe and
+    /// is not pinned by any test here; it is stated rather than claimed.
+    pub(crate) fn retain_watchers(&self, observed: &HashSet<EndpointIdentity>) {
+        self.watchers().retain(|deck, handle| {
+            if observed.contains(deck) {
+                return true;
+            }
+            if let Some(handle) = handle.take() {
+                handle.abort();
+            }
+            false
+        });
+    }
+
+    /// Which decks currently have a watcher.
+    #[cfg(test)]
+    pub(crate) fn watched_decks(&self) -> HashSet<EndpointIdentity> {
+        self.watchers().keys().cloned().collect()
     }
 
     /// Announce that the selected deck has changed (PRD #741 M9). See

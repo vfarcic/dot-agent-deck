@@ -115,25 +115,44 @@ pub struct DesktopConnection {
     pub project_actions_reason: Option<String>,
 }
 
-/// The three endpoint-shaped fields of [`DesktopConnection`], filled from the
-/// selection in force.
+/// The three endpoint-shaped fields of [`DesktopConnection`], **for one deck**.
 ///
 /// One function so the two construction sites — the classified handshake and
 /// [`disconnected_snapshot`] — cannot disagree about whether the deck is
 /// remote, which is the disagreement that would leave **Stop daemon** enabled
 /// on exactly the screen state where it is most tempting to press.
-pub(crate) fn selection_fields() -> (&'static str, Option<String>, Option<String>) {
-    let deck = selected_deck();
-    let kind = match &deck.endpoint {
+///
+/// # Two of the three now come from the argument, and one still does not
+///
+/// PRD #742 M3. `deck_kind` and `local_only_reason` are properties of **a**
+/// deck: whether *this* deck runs on this machine, and therefore whether Stop
+/// and Replace can act on it. They read the process-global selection until M3,
+/// which is why the PRD's Scope names "per-deck connection state" — with a fleet
+/// on screen, reading them off the selection would disable the lifecycle
+/// controls for the whole view whenever the *selected* deck happened to be
+/// remote, and enable them for a remote group whenever it happened to be local.
+///
+/// `selection_fallback` stays the selection's, because it describes the
+/// selection rather than a deck — "the deck you chose is gone, so you are on
+/// local". Attaching it to every group would be a claim about each of them.
+/// **The narrow fact that makes reading it off the global correct here**: the
+/// only selection observing more than one deck is
+/// [`crate::settings::Selection::All`], whose `resolve()` returns the local deck
+/// with no fallback at all, so a fleet never has one to misattribute; and every
+/// other selection observes exactly the deck it resolved to, so the fallback is
+/// that deck's by construction.
+pub(crate) fn selection_fields(
+    endpoint: &Endpoint,
+) -> (&'static str, Option<String>, Option<String>) {
+    let kind = match endpoint {
         Endpoint::Local(_) => "local",
         Endpoint::Remote(_) => "remote",
     };
-    let local_only = deck
-        .endpoint
+    let local_only = endpoint
         .require_local("Stop deck")
         .err()
         .map(|error| safe_display_text(error.to_string()));
-    (kind, local_only, deck.fallback)
+    (kind, local_only, selected_deck().fallback)
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
@@ -855,23 +874,53 @@ impl Default for SelectedDeck {
 ///
 /// **A process-global, deliberately, and for the same reason
 /// `SESSION_BUILD_MISMATCH_ALLOWED` is one**: every path that names the deck —
-/// `socket_path_text`, `disconnected_snapshot`, the watcher's refresh, the
-/// bootstrap's lazy-spawn guard — needs the answer, and most of them are not
-/// handed `DesktopState`. Threading it would mean changing every one of those
-/// signatures to carry a value that has exactly one writer.
+/// `disconnected_snapshot`, the watcher's refresh, the bootstrap's lazy-spawn
+/// guard — needs the answer, and most of them are not handed `DesktopState`.
+/// Threading it would mean changing every one of those signatures to carry a
+/// value that has exactly one writer.
 ///
 /// The writer is [`apply_settings_selection`], called from the app's `setup`
 /// hook (where the settings document is already being read for the zoom level)
 /// and from `desktop_set_settings` after a successful save. Unset reads as the
 /// local deck, which is what every caller did before endpoints existed and what
 /// a test that never loads a document sees.
+///
+/// **PRD #742 M3 narrowed what this answers.** It is still the one deck the
+/// *deck screen* and its terminals talk to (DECISION 1 keeps that single-deck),
+/// but it is no longer the deck a snapshot is stamped with — see
+/// [`deck_path_text`] and [`selection_fields`], which take the endpoint they are
+/// describing. The set of decks the fleet *observes* is [`OBSERVED_DECKS`].
 static SELECTED_DECK: std::sync::RwLock<Option<SelectedDeck>> = std::sync::RwLock::new(None);
+
+/// The applied observed set — every deck the fleet is watching (PRD #742 M3).
+///
+/// **Beside [`SELECTED_DECK`] rather than derived from it, because it is not
+/// derivable from it**: under [`crate::settings::Selection::All`] the resolved
+/// deck is the local one and the observed set is the whole fleet, so a caller
+/// asking "is this deck one of ours" cannot get the answer from the selection.
+/// Under every other selection the set is exactly the one element
+/// `SELECTED_DECK` holds, which is why this could not be noticed before `All`
+/// existed.
+///
+/// Written by the same single writer, from the same document, in the same call —
+/// so the two can never describe different saves.
+///
+/// Unset reads as the local deck alone, matching both `SELECTED_DECK`'s default
+/// and `DesktopSettings::observed_endpoints()`'s answer for a document with no
+/// `[endpoints]` section.
+static OBSERVED_DECKS: std::sync::RwLock<Option<Vec<Endpoint>>> = std::sync::RwLock::new(None);
 
 /// Apply a settings document's selection. Returns the deck now in force.
 ///
 /// The fallback is rendered here rather than stored as a type because the only
 /// consumer is a sentence on screen, and `SelectionFallback: Display` already
 /// writes it.
+///
+/// PRD #742 M3: this also applies the document's **observed set**. The two are
+/// written together on purpose — a probe that asked one and a watcher that asked
+/// the other could otherwise disagree about whether a deck is in the fleet, and
+/// disagreeing is precisely how a live transport gets released out from under a
+/// watcher holding a lease on it (see `endpoint_test::release_if_not_selected`).
 pub(crate) fn apply_settings_selection(
     settings: &crate::settings::DesktopSettings,
 ) -> SelectedDeck {
@@ -885,7 +934,39 @@ pub(crate) fn apply_settings_selection(
     if let Ok(mut slot) = SELECTED_DECK.write() {
         *slot = Some(deck.clone());
     }
+    if let Ok(mut slot) = OBSERVED_DECKS.write() {
+        *slot = Some(settings.observed_endpoints());
+    }
     deck
+}
+
+/// Every deck the fleet observes under the applied document (PRD #742 M3).
+///
+/// One element for every selection but [`crate::settings::Selection::All`], and
+/// for that one the local deck followed by every configured row that has
+/// somewhere to connect to — [`crate::settings::EndpointSettings::observed_endpoints`]
+/// is where that judgement is made and this only stores its answer.
+pub(crate) fn observed_decks() -> Vec<Endpoint> {
+    OBSERVED_DECKS
+        .read()
+        .ok()
+        .and_then(|slot| slot.clone())
+        .unwrap_or_else(|| vec![Endpoint::local()])
+}
+
+/// Is `endpoint` one of the decks the fleet observes?
+///
+/// Compared by [`EndpointIdentity`] — the key both `DaemonLinks` and
+/// `EndpointTunnels` are indexed by — and never by `describe()`, which omits the
+/// remote socket path, the identity file and the jump host. PRD #741's Greptile
+/// P1 is the reason: two decks differing only in one of those three read as one
+/// deck under a display string, and here that would answer "yes, we observe it"
+/// for a deck nothing is watching.
+pub(crate) fn deck_is_observed(endpoint: &Endpoint) -> bool {
+    let key = endpoint.identity();
+    observed_decks()
+        .iter()
+        .any(|observed| observed.identity() == key)
 }
 
 /// The selected deck, with whatever fallback reason came with it.
@@ -906,10 +987,18 @@ pub(crate) fn selected_endpoint() -> Endpoint {
     selected_deck().endpoint
 }
 
-/// How the selected deck is named in the connection banner. For a local deck
-/// that is its socket path, which is exactly what this reported before the
-/// endpoint type existed; for a remote one it is `user@host` (with the port when
-/// it is not 22), derived by `RemoteEndpoint::describe` from validated fields.
+/// How **this** deck is named in the connection banner. For a local deck that is
+/// its socket path, which is exactly what this reported before the endpoint type
+/// existed; for a remote one it is `user@host` (with the port when it is not 22),
+/// derived by `RemoteEndpoint::describe` from validated fields.
+///
+/// **It takes the deck it is naming (PRD #742 M3).** It read the process-global
+/// selection until then, which was invisible while there was one deck and is the
+/// whole of items 8 and 9: `snapshot_with` already took the endpoint as a
+/// parameter and this dropped it at the one place the identity is stamped, so
+/// every deck in a fleet came back under the selected deck's name and the
+/// frontend's `(daemonId, agentId)` composite key — `daemonId` is derived from
+/// this string at `desktop/src/lib/bridge.ts` — collapsed two fleets into one.
 ///
 /// Scrubbed through [`safe_display_text`] rather than [`safe_message`]. Every
 /// byte of a stored endpoint came through an ASCII charset that excludes the
@@ -917,16 +1006,25 @@ pub(crate) fn selected_endpoint() -> Endpoint {
 /// because the *next* thing rendered on this line may not have that property,
 /// and a footer that strips only category `Cc` is a footer a reordering
 /// character walks through.
-pub(crate) fn socket_path_text() -> String {
-    safe_display_text(selected_endpoint().describe())
+pub(crate) fn deck_path_text(endpoint: &Endpoint) -> String {
+    safe_display_text(endpoint.describe())
 }
 
-pub(crate) fn disconnected_snapshot(error: impl AsRef<str>) -> DesktopSnapshot {
-    let (deck_kind, local_only_reason, selection_fallback) = selection_fields();
+/// The disconnected snapshot **for one deck** (PRD #742 M3 takes the endpoint).
+///
+/// Every failure path in `snapshot_with` reaches here, and each of them already
+/// had the endpoint in hand — so before M3 a fleet's unreachable deck reported
+/// its failure under the *selected* deck's name, which on the overview would
+/// have painted a healthy deck as disconnected.
+pub(crate) fn disconnected_snapshot(
+    endpoint: &Endpoint,
+    error: impl AsRef<str>,
+) -> DesktopSnapshot {
+    let (deck_kind, local_only_reason, selection_fallback) = selection_fields(endpoint);
     DesktopSnapshot {
         connection: DesktopConnection {
             status: ConnectionStatus::Disconnected,
-            socket_path: socket_path_text(),
+            socket_path: deck_path_text(endpoint),
             error: Some(safe_message(error)),
             client_protocol_version: PROTOCOL_VERSION,
             server_protocol_version: None,
@@ -1156,8 +1254,9 @@ mod tests {
     /// report that a daemon had stopped gracefully.
     #[test]
     fn a_remote_selection_disables_the_daemon_lifecycle_controls() {
-        let (kind, local_only, fallback) =
-            with_selection(&selecting_a_remote_deck(), selection_fields);
+        let (kind, local_only, fallback) = with_selection(&selecting_a_remote_deck(), || {
+            selection_fields(&selected_endpoint())
+        });
 
         assert_eq!(kind, "remote");
         assert_eq!(
@@ -1180,10 +1279,10 @@ mod tests {
     /// local deck, with the controls enabled and nothing to explain.
     #[test]
     fn the_local_deck_is_the_default_and_keeps_its_controls() {
-        let (kind, local_only, fallback) = with_selection(
-            &crate::settings::DesktopSettings::default(),
-            selection_fields,
-        );
+        let (kind, local_only, fallback) =
+            with_selection(&crate::settings::DesktopSettings::default(), || {
+                selection_fields(&selected_endpoint())
+            });
 
         assert_eq!(kind, "local");
         assert_eq!(local_only, None);
@@ -1207,7 +1306,8 @@ mod tests {
             }),
             ..DesktopSettings::default()
         };
-        let (kind, local_only, fallback) = with_selection(&missing, selection_fields);
+        let (kind, local_only, fallback) =
+            with_selection(&missing, || selection_fields(&selected_endpoint()));
 
         assert_eq!(kind, "local", "the app still has a deck to talk to");
         assert_eq!(local_only, None, "and its controls still work");
@@ -1240,7 +1340,8 @@ mod tests {
             }),
             ..DesktopSettings::default()
         };
-        let (kind, _, fallback) = with_selection(&half_configured, selection_fields);
+        let (kind, _, fallback) =
+            with_selection(&half_configured, || selection_fields(&selected_endpoint()));
 
         assert_eq!(kind, "local");
         let reason = fallback.expect("a socket-less row must be reported");
@@ -1599,7 +1700,7 @@ mod tests {
 
     #[test]
     fn disconnected_snapshot_is_fixture_safe_and_sanitized() {
-        let snapshot = disconnected_snapshot("offline\u{1b}[31m");
+        let snapshot = disconnected_snapshot(&Endpoint::local(), "offline\u{1b}[31m");
         assert_eq!(snapshot.connection.status, ConnectionStatus::Disconnected);
         assert_eq!(snapshot.connection.error.as_deref(), Some("offline[31m"));
         assert!(snapshot.agents.is_empty());

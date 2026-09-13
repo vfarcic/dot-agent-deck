@@ -19,7 +19,7 @@ use std::time::Duration;
 use dot_agent_deck::agent_pty::{
     DOT_AGENT_DECK_PANE_ID, TabMembership, is_valid_display_name, mint_orchestration_id,
 };
-use dot_agent_deck::daemon_client::{DaemonClient, EventSubscription, StartAgentOptions};
+use dot_agent_deck::daemon_client::{DaemonClient, Endpoint, EventSubscription, StartAgentOptions};
 use dot_agent_deck::daemon_stop::{StopOutcome, run_daemon_stop};
 use dot_agent_deck::event::{
     AgentType, BroadcastMsg, EventType, PreparedWorkflow, ProjectRole, SendResult,
@@ -781,8 +781,49 @@ async fn refresh_and_emit(app: &AppHandle, links: &DaemonLinks) -> DesktopSnapsh
 /// improvement in how fast the desktop drains the daemon's broadcast.
 const EVENT_QUEUE_DEPTH: usize = 512;
 
-fn ensure_snapshot_watcher(app: &AppHandle, state: &DesktopState) {
-    if !state.start_watcher_once() {
+/// Start a watcher for every observed deck that has none (PRD #742 M3).
+///
+/// # One watcher per deck, and what that makes structural
+///
+/// #741 hit a **stale fold**: one watcher followed the selection, its event
+/// subscription was a connection to exactly one daemon, and nothing about a
+/// selection change ended it — so the previous deck's broadcasts went on being
+/// folded into the view answering the new deck's snapshots. That fix was a
+/// signal the watcher had to be told about. With N decks the hazard generalises
+/// and gets worse, because the subscriptions are now **concurrent** rather than
+/// sequential and `BroadcastMsg` carries no deck id at all.
+///
+/// So the isolation is built rather than remembered: each deck's watcher owns
+/// its own [`AgentView`], so a fold cannot reach another deck's view because it
+/// is in another task's object; and each stamps its own endpoint on what it
+/// emits, so a record cannot be labelled with another deck's name because the
+/// name comes from the task's own endpoint rather than from `selected_endpoint()`.
+///
+/// Per-deck watchers also settle the two things the PRD asks for by
+/// construction: **retry and backoff are per deck**, so one unreachable deck
+/// cannot starve the others, and **coalescing stays per watcher** — the
+/// alternative, one coalescer over N streams, shares its 150 ms window across
+/// decks and reintroduces exactly the cross-deck stall this milestone exists to
+/// remove.
+///
+/// # Idempotent, and called from every path that can change the set
+///
+/// The claim is [`DesktopState::start_watcher_once_for`], so calling this again
+/// for a deck that already has a watcher does nothing. The bootstrap paths call
+/// it because they are where the app first has a deck to watch; `apply_selection`
+/// calls it because a settings save can add a deck to the fleet **without**
+/// moving the resolved selection — which is the "the set gained a member" signal
+/// M2 derived and deliberately left without a consumer.
+fn ensure_snapshot_watchers(app: &AppHandle, state: &DesktopState) {
+    for endpoint in crate::dto::observed_decks() {
+        spawn_deck_watcher(app, state, endpoint);
+    }
+}
+
+/// The watcher loop for **one** deck.
+fn spawn_deck_watcher(app: &AppHandle, state: &DesktopState, endpoint: Endpoint) {
+    let key = endpoint.identity();
+    if !state.start_watcher_once_for(&key) {
         return;
     }
     let app = app.clone();
@@ -791,24 +832,26 @@ fn ensure_snapshot_watcher(app: &AppHandle, state: &DesktopState) {
     // connections per refresh at up to 6.667 refreshes a second — and it is
     // also the only place that can observe a daemon being replaced, because its
     // event subscription is the one connection the desktop holds open across
-    // refreshes. Hence the `invalidate_all` below.
+    // refreshes. Hence the `invalidate` below.
     let links = Arc::clone(&state.daemon);
     // PRD #741 M9: the selection signal. Subscribed here rather than inside the
     // task so the first observed generation is the one in force when the
     // watcher started, not whatever it happens to be when the task is polled.
     let mut selection = state.selection.subscribe();
-    tauri::async_runtime::spawn(async move {
+    let handle = tauri::async_runtime::spawn(async move {
         // PRD #741 M4(b): the incremental agent list. It belongs to this task
         // and to nothing else — it is only ever correct while this task's
         // subscription is the one feeding it, so a second holder could not be
-        // told whether its contents were live.
+        // told whether its contents were live. PRD #742 M3: that is now also
+        // what keeps one deck's fold out of another's, since there is one of
+        // these per deck and a fold cannot reach across two objects.
         let mut view = AgentView::default();
         loop {
-            let daemon = match trusted_daemon(&links).await {
+            let daemon = match links.trusted(&endpoint).await {
                 Ok(daemon) if daemon.require_compatible().is_ok() => daemon,
                 _ => {
                     view.resubscribed();
-                    let snapshot = get_snapshot(&links).await;
+                    let snapshot = snapshot_with(&endpoint, &links, None).await;
                     emit_snapshot(&app, &snapshot);
                     tokio::time::sleep(WATCH_RETRY_DELAY).await;
                     continue;
@@ -820,8 +863,12 @@ fn ensure_snapshot_watcher(app: &AppHandle, state: &DesktopState) {
                     // Could not even subscribe against a link that just said it
                     // was compatible: drop it rather than retry through it.
                     view.resubscribed();
-                    links.invalidate_all().await;
-                    let snapshot = get_snapshot(&links).await;
+                    // PRD #742 M3: THIS deck's link, not every deck's. A
+                    // subscription that failed says nothing about the other
+                    // machines in the fleet, and dropping their links would make
+                    // one deck's bad moment cost N handshakes.
+                    links.invalidate(&endpoint).await;
+                    let snapshot = snapshot_with(&endpoint, &links, None).await;
                     emit_snapshot(&app, &snapshot);
                     tokio::time::sleep(WATCH_RETRY_DELAY).await;
                     continue;
@@ -837,20 +884,22 @@ fn ensure_snapshot_watcher(app: &AppHandle, state: &DesktopState) {
             selection.mark_unchanged();
             let reader = spawn_event_reader(subscription);
             let ended =
-                watch_one_subscription(&app, &links, &mut view, reader, &mut selection).await;
-            // PRD #741 M4(a): the event stream ended. That is the desktop's
-            // ONE long-lived connection to the daemon going away, and a daemon
+                watch_one_subscription(&app, &endpoint, &links, &mut view, reader, &mut selection)
+                    .await;
+            // PRD #741 M4(a): the event stream ended. That is this watcher's
+            // long-lived connection to its daemon going away, and a daemon
             // cannot be replaced without the old process dying and taking this
             // socket with it — so this is the signal that the held handshake may
-            // now describe a process that no longer exists. Drop every link
-            // before reconnecting; the loop's next `trusted_daemon` handshakes
-            // against whatever is actually there now.
+            // now describe a process that no longer exists. Drop the link before
+            // reconnecting; the loop's next `trusted` handshakes against
+            // whatever is actually there now.
             //
             // A selection change reaches the same place for a different reason:
-            // the link is not stale, it simply describes a deck the user has
-            // left. `apply_selection` has already invalidated it, and the call
-            // below is a no-op in that case rather than a second mechanism.
-            links.invalidate_all().await;
+            // the link is not stale, it simply describes a deck whose applied
+            // selection state has moved. `apply_selection` has already
+            // invalidated it, and the call below is a no-op in that case rather
+            // than a second mechanism.
+            links.invalidate(&endpoint).await;
             // PRD #741 M9: the retry delay is a backoff for a deck that is not
             // answering. A selection change is a user's click, and there is a
             // healthy deck waiting at the other end of it, so it re-subscribes
@@ -862,6 +911,7 @@ fn ensure_snapshot_watcher(app: &AppHandle, state: &DesktopState) {
             tokio::time::sleep(WATCH_RETRY_DELAY).await;
         }
     });
+    state.register_watcher(&key, handle);
 }
 
 /// Drain one subscription into a channel until it ends.
@@ -904,8 +954,13 @@ enum SubscriptionEnd {
 /// arrives at all.
 ///
 /// Returns when the subscription ends, or when the selected deck changes.
+///
+/// PRD #742 M3: `endpoint` is the deck this subscription is against, and it is
+/// the only deck this call ever names — the fold it fills, the events it stamps
+/// and the snapshot it emits are all that deck's.
 async fn watch_one_subscription(
     app: &AppHandle,
+    endpoint: &Endpoint,
     links: &DaemonLinks,
     view: &mut AgentView,
     mut events: tokio::sync::mpsc::Receiver<BroadcastMsg>,
@@ -923,20 +978,36 @@ async fn watch_one_subscription(
         tokio::select! {
             msg = events.recv() => match msg {
                 Some(msg) => {
-                    let _ = app.emit("desktop://daemon-event", &msg);
+                    emit_daemon_event(app, endpoint, &msg);
                     view.apply(&msg);
                 }
                 // The reader task is gone, so the subscription ended.
                 None => return SubscriptionEnd::Ended,
             },
             _ = reconcile.tick() => view.mark_reconcile_due(),
-            // PRD #741 M9: returns BEFORE the refresh below, deliberately. The
-            // fold under this arm was built from the deck the user has just
-            // left, and `snapshot_with` would answer the new deck's snapshot
-            // out of it — one machine's agents under another machine's name.
-            // Returning discards the fold with the subscription that filled it:
-            // the caller re-establishes, and `view.resubscribed()` runs before
-            // the next stream can deliver anything.
+            // PRD #741 M9: returns BEFORE the refresh below, deliberately, and
+            // the shape is kept — but PRD #742 M3 changed what it buys, so the
+            // reason is restated rather than inherited.
+            //
+            // It used to be the thing that stopped a MISLABEL: one watcher
+            // followed the selection, so the fold under this arm was built from
+            // the deck the user had just left and `snapshot_with(&selected_endpoint(), …)`
+            // would have answered the NEW deck's snapshot out of it — one
+            // machine's agents under another machine's name. That is no longer
+            // what prevents it. This task's `endpoint` is fixed for its whole
+            // life, so the fold and the label come from the same deck by
+            // construction and could not disagree however late this arm fired.
+            //
+            // What returning still buys is the re-establishment, and it is a
+            // real one: `retarget_selection` has just called
+            // `DaemonLinks::invalidate_all`, so the link behind this
+            // subscription is one the app has deliberately forgotten. Returning
+            // discards the fold with the subscription that filled it, and
+            // `view.resubscribed()` runs before the next stream can deliver
+            // anything. The distinct return type is what keeps this off
+            // `WATCH_RETRY_DELAY`: a selection change is a click with a healthy
+            // deck behind it, and a second of dead air is the whole of what the
+            // user would see.
             //
             // `changed()` errors only when every sender is gone, which cannot
             // happen while `DesktopState` is alive; treated as "no more
@@ -951,31 +1022,40 @@ async fn watch_one_subscription(
         // costing one of its own. Before M4(b) each event cost a full
         // `ListAgents` and a 150 ms wait, so a burst of N drained at 6.667/s;
         // now a burst of N is N folds and one emit.
-        drain_pending(app, view, &mut events);
+        drain_pending(app, endpoint, view, &mut events);
         if let Some(previous) = last_refresh {
             let elapsed = previous.elapsed();
             if elapsed < SNAPSHOT_COALESCE_INTERVAL {
                 tokio::time::sleep(SNAPSHOT_COALESCE_INTERVAL - elapsed).await;
                 // The sleep is the coalescing window: whatever landed during it
                 // belongs to the snapshot about to be emitted.
-                drain_pending(app, view, &mut events);
+                drain_pending(app, endpoint, view, &mut events);
             }
         }
         // PRD #741, Greptile P1 on #1035: the `select!` arm above observes a
         // selection change only while this loop is PARKED in it. Everything
         // from there to the emit runs outside it — `drain_pending`, and above
         // all the coalescing sleep, which is up to `SNAPSHOT_COALESCE_INTERVAL`
-        // of wall clock — so a change landing in that stretch went unseen until
-        // the next iteration, by which time the emit had already happened. It
-        // would have paired the NEW deck's `selected_endpoint()` with a `view`
-        // folded from the OLD one: one machine's agents under another machine's
-        // name, and a later action on one of those rows sending an old agent id
-        // to the new deck. Exactly the defect M9 fixed for the subscription,
-        // surviving in the sleep.
+        // of wall clock — so a change landing in that stretch goes unseen until
+        // the next iteration, by which time the emit has already happened.
+        //
+        // PRD #742 M3 narrowed what that costs, and the old note overstated it
+        // from here on. It said the late emit "would have paired the NEW deck's
+        // `selected_endpoint()` with a `view` folded from the OLD one". That was
+        // true of a watcher that followed the selection; this one does not, so
+        // the emit below pairs THIS deck's endpoint with THIS deck's fold
+        // whenever it happens to run. What the poll still buys is promptness —
+        // the re-establishment the arm above exists for, taken at the end of
+        // this pass rather than one coalescing window later.
+        //
+        // Kept rather than removed because it is also the stronger of the two
+        // observations: an arm only covers the window it is racing, while one
+        // poll immediately before the emit covers everything since the last
+        // observation — the drain, the sleep, and the snapshot decision itself.
         if selection_moved_since_last_seen(selection) {
             return SubscriptionEnd::SelectionChanged;
         }
-        let snapshot = snapshot_with(&selected_endpoint(), links, Some(view)).await;
+        let snapshot = snapshot_with(endpoint, links, Some(view)).await;
         emit_snapshot(app, &snapshot);
         last_refresh = Some(tokio::time::Instant::now());
     }
@@ -1008,12 +1088,77 @@ fn selection_moved_since_last_seen(selection: &tokio::sync::watch::Receiver<u64>
 /// Apply every event already queued, without waiting for another.
 fn drain_pending(
     app: &AppHandle,
+    endpoint: &Endpoint,
     view: &mut AgentView,
     events: &mut tokio::sync::mpsc::Receiver<BroadcastMsg>,
 ) {
     while let Ok(msg) = events.try_recv() {
-        let _ = app.emit("desktop://daemon-event", &msg);
+        emit_daemon_event(app, endpoint, &msg);
         view.apply(&msg);
+    }
+}
+
+/// One daemon broadcast, forwarded to the webview **stamped with the deck it
+/// came from** (PRD #742 M3).
+///
+/// # The stamp
+///
+/// `BroadcastMsg` carries no deck id and this event was emitted unwrapped, so
+/// "which deck is this event from" was answerable only by "there is exactly
+/// one". With a watcher per observed deck that stops being true, and the raw
+/// event stream would have stayed single-deck under a multi-deck view — the
+/// drawer's evidence list and its handoff edges are both built from this stream.
+///
+/// # Additive on the wire, deliberately
+///
+/// `deck` is **flattened beside** the message rather than wrapping it, so the
+/// payload keeps `kind` and every snake_case `AgentEvent` field exactly where
+/// `desktop/src/lib/daemonEvents.ts` reads them today. A wrapper would have been
+/// a frontend change, and the frontend is M4's.
+///
+/// The value is [`crate::dto::deck_path_text`]'s — the same string
+/// `connection.socketPath` carries, which is what `bridge.ts` derives `daemonId`
+/// from — so a consumer can key an event to the group that a snapshot put on
+/// screen without a second naming scheme to keep in step.
+///
+/// # Unguarded, and stated rather than glossed
+///
+/// **No test asserts this**, and none can without a production refactor this
+/// milestone declined. Reaching an emit needs an `AppHandle`, which needs a
+/// running Tauri app; `tauri::test::MockRuntime` exists as a dev-dependency, but
+/// this chain names the concrete `AppHandle<Wry>` throughout, so driving it from
+/// a mock app means making `ensure_snapshot_watchers`, `emit_snapshot`,
+/// [`watch_one_subscription`], `refresh_and_emit` and [`drain_pending`] generic
+/// over `R: Runtime` — a real refactor with headless risk, and not M3's. What a
+/// reader should check by hand is one line: with two decks observed, every
+/// `desktop://daemon-event` payload in the webview console carries a `deck`
+/// equal to the `connection.socketPath` of the deck that emitted it.
+fn emit_daemon_event(app: &AppHandle, endpoint: &Endpoint, msg: &BroadcastMsg) {
+    let _ = app.emit("desktop://daemon-event", DeckStamped::new(endpoint, msg));
+}
+
+/// The `desktop://daemon-event` payload: one [`BroadcastMsg`], flattened, with
+/// the deck it came from beside it. See [`emit_daemon_event`].
+///
+/// A named type at module scope rather than a local inside the emit, so that the
+/// one half of this change a test **can** reach is reachable: the emit needs a
+/// running Tauri app, but the wire shape does not, and the wire shape is what
+/// would break `desktop/src/lib/daemonEvents.ts` if `flatten` did not do what
+/// this is relying on it to do. Pinned by
+/// [`tests::a_stamped_daemon_event_adds_the_deck_and_moves_nothing_else`].
+#[derive(Clone, serde::Serialize)]
+struct DeckStamped<'a> {
+    deck: String,
+    #[serde(flatten)]
+    event: &'a BroadcastMsg,
+}
+
+impl<'a> DeckStamped<'a> {
+    fn new(endpoint: &Endpoint, event: &'a BroadcastMsg) -> Self {
+        Self {
+            deck: crate::dto::deck_path_text(endpoint),
+            event,
+        }
     }
 }
 
@@ -1087,7 +1232,7 @@ async fn desktop_bootstrap(
     let options = options.unwrap_or_default();
     let snapshot = bootstrap(&options, &state.daemon).await;
     emit_snapshot(&app, &snapshot);
-    ensure_snapshot_watcher(&app, &state);
+    ensure_snapshot_watchers(&app, &state);
     ensure_explicit_start_connected(options.start_if_missing, &snapshot)?;
     Ok(snapshot)
 }
@@ -1269,7 +1414,16 @@ async fn desktop_set_settings(
 /// links are dropped before the tunnels, so a link cannot be re-established
 /// against a transport that is on its way out.
 async fn apply_selection(app: &AppHandle, state: &DesktopState, settings: &DesktopSettings) {
-    if !retarget_selection(state, settings).await {
+    let moved = retarget_selection(state, settings).await;
+    // PRD #742 M3: OUTSIDE the `moved` gate, and that is the point of putting it
+    // here rather than inside `retarget_selection`. Watchers follow the OBSERVED
+    // SET, and adding a deck to a fleet grows that set without moving the deck
+    // the screen resolves to — so gating this on `moved` would leave a newly
+    // added deck permanently unwatched. `retarget_selection` has already ended
+    // the departed decks' watchers; this starts the arrived ones', and does
+    // nothing at all for a save that changed neither.
+    ensure_snapshot_watchers(app, state);
+    if !moved {
         return;
     }
     refresh_and_emit(app, &state.daemon).await;
@@ -1291,7 +1445,17 @@ async fn retarget_selection(state: &DesktopState, settings: &DesktopSettings) ->
         terminal::detach_all(state).await;
     }
     state.daemon.invalidate_all().await;
-    state.tunnels.retain(&observed_keys(settings)).await;
+    let observed = observed_keys(settings);
+    state.tunnels.retain(&observed).await;
+    // PRD #742 M3: the watcher half of the same teardown, and the natural
+    // sibling of the `retain` above it — a deck that left the observed set must
+    // stop being watched as well as stop holding a transport, or it goes on
+    // emitting records into a view that no longer has a group for them.
+    //
+    // The STARTING half is not here, and cannot be: spawning a watcher needs an
+    // `AppHandle`, which is exactly what this function is split out to be
+    // without. `apply_selection` does it one line up the stack.
+    state.retain_watchers(&observed);
     if moved {
         state.selection_changed();
     }
@@ -1474,7 +1638,7 @@ async fn desktop_run_action(
         DesktopAction::Bootstrap { start_if_missing } => {
             let snapshot = bootstrap(&BootstrapOptions { start_if_missing }, &state.daemon).await;
             emit_snapshot(&app, &snapshot);
-            ensure_snapshot_watcher(&app, &state);
+            ensure_snapshot_watchers(&app, &state);
             ensure_explicit_start_connected(start_if_missing, &snapshot)?;
             return Ok(DesktopActionResult {
                 ok: snapshot.connection.status == ConnectionStatus::Connected,
@@ -1647,7 +1811,7 @@ async fn desktop_run_action(
             )
             .await;
             emit_snapshot(&app, &snapshot);
-            ensure_snapshot_watcher(&app, &state);
+            ensure_snapshot_watchers(&app, &state);
             ensure_explicit_start_connected(true, &snapshot)?;
             return Ok(DesktopActionResult {
                 ok: true,
@@ -2079,6 +2243,191 @@ mod tests {
             "the deck screen's own transport survives a fleet edit"
         );
         crate::dto::apply_settings_selection(&DesktopSettings::default());
+    }
+
+    // -----------------------------------------------------------------------
+    // PRD #742 M3 — the watcher set
+    //
+    // M2 left exactly this half open and said so: `retain` already tears down a
+    // departed deck's TRANSPORT, and a set difference is all a teardown needs —
+    // but a set that GAINED a member needs a watcher STARTED, which is the one
+    // set-level event a difference cannot be read backwards from, and M2 did not
+    // derive it because it had no consumer. The watchers are the consumer.
+    // -----------------------------------------------------------------------
+
+    /// **Test-plan item 11.** Scenario: three decks are observed and each has
+    /// claimed a watcher; the settings document is then saved with one deck
+    /// removed. After the save the departed deck is no longer watched, the two
+    /// that remain still are, and re-adding the departed deck hands out a fresh
+    /// watcher for it.
+    ///
+    /// Pinned at `retarget_selection` rather than at the registry alone, because
+    /// that is the function every settings save already reaches and where the
+    /// transport half of the same teardown already lives — one line below
+    /// `state.tunnels.retain(&observed_keys(settings))`. A watcher left running
+    /// for a deck the user has dropped goes on emitting that deck's records into
+    /// a view that no longer has a group for them.
+    ///
+    /// **What this does NOT pin**, stated because the ordering is the
+    /// load-bearing half of item 11 and this cannot reach it: that the watcher
+    /// ends BEFORE any further record from that deck is emitted. Emission needs
+    /// an `AppHandle`, which needs a running Tauri app. #741's own answer to the
+    /// same problem is the shape to copy — `watch_one_subscription` returns on
+    /// the selection arm *before* its refresh, so the stale fold is discarded
+    /// with the subscription that filled it rather than answering one more
+    /// snapshot.
+    #[tokio::test]
+    async fn a_deck_that_leaves_the_fleet_stops_being_watched() {
+        let state = DesktopState::default();
+        let fleet = fleet_of(&["build-box.example.com", "laptop.example.com"]);
+        for endpoint in fleet.observed_endpoints() {
+            assert!(
+                state.start_watcher_once_for(&endpoint.identity()),
+                "every observed deck starts unwatched: {endpoint:?}"
+            );
+        }
+        assert_eq!(state.watched_decks(), observed_keys(&fleet));
+
+        let smaller = fleet_of(&["build-box.example.com"]);
+        let kept = observed_keys(&smaller);
+        let departed: Vec<_> = observed_keys(&fleet).difference(&kept).cloned().collect();
+        assert_eq!(departed.len(), 1, "exactly one deck leaves the fleet");
+        let departed = departed.into_iter().next().expect("the departed deck");
+
+        retarget_selection(&state, &smaller).await;
+
+        assert!(
+            !state.watched_decks().contains(&departed),
+            "a deck dropped from the observed set must stop being watched"
+        );
+        assert_eq!(
+            state.watched_decks(),
+            kept,
+            "and the decks that stayed must keep the watchers they had"
+        );
+        assert!(
+            state.start_watcher_once_for(&departed),
+            "a deck that rejoins the fleet needs a watcher started again, which \
+             is the half a set difference cannot be read backwards from"
+        );
+
+        crate::dto::apply_settings_selection(&DesktopSettings::default());
+    }
+
+    /// **PRD #742 M3's deck stamp, at the one layer a test can reach.** Scenario:
+    /// a hook event from a named deck is turned into a `desktop://daemon-event`
+    /// payload. The payload must carry `deck`, and must leave `kind` and every
+    /// snake_case `AgentEvent` field exactly where they were.
+    ///
+    /// The stamp exists because `BroadcastMsg` carries no deck id and this event
+    /// was emitted unwrapped, so with N watchers "which deck is this from" had no
+    /// answer at all. It is added by `#[serde(flatten)]` rather than by wrapping
+    /// precisely so that `desktop/src/lib/daemonEvents.ts` needs no change —
+    /// the frontend is M4's — and that is the claim this test exists to check,
+    /// because a wrapper would break the evidence drawer and the handoff edges
+    /// silently and nothing else here would notice.
+    ///
+    /// **It does not reach the emit**, which is the residual: `app.emit` needs an
+    /// `AppHandle` and therefore a running Tauri app, and making the chain
+    /// generic over `R: Runtime` to reach one from `MockRuntime` is a production
+    /// refactor M3 deliberately did not start. So what stays unguarded is that
+    /// the watcher passes its **own** endpoint here — check that by hand with two
+    /// decks observed, where every payload's `deck` must equal the
+    /// `connection.socketPath` of the deck that emitted it.
+    #[test]
+    fn a_stamped_daemon_event_adds_the_deck_and_moves_nothing_else() {
+        use dot_agent_deck::daemon_client::{Endpoint, LocalEndpoint};
+        use dot_agent_deck::event::{AgentEvent, AgentType, BroadcastMsg, EventType};
+
+        let event = BroadcastMsg::Event(AgentEvent {
+            session_id: "pane-a-session".into(),
+            agent_type: AgentType::ClaudeCode,
+            event_type: EventType::ToolStart,
+            tool_name: Some("Bash".into()),
+            tool_detail: None,
+            cwd: None,
+            timestamp: chrono::Utc::now(),
+            user_prompt: None,
+            metadata: std::collections::HashMap::new(),
+            pane_id: Some("pane-a".into()),
+            agent_id: Some("agent-a".into()),
+            agent_version: None,
+            schema_version: None,
+            live_target: None,
+        });
+        let deck = Endpoint::Local(LocalEndpoint::at("/run/deck-a.sock"));
+
+        let bare = serde_json::to_value(&event).expect("the unstamped payload");
+        let stamped =
+            serde_json::to_value(DeckStamped::new(&deck, &event)).expect("the stamped payload");
+
+        assert_eq!(
+            stamped["deck"], "/run/deck-a.sock",
+            "the payload must name the deck it came from, and with the same \
+             string `connection.socketPath` carries"
+        );
+        assert_eq!(
+            stamped["kind"], "event",
+            "the internally-tagged discriminator must survive the flatten — a \
+             wrapper here would strand every reader in daemonEvents.ts"
+        );
+        assert_eq!(stamped["tool_name"], "Bash", "snake_case fields stay put");
+        assert_eq!(stamped["agent_id"], "agent-a");
+
+        // Additive, stated as a set difference rather than field by field: the
+        // frontend is M4's, so this milestone may ADD to this payload and may
+        // move nothing already in it.
+        let bare_keys = bare.as_object().expect("a map").clone();
+        let stamped_keys = stamped.as_object().expect("a map").clone();
+        for (key, value) in &bare_keys {
+            assert_eq!(
+                stamped_keys.get(key),
+                Some(value),
+                "the stamp moved `{key}`, which no frontend change accompanies"
+            );
+        }
+        let added: Vec<_> = stamped_keys
+            .keys()
+            .filter(|key| !bare_keys.contains_key(*key))
+            .collect();
+        assert_eq!(added, vec!["deck"], "exactly one field is added");
+    }
+
+    /// Scenario: one deck's watcher is claimed twice, then the fleet is emptied
+    /// and the deck is claimed again. A deck that is already watched must not
+    /// hand out a second watcher, and a deck whose watcher was ended must hand
+    /// out a fresh one.
+    ///
+    /// The N-deck form of `DesktopState::start_watcher_once`, whose `AtomicBool`
+    /// is the single-deck version of exactly this: one claim per deck rather
+    /// than one claim per process. Two watchers on one deck would fold the same
+    /// broadcast twice and emit two snapshots per coalescing window for it.
+
+    #[test]
+    fn each_observed_deck_claims_exactly_one_watcher() {
+        use dot_agent_deck::daemon_client::Endpoint;
+
+        let state = DesktopState::default();
+        let local = Endpoint::local().identity();
+
+        assert!(
+            state.start_watcher_once_for(&local),
+            "the first claim starts it"
+        );
+        assert!(
+            !state.start_watcher_once_for(&local),
+            "a deck that is already watched must not start a second watcher"
+        );
+
+        state.retain_watchers(&std::collections::HashSet::new());
+        assert!(
+            state.watched_decks().is_empty(),
+            "a deck named by no observed set keeps no watcher"
+        );
+        assert!(
+            state.start_watcher_once_for(&local),
+            "a deck whose watcher was ended must be startable again"
+        );
     }
 
     /// A remote deck at `host` whose daemon listens on `socket` over there,
@@ -3202,7 +3551,8 @@ command = "configured-planner"
 
     #[test]
     fn explicit_daemon_start_requires_a_connected_snapshot() {
-        let disconnected = crate::dto::disconnected_snapshot("daemon start timed out");
+        let disconnected =
+            crate::dto::disconnected_snapshot(&Endpoint::local(), "daemon start timed out");
         assert!(ensure_explicit_start_connected(false, &disconnected).is_ok());
         assert_eq!(
             ensure_explicit_start_connected(true, &disconnected).unwrap_err(),

@@ -183,6 +183,12 @@ impl std::fmt::Display for AcquireError {
 #[derive(Default)]
 pub(crate) struct EndpointTunnels {
     tunnels: AsyncMutex<HashMap<EndpointIdentity, Arc<TunnelLease>>>,
+    /// One `ssh`-authentication gate per deck (PRD #742 M3) — see
+    /// [`Self::acquire`].
+    ///
+    /// A `std::sync::Mutex` because it is never held across an `await`: it hands
+    /// out an `Arc` and is released, and the gate is what gets awaited.
+    gates: std::sync::Mutex<HashMap<EndpointIdentity, Arc<AsyncMutex<()>>>>,
 }
 
 #[cfg(unix)]
@@ -190,11 +196,35 @@ impl EndpointTunnels {
     /// A lease on the transport for `endpoint`, establishing one if there is
     /// none or the held one's child has exited.
     ///
-    /// One async mutex over the whole map, held across establishment, for the
-    /// same reason `DaemonLinks` takes one: concurrent first-uses collapse into
-    /// ONE ssh authentication instead of N, and a deck that is not answering
-    /// queues the other callers behind one connect attempt rather than giving
-    /// each its own.
+    /// # One gate per deck, and why this one has no test
+    ///
+    /// This held one async mutex over the whole map **across the `ssh` spawn**,
+    /// for the same reason `DaemonLinks` did, and it inverts at N decks for the
+    /// same reason: the callers queued behind an unreachable deck's connect
+    /// become *other decks*. PRD #742 M3 splits it the same way — a gate keyed
+    /// like the map, held across establishment, and the map's own lock held only
+    /// for the lookup and the insert around it. Concurrent first-uses of one
+    /// deck still collapse into ONE ssh authentication, because the second
+    /// caller waits on that deck's gate and then finds the lease already
+    /// published; two decks never wait for each other.
+    ///
+    /// **The half that `DaemonLinks` has and this does not is a test.** M3's
+    /// mutex test (`an_unresponsive_deck_does_not_queue_another_decks_handshake`)
+    /// injects its stall at `hello()`, which sits *after* this call inside
+    /// `establish()`, and for a `Local` endpoint this returns promptly — so that
+    /// test passes whether or not this lock was ever split. Stalling *this*
+    /// function deterministically means stalling `EndpointConnection::open`,
+    /// whose slow path is spawning `ssh`, which needs either a real network
+    /// timeout or a production test seam. Neither was judged worth it, so this
+    /// split is justified **from the code**: `establish()` holds `DaemonLinks`'
+    /// gate across this call, so splitting only `DaemonLinks` would have left
+    /// every `acquire` serialised behind one deck's ssh authentication and
+    /// success criterion 2 unmet for the remote decks it is actually about.
+    ///
+    /// The gate map forgets gates nobody is holding, on the same argument
+    /// `DaemonLinks::gate` gives: strong count 1 means this map is the only
+    /// holder, and no clone can be taken concurrently because cloning happens
+    /// under this same lock.
     ///
     /// The error is **typed**, and that is a security property rather than
     /// tidiness (PRD #741 final audit **F3**). This used to flatten
@@ -212,14 +242,20 @@ impl EndpointTunnels {
         endpoint: &Endpoint,
     ) -> Result<Arc<TunnelLease>, AcquireError> {
         let key = endpoint.identity();
-        let mut tunnels = self.tunnels.lock().await;
-        if let Some(held) = tunnels.get(&key) {
-            if held.alive() {
-                return Ok(Arc::clone(held));
+        // Held across the ssh spawn below, and it is this deck's alone.
+        let gate = self.gate(&key);
+        let _establishing = gate.lock().await;
+        {
+            let mut tunnels = self.tunnels.lock().await;
+            if let Some(held) = tunnels.get(&key) {
+                if held.alive() {
+                    return Ok(Arc::clone(held));
+                }
+                // Dropped from the map, not closed here: another caller may
+                // still be holding a lease, and its `Drop` is what tears the
+                // child down.
+                tunnels.remove(&key);
             }
-            // Dropped from the map, not closed here: another caller may still
-            // be holding a lease, and its `Drop` is what tears the child down.
-            tunnels.remove(&key);
         }
         let ssh = SshProgram::resolve().map_err(|error| AcquireError::Local(error.to_string()))?;
         let endpoint = endpoint.clone();
@@ -237,8 +273,19 @@ impl EndpointTunnels {
             address: connection.connect_address().to_path_buf(),
             connection: Mutex::new(connection),
         });
-        tunnels.insert(key, Arc::clone(&lease));
+        self.tunnels.lock().await.insert(key, Arc::clone(&lease));
         Ok(lease)
+    }
+
+    /// This deck's establishment gate, minting one if it has none. See
+    /// [`Self::acquire`].
+    fn gate(&self, key: &EndpointIdentity) -> Arc<AsyncMutex<()>> {
+        let mut gates = self
+            .gates
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        gates.retain(|held, gate| held == key || Arc::strong_count(gate) > 1);
+        Arc::clone(gates.entry(key.clone()).or_default())
     }
 
     /// Drop the map's handle on `endpoint`'s transport.
