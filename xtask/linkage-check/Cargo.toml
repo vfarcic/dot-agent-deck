@@ -44,3 +44,14 @@ libc = "0.2"
 # `label-policy.json` the labeler's setup step writes.
 serde_json = "1"
 tempfile = "3"
+# Issue #1061: `skill_frontmatter` has to decide whether a `SKILL.md`
+# frontmatter block is really valid YAML, and the whole defect it guards is
+# that a LENIENT reader accepted what a spec-correct one rejected — so
+# hand-rolling a parser here would reproduce the bug rather than catch it.
+# `yaml-rust2` is a fully YAML 1.2 compliant pure-Rust parser. This is the one
+# place in the workspace that pulls a YAML crate, and it is a DEV-dependency of
+# a `publish = false` xtask crate, so it reaches no shipped binary.
+# `default-features = false` drops the `encoding` feature and with it
+# `encoding_rs`: these files are read as UTF-8 `String`s, so the added closure
+# is just `yaml-rust2`, `hashlink` and `arraydeque`.
+yaml-rust2 = { version = "0.13", default-features = false }
