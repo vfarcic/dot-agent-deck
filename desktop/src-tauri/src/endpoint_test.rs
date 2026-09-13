@@ -417,6 +417,14 @@ fn apply_handshake(report: &mut EndpointTestReport, info: &HandshakeInfo, stamps
 /// id. Taking the token rather than an endpoint is what lets the two
 /// `SelectionFallback` states — a row that is gone, a row with no socket — be
 /// reported as themselves.
+///
+/// **`all` is not one of them, and lands on the `UnknownDeck` arm.** A probe
+/// tests one deck, and PRD #742's fleet token names a set; the panel reaches
+/// here with it only because its chooser shows no row while a fleet is
+/// selected, which #742 M4 is what settles. `EndpointId::parse` refuses the
+/// reserved word, so the existing malformed-token arm already answers it
+/// safely — the message is merely the wrong sentence for the case, not a wrong
+/// probe.
 pub(crate) async fn test_endpoint(
     settings: &DesktopSettings,
     selection: &str,

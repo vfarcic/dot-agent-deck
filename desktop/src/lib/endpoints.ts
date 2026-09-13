@@ -42,10 +42,10 @@
  */
 
 import type { EndpointSettingsDto, RemoteEndpointDto } from "./bridge";
-import { DEFAULT_SSH_PORT, LOCAL_ENDPOINT_SELECTION } from "./bridge";
+import { ALL_ENDPOINT_SELECTION, DEFAULT_SSH_PORT, LOCAL_ENDPOINT_SELECTION } from "./bridge";
 import { sanitizeText } from "./displayText";
 
-export { DEFAULT_SSH_PORT, LOCAL_ENDPOINT_SELECTION };
+export { ALL_ENDPOINT_SELECTION, DEFAULT_SSH_PORT, LOCAL_ENDPOINT_SELECTION };
 
 /** `EndpointId`'s bound — `MAX_ENDPOINT_ID_BYTES` in `settings.rs`. */
 export const MAX_ENDPOINT_ID_LENGTH = 64;
@@ -325,8 +325,9 @@ export const SPECIMEN_PLACEHOLDER_FIELDS: readonly EndpointField[] = ["host", "i
  * by sharing code but by `EndpointId::parse` — which every save and every
  * hand-edited document goes through — being the only thing that decides what an
  * id may be. Sixteen hex characters cannot collide with the reserved `local`
- * token or with any word a future `Selection` variant would reserve: those are
- * shorter and contain letters that are not hex digits.
+ * token, with the reserved `all` token #742 added, or with any word a further
+ * `Selection` variant would reserve: all of those are shorter and contain
+ * letters that are not hex digits.
  *
  * `crypto.getRandomValues` rather than `Math.random` because the Rust side
  * seeds from the operating system and the two should not differ in kind.
@@ -369,42 +370,73 @@ export function blankEndpoint(): RemoteEndpointDto {
  * `settings.rs` is the authority on it. What travels through the screens is this
  * union, for exactly the reason M6 made the Rust side an enum rather than an
  * `Option<EndpointId>`: [#742](https://github.com/vfarcic/dot-agent-deck/issues/742)
- * adds **All Decks** to this selector, and that has to be *additive*. With a
- * union it is one variant plus one arm in each of three places —
- * {@link parseSelection}, {@link selectionToken} and {@link deckChoices}. With a
- * bare id threaded through the components it would be a change to every prop
- * that carries a selection, and a `""`-means-all convention in each of them.
+ * adds **All Decks** to this selector, and that had to be *additive*. It was —
+ * one variant plus one arm in each of three places, {@link parseSelection},
+ * {@link selectionToken} and {@link deckChoices}, and nothing at all in
+ * `DeckSelector`. With a bare id threaded through the components it would have
+ * been a change to every prop that carries a selection, and a `""`-means-all
+ * convention in each of them.
+ *
+ * {@link sameSelection} is the one that looks like a fourth site and is not: it
+ * compares stored tokens rather than variants, so a new variant reaches it
+ * through {@link selectionToken} already.
  *
  * So: no component below this file handles a raw endpoint id, and none of them
- * needs to know that `local` is a reserved word.
+ * needs to know that `local` and `all` are reserved words.
  */
 export type DeckSelection =
   | { kind: "local" }
+  | { kind: "all" }
   | { kind: "one"; id: string };
 
 /** The default, and what an unrecognised token degrades to. */
 export const LOCAL_DECK_SELECTION: DeckSelection = { kind: "local" };
 
 /**
+ * Every configured deck at once — `Selection::All`, PRD #742's fleet.
+ *
+ * A reserved token like `local` rather than a row's id, and refused as an id on
+ * both sides (`ALL_SELECTION_TOKEN` in `settings.rs`), so the stored string is
+ * never ambiguous between "the fleet" and "the deck somebody called all".
+ */
+export const ALL_DECKS_SELECTION: DeckSelection = { kind: "all" };
+
+/**
  * Read a stored token.
  *
- * An unknown token — including one a *newer* build wrote, such as #742's `all`
- * — parses as `One`, finds no row, and is therefore rendered as the local deck
- * with the fallback the Rust side already reports. That is the same degradation
- * `Selection`'s own deserializer performs, and it is why nothing here throws:
- * the document is hand-editable and may have been written by a build with more
- * variants than this one.
+ * Two reserved words, then an id. An unknown token — one a *newer* build wrote,
+ * which is what `all` itself was to every build before #742 — parses as `One`,
+ * finds no row, and is therefore rendered as the local deck with the fallback
+ * the Rust side already reports. That is the same degradation `Selection`'s own
+ * deserializer performs, and it is why nothing here throws: the document is
+ * hand-editable and may have been written by a build with more variants than
+ * this one.
+ *
+ * That degradation is still live and still worth keeping: it is the reason
+ * shipping `all` could not damage an older build's document, and the reason the
+ * variant after this one will not damage ours.
  */
 export function parseSelection(token: string): DeckSelection {
-  return token === LOCAL_ENDPOINT_SELECTION ? LOCAL_DECK_SELECTION : { kind: "one", id: token };
+  if (token === LOCAL_ENDPOINT_SELECTION) return LOCAL_DECK_SELECTION;
+  if (token === ALL_ENDPOINT_SELECTION) return ALL_DECKS_SELECTION;
+  return { kind: "one", id: token };
 }
 
 /** The token to store. The inverse of {@link parseSelection}. */
 export function selectionToken(selection: DeckSelection): string {
-  return selection.kind === "local" ? LOCAL_ENDPOINT_SELECTION : selection.id;
+  if (selection.kind === "local") return LOCAL_ENDPOINT_SELECTION;
+  if (selection.kind === "all") return ALL_ENDPOINT_SELECTION;
+  return selection.id;
 }
 
-/** Whether two selections name the same deck. */
+/**
+ * Whether two selections name the same deck.
+ *
+ * No arm per variant, deliberately: it compares the STORED tokens, so a variant
+ * added to {@link DeckSelection} reaches it through {@link selectionToken} and
+ * this function never has to learn about it. #742's `all` was the first test of
+ * that and needed no change here.
+ */
 export function sameSelection(left: DeckSelection, right: DeckSelection): boolean {
   return selectionToken(left) === selectionToken(right);
 }
@@ -418,11 +450,20 @@ export interface DeckChoice {
 }
 
 /**
- * Every deck the user can choose, local first.
+ * Every deck the user can choose: the fleet, then the local deck, then the
+ * stored rows in document order.
  *
- * The local deck leads and is always present because it needs no configuration
- * — `Endpoint::local()` resolves it from the platform paths — so this list is
- * never empty and the selector is useful before anything is stored.
+ * **All Decks leads** because it is the widest choice rather than a deck — it
+ * is the one entry that does not narrow what is on screen — and because putting
+ * it above the decks it contains is how the list reads as a hierarchy instead of
+ * as one more sibling. It needs no configuration to be offered: with nothing
+ * stored it resolves to the local deck alone, which is the same thing the local
+ * entry does, and #742 M4 is what makes the two differ on screen.
+ *
+ * The local deck comes next and is always present because it needs no
+ * configuration either — `Endpoint::local()` resolves it from the platform
+ * paths — so this list is never empty and the selector is useful before
+ * anything is stored.
  *
  * **Rendered text says Deck, never "daemon".** M15 swept the rest of the app
  * into the same vocabulary, so this is no longer the only surface written in it:
@@ -431,6 +472,7 @@ export interface DeckChoice {
  */
 export function deckChoices(section: EndpointSettingsDto | undefined): DeckChoice[] {
   const choices: DeckChoice[] = [
+    { token: ALL_ENDPOINT_SELECTION, selection: ALL_DECKS_SELECTION, label: "All Decks" },
     { token: LOCAL_ENDPOINT_SELECTION, selection: LOCAL_DECK_SELECTION, label: "This machine" },
   ];
   for (const row of section?.remote ?? []) {

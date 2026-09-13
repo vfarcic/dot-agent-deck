@@ -263,8 +263,8 @@ export interface RemoteEndpointDto {
 export type AppearanceMode = "system" | "light" | "dark";
 
 /**
- * The `Selection` token that means the local deck, and therefore the one word
- * an endpoint id may not be (`LOCAL_SELECTION_TOKEN` in `settings.rs`).
+ * The `Selection` token that means the local deck, and therefore one of the two
+ * words an endpoint id may not be (`LOCAL_SELECTION_TOKEN` in `settings.rs`).
  *
  * The local deck is deliberately **not** a stored row: `Endpoint::local()`
  * resolves it from the platform paths the way every caller did before endpoints
@@ -272,6 +272,19 @@ export type AppearanceMode = "system" | "light" | "dark";
  * deleting the section gets the local deck back rather than nothing.
  */
 export const LOCAL_ENDPOINT_SELECTION = "local";
+
+/**
+ * The `Selection` token that means every configured deck at once — PRD #742's
+ * fleet — and therefore the other word an endpoint id may not be
+ * (`ALL_SELECTION_TOKEN` in `settings.rs`).
+ *
+ * Reserved on both sides rather than merely recognised here: `all` is a legal
+ * id *shape*, so `EndpointId::parse` refuses it case-insensitively and a
+ * hand-written `id = "all"` row fails to load. Without that the one stored
+ * string would be ambiguous between the fleet and a row somebody named after
+ * it.
+ */
+export const ALL_ENDPOINT_SELECTION = "all";
 
 /** `RemoteEndpoint::DEFAULT_PORT` — what a row with no `port` key means. */
 export const DEFAULT_SSH_PORT = 22;

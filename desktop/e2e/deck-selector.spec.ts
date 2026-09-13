@@ -125,12 +125,40 @@ for (const screen of SCREENS) {
       await expect(page.getByTestId("deck-selector-current")).toHaveText("This machine");
 
       const menu = await openMenu(page);
+      // All Decks leads (PRD #742 M1) and is rendered in the house vocabulary —
+      // **Decks**, never "daemons" — while the testid keeps the stored token.
       await expect(menu.getByRole("radio")).toHaveText([
+        "All Decks",
         "This machine",
         "vf@build-box.example.com",
         "relay.example.com:2222",
       ]);
       await expect(page.getByTestId("deck-selector-option-local")).toHaveAttribute("aria-checked", "true");
+      await expect(page.getByTestId("deck-selector-option-all")).toBeVisible();
+      await expect(page.getByTestId("deck-selector-option-all")).toHaveAttribute("aria-checked", "false");
+    });
+
+    test("All Decks is selectable and stores the reserved fleet token", async ({ page }) => {
+      await screen.open(page);
+      const menu = await openMenu(page);
+
+      await menu.getByTestId("deck-selector-option-all").click();
+
+      await expect(menu).toBeHidden();
+      await expect(page.getByTestId("deck-selector-current")).toHaveText("All Decks");
+
+      /*
+        The built bundle, in both engines, is where this is worth asserting: M1
+        ships the stored VALUE and the option, and the merged view is M4 — so the
+        only thing a browser can check now is that the option is genuinely
+        reachable by a click and that the document comes back holding `all`
+        rather than a deck id or the `local` default.
+      */
+      await expect.poll(() => storedSelection(page)).toBe("all");
+      await page.reload();
+      await expect(page.getByTestId("deck-selector-current")).toHaveText("All Decks");
+      await openMenu(page);
+      await expect(page.getByTestId("deck-selector-option-all")).toHaveAttribute("aria-checked", "true");
     });
 
     test("switching names the chosen deck and survives a reload", async ({ page }) => {
@@ -242,7 +270,7 @@ test.describe("the Deck selector's state line", () => {
     // rest of the shell is still there.
     await expect(page.getByTestId("deck-selector-current")).toHaveText("vf@build-box.example.com");
     const menu = await openMenu(page);
-    await expect(menu.getByRole("radio")).toHaveCount(3);
+    await expect(menu.getByRole("radio")).toHaveCount(4);
     await expect(page.getByTestId("open-overview")).toBeVisible();
   });
 });

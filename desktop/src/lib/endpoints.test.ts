@@ -4,8 +4,9 @@
  * (M9).
  */
 import { describe, expect, it } from "vitest";
-import { LOCAL_ENDPOINT_SELECTION, type EndpointSettingsDto } from "./bridge";
+import { ALL_ENDPOINT_SELECTION, LOCAL_ENDPOINT_SELECTION, type EndpointSettingsDto } from "./bridge";
 import {
+  ALL_DECKS_SELECTION,
   deckChoices,
   describeEndpoint,
   type EndpointField,
@@ -78,33 +79,60 @@ describe("the selection value", () => {
     expect(parseSelection(ID)).toEqual({ kind: "one", id: ID });
   });
 
+  it("reads the fleet token as its own variant and round-trips it", () => {
+    /*
+      PRD #742 M1. This assertion is the INVERSE of the one that stood here, and
+      deliberately: `all` used to be the worked example of a token this build
+      does not know, and this is the build that knows it. The token is reserved
+      on both sides — `EndpointId::parse` refuses it — so it can only ever mean
+      the fleet, never a row.
+    */
+    expect(parseSelection(ALL_ENDPOINT_SELECTION)).toEqual(ALL_DECKS_SELECTION);
+    expect(selectionToken(ALL_DECKS_SELECTION)).toBe(ALL_ENDPOINT_SELECTION);
+    expect(selectionToken(parseSelection(ALL_ENDPOINT_SELECTION))).toBe(ALL_ENDPOINT_SELECTION);
+    // And it is now a choice the selector offers, which is the other half of
+    // the inversion: this used to assert that nothing matched it.
+    const offered = deckChoices(section(LOCAL_ENDPOINT_SELECTION)).find((choice) => sameSelection(choice.selection, ALL_DECKS_SELECTION));
+    expect(offered?.label).toBe("All Decks");
+  });
+
   it("degrades a token this build does not know rather than throwing", () => {
     /*
-      `all` is the token PRD #742 will write, and this is the build that predates
-      it. It parses as `One`, matches no row, and is therefore rendered as the
-      local deck — with the substitution reported by `connection.selectionFallback`
-      — exactly as `Selection`'s own deserializer degrades it Rust-side. The
-      stored bytes are untouched, so the newer build's choice survives a save
-      made from here.
+      The property `all` used to stand for, kept with a word this build still
+      does not know. A token a NEWER build wrote parses as `One`, matches no row,
+      and is therefore rendered as the local deck — with the substitution
+      reported by `connection.selectionFallback` — exactly as `Selection`'s own
+      deserializer degrades it Rust-side. The stored bytes are untouched, so the
+      newer build's choice survives a save made from here.
+
+      This is what let #742 ship `all` without damaging any older build's
+      document, so it is worth keeping for the variant after it.
     */
-    const future = parseSelection("all");
-    expect(future).toEqual({ kind: "one", id: "all" });
+    const future = parseSelection("group");
+    expect(future).toEqual({ kind: "one", id: "group" });
     expect(deckChoices(section(LOCAL_ENDPOINT_SELECTION)).find((choice) => sameSelection(choice.selection, future))).toBeUndefined();
-    expect(selectionToken(future)).toBe("all");
+    expect(selectionToken(future)).toBe("group");
   });
 
   it("compares by the stored token, so two readings of one deck are one deck", () => {
     expect(sameSelection(parseSelection(ID), { kind: "one", id: ID })).toBe(true);
     expect(sameSelection(LOCAL_DECK_SELECTION, parseSelection(ID))).toBe(false);
+    // `sameSelection` has no arm per variant and needs none — it compares the
+    // stored tokens, so #742's variant arrived through `selectionToken`.
+    expect(sameSelection(ALL_DECKS_SELECTION, parseSelection(ALL_ENDPOINT_SELECTION))).toBe(true);
+    expect(sameSelection(ALL_DECKS_SELECTION, LOCAL_DECK_SELECTION)).toBe(false);
+    expect(sameSelection(ALL_DECKS_SELECTION, parseSelection(ID))).toBe(false);
   });
 });
 
 describe("deckChoices", () => {
-  it("always offers the local deck first, even with nothing configured", () => {
-    // The local deck needs no configuration — `Endpoint::local()` resolves it
-    // from the platform paths — so this list is never empty and the selector is
-    // useful before anything is stored.
+  it("offers the fleet and then the local deck, even with nothing configured", () => {
+    // Neither needs configuration — `Endpoint::local()` resolves the local deck
+    // from the platform paths, and All Decks resolves to it alone while nothing
+    // else is stored — so this list is never empty and the selector is useful
+    // before anything is stored.
     expect(deckChoices(undefined)).toEqual([
+      { token: ALL_ENDPOINT_SELECTION, selection: ALL_DECKS_SELECTION, label: "All Decks" },
       { token: LOCAL_ENDPOINT_SELECTION, selection: LOCAL_DECK_SELECTION, label: "This machine" },
     ]);
   });
@@ -113,13 +141,15 @@ describe("deckChoices", () => {
     const labels = deckChoices(section(LOCAL_ENDPOINT_SELECTION)).map((choice) => choice.label);
     // `user@host`, with `:port` appended only when the port is not 22 — the same
     // derivation `RemoteEndpoint::describe()` performs, because there is no
-    // stored display name to use instead.
-    expect(labels).toEqual(["This machine", "vf@build-box.example.com", "relay.example.com:2222"]);
+    // stored display name to use instead. The two unconfigured entries lead, in
+    // the order the selector shows them.
+    expect(labels).toEqual(["All Decks", "This machine", "vf@build-box.example.com", "relay.example.com:2222"]);
   });
 
   it("gives a deck with no host yet a label rather than an empty row", () => {
     const blank: EndpointSettingsDto = { remote: [{ host: "", id: ID, port: 22 }], selection: ID };
-    expect(deckChoices(blank)[1].label).toBe("New deck");
+    // Index 2: All Decks, then the local deck, then the stored rows.
+    expect(deckChoices(blank)[2].label).toBe("New deck");
   });
 });
 

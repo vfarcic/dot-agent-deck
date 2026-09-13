@@ -407,6 +407,18 @@ impl EndpointSettings {
     /// deck you selected is gone" and "the deck you selected has no socket path
     /// yet" are different things to tell a user, and neither is "connected to
     /// local".
+    ///
+    /// # [`Selection::All`] resolves here to the local deck, deliberately
+    ///
+    /// This method returns **one** `Endpoint`, and a fleet is a set — so the
+    /// honest answer for [`Selection::All`] is not an endpoint at all. Rather
+    /// than invent one, it travels through the same `let ... else` as
+    /// [`Selection::Local`] and gets the local deck with **no** fallback: PRD
+    /// #742 DECISION 1 keeps the deck screen and its terminals single-deck, and
+    /// this is the method that answers *that* screen. A fallback would be wrong
+    /// as well as noisy — nothing failed to be honoured, and the selector would
+    /// print a substitution notice about a selection that is in force.
+    /// [`Self::observed_endpoints`] is where the fleet's set lives.
     pub fn resolve(&self) -> ResolvedEndpoint {
         let local = || ResolvedEndpoint {
             endpoint: Endpoint::local(),
@@ -431,6 +443,43 @@ impl EndpointSettings {
                 fallback: Some(SelectionFallback::NoRemoteSocket { id: id.clone() }),
             },
         }
+    }
+
+    /// Every deck a fleet view watches under this selection — the set
+    /// [`Self::resolve`] cannot express.
+    ///
+    /// One element for [`Selection::Local`] and [`Selection::One`], which is
+    /// exactly [`Self::resolve`]'s answer, so a single-deck selection observes
+    /// the deck it resolves to and nothing else. For [`Selection::All`] it is
+    /// the local deck followed by every stored row, in document order.
+    ///
+    /// **A row with no socket path is not in the set, and that is the same
+    /// judgement [`Self::resolve`] already makes.** `endpoint()` is `None`
+    /// while a row has no remote socket (see [`RemoteEndpointSettings::socket`]
+    /// — it cannot be derived, and `Test connection` is what fills it in), so
+    /// there is nothing to connect to and a watcher for it would have no
+    /// address. What that costs is that a half-configured deck is *absent* from
+    /// the fleet rather than present-and-unconfigured; whether the merged view
+    /// should show it as a group with a "press Test connection" state is PRD
+    /// #742 M4's question, and answering it here would be inventing the answer
+    /// before the screen that renders it exists.
+    ///
+    /// The local deck leads because it needs no configuration and is therefore
+    /// the one deck always in the set — the same reason `deckChoices` leads
+    /// with it.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn observed_endpoints(&self) -> Vec<Endpoint> {
+        if !matches!(self.selection, Selection::All) {
+            return vec![self.resolve().endpoint];
+        }
+        let mut observed = vec![Endpoint::local()];
+        observed.extend(
+            self.remote
+                .iter()
+                .filter_map(|deck| deck.endpoint())
+                .map(Endpoint::Remote),
+        );
+        observed
     }
 }
 
@@ -660,9 +709,20 @@ pub struct EndpointId(String);
 /// blob.
 pub const MAX_ENDPOINT_ID_BYTES: usize = 64;
 
-/// The [`Selection`] token that means the local deck, and therefore the one
-/// word an [`EndpointId`] may not be.
+/// The [`Selection`] token that means the local deck, and therefore one of the
+/// two words an [`EndpointId`] may not be.
 pub const LOCAL_SELECTION_TOKEN: &str = "local";
+
+/// The [`Selection`] token that means every configured deck at once — PRD
+/// #742's fleet — and therefore the other word an [`EndpointId`] may not be.
+///
+/// Reserved rather than merely recognised. `all` is a legal id shape, so
+/// without this an `id = "all"` row and a `selection = "all"` fleet would be
+/// the same string meaning two things, and no reader of the document could
+/// tell which was meant. The cost is that a hand-written `id = "all"` — which
+/// [`EndpointId::mint`] can never produce — now refuses to load with a named
+/// error instead of loading into an ambiguity.
+pub const ALL_SELECTION_TOKEN: &str = "all";
 
 impl EndpointId {
     /// Validate `raw` and wrap it.
@@ -692,6 +752,11 @@ impl EndpointId {
                 "'{LOCAL_SELECTION_TOKEN}' is reserved: it is how a selection names the local deck"
             ));
         }
+        if raw.eq_ignore_ascii_case(ALL_SELECTION_TOKEN) {
+            return Err(format!(
+                "'{ALL_SELECTION_TOKEN}' is reserved: it is how a selection names every deck at once"
+            ));
+        }
         Ok(Self(raw.to_string()))
     }
 
@@ -701,9 +766,11 @@ impl EndpointId {
     /// seeded from the operating system. Uniqueness is what is wanted here, not
     /// unpredictability — nothing authenticates with this — but the function
     /// that gives one already gives the other. Sixteen hex characters cannot
-    /// collide with [`LOCAL_SELECTION_TOKEN`] or with any word a future
-    /// [`Selection`] variant would reserve, both of which are shorter and
-    /// contain letters that are not hex digits.
+    /// collide with [`LOCAL_SELECTION_TOKEN`], with [`ALL_SELECTION_TOKEN`] —
+    /// the word this sentence anticipated, which arrived with [`Selection::All`]
+    /// in PRD #742 — or with any word a further [`Selection`] variant would
+    /// reserve: all of them are shorter and contain letters that are not hex
+    /// digits.
     ///
     /// **Not reached in production for the same reason [`RemoteEndpointSettings::new`]
     /// is not**: the panel mints an id when the user adds a deck, because that
@@ -744,27 +811,35 @@ impl<'de> Deserialize<'de> for EndpointId {
 
 /// Which deck the app is talking to.
 ///
-/// # Shaped so a variant can be added, which is the one constraint M6 owes M9
+/// # Shaped so a variant can be added, and PRD #742 spent that room
 ///
 /// The Deck selector is PRD #741 M9 and "All Decks" is [#742](https://github.com/vfarcic/dot-agent-deck/issues/742),
 /// but the *stored* value lands here — and it lands as an enum rather than a
-/// bare [`EndpointId`] threaded through state precisely so #742 is **additive**
-/// rather than a retrofit. Adding `All` is one variant, one arm in
-/// [`SelectionVisitor::visit_str`], one arm in `Serialize`, and one arm in
-/// [`EndpointSettings::resolve`]. A bare id would have made it a change to
-/// every type that carries a selection.
+/// bare [`EndpointId`] threaded through state precisely so #742 was
+/// **additive** rather than a retrofit. It was: [`Self::All`] cost one variant,
+/// one arm in [`SelectionVisitor::visit_str`] and one in [`Self::as_token`]
+/// (which `Serialize` delegates to), and nothing else in production. A bare id
+/// would have made it a change to every type that carries a selection.
+///
+/// The map this comment used to offer also named [`EndpointSettings::resolve`],
+/// and that turned out to be one site too many: `resolve` answers "which single
+/// deck do the deck screen and its terminals talk to", `All` has no single
+/// answer, and its `let ... else` already sends every non-[`Self::One`]
+/// selection to the local deck. [`EndpointSettings::observed_endpoints`] is
+/// where a fleet's set lives instead, so neither method has to lie.
 ///
 /// # The wire form, and why an unknown token round-trips
 ///
-/// One string: the reserved word `local`, or an endpoint id. An unrecognised
-/// token — `all`, written by a build that has the variant this one does not —
-/// parses as an [`EndpointId`], resolves to no row, and therefore reads as the
-/// local deck with [`SelectionFallback::UnknownDeck`]; and because it is
-/// *stored* as the id it was, saving the document writes it back **unchanged**.
-/// So an older build degrades to local without destroying a newer build's
-/// selection, which is the same tolerance the rest of this schema is built for.
-/// That is also why [`EndpointId`]'s charset is wider than [`EndpointId::mint`]
-/// needs: a reserved word a future build invents has to fit through it.
+/// One string: the reserved word `local`, the reserved word `all`, or an
+/// endpoint id. A token this build does not recognise — one a *newer* build
+/// wrote, as `all` itself was until #742 — parses as an [`EndpointId`],
+/// resolves to no row, and therefore reads as the local deck with
+/// [`SelectionFallback::UnknownDeck`]; and because it is *stored* as the id it
+/// was, saving the document writes it back **unchanged**. So an older build
+/// degrades to local without destroying a newer build's selection, which is the
+/// same tolerance the rest of this schema is built for. That is also why
+/// [`EndpointId`]'s charset is wider than [`EndpointId::mint`] needs: a reserved
+/// word a future build invents has to fit through it.
 ///
 /// An over-long or non-charset token is a different thing — a malformed
 /// document rather than an unknown value — and is an error, exactly as
@@ -777,6 +852,14 @@ pub enum Selection {
     Local,
     /// The remote deck with this id, if the document still holds one.
     One(EndpointId),
+    /// Every configured deck at once — the local one and the stored rows — which
+    /// is PRD #742's fleet view.
+    ///
+    /// A *set*, and the one variant that does not name a single deck. Ask
+    /// [`EndpointSettings::observed_endpoints`] for it;
+    /// [`EndpointSettings::resolve`] answers a different question and sends this
+    /// variant to the local deck, exactly as it does [`Self::Local`].
+    All,
 }
 
 impl Selection {
@@ -784,6 +867,7 @@ impl Selection {
     pub fn as_token(&self) -> &str {
         match self {
             Self::Local => LOCAL_SELECTION_TOKEN,
+            Self::All => ALL_SELECTION_TOKEN,
             Self::One(id) => id.as_str(),
         }
     }
@@ -807,12 +891,21 @@ impl serde::de::Visitor<'_> for SelectionVisitor {
     type Value = Selection;
 
     fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "'{LOCAL_SELECTION_TOKEN}' or an endpoint id")
+        write!(
+            f,
+            "'{LOCAL_SELECTION_TOKEN}', '{ALL_SELECTION_TOKEN}' or an endpoint id"
+        )
     }
 
     fn visit_str<E: serde::de::Error>(self, raw: &str) -> Result<Selection, E> {
         if raw.eq_ignore_ascii_case(LOCAL_SELECTION_TOKEN) {
             return Ok(Selection::Local);
+        }
+        // Above the fallthrough, and not merely by convention: `EndpointId::parse`
+        // reserves this word, so reaching it would turn the fleet selection into
+        // a parse error rather than into `All`.
+        if raw.eq_ignore_ascii_case(ALL_SELECTION_TOKEN) {
+            return Ok(Selection::All);
         }
         EndpointId::parse(raw)
             .map(Selection::One)
@@ -3774,17 +3867,23 @@ level = 1.0
     }
 
     /// Scenario: a document written by a build that has a `Selection` variant
-    /// this one does not — `all`, which is issue #742's — is loaded, resolved
-    /// and saved again. It must degrade to the local deck **and** be written
-    /// back unchanged, so an older build cannot destroy a newer one's choice.
+    /// this one does not is loaded, resolved and saved again. It must degrade
+    /// to the local deck **and** be written back unchanged, so an older build
+    /// cannot destroy a newer one's choice.
     ///
     /// This is the growability `Selection` exists for, tested from the outside
     /// rather than asserted in a doc comment.
+    ///
+    /// The stand-in used to be `all`, and PRD #742 M1 made that word one this
+    /// build *does* know — so the example moved and the property did not. It is
+    /// still worth pinning, because it is what let `All` ship at all: an older
+    /// binary meeting a stored `all` still lands here, and `group` stands for
+    /// whatever word the variant after `All` reserves.
     #[test]
     fn a_selection_token_this_build_does_not_know_degrades_without_being_lost() {
         let dir = tempdir();
         let path = dir.path().join(SETTINGS_FILE_NAME);
-        std::fs::write(&path, "version = 1\n\n[endpoints]\nselection = \"all\"\n").unwrap();
+        std::fs::write(&path, "version = 1\n\n[endpoints]\nselection = \"group\"\n").unwrap();
 
         let loaded = load_from(&path);
         let resolved = loaded.resolve_endpoint();
@@ -3800,7 +3899,9 @@ level = 1.0
 
         save_to(&path, &loaded).unwrap();
         assert!(
-            std::fs::read_to_string(&path).unwrap().contains("\"all\""),
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("\"group\""),
             "the token a newer build wrote must survive this build reading and rewriting it"
         );
     }
@@ -3828,6 +3929,148 @@ level = 1.0
             );
         }
         assert_eq!(Selection::Local.as_token(), LOCAL_SELECTION_TOKEN);
+    }
+
+    /// Scenario: a fleet selection is stored, loaded and stored again. The `all`
+    /// token must read back as `Selection::All` and write back out as `all`, so
+    /// the choice a user made on the Deck selector survives the document rather
+    /// than degrading to a deck id on the next save. PRD #742 M1.
+    #[test]
+    fn the_fleet_selection_round_trips_through_the_stored_document() {
+        assert_eq!(Selection::All.as_token(), ALL_SELECTION_TOKEN);
+        assert_eq!(
+            serde_json::to_value(Selection::All).unwrap(),
+            serde_json::json!("all"),
+            "`Serialize` delegates to `as_token`, and the webview reads this one"
+        );
+
+        let dir = tempdir();
+        let path = dir.path().join(SETTINGS_FILE_NAME);
+        std::fs::write(&path, "version = 1\n\n[endpoints]\nselection = \"all\"\n").unwrap();
+
+        let loaded = load_from(&path);
+        assert_eq!(
+            loaded
+                .endpoints
+                .as_ref()
+                .expect("the section is present")
+                .selection,
+            Selection::All,
+            "`all` is this build's word now, not an endpoint id"
+        );
+
+        // Resolving is where `All` deliberately differs from an unknown token:
+        // the deck screen still has one target (DECISION 1) but NOTHING failed
+        // to be honoured, so there is no substitution to report.
+        let resolved = loaded.resolve_endpoint();
+        assert_eq!(resolved.endpoint, Endpoint::local());
+        assert_eq!(
+            resolved.fallback, None,
+            "a selection that IS in force must not print a fallback notice"
+        );
+
+        save_to(&path, &loaded).unwrap();
+        assert_eq!(
+            load_from(&path)
+                .endpoints
+                .expect("the section survived the save")
+                .selection,
+            Selection::All,
+            "a save must not turn the fleet back into a single deck"
+        );
+    }
+
+    /// Scenario: the reserved `all` token, in any case, is the fleet and is
+    /// refused as an endpoint id — the same two-sided reservation `local` has,
+    /// which is what lets the selection stay one plain string. PRD #742 M1.
+    #[test]
+    fn all_is_reserved_on_both_sides_of_the_selection() {
+        for token in ["all", "ALL", "All"] {
+            let document = format!("version = 1\n\n[endpoints]\nselection = {token:?}\n");
+            let settings = toml::from_str::<DesktopSettings>(&document)
+                .unwrap_or_else(|error| panic!("{token} must parse: {error}"));
+            assert_eq!(
+                settings
+                    .endpoints
+                    .expect("the section is present")
+                    .selection,
+                Selection::All,
+                "{token} must read as the fleet"
+            );
+
+            let refusal =
+                EndpointId::parse(token).expect_err("{token} must not be usable as a deck id");
+            assert!(
+                refusal.contains("reserved"),
+                "the error must say WHY, not merely refuse: {refusal}"
+            );
+            assert!(
+                refusal.contains(ALL_SELECTION_TOKEN),
+                "the error must name the token it refused: {refusal}"
+            );
+        }
+
+        // And through `Deserialize`, which is the path a hand-edited row takes:
+        // an ambiguous `id = "all"` refuses to load rather than becoming a row
+        // no selection could name unambiguously.
+        let row = "version = 1\n\n[[endpoints.remote]]\nid = \"all\"\nhost = \"build-box\"\n";
+        let refusal = toml::from_str::<DesktopSettings>(row)
+            .expect_err("a row claiming the reserved id must not load");
+        assert!(
+            refusal.to_string().contains("reserved"),
+            "the document-level error must carry the reason too: {refusal}"
+        );
+    }
+
+    /// Scenario: the fleet selection is asked what it observes. A single-deck
+    /// selection observes exactly the deck it resolves to; `All` observes the
+    /// local deck plus every stored row that has a socket to connect to, with
+    /// the half-configured row left out because there is no address to watch.
+    /// PRD #742 M1 — the set `resolve()` cannot express.
+    #[test]
+    fn the_fleet_observes_every_connectable_deck_and_a_single_selection_observes_one() {
+        let configured = EndpointId::parse("configured").unwrap();
+        let halfway = EndpointId::parse("halfway").unwrap();
+        let mut connectable = RemoteEndpointSettings::new(
+            configured.clone(),
+            Hostname::parse("build-box.example.com").unwrap(),
+        );
+        connectable.socket = Some(RemoteSocketPath::parse("/run/deck.sock").unwrap());
+        let rows = vec![
+            connectable,
+            // No socket: storable, and deliberately not connectable.
+            RemoteEndpointSettings::new(halfway, Hostname::parse("relay.example.com").unwrap()),
+        ];
+
+        let fleet = EndpointSettings {
+            remote: rows.clone(),
+            selection: Selection::All,
+        };
+        let observed = fleet.observed_endpoints();
+        assert_eq!(
+            observed.len(),
+            2,
+            "the local deck and the one row with somewhere to connect to"
+        );
+        assert_eq!(observed[0], Endpoint::local(), "the local deck leads");
+        let Endpoint::Remote(remote) = &observed[1] else {
+            panic!("the second observed deck must be the configured remote row");
+        };
+        assert_eq!(remote.host().as_str(), "build-box.example.com");
+
+        // Every other selection observes precisely what it resolves to, so
+        // nothing downstream has to special-case a one-element fleet.
+        for selection in [Selection::Local, Selection::One(configured)] {
+            let single = EndpointSettings {
+                remote: rows.clone(),
+                selection,
+            };
+            assert_eq!(
+                single.observed_endpoints(),
+                vec![single.resolve().endpoint],
+                "a single-deck selection observes the deck it resolves to and nothing else"
+            );
+        }
     }
 
     /// Scenario: minted ids are 16 lowercase hex characters, distinct from each
