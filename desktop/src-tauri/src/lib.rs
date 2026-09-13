@@ -2638,6 +2638,55 @@ command = "configured-planner"
         }
     }
 
+    /// A publish refusal reaches the caller **whole** — the path, the mode and
+    /// the `chmod` command the daemon composed (issue #1047 §2).
+    ///
+    /// This is the client half of that fix and the reason it needs a guard of
+    /// its own. The daemon has always logged a message naming the mode and the
+    /// remedy; what the desktop showed was the shorter sentence that crossed the
+    /// wire, so a user saw "remove those write bits and retry" with no path and
+    /// no command. The daemon now sends the long one, and nothing between the
+    /// socket and the toast may shorten it again — `safe_message` bounds the
+    /// string at 2048 characters, which this sits far inside, and a future
+    /// tightening of that bound would fail here rather than silently re-open the
+    /// defect that cost three launches and a filesystem-wide `find`.
+    #[tokio::test]
+    async fn a_publish_refusal_reaches_the_caller_with_its_path_and_remedy_intact() {
+        let sentence = "publish-failed: /home/dev/project/.dot-agent-deck is mode 0775, which \
+                        grants write to group or other — another local account could replace the \
+                        coordinator context's directory entry after it is published. The deck \
+                        tried to clear those bits and could not, so publishing is refused. On the \
+                        machine running the deck, run: chmod go-w \
+                        '/home/dev/project/.dot-agent-deck'";
+        let daemon = FakeWorkflowDaemon::new(
+            Ok(Some("unused-session")),
+            std::iter::empty(),
+            Ok(SendResult::Applied),
+        );
+        daemon
+            .prepare_results
+            .lock()
+            .unwrap()
+            .push_back(Err(sentence.to_string()));
+
+        let error = prepare_workflow_launch(
+            &daemon,
+            "loop",
+            "/home/dev/project",
+            "Build it.",
+            &launch_roles("claude"),
+            None,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error, sentence, "the sentence must arrive verbatim");
+        assert!(error.contains("/home/dev/project/.dot-agent-deck"));
+        assert!(error.contains("chmod go-w"));
+        assert!(error.contains("0775"));
+        assert!(daemon.started.lock().unwrap().is_empty());
+    }
+
     /// A Pi coordinator is refused during preparation, before any role is
     /// spawned — the guard moved with the rest of the flow and did not get lost
     /// on the way.
