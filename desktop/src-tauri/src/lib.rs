@@ -1235,12 +1235,15 @@ async fn desktop_set_settings(
 ///    after any save it may describe the wrong one, and holding it would report
 ///    the old deck's agent count beside the new deck's name for up to
 ///    `HANDSHAKE_REVALIDATE_INTERVAL`.
-/// 3. **Every transport except the selected deck's is released** — rule 3 of
+/// 3. **Every transport except the observed decks' is released** — rule 3 of
 ///    `endpoint_tunnels`, and the leak PRD #741 M7 names explicitly: without it
 ///    each selection change leaves an authenticated `ssh -N -L` child behind for
 ///    the life of the app. A lease already handed out survives this, so nothing
 ///    in flight is torn out from under — which since M9 includes a terminal
-///    session's own lease, not merely the link's.
+///    session's own lease, not merely the link's. **Observed decks**, plural,
+///    since PRD #742 M2: under `Selection::All` that is every configured deck
+///    with somewhere to connect to, and under any single-deck selection it is
+///    the one deck `resolve()` names, which is what this line meant before.
 ///
 /// # Only when the deck actually moved
 ///
@@ -1288,13 +1291,60 @@ async fn retarget_selection(state: &DesktopState, settings: &DesktopSettings) ->
         terminal::detach_all(state).await;
     }
     state.daemon.invalidate_all().await;
-    let live: std::collections::HashSet<dot_agent_deck::daemon_client::EndpointIdentity> =
-        [key].into_iter().collect();
-    state.tunnels.retain(&live).await;
+    state.tunnels.retain(&observed_keys(settings)).await;
     if moved {
         state.selection_changed();
     }
     moved
+}
+
+/// Every deck key the app must keep a transport for under `settings` — PRD
+/// #742 M2's live set.
+///
+/// # Why this is not gated on the deck having moved, and never was
+///
+/// The switch half of [`apply_selection`] is gated because it is *destructive
+/// to something a user can see* — it detaches every terminal — so it has to be
+/// told apart from a colour-scheme save. `retain` needs no such gate, and the
+/// reason survives the widening from one deck to N: the set is **derived from
+/// the document**, so a save that changed no deck produces a byte-identical set
+/// and `retain` removes nothing. It was already running unconditionally for
+/// that reason and it still does.
+///
+/// # What "the deck actually moved" becomes for a set
+///
+/// It does not become anything, and that is the design decision rather than an
+/// omission. The three things [`selection_moved`] gates — the detach, the
+/// watcher's re-subscribe, and `apply_selection`'s emit — are all about the
+/// **one** deck the deck screen and its terminals talk to, which PRD #742
+/// DECISION 1 keeps single-deck. So they keep comparing `resolve()`'s resolved
+/// key, unchanged and for the reasons [`selection_moved`] already gives.
+///
+/// The set-level events are real but land on a different consumer. A set that
+/// **gained** a member needs a watcher started (PRD #742 M3); a set whose
+/// existing member **changed address** needs the old address's transport torn
+/// down *and* that member's watcher restarted; a set that **lost** a member
+/// needs only the teardown. `retain` over this set already answers the last
+/// two halves of that — an edited address is a different [`dot_agent_deck::daemon_client::EndpointIdentity`],
+/// so the old one is simply no longer named — and it answers them without
+/// knowing which event it was, because a set difference is all a teardown
+/// needs. **Starting** a watcher is the half a set difference cannot be read
+/// backwards from, and it is M3's to build; deriving it here, with nothing to
+/// consume it, would be inventing the signal before its consumer.
+///
+/// # The resolved deck is always in here
+///
+/// [`crate::settings::DesktopSettings::observed_endpoints`] guarantees it by
+/// construction, and this is where it is load-bearing: were it not, an ordinary
+/// theme save would release the transport under the deck screen's own terminals.
+fn observed_keys(
+    settings: &DesktopSettings,
+) -> std::collections::HashSet<dot_agent_deck::daemon_client::EndpointIdentity> {
+    settings
+        .observed_endpoints()
+        .iter()
+        .map(dot_agent_deck::daemon_client::Endpoint::identity)
+        .collect()
 }
 
 /// Whether a save changed which deck the app is talking to.
@@ -1832,6 +1882,203 @@ mod tests {
             before,
             "the watcher must not be told to re-subscribe, and no session detached"
         );
+    }
+
+    /// A document selecting the whole fleet, with `hosts` as its rows — every
+    /// one of them connectable, since a row with no socket path is deliberately
+    /// not observed.
+    fn fleet_of(hosts: &[&str]) -> DesktopSettings {
+        use crate::settings::{EndpointId, EndpointSettings, RemoteEndpointSettings, Selection};
+        use dot_agent_deck::remote_tunnel::{Hostname, RemoteSocketPath};
+
+        let remote = hosts
+            .iter()
+            .enumerate()
+            .map(|(index, host)| {
+                let id = EndpointId::parse(&format!("deck00000000000{index}")).expect("a valid id");
+                let mut row =
+                    RemoteEndpointSettings::new(id, Hostname::parse(host).expect("a valid host"));
+                row.socket = Some(RemoteSocketPath::parse("/run/deck.sock").expect("a path"));
+                row
+            })
+            .collect();
+        DesktopSettings {
+            endpoints: Some(EndpointSettings {
+                remote,
+                selection: Selection::All,
+            }),
+            ..DesktopSettings::default()
+        }
+    }
+
+    /// The live set `retain` is given names every observed deck, not the one
+    /// the deck screen resolves to (PRD #742 M2).
+    ///
+    /// The seam this milestone is: `retain` and its map were already keyed and
+    /// already took a set, and the single-deck thing was this caller building a
+    /// one-element one. Asserted on keys rather than through `retarget_selection`
+    /// because acquiring a remote deck's transport would spawn `ssh`; that the
+    /// keys then keep their tunnels is `endpoint_tunnels`' own pair of tests.
+    #[test]
+    fn the_fleets_live_set_names_every_observed_deck() {
+        use dot_agent_deck::daemon_client::Endpoint;
+
+        let fleet = fleet_of(&["build-box.example.com", "laptop.example.com"]);
+        let keys = observed_keys(&fleet);
+        assert_eq!(keys.len(), 3, "the local deck plus both configured rows");
+        assert!(keys.contains(&Endpoint::local().identity()));
+        for endpoint in fleet.observed_endpoints() {
+            assert!(keys.contains(&endpoint.identity()), "{endpoint:?}");
+        }
+
+        // Every other selection retains over precisely the deck it resolves to,
+        // which is the set this caller built before M2 and still builds.
+        let single = DesktopSettings::default();
+        assert_eq!(
+            observed_keys(&single),
+            [single.resolve_endpoint().endpoint.identity()]
+                .into_iter()
+                .collect()
+        );
+    }
+
+    /// Whatever the selection, the deck the screen is talking to is one the
+    /// fleet observes — so `retain` can never release the transport under the
+    /// deck screen's own terminals (PRD #742 M2).
+    #[test]
+    fn the_deck_the_screen_talks_to_is_always_one_the_fleet_observes() {
+        use crate::settings::{EndpointId, EndpointSettings, Selection};
+
+        let fleet = fleet_of(&["build-box.example.com", "laptop.example.com"]);
+        let endpoints = fleet.endpoints.clone().expect("the fleet has a section");
+        let selections = [
+            Selection::All,
+            Selection::Local,
+            Selection::One(endpoints.remote[1].id.clone()),
+            // The two selections that fall back: a row that is gone, and — since
+            // `fleet_of` gives every row a socket — a hand-written id that never
+            // named one. Both resolve to the local deck, which leads every set.
+            Selection::One(EndpointId::parse("deck0000000000ff").expect("a valid id")),
+        ];
+        for selection in selections {
+            let settings = DesktopSettings {
+                endpoints: Some(EndpointSettings {
+                    selection: selection.clone(),
+                    ..endpoints.clone()
+                }),
+                ..DesktopSettings::default()
+            };
+            assert!(
+                observed_keys(&settings).contains(&settings.resolve_endpoint().endpoint.identity()),
+                "the resolved deck must be observed under {selection:?}"
+            );
+        }
+        // And with no `[endpoints]` section at all, which resolves and observes
+        // the local deck without either method reading a row.
+        let bare = DesktopSettings::default();
+        assert!(observed_keys(&bare).contains(&bare.resolve_endpoint().endpoint.identity()));
+    }
+
+    /// With the fleet selected, a save keeps EVERY observed deck's transport;
+    /// with one deck selected, the same save keeps one (PRD #742 M2).
+    ///
+    /// The end-to-end version of the milestone, at the caller that was the
+    /// single-deck half: `retain` and its map were already keyed by
+    /// `EndpointIdentity` and already took a set, and what made the app
+    /// single-deck was this function building a one-element one from
+    /// `resolve()`. A remote deck's transport is seeded rather than acquired
+    /// because acquiring one spawns `ssh`; `retain` never reads a connection,
+    /// so the seam fabricates nothing the assertion rests on.
+    #[tokio::test]
+    async fn the_fleet_keeps_every_observed_decks_transport_and_one_selection_keeps_one() {
+        use crate::settings::{EndpointSettings, Selection};
+
+        let state = DesktopState::default();
+        let fleet = fleet_of(&["build-box.example.com", "laptop.example.com"]);
+        let observed = fleet.observed_endpoints();
+        assert_eq!(observed.len(), 3, "the local deck plus both rows");
+        for endpoint in &observed {
+            state.tunnels.insert_stand_in(endpoint).await;
+        }
+
+        retarget_selection(&state, &fleet).await;
+        assert_eq!(
+            state.tunnels.held().await,
+            3,
+            "every deck the fleet observes keeps its transport across a save"
+        );
+
+        // The same document, now naming one deck. The other two leave the
+        // observed set and exactly they are dropped.
+        let endpoints = fleet.endpoints.clone().expect("the fleet has a section");
+        let one = DesktopSettings {
+            endpoints: Some(EndpointSettings {
+                selection: Selection::One(endpoints.remote[0].id.clone()),
+                ..endpoints
+            }),
+            ..DesktopSettings::default()
+        };
+        retarget_selection(&state, &one).await;
+
+        assert_eq!(state.tunnels.held().await, 1);
+        // Which one survived, asserted through `release` rather than `acquire`:
+        // acquiring a remote deck that had wrongly been dropped would leave the
+        // test spawning `ssh` at a hostname that does not resolve, so the one
+        // assertion that could hang is the one not made here.
+        state
+            .tunnels
+            .release(&one.resolve_endpoint().endpoint)
+            .await;
+        assert_eq!(
+            state.tunnels.held().await,
+            0,
+            "the deck still held is the deck still selected"
+        );
+        crate::dto::apply_settings_selection(&DesktopSettings::default());
+    }
+
+    /// Adding a deck to the fleet is not the deck screen moving, so it must not
+    /// take the switch path (PRD #742 M2).
+    ///
+    /// The set-level generalisation of `an_ordinary_settings_save_does_not_retarget_the_deck`,
+    /// and the reason the gate stays on `resolve()`'s key rather than on the
+    /// observed set: under `Selection::All` the screen and its terminals are on
+    /// the local deck whatever the fleet gains or loses, so widening the gate to
+    /// "the set changed" would detach a user's live panes because they added a
+    /// row in the settings sheet. The tunnel the local deck already holds
+    /// survives with them — `retain` over the grown set still names it.
+    #[tokio::test]
+    async fn growing_the_fleet_does_not_retarget_the_deck_screen() {
+        let state = DesktopState::default();
+        let one = fleet_of(&["build-box.example.com"]);
+        retarget_selection(&state, &one).await;
+        let before = *state.selection.borrow();
+        let local = dot_agent_deck::daemon_client::Endpoint::local();
+        let lease = state
+            .tunnels
+            .acquire(&local)
+            .await
+            .expect("lease the local deck");
+
+        let grown = fleet_of(&["build-box.example.com", "laptop.example.com"]);
+        assert!(
+            !retarget_selection(&state, &grown).await,
+            "a deck joining the fleet is not the deck screen moving"
+        );
+
+        assert_eq!(
+            *state.selection.borrow(),
+            before,
+            "no session detached, and the watcher was not told to re-subscribe"
+        );
+        assert!(
+            std::sync::Arc::ptr_eq(
+                &lease,
+                &state.tunnels.acquire(&local).await.expect("still leased")
+            ),
+            "the deck screen's own transport survives a fleet edit"
+        );
+        crate::dto::apply_settings_selection(&DesktopSettings::default());
     }
 
     /// A remote deck at `host` whose daemon listens on `socket` over there,

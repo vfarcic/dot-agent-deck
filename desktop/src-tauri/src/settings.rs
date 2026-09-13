@@ -332,6 +332,28 @@ impl DesktopSettings {
             },
         }
     }
+
+    /// Every deck this document says to keep alive — PRD #742 M2's set, and
+    /// the document-level twin of [`Self::resolve_endpoint`].
+    ///
+    /// An absent `[endpoints]` section observes the local deck, for the same
+    /// reason it *resolves* to the local deck: absence is this build saying "I
+    /// have nothing to add about endpoints", never "the user removed them".
+    ///
+    /// **[`Self::resolve_endpoint`]'s answer is always in here**, and callers
+    /// depend on it: `retarget_selection` retains over this set, so a deck
+    /// missing from it would have its transport dropped out from under the
+    /// deck screen that is talking to it. It holds by construction rather than
+    /// by care — a single-deck selection's set *is* `[resolve().endpoint]`, and
+    /// [`Selection::All`] leads with the local deck, which is exactly what
+    /// [`EndpointSettings::resolve`] returns for it. Pinned by
+    /// `lib.rs`'s `the_deck_the_screen_talks_to_is_always_one_the_fleet_observes`.
+    pub fn observed_endpoints(&self) -> Vec<Endpoint> {
+        match &self.endpoints {
+            Some(endpoints) => endpoints.observed_endpoints(),
+            None => vec![Endpoint::local()],
+        }
+    }
 }
 
 /// The `[endpoints]` section — PRD #741's tenant: which decks are configured,
@@ -467,7 +489,6 @@ impl EndpointSettings {
     /// The local deck leads because it needs no configuration and is therefore
     /// the one deck always in the set — the same reason `deckChoices` leads
     /// with it.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn observed_endpoints(&self) -> Vec<Endpoint> {
         if !matches!(self.selection, Selection::All) {
             return vec![self.resolve().endpoint];

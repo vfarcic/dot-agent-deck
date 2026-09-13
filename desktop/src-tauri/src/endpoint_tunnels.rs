@@ -30,10 +30,15 @@
 //!
 //! 3. **Teardown has four triggers, and each one is a place in the app:**
 //!    - *the selection changed* — `desktop_set_settings` calls [`EndpointTunnels::retain`]
-//!      with the newly selected endpoint's key, which closes the tunnel to a
+//!      with the **observed** endpoints' keys, which closes the tunnel to a
 //!      deck the user just deselected, re-addressed or removed. This is the
 //!      leak the PRD names: without it every selection change leaves an
-//!      authenticated `ssh` child behind.
+//!      authenticated `ssh` child behind. PRD #742 M2 widened that argument
+//!      from one key to a set — under `Selection::All` every configured deck
+//!      with somewhere to connect to is observed, and only the decks that left
+//!      the set are dropped — and changed nothing else here: the map was
+//!      already keyed, `retain` already took a set, and what was single-deck
+//!      was the caller building a one-element one.
 //!    - *the child died* — [`EndpointTunnels::acquire`] asks
 //!      `EndpointConnection::health`, never `Path::exists`, and re-opens on
 //!      `Exited`. The forwarded socket is created by the local `ssh` client and
@@ -72,6 +77,12 @@ use std::sync::{Arc, Mutex};
 
 use dot_agent_deck::daemon_client::{Endpoint, EndpointIdentity};
 use tokio::sync::Mutex as AsyncMutex;
+
+/// The address every [`EndpointTunnels::insert_stand_in`] lease reports. One
+/// value for every key, because nothing that seam is used to test ever reads
+/// it — a lease that is being *connected through* has to come from `acquire`.
+#[cfg(test)]
+const STAND_IN_ADDRESS: &str = "/tmp/dot-agent-deck-stand-in.sock";
 
 #[cfg(unix)]
 use dot_agent_deck::remote_tunnel::{EndpointConnection, SshProgram, TunnelHealth};
@@ -240,6 +251,21 @@ impl EndpointTunnels {
     /// The selection-change teardown. Takes the keys rather than the endpoints
     /// because the caller already has the new selection in hand and the key is
     /// what the map is indexed by.
+    ///
+    /// **`live` is the observed set, which is one key only when the selection
+    /// names one deck** (PRD #742 M2). It is a set difference and nothing more,
+    /// so it does not care *which* of the three set-level events happened: a
+    /// deck that was removed, and a deck whose address was edited — a different
+    /// [`EndpointIdentity`], so the old one is simply no longer named — are the
+    /// same instruction here. A deck that is newly named holds nothing yet and
+    /// is acquired lazily on first use; this never establishes anything, which
+    /// is what keeps N decks off `acquire`'s whole-map mutex until something
+    /// actually wants one.
+    ///
+    /// It removes only the map's handle, so a deck dropped here while another
+    /// deck's watcher or terminal holds its own lease keeps running until that
+    /// holder lets go (rule 2) — which is what makes a fleet safe to edit while
+    /// it is live.
     pub(crate) async fn retain(&self, live: &HashSet<EndpointIdentity>) {
         self.tunnels
             .lock()
@@ -250,6 +276,33 @@ impl EndpointTunnels {
     /// Drop every handle. The app-exit teardown.
     pub(crate) async fn close_all(&self) {
         self.tunnels.lock().await.clear();
+    }
+
+    /// Seed the map with a stand-in transport under `endpoint`'s key. Test-only.
+    ///
+    /// A **remote** deck's transport cannot be established in a unit test —
+    /// `acquire` would spawn `ssh` and authenticate against a host that is not
+    /// there — and a fleet whose every non-local member is remote is otherwise
+    /// unreachable from a test of the caller. What PRD #742 M2 needs to assert
+    /// at that level is which keys survive a `retain`, and neither the map nor
+    /// `retain` ever reads the connection, so a local stand-in under the remote
+    /// deck's own key exercises exactly the part under test and fabricates
+    /// nothing that part depends on. Anything that would *use* the transport
+    /// belongs in an integration test with a real deck at the other end.
+    #[cfg(test)]
+    pub(crate) async fn insert_stand_in(&self, endpoint: &Endpoint) -> Arc<TunnelLease> {
+        let address = PathBuf::from(STAND_IN_ADDRESS);
+        let lease = Arc::new(TunnelLease {
+            address: address.clone(),
+            connection: Mutex::new(EndpointConnection::Local(
+                dot_agent_deck::daemon_client::LocalEndpoint::at(address),
+            )),
+        });
+        self.tunnels
+            .lock()
+            .await
+            .insert(endpoint.identity(), Arc::clone(&lease));
+        lease
     }
 
     /// How many transports are held. Test-only: no production path has a reason
@@ -321,6 +374,29 @@ impl EndpointTunnels {
 
     pub(crate) async fn close_all(&self) {
         self.tunnels.lock().await.clear();
+    }
+
+    /// Seed the map with a stand-in transport under `endpoint`'s key. Test-only.
+    ///
+    /// A **remote** deck's transport cannot be established in a unit test —
+    /// `acquire` would spawn `ssh` and authenticate against a host that is not
+    /// there — and a fleet whose every non-local member is remote is otherwise
+    /// unreachable from a test of the caller. What PRD #742 M2 needs to assert
+    /// at that level is which keys survive a `retain`, and neither the map nor
+    /// `retain` ever reads the connection, so a local stand-in under the remote
+    /// deck's own key exercises exactly the part under test and fabricates
+    /// nothing that part depends on. Anything that would *use* the transport
+    /// belongs in an integration test with a real deck at the other end.
+    #[cfg(test)]
+    pub(crate) async fn insert_stand_in(&self, endpoint: &Endpoint) -> Arc<TunnelLease> {
+        let lease = Arc::new(TunnelLease {
+            address: PathBuf::from(STAND_IN_ADDRESS),
+        });
+        self.tunnels
+            .lock()
+            .await
+            .insert(endpoint.identity(), Arc::clone(&lease));
+        lease
     }
 
     #[cfg(test)]
@@ -405,6 +481,112 @@ mod tests {
         assert_eq!(
             again.address(),
             std::path::Path::new("/tmp/dot-agent-deck-lease-kept.sock")
+        );
+    }
+
+    /// The fleet's live set keeps EVERY deck it names, not the one deck a
+    /// single selection resolves to (PRD #742 M2).
+    ///
+    /// The sibling of the test above, and the pair is the whole of M2's
+    /// lifetime change: `retain` was never single-deck — the map has been keyed
+    /// and the argument has been a set since PRD #741 M7 — what was single-deck
+    /// is the caller, which built a one-element set from `resolve()`. So what
+    /// this pins is the semantics the new caller depends on, on the same three
+    /// decks the contrast at the end then reduces to one.
+    ///
+    /// Survival is asserted by [`Arc::ptr_eq`] rather than by the count,
+    /// because a count of three is also what "tear the map down and rebuild it
+    /// from the new set" produces — with three brand-new `ssh` children and
+    /// every lease a live holder is using orphaned behind them.
+    #[tokio::test]
+    async fn retain_keeps_every_deck_the_fleet_observes() {
+        let tunnels = EndpointTunnels::default();
+        let fleet: Vec<Endpoint> = ["local", "build-box", "laptop"]
+            .into_iter()
+            .map(|name| {
+                Endpoint::Local(LocalEndpoint::at(format!(
+                    "/tmp/dot-agent-deck-lease-fleet-{name}.sock"
+                )))
+            })
+            .collect();
+        let mut leased = Vec::new();
+        for deck in &fleet {
+            leased.push(tunnels.acquire(deck).await.expect("lease a fleet deck"));
+        }
+        assert_eq!(tunnels.held().await, 3);
+
+        let observed: HashSet<EndpointIdentity> = fleet.iter().map(Endpoint::identity).collect();
+        tunnels.retain(&observed).await;
+
+        assert_eq!(tunnels.held().await, 3, "the fleet observes all three");
+        for (deck, before) in fleet.iter().zip(&leased) {
+            let after = tunnels.acquire(deck).await.expect("still leased");
+            assert!(
+                Arc::ptr_eq(before, &after),
+                "a deck the fleet still observes keeps the transport it had, rather than being \
+                 re-established: {}",
+                deck.describe()
+            );
+        }
+
+        // The contrast the name is making: the one-element set a single-deck
+        // selection builds drops the other two off the same map.
+        let single: HashSet<EndpointIdentity> = [fleet[0].identity()].into_iter().collect();
+        tunnels.retain(&single).await;
+        assert_eq!(tunnels.held().await, 1);
+    }
+
+    /// Removing ONE deck from the fleet tears down exactly that deck's
+    /// transport and leaves the others' children running (PRD #742 M2).
+    ///
+    /// This is the property that makes a fleet safe to edit while it is live,
+    /// and it is the one a "rebuild the whole map whenever the set changes"
+    /// implementation fails silently: the count comes out right, every survivor
+    /// is a *different* transport, and every lease a watcher or a terminal is
+    /// holding now points at an `ssh` child nothing will ever reuse. So the
+    /// survivors are asserted by identity of the `Arc`, and the departed deck by
+    /// the map handing back a different one on the next acquire.
+    #[tokio::test]
+    async fn removing_one_deck_from_the_fleet_drops_only_that_decks_transport() {
+        let tunnels = EndpointTunnels::default();
+        let deck = |name: &str| {
+            Endpoint::Local(LocalEndpoint::at(format!(
+                "/tmp/dot-agent-deck-lease-edit-{name}.sock"
+            )))
+        };
+        let (kept_a, removed, kept_b) = (deck("kept-a"), deck("removed"), deck("kept-b"));
+        let lease_a = tunnels.acquire(&kept_a).await.expect("lease");
+        let lease_removed = tunnels.acquire(&removed).await.expect("lease");
+        let lease_b = tunnels.acquire(&kept_b).await.expect("lease");
+
+        // The user deleted the middle row. Every other deck is still observed.
+        let observed: HashSet<EndpointIdentity> =
+            [kept_a.identity(), kept_b.identity()].into_iter().collect();
+        tunnels.retain(&observed).await;
+
+        assert_eq!(tunnels.held().await, 2, "exactly one deck left the fleet");
+        for (deck, before) in [(&kept_a, &lease_a), (&kept_b, &lease_b)] {
+            assert!(
+                Arc::ptr_eq(before, &tunnels.acquire(deck).await.expect("still leased")),
+                "editing one deck out of the fleet must not disturb another's transport: {}",
+                deck.describe()
+            );
+        }
+        assert!(
+            !Arc::ptr_eq(
+                &lease_removed,
+                &tunnels.acquire(&removed).await.expect("re-leased")
+            ),
+            "the map genuinely let go of the removed deck: a later acquire establishes a new \
+             transport rather than handing back the old one"
+        );
+        // Rule 2: the holder's own lease outlives the map's handle, so removing
+        // a deck from a live fleet cannot tear the transport out from under
+        // whoever is mid-request on it.
+        assert_eq!(
+            lease_removed.address(),
+            std::path::Path::new("/tmp/dot-agent-deck-lease-edit-removed.sock"),
+            "the departed deck's already-handed-out lease is still usable"
         );
     }
 
