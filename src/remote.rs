@@ -68,6 +68,29 @@ impl SshTarget {
             None => self.host.clone(),
         }
     }
+
+    /// The command a user should run in a terminal to evaluate this host's key
+    /// themselves — the remedy
+    /// [`SshError::HostKeyVerificationFailed`] renders.
+    ///
+    /// **It carries the port, and that is a fix rather than a decoration**
+    /// (PRD #741 M5 audit, A5). The remedy used to be built from
+    /// [`Self::user_host`], which drops the port, so a failure on port 2222
+    /// sent the user to port 22 — a *different endpoint*. `known_hosts` keys a
+    /// non-default port as `[host]:port`, so a key accepted at the wrong port
+    /// does not satisfy the connection that failed, and the user has been
+    /// induced to trust a host key for a host nothing asked them to evaluate.
+    ///
+    /// `-i` is deliberately absent: host-key verification happens before
+    /// authentication, so naming a key buys nothing here, and leaving it out
+    /// keeps a `--key` path out of a rendered message.
+    pub fn host_key_remedy(&self) -> String {
+        if self.port == DEFAULT_SSH_PORT {
+            format!("ssh {}", self.user_host())
+        } else {
+            format!("ssh -p {} {}", self.port, self.user_host())
+        }
+    }
 }
 
 /// Captured output of one ssh invocation.
@@ -108,9 +131,9 @@ pub enum SshError {
         source: std::io::Error,
     },
     #[error(
-        "ssh failed: host key not yet trusted for {target}. If this is a first-time connection, run `ssh {target}` once to accept the host key, then retry `remote add`. If the key has changed unexpectedly, investigate before connecting."
+        "ssh failed: host key not yet trusted for {target}. If this is a first-time connection, run `{remedy}` once to accept the host key, then retry. If the key has changed unexpectedly, investigate before connecting."
     )]
-    HostKeyVerificationFailed { target: String },
+    HostKeyVerificationFailed { target: String, remedy: String },
     #[error("ssh to {target} failed: {detail}")]
     Other { target: String, detail: String },
 }
@@ -157,10 +180,38 @@ fn scrub_remote_text(s: &str) -> String {
 /// `SshError` variant. Extracted from `SystemSshExecutor::run` so it can be
 /// unit-tested without spawning a process.
 ///
+/// Public since PRD #741 M5, which reuses it rather than growing a third
+/// classifier: the `ssh -N -L` tunnel's child dies with the same stderr and the
+/// same exit 255, and `HostKeyVerificationFailed` already carries the shape of
+/// remedy a GUI has to show — run the connection once in a terminal. What it
+/// does **not** carry is the remedy's text, which is why
+/// [`classify_ssh_error_with_remedy`] exists: this function fills it from
+/// [`SshTarget::host_key_remedy`], and the tunnel fills it from its endpoint so
+/// the bastion and the port survive (M5 audit A5).
+///
 /// Classification matches against the **raw** stderr while `detail` carries the
 /// [`scrub_remote_text`] form: the matcher looks for ssh's own fixed phrases,
-/// and scrubbing first could only ever change what it sees.
-fn classify_ssh_error(target: &SshTarget, stderr: &str) -> SshError {
+/// and scrubbing first could only ever change what it sees. PRD #741 M5's
+/// tunnel did not honour that and now does — see
+/// [`crate::remote_tunnel::RemoteTunnel::stderr_raw_text`].
+pub fn classify_ssh_error(target: &SshTarget, stderr: &str) -> SshError {
+    classify_ssh_error_with_remedy(target, stderr, &target.host_key_remedy())
+}
+
+/// [`classify_ssh_error`] with the host-key remedy supplied by the caller.
+///
+/// Exists because an [`SshTarget`] cannot name every endpoint this crate
+/// reaches: PRD #741's tunnel may go through `ssh -J <bastion>`, and a jump
+/// host has no field in this type. The remedy a user is told to run has to
+/// describe the endpoint that actually failed — port and bastion included —
+/// or it sends them to a different host (audit A5). `remote add` and
+/// `remote doctor` keep [`SshTarget::host_key_remedy`], which is the same
+/// string plus the port they were dropping.
+pub fn classify_ssh_error_with_remedy(
+    target: &SshTarget,
+    stderr: &str,
+    host_key_remedy: &str,
+) -> SshError {
     let lower = stderr.to_ascii_lowercase();
     let detail = scrub_remote_text(stderr);
     if lower.contains("connection refused")
@@ -186,6 +237,7 @@ fn classify_ssh_error(target: &SshTarget, stderr: &str) -> SshError {
     {
         return SshError::HostKeyVerificationFailed {
             target: target.user_host(),
+            remedy: host_key_remedy.to_string(),
         };
     }
     if lower.contains("permission denied") || lower.contains("publickey") {

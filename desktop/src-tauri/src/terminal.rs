@@ -6,28 +6,69 @@ use dot_agent_deck::daemon_protocol::{
     KIND_DETACH, KIND_GEOMETRY, KIND_STREAM_END, KIND_STREAM_IN, KIND_STREAM_OUT,
     KIND_STREAM_REJECT, parse_geometry_frame, read_frame, write_frame,
 };
-use dot_agent_deck::platform::ipc::IpcWriteHalf;
+use dot_agent_deck::platform::transport::TransportWriteHalf;
 use tauri::ipc::{Channel, Response};
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::Mutex as AsyncMutex;
 
-use crate::daemon_bridge::trusted_daemon;
+use crate::daemon_bridge::{DaemonLinks, trusted_daemon};
 use crate::dto::{
     TerminalAttachResult, TerminalState, TerminalStateEvent, safe_message, validate_agent_id,
     validate_dimensions, validate_terminal_input,
 };
+use crate::endpoint_tunnels::EndpointTunnels;
 
 #[derive(Clone)]
 struct TerminalSession {
     agent_id: String,
     channel_id: u32,
     generation: u64,
-    writer: Arc<AsyncMutex<IpcWriteHalf>>,
+    /// PRD #741 M3: a boxed transport half, not the IPC backend's concrete one.
+    ///
+    /// This is the site that decided the seam's shape. `TerminalSession` lives
+    /// in a `HashMap` inside `DesktopState`, a Tauri-managed singleton every
+    /// command reaches, so a type parameter here propagates to the registry, to
+    /// `DesktopState` and to every command signature. The box costs one vtable
+    /// dispatch per `KIND_STREAM_IN` frame (one per keystroke batch), which is
+    /// invisible next to the syscall it precedes.
+    ///
+    /// **Not** because a local and a remote session could not share one map: an
+    /// earlier version of this comment said so and it is false under PRD #741's
+    /// DECISION 1A, where a remote deck is an `ssh -L` forwarded Unix socket and
+    /// therefore the *same* concrete transport. M5 adds no second
+    /// `AttachTransport` impl. See `platform::transport`'s module docs for the
+    /// three reasons that do hold.
+    ///
+    /// Its `Drop` still half-closes, which is what tells the daemon this viewer
+    /// is gone when a tile closes without an explicit DETACH.
+    writer: Arc<AsyncMutex<TransportWriteHalf>>,
     /// PRD #882 — the viewer token this session's attach was given, sent back on
     /// every resize so the request updates THIS tile's constraint. Two tiles can
     /// show the same agent, so the token is what tells them apart — the process
     /// identity behind the connection cannot.
     viewer: Option<String>,
+    /// PRD #741 M9 — a lease of this session's own on the transport it streams
+    /// over.
+    ///
+    /// **This field is the residual M7 named and left as an argument.** The
+    /// argument was: a session is alive only while a link is, so the tunnel is
+    /// held for it in practice. That is true of the *establishment* moment and
+    /// of nothing after it — `DaemonLinks` drops a link on a selection change
+    /// and rebuilds one every `HANDSHAKE_REVALIDATE_INTERVAL`, while
+    /// [`Self::writer`] is a write half on the forwarded socket that outlives
+    /// the request that opened it by the whole life of the tile. Without a lease
+    /// here, `apply_selection`'s `EndpointTunnels::retain` drops the map's
+    /// handle, the last holder lets go, the `ssh` child dies, and a still-open
+    /// terminal loses its transport mid-stream.
+    ///
+    /// M9 is where that stopped being hypothetical: it is the milestone that
+    /// puts several tiles on a *remote* deck and gives the user a control that
+    /// changes the selection while they are watching one.
+    ///
+    /// Never read. It exists for its `Drop` order — the lease is released when
+    /// the session leaves the registry, which is what lets the `ssh` child go
+    /// once the last tile on that deck has detached.
+    _transport: Arc<crate::endpoint_tunnels::TunnelLease>,
 }
 
 pub(crate) struct DesktopState {
@@ -35,15 +76,65 @@ pub(crate) struct DesktopState {
     attach_gate: AsyncMutex<()>,
     next_generation: AtomicU64,
     pub(crate) watcher_started: AtomicBool,
+    /// PRD #741 M4(a): the established daemon links, keyed by endpoint.
+    ///
+    /// This is the field the milestone is about. Before it, nothing in this
+    /// process owned a daemon connection of any kind — every `trusted_daemon()`
+    /// took a fresh handshake and dropped it, so a `get_snapshot()` cost two
+    /// connections and the watcher paid that up to 6.667 times a second.
+    ///
+    /// An [`Arc`] rather than a plain field because the snapshot watcher is a
+    /// `'static` spawned task that outlives any borrow of this state; it holds
+    /// its own handle and invalidates through it when its event stream ends.
+    pub(crate) daemon: Arc<DaemonLinks>,
+    /// PRD #741 M7: the live `ssh -N -L` children, keyed by endpoint.
+    ///
+    /// **Beside [`DaemonLinks`], never inside it.** A `TrustedDaemon` is
+    /// re-established every `HANDSHAKE_REVALIDATE_INTERVAL` (5 s); a tunnel
+    /// owned by one would re-authenticate ssh every five seconds. The two maps
+    /// share a key and nothing else — see `endpoint_tunnels`'s module docs for
+    /// the ownership and teardown rules M9 and #742 inherit.
+    ///
+    /// An [`Arc`] for the same reason `daemon` is: the snapshot watcher is a
+    /// `'static` task that outlives any borrow of this state.
+    pub(crate) tunnels: Arc<EndpointTunnels>,
+    /// How many times the selected deck has changed (PRD #741 M9).
+    ///
+    /// # Why the watcher needs telling, rather than noticing
+    ///
+    /// The snapshot watcher's event subscription is a connection to **one
+    /// daemon**, opened once and read until it ends. Nothing about a selection
+    /// change ends it: the old deck is still there, still healthy, still
+    /// pushing. So without this signal the watcher would go on folding the
+    /// *previous* deck's broadcasts into the agent view that answers snapshots
+    /// for the *new* one, and go on re-emitting them to the webview as
+    /// `desktop://daemon-event` — the fleet of one machine under the name of
+    /// another, which is the outcome PRD #741 exists to make impossible.
+    ///
+    /// A [`tokio::sync::watch`] rather than a `Notify`: `changed()` is
+    /// cancel-safe *and* edge-tracking per receiver, so a change that lands
+    /// while the watcher is between subscriptions is still observed on its next
+    /// wait instead of being lost. The value is a counter and nobody reads it;
+    /// what carries the signal is that it moved.
+    pub(crate) selection: tokio::sync::watch::Sender<u64>,
 }
 
 impl Default for DesktopState {
     fn default() -> Self {
+        // ONE tunnel map, reachable by two names. `DaemonLinks` needs it
+        // because establishment is where a transport is acquired; the state
+        // needs it because the selection-change and app-exit teardowns are
+        // commands, not handshakes. Cloning the `Arc` is what keeps them the
+        // same map rather than two that drift.
+        let daemon = Arc::new(DaemonLinks::default());
         Self {
             sessions: Mutex::new(HashMap::new()),
             attach_gate: AsyncMutex::new(()),
             next_generation: AtomicU64::new(1),
             watcher_started: AtomicBool::new(false),
+            daemon: Arc::clone(&daemon),
+            tunnels: daemon.tunnels(),
+            selection: tokio::sync::watch::Sender::new(0),
         }
     }
 }
@@ -57,6 +148,12 @@ impl DesktopState {
 
     pub(crate) fn start_watcher_once(&self) -> bool {
         !self.watcher_started.swap(true, Ordering::AcqRel)
+    }
+
+    /// Announce that the selected deck has changed (PRD #741 M9). See
+    /// [`Self::selection`].
+    pub(crate) fn selection_changed(&self) {
+        self.selection.send_modify(|generation| *generation += 1);
     }
 
     fn insert_unique_session(
@@ -98,7 +195,7 @@ fn rejection_notice(reason: &[u8]) -> Vec<u8> {
         })
         .collect::<String>();
     let reason = if reason.trim().is_empty() {
-        "daemon refused terminal input"
+        "the deck refused terminal input"
     } else {
         reason.trim()
     };
@@ -136,12 +233,15 @@ pub(crate) async fn attach(
         });
     }
     detach_agent(state, &agent_id).await;
-    let daemon = trusted_daemon().await?;
+    let daemon = trusted_daemon(&state.daemon).await?;
     daemon.require_compatible()?;
     // PRD #882: a half-measured tile (one axis zero) declares nothing rather
     // than a geometry it does not mean — under a smallest-wins policy a bogus
     // constraint would shrink the agent for every other client too.
     let viewport = viewport.filter(|(rows, cols)| *rows > 0 && *cols > 0);
+    // PRD #741 M9: taken from the link the attach is about to ride, BEFORE the
+    // attach, so the session and its stream are leased to the same transport.
+    let transport = daemon.transport();
     // PRD #882: participate in the policy either way. The tile very often
     // attaches BEFORE the webview has measured it — the shown-set effect drives
     // the attach and `FitAddon` runs a frame later — and a tile that attached as
@@ -172,6 +272,7 @@ pub(crate) async fn attach(
             generation,
             writer: Arc::new(AsyncMutex::new(writer)),
             viewer,
+            _transport: transport,
         },
     )?;
 
@@ -284,7 +385,7 @@ pub(crate) async fn attach(
                             generation,
                             state: TerminalState::Error,
                             message: Some(format!(
-                                "unexpected daemon terminal frame kind 0x{kind:02x}"
+                                "unexpected terminal frame kind 0x{kind:02x} from the deck"
                             )),
                         },
                     );
@@ -360,7 +461,7 @@ pub(crate) async fn resize(
         .get(session_id)
         .map(|session| (session.agent_id.clone(), session.viewer.clone()))
         .ok_or_else(|| format!("terminal session not found: {}", safe_message(session_id)))?;
-    let daemon = trusted_daemon().await?;
+    let daemon = trusted_daemon(&state.daemon).await?;
     daemon.require_compatible()?;
     // PRD #882: name this tile's viewer so the request updates its constraint
     // rather than overriding every other client's. The daemon answers with what
@@ -441,32 +542,107 @@ mod tests {
         assert!(!detach(&state, "terminal-missing").await.unwrap());
     }
 
+    /// A lease on a local deck, which holds no child and needs no ssh — enough
+    /// to stand in for the one an attach takes (PRD #741 M9).
+    #[cfg(unix)]
+    async fn fixture_lease() -> Arc<crate::endpoint_tunnels::TunnelLease> {
+        use dot_agent_deck::daemon_client::{Endpoint, LocalEndpoint};
+        crate::endpoint_tunnels::EndpointTunnels::default()
+            .acquire(&Endpoint::Local(LocalEndpoint::at(
+                "/tmp/dot-agent-deck-terminal-lease-test.sock",
+            )))
+            .await
+            .expect("a local deck always leases")
+    }
+
+    #[cfg(unix)]
+    fn fixture_session(
+        agent_id: &str,
+        generation: u64,
+        transport: Arc<crate::endpoint_tunnels::TunnelLease>,
+    ) -> TerminalSession {
+        let (stream, _peer) = tokio::net::UnixStream::pair().unwrap();
+        // PRD #741 M3: the native split then boxed, matching what
+        // `AttachConnection::into_split` hands production — a
+        // `tokio::io::split` half here would be a fixture whose teardown
+        // differs from the real one.
+        let (_, writer) = stream.into_split();
+        let writer = TransportWriteHalf::new(writer);
+        TerminalSession {
+            agent_id: agent_id.into(),
+            channel_id: generation as u32,
+            generation,
+            writer: Arc::new(AsyncMutex::new(writer)),
+            // Test seam: no attach happened, so there is no viewer token.
+            viewer: None,
+            _transport: transport,
+        }
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn registry_keeps_only_one_session_per_agent() {
-        fn fixture_session(agent_id: &str, generation: u64) -> TerminalSession {
-            let (stream, _peer) = tokio::net::UnixStream::pair().unwrap();
-            let (_, writer) = stream.into_split();
-            TerminalSession {
-                agent_id: agent_id.into(),
-                channel_id: generation as u32,
-                generation,
-                writer: Arc::new(AsyncMutex::new(writer)),
-                // Test seam: no attach happened, so there is no viewer token.
-                viewer: None,
-            }
-        }
-
+        let lease = fixture_lease().await;
         let state = DesktopState::default();
         state
-            .insert_unique_session("terminal-1".into(), fixture_session("agent-a", 1))
+            .insert_unique_session(
+                "terminal-1".into(),
+                fixture_session("agent-a", 1, Arc::clone(&lease)),
+            )
             .unwrap();
         state
-            .insert_unique_session("terminal-2".into(), fixture_session("agent-a", 2))
+            .insert_unique_session(
+                "terminal-2".into(),
+                fixture_session("agent-a", 2, Arc::clone(&lease)),
+            )
             .unwrap();
 
         let sessions = state.sessions().unwrap();
         assert_eq!(sessions.len(), 1);
         assert!(sessions.contains_key("terminal-2"));
+    }
+
+    /// A live session holds the transport open on its own account, so dropping
+    /// every OTHER holder does not release it (PRD #741 M9).
+    ///
+    /// This is the residual M7 named, pinned as a type rather than argued. The
+    /// tunnel map is the only other holder here, and `retain` with an empty set
+    /// is exactly what `apply_selection` does when the user picks a different
+    /// deck; the session's own lease is what keeps the `ssh` child alive until
+    /// the tile that is still streaming over it detaches.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_live_terminal_session_holds_its_own_transport_lease() {
+        use dot_agent_deck::daemon_client::{Endpoint, LocalEndpoint};
+        let tunnels = crate::endpoint_tunnels::EndpointTunnels::default();
+        let endpoint = Endpoint::Local(LocalEndpoint::at(
+            "/tmp/dot-agent-deck-terminal-lease-retain.sock",
+        ));
+        let lease = tunnels.acquire(&endpoint).await.expect("lease");
+        let state = DesktopState::default();
+        state
+            .insert_unique_session(
+                "terminal-1".into(),
+                fixture_session("agent-a", 1, Arc::clone(&lease)),
+            )
+            .unwrap();
+        // Everything the app itself holds is now gone: the map's handle, and
+        // the caller's.
+        tunnels.retain(&std::collections::HashSet::new()).await;
+        drop(lease);
+        assert_eq!(tunnels.held().await, 0, "the map released its handle");
+
+        let held = {
+            let sessions = state.sessions().unwrap();
+            Arc::strong_count(&sessions["terminal-1"]._transport)
+        };
+        assert_eq!(
+            held, 1,
+            "the session is the last holder, so the transport is still alive for it"
+        );
+
+        // Detaching is what lets it go.
+        assert!(detach(&state, "terminal-1").await.unwrap());
+        assert!(state.sessions().unwrap().is_empty());
     }
 }

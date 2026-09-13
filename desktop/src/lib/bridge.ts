@@ -2,6 +2,7 @@ import { createFixtureSnapshot, DEFAULT_PROFILES, type FixtureState } from "../d
 import { getTerminal } from "./terminalRegistry";
 import { applyHandoffEvent, mapDaemonEvent, MAX_LIVE_EVIDENCE } from "./daemonEvents";
 import { DISPLAY_LIMITS, displayText } from "./displayText";
+import { describeEndpoint } from "./endpoints";
 import { clampZoom, DEFAULT_ZOOM } from "./zoom";
 import { UNREPORTED } from "../types";
 import type { HandoffEdge,
@@ -24,6 +25,22 @@ export interface DesktopSnapshotDto {
   connection: {
     status: "connected" | "disconnected" | "incompatible";
     socketPath: string;
+    /** `"local"` or `"remote"` — PRD #741 M7. Always present. */
+    deckKind: string;
+    /** Why Stop and Replace are unavailable; present exactly for a remote deck. */
+    localOnlyReason?: string;
+    /** Why the app is on the local deck when the stored selection named another. */
+    selectionFallback?: string;
+    /**
+     * Why projects and workflows cannot be started against this deck (PRD #741
+     * M8), or absent when they can.
+     *
+     * Derived daemon-side from the `Hello` reply's ADVERTISED capability set,
+     * not from a version digit or a build stamp — which is the point: it answers
+     * "does this deck do what I am about to ask it to" rather than "is this deck
+     * the same build as me".
+     */
+    projectActionsReason?: string;
     error?: string;
     clientProtocolVersion: number;
     serverProtocolVersion?: number;
@@ -187,6 +204,18 @@ export interface DesktopSettingsDto {
   version: number;
   appearance: { mode: AppearanceMode };
   /**
+   * The configured decks and which one the app is talking to (PRD #741 M6/M7).
+   *
+   * **Optional, and `undefined` means *unspecified* rather than *empty*.** The
+   * Rust field is an `Option<EndpointSettings>` and its `None` is what stops a
+   * build whose UI cannot render endpoints from deleting them: the save merges
+   * the decoded struct over the document on disk, so a section this side
+   * fabricated as `{ remote: [], selection: "local" }` would write that empty
+   * table over every remote deck the user had. Never default it — round-trip it
+   * or omit it.
+   */
+  endpoints?: EndpointSettingsDto;
+  /**
    * The window's zoom level as a scale factor, always one of `ZOOM_LEVELS`
    * (PRD #744). A scale factor rather than a percentage because that is the
    * unit `webview.set_zoom` takes, so storage, this wire, the frontend ladder
@@ -195,12 +224,67 @@ export interface DesktopSettingsDto {
   zoom: { level: number };
 }
 
+/** The `[endpoints]` section: the remote decks, and which deck is selected. */
+export interface EndpointSettingsDto {
+  remote: RemoteEndpointDto[];
+  /**
+   * A `Selection` token: the reserved word `local`, or a row's `id`. A token
+   * this build does not recognise resolves to the local deck **and is written
+   * back unchanged**, so an older build degrades rather than destroying a newer
+   * build's selection.
+   */
+  selection: string;
+}
+
+/**
+ * One `[[endpoints.remote]]` row. References only — a host, an optional user, a
+ * port, an optional identity-file *path*, an optional jump-host *name* — and
+ * never a secret. There is no display name: `RemoteEndpoint::describe()` derives
+ * the label from the address, because a free-text label is exactly the arbitrary
+ * `String` the settings field-type guard refuses.
+ */
+export interface RemoteEndpointDto {
+  host: string;
+  id: string;
+  identity?: string;
+  jump?: string;
+  port: number;
+  /**
+   * The deck's attach socket path **on the remote host**. Optional because it
+   * cannot be derived — OpenSSH expands neither `~` nor an environment variable
+   * on the remote side of `-L` — so a row without one is storable and not
+   * connectable, and Test connection is what discovers it.
+   */
+  socket?: string;
+  user?: string;
+}
+
 /** How the app picks its light/dark palette. What it does is PRD #743's. */
 export type AppearanceMode = "system" | "light" | "dark";
 
+/**
+ * The `Selection` token that means the local deck, and therefore the one word
+ * an endpoint id may not be (`LOCAL_SELECTION_TOKEN` in `settings.rs`).
+ *
+ * The local deck is deliberately **not** a stored row: `Endpoint::local()`
+ * resolves it from the platform paths the way every caller did before endpoints
+ * existed, so a fresh install has no `[endpoints]` section and still works, and
+ * deleting the section gets the local deck back rather than nothing.
+ */
+export const LOCAL_ENDPOINT_SELECTION = "local";
+
+/** `RemoteEndpoint::DEFAULT_PORT` — what a row with no `port` key means. */
+export const DEFAULT_SSH_PORT = 22;
+
 const APPEARANCE_MODES: readonly AppearanceMode[] = ["system", "light", "dark"];
 
-/** Mirrors `DesktopSettings::default()`; used when nothing is stored yet. */
+/**
+ * Mirrors `DesktopSettings::default()`; used when nothing is stored yet.
+ *
+ * No `endpoints` key, deliberately: the Rust default is `None`, TOML omits it,
+ * and a default `{ remote: [], selection: "local" }` here would be the exact
+ * fabrication that deletes a user's decks.
+ */
 export const DEFAULT_DESKTOP_SETTINGS: DesktopSettingsDto = {
   version: 1,
   appearance: { mode: "system" },
@@ -240,7 +324,64 @@ export function normalizeDesktopSettings(value: unknown): DesktopSettingsDto {
   return {
     version: typeof record.version === "number" && Number.isFinite(record.version) ? record.version : DEFAULT_DESKTOP_SETTINGS.version,
     appearance: { mode },
+    endpoints: normalizeEndpointSettings(record.endpoints),
     zoom: { level: clampZoom(zoom.level) },
+  };
+}
+
+/**
+ * Coerce the `[endpoints]` section, **preserving absence** (PRD #741 M7).
+ *
+ * This is the frontend half of the pin `a_client_that_cannot_render_endpoints_cannot_delete_them`
+ * makes Rust-side, and getting it wrong is silent data loss rather than a
+ * visible bug. `normalizeDesktopSettings` builds a fresh object with a fixed key
+ * set — that fixed set is itself a credential guard, so it is not going away —
+ * which means a section this function does not read is gone before any panel
+ * spreads the document, and `desktop_set_settings` then merges the decoded
+ * struct over the file. Returning `{ remote: [], selection: "local" }` for an
+ * absent section would therefore delete every remote deck the user had, on a
+ * save triggered by changing the theme.
+ *
+ * So: `undefined` in, `undefined` out. A section that IS present is rebuilt
+ * field by field — no spread, for the same credential-guard reason the parent
+ * has none — and a row missing a `host` or an `id` is dropped rather than
+ * repaired, because those two are what make a row a row and Rust would refuse
+ * the whole document over one of them.
+ */
+function normalizeEndpointSettings(value: unknown): EndpointSettingsDto | undefined {
+  if (typeof value !== "object" || value === null) return undefined;
+  const record = value as Record<string, unknown>;
+  const rows = Array.isArray(record.remote) ? record.remote : [];
+  const remote: RemoteEndpointDto[] = [];
+  for (const entry of rows) {
+    const row = normalizeRemoteEndpoint(entry);
+    if (row) remote.push(row);
+  }
+  return {
+    remote,
+    selection: typeof record.selection === "string" && record.selection ? record.selection : LOCAL_ENDPOINT_SELECTION,
+  };
+}
+
+/** One row, rebuilt key by key. `undefined` for anything that is not a row. */
+function normalizeRemoteEndpoint(value: unknown): RemoteEndpointDto | undefined {
+  if (typeof value !== "object" || value === null) return undefined;
+  const record = value as Record<string, unknown>;
+  const host = typeof record.host === "string" ? record.host : "";
+  const id = typeof record.id === "string" ? record.id : "";
+  if (!host || !id) return undefined;
+  const optional = (key: string): string | undefined => {
+    const raw = record[key];
+    return typeof raw === "string" && raw ? raw : undefined;
+  };
+  return {
+    host,
+    id,
+    identity: optional("identity"),
+    jump: optional("jump"),
+    port: typeof record.port === "number" && Number.isInteger(record.port) && record.port > 0 && record.port <= 65535 ? record.port : DEFAULT_SSH_PORT,
+    socket: optional("socket"),
+    user: optional("user"),
   };
 }
 
@@ -256,6 +397,79 @@ export function normalizeDesktopSettings(value: unknown): DesktopSettingsDto {
 export interface DesktopSettingsSnapshotDto {
   settings: DesktopSettingsDto;
   path?: string;
+}
+
+/**
+ * The twelve states a `Test connection` can end in (PRD #741 M10).
+ *
+ * Mirrors `EndpointTestState` in `desktop/src-tauri/src/endpoint_test.rs`, which
+ * is the authority. Not one of them is "failed": "your ssh config has never seen
+ * this host's key" and "the deck over there is not running" and "this build and
+ * that daemon disagree about the wire" are three different things for a user to
+ * do next.
+ */
+export type EndpointTestState =
+  | "unknown_deck"
+  | "ssh_unavailable"
+  | "no_remote_socket"
+  | "host_unreachable"
+  | "host_key_unverified"
+  | "auth_failed"
+  | "transport_failed"
+  | "deck_not_answering"
+  | "handshake_refused"
+  | "protocol_refused"
+  | "build_stamp_differs"
+  | "reachable";
+
+/** What `desktop_test_endpoint` reports. Every text field is already scrubbed. */
+export interface EndpointTestReportDto {
+  endpointId: string;
+  deck: string;
+  state: EndpointTestState;
+  /**
+   * Whether `state` means the deck is usable right now. Carried rather than
+   * derived here, so the twelve-way classification stays in one place.
+   */
+  ok: boolean;
+  message: string;
+  /** A command to run, when there is one — today only the host-key state. */
+  remedy?: string;
+  /** ssh's own words, when there were any. */
+  detail?: string;
+  /** A socket path the probe learned. The panel writes it into the row. */
+  discoveredSocket?: string;
+  /**
+   * Whether `forwards` and `knownHosts` are answers or absences. `false` means
+   * the one `ssh -G` resolution behind both did not run or could not be read,
+   * which is **not** the same claim as "there are none" — so the panel must not
+   * render it as one, and must not render it as nothing either.
+   */
+  disclosureKnown: boolean;
+  /**
+   * What this deck's tunnel inherits from the user's own ssh config.
+   *
+   * Complete as of PRD #741 final audit F1: a forward line whose value `ssh -G`
+   * printed unquoted — a path with a space is enough — is reported as
+   * unreadable rather than dropped, so this is never quietly shorter than the
+   * user's config.
+   */
+  forwards: string[];
+  /**
+   * Where ssh resolved the host keys it checks this deck against (PRD #741
+   * final audit F2). The tunnel forces the host-key *check* and inherits the
+   * *trust anchor*, so this is the only place a user can see which one their
+   * config chose.
+   *
+   * Additive context, never a claim: empty means ssh named no source, and the
+   * panel renders nothing rather than asserting there is none.
+   */
+  knownHosts: string[];
+  clientProtocolVersion: number;
+  serverProtocolVersion?: number;
+  clientBuildVersion: string;
+  daemonBuildVersion?: string;
+  runningAgentCount?: number;
 }
 
 /** Coerce a `desktop_get_settings` reply into a valid snapshot. */
@@ -337,6 +551,17 @@ export interface DeckBridge {
   getSettings(): Promise<DesktopSettingsSnapshotDto>;
   /** Persist the whole document and resolve with what was written. */
   saveSettings(settings: DesktopSettingsDto): Promise<DesktopSettingsDto>;
+  /**
+   * Test one deck end to end and resolve with a **named state** (PRD #741 M10).
+   *
+   * `selection` is a `Selection` token: `local`, or a row's `id`. The whole
+   * document goes with it because the row a user is testing is usually one they
+   * have just typed — reading the file instead would test the previous value.
+   *
+   * Never rejects for a deck that failed: every outcome is a report. It rejects
+   * only when the call itself could not be made.
+   */
+  testEndpoint(settings: DesktopSettingsDto, selection: string): Promise<EndpointTestReportDto>;
   /**
    * States the WHOLE set of agents whose terminal is on screen right now
    * (PRD #745 M7). Attach follows this and nothing else — not `connect()`, not
@@ -439,7 +664,7 @@ function taskLine(agent: DesktopAgentDto): string {
   // neither (PRD #745 M8).
   const reported = agent.lastUserPrompt
     ?? (agent.activeTool ? `Active tool: ${agent.activeTool.name}${agent.activeTool.detail ? ` · ${agent.activeTool.detail}` : ""}` : undefined);
-  return reported === undefined ? "Task metadata unavailable from daemon" : displayText(reported, DISPLAY_LIMITS.prompt);
+  return reported === undefined ? "Task metadata unavailable from the deck" : displayText(reported, DISPLAY_LIMITS.prompt);
 }
 
 function agentFromDto(agent: DesktopAgentDto, index: number, daemonId: string): AgentSession {
@@ -519,12 +744,12 @@ export function modeScopedKey(base: string): string {
  * the same flag the Connect anyway affordance is gated on.
  */
 function fallbackConnectionMessage(connection: DesktopSnapshotDto["connection"]): string {
-  if (connection.status === "connected") return "Daemon responding";
-  if (connection.status !== "incompatible") return "Daemon unavailable";
+  if (connection.status === "connected") return "Deck responding";
+  if (connection.status !== "incompatible") return "Deck unavailable";
   if (connection.buildStampMismatchOnly) {
-    return `Build mismatch: desktop is ${connection.clientBuildVersion}, daemon is ${connection.daemonBuildVersion ?? "unreported"}.`;
+    return `Build mismatch: desktop is ${connection.clientBuildVersion}, deck is ${connection.daemonBuildVersion ?? "unreported"}.`;
   }
-  return `Protocol mismatch: desktop v${connection.clientProtocolVersion}, daemon v${connection.serverProtocolVersion ?? "unknown"}`;
+  return `Protocol mismatch: desktop v${connection.clientProtocolVersion}, deck v${connection.serverProtocolVersion ?? "unknown"}`;
 }
 
 export function mapDesktopSnapshot(dto: DesktopSnapshotDto, previous?: DeckSnapshot, evidence?: EvidenceItem[], handoffs?: HandoffEdge[]): DeckSnapshot {
@@ -551,7 +776,7 @@ export function mapDesktopSnapshot(dto: DesktopSnapshotDto, previous?: DeckSnaps
   }));
 
   return {
-    runId: previous?.runId ?? "live-daemon",
+    runId: previous?.runId ?? "live-deck",
     repo,
     // No branch: nothing daemon-side tracks one, and the literal "Unavailable"
     // this used to carry was a placeholder the topbar printed as if it were the
@@ -566,6 +791,10 @@ export function mapDesktopSnapshot(dto: DesktopSnapshotDto, previous?: DeckSnaps
       buildStampMismatchOnly: dto.connection.buildStampMismatchOnly,
       clientBuildVersion: dto.connection.clientBuildVersion,
       daemonBuildVersion: dto.connection.daemonBuildVersion,
+      deckKind: dto.connection.deckKind === "remote" ? "remote" : "local",
+      localOnlyReason: dto.connection.localOnlyReason,
+      selectionFallback: dto.connection.selectionFallback,
+      projectActionsReason: dto.connection.projectActionsReason,
     },
     health: dto.connection.status === "incompatible" ? "failed" : dto.connection.status === "disconnected" ? "idle" : agents.some((agent) => agent.status === "failed") ? "failed" : "healthy",
     elapsed: previous?.elapsed ?? "—",
@@ -724,6 +953,40 @@ class FixtureDeckBridge implements DeckBridge {
   }
 
   /**
+   * The browser preview has no socket, no `IpcStream` and no ssh, so it cannot
+   * test anything — and says so rather than inventing a verdict.
+   *
+   * A synthesised `reachable` would be worse than useless here: the preview is
+   * where the panel's layout is driven in Playwright, and a fixture that
+   * pretended a deck answered would make a screen that can never be wrong. The
+   * honest answer is a real state with a real sentence, which is also what the
+   * browser tier needs in order to assert the panel renders one.
+   */
+  async testEndpoint(settings: DesktopSettingsDto, selection: string): Promise<EndpointTestReportDto> {
+    await Promise.resolve();
+    const row = settings.endpoints?.remote.find((candidate) => candidate.id === selection);
+    const deck = selection === LOCAL_ENDPOINT_SELECTION
+      ? "this machine"
+      : row
+        ? describeEndpoint(row)
+        : selection;
+    return {
+      endpointId: selection,
+      deck,
+      state: row || selection === LOCAL_ENDPOINT_SELECTION ? "ssh_unavailable" : "unknown_deck",
+      ok: false,
+      message: row || selection === LOCAL_ENDPOINT_SELECTION
+        ? "Browser preview — it has no way to reach a deck, so nothing was tested."
+        : "That deck is no longer in this settings document.",
+      disclosureKnown: false,
+      forwards: [],
+      knownHosts: [],
+      clientProtocolVersion: 0,
+      clientBuildVersion: "browser-preview",
+    };
+  }
+
+  /**
    * Fixture mode owns no PTYs, so there is nothing to attach or evict — but the
    * seam lives on `DeckBridge` rather than on `TauriDeckBridge` alone, so no
    * screen ever has to know which bridge it is holding.
@@ -751,7 +1014,7 @@ class FixtureDeckBridge implements DeckBridge {
    */
   async resolveProject(): Promise<DaemonResolvedProject> {
     await Promise.resolve();
-    throw new Error("The deterministic preview has no daemon, so it can resolve no project. Run against a live daemon to choose one.");
+    throw new Error("The deterministic preview has no deck, so it can resolve no project. Run against a live deck to choose one.");
   }
 
   async dispose(): Promise<void> {
@@ -1290,14 +1553,14 @@ export class TauriDeckBridge implements DeckBridge {
     if (action.type === "start_daemon") {
       const dto = await invoke<DesktopSnapshotDto>("desktop_bootstrap", { options: { startIfMissing: true } });
       if (dto.connection.status !== "connected") {
-        throw new Error(dto.connection.error ?? "The local daemon did not become connected.");
+        throw new Error(dto.connection.error ?? "The local deck did not become connected.");
       }
       // PRD #745 M7: starting the daemon no longer attaches its whole fleet
       // either — this was the third eager call site, and the one reachable
       // without a snapshot event at all.
       return { ok: true };
     }
-    throw new Error("This orchestration control is available in the fixture preview but is not yet exposed by the live daemon.");
+    throw new Error("This orchestration control is available in the fixture preview but is not yet exposed by the live deck.");
   }
 
   /**
@@ -1329,6 +1592,17 @@ export class TauriDeckBridge implements DeckBridge {
   async saveSettings(settings: DesktopSettingsDto): Promise<DesktopSettingsDto> {
     const invoke = await this.getInvoke();
     return normalizeDesktopSettings(await invoke<DesktopSettingsDto>("desktop_set_settings", { settings }));
+  }
+
+  /**
+   * PRD #741 M10. The reply is a classified report and is rendered as text, so
+   * it is not run through a normaliser: there is no field here a malformed
+   * value could reach state or storage through, and the crate has already
+   * scrubbed every string it carries. The panel bounds what it renders.
+   */
+  async testEndpoint(settings: DesktopSettingsDto, selection: string): Promise<EndpointTestReportDto> {
+    const invoke = await this.getInvoke();
+    return invoke<EndpointTestReportDto>("desktop_test_endpoint", { settings, selection });
   }
 
   async sendTerminalInput(agentId: string, data: string): Promise<void> {

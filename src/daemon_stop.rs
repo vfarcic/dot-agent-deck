@@ -6,7 +6,11 @@
 //! 1. **PID discovery via `peer_pid()`** ([`crate::platform::peercred::peer_pid`])
 //!    — `SO_PEERCRED` / `LOCAL_PEERPID` on the connected attach socket.
 //!    No protocol surface required, so this works against *any* daemon
-//!    version including the v0.24.x daemon that motivated this PRD.
+//!    version including the v0.24.x daemon that motivated this PRD. It is also
+//!    why this whole module takes a
+//!    [`LocalEndpoint`](crate::daemon_client::LocalEndpoint) and not a path
+//!    (PRD #741 M2): a peer credential names a process on *this* machine, so
+//!    over a forwarded socket it would name the tunnel rather than the daemon.
 //! 2. **Agent-liveness check via existing `ListAgents`** — predates
 //!    every change in this PRD, so a stale daemon answers normally.
 //!    Refuse without `--force` when ≥1 agent is alive (data-loss
@@ -29,13 +33,12 @@
 //! PRD #93.
 
 use std::io;
-use std::path::Path;
 use std::time::Duration;
 
 use tracing::debug;
 
 use crate::build_version_handshake::{HandshakeError, TerminateOutcome, terminate_daemon_graceful};
-use crate::daemon_client::issue_command;
+use crate::daemon_client::{LocalEndpoint, issue_command};
 use crate::daemon_protocol::AttachRequest;
 use crate::platform::ipc::IpcStream;
 use crate::platform::peercred::peer_pid;
@@ -124,7 +127,7 @@ impl std::fmt::Display for StopError {
 
 impl std::error::Error for StopError {}
 
-/// Drive the `daemon stop` flow against `attach_path`. Reusable from
+/// Drive the `daemon stop` flow against `endpoint`. Reusable from
 /// `cmd_daemon_stop`, `cmd_daemon_restart`, and the integration test
 /// suite (`tests/daemon_stop.rs`).
 ///
@@ -151,11 +154,15 @@ impl std::error::Error for StopError {}
 ///      is orphaned permanently rather than merely killed. A daemon
 ///      predating the field reports `None` and this check is skipped.
 ///    - ≥1 managed agent alive → [`StopError::LiveAgents`], unchanged.
-/// 4. `terminate_daemon_graceful(pid, attach_path, 5s, force.then(|| 1s))`:
+/// 4. `terminate_daemon_graceful(pid, endpoint, 5s, force.then(|| 1s))`:
 ///    - SIGTERM, poll up to 5 s for the daemon to stop accepting connects.
 ///    - On timeout with `force`: SIGKILL, poll up to 1 s.
 ///    - On timeout without `force`: surface as `TimedOut`.
-pub async fn run_daemon_stop(attach_path: &Path, force: bool) -> Result<StopOutcome, StopError> {
+pub async fn run_daemon_stop(
+    endpoint: &LocalEndpoint,
+    force: bool,
+) -> Result<StopOutcome, StopError> {
+    let attach_path = endpoint.path();
     let stream = match IpcStream::connect(attach_path).await {
         Ok(s) => s,
         Err(e)
@@ -251,8 +258,7 @@ pub async fn run_daemon_stop(attach_path: &Path, force: bool) -> Result<StopOutc
     } else {
         None
     };
-    let outcome =
-        terminate_daemon_graceful(pid, attach_path, STOP_GRACE_TIMEOUT, force_window).await;
+    let outcome = terminate_daemon_graceful(pid, endpoint, STOP_GRACE_TIMEOUT, force_window).await;
     // Explicit, and load-bearing: the pin must outlive the *last* by-pid call
     // inside `terminate_daemon_graceful`, so it is released here and not a line
     // earlier. (Dropping it at end of scope would be correct too; naming the drop
@@ -386,8 +392,11 @@ pub fn format_live_orchestrations_refusal(roles: &[OrchestrationRoleRecord]) -> 
 /// race the next TUI's `ensure_external_daemon_or_die` (two daemons
 /// trying to bind under flock) or require duplicating the lazy-spawn
 /// machinery here.
-pub async fn run_daemon_restart(attach_path: &Path, force: bool) -> Result<StopOutcome, StopError> {
-    run_daemon_stop(attach_path, force).await
+pub async fn run_daemon_restart(
+    endpoint: &LocalEndpoint,
+    force: bool,
+) -> Result<StopOutcome, StopError> {
+    run_daemon_stop(endpoint, force).await
 }
 
 #[cfg(test)]

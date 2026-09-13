@@ -1,16 +1,24 @@
+mod agent_view;
 mod appearance;
 mod daemon_bridge;
 mod dto;
+mod endpoint_test;
+// Tests only: the shared endpoint-validation table, read from here and from
+// `desktop/src/lib/endpoints.test.ts`. No item outside `#[cfg(test)]`, so it
+// adds nothing to a normal build.
+#[cfg(test)]
+mod endpoint_field_parity;
+mod endpoint_tunnels;
 mod settings;
 mod terminal;
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::time::Duration;
 
 use dot_agent_deck::agent_pty::{
     DOT_AGENT_DECK_PANE_ID, TabMembership, is_valid_display_name, mint_orchestration_id,
 };
-use dot_agent_deck::config::attach_socket_path;
 use dot_agent_deck::daemon_client::{DaemonClient, EventSubscription, StartAgentOptions};
 use dot_agent_deck::daemon_stop::{StopOutcome, run_daemon_stop};
 use dot_agent_deck::event::{
@@ -29,14 +37,16 @@ use dot_agent_deck::ui::{describe_send_result, is_terminal_send_result, send_ret
 use tauri::ipc::{Channel, Response};
 use tauri::{AppHandle, Emitter, Manager, State, Webview};
 
+use crate::agent_view::{AgentView, RECONCILE_INTERVAL};
 use crate::daemon_bridge::{
-    allow_build_mismatch_this_session, bootstrap, get_snapshot, trusted_daemon,
+    DaemonLinks, allow_build_mismatch_this_session, bootstrap, get_snapshot, snapshot_with,
+    trusted_daemon,
 };
 use crate::dto::{
     BootstrapOptions, COMMAND_MAX_BYTES, ConnectionStatus, DesktopAction, DesktopActionResult,
     DesktopProjectListing, DesktopResolvedProject, DesktopSnapshot, TerminalAttachResult,
     WorkflowRoleInput, ensure_desktop_workflow_platform_supported, map_project_listing,
-    map_resolved_project, mint_desktop_pane_id, safe_message, validate_agent_id,
+    map_resolved_project, mint_desktop_pane_id, safe_message, selected_endpoint, validate_agent_id,
     validate_pasted_project_path, validate_start_fields, validate_workflow_shape,
 };
 use crate::settings::DesktopSettings;
@@ -115,7 +125,7 @@ fn order_workflow_roles(
             })?;
         if requested_role.start != config_role.start {
             return Err(format!(
-                "workflow start marker for role {} does not match the orchestration the daemon prepared",
+                "workflow start marker for role {} does not match the orchestration the deck prepared",
                 safe_message(&config_role.name)
             ));
         }
@@ -181,13 +191,13 @@ async fn prepare_workflow_launch<D: WorkflowDaemon + Sync>(
     // close, and the prompt names a project-state file only the daemon wrote.
     if prepared.path.is_empty() {
         return Err(
-            "the daemon prepared the workflow but reported no canonical project path; refusing to spawn against an unconfirmed directory"
+            "the deck prepared the workflow but reported no canonical project path; refusing to spawn against an unconfirmed directory"
                 .into(),
         );
     }
     if prepared.prompt.trim().is_empty() {
         return Err(
-            "the daemon prepared the workflow but reported no coordinator prompt; the context would never be read"
+            "the deck prepared the workflow but reported no coordinator prompt; the context would never be read"
                 .into(),
         );
     }
@@ -240,10 +250,10 @@ fn ensure_daemon_can_prepare(
         return Ok(());
     }
     Err(format!(
-        "{PROJECT_ERR_UNSUPPORTED_PLATFORM}: this daemon offers the project verbs but withholds \
-         `{CAP_PREPARE_WORKFLOW}`, which is what a daemon does when its platform cannot give the \
+        "{PROJECT_ERR_UNSUPPORTED_PLATFORM}: this deck offers the project verbs but withholds \
+         `{CAP_PREPARE_WORKFLOW}`, which is what a deck does when its platform cannot give the \
          published coordinator context an owner-only guarantee. Nothing was started. Launch this \
-         workflow from the TUI on the daemon's own host, or point the app at a Unix daemon."
+         workflow from the TUI on that deck's own host, or point the app at a deck on a Unix host."
     ))
 }
 
@@ -746,62 +756,275 @@ fn ensure_explicit_start_connected(
         .connection
         .error
         .clone()
-        .unwrap_or_else(|| "the local daemon did not become connected".into()))
+        .unwrap_or_else(|| "the local deck did not become connected".into()))
 }
 
-async fn refresh_and_emit(app: &AppHandle) -> DesktopSnapshot {
-    let snapshot = get_snapshot().await;
+async fn refresh_and_emit(app: &AppHandle, links: &DaemonLinks) -> DesktopSnapshot {
+    let snapshot = get_snapshot(links).await;
     emit_snapshot(app, &snapshot);
     snapshot
 }
+
+/// Queue depth between the subscription reader and the refresh loop.
+///
+/// PRD #741 M4(b) split the two because [`EventSubscription::next_event`] is
+/// **not cancel-safe** — `read_frame` accumulates a five-byte header across
+/// awaits into a local buffer, so a `select!` arm that drops the future mid-read
+/// loses those bytes and desynchronises the stream. An `mpsc::Receiver::recv` is
+/// cancel-safe and an `Interval::tick` is, so the reader owns the subscription
+/// exclusively and the loop selects on the channel instead.
+///
+/// Bounded rather than unbounded: a refresh loop that stalls must apply
+/// backpressure to the socket rather than grow without limit. 512 is generous
+/// against what it replaces — before this split the loop read at most one event
+/// per full `get_snapshot()`, i.e. ~6.667/s, so any depth at all is an
+/// improvement in how fast the desktop drains the daemon's broadcast.
+const EVENT_QUEUE_DEPTH: usize = 512;
 
 fn ensure_snapshot_watcher(app: &AppHandle, state: &DesktopState) {
     if !state.start_watcher_once() {
         return;
     }
     let app = app.clone();
+    // PRD #741 M4(a): the watcher holds its own handle on the link store. It is
+    // the loop this milestone exists for — it is the thing that was paying two
+    // connections per refresh at up to 6.667 refreshes a second — and it is
+    // also the only place that can observe a daemon being replaced, because its
+    // event subscription is the one connection the desktop holds open across
+    // refreshes. Hence the `invalidate_all` below.
+    let links = Arc::clone(&state.daemon);
+    // PRD #741 M9: the selection signal. Subscribed here rather than inside the
+    // task so the first observed generation is the one in force when the
+    // watcher started, not whatever it happens to be when the task is polled.
+    let mut selection = state.selection.subscribe();
     tauri::async_runtime::spawn(async move {
+        // PRD #741 M4(b): the incremental agent list. It belongs to this task
+        // and to nothing else — it is only ever correct while this task's
+        // subscription is the one feeding it, so a second holder could not be
+        // told whether its contents were live.
+        let mut view = AgentView::default();
         loop {
-            let daemon = match trusted_daemon().await {
+            let daemon = match trusted_daemon(&links).await {
                 Ok(daemon) if daemon.require_compatible().is_ok() => daemon,
                 _ => {
-                    let snapshot = get_snapshot().await;
+                    view.resubscribed();
+                    let snapshot = get_snapshot(&links).await;
                     emit_snapshot(&app, &snapshot);
                     tokio::time::sleep(WATCH_RETRY_DELAY).await;
                     continue;
                 }
             };
-            let mut subscription = match daemon.client.subscribe_events().await {
+            let subscription = match daemon.client.subscribe_events().await {
                 Ok(subscription) => subscription,
                 Err(_) => {
-                    let snapshot = get_snapshot().await;
+                    // Could not even subscribe against a link that just said it
+                    // was compatible: drop it rather than retry through it.
+                    view.resubscribed();
+                    links.invalidate_all().await;
+                    let snapshot = get_snapshot(&links).await;
                     emit_snapshot(&app, &snapshot);
                     tokio::time::sleep(WATCH_RETRY_DELAY).await;
                     continue;
                 }
             };
-            let mut last_refresh: Option<tokio::time::Instant> = None;
-            while let Ok(Some(event)) = subscription.next_event().await {
-                let _ = app.emit("desktop://daemon-event", &event);
-                if let Some(previous) = last_refresh {
-                    let elapsed = previous.elapsed();
-                    if elapsed < SNAPSHOT_COALESCE_INTERVAL {
-                        tokio::time::sleep(SNAPSHOT_COALESCE_INTERVAL - elapsed).await;
-                    }
-                }
-                let snapshot = get_snapshot().await;
-                emit_snapshot(&app, &snapshot);
-                last_refresh = Some(tokio::time::Instant::now());
+            // A NEW subscription means the fold has a hole in it of unknown
+            // size, so everything held is discarded and the first refresh under
+            // this stream re-fetches. Called before the first event can arrive.
+            view.resubscribed();
+            // PRD #741 M9: anything announced before this subscription existed
+            // is already accounted for by the establishment above, so the arm
+            // starts from here rather than firing once on a stale edge.
+            selection.mark_unchanged();
+            let reader = spawn_event_reader(subscription);
+            let ended =
+                watch_one_subscription(&app, &links, &mut view, reader, &mut selection).await;
+            // PRD #741 M4(a): the event stream ended. That is the desktop's
+            // ONE long-lived connection to the daemon going away, and a daemon
+            // cannot be replaced without the old process dying and taking this
+            // socket with it — so this is the signal that the held handshake may
+            // now describe a process that no longer exists. Drop every link
+            // before reconnecting; the loop's next `trusted_daemon` handshakes
+            // against whatever is actually there now.
+            //
+            // A selection change reaches the same place for a different reason:
+            // the link is not stale, it simply describes a deck the user has
+            // left. `apply_selection` has already invalidated it, and the call
+            // below is a no-op in that case rather than a second mechanism.
+            links.invalidate_all().await;
+            // PRD #741 M9: the retry delay is a backoff for a deck that is not
+            // answering. A selection change is a user's click, and there is a
+            // healthy deck waiting at the other end of it, so it re-subscribes
+            // straight away — a second of dead air after choosing a deck is the
+            // whole of what the user would see.
+            if ended == SubscriptionEnd::SelectionChanged {
+                continue;
             }
             tokio::time::sleep(WATCH_RETRY_DELAY).await;
         }
     });
 }
 
+/// Drain one subscription into a channel until it ends.
+///
+/// A task of its own so nothing can cancel a partially-read frame — see
+/// [`EVENT_QUEUE_DEPTH`].
+fn spawn_event_reader(
+    mut subscription: EventSubscription,
+) -> tokio::sync::mpsc::Receiver<BroadcastMsg> {
+    let (tx, rx) = tokio::sync::mpsc::channel(EVENT_QUEUE_DEPTH);
+    tauri::async_runtime::spawn(async move {
+        while let Ok(Some(msg)) = subscription.next_event().await {
+            if tx.send(msg).await.is_err() {
+                break;
+            }
+        }
+        // Dropping `tx` here is what tells the refresh loop the stream ended,
+        // and it happens after every already-read event has been delivered.
+    });
+    rx
+}
+
+/// Why [`watch_one_subscription`] returned (PRD #741 M9).
+///
+/// The two are not the same event and must not share a retry policy: a stream
+/// that ended is a deck that may be gone, and backing off is right; a selection
+/// change is a click, and backing off is a second of dead air the user reads as
+/// the app ignoring them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SubscriptionEnd {
+    /// The daemon's event stream ended — EOF, an error, or a replaced daemon.
+    Ended,
+    /// The user chose a different deck, so this subscription is against the
+    /// wrong one.
+    SelectionChanged,
+}
+
+/// The refresh loop for one subscription: fold what arrives, re-emit at the
+/// coalesce floor, and wake on the reconciliation timer even when nothing
+/// arrives at all.
+///
+/// Returns when the subscription ends, or when the selected deck changes.
+async fn watch_one_subscription(
+    app: &AppHandle,
+    links: &DaemonLinks,
+    view: &mut AgentView,
+    mut events: tokio::sync::mpsc::Receiver<BroadcastMsg>,
+    selection: &mut tokio::sync::watch::Receiver<u64>,
+) -> SubscriptionEnd {
+    let mut reconcile = tokio::time::interval(RECONCILE_INTERVAL);
+    reconcile.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // `interval` fires immediately on its first tick; the refresh below already
+    // fetches because a fresh view demands it, so consume that one here rather
+    // than paying for it twice.
+    reconcile.tick().await;
+
+    let mut last_refresh: Option<tokio::time::Instant> = None;
+    loop {
+        tokio::select! {
+            msg = events.recv() => match msg {
+                Some(msg) => {
+                    let _ = app.emit("desktop://daemon-event", &msg);
+                    view.apply(&msg);
+                }
+                // The reader task is gone, so the subscription ended.
+                None => return SubscriptionEnd::Ended,
+            },
+            _ = reconcile.tick() => view.mark_reconcile_due(),
+            // PRD #741 M9: returns BEFORE the refresh below, deliberately. The
+            // fold under this arm was built from the deck the user has just
+            // left, and `snapshot_with` would answer the new deck's snapshot
+            // out of it — one machine's agents under another machine's name.
+            // Returning discards the fold with the subscription that filled it:
+            // the caller re-establishes, and `view.resubscribed()` runs before
+            // the next stream can deliver anything.
+            //
+            // `changed()` errors only when every sender is gone, which cannot
+            // happen while `DesktopState` is alive; treated as "no more
+            // selection changes" rather than as a reason to end the watch.
+            changed = selection.changed() => {
+                if changed.is_ok() {
+                    return SubscriptionEnd::SelectionChanged;
+                }
+            }
+        }
+        // Everything already queued is applied to THIS refresh rather than
+        // costing one of its own. Before M4(b) each event cost a full
+        // `ListAgents` and a 150 ms wait, so a burst of N drained at 6.667/s;
+        // now a burst of N is N folds and one emit.
+        drain_pending(app, view, &mut events);
+        if let Some(previous) = last_refresh {
+            let elapsed = previous.elapsed();
+            if elapsed < SNAPSHOT_COALESCE_INTERVAL {
+                tokio::time::sleep(SNAPSHOT_COALESCE_INTERVAL - elapsed).await;
+                // The sleep is the coalescing window: whatever landed during it
+                // belongs to the snapshot about to be emitted.
+                drain_pending(app, view, &mut events);
+            }
+        }
+        // PRD #741, Greptile P1 on #1035: the `select!` arm above observes a
+        // selection change only while this loop is PARKED in it. Everything
+        // from there to the emit runs outside it — `drain_pending`, and above
+        // all the coalescing sleep, which is up to `SNAPSHOT_COALESCE_INTERVAL`
+        // of wall clock — so a change landing in that stretch went unseen until
+        // the next iteration, by which time the emit had already happened. It
+        // would have paired the NEW deck's `selected_endpoint()` with a `view`
+        // folded from the OLD one: one machine's agents under another machine's
+        // name, and a later action on one of those rows sending an old agent id
+        // to the new deck. Exactly the defect M9 fixed for the subscription,
+        // surviving in the sleep.
+        if selection_moved_since_last_seen(selection) {
+            return SubscriptionEnd::SelectionChanged;
+        }
+        let snapshot = snapshot_with(&selected_endpoint(), links, Some(view)).await;
+        emit_snapshot(app, &snapshot);
+        last_refresh = Some(tokio::time::Instant::now());
+    }
+}
+
+/// Has the selection moved since this receiver last observed it?
+///
+/// A named function rather than the one call inlined, because the two things
+/// worth pinning about it are both decisions and neither is visible at the call
+/// site (PRD #741, Greptile P1 on #1035).
+///
+/// **Polled rather than a second `select!` arm on the sleep**, and that is the
+/// stronger of the two: an arm would only cover the window it is racing, while
+/// one poll immediately before the emit covers *everything* since the last
+/// observation — the drain, the sleep, and the snapshot decision itself.
+///
+/// **An error reads as `false`, not as a reason to end the watch.**
+/// [`tokio::sync::watch::Receiver::has_changed`] errors only when every sender
+/// is gone, which cannot happen while `DesktopState` is alive; and an arm that
+/// took the error as "changed" would complete immediately and forever, spinning
+/// the loop instead of coalescing it.
+///
+/// Returning without marking the value seen is correct: the caller runs
+/// `selection.mark_unchanged()` before the next subscription, so the next
+/// `watch_one_subscription` starts from the generation actually in force.
+fn selection_moved_since_last_seen(selection: &tokio::sync::watch::Receiver<u64>) -> bool {
+    selection.has_changed().unwrap_or(false)
+}
+
+/// Apply every event already queued, without waiting for another.
+fn drain_pending(
+    app: &AppHandle,
+    view: &mut AgentView,
+    events: &mut tokio::sync::mpsc::Receiver<BroadcastMsg>,
+) {
+    while let Ok(msg) = events.try_recv() {
+        let _ = app.emit("desktop://daemon-event", &msg);
+        view.apply(&msg);
+    }
+}
+
 #[tauri::command]
-async fn desktop_get_snapshot(app: AppHandle, webview: Webview) -> Result<DesktopSnapshot, String> {
+async fn desktop_get_snapshot(
+    app: AppHandle,
+    webview: Webview,
+    state: State<'_, DesktopState>,
+) -> Result<DesktopSnapshot, String> {
     ensure_main_webview(&webview)?;
-    Ok(refresh_and_emit(&app).await)
+    Ok(refresh_and_emit(&app, &state.daemon).await)
 }
 
 /// PRD #819 M6: the projects THIS DAEMON knows about.
@@ -812,9 +1035,12 @@ async fn desktop_get_snapshot(app: AppHandle, webview: Webview) -> Result<Deskto
 /// its startup cwd is not a project" — and the webview renders its
 /// paste-a-path surface for it rather than an error.
 #[tauri::command]
-async fn desktop_list_projects(webview: Webview) -> Result<DesktopProjectListing, String> {
+async fn desktop_list_projects(
+    webview: Webview,
+    state: State<'_, DesktopState>,
+) -> Result<DesktopProjectListing, String> {
     ensure_main_webview(&webview)?;
-    let daemon = trusted_daemon().await?;
+    let daemon = trusted_daemon(&state.daemon).await?;
     daemon.require_compatible()?;
     let listing = daemon
         .client
@@ -835,11 +1061,12 @@ async fn desktop_list_projects(webview: Webview) -> Result<DesktopProjectListing
 #[tauri::command]
 async fn desktop_resolve_project(
     webview: Webview,
+    state: State<'_, DesktopState>,
     path: String,
 ) -> Result<DesktopResolvedProject, String> {
     ensure_main_webview(&webview)?;
     validate_pasted_project_path(&path)?;
-    let daemon = trusted_daemon().await?;
+    let daemon = trusted_daemon(&state.daemon).await?;
     daemon.require_compatible()?;
     let project = daemon
         .client
@@ -858,7 +1085,7 @@ async fn desktop_bootstrap(
 ) -> Result<DesktopSnapshot, String> {
     ensure_main_webview(&webview)?;
     let options = options.unwrap_or_default();
-    let snapshot = bootstrap(&options).await;
+    let snapshot = bootstrap(&options, &state.daemon).await;
     emit_snapshot(&app, &snapshot);
     ensure_snapshot_watcher(&app, &state);
     ensure_explicit_start_connected(options.start_if_missing, &snapshot)?;
@@ -971,7 +1198,9 @@ async fn desktop_get_settings(
 /// framework parses before this signature is reached.
 #[tauri::command]
 async fn desktop_set_settings(
+    app: AppHandle,
     webview: Webview,
+    state: State<'_, DesktopState>,
     settings: DesktopSettings,
 ) -> Result<DesktopSettings, String> {
     ensure_main_webview(&webview)?;
@@ -981,7 +1210,153 @@ async fn desktop_set_settings(
         eprintln!("{}", error.detail());
         safe_message(error.public())
     })?;
+    apply_selection(&app, &state, &settings).await;
     Ok(settings)
+}
+
+/// Put a saved document's deck selection into force (PRD #741 M7, completed at
+/// M9).
+///
+/// # Every settings save reaches here, and most of them changed no deck
+///
+/// The command that calls this is `desktop_set_settings`, which is also how a
+/// theme, a zoom level and every future preference are written. So the work
+/// below is split in two by [`selection_moved`], and getting that split wrong is
+/// not a matter of efficiency: the switch half **detaches every terminal
+/// session**, and running it unconditionally would tear down a user's live
+/// panes because they changed the colour scheme.
+///
+/// # Always, because a save is rare and dropping a held classification is cheap
+///
+/// 1. **The selection is applied**, so `selected_endpoint()` — and therefore the
+///    snapshot, the banner and the Stop/Replace gating — name the deck the
+///    document now says.
+/// 2. **The held handshake is dropped.** A classification describes one daemon;
+///    after any save it may describe the wrong one, and holding it would report
+///    the old deck's agent count beside the new deck's name for up to
+///    `HANDSHAKE_REVALIDATE_INTERVAL`.
+/// 3. **Every transport except the selected deck's is released** — rule 3 of
+///    `endpoint_tunnels`, and the leak PRD #741 M7 names explicitly: without it
+///    each selection change leaves an authenticated `ssh -N -L` child behind for
+///    the life of the app. A lease already handed out survives this, so nothing
+///    in flight is torn out from under — which since M9 includes a terminal
+///    session's own lease, not merely the link's.
+///
+/// # Only when the deck actually moved
+///
+/// 4. **Every terminal session is detached.** A session streams from ONE
+///    daemon's PTY; after a selection change every one of them is showing the
+///    deck the user has left. The same pairing `StopDaemon` and `RestartDaemon`
+///    already make, and for the same reason: a tile left attached to a deck that
+///    is no longer selected is a tile whose keystrokes go to another machine's
+///    agent.
+/// 5. **The watcher is told** (M9). Its event subscription is a connection to
+///    one daemon and a selection change does not end it, so without this it
+///    would keep folding the old deck's broadcasts into the view that answers
+///    the new deck's snapshots. See [`DesktopState::selection`].
+/// 6. **A snapshot for the new deck is emitted** (M9). The watcher re-subscribes
+///    within a moment and would emit one of its own on its next event or
+///    reconcile tick, but "within five seconds" is not an answer to a click.
+///    This is also the step that must not run on an ordinary save: against an
+///    unreachable remote deck it costs a full connect timeout, and putting that
+///    in front of a theme change would make the whole settings sheet feel stuck.
+///
+/// The order matters in two places: the sessions are detached before the tunnels
+/// are released, so a detach frame still has a transport to travel over; and the
+/// links are dropped before the tunnels, so a link cannot be re-established
+/// against a transport that is on its way out.
+async fn apply_selection(app: &AppHandle, state: &DesktopState, settings: &DesktopSettings) {
+    if !retarget_selection(state, settings).await {
+        return;
+    }
+    refresh_and_emit(app, &state.daemon).await;
+}
+
+/// [`apply_selection`] minus the emit, reporting whether the deck moved.
+///
+/// Split out because everything above the emit is testable and the emit is not —
+/// it needs an `AppHandle`, which means a running Tauri app. The one thing worth
+/// pinning here is exactly the thing a running app makes hard to observe: that an
+/// ordinary settings save does **not** take the switch path.
+async fn retarget_selection(state: &DesktopState, settings: &DesktopSettings) -> bool {
+    let previous = crate::dto::selected_endpoint().identity();
+    let deck = crate::dto::apply_settings_selection(settings);
+    let key = deck.endpoint.identity();
+    let moved = selection_moved(&previous, &key);
+    // Before the tunnels are released, so a DETACH frame still has a transport.
+    if moved {
+        terminal::detach_all(state).await;
+    }
+    state.daemon.invalidate_all().await;
+    let live: std::collections::HashSet<dot_agent_deck::daemon_client::EndpointIdentity> =
+        [key].into_iter().collect();
+    state.tunnels.retain(&live).await;
+    if moved {
+        state.selection_changed();
+    }
+    moved
+}
+
+/// Whether a save changed which deck the app is talking to.
+///
+/// Compared by [`dot_agent_deck::daemon_client::EndpointIdentity`] — the key
+/// both `DaemonLinks` and `EndpointTunnels` are indexed by — rather than by the
+/// stored `Selection` token, and the difference is load-bearing in both
+/// directions. **Editing the selected deck's address moves the deck without
+/// moving the token**, and that has to count: the tunnel, the link and every
+/// terminal on it belong to the old address. And a *resolved* key is what the
+/// app is actually talking to, so a selection that falls back to the local deck
+/// — a row that is gone, a row with no socket path yet — compares as local,
+/// which is what it is.
+///
+/// The converse is the case this exists for: editing a deck the user is **not**
+/// on, or changing a theme, leaves the key identical and takes no switch path.
+///
+/// It compared `Endpoint::describe()` until PRD #741's Greptile P1 review: that
+/// string omits the remote socket path, the identity file and the jump host, so
+/// editing any of the three on the selected deck moved the deck without moving
+/// the comparison — no detach, no tunnel teardown, and the held link stayed
+/// pointed at the old route. The identity type is what closes it here and in
+/// the two maps at once.
+fn selection_moved(
+    previous: &dot_agent_deck::daemon_client::EndpointIdentity,
+    next: &dot_agent_deck::daemon_client::EndpointIdentity,
+) -> bool {
+    previous != next
+}
+
+/// Test one endpoint end to end and report a **named state** (PRD #741 M10).
+///
+/// A standalone command rather than a `DesktopAction`, for the same reason the
+/// settings commands are: every `DesktopAction` ends in `refresh_and_emit`, so
+/// routing this through one would make testing a deck the app is *not* talking
+/// to cost a `ListAgents` round trip against the deck it is, and return the
+/// answer inside a snapshot that has nowhere to put it.
+///
+/// It takes the document from the webview rather than re-reading the file,
+/// because the row a user is testing is usually one they have just typed and
+/// the panel saves optimistically — reading the disk would test the previous
+/// value. The document is the same validated `DesktopSettings` the save path
+/// takes, so nothing unvalidated reaches ssh.
+///
+/// **It writes nothing.** A discovered socket path comes back in the report and
+/// the panel puts it in the row; see `endpoint_test`'s module docs for why the
+/// write-back is not made here.
+#[tauri::command]
+async fn desktop_test_endpoint(
+    webview: Webview,
+    state: State<'_, DesktopState>,
+    settings: DesktopSettings,
+    selection: String,
+) -> Result<crate::endpoint_test::EndpointTestReport, String> {
+    ensure_main_webview(&webview)?;
+    if selection.len() > crate::settings::MAX_ENDPOINT_ID_BYTES {
+        return Err(format!(
+            "an endpoint id is at most {} bytes",
+            crate::settings::MAX_ENDPOINT_ID_BYTES
+        ));
+    }
+    Ok(crate::endpoint_test::test_endpoint(&settings, &selection, &state.tunnels).await)
 }
 
 /// Apply a zoom level to the main webview (PRD #744).
@@ -1047,7 +1422,7 @@ async fn desktop_run_action(
     match action {
         DesktopAction::Refresh => {}
         DesktopAction::Bootstrap { start_if_missing } => {
-            let snapshot = bootstrap(&BootstrapOptions { start_if_missing }).await;
+            let snapshot = bootstrap(&BootstrapOptions { start_if_missing }, &state.daemon).await;
             emit_snapshot(&app, &snapshot);
             ensure_snapshot_watcher(&app, &state);
             ensure_explicit_start_connected(start_if_missing, &snapshot)?;
@@ -1077,7 +1452,7 @@ async fn desktop_run_action(
             )?;
             let agent_type = AgentType::from_command(command.as_deref());
             let pane_id = mint_desktop_pane_id();
-            let daemon = trusted_daemon().await?;
+            let daemon = trusted_daemon(&state.daemon).await?;
             daemon.require_compatible()?;
             let id = daemon
                 .client
@@ -1119,11 +1494,11 @@ async fn desktop_run_action(
             // The supported non-Pi coordinator still uses the readiness-gated,
             // identity-bound retry path in `launch_workflow`; Pi is rejected
             // inside the preparation, before anything is spawned.
-            let daemon = trusted_daemon().await?;
+            let daemon = trusted_daemon(&state.daemon).await?;
             daemon.require_compatible()?;
             ensure_daemon_can_prepare(daemon.client.cached_capabilities().as_ref())?;
             let (roles, prepared) = prepare_workflow_launch(
-                &daemon.client,
+                daemon.client.as_ref(),
                 &name,
                 &cwd,
                 &task_prompt,
@@ -1133,7 +1508,7 @@ async fn desktop_run_action(
             .await?;
             let orchestration_id = mint_orchestration_id();
             let launched = launch_workflow(
-                &daemon.client,
+                daemon.client.as_ref(),
                 &name,
                 // The daemon's CANONICAL spelling, not the one that was sent.
                 // An alias or a symlink resolves elsewhere, canonicalising
@@ -1158,7 +1533,7 @@ async fn desktop_run_action(
         }
         DesktopAction::StopAgent { agent_id } => {
             validate_agent_id(&agent_id)?;
-            let daemon = trusted_daemon().await?;
+            let daemon = trusted_daemon(&state.daemon).await?;
             daemon.require_compatible()?;
             daemon
                 .client
@@ -1173,24 +1548,53 @@ async fn desktop_run_action(
             result_agent_id = Some(agent_id);
         }
         DesktopAction::StopDaemon { force } => {
-            let outcome = run_daemon_stop(&attach_socket_path(), force)
+            // PRD #741 M2: `run_daemon_stop` takes a `LocalEndpoint`, so this
+            // cannot reach a remote deck even by accident — `require_local`
+            // is the only way to produce one and it refuses, naming the deck
+            // and the reason. (M7 renders this as a disabled button carrying
+            // the same explanation rather than a failed action.)
+            let endpoint = selected_endpoint();
+            let local = endpoint
+                .require_local("Stop deck")
+                .map_err(|error| safe_message(error.to_string()))?;
+            let outcome = run_daemon_stop(local, force)
                 .await
                 .map_err(|error| safe_message(error.to_string()))?;
+            // PRD #741 M4(a): the daemon this link was established against is
+            // being terminated, so the handshake held for it describes a
+            // process that is going away. Drop it here rather than waiting for
+            // the watcher to notice its stream end.
+            state.daemon.invalidate(&endpoint).await;
             terminal::detach_all(&state).await;
             result_message = Some(match outcome {
-                StopOutcome::NoDaemonRunning => "No daemon was running.".into(),
-                StopOutcome::Stopped { pid } => format!("Daemon stopped gracefully (pid {pid})."),
-                StopOutcome::ForceKilled { pid } => format!("Daemon force-killed (pid {pid})."),
+                StopOutcome::NoDaemonRunning => "No deck was running.".into(),
+                StopOutcome::Stopped { pid } => format!("Deck stopped gracefully (pid {pid})."),
+                StopOutcome::ForceKilled { pid } => format!("Deck force-killed (pid {pid})."),
             });
         }
         DesktopAction::RestartDaemon => {
-            run_daemon_stop(&attach_socket_path(), false)
+            // Replace daemon is Stop plus a lazy-spawn of the desktop's own
+            // bundled build. Both halves are local acts, and on a remote deck
+            // the pair would be worse than either: terminate the ssh tunnel,
+            // then start a LOCAL daemon and report success. Refused by type.
+            let endpoint = selected_endpoint();
+            let local = endpoint
+                .require_local("Replace deck")
+                .map_err(|error| safe_message(error.to_string()))?;
+            run_daemon_stop(local, false)
                 .await
                 .map_err(|error| safe_message(error.to_string()))?;
+            // Same as Stop: the held handshake describes the daemon just
+            // terminated, and the `bootstrap` below is about to start a
+            // different one at the same address.
+            state.daemon.invalidate(&endpoint).await;
             terminal::detach_all(&state).await;
-            let snapshot = bootstrap(&BootstrapOptions {
-                start_if_missing: true,
-            })
+            let snapshot = bootstrap(
+                &BootstrapOptions {
+                    start_if_missing: true,
+                },
+                &state.daemon,
+            )
             .await;
             emit_snapshot(&app, &snapshot);
             ensure_snapshot_watcher(&app, &state);
@@ -1201,7 +1605,7 @@ async fn desktop_run_action(
                 agent_ids: Vec::new(),
                 send_result: None,
                 terminal: None,
-                message: Some("Daemon replaced with the desktop's matching bundled build.".into()),
+                message: Some("Deck replaced with the desktop's matching bundled build.".into()),
                 snapshot,
             });
         }
@@ -1213,6 +1617,12 @@ async fn desktop_run_action(
             // at the tail of this function does unconditionally, and which is
             // why nothing here may cache a verdict.
             allow_build_mismatch_this_session();
+            // PRD #741 M4(a): this action's ENTIRE effect is that the handshake
+            // must be classified again — the comment above says so, and since
+            // the classification is now held it has to be dropped explicitly.
+            // Without this the flag would be set and the banner would keep
+            // reporting the refusal it just lifted.
+            state.daemon.invalidate_all().await;
             result_message = Some(
                 "Build-stamp mismatch accepted for this session; the caveat stays in the connection banner."
                     .into(),
@@ -1229,7 +1639,7 @@ async fn desktop_run_action(
                         .into(),
                 );
             }
-            let daemon = trusted_daemon().await?;
+            let daemon = trusted_daemon(&state.daemon).await?;
             daemon.require_compatible()?;
             let existing_cwd = daemon
                 .client
@@ -1270,7 +1680,7 @@ async fn desktop_run_action(
                     "text must be 1..={COMMAND_MAX_BYTES} bytes and contain no NUL"
                 ));
             }
-            let daemon = trusted_daemon().await?;
+            let daemon = trusted_daemon(&state.daemon).await?;
             daemon.require_compatible()?;
             let record = daemon
                 .client
@@ -1294,7 +1704,7 @@ async fn desktop_run_action(
         }
     }
 
-    let snapshot = refresh_and_emit(&app).await;
+    let snapshot = refresh_and_emit(&app, &state.daemon).await;
     let action_ok = action_result_ok(result_send.as_ref());
     Ok(DesktopActionResult {
         // Preserve the daemon's honest delivery semantics: a successfully
@@ -1340,9 +1750,16 @@ pub fn run() {
         // A missing window is not an error. `load_snapshot` never fails, and a
         // default level makes this a no-op rather than a special case.
         .setup(|app| {
-            let level = settings::load_snapshot().settings.zoom.level;
+            let stored = settings::load_snapshot().settings;
+            // PRD #741 M7: the stored deck selection goes into force before the
+            // first snapshot, so the app connects to the deck the user chose
+            // rather than to the local one and then switching. An unresolvable
+            // selection falls back to local **with a reason**, which the
+            // connection banner renders — a silent substitution is how a user
+            // ends up acting on the wrong machine's agents.
+            crate::dto::apply_settings_selection(&stored);
             if let Some(window) = app.get_webview_window("main") {
-                apply_zoom(window.as_ref(), level);
+                apply_zoom(window.as_ref(), stored.zoom.level);
             }
             Ok(())
         })
@@ -1357,6 +1774,7 @@ pub fn run() {
             desktop_terminal_detach,
             desktop_get_settings,
             desktop_set_settings,
+            desktop_test_endpoint,
             desktop_set_zoom,
             desktop_run_action,
         ])
@@ -1368,7 +1786,14 @@ pub fn run() {
             tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit
         ) {
             let state = app_handle.state::<DesktopState>();
-            tauri::async_runtime::block_on(terminal::detach_all(&state));
+            tauri::async_runtime::block_on(async {
+                terminal::detach_all(&state).await;
+                // PRD #741 M7, teardown trigger 4: every `ssh -N -L` child this
+                // process owns dies with the app. `Drop` on the last lease is
+                // what actually signals the process group; this is what drops
+                // the map's handle so there is a last lease to drop.
+                state.tunnels.close_all().await;
+            });
         }
     });
 }
@@ -1379,6 +1804,145 @@ mod tests {
     use std::collections::VecDeque;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A settings save that changed no deck must NOT take the switch path
+    /// (PRD #741 M9).
+    ///
+    /// Every settings save reaches `apply_selection`, theme and zoom included,
+    /// so this is not an efficiency test: the switch path detaches every
+    /// terminal session, and running it unconditionally would tear down a user's
+    /// live panes because they changed the colour scheme. The selection
+    /// generation is the observable proxy — it is bumped on exactly the path
+    /// that also detaches.
+    #[tokio::test]
+    async fn an_ordinary_settings_save_does_not_retarget_the_deck() {
+        let state = DesktopState::default();
+        let settings = DesktopSettings::default();
+        // The selection in force starts as this document's, so the save below is
+        // the "changed something else" case.
+        retarget_selection(&state, &settings).await;
+        let before = *state.selection.borrow();
+
+        assert!(
+            !retarget_selection(&state, &settings).await,
+            "saving the same document must not read as a deck change"
+        );
+        assert_eq!(
+            *state.selection.borrow(),
+            before,
+            "the watcher must not be told to re-subscribe, and no session detached"
+        );
+    }
+
+    /// A remote deck at `host` whose daemon listens on `socket` over there,
+    /// with every optional field left off.
+    fn deck_at(host: &str, socket: &str) -> dot_agent_deck::daemon_client::RemoteEndpoint {
+        use dot_agent_deck::remote_tunnel::{Hostname, RemoteSocketPath};
+        dot_agent_deck::daemon_client::RemoteEndpoint::new(
+            Hostname::parse(host).expect("a valid hostname"),
+            RemoteSocketPath::parse(socket).expect("a valid remote socket path"),
+        )
+    }
+
+    /// The decision is made on the RESOLVED endpoint key, not on the stored
+    /// token (PRD #741 M9).
+    #[test]
+    fn a_deck_moves_when_its_address_moves_even_if_the_token_does_not() {
+        use dot_agent_deck::daemon_client::{Endpoint, LocalEndpoint};
+
+        // The key both `DaemonLinks` and `EndpointTunnels` are indexed by. An
+        // edit to the selected deck's address moves the tunnel, the link and
+        // every terminal on it, while leaving the stored token identical — so a
+        // token comparison would miss exactly the case that matters most.
+        let box_22 = Endpoint::Remote(deck_at("build-box.example.com", "/run/deck.sock"));
+        let box_2222 =
+            Endpoint::Remote(deck_at("build-box.example.com", "/run/deck.sock").with_port(2222));
+        let local = Endpoint::Local(LocalEndpoint::at("/run/deck.sock"));
+        assert!(selection_moved(&box_22.identity(), &box_2222.identity()));
+        assert!(!selection_moved(&local.identity(), &local.identity()));
+        // A selection that falls back to local compares as local, which is what
+        // the app is actually talking to.
+        assert!(selection_moved(&box_22.identity(), &local.identity()));
+    }
+
+    /// The emit must not be reached with a selection change already pending
+    /// (PRD #741, Greptile P1 on #1035).
+    ///
+    /// The composition — that this is polled immediately before
+    /// `snapshot_with` — is read rather than asserted, because the emit needs
+    /// an `AppHandle` and therefore a running Tauri app. What is pinned here is
+    /// the decision the call site cannot show: a change from ANY point since
+    /// the last observation counts, and a dead sender is not one.
+    #[test]
+    fn a_selection_change_is_seen_after_the_coalescing_sleep_too() {
+        let (tx, rx) = tokio::sync::watch::channel(0u64);
+        assert!(
+            !selection_moved_since_last_seen(&rx),
+            "a fresh receiver has seen the generation in force"
+        );
+
+        // What the M9 `select!` arm cannot see: the change lands while the loop
+        // is in `drain_pending` or the coalescing sleep rather than parked in
+        // the arm.
+        tx.send(1).expect("the receiver is alive");
+        assert!(
+            selection_moved_since_last_seen(&rx),
+            "the emit must not pair the new deck with the old fold"
+        );
+
+        // Observing it clears it, so one change ends one subscription.
+        let mut rx = rx;
+        rx.mark_unchanged();
+        assert!(!selection_moved_since_last_seen(&rx));
+
+        // Every sender gone is not a selection change. Taking it as one would
+        // spin the refresh loop instead of coalescing it.
+        drop(tx);
+        assert!(
+            !selection_moved_since_last_seen(&rx),
+            "a dead sender must not read as a deck switch"
+        );
+    }
+
+    /// The three fields `Endpoint::describe()` does not render (PRD #741,
+    /// Greptile P1 on #1035).
+    ///
+    /// Each names a different daemon, or a different ssh route to one, while
+    /// leaving `user@host[:port]` byte-identical — so while the comparison was
+    /// a display string, editing any of them on the selected deck took the
+    /// no-op path: nothing detached, no tunnel was released, and the held link
+    /// kept talking through the route the user had just replaced.
+    #[test]
+    fn a_deck_moves_when_a_field_describe_does_not_render_moves() {
+        use dot_agent_deck::daemon_client::Endpoint;
+        use dot_agent_deck::remote_tunnel::{HostAlias, KeyPath};
+
+        let base = deck_at("build-box.example.com", "/run/deck.sock");
+        let others = [
+            // A different daemon on the same host.
+            deck_at("build-box.example.com", "/run/other.sock"),
+            // A different key, so a different ssh identity.
+            base.clone()
+                .with_key(KeyPath::parse("~/.ssh/id_ed25519").expect("key path")),
+            // A different route to the same host.
+            base.clone()
+                .with_jump(HostAlias::parse("bastion").expect("jump alias")),
+        ];
+        for other in others {
+            assert_eq!(
+                base.describe(),
+                other.describe(),
+                "the premise of this test is that `describe()` cannot tell these apart"
+            );
+            assert!(
+                selection_moved(
+                    &Endpoint::Remote(base.clone()).identity(),
+                    &Endpoint::Remote(other.clone()).identity()
+                ),
+                "a field that changes the connection must move the deck: {other:?}"
+            );
+        }
+    }
 
     #[derive(Clone)]
     struct PromptSubmission {

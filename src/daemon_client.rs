@@ -16,10 +16,15 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite};
 
-use crate::platform::ipc::{IpcReadHalf, IpcStream, IpcWriteHalf};
+use crate::platform::ipc::{
+    EndpointAvailability, EndpointPresence, IpcStream, LOCAL_ENDPOINT_PRESENCE,
+};
+use crate::platform::transport::{AttachTransport, TransportReadHalf, TransportWriteHalf};
+use crate::remote_tunnel::{HostAlias, Hostname, KeyPath, RemoteSocketPath, SshUser};
 
 pub use crate::agent_pty::{
     AgentRecord, TabMembership, validate_orchestration_surface, validate_tab_membership,
@@ -43,6 +48,491 @@ pub enum ClientError {
     SocketMissing(PathBuf),
     #[error("malformed daemon response: {0}")]
     Malformed(String),
+}
+
+/// Where a daemon lives, from a client's point of view (PRD #741 M2).
+///
+/// Until this type existed a daemon *was* a `PathBuf`, and every operation the
+/// deck performs against one took that path. That is exactly right while the
+/// only daemon reachable is the one on this machine, and exactly wrong the
+/// moment a second kind exists: three of those operations act on a **local
+/// process or a local inode**, and handed a remote deck's address they would
+/// act on the wrong thing while reporting success.
+///
+/// So the kind is in the type, and the local-only operations take
+/// [`LocalEndpoint`] rather than `&Path`. [`Self::as_local`] is the only way to
+/// obtain one from an `Endpoint`, and it returns `None` for [`Self::Remote`] —
+/// so those operations cannot be *reached* from a remote deck and the caller is
+/// made to decide what to do instead.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum Endpoint {
+    /// A daemon process on this machine. Byte-identical in behaviour to
+    /// everything that came before this type: same path, same trust check, same
+    /// lazy-spawn, same stop.
+    Local(LocalEndpoint),
+    /// A daemon on another machine. PRD #741 M5 gives it a transport and M6 a
+    /// stored shape; today it exists so the *type* distinction is real and the
+    /// local-only operations have something to refuse.
+    Remote(RemoteEndpoint),
+}
+
+impl Endpoint {
+    /// This host's configured attach endpoint — what every caller used before
+    /// this type existed, and still the default selection until M6 stores one.
+    pub fn local() -> Self {
+        Self::Local(LocalEndpoint::from_config())
+    }
+
+    /// The local daemon behind this endpoint, or `None` if there is not one.
+    ///
+    /// This is the whole mechanism. `None` for [`Self::Remote`] is what makes
+    /// `peer_pid` termination, the stale-inode unlink and lazy-spawn
+    /// unreachable for a remote deck.
+    pub fn as_local(&self) -> Option<&LocalEndpoint> {
+        match self {
+            Self::Local(local) => Some(local),
+            Self::Remote(_) => None,
+        }
+    }
+
+    /// [`Self::as_local`] with a refusal that names the operation and the deck,
+    /// for the call sites that must report *why* rather than silently skip —
+    /// the desktop's Stop and Replace buttons (PRD #741 M7 turns this message
+    /// into a disabled control with the same explanation).
+    pub fn require_local(&self, operation: &'static str) -> Result<&LocalEndpoint, EndpointError> {
+        self.as_local().ok_or_else(|| EndpointError::LocalOnly {
+            operation,
+            deck: self.describe(),
+        })
+    }
+
+    /// The address a client connects to.
+    ///
+    /// **Deliberately a bare `&Path` and never a [`LocalEndpoint`].** When M5
+    /// adds the `ssh -N -L` transport, the address a *remote* deck is reached at
+    /// is a forwarded socket on this filesystem — and spelling that
+    /// `LocalEndpoint` would hand it straight back to `run_daemon_stop`, whose
+    /// `SO_PEERCRED` lookup would then name the local `ssh` client. The two
+    /// values are different things and this type keeps them different.
+    pub fn connect_address(&self) -> Result<&Path, EndpointError> {
+        match self {
+            Self::Local(local) => Ok(local.path()),
+            Self::Remote(remote) => Err(EndpointError::RemoteAddressIsTheTunnels {
+                deck: remote.describe(),
+            }),
+        }
+    }
+
+    /// What this endpoint's connect address can be asked about on **this**
+    /// filesystem (PRD #741 M3).
+    ///
+    /// The third answer the four filesystem-presence predicates needed. It is a
+    /// property of the *endpoint*, not of the platform and not of the path —
+    /// under DECISION 1A a remote deck's connect address is a forwarded socket
+    /// that exists right here, so nothing about the path itself distinguishes
+    /// the cases and only the endpoint knows.
+    pub fn presence(&self) -> EndpointPresence {
+        match self {
+            Self::Local(_) => LOCAL_ENDPOINT_PRESENCE,
+            Self::Remote(_) => EndpointPresence::Elsewhere,
+        }
+    }
+
+    /// How this endpoint is named in a message to the user. For a local deck
+    /// that is its address, which is what the desktop's connection banner has
+    /// always shown.
+    ///
+    /// **A label, and never a key.** Two decks that differ only in remote
+    /// socket path, identity file or jump host describe *identically* — see
+    /// [`EndpointIdentity`], which is what anything caching a connection must
+    /// index by instead.
+    pub fn describe(&self) -> String {
+        match self {
+            Self::Local(local) => local.path().to_string_lossy().into_owned(),
+            Self::Remote(remote) => remote.describe(),
+        }
+    }
+
+    /// What makes two decks the **same connection**, for anything that caches
+    /// one.
+    pub fn identity(&self) -> EndpointIdentity {
+        EndpointIdentity(self.clone())
+    }
+}
+
+/// The key a cached connection to a deck is indexed by.
+///
+/// # Why this is not `Endpoint::describe()`
+///
+/// It was, and that was a defect (PRD #741, Greptile P1 on #1035).
+/// [`Endpoint::describe`] renders a remote deck as `user@host[:port]` — a
+/// sentence for a human — and **three** of [`RemoteEndpoint`]'s six fields do
+/// not appear in it: the remote socket path, the identity file, and the jump
+/// host. Each of those changes which daemon the app ends up talking to, or how
+/// it gets there:
+///
+/// * `socket` names a *different daemon on the same host*;
+/// * `key` and `jump` name a different ssh route to it.
+///
+/// So two rows differing only in one of them collapsed onto one key, and
+/// `DaemonLinks` and `EndpointTunnels` handed the second row the first row's
+/// held link and live `ssh` child. The user-visible shape: edit the jump host
+/// of the deck you are on, save, and the app stays connected through the
+/// bastion you just removed while telling you it is on the new route.
+///
+/// # Why a newtype over the whole endpoint
+///
+/// Structural, derived equality over the entire [`Endpoint`] rather than a
+/// rendered string or a hand-picked tuple of fields, because those are the two
+/// ways this defect comes back. A rendering has to be *remembered* — the one
+/// that broke was a perfectly good display string that nobody had asked to be
+/// an identity — and a hand-picked tuple has to be *updated* when a field is
+/// added. A derive cannot be forgotten: a new field on [`RemoteEndpoint`] joins
+/// the key the moment it is declared, and a field that genuinely should not
+/// (there is none today) would have to be argued for explicitly by writing
+/// `Hash`/`PartialEq` by hand.
+///
+/// It is deliberately opaque — no `Display`, no `as_str`. The only thing a
+/// caller may do with one is compare it, hash it, or put it in a map, which is
+/// the whole point: a key that could be *printed* is a key someone will
+/// eventually build by printing.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct EndpointIdentity(Endpoint);
+
+/// A daemon running on **this machine**, addressed by the OS name a client
+/// connects to: a Unix domain socket path, or a `\\.\pipe\…` name on Windows
+/// (which has no filesystem presence — see
+/// [`crate::platform::ipc::LOCAL_ENDPOINT_PRESENCE`]).
+///
+/// A newtype over the `PathBuf` these call sites used to pass, and the wrapper
+/// is the point. Three operations are only meaningful — and only safe — when
+/// the daemon is a process on this host:
+///
+/// 1. **Termination by peer credential.** [`crate::daemon_stop::run_daemon_stop`]
+///    reads the daemon's pid off the connected socket
+///    ([`crate::platform::peercred::peer_pid`]) and terminates it;
+///    [`crate::build_version_handshake::ensure_compatible_daemon_or_die`] does
+///    the same on a build-stamp mismatch. Over an `ssh -L` forwarded socket
+///    that pid is the **local `ssh` client's**, so the call would tear the
+///    tunnel down and report that it had stopped the daemon — and Replace would
+///    then lazy-spawn a *local* daemon and report success.
+/// 2. **The stale-inode unlink** in
+///    [`crate::daemon_attach::ensure_daemon_running`], which is safe only
+///    because the trust check immediately above it just proved the inode is
+///    ours.
+/// 3. **Lazy-spawn**, which starts a daemon process *here* — never the answer
+///    when the daemon you asked for is somewhere else.
+///
+/// Each of those takes `&LocalEndpoint`, and [`Endpoint::as_local`] is the only
+/// route from an [`Endpoint`] to one.
+///
+/// **What this does not claim.** [`Self::at`] accepts any path, so the type
+/// guards against *reaching for the wrong value*, not against a caller that
+/// deliberately asserts a wrong one. That is why [`Endpoint::connect_address`]
+/// returns a bare `&Path`: the one value most likely to be wrapped by mistake —
+/// M5's forwarded socket — never arrives here already wearing this type.
+///
+/// # Signature stability — the reversion that would pass every test
+///
+/// Every function that takes one must keep taking `&LocalEndpoint` and must
+/// never revert to `&Path`. At the time of writing that is **seven** — six
+/// public entry points ([`crate::daemon_stop::run_daemon_stop`],
+/// [`crate::daemon_stop::run_daemon_restart`],
+/// [`crate::build_version_handshake::ensure_compatible_daemon_or_die`],
+/// [`crate::build_version_handshake::terminate_daemon_graceful`],
+/// [`crate::daemon_attach::ensure_daemon_running`] and
+/// [`crate::daemon_attach::ensure_external_daemon_or_die`]) plus
+/// `build_version_handshake::terminate_and_recover`, which is private and
+/// reached only from the first of those. Count them with
+/// `grep -rn '&LocalEndpoint' src/` rather than trusting this number, which is a
+/// snapshot. The parameter type **is** the guarantee: widening it back deletes
+/// "a remote deck cannot terminate a daemon, unlink an inode or lazy-spawn"
+/// while leaving the whole suite green, because every existing caller already
+/// holds a local endpoint and would keep compiling and passing. There is no
+/// assertion to fail — the property was only ever enforced by the compiler
+/// refusing a call nobody currently writes.
+///
+/// **The posture is review plus grep, and that is a decision rather than an
+/// oversight.** A `trybuild` harness would pin it — assert that
+/// `run_daemon_stop(&Endpoint::Remote(…))` fails to compile — but this repo has
+/// no `trybuild` harness at all, and DECISION 1's audit reasoning (a new
+/// dependency is weighed against a currently-clean required `security` gate)
+/// argues against adding one, plus its `dev-dependencies` closure and its
+/// notoriously toolchain-sensitive expected-output files, for this single
+/// property. So the enforcement is human:
+///
+/// - `grep -n 'LocalEndpoint' src/` names every site that holds the guarantee;
+///   `grep -rn 'LocalEndpoint::at' src/ desktop/` names every site that asserts
+///   one, which is the short list a reviewer actually has to read.
+/// - A diff that turns a `&LocalEndpoint` parameter into `&Path`, or that adds a
+///   `LocalEndpoint::at` call on a value a transport produced, is the change to
+///   refuse. Both are one grep away and neither is visible as a test failure.
+///
+/// M2's verification was exactly this, done by hand: a deliberate
+/// `run_daemon_stop(&Endpoint::Remote(…))` was compiled, the `E0308` read, and
+/// the probe reverted.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct LocalEndpoint {
+    path: PathBuf,
+}
+
+impl LocalEndpoint {
+    /// This host's configured attach endpoint,
+    /// [`crate::config::attach_socket_path`] — exactly the value every caller
+    /// passed before this type existed, `DOT_AGENT_DECK_ATTACH_SOCKET` override
+    /// included.
+    pub fn from_config() -> Self {
+        Self::at(crate::config::attach_socket_path())
+    }
+
+    /// A local daemon at an explicitly chosen address.
+    ///
+    /// The escape hatch, and it is named as one: nothing here verifies that
+    /// `path` names a daemon on this machine. It exists for callers that
+    /// already hold the configured path and for tests that bind a scripted
+    /// listener in a `tempfile::tempdir()`. **Never** hand it an address a
+    /// remote transport produced — see the type's docs for what that would cost.
+    pub fn at(path: impl Into<PathBuf>) -> Self {
+        Self { path: path.into() }
+    }
+
+    /// The address to connect to, bind against, or poll for.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl AsRef<Path> for LocalEndpoint {
+    fn as_ref(&self) -> &Path {
+        &self.path
+    }
+}
+
+/// A daemon on another machine (PRD #741 M5).
+///
+/// Every field is a **validating newtype** rather than a `String`, and the
+/// reason is two reasons that happen to want the same code:
+///
+/// 1. **Nothing validates an ssh argument today.**
+///    [`crate::remote::SshTarget::parse`] splits `[user@]host` on the first `@`
+///    and stores both halves verbatim — no length bound, no charset, no
+///    rejection of a leading `-`, of whitespace, or of a NUL. `--` and
+///    `Command::arg` stop a hostile value being read as an *option* or reaching
+///    a local shell directly, and both existing ssh call sites do that
+///    correctly; neither stops it reaching the user's own `~/.ssh/config`, where
+///    `ProxyCommand`/`LocalCommand` interpolate `%h`/`%r` into a string OpenSSH
+///    hands to a shell. That is CVE-2023-51385's class, fixed in OpenSSH 9.6 —
+///    and a bundled desktop app runs against whatever OpenSSH the user has.
+/// 2. **`String` is not available in the settings schema.**
+///    `xtask/linkage-check`'s `ALLOWED_FIELD_TYPES` allowlists five types and
+///    `String` is deliberately absent, so M6 putting this struct in
+///    `desktop.toml` with a `String` field reddens a **required** CI check.
+///
+/// The storage policy the fields encode: **never store a secret.** Reference
+/// the user's ssh config and agent by name only — host, optional user, port,
+/// optional key *path*, optional jump-host *name*. `remotes.toml` has proved
+/// that sufficient since PRD #76.
+///
+/// [`Self::socket`] is the one field the PRD's list did not anticipate, and it
+/// is required rather than derived; [`crate::remote_tunnel::RemoteSocketPath`]
+/// records why OpenSSH leaves us no way to compute it from here.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct RemoteEndpoint {
+    host: Hostname,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    user: Option<SshUser>,
+    #[serde(default = "default_ssh_port")]
+    port: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    key: Option<KeyPath>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    jump: Option<HostAlias>,
+    socket: RemoteSocketPath,
+}
+
+fn default_ssh_port() -> u16 {
+    crate::remote::DEFAULT_SSH_PORT
+}
+
+impl RemoteEndpoint {
+    /// The ssh port a remote deck is reached on when nothing says otherwise.
+    ///
+    /// Exposed on the type because a *stored* endpoint needs the same default
+    /// its constructor applies, and the two agreeing is the property worth
+    /// naming: PRD #741 M6's `RemoteEndpointSettings` fills a document with no
+    /// `port` key from this, so a row saved without one and a row saved with
+    /// `port = 22` describe the same deck.
+    pub const DEFAULT_PORT: u16 = crate::remote::DEFAULT_SSH_PORT;
+
+    /// A remote deck at `host`, reached on the default ssh port, whose daemon
+    /// listens on `socket` over there.
+    pub fn new(host: Hostname, socket: RemoteSocketPath) -> Self {
+        Self {
+            host,
+            user: None,
+            port: crate::remote::DEFAULT_SSH_PORT,
+            key: None,
+            jump: None,
+            socket,
+        }
+    }
+
+    /// Log in as `user` rather than whatever the ssh config resolves.
+    pub fn with_user(mut self, user: SshUser) -> Self {
+        self.user = Some(user);
+        self
+    }
+
+    /// Connect on a non-default port.
+    pub fn with_port(mut self, port: u16) -> Self {
+        self.port = port;
+        self
+    }
+
+    /// Offer a specific private key (`ssh -i`). A key **path** — never key
+    /// material, and never a passphrase.
+    pub fn with_key(mut self, key: KeyPath) -> Self {
+        self.key = Some(key);
+        self
+    }
+
+    /// Reach the host through a jump host named in the user's `~/.ssh/config`
+    /// (`ssh -J`). A *name*, so the jump host's own address, port, user and key
+    /// stay in the config where they already are.
+    pub fn with_jump(mut self, jump: HostAlias) -> Self {
+        self.jump = Some(jump);
+        self
+    }
+
+    pub fn host(&self) -> &Hostname {
+        &self.host
+    }
+
+    pub fn user(&self) -> Option<&SshUser> {
+        self.user.as_ref()
+    }
+
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+
+    pub fn key(&self) -> Option<&KeyPath> {
+        self.key.as_ref()
+    }
+
+    pub fn jump(&self) -> Option<&HostAlias> {
+        self.jump.as_ref()
+    }
+
+    /// The daemon's attach socket path **on the remote host**.
+    pub fn socket(&self) -> &RemoteSocketPath {
+        &self.socket
+    }
+
+    /// Everything `ssh` needs to reach this deck's host, with the attach socket
+    /// left behind (PRD #741 M10).
+    ///
+    /// The three methods below delegate to it, so a probe built from a
+    /// [`crate::remote_tunnel::SshDestination`] and a tunnel built from this
+    /// type cannot describe different endpoints — the defect class M5's audit
+    /// A5 found in the host-key remedy.
+    pub fn destination(&self) -> crate::remote_tunnel::SshDestination {
+        crate::remote_tunnel::SshDestination::with_parts(
+            self.host.clone(),
+            self.user.clone(),
+            self.port,
+            self.key.clone(),
+            self.jump.clone(),
+        )
+    }
+
+    /// The destination argument ssh wants: `user@host`, or `host` when the ssh
+    /// config decides the user.
+    pub fn user_host(&self) -> String {
+        self.destination().user_host()
+    }
+
+    /// How this deck is named to a user, and in an error message.
+    ///
+    /// Derived from the address rather than stored as free text, which is not
+    /// only tidiness: a user-chosen label would be exactly the arbitrary
+    /// `String` the settings guard refuses, and it would need its own bidi and
+    /// control-character handling before being rendered. Every byte of this
+    /// string came through a validated ASCII charset, so there is nothing here
+    /// to escape.
+    pub fn describe(&self) -> String {
+        self.destination().describe()
+    }
+
+    /// The command a user should run in a terminal to evaluate this deck's host
+    /// key themselves, for [`crate::remote::SshError::HostKeyVerificationFailed`].
+    ///
+    /// **Built from this type rather than from [`crate::remote::SshTarget`],
+    /// and that is PRD #741 M5's audit finding A5.** `SshTarget` has no `jump`
+    /// field and `SshTarget::user_host()` drops the port, so the remedy the
+    /// tunnel rendered named a *different endpoint*: a failure on port 2222
+    /// through `-J bastion` told the user to run `ssh deploy@build-box`, which
+    /// reaches port 22 with no bastion. Either that is dead-end advice, or it
+    /// succeeds against something unrelated and the user accepts a host key for
+    /// `[build-box]:22` — which, because `known_hosts` keys a non-default port
+    /// as `[host]:port`, does not satisfy the tunnel. The app would have
+    /// induced the user to trust a host key for a host it never asked them to
+    /// evaluate.
+    ///
+    /// The flag order matches [`crate::remote_tunnel::tunnel_args`]' so the two
+    /// read as the same connection. `-i` is omitted for the reason
+    /// [`crate::remote::SshTarget::host_key_remedy`] gives.
+    pub fn host_key_remedy(&self) -> String {
+        self.destination().host_key_remedy()
+    }
+
+    /// The unvalidated [`crate::remote::SshTarget`] the existing ssh helpers
+    /// take — built *from* validated parts, so this is the one direction the
+    /// conversion may go.
+    pub fn ssh_target(&self) -> crate::remote::SshTarget {
+        self.destination().ssh_target()
+    }
+}
+
+impl std::fmt::Display for RemoteEndpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.describe())
+    }
+}
+
+/// Why an operation could not be performed against an [`Endpoint`].
+///
+/// Both variants are *errors returned*, not panics: a caller that reaches a
+/// remote deck gets a message it can render, which is the difference between a
+/// seam not yet wired and a crash.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum EndpointError {
+    /// A remote deck has no connect address of its own: the address is the
+    /// `ssh -N -L` tunnel's, and comes into existence when the tunnel does.
+    ///
+    /// PRD #741 M5 replaced the earlier `RemoteTransportUnavailable`, which said
+    /// the transport did not exist. It does now
+    /// ([`crate::remote_tunnel::RemoteTunnel`]); what an [`Endpoint`] alone
+    /// cannot do is *name* an address, because nothing has been established
+    /// yet. [`crate::remote_tunnel::EndpointConnection`] is the type that can,
+    /// and it hands back a bare `&Path` for the same reason
+    /// [`Endpoint::connect_address`] does.
+    #[error(
+        "the remote deck {deck} is reached through its own ssh tunnel, so it has no address until \
+         one is open: establish an EndpointConnection and ask that for the address"
+    )]
+    RemoteAddressIsTheTunnels { deck: String },
+    /// The operation acts on a local process or a local inode, so it has no
+    /// meaning against a daemon on another machine. PRD #741 M7 renders this as
+    /// a disabled control rather than a failed action.
+    #[error(
+        "{operation} is not available for the remote deck {deck}: it acts on a process on this \
+         machine, which is not the machine that deck runs on"
+    )]
+    LocalOnly {
+        operation: &'static str,
+        deck: String,
+    },
 }
 
 /// PRD #127 C5: the distinct outcomes of a `run-now`. Both mean the task is
@@ -468,6 +958,15 @@ fn cached_capabilities_for(
 #[derive(Debug, Clone)]
 pub struct DaemonClient {
     socket_path: PathBuf,
+    /// PRD #741 M3: what a `stat` of `socket_path` is allowed to mean.
+    ///
+    /// Carried rather than derived, because the address alone cannot say: under
+    /// DECISION 1A a remote deck's connect address is a forwarded socket on this
+    /// filesystem and is indistinguishable from a local daemon's by inspection.
+    /// [`Self::new`] sets the local answer — every caller that existed before
+    /// this field held a local daemon's path — and
+    /// [`Self::for_endpoint`] is how a caller that knows better says so.
+    presence: EndpointPresence,
     /// PRD #819 M5: the capability set captured at the handshake for
     /// `socket_path`, shared across clones of this handle so the set is fetched
     /// ONCE per daemon rather than once per project-aware call.
@@ -483,9 +982,63 @@ pub struct DaemonClient {
 }
 
 impl DaemonClient {
+    /// A client for a daemon on **this** machine, at `socket_path`.
+    ///
+    /// Deliberately unchanged in signature (PRD #741 M3): every TUI and CLI
+    /// caller holds this host's attach path and nothing about them moves for
+    /// this PRD. The presence it records is
+    /// [`LOCAL_ENDPOINT_PRESENCE`], which is exactly what the code did before
+    /// the field existed.
     pub fn new(socket_path: PathBuf) -> Self {
         Self {
             socket_path,
+            presence: LOCAL_ENDPOINT_PRESENCE,
+            capabilities: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// A client for whichever deck `endpoint` names (PRD #741 M3).
+    ///
+    /// The difference from [`Self::new`] is the presence, not the address: a
+    /// remote deck's connect address is still a path, and still one this process
+    /// connects to. What changes is that nothing may read a `stat` of it as the
+    /// daemon's health — see [`EndpointPresence::Elsewhere`].
+    ///
+    /// Errors while [`Endpoint::connect_address`] does, i.e. for a remote deck
+    /// until M5 lands.
+    pub fn for_endpoint(endpoint: &Endpoint) -> Result<Self, EndpointError> {
+        Ok(Self {
+            socket_path: endpoint.connect_address()?.to_path_buf(),
+            presence: endpoint.presence(),
+            capabilities: Arc::new(Mutex::new(None)),
+        })
+    }
+
+    /// A client for a deck reached over an established transport (PRD #741 M5).
+    ///
+    /// **This is the seam M7 has to use, and its absence was a trap rather than
+    /// a gap.** The other two constructors cannot serve a tunnel:
+    /// [`Self::for_endpoint`] *errors* for the `Remote` arm, because
+    /// [`Endpoint::connect_address`] returns
+    /// [`EndpointError::RemoteAddressIsTheTunnels`] — an `Endpoint` alone has
+    /// no address until a tunnel exists. So the only spelling available to a
+    /// caller holding a live tunnel was
+    /// `DaemonClient::new(tunnel.connect_address().to_path_buf())`, which
+    /// hard-codes [`LOCAL_ENDPOINT_PRESENCE`] and thereby restores
+    /// `exists()`-as-health on **exactly** the socket PRD #741 M3 built
+    /// `EndpointPresence::Elsewhere` to protect. That would have re-opened the
+    /// path M2 and M3 closed: read a forwarded socket as a stale local daemon
+    /// inode and `remove_file` it.
+    ///
+    /// Infallible, unlike [`Self::for_endpoint`], and that is the point: by the
+    /// time an [`crate::remote_tunnel::EndpointConnection`] exists the
+    /// transport is up, so there is no error arm to tempt a caller back to
+    /// [`Self::new`].
+    #[cfg(unix)]
+    pub fn for_connection(connection: &crate::remote_tunnel::EndpointConnection) -> Self {
+        Self {
+            socket_path: connection.connect_address().to_path_buf(),
+            presence: connection.presence(),
             capabilities: Arc::new(Mutex::new(None)),
         }
     }
@@ -497,15 +1050,41 @@ impl DaemonClient {
     /// Surface a clear "daemon not running" error before any I/O is
     /// attempted. The remote-deck-local TUI calls this at startup so the
     /// user doesn't see a generic ECONNREFUSED.
+    ///
+    /// PRD #741 M3: only [`EndpointAvailability::Absent`] is a refusal.
+    /// `Unanswerable` is the third answer this used to spell as absence — a
+    /// Windows pipe name has nothing to `stat` (so this reported *every* live
+    /// Windows daemon missing), and a remote deck has something to `stat` that
+    /// is not the daemon. In both cases the connect that follows is the only
+    /// honest test, so this steps aside rather than inventing a verdict.
     pub fn ensure_socket_exists(&self) -> Result<(), ClientError> {
-        if !self.socket_path.exists() {
-            return Err(ClientError::SocketMissing(self.socket_path.clone()));
+        match self.presence.availability(&self.socket_path) {
+            EndpointAvailability::Absent => {
+                Err(ClientError::SocketMissing(self.socket_path.clone()))
+            }
+            EndpointAvailability::Present | EndpointAvailability::Unanswerable => Ok(()),
         }
-        Ok(())
     }
 
-    async fn connect(&self) -> io::Result<IpcStream> {
-        IpcStream::connect(&self.socket_path).await
+    /// Open a connection to the daemon and split it into owned halves.
+    ///
+    /// **PRD #741 M3: this returns the halves, not the stream, and that is the
+    /// design rather than a convenience.** Every one of the seventeen callers
+    /// split immediately, so handing back an unsplit transport bought nothing —
+    /// and what it cost is that a caller could split it itself with
+    /// [`tokio::io::split`], which is the exact regression
+    /// [`crate::platform::ipc`]'s module docs record an earlier draft shipping:
+    /// a write half that does not half-close on drop, so the daemon never
+    /// notices a client has gone. Splitting here, once, makes that unreachable
+    /// from the client.
+    ///
+    /// The concrete transport is still an [`IpcStream`] — M3 changes the type
+    /// that flows, not what is underneath, and not the lifetime either (holding
+    /// the connection open is M4).
+    async fn connect(&self) -> io::Result<(TransportReadHalf, TransportWriteHalf)> {
+        Ok(IpcStream::connect(&self.socket_path)
+            .await?
+            .split_transport())
     }
 
     /// List daemon-side agents. Returns one [`AgentRecord`] per agent,
@@ -524,8 +1103,7 @@ impl DaemonClient {
     /// drift — we never propagate a control-byte name into
     /// bucketing/logging/tab lookup.
     pub async fn list_agents(&self) -> Result<Vec<AgentRecord>, ClientError> {
-        let stream = self.connect().await?;
-        let (mut rd, mut wr) = stream.into_split();
+        let (mut rd, mut wr) = self.connect().await?;
         let resp = issue_command(&mut rd, &mut wr, &AttachRequest::ListAgents).await?;
         if !resp.ok {
             return Err(ClientError::Server(
@@ -568,8 +1146,7 @@ impl DaemonClient {
     /// mutating subcommands call this after an atomic write so the daemon picks
     /// the change up live.
     pub async fn reload_schedules(&self) -> Result<Vec<String>, ClientError> {
-        let stream = self.connect().await?;
-        let (mut rd, mut wr) = stream.into_split();
+        let (mut rd, mut wr) = self.connect().await?;
         let resp = issue_command(&mut rd, &mut wr, &AttachRequest::ReloadSchedules).await?;
         if !resp.ok {
             return Err(ClientError::Server(
@@ -583,8 +1160,7 @@ impl DaemonClient {
     /// PRD #127 M1.5: fire a registered scheduled task now (the
     /// `schedule run-now` door). Errors if no such task is registered.
     pub async fn run_now(&self, name: &str) -> Result<RunNowOutcome, ClientError> {
-        let stream = self.connect().await?;
-        let (mut rd, mut wr) = stream.into_split();
+        let (mut rd, mut wr) = self.connect().await?;
         let resp = issue_command(
             &mut rd,
             &mut wr,
@@ -603,8 +1179,7 @@ impl DaemonClient {
     }
 
     pub async fn start_agent(&self, opts: StartAgentOptions) -> Result<String, ClientError> {
-        let stream = self.connect().await?;
-        let (mut rd, mut wr) = stream.into_split();
+        let (mut rd, mut wr) = self.connect().await?;
         let req = AttachRequest::StartAgent {
             command: opts.command,
             cwd: opts.cwd,
@@ -733,8 +1308,7 @@ impl DaemonClient {
         &self,
         request: &serde_json::Value,
     ) -> Result<AttachResponse, ClientError> {
-        let stream = self.connect().await?;
-        let (mut rd, mut wr) = stream.into_split();
+        let (mut rd, mut wr) = self.connect().await?;
         let payload = serde_json::to_vec(request)
             .map_err(|e| ClientError::Malformed(format!("request JSON: {e}")))?;
         write_frame(&mut wr, KIND_REQ, &payload).await?;
@@ -748,8 +1322,7 @@ impl DaemonClient {
     /// omits the field (so the caller fails a guarded send safe). A transport
     /// error surfaces as `Err` (also fail-safe: the caller does not submit).
     async fn daemon_advertises_guarded_send(&self) -> Result<bool, ClientError> {
-        let stream = self.connect().await?;
-        let (mut rd, mut wr) = stream.into_split();
+        let (mut rd, mut wr) = self.connect().await?;
         let resp = issue_command(
             &mut rd,
             &mut wr,
@@ -795,8 +1368,7 @@ impl DaemonClient {
         if let Some(hit) = self.cached_capabilities() {
             return Ok(hit);
         }
-        let stream = self.connect().await?;
-        let (mut rd, mut wr) = stream.into_split();
+        let (mut rd, mut wr) = self.connect().await?;
         let resp = issue_command(
             &mut rd,
             &mut wr,
@@ -891,8 +1463,7 @@ impl DaemonClient {
     pub async fn list_projects(&self) -> Result<crate::event::ProjectListing, ClientError> {
         self.require_capability(crate::daemon_protocol::CAP_LIST_PROJECTS)
             .await?;
-        let stream = self.connect().await?;
-        let (mut rd, mut wr) = stream.into_split();
+        let (mut rd, mut wr) = self.connect().await?;
         let resp = issue_command(&mut rd, &mut wr, &AttachRequest::ListProjects {}).await?;
         if !resp.ok {
             return Err(ClientError::Server(
@@ -923,8 +1494,7 @@ impl DaemonClient {
     ) -> Result<crate::event::ResolvedProject, ClientError> {
         self.require_capability(crate::daemon_protocol::CAP_RESOLVE_PROJECT)
             .await?;
-        let stream = self.connect().await?;
-        let (mut rd, mut wr) = stream.into_split();
+        let (mut rd, mut wr) = self.connect().await?;
         let resp = issue_command(
             &mut rd,
             &mut wr,
@@ -964,8 +1534,7 @@ impl DaemonClient {
     ) -> Result<crate::event::PreparedWorkflow, ClientError> {
         self.require_capability(crate::daemon_protocol::CAP_PREPARE_WORKFLOW)
             .await?;
-        let stream = self.connect().await?;
-        let (mut rd, mut wr) = stream.into_split();
+        let (mut rd, mut wr) = self.connect().await?;
         let resp = issue_command(
             &mut rd,
             &mut wr,
@@ -1048,8 +1617,7 @@ impl DaemonClient {
             agent_type: opts.agent_type,
             seed: opts.seed,
         };
-        let stream = self.connect().await?;
-        let (mut rd, mut wr) = stream.into_split();
+        let (mut rd, mut wr) = self.connect().await?;
         let resp = issue_command(&mut rd, &mut wr, &req).await?;
         if !resp.ok {
             return Err(ClientError::Server(
@@ -1094,8 +1662,7 @@ impl DaemonClient {
         cols: u16,
         viewer: Option<&str>,
     ) -> Result<Option<(u16, u16)>, ClientError> {
-        let stream = self.connect().await?;
-        let (mut rd, mut wr) = stream.into_split();
+        let (mut rd, mut wr) = self.connect().await?;
         let resp = issue_command(
             &mut rd,
             &mut wr,
@@ -1131,8 +1698,7 @@ impl DaemonClient {
         display_name: Option<String>,
         cwd: Option<String>,
     ) -> Result<(), ClientError> {
-        let stream = self.connect().await?;
-        let (mut rd, mut wr) = stream.into_split();
+        let (mut rd, mut wr) = self.connect().await?;
         let resp = issue_command(
             &mut rd,
             &mut wr,
@@ -1153,8 +1719,7 @@ impl DaemonClient {
     }
 
     pub async fn stop_agent(&self, id: &str) -> Result<(), ClientError> {
-        let stream = self.connect().await?;
-        let (mut rd, mut wr) = stream.into_split();
+        let (mut rd, mut wr) = self.connect().await?;
         let resp = issue_command(
             &mut rd,
             &mut wr,
@@ -1176,8 +1741,7 @@ impl DaemonClient {
     /// closes the stream (`KIND_STREAM_END` carrying the reason) or
     /// either side drops the socket.
     pub async fn subscribe_events(&self) -> Result<EventSubscription, ClientError> {
-        let stream = self.connect().await?;
-        let (mut rd, mut wr) = stream.into_split();
+        let (mut rd, mut wr) = self.connect().await?;
         let resp = issue_command(&mut rd, &mut wr, &AttachRequest::SubscribeEvents).await?;
         if !resp.ok {
             return Err(ClientError::Server(
@@ -1220,8 +1784,7 @@ impl DaemonClient {
     /// is asynchronous from that point (SIGTERM grace + SIGKILL) but
     /// the user's commit has been acknowledged.
     pub async fn send_shutdown(&self) -> Result<(), ClientError> {
-        let stream = self.connect().await?;
-        let (mut rd, mut wr) = stream.into_split();
+        let (mut rd, mut wr) = self.connect().await?;
         write_frame(&mut wr, KIND_SHUTDOWN, &[]).await?;
         // Bound the wait at 1s — the daemon writes the ack BEFORE
         // beginning teardown (so the wire ordering is honest even when
@@ -1301,8 +1864,7 @@ impl DaemonClient {
         viewport: Option<(u16, u16)>,
         geometry_updates: bool,
     ) -> Result<AttachConnection, ClientError> {
-        let stream = self.connect().await?;
-        let (mut rd, mut wr) = stream.into_split();
+        let (mut rd, mut wr) = self.connect().await?;
         let resp = issue_command(
             &mut rd,
             &mut wr,
@@ -1339,14 +1901,22 @@ impl DaemonClient {
 /// receiver fell behind) or the socket drops. Callers reconnect via
 /// [`DaemonClient::subscribe_events`].
 pub struct EventSubscription {
-    rd: IpcReadHalf,
+    rd: TransportReadHalf,
     /// Held purely as a lifetime signal: dropping the subscription drops
-    /// `_wr`, which — on the Unix backend, whose [`IpcWriteHalf`] is
-    /// `tokio::net::unix::OwnedWriteHalf` — half-closes the socket via
-    /// `SHUT_WR`, tripping the daemon's read-side disconnect detector and
-    /// tearing the per-connection receiver down promptly. Never written to
-    /// after the request.
-    _wr: IpcWriteHalf,
+    /// `_wr`, which half-closes the transport — on the Unix backend a
+    /// `shutdown(SHUT_WR)` — tripping the daemon's read-side disconnect
+    /// detector and tearing the per-connection receiver down promptly. Never
+    /// written to after the request.
+    ///
+    /// PRD #741 M3: this is now a boxed
+    /// [`TransportWriteHalf`], and the drop behaviour survives the box because
+    /// the box holds the backend's own half, whose `Drop` runs unchanged. The
+    /// thing that would lose it is [`tokio::io::split`], which is why
+    /// [`crate::platform::transport::TransportWriteHalf::new`] takes a
+    /// [`HalfCloseOnDrop`](crate::platform::transport::HalfCloseOnDrop) rather
+    /// than an `AsyncWrite`. `transport::tests::
+    /// dropping_the_write_half_alone_gives_the_server_eof` is the proof.
+    _wr: TransportWriteHalf,
 }
 
 impl EventSubscription {
@@ -1417,8 +1987,12 @@ impl EventSubscription {
 /// the next read returns the daemon-supplied scrollback snapshot, then live
 /// STREAM_OUT frames until the agent exits or the client detaches.
 pub struct AttachConnection {
-    rd: IpcReadHalf,
-    wr: IpcWriteHalf,
+    /// PRD #741 M3: boxed transport halves rather than the IPC backend's own,
+    /// so a PTY stream can run over something that is not a Unix socket or a
+    /// named pipe. `wr`'s drop still half-closes — see
+    /// [`EventSubscription`]'s `_wr` for why that is not automatic.
+    rd: TransportReadHalf,
+    wr: TransportWriteHalf,
     /// PRD #882 — the viewer token for this attach, or `None` when no viewport
     /// was declared. Pass it to [`DaemonClient::resize_agent_as_viewer`] so a
     /// resize updates this view's constraint instead of overriding everyone.
@@ -1488,7 +2062,7 @@ impl AttachConnection {
 
     /// Split into owned halves for callers that drive read and write tasks
     /// concurrently (the typical pane wiring).
-    pub fn into_split(self) -> (IpcReadHalf, IpcWriteHalf) {
+    pub fn into_split(self) -> (TransportReadHalf, TransportWriteHalf) {
         (self.rd, self.wr)
     }
 
@@ -1506,7 +2080,13 @@ impl AttachConnection {
     #[cfg(all(test, unix))]
     pub(crate) fn connected_pair_for_test() -> (Self, tokio::net::UnixStream) {
         let (ours, peer) = tokio::net::UnixStream::pair().expect("socket pair for test");
+        // PRD #741 M3: the native split, then boxed — so the test seam carries
+        // the same `SHUT_WR`-on-drop write half production does. Going through
+        // `tokio::io::split` here would give a test double whose teardown does
+        // not match the thing under test.
         let (rd, wr) = ours.into_split();
+        let rd = TransportReadHalf::new(rd);
+        let wr = TransportWriteHalf::new(wr);
         (
             Self {
                 rd,
@@ -1522,6 +2102,78 @@ impl AttachConnection {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every [`RemoteEndpoint`] field that changes the connection changes the
+    /// [`EndpointIdentity`] — including the three [`Endpoint::describe`] does
+    /// not render (PRD #741, Greptile P1 on #1035).
+    ///
+    /// The `describe()` assertion in each case is the premise rather than
+    /// decoration: it is what shows the pair really is indistinguishable to the
+    /// old key, so a future change that made `describe()` render the socket
+    /// path would turn this test vacuous loudly instead of quietly.
+    #[test]
+    fn every_connection_bearing_field_is_part_of_the_identity() {
+        use crate::remote_tunnel::{HostAlias, Hostname, KeyPath, RemoteSocketPath, SshUser};
+
+        let deck = |host: &str, socket: &str| {
+            RemoteEndpoint::new(
+                Hostname::parse(host).expect("hostname"),
+                RemoteSocketPath::parse(socket).expect("remote socket path"),
+            )
+        };
+        let base = deck("build-box.example.com", "/run/deck.sock");
+
+        // Rendered by `describe()`, so the old string key saw these two.
+        let visible = [
+            deck("other-box.example.com", "/run/deck.sock"),
+            base.clone()
+                .with_user(SshUser::parse("deploy").expect("user")),
+            base.clone().with_port(2222),
+        ];
+        // NOT rendered by `describe()`. Each names a different daemon, or a
+        // different ssh route to one.
+        let invisible = [
+            deck("build-box.example.com", "/run/other.sock"),
+            base.clone()
+                .with_key(KeyPath::parse("~/.ssh/id_ed25519").expect("key path")),
+            base.clone()
+                .with_jump(HostAlias::parse("bastion").expect("jump alias")),
+        ];
+
+        for other in visible.iter().chain(invisible.iter()) {
+            assert_ne!(
+                Endpoint::Remote(base.clone()).identity(),
+                Endpoint::Remote(other.clone()).identity(),
+                "a field that changes the connection must change the key: {other:?}"
+            );
+        }
+        for other in &invisible {
+            assert_eq!(
+                base.describe(),
+                other.describe(),
+                "this case only means something while `describe()` cannot tell the two apart"
+            );
+        }
+
+        // And the same deck twice is one key, or nothing would ever be cached.
+        assert_eq!(
+            Endpoint::Remote(base.clone()).identity(),
+            Endpoint::Remote(deck("build-box.example.com", "/run/deck.sock")).identity()
+        );
+        // A local deck is keyed by its address, and never equal to a remote one.
+        assert_eq!(
+            Endpoint::Local(LocalEndpoint::at("/run/deck.sock")).identity(),
+            Endpoint::Local(LocalEndpoint::at("/run/deck.sock")).identity()
+        );
+        assert_ne!(
+            Endpoint::Local(LocalEndpoint::at("/run/deck.sock")).identity(),
+            Endpoint::Local(LocalEndpoint::at("/run/other.sock")).identity()
+        );
+        assert_ne!(
+            Endpoint::Local(LocalEndpoint::at("/run/deck.sock")).identity(),
+            Endpoint::Remote(base).identity()
+        );
+    }
     // `spec::spec` is needed cross-platform by `pane_input_011` (a pure serde
     // decode test that stays cross-platform below).
     use spec::spec;
@@ -1578,6 +2230,139 @@ mod tests {
         (dir, path, registry)
     }
 
+    /// PRD #741 M2, the headline property: the local-only operations take a
+    /// [`LocalEndpoint`], and the only route from an [`Endpoint`] to one refuses
+    /// a remote deck. This is the runtime half of a property the compiler
+    /// already enforces — `run_daemon_stop(&Endpoint::Remote(..))` does not
+    /// build, so there is nothing here to assert about it — and what it pins is
+    /// that the *accessor* keeps returning `None` rather than being "helpfully"
+    /// widened later to hand back some substitute local endpoint.
+    /// A remote deck for the endpoint tests: the host name they already assert
+    /// on, plus the remote attach socket PRD #741 M5 made a required field.
+    fn remote_deck() -> RemoteEndpoint {
+        RemoteEndpoint::new(
+            Hostname::parse("build-box").expect("a plain host name is valid"),
+            RemoteSocketPath::parse("/run/user/1000/dot-agent-deck-attach.sock")
+                .expect("an absolute remote socket path is valid"),
+        )
+    }
+
+    #[test]
+    fn a_remote_endpoint_yields_no_local_endpoint() {
+        let local = Endpoint::Local(LocalEndpoint::at("/tmp/attach.sock"));
+        assert_eq!(
+            local.as_local().map(LocalEndpoint::path),
+            Some(Path::new("/tmp/attach.sock")),
+            "a local deck must hand back the endpoint the local-only operations take"
+        );
+
+        let remote = Endpoint::Remote(remote_deck());
+        assert!(
+            remote.as_local().is_none(),
+            "a remote deck must yield NO local endpoint — this is what makes \
+             peer_pid termination, the stale-inode unlink and lazy-spawn \
+             unreachable for it"
+        );
+    }
+
+    /// The refusal a user reads when they press Stop or Replace against a remote
+    /// deck: it names the operation and the deck, and it says *why* rather than
+    /// reporting a bare failure. M7 turns this text into a disabled control.
+    #[test]
+    fn require_local_refuses_a_remote_deck_by_name() {
+        let remote = Endpoint::Remote(remote_deck());
+        let err = remote
+            .require_local("Stop daemon")
+            .expect_err("a remote deck must refuse a local-only operation");
+        assert_eq!(
+            err,
+            EndpointError::LocalOnly {
+                operation: "Stop daemon",
+                deck: "build-box".to_string(),
+            }
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("Stop daemon"), "name the operation: {msg}");
+        assert!(msg.contains("build-box"), "name the deck: {msg}");
+        assert!(
+            msg.contains("this machine"),
+            "say why it cannot apply: {msg}"
+        );
+
+        let local = Endpoint::Local(LocalEndpoint::at("/tmp/attach.sock"));
+        assert!(
+            local.require_local("Stop daemon").is_ok(),
+            "a local deck must still be stoppable — the guard must not refuse everything"
+        );
+    }
+
+    /// An [`Endpoint`] alone still names no address for a remote deck, and that
+    /// is the property rather than a gap: under PRD #741 M5's DECISION 1A the
+    /// address is the `ssh -N -L` tunnel's forwarded socket, which does not
+    /// exist until a tunnel is open. The refusal points at the type that can
+    /// answer instead of reporting a broken deck.
+    #[test]
+    fn a_remote_deck_has_no_address_until_its_tunnel_is_open() {
+        let remote = Endpoint::Remote(remote_deck());
+        let err = remote
+            .connect_address()
+            .expect_err("a remote deck names no address of its own");
+        assert_eq!(
+            err,
+            EndpointError::RemoteAddressIsTheTunnels {
+                deck: "build-box".to_string(),
+            }
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("ssh tunnel"), "name the transport: {msg}");
+        assert!(
+            msg.contains("EndpointConnection"),
+            "point at the type that can answer: {msg}"
+        );
+    }
+
+    /// `Local` is byte-identical, which is the milestone's other half. Two
+    /// things pin it: the connect address is exactly the path handed in (not a
+    /// normalised or re-derived one), and `from_config()` is exactly
+    /// `config::attach_socket_path()` — the value every call site passed before
+    /// this type existed, `DOT_AGENT_DECK_ATTACH_SOCKET` override included.
+    #[test]
+    fn a_local_endpoint_still_resolves_to_todays_attach_path() {
+        let explicit = Endpoint::Local(LocalEndpoint::at("/tmp/attach.sock"));
+        assert_eq!(
+            explicit.connect_address().expect("a local deck connects"),
+            Path::new("/tmp/attach.sock")
+        );
+
+        assert_eq!(
+            LocalEndpoint::from_config().path(),
+            crate::config::attach_socket_path(),
+            "the configured local endpoint must be exactly the path this crate \
+             has always used, or the local case is not byte-identical"
+        );
+    }
+
+    /// The desktop's connection banner renders `describe()`, and for a local
+    /// deck that has to stay the socket path it showed before — otherwise a
+    /// milestone that adds no user-visible behaviour has changed a user-visible
+    /// string.
+    #[test]
+    fn describing_a_local_deck_still_prints_its_socket_path() {
+        assert_eq!(
+            Endpoint::Local(LocalEndpoint::at("/tmp/attach.sock")).describe(),
+            "/tmp/attach.sock"
+        );
+        assert_eq!(Endpoint::Remote(remote_deck()).describe(), "build-box");
+    }
+
+    /// Unix only since PRD #741 M3, and the gate is the fix rather than a
+    /// retreat. `ensure_socket_exists` used to `stat` unconditionally, so on
+    /// Windows — where the address is a `\\.\pipe\…` name that never
+    /// exists — it reported *every* live daemon missing. It now answers only
+    /// where a `stat` means something, and this test asserts the arm where it
+    /// does; the other two arms are
+    /// `ensure_socket_exists_stays_silent_when_a_stat_cannot_answer`.
+    #[cfg(unix)]
     #[tokio::test]
     async fn ensure_socket_exists_reports_missing() {
         let dir = tempfile::tempdir().unwrap();
@@ -1585,6 +2370,200 @@ mod tests {
         let client = DaemonClient::new(missing.clone());
         let err = client.ensure_socket_exists().unwrap_err();
         assert!(matches!(err, ClientError::SocketMissing(p) if p == missing));
+    }
+
+    /// PRD #741 M3, the third answer at the fourth predicate: an address a
+    /// `stat` cannot speak for must not be reported as a missing daemon.
+    ///
+    /// Two ways to arrive there, and the test drives both on every platform by
+    /// naming the presence rather than relying on which one is native. A remote
+    /// deck is the one that matters for M5 — its address really does exist
+    /// (DECISION 1A forwards a socket onto this filesystem), so a predicate that
+    /// trusted `exists()` would have reported a *healthy* deck for a dead one.
+    #[test]
+    fn ensure_socket_exists_stays_silent_when_a_stat_cannot_answer() {
+        let dir = tempfile::tempdir().unwrap();
+        let absent = dir.path().join("does-not-exist.sock");
+
+        // A named pipe: nothing to stat, so nothing may be concluded.
+        let pipe_client = DaemonClient {
+            socket_path: absent.clone(),
+            presence: EndpointPresence::NoFilesystemName,
+            capabilities: Arc::new(Mutex::new(None)),
+        };
+        assert!(
+            pipe_client.ensure_socket_exists().is_ok(),
+            "a pipe name that cannot exist must not read as a missing daemon"
+        );
+
+        // A remote deck, with nothing at the address: still unanswerable here,
+        // because the thing that would be there is the tunnel and not the deck.
+        let remote_client = DaemonClient {
+            socket_path: absent,
+            presence: EndpointPresence::Elsewhere,
+            capabilities: Arc::new(Mutex::new(None)),
+        };
+        assert!(
+            remote_client.ensure_socket_exists().is_ok(),
+            "a deck on another machine cannot be declared gone by a local stat"
+        );
+    }
+
+    /// PRD #741 M3: [`DaemonClient::new`] is byte-identical to what it was, and
+    /// [`DaemonClient::for_endpoint`] agrees with it for a local deck. The two
+    /// differ only in what a `stat` is allowed to mean, which is the whole
+    /// point of the field.
+    #[test]
+    fn for_endpoint_matches_new_for_a_local_deck_and_refuses_a_remote_one() {
+        let local = Endpoint::Local(LocalEndpoint::at("/tmp/attach.sock"));
+        let from_endpoint = DaemonClient::for_endpoint(&local).expect("a local deck connects");
+        let from_path = DaemonClient::new("/tmp/attach.sock".into());
+        assert_eq!(from_endpoint.socket_path(), from_path.socket_path());
+        assert_eq!(from_endpoint.presence, from_path.presence);
+        assert_eq!(from_path.presence, LOCAL_ENDPOINT_PRESENCE);
+
+        let remote = Endpoint::Remote(remote_deck());
+        assert_eq!(
+            remote.presence(),
+            EndpointPresence::Elsewhere,
+            "a remote deck's address is never the daemon's inode"
+        );
+        assert!(
+            DaemonClient::for_endpoint(&remote).is_err(),
+            "a client is built from an address, and a remote deck has none until \
+             its tunnel is open"
+        );
+    }
+
+    /// PRD #741 M3 test-plan item 4, at the client seam rather than at the
+    /// transport's own: [`DaemonClient::connect`] now hands back boxed halves,
+    /// and the half-close has to survive the box.
+    ///
+    /// Drives a scripted socket — accept, read the request frame, answer — and
+    /// then asserts the server observes EOF once the client drops **only** its
+    /// write half. That ordering is the whole test: dropping both halves closes
+    /// the socket on any implementation, so a version that kept them together
+    /// would pass while the property was gone. It is the property
+    /// [`EventSubscription`]'s `_wr` exists for, and the one
+    /// `platform/ipc/mod.rs`'s module docs record an earlier draft silently
+    /// regressing by splitting with [`tokio::io::split`].
+    ///
+    /// Failure mode is a hang, not a wrong value, so the server's second read is
+    /// bounded — an unbounded `read_frame` on a regressed build would wedge the
+    /// run instead of reporting.
+    ///
+    /// Binds a plain `tokio::net::UnixListener` rather than going through
+    /// `spawn_test_server`: the subject is the transport teardown, not the
+    /// protocol, and `bind_attach_listener` flips the process-global umask
+    /// (which is what `BIND_LOCK` exists to contain).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropping_a_clients_write_half_lets_the_daemon_see_the_disconnect() {
+        use tokio::io::AsyncWriteExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("s");
+        let listener = tokio::net::UnixListener::bind(&socket).expect("bind the scripted daemon");
+
+        let server = tokio::spawn(async move {
+            let (stream, _peer) = listener.accept().await.expect("accept one client");
+            let (mut reader, mut writer) = stream.into_split();
+            let (kind, _payload) = read_frame(&mut reader)
+                .await
+                .expect("read the request")
+                .expect("the client sent a frame");
+            assert_eq!(kind, KIND_REQ);
+            let ok = serde_json::to_vec(&AttachResponse::ok()).expect("serialize");
+            write_frame(&mut writer, KIND_RESP, &ok)
+                .await
+                .expect("answer the client");
+            // The daemon's disconnect detector is a read that must complete.
+            tokio::time::timeout(std::time::Duration::from_secs(5), read_frame(&mut reader)).await
+        });
+
+        let client = DaemonClient::new(socket);
+        let (mut rd, mut wr) = client.connect().await.expect("connect");
+        let resp = issue_command(&mut rd, &mut wr, &AttachRequest::SubscribeEvents)
+            .await
+            .expect("the scripted daemon answers");
+        assert!(resp.ok);
+        wr.flush().await.expect("flush");
+
+        drop(wr);
+        // `rd` stays alive on purpose — see the doc comment.
+        let observed = server
+            .await
+            .expect("the scripted daemon must not panic")
+            .expect(
+                "the daemon must observe EOF once the client's write half drops — without the \
+                 half-close it stays blocked here and never tears the subscription down",
+            )
+            .expect("EOF is not an I/O error");
+        assert!(
+            observed.is_none(),
+            "EOF must arrive as a clean end-of-stream, got frame {observed:?}"
+        );
+        drop(rd);
+    }
+
+    /// PRD #741 M4(a): **a request connection answers exactly one request and
+    /// is then closed by the daemon.** Pinned here because three later pieces of
+    /// work rest on it and none of them can see it from where they sit.
+    ///
+    /// `handle_connection` reads one frame at the top, dispatches it, writes the
+    /// reply and returns — so the socket closes with the function. That makes
+    /// "hold a request connection open and reuse it" unreachable from the
+    /// client at any cost: the desktop's M4(a) link therefore holds the
+    /// *handshake* rather than a socket, #745's connection model is sized
+    /// against one connection per request rather than one per session, and any
+    /// future multiplexing has to begin with a daemon-side request loop.
+    ///
+    /// The assertion is deliberately on the SECOND request rather than on the
+    /// first reply: a daemon that looped would answer both, and nothing else
+    /// about the exchange would look different. Both failure shapes are
+    /// accepted — the write can fail with `EPIPE` if the close has already
+    /// landed, or succeed into a socket buffer and the read then hit EOF — since
+    /// which one occurs is a timing detail of the peer's close, not a property
+    /// of the protocol. What is asserted is that no second **reply** ever
+    /// arrives, and the control below proves the server is still healthy so the
+    /// failure is the connection's and not the daemon's.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_request_connection_answers_once_and_is_then_closed() {
+        let (_dir, path, _registry) = spawn_test_server().await;
+        let client = DaemonClient::new(path.clone());
+
+        let (mut rd, mut wr) = client.connect().await.expect("connect");
+        let first = issue_command(&mut rd, &mut wr, &AttachRequest::ListAgents)
+            .await
+            .expect("the first request on a fresh connection is answered");
+        assert!(first.ok);
+
+        // The property. Same halves, same socket.
+        let second = async {
+            send_request(&mut wr, &AttachRequest::ListAgents).await?;
+            read_response(&mut rd).await
+        }
+        .await;
+        let Err(error) = second else {
+            panic!(
+                "a second request on an already-answered connection must NOT be \
+                 served — if this starts passing, the daemon has learned to loop \
+                 and PRD #741 M4(a)'s whole shape is revisitable"
+            );
+        };
+        assert!(
+            matches!(error, ClientError::Io(_) | ClientError::Malformed(_)),
+            "the failure must be the connection going away, not a server-level \
+             refusal: {error}"
+        );
+
+        // The control: the daemon is fine, it is the connection that is spent.
+        let fresh = DaemonClient::new(path);
+        fresh
+            .list_agents()
+            .await
+            .expect("a fresh connection is still served");
     }
 
     #[cfg(unix)]

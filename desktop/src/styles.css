@@ -372,6 +372,37 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .branch-line { gap: 5px; margin-top: 6px; color: var(--muted); font-family: "JetBrains Mono", monospace; font-size: 9.5px; }
 .branch-line span { max-width: 180px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .branch-line i { width: 3px; height: 3px; border-radius: 50%; background: var(--line-strong); }
+/* PRD #741 M9 — the Deck selector, in the top bar's `.repo-context` on both
+   the deck and the overview.
+
+   `position: relative` on the root and the menu absolutely positioned under it,
+   the same shape `.overview-columns-picker` uses, so the menu cannot widen the
+   top bar. That matters here more than there: `.repo-context` is the topbar's
+   FIRST grid column at `minmax(210px, 1fr)`, so an in-flow menu would push the
+   instruments and the actions sideways at a narrow window — the 900px case the
+   browser tier measures. Every text node in the trigger is
+   `text-overflow: ellipsis` for the same reason: a deck is named `user@host`
+   and a long one must shorten rather than shove. */
+.deck-selector { position: relative; margin-top: 6px; min-width: 0; }
+.deck-selector-trigger { max-width: 100%; padding: 2px 6px 2px 4px; display: flex; align-items: center; gap: 5px; border: 1px solid var(--line); border-radius: 3px; background: none; color: var(--muted); font-size: 9.5px; cursor: pointer; }
+.deck-selector-trigger:hover { color: var(--ink); background: var(--paper-strong); }
+.deck-selector-trigger strong { min-width: 0; overflow: hidden; color: var(--ink); font-family: "JetBrains Mono", monospace; font-size: 9.5px; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
+.deck-selector-state { margin-top: 4px; display: flex; align-items: center; gap: 4px; min-width: 0; color: var(--muted); font-size: 9px; line-height: 1.35; }
+.deck-selector-state.is-problem { color: var(--status-warn); }
+.deck-selector-state span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.deck-selector-state svg { flex: none; }
+.deck-selector-menu { position: absolute; top: calc(100% + 6px); left: 0; z-index: 30; min-width: 204px; max-width: min(320px, 80vw); padding: 8px; display: flex; flex-direction: column; gap: 1px; border: 1px solid var(--line-strong); border-radius: var(--radius); background: var(--paper); box-shadow: 0 10px 26px rgb(var(--scrim-rgb) / .13); }
+/* A `<span>` with an id, read by the radiogroup's `aria-labelledby`. NOT a
+   `<legend>`: WebKit forces a rendered legend's `float` to `none` (#1032), and
+   the app ships on WebKit. */
+.deck-selector-menu-label { margin-bottom: 5px; color: var(--faint); font-size: 8px; letter-spacing: .08em; text-transform: uppercase; }
+.deck-selector-menu p { margin: 6px 0 0; padding-top: 6px; border-top: 1px solid var(--line); color: var(--faint); font-size: 9px; line-height: 1.45; }
+.deck-selector-option { width: 100%; padding: 4px 5px; display: flex; align-items: center; gap: 6px; border: 0; border-radius: 3px; background: none; color: var(--ink); font-size: 10px; text-align: left; cursor: pointer; }
+.deck-selector-option:hover { background: var(--paper-strong); }
+.deck-selector-option span { min-width: 0; overflow: hidden; font-family: "JetBrains Mono", monospace; text-overflow: ellipsis; white-space: nowrap; }
+.deck-selector-option svg { margin-left: auto; flex: none; color: var(--status-ok); }
+.deck-selector-option.is-selected { background: var(--paper-strong); font-weight: 600; }
+
 .run-instruments { display: flex; align-self: stretch; border-inline: 1px solid var(--line); }
 .instrument { min-width: 62px; padding: 0 11px; display: flex; flex-direction: column; justify-content: center; gap: 4px; border-right: 1px solid var(--line); }
 .instrument:last-child { border-right: 0; }
@@ -740,7 +771,13 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
    control needs no group, so `for`/`id` is the whole accessible name. The
    selector carries the same 13px/650 sub-header treatment the legend gets, so
    a select row and a segmented row read as the same convention. */
-.settings-row > label { color: var(--ink); font-size: 13px; font-weight: 650; }
+.settings-row > label,
+/* A group's visible label (PRD #741 M7). A `<span>` with `aria-labelledby`
+   rather than a `<legend>`: the floated-legend trick above is Chromium-only —
+   WebKit forces the rendered legend's `float` to `none`, so the legend never
+   becomes a grid item there and the control lands in column one beside its
+   label. Measured on the browser tier, in both engines. */
+.settings-row > .settings-row-label { color: var(--ink); font-size: 13px; font-weight: 650; }
 .settings-row select { min-width: 96px; height: 28px; padding: 0 7px; border: 1px solid var(--line-strong); border-radius: 5px; color: var(--ink); background: var(--paper); font-size: 10px; }
 .settings-row select:disabled { color: var(--faint); background: var(--paper-sunken); cursor: not-allowed; }
 
@@ -752,6 +789,54 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .settings-hint { margin: 0; color: var(--muted); font-size: 9px; line-height: 1.5; }
 .settings-error { margin: 0; padding: 9px 11px; display: flex; align-items: flex-start; gap: 7px; border: 1px solid var(--red-rim); border-radius: 4px; color: var(--red-ink); background: var(--red-soft); font-size: 9px; line-height: 1.5; }
 .settings-error svg { flex: 0 0 auto; margin-top: 1px; }
+
+/* A text row's control (PRD #741 M7). Sized to match the select beside it in
+   the Zoom row — same 28px height, same rim, same radius — so a panel of text
+   rows and a panel of selects read as one convention rather than two. The input
+   fills the grid's second column, which is what keeps every row's control
+   starting and ending at the same x. */
+.settings-input { width: 100%; height: 28px; padding: 0 8px; border: 1px solid var(--line-strong); border-radius: 5px; color: var(--ink); background: var(--paper); font-family: "JetBrains Mono", monospace; font-size: 10px; }
+.settings-input::placeholder { color: var(--faint); }
+.settings-input:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 1px; }
+/* A port is four digits; a full-width box for it reads as a field that wants a
+   sentence. */
+.settings-input.is-narrow { width: 96px; }
+/* What is wrong with a field. Below the row it belongs to and inside the label
+   column's gutter, so it reads as attached to the control rather than as a new
+   setting. */
+.settings-hint.is-problem { margin-left: 148px; color: var(--red-ink); }
+
+/* ---- Decks (PRD #741 M7) ---- */
+/* The chooser sits in the settings row's second column, so it starts at the
+   same x as every other panel's control. A column rather than a segmented
+   control because the number of decks is unbounded and each label is an
+   address, not a word. */
+.deck-choices { width: 100%; display: grid; gap: 5px; }
+.deck-choice { min-height: 30px; padding: 0 4px 0 9px; display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 8px; border: 1px solid var(--line); border-radius: 4px; background: var(--paper); }
+.deck-choice.is-selected { border-color: var(--teal-rim); background: var(--teal-wash); }
+.deck-choice label { min-width: 0; display: flex; align-items: center; gap: 8px; cursor: pointer; }
+.deck-choice label > span { overflow: hidden; color: var(--ink); font-family: "JetBrains Mono", monospace; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+.deck-choice input { accent-color: var(--teal); }
+.add-deck { min-height: 30px; display: flex; align-items: center; justify-content: center; gap: 6px; border: 1px dashed var(--teal-rim); border-radius: 4px; color: var(--teal); background: var(--teal-wash); cursor: pointer; font-size: 9px; font-weight: 700; }
+/* The chosen deck's own fields. A rule above them rather than a card around
+   them: the rows inside are the same two-column rows as everywhere else, and a
+   box would make them read as a different kind of setting. */
+.deck-detail { display: grid; gap: 10px; padding-top: 13px; border-top: 1px solid var(--line); }
+.deck-test { display: grid; justify-items: start; gap: 9px; }
+.deck-result { width: 100%; padding: 9px 11px; display: grid; gap: 6px; border: 1px solid var(--line-strong); border-radius: 4px; background: var(--paper-sunken); font-size: 9px; line-height: 1.5; }
+.deck-result.is-ok { border-color: var(--teal-rim); background: var(--teal-wash); }
+.deck-result-line { margin: 0; display: flex; align-items: flex-start; gap: 7px; color: var(--ink); }
+.deck-result-line svg { flex: 0 0 auto; margin-top: 1px; }
+.deck-result-remedy { margin: 0; }
+.deck-result-remedy code { display: block; padding: 6px 8px; border-radius: 3px; color: var(--ink); background: var(--paper-strong); font-family: "JetBrains Mono", monospace; font-size: 9px; overflow-wrap: anywhere; }
+.deck-result-detail { margin: 0; color: var(--muted); font-family: "JetBrains Mono", monospace; overflow-wrap: anywhere; }
+/* The forwards disclosure. Muted rather than alarming: it is telling the user
+   what their own ssh config does, which is information they may well want and
+   not a fault. */
+.deck-result-forwards { color: var(--muted); }
+.deck-result-forwards p { margin: 0 0 3px; }
+.deck-result-forwards ul { margin: 0; padding-left: 16px; }
+.deck-result-forwards li { font-family: "JetBrains Mono", monospace; overflow-wrap: anywhere; }
 
 .projects-layout { min-height: 0; flex: 1; display: grid; grid-template-columns: 260px minmax(0, 1fr); }
 .project-library { min-height: 0; padding: 11px; display: flex; flex-direction: column; border-right: 1px solid var(--line); background: var(--paper-sunken); }
@@ -899,6 +984,9 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
    wrong one at 780px, so it lives here and not in the rule above. */
 @media (max-width: 420px) {
   .settings-row { grid-template-columns: minmax(0, 1fr); gap: 6px; }
+  /* The stacked row has no label column, so the problem line has nothing to
+     align under. */
+  .settings-hint.is-problem { margin-left: 0; }
 }
 
 @media (prefers-reduced-motion: reduce) {

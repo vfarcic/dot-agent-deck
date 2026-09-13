@@ -9,11 +9,12 @@
  * component to register — and #741 and #802 would have collided on adjacent
  * lines of the same array.
  *
- * It holds a row per tenant and nothing speculative: #741's daemon endpoints
- * and #802's voice backends each add their own when they land. Pre-creating
- * empty sections for them would be this container growing opinions about its
- * contents, which is the specific failure PRD #803 exists to prevent — a
- * container with opinions blocks the dependents it was built for.
+ * It holds a row per tenant and nothing speculative: #741's decks landed as one
+ * row here plus `EndpointsPanel`, and #802's voice backends add their own when
+ * they land. Pre-creating empty sections for them would be this container
+ * growing opinions about its contents, which is the specific failure PRD #803
+ * exists to prevent — a container with opinions blocks the dependents it was
+ * built for.
  *
  * Below two entries the sheet drops the section column and renders the one
  * panel full width. **PRD #744's Zoom row is what brought the column back**,
@@ -23,13 +24,17 @@
  * having two rows, so a later PRD removing one does not silently delete the
  * coverage.
  */
-import { Palette, ZoomIn } from "lucide-react";
+import { Palette, Server, ZoomIn } from "lucide-react";
 import { AppearancePanel } from "../components/AppearancePanel";
+import { EndpointsPanel } from "../components/EndpointsPanel";
 import { ZoomPanel } from "../components/ZoomPanel";
 import type { SettingsSection } from "./settingsContract";
 
 /** The registry. Adding a section is one row here and one component. */
 export const SETTINGS_SECTIONS: SettingsSection[] = [
   { id: "appearance", label: "Appearance", icon: Palette, component: AppearancePanel },
+  // PRD #741 M7. One row and one component, which is the whole of the contract
+  // this registry exists to keep true — `SettingsSheet.tsx` was not opened.
+  { id: "decks", label: "Decks", icon: Server, component: EndpointsPanel },
   { id: "zoom", label: "Zoom", icon: ZoomIn, component: ZoomPanel },
 ];

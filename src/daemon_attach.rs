@@ -31,6 +31,7 @@ use thiserror::Error;
 
 use crate::agent_pty::DOT_AGENT_DECK_VIA_DAEMON;
 use crate::config::state_dir;
+use crate::daemon_client::LocalEndpoint;
 
 /// How long [`ensure_external_daemon_or_die`] polls for the freshly-spawned
 /// daemon's endpoint before giving up.
@@ -120,7 +121,7 @@ pub enum AttachError {
 /// trust verification happens inside that connect. See the body for why an
 /// unconditional `exists()` would make Windows lazy-spawn always time out.
 pub async fn ensure_daemon_running<F>(
-    socket_path: &Path,
+    endpoint: &LocalEndpoint,
     state_dir: &Path,
     spawn_fn: F,
     poll_interval: Duration,
@@ -129,6 +130,14 @@ pub async fn ensure_daemon_running<F>(
 where
     F: FnOnce() -> std::io::Result<()>,
 {
+    // PRD #741 M2: a `&LocalEndpoint`, not a `&Path`. Two of the things this
+    // function does are meaningful only against a daemon on this machine — it
+    // `remove_file`s the inode at the address when the probe says nothing is
+    // listening, and it starts a daemon process HERE. Neither is something to do
+    // on behalf of a deck that lives somewhere else, and the unlink in
+    // particular is safe only because `verify_socket_trusted` just proved the
+    // inode is ours. `Endpoint::as_local()` is the only route to this type.
+    let socket_path = endpoint.path();
     // Lock file lives inside the state dir, so we have to make sure the dir
     // exists first. `ensure_owner_only_dir` creates idempotently AND enforces
     // mode 0o700 unconditionally — including repairing a pre-existing dir
@@ -155,7 +164,12 @@ where
     // (`IpcStream::connect` verifies the pipe server's owner SID before handing
     // back a stream), so there is nothing to verify out of band and no inode to
     // unlink. The Unix branch below is byte-for-byte what it always was.
-    if crate::platform::ipc::ENDPOINT_IS_FILESYSTEM_PATH {
+    //
+    // PRD #741 M3: the boolean became three-valued. This function is
+    // `LocalEndpoint`-only by type since M2 — it unlinks an inode and starts a
+    // process HERE — so the presence it asks is the local one, and the third
+    // answer (a deck on another machine) is unreachable rather than handled.
+    if crate::platform::ipc::LOCAL_ENDPOINT_PRESENCE.is_daemon_owned_inode() {
         if socket_path.exists() {
             verify_socket_trusted(socket_path)?;
             // Trust check only validates the inode (type, owner, mode) — it
@@ -181,7 +195,7 @@ where
     let log_path = state_dir.join("daemon.log");
     let start = Instant::now();
     loop {
-        if crate::platform::ipc::ENDPOINT_IS_FILESYSTEM_PATH {
+        if crate::platform::ipc::LOCAL_ENDPOINT_PRESENCE.is_daemon_owned_inode() {
             if socket_path.exists() {
                 verify_socket_trusted(socket_path)?;
                 return Ok(());
@@ -313,11 +327,11 @@ pub fn via_daemon_enabled() -> bool {
 /// [`DAEMON_START_POLL_TIMEOUT`] at [`DAEMON_START_POLL_INTERVAL`]; see the
 /// former's docs for why the budget is derived from the daemon's own pre-bind
 /// work rather than hardcoded.
-pub async fn ensure_external_daemon_or_die(attach_path: &Path) -> Result<(), AttachError> {
+pub async fn ensure_external_daemon_or_die(endpoint: &LocalEndpoint) -> Result<(), AttachError> {
     let state = state_dir();
     let state_for_spawn = state.clone();
     ensure_daemon_running(
-        attach_path,
+        endpoint,
         &state,
         move || spawn_daemon_serve_detached(&state_for_spawn),
         DAEMON_START_POLL_INTERVAL,

@@ -2745,8 +2745,18 @@ async fn wait_for_worker_event(
             }
             // Issue #717: neither variant is evidence about this pane.
             // Grouped rather than wildcarded so a future variant still
-            // fails this match and gets considered on its merits.
-            Ok(Ok(BroadcastMsg::OrchestrationSurface(_) | BroadcastMsg::WorktreeKept(_))) => {
+            // fails this match and gets considered on its merits — and
+            // `Unknown` (PRD #741 M8) is listed for the same reason rather
+            // than standing in for one. It is the tag a future daemon sends
+            // that this build cannot decode, and a message whose meaning is
+            // unknown is not evidence either way about this pane; what it
+            // buys is that the frame no longer kills the whole
+            // subscription.
+            Ok(Ok(
+                BroadcastMsg::OrchestrationSurface(_)
+                | BroadcastMsg::WorktreeKept(_)
+                | BroadcastMsg::Unknown,
+            )) => {
                 continue;
             }
             Ok(Err(broadcast::error::RecvError::Lagged(dropped))) => {
@@ -3730,8 +3740,18 @@ pub(crate) async fn wait_for_session_start(
             // PRD #120: not a hook event — keep waiting for the SessionStart.
             // Issue #717: neither variant is evidence about this pane.
             // Grouped rather than wildcarded so a future variant still
-            // fails this match and gets considered on its merits.
-            Ok(Ok(BroadcastMsg::OrchestrationSurface(_) | BroadcastMsg::WorktreeKept(_))) => {
+            // fails this match and gets considered on its merits — and
+            // `Unknown` (PRD #741 M8) is listed for the same reason rather
+            // than standing in for one. It is the tag a future daemon sends
+            // that this build cannot decode, and a message whose meaning is
+            // unknown is not evidence either way about this pane; what it
+            // buys is that the frame no longer kills the whole
+            // subscription.
+            Ok(Ok(
+                BroadcastMsg::OrchestrationSurface(_)
+                | BroadcastMsg::WorktreeKept(_)
+                | BroadcastMsg::Unknown,
+            )) => {
                 continue;
             }
             Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
@@ -4032,8 +4052,18 @@ pub(crate) async fn wait_for_prompt_submission(
             }
             // Issue #717: neither variant is evidence about this pane.
             // Grouped rather than wildcarded so a future variant still
-            // fails this match and gets considered on its merits.
-            Ok(Ok(BroadcastMsg::OrchestrationSurface(_) | BroadcastMsg::WorktreeKept(_))) => {
+            // fails this match and gets considered on its merits — and
+            // `Unknown` (PRD #741 M8) is listed for the same reason rather
+            // than standing in for one. It is the tag a future daemon sends
+            // that this build cannot decode, and a message whose meaning is
+            // unknown is not evidence either way about this pane; what it
+            // buys is that the frame no longer kills the whole
+            // subscription.
+            Ok(Ok(
+                BroadcastMsg::OrchestrationSurface(_)
+                | BroadcastMsg::WorktreeKept(_)
+                | BroadcastMsg::Unknown,
+            )) => {
                 continue;
             }
             Ok(Err(broadcast::error::RecvError::Lagged(_))) => return PromptWatch::Indeterminate,
@@ -5991,6 +6021,57 @@ impl AppState {
             .max_by_key(|s| s.last_activity)
             .map(|s| s.writable())
             .unwrap_or(Writable::Live)
+    }
+
+    /// PRD #162's `ListAgents` join, for ONE registry record: the live,
+    /// event-derived session this state holds for `(agent_id, pane_id)`, or
+    /// `None` when it holds none.
+    ///
+    /// Matching is on **both** keys — a `/clear` restart can leave a stale
+    /// session sharing one of them — and ties on an identical `last_activity`
+    /// break on the (unique) `session_id`, because `HashMap::values()` yields an
+    /// unspecified order and the pick has to be total and deterministic.
+    ///
+    /// # Why this is a method rather than a loop at each call site
+    ///
+    /// It was a loop at each call site, twice, character for character
+    /// ([`crate::daemon_protocol`]'s `ListAgents` handler and its
+    /// `project_candidates`). PRD #741 M4(b) adds a **third** caller that is not
+    /// in this process at all: the desktop app folds the daemon's own broadcast
+    /// into its own [`AppState`] and re-joins the records it already holds,
+    /// instead of re-fetching the whole list on every event. That client and
+    /// this daemon disagreeing about which session is "the" live one for a
+    /// record is precisely the failure mode that would put a wrong status on
+    /// screen, so the join is one function and all three callers run it.
+    pub fn live_session_for(
+        &self,
+        agent_id: &str,
+        pane_id: Option<&str>,
+    ) -> Option<SessionSnapshot> {
+        self.sessions
+            .values()
+            .filter(|s| s.agent_id.as_deref() == Some(agent_id) && s.pane_id.as_deref() == pane_id)
+            .max_by(|a, b| {
+                a.last_activity
+                    .cmp(&b.last_activity)
+                    .then_with(|| a.session_id.cmp(&b.session_id))
+            })
+            .map(|s| s.live_snapshot())
+    }
+
+    /// [`Self::live_session_for`] over a whole `ListAgents` reply, writing each
+    /// answer onto its record's `live` field.
+    ///
+    /// **Unconditional, including the `None` case**, which is what the two
+    /// daemon-side call sites have always done: a record whose session this
+    /// state does not hold reports no live state rather than keeping whatever
+    /// was on the record. A caller that has a better previous answer — the
+    /// desktop's cache, which holds the last full reply — must therefore keep
+    /// its own fallback rather than expecting this to preserve one.
+    pub fn attach_live_sessions(&self, records: &mut [crate::agent_pty::AgentRecord]) {
+        for record in records {
+            record.live = self.live_session_for(&record.id, record.pane_id_env.as_deref());
+        }
     }
 
     /// Register a pane ID as managed by our app.

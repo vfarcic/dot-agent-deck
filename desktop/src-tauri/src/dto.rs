@@ -8,6 +8,7 @@ use dot_agent_deck::agent_pty::{
     is_valid_orchestration_cwd, is_valid_pane_id_env,
 };
 use dot_agent_deck::agent_registry;
+use dot_agent_deck::daemon_client::Endpoint;
 use dot_agent_deck::daemon_protocol::PROTOCOL_VERSION;
 use dot_agent_deck::event::{
     AgentType, ProjectListing, ProjectOrchestration, ResolvedProject, SendResult, Writable,
@@ -65,6 +66,74 @@ pub struct DesktopConnection {
     /// what keeps the wire check unoverridable from the UI as well as from the
     /// bypass itself.
     pub build_stamp_mismatch_only: bool,
+    /// `"local"` or `"remote"` — which kind of deck this connection is to
+    /// (PRD #741 M7).
+    ///
+    /// Always emitted, for the same reason `build_stamp_mismatch_only` is: the
+    /// webview branches on it to disable **Stop daemon** and **Replace daemon**,
+    /// and an absent field must not read as "local".
+    pub deck_kind: &'static str,
+    /// Why the daemon-lifecycle controls are unavailable, when they are
+    /// (PRD #741 M7).
+    ///
+    /// `Some` exactly when [`Self::deck_kind`] is `"remote"`. The sentence is
+    /// `Endpoint::require_local("Stop daemon")`'s own — M2 made the operation
+    /// unreachable by type and wrote the refusal at the same time, so this is
+    /// rendering an error that already exists rather than inventing one. Stop
+    /// and Replace act on a process on *this* machine; against a deck on
+    /// another one they would either do nothing or, over a forwarded socket,
+    /// SIGTERM the local `ssh` client and report that a daemon had stopped
+    /// gracefully.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub local_only_reason: Option<String>,
+    /// Why the app is talking to the local deck when the stored selection named
+    /// another one (PRD #741 M7).
+    ///
+    /// `SelectionFallback`'s own sentence. Reported rather than folded into
+    /// "connected": "that deck is gone" and "that deck has no socket path yet"
+    /// are different things to tell a user, and a silent substitution is how a
+    /// user ends up acting on the wrong machine's agents.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selection_fallback: Option<String>,
+    /// Why the project-aware surfaces — choosing a project, preparing and
+    /// launching a workflow — are unavailable against this daemon (PRD #741 M8).
+    ///
+    /// **The field that replaces the build stamp as the thing a screen acts
+    /// on.** It is derived from what the daemon ADVERTISED in its `Hello` reply,
+    /// through `DaemonCapabilities::supports`, so it answers "can this deck do
+    /// what I am about to ask" rather than "is this deck the same build as me" —
+    /// the distinction issue #801 is about. A daemon that advertises no set at
+    /// all is an older daemon and withholds every verb, which is why absence is
+    /// a reason rather than a grant.
+    ///
+    /// `None` means available. Omitted from the wire when `None`, unlike
+    /// [`Self::deck_kind`] and [`Self::build_stamp_mismatch_only`]: those two
+    /// are branched on to decide whether a control EXISTS, where an absent field
+    /// reading as `false` would be wrong. This one is a sentence to render, and
+    /// "no sentence" is exactly what absence should mean.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_actions_reason: Option<String>,
+}
+
+/// The three endpoint-shaped fields of [`DesktopConnection`], filled from the
+/// selection in force.
+///
+/// One function so the two construction sites — the classified handshake and
+/// [`disconnected_snapshot`] — cannot disagree about whether the deck is
+/// remote, which is the disagreement that would leave **Stop daemon** enabled
+/// on exactly the screen state where it is most tempting to press.
+pub(crate) fn selection_fields() -> (&'static str, Option<String>, Option<String>) {
+    let deck = selected_deck();
+    let kind = match &deck.endpoint {
+        Endpoint::Local(_) => "local",
+        Endpoint::Remote(_) => "remote",
+    };
+    let local_only = deck
+        .endpoint
+        .require_local("Stop deck")
+        .err()
+        .map(|error| safe_display_text(error.to_string()));
+    (kind, local_only, deck.fallback)
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
@@ -592,7 +661,7 @@ pub(crate) fn map_resolved_project(project: ResolvedProject) -> DesktopResolvedP
 pub(crate) fn validate_pasted_project_path(path: &str) -> Result<(), String> {
     if !is_valid_orchestration_cwd(path) {
         return Err(
-            "enter an absolute directory path, without control characters, that the daemon can see"
+            "enter an absolute directory path, without control characters, that the deck can see"
                 .into(),
         );
     }
@@ -733,15 +802,127 @@ pub(crate) fn safe_message(message: impl AsRef<str>) -> String {
         .collect()
 }
 
+/// Display text for a value a **settings document** supplied, scrubbed of
+/// control *and* bidi characters (PRD #741 M7).
+///
+/// [`safe_message`] is not enough here and the difference is the whole point:
+/// its `char::is_control` test covers general category `Cc`, so the bidi
+/// formatting codepoints (category `Cf`) pass through it intact. A single
+/// `U+202E` in a settings-supplied host visually reverses the text after it and
+/// can swallow the siblings printed beside it — and the connection footer's
+/// whole job is telling the user which deck they are talking to, which makes
+/// this the one place a mis-rendered endpoint has a direct security
+/// consequence.
+///
+/// The policy is `untrusted_text::strip_control_and_bidi`'s, which the webview's
+/// own `displayText.ts` mirrors character for character; routing through the
+/// Rust function rather than restating it is what keeps the two ends from
+/// drifting. `keep_newlines: false` because an endpoint label is one line.
+///
+/// Bounded afterwards by [`safe_message`]'s character cap, which is a second
+/// line of defence rather than a duplicate: every endpoint field is already
+/// byte-bounded by its own newtype, but this function is the seam and the seam
+/// should not depend on that.
+pub(crate) fn safe_display_text(text: impl AsRef<str>) -> String {
+    safe_message(dot_agent_deck::untrusted_text::strip_control_and_bidi(
+        text.as_ref(),
+        false,
+    ))
+}
+
+/// The deck this app is talking to, and why (PRD #741 M7).
+///
+/// `fallback` is `Some` when the stored selection could not be honoured and the
+/// local deck was substituted — "that deck is gone" and "that deck has no
+/// socket path yet" are different things to tell a user, and neither is
+/// "connected to local".
+#[derive(Debug, Clone)]
+pub(crate) struct SelectedDeck {
+    pub(crate) endpoint: Endpoint,
+    pub(crate) fallback: Option<String>,
+}
+
+impl Default for SelectedDeck {
+    fn default() -> Self {
+        Self {
+            endpoint: Endpoint::local(),
+            fallback: None,
+        }
+    }
+}
+
+/// The applied selection.
+///
+/// **A process-global, deliberately, and for the same reason
+/// `SESSION_BUILD_MISMATCH_ALLOWED` is one**: every path that names the deck —
+/// `socket_path_text`, `disconnected_snapshot`, the watcher's refresh, the
+/// bootstrap's lazy-spawn guard — needs the answer, and most of them are not
+/// handed `DesktopState`. Threading it would mean changing every one of those
+/// signatures to carry a value that has exactly one writer.
+///
+/// The writer is [`apply_settings_selection`], called from the app's `setup`
+/// hook (where the settings document is already being read for the zoom level)
+/// and from `desktop_set_settings` after a successful save. Unset reads as the
+/// local deck, which is what every caller did before endpoints existed and what
+/// a test that never loads a document sees.
+static SELECTED_DECK: std::sync::RwLock<Option<SelectedDeck>> = std::sync::RwLock::new(None);
+
+/// Apply a settings document's selection. Returns the deck now in force.
+///
+/// The fallback is rendered here rather than stored as a type because the only
+/// consumer is a sentence on screen, and `SelectionFallback: Display` already
+/// writes it.
+pub(crate) fn apply_settings_selection(
+    settings: &crate::settings::DesktopSettings,
+) -> SelectedDeck {
+    let resolved = settings.resolve_endpoint();
+    let deck = SelectedDeck {
+        endpoint: resolved.endpoint,
+        fallback: resolved
+            .fallback
+            .map(|fallback| safe_display_text(fallback.to_string())),
+    };
+    if let Ok(mut slot) = SELECTED_DECK.write() {
+        *slot = Some(deck.clone());
+    }
+    deck
+}
+
+/// The selected deck, with whatever fallback reason came with it.
+pub(crate) fn selected_deck() -> SelectedDeck {
+    SELECTED_DECK
+        .read()
+        .ok()
+        .and_then(|slot| slot.clone())
+        .unwrap_or_default()
+}
+
+/// The deck this app is talking to (PRD #741 M2, selected since M7).
+///
+/// A function rather than a constant so the selection has exactly one source,
+/// and so the call sites that must refuse a remote deck — the Stop and Replace
+/// actions — are written against an [`Endpoint`] rather than against a path.
+pub(crate) fn selected_endpoint() -> Endpoint {
+    selected_deck().endpoint
+}
+
+/// How the selected deck is named in the connection banner. For a local deck
+/// that is its socket path, which is exactly what this reported before the
+/// endpoint type existed; for a remote one it is `user@host` (with the port when
+/// it is not 22), derived by `RemoteEndpoint::describe` from validated fields.
+///
+/// Scrubbed through [`safe_display_text`] rather than [`safe_message`]. Every
+/// byte of a stored endpoint came through an ASCII charset that excludes the
+/// bidi codepoints, so today this cannot change the output — the seam is here
+/// because the *next* thing rendered on this line may not have that property,
+/// and a footer that strips only category `Cc` is a footer a reordering
+/// character walks through.
 pub(crate) fn socket_path_text() -> String {
-    safe_message(
-        dot_agent_deck::config::attach_socket_path()
-            .to_string_lossy()
-            .as_ref(),
-    )
+    safe_display_text(selected_endpoint().describe())
 }
 
 pub(crate) fn disconnected_snapshot(error: impl AsRef<str>) -> DesktopSnapshot {
+    let (deck_kind, local_only_reason, selection_fallback) = selection_fields();
     DesktopSnapshot {
         connection: DesktopConnection {
             status: ConnectionStatus::Disconnected,
@@ -754,6 +935,12 @@ pub(crate) fn disconnected_snapshot(error: impl AsRef<str>) -> DesktopSnapshot {
             daemon_version: None,
             running_agent_count: None,
             build_stamp_mismatch_only: false,
+            deck_kind,
+            local_only_reason,
+            selection_fallback,
+            // Nothing was advertised because nothing answered. A disconnected
+            // screen is already saying the only thing there is to say.
+            project_actions_reason: None,
         },
         agents: Vec::new(),
         protocol_version: PROTOCOL_VERSION,
@@ -909,6 +1096,177 @@ pub(crate) fn ensure_desktop_workflow_platform_supported(target_os: &str) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------------
+    // PRD #741 M7 — the selection, and the two things it decides on screen
+    // -----------------------------------------------------------------------
+
+    /// The applied selection is a process-global, so every test that writes it
+    /// takes this first and puts it back. Under nextest each test owns its
+    /// process and the lock is free.
+    static SELECTION_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// A document whose `[endpoints]` selection names a connectable remote row.
+    fn selecting_a_remote_deck() -> crate::settings::DesktopSettings {
+        use crate::settings::{
+            DesktopSettings, EndpointId, EndpointSettings, RemoteEndpointSettings, Selection,
+        };
+        use dot_agent_deck::remote_tunnel::{Hostname, RemoteSocketPath};
+
+        let id = EndpointId::parse("deck00000000000b").expect("a valid id");
+        let mut row = RemoteEndpointSettings::new(
+            id.clone(),
+            Hostname::parse("build-box").expect("a valid host"),
+        );
+        row.user = Some(dot_agent_deck::remote_tunnel::SshUser::parse("deploy").expect("user"));
+        row.socket = Some(
+            RemoteSocketPath::parse("/run/user/1000/dot-agent-deck-attach.sock").expect("path"),
+        );
+        DesktopSettings {
+            endpoints: Some(EndpointSettings {
+                remote: vec![row],
+                selection: Selection::One(id),
+            }),
+            ..DesktopSettings::default()
+        }
+    }
+
+    /// Apply `settings`, run `body`, and restore the default selection.
+    fn with_selection<T>(
+        settings: &crate::settings::DesktopSettings,
+        body: impl FnOnce() -> T,
+    ) -> T {
+        let guard = SELECTION_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        apply_settings_selection(settings);
+        let result = body();
+        apply_settings_selection(&crate::settings::DesktopSettings::default());
+        drop(guard);
+        result
+    }
+
+    /// Selecting a remote deck disables the two daemon-lifecycle controls, and
+    /// the explanation is `require_local`'s own sentence rather than a new one.
+    ///
+    /// This is the property M2 built by type and M7 renders: **Stop daemon**
+    /// and **Replace daemon** act on a process on *this* machine, and over a
+    /// forwarded socket `run_daemon_stop`'s `SO_PEERCRED` lookup would name the
+    /// local `ssh` client — so pressing Stop would tear the tunnel down and
+    /// report that a daemon had stopped gracefully.
+    #[test]
+    fn a_remote_selection_disables_the_daemon_lifecycle_controls() {
+        let (kind, local_only, fallback) =
+            with_selection(&selecting_a_remote_deck(), selection_fields);
+
+        assert_eq!(kind, "remote");
+        assert_eq!(
+            fallback, None,
+            "the selection resolved, so nothing fell back"
+        );
+        let reason = local_only.expect("a remote deck must say why Stop and Replace are off");
+        assert!(
+            reason.contains("Stop deck") && reason.contains("deploy@build-box"),
+            "the explanation must name the operation and the deck: {reason}"
+        );
+        assert!(
+            reason.contains("not the machine that deck runs on"),
+            "the explanation is `Endpoint::require_local`'s, not a second one written here: \
+             {reason}"
+        );
+    }
+
+    /// The default — and every document with no `[endpoints]` section — is the
+    /// local deck, with the controls enabled and nothing to explain.
+    #[test]
+    fn the_local_deck_is_the_default_and_keeps_its_controls() {
+        let (kind, local_only, fallback) = with_selection(
+            &crate::settings::DesktopSettings::default(),
+            selection_fields,
+        );
+
+        assert_eq!(kind, "local");
+        assert_eq!(local_only, None);
+        assert_eq!(fallback, None);
+    }
+
+    /// A selection naming a row the document no longer holds falls back to the
+    /// local deck **and says so**. "That deck is gone" is not "connected to
+    /// local", and a silent substitution is how a user ends up acting on the
+    /// wrong machine's agents.
+    #[test]
+    fn a_selection_that_cannot_be_honoured_reports_why() {
+        use crate::settings::{DesktopSettings, EndpointId, EndpointSettings, Selection};
+
+        let missing = DesktopSettings {
+            endpoints: Some(EndpointSettings {
+                remote: Vec::new(),
+                selection: Selection::One(
+                    EndpointId::parse("deck00000000000c").expect("a valid id"),
+                ),
+            }),
+            ..DesktopSettings::default()
+        };
+        let (kind, local_only, fallback) = with_selection(&missing, selection_fields);
+
+        assert_eq!(kind, "local", "the app still has a deck to talk to");
+        assert_eq!(local_only, None, "and its controls still work");
+        let reason = fallback.expect("an unhonoured selection must be reported");
+        assert!(
+            reason.contains("no longer configured"),
+            "the sentence must distinguish a missing row from a row with no socket: {reason}"
+        );
+    }
+
+    /// The other fallback: a row that exists and has no socket path yet — the
+    /// state M6 made a first-class answer so a half-configured deck is
+    /// something the UI can explain rather than a save that refuses.
+    #[test]
+    fn a_row_with_no_socket_path_falls_back_with_its_own_reason() {
+        use crate::settings::{
+            DesktopSettings, EndpointId, EndpointSettings, RemoteEndpointSettings, Selection,
+        };
+        use dot_agent_deck::remote_tunnel::Hostname;
+
+        let id = EndpointId::parse("deck00000000000d").expect("a valid id");
+        let row = RemoteEndpointSettings::new(
+            id.clone(),
+            Hostname::parse("build-box").expect("a valid host"),
+        );
+        let half_configured = DesktopSettings {
+            endpoints: Some(EndpointSettings {
+                remote: vec![row],
+                selection: Selection::One(id),
+            }),
+            ..DesktopSettings::default()
+        };
+        let (kind, _, fallback) = with_selection(&half_configured, selection_fields);
+
+        assert_eq!(kind, "local");
+        let reason = fallback.expect("a socket-less row must be reported");
+        assert!(
+            reason.contains("no remote socket path yet"),
+            "this is a different thing to tell a user than a missing row: {reason}"
+        );
+    }
+
+    /// A bidi override in a settings-supplied host cannot reach the line whose
+    /// whole job is telling the user which deck they are talking to.
+    ///
+    /// The stored newtypes exclude these bytes, so today this is the seam
+    /// holding rather than the only thing between the user and a reordered
+    /// footer — which is the point: `safe_message` alone strips category `Cc`
+    /// and lets category `Cf` through.
+    #[test]
+    fn endpoint_display_text_strips_bidi_as_well_as_control_characters() {
+        assert_eq!(safe_display_text("build\u{202e}xob"), "buildxob");
+        assert_eq!(safe_display_text("deploy@build-box"), "deploy@build-box");
+        assert!(
+            safe_message("build\u{202e}xob").contains('\u{202e}'),
+            "the control-only scrub is what this function exists to replace on this path"
+        );
+    }
+
     use dot_agent_deck::agent_pty::PTY_RESIZE_DIM_MAX;
     use dot_agent_deck::event::{LiveTarget, TargetKind};
     use dot_agent_deck::state::{ActiveTool, SessionSnapshot};

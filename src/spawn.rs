@@ -1652,8 +1652,18 @@ fn drain_pre_write_events(
             }
             // Issue #717: neither variant is evidence about this pane.
             // Grouped rather than wildcarded so a future variant still
-            // fails this match and gets considered on its merits.
-            Ok(BroadcastMsg::OrchestrationSurface(_) | BroadcastMsg::WorktreeKept(_)) => {
+            // fails this match and gets considered on its merits — and
+            // `Unknown` (PRD #741 M8) is listed for the same reason rather
+            // than standing in for one. It is the tag a future daemon sends
+            // that this build cannot decode, and a message whose meaning is
+            // unknown is not evidence either way about this pane; what it
+            // buys is that the frame no longer kills the whole
+            // subscription.
+            Ok(
+                BroadcastMsg::OrchestrationSurface(_)
+                | BroadcastMsg::WorktreeKept(_)
+                | BroadcastMsg::Unknown,
+            ) => {
                 continue;
             }
             // Issue #424 D2 (both reviewers): TERMINAL, where this used to carry

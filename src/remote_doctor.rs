@@ -81,6 +81,32 @@ use crate::connect::{
 use crate::remote::{SshExecutor, SshTarget, SystemSshExecutor, run_local_bounded};
 use crate::untrusted_text::escape_control_and_bidi;
 
+/// Which of ssh's three forwarding keys a line came from.
+///
+/// Carried by [`ResolvedForward::Unsplit`] so a line whose endpoints could not
+/// be separated still reports the one thing that is never in doubt: ssh printed
+/// the key, so the *direction* is known even when the addresses are not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForwardKeyword {
+    /// `localforward` — a listener on this machine.
+    Local,
+    /// `remoteforward` — a listener on the far machine, pointed back here.
+    Remote,
+    /// `dynamicforward` — a SOCKS listener on this machine.
+    Dynamic,
+}
+
+impl ForwardKeyword {
+    /// The noun phrase a user reads, naming the direction.
+    fn noun(self) -> &'static str {
+        match self {
+            Self::Local => "a local forward",
+            Self::Remote => "a remote forward",
+            Self::Dynamic => "a dynamic (SOCKS) forward",
+        }
+    }
+}
+
 /// One forwarding directive from ssh's resolved (`ssh -G`) configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResolvedForward {
@@ -92,6 +118,79 @@ pub enum ResolvedForward {
     Dynamic { listen: String },
     /// A laptop-side local forward.
     Local { listen: String, destination: String },
+    /// A forward line whose value did not have the field count the arms above
+    /// expect, kept rather than dropped (PRD #741 final audit **F1**).
+    ///
+    /// `ssh -G` prints forward endpoints **unquoted and unescaped**, so a path
+    /// or a host containing whitespace splits into more fields than a listener
+    /// and a destination. Measured on OpenSSH 10.2p1, with no adversary
+    /// involved: `LocalForward "/Users/First Last/db.sock" /var/run/pg.sock`
+    /// prints as three fields, `LocalForward 127.0.0.1:7001 "weird host":22`
+    /// prints as three, and a Unix-socket `LocalForward` additionally emits a
+    /// two-field `dynamicforward` line of its own.
+    ///
+    /// Dropping those was survivable while the only consumer was `remote
+    /// doctor`'s criterion checks; it is not survivable for PRD #741 M10's
+    /// disclosure, whose entire contract is completeness — a forward the user
+    /// is never shown is inherited by the tunnel for its whole life anyway.
+    ///
+    /// [`value`] is ssh's own field list rejoined with single spaces, which is
+    /// all the original separation the split preserved. The parser deliberately
+    /// does not guess where the listener ends: a wrong split rendered
+    /// confidently is worse than an honest "could not read this one".
+    ///
+    /// [`value`]: ResolvedForward::Unsplit::value
+    Unsplit {
+        keyword: ForwardKeyword,
+        value: String,
+    },
+}
+
+impl std::fmt::Display for ResolvedForward {
+    /// One line a user can read, naming the **direction** as well as the ports.
+    ///
+    /// Direction is the part that matters and the part nobody can infer from a
+    /// pair of addresses: a `LocalForward` opens a listener on *this* machine,
+    /// a `RemoteForward` opens one on the *far* machine and points it back
+    /// here, and a dynamic one is a SOCKS proxy over the whole reachable
+    /// network on whichever side it was opened.
+    ///
+    /// Added by PRD #741 M10 for the `Test connection` disclosure. The tunnel
+    /// inherits the user's forwards for its whole life (`remote_tunnel`'s
+    /// audit **A3**) and until now said nothing about it, while `remote doctor`
+    /// refuses to create one at all and calls it a criterion violation. This is
+    /// the one place a user can find out what their own ssh config is doing on
+    /// their behalf.
+    ///
+    /// The values are `ssh -G`'s own output and therefore influenced by a
+    /// planted `~/.ssh/config`; every caller escapes or strips them at its own
+    /// render seam, as `remote doctor` already does.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::RemoteDynamic { listen } => {
+                write!(
+                    f,
+                    "SOCKS proxy on the remote at {listen}, into this network"
+                )
+            }
+            Self::Remote {
+                listen,
+                destination,
+            } => write!(f, "remote {listen} forwarded to {destination}"),
+            Self::Dynamic { listen } => {
+                write!(f, "SOCKS proxy on this machine at {listen}")
+            }
+            Self::Local {
+                listen,
+                destination,
+            } => write!(f, "local {listen} forwarded to {destination}"),
+            Self::Unsplit { keyword, value } => write!(
+                f,
+                "{}, which this build could not split into endpoints — ssh printed `{value}`",
+                keyword.noun()
+            ),
+        }
+    }
 }
 
 /// The subset of resolved client-side ssh configuration used by the doctor.
@@ -100,6 +199,69 @@ pub struct ResolvedSshConfig {
     pub forwards: Vec<ResolvedForward>,
     pub exit_on_forward_failure: Option<bool>,
     pub forward_agent: Option<bool>,
+    /// `KnownHostsCommand`, as resolved. `None` when ssh printed no such line,
+    /// which on 10.2p1 is what an unset option and an explicit `none` both look
+    /// like.
+    ///
+    /// Parsed for PRD #741 M10's disclosure (final audit **F2**), not for any
+    /// doctor check. `StrictHostKeyChecking=yes` is forced onto both hops and
+    /// forces the *check*; where ssh looks for the key it is strict about stays
+    /// the user's config's to decide, and this is the one place a user can see
+    /// what it decided. A `KnownHostsCommand` that emits whatever key the
+    /// server presents satisfies a forced `yes` against any host.
+    pub known_hosts_command: Option<String>,
+    /// `UserKnownHostsFile`, as resolved. A **list** — ssh prints several
+    /// space-separated paths by default — kept as the whole value text rather
+    /// than destructured, for exactly the reason [`ResolvedForward::Unsplit`]
+    /// exists: these are unquoted paths that may contain whitespace.
+    pub user_known_hosts_file: Option<String>,
+    /// `GlobalKnownHostsFile`, as resolved. Same list shape as
+    /// [`Self::user_known_hosts_file`].
+    pub global_known_hosts_file: Option<String>,
+}
+
+impl ResolvedSshConfig {
+    /// One readable line per resolved host-key source, in the order ssh
+    /// consults them, or empty when ssh printed none.
+    ///
+    /// The disclosure counterpart of [`ResolvedForward`]'s `Display`, and here
+    /// for the same reason: the tunnel forces the host-key *check* and inherits
+    /// the *trust anchor*, so a user who wants to know what their key check is
+    /// actually anchored to has nowhere else to look.
+    ///
+    /// The values are `ssh -G`'s own output and therefore influenced by a
+    /// planted `~/.ssh/config`; every caller escapes or strips them at its own
+    /// render seam, as `remote doctor` already does.
+    pub fn known_hosts_lines(&self) -> Vec<String> {
+        let mut lines = Vec::new();
+        if let Some(command) = &self.known_hosts_command {
+            lines.push(format!(
+                "host keys come from the command `{command}`, not from a file"
+            ));
+        }
+        if let Some(file) = &self.user_known_hosts_file {
+            lines.push(format!("your known-hosts file: {file}"));
+        }
+        if let Some(file) = &self.global_known_hosts_file {
+            lines.push(format!("the system known-hosts file: {file}"));
+        }
+        lines
+    }
+
+    /// Whether any forward line was kept as an [`ResolvedForward::Unsplit`]
+    /// under `keyword` — i.e. ssh resolved a forward of that direction that
+    /// this build could not read in full.
+    ///
+    /// Consulted by the checks that would otherwise state an absolute about
+    /// forwards of that direction (CLAUDE.md rule 17): an unreadable
+    /// `dynamicforward` line must not be reported as "no laptop-side SOCKS
+    /// listener is configured", which is the confident wrong answer the whole
+    /// module is written against.
+    fn has_unsplit(&self, keyword: ForwardKeyword) -> bool {
+        self.forwards
+            .iter()
+            .any(|forward| matches!(forward, ResolvedForward::Unsplit { keyword: k, .. } if *k == keyword))
+    }
 }
 
 /// Resolved values accepted by sshd for `AllowTcpForwarding`.
@@ -335,6 +497,14 @@ fn parse_ssh_bool(raw: Option<&&str>) -> Option<bool> {
 /// individually; nothing aborts the parse, and there is no error path at all.
 /// A later occurrence of a key wins, which matches ssh's own "print the
 /// resolved value" semantics.
+///
+/// **The three forward keys are the exception, and it is deliberate** (PRD #741
+/// final audit **F1**). A `localforward`, `remoteforward` or `dynamicforward`
+/// line whose value does not have the expected field count is kept as a
+/// [`ResolvedForward::Unsplit`] rather than skipped, so this function never
+/// returns a forward list that is quietly shorter than what ssh resolved.
+/// Leniency about a key nobody reads costs nothing; leniency about a forward
+/// costs a security disclosure its completeness.
 pub fn parse_ssh_g(stdout: &str) -> ResolvedSshConfig {
     let mut resolved = ResolvedSshConfig::default();
     for line in stdout.lines() {
@@ -358,40 +528,68 @@ pub fn parse_ssh_g(stdout: &str) -> ResolvedSshConfig {
             // `[socks]:0`, so the correct #97 configuration and a concrete
             // reverse tunnel are distinguishable without any guessing.
             "remoteforward" => {
-                if let [listen, destination] = values.as_slice() {
-                    resolved
-                        .forwards
-                        .push(if *destination == SOCKS_DESTINATION {
-                            ResolvedForward::RemoteDynamic {
-                                listen: listen.to_string(),
-                            }
-                        } else {
-                            ResolvedForward::Remote {
-                                listen: listen.to_string(),
-                                destination: destination.to_string(),
-                            }
-                        });
-                }
-            }
-            "dynamicforward" => {
-                if let [listen] = values.as_slice() {
-                    resolved.forwards.push(ResolvedForward::Dynamic {
-                        listen: listen.to_string(),
-                    });
-                }
-            }
-            "localforward" => {
-                if let [listen, destination] = values.as_slice() {
-                    resolved.forwards.push(ResolvedForward::Local {
+                resolved.forwards.push(match values.as_slice() {
+                    [listen, destination] if *destination == SOCKS_DESTINATION => {
+                        ResolvedForward::RemoteDynamic {
+                            listen: listen.to_string(),
+                        }
+                    }
+                    [listen, destination] => ResolvedForward::Remote {
                         listen: listen.to_string(),
                         destination: destination.to_string(),
-                    });
-                }
+                    },
+                    other => unsplit(ForwardKeyword::Remote, other),
+                });
+            }
+            "dynamicforward" => {
+                resolved.forwards.push(match values.as_slice() {
+                    [listen] => ResolvedForward::Dynamic {
+                        listen: listen.to_string(),
+                    },
+                    other => unsplit(ForwardKeyword::Dynamic, other),
+                });
+            }
+            "localforward" => {
+                resolved.forwards.push(match values.as_slice() {
+                    [listen, destination] => ResolvedForward::Local {
+                        listen: listen.to_string(),
+                        destination: destination.to_string(),
+                    },
+                    other => unsplit(ForwardKeyword::Local, other),
+                });
+            }
+            // The three host-key sources, kept whole rather than destructured:
+            // two of them are lists and all of them are unquoted paths (PRD
+            // #741 final audit F2). An empty value list yields `None`, because
+            // a key with nothing after it discloses nothing.
+            "knownhostscommand" => {
+                resolved.known_hosts_command = joined(&values);
+            }
+            "userknownhostsfile" => {
+                resolved.user_known_hosts_file = joined(&values);
+            }
+            "globalknownhostsfile" => {
+                resolved.global_known_hosts_file = joined(&values);
             }
             _ => {}
         }
     }
     resolved
+}
+
+/// A forward line ssh printed that did not have the field count its arm
+/// expects, kept with its direction. See [`ResolvedForward::Unsplit`].
+fn unsplit(keyword: ForwardKeyword, values: &[&str]) -> ResolvedForward {
+    ResolvedForward::Unsplit {
+        keyword,
+        value: values.join(" "),
+    }
+}
+
+/// `ssh -G`'s value text for a key, rejoined with single spaces. `None` when
+/// the key carried no value at all.
+fn joined(values: &[&str]) -> Option<String> {
+    (!values.is_empty()).then(|| values.join(" "))
 }
 
 /// How ssh spells the destination of a reverse-dynamic (SOCKS) forward.
@@ -646,6 +844,15 @@ pub fn classify(inputs: &DoctorInputs) -> Vec<CheckResult> {
     // --- what ssh actually resolved locally ------------------------------
     checks.push(match reverse_forward_summary(&inputs.ssh) {
         Some(summary) => CheckResult::new(CheckId::RemoteForward, Verdict::Pass, &summary, ""),
+        // UNKNOWN, not FAIL: ssh resolved a `remoteforward` line this build
+        // could not split, so "resolved none" is a claim the parse cannot
+        // support (PRD #741 final audit F1, CLAUDE.md rule 17).
+        None if inputs.ssh.has_unsplit(ForwardKeyword::Remote) => CheckResult::new(
+            CheckId::RemoteForward,
+            Verdict::Unknown,
+            "ssh resolved a reverse tunnel whose endpoints this build could not read",
+            "`ssh -G` prints forward addresses unquoted, so whitespace in a path or a host name makes the line ambiguous. Run `ssh -G <host>` yourself and read the `remoteforward` line.",
+        ),
         None => CheckResult::new(
             CheckId::RemoteForward,
             Verdict::Fail,
@@ -670,6 +877,16 @@ pub fn classify(inputs: &DoctorInputs) -> Vec<CheckResult> {
                 "`DynamicForward {port}` points the wrong direction — that SOCKS listener lands on this laptop"
             ),
             "Replace it with `RemoteForward <port>` (no destination) in `~/.ssh/config`: the reverse form is what puts the SOCKS listener on the remote. This exact mistake appeared in issue #97's original proposal.",
+        ),
+        // Same narrowing as `RemoteForward` above: an unreadable
+        // `dynamicforward` line makes "no laptop-side SOCKS listener is
+        // configured" a confident wrong answer, which is the one thing this
+        // command exists to avoid.
+        None if inputs.ssh.has_unsplit(ForwardKeyword::Dynamic) => CheckResult::new(
+            CheckId::DynamicForward,
+            Verdict::Unknown,
+            "ssh resolved a laptop-side SOCKS listener whose address this build could not read",
+            "`ssh -G` prints forward addresses unquoted, so whitespace in a path makes the line ambiguous. Run `ssh -G <host>` yourself and read the `dynamicforward` line.",
         ),
         None => CheckResult::new(
             CheckId::DynamicForward,
@@ -1962,6 +2179,7 @@ remoteforward 1080 [socks]:0
                 }],
                 exit_on_forward_failure: Some(true),
                 forward_agent: Some(false),
+                ..ResolvedSshConfig::default()
             },
             sshd: ResolvedSshdConfig {
                 allow_tcp_forwarding: Some(AllowTcpForwarding::Yes),
@@ -2062,7 +2280,9 @@ remoteforward 1080 [socks]:0
     }
 
     /// Scenario: Feed a captured, mostly-unrelated `ssh -G localhost` dump plus
-    /// future and malformed lines; known settings after the bad lines still parse.
+    /// future and malformed lines; known settings after the bad lines still
+    /// parse, and the one-field `remoteforward` line is kept as unsplit rather
+    /// than dropped.
     #[test]
     fn ssh_g_ignores_unknown_and_malformed_lines_in_realistic_dump() {
         let parsed = parse_ssh_g(REALISTIC_SSH_G);
@@ -2071,10 +2291,181 @@ remoteforward 1080 [socks]:0
         assert_eq!(parsed.forward_agent, Some(true));
         assert_eq!(
             parsed.forwards,
-            vec![ResolvedForward::RemoteDynamic {
-                listen: "1080".to_string(),
-            }]
+            vec![
+                // `remoteforward missing-destination`: a forward ssh resolved,
+                // so it is reported as unreadable rather than as absent.
+                ResolvedForward::Unsplit {
+                    keyword: ForwardKeyword::Remote,
+                    value: "missing-destination".to_string(),
+                },
+                ResolvedForward::RemoteDynamic {
+                    listen: "1080".to_string(),
+                },
+            ]
         );
+    }
+
+    /// Scenario: Feed the exact `ssh -G` output OpenSSH 10.2p1 prints for a
+    /// whitespace-bearing and a Unix-socket forward; every line is reported,
+    /// the readable ones split and the ambiguous ones kept whole, so the
+    /// disclosure can never be quietly shorter than the user's config.
+    #[test]
+    fn ssh_g_keeps_a_forward_it_cannot_split_instead_of_dropping_it() {
+        // Measured, not invented: this is `ssh -F <cfg> -G host` on
+        // OpenSSH_10.2p1 for a `Host *` block carrying
+        //   LocalForward /tmp/plain.sock /tmp/remote-plain.sock
+        //   LocalForward "/tmp/with space.sock" /tmp/remote2.sock
+        //   LocalForward 127.0.0.1:7001 "weird host":22
+        // Note the two `dynamicforward` lines: ssh emits one per Unix-socket
+        // local forward, and the second of them is the two-field shape the old
+        // single-field pattern dropped.
+        let parsed = parse_ssh_g(
+            "dynamicforward /tmp/plain.sock\n\
+             dynamicforward /tmp/with space.sock\n\
+             localforward /tmp/plain.sock /tmp/remote-plain.sock\n\
+             localforward /tmp/with space.sock /tmp/remote2.sock\n\
+             localforward [127.0.0.1]:7001 [weird host]:22\n",
+        );
+
+        assert_eq!(
+            parsed.forwards,
+            vec![
+                ResolvedForward::Dynamic {
+                    listen: "/tmp/plain.sock".to_string(),
+                },
+                ResolvedForward::Unsplit {
+                    keyword: ForwardKeyword::Dynamic,
+                    value: "/tmp/with space.sock".to_string(),
+                },
+                ResolvedForward::Local {
+                    listen: "/tmp/plain.sock".to_string(),
+                    destination: "/tmp/remote-plain.sock".to_string(),
+                },
+                ResolvedForward::Unsplit {
+                    keyword: ForwardKeyword::Local,
+                    value: "/tmp/with space.sock /tmp/remote2.sock".to_string(),
+                },
+                ResolvedForward::Unsplit {
+                    keyword: ForwardKeyword::Local,
+                    value: "[127.0.0.1]:7001 [weird host]:22".to_string(),
+                },
+            ]
+        );
+    }
+
+    /// Scenario: Render an unsplit forward and check the line still names the
+    /// direction and carries ssh's own text, because the direction is the half
+    /// a user cannot infer and the text is the evidence.
+    #[test]
+    fn an_unsplit_forward_still_names_its_direction_to_the_user() {
+        let rendered = ResolvedForward::Unsplit {
+            keyword: ForwardKeyword::Local,
+            value: "/tmp/with space.sock /tmp/remote2.sock".to_string(),
+        }
+        .to_string();
+
+        assert!(rendered.contains("a local forward"), "{rendered}");
+        assert!(
+            rendered.contains("/tmp/with space.sock /tmp/remote2.sock"),
+            "{rendered}"
+        );
+        for other in [
+            ResolvedForward::Unsplit {
+                keyword: ForwardKeyword::Remote,
+                value: "x".to_string(),
+            },
+            ResolvedForward::Unsplit {
+                keyword: ForwardKeyword::Dynamic,
+                value: "x".to_string(),
+            },
+        ] {
+            assert!(!other.to_string().contains("a local forward"));
+        }
+    }
+
+    /// Scenario: Give the classifier a `dynamicforward` line it cannot read and
+    /// check the SOCKS-direction check reports UNKNOWN rather than the
+    /// confident "no laptop-side SOCKS listener is configured".
+    #[test]
+    fn an_unreadable_dynamic_forward_is_unknown_not_a_confident_pass() {
+        let mut inputs = healthy_inputs();
+        inputs.ssh.forwards.push(ResolvedForward::Unsplit {
+            keyword: ForwardKeyword::Dynamic,
+            value: "/tmp/with space.sock".to_string(),
+        });
+
+        let checks = classify(&inputs);
+
+        assert_eq!(
+            check(&checks, CheckId::DynamicForward).verdict,
+            Verdict::Unknown
+        );
+        assert_eq!(overall_verdict(&checks), Verdict::Unknown);
+    }
+
+    /// Scenario: Give the classifier a `remoteforward` line it cannot read and
+    /// nothing else, and check the reverse-tunnel check reports UNKNOWN rather
+    /// than "ssh resolved no reverse tunnel".
+    #[test]
+    fn an_unreadable_remote_forward_is_unknown_not_a_confident_absence() {
+        let mut inputs = healthy_inputs();
+        inputs.ssh.forwards = vec![ResolvedForward::Unsplit {
+            keyword: ForwardKeyword::Remote,
+            value: "/tmp/with space.sock /tmp/other.sock".to_string(),
+        }];
+
+        let checks = classify(&inputs);
+
+        assert_eq!(
+            check(&checks, CheckId::RemoteForward).verdict,
+            Verdict::Unknown
+        );
+    }
+
+    /// Scenario: Parse the three host-key source keys `ssh -G` prints, keeping
+    /// each value whole — two of them are space-separated lists and all three
+    /// are unquoted paths, so destructuring them would be F1 again.
+    #[test]
+    fn ssh_g_parses_the_host_key_sources_without_splitting_them() {
+        // Measured on OpenSSH_10.2p1: both file keys are always printed and
+        // carry a list; `knownhostscommand` appears only when set to something
+        // other than `none`.
+        let parsed = parse_ssh_g(
+            "knownhostscommand /bin/attacker-keys %H\n\
+             globalknownhostsfile /etc/ssh/ssh_known_hosts /etc/ssh/ssh_known_hosts2\n\
+             userknownhostsfile /tmp/a b/known hosts /tmp/other\n",
+        );
+
+        assert_eq!(
+            parsed.known_hosts_command.as_deref(),
+            Some("/bin/attacker-keys %H")
+        );
+        assert_eq!(
+            parsed.global_known_hosts_file.as_deref(),
+            Some("/etc/ssh/ssh_known_hosts /etc/ssh/ssh_known_hosts2")
+        );
+        assert_eq!(
+            parsed.user_known_hosts_file.as_deref(),
+            Some("/tmp/a b/known hosts /tmp/other")
+        );
+
+        let lines = parsed.known_hosts_lines();
+        assert_eq!(lines.len(), 3, "{lines:?}");
+        assert!(lines[0].contains("/bin/attacker-keys %H"), "{lines:?}");
+        assert!(lines[1].contains("/tmp/a b/known hosts"), "{lines:?}");
+        assert!(lines[2].contains("/etc/ssh/ssh_known_hosts2"), "{lines:?}");
+    }
+
+    /// Scenario: Parse a dump with no host-key keys at all and get no lines,
+    /// so a caller can tell "ssh printed none" from "ssh printed a redirect".
+    #[test]
+    fn ssh_g_without_host_key_sources_yields_no_disclosure_lines() {
+        let parsed = parse_ssh_g("host localhost\nhashknownhosts no\n");
+
+        assert_eq!(parsed.known_hosts_command, None);
+        assert_eq!(parsed.user_known_hosts_file, None);
+        assert_eq!(parsed.global_known_hosts_file, None);
+        assert!(parsed.known_hosts_lines().is_empty());
     }
 
     /// Scenario: Parse a resolved config with no `RemoteForward` directives and

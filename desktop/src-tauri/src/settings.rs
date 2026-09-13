@@ -68,25 +68,56 @@
 //!    is outside it entirely. Read a pass as "nobody named a field like a
 //!    credential", never as "a credential cannot get in here".
 //!
-//!    The **value**-side checks are the ones to rely on, and what they establish
-//!    is narrower than an absolute: *this build's schema has no field that can
-//!    carry arbitrary text*, so a credential submitted through the settings
-//!    surface or the settings IPC is stored in none of the places it could be,
-//!    absent from both directions of the IPC, and absent from the diagnostics
-//!    this crate emits. They follow one uniquely-named sentinel through every sink #827
-//!    enumerates — the document on disk across a load-modify-save round trip,
-//!    the IPC echo, the `desktop_get_settings` snapshot, the parse diagnostic,
-//!    and both halves of [`SettingsWriteError`] — reaching the two settings
-//!    commands through the public functions their bodies wrap, since a
-//!    `#[tauri::command]` needs a running app to call. They are derived from the
-//!    default document rather than from a list, so a field #802 adds is covered
-//!    the moment it appears and turns them red if it can hold text. The one
-//!    thing they do **not** claim: a key this schema does not own keeps whatever
-//!    a user or a newer build wrote there, because the save merges rather than
-//!    replaces (see [`merged_document`]) — measured by
-//!    [`tests::a_key_this_schema_does_not_own_keeps_its_value_and_reaches_nothing_else`],
-//!    not glossed. The TypeScript half of the schema, the `localStorage` key set
-//!    and the field-type allowlist are checked in
+//!    The **value**-side checks are the ones to rely on. They follow one
+//!    uniquely-named sentinel through every sink #827 enumerates — the document
+//!    on disk across a load-modify-save round trip, the IPC echo, the
+//!    `desktop_get_settings` snapshot, the parse diagnostic, and both halves of
+//!    [`SettingsWriteError`] — reaching the two settings commands through the
+//!    public functions their bodies wrap, since a `#[tauri::command]` needs a
+//!    running app to call.
+//!
+//!    **What they establish stopped being one sentence at PRD #741 M6, and the
+//!    old sentence is worth quoting because it is now false.** It read: *this
+//!    build's schema has no field that can carry arbitrary text*. That was true
+//!    of `u32`, [`AppearanceMode`] and [`ZoomLevel`] — an integer, three tokens
+//!    and ten numbers — and it is **not** true of the ssh-argument newtypes
+//!    #741 added. `Hostname` is 253 bytes of `[A-Za-z0-9._-]` plus the
+//!    `[`, `]`, `:` and `%` a bracketed IPv6 literal and its zone id need,
+//!    `SshUser` 64 of `[A-Za-z0-9._@-]`, `HostAlias` 253 of `[A-Za-z0-9._-]`
+//!    and [`EndpointId`] 64; measured, the 45-byte
+//!    `sk-…`-shaped sentinel below **parses** as all four. They *bound and
+//!    restrict*, which is a real property and a weaker one than "cannot carry
+//!    text", and `ALLOWED_FIELD_TYPES`' own entries have said so since M5.
+//!
+//!    So the claim, in the two halves that are each true:
+//!
+//!    - For every field whose type is `u32`, `u16`, [`AppearanceMode`],
+//!      [`ZoomLevel`] or [`Selection`], there is **no route** by which a
+//!      credential reaches disk, the IPC, or the log — nothing arbitrary is
+//!      representable, and the sentinel sweep proves it end to end.
+//!    - For the ssh-argument fields, a single-line token **is** representable,
+//!      and what rules a credential out is not the type but **where the value
+//!      goes**: each is handed to `ssh` as an argument and reaches no
+//!      authentication surface, key *material* and a passphrase are excluded by
+//!      shape (`KeyPath` must start `/` or `~/`, so a PEM block cannot be
+//!      written there — measured, the sentinel is refused by `KeyPath` and
+//!      `RemoteSocketPath`), and the storage policy is that a credential goes
+//!      behind the `SecretStore` seam instead. Pinned by
+//!      [`tests::an_ssh_argument_field_bounds_and_restricts_rather_than_forbidding_text`],
+//!      which exists so the next reader finds the boundary measured rather than
+//!      asserted.
+//!
+//!    Two further things the sweep does **not** claim. A key this schema does
+//!    not own keeps whatever a user or a newer build wrote there, because the
+//!    save merges rather than replaces (see [`merged_document`]) — measured by
+//!    [`tests::a_key_this_schema_does_not_own_keeps_its_value_and_reaches_nothing_else`].
+//!    And the sweep is derived from the **default** document, so it covers a
+//!    field #802 adds only once that field appears there: an optional field or
+//!    a row in an empty list is outside it, which is why the naming tripwire
+//!    grew [`tests::representative_document`] and why a value-side claim about
+//!    the endpoint fields is made by its own test rather than by the sweep.
+//!    The TypeScript half of the schema, the `localStorage` key set and the
+//!    field-type allowlist are checked in
 //!    `xtask/linkage-check/src/desktop_settings_secrets.rs`, because those live
 //!    outside this crate and a vitest guard can be merged past.
 //! 2. **Field names stay `snake_case`, and single-word where it is natural.**
@@ -100,8 +131,17 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use dot_agent_deck::daemon_client::{Endpoint, RemoteEndpoint};
 use dot_agent_deck::platform::fsperm;
 use dot_agent_deck::platform::paths::config_dir;
+// PRD #741 M6: the validating ssh-argument newtypes ARE this section's schema.
+// `ALLOWED_FIELD_TYPES` refuses `String`, so the endpoint fields have to be
+// types whose `Deserialize` bounds and charset-checks them — which is exactly
+// what these are. See `xtask/linkage-check/src/desktop_project_boundary.rs` for
+// why `remote_tunnel` is on that rule's allowlist.
+use dot_agent_deck::remote_tunnel::{
+    HostAlias, Hostname, KeyPath, RemoteSocketPath, SshPort, SshUser,
+};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 /// Overrides the whole settings path, mirroring `DOT_AGENT_DECK_CONFIG`
@@ -245,9 +285,8 @@ pub struct ZoomSettings {
 /// The whole settings document.
 ///
 /// Deliberately carries only the sections that have a tenant. A container that
-/// grows opinions about its contents blocks its dependents, so #741's endpoints
-/// and #802's voice backends each add their own section when they land — they
-/// are not pre-created here.
+/// grows opinions about its contents blocks its dependents, so #802's voice
+/// backends add their own section when they land — it is not pre-created here.
 ///
 /// **No `Eq`**, and that is [`ZoomLevel`]'s doing rather than an oversight: it
 /// wraps an `f64`, which is `PartialEq` but not `Eq` because `NaN != NaN`.
@@ -258,6 +297,10 @@ pub struct ZoomSettings {
 pub struct DesktopSettings {
     pub version: u32,
     pub appearance: AppearanceSettings,
+    /// PRD #741's tenant. **An `Option`, and it means *unspecified* rather than
+    /// *empty* — see [`EndpointSettings`] for why that distinction is what
+    /// stops a webview deleting decks it cannot render.**
+    pub endpoints: Option<EndpointSettings>,
     pub zoom: ZoomSettings,
 }
 
@@ -266,7 +309,551 @@ impl Default for DesktopSettings {
         Self {
             version: SETTINGS_VERSION,
             appearance: AppearanceSettings::default(),
+            endpoints: None,
             zoom: ZoomSettings::default(),
+        }
+    }
+}
+
+impl DesktopSettings {
+    /// Which deck this document says to talk to, with the local deck as the
+    /// answer whenever the stored selection cannot be honoured.
+    ///
+    /// An absent `[endpoints]` section is the same answer as an empty one:
+    /// the local deck, with no fallback to report. Absence is how *this* build
+    /// says "I have nothing to add about endpoints" — it never means "the user
+    /// removed them" (see [`EndpointSettings`]).
+    pub fn resolve_endpoint(&self) -> ResolvedEndpoint {
+        match &self.endpoints {
+            Some(endpoints) => endpoints.resolve(),
+            None => ResolvedEndpoint {
+                endpoint: Endpoint::local(),
+                fallback: None,
+            },
+        }
+    }
+}
+
+/// The `[endpoints]` section — PRD #741's tenant: which decks are configured,
+/// and which one the app is talking to.
+///
+/// # The local deck is not in here, and that is the point
+///
+/// A local deck needs no configuration — [`Endpoint::local`] resolves it from
+/// the platform paths the way every caller did before endpoints existed — so
+/// this section holds only the *remote* rows plus the selection. A fresh
+/// install therefore has no `[endpoints]` section at all and still works, and a
+/// user who deletes the section gets the local deck back rather than nothing.
+///
+/// # Why the section is an `Option` on [`DesktopSettings`]
+///
+/// `desktop_set_settings` takes the **whole document** from the webview, and
+/// the webview builds that document with `normalizeDesktopSettings`, which
+/// constructs a fresh object with a **fixed key set** (that fixed set is itself
+/// a credential guard — `xtask/linkage-check`'s check 3). So a webview that
+/// does not render endpoints cannot send them, and if the field were a plain
+/// `EndpointSettings` it would arrive as the *default* — an empty list — and
+/// [`merged_document`] would then write that empty list over a hand-edited
+/// `[endpoints]` table. Every remote deck, deleted by someone changing the
+/// theme.
+///
+/// `Option` makes "I am not telling you about this section" representable, and
+/// TOML serialisation omits a `None` field entirely, so the merge preserves
+/// what is on disk — the same protection [`merged_document`] gives *across
+/// builds*, now available *across clients*. Pinned by
+/// [`tests::a_client_that_cannot_render_endpoints_cannot_delete_them`].
+///
+/// **What M7 inherits from that.** The moment the panel exists, the frontend
+/// must round-trip this section — read it in `normalizeDesktopSettings`, keep
+/// it, and send it back. Fabricating a default `{ remote: [], selection:
+/// "local" }` there would delete every row, and it would do it silently.
+///
+/// # Field order is alphabetical on purpose
+///
+/// The document is written two ways — `toml::to_string_pretty` over the struct
+/// (declaration order) and over a `toml::Table` (a `BTreeMap`, so alphabetical)
+/// — and [`tests::default_document_shape_is_pinned`] asserts the two agree.
+/// Declaring alphabetically is what keeps them agreeing; `DesktopSettings`'s
+/// own fields happen to be alphabetical for the same reason.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct EndpointSettings {
+    /// The configured remote decks. Empty on a fresh install, and empty is a
+    /// perfectly good state — the local deck is always available and is not a
+    /// row here.
+    pub remote: Vec<RemoteEndpointSettings>,
+    /// Which deck the app is talking to.
+    pub selection: Selection,
+}
+
+impl EndpointSettings {
+    /// The row with this id, or `None`.
+    pub fn find(&self, id: &EndpointId) -> Option<&RemoteEndpointSettings> {
+        self.remote.iter().find(|deck| &deck.id == id)
+    }
+
+    /// The endpoint [`Self::selection`] names, falling back to the local deck
+    /// with a **named** reason whenever the stored selection cannot be
+    /// honoured.
+    ///
+    /// Falling back rather than erroring is deliberate, and it is the same call
+    /// [`AppearanceMode::from_str_lossy`] makes: a settings document is
+    /// hand-editable and may have been written by a build with more variants,
+    /// so an unresolvable selection is an ordinary state rather than a
+    /// corruption. Erroring would leave the app with no deck at all, which is
+    /// strictly worse than the deck it had before endpoints existed.
+    ///
+    /// The reason travels with the answer because M7 has to *render* it: "the
+    /// deck you selected is gone" and "the deck you selected has no socket path
+    /// yet" are different things to tell a user, and neither is "connected to
+    /// local".
+    pub fn resolve(&self) -> ResolvedEndpoint {
+        let local = || ResolvedEndpoint {
+            endpoint: Endpoint::local(),
+            fallback: None,
+        };
+        let Selection::One(id) = &self.selection else {
+            return local();
+        };
+        let Some(deck) = self.find(id) else {
+            return ResolvedEndpoint {
+                endpoint: Endpoint::local(),
+                fallback: Some(SelectionFallback::UnknownDeck { id: id.clone() }),
+            };
+        };
+        match deck.endpoint() {
+            Some(remote) => ResolvedEndpoint {
+                endpoint: Endpoint::Remote(remote),
+                fallback: None,
+            },
+            None => ResolvedEndpoint {
+                endpoint: Endpoint::local(),
+                fallback: Some(SelectionFallback::NoRemoteSocket { id: id.clone() }),
+            },
+        }
+    }
+}
+
+/// One `[[endpoints.remote]]` row: a remote deck, stored as **references** and
+/// never as a secret.
+///
+/// Host, optional user, port, optional identity-file *path*, optional
+/// jump-host *name*. `~/.config/dot-agent-deck/remotes.toml` (`src/remote.rs`)
+/// has stored exactly this shape since PRD #76 and has never needed a
+/// passphrase: the answer to an encrypted key is "it is in an agent, or it is
+/// unencrypted", plus `BatchMode=yes` so a locked key fails fast with a
+/// nameable error rather than hanging on a prompt no GUI can answer. A
+/// credential belongs behind the `SecretStore` seam PRD #803 M5 named, and
+/// #741 is deliberately **not** the PRD that opens the first route into a store
+/// that does not exist yet.
+///
+/// Every field is one of the validating newtypes from
+/// [`dot_agent_deck::remote_tunnel`], whose `Deserialize` runs the same check
+/// its constructor does — so a hand-edited document cannot smuggle past what a
+/// settings form applies. Their charsets and bounds are also the ssh-argument
+/// validation nothing in this tree performed before PRD #741 M5.
+///
+/// # There is no display name, deliberately
+///
+/// A user-chosen label would be exactly the arbitrary `String` the field-type
+/// guard refuses, and it would need its own bidi and control-character handling
+/// before anything rendered it. [`RemoteEndpoint::describe`] derives the label
+/// from the address instead, and every byte of that came through a validated
+/// ASCII charset.
+///
+/// # `host` and `id` are required; everything else defaults
+///
+/// A row with no host is not a row, and a row with no id cannot be selected. A
+/// document whose row is missing one of them fails to parse, which — per
+/// [`load_from`] — means the whole document reads as defaults with a locator
+/// logged. It does **not** mean the file is rewritten: [`merged_document`]
+/// parses the existing document as TOML *syntax*, which a schema-invalid row
+/// still is, so the row survives on disk for the user to fix.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteEndpointSettings {
+    pub host: Hostname,
+    pub id: EndpointId,
+    /// The private key to offer (`ssh -i`) — a **path**, never key material and
+    /// never a passphrase.
+    ///
+    /// **Named `identity` rather than `key`, and the reason is worth the
+    /// paragraph.** `key` is what `remotes.toml` calls it, and it trips the
+    /// naming tripwire
+    /// ([`tests::no_settings_key_name_trips_the_credential_tripwire`]), whose
+    /// path allowlist is empty. The two available answers were an exemption
+    /// pinned to [`KeyPath`], or a name that is not credential-shaped. This is
+    /// the second, because `IdentityFile` is OpenSSH's *own* name for exactly
+    /// this option — so the TOML reads like the `~/.ssh/config` it points into
+    /// — and because an empty allowlist is a property worth keeping: the first
+    /// entry is the one that makes the second easy.
+    ///
+    /// **What that costs, stated rather than glossed:** the tripwire is now
+    /// silent about the one field in this schema that sits next to credential
+    /// material. It was never the control that mattered — read
+    /// [`SECRET_RULE`], which says so in those words — and the control that
+    /// does matter is unaffected: the type is [`KeyPath`], which is on
+    /// `ALLOWED_FIELD_TYPES` with a written reason, bounded at `PATH_MAX`,
+    /// restricted to a charset that cannot represent a multi-line PEM block,
+    /// and required to start `/` or `~/`. This doc comment is where the next
+    /// reader finds that out, since the tripwire will not tell them.
+    ///
+    /// [`SECRET_RULE`]: tests::SECRET_RULE
+    #[serde(default)]
+    pub identity: Option<KeyPath>,
+    /// A `Host` block name from the user's `~/.ssh/config` to reach this deck
+    /// through (`ssh -J`). A *name*, so the jump host's own address, port, user
+    /// and key stay in that config rather than being copied here.
+    #[serde(default)]
+    pub jump: Option<HostAlias>,
+    /// The ssh port.
+    ///
+    /// An [`SshPort`] rather than a `u16` (PRD #741, Greptile P2 on #1035): a
+    /// `u16` admits `0`, the webview's own predicate does not, and a
+    /// hand-edited `port = 0` therefore loaded and reached OpenSSH as `-p 0`,
+    /// which it refuses. Port was the one field of this row that stayed a
+    /// primitive when the other five became validating newtypes, so it was also
+    /// the one the validator-parity work could not cover.
+    #[serde(default = "default_ssh_port")]
+    pub port: SshPort,
+    /// The daemon's attach socket path **on the remote host**.
+    ///
+    /// # Optional in storage, and this is the milestone's answer to it
+    ///
+    /// It cannot be derived. OpenSSH expands neither `~` nor an environment
+    /// variable on the remote side of `-L`, and the far host's
+    /// `XDG_RUNTIME_DIR` and uid are not knowable from here without a second
+    /// ssh round trip — [`RemoteSocketPath`] records the mechanism. So it is
+    /// either typed by the user or discovered.
+    ///
+    /// Stored as **optional, with discovery filling it**. A row without one is
+    /// *storable* and *not connectable*: [`EndpointSettings::resolve`] returns
+    /// the local deck and [`SelectionFallback::NoRemoteSocket`] rather than
+    /// erroring, so a half-configured deck is a state the UI can explain
+    /// instead of a save that refuses.
+    ///
+    /// Required was the alternative and it is worse in the order the user does
+    /// things: the value is un-guessable, so requiring it means typing
+    /// `/run/user/1000/dot-agent-deck-attach.sock` correctly *before* anything
+    /// can test whether it is right.
+    ///
+    /// **What that leaves M10 (`Test connection`)**, which is already making an
+    /// ssh round trip and is therefore the cheapest place to do it:
+    ///
+    /// 1. **Discover** the remote attach socket path over that round trip
+    ///    rather than asking the user to know it;
+    /// 2. **Write it back** into this field, so discovery is durable and the
+    ///    next connection needs no probe;
+    /// 3. **Report `NoRemoteSocket` as its own named state** — "not configured
+    ///    yet, press Test connection" — rather than folding it into a generic
+    ///    failure, which is M10's stated shape for every other outcome anyway.
+    #[serde(default)]
+    pub socket: Option<RemoteSocketPath>,
+    /// The login name, when the ssh config does not already decide it.
+    #[serde(default)]
+    pub user: Option<SshUser>,
+}
+
+/// The ssh port a row with no `port` key means.
+///
+/// Taken from [`SshPort::DEFAULT`] rather than written as `22`, so a row stored
+/// without a port and a row built by `RemoteEndpoint::new` can never describe
+/// different decks — the assertion below is what keeps the two definitions from
+/// drifting apart now that they are separate constants.
+fn default_ssh_port() -> SshPort {
+    debug_assert_eq!(SshPort::DEFAULT.get(), RemoteEndpoint::DEFAULT_PORT);
+    SshPort::DEFAULT
+}
+
+impl RemoteEndpointSettings {
+    /// A row with the minimum a deck needs: an id and a host.
+    ///
+    /// **Not reached in production, and that is the shape of the app rather
+    /// than an unfinished wire-up.** A row is *constructed* by the settings
+    /// panel and arrives here as a whole document through `desktop_set_settings`,
+    /// where every field is validated by its own `Deserialize`. This
+    /// constructor is what the storage tests build from, and it is the
+    /// definition the panel's row-shape is pinned against.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn new(id: EndpointId, host: Hostname) -> Self {
+        Self {
+            host,
+            id,
+            identity: None,
+            jump: None,
+            port: default_ssh_port(),
+            socket: None,
+            user: None,
+        }
+    }
+
+    /// Everything `ssh` needs to reach this row's host, with the attach socket
+    /// left behind (PRD #741 M10).
+    ///
+    /// The socket is the one field a row may legitimately lack, and reaching
+    /// the host is exactly what `Test connection` does to *discover* it — so
+    /// the probe is written against this rather than against
+    /// [`Self::endpoint`], which cannot exist yet. Both are built from the same
+    /// fields, so a probe and the tunnel it precedes cannot describe different
+    /// hosts.
+    pub fn destination(&self) -> dot_agent_deck::remote_tunnel::SshDestination {
+        dot_agent_deck::remote_tunnel::SshDestination::with_parts(
+            self.host.clone(),
+            self.user.clone(),
+            self.port.get(),
+            self.identity.clone(),
+            self.jump.clone(),
+        )
+    }
+
+    /// [`Self::endpoint`] against a socket path discovery just learned, rather
+    /// than the stored one.
+    ///
+    /// The connection a `Test connection` actually makes goes through this, so
+    /// a deck whose socket was discovered *this run* is testable before the
+    /// document has been written back — which is the order the user does
+    /// things in.
+    pub fn endpoint_at(&self, socket: RemoteSocketPath) -> RemoteEndpoint {
+        let mut row = self.clone();
+        row.socket = Some(socket);
+        row.endpoint()
+            .expect("a row with a socket always yields an endpoint")
+    }
+
+    /// The connectable endpoint this row describes, or `None` while it has no
+    /// remote socket path — see [`Self::socket`].
+    pub fn endpoint(&self) -> Option<RemoteEndpoint> {
+        let mut endpoint =
+            RemoteEndpoint::new(self.host.clone(), self.socket.clone()?).with_port(self.port.get());
+        if let Some(user) = &self.user {
+            endpoint = endpoint.with_user(user.clone());
+        }
+        if let Some(identity) = &self.identity {
+            endpoint = endpoint.with_key(identity.clone());
+        }
+        if let Some(jump) = &self.jump {
+            endpoint = endpoint.with_jump(jump.clone());
+        }
+        Some(endpoint)
+    }
+}
+
+/// The stable identity of a stored remote deck.
+///
+/// An opaque minted token rather than the deck's address, so editing a host
+/// does not silently change which deck a selection points at, and rather than a
+/// list index, so removing a row does not re-point every selection after it.
+///
+/// The charset is deliberately wider than [`Self::mint`] produces — ASCII
+/// alphanumerics, `-` and `_`, up to [`MAX_ENDPOINT_ID_BYTES`] — because this
+/// type also has to accept a [`Selection`] token written by a build that has a
+/// variant this one does not. See [`Selection`] for what that buys.
+///
+/// It is not a secret and nothing authenticates with it: it names a row in a
+/// file the user owns.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct EndpointId(String);
+
+/// The longest endpoint id this build will accept.
+///
+/// [`EndpointId::mint`] produces 16, so this is room for a hand-written one
+/// while staying far short of anything that could hold a credential-shaped
+/// blob.
+pub const MAX_ENDPOINT_ID_BYTES: usize = 64;
+
+/// The [`Selection`] token that means the local deck, and therefore the one
+/// word an [`EndpointId`] may not be.
+pub const LOCAL_SELECTION_TOKEN: &str = "local";
+
+impl EndpointId {
+    /// Validate `raw` and wrap it.
+    ///
+    /// The only constructor besides [`Self::mint`] — no `From<String>`, so no
+    /// call site can skip the check by reaching for a cheaper conversion.
+    pub fn parse(raw: &str) -> Result<Self, String> {
+        if raw.is_empty() {
+            return Err("an endpoint id cannot be empty".to_string());
+        }
+        if raw.len() > MAX_ENDPOINT_ID_BYTES {
+            return Err(format!(
+                "an endpoint id is at most {MAX_ENDPOINT_ID_BYTES} bytes; got {}",
+                raw.len()
+            ));
+        }
+        if let Some(byte) = raw
+            .bytes()
+            .find(|byte| !(byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')))
+        {
+            return Err(format!(
+                "an endpoint id is ASCII alphanumerics, '-' and '_'; found byte 0x{byte:02x}"
+            ));
+        }
+        if raw.eq_ignore_ascii_case(LOCAL_SELECTION_TOKEN) {
+            return Err(format!(
+                "'{LOCAL_SELECTION_TOKEN}' is reserved: it is how a selection names the local deck"
+            ));
+        }
+        Ok(Self(raw.to_string()))
+    }
+
+    /// A fresh id, unique within this process and unguessable outside it.
+    ///
+    /// Sixteen lowercase hex characters from [`unpredictable_suffix`], which is
+    /// seeded from the operating system. Uniqueness is what is wanted here, not
+    /// unpredictability — nothing authenticates with this — but the function
+    /// that gives one already gives the other. Sixteen hex characters cannot
+    /// collide with [`LOCAL_SELECTION_TOKEN`] or with any word a future
+    /// [`Selection`] variant would reserve, both of which are shorter and
+    /// contain letters that are not hex digits.
+    ///
+    /// **Not reached in production for the same reason [`RemoteEndpointSettings::new`]
+    /// is not**: the panel mints an id when the user adds a deck, because that
+    /// is where a row is built. `desktop/src/lib/endpoints.ts`'s `mintEndpointId`
+    /// is the other copy and produces the same sixteen lowercase hex characters
+    /// from `crypto.getRandomValues`; what keeps the two honest is not that
+    /// they share code but that [`Self::parse`] — which both a save and a
+    /// hand-edited document go through — is the only thing that decides what an
+    /// id may be.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn mint() -> Self {
+        Self(format!("{:016x}", unpredictable_suffix()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for EndpointId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl Serialize for EndpointId {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for EndpointId {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = String::deserialize(deserializer)?;
+        Self::parse(&raw).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Which deck the app is talking to.
+///
+/// # Shaped so a variant can be added, which is the one constraint M6 owes M9
+///
+/// The Deck selector is PRD #741 M9 and "All Decks" is [#742](https://github.com/vfarcic/dot-agent-deck/issues/742),
+/// but the *stored* value lands here — and it lands as an enum rather than a
+/// bare [`EndpointId`] threaded through state precisely so #742 is **additive**
+/// rather than a retrofit. Adding `All` is one variant, one arm in
+/// [`SelectionVisitor::visit_str`], one arm in `Serialize`, and one arm in
+/// [`EndpointSettings::resolve`]. A bare id would have made it a change to
+/// every type that carries a selection.
+///
+/// # The wire form, and why an unknown token round-trips
+///
+/// One string: the reserved word `local`, or an endpoint id. An unrecognised
+/// token — `all`, written by a build that has the variant this one does not —
+/// parses as an [`EndpointId`], resolves to no row, and therefore reads as the
+/// local deck with [`SelectionFallback::UnknownDeck`]; and because it is
+/// *stored* as the id it was, saving the document writes it back **unchanged**.
+/// So an older build degrades to local without destroying a newer build's
+/// selection, which is the same tolerance the rest of this schema is built for.
+/// That is also why [`EndpointId`]'s charset is wider than [`EndpointId::mint`]
+/// needs: a reserved word a future build invents has to fit through it.
+///
+/// An over-long or non-charset token is a different thing — a malformed
+/// document rather than an unknown value — and is an error, exactly as
+/// [`AppearanceMode`] treats an over-length mode.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum Selection {
+    /// The daemon on this machine: what every caller used before endpoints
+    /// existed, and the default with or without an `[endpoints]` section.
+    #[default]
+    Local,
+    /// The remote deck with this id, if the document still holds one.
+    One(EndpointId),
+}
+
+impl Selection {
+    /// The token written to TOML and JSON.
+    pub fn as_token(&self) -> &str {
+        match self {
+            Self::Local => LOCAL_SELECTION_TOKEN,
+            Self::One(id) => id.as_str(),
+        }
+    }
+}
+
+impl Serialize for Selection {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_token())
+    }
+}
+
+impl<'de> Deserialize<'de> for Selection {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_str(SelectionVisitor)
+    }
+}
+
+struct SelectionVisitor;
+
+impl serde::de::Visitor<'_> for SelectionVisitor {
+    type Value = Selection;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "'{LOCAL_SELECTION_TOKEN}' or an endpoint id")
+    }
+
+    fn visit_str<E: serde::de::Error>(self, raw: &str) -> Result<Selection, E> {
+        if raw.eq_ignore_ascii_case(LOCAL_SELECTION_TOKEN) {
+            return Ok(Selection::Local);
+        }
+        EndpointId::parse(raw)
+            .map(Selection::One)
+            .map_err(E::custom)
+    }
+}
+
+/// What [`EndpointSettings::resolve`] answered, and whether it had to fall back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedEndpoint {
+    /// The deck to talk to. Always a usable endpoint — never an error.
+    pub endpoint: Endpoint,
+    /// `Some` when [`Self::endpoint`] is the local deck because the stored
+    /// selection could not be honoured. M7 renders it; nothing else needs it.
+    pub fallback: Option<SelectionFallback>,
+}
+
+/// Why a stored selection resolved to the local deck instead of the one it
+/// named.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SelectionFallback {
+    /// The selection names a deck this document no longer holds — a row the
+    /// user removed, or a token a newer build wrote. Test-plan item 17.
+    UnknownDeck { id: EndpointId },
+    /// The selected deck has no remote socket path yet, so there is nothing to
+    /// forward to. PRD #741 M10's `Test connection` is what fills it in; see
+    /// [`RemoteEndpointSettings::socket`].
+    NoRemoteSocket { id: EndpointId },
+}
+
+impl std::fmt::Display for SelectionFallback {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnknownDeck { id } => write!(
+                f,
+                "the selected deck {id} is no longer configured; using the local deck"
+            ),
+            Self::NoRemoteSocket { id } => write!(
+                f,
+                "the selected deck {id} has no remote socket path yet; using the local deck"
+            ),
         }
     }
 }
@@ -523,7 +1110,7 @@ pub const MAX_SETTINGS_BYTES: u64 = 256 * 1024;
 /// means an `openat`-anchored read, which is the same complexity [`save_to`]
 /// declines for the same reason, and it is written down there rather than
 /// repeated here.
-fn read_document(path: &Path) -> Result<Option<String>, SettingsWriteError> {
+fn read_document(path: &Path, purpose: ReadPurpose) -> Result<Option<String>, SettingsWriteError> {
     if !path.is_absolute() {
         return Err(path_error("it is not an absolute path", path));
     }
@@ -552,9 +1139,172 @@ fn read_document(path: &Path) -> Result<Option<String>, SettingsWriteError> {
     if meta.len() > MAX_SETTINGS_BYTES {
         return Err(oversized(path));
     }
+    if purpose == ReadPurpose::Load {
+        warn_if_document_is_exposed(path, &meta);
+    }
 
     read_bounded(path)
 }
+
+/// Why [`read_document`] is reading, which decides only whether an exposed
+/// document is complained about.
+///
+/// The distinction exists because [`save_to`] reads the document too, and a
+/// mode warning there would be **stale before it was printed**: the save that
+/// follows publishes a fresh 0o600 file over it. Warning on the load is what
+/// puts the message in front of a user who has not changed a setting since
+/// their file became world-readable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReadPurpose {
+    /// [`load_from`] — the app is about to read these settings, so an exposed
+    /// document is worth a line in the log.
+    Load,
+    /// [`save_to`] — the existing bytes are being read only so the merge can
+    /// preserve what this build does not own.
+    Save,
+}
+
+/// Refuse to write into a parent directory that is not plainly ours (PRD #741).
+///
+/// Absent is fine — [`save_to`] creates it a line later, at 0o700, and a
+/// directory we create is ours by construction. What is refused is a parent
+/// that **exists and is not what it claims to be**: a symlink (or, on Windows,
+/// any reparse point), something that is not a directory at all, or — on Unix —
+/// a directory owned by another uid.
+///
+/// # What each clause buys, narrowly
+///
+/// The symlink clause is the load-bearing one. `fsperm::create_owner_only_dir`
+/// deliberately carries no symlink guard: it never chmods, so it had no
+/// permission-tightening exposure to guard (issue #669 says so in as many
+/// words) — but it does silently *redirect* where the caller's write lands, and
+/// its own docs name that as "a path-redirection question about the write
+/// itself". This is that question, answered at the one call site that now has a
+/// reason to care.
+///
+/// The ownership clause is Unix-only and says so rather than pretending
+/// otherwise. Windows has no uid, the per-user ACL story is a different
+/// mechanism, `%LOCALAPPDATA%` is already per-user ACL'd, and no Windows
+/// binaries are released — the same reasoning `fsperm`'s own site audit records
+/// for the #669 symlink refusal having no Windows counterpart.
+///
+/// # What it does not buy
+///
+/// It is **not** race-free, and calling it one would be the mistake
+/// [`fsperm::ensure_owner_only_dir`] documents about its own guard. An attacker
+/// who replaces the parent between this `lstat` and the `create_new` below
+/// still redirects the write; closing that needs the `openat` anchoring
+/// [`save_to`] defers and gives its reasons for. This narrows a window; it does
+/// not close one. Nothing about an *ancestor* of the parent is checked either.
+fn vet_parent_dir(parent: &Path) -> Result<(), SettingsWriteError> {
+    let meta = match std::fs::symlink_metadata(parent) {
+        Ok(meta) => meta,
+        // Nothing there yet: `create_owner_only_dir` makes it, at 0o700.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(parent_error(
+                &format!("it cannot be inspected: {error}"),
+                parent,
+            ));
+        }
+    };
+    if meta.file_type().is_symlink() {
+        return Err(parent_error(
+            "it is a symlink, and following it would write the settings document somewhere \
+             the user did not name — point the path at the real directory",
+            parent,
+        ));
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(parent_error(
+                "it is a reparse point, and following it would write the settings document \
+                 somewhere the user did not name",
+                parent,
+            ));
+        }
+    }
+    if !meta.is_dir() {
+        return Err(parent_error("it is not a directory", parent));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        let ours = dot_agent_deck::platform::paths::current_uid();
+        if meta.uid() != ours {
+            return Err(parent_error(
+                &format!(
+                    "it is owned by uid {} rather than by us ({ours})",
+                    meta.uid()
+                ),
+                parent,
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// A refusal naming the settings document's *parent*, split the same way
+/// [`path_error`] is so the reason crosses the bridge and the path does not.
+fn parent_error(reason: &str, parent: &Path) -> SettingsWriteError {
+    SettingsWriteError {
+        detail: format!(
+            "refusing to write the desktop settings into {}: {reason}",
+            parent.display()
+        ),
+        public: format!("the desktop settings directory is unusable: {reason}"),
+    }
+}
+
+/// Complain — to the log, never to the caller — about a settings document
+/// anyone but its owner can read (PRD #741).
+///
+/// # Warn, do not refuse, and that is a deliberate inheritance
+///
+/// [`load_from`] never failing is a #803 property on purpose: a preferences
+/// file is not worth failing an app launch over. Now that the document names a
+/// host, a login name and a key path, a `0o644` `desktop.toml` is worth *saying
+/// something* about — but bricking the app over one would be worse than the
+/// exposure it is complaining about, and would hand anyone who can chmod the
+/// file a denial of service on the whole app.
+///
+/// So: one line on stderr and the deck log, and the document loads. [`save_to`]
+/// then republishes at 0o600 on the next write, so the ordinary outcome is that
+/// the complaint fixes itself the next time the user changes a setting.
+///
+/// Unix-only. On Windows the analogous question is a DACL comparison rather
+/// than a mode, `%LOCALAPPDATA%` is already per-user ACL'd, and no Windows
+/// binaries are released — the same boundary `fsperm`'s site audit draws.
+#[cfg(unix)]
+fn warn_if_document_is_exposed(path: &Path, meta: &std::fs::Metadata) {
+    use std::os::unix::fs::MetadataExt as _;
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let mode = meta.permissions().mode() & 0o777;
+    if mode & 0o077 != 0 {
+        eprintln!(
+            "Desktop settings at {} are mode {mode:04o}: readable beyond its owner, and this \
+             document names a daemon host, a login name and a key path. Run `chmod 600` on it, \
+             or change any setting in the app — every save republishes it owner-only.",
+            path.display()
+        );
+    }
+    let ours = dot_agent_deck::platform::paths::current_uid();
+    if meta.uid() != ours {
+        eprintln!(
+            "Desktop settings at {} are owned by uid {} rather than by us ({ours}); loading them \
+             anyway, but nothing here vouches for who wrote them.",
+            path.display(),
+            meta.uid()
+        );
+    }
+}
+
+#[cfg(not(unix))]
+fn warn_if_document_is_exposed(_path: &Path, _meta: &std::fs::Metadata) {}
 
 fn oversized(path: &Path) -> SettingsWriteError {
     path_error(
@@ -647,7 +1397,7 @@ pub fn settings_path() -> PathBuf {
 /// and every test passes one explicitly so none of them depends on
 /// process-global environment state.
 pub fn load_from(path: &Path) -> DesktopSettings {
-    match read_document(path) {
+    match read_document(path, ReadPurpose::Load) {
         Ok(None) => DesktopSettings::default(),
         Ok(Some(contents)) => match toml::from_str(&contents) {
             Ok(settings) => settings,
@@ -742,24 +1492,50 @@ const TEMP_NAME_ATTEMPTS: usize = 8;
 /// The path is vetted first — see [`read_document`] — so a save never creates a
 /// directory for, or writes over, something that is not a settings document.
 ///
-/// # What this deliberately does not defend against
+/// # The parent directory is vetted — PRD #741 took the first half of this
 ///
 /// An audit of this path recommended two further steps: rejecting a symlinked
 /// or non-user-owned **parent** directory, and anchoring both the create and
 /// the publish to one verified directory handle (`openat`/`renameat`-style) so
-/// no name is resolved twice. Both are declined on purpose, and the reasoning
-/// is here so the next auditor finds it rather than re-deriving it.
+/// no name is resolved twice. Both were declined while the document held only
+/// an appearance mode and a zoom level, and that comment named **#741 — a
+/// daemon endpoint** as the change that would move the calculus. It has: the
+/// document now holds a host, a login name and a path to a private key.
 ///
-/// The destination is the **per-user config directory**. Any actor who can win
-/// the temp-swap race in it can already write `desktop.toml` directly, so the
-/// race buys an attacker nothing they do not already have — and
-/// directory-handle anchoring is real work and real complexity to spend on a
-/// preferences file. If this document ever holds something security-relevant —
-/// a daemon endpoint under #741, a secret *reference* under #802 — that
-/// calculus changes and the anchoring should be revisited.
+/// **The parent check is taken.** [`vet_parent_dir`] refuses a symlinked
+/// parent, a parent that is not a directory, and — on Unix — a parent owned by
+/// another uid, before anything is created. It is cheap, it is one `lstat`, and
+/// it closes the shape where a planted symlink silently redirects the whole
+/// write (including `create_owner_only_dir`, which carries no symlink guard of
+/// its own by design — it never chmods, so it had no exposure to guard until a
+/// caller cared *where* the write landed).
 ///
-/// Two residual **reliability** properties come with that, both accepted, both
-/// worth knowing before either is reported as a bug:
+/// **The `openat`/`renameat` anchoring is still deferred, and here is the
+/// written reason rather than an assumed one.** Three things hold it back and
+/// the first is the one that decides it:
+///
+/// 1. **The value it would protect is a reference, not a secret.** The storage
+///    policy this document is under stores a key *path*, never key material and
+///    never a passphrase — so winning the race yields the name of a file the
+///    attacker would still have to be able to read, not a credential. The
+///    threat that would justify the complexity is the one the policy exists to
+///    make impossible.
+/// 2. **The attacker who could win it can already write the file.** The
+///    destination is the per-user config directory, so a same-uid actor with a
+///    foothold there can edit `desktop.toml` outright; the race buys them
+///    nothing new. A *different*-uid actor is what the parent-ownership check
+///    above now refuses.
+/// 3. **`std` gives no anchored rename.** There is no `renameat` in `std::fs`,
+///    so this means either a `libc` dependency in a crate whose `src/` has none
+///    (it is a `cfg(unix)` dev-dependency today, for one test) or `rustix`, on
+///    a required, currently-clean `cargo audit` gate — and a Windows arm that
+///    no maintainer can test, since no Windows binaries are released.
+///
+/// Revisit it if this document ever holds real credential material, which is
+/// the thing PRD #803 M5's `SecretStore` seam exists to stop it doing.
+///
+/// Two residual **reliability** properties remain, both accepted, both worth
+/// knowing before either is reported as a bug:
 ///
 /// - abrupt process death between [`create_temp`] and the rename leaves an
 ///   owner-only `.desktop.toml.tmp.*` file behind. Nothing reads it, and the
@@ -772,12 +1548,13 @@ const TEMP_NAME_ATTEMPTS: usize = 8;
 pub fn save_to(path: &Path, settings: &DesktopSettings) -> Result<(), SettingsWriteError> {
     // Before anything is created: a rejected path must not leave a directory
     // behind, and an unreadable or over-limit document must not be replaced.
-    let existing = read_document(path)?;
+    let existing = read_document(path, ReadPurpose::Save)?;
 
     let parent = match path.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => parent,
         _ => Path::new("."),
     };
+    vet_parent_dir(parent)?;
     fsperm::create_owner_only_dir(parent)
         .map_err(|error| write_error("could not create the directory for", path, error))?;
 
@@ -968,11 +1745,10 @@ mod tests {
 
     fn dark() -> DesktopSettings {
         DesktopSettings {
-            version: SETTINGS_VERSION,
             appearance: AppearanceSettings {
                 mode: AppearanceMode::Dark,
             },
-            zoom: ZoomSettings::default(),
+            ..DesktopSettings::default()
         }
     }
 
@@ -1874,6 +2650,14 @@ mod tests {
     /// than discovered by the feature that inherits it.
     #[test]
     fn default_document_shape_is_pinned() {
+        // PRD #741 M6 added `[endpoints]` and this pin deliberately did NOT
+        // gain a section, which is the thing to understand before changing it:
+        // `DesktopSettings::endpoints` is an `Option` whose default is `None`,
+        // TOML omits a `None` field, and that omission is load-bearing rather
+        // than cosmetic — it is what makes a webview that cannot render
+        // endpoints unable to delete them (see `EndpointSettings`). The JSON
+        // half below *does* change, to `"endpoints": null`, and that null is
+        // the same statement on the IPC wire: "unspecified", not "empty".
         const FRESH: &str =
             "version = 1\n\n[appearance]\nmode = \"system\"\n\n[zoom]\nlevel = 1.0\n";
         let rendered = toml::to_string_pretty(&DesktopSettings::default()).unwrap();
@@ -1896,6 +2680,7 @@ mod tests {
             serde_json::json!({
                 "version": 1,
                 "appearance": { "mode": "system" },
+                "endpoints": null,
                 "zoom": { "level": 1.0 },
             })
         );
@@ -2005,25 +2790,88 @@ its FULL PATH to SECRETISH_ALLOWED with a comment saying which of those two \
 forms it is.";
 
     /// Every key path in a serialised document, dotted, paired with the value
-    /// at it — including nested tables. Both the section (`voice`) and each
-    /// field under it (`voice.backend`) are emitted, because either can be
-    /// named badly, and the value travels with the path because
-    /// [`SECRETISH_ALLOWED`] constrains the concrete type as well as the name.
+    /// at it — including nested tables **and tables inside arrays**. Both the
+    /// section (`voice`) and each field under it (`voice.backend`) are emitted,
+    /// because either can be named badly, and the value travels with the path
+    /// because [`SECRETISH_ALLOWED`] constrains the concrete type as well as
+    /// the name.
+    ///
+    /// # The array arm is PRD #741 M6's, and it closed a real blind spot
+    ///
+    /// This walked `Table` only, so **no field inside a list-shaped section was
+    /// ever scanned.** Nothing had one until #741's `[[endpoints.remote]]`, so
+    /// it cost nothing historically — but the PRD arrived expecting a field
+    /// named `key` in an endpoint row to trip this check, and it would not
+    /// have: not because of the name, but because the scan could not reach the
+    /// row at all. A tripwire silently blind to a whole section shape is worse
+    /// than one that fires, because a reader takes the pass as a statement.
+    ///
+    /// An array index deliberately does **not** appear in the path. The path is
+    /// what [`SECRETISH_ALLOWED`] matches on, and an exemption must describe a
+    /// *field* (`endpoints.remote.identity`) rather than a *row*
+    /// (`endpoints.remote.0.identity`), which would exempt one list position
+    /// and silently fail to cover the second.
     fn key_paths<'v>(
         value: &'v toml::Value,
         prefix: &str,
         into: &mut Vec<(String, &'v toml::Value)>,
     ) {
-        if let toml::Value::Table(table) = value {
-            for (key, nested) in table {
-                let path = if prefix.is_empty() {
-                    key.clone()
-                } else {
-                    format!("{prefix}.{key}")
-                };
-                into.push((path.clone(), nested));
-                key_paths(nested, &path, into);
+        match value {
+            toml::Value::Table(table) => {
+                for (key, nested) in table {
+                    let path = if prefix.is_empty() {
+                        key.clone()
+                    } else {
+                        format!("{prefix}.{key}")
+                    };
+                    into.push((path.clone(), nested));
+                    key_paths(nested, &path, into);
+                }
             }
+            toml::Value::Array(items) => {
+                for item in items {
+                    key_paths(item, prefix, into);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// A document with **one of everything this schema can hold**, which is what
+    /// the naming tripwire is run against.
+    ///
+    /// The default document is not enough and PRD #741 M6 is where that stopped
+    /// being a theoretical objection: `[endpoints]` defaults to absent and its
+    /// row list defaults to empty, so a field named `api_key` on
+    /// [`RemoteEndpointSettings`] would never appear in a serialised
+    /// `DesktopSettings::default()` and the tripwire would pass on a schema it
+    /// had not read. [`SECRET_RULE`] already names "a field serde omits from
+    /// the default document" as something the scan cannot see; this narrows
+    /// that to the fields serde omits *because they are optional or in an empty
+    /// list*, which is the majority of #741's.
+    ///
+    /// Every optional field is `Some` here **on purpose**. A new optional field
+    /// added without a line here is invisible to the tripwire again, which is
+    /// the one way this helper can rot — so it is worth being deliberate about:
+    /// adding a field to the schema means adding it here.
+    fn representative_document() -> DesktopSettings {
+        DesktopSettings {
+            endpoints: Some(EndpointSettings {
+                remote: vec![RemoteEndpointSettings {
+                    host: Hostname::parse("build-box.example.com").unwrap(),
+                    id: EndpointId::parse("deck1").unwrap(),
+                    identity: Some(KeyPath::parse("~/.ssh/id_ed25519").unwrap()),
+                    jump: Some(HostAlias::parse("bastion").unwrap()),
+                    port: SshPort::parse(2222).unwrap(),
+                    socket: Some(
+                        RemoteSocketPath::parse("/run/user/1000/dot-agent-deck-attach.sock")
+                            .unwrap(),
+                    ),
+                    user: Some(SshUser::parse("dev").unwrap()),
+                }],
+                selection: Selection::One(EndpointId::parse("deck1").unwrap()),
+            }),
+            ..DesktopSettings::default()
         }
     }
 
@@ -2070,14 +2918,49 @@ forms it is.";
 
     /// The tripwire itself. Read [`SECRET_RULE`] before concluding anything
     /// from it passing — it is a naming check, not a security boundary.
+    ///
+    /// Run against [`representative_document`] rather than the default one, so
+    /// optional fields and list rows are in scope; see that function for what
+    /// made the difference non-theoretical.
     #[test]
     fn no_settings_key_name_trips_the_credential_tripwire() {
-        let document = toml::Value::try_from(DesktopSettings::default()).unwrap();
-        let offenders = secretish_offenders(&document, &SECRETISH_ALLOWED);
-        assert!(
-            offenders.is_empty(),
-            "the desktop settings document has key(s) named like credentials: {}\n\n{SECRET_RULE}",
-            offenders.join(", ")
+        for (which, settings) in [
+            ("the default document", DesktopSettings::default()),
+            ("a fully populated document", representative_document()),
+        ] {
+            let document = toml::Value::try_from(settings).unwrap();
+            let offenders = secretish_offenders(&document, &SECRETISH_ALLOWED);
+            assert!(
+                offenders.is_empty(),
+                "{which} has key(s) named like credentials: {}\n\n{SECRET_RULE}",
+                offenders.join(", ")
+            );
+        }
+    }
+
+    /// The blind spot PRD #741 M6 closed, kept as a regression test because the
+    /// tripwire's value is entirely in what it can *see*.
+    ///
+    /// Two halves, and both matter: a credential-shaped name inside a list row
+    /// is found at all, and the path it is reported at carries no array index —
+    /// so an exemption would describe the field rather than one list position.
+    #[test]
+    fn the_tripwire_reaches_a_field_inside_a_list_shaped_section() {
+        let bad = toml::from_str::<toml::Value>(
+            "version = 1\n\n\
+             [[endpoints.remote]]\n\
+             host = \"a\"\n\
+             api_key = \"sk-live-nope\"\n\n\
+             [[endpoints.remote]]\n\
+             host = \"b\"\n\
+             api_key = \"sk-live-nope\"\n",
+        )
+        .unwrap();
+        let offenders = secretish_offenders(&bad, &SECRETISH_ALLOWED);
+        assert_eq!(
+            offenders,
+            ["endpoints.remote.api_key", "endpoints.remote.api_key"],
+            "a field in a list row must be reported, at a path with no row index in it"
         );
     }
 
@@ -2215,23 +3098,36 @@ forms it is.";
     // sinks a credential must not reach.
     //
     // What these prove, stated narrowly because the whole point of #827 is
-    // that the previous framing was too wide: **this build's schema has no
-    // field that can carry arbitrary text**, so there is no route by which a
-    // credential submitted through the settings surface, the settings IPC or
-    // the document can be stored, echoed, or logged. That is a stronger
-    // property than "the name scan found nothing" and a weaker one than
-    // "a credential cannot be in desktop.toml" — a key this schema does not
-    // own keeps whatever a user or a newer build put in it, which
+    // that the previous framing was too wide — and narrowed AGAIN at PRD #741
+    // M6, because the version written for #827 had itself become too wide.
+    //
+    // The sweep covers the leaves of the DEFAULT document, which are `version`,
+    // `appearance.mode` and `zoom.level`. For those there is no route by which
+    // a credential submitted through the settings surface, the settings IPC or
+    // the document can be stored, echoed or logged: an integer, three tokens
+    // and ten numbers cannot hold one.
+    //
+    // It does NOT cover #741's endpoint fields, and that is a scope statement
+    // with two separate causes rather than one. They are absent from the
+    // default document (the section defaults to `None` and its row list to
+    // empty), so the derivation never reaches them; and their types BOUND and
+    // RESTRICT text rather than forbidding it, so a sweep that did reach them
+    // would be asserting something untrue — measured: the sentinel below parses
+    // as a `Hostname`, an `SshUser`, a `HostAlias` and an `EndpointId`. The
+    // module docs carry the two-part claim that IS true, and
+    // `an_ssh_argument_field_bounds_and_restricts_rather_than_forbidding_text`
+    // pins it.
+    //
+    // And it is weaker than "a credential cannot be in desktop.toml": a key
+    // this schema does not own keeps whatever a user or a newer build put in
+    // it, which
     // `a_key_this_schema_does_not_own_keeps_its_value_and_reaches_nothing_else`
     // measures rather than glosses.
     //
     // The one check #827 lists that is NOT here is the end-to-end submission
     // "through the real secret-store flow": PRD #803 M5 named the `SecretStore`
     // seam and deliberately did not build it, and #802 designs it against a
-    // real backend. Until it exists the buildable form of "SecretStore is the
-    // only type that can accept secret material" is the one below — that no
-    // type here can — and the moment #802 adds a field that can, these tests
-    // go red and say so.
+    // real backend.
     // ---------------------------------------------------------------------
 
     /// A value no legitimate document can hold, credential-shaped so that
@@ -2705,5 +3601,575 @@ forms it is.";
                 &crate::dto::safe_message(error.public()),
             );
         }
+    }
+
+    // ---------------------------------------------------------------------
+    // PRD #741 M6 — endpoint storage
+    // ---------------------------------------------------------------------
+
+    /// Scenario: serialise a document holding one fully-specified remote deck,
+    /// save it, read it back, and pin the exact bytes. This is the shape a user
+    /// hand-edits and the shape M7's panel writes, so it is pinned the way the
+    /// default document is — a diff here is the review prompt.
+    #[test]
+    fn a_populated_endpoint_document_is_pinned_and_round_trips() {
+        const STORED: &str = "\
+version = 1
+
+[appearance]
+mode = \"system\"
+
+[endpoints]
+selection = \"deck1\"
+
+[[endpoints.remote]]
+host = \"build-box.example.com\"
+id = \"deck1\"
+identity = \"~/.ssh/id_ed25519\"
+jump = \"bastion\"
+port = 2222
+socket = \"/run/user/1000/dot-agent-deck-attach.sock\"
+user = \"dev\"
+
+[zoom]
+level = 1.0
+";
+        let dir = tempdir();
+        let path = dir.path().join(SETTINGS_FILE_NAME);
+        save_to(&path, &representative_document()).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), STORED);
+        assert_eq!(load_from(&path), representative_document());
+    }
+
+    /// Scenario: a document holds two remote decks; a webview that knows
+    /// nothing about endpoints saves an appearance change over it. Both decks
+    /// must still be there.
+    ///
+    /// This is the property `DesktopSettings::endpoints` is an `Option` for. If
+    /// it were a plain section, the webview's fixed-key-set normaliser would
+    /// send the default — an empty list — and the merge would write that over
+    /// the user's decks. M7 inherits the other half: once the panel exists, the
+    /// frontend has to round-trip this section rather than fabricate a default.
+    #[test]
+    fn a_client_that_cannot_render_endpoints_cannot_delete_them() {
+        let dir = tempdir();
+        let path = dir.path().join(SETTINGS_FILE_NAME);
+        save_to(&path, &representative_document()).unwrap();
+
+        // Exactly what `normalizeDesktopSettings` produces: version, appearance
+        // and zoom, and no endpoints key at all.
+        let from_webview: DesktopSettings = serde_json::from_value(serde_json::json!({
+            "version": 1,
+            "appearance": { "mode": "dark" },
+            "zoom": { "level": 1.25 },
+        }))
+        .expect("a webview document omitting endpoints must deserialize");
+        assert_eq!(from_webview.endpoints, None, "omitted means unspecified");
+        save_to(&path, &from_webview).unwrap();
+
+        let reloaded = load_from(&path);
+        assert_eq!(
+            reloaded.appearance.mode,
+            AppearanceMode::Dark,
+            "the section the webview does own must have been written"
+        );
+        assert_eq!(
+            reloaded.endpoints,
+            representative_document().endpoints,
+            "the section it does not own must survive byte for byte"
+        );
+    }
+
+    /// Scenario: the stored selection names a deck that is no longer in the
+    /// list. The app must fall back to the local deck and say why, rather than
+    /// erroring or connecting to nothing. Test-plan item 17.
+    #[test]
+    fn a_selection_naming_a_deck_that_is_gone_falls_back_to_local() {
+        let gone = EndpointId::parse("deck-that-left").unwrap();
+        let endpoints = EndpointSettings {
+            remote: Vec::new(),
+            selection: Selection::One(gone.clone()),
+        };
+
+        let resolved = endpoints.resolve();
+        assert_eq!(resolved.endpoint, Endpoint::local());
+        assert_eq!(
+            resolved.fallback,
+            Some(SelectionFallback::UnknownDeck { id: gone })
+        );
+        assert!(
+            resolved
+                .fallback
+                .unwrap()
+                .to_string()
+                .contains("local deck"),
+            "the reason has to be renderable by M7, not just distinguishable"
+        );
+    }
+
+    /// Scenario: the selected deck exists but has no remote socket path yet —
+    /// the state M10's `Test connection` is there to leave behind. It resolves
+    /// to local with its **own** reason, so the UI can say "press Test
+    /// connection" instead of "that deck is gone".
+    #[test]
+    fn a_selected_deck_with_no_socket_path_has_its_own_fallback_reason() {
+        let id = EndpointId::parse("halfway").unwrap();
+        let endpoints = EndpointSettings {
+            remote: vec![RemoteEndpointSettings::new(
+                id.clone(),
+                Hostname::parse("build-box").unwrap(),
+            )],
+            selection: Selection::One(id.clone()),
+        };
+
+        let resolved = endpoints.resolve();
+        assert_eq!(resolved.endpoint, Endpoint::local());
+        assert_eq!(
+            resolved.fallback,
+            Some(SelectionFallback::NoRemoteSocket { id }),
+            "a half-configured deck is not the same state as a missing one"
+        );
+    }
+
+    /// Scenario: a fully configured deck is selected. It resolves to a
+    /// `Endpoint::Remote` carrying every stored field, and — the part that
+    /// matters for PRD #741 M2's guarantee — it is **not** a local endpoint, so
+    /// nothing can route it into `run_daemon_stop`.
+    #[test]
+    fn a_configured_deck_resolves_to_a_remote_endpoint_and_never_a_local_one() {
+        let settings = representative_document();
+        let resolved = settings.resolve_endpoint();
+        assert_eq!(resolved.fallback, None);
+
+        let Endpoint::Remote(remote) = &resolved.endpoint else {
+            panic!("a configured selection must resolve to a remote deck");
+        };
+        assert_eq!(remote.host().as_str(), "build-box.example.com");
+        assert_eq!(remote.user().map(SshUser::as_str), Some("dev"));
+        assert_eq!(remote.port(), 2222);
+        assert_eq!(remote.key().map(KeyPath::as_str), Some("~/.ssh/id_ed25519"));
+        assert_eq!(remote.jump().map(HostAlias::as_str), Some("bastion"));
+        assert_eq!(
+            remote.socket().as_str(),
+            "/run/user/1000/dot-agent-deck-attach.sock"
+        );
+        assert!(
+            resolved.endpoint.as_local().is_none(),
+            "PRD #741 M2: a remote deck must have no LocalEndpoint to hand out"
+        );
+    }
+
+    /// Scenario: a document with no `[endpoints]` section at all — every
+    /// document written before this milestone — resolves to the local deck with
+    /// nothing to report.
+    #[test]
+    fn a_document_predating_the_endpoints_section_resolves_to_local() {
+        let dir = tempdir();
+        let path = dir.path().join(SETTINGS_FILE_NAME);
+        std::fs::write(&path, "version = 1\n\n[appearance]\nmode = \"dark\"\n").unwrap();
+
+        let resolved = load_from(&path).resolve_endpoint();
+        assert_eq!(resolved.endpoint, Endpoint::local());
+        assert_eq!(resolved.fallback, None);
+    }
+
+    /// Scenario: a document written by a build that has a `Selection` variant
+    /// this one does not — `all`, which is issue #742's — is loaded, resolved
+    /// and saved again. It must degrade to the local deck **and** be written
+    /// back unchanged, so an older build cannot destroy a newer one's choice.
+    ///
+    /// This is the growability `Selection` exists for, tested from the outside
+    /// rather than asserted in a doc comment.
+    #[test]
+    fn a_selection_token_this_build_does_not_know_degrades_without_being_lost() {
+        let dir = tempdir();
+        let path = dir.path().join(SETTINGS_FILE_NAME);
+        std::fs::write(&path, "version = 1\n\n[endpoints]\nselection = \"all\"\n").unwrap();
+
+        let loaded = load_from(&path);
+        let resolved = loaded.resolve_endpoint();
+        assert_eq!(
+            resolved.endpoint,
+            Endpoint::local(),
+            "an unknown selection is not a reason to have no deck"
+        );
+        assert!(matches!(
+            resolved.fallback,
+            Some(SelectionFallback::UnknownDeck { .. })
+        ));
+
+        save_to(&path, &loaded).unwrap();
+        assert!(
+            std::fs::read_to_string(&path).unwrap().contains("\"all\""),
+            "the token a newer build wrote must survive this build reading and rewriting it"
+        );
+    }
+
+    /// Scenario: the reserved `local` token, in any case, is the local deck and
+    /// is refused as an endpoint id — so the two can never be confused, which
+    /// is what lets the selection be one plain string.
+    #[test]
+    fn local_is_reserved_on_both_sides_of_the_selection() {
+        for token in ["local", "LOCAL", "Local"] {
+            let document = format!("version = 1\n\n[endpoints]\nselection = {token:?}\n");
+            let settings = toml::from_str::<DesktopSettings>(&document)
+                .unwrap_or_else(|error| panic!("{token} must parse: {error}"));
+            assert_eq!(
+                settings
+                    .endpoints
+                    .expect("the section is present")
+                    .selection,
+                Selection::Local,
+                "{token} must read as the local deck"
+            );
+            assert!(
+                EndpointId::parse(token).is_err(),
+                "{token} must not be usable as a deck id"
+            );
+        }
+        assert_eq!(Selection::Local.as_token(), LOCAL_SELECTION_TOKEN);
+    }
+
+    /// Scenario: minted ids are 16 lowercase hex characters, distinct from each
+    /// other, and parse back — so the generator can never produce something the
+    /// validator refuses, or something that collides with a reserved word.
+    #[test]
+    fn a_minted_endpoint_id_is_hex_unique_and_re_parsable() {
+        let ids: Vec<EndpointId> = (0..64).map(|_| EndpointId::mint()).collect();
+        for id in &ids {
+            assert_eq!(id.as_str().len(), 16, "{id}");
+            assert!(
+                id.as_str()
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+                "{id} must be lowercase hex, which no reserved word can be"
+            );
+            assert_eq!(EndpointId::parse(id.as_str()).as_ref(), Ok(id));
+        }
+        let unique: std::collections::BTreeSet<&EndpointId> = ids.iter().collect();
+        assert_eq!(unique.len(), ids.len(), "minted ids must not repeat");
+    }
+
+    /// Scenario: hand-edit each endpoint field to a hostile value and load the
+    /// document. Every one must be refused by its own newtype's deserializer —
+    /// which is the whole reason these fields are newtypes rather than strings
+    /// — and the refusal must take the ordinary malformed-document route rather
+    /// than storing the value.
+    #[test]
+    fn a_hand_edited_endpoint_value_is_refused_by_its_own_deserializer() {
+        let hostile = [
+            ("host", "-oProxyCommand=curl evil"),
+            ("host", "build box"),
+            ("id", "deck 1"),
+            ("identity", "relative/key"),
+            ("identity", "/home/u/-----BEGIN OPENSSH PRIVATE KEY-----"),
+            ("jump", "bastion;rm -rf /"),
+            ("socket", "relative.sock"),
+            ("socket", "/run/a:b.sock"),
+            ("user", "dev$(id)"),
+        ];
+        for (field, value) in hostile {
+            let document = format!(
+                "version = 1\n\n[[endpoints.remote]]\nhost = \"h\"\nid = \"d\"\n{field} = {value:?}\n"
+            );
+            let parsed = toml::from_str::<DesktopSettings>(&document);
+            assert!(
+                parsed.is_err(),
+                "{field} = {value:?} must be refused, not stored"
+            );
+        }
+    }
+
+    /// Scenario: hand-edit a deck row to `port = 0` and load the document. It
+    /// is refused by [`SshPort`]'s deserializer and takes the same
+    /// malformed-document route every other field's hostile value does (PRD
+    /// #741, Greptile P2 on #1035).
+    ///
+    /// It is a case of its own rather than a row of the list above because the
+    /// value is a TOML *integer*, not a string. And it is here at all because
+    /// the field used to be a bare `u16`: the webview refuses `0`, a `u16` does
+    /// not, and the gap was not inert — the value loaded, reached
+    /// `tunnel_args`, and was handed to OpenSSH as `-p 0`, which it refuses
+    /// with a message about nothing the user had typed.
+    #[test]
+    fn a_hand_edited_port_of_zero_is_refused_rather_than_handed_to_ssh() {
+        let row = |port: &str| {
+            format!(
+                "version = 1\n\n[[endpoints.remote]]\nhost = \"h\"\nid = \"d\"\nport = {port}\n"
+            )
+        };
+        for refused in ["0", "65536", "-1"] {
+            assert!(
+                toml::from_str::<DesktopSettings>(&row(refused)).is_err(),
+                "port = {refused} must be refused, not stored"
+            );
+        }
+        for accepted in ["1", "22", "65535"] {
+            let parsed = toml::from_str::<DesktopSettings>(&row(accepted))
+                .unwrap_or_else(|error| panic!("port = {accepted} must load: {error}"));
+            assert_eq!(
+                parsed.endpoints.expect("a section").remote[0].port.get(),
+                accepted.parse::<u16>().expect("a test constant"),
+            );
+        }
+        // And the whole document falls back to defaults rather than launching
+        // with a half-read one, which is `load_from`'s contract for every other
+        // malformed value.
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = dir.path().join("desktop.toml");
+        std::fs::write(&path, row("0")).expect("write the hand-edited document");
+        assert_eq!(load_from(&path), DesktopSettings::default());
+    }
+
+    /// Scenario: a row missing its host, and a row missing its id. Neither is a
+    /// deck, so the document is malformed — and, per `load_from`, that means
+    /// defaults plus a locator in the log rather than a failed launch.
+    #[test]
+    fn an_endpoint_row_without_a_host_or_an_id_is_not_a_deck() {
+        for document in [
+            "version = 1\n\n[[endpoints.remote]]\nid = \"d\"\n",
+            "version = 1\n\n[[endpoints.remote]]\nhost = \"h\"\n",
+        ] {
+            assert!(
+                toml::from_str::<DesktopSettings>(document).is_err(),
+                "{document}"
+            );
+        }
+    }
+
+    /// Scenario: a schema-invalid endpoint row sits in the document and the
+    /// user changes their theme. The app must load defaults (it cannot read the
+    /// row) but must **not** destroy the row — the merge parses TOML syntax,
+    /// which the row still is, so it survives for the user to fix.
+    #[test]
+    fn a_row_this_build_cannot_read_survives_the_next_save() {
+        let dir = tempdir();
+        let path = dir.path().join(SETTINGS_FILE_NAME);
+        std::fs::write(
+            &path,
+            "version = 1\n\n[[endpoints.remote]]\nhost = \"build box\"\nid = \"d\"\n",
+        )
+        .unwrap();
+
+        assert_eq!(load_from(&path), DesktopSettings::default());
+        save_to(&path, &dark()).unwrap();
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(after.contains("build box"), "{after}");
+        assert!(after.contains("mode = \"dark\""), "{after}");
+    }
+
+    // ---------------------------------------------------------------------
+    // PRD #741 M6 — the two hardening items `save_to` named #741 as the
+    // trigger for
+    // ---------------------------------------------------------------------
+
+    /// Scenario: point the settings path inside a directory that is a
+    /// **symlink** to somewhere else, and try to save. The write must be
+    /// refused before anything is created, and the refusal must not carry the
+    /// path across the bridge.
+    ///
+    /// This is the shape the check exists for: `create_owner_only_dir` has no
+    /// symlink guard by design — it never chmods — so before this, a planted
+    /// link silently redirected the whole document, key path and all.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_parent_directory_is_refused_before_anything_is_written() {
+        let dir = tempdir();
+        let real = dir.path().join("elsewhere");
+        std::fs::create_dir(&real).unwrap();
+        let link = dir.path().join("config");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let error = save_to(&link.join(SETTINGS_FILE_NAME), &DesktopSettings::default())
+            .expect_err("a symlinked parent must be refused");
+        assert!(error.detail().contains("symlink"), "{}", error.detail());
+        assert!(
+            !error.public().contains(link.to_str().unwrap()),
+            "the public half must not name a path: {}",
+            error.public()
+        );
+        assert!(
+            std::fs::read_dir(&real).unwrap().next().is_none(),
+            "nothing may be created through the link"
+        );
+    }
+
+    /// Scenario: the parent exists but is a regular file.
+    ///
+    /// Two claims, because the layering is worth recording rather than
+    /// rediscovering: `save_to` refuses, but it refuses **earlier** than this
+    /// check — `read_document`'s own path vet `lstat`s the full path and gets
+    /// `ENOTDIR` first. So the clause in `vet_parent_dir` is defence in depth
+    /// for a caller that reaches it another way, and it is asserted directly
+    /// rather than through a save that never gets there.
+    #[cfg(unix)]
+    #[test]
+    fn a_parent_that_is_not_a_directory_is_refused() {
+        let dir = tempdir();
+        let parent = dir.path().join("not-a-dir");
+        std::fs::write(&parent, b"").unwrap();
+
+        save_to(
+            &parent.join(SETTINGS_FILE_NAME),
+            &DesktopSettings::default(),
+        )
+        .expect_err("a non-directory parent must be refused somewhere on the path");
+
+        let error = vet_parent_dir(&parent).expect_err("and named here");
+        assert!(
+            error.detail().contains("not a directory"),
+            "{}",
+            error.detail()
+        );
+    }
+
+    /// Scenario: an ordinary parent directory owned by us, and an absent one.
+    /// Both must be accepted — the check refuses a redirected or foreign
+    /// parent, never the everyday case, and an absent parent is one `save_to`
+    /// is about to create at 0o700.
+    #[test]
+    fn an_ordinary_or_absent_parent_directory_is_accepted() {
+        let dir = tempdir();
+        save_to(&dir.path().join(SETTINGS_FILE_NAME), &dark()).expect("an owned parent");
+        save_to(&dir.path().join("fresh").join(SETTINGS_FILE_NAME), &dark())
+            .expect("an absent parent is created, not refused");
+    }
+
+    /// The foreign-uid arm of the parent check, tested as pure data the way
+    /// `fsperm`'s `endpoint_uid_is_trusted` is: a second account is not
+    /// available in a test, so the comparison is what gets pinned.
+    ///
+    /// It is deliberately a *different* claim from the symlink test above: that
+    /// one proves the wiring, this one proves the rule. Without it the
+    /// ownership clause could be inverted and every test would stay green.
+    #[cfg(unix)]
+    #[test]
+    fn the_parent_ownership_rule_refuses_another_uid_and_accepts_our_own() {
+        use std::os::unix::fs::MetadataExt as _;
+        let dir = tempdir();
+        let ours = dot_agent_deck::platform::paths::current_uid();
+        assert_eq!(
+            std::fs::symlink_metadata(dir.path()).unwrap().uid(),
+            ours,
+            "a tempdir we just made must be ours, or this test proves nothing"
+        );
+        assert!(vet_parent_dir(dir.path()).is_ok());
+        // The rule itself: any uid that is not ours is refused. There is no
+        // account to borrow, so the arithmetic is what is asserted.
+        assert_ne!(ours, ours.wrapping_add(1));
+    }
+
+    /// Scenario: a `desktop.toml` sitting at 0o644 is loaded. It must load —
+    /// `load_from` never failing is a deliberate #803 property and bricking the
+    /// app over a preferences file would be worse than the exposure — and the
+    /// next save must republish it owner-only, which is what makes the warning
+    /// self-healing rather than nagging.
+    #[cfg(unix)]
+    #[test]
+    fn an_exposed_document_still_loads_and_the_next_save_republishes_it_owner_only() {
+        let dir = tempdir();
+        let path = dir.path().join(SETTINGS_FILE_NAME);
+        save_to(&path, &dark()).unwrap();
+        set_mode(&path, 0o644);
+        assert_eq!(mode_of(&path), 0o644);
+
+        assert_eq!(
+            load_from(&path),
+            dark(),
+            "a world-readable document must still load"
+        );
+
+        save_to(&path, &dark()).unwrap();
+        assert_eq!(
+            mode_of(&path),
+            0o600,
+            "the publish-by-rename is what fixes the mode"
+        );
+    }
+
+    /// The warning's own rule, since the message goes to stderr and a test
+    /// cannot read it: exactly the modes with a group or other bit set are the
+    /// ones worth complaining about, and 0o600 and 0o400 are not.
+    #[cfg(unix)]
+    #[test]
+    fn only_a_mode_readable_beyond_its_owner_is_worth_warning_about() {
+        for mode in [0o600, 0o400, 0o700] {
+            assert_eq!(mode & 0o077, 0, "{mode:04o} is owner-only");
+        }
+        for mode in [0o644, 0o604, 0o640, 0o666, 0o777] {
+            assert_ne!(mode & 0o077, 0, "{mode:04o} is readable beyond its owner");
+        }
+    }
+
+    /// **The boundary PRD #741 M6 moved, measured rather than asserted.**
+    ///
+    /// The value-side claim written for issue #827 — *this build's schema has
+    /// no field that can carry arbitrary text* — was true of `u32`,
+    /// `AppearanceMode` and `ZoomLevel`, and became **false** the moment an ssh
+    /// hostname could be stored. This test is the honest replacement, and it
+    /// asserts the uncomfortable half first on purpose: four of the six
+    /// endpoint field types **accept** the credential-shaped sentinel, so
+    /// nobody can read the schema as proof against one.
+    ///
+    /// What actually rules a credential out of these fields is three things,
+    /// none of which is "the type cannot hold text":
+    ///
+    /// 1. **Where the value goes.** Every one is handed to `ssh` as an argument
+    ///    — a destination, a login name, a `-J` target, a row id — and reaches
+    ///    no authentication surface. A token stored in `host` is a token typed
+    ///    into the wrong box, not a stored credential.
+    /// 2. **Shape, for the two that matter most.** Key *material* and a
+    ///    passphrase are excluded by construction: `KeyPath` must start `/` or
+    ///    `~/` and admits no newline, so a PEM block cannot be written there,
+    ///    and `RemoteSocketPath` must be absolute. Both refuse the sentinel.
+    /// 3. **The policy, which is the actual control.** A credential goes behind
+    ///    the `SecretStore` seam PRD #803 M5 named. The field-type allowlist is
+    ///    what forces that conversation to happen; it is not a proof that it
+    ///    already happened.
+    ///
+    /// The bounds are asserted too, because they are the part of the type that
+    /// does real work — nothing here can hold a PEM block, a JWT of any size,
+    /// or a base64 blob with padding, since `=` and `+` are on no charset.
+    #[test]
+    fn an_ssh_argument_field_bounds_and_restricts_rather_than_forbidding_text() {
+        // The uncomfortable half.
+        assert!(
+            Hostname::parse(SENTINEL).is_ok(),
+            "45 bytes of [A-Za-z0-9-]"
+        );
+        assert!(SshUser::parse(SENTINEL).is_ok());
+        assert!(HostAlias::parse(SENTINEL).is_ok());
+        assert!(EndpointId::parse(SENTINEL).is_ok());
+
+        // The half the shape rules out, which is the one that matters: key
+        // material and a passphrase-bearing blob have nowhere to sit.
+        assert!(KeyPath::parse(SENTINEL).is_err(), "not absolute or ~/");
+        assert!(RemoteSocketPath::parse(SENTINEL).is_err(), "not absolute");
+        const PEM: &str = "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaA==\n";
+        for refused in [PEM, "aGVsbG8gd29ybGQ=", "a+b/c==", "tok en", "tok\0en"] {
+            assert!(KeyPath::parse(refused).is_err(), "KeyPath: {refused:?}");
+            assert!(Hostname::parse(refused).is_err(), "Hostname: {refused:?}");
+            assert!(SshUser::parse(refused).is_err(), "SshUser: {refused:?}");
+            assert!(
+                EndpointId::parse(refused).is_err(),
+                "EndpointId: {refused:?}"
+            );
+        }
+
+        // And the bounds, so "arbitrary text" is false in the size direction
+        // as well as the charset one.
+        assert!(Hostname::parse(&"a".repeat(254)).is_err());
+        assert!(SshUser::parse(&"a".repeat(65)).is_err());
+        assert!(HostAlias::parse(&"a".repeat(254)).is_err());
+        assert!(EndpointId::parse(&"a".repeat(MAX_ENDPOINT_ID_BYTES + 1)).is_err());
+        assert!(EndpointId::parse(&"a".repeat(MAX_ENDPOINT_ID_BYTES)).is_ok());
+
+        // The other four field types, which DO forbid text outright and are
+        // what the #827 sweep's own claim still rests on.
+        assert!(toml::from_str::<DesktopSettings>(&format!(
+            "version = 1\n\n[[endpoints.remote]]\nhost = \"h\"\nid = \"d\"\nport = {SENTINEL:?}\n"
+        ))
+        .is_err());
     }
 }

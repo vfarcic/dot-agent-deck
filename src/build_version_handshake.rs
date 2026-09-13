@@ -47,7 +47,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use crate::build_id::local_build_id;
-use crate::daemon_client::{DaemonClient, issue_command};
+use crate::daemon_client::{DaemonClient, LocalEndpoint, issue_command};
 use crate::daemon_protocol::{
     AttachRequest, AttachResponse, PROTOCOL_VERSION, RunningAgentsSummary,
 };
@@ -153,8 +153,15 @@ impl std::error::Error for HandshakeError {}
 /// (wrong socket, wrong daemon binary) or the wire-format encoding of the
 /// `build_version` field.
 pub async fn ensure_compatible_daemon_or_die(
-    attach_path: &Path,
+    endpoint: &LocalEndpoint,
 ) -> Result<HandshakeOutcome, HandshakeError> {
+    // PRD #741 M2: a `&LocalEndpoint`, not a `&Path`, because the mismatch path
+    // below ends in `terminate_and_recover` — a `SO_PEERCRED` lookup followed by
+    // a SIGTERM. Over a forwarded socket that pid names the local `ssh` client,
+    // so this function would kill the tunnel and then lazy-spawn a *local*
+    // daemon in its place. `Endpoint::as_local()` is the only route to the type
+    // this takes, so a remote deck cannot reach it.
+    let attach_path = endpoint.path();
     // `local_build_id()` returns the compile-time `env!("DAD_BUILD_ID")`
     // in production; the `DOT_AGENT_DECK_BUILD_ID_OVERRIDE` env var
     // (test-only, honoured by both this comparison and
@@ -226,7 +233,7 @@ pub async fn ensure_compatible_daemon_or_die(
                 daemon_build = ?daemon_build,
                 "local daemon build_version handshake: mismatch, no agents — silent restart"
             );
-            return terminate_and_recover(&probe, attach_path).await;
+            return terminate_and_recover(&probe, endpoint).await;
         }
         MismatchAction::AgentsPresent { names } => names,
     };
@@ -269,7 +276,7 @@ pub async fn ensure_compatible_daemon_or_die(
         // it unchanged so the user's running agents stay reachable (PRD
         // #161 D4 never-strand). The caller must NOT re-spawn.
         InteractiveDecision::Decline => Ok(HandshakeOutcome::ProceedOnExisting),
-        InteractiveDecision::Restart => terminate_and_recover(&probe, attach_path).await,
+        InteractiveDecision::Restart => terminate_and_recover(&probe, endpoint).await,
     }
 }
 
@@ -338,7 +345,7 @@ fn decide_mismatch_action(
 /// and the consented restart (b).
 async fn terminate_and_recover(
     probe: &ProbeOutcome,
-    attach_path: &Path,
+    endpoint: &LocalEndpoint,
 ) -> Result<HandshakeOutcome, HandshakeError> {
     // PRD #103 PID-reuse mitigation: re-resolve `peer_pid()` on the SAME
     // `UnixStream` we kept open across the (possible) interactive prompt.
@@ -377,7 +384,7 @@ async fn terminate_and_recover(
     // outcome is the only success variant we care about here; treat both
     // Stopped and Killed (the latter is unreachable with `None`) as
     // Recovered.
-    terminate_daemon_graceful(resolved_pid, attach_path, TERMINATE_POLL_TIMEOUT, None).await?;
+    terminate_daemon_graceful(resolved_pid, endpoint, TERMINATE_POLL_TIMEOUT, None).await?;
     Ok(HandshakeOutcome::Recovered)
 }
 
@@ -473,10 +480,16 @@ pub enum TerminateOutcome {
 ///   front).
 pub async fn terminate_daemon_graceful(
     pid: u32,
-    attach_path: &Path,
+    endpoint: &LocalEndpoint,
     grace_timeout: Duration,
     force_kill_after: Option<Duration>,
 ) -> Result<TerminateOutcome, HandshakeError> {
+    // PRD #741 M2: `&LocalEndpoint` rather than `&Path`. `pid` reached this
+    // function from `peer_pid()` on a connected attach socket, which names a
+    // process on THIS machine — so both the address polled below and the pid
+    // terminated have to belong to the same local daemon, and the type is what
+    // keeps a remote deck's address out of the pairing.
+    let attach_path = endpoint.path();
     // TOCTOU residual risk: between `peer_pid()` (on the connected
     // attach socket) reading this PID and the SIGTERM below, the
     // daemon could exit and the kernel could recycle the PID for an
@@ -599,7 +612,14 @@ async fn poll_daemon_gone(attach_path: &Path, budget: Duration) -> bool {
         // Where the endpoint has no filesystem presence, the connect attempt below
         // is the only liveness signal (and it is the authoritative one on both
         // platforms).
-        if crate::platform::ipc::ENDPOINT_IS_FILESYSTEM_PATH && !attach_path.exists() {
+        // PRD #741 M3: three-valued now. `poll_daemon_gone` is reached only
+        // from the terminate path, which is `LocalEndpoint`-only by type since
+        // M2, so the presence is the local one — and for a remote deck the
+        // short-circuit would be wrong a third way, reading the tunnel's socket
+        // as the daemon's.
+        if crate::platform::ipc::LOCAL_ENDPOINT_PRESENCE.availability(attach_path)
+            == crate::platform::ipc::EndpointAvailability::Absent
+        {
             return true;
         }
         if IpcStream::connect(attach_path).await.is_err() {

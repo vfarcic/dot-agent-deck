@@ -11,6 +11,15 @@
 #
 # Usage: scripts/windows-cross-check.sh [extra cargo args…]
 #
+# `--examples` is load-bearing too, and it was missing. `build-windows` runs
+# `cargo nextest run --workspace`, and `cargo test --no-run` BUILDS examples, so
+# that job compiles `examples/*.rs` for Windows while this script did not. PRD
+# #741 paid for the gap: `examples/perf_baseline_probe.rs` calls
+# `tokio::net::UnixStream::connect`, which does not exist on Windows, and this
+# script reported clean while `build-windows` failed with E0433. It cost a CI
+# round trip precisely because rustc stops at the first error — the example's
+# break was invisible behind an unrelated E0425 until that one was fixed.
+#
 # `--workspace` is load-bearing, for the same reason it is on the clippy and
 # nextest gates (CLAUDE.md rules 2 and 5): cargo's default target selection is
 # the ROOT PACKAGE ALONE, so without it this script type-checks none of the
@@ -186,7 +195,7 @@ _cache_root="${XDG_CACHE_HOME:-${HOME:+$HOME/.cache}}"
 TARGET_DIR="${WINDOWS_CROSS_CHECK_TARGET_DIR:-${_cache_root:-${TMPDIR:-/tmp}}/dot-agent-deck/win-check}"
 mkdir -p "$TARGET_DIR"
 
-echo "==> cargo check --workspace --tests --target $TARGET (target-dir: $TARGET_DIR)"
+echo "==> cargo check --workspace --tests --examples --target $TARGET (target-dir: $TARGET_DIR)"
 # The compiler and archiver overrides are per-target and their names are
 # computed, so they go through `env` — bash only recognises a literal
 # `name=value` as an assignment prefix, and would try to *execute* an expanded
@@ -199,4 +208,4 @@ env \
     WINDOWS_CROSS_CHECK_EMPTY_OBJ="$EMPTY_OBJ" \
     RUSTC="$TOOLCHAIN/bin/rustc" \
     CARGO_TARGET_DIR="$TARGET_DIR" \
-    "$TOOLCHAIN/bin/cargo" check --workspace --tests --target "$TARGET" "$@"
+    "$TOOLCHAIN/bin/cargo" check --workspace --tests --examples --target "$TARGET" "$@"

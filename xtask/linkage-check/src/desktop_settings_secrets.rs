@@ -13,16 +13,26 @@
 //!
 //! 1. **Every field in the Rust settings schema has a type from a pinned
 //!    allowlist.** This is the boundary. It constrains the *types* a field may
-//!    have rather than its name: none of `u32`, `AppearanceMode` or `ZoomLevel`
-//!    can carry arbitrary text, so a credential has no field to sit in whatever
-//!    anybody calls it. It is also the check
-//!    that closes the "field serde omits" gap — an omitted field still has to
-//!    have an allowlisted type — and the one that will go red when PRD #802
-//!    adds a `String`, which is exactly the moment somebody has to route it
-//!    through the `SecretStore` seam instead. A serde attribute that hides a
-//!    field from the serialised document (`skip`, `flatten`) is refused for the
-//!    same reason: `settings.rs`'s sentinel sweep walks that document, so a
-//!    field missing from it is a field nothing follows a value through.
+//!    have rather than its name, and the strength of that varies by type — a
+//!    distinction PRD #741 M6 made load-bearing rather than pedantic. `u32`,
+//!    `u16`, `AppearanceMode`, `ZoomLevel` and `Selection` cannot carry
+//!    arbitrary text at all. The five ssh-argument newtypes #741 stores
+//!    (`Hostname`, `SshUser`, `KeyPath`, `HostAlias`, `RemoteSocketPath`) and
+//!    `EndpointId` **bound and charset-restrict** it, which is weaker: measured,
+//!    a 45-byte `sk-…`-shaped token parses as a `Hostname`. Each row on the
+//!    allowlist says which of the two it is; read them, because "it is on the
+//!    list" no longer means one single thing. What the list still does
+//!    unconditionally is force the conversation: a new type is a deliberate
+//!    edit with a written reason, and `String` is not on it.
+//!
+//!    It is also the check that closes the "field serde omits" gap — an omitted
+//!    field still has to have an allowlisted type — and the one that will go
+//!    red when PRD #802 adds a `String`, which is exactly the moment somebody
+//!    has to route it through the `SecretStore` seam instead. A serde attribute
+//!    that hides a field from the serialised document (`skip`, `flatten`) is
+//!    refused for the same reason: `settings.rs`'s sentinel sweep walks that
+//!    document, so a field missing from it is a field nothing follows a value
+//!    through.
 //! 2. **The TypeScript DTO's declared shape is pinned, field by field, with its
 //!    types.** The Rust tripwire cannot see `bridge.ts` at all, so a
 //!    frontend-only `apiKey` on `DesktopSettingsDto` was declared where
@@ -67,10 +77,18 @@
 //!
 //! **What none of this proves.** There is no `SecretStore` yet — PRD #803 M5
 //! named the seam and deliberately did not build it — so "a credential can
-//! only enter through `SecretStore`" is not assertable here. What is assertable
-//! is stronger while it holds and weaker in scope: *no route in exists at all*.
-//! When #802 builds the store, check 1 is what forces the credential to go
-//! through it.
+//! only enter through `SecretStore`" is not assertable here.
+//!
+//! What used to stand in for it was *no route in exists at all*, and **PRD #741
+//! M6 retired that claim rather than restating it.** It was true while every
+//! field was an integer, a three-token enum or a snapped float; it stopped
+//! being true when the schema gained a 253-byte hostname. A single-line token
+//! now has somewhere it would fit. What is assertable instead is narrower and
+//! still worth having: **nothing in this schema is free text** — every field is
+//! bounded and charset-restricted by a deserializer, no field can hold a PEM
+//! block or a padded base64 blob, and adding one that could means editing
+//! `ALLOWED_FIELD_TYPES` in a required gate. When #802 builds the store, check
+//! 1 is what forces the credential to go through it.
 //!
 //! **Fails closed**, like `desktop_palette`: every filesystem error fails the
 //! test rather than removing a file from the scan, and a symlink is refused
@@ -93,19 +111,42 @@ const BRIDGE_TS: &str = "desktop/src/lib/bridge.ts";
 /// The frontend tree the `localStorage` scan walks.
 const DESKTOP_SRC: &str = "desktop/src";
 
-/// A field type a settings struct may use, and why it cannot carry a
-/// credential.
+/// A field type a settings struct may use, and why a credential does not belong
+/// in it.
 ///
 /// **Read this list as the boundary, not as bookkeeping.** Adding an entry is
-/// the act of asserting that values of that type cannot hold arbitrary text —
-/// so `String`, `Option<String>`, `PathBuf`, `Vec<String>` and any map do not
-/// belong on it, whatever the field is called. If PRD #802 needs a credential,
-/// the answer is the `SecretStore` seam, not a row here.
-const ALLOWED_FIELD_TYPES: [(&str, FieldKind, &str); 5] = [
+/// the act of asserting, in writing, what values of that type can and cannot
+/// be — so `String`, `Option<String>`, `PathBuf`, `Vec<String>` and any map do
+/// not belong on it, whatever the field is called. If PRD #802 needs a
+/// credential, the answer is the `SecretStore` seam, not a row here.
+///
+/// **The entries are not all the same strength, and the reason column is where
+/// that is recorded.** Some say *no text is representable* (`u32`, `u16`,
+/// `AppearanceMode`, `ZoomLevel`, `Selection`). The ssh-argument newtypes and
+/// `EndpointId` say something weaker and true: *this charset and this bound*,
+/// plus what that makes unrepresentable. Do not summarise a row you have not
+/// read.
+///
+/// Entries name the **element** type, not the container: a field is resolved
+/// through [`allowlisted_as`] first, which strips one `Option<…>` or `Vec<…>`
+/// layer. That is why `Option<String>` and `Vec<String>` still have no way in —
+/// they resolve to `String`, which is absent — and why there is no row for each
+/// container shape.
+const ALLOWED_FIELD_TYPES: [(&str, FieldKind, &str); 15] = [
     (
         "u32",
         FieldKind::Scalar,
         "an integer; there is no text for a credential to be",
+    ),
+    (
+        "SshPort",
+        FieldKind::Scalar,
+        "an integer; there is no text for a credential to be. It is the ssh \
+         port, and the type is the bound — a newtype over NonZeroU16, so \
+         1..=65535 and nothing else is representable. It replaced a bare `u16` \
+         (PRD #741, Greptile P2 on #1035): that admitted 0, the webview's own \
+         predicate did not, and a hand-edited `port = 0` reached OpenSSH as \
+         `-p 0`",
     ),
     (
         "AppearanceMode",
@@ -123,10 +164,95 @@ const ALLOWED_FIELD_TYPES: [(&str, FieldKind, &str); 5] = [
         "a newtype over f64 whose deserializer snaps to ZOOM_LEVELS, so the \
          value this crate reads out and writes back is one of ten numbers",
     ),
+    // PRD #741 M5/M6: the remote-deck address. Five validating newtypes over
+    // `String`, defined in `src/remote_tunnel.rs`, each of whose `Deserialize`
+    // runs the same check its constructor does — so a hand-edited
+    // `desktop.toml` cannot smuggle past what a settings form applies. Read the
+    // reasons as narrow claims, because they are: each says what the charset
+    // and the bound make unrepresentable, not that the field is proof against
+    // every secret anyone could think of. What rules a credential out of these
+    // rows is that every one of them is *used* as an ssh argument — a token
+    // stored in any of them reaches no authentication surface — and PRD #802's
+    // `SecretStore` is still the answer if a credential ever genuinely needs
+    // storing.
+    (
+        "Hostname",
+        FieldKind::Scalar,
+        "a newtype over String whose deserializer bounds it at 253 bytes and \
+         accepts only ASCII alphanumerics, '.', '-', '_' and the bracketed-IPv6 \
+         punctuation, refusing whitespace, NUL, every control byte, every \
+         non-ASCII byte, a leading '-' and every shell metacharacter",
+    ),
+    (
+        "SshUser",
+        FieldKind::Scalar,
+        "a newtype over String bounded at 64 bytes and restricted to ASCII \
+         alphanumerics, '.', '-', '_' and '@' — too narrow for a PEM block, a \
+         base64 blob or anything carrying padding, and refusing the same \
+         universal bytes Hostname does",
+    ),
+    (
+        "KeyPath",
+        FieldKind::Scalar,
+        "a newtype over String holding a path to a private key, never key \
+         material: bounded at PATH_MAX, restricted to ASCII alphanumerics, \
+         '.', '-', '_', '/' and '~', required to start '/' or '~/', and \
+         refusing whitespace, control bytes, non-ASCII bytes and shell \
+         metacharacters — so a multi-line PEM block, the credential shape this \
+         field sits next to, cannot be represented. A single-line token would \
+         fit this charset; what rules it out is that the value is handed to \
+         `ssh -i` as a filename and reaches no authentication surface as text",
+    ),
+    (
+        "HostAlias",
+        FieldKind::Scalar,
+        "a newtype over String naming a Host block in the user's ~/.ssh/config, \
+         bounded at 253 bytes and restricted to ASCII alphanumerics, '.', '-' \
+         and '_' — the jump host's own address, port, user and key stay in that \
+         config rather than being copied here",
+    ),
+    (
+        "RemoteSocketPath",
+        FieldKind::Scalar,
+        "a newtype over String bounded at 104 bytes — the smaller of the two \
+         sun_path limits — restricted to ASCII alphanumerics, '.', '-', '_' and \
+         '/', and required to be absolute; ':' is refused because ssh parses \
+         its -L forward specification by splitting on it",
+    ),
+    // PRD #741 M6: the endpoint list's own identity and selection tokens.
+    (
+        "EndpointId",
+        FieldKind::Scalar,
+        "a newtype over String naming a row in this document, bounded at \
+         MAX_ENDPOINT_ID_BYTES (64) and restricted to ASCII alphanumerics, '-' \
+         and '_' by a deserializer that runs the constructor's own check. It is \
+         not a secret and nothing authenticates with it — it is minted locally \
+         and names a row in a file the user owns",
+    ),
+    (
+        "Selection",
+        FieldKind::Scalar,
+        "a closed enum serialised as one token: the reserved word 'local', or \
+         an EndpointId, which carries that type's charset and bound. There is \
+         no free-text arm — an unrecognised token becomes an EndpointId or the \
+         deserializer errors",
+    ),
     (
         "AppearanceSettings",
         FieldKind::Section,
         "a section struct, whose own fields this check walks",
+    ),
+    (
+        "EndpointSettings",
+        FieldKind::Section,
+        "a section struct, whose own fields this check walks",
+    ),
+    (
+        "RemoteEndpointSettings",
+        FieldKind::Section,
+        "a section struct — one stored remote deck — whose own fields this \
+         check walks. It appears as a Vec, which changes nothing: see \
+         `allowlisted_as`",
     ),
     (
         "ZoomSettings",
@@ -134,6 +260,42 @@ const ALLOWED_FIELD_TYPES: [(&str, FieldKind, &str); 5] = [
         "a section struct, whose own fields this check walks",
     ),
 ];
+
+/// The type an allowlist lookup is really performed on: one `Option<…>` or
+/// `Vec<…>` layer removed, and nothing else.
+///
+/// # Why unwrapping does not weaken the boundary
+///
+/// A container of `T` carries exactly the values `T` carries and no others, so
+/// `Option<KeyPath>` is as incapable of holding a credential as `KeyPath` is.
+/// Crucially the unwrap is **not an escape hatch**: it resolves to the inner
+/// type and that type still has to be on [`ALLOWED_FIELD_TYPES`], so
+/// `Option<String>` resolves to `String` — which is deliberately absent — and
+/// is refused exactly as a bare `String` is. Pinned by
+/// [`tests::the_field_type_scan_catches_a_free_text_field_however_it_is_named`].
+///
+/// # What is deliberately *not* unwrapped
+///
+/// Only these two, and only one layer. A map is not unwrapped at all: its key
+/// is a name the schema does not fix, which is a different question from what a
+/// value may hold, so `HashMap<String, ZoomLevel>` stays unlisted and therefore
+/// refused. `Vec<Vec<String>>` unwraps once to `Vec<String>`, which is not on
+/// the list either. The allowlist's doc comment says `Option<String>`,
+/// `Vec<String>` and any map do not belong on it, and this function is what
+/// keeps that true without needing a row per container shape.
+fn allowlisted_as(ty: &str) -> &str {
+    for wrapper in ["Option<", "Vec<"] {
+        if let Some(inner) = ty.strip_prefix(wrapper).and_then(|r| r.strip_suffix('>')) {
+            // One type parameter only. A comma means something this function
+            // cannot reason about, so it is handed back whole and lands as an
+            // unlisted type.
+            if !inner.contains(',') {
+                return inner;
+            }
+        }
+    }
+    ty
+}
 
 /// Whether an allowlisted type is a leaf or another struct in the same file.
 ///
@@ -165,14 +327,36 @@ const KEYLESS_MEMBERS: [&str; 3] = ["clear", "key", "length"];
 /// name scan on this side would repeat the mistake #827 is about: `endpoint:
 /// string` passes any name check and is a free-text field. A diff here is the
 /// review prompt.
-const PINNED_TS_FIELDS: [(&str, &str, &str); 5] = [
+const PINNED_TS_FIELDS: [(&str, &str, &str); 15] = [
     ("DesktopSettingsDto", "version", "number"),
     (
         "DesktopSettingsDto",
         "appearance",
         "{ mode: AppearanceMode }",
     ),
+    // PRD #741 M6/M7. `?` is load-bearing: the Rust field is an
+    // `Option<EndpointSettings>` whose `None` means *unspecified*, which is what
+    // stops a build whose UI cannot render endpoints from writing an empty
+    // section over a user's decks. A required field here would make the
+    // normaliser fabricate one.
+    ("DesktopSettingsDto", "endpoints?", "EndpointSettingsDto"),
     ("DesktopSettingsDto", "zoom", "{ level: number }"),
+    // The two nested interfaces are scanned as well, and that is the point of
+    // adding them rather than letting `EndpointSettingsDto` be an opaque name:
+    // a credential riding into the document through a nested shape would
+    // otherwise be invisible to this pin. Every field below is a reference —
+    // a host, a login name, a port, a key *path*, a jump-host *name*, a socket
+    // path — and the Rust counterpart of each is a validating newtype on
+    // `ALLOWED_FIELD_TYPES`.
+    ("EndpointSettingsDto", "remote", "RemoteEndpointDto[]"),
+    ("EndpointSettingsDto", "selection", "string"),
+    ("RemoteEndpointDto", "host", "string"),
+    ("RemoteEndpointDto", "id", "string"),
+    ("RemoteEndpointDto", "identity?", "string"),
+    ("RemoteEndpointDto", "jump?", "string"),
+    ("RemoteEndpointDto", "port", "number"),
+    ("RemoteEndpointDto", "socket?", "string"),
+    ("RemoteEndpointDto", "user?", "string"),
     (
         "DesktopSettingsSnapshotDto",
         "settings",
@@ -773,8 +957,14 @@ fn namespaced_literals(source: &str) -> BTreeSet<String> {
 mod tests {
     use super::*;
 
-    /// Check 1, and the boundary this whole module exists for: **no field in
-    /// the settings schema has a type that can carry arbitrary text.**
+    /// Check 1, and the boundary this whole module exists for: **every field
+    /// in the settings schema has a type from [`ALLOWED_FIELD_TYPES`], and no
+    /// field is free text.**
+    ///
+    /// That sentence used to read "no field has a type that can carry arbitrary
+    /// text", which PRD #741 M6 falsified — a `Hostname` carries 253 bytes of
+    /// `[A-Za-z0-9._-]`. Read the module docs for the two-part claim that
+    /// survives; the mechanism this test enforces is unchanged.
     ///
     /// This is the check that makes "a credential cannot be stored here" a
     /// statement about types rather than about names, and the one PRD #802
@@ -805,9 +995,13 @@ mod tests {
             ));
         }
         for field in &fields {
+            // One `Option<…>`/`Vec<…>` layer off, for the reason
+            // `allowlisted_as` gives: a container carries exactly what its
+            // element carries, and the element still has to be on the list.
+            let resolved = allowlisted_as(&field.ty);
             let allowed = ALLOWED_FIELD_TYPES
                 .iter()
-                .find(|(ty, _, _)| *ty == field.ty);
+                .find(|(ty, _, _)| *ty == resolved);
             match allowed {
                 None => offenders.push(format!(
                     "{SETTINGS_RS}:{}: {}.{} is a `{}`, which is not on ALLOWED_FIELD_TYPES",
@@ -883,6 +1077,55 @@ pub struct VoiceSettings {
             assert!(
                 fields.iter().any(|f| f.attrs.contains(fragment)),
                 "the fixture should exercise `{fragment}`"
+            );
+        }
+    }
+
+    /// The container unwrap, and specifically that it is **not** a way past the
+    /// allowlist (PRD #741 M6).
+    ///
+    /// `Option<KeyPath>` has to resolve, because a stored endpoint's identity
+    /// file is optional and an `Option` carries exactly what its element
+    /// carries. The same step must leave `Option<String>` and `Vec<String>`
+    /// exactly as refused as a bare `String` — which is the property that makes
+    /// the unwrap safe to have at all, and the one a careless generalisation
+    /// would lose.
+    #[test]
+    fn a_container_resolves_to_its_element_and_cannot_launder_a_free_text_type() {
+        for (ty, expected) in [
+            ("KeyPath", "KeyPath"),
+            ("Option<KeyPath>", "KeyPath"),
+            ("Vec<RemoteEndpointSettings>", "RemoteEndpointSettings"),
+            // Refused, and by resolving rather than by failing to resolve:
+            // these land on a name that is deliberately absent from the list.
+            ("String", "String"),
+            ("Option<String>", "String"),
+            ("Vec<String>", "String"),
+            // Not unwrapped at all: two parameters, so nothing is claimed.
+            ("HashMap<String, String>", "HashMap<String, String>"),
+            ("BTreeMap<String, ZoomLevel>", "BTreeMap<String, ZoomLevel>"),
+            // One layer only.
+            ("Vec<Vec<String>>", "Vec<String>"),
+            // Not a container at all.
+            ("PathBuf", "PathBuf"),
+            ("Optional", "Optional"),
+        ] {
+            assert_eq!(allowlisted_as(ty), expected, "resolving `{ty}`");
+        }
+
+        for refused in [
+            "String",
+            "Option<String>",
+            "Vec<String>",
+            "PathBuf",
+            "Option<PathBuf>",
+            "HashMap<String, String>",
+            "Vec<Vec<String>>",
+        ] {
+            let resolved = allowlisted_as(refused);
+            assert!(
+                !ALLOWED_FIELD_TYPES.iter().any(|(ty, _, _)| *ty == resolved),
+                "`{refused}` resolved to `{resolved}`, which must not be allowlisted"
             );
         }
     }
@@ -972,7 +1215,12 @@ pub struct VoiceSettings {
     fn the_typescript_settings_dtos_carry_exactly_the_pinned_fields() {
         let source = read(BRIDGE_TS);
         let mut found = Vec::new();
-        for interface in ["DesktopSettingsDto", "DesktopSettingsSnapshotDto"] {
+        for interface in [
+            "DesktopSettingsDto",
+            "EndpointSettingsDto",
+            "RemoteEndpointDto",
+            "DesktopSettingsSnapshotDto",
+        ] {
             let body = block_after(&source, &format!("export interface {interface} "))
                 .unwrap_or_else(|| {
                     panic!("no `export interface {interface}` block in {BRIDGE_TS}")
@@ -1008,21 +1256,33 @@ pub struct VoiceSettings {
     #[test]
     fn the_settings_normaliser_constructs_its_result_and_never_spreads_its_input() {
         let source = read(BRIDGE_TS);
+        // PRD #741 M7 added two helpers the normaliser delegates to, and the
+        // fixed-key-set property now rests on all three: a spread inside
+        // `normalizeEndpointSettings` would carry an undeclared field into the
+        // document just as surely as one in the parent, and a spread inside
+        // `normalizeRemoteEndpoint` would carry one into a stored row.
+        for signature in [
+            "export function normalizeDesktopSettings(value: unknown): DesktopSettingsDto ",
+            "function normalizeEndpointSettings(value: unknown): EndpointSettingsDto | undefined ",
+            "function normalizeRemoteEndpoint(value: unknown): RemoteEndpointDto | undefined ",
+        ] {
+            let body = block_after(&source, signature)
+                .unwrap_or_else(|| panic!("no `{signature}` in {BRIDGE_TS}"));
+            assert!(
+                !body.contains("..."),
+                "`{signature}` gained a spread, which would make it a passthrough for any \
+                 field its caller was handed — including a credential (issue #827). Name \
+                 every field it returns:\n{body}"
+            );
+        }
+
         let body = block_after(
             &source,
             "export function normalizeDesktopSettings(value: unknown): DesktopSettingsDto ",
         )
-        .unwrap_or_else(|| panic!("no `normalizeDesktopSettings` in {BRIDGE_TS}"));
-
-        assert!(
-            !body.contains("..."),
-            "`normalizeDesktopSettings` gained a spread, which would make it a \
-             passthrough for any field its caller was handed — including a credential \
-             (issue #827). Name every field it returns:\n{body}"
-        );
-
+        .expect("checked above");
         // And the object it does return carries exactly the pinned key set, so
-        // a fourth key is a diff here as well as in PINNED_TS_FIELDS.
+        // a fifth key is a diff here as well as in PINNED_TS_FIELDS.
         let returned = block_after(&body, "return ")
             .unwrap_or_else(|| panic!("`normalizeDesktopSettings` has no object literal return"));
         let mut keys: Vec<&str> = returned
@@ -1033,7 +1293,7 @@ pub struct VoiceSettings {
         keys.sort();
         assert_eq!(
             keys,
-            ["appearance", "version", "zoom"],
+            ["appearance", "endpoints", "version", "zoom"],
             "unexpected normaliser result shape:\n{returned}"
         );
     }

@@ -344,7 +344,7 @@ function crowdedAgent(seed: CrowdedSeed): AgentSession {
     task: seed.lastUserPrompt
       ?? (seed.activeTool
         ? `Active tool: ${seed.activeTool}${seed.activeToolDetail ? ` · ${seed.activeToolDetail}` : ""}`
-        : "Task metadata unavailable from daemon"),
+        : "Task metadata unavailable from the deck"),
     cwd: seed.cwd,
     // No attempt: live mode reports none, and the crowded scenario is meant to
     // be a faithful preview of a real daemon (PRD #745 M8).
@@ -441,10 +441,10 @@ const crowdedAgents: AgentSession[] = [
 export function createFixtureSnapshot(state: FixtureState = "connected"): DeckSnapshot {
   const connected = state === "connected" || state === "crowded" || state === "empty";
   const connection = connected
-    ? { status: "connected" as const, socketPath: FIXTURE_DAEMON_ID, message: state === "empty" ? "Daemon responding · no agents running" : "Daemon responding" }
+    ? { status: "connected" as const, socketPath: FIXTURE_DAEMON_ID, message: state === "empty" ? "Deck responding · no agents running" : "Deck responding" }
     : state === "error"
-      ? { status: "error" as const, message: "Protocol handshake failed. Desktop expects v6; daemon reported v5." }
-      : { status: "disconnected" as const, message: "No dot-agent-deck daemon is listening on the configured socket." };
+      ? { status: "error" as const, message: "Protocol handshake failed. Desktop expects v6; deck reported v5." }
+      : { status: "disconnected" as const, message: "No deck is listening on the configured socket." };
 
   const fleet = state === "empty" ? [] : state === "crowded" ? crowdedAgents : agents;
 

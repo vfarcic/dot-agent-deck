@@ -716,15 +716,36 @@ pub fn ssh_error_detail(err: &SshError) -> String {
     crate::untrusted_text::escape_control_and_bidi(&raw)
 }
 
-/// The three canonical fragments OpenSSH emits when a requested forward could
-/// not be established. Issue #344: kept deliberately narrow. An ordinary
+/// The canonical fragments OpenSSH emits when a requested forward could not be
+/// established. Issue #344: kept deliberately narrow. An ordinary
 /// `ssh: connect to host x port 22: Connection refused` must NOT match — an
 /// over-broad pattern that swallowed real unreachability would be strictly
 /// worse than the misclassification this replaces.
+///
+/// The first three are TCP-shaped, because a TCP forward was the only kind this
+/// tree made when they were written. **PRD #741 M5 makes the first Unix-socket
+/// forward**, and OpenSSH reports that failure in words none of the three
+/// contain: `unix_listener` bind failures read `unix_listener: cannot bind to
+/// path /run/…/t.sock: Address already in use`, which does not contain the
+/// substring `bind: address already in use`, and `ssh_init_forwarding` follows
+/// them with `Could not request local forwarding.`. Without the last two
+/// entries an `ssh -L` collision on a Unix socket classified as
+/// `HostUnreachable` and sent the user to debug a network path that was never
+/// broken — exactly the defect #344 exists to prevent, reappearing through the
+/// hole the wording left.
+///
+/// Both additions stay inside #344's rule. Neither can appear in a transport
+/// failure: `cannot bind to path` is emitted only by `unix_listener`, and
+/// `could not request local forwarding` only when a `-L` listener could not be
+/// set up. Pinned in both directions by
+/// `map_probe_ssh_error_classifies_forward_failures` and
+/// `widening_the_forward_markers_did_not_swallow_transport_failures`.
 const FORWARD_FAILURE_MARKERS: &[&str] = &[
     "remote port forwarding failed for listen port",
     "bind: address already in use",
     "cannot listen to port",
+    "cannot bind to path",
+    "could not request local forwarding",
 ];
 
 /// True when ssh's stderr names a forwarding failure rather than a transport
@@ -1767,14 +1788,22 @@ mod tests {
         assert_eq!(parse_version_output("dot-agent-deck 9"), None);
     }
 
-    /// Scenario: Map each canonical ssh remote-forward failure message to the
-    /// dedicated error instead of misreporting the host as unreachable.
+    /// Scenario: Map each canonical ssh forward-failure message — TCP and Unix
+    /// socket alike — to the dedicated error instead of misreporting the host as
+    /// unreachable.
     #[test]
     fn map_probe_ssh_error_classifies_forward_failures() {
         let cases = [
             "remote port forwarding failed for listen port 1080",
             "bind: Address already in use",
             "cannot listen to port",
+            // PRD #741 M5: the two Unix-socket shapes, verbatim as OpenSSH
+            // writes them. Neither contains any of the three above, which is
+            // why a `ssh -L <unix>:<unix>` collision used to be reported as an
+            // unreachable host.
+            "unix_listener: cannot bind to path /run/user/1000/dot-agent-deck/tunnels/t.sock: \
+             Address already in use",
+            "Could not request local forwarding.",
         ];
 
         for detail in cases {
@@ -1794,6 +1823,27 @@ mod tests {
                     } if name == "prod" && mapped_detail == detail
                 ),
                 "forward stderr must map to ForwardFailed: {detail:?}; got {error:?}"
+            );
+        }
+    }
+
+    /// Scenario: The messages a *transport* failure produces must still be
+    /// HostUnreachable after PRD #741 M5 widened the forward markers — an
+    /// over-broad pattern that swallowed real unreachability would be strictly
+    /// worse than the misclassification the markers exist to prevent.
+    #[test]
+    fn widening_the_forward_markers_did_not_swallow_transport_failures() {
+        for detail in [
+            "ssh: connect to host build-box port 22: Connection refused",
+            "ssh: connect to host build-box port 22: Network is unreachable",
+            "ssh: Could not resolve hostname build-box: Name or service not known",
+            "build-box: Permission denied (publickey).",
+            "Host key verification failed.",
+            "bind [::1]:8080: Cannot assign requested address",
+        ] {
+            assert!(
+                !is_forward_failure_detail(detail),
+                "must not read as a forward failure: {detail:?}"
             );
         }
     }

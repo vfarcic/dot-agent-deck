@@ -31,6 +31,45 @@ export interface ConnectionView {
   status: ConnectionStatus;
   socketPath?: string;
   message?: string;
+  /**
+   * Which kind of deck this connection is to (PRD #741 M7): `"local"` for a
+   * daemon on this machine, `"remote"` for one reached over an ssh tunnel.
+   *
+   * Defaulted to `"local"` where a fixture or an older reply says nothing, so a
+   * screen that gates a destructive control on it fails safe in the direction
+   * that keeps today's behaviour rather than in the direction that enables a
+   * button against a machine the user does not own.
+   */
+  deckKind?: "local" | "remote";
+  /**
+   * Why the daemon-lifecycle controls are unavailable, when they are — present
+   * exactly when `deckKind` is `"remote"`.
+   *
+   * `Endpoint::require_local("Stop daemon")`'s own sentence, not one written on
+   * this side. Stop and Replace act on a process on *this* machine, and over a
+   * forwarded socket `run_daemon_stop`'s peer-credential lookup names the local
+   * `ssh` client — so pressing Stop would tear the tunnel down and report that a
+   * daemon had stopped gracefully.
+   */
+  localOnlyReason?: string;
+  /**
+   * Why the app is talking to the local deck when the stored selection named
+   * another one (PRD #741 M7). "That deck is gone" and "that deck has no socket
+   * path yet" are different things to tell a user, and neither is "connected to
+   * local".
+   */
+  selectionFallback?: string;
+  /**
+   * Why the project-aware surfaces — choosing a project, preparing and launching
+   * a workflow — are unavailable against this deck (PRD #741 M8).
+   *
+   * The daemon's own sentence, derived from what it ADVERTISED in its `Hello`
+   * reply rather than from a version number or a build stamp. Absent means
+   * available, so a screen reads absence as "nothing to say" and not as "unknown
+   * — better disable it": the desktop crate omits the field only when every verb
+   * the launch needs was advertised.
+   */
+  projectActionsReason?: string;
   /** True when a daemon answered Hello but failed protocol/build compatibility. */
   daemonDetected?: boolean;
   /** Honest count reported by Hello; undefined when the daemon could not report it. */
@@ -514,13 +553,13 @@ export function isDelivered(result: DeckActionResult): boolean {
 /** Operator-facing explanation of a non-delivered outcome. */
 export function sendResultReason(result: SendResult | undefined): string {
   switch (result) {
-    case "stale": return "the daemon's view of that pane had already moved on";
+    case "stale": return "the deck's view of that pane had already moved on";
     case "wrong-session": return "the pane handle no longer maps to that agent's session";
     case "history-only": return "the agent has no live pane — only its history remains";
     case "no-live-target": return "there is nothing live to write to";
     case "ambiguous": return "the write started but did not complete; some of it may already have landed, so it was not retried";
-    case "unknown": return "the daemon reported an outcome this build does not recognise";
-    default: return "the daemon did not confirm delivery";
+    case "unknown": return "the deck reported an outcome this build does not recognise";
+    default: return "the deck did not confirm delivery";
   }
 }
 
@@ -632,6 +671,18 @@ export interface DeckRuntimeState {
   getSettings: () => Promise<import("./lib/bridge").DesktopSettingsSnapshotDto>;
   /** Persist the whole document; resolves to what was written. */
   saveSettings: (settings: import("./lib/bridge").DesktopSettingsDto) => Promise<import("./lib/bridge").DesktopSettingsDto>;
+  /**
+   * Test one deck end to end and resolve with a named state (PRD #741 M10).
+   *
+   * Rejects only when the call itself could not be made: a deck that failed is
+   * a report, not an exception, because "your ssh config has never seen this
+   * host's key" and "the deck over there is not running" are different things
+   * for a user to do next.
+   */
+  testEndpoint: (
+    settings: import("./lib/bridge").DesktopSettingsDto,
+    selection: string,
+  ) => Promise<import("./lib/bridge").EndpointTestReportDto>;
   /**
    * Scale the whole window, terminals included (PRD #744).
    *

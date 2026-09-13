@@ -2,7 +2,8 @@
  * The contract a feature implements to put a setting in the settings surface
  * (PRD #803).
  *
- * The whole of it, deliberately. Adding a **setting** is a field on your
+ * The whole of it, deliberately — with one escape hatch beside it, named at the
+ * bottom of this comment. Adding a **setting** is a field on your
  * feature's section struct in `src-tauri/src/settings.rs` plus an edit to your
  * own panel. Adding a **section** is one row in `SETTINGS_SECTIONS`
  * (`lib/settingsRegistry.ts`) and one component implementing
@@ -66,6 +67,21 @@ export interface SettingsPanelProps {
    */
   mode: import("../types").RuntimeMode;
 }
+
+/*
+ * **The escape hatch, for a panel that needs to CALL something** (PRD #741 M10).
+ *
+ * The four props above are still the whole of the data contract: the document
+ * travels one way and one way only, and nothing else supplies it. What #741's
+ * `Test connection` needed was not data but an *action* — a bridge call — and a
+ * `testEndpoint` prop would have been precisely the feature-specific prop the
+ * `mode` note above rules out, with #802 wanting a sixth behind it.
+ *
+ * So actions come from `lib/settingsBridge.tsx`'s context instead:
+ * `useSettingsBridge()` returns `undefined` where no provider is mounted, so a
+ * panel renders without one rather than throwing, and nothing in it holds state
+ * a render depends on. Read that file before adding to it.
+ */
 
 /** One row of the section registry. */
 export interface SettingsSection {

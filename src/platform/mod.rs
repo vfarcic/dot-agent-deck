@@ -28,3 +28,6 @@ pub mod paths;
 pub mod peercred;
 pub mod proc;
 pub mod shell;
+/// PRD #741 M3 — the attach transport seam: boxed, splittable halves whose
+/// write half carries the half-close-on-drop contract the protocol depends on.
+pub mod transport;

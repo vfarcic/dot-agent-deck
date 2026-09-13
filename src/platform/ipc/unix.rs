@@ -33,6 +33,26 @@ pub type IpcReadHalf = tokio::net::unix::OwnedReadHalf;
 /// protocol relies on to signal the peer independently of the read half.
 pub type IpcWriteHalf = tokio::net::unix::OwnedWriteHalf;
 
+/// PRD #741 M3: the Unix write half half-closes on drop, so it may be boxed into
+/// a [`TransportWriteHalf`](crate::platform::transport::TransportWriteHalf).
+///
+/// This is answer (1) on [`HalfCloseOnDrop`]: `OwnedWriteHalf::drop` performs
+/// `shutdown(SHUT_WR)`, so the peer observes end-of-write the moment this half
+/// drops, *while our read half is still live*. That independent EOF is what the
+/// attach protocol depends on — `EventSubscription` holds its write half purely
+/// to trip the daemon's disconnect detector on drop, and the attach server moves
+/// its own write half into an output task that can end before the read loop.
+///
+/// **There is deliberately no `impl` for [`tokio::io::split`]'s `WriteHalf`
+/// here.** Its drop does nothing to the socket, and `platform/ipc/mod.rs`'s
+/// module docs record that an earlier draft used it and silently regressed
+/// exactly this behaviour. Re-introducing that split is now a compile error at
+/// the `TransportWriteHalf::new` call rather than a behaviour change nothing
+/// catches.
+///
+/// [`HalfCloseOnDrop`]: crate::platform::transport::HalfCloseOnDrop
+impl crate::platform::transport::HalfCloseOnDrop for IpcWriteHalf {}
+
 /// Async bidirectional IPC stream. Unix backend: a thin newtype over
 /// [`tokio::net::UnixStream`]. `AsyncRead`/`AsyncWrite` delegate to the inner
 /// socket so the framing helpers in `daemon_protocol` and `daemon_client`

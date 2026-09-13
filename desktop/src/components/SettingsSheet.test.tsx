@@ -87,13 +87,16 @@ describe("SettingsSheet section column", () => {
     expect(screen.getByTestId("stub-body-alpha")).toBeVisible();
   });
 
-  it("shows the column for the real registry, which now has two sections", () => {
+  it("shows the column for the real registry, which now has three sections", () => {
     // The bridge between the two stub-driven tests above and what a user
     // actually sees. This was the collapsed case until PRD #744's Zoom row
     // landed; it flipped on its own, with no change to the sheet, which is
     // exactly the claim the collapse was built to make good. Inverted rather
-    // than deleted, so the live registry's real layout stays pinned.
-    expect(SETTINGS_SECTIONS).toHaveLength(2);
+    // than deleted, so the live registry's real layout stays pinned. PRD #741's
+    // Decks row took it to three, again with no change to the sheet — the count
+    // is pinned so adding a section is a deliberate edit here rather than a
+    // silent one.
+    expect(SETTINGS_SECTIONS).toHaveLength(3);
     renderSheet();
     expect(screen.getByTestId("settings-layout")).not.toHaveClass("is-single");
     expect(screen.getByRole("navigation", { name: "Settings sections" })).toBeVisible();

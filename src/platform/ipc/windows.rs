@@ -15,8 +15,9 @@
 //! instance so there is always one pending — replicating the always-listening
 //! invariant a Unix `accept` loop has for free. Named pipes have no on-disk
 //! inode, so there is no stale-socket probe/remove/rebind here (see
-//! [`super::ENDPOINT_IS_FILESYSTEM_PATH`], which is what short-circuits that
-//! dance in the callers).
+//! [`super::LOCAL_ENDPOINT_PRESENCE`], which is
+//! [`EndpointPresence::NoFilesystemName`](super::EndpointPresence::NoFilesystemName)
+//! here and is what short-circuits that dance in the callers).
 //!
 //! ## Security (PRD #163 M4 — the release [BLOCKER])
 //!
@@ -77,6 +78,24 @@ use crate::platform::fsperm::{pipe_security_descriptor, verify_object_owner_is_c
 pub type IpcReadHalf = tokio::io::ReadHalf<IpcStream>;
 /// Owned write half of an [`IpcStream`] — see [`IpcReadHalf`].
 pub type IpcWriteHalf = tokio::io::WriteHalf<IpcStream>;
+
+/// PRD #741 M3: the named-pipe write half may be boxed into a
+/// [`TransportWriteHalf`](crate::platform::transport::TransportWriteHalf).
+///
+/// This is answer (2) on [`HalfCloseOnDrop`], and it is why that trait's bar is
+/// "the strongest primitive the transport has" rather than "`SHUT_WR`". A named
+/// pipe has no per-half half-close at all — see [`IpcStream::into_split`] — so
+/// both halves keep the pipe alive and the peer observes EOF once both drop.
+/// The attach protocol already runs on that, unchanged by this milestone; the
+/// `impl` asserts nothing stronger than what Windows had before it.
+///
+/// Note this is the same `tokio::io::WriteHalf` the Unix backend deliberately
+/// does **not** implement the trait for. The difference is not the wrapper, it
+/// is what is underneath: on Unix it discards a half-close the socket really
+/// has, here there is none to discard.
+///
+/// [`HalfCloseOnDrop`]: crate::platform::transport::HalfCloseOnDrop
+impl crate::platform::transport::HalfCloseOnDrop for IpcWriteHalf {}
 
 /// Total budget for the `ERROR_PIPE_BUSY` connect retry. The busy error is the
 /// named-pipe analogue of a momentarily-unaccepted socket: all server

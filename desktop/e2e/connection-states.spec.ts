@@ -60,7 +60,7 @@ const STATES: StateExpectation[] = [
     note: "overview-disconnected",
     lampClass: "connection-disconnected",
     agents: "—",
-    daemonState: "No dot-agent-deck daemon is listening on the configured socket.",
+    daemonState: "No deck is listening on the configured socket.",
   },
   {
     name: "a daemon this build cannot speak to",
@@ -68,7 +68,7 @@ const STATES: StateExpectation[] = [
     note: "overview-incompatible",
     lampClass: "connection-error",
     agents: "—",
-    daemonState: "Protocol handshake failed. Desktop expects v6; daemon reported v5.",
+    daemonState: "Protocol handshake failed. Desktop expects v6; deck reported v5.",
   },
 ];
 

@@ -20,6 +20,7 @@ const snapshot: DesktopSnapshotDto = {
   connection: {
     status: "connected",
     socketPath: "/tmp/deck.sock",
+    deckKind: "local",
     clientProtocolVersion: 6,
     serverProtocolVersion: 6,
     clientBuildVersion: "0.1.0",
@@ -68,7 +69,7 @@ describe("TauriDeckBridge", () => {
     expect(mappedIncompatible).toMatchObject({
       health: "failed",
       connection: { status: "error", daemonDetected: true, runningAgentCount: 1 },
-      agents: [{ displayName: "Coder", model: "Unavailable", task: "Task metadata unavailable from daemon" }],
+      agents: [{ displayName: "Coder", model: "Unavailable", task: "Task metadata unavailable from the deck" }],
     });
     // An unreported cwd is ABSENT on the model, not the deck's stand-in word:
     // that word is a directory name the daemon can legitimately report, so a
@@ -328,7 +329,7 @@ describe("TauriDeckBridge", () => {
     const { createDeckBridge } = await import("./bridge");
     const bridge = createDeckBridge("fixture");
     expect(await bridge.listProjects()).toEqual({ projects: [] });
-    await expect(bridge.resolveProject("/anything")).rejects.toThrow("no daemon");
+    await expect(bridge.resolveProject("/anything")).rejects.toThrow("no deck");
     await bridge.dispose();
   });
 
@@ -409,15 +410,33 @@ describe("TauriDeckBridge", () => {
 
     const stampOnly = structuredClone(snapshot);
     stampOnly.connection.status = "incompatible";
-    stampOnly.connection.error = "build mismatch: desktop is a, daemon is b. Connect anyway to keep this one.";
+    stampOnly.connection.error = "build mismatch: desktop is a, deck is b. Connect anyway to keep this one.";
     stampOnly.connection.buildStampMismatchOnly = true;
     expect(mapDesktopSnapshot(stampOnly).connection).toMatchObject({ status: "error", buildStampMismatchOnly: true });
 
     const protocolMismatch = structuredClone(snapshot);
     protocolMismatch.connection.status = "incompatible";
-    protocolMismatch.connection.error = "protocol mismatch: desktop expects 8, daemon reports 7";
+    protocolMismatch.connection.error = "protocol mismatch: desktop expects 8, deck reports 7";
     protocolMismatch.connection.buildStampMismatchOnly = false;
     expect(mapDesktopSnapshot(protocolMismatch).connection.buildStampMismatchOnly).toBe(false);
+  });
+
+  /**
+   * PRD #741 M8. The capability reason travels to the connection view, and its
+   * ABSENCE means available rather than unknown.
+   *
+   * The crate omits the field exactly when every verb the launch needs was
+   * advertised, so a screen that read absence as "better disable it" would
+   * withhold the launch against every healthy deck.
+   */
+  it("carries the project-capability reason through, and reads absence as available", async () => {
+    const { mapDesktopSnapshot } = await import("./bridge");
+
+    const withheld = structuredClone(snapshot);
+    withheld.connection.projectActionsReason = "This deck does not advertise prepare-workflow, so projects and workflows cannot be started from here. Agents already running on it stay visible and usable.";
+    expect(mapDesktopSnapshot(withheld).connection.projectActionsReason).toContain("prepare-workflow");
+
+    expect(mapDesktopSnapshot(structuredClone(snapshot)).connection.projectActionsReason).toBeUndefined();
   });
 
   /**
@@ -440,7 +459,7 @@ describe("TauriDeckBridge", () => {
 
     expect(mapped.connection).toMatchObject({
       status: "connected",
-      message: "Daemon responding",
+      message: "Deck responding",
       buildStampMismatchOnly: false,
       clientBuildVersion: "0.39.0-49-ga0165f8",
       daemonBuildVersion: "0.39.0-g1ea0fe7",
@@ -453,7 +472,7 @@ describe("TauriDeckBridge", () => {
    * The whole point of the override: connected, and STILL saying so. The crate
    * keeps the mismatch in `error` on the bypass path, and this mapping is what
    * would drop it — a `connected` status used to be enough to reach for the
-   * "Daemon responding" fallback, which would have made the caveat invisible
+   * "Deck responding" fallback, which would have made the caveat invisible
    * the moment it mattered.
    */
   it("keeps the build-mismatch caveat visible after connecting anyway", async () => {
@@ -462,7 +481,7 @@ describe("TauriDeckBridge", () => {
     overridden.connection.status = "connected";
     overridden.connection.daemonBuildVersion = "v0.39.0";
     overridden.connection.buildStampMismatchOnly = true;
-    overridden.connection.error = "build mismatch: desktop is v0.38.0-50-gf118e99, daemon is v0.39.0. Connected anyway for this session; protocol 8 matched on both sides.";
+    overridden.connection.error = "build mismatch: desktop is v0.38.0-50-gf118e99, deck is v0.39.0. Connected anyway for this session; protocol 8 matched on both sides.";
 
     const mapped = mapDesktopSnapshot(overridden);
 
@@ -487,13 +506,13 @@ describe("TauriDeckBridge", () => {
     stampOnly.connection.daemonBuildVersion = "v0.39.0";
     stampOnly.connection.buildStampMismatchOnly = true;
     delete stampOnly.connection.error;
-    expect(mapDesktopSnapshot(stampOnly).connection.message).toBe("Build mismatch: desktop is v0.38.0-50-gf118e99, daemon is v0.39.0.");
+    expect(mapDesktopSnapshot(stampOnly).connection.message).toBe("Build mismatch: desktop is v0.38.0-50-gf118e99, deck is v0.39.0.");
 
     const protocolMismatch = structuredClone(snapshot);
     protocolMismatch.connection.status = "incompatible";
     protocolMismatch.connection.serverProtocolVersion = 7;
     delete protocolMismatch.connection.error;
-    expect(mapDesktopSnapshot(protocolMismatch).connection.message).toBe("Protocol mismatch: desktop v6, daemon v7");
+    expect(mapDesktopSnapshot(protocolMismatch).connection.message).toBe("Protocol mismatch: desktop v6, deck v7");
   });
 
   it("carries the daemon identity and the daemon's own tab membership onto the agent model", async () => {
@@ -1767,6 +1786,69 @@ describe("desktop settings (PRD 803)", () => {
     expect(normalizeDesktopSettings({ zoom: { level: 1.3 } }).zoom.level).toBe(1.25);
     expect(normalizeDesktopSettings({ zoom: { level: 99 } }).zoom.level).toBe(3);
   });
+
+  /**
+   * PRD #741 M7 — the frontend half of
+   * `a_client_that_cannot_render_endpoints_cannot_delete_them`, and the reason
+   * it needs a test of its own: getting it wrong is **silent data loss**, not a
+   * visible bug.
+   *
+   * `normalizeDesktopSettings` builds a fresh object with a fixed key set, so a
+   * section it does not read is gone before any panel spreads the document, and
+   * `desktop_set_settings` then merges the decoded struct over the file. If an
+   * absent `[endpoints]` section normalised to `{ remote: [], selection:
+   * "local" }`, changing the theme would write that empty table over every
+   * remote deck the user had.
+   *
+   * So absence stays absence, and presence round-trips.
+   */
+  it("round-trips the endpoints section and never fabricates one", async () => {
+    const { normalizeDesktopSettings } = await import("./bridge");
+
+    // Absent in, absent out — across every shape a document can arrive in.
+    for (const document of [{}, { appearance: { mode: "dark" } }, { endpoints: null }, { endpoints: "nonsense" }]) {
+      expect(normalizeDesktopSettings(document).endpoints).toBeUndefined();
+    }
+
+    // Present in, present out, field for field.
+    const stored = {
+      appearance: { mode: "dark" },
+      endpoints: {
+        remote: [
+          { host: "build-box", id: "deck0000000000aa", port: 2222, user: "deploy", identity: "~/.ssh/id_ed25519", jump: "bastion", socket: "/run/user/1000/dot-agent-deck-attach.sock" },
+          { host: "ci-box", id: "deck0000000000bb", port: 22 },
+        ],
+        selection: "deck0000000000aa",
+      },
+      zoom: { level: 1.25 },
+    };
+    expect(normalizeDesktopSettings(stored).endpoints).toEqual(stored.endpoints);
+
+    // A save made from ANOTHER panel carries the section through untouched,
+    // which is the actual failure mode: the theme row is what a user is most
+    // likely to change, and it spreads the document this function produced.
+    const loaded = normalizeDesktopSettings(stored);
+    const afterAppearanceChange = { ...loaded, appearance: { mode: "light" as const } };
+    expect(normalizeDesktopSettings(afterAppearanceChange).endpoints).toEqual(stored.endpoints);
+
+    // A row missing what makes it a row is dropped rather than repaired: Rust
+    // refuses the whole document over a row with no host or no id, and a
+    // fabricated one would be a deck the user never configured.
+    const partial = normalizeDesktopSettings({
+      endpoints: { remote: [{ host: "build-box" }, { id: "deck0000000000cc" }, { host: "ci-box", id: "deck0000000000dd" }], selection: "local" },
+    });
+    expect(partial.endpoints?.remote.map((row) => row.id)).toEqual(["deck0000000000dd"]);
+    // And a row with no port reads as 22, the same default `RemoteEndpoint::DEFAULT_PORT`
+    // fills a document with no `port` key from.
+    expect(partial.endpoints?.remote[0].port).toBe(22);
+
+    // An unrecognised selection token is written back UNCHANGED, so an older
+    // build degrades to the local deck without destroying a newer build's
+    // selection.
+    expect(normalizeDesktopSettings({ endpoints: { remote: [], selection: "all" } }).endpoints?.selection).toBe("all");
+    // And an empty or missing token reads as the reserved local word.
+    expect(normalizeDesktopSettings({ endpoints: { remote: [] } }).endpoints?.selection).toBe("local");
+  });
 });
 
 /**
@@ -1830,7 +1912,17 @@ describe("desktop settings hold no credential (issue 827)", () => {
       expect(JSON.stringify(normalized)).not.toContain(SENTINEL);
       // And the result is always a complete, valid document rather than a
       // partial one: dropping the unknown field must not drop the known ones.
-      expect(Object.keys(normalized).sort()).toEqual(["appearance", "version", "zoom"]);
+      //
+      // `endpoints` is in the key set with the value `undefined` (PRD #741 M7).
+      // That is the shape "unspecified" has to take on this side — the key
+      // cannot be omitted conditionally without a spread, and a spread is
+      // exactly what the structural guard forbids here — and it is what Rust's
+      // `Option<EndpointSettings>` reads as `None`, because `JSON.stringify`
+      // drops an `undefined` value on the way to the bridge. The assertion
+      // below pins that it carries no *value*.
+      expect(Object.keys(normalized).sort()).toEqual(["appearance", "endpoints", "version", "zoom"]);
+      expect(normalized.endpoints).toBeUndefined();
+      expect(JSON.parse(JSON.stringify(normalized))).not.toHaveProperty("endpoints");
     }
     // A wrongly-typed known field falls back rather than propagating, the same
     // way `AppearanceMode::from_str_lossy` does Rust-side.

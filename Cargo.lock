@@ -1073,6 +1073,7 @@ dependencies = [
 name = "dot-agent-deck-desktop"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "dot-agent-deck",
  "libc",
  "serde",

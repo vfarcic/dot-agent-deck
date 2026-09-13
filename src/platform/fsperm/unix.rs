@@ -166,6 +166,26 @@ pub fn set_endpoint_mode_owner_only(path: &Path) -> std::io::Result<()> {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
 }
 
+/// The pure-data core of [`verify_endpoint_trusted`]'s ownership clause: an
+/// endpoint is trusted only when its owning uid is exactly ours.
+///
+/// Split out for the same reason as the Windows SID analogue
+/// [`super::endpoint_owner_is_trusted`] and
+/// [`crate::config::config_owner_is_trusted`] — the *refusal* arm needs a
+/// socket owned by another account, which a test process cannot create without
+/// a second account or root. As pure data the rule is exhaustively testable on
+/// any host, which is what pins the foreign-uid denial (PRD #741 M1).
+///
+/// Fails closed on any mismatch in either direction: uid 0 is not a wildcard
+/// on either side, and the error names both uids so an operator can see who
+/// squatted the endpoint.
+fn endpoint_uid_is_trusted(owner_uid: u32, our_uid: u32) -> Result<(), String> {
+    if owner_uid != our_uid {
+        return Err(format!("owned by uid {owner_uid} (expected {our_uid})"));
+    }
+    Ok(())
+}
+
 /// Verify `path` is a Unix socket owned by the current uid at mode 0o600.
 /// Returns `Err(reason)` describing the first failed check; the caller wraps it
 /// in its own error type.
@@ -187,14 +207,7 @@ pub fn verify_endpoint_trusted(path: &Path) -> Result<(), String> {
         return Err("not a Unix domain socket".to_string());
     }
 
-    let our_uid = crate::platform::paths::current_uid();
-    if metadata.uid() != our_uid {
-        return Err(format!(
-            "owned by uid {} (expected {})",
-            metadata.uid(),
-            our_uid
-        ));
-    }
+    endpoint_uid_is_trusted(metadata.uid(), crate::platform::paths::current_uid())?;
 
     let mode = metadata.mode() & 0o777;
     if mode != 0o600 {
@@ -212,7 +225,7 @@ mod tests {
 
     fn mode_of(path: &Path) -> u32 {
         std::fs::metadata(path)
-            .expect("stat the directory")
+            .expect("stat the path")
             .permissions()
             .mode()
             & 0o777
@@ -321,5 +334,215 @@ mod tests {
             0o755,
             "create-only must never chmod the attacker's target"
         );
+    }
+
+    /// Bind a real Unix socket at `path` and leave it at mode 0o600 — the state
+    /// `platform::ipc::IpcListener::bind` produces, reached through that path's
+    /// second half ([`set_endpoint_mode_owner_only`]) rather than its first.
+    /// The returned listener must be kept alive for the test's duration.
+    ///
+    /// Deliberately does **not** go through [`with_socket_umask`]: umask is
+    /// process-global and its own doc says the lock serializes only cooperating
+    /// callers, so borrowing it here would set 0o177 for the whole test binary
+    /// for the duration of the `bind`. Measured — every `tempfile::tempdir()`
+    /// created by a parallel test in that window lands at 0o600 with no search
+    /// bit, and four tests here died with EACCES inside their own temp roots.
+    /// The restate is deterministic under any ambient umask and perturbs
+    /// nothing, which is what a fixture wants.
+    fn bind_trusted_socket(path: &Path) -> std::os::unix::net::UnixListener {
+        let listener = std::os::unix::net::UnixListener::bind(path).expect("bind the socket");
+        set_endpoint_mode_owner_only(path).expect("restate 0o600 on the socket inode");
+        listener
+    }
+
+    /// PRD #741 M1, the accept arm: a real `UnixListener` bound the way the
+    /// daemon binds it — our uid, mode exactly 0o600 — must be trusted.
+    ///
+    /// This is also what pins the `& 0o777` mask in the mode clause: a socket's
+    /// raw `st_mode` is `0o140600`, so a refactor that dropped the mask would
+    /// compare `0o140600 != 0o600` and refuse *every* endpoint, including this
+    /// one. And it pins that `endpoint_uid_is_trusted` is really wired in —
+    /// inverting that comparison refuses our own socket here.
+    #[test]
+    fn verify_endpoint_trusted_accepts_our_own_0o600_socket() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let endpoint = root.path().join("attach.sock");
+        let _listener = bind_trusted_socket(&endpoint);
+
+        assert_eq!(
+            mode_of(&endpoint),
+            0o600,
+            "the fixture must land the inode at exactly 0o600"
+        );
+        verify_endpoint_trusted(&endpoint).expect("our own 0o600 socket must be trusted");
+    }
+
+    /// The mode clause is **exact equality** against 0o600, not a mask, so a
+    /// *tighter* mode is refused along with every looser one. That is
+    /// surprising enough to pin deliberately: a refactor to `mode & 0o077 != 0`
+    /// ("nothing for group or other") would keep accepting 0o400 and 0o000 and
+    /// silently pass a test that only exercised the loose direction.
+    #[test]
+    fn verify_endpoint_trusted_refuses_every_mode_but_exactly_0o600() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let endpoint = root.path().join("attach.sock");
+        let _listener = bind_trusted_socket(&endpoint);
+
+        for mode in [
+            0o644, // the classic "arrived under the ambient umask" shape
+            0o755, // …and the other one
+            0o660, // group-readable: another account in our group could connect
+            0o666, // world-writable
+            0o601, // a single other-bit is still a leak
+            0o700, // one bit *added* over 0o600, and still refused
+            0o400, // strictly tighter than 0o600 — refused, not accepted
+            0o000, // and so is the completely locked-down inode
+        ] {
+            chmod(&endpoint, mode);
+            let Err(err) = verify_endpoint_trusted(&endpoint) else {
+                panic!("mode 0o{mode:o} must be refused");
+            };
+            assert_eq!(err, format!("mode is 0o{mode:o} (expected 0o600)"));
+        }
+
+        // The control: restored to exactly 0o600 it is trusted again, so the
+        // loop above is pinning the mode clause rather than something the first
+        // chmod broke for good.
+        chmod(&endpoint, 0o600);
+        verify_endpoint_trusted(&endpoint).expect("restored to 0o600, it is trusted again");
+    }
+
+    /// The type clause: anything at the path that is not a Unix domain socket
+    /// is refused, and it is refused *first* — a regular file at a wrong mode
+    /// reports the type, not the mode — so the precedence of the three checks
+    /// is pinned along with the checks themselves.
+    #[test]
+    fn verify_endpoint_trusted_refuses_a_path_that_is_not_a_socket() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let root = tempfile::tempdir().expect("tempdir");
+
+        // A regular file at exactly the mode a socket would be accepted at, so
+        // the refusal can only be coming from the file-type clause.
+        let plain = root.path().join("plain");
+        std::fs::write(&plain, b"").expect("create the regular file");
+        chmod(&plain, 0o600);
+        assert_eq!(
+            verify_endpoint_trusted(&plain).expect_err("a regular file must be refused"),
+            "not a Unix domain socket"
+        );
+
+        // …and a regular file at a *wrong* mode still reports the type, which
+        // is what pins the check order.
+        chmod(&plain, 0o644);
+        assert_eq!(
+            verify_endpoint_trusted(&plain).expect_err("a regular file must be refused"),
+            "not a Unix domain socket",
+            "the type clause must be reported before the mode clause"
+        );
+
+        // A FIFO: the special file closest to a socket, and the one a check
+        // asking "is it special?" rather than "is it a socket?" would let
+        // through. `metadata` only stats it, so nothing blocks on a reader.
+        let fifo = root.path().join("fifo");
+        let c_fifo = std::ffi::CString::new(fifo.as_os_str().as_bytes()).expect("CString");
+        // SAFETY: `mkfifo(3)` reads a NUL-terminated path and a mode; `c_fifo`
+        // outlives the call and there is nothing returned to own.
+        let rc = unsafe { libc::mkfifo(c_fifo.as_ptr(), 0o600) };
+        assert_eq!(rc, 0, "mkfifo: {}", std::io::Error::last_os_error());
+        assert_eq!(
+            verify_endpoint_trusted(&fifo).expect_err("a FIFO must be refused"),
+            "not a Unix domain socket"
+        );
+
+        // A directory, likewise. Restored to 0o700 afterwards so the tempdir
+        // can still clean itself up.
+        let dir = root.path().join("dir");
+        std::fs::create_dir(&dir).expect("create the directory");
+        chmod(&dir, 0o600);
+        assert_eq!(
+            verify_endpoint_trusted(&dir).expect_err("a directory must be refused"),
+            "not a Unix domain socket"
+        );
+        chmod(&dir, 0o700);
+    }
+
+    /// Nothing at the path at all: the `stat` failure is surfaced verbatim
+    /// rather than flattened into a generic refusal, so an operator can tell
+    /// "the daemon never bound" apart from "something untrusted is squatting
+    /// the path".
+    #[test]
+    fn verify_endpoint_trusted_refuses_a_path_with_nothing_at_it() {
+        let root = tempfile::tempdir().expect("tempdir");
+
+        let missing = root.path().join("never-bound.sock");
+        let err = verify_endpoint_trusted(&missing).expect_err("an absent endpoint is refused");
+        assert!(err.starts_with("stat failed:"), "{err}");
+        assert!(err.contains("os error 2"), "ENOENT must be named: {err}");
+
+        // A dangling symlink reads as absent, for the same reason the test
+        // below reads through a live one: `metadata` follows links.
+        let dangling = root.path().join("dangling.sock");
+        std::os::unix::fs::symlink(root.path().join("nowhere"), &dangling)
+            .expect("plant the dangling symlink");
+        let err = verify_endpoint_trusted(&dangling).expect_err("a dangling symlink is refused");
+        assert!(err.starts_with("stat failed:"), "{err}");
+    }
+
+    /// Characterization, not endorsement: the check stats **through** symlinks
+    /// (`std::fs::metadata`, not `symlink_metadata`), so a link to a trusted
+    /// socket is trusted and the link's own mode never decides anything. Recon
+    /// did not list this case; it is pinned because PRD #741's `Endpoint` split
+    /// is about to move this code and a switch to `symlink_metadata` would flip
+    /// it silently.
+    #[test]
+    fn verify_endpoint_trusted_stats_through_a_symlink_to_a_trusted_socket() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let real = root.path().join("real.sock");
+        let _listener = bind_trusted_socket(&real);
+
+        let link = root.path().join("link.sock");
+        std::os::unix::fs::symlink(&real, &link).expect("plant the symlink");
+
+        verify_endpoint_trusted(&link)
+            .expect("today's check follows the link and trusts its target");
+
+        // …and it is the target's mode, not the link's, that decides.
+        chmod(&real, 0o644);
+        assert_eq!(
+            verify_endpoint_trusted(&link).expect_err("the target's mode must decide"),
+            "mode is 0o644 (expected 0o600)"
+        );
+    }
+
+    /// The foreign-uid denial, at the level where it is decidable without a
+    /// second account — the Unix mirror of
+    /// `endpoint_owner_trust_accepts_only_our_own_sid` in the parent module.
+    /// The only accepted case is "the endpoint's owner uid is exactly ours".
+    #[test]
+    fn endpoint_uid_trust_accepts_only_our_own_uid() {
+        endpoint_uid_is_trusted(1000, 1000).expect("our own uid must be trusted");
+        endpoint_uid_is_trusted(0, 0).expect("a root deck's own root-owned socket is still ours");
+        endpoint_uid_is_trusted(u32::MAX, u32::MAX).expect("the value itself decides nothing");
+    }
+
+    /// …and everything else is refused, with both uids named in the reason so
+    /// the operator can see who squatted the endpoint. The mirror of
+    /// `endpoint_owner_trust_refuses_a_foreign_or_missing_owner`.
+    #[test]
+    fn endpoint_uid_trust_refuses_a_foreign_uid() {
+        let err =
+            endpoint_uid_is_trusted(0, 1000).expect_err("a root-owned socket must be refused");
+        assert!(err.contains("uid 0"), "the squatter must be named: {err}");
+        assert!(err.contains("expected 1000"), "we must be named: {err}");
+
+        // A one-digit difference is still a different account.
+        assert!(endpoint_uid_is_trusted(1001, 1000).is_err());
+        // Refused in the other direction too: running as root does not make
+        // another user's socket ours.
+        assert!(endpoint_uid_is_trusted(1000, 0).is_err());
+        // uid 0 is a wildcard on neither side.
+        assert!(endpoint_uid_is_trusted(u32::MAX, 1000).is_err());
+        assert!(endpoint_uid_is_trusted(0, u32::MAX).is_err());
     }
 }

@@ -141,7 +141,7 @@ export function AgentTile({
           no attempt was reported. Live mode used to hardcode `1`, so every tile
           printed `ATT 01` as if the daemon tracked retries; it tracks none.
         */}
-        <div className="agent-attempt" title={agent.attempt === undefined ? "No attempt count is reported by the daemon" : "Current attempt"}>
+        <div className="agent-attempt" title={agent.attempt === undefined ? "No attempt count is reported by the deck" : "Current attempt"}>
           <span>ATT</span>
           <strong>{agent.attempt === undefined ? "—" : agent.attempt.toString().padStart(2, "0")}</strong>
         </div>
@@ -222,7 +222,7 @@ export function AgentTile({
         {tab === "diff" && (
           <div className="text-panel diff-panel">
             <div className="panel-caption"><FileCode2 size={14} /> Changed files</div>
-            {agent.diff.length ? agent.diff.map((line) => <code key={line}>{line}</code>) : <EmptyPanel label={fixture ? "No changes in this agent's lease" : "Diff data is not exposed by the daemon"} />}
+            {agent.diff.length ? agent.diff.map((line) => <code key={line}>{line}</code>) : <EmptyPanel label={fixture ? "No changes in this agent's lease" : "Diff data is not exposed by the deck"} />}
           </div>
         )}
         {tab === "checks" && (
@@ -233,7 +233,7 @@ export function AgentTile({
                 <div><strong>{check.name}</strong><span>{check.command ?? "Pending command"}</span></div>
                 <small>{check.duration ?? check.status}</small>
               </div>
-            )) : <EmptyPanel label={fixture ? "No checks attached" : "Check results are not exposed by the daemon"} />}
+            )) : <EmptyPanel label={fixture ? "No checks attached" : "Check results are not exposed by the deck"} />}
           </div>
         )}
         {tab === "handoffs" && (
@@ -243,14 +243,14 @@ export function AgentTile({
                 <span className={`verdict verdict-${item.verdict.toLowerCase()}`}>{item.verdict}</span>
                 <div><strong>{item.title}</strong><small>{item.from} → {item.to}</small></div>
               </button>
-            )) : <EmptyPanel label={fixture ? "No handoff evidence yet" : "Structured handoffs are not exposed by the daemon"} />}
+            )) : <EmptyPanel label={fixture ? "No handoff evidence yet" : "Structured handoffs are not exposed by the deck"} />}
           </div>
         )}
         {tab === "artifacts" && (
           <div className="text-panel artifact-panel">
             {agent.artifacts.length ? agent.artifacts.map((artifact) => (
               <div key={artifact.id}><Box size={14} /><span><strong>{artifact.name}</strong><code>{artifact.path}</code></span></div>
-            )) : <EmptyPanel label={fixture ? "No artifacts produced" : "Artifacts are not exposed by the daemon"} />}
+            )) : <EmptyPanel label={fixture ? "No artifacts produced" : "Artifacts are not exposed by the deck"} />}
           </div>
         )}
       </div>
