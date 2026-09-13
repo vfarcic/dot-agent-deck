@@ -351,6 +351,43 @@ def already_noticed_at(comments, sha, app_login):
     )
 
 
+def bot_rejection_is_stale(reviews, sha):
+    """True when the newest BOT changes-requested review sits on an older head.
+
+    The reviewer could reject a pull request and then never look at it again.
+    `reviewDecision` stays `CHANGES_REQUESTED` until the review is dismissed or
+    superseded — GitHub's `dismiss_stale_reviews_on_push` dismisses APPROVALS
+    only — and both the selector and the vote job skip on that decision, so a
+    rejected pull request was permanently excluded from its own reviewer. The
+    author pushed a fix and nothing came back. Measured on #1019: the rejection
+    stayed pinned to `5f76cfdd` while the head moved to `47ce8906`, and it took a
+    manual dismissal to unstick it.
+
+    Keyed on BOT authorship, not on the App's login, because the selector holds
+    no App credential and cannot ask who it is. That is sound here for a reason
+    rather than by luck: a human's changes-requested must keep parking the pull
+    request (it is someone else's homework, and re-deriving a verdict talks over
+    them mid-fix), and the only other bot reviewing here posts `COMMENTED` and
+    never `CHANGES_REQUESTED`. The vote job, which does know its own login, is
+    stricter still.
+
+    Dismissed reviews are ignored: a dismissal has already released the pull
+    request, so it is not what is holding it.
+    """
+    rejections = [
+        r for r in reviews or () if r.get("state") == "CHANGES_REQUESTED"
+    ]
+    # ANY human rejection parks it, at any age and whatever a bot also said.
+    # Looking only at the bot ones and ignoring the rest was the first version of
+    # this, and its own test caught it: a human rejection sitting beside a stale
+    # bot one read as "stale", which would have re-reviewed over a maintainer.
+    if any((r.get("user") or {}).get("type") != "Bot" for r in rejections):
+        return False
+    if not rejections:
+        return False
+    return all(r.get("commit_id") != sha for r in rejections)
+
+
 def pr_reviews(repo, pr_number):
     """Every review on a pull request, paginated.
 
@@ -363,7 +400,7 @@ def pr_reviews(repo, pr_number):
     """
     return gh_json_paginated(
         "api", f"repos/{repo}/pulls/{pr_number}/reviews", "--paginate",
-        "--jq", "[.[] | {commit_id, state, user: {login: .user.login}}]",
+        "--jq", "[.[] | {commit_id, state, user: {login: .user.login, type: .user.type}}]",
     )
 
 

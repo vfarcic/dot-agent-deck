@@ -225,8 +225,27 @@ def main():
         print(f"#{pr_number}: converted to draft during review; not voting.")
         return
     if current.get("reviewDecision") == "CHANGES_REQUESTED":
-        print(f"#{pr_number}: a reviewer requested changes during review; not voting.")
-        return
+        # Exact here, because this job DOES know its own login: re-vote only when
+        # every live changes-requested review is mine and predates this head. A
+        # human's rejection still stops the vote. Casting a new review supersedes
+        # my own earlier one, which is what releases the pull request; it cannot
+        # clear anyone else's.
+        mine = [
+            r
+            for r in pr_reviews(repo, pr_number)
+            if r.get("state") == "CHANGES_REQUESTED"
+        ]
+        others = [r for r in mine if (r.get("user") or {}).get("login") != app_login]
+        stale = mine and not others and all(
+            r.get("commit_id") != expected_sha for r in mine
+        )
+        if not stale:
+            print(f"#{pr_number}: a reviewer requested changes during review; not voting.")
+            return
+        print(
+            f"#{pr_number}: my own rejection predates {expected_sha[:8]}; re-voting on "
+            "the new head."
+        )
 
     if not app_login:
         # Fail OPEN and say so. Refusing to vote here would block every merge this

@@ -14,11 +14,13 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from pr_review_common import (  # noqa: E402
     DENY_PATHS,
+    bot_rejection_is_stale,
     checks_green,
     deny_sort_key,
     gh_json,
     gh_json_paginated,
     latest_verdict,
+    pr_reviews,
     unresolved_threads,
 )
 
@@ -145,8 +147,17 @@ def main():
             continue
 
         if pr.get("reviewDecision") == "CHANGES_REQUESTED":
-            skipped.append((number, "changes requested by a reviewer"))
-            continue
+            # ... unless the only thing holding it is OUR OWN rejection, on a head
+            # that has since moved. `dismiss_stale_reviews_on_push` dismisses
+            # approvals and not changes-requested, so without this a pull request
+            # the reviewer rejected was excluded from the reviewer FOREVER: the
+            # author pushes a fix and nothing ever looks again (#1019 needed a
+            # manual dismissal to escape). A human's changes-requested still
+            # parks it — that is someone else's homework.
+            if not bot_rejection_is_stale(pr_reviews(repo, number), sha):
+                skipped.append((number, "changes requested by a reviewer"))
+                continue
+            print(f"note #{number}: re-reviewing; my own rejection predates {sha[:8]}")
 
         green, why = checks_green(repo, sha)
         if not green:

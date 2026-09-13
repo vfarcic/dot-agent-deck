@@ -59,7 +59,7 @@ fn run_py(body: &str) -> Output {
         "import sys\nsys.path.insert(0, {scripts:?})\n\
          from pr_review_common import (_is_trusted_verdict_comment, parse_verdict,\n\
         \x20    DENY_PATHS, already_reviewed_at, already_noticed_at, NO_VOTE_MARKER,\n\
-        \x20    concat_json_documents)\n\
+        \x20    concat_json_documents, bot_rejection_is_stale)\n\
          SHA = '0' * 40\n\
          BLOCK = ('```json\\n{{\"schema\":\"pr-review/v1\",\"pr\":1,\"head_sha\":\"' + SHA +\n\
          '\",\"verdict\":\"APPROVE\",\"reasons\":[]}}\\n```')\n\
@@ -501,5 +501,49 @@ fn renovate_pull_requests_are_eligible_without_a_label_but_rank_last() {
          prs.sort(key=lambda p: p['author']['login'] in sel.DEPRIORITISED_AUTHORS)\n\
          assert [p['author']['login'] for p in prs] == \\\n\
         \x20   ['vfarcic', 'prageethw', 'app/renovate', 'app/renovate'], prs",
+    );
+}
+
+/// A rejection the reviewer itself cast must not exclude the pull request from
+/// the reviewer forever.
+///
+/// `reviewDecision` stays `CHANGES_REQUESTED` until the review is dismissed or
+/// superseded — `dismiss_stale_reviews_on_push` dismisses approvals only — and
+/// both passes skip on that decision. So a rejected pull request could never be
+/// re-reviewed: the author pushes a fix and nothing looks again. #1019 needed a
+/// manual dismissal to escape it.
+#[test]
+fn my_own_rejection_on_an_old_head_does_not_park_a_pull_request_forever() {
+    assert_py_ok(
+        "old = review(APP, 'aaaaaaaa', 'CHANGES_REQUESTED')\n\
+         old['user']['type'] = 'Bot'\n\
+         assert bot_rejection_is_stale([old], 'bbbbbbbb')\n\
+         assert not bot_rejection_is_stale([old], 'aaaaaaaa')",
+    );
+}
+
+/// A HUMAN's changes-requested keeps parking it, at any age. That is someone
+/// else's homework: re-deriving a verdict talks over a reviewer mid-fix, and the
+/// selector holds no App credential, so it tells the two apart by bot-ness.
+#[test]
+fn a_humans_rejection_still_parks_the_pull_request() {
+    assert_py_ok(
+        "h = review('vfarcic', 'aaaaaaaa', 'CHANGES_REQUESTED')\n\
+         h['user']['type'] = 'User'\n\
+         assert not bot_rejection_is_stale([h], 'bbbbbbbb')\n\
+         b = review(APP, 'aaaaaaaa', 'CHANGES_REQUESTED'); b['user']['type'] = 'Bot'\n\
+         assert not bot_rejection_is_stale([h, b], 'bbbbbbbb'), \\\n\
+        \x20   'a human rejection was overridden by a stale bot one'",
+    );
+}
+
+/// No rejection at all is not a stale rejection — the ordinary case must not be
+/// mistaken for one, or every PR would print the re-review note.
+#[test]
+fn an_unrejected_pull_request_is_not_a_stale_rejection() {
+    assert_py_ok(
+        "ok = review(APP, 'bbbbbbbb', 'APPROVED'); ok['user']['type'] = 'Bot'\n\
+         assert not bot_rejection_is_stale([], 'bbbbbbbb')\n\
+         assert not bot_rejection_is_stale([ok], 'bbbbbbbb')",
     );
 }
