@@ -1545,14 +1545,26 @@ describe("ControlDeck", () => {
   /**
    * Issue #1046: a deck whose `error` is real state, cleared by the same
    * `clearError` the button calls — which is what `useDeckRuntime` gives the
-   * app. A fake whose `clearError` were only a spy would let the assertion
+   * app. A fake whose `clearError` were only a spy would let the assertions
    * below pass while the toast stayed on screen for a user, since the toast
    * renders on `notice || error` and re-renders from whatever `error` still is.
+   *
+   * `overrides` seeds the state a case is about directly rather than driving
+   * the flow that produces it: what the dismiss handler decides is a function of
+   * the two strings it holds, and the interesting pairs take a project pick or a
+   * second action to reach honestly.
    */
-  function DeckWithClearableError({ message }: { message: string }) {
-    const base = useMemo(() => runtime({ mode: "live" }), []);
+  function DeckWithClearableError({ message, overrides }: { message: string; overrides?: Partial<DeckRuntimeState> }) {
+    const base = useMemo(() => runtime({ mode: "live", ...overrides }), []);
     const [error, setError] = useState<string | undefined>(message);
     return <ControlDeck runtime={{ ...base, error, clearError: () => setError(undefined) }} />;
+  }
+
+  /** A live deck with no daemon, which is what puts the Start deck button up. */
+  function disconnectedLive() {
+    const snapshot = createFixtureSnapshot("disconnected");
+    snapshot.agents = [];
+    return snapshot;
   }
 
   /**
@@ -1574,15 +1586,67 @@ describe("ControlDeck", () => {
   });
 
   /**
+   * Scenario: an error is on screen and a notice saying something ELSE arrives
+   * over it — a handler translating what it caught, or a failure landing while
+   * an older notice is still up. Clicking the X dismisses the notice the user
+   * was actually reading and the error takes the toast's place rather than
+   * being dropped unread; a second click clears that too. Greptile P1 on PR
+   * #1064: the first fix cleared both unconditionally, which silently discarded
+   * the half nobody had seen.
+   */
+  it("reveals an error hiding behind a different notice instead of discarding it", async () => {
+    const hidden = "daemon returned error: publish-failed";
+    render(<DeckWithClearableError message={hidden} overrides={{
+      snapshot: disconnectedLive(),
+      runAction: vi.fn(async () => { throw new Error("daemon start timed out"); }),
+    }} />);
+    expect(await screen.findByText(hidden)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByTestId("start-daemon"));
+    fireEvent.click(screen.getAllByRole("button", { name: "Start deck" }).at(-1)!);
+    expect(await screen.findByText("daemon start timed out")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByLabelText("Dismiss message"));
+
+    expect(await screen.findByText(hidden)).toBeInTheDocument();
+    expect(screen.queryByText("daemon start timed out")).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByLabelText("Dismiss message"));
+
+    await waitFor(() => expect(screen.queryByText(hidden)).not.toBeInTheDocument());
+  });
+
+  /**
+   * Scenario: the ordinary failed action, where the notice and the error carry
+   * the same string because the handler reported the very cause `runAction`
+   * recorded. One click clears the toast for good — clearing the notice alone
+   * would leave an identical toast behind, and a click that appears to do
+   * nothing is the bug this closes wearing a different hat.
+   */
+  it("takes an error that says the same thing as the notice with it", async () => {
+    const message = "daemon start timed out";
+    render(<DeckWithClearableError message={message} overrides={{
+      snapshot: disconnectedLive(),
+      runAction: vi.fn(async () => { throw new Error(message); }),
+    }} />);
+
+    fireEvent.click(screen.getByTestId("start-daemon"));
+    fireEvent.click(screen.getAllByRole("button", { name: "Start deck" }).at(-1)!);
+    expect(await screen.findByText(message)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByLabelText("Dismiss message"));
+
+    await waitFor(() => expect(screen.queryByText(message)).not.toBeInTheDocument());
+  });
+
+  /**
    * The other half of the same click: the deck's own notices still clear, and
    * they clear through `setNotice` rather than through the runtime — so a
    * runtime that never errored is not asked to do anything on its behalf.
    */
   it("still dismisses a notice the deck raised itself", async () => {
     const started = "Local deck started and control channel reconnected.";
-    const disconnected = createFixtureSnapshot("disconnected");
-    disconnected.agents = [];
-    render(<ControlDeck runtime={runtime({ mode: "live", snapshot: disconnected })} />);
+    render(<ControlDeck runtime={runtime({ mode: "live", snapshot: disconnectedLive() })} />);
 
     fireEvent.click(screen.getByTestId("start-daemon"));
     fireEvent.click(screen.getAllByRole("button", { name: "Start deck" }).at(-1)!);

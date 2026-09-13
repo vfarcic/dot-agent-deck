@@ -634,7 +634,7 @@ export interface DeckRuntimeState {
   /**
    * Drop the last action's error (issue #1046).
    *
-   * Required rather than optional: the deck's one toast renders on
+   * Required rather than optional: the toast in `App.tsx` renders on
    * `notice || error`, so a runtime that cannot clear `error` produces a toast
    * whose dismiss button silently does nothing — which is exactly the bug this
    * closes, and a fake that omits this member should stop type-checking.

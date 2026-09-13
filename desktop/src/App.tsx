@@ -570,6 +570,27 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
     });
   };
 
+  /*
+   * Issue #1046. The toast shows `notice ?? runtime.error`, so a click can only
+   * honestly dismiss what is on screen — and until this issue it could not even
+   * do that, since `runtime.error` had no clear and the X was inoperative for
+   * every error-sourced message.
+   *
+   * The error goes with the notice when it IS the notice: a handler that reports
+   * a failed action sets its notice from the same cause `runAction` recorded, so
+   * clearing only one would leave an identical toast behind and the click would
+   * look as dead as the bug this closes. An error saying something DIFFERENT is
+   * not what the user just dismissed — it survives and takes the toast's place,
+   * which is what happened before this change and is the half worth keeping.
+   * It reaches that state when a handler translates the failure it caught into
+   * friendlier words, and when an error arrives while an older notice is still
+   * up — nothing expires a notice.
+   */
+  const dismissToast = () => {
+    if (notice === undefined || notice === runtime.error) runtime.clearError();
+    setNotice(undefined);
+  };
+
   const commandItems = [
     ...(coordinator ? [{ label: "Message coordinator…", hint: `Send text to ${coordinator.displayName}`, icon: Send, run: () => focusComposer(coordinator.id) }] : []),
     { label: "Manage projects", hint: "Choose repositories & workflows", icon: FolderGit2, run: () => setProjectsOpen(true) },
@@ -788,7 +809,7 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
       {paletteOpen && <CommandPalette commands={commandItems} onClose={() => setPaletteOpen(false)} />}
       {helpOpen && <ShortcutHelp onClose={() => setHelpOpen(false)} />}
       {confirm && <ConfirmDialog state={confirm} onClose={() => setConfirm(undefined)} />}
-      {(notice || runtime.error) && <div className="toast" role="status"><AlertTriangle size={15} /><span>{notice ?? runtime.error}</span><button aria-label="Dismiss message" onClick={() => { setNotice(undefined); runtime.clearError(); }}><X size={14} /></button></div>}
+      {(notice || runtime.error) && <div className="toast" role="status"><AlertTriangle size={15} /><span>{notice ?? runtime.error}</span><button aria-label="Dismiss message" onClick={dismissToast}><X size={14} /></button></div>}
     </div>
   );
 }
