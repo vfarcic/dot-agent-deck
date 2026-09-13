@@ -13,7 +13,7 @@ import { expect, type Locator, type Page } from "@playwright/test";
  * query string. They need no daemon, no credentials and no real agent, so a
  * browser driver can use them exactly as a human reviewer does.
  */
-export type FixtureScenario = "connected" | "crowded" | "empty" | "disconnected" | "error";
+export type FixtureScenario = "connected" | "crowded" | "empty" | "disconnected" | "error" | "fleet";
 
 /**
  * Every column the overview can show, in the picker's own order.
@@ -94,7 +94,11 @@ export function legendFor(columns: Iterable<OverviewColumn>): string[] {
 export async function openOverview(page: Page, scenario: FixtureScenario = "crowded"): Promise<void> {
   await page.goto(`/?fixture=1&state=${scenario}`);
   await page.getByTestId("open-overview").click();
-  await expect(page.getByTestId("overview-table-region")).toBeVisible();
+  // `.first()`, because PRD #742 M4 made the deck the outer unit and each deck
+  // carries its own table region — `fleet` has three sections and a strict
+  // locator would fail on the count rather than on anything a reader would
+  // notice. Every single-deck scenario still matches exactly one.
+  await expect(tableRegion(page).first()).toBeVisible();
 }
 
 /**
@@ -167,9 +171,26 @@ export function legendLabels(page: Page): Locator {
   return page.locator(".overview-legend span");
 }
 
-/** The single scroll region the legend and every group card live inside. */
+/**
+ * The scroll region one deck's legend and group cards live inside.
+ *
+ * One per DECK since PRD #742 M4 — a single-deck scenario has exactly one, and
+ * `fleet` has one per answering deck. Callers that mean "the only one" say
+ * `.first()`; the alignment specs run against single-deck scenarios and are
+ * strict on purpose.
+ */
 export function tableRegion(page: Page): Locator {
   return page.getByTestId("overview-table-region");
+}
+
+/** Every deck section on screen, in document order (PRD #742 M4). */
+export function deckSections(page: Page): Locator {
+  return page.getByTestId("daemon-group");
+}
+
+/** The deck ids the screen is showing, in document order. */
+export async function deckIds(page: Page): Promise<string[]> {
+  return deckSections(page).evaluateAll((nodes) => nodes.map((node) => node.getAttribute("data-daemon-id") ?? ""));
 }
 
 /** Every group card currently on screen, in document order. */

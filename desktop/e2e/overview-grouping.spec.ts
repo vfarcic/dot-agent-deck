@@ -245,3 +245,128 @@ test.describe("the overview at fifteen agents", () => {
     }
   });
 });
+
+/**
+ * PRD #742 M4 — the fleet as a reader sees it, in a real engine.
+ *
+ * The vitest tier already asserts that three deck sections reach the DOM with
+ * the right agents inside them. What only an engine can answer is whether they
+ * reach the SCREEN: three sections that descend the page in the order the DOM
+ * lists them, none overlapping another, each with a box. A `position: absolute`
+ * left over from the single-deck layout, or a `gap` that never applied, would
+ * leave every DOM assertion green and stack the fleet on top of itself.
+ *
+ * The phone width is here because it is where a fleet is most likely to break:
+ * the overview's narrow rule hides the status pips and drops the padding, and
+ * three stacked sections is three times as much page to get wrong. The contract
+ * is the same one `page-overflow.spec.ts` states for one deck — the page body
+ * never slides sideways — asserted against the screen that has the most in it.
+ */
+test.describe("the fleet view (PRD #742 M4)", () => {
+  /** Each deck section's identity and box, read in one round trip. */
+  async function readDecks(page: Page) {
+    return page.evaluate(() =>
+      Array.from(document.querySelectorAll("[data-testid='daemon-group']")).map((section) => {
+        const box = section.getBoundingClientRect();
+        return {
+          deckId: section.getAttribute("data-daemon-id") ?? "",
+          connected: section.getAttribute("data-deck-connected") ?? "",
+          name: section.querySelector("[data-testid='daemon-identity']")?.textContent ?? "",
+          top: box.top,
+          bottom: box.bottom,
+          left: box.left,
+          right: box.right,
+          height: box.height,
+          rows: Array.from(section.querySelectorAll(".overview-row")).map(
+            (row) => row.querySelector(".overview-agent-name strong")?.textContent ?? "",
+          ),
+        };
+      }),
+    );
+  }
+
+  test("renders one section per deck, in order, each holding only its own deck's rows", async ({ page }) => {
+    await openOverview(page, "fleet");
+    const decks = await readDecks(page);
+
+    // DOM shape: three decks, the local one first, and each named the way a
+    // reader is meant to tell them apart.
+    expect(decks.map((deck) => deck.deckId)).toEqual(["/tmp/dot-agent-deck.sock", "dev@build-box", "ci@runner-7"]);
+    expect(decks.map((deck) => deck.connected)).toEqual(["yes", "yes", "no"]);
+    expect(decks.map((deck) => deck.name)).toEqual(["Local deck", "dev@build-box", "ci@runner-7"]);
+
+    // No deck's rows appear under another deck's heading. The two connected
+    // decks mint colliding agent ids, so this is about the section a row is
+    // IN and not about the id it carries.
+    expect(decks[0].rows).toContain("Plan / architecture");
+    expect(decks[1].rows).toContain("Nightly build watch");
+    expect(decks[0].rows).not.toContain("Nightly build watch");
+    expect(decks[1].rows).not.toContain("Plan / architecture");
+
+    /*
+      Real geometry, and the half the DOM cannot answer: every section has a
+      box, and they descend the page in the order the DOM lists them without
+      overlapping. A stacking or ordering fault leaves every assertion above
+      green and puts one deck on top of another.
+    */
+    for (const deck of decks) {
+      expect(deck.height, `the "${deck.name}" section laid out with no height`).toBeGreaterThan(0);
+    }
+    for (let index = 1; index < decks.length; index += 1) {
+      expect(
+        decks[index].top,
+        `the "${decks[index].name}" section is not below "${decks[index - 1].name}"`,
+      ).toBeGreaterThanOrEqual(decks[index - 1].bottom);
+    }
+  });
+
+  test("states how many decks answered, and counts only those", async ({ page }) => {
+    await openOverview(page, "fleet");
+
+    // Two of three. The literal string is the contract: it is the only thing
+    // on the header that says the four counts beside it are partial.
+    await expect(page.getByTestId("overview-count-decks").locator("strong")).toHaveText("2/3");
+
+    // Seven agents across the two answering decks. The unreachable deck was
+    // last seen running two more, and adding them would print "9" — a number
+    // that looks exactly as correct as this one.
+    await expect(page.getByTestId("overview-count-agents").locator("strong")).toHaveText("7");
+  });
+
+  test.describe("at 400x780 phone", () => {
+    test.use({ viewport: { width: 400, height: 780 } });
+
+    test("stacks three decks down a phone screen without sliding the page sideways", async ({ page }) => {
+      await openOverview(page, "fleet");
+      const decks = await readDecks(page);
+      expect(decks).toHaveLength(3);
+
+      // Every section is inside the viewport horizontally, and still stacked.
+      for (const deck of decks) {
+        expect(deck.height, `the "${deck.name}" section collapsed at phone width`).toBeGreaterThan(0);
+        expect(deck.left, `the "${deck.name}" section starts off the left edge`).toBeGreaterThanOrEqual(0);
+        expect(deck.right, `the "${deck.name}" section extends past the right edge`).toBeLessThanOrEqual(400.5);
+      }
+      for (let index = 1; index < decks.length; index += 1) {
+        expect(decks[index].top).toBeGreaterThanOrEqual(decks[index - 1].bottom);
+      }
+
+      /*
+        The same contract `page-overflow.spec.ts` states for one deck. `body`
+        carries `overflow-x: hidden`, so content past the right edge is clipped
+        rather than reachable — a reader sees a truncated screen and no
+        scrollbar saying why — and only `scrollWidth` reports it.
+      */
+      const metrics = await page.evaluate(() => ({
+        rootScroll: document.documentElement.scrollWidth,
+        rootClient: document.documentElement.clientWidth,
+        bodyScroll: document.body.scrollWidth,
+        bodyClient: document.body.clientWidth,
+        viewport: window.innerWidth,
+      }));
+      expect(metrics.bodyScroll, "content extends past the body, clipped by overflow-x: hidden").toBeLessThanOrEqual(metrics.bodyClient);
+      expect(metrics.rootScroll, "the root scrolls sideways, so the whole page slides").toBeLessThanOrEqual(metrics.rootClient);
+      expect(metrics.rootClient, "the root is wider than the viewport").toBeLessThanOrEqual(metrics.viewport);
+    });
+  });
+});

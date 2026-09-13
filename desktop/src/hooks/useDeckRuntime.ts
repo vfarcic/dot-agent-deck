@@ -4,48 +4,64 @@ import { createDeckBridge, selectRuntimeMode } from "../lib/bridge";
 import type { DesktopSettingsDto } from "../lib/bridge";
 import { applyTerminalChunk } from "../lib/terminalBuffer";
 const EMPTY_TERMINAL_DATA: Record<string, TerminalBuffer> = {};
-import type { DeckAction, DeckRuntimeState, DeckSnapshot, TerminalBuffer } from "../types";
+import type { DeckAction, DeckFleet, DeckRuntimeState, DeckSnapshot, RuntimeMode, TerminalBuffer } from "../types";
+
+/**
+ * The snapshot a runtime starts with, before any deck has answered. Lifted out
+ * of `useState` when PRD #742 M4 made the state a fleet — the seed is one deck
+ * either way, because there is exactly one deck the app knows of before a
+ * handshake: the one the selection resolves to.
+ */
+function seedSnapshot(mode: RuntimeMode): DeckSnapshot {
+  if (mode === "live") {
+    // PR #416 review B2: live mode gets its own HONEST empty seed. The old
+    // seed spread createFixtureSnapshot("empty"), which empties the arrays
+    // but keeps the scalars — so with no daemon running the top bar showed a
+    // fixture branch, run id, elapsed time and node count as steady state,
+    // with no DEMO DATA banner to disclaim them. Nothing here is invented:
+    // every field says "unavailable" until the daemon says otherwise.
+    const fixtureShape = createFixtureSnapshot("empty");
+    return {
+      ...fixtureShape,
+      runId: "—",
+      repo: "No active project",
+      // PRD #745 M8: no branch and no attempt at all, rather than a
+      // placeholder branch and a zeroed attempt counter. Neither exists
+      // daemon-side, and the seed is what the topbar shows before the first
+      // snapshot arrives.
+      branch: undefined,
+      worktree: "No active project",
+      elapsed: "—",
+      spend: 0,
+      currentNode: 0,
+      totalNodes: 0,
+      currentAttempt: undefined,
+      stages: [],
+      agents: [],
+      evidence: [],
+      handoffs: [],
+      connection: { status: "loading", message: "Connecting to the local deck…" },
+    };
+  }
+  const initial = createFixtureSnapshot("empty");
+  return {
+    ...initial,
+    connection: { status: "loading", message: "Loading deterministic fixture…" },
+  };
+}
 
 export function useDeckRuntime(): DeckRuntimeState {
   const mode = useMemo(selectRuntimeMode, []);
   const bridge = useMemo(() => createDeckBridge(mode), [mode]);
-  const [snapshot, setSnapshot] = useState<DeckSnapshot>(() => {
-    if (mode === "live") {
-      // PR #416 review B2: live mode gets its own HONEST empty seed. The old
-      // seed spread createFixtureSnapshot("empty"), which empties the arrays
-      // but keeps the scalars — so with no daemon running the top bar showed a
-      // fixture branch, run id, elapsed time and node count as steady state,
-      // with no DEMO DATA banner to disclaim them. Nothing here is invented:
-      // every field says "unavailable" until the daemon says otherwise.
-      const fixtureShape = createFixtureSnapshot("empty");
-      return {
-        ...fixtureShape,
-        runId: "—",
-        repo: "No active project",
-        // PRD #745 M8: no branch and no attempt at all, rather than a
-        // placeholder branch and a zeroed attempt counter. Neither exists
-        // daemon-side, and the seed is what the topbar shows before the first
-        // snapshot arrives.
-        branch: undefined,
-        worktree: "No active project",
-        elapsed: "—",
-        spend: 0,
-        currentNode: 0,
-        totalNodes: 0,
-        currentAttempt: undefined,
-        stages: [],
-        agents: [],
-        evidence: [],
-        handoffs: [],
-        connection: { status: "loading", message: "Connecting to the local deck…" },
-      };
-    }
-    const initial = createFixtureSnapshot("empty");
-    return {
-      ...initial,
-      connection: { status: "loading", message: "Loading deterministic fixture…" },
-    };
-  });
+  /**
+   * The whole fleet, selected deck first (PRD #742 M4). It replaced a single
+   * `snapshot` because the desktop crate now runs one watcher per observed
+   * deck: N snapshots arrive per coalescing window, and a single-snapshot state
+   * renders whichever landed last. `snapshot` below is `fleet[0]`, so every
+   * single-deck screen reads exactly what it read before.
+   */
+  const [fleet, setFleet] = useState<DeckFleet>(() => [seedSnapshot(mode)]);
+  const snapshot = fleet[0];
   const [error, setError] = useState<string>();
   // PTY bytes deliberately bypass React state. Routing every output chunk
   // through setState re-rendered the whole deck per chunk per agent — with six
@@ -77,22 +93,48 @@ export function useDeckRuntime(): DeckRuntimeState {
     for (const listener of terminalListenersRef.current.get(event.agentId) ?? []) listener(next);
   }, []);
 
+  /**
+   * Replace the SELECTED deck and leave the rest of the fleet where it is.
+   *
+   * Every failure this hook reports is about the connection the app itself
+   * owns — the bootstrap it just made — and that is the selected deck's. A
+   * remote deck that is down reports through its own `ConnectionView` in its
+   * own group, which is the whole point of the per-deck state; rewriting the
+   * fleet here would paint every deck with one deck's failure.
+   */
+  const updateSelected = useCallback((update: (current: DeckSnapshot) => DeckSnapshot) => {
+    setFleet((current) => [update(current[0]), ...current.slice(1)]);
+  }, []);
+
+  /**
+   * Take a fleet from the bridge, and never an empty one.
+   *
+   * `DeckFleet` says it is never empty and both bridges honour that, but the
+   * type cannot express it — and the cost of being wrong is not a bad render,
+   * it is `fleet[0]` being `undefined` under every single-deck screen. Keeping
+   * the previous fleet is the honest fallback: it is the last thing that was
+   * actually true, and the next snapshot replaces it.
+   */
+  const adoptFleet = useCallback((next: DeckFleet) => {
+    if (next.length) setFleet(next);
+  }, []);
+
   const reconnect = useCallback(async () => {
     setError(undefined);
-    setSnapshot((current) => ({ ...current, connection: { ...current.connection, status: "loading", message: "Reconnecting…" } }));
+    updateSelected((current) => ({ ...current, connection: { ...current.connection, status: "loading", message: "Reconnecting…" } }));
     try {
       const connected = await bridge.connect();
-      setSnapshot(connected);
+      adoptFleet(connected);
     } catch (cause) {
       const message = cause instanceof Error ? cause.message : String(cause);
       setError(message);
-      setSnapshot((current) => ({
+      updateSelected((current) => ({
         ...current,
         health: "failed",
         connection: { status: "error", message },
       }));
     }
-  }, [bridge]);
+  }, [adoptFleet, bridge, updateSelected]);
 
   useEffect(() => {
     let active = true;
@@ -101,7 +143,7 @@ export function useDeckRuntime(): DeckRuntimeState {
     void (async () => {
       try {
         unsubscribe = await bridge.subscribe(
-          (next) => active && setSnapshot(next),
+          (next) => active && adoptFleet(next),
           (event) => active && updateTerminal(event),
         );
         if (!active) {
@@ -109,12 +151,12 @@ export function useDeckRuntime(): DeckRuntimeState {
           return;
         }
         const initial = await bridge.connect();
-        if (active) setSnapshot(initial);
+        if (active) adoptFleet(initial);
       } catch (cause) {
         if (!active) return;
         const message = cause instanceof Error ? cause.message : String(cause);
         setError(message);
-        setSnapshot((current) => ({ ...current, health: "failed", connection: { status: "error", message } }));
+        updateSelected((current) => ({ ...current, health: "failed", connection: { status: "error", message } }));
       }
     })();
 
@@ -123,7 +165,7 @@ export function useDeckRuntime(): DeckRuntimeState {
       unsubscribe?.();
       void bridge.dispose();
     };
-  }, [bridge, updateTerminal]);
+  }, [adoptFleet, bridge, updateSelected, updateTerminal]);
 
   const runAction = useCallback(async (action: DeckAction) => {
     setError(undefined);
@@ -186,6 +228,7 @@ export function useDeckRuntime(): DeckRuntimeState {
     appliedGeometry,
     mode,
     snapshot,
+    fleet,
     terminalData: EMPTY_TERMINAL_DATA,
     terminalFeed,
     error,

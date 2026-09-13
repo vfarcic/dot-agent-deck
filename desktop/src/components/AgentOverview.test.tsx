@@ -16,7 +16,7 @@ import "../styles.css";
 */
 import stylesheetSource from "../styles.css?raw";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { createFixtureSnapshot, FIXTURE_DAEMON_ID } from "../data/fixture";
+import { createFixtureFleet, createFixtureSnapshot, FIXTURE_DAEMON_ID, FIXTURE_REMOTE_DAEMON_ID, FIXTURE_UNREACHABLE_DAEMON_ID } from "../data/fixture";
 import { DEFAULT_DESKTOP_SETTINGS, type DesktopSettingsDto } from "../lib/bridge";
 import { DISPLAY_LIMITS } from "../lib/displayText";
 import { UNREPORTED } from "../types";
@@ -56,9 +56,10 @@ const HOSTILE_CODEPOINTS = [
 ];
 
 function runtime(overrides: Partial<DeckRuntimeState> = {}): DeckRuntimeState {
+  const base = createFixtureSnapshot("crowded");
   return {
     mode: "fixture",
-    snapshot: createFixtureSnapshot("crowded"),
+    snapshot: base,
     terminalData: {},
     runAction: vi.fn(async () => ({ ok: true }) as import("../types").DeckActionResult),
     sendTerminalInput: vi.fn(async () => undefined),
@@ -91,6 +92,14 @@ function runtime(overrides: Partial<DeckRuntimeState> = {}): DeckRuntimeState {
     getSettings: vi.fn(async () => ({ settings: structuredClone(DEFAULT_DESKTOP_SETTINGS) })),
     saveSettings: vi.fn(async (settings: DesktopSettingsDto) => structuredClone(settings)),
     ...overrides,
+    /*
+      PRD #742 M4: the fleet, derived from whatever `snapshot` this test asked
+      for unless the test states one of its own. Derived rather than required
+      so a single-deck case stays one line — and derived from `overrides` so
+      `fleet[0]` and `snapshot` cannot silently describe two different decks,
+      which is the invariant `DeckRuntimeState` documents.
+    */
+    fleet: overrides.fleet ?? [overrides.snapshot ?? base],
   };
 }
 
@@ -1796,5 +1805,173 @@ describe("DeckShell", () => {
 
     expect(screen.getByTestId("daemon-group")).toBeVisible();
     expect(terminalMounted).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * PRD #742 M4 — the fleet appears.
+ *
+ * Two questions, and they are genuinely different. The first is STRUCTURE: does
+ * one deck per observed deck reach the screen, with each deck's agents inside
+ * its own section and `groupAgents` still bucketing WITHIN a deck rather than
+ * across the fleet. The second is HONESTY: what the header says when only some
+ * of the fleet is answering, which is the state the whole PRD is about — a
+ * disconnected deck's agent count is unknown, and the failure to avoid is
+ * adding zero for it and printing a total that looks right.
+ *
+ * The fixture is deliberately the hard case rather than the flattering one:
+ * three decks, two up and one down, and the two connected decks mint COLLIDING
+ * agent ids — which is the ordinary case, ids being per-daemon monotonic
+ * values, and the reason nothing here may key an agent by the bare id.
+ */
+describe("AgentOverview across a fleet (PRD 742 M4)", () => {
+  beforeEach(() => {
+    terminalMounted.mockClear();
+    window.localStorage.clear();
+  });
+
+  /** Every deck section on screen, in document order. */
+  function deckSections(): HTMLElement[] {
+    return screen.getAllByTestId("daemon-group");
+  }
+
+  function renderFleet(overrides: Partial<DeckRuntimeState> = {}) {
+    const fleet = createFixtureFleet("fleet");
+    window.localStorage.setItem(OVERVIEW_COLUMNS_STORAGE_KEY, JSON.stringify({ columns: ALL_OVERVIEW_COLUMNS }));
+    return {
+      fleet,
+      ...render(<AgentOverview runtime={runtime({ snapshot: fleet[0], fleet, ...overrides })} onNavigate={vi.fn()} />),
+    };
+  }
+
+  // Test-plan item 13.
+  it("renders one sibling section per observed deck, each holding only its own deck's agents", () => {
+    const { fleet } = renderFleet();
+
+    const sections = deckSections();
+    expect(sections).toHaveLength(3);
+    expect(sections.map((section) => section.getAttribute("data-daemon-id")))
+      .toEqual([FIXTURE_DAEMON_ID, FIXTURE_REMOTE_DAEMON_ID, FIXTURE_UNREACHABLE_DAEMON_ID]);
+
+    // Siblings, not nested: a deck inside another deck would still satisfy
+    // every count above it.
+    for (const section of sections) {
+      expect(section.parentElement).toBe(sections[0].parentElement);
+      expect(section.querySelector("[data-testid='daemon-group']")).toBeNull();
+    }
+
+    /*
+      Each ANSWERING deck's rows are in that deck's section and in no other,
+      addressed by the composite key — which is the assertion the colliding ids
+      make real. The deck that is down lists none of its last-known agents, and
+      that is the pre-existing rule rather than a fleet one: nothing can be said
+      about a fleet a deck is no longer vouching for, so the list is blank
+      rather than stale.
+    */
+    for (const [index, deck] of fleet.entries()) {
+      const answering = deck.connection.status === "connected";
+      for (const agent of deck.agents) {
+        const matches = screen.queryAllByTestId(`overview-agent-${agentDomKey(agent)}`);
+        expect(matches).toHaveLength(answering ? 1 : 0);
+        if (answering) expect(within(sections[index]).getByTestId(`overview-agent-${agentDomKey(agent)}`)).toBeVisible();
+      }
+    }
+    // The collision is the point: two decks minting the same agent id is the
+    // ordinary case, and a fixture without one would let a bare-id key pass.
+    const localIds = new Set(fleet[0].agents.map((agent) => agent.id));
+    expect(fleet[1].agents.some((agent) => localIds.has(agent.id))).toBe(true);
+  });
+
+  // Test-plan item 13, second half: the grouping INSIDE a deck is unchanged.
+  it("groups within each deck by tab membership and never across decks", () => {
+    const { fleet } = renderFleet();
+    const sections = deckSections();
+
+    for (const [index, deck] of fleet.entries()) {
+      const expected = deck.connection.status === "connected" ? groupAgents(deck.agents.map(toOverviewAgent)) : [];
+      const cards = Array.from(sections[index].querySelectorAll(".overview-group"));
+      expect(cards).toHaveLength(expected.length);
+      expect(cards.map((card) => card.getAttribute("data-group-kind"))).toEqual(expected.map((group) => group.kind));
+    }
+
+    // The remote deck's release-train orchestration is one card, and the local
+    // deck's dashboard agents are NOT in it — a fleet-wide `groupAgents` would
+    // have put both machines' roles in one orchestration.
+    const release = screen.getByTestId(`overview-group-${groupKey("orchestration", "orc-release")}`);
+    expect(rows(release).length).toBe(2);
+    expect(sections[1].contains(release)).toBe(true);
+  });
+
+  // Test-plan item 14.
+  it("counts over the decks that answered, says how many did, and never counts a silent deck as zero", () => {
+    const { fleet } = renderFleet();
+
+    const up = fleet.filter((deck) => deck.connection.status === "connected");
+    const answered = up.flatMap((deck) => deck.agents);
+    expect(up).toHaveLength(2);
+    expect(fleet).toHaveLength(3);
+
+    expect(screen.getByTestId("overview-count-decks").querySelector("strong")).toHaveTextContent("2/3");
+    expect(screen.getByTestId("overview-count-agents").querySelector("strong")).toHaveTextContent(String(answered.length));
+    expect(screen.getByTestId("overview-count-groups").querySelector("strong"))
+      .toHaveTextContent(String(up.reduce((total, deck) => total + groupAgents(deck.agents.map(toOverviewAgent)).length, 0)));
+
+    /*
+      The distinguishing assertion, and the reason the unreachable deck carries
+      a STALE fleet: summing over every deck would print a strictly larger
+      number, and it would look exactly as correct as this one. The header
+      states `2/3` beside it so the reader knows the total is partial.
+    */
+    const everyDeck = fleet.flatMap((deck) => deck.agents);
+    expect(everyDeck.length).toBeGreaterThan(answered.length);
+    expect(screen.getByTestId("overview-count-agents").querySelector("strong")).not.toHaveTextContent(String(everyDeck.length));
+  });
+
+  // Test-plan item 14, the degraded half.
+  it("renders a deck that is down as a degraded group with an em dash, never as a group with zero agents", () => {
+    renderFleet();
+    const down = deckSections()[2];
+
+    expect(down).toHaveAttribute("data-deck-connected", "no");
+    expect(down.className).toContain("is-degraded");
+    expect(within(down).getByTestId("daemon-unknown")).toHaveTextContent("—");
+    expect(within(down).getByTestId("overview-disconnected")).toBeVisible();
+    expect(within(down).getByTestId("daemon-state")).toHaveTextContent("No deck is listening on the configured socket.");
+    // Not a table with nothing in it, and not a pip saying "0".
+    expect(down.querySelectorAll(".overview-row")).toHaveLength(0);
+    expect(down.querySelector(".daemon-pips")).toBeNull();
+    expect(down.textContent).not.toMatch(/\b0 (running|waiting|failed|queued|passed|stopped)\b/);
+  });
+
+  it("names a remote deck by its address and the local one 'Local deck', and says 'daemon' nowhere a reader can see", () => {
+    renderFleet();
+    const sections = deckSections();
+
+    expect(within(sections[0]).getByTestId("daemon-identity")).toHaveTextContent("Local deck");
+    expect(within(sections[1]).getByTestId("daemon-identity")).toHaveTextContent(FIXTURE_REMOTE_DAEMON_ID);
+    expect(within(sections[2]).getByTestId("daemon-identity")).toHaveTextContent(FIXTURE_UNREACHABLE_DAEMON_ID);
+    expect(document.querySelector(".overview-screen")?.textContent ?? "").not.toMatch(/daemon/i);
+  });
+
+  /**
+   * The single-deck screen is the control: every assertion above would also
+   * hold for a component that simply rendered N of everything, so the thing
+   * worth pinning is that a fleet of one still reads exactly as it did before
+   * the fleet existed.
+   */
+  it("still renders one section and a 1/1 deck count for a single-deck fleet", () => {
+    renderOverview();
+
+    expect(screen.getAllByTestId("daemon-group")).toHaveLength(1);
+    expect(screen.getByTestId("overview-count-decks").querySelector("strong")).toHaveTextContent("1/1");
+    expect(screen.getByTestId("daemon-identity")).toHaveTextContent("Local deck");
+  });
+
+  it("reads every count as unknown when no deck in the fleet is answering", () => {
+    const fleet = [createFixtureSnapshot("disconnected"), createFixtureSnapshot("error")];
+    render(<AgentOverview runtime={runtime({ snapshot: fleet[0], fleet })} onNavigate={vi.fn()} />);
+
+    expect(counterText()).toEqual(["—", "—", "—", "—", "—"]);
+    expect(screen.getByTestId("overview-count-decks").querySelector("strong")).toHaveTextContent("0/2");
   });
 });

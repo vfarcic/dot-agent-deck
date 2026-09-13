@@ -31,10 +31,11 @@ function settingsStore(initial?: Partial<DesktopSettingsDto>, path?: string) {
 }
 
 function runtime(overrides: Partial<DeckRuntimeState> = {}): DeckRuntimeState {
+  const base = createFixtureSnapshot("connected");
   const settings = settingsStore();
   return {
     mode: "fixture",
-    snapshot: createFixtureSnapshot("connected"),
+    snapshot: base,
     terminalData: {},
     runAction: vi.fn(async () => ({ ok: true }) as import("./types").DeckActionResult),
     sendTerminalInput: vi.fn(async () => undefined),
@@ -64,6 +65,14 @@ function runtime(overrides: Partial<DeckRuntimeState> = {}): DeckRuntimeState {
     getSettings: settings.getSettings,
     saveSettings: settings.saveSettings,
     ...overrides,
+    /*
+      PRD #742 M4: the fleet, derived from whatever `snapshot` this test asked
+      for unless the test states one of its own. Derived rather than required
+      so a single-deck case stays one line — and derived from `overrides` so
+      `fleet[0]` and `snapshot` cannot silently describe two different decks,
+      which is the invariant `DeckRuntimeState` documents.
+    */
+    fleet: overrides.fleet ?? [overrides.snapshot ?? base],
   };
 }
 

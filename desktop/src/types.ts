@@ -482,6 +482,29 @@ export interface DeckSnapshot {
   profiles: AgentProfile[];
 }
 
+/**
+ * Every deck the app is observing right now, one snapshot each (PRD #742 M4).
+ *
+ * # Selected deck first, and never empty
+ *
+ * The desktop crate's observed set is `[resolve().endpoint]` for every
+ * selection except `All`, and for `All` it LEADS with the local deck — which is
+ * what `All` resolves to. So the first entry is always the deck the
+ * single-deck surfaces talk to, and there is always at least one: a deck the
+ * app cannot reach is still an entry, carrying a `disconnected` connection and
+ * no agents. That is the distinction the whole fleet view rests on — "no
+ * agents" and "we cannot see the agents" are different statements, and an
+ * absent entry could not tell them apart.
+ *
+ * # Keyed by `connection.socketPath`
+ *
+ * That string is `Endpoint::describe()` — the socket path for a local deck,
+ * `user@host[:port]` for a remote one — and it is the same value `daemonId` is
+ * derived from, so an entry here and the agents inside it agree on identity by
+ * construction rather than by care.
+ */
+export type DeckFleet = DeckSnapshot[];
+
 /** One delegation's lifecycle, driven by the daemon's handoff events. */
 export interface HandoffEdge {
   /** The daemon's delegation id (`dlg-<millis>-<seq>`). */
@@ -626,7 +649,24 @@ export interface TerminalFeed {
 
 export interface DeckRuntimeState {
   mode: RuntimeMode;
+  /**
+   * The deck every SINGLE-DECK surface is bound to — the deck screen, its
+   * terminals, and every action. Identical to `fleet[0]` (PRD #742 M4), and
+   * kept as its own member because "the selected deck" is what these screens
+   * mean and reading it as an index would put the invariant at each call site.
+   */
   snapshot: DeckSnapshot;
+  /**
+   * Every deck the app is observing, selected first (PRD #742 M4). One entry
+   * under every selection but `All`, where it is the whole configured fleet.
+   *
+   * The agent overview renders one group per entry. Nothing else does: a tile's
+   * terminal is always the selected deck's, because an attach costs one
+   * connection and one daemon-side task PER VISIBLE TILE and attach streams
+   * carry no stream id, so N decks of rows is cheap and N decks of live
+   * terminals is not (PRD #742 DECISION 1).
+   */
+  fleet: DeckFleet;
   terminalData: Record<string, TerminalBuffer>;
   /** Direct PTY-byte path that bypasses React state; absent in tests/fixture. */
   terminalFeed?: TerminalFeed;

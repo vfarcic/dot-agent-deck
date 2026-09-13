@@ -39,9 +39,10 @@ function settingsWith(endpoints?: EndpointSettingsDto): DesktopSettingsDto {
 }
 
 function runtime(overrides: Partial<DeckRuntimeState> = {}): DeckRuntimeState {
+  const base = createFixtureSnapshot("crowded");
   return {
     mode: "live",
-    snapshot: createFixtureSnapshot("crowded"),
+    snapshot: base,
     terminalData: {},
     runAction: vi.fn(async () => ({ ok: true }) as import("../types").DeckActionResult),
     sendTerminalInput: vi.fn(async () => undefined),
@@ -66,6 +67,14 @@ function runtime(overrides: Partial<DeckRuntimeState> = {}): DeckRuntimeState {
     getSettings: vi.fn(async () => ({ settings: settingsWith() })),
     saveSettings: vi.fn(async (settings: DesktopSettingsDto) => structuredClone(settings)),
     ...overrides,
+    /*
+      PRD #742 M4: the fleet, derived from whatever `snapshot` this test asked
+      for unless the test states one of its own. Derived rather than required
+      so a single-deck case stays one line — and derived from `overrides` so
+      `fleet[0]` and `snapshot` cannot silently describe two different decks,
+      which is the invariant `DeckRuntimeState` documents.
+    */
+    fleet: overrides.fleet ?? [overrides.snapshot ?? base],
   };
 }
 

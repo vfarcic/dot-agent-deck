@@ -1,4 +1,4 @@
-import { createFixtureSnapshot, DEFAULT_PROFILES, type FixtureState } from "../data/fixture";
+import { createFixtureFleet, DEFAULT_PROFILES, type FixtureState } from "../data/fixture";
 import { getTerminal } from "./terminalRegistry";
 import { applyHandoffEvent, mapDaemonEvent, MAX_LIVE_EVIDENCE } from "./daemonEvents";
 import { DISPLAY_LIMITS, displayText } from "./displayText";
@@ -13,6 +13,7 @@ import type { HandoffEdge,
   DaemonResolvedProject,
   DeckAction,
   DeckActionResult,
+  DeckFleet,
   DeckSnapshot,
   EvidenceItem,
   RuntimeMode,
@@ -315,6 +316,39 @@ export const DEFAULT_DESKTOP_SETTINGS: DesktopSettingsDto = {
  */
 export const FIXTURE_SETTINGS_KEY = "dot-agent-deck.desktop-settings";
 
+/** The fingerprint of a document that declares no `[endpoints]` section. */
+const UNSPECIFIED_ENDPOINTS = "unspecified";
+
+/**
+ * The `[endpoints]` section as one comparable string (PRD #742 M4).
+ *
+ * What it answers is "could this document have changed which decks the app
+ * observes", and the whole section is the honest answer to that: the selection
+ * decides whether the fleet is one deck or all of them, and each row's address
+ * fields decide which deck a row IS — a changed `socket`, `identity` or `jump`
+ * names a different daemon or a different route to it, which is exactly the
+ * distinction `EndpointIdentity` was introduced for on the Rust side.
+ *
+ * It is deliberately coarse in one direction: a row edited from one unreachable
+ * address to another re-establishes the fleet for nothing. That costs one
+ * handshake against a deck the user is actively editing, which is the cheapest
+ * possible moment to spend one.
+ *
+ * `JSON.stringify` over fields this module names in this order, so the answer
+ * does not depend on the key order the crate happened to serialise.
+ */
+function endpointsFingerprint(settings: DesktopSettingsDto): string {
+  const endpoints = settings.endpoints;
+  // `undefined` is UNSPECIFIED and never empty — see `DesktopSettingsDto`. A
+  // document that says nothing about the section left whatever is on disk
+  // exactly where it was, so it cannot have changed which decks are observed.
+  if (!endpoints) return UNSPECIFIED_ENDPOINTS;
+  return JSON.stringify([
+    endpoints.selection,
+    endpoints.remote.map((row) => [row.id, row.host, row.user, row.port, row.socket, row.identity, row.jump]),
+  ]);
+}
+
 /**
  * Coerce anything read back from storage into a valid document. An unknown
  * appearance value falls back to the default rather than propagating, matching
@@ -518,7 +552,18 @@ export type DesktopRunActionDto =
   | { type: "restart_daemon" }
   | { type: "allow_build_mismatch" };
 
-type SnapshotListener = (snapshot: DeckSnapshot) => void;
+/**
+ * PRD #742 M4: the listener takes the WHOLE fleet, never one deck's snapshot.
+ *
+ * It used to take one, and that was the shape the last-wins flicker came out
+ * of: with `Selection::All` the desktop crate runs one watcher per observed
+ * deck, each coalescing on its own 150 ms window, so N snapshots arrive per
+ * window and a single-snapshot listener renders whichever landed last. The
+ * bridge folds them into a fleet keyed by deck instead, and hands the listener
+ * the fold — so an arriving snapshot updates ITS deck and leaves the others
+ * exactly where they were.
+ */
+type FleetListener = (fleet: DeckFleet) => void;
 type TerminalListener = (event: TerminalChunk) => void;
 type Unsubscribe = () => void;
 
@@ -533,8 +578,24 @@ interface PendingTerminalAttachment {
 
 export interface DeckBridge {
   readonly mode: RuntimeMode;
-  connect(): Promise<DeckSnapshot>;
-  subscribe(onSnapshot: SnapshotListener, onTerminal: TerminalListener): Promise<Unsubscribe>;
+  /**
+   * Establish the fleet and answer every deck the app is observing, SELECTED
+   * DECK FIRST (PRD #742 M4).
+   *
+   * It answered one `DeckSnapshot` until M4, which is where "one deck" was
+   * baked into the CONTRACT rather than merely into the data — a bridge whose
+   * only snapshot verb returns one deck cannot express a fleet however
+   * multi-deck the wire underneath it becomes.
+   *
+   * **It also RESETS fleet membership**, and that is the half worth knowing
+   * before calling it. The desktop crate pushes a per-deck snapshot but no
+   * "this deck left the fleet" event, so the set of decks the bridge knows
+   * about is the set seen since the last connect. Everything that can change
+   * which decks are observed therefore goes through here: app start, Reconnect,
+   * and a settings save that touched `[endpoints]` (see `saveSettings`).
+   */
+  connect(): Promise<DeckFleet>;
+  subscribe(onFleet: FleetListener, onTerminal: TerminalListener): Promise<Unsubscribe>;
   runAction(action: DeckAction): Promise<DeckActionResult>;
   sendTerminalInput(agentId: string, data: string): Promise<void>;
   resizeTerminal(agentId: string, cols: number, rows: number): Promise<void>;
@@ -562,7 +623,15 @@ export interface DeckBridge {
   setZoom(level: number): Promise<number>;
   /** The desktop app's own settings document, and where it lives (PRD #803). Never rejects. */
   getSettings(): Promise<DesktopSettingsSnapshotDto>;
-  /** Persist the whole document and resolve with what was written. */
+  /**
+   * Persist the whole document and resolve with what was written.
+   *
+   * PRD #742 M4: a write that changed the `[endpoints]` section also
+   * **re-establishes the fleet**, because that section is the only thing that
+   * decides which decks are observed and the crate emits no membership event a
+   * listener could prune from. A theme save changes no deck and takes no such
+   * path.
+   */
   saveSettings(settings: DesktopSettingsDto): Promise<DesktopSettingsDto>;
   /**
    * Test one deck end to end and resolve with a **named state** (PRD #741 M10).
@@ -833,39 +902,57 @@ export function mapDesktopSnapshot(dto: DesktopSnapshotDto, previous?: DeckSnaps
  * reachable from the URL — the previous inline `||` chain had to be edited in
  * lockstep with the fixture and was not.
  */
-const FIXTURE_STATES: readonly FixtureState[] = ["connected", "crowded", "disconnected", "error", "empty"];
+const FIXTURE_STATES: readonly FixtureState[] = ["connected", "crowded", "disconnected", "error", "empty", "fleet"];
 
 class FixtureDeckBridge implements DeckBridge {
   readonly mode = "fixture" as const;
-  private snapshot: DeckSnapshot;
-  private snapshotListeners = new Set<SnapshotListener>();
+  /**
+   * The whole fixture fleet, selected deck first (PRD #742 M4). One entry for
+   * every scenario but `fleet`, which is the three-deck one.
+   */
+  private fleet: DeckFleet;
+  private fleetListeners = new Set<FleetListener>();
   private terminalListeners = new Set<TerminalListener>();
   private fixtureStep = 0;
   private settings?: DesktopSettingsDto;
 
+  /**
+   * The selected deck, which is the only one every mutating fixture action
+   * touches — `runAction` is the deck screen's, and the deck screen is
+   * single-deck (PRD #742 DECISION 1). An accessor rather than a second field
+   * so the two can never disagree.
+   */
+  private get snapshot(): DeckSnapshot {
+    return this.fleet[0];
+  }
+
+  private set snapshot(value: DeckSnapshot) {
+    this.fleet[0] = value;
+  }
+
   constructor() {
     const requestedState = new URLSearchParams(window.location.search).get("state");
     const state = FIXTURE_STATES.find((candidate) => candidate === requestedState) ?? "connected";
-    this.snapshot = createFixtureSnapshot(state);
+    this.fleet = createFixtureFleet(state);
   }
 
-  async connect(): Promise<DeckSnapshot> {
+  async connect(): Promise<DeckFleet> {
     await Promise.resolve();
-    return structuredClone(this.snapshot);
+    return structuredClone(this.fleet);
   }
 
-  async subscribe(onSnapshot: SnapshotListener, onTerminal: TerminalListener): Promise<Unsubscribe> {
-    this.snapshotListeners.add(onSnapshot);
+  async subscribe(onFleet: FleetListener, onTerminal: TerminalListener): Promise<Unsubscribe> {
+    this.fleetListeners.add(onFleet);
     this.terminalListeners.add(onTerminal);
     return () => {
-      this.snapshotListeners.delete(onSnapshot);
+      this.fleetListeners.delete(onFleet);
       this.terminalListeners.delete(onTerminal);
     };
   }
 
   private emitSnapshot(): void {
-    const value = structuredClone(this.snapshot);
-    this.snapshotListeners.forEach((listener) => listener(value));
+    const value = structuredClone(this.fleet);
+    this.fleetListeners.forEach((listener) => listener(value));
   }
 
   async runAction(action: DeckAction): Promise<DeckActionResult> {
@@ -897,7 +984,9 @@ class FixtureDeckBridge implements DeckBridge {
         this.snapshot.agents = this.snapshot.agents.map((agent) => agent.id === "tester" ? { ...agent, status: "passed", transcript: `${agent.transcript}\u001b[32mPASS\u001b[0m browser · a11y · PTY fixture\r\n` } : agent);
         this.snapshot.currentNode = 6;
       } else {
-        this.snapshot = createFixtureSnapshot("connected");
+        // Only the SELECTED deck is reset: `advance_fixture` is the deck
+        // screen's own control, and the deck screen is single-deck.
+        this.snapshot = createFixtureFleet("connected")[0];
       }
     }
     this.emitSnapshot();
@@ -1031,7 +1120,7 @@ class FixtureDeckBridge implements DeckBridge {
   }
 
   async dispose(): Promise<void> {
-    this.snapshotListeners.clear();
+    this.fleetListeners.clear();
     this.terminalListeners.clear();
   }
 }
@@ -1096,6 +1185,36 @@ export class TauriDeckBridge implements DeckBridge {
   private attachRequested = new Set<string>();
   private terminalListener?: TerminalListener;
   /**
+   * The fold every `desktop://snapshot` lands in (PRD #742 M4): one entry per
+   * deck, keyed by `connection.socketPath`, in insertion order — which is
+   * observed order, because `connect()` seeds the selected deck and every other
+   * deck is inserted by its own watcher's first emit.
+   *
+   * A `Map` rather than an array because the wire is an UPSERT stream: N
+   * watchers each emit their own deck on their own coalescing window, so what
+   * arrives is "here is deck X as of now" and never "here is the fleet". The
+   * array the listeners see is built from this on every emit.
+   */
+  private fleet = new Map<string, DeckSnapshot>();
+  /**
+   * Which deck the single-deck surfaces are bound to, as `connect()` last
+   * answered it — the desktop crate's `resolve()`, which is the one
+   * authoritative statement of it the frontend ever receives.
+   *
+   * Nothing on the snapshot stream says "this one is selected", and it cannot
+   * be inferred: under `All` every observed deck emits the same shape. So it is
+   * re-learnt at `connect()` and nowhere else, which is exactly why a settings
+   * write that touched `[endpoints]` re-connects (see `saveSettings`).
+   */
+  private selectedDeckId?: string;
+  private fleetListener?: FleetListener;
+  /**
+   * The `[endpoints]` section as this bridge last saw it, serialised. Compared
+   * on every `saveSettings` so a theme save does not re-establish a fleet, and
+   * an endpoint edit does. `undefined` until a read or a write has been seen.
+   */
+  private lastEndpoints?: string;
+  /**
    * PRD #882 — the geometry the daemon has applied per agent, and who wants to
    * hear about it changing.
    *
@@ -1123,6 +1242,23 @@ export class TauriDeckBridge implements DeckBridge {
     const match = this.agentIndex.find((agent) => (agentId && agent.id === agentId) || (paneId && agent.paneId === paneId));
     return match ? { id: match.id, role: match.role } : undefined;
   };
+
+  /**
+   * Whether a `desktop://daemon-event` payload belongs to the deck the deck
+   * screen is on (PRD #742 M4).
+   *
+   * `deck` is the flat string PRD #742 M3 stamps beside the event, carrying
+   * exactly what `connection.socketPath` does. An absent or non-string `deck`
+   * reads as YES, deliberately: the field is additive, and treating its absence
+   * as "some other deck" would silence every event from a build that predates
+   * the stamp and every event a fixture synthesises.
+   */
+  private isSelectedDeckEvent(payload: unknown): boolean {
+    if (this.selectedDeckId === undefined) return true;
+    if (typeof payload !== "object" || payload === null) return true;
+    const deck = (payload as { deck?: unknown }).deck;
+    return typeof deck !== "string" || deck === this.selectedDeckId;
+  }
 
   private recordDaemonEvent(payload: unknown): boolean {
     const edges = applyHandoffEvent(this.handoffs, payload);
@@ -1443,7 +1579,23 @@ export class TauriDeckBridge implements DeckBridge {
     });
   }
 
-  async connect(): Promise<DeckSnapshot> {
+  /**
+   * The fleet as the bridge holds it, selected deck first.
+   *
+   * Built on every emit rather than maintained as an array, because the wire is
+   * an upsert stream and the order a listener needs is not the order snapshots
+   * arrive in: the selected deck must lead however late its watcher happened to
+   * fire. Insertion order carries the rest, which is observed order.
+   */
+  private fleetView(): DeckFleet {
+    const decks = Array.from(this.fleet.values());
+    const selectedAt = decks.findIndex((deck) => deck.connection.socketPath === this.selectedDeckId);
+    if (selectedAt <= 0) return decks;
+    const [selected] = decks.splice(selectedAt, 1);
+    return [selected, ...decks];
+  }
+
+  async connect(): Promise<DeckFleet> {
     // Reconnect is the user's remedy for a wedged control room, so it has to be
     // able to remedy this too. `useDeckRuntime` memoizes the bridge on `mode`
     // alone and `reconnect()` calls straight into here, so nothing is disposed
@@ -1455,22 +1607,64 @@ export class TauriDeckBridge implements DeckBridge {
     // the daemon owns, so a nine-agent fleet cost nine sockets and nine
     // scrollback replays before a single terminal was on screen. The UI states
     // what it shows through `setShownTerminals`, and that is the only trigger.
-    const snapshot = mapDesktopSnapshot(dto, undefined, this.evidence, this.handoffs);
+    const snapshot = mapDesktopSnapshot(dto, this.fleet.get(dto.connection.socketPath), this.evidence, this.handoffs);
     this.agentIndex = snapshot.agents;
-    return snapshot;
+    // PRD #742 M4: membership is RESET here, not merged. `desktop_bootstrap`
+    // answers the deck `resolve()` names, so this is both the authoritative
+    // statement of which deck is selected and the only moment at which a deck
+    // that has LEFT the observed set can be forgotten — the crate emits no
+    // event that says one has. Every still-observed deck reinstates itself on
+    // its watcher's next emit, which for a newly established one is immediate
+    // and for a quiet one is bounded by the crate's reconcile interval.
+    this.selectedDeckId = dto.connection.socketPath;
+    this.fleet.clear();
+    this.fleet.set(dto.connection.socketPath, snapshot);
+    return this.fleetView();
   }
 
-  async subscribe(onSnapshot: SnapshotListener, onTerminal: TerminalListener): Promise<Unsubscribe> {
+  /**
+   * Fold one deck's snapshot into the fleet and answer the new whole.
+   *
+   * The previous snapshot passed to `mapDesktopSnapshot` is THIS DECK'S, never
+   * the last one to arrive: it carries the per-agent transcripts forward, and
+   * agent ids are per-daemon monotonic integers, so folding deck B's arrival
+   * against deck A's previous state would graft one machine's scrollback onto
+   * another machine's agent of the same id.
+   */
+  private foldSnapshot(dto: DesktopSnapshotDto): DeckFleet {
+    const deckId = dto.connection.socketPath;
+    /*
+      The evidence ring and the handoff edges are the SELECTED deck's — the
+      only deck whose events this bridge records at all, since the stamped
+      `desktop://daemon-event` filter drops the rest — so they are handed to
+      that deck's snapshot and to no other. Passing them to every deck would
+      hang one machine's hook history off another machine's snapshot; an
+      omitted argument leaves each other deck with whatever it already had,
+      which on a first arrival is nothing.
+    */
+    const selected = deckId === this.selectedDeckId;
+    const mapped = mapDesktopSnapshot(
+      dto,
+      this.fleet.get(deckId),
+      selected ? this.evidence : undefined,
+      selected ? this.handoffs : undefined,
+    );
+    this.fleet.set(deckId, mapped);
+    // The hook-event resolver is the deck screen's, and the deck screen is
+    // single-deck — so it indexes the SELECTED deck alone. Indexing the fleet
+    // would let a colliding agent id resolve an event to the wrong machine's
+    // agent, which is the same mislabel the composite key exists to stop.
+    if (selected) this.agentIndex = mapped.agents;
+    return this.fleetView();
+  }
+
+  async subscribe(onFleet: FleetListener, onTerminal: TerminalListener): Promise<Unsubscribe> {
     const { listen } = await import("@tauri-apps/api/event");
     this.terminalListener = onTerminal;
+    this.fleetListener = onFleet;
     this.pendingTerminal.forEach((events) => events.forEach((event) => onTerminal(event)));
     this.pendingTerminal.clear();
-    let latest: DeckSnapshot | undefined;
-    const emit = (dto: DesktopSnapshotDto) => {
-      latest = mapDesktopSnapshot(dto, latest, this.evidence, this.handoffs);
-      this.agentIndex = latest.agents;
-      onSnapshot(latest);
-    };
+    const emit = (dto: DesktopSnapshotDto) => onFleet(this.foldSnapshot(dto));
     const stopSnapshot = await listen<DesktopSnapshotDto>("desktop://snapshot", (event) => {
       // PRD #745 M7: a snapshot reports what the daemon owns, which says nothing
       // about what is on screen — so re-declare the set the UI last declared,
@@ -1492,9 +1686,22 @@ export class TauriDeckBridge implements DeckBridge {
     // event produces one within the coalescing window; republishing the last
     // mapped snapshot keeps the drawer current without waiting for the next.
     const stopDaemonEvent = await listen<unknown>("desktop://daemon-event", (event) => {
-      if (!this.recordDaemonEvent(event.payload) || !latest) return;
-      latest = { ...latest, evidence: this.evidence, handoffs: this.handoffs };
-      onSnapshot(latest);
+      // PRD #742 M3 stamped every payload with the deck it came from, and this
+      // is the reader that stamp was for: the evidence drawer and the handoff
+      // rail are the DECK SCREEN's, which DECISION 1 keeps single-deck, so an
+      // event from a deck the screen is not on is dropped rather than folded
+      // into another machine's drawer. An UNSTAMPED payload is kept — a fixture
+      // sends none, and an older crate sent none either.
+      if (!this.isSelectedDeckEvent(event.payload)) return;
+      // Recorded BEFORE the guards below, exactly as it was when the guard was
+      // `!latest`: an event that lands before the first snapshot still belongs
+      // in the ring, and dropping it would lose the drawer's earliest entries.
+      const changed = this.recordDaemonEvent(event.payload);
+      const selectedDeckId = this.selectedDeckId;
+      const selected = selectedDeckId === undefined ? undefined : this.fleet.get(selectedDeckId);
+      if (!changed || selectedDeckId === undefined || selected === undefined) return;
+      this.fleet.set(selectedDeckId, { ...selected, evidence: this.evidence, handoffs: this.handoffs });
+      onFleet(this.fleetView());
     });
     const stopTerminalState = await listen<DesktopTerminalStateDto>("desktop://terminal-state", (event) => {
       if (event.payload.state === "attached") return;
@@ -1599,12 +1806,45 @@ export class TauriDeckBridge implements DeckBridge {
    */
   async getSettings(): Promise<DesktopSettingsSnapshotDto> {
     const invoke = await this.getInvoke();
-    return normalizeDesktopSettingsSnapshot(await invoke<DesktopSettingsSnapshotDto>("desktop_get_settings"));
+    const snapshot = normalizeDesktopSettingsSnapshot(await invoke<DesktopSettingsSnapshotDto>("desktop_get_settings"));
+    this.lastEndpoints = endpointsFingerprint(snapshot.settings);
+    return snapshot;
   }
 
   async saveSettings(settings: DesktopSettingsDto): Promise<DesktopSettingsDto> {
     const invoke = await this.getInvoke();
-    return normalizeDesktopSettings(await invoke<DesktopSettingsDto>("desktop_set_settings", { settings }));
+    const written = normalizeDesktopSettings(await invoke<DesktopSettingsDto>("desktop_set_settings", { settings }));
+    const fingerprint = endpointsFingerprint(written);
+    // An unspecified section is not a change and must not become the baseline
+    // either: recording the sentinel would make the NEXT real edit compare
+    // against it and re-establish the fleet for nothing.
+    const known = fingerprint !== UNSPECIFIED_ENDPOINTS;
+    const moved = known && this.lastEndpoints !== undefined && this.lastEndpoints !== fingerprint;
+    if (known) this.lastEndpoints = fingerprint;
+    /*
+      PRD #742 M4. `[endpoints]` is the only part of this document that decides
+      which decks are OBSERVED, and the desktop crate emits no membership event:
+      `desktop_set_settings` → `apply_selection` ends a departed deck's watcher
+      and starts an arrived one's, but nothing tells the webview that a deck it
+      already holds a group for has left. Left alone, unticking a deck from the
+      fleet would leave its last-known agents frozen on the overview looking
+      live, and moving the selection to another deck would leave the app
+      believing the old one is still the selected one.
+
+      Re-connecting answers both at once, because `desktop_bootstrap` is the
+      crate's authoritative statement of `resolve()` AND the one place the fleet
+      map is reset. It is awaited before this resolves so the caller's next
+      render already has the new fleet.
+
+      Gated on the section having MOVED, so an appearance save — which sends the
+      whole document too — costs no handshake, and `undefined` (nothing read or
+      written yet on this bridge) never counts as a move.
+    */
+    if (moved) {
+      const fleet = await this.connect().catch(() => undefined);
+      if (fleet) this.fleetListener?.(fleet);
+    }
+    return written;
   }
 
   /**

@@ -176,3 +176,102 @@ test("the daemon lamp's colour separates fault from health", async ({ page }) =>
   expect(painted.get("error")).not.toBe(painted.get("connected"));
   expect(painted.get("error"), "a downed daemon and an incompatible one paint the same lamp").not.toBe(painted.get("disconnected"));
 });
+
+/**
+ * PRD #742 M4 — PARTIAL connectivity, which is a fifth state the four above
+ * cannot express.
+ *
+ * Each of those is one deck in one condition, and the screen's answer is
+ * whole-screen: a table, or a note. A fleet is two answers at once, and the
+ * thing that has to read correctly is the boundary between them — the healthy
+ * decks keep their tables, the unreachable one degrades ON ITS OWN, and the
+ * header says the totals beside it are over the decks that answered.
+ *
+ * The failure this is really about does not look like a failure. A header that
+ * summed over every deck would print a larger number with no lamp, no note and
+ * nothing out of place — a deck's whole fleet quietly counted as the agents it
+ * happened to be running the last time anyone could see it, or as zero. So the
+ * assertions here are about what is stated, and one of them is that a specific
+ * wrong number is NOT on screen.
+ */
+test.describe("partial connectivity (PRD #742 M4)", () => {
+  async function openFleet(page: Page): Promise<void> {
+    await page.goto("/?fixture=1&state=fleet");
+    await page.getByTestId("open-overview").click();
+    await expect(page.getByTestId("daemon-group").first()).toBeVisible();
+  }
+
+  test("one deck down among two up reads as one deck's problem, not the screen's", async ({ page }) => {
+    await openFleet(page);
+    const decks = page.getByTestId("daemon-group");
+    await expect(decks).toHaveCount(3);
+
+    // The two that answered keep their tables and their pips.
+    for (const index of [0, 1]) {
+      const deck = decks.nth(index);
+      await expect(deck.getByTestId("overview-table-region")).toBeVisible();
+      await expect(deck.locator(".daemon-pips")).toBeVisible();
+      await expect(deck.getByTestId("overview-disconnected")).toHaveCount(0);
+    }
+
+    /*
+      The one that did not says so in its own section: its own lamp, its own
+      note, its own remedy — and an em dash where its neighbours print counts,
+      because what it is running is UNKNOWN rather than none.
+    */
+    const down = decks.nth(2);
+    await expect(down).toHaveAttribute("data-deck-connected", "no");
+    await expect(down.getByTestId("daemon-identity")).toHaveText("ci@runner-7");
+    await expect(down.getByTestId("overview-disconnected")).toBeVisible();
+    await expect(down.getByTestId("daemon-state")).toHaveText("No deck is listening on the configured socket.");
+    await expect(down.getByTestId("daemon-unknown")).toHaveText("—");
+    await expect(down.locator(".overview-row")).toHaveCount(0);
+    await expect(down.locator(".daemon-pips")).toHaveCount(0);
+
+    /*
+      Real geometry: the degraded section is a box a reader can see, inside the
+      viewport and below the deck above it. A note rendered at zero height is a
+      blank screen with the right `data-testid` on it, which is exactly what
+      this tier exists to tell apart from the right answer.
+    */
+    const placement = await down.evaluate((node) => {
+      const box = node.getBoundingClientRect();
+      const note = node.querySelector("[data-testid='overview-disconnected']")!.getBoundingClientRect();
+      return { height: box.height, noteWidth: note.width, noteHeight: note.height, right: box.right, viewport: window.innerWidth };
+    });
+    expect(placement.height, "the degraded deck laid out with no height").toBeGreaterThan(0);
+    expect(placement.noteWidth, "the degraded deck's note laid out with no width").toBeGreaterThan(0);
+    expect(placement.noteHeight, "the degraded deck's note laid out with no height").toBeGreaterThan(0);
+    expect(placement.right).toBeLessThanOrEqual(placement.viewport);
+  });
+
+  test("the header counts the decks that answered and never the fleet the silent one was last seen running", async ({ page }) => {
+    await openFleet(page);
+
+    // Two of three, stated. Without this the four counts beside it are a total
+    // with no way to know it is partial.
+    await expect(page.getByTestId("overview-count-decks").locator("strong")).toHaveText("2/3");
+
+    /*
+      Seven, not nine. The unreachable deck was last seen running two agents and
+      the fixture carries them, exactly as live mode does — a reconnect failure
+      replaces the connection and keeps the fleet it last knew. Summing over
+      every deck prints nine; treating the silent deck as zero prints seven by
+      luck and would print seven for the wrong reason only if it had none, which
+      is why the fixture gives it some.
+    */
+    await expect(page.getByTestId("overview-count-agents").locator("strong")).toHaveText("7");
+    await expect(page.getByTestId("overview-count-agents").locator("strong")).not.toHaveText("9");
+
+    // Every lamp on the page, so "which deck is in which state" is legible at a
+    // glance rather than only in a note somebody has to read.
+    const lamps = await page.locator(".daemon-group-header .connection-lamp").evaluateAll((nodes) =>
+      nodes.map((node) => ({ className: node.className, background: getComputedStyle(node).backgroundColor })),
+    );
+    expect(lamps).toHaveLength(3);
+    expect(lamps[0].className).toContain("connection-connected");
+    expect(lamps[1].className).toContain("connection-connected");
+    expect(lamps[2].className).toContain("connection-disconnected");
+    expect(lamps[2].background, "a downed deck's lamp paints the same as a healthy one's").not.toBe(lamps[0].background);
+  });
+});

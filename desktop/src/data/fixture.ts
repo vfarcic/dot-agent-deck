@@ -8,8 +8,17 @@ import type { AgentProfile, AgentSession, AgentStatus, AgentTab, DeckSnapshot, E
  */
 export const FIXTURE_DAEMON_ID = "/tmp/dot-agent-deck.sock";
 
-/** Which scenario `createFixtureSnapshot` builds; selected by `?state=`. */
-export type FixtureState = "connected" | "disconnected" | "error" | "empty" | "crowded";
+/**
+ * The remote decks the `fleet` scenario adds (PRD #742 M4), named the way the
+ * desktop crate names a remote one: `Endpoint::describe()` renders a remote
+ * deck as `user@host[:port]`, never as a socket path, so the fixture's ids are
+ * the shape a real fleet's are.
+ */
+export const FIXTURE_REMOTE_DAEMON_ID = "dev@build-box";
+export const FIXTURE_UNREACHABLE_DAEMON_ID = "ci@runner-7";
+
+/** Which scenario `createFixtureFleet` builds; selected by `?state=`. */
+export type FixtureState = "connected" | "disconnected" | "error" | "empty" | "crowded" | "fleet";
 
 export const DEFAULT_PROFILES: AgentProfile[] = [
   {
@@ -438,7 +447,189 @@ const crowdedAgents: AgentSession[] = [
  * It is opt-in rather than the default because changing the default would
  * churn the existing `App.test.tsx` suite for no gain.
  */
+
+/**
+ * The three decks `?fixture=1&state=fleet` shows, and the shape of the fleet is
+ * the point of it (PRD #742 M4).
+ *
+ * Two connected and one not, because **partial connectivity is the state this
+ * whole PRD is about**: a fixture where every deck answers would let a header
+ * that sums over all decks look correct, and summing is exactly the failure to
+ * avoid — a disconnected deck's fleet is unknown, not zero.
+ *
+ * The remote decks' agents deliberately reuse the local deck's agent **ids**.
+ * Ids are per-daemon monotonic values, so two decks minting the same one is the
+ * ORDINARY case rather than a contrived one, and a fixture that avoided the
+ * collision would make every `(daemonId, agentId)` assertion pass for the wrong
+ * reason.
+ */
+const remoteAgents: AgentSession[] = [
+  {
+    ...(agents[0] as AgentSession),
+    daemonId: FIXTURE_REMOTE_DAEMON_ID,
+    displayName: "Nightly build watch",
+    role: "Builder",
+    status: "running",
+    task: "Keep the release branch green across the arm64 matrix.",
+    cwd: "/home/dev/code/dot-agent-deck",
+    transcript: "",
+    handoffIds: [],
+    artifacts: [],
+    checks: [],
+    tab: orchestrationTab("orc-release", "release-train", "Release train · arm64", "builder", 0, true, "/home/dev/code/dot-agent-deck"),
+    inOrchestration: true,
+    isStartRole: true,
+  },
+  {
+    ...(agents[1] as AgentSession),
+    daemonId: FIXTURE_REMOTE_DAEMON_ID,
+    displayName: "Matrix reviewer",
+    role: "Reviewer",
+    status: "waiting",
+    task: "Read the failing arm64 job and say whether it is the change or the runner.",
+    cwd: "/home/dev/code/dot-agent-deck",
+    transcript: "",
+    handoffIds: [],
+    artifacts: [],
+    checks: [],
+    tab: orchestrationTab("orc-release", "release-train", "Release train · arm64", "reviewer", 1, false, "/home/dev/code/dot-agent-deck"),
+    inOrchestration: true,
+    isStartRole: false,
+  },
+  {
+    ...(agents[2] as AgentSession),
+    daemonId: FIXTURE_REMOTE_DAEMON_ID,
+    displayName: "Scratch shell",
+    role: "Claude code",
+    status: "failed",
+    task: "Task metadata unavailable from the deck",
+    cwd: "/home/dev/code/scratch",
+    transcript: "",
+    handoffIds: [],
+    artifacts: [],
+    checks: [],
+    tab: { kind: "dashboard" },
+    inOrchestration: false,
+    isStartRole: false,
+  },
+];
+
+/**
+ * What the unreachable deck was running when it last answered — see the comment
+ * at its `fleetDeck` call, which is where the reason lives.
+ */
+const staleAgents: AgentSession[] = [
+  {
+    ...(agents[0] as AgentSession),
+    daemonId: FIXTURE_UNREACHABLE_DAEMON_ID,
+    displayName: "Integration sweep",
+    role: "Tester",
+    status: "running",
+    task: "Run the integration tier against the staging cluster.",
+    cwd: "/home/ci/code/dot-agent-deck",
+    transcript: "",
+    handoffIds: [],
+    artifacts: [],
+    checks: [],
+    tab: { kind: "dashboard" },
+  },
+  {
+    ...(agents[1] as AgentSession),
+    daemonId: FIXTURE_UNREACHABLE_DAEMON_ID,
+    displayName: "Flake triage",
+    role: "Reviewer",
+    status: "waiting",
+    task: "Classify last night's flakes by whether they touch the PTY harness.",
+    cwd: "/home/ci/code/dot-agent-deck",
+    transcript: "",
+    handoffIds: [],
+    artifacts: [],
+    checks: [],
+    tab: { kind: "mode", name: "review" },
+  },
+];
+
+/**
+ * One deck of the fleet, built from the `connected` scenario so every field the
+ * screens read is present and only the things that genuinely differ per deck —
+ * identity, reachability and the agents — are overridden.
+ */
+function fleetDeck(
+  daemonId: string,
+  connection: DeckSnapshot["connection"],
+  fleetAgents: AgentSession[],
+  worktree: string,
+): DeckSnapshot {
+  const base = createFixtureSnapshot("connected");
+  return {
+    ...base,
+    runId: `run_${daemonId.replace(/[^a-z0-9]+/gi, "_")}`,
+    repo: worktree.split("/").filter(Boolean).at(-1) ?? worktree,
+    worktree,
+    connection,
+    health: connection.status === "connected" ? (fleetAgents.some((agent) => agent.status === "failed") ? "failed" : "healthy") : "idle",
+    agents: fleetAgents.map((agent) => ({ ...agent })),
+    totalNodes: fleetAgents.length,
+    // A deck nobody can reach has nothing to say about a run, and a screen that
+    // showed one deck's stages under another deck's name would be the mislabel
+    // the whole milestone is about.
+    stages: connection.status === "connected" ? base.stages : [],
+    evidence: connection.status === "connected" ? base.evidence : [],
+    handoffs: connection.status === "connected" ? base.handoffs : [],
+  };
+}
+
+/**
+ * Every deck a scenario shows, SELECTED DECK FIRST — the fixture half of
+ * `DeckBridge.connect()`'s contract (PRD #742 M4).
+ *
+ * Every scenario but `fleet` is one deck, byte for byte what
+ * {@link createFixtureSnapshot} always returned, so nothing that existed before
+ * this milestone changes. `fleet` is the one that needs the array to exist.
+ */
+export function createFixtureFleet(state: FixtureState = "connected"): DeckSnapshot[] {
+  if (state !== "fleet") return [createFixtureSnapshot(state)];
+  return [
+    fleetDeck(
+      FIXTURE_DAEMON_ID,
+      { status: "connected", socketPath: FIXTURE_DAEMON_ID, message: "Deck responding", deckKind: "local" },
+      agents,
+      "/home/dev/code/dot-agent-deck-gui",
+    ),
+    fleetDeck(
+      FIXTURE_REMOTE_DAEMON_ID,
+      { status: "connected", socketPath: FIXTURE_REMOTE_DAEMON_ID, message: "Deck responding", deckKind: "remote", localOnlyReason: "Stop daemon acts on a process on this machine." },
+      remoteAgents,
+      "/home/dev/code/dot-agent-deck",
+    ),
+    /*
+      The unreachable deck, and it deliberately carries the agents it was LAST
+      SEEN running rather than none.
+
+      That is what live mode does — a reconnect failure replaces the connection
+      and keeps the previous snapshot's fleet — and it is the only version of
+      this scenario that can tell a correct header from a wrong one: with an
+      empty deck, summing over every deck and summing over the answering ones
+      give the same number, so the test that is supposed to catch the
+      under-count would pass against the bug. The screen still lists none of
+      them, because a deck that stopped answering cannot vouch for what it was
+      running; the stale list exists so the COUNT has something to be wrong
+      about.
+    */
+    fleetDeck(
+      FIXTURE_UNREACHABLE_DAEMON_ID,
+      { status: "disconnected", socketPath: FIXTURE_UNREACHABLE_DAEMON_ID, message: "No deck is listening on the configured socket.", deckKind: "remote", localOnlyReason: "Stop daemon acts on a process on this machine." },
+      staleAgents,
+      "/home/dev/code/dot-agent-deck",
+    ),
+  ];
+}
+
 export function createFixtureSnapshot(state: FixtureState = "connected"): DeckSnapshot {
+  // `fleet` is a THREE-deck scenario and has no single snapshot, so a caller
+  // asking for one gets the deck the single-deck screens are on — never the
+  // disconnected fall-through an unlisted state would otherwise land in.
+  if (state === "fleet") return createFixtureFleet(state)[0];
   const connected = state === "connected" || state === "crowded" || state === "empty";
   const connection = connected
     ? { status: "connected" as const, socketPath: FIXTURE_DAEMON_ID, message: state === "empty" ? "Deck responding · no agents running" : "Deck responding" }

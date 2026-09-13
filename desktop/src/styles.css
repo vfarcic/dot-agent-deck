@@ -1020,8 +1020,18 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
    been checked. Two were alpha tints with no channel token to keep them as
    tints (`--red-rgb`/`--amber-rgb` do not exist) and are now the solid `-soft`
    surfaces meant for that role, which reads slightly stronger in light. */
-.overview-body { padding: 14px 16px 20px; }
+/* One column of deck sections (PRD #742 M4). It held exactly one until the
+   fleet view; the gap is what separates two decks' cards from each other now
+   that there can be several, and with one deck it changes nothing. */
+.overview-body { padding: 14px 16px 20px; display: flex; flex-direction: column; gap: 12px; }
 .daemon-group { border: 1px solid var(--line-strong); border-radius: var(--radius); background: var(--paper); }
+/* A deck that is not answering, sitting beside decks that are. Dimmed rather
+   than alarming: an unreachable deck in a fleet is a fact about that deck, and
+   painting it as an error would put every healthy deck under a red banner. */
+.daemon-group.is-degraded { border-style: dashed; background: rgb(var(--paper-rgb) / .55); }
+/* The em dash where a connected deck's pips are, so "unknown" and "none" read
+   differently on the same line. */
+.daemon-unknown { margin-left: auto; color: var(--faint); font-family: "JetBrains Mono", monospace; font-size: 11px; }
 .daemon-group-header { min-height: 50px; padding: 9px 13px; display: flex; align-items: center; gap: 11px; border-bottom: 1px solid var(--line); background: var(--paper-strong); border-radius: var(--radius) var(--radius) 0 0; }
 /* One line, not two: the socket filename that used to sit under the name is
    gone from the layout and lives on the name's own `title` — it contained the
@@ -1134,6 +1144,12 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .overview-lease.lease-read, .overview-lease.lease-none { color: var(--amber); background: var(--amber-soft); }
 
 .overview-note { min-height: 260px; padding: 30px; display: flex; flex-direction: column; align-items: center; justify-content: center; border: 1px dashed var(--line-strong); border-radius: var(--radius); color: var(--muted); background: rgb(var(--paper-rgb) / .55); text-align: center; }
+/* The same note inside a FLEET, where it is one deck's line among its
+   neighbours' rather than the whole screen (PRD #742 M4). At 260px each, three
+   decks of notes would push every healthy deck below the fold. */
+.overview-note.is-compact { min-height: 0; padding: 14px 16px; }
+.overview-note.is-compact h3 { margin: 6px 0 3px; font-size: 12px; }
+.overview-note.is-compact > div { margin-top: 10px; }
 .overview-note h3 { margin: 11px 0 5px; color: var(--ink); font-size: 14px; }
 .overview-note p { max-width: 460px; margin: 0 0 4px; font-size: 10px; line-height: 1.55; }
 .overview-note-hint { color: var(--faint); }

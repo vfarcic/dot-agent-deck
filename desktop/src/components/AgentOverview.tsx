@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from "react";
+import { useEffect, useId, useMemo, useRef, useState, type CSSProperties, type ReactNode } from "react";
 import { Blocks, Boxes, Columns3, LayoutList, Layers, Network, RefreshCw, RotateCcw, ShieldAlert, Sparkles, SquareTerminal, Wrench } from "lucide-react";
 import type { AgentSession, AgentStatus, ConnectionView, DeckRuntimeState, DeckView } from "../types";
 import { modeScopedKey } from "../lib/bridge";
@@ -589,13 +589,17 @@ const WRITE_LEASE_TITLE: Record<"read" | "write" | "none", string> = {
  * standalone gets everything except the control that needs a document.
  */
 export function AgentOverview({ runtime, settings, onNavigate }: { runtime: DeckRuntimeState; settings?: DesktopSettingsState; onNavigate: (view: DeckView) => void }) {
-  const { snapshot, mode, setShownTerminals } = runtime;
+  const { fleet, snapshot, mode, setShownTerminals } = runtime;
   /**
    * The screen's whole claim, stated to the bridge rather than merely printed in
    * its own header (PRD #745 M7): this screen shows no terminal, so it opens no
    * PTY. Declaring the empty set also flushes the warm set to zero, which is
    * what makes the claim true when you arrive here from a nine-tile deck rather
    * than only on a cold start.
+   *
+   * PRD #742 M4 did not widen it and must not: a tile's terminal is always the
+   * SELECTED deck's, so the set of shown terminals is still one deck's set and
+   * the empty declaration is still the whole claim.
    *
    * What it cannot claim is that every socket a previous screen opened is
    * already gone by the time this renders: the declaration is fire-and-forget,
@@ -606,17 +610,15 @@ export function AgentOverview({ runtime, settings, onNavigate }: { runtime: Deck
   useEffect(() => {
     void setShownTerminals([]);
   }, [setShownTerminals]);
-  const connection = snapshot.connection;
   /**
-   * The fleet is only knowable while the daemon is answering. A reconnect
-   * failure replaces the connection and KEEPS the previous snapshot's agents
-   * (`hooks/useDeckRuntime.ts`), and both the `disconnected` and `error`
-   * fixtures ship the default four — so deriving the instruments from
-   * `snapshot.agents` unconditionally printed `AGENTS 4 · GROUPS 1` above a
-   * body correctly saying the fleet cannot be read. The body suppressed the
-   * list and the header contradicted it.
+   * The SELECTED deck's connection — the Deck selector's, and the rail lamp's.
+   *
+   * It is `fleet[0]`'s and deliberately not an aggregate: `selectionFallback`
+   * describes THE SELECTION rather than a deck ("the deck you chose is gone"),
+   * so it has exactly one true value however many decks are observed, and the
+   * control that renders it is the control that made the selection.
    */
-  const connected = connection.status === "connected";
+  const connection = snapshot.connection;
   /*
     Re-read on a timer so the relative cells keep counting between daemon
     events. It re-renders and refetches nothing — see `useOverviewClock`.
@@ -637,64 +639,54 @@ export function AgentOverview({ runtime, settings, onNavigate }: { runtime: Deck
       // round for a display preference.
     }
   }, [columns]);
-  const agents = useMemo(() => snapshot.agents.map(toOverviewAgent), [snapshot.agents]);
-  const groups = useMemo(() => groupAgents(agents), [agents]);
-  const counts = useMemo(() => countByStatus(agents), [agents]);
-  const countOf = (status: AgentStatus) => counts.find((entry) => entry.status === status)?.count ?? 0;
+  /**
+   * One rendered group per observed deck, each carrying its OWN agents, its own
+   * grouping and its own connection (PRD #742 M4).
+   *
+   * `groupAgents` is untouched and is called once per deck: it buckets WITHIN a
+   * deck by tab membership, which is a different question from which deck an
+   * agent is on, and merging the fleet before calling it would put two
+   * machines' roles in one orchestration card.
+   */
+  const decks = useMemo(() => fleet.map((deck) => {
+    const deckAgents = deck.agents.map(toOverviewAgent);
+    return {
+      snapshot: deck,
+      agents: deckAgents,
+      groups: groupAgents(deckAgents),
+      counts: countByStatus(deckAgents),
+      connected: deck.connection.status === "connected",
+    };
+  }), [fleet]);
+  /**
+   * The fleet aggregate, over CONNECTED decks only (PRD #742 M4).
+   *
+   * Summing over every deck is the failure this exists to avoid: a deck that is
+   * not answering has an UNKNOWN number of agents, and adding zero for it
+   * silently under-counts the fleet by however many agents that deck is running
+   * — a wrong number that looks exactly like a right one. Its group says so in
+   * its own header instead, and `decksUp` below is what tells the reader the
+   * total is partial.
+   */
+  const aggregate = useMemo(() => {
+    const visible = decks.filter((deck) => deck.connected);
+    const agents = visible.flatMap((deck) => deck.agents);
+    return {
+      agents,
+      groups: visible.reduce((total, deck) => total + deck.groups.length, 0),
+      counts: countByStatus(agents),
+      decksUp: visible.length,
+    };
+  }, [decks]);
+  /**
+   * Whether anything can be counted at all. With one deck this is exactly the
+   * old `connection.status === "connected"`; with N it is "at least one deck is
+   * answering", because one reachable deck makes the instruments a true
+   * statement about a knowable part of the fleet rather than a guess.
+   */
+  const known = aggregate.decksUp > 0;
+  const countOf = (status: AgentStatus) => aggregate.counts.find((entry) => entry.status === status)?.count ?? 0;
   const openDeck = () => onNavigate({ kind: "deck" });
-  const socketPath = connection.socketPath;
-  const daemonMessage = connection.message ? displayText(connection.message, DISPLAY_LIMITS.message) : undefined;
-  /**
-   * Whether the connection message says anything the lamp beside it does not
-   * (PRD #745). A healthy connection's message is literally `Deck
-   * responding`, which is the lamp restated in words — two renderings of one
-   * bit, and the screen narrating its own state.
-   *
-   * The test is the flag rather than the wording, because the wording is not
-   * the point and a string match would rot. There are exactly two ways to be
-   * `connected`: the ordinary one, where the desktop crate reported no message
-   * at all and the webview synthesised the restatement, and the one where a
-   * build-stamp mismatch was bypassed — which is the case whose caveat issue
-   * #801 requires to stay on screen for the whole session. `buildStampMismatchOnly`
-   * is the same flag Connect anyway is gated on, and the crate sets it on
-   * exactly the branch that puts a message in `error`. So a naive "hide when
-   * connected" is what this deliberately is not.
-   */
-  const messageSaysSomethingNew = !connected || connection.buildStampMismatchOnly === true;
-  /**
-   * Issue #801. Since the crate stopped refusing a daemon that names the same
-   * release, the ordinary case is two builds from different commits connecting
-   * with nothing on screen — which is the point, but it also means the
-   * difference had nowhere left to be seen. A `title` is the whole trace:
-   * available on hover, absent from the layout, and deliberately NOT an alert.
-   * A real compatibility break still gets the banner and Connect anyway.
-   */
-  const buildStampsCaveat = connection.clientBuildVersion && connection.daemonBuildVersion
-    && connection.clientBuildVersion !== connection.daemonBuildVersion
-    ? `Built from different commits — desktop ${connection.clientBuildVersion}, deck ${connection.daemonBuildVersion}.`
-    : undefined;
-  /**
-   * Everything hover can say about WHICH daemon this is: its socket path, and
-   * the two build stamps when they differ.
-   *
-   * The socket path used to be on screen, shortened to its last segment — a
-   * label whose stated purpose was keeping a uid or a username out of
-   * screenshots, and which on the default socket reads
-   * `dot-agent-deck-attach-501.sock`, so it leaked the very uid it was meant to
-   * hide and told the reader nothing actionable either way. The path is
-   * genuinely diagnostic, so it stays here, where it costs no layout;
-   * `data-daemon-id` on the section still carries the identity for tests and a
-   * future drill-in.
-   *
-   * The stamps hover moved here with it, and had to: it used to hang off the
-   * connection message, which for a healthy connection no longer renders. On
-   * the daemon's own name it is more discoverable than it was — a reader hovers
-   * a thing they can see.
-   */
-  const daemonFacts = [socketPath, buildStampsCaveat].filter((fact): fact is string => Boolean(fact));
-  // Joined rather than stacked: a sanitised `title` cannot carry a newline —
-  // `displayText` strips category `Cc`, and `\n` is in it.
-  const daemonIdentityTitle = daemonFacts.length ? displayTitle(daemonFacts.join(" · ")) : undefined;
   const [confirm, setConfirm] = useState<ConfirmState>();
   const [overrideError, setOverrideError] = useState<string>();
   /**
@@ -704,6 +696,10 @@ export function AgentOverview({ runtime, settings, onNavigate }: { runtime: Deck
    * looking at, so it belongs on the screen that is refusing to show it. Gated
    * on `buildStampMismatchOnly`, so a genuine protocol mismatch never offers
    * it.
+   *
+   * The allowance is this APP's, not one deck's — `allow_build_mismatch` sets a
+   * process-wide flag the next handshake reads — so it stays one control on the
+   * selected deck's group rather than one per deck in a fleet.
    */
   const requestConnectAnyway = () => {
     if (mode !== "live" || !connection.buildStampMismatchOnly) return;
@@ -735,7 +731,7 @@ export function AgentOverview({ runtime, settings, onNavigate }: { runtime: Deck
           <OverviewRailButton icon={LayoutList} label="Overview" active onClick={() => onNavigate({ kind: "overview" })} testId="open-overview" />
         </nav>
         <div className="rail-bottom">
-          <span className={`connection-lamp connection-${connection.status}`} title={daemonMessage} />
+          <span className={`connection-lamp connection-${connection.status}`} title={connection.message ? displayText(connection.message, DISPLAY_LIMITS.message) : undefined} />
         </div>
       </aside>
 
@@ -747,11 +743,22 @@ export function AgentOverview({ runtime, settings, onNavigate }: { runtime: Deck
             {settings && <DeckSelector settings={settings} connection={connection} />}
           </div>
           <div className="run-instruments">
-            <OverviewInstrument label="AGENTS" testId="overview-count-agents"><OverviewCount known={connected} value={agents.length} /></OverviewInstrument>
-            <OverviewInstrument label="RUNNING" testId="overview-count-running"><OverviewCount known={connected} value={countOf("running")} className="count-running" /></OverviewInstrument>
-            <OverviewInstrument label="WAITING" testId="overview-count-waiting"><OverviewCount known={connected} value={countOf("waiting")} className="count-waiting" /></OverviewInstrument>
-            <OverviewInstrument label="FAILED" testId="overview-count-failed"><OverviewCount known={connected} value={countOf("failed")} className="count-failed" /></OverviewInstrument>
-            <OverviewInstrument label="GROUPS" testId="overview-count-groups"><OverviewCount known={connected} value={groups.length} /></OverviewInstrument>
+            <OverviewInstrument label="AGENTS" testId="overview-count-agents"><OverviewCount known={known} value={aggregate.agents.length} /></OverviewInstrument>
+            <OverviewInstrument label="RUNNING" testId="overview-count-running"><OverviewCount known={known} value={countOf("running")} className="count-running" /></OverviewInstrument>
+            <OverviewInstrument label="WAITING" testId="overview-count-waiting"><OverviewCount known={known} value={countOf("waiting")} className="count-waiting" /></OverviewInstrument>
+            <OverviewInstrument label="FAILED" testId="overview-count-failed"><OverviewCount known={known} value={countOf("failed")} className="count-failed" /></OverviewInstrument>
+            <OverviewInstrument label="GROUPS" testId="overview-count-groups"><OverviewCount known={known} value={aggregate.groups} /></OverviewInstrument>
+            {/*
+              PRD #742 M4. The one instrument that is ALWAYS known, and it is
+              what makes the four beside it readable: they are computed over the
+              decks that answered, so "how many answered" is the caveat that
+              belongs next to them. It renders at one deck too — `1/1` is the
+              honest reading of a single-deck fleet, and hiding it would mean
+              the caveat appears only once there is already something wrong.
+            */}
+            <OverviewInstrument label="DECKS" testId="overview-count-decks">
+              <strong className={aggregate.decksUp === decks.length ? undefined : "count-failed"} title={decksUpTitle(aggregate.decksUp, decks.length)}>{aggregate.decksUp}/{decks.length}</strong>
+            </OverviewInstrument>
           </div>
           <div className="top-actions">
             <button className="button secondary compact" data-testid="overview-open-deck" onClick={openDeck}><SquareTerminal size={14} /><span>Open deck</span></button>
@@ -769,51 +776,26 @@ export function AgentOverview({ runtime, settings, onNavigate }: { runtime: Deck
 
         <section className="overview-body" aria-label="Agent overview">
           {/*
-            The daemon group is the OUTER unit even though there is exactly one
-            daemon. With one it is minimal chrome; #742's second daemon becomes a
-            sibling here and changes no inner component.
+            One `daemon-group` per observed deck (PRD #742 M4). The section was
+            already the outer unit when there was exactly one, and the comment
+            that stood here said #742's second deck "becomes a sibling here and
+            changes no inner component" — which is what happened: this is a
+            `.map`, and `DaemonBody` below took a `fleetSize` for its note
+            density and nothing else.
           */}
-          <section className="daemon-group" data-testid="daemon-group" data-daemon-id={socketPath === undefined ? "" : domIdentity(socketPath)} aria-labelledby="daemon-group-title">
-            <header className="daemon-group-header">
-              <span className={`connection-lamp connection-${connection.status}`} aria-hidden="true" />
-              <div className="daemon-identity">
-                {/*
-                  The socket filename is gone from the layout and lives on
-                  hover — see `daemonIdentityTitle`, which is also where the
-                  build stamps disclose themselves.
-                */}
-                <strong id="daemon-group-title" title={daemonIdentityTitle} data-testid="daemon-identity">Local deck</strong>
-              </div>
-              {/*
-                Only when it says something the lamp does not. The element is
-                not deleted — in the disconnected, incompatible and
-                connected-anyway states it carries the only explanation on the
-                header, including the build-mismatch caveat issue #801 requires
-                to survive the whole session.
-              */}
-              {messageSaysSomethingNew && <p className="daemon-state" data-testid="daemon-state">{daemonMessage ?? connection.status}</p>}
-              {connected && agents.length > 0 && (
-                <div className="daemon-pips">{counts.map((entry) => (
-                  <span className={`status-label status-${entry.status}`} key={entry.status}>{entry.count} {entry.status}</span>
-                ))}</div>
-              )}
-            </header>
-
-            <div className="daemon-group-body">
-              <DaemonBody
-                agents={agents}
-                groups={groups}
-                now={now}
-                columns={columns}
-                connection={connection}
-                message={daemonMessage}
-                overrideError={overrideError}
-                onOpenDeck={openDeck}
-                onReconnect={() => void runtime.reconnect()}
-                onConnectAnyway={mode === "live" && connection.buildStampMismatchOnly ? requestConnectAnyway : undefined}
-              />
-            </div>
-          </section>
+          {decks.map((deck) => (
+            <DeckGroup
+              key={deck.snapshot.connection.socketPath ?? ""}
+              deck={deck}
+              now={now}
+              columns={columns}
+              fleetSize={decks.length}
+              onOpenDeck={openDeck}
+              onReconnect={() => void runtime.reconnect()}
+              overrideError={deck.snapshot.connection.socketPath === connection.socketPath ? overrideError : undefined}
+              onConnectAnyway={mode === "live" && deck.snapshot.connection.buildStampMismatchOnly ? requestConnectAnyway : undefined}
+            />
+          ))}
         </section>
       </main>
       {confirm && <ConfirmDialog state={confirm} onClose={() => setConfirm(undefined)} />}
@@ -821,7 +803,181 @@ export function AgentOverview({ runtime, settings, onNavigate }: { runtime: Deck
   );
 }
 
-function DaemonBody({ agents, groups, now, columns, connection, message, overrideError, onOpenDeck, onReconnect, onConnectAnyway }: {
+/** One deck of the fleet, as {@link AgentOverview} prepares it for rendering. */
+interface FleetDeck {
+  snapshot: DeckRuntimeState["snapshot"];
+  agents: OverviewAgent[];
+  groups: OverviewGroup[];
+  counts: { status: AgentStatus; count: number }[];
+  connected: boolean;
+}
+
+/**
+ * How many of the fleet's decks are answering, as a sentence (PRD #742 M4).
+ *
+ * The instrument prints `2/3`, which is the compact reading; this is the hover,
+ * and it is where the thing a ratio cannot say gets said — that the counts
+ * beside it are over the decks that answered and not over the fleet.
+ */
+function decksUpTitle(up: number, total: number): string {
+  if (total === 1) return up === 1 ? "The deck is answering." : "The deck is not answering, so nothing can be counted.";
+  if (up === total) return `All ${total} decks are answering.`;
+  if (up === 0) return `No deck is answering, so nothing can be counted. ${total} are configured.`;
+  return `${up} of ${total} decks are answering. Every count beside this one is over those ${up}; the decks that are not answering say so in their own group.`;
+}
+
+/**
+ * One deck's section: its identity, its state, and either its fleet or the note
+ * that says why there isn't one.
+ *
+ * A deck that is down renders a DEGRADED GROUP — its own header, its own lamp,
+ * its own note — and never a group with zero agents, because "this deck runs
+ * nothing" and "we cannot see what this deck runs" are different statements and
+ * only the first is a number.
+ */
+function DeckGroup({ deck, now, columns, fleetSize, overrideError, onOpenDeck, onReconnect, onConnectAnyway }: {
+  deck: FleetDeck;
+  now: number;
+  columns: OverviewColumnId[];
+  /** How many decks are on screen — the note density, and nothing else. */
+  fleetSize: number;
+  overrideError?: string;
+  onOpenDeck: () => void;
+  onReconnect: () => void;
+  onConnectAnyway?: () => void;
+}) {
+  const connection = deck.snapshot.connection;
+  const socketPath = connection.socketPath;
+  const titleId = useId();
+  const daemonMessage = connection.message ? displayText(connection.message, DISPLAY_LIMITS.message) : undefined;
+  /**
+   * Whether the connection message says anything the lamp beside it does not
+   * (PRD #745). A healthy connection's message is literally `Deck
+   * responding`, which is the lamp restated in words — two renderings of one
+   * bit, and the screen narrating its own state.
+   *
+   * The test is the flag rather than the wording, because the wording is not
+   * the point and a string match would rot. There are exactly two ways to be
+   * `connected`: the ordinary one, where the desktop crate reported no message
+   * at all and the webview synthesised the restatement, and the one where a
+   * build-stamp mismatch was bypassed — which is the case whose caveat issue
+   * #801 requires to stay on screen for the whole session. `buildStampMismatchOnly`
+   * is the same flag Connect anyway is gated on, and the crate sets it on
+   * exactly the branch that puts a message in `error`. So a naive "hide when
+   * connected" is what this deliberately is not.
+   */
+  const messageSaysSomethingNew = !deck.connected || connection.buildStampMismatchOnly === true;
+  /**
+   * Issue #801. Since the crate stopped refusing a daemon that names the same
+   * release, the ordinary case is two builds from different commits connecting
+   * with nothing on screen — which is the point, but it also means the
+   * difference had nowhere left to be seen. A `title` is the whole trace:
+   * available on hover, absent from the layout, and deliberately NOT an alert.
+   * A real compatibility break still gets the banner and Connect anyway.
+   */
+  const buildStampsCaveat = connection.clientBuildVersion && connection.daemonBuildVersion
+    && connection.clientBuildVersion !== connection.daemonBuildVersion
+    ? `Built from different commits — desktop ${connection.clientBuildVersion}, deck ${connection.daemonBuildVersion}.`
+    : undefined;
+  /**
+   * Everything hover can say about WHICH deck this is: its socket path, and
+   * the two build stamps when they differ.
+   *
+   * The socket path used to be on screen, shortened to its last segment — a
+   * label whose stated purpose was keeping a uid or a username out of
+   * screenshots, and which on the default socket reads
+   * `dot-agent-deck-attach-501.sock`, so it leaked the very uid it was meant to
+   * hide and told the reader nothing actionable either way. The path is
+   * genuinely diagnostic, so it stays here, where it costs no layout;
+   * `data-daemon-id` on the section still carries the identity for tests and a
+   * future drill-in.
+   *
+   * The stamps hover moved here with it, and had to: it used to hang off the
+   * connection message, which for a healthy connection no longer renders. On
+   * the deck's own name it is more discoverable than it was — a reader hovers
+   * a thing they can see.
+   */
+  const daemonFacts = [socketPath, buildStampsCaveat].filter((fact): fact is string => Boolean(fact));
+  // Joined rather than stacked: a sanitised `title` cannot carry a newline —
+  // `displayText` strips category `Cc`, and `\n` is in it.
+  const daemonIdentityTitle = daemonFacts.length ? displayTitle(daemonFacts.join(" · ")) : undefined;
+  return (
+    <section
+      className={deck.connected ? "daemon-group" : "daemon-group is-degraded"}
+      data-testid="daemon-group"
+      data-daemon-id={socketPath === undefined ? "" : domIdentity(socketPath)}
+      data-deck-connected={deck.connected ? "yes" : "no"}
+      aria-labelledby={titleId}
+    >
+      <header className="daemon-group-header">
+        <span className={`connection-lamp connection-${connection.status}`} aria-hidden="true" />
+        <div className="daemon-identity">
+          {/*
+            The socket filename is gone from the layout and lives on
+            hover — see `daemonIdentityTitle`, which is also where the
+            build stamps disclose themselves.
+          */}
+          <strong id={titleId} title={daemonIdentityTitle} data-testid="daemon-identity">{deckName(connection)}</strong>
+        </div>
+        {/*
+          Only when it says something the lamp does not. The element is
+          not deleted — in the disconnected, incompatible and
+          connected-anyway states it carries the only explanation on the
+          header, including the build-mismatch caveat issue #801 requires
+          to survive the whole session.
+        */}
+        {messageSaysSomethingNew && <p className="daemon-state" data-testid="daemon-state">{daemonMessage ?? connection.status}</p>}
+        {deck.connected && deck.agents.length > 0 && (
+          <div className="daemon-pips">{deck.counts.map((entry) => (
+            <span className={`status-label status-${entry.status}`} key={entry.status}>{entry.count} {entry.status}</span>
+          ))}</div>
+        )}
+        {/*
+          PRD #742 M4: an em dash where the pips would be, so a deck whose
+          fleet cannot be read reads as UNKNOWN on the same line its
+          neighbours read as counted — never as a deck running nothing.
+        */}
+        {!deck.connected && <span className="daemon-unknown" data-testid="daemon-unknown" title="Not known — this deck is not answering, so its agents cannot be counted.">—</span>}
+      </header>
+
+      <div className="daemon-group-body">
+        <DaemonBody
+          agents={deck.agents}
+          groups={deck.groups}
+          now={now}
+          columns={columns}
+          connection={connection}
+          message={daemonMessage}
+          compactNote={fleetSize > 1}
+          overrideError={overrideError}
+          onOpenDeck={onOpenDeck}
+          onReconnect={onReconnect}
+          onConnectAnyway={onConnectAnyway}
+        />
+      </div>
+    </section>
+  );
+}
+
+/**
+ * What a deck is CALLED on screen — and it is never "daemon" (PRD #741 M9's
+ * vocabulary rule, which #742 inherits).
+ *
+ * A local deck is "Local deck", exactly as it was when there was only one. A
+ * remote one is named by its address, because that is what distinguishes it
+ * from the other decks beside it and it is the same string the user typed into
+ * the settings row. `Endpoint::describe()` renders a remote deck as
+ * `user@host[:port]`, every byte of which came through a validated ASCII
+ * charset — it goes through `displayText` anyway, because bounding a
+ * daemon-supplied string at the render seam is this screen's rule and not a
+ * judgement about any one field.
+ */
+function deckName(connection: ConnectionView): string {
+  if (connection.deckKind !== "remote") return "Local deck";
+  return connection.socketPath ? displayText(connection.socketPath, DISPLAY_LIMITS.path) : "Remote deck";
+}
+
+function DaemonBody({ agents, groups, now, columns, connection, message, compactNote, overrideError, onOpenDeck, onReconnect, onConnectAnyway }: {
   agents: OverviewAgent[];
   groups: OverviewGroup[];
   /** The one instant every relative cell on this screen is measured against. */
@@ -830,15 +986,23 @@ function DaemonBody({ agents, groups, now, columns, connection, message, overrid
   columns: OverviewColumnId[];
   connection: ConnectionView;
   message?: string;
+  /**
+   * Whether this deck is one of several on screen (PRD #742 M4). A note is the
+   * WHOLE of a single-deck screen, so it is laid out as a full panel; in a
+   * fleet it is one deck's line among its neighbours', and a 260px panel per
+   * unreachable deck would push every healthy deck off the screen.
+   */
+  compactNote?: boolean;
   overrideError?: string;
   onOpenDeck: () => void;
   onReconnect: () => void;
   /** Absent unless the mismatch is stamp-only — see `requestConnectAnyway`. */
   onConnectAnyway?: () => void;
 }) {
+  const noteClass = compactNote ? "overview-note is-compact" : "overview-note";
   if (connection.status === "loading") {
     return (
-      <OverviewNote testId="overview-loading" icon={<RefreshCw className="spin" size={24} />} title="Establishing control channel">
+      <OverviewNote className={noteClass} testId="overview-loading" icon={<RefreshCw className="spin" size={24} />} title="Establishing control channel">
         <p>Reading the deck's agent list. Nothing is attached while this runs.</p>
       </OverviewNote>
     );
@@ -846,7 +1010,7 @@ function DaemonBody({ agents, groups, now, columns, connection, message, overrid
 
   if (connection.status === "disconnected") {
     return (
-      <OverviewNote testId="overview-disconnected" icon={<ShieldAlert size={24} />} title="Deck disconnected">
+      <OverviewNote className={noteClass} testId="overview-disconnected" icon={<ShieldAlert size={24} />} title="Deck disconnected">
         <p>{message ?? "No deck is listening on the configured socket."}</p>
         <p className="overview-note-hint">Nothing can be said about the fleet until a deck answers, so this list is blank rather than stale. Start one from the deck screen, then reconnect.</p>
         <div>
@@ -859,7 +1023,7 @@ function DaemonBody({ agents, groups, now, columns, connection, message, overrid
 
   if (connection.status === "error") {
     return (
-      <OverviewNote testId="overview-incompatible" icon={<ShieldAlert size={24} />} title="Incompatible deck">
+      <OverviewNote className={noteClass} testId="overview-incompatible" icon={<ShieldAlert size={24} />} title="Incompatible deck">
         <p>{message ?? "A deck answered but this build cannot speak to it."}</p>
         <p className="overview-note-hint">
           {connection.runningAgentCount === undefined
@@ -880,7 +1044,7 @@ function DaemonBody({ agents, groups, now, columns, connection, message, overrid
 
   if (!agents.length) {
     return (
-      <OverviewNote testId="overview-first-run" icon={<Blocks size={26} />} title="No agents are running yet">
+      <OverviewNote className={noteClass} testId="overview-first-run" icon={<Blocks size={26} />} title="No agents are running yet">
         <p>The deck is healthy and owns nothing. This is what a fresh install looks like — not a failure.</p>
         <p className="overview-note-hint">Launch a workflow from the deck's Workflows panel, or start an agent from the CLI in a project directory. Whatever the deck adopts shows up here on the next snapshot.</p>
         <div>
@@ -1291,8 +1455,8 @@ function OverviewRow({ agent, hoistedCwd, now, columns }: { agent: OverviewAgent
   );
 }
 
-function OverviewNote({ testId, icon, title, children }: { testId: string; icon: ReactNode; title: string; children: ReactNode }) {
-  return <div className="overview-note" data-testid={testId}>{icon}<h3>{title}</h3>{children}</div>;
+function OverviewNote({ className, testId, icon, title, children }: { className?: string; testId: string; icon: ReactNode; title: string; children: ReactNode }) {
+  return <div className={className ?? "overview-note"} data-testid={testId}>{icon}<h3>{title}</h3>{children}</div>;
 }
 
 function OverviewRailButton({ icon: Icon, label, active, onClick, testId }: { icon: typeof LayoutList; label: string; active?: boolean; onClick: () => void; testId: string }) {
