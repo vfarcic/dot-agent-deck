@@ -2878,4 +2878,327 @@ mod tests {
         assert_eq!(daemon.await.expect("no panic"), 2);
         let _ = std::fs::remove_dir_all(dir);
     }
+
+    // -----------------------------------------------------------------------
+    // PRD #742 M3 — the fleet: isolated folds, deck-stamped emits, and the
+    // whole-map mutex.
+    //
+    // Everything above this line drives ONE deck, which is what the desktop has
+    // always had. These drive two at once, which is the milestone: #741's stale
+    // fold was a SEQUENTIAL hazard (the deck the user left), and with N decks
+    // the subscriptions are concurrent, so "which deck is this from" stops
+    // being answerable by "there is exactly one".
+    // -----------------------------------------------------------------------
+
+    /// One `ToolStart` naming a specific deck's agent, so a fold can be traced
+    /// back to the deck that broadcast it.
+    #[cfg(unix)]
+    fn tool_event_for(
+        pane_id: &str,
+        agent_id: &str,
+        tool: &str,
+    ) -> dot_agent_deck::event::BroadcastMsg {
+        use dot_agent_deck::event::{AgentEvent, AgentType, BroadcastMsg, EventType};
+        BroadcastMsg::Event(AgentEvent {
+            session_id: format!("{pane_id}-session"),
+            agent_type: AgentType::ClaudeCode,
+            event_type: EventType::ToolStart,
+            tool_name: Some(tool.to_string()),
+            tool_detail: None,
+            cwd: None,
+            timestamp: chrono::Utc::now(),
+            user_prompt: None,
+            metadata: std::collections::HashMap::new(),
+            pane_id: Some(pane_id.into()),
+            agent_id: Some(agent_id.into()),
+            agent_version: None,
+            schema_version: None,
+            live_target: None,
+        })
+    }
+
+    /// The active tool the snapshot shows for `id`, or `None` if that agent is
+    /// not in it at all.
+    #[cfg(unix)]
+    fn active_tool_of(snapshot: &DesktopSnapshot, id: &str) -> Option<String> {
+        snapshot
+            .agents
+            .iter()
+            .find(|agent| agent.id == id)
+            .and_then(|agent| agent.active_tool.as_ref())
+            .map(|tool| tool.name.clone())
+    }
+
+    /// **Test-plan item 8, and the headline of the milestone.** Scenario: two
+    /// decks are observed and answered concurrently, each running its own agent,
+    /// and deck A broadcasts a `ToolStart` for A's agent. Deck A's snapshot must
+    /// show that agent working and must be labelled with deck A's own address;
+    /// deck B's snapshot must show only B's agent, untouched by A's broadcast,
+    /// and must be labelled with B's address.
+    ///
+    /// This is the N-deck generalisation of the bug PRD #741 already shipped and
+    /// fixed once: its watcher went on folding the previous deck's broadcasts
+    /// into the view answering the new deck's snapshots and re-emitting them
+    /// under the new deck's name. #741's fix handled a sequential selection
+    /// change; here both subscriptions are live at the same time, which is
+    /// strictly harder because `BroadcastMsg` carries no deck id.
+    ///
+    /// **Asserted on the end state rather than on the routing.** Nothing here
+    /// says how many watcher tasks there are or where a view lives — only that a
+    /// snapshot answered FOR a deck carries that deck's agents and that deck's
+    /// identity. Every emit goes through this function, so a merged watcher that
+    /// mislabelled would fail here whatever its task topology.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_fold_for_one_deck_never_reaches_another_decks_snapshot() {
+        let (dir_a, socket_a) = scratch_socket("m3-fold-a");
+        let (dir_b, socket_b) = scratch_socket("m3-fold-b");
+        let listener_a = bind_trusted(&socket_a);
+        let listener_b = bind_trusted(&socket_b);
+        let (stop_a, stop_a_rx) = tokio::sync::oneshot::channel::<()>();
+        let (stop_b, stop_b_rx) = tokio::sync::oneshot::channel::<()>();
+        let daemon_a = tokio::spawn(counting_daemon(
+            listener_a,
+            vec![listed_agent("agent-a", "pane-a")],
+            stop_a_rx,
+        ));
+        let daemon_b = tokio::spawn(counting_daemon(
+            listener_b,
+            vec![listed_agent("agent-b", "pane-b")],
+            stop_b_rx,
+        ));
+
+        let links = DaemonLinks::default();
+        let deck_a = Endpoint::Local(LocalEndpoint::at(&socket_a));
+        let deck_b = Endpoint::Local(LocalEndpoint::at(&socket_b));
+        let mut view_a = AgentView::default();
+        let mut view_b = AgentView::default();
+
+        // Both decks answered at once, which is the fleet's shape rather than
+        // the selection change #741 fixed.
+        let (first_a, first_b) = tokio::join!(
+            snapshot_with(&deck_a, &links, Some(&mut view_a)),
+            snapshot_with(&deck_b, &links, Some(&mut view_b)),
+        );
+        assert_eq!(first_a.connection.status, ConnectionStatus::Connected);
+        assert_eq!(first_b.connection.status, ConnectionStatus::Connected);
+
+        // Deck A broadcasts. Nothing about the message says which deck it came
+        // from, which is exactly why the isolation has to be structural.
+        view_a.apply(&tool_event_for("pane-a", "agent-a", "Bash"));
+
+        let (second_a, second_b) = tokio::join!(
+            snapshot_with(&deck_a, &links, Some(&mut view_a)),
+            snapshot_with(&deck_b, &links, Some(&mut view_b)),
+        );
+
+        let _ = stop_a.send(());
+        let _ = stop_b.send(());
+        daemon_a.abort();
+        daemon_b.abort();
+
+        // The fold reached the deck that broadcast it...
+        assert_eq!(
+            active_tool_of(&second_a, "agent-a"),
+            Some("Bash".to_string()),
+            "the broadcasting deck's own snapshot must show its agent working"
+        );
+        // ...and only that deck.
+        assert_eq!(
+            second_b
+                .agents
+                .iter()
+                .map(|a| a.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["agent-b"],
+            "the other deck's snapshot must carry only its own agents"
+        );
+        assert_eq!(
+            active_tool_of(&second_b, "agent-b"),
+            None,
+            "one deck's broadcast must not move another deck's agent"
+        );
+
+        // And each snapshot is LABELLED with the deck it was answered for. The
+        // frontend derives `daemonId` from `connection.socketPath`
+        // (`desktop/src/lib/bridge.ts`), so this string is the deck identity as
+        // far as every screen is concerned.
+        assert_eq!(
+            second_a.connection.socket_path,
+            deck_a.describe(),
+            "a snapshot answered for deck A must name deck A"
+        );
+        assert_eq!(
+            second_b.connection.socket_path,
+            deck_b.describe(),
+            "a snapshot answered for deck B must name deck B"
+        );
+
+        let _ = std::fs::remove_dir_all(dir_a);
+        let _ = std::fs::remove_dir_all(dir_b);
+    }
+
+    /// **Test-plan item 9.** Scenario: two observed decks are each running an
+    /// agent that reports the SAME registry id, and both are snapshotted. The
+    /// two snapshots must carry different deck identities, so the frontend's
+    /// `(daemonId, agentId)` composite key still tells the two agents apart.
+    ///
+    /// This is the failure that looks right on screen, which is why it needs a
+    /// test rather than review. `AgentOverview.tsx` keys agents by
+    /// `(daemonId, agentId)` and `daemonId` comes from `connection.socketPath`;
+    /// the DTO carries exactly ONE `connection`. So a merge that emits N decks'
+    /// agents under one identity does not render an error — it renders one fleet
+    /// where there were two, and a later action on such a row sends one deck's
+    /// agent id to the other deck.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn two_decks_running_the_same_agent_id_never_share_one_deck_identity() {
+        let (dir_a, socket_a) = scratch_socket("m3-ident-a");
+        let (dir_b, socket_b) = scratch_socket("m3-ident-b");
+        let listener_a = bind_trusted(&socket_a);
+        let listener_b = bind_trusted(&socket_b);
+        // The same id on both decks: a bare-id key collides, and only the deck
+        // half of the composite key can separate them.
+        let daemon_a = tokio::spawn(scripted_daemon_sequence(
+            listener_a,
+            vec![
+                matching_hello(),
+                AttachResponse::agent_records(vec![listed_agent("1", "pane-1")]),
+            ],
+        ));
+        let daemon_b = tokio::spawn(scripted_daemon_sequence(
+            listener_b,
+            vec![
+                matching_hello(),
+                AttachResponse::agent_records(vec![listed_agent("1", "pane-1")]),
+            ],
+        ));
+
+        let links = DaemonLinks::default();
+        let deck_a = Endpoint::Local(LocalEndpoint::at(&socket_a));
+        let deck_b = Endpoint::Local(LocalEndpoint::at(&socket_b));
+
+        let (snapshot_a, snapshot_b) =
+            tokio::join!(snapshot_of(&deck_a, &links), snapshot_of(&deck_b, &links),);
+
+        daemon_a.abort();
+        daemon_b.abort();
+
+        assert_eq!(snapshot_a.connection.status, ConnectionStatus::Connected);
+        assert_eq!(snapshot_b.connection.status, ConnectionStatus::Connected);
+        assert_eq!(snapshot_a.agents.len(), 1);
+        assert_eq!(snapshot_b.agents.len(), 1);
+        assert_eq!(
+            snapshot_a.agents[0].id, snapshot_b.agents[0].id,
+            "the fixture must really put the same agent id on both decks, or \
+             this test proves nothing"
+        );
+
+        assert_ne!(
+            snapshot_a.connection.socket_path, snapshot_b.connection.socket_path,
+            "two decks must never be emitted under one identity — the composite \
+             key collapses and two fleets render as one"
+        );
+        assert_eq!(snapshot_a.connection.socket_path, deck_a.describe());
+        assert_eq!(snapshot_b.connection.socket_path, deck_b.describe());
+
+        let _ = std::fs::remove_dir_all(dir_a);
+        let _ = std::fs::remove_dir_all(dir_b);
+    }
+
+    /// A deck that accepts a handshake and then never answers it.
+    ///
+    /// A **deterministic** stall the test controls rather than a real connect
+    /// timeout waited out: [`hello`] has no deadline of its own, so a daemon
+    /// that reads the request frame and does not reply parks the caller inside
+    /// `establish()` for exactly as long as the test wants it there. Signals
+    /// `accepted` once it is holding the connection and holds it until `release`
+    /// fires — the write half is kept bound rather than dropped, because
+    /// dropping it shuts the socket down and the client would see EOF instead of
+    /// a stall.
+    #[cfg(unix)]
+    async fn unresponsive_daemon(
+        listener: tokio::net::UnixListener,
+        accepted: tokio::sync::oneshot::Sender<()>,
+        release: tokio::sync::oneshot::Receiver<()>,
+    ) {
+        use dot_agent_deck::daemon_protocol::read_frame;
+        let (stream, _peer) = listener.accept().await.expect("accept one client");
+        let (mut reader, _writer) = stream.into_split();
+        let _ = read_frame(&mut reader).await;
+        let _ = accepted.send(());
+        let _ = release.await;
+    }
+
+    /// **Test-plan item 10, and the risk this PRD is most likely to fail on.**
+    /// Scenario: one observed deck accepts a handshake and never answers it,
+    /// while a second, healthy deck is asked for its own. The healthy deck's
+    /// handshake must complete promptly rather than queueing behind the
+    /// unresponsive one.
+    ///
+    /// [`DaemonLinks::trusted`] holds **one async mutex over the whole map,
+    /// across establishment**, and its own doc calls that the better of the two
+    /// — which it is, for one deck: concurrent first-uses of the same deck
+    /// collapse into one handshake. At N decks it inverts, because the callers
+    /// queued behind the timeout are now OTHER decks. That is success criterion
+    /// 2 of PRD #742, stated as a measurement precisely because it fails
+    /// silently.
+    ///
+    /// **The property, not the lock's shape.** Nothing here asserts that a mutex
+    /// was split, or that establishment moved out of it; either fix passes. What
+    /// is asserted is that a healthy deck's handshake completes while another
+    /// deck is mid-connect.
+    ///
+    /// The bound is five seconds against a sub-millisecond local handshake —
+    /// three orders of magnitude of headroom, because `.config/nextest.toml`
+    /// keeps `retries = 0` and a flaky timing test here would be worse than no
+    /// test at all.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_unresponsive_deck_does_not_queue_another_decks_handshake() {
+        let (dir_stalled, socket_stalled) = scratch_socket("m3-stall");
+        let (dir_healthy, socket_healthy) = scratch_socket("m3-healthy");
+        let stalled_listener = bind_trusted(&socket_stalled);
+        let healthy_listener = bind_trusted(&socket_healthy);
+        let (accepted, accepted_rx) = tokio::sync::oneshot::channel::<()>();
+        let (release, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let stalled = tokio::spawn(unresponsive_daemon(stalled_listener, accepted, release_rx));
+        let healthy = tokio::spawn(scripted_daemon_sequence(
+            healthy_listener,
+            vec![matching_hello()],
+        ));
+
+        let links = Arc::new(DaemonLinks::default());
+        let unresponsive = Endpoint::Local(LocalEndpoint::at(&socket_stalled));
+        let reachable = Endpoint::Local(LocalEndpoint::at(&socket_healthy));
+
+        let blocked = {
+            let links = Arc::clone(&links);
+            tokio::spawn(async move {
+                let _ = links.trusted(&unresponsive).await;
+            })
+        };
+        accepted_rx
+            .await
+            .expect("the unresponsive deck must have taken the handshake");
+
+        let outcome = tokio::time::timeout(Duration::from_secs(5), links.trusted(&reachable)).await;
+
+        // Cleanup BEFORE the assertion, so the failing run still lets go of the
+        // stalled connection and the scratch sockets.
+        let _ = release.send(());
+        let _ = stalled.await;
+        blocked.abort();
+        healthy.abort();
+        let _ = std::fs::remove_dir_all(dir_stalled);
+        let _ = std::fs::remove_dir_all(dir_healthy);
+
+        let link = outcome
+            .expect(
+                "a healthy deck's handshake must not be queued behind an \
+                 unreachable deck's connect — PRD #742 success criterion 2",
+            )
+            .expect("the healthy deck answered, so its link must establish");
+        assert_eq!(link.connection().status, ConnectionStatus::Connected);
+    }
 }

@@ -1467,4 +1467,97 @@ mod tests {
             ..DesktopSettings::default()
         }
     }
+
+    // -----------------------------------------------------------------------
+    // PRD #742 M3 — the regression guard for a defect M3 CREATES
+    //
+    // `release_if_not_selected` compares the probed deck against
+    // `crate::dto::selected_endpoint()`. Under `Selection::All` the selected
+    // deck resolves to the LOCAL one, so **Test connection** on any remote
+    // observed deck releases that deck's transport.
+    //
+    // That is inert today — nothing holds a lease on a non-selected deck, so the
+    // release drops the only handle and the next use re-opens. It becomes a real
+    // defect the moment M3's per-deck watchers hold leases: releasing the map's
+    // handle leaves the child alive under the watcher while the next
+    // `establish()` opens a SECOND `ssh` child beside it. A duplicate
+    // authenticated session is the exact hazard this function's own doc comment
+    // warns about, arrived at from the fleet's side.
+    // -----------------------------------------------------------------------
+
+    /// A one-row fleet document under `Selection::All`, plus the connectable
+    /// endpoint for that row.
+    #[cfg(unix)]
+    fn fleet_with(host: &str) -> (DesktopSettings, Endpoint) {
+        use crate::settings::{EndpointSettings, Selection};
+        use dot_agent_deck::remote_tunnel::{Hostname, RemoteSocketPath};
+
+        let mut row = RemoteEndpointSettings::new(
+            EndpointId::parse("deck000000000042").expect("a valid id"),
+            Hostname::parse(host).expect("a valid host"),
+        );
+        row.socket = Some(RemoteSocketPath::parse("/run/deck.sock").expect("a path"));
+        let settings = DesktopSettings {
+            endpoints: Some(EndpointSettings {
+                remote: vec![row],
+                selection: Selection::All,
+            }),
+            ..DesktopSettings::default()
+        };
+        let endpoint = settings
+            .observed_endpoints()
+            .into_iter()
+            .find(|endpoint| matches!(endpoint, Endpoint::Remote(_)))
+            .expect("the fleet observes its remote row");
+        (settings, endpoint)
+    }
+
+    /// Scenario: the fleet is selected, a remote deck in it holds a transport,
+    /// and **Test connection** is run against that deck. The probe must leave
+    /// that deck's transport in place; a deck the fleet does NOT observe must
+    /// still have its transport given back.
+    ///
+    /// The correct predicate is "is this deck **observed**", sourced from the
+    /// APPLIED observed set rather than from the optimistic document the webview
+    /// passes in — `crate::dto::apply_settings_selection` is the one writer of
+    /// applied selection state, so the set belongs beside the deck it already
+    /// stores. This test does not care where it is stored; it drives the
+    /// behaviour through the applied document.
+    ///
+    /// The second half is not decoration: `release_if_not_selected` exists to
+    /// stop a tunnel leaking per Test-connection click, and a fix that simply
+    /// stopped releasing would trade one leak for another.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn testing_an_observed_deck_keeps_its_transport() {
+        let (fleet, observed) = fleet_with("build-box.example.com");
+        let (_unobserved_doc, stranger) = fleet_with("not-in-the-fleet.example.com");
+        crate::dto::apply_settings_selection(&fleet);
+
+        let tunnels = EndpointTunnels::default();
+        tunnels.insert_stand_in(&observed).await;
+        assert_eq!(tunnels.held().await, 1, "the fixture must seed a transport");
+
+        release_if_not_selected(&tunnels, &observed).await;
+        assert_eq!(
+            tunnels.held().await,
+            1,
+            "probing a deck the fleet OBSERVES must not release its transport — \
+             a watcher is holding a lease on it, so the next establish() would \
+             open a second ssh child beside the live one"
+        );
+
+        // The converse still holds: a deck nothing observes is still released.
+        tunnels.insert_stand_in(&stranger).await;
+        assert_eq!(tunnels.held().await, 2);
+        release_if_not_selected(&tunnels, &stranger).await;
+        assert_eq!(
+            tunnels.held().await,
+            1,
+            "a deck outside the observed set must still give its transport back \
+             — that leak is what this function exists for"
+        );
+
+        crate::dto::apply_settings_selection(&DesktopSettings::default());
+    }
 }
