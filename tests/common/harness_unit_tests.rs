@@ -2952,6 +2952,162 @@ fn the_seeded_claude_json_registers_its_account_identity_fields() {
     }
 }
 
+/// Scenario: Point `HOME` at a fabricated host home, then seed trust into one
+/// isolated test HOME TWICE — once for a work dir, then for a sibling
+/// directory, which is exactly what `with_claude_trust_workdir` plus a later
+/// `seed_claude_trust_in_home` does. Both paths must be trusted in the file
+/// that ends up on disk, and the host-derived `oauthAccount` and
+/// `hasCompletedOnboarding` must still be there.
+///
+/// PRD #220. The second call used to re-base from the HOST `~/.claude.json` and
+/// overwrite, so it wrote a `projects` map holding only the sibling and
+/// silently un-trusted the work dir; the host holds no entry for a tempdir made
+/// seconds ago, so nothing restored it. The agent then sat at claude's "Is this
+/// a project you created or one you trust?" prompt — which defaults to "No" and
+/// so never resolves itself — until the test's own timeout fired.
+#[test]
+fn a_second_trust_seeding_keeps_the_paths_the_first_one_trusted() {
+    // SAFETY: single-threaded test body in its own nextest process.
+    unsafe {
+        std::env::remove_var(ANTHROPIC_API_KEY_ENV);
+        std::env::remove_var("OPENAI_API_KEY");
+    }
+    let uuid = "0b47a1de-FAKE-4c08-8e55-1d93f6a20c74";
+    let source_home = harness_tempdir().expect("fabricated host home");
+    std::fs::write(
+        source_home.path().join(".claude.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "hasCompletedOnboarding": true,
+            "oauthAccount": { "accountUuid": uuid },
+            // A host entry for some UNRELATED project, to prove the re-base is
+            // still what carries host state into a fresh HOME.
+            "projects": { "/home/fabricated/unrelated": { "hasTrustDialogAccepted": true } },
+        }))
+        .expect("serialize the fabricated ~/.claude.json"),
+    )
+    .expect("write the fabricated ~/.claude.json");
+    let restore_home = std::env::var_os("HOME");
+    // SAFETY: as above.
+    unsafe { std::env::set_var("HOME", source_home.path()) };
+
+    let test_home = harness_tempdir().expect("isolated test HOME");
+    let work_dir = test_home.path().join("work").to_string_lossy().into_owned();
+    let sibling = test_home
+        .path()
+        .join("sibling-worktree")
+        .to_string_lossy()
+        .into_owned();
+    // Call one: the builder's `with_claude_trust_workdir` seam, against a HOME
+    // with no `~/.claude.json` yet.
+    let first = seed_claude_project_trust(test_home.path(), std::slice::from_ref(&work_dir));
+    // Call two: the post-launch `seed_claude_trust_in_home` seam, for a
+    // directory that did not exist when the deck launched.
+    let second = seed_claude_project_trust(test_home.path(), std::slice::from_ref(&sibling));
+    // SAFETY: as above.
+    unsafe {
+        match &restore_home {
+            Some(value) => std::env::set_var("HOME", value),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+    first.expect("the first seeding writes cleanly");
+    second.expect("the second seeding writes cleanly");
+
+    let written: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(test_home.path().join(".claude.json"))
+            .expect("the seeding wrote a ~/.claude.json into the isolated HOME"),
+    )
+    .expect("the seeded ~/.claude.json is valid JSON");
+
+    for (which, path) in [("work dir", &work_dir), ("sibling worktree", &sibling)] {
+        assert_eq!(
+            written["projects"][path]["hasTrustDialogAccepted"],
+            serde_json::json!(true),
+            "the {which} is not trusted in the document the second seeding \
+             left on disk, so an unattended agent started there stalls at \
+             claude's folder-trust prompt until the test times out:\n{written:#}"
+        );
+    }
+
+    // The host re-base is preserved for what it is legitimately for: a FIRST
+    // call still carries the host's onboarding state, account and project map
+    // into the fresh HOME, and the merge must not have cost any of it.
+    assert_eq!(
+        written["hasCompletedOnboarding"],
+        serde_json::json!(true),
+        "the merge dropped the host onboarding flag, so the agent stops on the \
+         first-run gate instead:\n{written:#}"
+    );
+    assert_eq!(
+        written["oauthAccount"]["accountUuid"],
+        serde_json::json!(uuid),
+        "the merge dropped the host `oauthAccount`, so the agent has no \
+         identity to authenticate with:\n{written:#}"
+    );
+    assert_eq!(
+        written["projects"]["/home/fabricated/unrelated"]["hasTrustDialogAccepted"],
+        serde_json::json!(true),
+        "the merge dropped the host's own `projects` entries:\n{written:#}"
+    );
+}
+
+/// Scenario: Leave a `~/.claude.json` in the test HOME that is valid JSON but
+/// not an object, then seed trust into that HOME and check it re-bases from the
+/// host and trusts the path rather than panicking.
+///
+/// PRD #220. `cfg["projects"] = …` panics when `cfg` is not an object, so the
+/// merge would otherwise have taken the whole harness down over a fragment a
+/// wedged agent left behind — the guard that already covered the host base has
+/// to cover the new one too.
+#[test]
+fn a_non_object_claude_json_in_the_test_home_falls_back_to_the_host() {
+    // SAFETY: single-threaded test body in its own nextest process.
+    unsafe {
+        std::env::remove_var(ANTHROPIC_API_KEY_ENV);
+        std::env::remove_var("OPENAI_API_KEY");
+    }
+    let source_home = harness_tempdir().expect("fabricated host home");
+    std::fs::write(
+        source_home.path().join(".claude.json"),
+        serde_json::to_vec(&serde_json::json!({ "hasCompletedOnboarding": true }))
+            .expect("serialize the fabricated ~/.claude.json"),
+    )
+    .expect("write the fabricated ~/.claude.json");
+    let restore_home = std::env::var_os("HOME");
+    // SAFETY: as above.
+    unsafe { std::env::set_var("HOME", source_home.path()) };
+
+    let test_home = harness_tempdir().expect("isolated test HOME");
+    std::fs::write(test_home.path().join(".claude.json"), b"[]")
+        .expect("write the non-object ~/.claude.json");
+    let work_dir = test_home.path().join("work").to_string_lossy().into_owned();
+    let seeded = seed_claude_project_trust(test_home.path(), std::slice::from_ref(&work_dir));
+    // SAFETY: as above.
+    unsafe {
+        match &restore_home {
+            Some(value) => std::env::set_var("HOME", value),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+    seeded.expect("a non-object test-home config seeds cleanly from the host");
+
+    let written: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(test_home.path().join(".claude.json"))
+            .expect("the seeding rewrote the ~/.claude.json"),
+    )
+    .expect("the seeded ~/.claude.json is valid JSON");
+    assert_eq!(
+        written["projects"][&work_dir]["hasTrustDialogAccepted"],
+        serde_json::json!(true),
+        "the work dir is not trusted:\n{written:#}"
+    );
+    assert_eq!(
+        written["hasCompletedOnboarding"],
+        serde_json::json!(true),
+        "the host re-base did not happen:\n{written:#}"
+    );
+}
+
 // -----------------------------------------------------------------------
 // Issue #502/#785 blocker A — a credential the TERMINAL WRAPPED
 // -----------------------------------------------------------------------

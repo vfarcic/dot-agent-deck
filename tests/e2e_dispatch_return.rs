@@ -231,14 +231,57 @@ fn submitted_ack_is_visible(deck: &TuiDeck, unit: &str) -> bool {
     })
 }
 
+fn rightmost_pane_cell(line: &str) -> Option<&str> {
+    let (before_right_border, _) = line.rsplit_once('│')?;
+    before_right_border.rsplit_once('│').map(|(_, cell)| cell)
+}
+
+fn submitted_completion_region(grid: &str) -> Option<String> {
+    const OPENING: &str = "SUBMITTED:dispatch: a unit you dispatched has completed";
+    const REPORT_CLOSE: &str = ":END-UNTRUSTED-WORKER-REPORT]";
+
+    let pane_cells: Vec<&str> = grid.lines().filter_map(rightmost_pane_cell).collect();
+    for (start, cell) in pane_cells.iter().enumerate() {
+        let Some(opening) = cell.find(OPENING) else {
+            continue;
+        };
+
+        let mut region = cell[opening..].to_string();
+        if region.contains(REPORT_CLOSE) {
+            return Some(region);
+        }
+        for continuation in &pane_cells[start + 1..] {
+            if continuation.starts_with("SUBMITTED:")
+                || continuation.starts_with("NOTICE:")
+                || continuation.trim().is_empty()
+            {
+                break;
+            }
+            region.push_str(continuation);
+            if region.contains(REPORT_CLOSE) {
+                return Some(region);
+            }
+        }
+    }
+    None
+}
+
 fn submitted_return_is_visible(deck: &TuiDeck, unit: &str, report: &str) -> bool {
-    let quoted_unit = format!("'{unit}'");
-    deck.snapshot_grid().lines().any(|line| {
-        line.contains("SUBMITTED:dispatch:")
-            && line.contains(&quoted_unit)
-            && line_has_word(line, "completed")
-            && line.contains(report)
-    })
+    let grid = deck.snapshot_grid();
+    let Some(region) = submitted_completion_region(&grid) else {
+        return false;
+    };
+    let key = common::search_key(&region);
+    let unit_frame = common::search_key(&format!(
+        "[UNTRUSTED-ROLE-LABEL: {unit} :END-UNTRUSTED-ROLE-LABEL]"
+    ));
+    let report_frame = common::search_key(&format!(
+        "[UNTRUSTED-WORKER-REPORT: {report} :END-UNTRUSTED-WORKER-REPORT]"
+    ));
+    region.starts_with("SUBMITTED:dispatch:")
+        && line_has_word(&region, "completed")
+        && key.contains(&unit_frame)
+        && key.contains(&report_frame)
 }
 
 fn wait_for_submitted_ack(deck: &TuiDeck, unit: &str, caller: &PaneRef, log: &Path) {
@@ -366,9 +409,11 @@ fn assert_return_reached_caller(
             deck, unit, report
         )),
         "the terminal completion for dispatched unit {unit:?} never appeared in the \
-         CALLER'S rendered pane as a submitted turn within {}s. Expected one line \
-         carrying `dispatch:`, {unit:?} quoted, the word `completed`, and report \
-         {report:?}. {structural_reason}\nCaller PTY:\n{}\nDaemon log:\n{}\nFinal grid:\n{}",
+         CALLER'S rendered pane as a submitted turn within {}s. Expected one wrapped \
+         message region beginning `SUBMITTED:dispatch:`, carrying {unit:?} in an \
+         `UNTRUSTED-ROLE-LABEL` frame, the word `completed`, and report {report:?} \
+         in an `UNTRUSTED-WORKER-REPORT` frame. {structural_reason}\nCaller PTY:\n{}\n\
+         Daemon log:\n{}\nFinal grid:\n{}",
         RETURN_WAIT.as_secs(),
         pane_text(deck, caller),
         log_tail(log),

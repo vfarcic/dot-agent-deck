@@ -1516,6 +1516,190 @@ fn orchestration_dispatch_002_every_real_agent_role_comes_alive() {
 }
 
 // ---------------------------------------------------------------------------
+// A real single-agent completion returns to its dispatcher (PRD #220 M2.3)
+// ---------------------------------------------------------------------------
+
+/// Scenario: Open a real interactive Haiku dispatcher pane and tell it to dispatch
+/// one single agent that must inspect the isolated checkout for a uniquely named
+/// sentinel. Without any test-issued `work-done` call, the unit must report the
+/// discovered filename and the resulting completion must render in the dispatcher.
+#[spec("dispatch/return/006")]
+#[test]
+fn dispatch_return_006_real_single_agent_reports_to_the_dispatcher() {
+    // Decision 26 runtime-skip: missing CLI / credentials is environmental.
+    skip_unless!(common::check_claude_available());
+
+    const UNIT: &str = "live-return-probe";
+    const SENTINEL_PREFIX: &str = "dispatch-return-live-sentinel-";
+    const SENTINEL: &str = "dispatch-return-live-sentinel-6f2c.txt";
+    const HAIKU_MODEL: &str = "claude-haiku-4-5-20251001";
+
+    // Both the dispatcher and the unit it spawns inherit this command. Keep them
+    // fully interactive (no `-p`), pin the cheap model, and pre-allow every tool
+    // the two short turns need: Bash for the real deck CLI / listing / cleanup,
+    // Read for inspection, and Write for the completion report file.
+    let agent_command =
+        format!("claude --ax-screen-reader --model {HAIKU_MODEL} --allowedTools Bash Read Write");
+    let config = write_default_command_config(&agent_command);
+    let deck = TuiDeck::builder()
+        .with_pty_size(220, 60)
+        .with_imported_claude_credentials()
+        .with_claude_trust_workdir()
+        .with_env(
+            "DOT_AGENT_DECK_CONFIG",
+            config.path().join("config.toml").to_string_lossy(),
+        )
+        // The agent's `dot-agent-deck dispatch` and `work-done` calls must use
+        // the branch build, not a host-installed binary that predates the verbs.
+        .with_env("PATH", path_with_binary_dir())
+        .launch_with_fixture("minimal");
+    deck.wait_for_string("No active sessions");
+
+    // The unit receives a committed checkout. Its task names only the prefix,
+    // so the full sentinel in its returned report can only come from inspecting
+    // the real dispatched worktree, not from parroting the dispatcher's prompt.
+    std::fs::write(
+        deck.workdir().join(SENTINEL),
+        "This fixture proves the dispatched unit inspected its checkout.\n",
+    )
+    .expect("write the uniquely named fixture sentinel");
+    commit_fixture_repo(deck.workdir());
+
+    let expected_worktree = dispatch_worktree_of(&deck, UNIT);
+    let _worktree_guard = SiblingWorktreeGuard(expected_worktree.clone());
+
+    // Trust the not-yet-created sibling worktree before dispatch, so the unit's
+    // injected prompt reaches a usable interactive agent rather than a project
+    // trust dialog. Also trust the canonical-parent spelling for macOS's
+    // `/var` -> `/private/var` tempdir alias.
+    let mut worktree_trust = vec![expected_worktree.to_string_lossy().into_owned()];
+    if let (Some(parent), Some(name)) = (expected_worktree.parent(), expected_worktree.file_name())
+        && let Ok(canonical_parent) = parent.canonicalize()
+    {
+        let canonical = canonical_parent.join(name).to_string_lossy().into_owned();
+        if !worktree_trust.contains(&canonical) {
+            worktree_trust.push(canonical);
+        }
+    }
+    common::seed_claude_trust_in_home(deck.home_dir(), &worktree_trust)
+        .expect("seed Claude trust for the dispatched worktree");
+
+    // Open a real dispatcher through the same user-facing form as
+    // `prompt/new-pane/016`.
+    deck.send_keys(b"\x0e"); // Ctrl+n -> directory picker
+    deck.send_keys(b" "); // Space -> current dir -> new-pane form
+    deck.wait_for_string("No mode");
+    deck.send_keys(b"\x1b[C\x1b[C\x1b[C\x1b[C\x1b[C\x1b[C\x1b[C\x1b[C");
+    deck.wait_for_string("dispatcher mode");
+    let (submit_col, submit_row) = deck.wait_for_in_grid("[Submit]");
+    deck.click(submit_col, submit_row);
+    deck.wait_for_absence("[Submit]");
+
+    // A visible Claude card plus the seed in native prompt history is the
+    // precondition that this is a real, instructed dispatcher rather than a
+    // generic shell that happens to accept our following bytes.
+    const DISPATCHER_READY_WAIT: Duration = Duration::from_secs(120);
+    assert!(
+        common::wait_until(DISPATCHER_READY_WAIT, || {
+            let grid = deck.snapshot_grid();
+            grid.contains("1 session(s)")
+                && grid.contains("ClaudeCode")
+                && seed_is_in_a_card_prompt_history(&deck)
+        }),
+        "a real seeded dispatcher never became ready within {}s. The test cannot ask an \
+         uninstructed pane to exercise the dispatch contract.\nFinal grid:\n{}",
+        DISPATCHER_READY_WAIT.as_secs(),
+        deck.snapshot_grid()
+    );
+
+    // Let the seed turn finish painting before typing the user's goal. This is
+    // intentionally non-fatal: prompt history above is the hard readiness fact,
+    // while a busy host can keep a harmless spinner repainting past the quiet
+    // heuristic even after the prompt editor is usable.
+    let dispatcher_ids: Vec<String> = common::agent_records_on(deck.attach_socket_path())
+        .into_iter()
+        .filter(|record| {
+            record
+                .live
+                .as_ref()
+                .and_then(|live| live.last_user_prompt.as_deref())
+                .is_some_and(|prompt| prompt.contains(DISPATCHER_SEED_OPENING))
+        })
+        .map(|record| record.id)
+        .collect();
+    if !common::wait_until_panes_settled(
+        deck.attach_socket_path(),
+        &dispatcher_ids,
+        Duration::from_millis(1500),
+        Duration::from_secs(8),
+        Duration::from_secs(90),
+    ) {
+        eprintln!("warning: the dispatcher pane did not settle within 90s; proceeding anyway");
+    }
+
+    // The dispatcher — not this test — invokes the real CLI. The unit's task
+    // does NOT mention `work-done`; the production `dispatch_prompt` is solely
+    // responsible for teaching the fresh agent how to signal completion.
+    let directive = format!(
+        "Use Bash to run exactly this command now, then wait for its result: \
+         dot-agent-deck dispatch {UNIT} --single --task \"Use Bash to list the repo root. \
+         Find the only filename beginning {SENTINEL_PREFIX}. Report the full matching \
+         filename and say whether it exists. Do not ask questions.\" \
+         Do not inspect the files or do the unit's work yourself, and do not ask me anything first."
+    );
+    deck.send_keys(directive.as_bytes());
+    deck.send_keys(b"\r");
+
+    // This is one user-visible predicate over the dispatcher's current grid.
+    // `search_key` makes the completion and its two security frames
+    // wrap-insensitive while the raw-grid check retains the `dispatch:` prefix.
+    // The full sentinel was absent from every prompt, so seeing it inside the
+    // worker-report frame also proves the real unit inspected the checkout.
+    const RETURN_WAIT: Duration = Duration::from_secs(240);
+    let completion_stem = common::search_key("dispatch: a unit you dispatched has completed");
+    let unit_frame = common::search_key(&format!(
+        "[UNTRUSTED-ROLE-LABEL: {UNIT} :END-UNTRUSTED-ROLE-LABEL]"
+    ));
+    let report_open = common::search_key("[UNTRUSTED-WORKER-REPORT:");
+    let report_close = common::search_key(":END-UNTRUSTED-WORKER-REPORT]");
+    assert!(
+        common::wait_until(RETURN_WAIT, || {
+            let grid = deck.snapshot_grid();
+            let key = common::search_key(&grid);
+            grid.contains("dispatch:")
+                && key.contains(&completion_stem)
+                && key.contains(&unit_frame)
+                && key
+                    .find(&report_open)
+                    .and_then(|start| {
+                        let report = &key[start + report_open.len()..];
+                        report.find(&report_close).map(|end| &report[..end])
+                    })
+                    .is_some_and(|report| report.contains(SENTINEL))
+        }),
+        "the real unit never returned a visible completion to the dispatcher within {}s. \
+         Expected the dispatcher's grid to carry `dispatch:`, unit {UNIT:?} in an \
+         `UNTRUSTED-ROLE-LABEL` frame, the word `completed`, and the unit-discovered \
+         sentinel {SENTINEL:?} inside an `UNTRUSTED-WORKER-REPORT` frame. \
+         worktree_exists={}. No test code invoked `work-done`, so a missing completion \
+         after a started unit is a failure of the real single-agent instruction path.\n\
+         Records: {:?}\nFinal grid:\n{}",
+        RETURN_WAIT.as_secs(),
+        expected_worktree.exists(),
+        common::agent_records_on(deck.attach_socket_path())
+            .iter()
+            .map(|record| (
+                record.id.clone(),
+                record.display_name.clone(),
+                record.cwd.clone(),
+                record.live.as_ref().map(|live| live.status.clone())
+            ))
+            .collect::<Vec<_>>(),
+        deck.snapshot_grid()
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Closing a dispatched card (PRD #220 follow-up)
 // ---------------------------------------------------------------------------
 
