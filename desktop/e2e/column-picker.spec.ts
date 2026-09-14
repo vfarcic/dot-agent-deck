@@ -168,6 +168,45 @@ test.describe("the overview's column picker", () => {
     await expect(page.getByTestId("overview-columns-toggle")).toHaveAttribute("aria-expanded", "false");
   });
 
+  test("dismisses on Escape raised inside a sibling that swallows the key", async ({ page }) => {
+    await openOverview(page, "crowded");
+    const menu = await openColumnPicker(page);
+
+    /*
+      The neighbour problem, found in review on PR #1071. `DeckSelector` sits in
+      this same top bar and stops Escape at its own root on EVERY press, open or
+      shut — so a dismiss listener bound in the bubble phase never sees a key
+      raised while focus is inside it, and the menu would stay open with nothing
+      but the mouse to shut it. This is reachable by keyboard alone: Tab moves
+      focus without a pointer, and no pointer means no `pointerdown`, so the
+      picker is still open when it lands.
+
+      Focus is moved by script for the reason the test above moves it that way —
+      a click would dismiss through the pointer path and prove nothing about the
+      key. The listener captures at `document`, which is what puts it ahead of
+      the sibling's handler.
+    */
+    const focus = await page.evaluate(() => {
+      const sibling = document.querySelector<HTMLElement>('[data-testid="deck-selector-toggle"]');
+      sibling?.focus();
+      const active = document.activeElement;
+      const picker = document.querySelector(".overview-columns-picker")!;
+      return {
+        siblingExists: sibling !== null,
+        onSibling: active === sibling,
+        insidePicker: active instanceof Node && picker.contains(active),
+      };
+    });
+    expect(focus.siblingExists, "the Deck selector is not on this screen, so this test is not exercising the neighbour problem").toBe(true);
+    expect(focus.onSibling, "focus did not land on the Deck selector's trigger").toBe(true);
+    expect(focus.insidePicker).toBe(false);
+    await expect(menu).toBeVisible();
+
+    await page.keyboard.press("Escape");
+    await expect(menu, "the sibling swallowed Escape and the picker stayed open").toBeHidden();
+    await expect(page.getByTestId("overview-columns-toggle")).toHaveAttribute("aria-expanded", "false");
+  });
+
   test("toggles on its trigger rather than reopening", async ({ page }) => {
     await openOverview(page, "crowded");
     const toggle = page.getByTestId("overview-columns-toggle");

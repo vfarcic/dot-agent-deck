@@ -713,6 +713,38 @@ describe("AgentOverview", () => {
   });
 
   /**
+   * Scenario: open the Columns menu, then press Escape somewhere that stops the
+   * key at its own root — which is what every sibling control in this top bar
+   * does, `DeckSelector` included, whether or not its own menu is open. The
+   * picker closes anyway, because its listener captures at `document` and so
+   * runs before anything on the page can swallow the press (found in review on
+   * PR #1071).
+   */
+  it("closes the column picker on an Escape a sibling control would swallow", () => {
+    renderOverviewWithStoredColumns(undefined);
+    fireEvent.click(screen.getByTestId("overview-columns-toggle"));
+    expect(screen.getByTestId("overview-columns-menu")).toBeVisible();
+
+    /*
+      A stand-in for that sibling rather than the sibling itself: `DeckSelector`
+      renders only when the overview is given `settings`, which this harness
+      does not, and the property under test is about the PHASE the picker
+      listens in — that nothing between the key and `document` can take the
+      press first — not about which neighbour does the swallowing.
+    */
+    const swallower = document.createElement("button");
+    swallower.addEventListener("keydown", (event) => event.stopPropagation());
+    document.body.append(swallower);
+    try {
+      fireEvent.keyDown(swallower, { key: "Escape" });
+      expect(screen.queryByTestId("overview-columns-menu")).not.toBeInTheDocument();
+      expect(screen.getByTestId("overview-columns-toggle")).toHaveAttribute("aria-expanded", "false");
+    } finally {
+      swallower.remove();
+    }
+  });
+
+  /**
    * Scenario: with the menu open, click the Columns button again. It closes and
    * stays closed. The trigger sits INSIDE the dismissal boundary on purpose —
    * outside it, its own pointer-down would close the menu and its click would
