@@ -60,7 +60,16 @@ Cleanup is keyed to the dispatched unit's own tab. Three defects lived here, eac
 ## Deferred, and why
 
 - **Scheduled issue-dispatch (#120) does not get the orchestrator context.** The composition is *shared* (`src/orchestrator_context.rs`) rather than duplicated, so enabling it there is cheap — but doing it here would change what lands in a shipped feature's pane (a pointer line instead of the prompt text). That is [#222](https://github.com/vfarcic/dot-agent-deck/issues/222)'s job, with its own tests updated. Until then #120 orchestrations keep their existing defect.
-- **The return edge** (a dispatched unit reporting completion back to the dispatcher) is Phase 2 of PRD #220 itself, deferred rather than dropped. It is *not* tracked by #174 — that is the separate *Cross-project orchestration dispatch* PRD, which **depends on** this one. The dependency has been stated backwards more than once.
+
+## Return edge
+
+A dispatched unit's terminal `work-done --done` is delivered back into the pane that dispatched it, as a submitted turn reading `dispatch: unit '<name>' completed. Report: <the unit's report>`. Both shapes reach it: an orchestration's orchestrator context already ends with that call, and `dispatch_prompt` appends the same instruction to a `--single` unit's prompt, which otherwise had no completion signal at all.
+
+The caller's `(pane_id, agent_id)` pair — already captured at dispatch time so the spawn acknowledgement reaches the agent that *asked* (issue #617 finding 3) — is retained in `dispatch_return::DispatchReturns`, keyed on the dispatched unit's TERMINAL pane (`SpawnHandle::delivery_pane_id`: the single agent's pane, or the orchestration's start role). Keying on that pane rather than on the worktree is what lets the unknown-pane branch route a `--single` completion without widening its admission gate, and what stops an ordinary worker inside a dispatched orchestration matching. Entries are evicted on delivery and by `begin_pane_close` in both roles. Delivery reuses `deliver_dispatch_result`, so the caller-identity gate and the never-retried refusal policy are the acknowledgement's rather than a second copy that can drift.
+
+**This is the live-recipient path only.** A caller pane that is gone degrades to drop-and-log: there is no queue, no file-backed outbox and no retry. An outcome with no live recipient is a deck-wide attention question and belongs with [#630](https://github.com/vfarcic/dot-agent-deck/issues/630), not here.
+
+The edge is #220's own Phase 2. It is *not* tracked by #174 — that is the separate *Cross-project orchestration dispatch* PRD, which **depends on** this one. The dependency has been stated backwards more than once.
 
 ## Graduation
 
