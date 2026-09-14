@@ -957,9 +957,32 @@ function OverviewColumnPicker({ columns, onChange }: { columns: OverviewColumnId
     outside, its pointer-down would close the menu and its click would toggle it
     straight back open, so the button would appear not to work at all.
 
-    The listener is bound only while the menu is open and removed when it
+    The listeners are bound only while the menu is open and removed when it
     closes, not merely on unmount — `open` is in the dependency list, so React
     runs the cleanup on the same transition that hides the menu.
+  */
+  /*
+    Escape dismisses from anywhere on the page, for the same reason a pointer
+    does (issue #957). The root's own `onKeyDown` below sees the key only while
+    focus is INSIDE the picker, and what is supposed to put it there is the
+    click that opened the menu — which is the engine-dependent part. Measured
+    during the browser tier's bring-up, a real click leaves
+    `document.activeElement` on the trigger in Chromium and in Playwright's
+    WebKit. WKWebView, which is what the packaged macOS app renders in, has not
+    been measured either way, and Safari on macOS is documented not to focus a
+    `<button>` on click; WebKitGTK under Tauri is the distribution's build and
+    moves independently of Playwright's pinned one. Nothing has been seen
+    failing anywhere — this listener removes the dependency rather than
+    settling the question, which the manual macOS walkthrough in
+    `docs/develop/desktop-gui.md` or the driver-level tier in #953 would.
+
+    It reuses the pointer rule wholesale, INCLUDING the inside-the-root
+    exemption, which is what keeps the two paths from fighting: an Escape
+    raised inside the picker belongs to the root handler below, which stops it
+    propagating so the app-wide Escape in `App.tsx` does not act on the same
+    press. Outside the root the key is deliberately NOT stopped — focus is
+    somewhere else, possibly in an overlay that wants that press, and a
+    dismissal nobody can see must not eat it.
   */
   useEffect(() => {
     if (!open) return;
@@ -967,8 +990,16 @@ function OverviewColumnPicker({ columns, onChange }: { columns: OverviewColumnId
       if (event.target instanceof Node && root.current?.contains(event.target)) return;
       setOpen(false);
     };
+    const dismissOnEscape = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      dismiss(event);
+    };
     document.addEventListener("pointerdown", dismiss);
-    return () => document.removeEventListener("pointerdown", dismiss);
+    document.addEventListener("keydown", dismissOnEscape);
+    return () => {
+      document.removeEventListener("pointerdown", dismiss);
+      document.removeEventListener("keydown", dismissOnEscape);
+    };
   }, [open]);
   return (
     <div

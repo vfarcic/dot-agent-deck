@@ -684,6 +684,35 @@ describe("AgentOverview", () => {
   });
 
   /**
+   * Scenario: open the Columns menu, then press Escape with the key arriving at
+   * the page body rather than anywhere inside the picker. The menu closes
+   * anyway, because dismissal is bound to `document` and not to wherever the
+   * click that opened it left focus (issue #957).
+   */
+  it("closes the column picker on Escape raised outside it", () => {
+    renderOverviewWithStoredColumns(undefined);
+    fireEvent.click(screen.getByTestId("overview-columns-toggle"));
+    expect(screen.getByTestId("overview-columns-menu")).toBeVisible();
+
+    /*
+      `document.body` is outside React's root container, so this key reaches
+      NOTHING of the picker's own except the document listener — which is the
+      state an engine that does not move focus to a `<button>` on click would
+      leave the page in. Whether any engine the app ships on does that is not
+      settled here or anywhere; the listener is what makes the answer not
+      matter.
+    */
+    fireEvent.keyDown(document.body, { key: "Escape" });
+    expect(screen.queryByTestId("overview-columns-menu")).not.toBeInTheDocument();
+    expect(screen.getByTestId("overview-columns-toggle")).toHaveAttribute("aria-expanded", "false");
+
+    // And the listener went with the menu: a second Escape has nothing left to
+    // act on, so the picker stays shut rather than toggling back open.
+    fireEvent.keyDown(document.body, { key: "Escape" });
+    expect(screen.queryByTestId("overview-columns-menu")).not.toBeInTheDocument();
+  });
+
+  /**
    * Scenario: with the menu open, click the Columns button again. It closes and
    * stays closed. The trigger sits INSIDE the dismissal boundary on purpose —
    * outside it, its own pointer-down would close the menu and its click would
