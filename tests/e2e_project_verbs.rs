@@ -198,6 +198,143 @@ fn project_resolve_001_enumeration_offers_only_projects_that_resolve() {
     }
 }
 
+/// Scenario: Make two directories that are equally good projects, start the
+/// daemon standing in one of them, then move the client process into the other
+/// so the two sides no longer share a resolution input, and ask the daemon what
+/// projects it knows. The listing must name the DAEMON's directory and must not
+/// name the client's — an answer a client resolving against its own environment
+/// could not have produced.
+///
+/// # Why this retires a claim, and what the claim got right
+///
+/// `docs/develop/desktop-gui.md` says a loopback ssh tunnel is not a substitute
+/// for a second machine "because locally the client's filesystem *is* the
+/// daemon's and every path assertion passes whichever side resolved it". That
+/// is true of a naive test and it is **not** a proof that the property is
+/// untestable on one machine: what has to differ is not the filesystem but the
+/// **resolution inputs**. Two directories on one disk, and a daemon and a
+/// client standing in different ones, are distinguishable — and that is all
+/// PRD #819's "the client holds no project state" needs to be falsifiable.
+///
+/// # `HOME` is not the lever, and finding that out is part of the answer
+///
+/// The obvious divergence to reach for is `HOME`, and it does not work here:
+/// **no project-resolution path reads it.** `ResolveProject` refuses anything
+/// that is not already absolute (`validate_project_path`, and
+/// `tests/daemon_protocol.rs` pins the refusal), so there is no `~` to expand
+/// and no relative spelling to resolve against anybody's environment;
+/// `read_project_config` reads `<dir>/.dot-agent-deck.toml` and does not walk
+/// upwards; and `ListProjects` enumerates from state the daemon already holds.
+///
+/// The tell is asserted below rather than argued: the harness already gives
+/// every daemon its own `HOME`, so if `HOME` were a resolution input this
+/// property would have been "provable" by every e2e test in the tree since the
+/// harness was written — which is exactly the shape of a test that proves
+/// nothing. What actually separates the two sides is the **cwd**, because that
+/// is the one environment fact `ListProjects` genuinely resolves from
+/// (`capture_daemon_startup_cwd`, taken once in `run_daemon_with` so the answer
+/// cannot depend on when it was asked).
+///
+/// `set_current_dir` is process-global, and that is sound here for the reason
+/// it is sound nowhere else: both e2e aliases run under nextest, which is
+/// process-per-test, so this process is this test. The original is restored at
+/// the end anyway.
+#[spec("project/resolve/002")]
+#[test]
+fn project_resolve_002_the_enumeration_is_the_daemons_cwd_and_not_the_clients() {
+    let workspace = common::harness_tempdir().expect("mint the project sandbox");
+    // Byte-identical config in both, so nothing about the CONTENT can be what
+    // separates them in the listing below.
+    let daemon_side = make_dir(workspace.path(), "daemon-side", Some(NAMED_PROJECT_TOML));
+    let client_side = make_dir(workspace.path(), "client-side", Some(NAMED_PROJECT_TOML));
+
+    let original_cwd = std::env::current_dir().expect("the test process has a working directory");
+    // The daemon inherits this process's cwd, which is what
+    // `capture_daemon_startup_cwd` records at startup.
+    std::env::set_current_dir(&daemon_side).expect("stand in the daemon's project");
+    let daemon = common::spawn_daemon_serve_with_env(None, "0", &[]);
+    // ...and from here on the client stands somewhere else entirely. The two
+    // sides now disagree about "where am I" while sharing one filesystem.
+    std::env::set_current_dir(&client_side).expect("stand the client in its own project");
+
+    // The `HOME` half, asserted so the paragraph above is a measurement rather
+    // than a claim: the two sides already diverge on `HOME`, and it makes no
+    // difference to anything below.
+    let client_home = std::env::var("HOME").expect("HOME is set on the host");
+    assert_ne!(
+        Path::new(&client_home),
+        daemon.home.as_path(),
+        "the harness already gives the daemon its own HOME — if HOME were a \
+         resolution input, this property would have been free all along"
+    );
+
+    // Both directories really are projects this daemon can resolve, asked of
+    // the daemon itself. Without this the assertion below could pass because
+    // the client's directory was never resolvable in the first place, which
+    // would prove nothing about WHO resolved.
+    for (label, dir) in [
+        ("the daemon's", &daemon_side),
+        ("the client's", &client_side),
+    ] {
+        let resp = daemon
+            .send_attach_request(&AttachRequest::ResolveProject {
+                path: wire_path(&canonical(dir)),
+            })
+            .expect("ResolveProject over the attach socket");
+        assert!(
+            resp.ok,
+            "{label} directory must be a project this daemon can resolve when \
+             asked by absolute path, or the enumeration below proves nothing: \
+             {:?}",
+            resp.error
+        );
+    }
+
+    let resp = daemon
+        .send_attach_request(&AttachRequest::ListProjects {})
+        .expect("ListProjects over the attach socket");
+    assert!(
+        resp.ok,
+        "ListProjects must answer; it refused instead: {:?}",
+        resp.error
+    );
+    let listing = resp
+        .projects
+        .expect("a successful ListProjects must carry a ProjectListing");
+    let offered: Vec<&str> = listing.projects.iter().map(|p| p.path.as_str()).collect();
+
+    let want = canonical(&daemon_side);
+    let unwanted = canonical(&client_side);
+    assert!(
+        offered.iter().any(|p| Path::new(p) == want),
+        "the enumeration must name the directory the DAEMON started in ({}); \
+         offered {offered:?}",
+        want.display()
+    );
+    assert!(
+        !offered.iter().any(|p| Path::new(p) == unwanted),
+        "the enumeration must NOT name the directory the CLIENT stands in \
+         ({}) — that is the answer a client resolving against its own \
+         environment would produce, and on one filesystem it is just as valid a \
+         project; offered {offered:?}",
+        unwanted.display()
+    );
+    // `primary` is deliberately absent, and asserting that is what keeps the
+    // claim above honest: it is a fact about LIVE state, nominated from the most
+    // recent recorded activity, and the daemon's own startup cwd is a seed with
+    // no clock (`ProjectCandidate::activity_ms` is `None` for it). So "the
+    // daemon knows where it is standing" and "the daemon has something live
+    // there" are different answers, and only the first is being made here.
+    assert_eq!(
+        listing.primary, None,
+        "a startup-cwd seed carries no activity timestamp, so nothing may be \
+         nominated as primary from it alone; got {:?}",
+        listing.primary
+    );
+
+    std::env::set_current_dir(&original_cwd).expect("restore the test process's cwd");
+}
+
 /// Scenario: Start a headless daemon and ask it to prepare a workflow against a
 /// real project, then check both halves of the answer — the coordinator context
 /// is published at `<project>/.dot-agent-deck/orchestrator-context.md` carrying

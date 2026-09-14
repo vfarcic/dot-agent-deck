@@ -5101,6 +5101,13 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 
 #### project/launch
 
+##### project/resolve/002 — The enumeration names the directory the DAEMON started in, never the one the client stands in — the daemon-side-resolution property, made falsifiable on one machine.
+- **Layer:** L2 lane 1 (one headless `daemon serve` driven over its attach socket).
+- **Agent:** none. No credential.
+- **Asserts:** two byte-identically configured project directories on one filesystem, with the daemon started in one and the client process standing in the other, are distinguishable: both resolve when asked of the daemon by absolute path (so neither is disqualified as "not a project"), and `ListProjects` offers the **daemon's** and not the **client's** — which is an answer a client resolving against its own environment could not have produced, and is the property PRD #819 moved project resolution daemon-side for. Also that `primary` stays `None`, because it is a fact about live state and the daemon's own startup cwd is a seed with no activity timestamp. `HOME` is asserted to already differ between the two sides *and to make no difference*, which is the evidence for the note below rather than a property of its own.
+- **Does not assert:** that `HOME` distinguishes the two sides — it does not, and no project-resolution path reads it: `ResolveProject` refuses anything non-absolute (`tests/daemon_protocol.rs` pins that refusal, `relative/path` included), `read_project_config` reads `<dir>/.dot-agent-deck.toml` without walking upwards, and `ListProjects` enumerates from state the daemon already holds. The lever is the **cwd**, via `capture_daemon_startup_cwd`. Nor the display half — what a connected desktop window *draws* for a remote deck still needs a second machine (`docs/develop/desktop-gui.md`). Nor a remote deck: the divergence here is in the resolution inputs, not in the transport, which is `fleet/observe/002`'s.
+- **Platform coverage:** linux+mac (the file is `unix`-gated).
+
 ##### project/launch/001 — `PrepareWorkflow` publishes the coordinator context where the agent will read it and names it in the reply; a failed preparation publishes nothing and starts no roles.
 - **Layer:** L2 lane 1 (headless `daemon serve` driven over the attach socket).
 - **Agent:** none (the project fixture's roles are `cat`; the verb resolves, composes and publishes, and per PRD #819 Open Question 5 spawning stays a later `StartAgent` sequence, so no role is started by either half).
