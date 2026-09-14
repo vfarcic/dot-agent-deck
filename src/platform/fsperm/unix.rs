@@ -23,17 +23,43 @@ static UMASK_LOCK: Mutex<()> = Mutex::new(());
 ///
 /// Only the umask/mode policy lives here; the socket bind itself stays at the
 /// call site (M2 owns the transport).
+///
+/// **The restore is a `Drop`, so it also runs if `f` unwinds** (PRD #742 M11's
+/// F4). Every caller today hands this a `bind(2)` that returns `io::Result` and
+/// panics for nothing, so this changes no behaviour that exists — what it
+/// removes is the dependence on that staying true. A panic escaping `f` with
+/// the old shape left the process at `0o177` permanently, and that is not a
+/// quiet failure: `bind_trusted_socket`'s own comment records measuring four
+/// sibling tests dying with `EACCES` inside their own temp roots because every
+/// `tempfile::tempdir()` created while the mask was up landed at `0o600` with
+/// no search bit. Restoring from a guard costs nothing and turns that from a
+/// standing assumption about every future `f` into a property of this function.
+///
+/// The guard is declared after `_guard`, so it drops first: the mask is back
+/// before [`UMASK_LOCK`] is released, and the next cooperating caller never
+/// sees `0o177`. (A panic poisons that mutex; the `into_inner` above is what
+/// keeps a poisoned lock from turning one panicking caller into every later
+/// caller's panic.)
 pub fn with_socket_umask<T>(f: impl FnOnce() -> T) -> T {
+    /// Restores the mask this swapped out, on the ordinary path and on an
+    /// unwind alike.
+    struct Restore(libc::mode_t);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            // SAFETY: as below — `umask(2)` swaps a per-process value and
+            // cannot fail.
+            unsafe {
+                libc::umask(self.0);
+            }
+        }
+    }
+
     let _guard = UMASK_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     // SAFETY: `umask(2)` is a thread-safe libc call that simply swaps a
-    // per-process value. We restore the previous mask immediately after `f`
-    // so other code (file creation elsewhere) is unaffected.
-    let prev = unsafe { libc::umask(0o177) };
-    let result = f();
-    unsafe {
-        libc::umask(prev);
-    }
-    result
+    // per-process value. `Restore` puts the previous mask back as soon as `f`
+    // is done, so other code (file creation elsewhere) is unaffected.
+    let _restore = Restore(unsafe { libc::umask(0o177) });
+    f()
 }
 
 /// Create `dir` (recursively) with mode 0o700 **and re-apply the mode to
@@ -544,5 +570,50 @@ mod tests {
         // uid 0 is a wildcard on neither side.
         assert!(endpoint_uid_is_trusted(u32::MAX, 1000).is_err());
         assert!(endpoint_uid_is_trusted(0, u32::MAX).is_err());
+    }
+
+    /// The umask restore runs on an unwind, not only on the ordinary return
+    /// (PRD #742 M11's F4). No caller hands this a panicking body today; what
+    /// the guard removes is the dependence on that staying true, because the
+    /// failure mode is process-wide and silent — the mask stays at `0o177` for
+    /// the life of the process and every later file creation loses its mode
+    /// bits, which is the `EACCES` cascade `bind_trusted_socket`'s comment
+    /// records measuring.
+    ///
+    /// Reads the mask the only way `umask(2)` offers: swap a value in and put
+    /// it straight back. Sound here for the same reason the rest of this
+    /// module's process-global work is — nextest is process-per-test.
+    #[test]
+    fn a_panicking_body_still_restores_the_process_umask() {
+        fn current() -> libc::mode_t {
+            // SAFETY: `umask(2)` swaps a per-process value and cannot fail;
+            // the second call puts back what the first read.
+            unsafe {
+                let prev = libc::umask(0o022);
+                libc::umask(prev);
+                prev
+            }
+        }
+
+        let before = current();
+        // The default hook would print a backtrace for a panic this test is
+        // deliberately causing, which reads as a failure in the log of a
+        // passing run.
+        let hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let caught = std::panic::catch_unwind(|| {
+            let _: () = with_socket_umask(|| panic!("the body this test hands in"));
+        });
+        std::panic::set_hook(hook);
+
+        assert!(
+            caught.is_err(),
+            "the panic must propagate to the caller, not be swallowed by the guard"
+        );
+        assert_eq!(
+            current(),
+            before,
+            "a body that unwound must still leave the process umask where it found it"
+        );
     }
 }

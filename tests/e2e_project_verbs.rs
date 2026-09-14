@@ -114,6 +114,41 @@ fn wire_path(path: &Path) -> String {
         .to_string()
 }
 
+/// The process's working directory as it was when this was taken, restored on
+/// drop.
+///
+/// `project/resolve/002` moves the process cwd, which is process-global, and
+/// its own doc records why that is sound: both e2e aliases run under nextest,
+/// which is process-per-test. This guard is the belt-and-braces half — the
+/// restore happens on an unwind as well as on the return, so "the cwd is put
+/// back" stops being a property of the *runner* and becomes a property of the
+/// test. Under nextest the process is about to exit either way; under anything
+/// else a mid-test assertion failure no longer leaves the directory moved for
+/// whatever runs next.
+///
+/// Same name and same shape as the guards `tests/durable_hook_binary_path.rs`,
+/// `tests/features.rs` and `src/opencode_manage.rs` each already keep for their
+/// own cwd moves — a per-file struct rather than a `common` helper, which is
+/// how those three do it too. Each `tests/*.rs` file is its own crate, so a
+/// shared one would have to live in `common`, and a shared affordance for
+/// moving the process cwd is an invitation rather than a convenience.
+struct CwdGuard(PathBuf);
+
+impl CwdGuard {
+    fn take() -> Self {
+        Self(std::env::current_dir().expect("the test process has a working directory"))
+    }
+}
+
+impl Drop for CwdGuard {
+    fn drop(&mut self) {
+        // Best-effort by construction: this runs on the unwind path too, where
+        // panicking again would abort the process and replace a legible test
+        // failure with one that says nothing.
+        let _ = std::env::set_current_dir(&self.0);
+    }
+}
+
 /// Register one long-lived synthetic agent with `cwd` recorded on its
 /// `AgentRecord`, which is the enumeration seed PRD #819 draws on. No LLM and
 /// no credential — a `sleep` stub is enough, because the claim under test is
@@ -238,7 +273,11 @@ fn project_resolve_001_enumeration_offers_only_projects_that_resolve() {
 /// `set_current_dir` is process-global, and that is sound here for the reason
 /// it is sound nowhere else: both e2e aliases run under nextest, which is
 /// process-per-test, so this process is this test. The original is restored at
-/// the end anyway.
+/// the end anyway — by a [`CwdGuard`] rather than by a trailing statement,
+/// so an assertion that fires mid-test restores it on the way out too. That is
+/// belt and braces on top of the nextest argument, not a replacement for it:
+/// under nextest the process is about to die either way, and what the guard
+/// buys is that the property stops depending on which runner is driving.
 #[spec("project/resolve/002")]
 #[test]
 fn project_resolve_002_the_enumeration_is_the_daemons_cwd_and_not_the_clients() {
@@ -248,7 +287,10 @@ fn project_resolve_002_the_enumeration_is_the_daemons_cwd_and_not_the_clients() 
     let daemon_side = make_dir(workspace.path(), "daemon-side", Some(NAMED_PROJECT_TOML));
     let client_side = make_dir(workspace.path(), "client-side", Some(NAMED_PROJECT_TOML));
 
-    let original_cwd = std::env::current_dir().expect("the test process has a working directory");
+    // Taken BEFORE the first move and dropped after the last assertion, so
+    // every exit from here on — the return below, or an unwind out of any
+    // `assert!` between here and it — puts the process back where it started.
+    let _cwd = CwdGuard::take();
     // The daemon inherits this process's cwd, which is what
     // `capture_daemon_startup_cwd` records at startup.
     std::env::set_current_dir(&daemon_side).expect("stand in the daemon's project");
@@ -331,8 +373,6 @@ fn project_resolve_002_the_enumeration_is_the_daemons_cwd_and_not_the_clients() 
          nominated as primary from it alone; got {:?}",
         listing.primary
     );
-
-    std::env::set_current_dir(&original_cwd).expect("restore the test process's cwd");
 }
 
 /// Scenario: Start a headless daemon and ask it to prepare a workflow against a

@@ -3619,6 +3619,14 @@ mod tests {
     /// because a socket this test created some other way would not be the thing
     /// the trust check is supposed to be running against.
     ///
+    /// "Momentary" is a property of the production helper rather than of this
+    /// call site, and since PRD #742 M11 it holds on the unwind path too:
+    /// `platform::fsperm::with_socket_umask` restores from a `Drop`, so a body
+    /// that panicked could not leave the process at `0o177`. Nothing here needs
+    /// a scope guard of its own — unlike `project/resolve/002`'s cwd, the flip
+    /// is confined to one `bind(2)` inside production code and is already back
+    /// before `start` returns.
+    ///
     /// [`bind_attach_listener`]: dot_agent_deck::daemon_protocol::bind_attach_listener
     #[cfg(unix)]
     struct RealDeck {

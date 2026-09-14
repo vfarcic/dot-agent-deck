@@ -58,10 +58,13 @@
 //! literal, and `describe("AgentOverview across a fleet (PRD #742 M4)")` failed
 //! `cargo test-fast` as a hard-coded colour. Any issue number of 3, 4, 6 or 8
 //! digits does. [`is_issue_reference`] is the narrow exemption: a decimal run
-//! introduced by one of [`ISSUE_CUES`]. Both halves are load-bearing — decimal
-//! alone would exempt `#000` and `#333`, and a cue word alone would let
-//! `PRD #fff` through — and a general "any word then a space" rule was
-//! rejected because `1px solid #333` would satisfy it.
+//! introduced by one of [`ISSUE_CUES`], or wrapped in its own parentheses as
+//! `(#742)`. Both halves of the cue form are load-bearing — decimal alone would
+//! exempt `#000` and `#333`, and a cue word alone would let `PRD #fff` through
+//! — and a general "any word then a space" rule was rejected because
+//! `1px solid #333` would satisfy it. The parenthesised form needs **both**
+//! brackets for the same reason; [`is_issue_reference`]'s own doc enumerates
+//! the CSS each looser spelling would have let through.
 //!
 //! **Both guards fail closed.** Every filesystem error — a directory that
 //! cannot be listed, an entry that cannot be typed, a file that cannot be read
@@ -99,7 +102,27 @@ const COLOUR_WORDS: [&str; 2] = ["white", "black"];
 /// three-digit issue number is three valid hex digits. `describe("... (PRD
 /// #742 M4)")` therefore failed as a hard-coded colour, and so would any issue
 /// whose number is 3, 4, 6 or 8 digits long. See [`is_issue_reference`].
-const ISSUE_CUES: [&str; 7] = ["issue", "issues", "pr", "prd", "pull", "gh", "github"];
+///
+/// The nouns are the original set; the verbs are GitHub's own closing keywords
+/// minus the past participles (see below), plus `refs`/`ref`/`see`. They are
+/// here because a reference introduced by one of them is just as ordinary as
+/// `PRD #742` and was still being flagged, which forced the same `#`-dropping
+/// workaround this exemption exists to retire.
+///
+/// **`fixed` is deliberately absent, and it is the one that shows where the
+/// boundary is.** Every cue added is one more word that could in principle
+/// stand immediately left of a real colour, and `fixed` is a CSS *value*:
+/// `background` is an any-order shorthand, so `background: fixed #333` is valid
+/// and would be laundered. Its two siblings `closed` and `resolved` are left
+/// out with it, so the list states a rule someone can restate — the base and
+/// `-s` forms, never the past participle — rather than an arbitrary set with
+/// one hole punched in it. `fixes #742` is the spelling people actually write
+/// in a source comment; `fixed #742` is a commit-message spelling and costs a
+/// CSS keyword to admit.
+const ISSUE_CUES: [&str; 16] = [
+    "issue", "issues", "pr", "prd", "pull", "gh", "github", "fix", "fixes", "close", "closes",
+    "resolve", "resolves", "ref", "refs", "see",
+];
 
 /// The workspace root, from this crate's manifest dir rather than the process
 /// cwd, so the tests do not depend on how the runner was invoked.
@@ -369,9 +392,38 @@ fn literals_in(line: &str) -> Vec<String> {
 ///
 /// The cue may be followed by any run of spaces or by none at all, so
 /// `PRD #742`, `PRD  #742` and `PRD#742` all read the same way.
+///
+/// # The one cue-less spelling, and why it is exactly one
+///
+/// `(#742)` — a bare parenthesised reference with no word to its left — is as
+/// conventional as any of the cues, and until now it failed: nothing alphabetic
+/// precedes it, so the walk below finds `start == end`. It is admitted, and the
+/// **closing** `)` is required as well as the opening `(`, which is what keeps
+/// it from being a hole rather than an exemption:
+///
+/// * a *line-start* rule would exempt the second line of a wrapped
+///   `linear-gradient(\n  #333,\n  #000\n)`, which is ordinary formatted CSS;
+/// * a *string-start* rule would exempt `"#333"`, which is the single most
+///   common hard-coded colour there is and one of the cases the tests pin;
+/// * an *opening-paren* rule alone would exempt the first stop of a one-line
+///   `linear-gradient(#333, #000)`.
+///
+/// Requiring `(` … `)` around the whole run leaves none of those: each ends in
+/// `,` or a space rather than `)`. What is left is the shape `fn(#NNN)` — a
+/// call whose sole argument is an all-decimal hex — and the two spellings of it
+/// are `url(#742)`, an SVG fragment reference where exempting it is the right
+/// answer anyway, and CSS Color 5's single-argument `contrast-color(#333)`,
+/// which is the residual. That one is accepted knowingly rather than
+/// overlooked: it is Safari-only at the time of writing, appears nowhere under
+/// `desktop/src`, and a `theme-invariant:` marker is the escape hatch if it
+/// ever needs one. Nothing wider than that is claimed here — this is the shape
+/// to re-examine before widening the rule again.
 fn is_issue_reference(chars: &[char], at: usize, run: usize) -> bool {
     if !chars[at + 1..=at + run].iter().all(char::is_ascii_digit) {
         return false;
+    }
+    if at > 0 && chars[at - 1] == '(' && chars.get(at + run + 1) == Some(&')') {
+        return true;
     }
     let mut end = at;
     while end > 0 && chars[end - 1] == ' ' {
@@ -1235,10 +1287,19 @@ mod tests {
             ("styles.css", PALETTE),
             (
                 "ok.tsx",
+                // Every run here is 3, 4, 6 or 8 digits long, which is the only
+                // window `is_issue_reference` is ever consulted in. A five-digit
+                // run scans clean whatever word precedes it, so a fixture line
+                // carrying one asserts nothing about the cue list — this test
+                // held such a line (`#74253`) until PRD #742 M11.
                 "describe(\"AgentOverview across a fleet (PRD #742 M4)\", () => {});\n\
                  it(\"regression for issue #1046 and PR #416\", () => {});\n\
                  const a = \"PRD#742 M6 — no space is still a reference\";\n\
-                 const b = \"see github #74253 for the rest\";\n",
+                 const b = \"see github #7425 for the rest\";\n\
+                 const c = \"fixes #742, closes #416, resolves #1046, refs #7425\";\n\
+                 const d = \"fix #742, close #416, resolve #1046, ref #7425\";\n\
+                 const e = \"the parenthesised form (#742) carries no cue at all\";\n\
+                 const f = \"pull #742, issues #416, gh #1046\";\n",
             ),
         ]);
         assert_eq!(scanned(dir.path()), vec![], "issue numbers are not colours");
@@ -1252,11 +1313,19 @@ mod tests {
                 //    have exempted;
                 // 3. the same, in the shorthand position a general
                 //    \"word then a space\" rule would have exempted;
-                // 4. a cue word in front of a run that is not a number.
+                // 4. a cue word in front of a run that is not a number;
+                // 5. `fixed`, the cue deliberately left out of the list because
+                //    `background` is an any-order shorthand and this is valid
+                //    CSS — the one line that pins where the boundary was drawn;
+                // 6. the first stop of a one-line gradient, which an
+                //    opening-paren-alone rule would have exempted, and its
+                //    second stop, which nothing was ever going to exempt.
                 "const s = { color: \"#fff\" };\n\
                  const t = { color: \"#333\" };\n\
                  const u = { border: \"1px solid #000\" };\n\
-                 const v = { color: \"PRD #fff\" };\n",
+                 const v = { color: \"PRD #fff\" };\n\
+                 const w = { background: \"fixed #333\" };\n\
+                 const x = { background: \"linear-gradient(#333, #000)\" };\n",
             ),
         ]);
         let findings = scanned(dir.path());
@@ -1271,9 +1340,53 @@ mod tests {
                 (2, "#333".to_string()),
                 (3, "#000".to_string()),
                 (4, "#fff".to_string()),
+                (5, "#333".to_string()),
+                (6, "#333".to_string()),
+                (6, "#000".to_string()),
             ],
             "{findings:#?}"
         );
+    }
+
+    /// The parenthesised exemption is anchored on **both** brackets, and the
+    /// case that pays for the closing one is ordinary formatted CSS: a wrapped
+    /// `linear-gradient` puts a bare `#333,` at the start of a line, which a
+    /// line-start rule would have waved through.
+    #[test]
+    fn a_bare_reference_is_exempt_only_when_its_own_parentheses_close_it() {
+        let dir = tree(&[
+            ("styles.css", PALETTE),
+            (
+                "wrapped.css",
+                ".a {\n  \
+                 background: linear-gradient(\n    \
+                 #333,\n    \
+                 #000\n  \
+                 );\n\
+                 }\n",
+            ),
+        ]);
+        let hits: Vec<(usize, String)> = scanned(dir.path())
+            .iter()
+            .map(|f| (f.line, f.literal.clone()))
+            .collect();
+        assert_eq!(
+            hits,
+            vec![(3, "#333".to_string()), (4, "#000".to_string())],
+            "a colour at the start of a wrapped value line is still a colour"
+        );
+
+        // And the form that is exempt really is, in the position it is written
+        // in: closed by its own `)`, with an ordinary word to its left.
+        let dir = tree(&[
+            ("styles.css", PALETTE),
+            (
+                "cited.tsx",
+                "describe(\"the fleet snapshot (#742)\", () => {});\n\
+                 it(\"and a second one (#1046)\", () => {});\n",
+            ),
+        ]);
+        assert_eq!(scanned(dir.path()), vec![]);
     }
 
     #[test]

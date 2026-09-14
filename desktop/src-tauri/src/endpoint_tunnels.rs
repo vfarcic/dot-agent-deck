@@ -255,6 +255,20 @@ impl EndpointTunnels {
     /// holder, and no clone can be taken concurrently because cloning happens
     /// under this same lock.
     ///
+    /// ## "A whole-map lock across establishment" is the OTHER arm
+    ///
+    /// Worth stating in the present tense, because the PRD, a PRD #742 audit
+    /// finding and several task briefs all carried that description as if it
+    /// were true of the shipping build, and it is not. In **this** arm the map
+    /// lock is scoped to the block above and released before
+    /// `EndpointConnection::open` is handed to `spawn_blocking`; what is held
+    /// across the `ssh` spawn is the per-deck gate and nothing else. The
+    /// description is accurate only of the `#[cfg(not(unix))]` arm below, whose
+    /// own comment says so — and it costs nothing there, because that arm's
+    /// "establishment" is one `connect_address()` and a map insert with no
+    /// child to spawn and no I/O to wait on. So the standing concern is a
+    /// concern about one platform, and on that platform it is not a stall.
+    ///
     /// # Publishing is conditional, because the gate does not exclude teardown
     ///
     /// PRD #742 M8. The whole-map lock M3 replaced was doing two jobs: it

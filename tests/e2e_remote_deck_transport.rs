@@ -72,6 +72,24 @@
 //! `DOT_AGENT_DECK_REQUIRE_REAL_E2E=1` turns those skips into failures
 //! (CLAUDE.md rule 5). A vacuous pass would be worse than no test.
 //!
+//! ### So this test's CI coverage is CONDITIONAL, and nothing else says so
+//!
+//! `e2e-deterministic` runs `cargo test-e2e` on `ubuntu-latest` and does **not**
+//! set `DOT_AGENT_DECK_REQUIRE_REAL_E2E`. If a runner image ever ships without
+//! an `sshd` at one of [`SSHD_CANDIDATES`], this file skips honestly: the job
+//! stays green, this transport is covered by nothing, and no line of output
+//! distinguishes that from a run that passed. GitHub's ubuntu images ship
+//! `openssh-server`, so it almost certainly runs today — but that is an
+//! inherited property of someone else's image, not something this repository
+//! asserts, and it can change without anything here noticing.
+//!
+//! Setting the flag on that job is **not** the fix. It is tier-wide, so it
+//! would promote every legitimate skip in every other e2e file to a failure,
+//! which is a far larger change than making one test's coverage load-bearing.
+//! The conditionality is written down here and in this test's `tests/CATALOG.md`
+//! entry instead, so it is found by anyone looking for what covers the remote
+//! transport rather than discovered when it is already gone.
+//!
 //! ## Why the `ssh` program is a wrapper, and exactly what it changes
 //!
 //! `forced_options()` forces `StrictHostKeyChecking=yes` — deliberately, and
@@ -441,8 +459,26 @@ fn await_listening(child: &mut std::process::Child, port: u16) -> Result<(), Str
     }
 }
 
+/// `path` as one `/bin/sh` word: wrapped in single quotes, with any embedded
+/// single quote closed, escaped and reopened.
+///
+/// Single quoting rather than double, because inside single quotes `sh` gives
+/// no character any meaning at all — there is nothing left to think about for
+/// `$`, a backtick or a backslash. The `'\''` dance is the only case single
+/// quotes cannot express directly.
+fn sh_word(path: &Path) -> String {
+    format!("'{}'", path.display().to_string().replace('\'', r"'\''"))
+}
+
 /// Write the `ssh` wrapper described in this module's header and return its
 /// path. `real` is whatever `SshProgram::resolve()` chose.
+///
+/// Both interpolated paths go through [`sh_word`]. Neither can hold anything
+/// interesting today — the `ssh` binary comes from `SSH_PROGRAM_CANDIDATES`,
+/// which is a list of absolute literals, and `known_hosts` is a file this test
+/// made under the harness temp root — but "the temp root has no spaces in it"
+/// is an assumption that is invisible from the call site, and quoting costs a
+/// pair of characters to stop making it.
 fn write_ssh_wrapper(path: &Path, real: &Path, known_hosts: &Path) -> Result<(), String> {
     use std::os::unix::fs::OpenOptionsExt;
     let script = format!(
@@ -457,8 +493,8 @@ fn write_ssh_wrapper(path: &Path, real: &Path, known_hosts: &Path) -> Result<(),
          \x20 -o IdentitiesOnly=yes \\\n\
          \x20 -o IdentityAgent=none \\\n\
          \x20 \"$@\"\n",
-        real.display(),
-        known_hosts.display(),
+        sh_word(real),
+        sh_word(known_hosts),
     );
     let mut file = std::fs::OpenOptions::new()
         .write(true)

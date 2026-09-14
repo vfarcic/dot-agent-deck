@@ -765,15 +765,27 @@ fn dispatch_005_respects_max_per_run() {
 
     let pd = |n: u64| derive_issue_paths(Path::new(&work_str), "dispatch-task", n);
 
-    // The first two issues are dispatched.
-    assert!(
-        common::wait_for_path(&pd(1).worktree_dir, W),
-        "issue 1 must be dispatched"
-    );
-    assert!(
-        common::wait_for_path(&pd(2).worktree_dir, W),
-        "issue 2 must be dispatched"
-    );
+    // The first two issues are dispatched — the worktree AND the orchestrator
+    // agent, waited for separately, because they are two steps of the dispatch
+    // and only the first has landed when the directory appears. The count
+    // below is a snapshot with no wait of its own, so without this it reads
+    // the registry mid-spawn and sees one orchestrator where two are coming:
+    // measured on a loaded box, `left: 1, right: 2`. Every sibling test in
+    // this file already pairs the two waits this way (`dispatch_003`,
+    // `dispatch_007`, `dispatch_008`); this one was the exception.
+    for n in [1u64, 2] {
+        let paths = pd(n);
+        assert!(
+            common::wait_for_path(&paths.worktree_dir, W),
+            "issue {n} must be dispatched"
+        );
+        assert!(
+            daemon
+                .wait_for_agent_where(|r| orchestrator_in(r, &paths.worktree_dir), W)
+                .is_some(),
+            "issue {n} must spawn an orchestrator agent before the cap is counted"
+        );
+    }
 
     // The remaining three are left untouched.
     for n in [3u64, 4, 5] {
