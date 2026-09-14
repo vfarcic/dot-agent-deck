@@ -22,9 +22,12 @@ use crate::project_config::OrchestrationConfig;
 /// them: a person at the keyboard. This repo's own says "Surface the plan to the
 /// user as a Markdown table and STOP", and any project whose coordinator
 /// template has a step like it inherits the same trap the first time it
-/// dispatches a team. A `dispatch` is fire-and-forget with no return edge, so a
-/// coordinator that takes that step literally parks its whole team for the life
-/// of the run and tells nobody. Dispatched orchestrations have sailed past that
+/// dispatches a team. Nobody is WATCHING a dispatched pane, so a coordinator that
+/// takes that step literally parks its whole team for the life of the run and
+/// tells nobody. PRD #220 Phase 2 gave `dispatch` a return edge and that is still
+/// true: the edge fires once, at terminal completion, so it answers no gate
+/// mid-run — and a parked coordinator never completes, so it never even fires.
+/// Dispatched orchestrations have sailed past that
 /// gate in practice — by reading the dispatched task as pre-approval, which is a
 /// fortunate reading of an ambiguity rather than a designed outcome.
 ///
@@ -1309,7 +1312,11 @@ mod tests {
     /// that no human is there to approve it and nothing arbitrating between that
     /// step and a task that says to open a PR and stop. A coordinator that read
     /// the step literally parked its whole team for the life of the run, and
-    /// `dispatch` has no return edge, so nobody was told.
+    /// `dispatch` had no return edge at the time, so nobody was told.
+    ///
+    /// PRD #220 Phase 2 added that return edge, and it does not retire this test:
+    /// the edge fires at TERMINAL completion, which a parked coordinator never
+    /// reaches — so the silence this asserts against is unchanged.
     #[test]
     fn an_unattended_run_is_told_so_and_told_which_half_wins() {
         let tmp = tempfile::tempdir().unwrap();

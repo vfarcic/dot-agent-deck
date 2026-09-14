@@ -1929,11 +1929,17 @@ enum WorkDoneReportChannel {
 ///   asked for this work and is waiting on it, so the report is a turn in its
 ///   conversation rather than bytes in its scrollback that nothing will ever read.
 ///
-/// The entry is evicted as it is resolved, whatever the delivery's outcome. A
-/// refusal is terminal and never retried — a retry could only re-target whoever
-/// now occupies the pane — and a pane that is simply GONE degrades to
-/// drop-and-log (PRD #220 decision B): there is deliberately no queue and no
-/// file-backed outbox here, because an outcome with no live recipient is a
+/// The entry is evicted as it is resolved, whatever the delivery's outcome,
+/// because NO OUTCOME IS RETRIED. That is the shared property, and it is worth
+/// stating as itself rather than as "every non-delivery is a refusal" (PRD #220
+/// Phase 2 review, finding A5): [`crate::daemon::deliver_dispatch_result`] says
+/// outright that `Ambiguous` is deliberately NOT folded in with the refusals,
+/// since bytes of ours already reached the authorized caller. A refusal is not
+/// retried because a retry could only re-target whoever now occupies the pane; an
+/// ambiguous write is not retried because re-sending would duplicate a
+/// half-written message rather than repair it. A pane that is simply GONE
+/// degrades to drop-and-log (PRD #220 decision B): there is deliberately no queue
+/// and no file-backed outbox here, because an outcome with no live recipient is a
 /// deck-wide attention question that belongs with issue #630.
 async fn return_dispatch_completion(signal: &WorkDoneSignal, registry: &AgentPtyRegistry) -> bool {
     // Only a TERMINAL completion returns. A dispatched unit reporting progress
@@ -1952,10 +1958,11 @@ async fn return_dispatch_completion(signal: &WorkDoneSignal, registry: &AgentPty
     // renders it; turning the subscriber's own ANSI styling off does none of that.
     //
     // The two pane ids and the agent id are daemon-minted and stay bare. The
-    // REPORT BODY is deliberately absent from this line and from every other one on
-    // this path: `deliver_dispatch_result`'s caller-gone and refusal warnings log
-    // pane/agent ids and the outcome only, so a report that could not be delivered
-    // is not leaked into the log instead. Do not "helpfully" add it back.
+    // REPORT BODY is deliberately absent from this line, and from the warnings
+    // `deliver_dispatch_result` emits when the caller is gone or the identity gate
+    // refuses — those carry pane/agent ids and the outcome only, so a report that
+    // could not be delivered is not leaked into the log instead. That silence is
+    // the auditor's reasoned negative; do not "helpfully" add the body back.
     tracing::info!(
         unit_pane_id = %signal.pane_id,
         unit = %crate::config_validation::escape_field_for_log(

@@ -328,8 +328,8 @@ fn shape_override_of(shape: Option<&crate::event::DispatchShape>) -> Option<Spaw
 /// generated report filename stops using it.
 ///
 /// Not a security bound — [`sanitize_name`] already guarantees the slug is a
-/// single safe path segment — but a filesystem one: `NAME_MAX` is 255 bytes on
-/// every filesystem this runs on, and `sanitize_name` keeps non-ASCII
+/// single safe path segment — but a filesystem one: Linux and macOS both cap a
+/// single name at 255 bytes, and `sanitize_name` keeps non-ASCII
 /// alphanumerics, which cost up to four bytes each. 48 characters therefore
 /// cannot push the whole name past the limit even in the worst case, while
 /// leaving every realistic slug intact and readable in the prompt.
@@ -579,10 +579,13 @@ pub async fn handle_dispatch(
         resolved_target: Some(resolved_target),
         // PRD #222 parity, dispatch-only for now — see the field's docs.
         //
-        // `Unattended` (issue #703): `dispatch` is fire-and-forget with no return
-        // edge, so nobody has been asked to watch the pane this opens and a
-        // coordinator that takes its template's "STOP and wait for approval" step
-        // literally parks its whole team for the life of the run, silently.
+        // `Unattended` (issue #703): nobody has been asked to WATCH the pane this
+        // opens, so a coordinator that takes its template's "STOP and wait for
+        // approval" step literally parks its whole team for the life of the run,
+        // silently. PRD #220 Phase 2 added a return edge, which does not change
+        // this: it fires exactly once, at terminal completion, so it puts nobody
+        // in front of the pane mid-run and a coordinator waiting for an approval
+        // never reaches the completion that would report it.
         compose_orchestrator_context: Some(crate::orchestrator_context::Attendance::Unattended),
     };
 
@@ -1634,12 +1637,13 @@ mod tests {
             "the caller's task must ride inside the context file:\n{content}"
         );
         // Issue #703, on the real dispatch path rather than on the composer
-        // alone: `dispatch` is fire-and-forget with no return edge, so the
-        // composed file must say that nobody is watching the pane — otherwise a
-        // coordinator inheriting an interactive template's "STOP and wait for
-        // explicit approval" step parks its whole team for the life of the run,
-        // silently — and must say which half wins when that template and this
-        // task disagree.
+        // alone: nobody is WATCHING a dispatched pane, so the composed file must
+        // say so — otherwise a coordinator inheriting an interactive template's
+        // "STOP and wait for explicit approval" step parks its whole team for the
+        // life of the run, silently — and must say which half wins when that
+        // template and this task disagree. PRD #220 Phase 2's return edge does
+        // not soften this: it fires once, at terminal completion, which a parked
+        // coordinator never reaches.
         assert!(
             content.contains("## Unattended run")
                 && content.contains("nobody has been asked to watch this pane"),
