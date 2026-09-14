@@ -297,6 +297,16 @@ pub struct DispatchContext {
     /// [`crate::state::AppState::register_orchestration_role`]. `None` in unit
     /// tests, which assert on the worktree/spawn result rather than on routing.
     pub state: Option<crate::state::SharedState>,
+    /// PRD #220 M2.0: the pane that asked for this dispatch, retained so the
+    /// unit it starts can report back when it finishes.
+    ///
+    /// Carried in the context rather than resolved here because the daemon reads
+    /// the caller's agent id and cwd from ONE `AgentRecord` (issue #617 finding
+    /// 3) — re-reading the identity down here could straddle a hand-over and
+    /// pair one agent's cwd with another's identity. `None` in unit tests, and
+    /// for any future producer with no live caller to report to, in which case
+    /// the dispatch simply keeps its pre-Phase-2 fire-and-forget behaviour.
+    pub caller: Option<crate::dispatch_return::DispatchCaller>,
 }
 
 /// Translate the wire choice into the spawn-side override.
@@ -312,6 +322,54 @@ fn shape_override_of(shape: Option<&crate::event::DispatchShape>) -> Option<Spaw
             Some(SpawnShapeOverride::Orchestration(name.clone()))
         }
     }
+}
+
+/// PRD #220 M2.3: what a dispatched unit is actually prompted with.
+///
+/// An ORCHESTRATION dispatch passes the task through UNCHANGED. `spawn` composes
+/// the orchestrator context around it — roles, delegation protocol, and the
+/// `work-done --done` call that ends the run — so a completion instruction added
+/// here would be a second, differently-worded copy of one the unit already has,
+/// and the two would disagree the moment either is edited.
+///
+/// A SINGLE dispatch composes nothing: the task IS the whole prompt, so before
+/// this the unit was never told that anyone was waiting on it. The PRD records
+/// the consequence as "`--single` emits no completion signal at all" — half the
+/// dispatch shapes had nothing for the return edge to resolve, however well the
+/// daemon side worked. The instruction is appended rather than prepended so the
+/// caller's own task stays the first thing the agent reads.
+fn dispatch_prompt(task: &str, target: &crate::spawn::SpawnTarget) -> String {
+    if matches!(target, crate::spawn::SpawnTarget::Orchestration { .. }) {
+        return task.to_string();
+    }
+    let bin = crate::platform::paths::binary_name();
+    let mut prompt = String::new();
+    let task = task.trim();
+    if !task.is_empty() {
+        prompt.push_str(task);
+        prompt.push_str("\n\n");
+    }
+    // The `--task` allowlist warning is the same one the orchestrator context
+    // carries, for the same reason: everything after `--task` is rewritten by the
+    // unit's own shell before the CLI sees it, and a summary that loses half its
+    // words still reports success. `--task-file` is read from disk verbatim.
+    prompt.push_str(&format!(
+        "When this work is finished — or if you are blocked and cannot finish it — report \
+         back to the agent that asked for it by running:\n\n\
+         ```bash\n\
+         {bin} work-done --done --task-file '.dot-agent-deck/dispatch-report-<slug>.md'\n\
+         ```\n\n\
+         Write that file with your file-writing tool, invent a fresh `<slug>`, and delete \
+         exactly that path once the command has exited successfully. Use \
+         `{bin} work-done --done --task \"One plain line.\"` only when the summary really is \
+         one plain line of text with no backticks, no `$`, no `\"`, no `\\` and no `!` — \
+         anything else is rewritten by your own shell before the CLI sees it, and the \
+         signal still reports success with the words missing.\n\n\
+         That report is delivered straight into the conversation that dispatched you, so \
+         write it for someone who cannot see this pane: what you did, what the outcome was, \
+         and anything they have to act on. Run it exactly once, when you are done."
+    ));
+    prompt
 }
 
 pub async fn handle_dispatch(
@@ -431,7 +489,7 @@ pub async fn handle_dispatch(
         RemovalPolicy::KeepIfDirty,
     );
 
-    let prompt = task.to_string();
+    let prompt = dispatch_prompt(task, &resolved_target);
 
     let req = SpawnRequest {
         task_name: format!("dispatch-{name}"),
@@ -462,45 +520,64 @@ pub async fn handle_dispatch(
     )
     .await
     {
-        Ok(handle) => DispatchResult {
-            worktree_dir: paths.worktree_dir.clone(),
-            success: true,
-            // Report what was ACTUALLY opened, from the spawn's own verdict.
-            // `spawn` → `decide_target` branches on the dispatched worktree's
-            // `.dot-agent-deck.toml`: a repo defining `[[orchestrations]]` gets a
-            // full multi-role orchestration, anything else a single agent (PRD
-            // #220 M1.1). Hardcoding either word makes this message a lie in the
-            // other case — and it is written straight into the caller's pane, so
-            // the dispatching agent repeats it to the user verbatim.
-            //
-            // The base clause is appended rather than interpolated into both
-            // arms so a failed probe degrades to the pre-#674 sentence exactly,
-            // instead of leaving a dangling "cut from ".
-            message: {
-                let opened = match &handle.kind {
-                    SpawnKind::Orchestration { name: orch } => format!(
-                        "dispatch: spawned isolated orchestration '{orch}' for '{name}' in {}",
-                        paths.worktree_dir.display()
-                    ),
-                    SpawnKind::SingleAgent => format!(
-                        "dispatch: spawned isolated agent for '{name}' in {}",
-                        paths.worktree_dir.display()
-                    ),
-                };
-                let mut msg = match &base {
-                    Some(base) => format!("{opened}, cut from {base}"),
-                    None => opened,
-                };
-                // Only for an orchestration: a `--single` dispatch consulted no
-                // default, so a note about which one it would have picked is
-                // noise the caller then relays to the user as if it mattered.
-                if let (SpawnKind::Orchestration { .. }, Some(note)) = (&handle.kind, &default_note)
-                {
-                    msg.push_str(&format!("\ndispatch: {note}"));
-                }
-                msg
-            },
-        },
+        Ok(handle) => {
+            // PRD #220 M2.0: retain the caller against the unit's TERMINAL pane —
+            // the single agent's pane, or the orchestration's start role — which is
+            // the pane a `work-done --done` will arrive under. Registered here, at
+            // the first moment that pane id exists, rather than by the daemon after
+            // this call returns: every instant between the spawn and the
+            // registration is an instant in which a completion resolves to nothing.
+            if let Some(caller) = ctx.caller.clone() {
+                tracing::debug!(
+                    unit_pane_id = %handle.delivery_pane_id,
+                    caller_pane_id = %caller.pane_id,
+                    unit = %caller.unit_name,
+                    "dispatch: retained the caller for this unit's completion report"
+                );
+                ctx.registry
+                    .register_dispatch_return(&handle.delivery_pane_id, caller);
+            }
+            DispatchResult {
+                worktree_dir: paths.worktree_dir.clone(),
+                success: true,
+                // Report what was ACTUALLY opened, from the spawn's own verdict.
+                // `spawn` → `decide_target` branches on the dispatched worktree's
+                // `.dot-agent-deck.toml`: a repo defining `[[orchestrations]]` gets a
+                // full multi-role orchestration, anything else a single agent (PRD
+                // #220 M1.1). Hardcoding either word makes this message a lie in the
+                // other case — and it is written straight into the caller's pane, so
+                // the dispatching agent repeats it to the user verbatim.
+                //
+                // The base clause is appended rather than interpolated into both
+                // arms so a failed probe degrades to the pre-#674 sentence exactly,
+                // instead of leaving a dangling "cut from ".
+                message: {
+                    let opened = match &handle.kind {
+                        SpawnKind::Orchestration { name: orch } => format!(
+                            "dispatch: spawned isolated orchestration '{orch}' for '{name}' in {}",
+                            paths.worktree_dir.display()
+                        ),
+                        SpawnKind::SingleAgent => format!(
+                            "dispatch: spawned isolated agent for '{name}' in {}",
+                            paths.worktree_dir.display()
+                        ),
+                    };
+                    let mut msg = match &base {
+                        Some(base) => format!("{opened}, cut from {base}"),
+                        None => opened,
+                    };
+                    // Only for an orchestration: a `--single` dispatch consulted no
+                    // default, so a note about which one it would have picked is
+                    // noise the caller then relays to the user as if it mattered.
+                    if let (SpawnKind::Orchestration { .. }, Some(note)) =
+                        (&handle.kind, &default_note)
+                    {
+                        msg.push_str(&format!("\ndispatch: {note}"));
+                    }
+                    msg
+                },
+            }
+        }
         Err(e) => {
             let cleanup_note = match rollback_dispatched_worktree(
                 &ctx.registry,
@@ -1220,6 +1297,84 @@ mod tests {
         assert_eq!(ok.orchestrations[0].roles, 2);
     }
 
+    /// PRD #220 M2.3: a `--single` dispatch must TELL its unit to report back.
+    ///
+    /// The PRD records the gap as "`--single` emits no completion signal at all":
+    /// a single agent gets no orchestrator template, so it is never told that
+    /// `work-done --done` exists or that anyone is waiting on it. However well the
+    /// daemon's return edge resolves, half the dispatch shapes had nothing to
+    /// resolve — which is why the retention half alone would have shipped exactly
+    /// the working-for-orchestrations, silent-for-single dispatcher decision C
+    /// exists to prevent.
+    ///
+    /// A pure composer test rather than a spawned one: the single-agent prompt is
+    /// delivered into a PTY and never written to disk, so there is no artefact to
+    /// assert on the way the orchestration test asserts on
+    /// `orchestrator-context.md`. `dispatch/return/003` covers the same
+    /// instruction arriving at a real dispatched unit end to end.
+    #[test]
+    fn a_single_dispatch_prompt_tells_the_unit_to_report_when_it_finishes() {
+        let bin = crate::platform::paths::binary_name();
+        let prompt = dispatch_prompt(
+            "Verify PR #232 and report back.",
+            &crate::spawn::SpawnTarget::SingleAgent { command: None },
+        );
+
+        assert!(
+            prompt.starts_with("Verify PR #232 and report back."),
+            "the caller's own task must stay the first thing the agent reads:\n{prompt}"
+        );
+        assert!(
+            prompt.contains(&format!("{bin} work-done --done")),
+            "a dispatched single agent must be told how to signal terminal \
+             completion, or the return edge has nothing to fire on:\n{prompt}"
+        );
+        assert!(
+            prompt.contains("--task-file"),
+            "the file form must be offered first — a shell-rewritten `--task` \
+             reports success with the words missing:\n{prompt}"
+        );
+        assert!(
+            prompt.contains("dispatched you"),
+            "the unit must know the report goes to the agent that dispatched it, \
+             not into a log nobody reads:\n{prompt}"
+        );
+    }
+
+    /// The orchestration half must NOT gain a second, differently-worded copy.
+    ///
+    /// `spawn` composes the orchestrator context around this prompt, and that
+    /// context already ends with the `work-done --done` call. Appending another
+    /// here would put two instructions in one pane that drift apart the moment
+    /// either is edited.
+    #[test]
+    fn an_orchestration_dispatch_prompt_is_left_to_the_orchestrator_context() {
+        use crate::project_config::{OrchestrationConfig, OrchestrationRoleConfig};
+        let target = crate::spawn::SpawnTarget::Orchestration {
+            name: "demo-orch".to_string(),
+            roles: Vec::new(),
+            config: Box::new(OrchestrationConfig {
+                default: false,
+                name: "demo-orch".to_string(),
+                roles: vec![OrchestrationRoleConfig {
+                    agent: None,
+                    name: "orchestrator".to_string(),
+                    command: "cat".to_string(),
+                    start: true,
+                    description: None,
+                    prompt_template: None,
+                    clear: true,
+                }],
+            }),
+        };
+
+        assert_eq!(
+            dispatch_prompt("Verify PR #232 and report back.", &target),
+            "Verify PR #232 and report back.",
+            "an orchestration's task rides into the composed context verbatim"
+        );
+    }
+
     /// An ORCHESTRATION dispatch must start the team WITH its delegation protocol.
     ///
     /// This is the defect reported from real use: the orchestration came up, its
@@ -1269,6 +1424,10 @@ mod tests {
             // These unit tests assert on the worktree + spawn shape, not on
             // delegate routing (`orchestration/dispatch/001` owns that).
             state: None,
+            // No live caller to report back to: these tests assert on the
+            // worktree/spawn result, and PRD #220's return edge is covered by
+            // `dispatch/return/*` end to end.
+            caller: None,
         };
 
         let result = handle_dispatch(
@@ -1393,6 +1552,8 @@ mod tests {
             worktrees: new_worktree_registry(),
             default_command: None,
             state: Some(state.clone()),
+            // No live caller to report back to — see the sibling tests.
+            caller: None,
         };
 
         let result = handle_dispatch(
@@ -1508,6 +1669,10 @@ mod tests {
             worktrees: new_worktree_registry(),
             default_command: None,
             state: None,
+            // No live caller to report back to: these tests assert on the
+            // worktree/spawn result, and PRD #220's return edge is covered by
+            // `dispatch/return/*` end to end.
+            caller: None,
         };
 
         let result = handle_dispatch(
@@ -1659,6 +1824,10 @@ mod tests {
             // These unit tests assert on the worktree + spawn shape, not on
             // delegate routing (`orchestration/dispatch/001` owns that).
             state: None,
+            // No live caller to report back to: these tests assert on the
+            // worktree/spawn result, and PRD #220's return edge is covered by
+            // `dispatch/return/*` end to end.
+            caller: None,
         };
         let result = handle_dispatch(
             &ctx,

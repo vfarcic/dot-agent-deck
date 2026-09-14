@@ -19,6 +19,7 @@ pub mod daemon_status;
 pub mod daemon_stop;
 pub mod devin_hooks_manage;
 pub mod dispatch;
+pub mod dispatch_return;
 pub mod embedded_pane;
 pub mod error;
 pub mod event;

@@ -1897,6 +1897,59 @@ enum WorkDoneReportChannel {
     Unsolicited,
 }
 
+/// PRD #220 M2.1: a dispatched unit has reached TERMINAL completion — resolve
+/// the caller that dispatched it and submit the report into that caller's pane.
+///
+/// Returns whether `signal.pane_id` was a dispatched unit's terminal pane at all,
+/// so the caller can tell "handled here" from "fall through to the ordinary
+/// path". It is `false` for every pane in a deck where nothing was dispatched,
+/// which is what leaves the rest of `handle_work_done` untouched.
+///
+/// Three properties this leans on rather than re-implements:
+///
+/// * **Addressing.** The recipient is the retained `(pane_id, agent_id)` pair, never a
+///   `(name, cwd)` tuple lookup — that tuple can never match, because a dispatched unit
+///   lives in a sibling worktree by construction, which is precisely why the return edge
+///   needed retention rather than a lookup.
+/// * **Identity.** Delivery goes through [`crate::daemon::deliver_dispatch_result`], the
+///   same guarded seam the spawn acknowledgement already uses, so a caller pane that
+///   changed hands between the dispatch and the completion is REFUSED with no bytes
+///   written. Reusing that seam rather than writing a second delivery path is what keeps
+///   one identity policy instead of two that can drift.
+/// * **Delivery mode.** SUBMIT, not a passive notice (PRD #220 decision A). The caller
+///   asked for this work and is waiting on it, so the report is a turn in its
+///   conversation rather than bytes in its scrollback that nothing will ever read.
+///
+/// The entry is evicted as it is resolved, whatever the delivery's outcome. A
+/// refusal is terminal and never retried — a retry could only re-target whoever
+/// now occupies the pane — and a pane that is simply GONE degrades to
+/// drop-and-log (PRD #220 decision B): there is deliberately no queue and no
+/// file-backed outbox here, because an outcome with no live recipient is a
+/// deck-wide attention question that belongs with issue #630.
+async fn return_dispatch_completion(signal: &WorkDoneSignal, registry: &AgentPtyRegistry) -> bool {
+    // Only a TERMINAL completion returns. A dispatched unit reporting progress
+    // without `--done` has not finished, and its caller is owed one report, not a
+    // running commentary.
+    if !signal.done {
+        return false;
+    }
+    let Some(caller) = registry.take_dispatch_return(&signal.pane_id) else {
+        return false;
+    };
+    tracing::info!(
+        unit_pane_id = %signal.pane_id,
+        unit = %caller.unit_name,
+        caller_pane_id = %caller.pane_id,
+        caller_agent_id = %caller.agent_id,
+        "dispatch: unit complete; returning its report to the pane that dispatched it"
+    );
+    let message =
+        crate::dispatch_return::compose_completion_report(&caller.unit_name, &signal.task);
+    crate::daemon::deliver_dispatch_result(registry, &caller.pane_id, &caller.agent_id, &message)
+        .await;
+    true
+}
+
 /// Issue #433 + #448: compose the single-line feedback the daemon submits into
 /// the orchestrator's pane when one of its workers reports `work-done`.
 ///
@@ -7002,6 +7055,17 @@ impl AppState {
         let role_name = match self.pane_role_map.get(&signal.pane_id) {
             Some(name) => name.clone(),
             None => {
+                // PRD #220 M2.3: a dispatched `--single` unit is in NO role map —
+                // `pane_role_map` is populated only when orchestration roles spawn
+                // — so this is the branch its terminal completion arrives in, and
+                // before Phase 2 it was the end of the line for half the dispatch
+                // shapes. The dispatched unit's identity is the retained return
+                // entry itself, held daemon-side against its own delivery pane,
+                // which is what lets this route WITHOUT widening the admission
+                // gate below: a pane nobody dispatched still takes the warning.
+                if return_dispatch_completion(&signal, registry).await {
+                    return;
+                }
                 warn!(pane_id = %signal.pane_id, "work-done from unknown pane");
                 return;
             }
@@ -7014,6 +7078,11 @@ impl AppState {
                 task = %signal.task,
                 "orchestration complete (orchestrator --done)"
             );
+            // PRD #220 M2.1: ...and if this orchestration was DISPATCHED, that
+            // completion is also the one thing its caller has been waiting for.
+            // An ordinary orchestration has no retained entry here and is
+            // unchanged: logged, and no feedback written.
+            return_dispatch_completion(&signal, registry).await;
             return;
         }
 

@@ -2995,6 +2995,18 @@ pub struct AgentPtyRegistry {
     /// running daemon can reach, and the drop-driven cancellation below now
     /// retires stale tasks long before they could collide anyway.
     delegation_seq: AtomicU64,
+    /// PRD #220 M2.0: dispatched units that still owe their caller a completion
+    /// report, keyed by the unit's terminal pane. See
+    /// [`crate::dispatch_return::DispatchReturns`] for the eviction rules.
+    ///
+    /// Lives HERE, and not in [`crate::state::AppState`], because the two ends
+    /// of the edge share nothing else: `crate::dispatch::handle_dispatch`
+    /// registers after the spawn, and `AppState::handle_work_done` resolves
+    /// under the state READ lock, which cannot mutate a plain `AppState` field.
+    /// This registry is already the daemon's interior-mutable home for exactly
+    /// this shape of per-pane bookkeeping (delegations, silence watches,
+    /// commissions), and it is the one thing both ends are handed.
+    dispatch_returns: Mutex<crate::dispatch_return::DispatchReturns>,
 }
 
 /// PRD #126: the outstanding-delegation side state — records plus the
@@ -3655,6 +3667,7 @@ impl AgentPtyRegistry {
             delivery_notice_sink: Mutex::new(None),
             delegations: Mutex::new(DelegationTracker::default()),
             delegation_seq: AtomicU64::new(1),
+            dispatch_returns: Mutex::new(crate::dispatch_return::DispatchReturns::default()),
         }
     }
 
@@ -4133,6 +4146,54 @@ impl AgentPtyRegistry {
         )
     }
 
+    /// PRD #220 M2.0: retain `caller` as the recipient for the completion of the
+    /// dispatched unit whose TERMINAL pane is `unit_pane_id` — the single agent's
+    /// pane, or the orchestration's start-role pane
+    /// (`SpawnHandle::delivery_pane_id` in both cases).
+    ///
+    /// Called from `crate::dispatch::handle_dispatch` once the spawn has
+    /// succeeded, which is the first moment the unit's pane id exists. A unit
+    /// fast enough to reach `work-done --done` before this returns would find no
+    /// entry and be dropped — accepted rather than engineered around, since
+    /// closing it would mean registering a pane id before it is minted, and the
+    /// window is the few microseconds between `spawn` returning and this call
+    /// against a unit that has yet to read its prompt.
+    pub fn register_dispatch_return(
+        &self,
+        unit_pane_id: &str,
+        caller: crate::dispatch_return::DispatchCaller,
+    ) {
+        let displaced = self
+            .dispatch_returns
+            .lock()
+            .unwrap()
+            .register(unit_pane_id, caller);
+        if let Some(stale) = displaced {
+            tracing::debug!(
+                unit_pane_id = %unit_pane_id,
+                stale_caller_pane_id = %stale.pane_id,
+                stale_unit = %stale.unit_name,
+                "dispatch return: a recycled unit pane displaced an undelivered entry"
+            );
+        }
+    }
+
+    /// PRD #220 M2.1: who the unit at `unit_pane_id` owes its completion report
+    /// to, evicting the entry as it answers. `None` for every pane that is not a
+    /// dispatched unit's terminal pane, which is what keeps the `work-done`
+    /// handler's unknown-pane admission gate intact for arbitrary panes.
+    pub fn take_dispatch_return(
+        &self,
+        unit_pane_id: &str,
+    ) -> Option<crate::dispatch_return::DispatchCaller> {
+        self.dispatch_returns.lock().unwrap().take(unit_pane_id)
+    }
+
+    /// How many dispatched units still owe a report. Observability and tests.
+    pub fn outstanding_dispatch_returns(&self) -> usize {
+        self.dispatch_returns.lock().unwrap().len()
+    }
+
     /// PRD #126 M1 review (finding 1) / audit (finding 2): begin a race-safe
     /// pane close. Atomically marks `pane_id` as closing and drops every
     /// outstanding delegation that touches it — as the *worker* (keyed by the
@@ -4157,6 +4218,19 @@ impl AgentPtyRegistry {
     pub fn begin_pane_close(&self, pane_id: &str) -> Vec<OutstandingDelegation> {
         let mut tracker = self.delegations.lock().unwrap();
         tracker.closing_panes.insert(pane_id.to_string());
+        // PRD #220 M2.0: the same sweep for the dispatch return edge, and by the
+        // same two roles. A closing pane is either a dispatched unit that will
+        // now never complete, or a caller with nowhere left to be reported to;
+        // either way the entry is undeliverable and must not sit in the map
+        // waiting for a pane id to be recycled underneath it.
+        let dropped_returns = self.dispatch_returns.lock().unwrap().evict_pane(pane_id);
+        if dropped_returns > 0 {
+            tracing::debug!(
+                pane_id = %pane_id,
+                dropped_returns,
+                "pane close: dropped dispatch return entries touching this pane"
+            );
+        }
         // PRD #249 round-6 review (Greptile): wake anything waiting on this pane
         // BEFORE the up-to-`AGENT_TERMINATE_GRACE` termination starts, by dropping
         // its senders. Same ordering argument as the sweeps below.
@@ -12478,6 +12552,56 @@ mod spawn_tests {
     /// workers' watches. Records are keyed by worker pane, so the old
     /// pane-keyed cancellation left them armed against a pane id that a later,
     /// unrelated agent could inherit.
+    /// PRD #220 M2.0, through the registry rather than the map: the retention
+    /// entry a dispatch leaves behind is evicted by the SAME pane-close
+    /// transition that sweeps delegations and watches.
+    ///
+    /// The pure-data rules are asserted in [`crate::dispatch_return`]; what this
+    /// pins is the wiring, which is the half that can silently not happen — a map
+    /// whose eviction call was never made keeps answering correctly in its own
+    /// tests forever.
+    #[test]
+    fn begin_pane_close_evicts_dispatch_returns_touching_the_closing_pane() {
+        let reg = AgentPtyRegistry::new();
+        let caller = |pane: &str, unit: &str| crate::dispatch_return::DispatchCaller {
+            pane_id: pane.to_string(),
+            agent_id: "agent-7".to_string(),
+            unit_name: unit.to_string(),
+        };
+        reg.register_dispatch_return("unit-pane-a", caller("caller-1", "a"));
+        reg.register_dispatch_return("unit-pane-b", caller("caller-1", "b"));
+        reg.register_dispatch_return("unit-pane-c", caller("caller-2", "c"));
+        assert_eq!(reg.outstanding_dispatch_returns(), 3);
+
+        // The dispatched unit's own tab closing: nothing will ever complete there.
+        drop(reg.begin_pane_close("unit-pane-a"));
+        assert_eq!(reg.outstanding_dispatch_returns(), 2);
+        assert!(
+            reg.take_dispatch_return("unit-pane-a").is_none(),
+            "a closed unit must not stay resolvable against a recyclable pane id"
+        );
+
+        // The CALLER's pane closing: every unit it started loses its recipient.
+        drop(reg.begin_pane_close("caller-1"));
+        assert_eq!(
+            reg.outstanding_dispatch_returns(),
+            1,
+            "closing the caller evicts its remaining unit too"
+        );
+        assert!(reg.take_dispatch_return("unit-pane-b").is_none());
+
+        // And the other caller's unit is untouched, then consumed by delivery.
+        assert_eq!(
+            reg.take_dispatch_return("unit-pane-c").map(|c| c.unit_name),
+            Some("c".to_string())
+        );
+        assert_eq!(
+            reg.outstanding_dispatch_returns(),
+            0,
+            "resolving a return evicts it, so no report can be delivered twice"
+        );
+    }
+
     #[test]
     fn begin_pane_close_cancels_records_targeting_the_closing_orchestrator() {
         let reg = Arc::new(AgentPtyRegistry::new());

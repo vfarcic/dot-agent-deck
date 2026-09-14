@@ -2601,6 +2601,20 @@ async fn run_hook_loop_with_idle_timeout(
                                         // this its orchestrator gets the delegation
                                         // protocol and no way to use it.
                                         state: Some(state.clone()),
+                                        // PRD #220 M2.0: the caller identity captured
+                                        // above, carried into the dispatch so the unit
+                                        // it starts can report back when it finishes.
+                                        // The SAME pair the acknowledgement below is
+                                        // bound to — retained rather than used once and
+                                        // discarded, which is the whole of the return
+                                        // edge's addressing.
+                                        caller: Some(
+                                            crate::dispatch_return::DispatchCaller {
+                                                pane_id: signal.pane_id.clone(),
+                                                agent_id: caller_agent_id.clone(),
+                                                unit_name: signal.name.clone(),
+                                            },
+                                        ),
                                     };
                                     let task = signal.task.as_deref().unwrap_or_default();
                                     let result = dispatch::handle_dispatch(
