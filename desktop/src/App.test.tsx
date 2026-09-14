@@ -713,6 +713,52 @@ describe("ControlDeck", () => {
     expect(listProjects.mock.calls.length).toBe(afterThird);
   });
 
+  /**
+   * Issue #887: the fourth of the daemon's four project seeds is every
+   * registered schedule's working directory, and no schedule reaches this app
+   * at all — so registering one in a directory the daemon has nothing else
+   * running in added a project the picker could not re-list in response to.
+   *
+   * The daemon now reports a monotonic `scheduleRevision` and the key carries
+   * it. The agent set is deliberately held IDENTICAL across every rerender
+   * here, so the revision is the only thing that moves and nothing else in the
+   * key could account for a re-list.
+   *
+   * The last two rerenders are the controls. Re-sending the same revision must
+   * not re-list, or the test would pass against a key that changes on every
+   * render; and dropping the field entirely (a daemon that reports none) must
+   * not re-list either, or a peer that cannot answer the question would make
+   * the picker churn on every snapshot.
+   */
+  it("re-lists projects when the daemon's schedule revision moves, with the agent set unchanged", async () => {
+    const listProjects = vi.fn(async () => ({ projects: [daemonProject("/home/dev/code/deck", "deck")] }));
+    const agents = [agentIn("1", "/home/dev/code/deck")];
+    const withRevision = (scheduleRevision?: number) => ({ ...liveSnapshot(agents), scheduleRevision });
+    const base = liveWithProject({ listProjects, snapshot: withRevision(0) });
+    const { rerender } = render(<ControlDeck runtime={base} />);
+    await waitFor(() => expect(listProjects.mock.calls.length).toBeGreaterThan(0));
+
+    // A schedule was registered: same agents, same cwds, next revision.
+    const afterFirst = listProjects.mock.calls.length;
+    rerender(<ControlDeck runtime={{ ...base, snapshot: withRevision(1) }} />);
+    await waitFor(() => expect(listProjects.mock.calls.length).toBeGreaterThan(afterFirst));
+
+    // Control: the same revision again is not a change.
+    const afterSecond = listProjects.mock.calls.length;
+    rerender(<ControlDeck runtime={{ ...base, snapshot: withRevision(1) }} />);
+    await new Promise((settle) => setTimeout(settle, 0));
+    expect(listProjects.mock.calls.length).toBe(afterSecond);
+
+    // Control: an unreported revision is stable too — it must not alternate
+    // with the reported one and re-list on every other snapshot.
+    rerender(<ControlDeck runtime={{ ...base, snapshot: withRevision(undefined) }} />);
+    await waitFor(() => expect(listProjects.mock.calls.length).toBeGreaterThan(afterSecond));
+    const afterThird = listProjects.mock.calls.length;
+    rerender(<ControlDeck runtime={{ ...base, snapshot: withRevision(undefined) }} />);
+    await new Promise((settle) => setTimeout(settle, 0));
+    expect(listProjects.mock.calls.length).toBe(afterThird);
+  });
+
   it("explains and disables live workflow launch on Windows before confirmation", () => {
     const live = runtime({ mode: "live" });
     render(<ControlDeck runtime={live} workflowPlatformIssue={WINDOWS_WORKFLOW_BLOCK_REASON} />);

@@ -7,7 +7,6 @@ use dot_agent_deck::agent_pty::{
     AgentRecord, TabMembership, clamp_pty_dims, is_valid_cwd, is_valid_display_name,
     is_valid_orchestration_cwd, is_valid_pane_id_env,
 };
-use dot_agent_deck::agent_registry;
 use dot_agent_deck::daemon_client::Endpoint;
 use dot_agent_deck::daemon_protocol::PROTOCOL_VERSION;
 use dot_agent_deck::event::{
@@ -35,6 +34,24 @@ pub struct DesktopSnapshot {
     // now comes from `list-projects` / `resolve-project`; the directory the
     // header shows comes from the daemon-reported agent `cwd` it already
     // preferred.
+    /// Issue #887: the daemon's registered-schedule revision, copied through
+    /// from the `ListAgents` reply
+    /// ([`dot_agent_deck::daemon_protocol::AttachResponse::schedule_revision`]).
+    ///
+    /// It is a **change notice and nothing else** — no schedule reaches this
+    /// snapshot, and none should: the webview shows no schedule surface. What it
+    /// buys is the one seed of the daemon's project list the webview could not
+    /// observe. `projectsRevision` in `App.tsx` already carries the connection
+    /// status, the agent count and the agent/orchestration cwds; appending this
+    /// closes the last seed that could move without the picker being able to
+    /// notice, which is why a schedule registered while the app is open did not
+    /// make the **Projects** picker re-list.
+    ///
+    /// Absent from a daemon that does not report one, in which case the picker
+    /// behaves exactly as it did before — the manual **Refresh** button was
+    /// always the remedy and remains one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub schedule_revision: Option<u64>,
     pub protocol_version: u32,
     pub source: &'static str,
 }
@@ -157,24 +174,34 @@ pub struct DesktopAgent {
     pub rows: u16,
     pub cols: u16,
     pub agent_type: String,
-    /// The BINARY the registry says this agent type runs — `claude`,
-    /// `opencode`, `pi`, `codex`, `devin` — read straight off
-    /// `AgentSpec::default_command` rather than restated here.
+    /// The BINARY this agent runs — `claude`, `opencode`, `pi`, `codex`,
+    /// `devin` — **as the daemon reported it** ([`AgentRecord::cli_name`],
+    /// issue #856). Copied through; never computed here.
     ///
     /// `agent_type` above is the wire IDENTITY and stays snake_case for the
     /// consumers that key on it; it is not a name anybody types. Rendering it
     /// showed Claude Code as `claude_code` and OpenCode as `open_code`, with
-    /// `codex` right only by coincidence. Deriving the answer from the registry
-    /// is what stops a second copy of it drifting: adding an agent there gives
-    /// this field its value with nothing to update here.
+    /// `codex` right only by coincidence.
     ///
-    /// Absent — never a placeholder, and never invented — for
-    /// [`AgentType::None`] and for a record that reported no type at all.
-    /// `None` is also `#[serde(other)]`, so a FUTURE agent type from a newer
-    /// daemon lands there; this build genuinely does not know what binary that
-    /// is, and says nothing rather than guessing.
+    /// **It used to be resolved here**, by looking `agent_type` up in this
+    /// crate's own compiled-in `agent_registry` — the one entry PRD #819's M1
+    /// ownership sweep classified as computed locally that no other issue
+    /// covered. Which binary a running agent is, is a fact about the daemon's
+    /// world: it forked the process. It could not diverge while
+    /// `classify_handshake` demanded an exact `server_version` match plus
+    /// matching build stamps, since both sides then compile one table by
+    /// construction — but that is a property of the gate, and issue #801 exists
+    /// to relax the gate.
+    ///
+    /// Absent — never a placeholder, and **never resolved from the local table**
+    /// — whenever the daemon named no binary: an agent type whose spec has no
+    /// `default_command` (`AgentType::None`, which carries `#[serde(other)]` and
+    /// so absorbs a type from a NEWER daemon), a record reporting no type, or a
+    /// daemon predating the field. Falling back here would reinstate exactly the
+    /// divergence the field closes, so the webview renders nothing — the
+    /// disposition `spawned_at_ms` and `last_activity_ms` already take.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub cli_name: Option<&'static str>,
+    pub cli_name: Option<String>,
     pub status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub active_tool: Option<DesktopActiveTool>,
@@ -738,8 +765,9 @@ fn write_lease_name(writable: &Writable) -> &'static str {
 
 pub(crate) fn map_agent(record: AgentRecord) -> DesktopAgent {
     let live = record.live.as_ref();
-    // Resolved ONCE, so the wire identity and the binary name can never
-    // disagree about which agent this is.
+    // The wire identity, resolved with the same precedence the DAEMON uses to
+    // resolve the binary name beside it (`AgentRecord::reported_agent_type`) —
+    // which is what keeps the two from disagreeing about which agent this is.
     let reported_type = live
         .and_then(|snapshot| snapshot.agent_type.as_ref())
         .or(record.agent_type.as_ref());
@@ -747,10 +775,6 @@ pub(crate) fn map_agent(record: AgentRecord) -> DesktopAgent {
         .map(agent_type_name)
         .unwrap_or("none")
         .to_string();
-    // Off the registry, which is where the deck already keeps the command that
-    // launches each agent — see `cli_name`.
-    let cli_name =
-        reported_type.and_then(|agent_type| agent_registry::spec(agent_type).default_command);
     let status = live
         .map(|snapshot| session_status_name(&snapshot.status))
         .unwrap_or("running")
@@ -771,6 +795,11 @@ pub(crate) fn map_agent(record: AgentRecord) -> DesktopAgent {
     // when it spawned a process whether or not that process has ever emitted an
     // event.
     let spawned_at_ms = record.spawned_at_ms;
+    // Issue #856: copied through from the daemon, which forked the process and
+    // holds the answer. There is deliberately NO fallback to this crate's own
+    // `agent_registry` — a fallback would reinstate the divergence the field
+    // closes, and make the change cosmetic.
+    let cli_name = record.cli_name;
     let tab = map_tab(record.tab_membership.as_ref());
 
     DesktopAgent {
@@ -943,6 +972,8 @@ pub(crate) fn disconnected_snapshot(error: impl AsRef<str>) -> DesktopSnapshot {
             project_actions_reason: None,
         },
         agents: Vec::new(),
+        // Issue #887: nothing answered, so this daemon reported no revision.
+        schedule_revision: None,
         protocol_version: PROTOCOL_VERSION,
         source: "daemon",
     }
@@ -1297,6 +1328,9 @@ mod tests {
                 last_activity_ms: None,
             }),
             spawned_at_ms: None,
+            // Issue #856: as the DAEMON reported it. The fixture agent is
+            // Codex, and `codex` is what a codex daemon resolves.
+            cli_name: Some("codex".into()),
         }
     }
 
@@ -1312,54 +1346,43 @@ mod tests {
         assert_eq!(value["tab"]["kind"], "mode");
     }
 
-    /// PRD #745: the CLI column shows a binary somebody could type, and EVERY
-    /// variant is checked here rather than only the one the fixture happens to
-    /// carry — the enum names had Claude Code reading `claude_code` and
-    /// OpenCode reading `open_code`, with `codex` right only by coincidence.
+    /// Issue #856: the CLI column is the DAEMON's answer, copied through
+    /// verbatim — and a daemon this build disagrees with about the registry
+    /// still gets its own answer rendered.
+    ///
+    /// The fixture record reports Codex while naming `pinocchio`, a binary no
+    /// `AgentSpec` in this build holds. Any local lookup — the
+    /// `agent_registry::spec(agent_type).default_command` this used to do —
+    /// answers `codex` for that record, so the assertion fails the moment a
+    /// fallback is reintroduced. That is the whole point of the issue: the
+    /// desktop and the daemon compile one table only because
+    /// `classify_handshake` demands matching builds, and #801 exists to relax
+    /// exactly that.
     #[test]
-    fn every_agent_type_reports_the_binary_it_runs() {
-        let cli_of = |agent_type: Option<AgentType>| {
-            let mut record = fixture_record();
-            record.agent_type = agent_type;
-            record.live = None;
-            map_agent(record).cli_name
-        };
-        assert_eq!(cli_of(Some(AgentType::ClaudeCode)), Some("claude"));
-        assert_eq!(cli_of(Some(AgentType::OpenCode)), Some("opencode"));
-        assert_eq!(cli_of(Some(AgentType::Pi)), Some("pi"));
-        assert_eq!(cli_of(Some(AgentType::Codex)), Some("codex"));
-        assert_eq!(cli_of(Some(AgentType::Devin)), Some("devin"));
-        // `None` is both "no recognized agent" and the `#[serde(other)]`
-        // landing spot for a type this build has never heard of. Neither has a
-        // binary this build can name, so it reports nothing rather than a word.
-        assert_eq!(cli_of(Some(AgentType::None)), None);
-        assert_eq!(cli_of(None), None);
-    }
-
-    /// The live snapshot's type wins over the record's for the binary name
-    /// exactly as it does for the wire identity — one resolution, so the two
-    /// fields cannot end up naming different agents.
-    #[test]
-    fn the_live_agent_type_decides_the_binary_too() {
+    fn the_cli_binary_is_copied_from_the_daemon_and_never_derived_locally() {
         let mut record = fixture_record();
         record.agent_type = Some(AgentType::Codex);
-        if let Some(live) = record.live.as_mut() {
-            live.agent_type = Some(AgentType::ClaudeCode);
-        }
-        let mapped = map_agent(record);
-        assert_eq!(mapped.agent_type, "claude_code");
-        assert_eq!(mapped.cli_name, Some("claude"));
+        record.cli_name = Some("pinocchio".into());
+        assert_eq!(map_agent(record).cli_name.as_deref(), Some("pinocchio"));
     }
 
-    /// Absence stays OFF the wire, so the webview reads absence rather than an
+    /// Issue #856: a record the daemon named no binary for renders nothing, and
+    /// the key stays OFF the wire so the webview reads absence rather than an
     /// empty string it would have to special-case.
+    ///
+    /// **Never a fallback to the local table**, which is what makes this the
+    /// load-bearing half of the pair above. The record here reports a perfectly
+    /// well-known `AgentType::Codex` — a local lookup has an answer for it and
+    /// would print `codex`. Absence on the wire means the daemon named no
+    /// binary, and inventing one from a table the daemon may not share
+    /// reinstates the divergence the field closes.
     #[test]
     fn an_unnameable_cli_is_absent_from_the_serialized_shape() {
         let mut record = fixture_record();
-        record.agent_type = Some(AgentType::None);
-        record.live = None;
+        record.agent_type = Some(AgentType::Codex);
+        record.cli_name = None;
         let value = serde_json::to_value(map_agent(record)).unwrap();
-        assert_eq!(value["agentType"], "none");
+        assert_eq!(value["agentType"], "codex");
         assert!(value.get("cliName").is_none());
     }
 

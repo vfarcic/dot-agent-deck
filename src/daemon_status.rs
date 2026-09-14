@@ -234,6 +234,7 @@ mod tests {
             cols: 0,
             live,
             spawned_at_ms: None,
+            cli_name: None,
         }
     }
 

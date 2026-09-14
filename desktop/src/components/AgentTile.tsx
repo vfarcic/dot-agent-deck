@@ -122,7 +122,10 @@ export function AgentTile({
               </div>
             ) : (
               <p>
-                {agent.cli} <span aria-hidden="true">·</span> {agent.model}
+                {/* Issue #856: the binary the daemon named, dropped entirely
+                    when it named none — the separator goes with it rather than
+                    leaving a dangling `· Unavailable`. */}
+                {agent.cli ? <>{agent.cli} <span aria-hidden="true">·</span> </> : null}{agent.model}
                 {onRename && (
                   <button
                     className="agent-rename-trigger"

@@ -292,12 +292,34 @@ describe("AgentOverview", () => {
   });
 
   /**
+   * Scenario: an agent whose record carried no `cliName` — the daemon named no
+   * binary for it — is rendered with the whole fleet. Its CLI cell is EMPTY,
+   * with no hover text, rather than carrying a generic word or a name looked up
+   * locally from its agent type (issue #856).
+   *
+   * The agent left in the snapshot is one the deck knows perfectly well: the
+   * fixture's first, whose type a local table has an answer for. So the empty
+   * cell is a property of the absent field and not of an unrecognisable agent —
+   * which is what makes this the regression guard for the fallback the issue
+   * forbids. An empty cell says "the deck did not say"; a word says something
+   * about the agent that nothing reported.
+   */
+  it("leaves the CLI cell empty when the daemon named no binary", () => {
+    const { container } = renderOverview({ snapshot: snapshotWithAgent({ cli: undefined }) });
+
+    const cell = container.querySelector(".overview-cli");
+    expect(cell).not.toBeNull();
+    expect(cell?.textContent).toBe("");
+    expect(cell).not.toHaveAttribute("title");
+  });
+
+  /**
    * Scenario: read the CLI column down the whole fleet. Every cell names a
    * BINARY somebody could type. It used to render the serialised agent-type
    * enum, so Claude Code read `claude_code` and OpenCode read `open_code`,
-   * with `codex` right only by coincidence — the name now comes from the agent
-   * registry, which is where the deck already keeps each agent's command
-   * (PRD #745).
+   * with `codex` right only by coincidence — PRD #745 took the name off the
+   * agent registry, and issue #856 moved that resolution to the daemon, which
+   * is the side that forked the process.
    */
   it("names the binary each agent runs, never the enum the wire keys it by", () => {
     const { container } = renderOverview();

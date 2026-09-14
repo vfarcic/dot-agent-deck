@@ -1222,15 +1222,24 @@ function OverviewRow({ agent, hoistedCwd, now, columns }: { agent: OverviewAgent
         return <td className="overview-uptime" role="cell" key={column} title={uptime && `Spawned by the deck at: ${uptime.title}`}>{uptime?.label ?? ""}</td>;
       case "cli":
         /*
-          The BINARY this agent runs, resolved from the agent registry rather
-          than from the wire identity (PRD #745). It used to print the
-          serialised enum, so Claude Code read `claude_code` and OpenCode read
-          `open_code` — neither of them a name anybody would type — while
-          `codex` happened to be right. The hover is the full value and nothing
-          else: the column header already says what it is, and a sentence
-          restating it would be the screen describing itself.
+          The BINARY this agent runs, as the DAEMON reported it (issue #856). It
+          used to print the serialised wire identity, so Claude Code read
+          `claude_code` and OpenCode read `open_code` — neither a name anybody
+          would type — while `codex` happened to be right; PRD #745 fixed that
+          by resolving the name from the agent registry, and #856 moved the
+          resolution to the side of the wire that forked the process.
+
+          Empty when the daemon named no binary, and deliberately NOT a word
+          standing in for one — exactly what the uptime and activity cells above
+          do with an unreported value. There is no local registry lookup to fall
+          back to here, which is the point: a fallback would reinstate the
+          divergence #856 closed.
+
+          The hover is the full value and nothing else: the column header
+          already says what it is, and a sentence restating it would be the
+          screen describing itself.
         */
-        return <td className="overview-cli" role="cell" key={column} title={displayTitle(agent.cli)}>{displayText(agent.cli, DISPLAY_LIMITS.name)}</td>;
+        return <td className="overview-cli" role="cell" key={column} title={agent.cli && displayTitle(agent.cli)}>{agent.cli ? displayText(agent.cli, DISPLAY_LIMITS.name) : ""}</td>;
       case "activeTool":
         return (
           <td className="overview-tool" role="cell" key={column}>

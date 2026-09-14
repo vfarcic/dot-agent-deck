@@ -27,6 +27,26 @@ prompt = "alpha prompt"
 enabled = true
 "#;
 
+// A second task in a directory `alpha` does not name, so registering it moves
+// the daemon's project-enumeration seed set (issue #887).
+const INITIAL_PLUS_GAMMA: &str = r#"
+[[scheduled_tasks]]
+name = "alpha"
+cron = "0 9 * * *"
+working_dir = "/tmp"
+command = "cat"
+prompt = "alpha prompt"
+enabled = true
+
+[[scheduled_tasks]]
+name = "gamma"
+cron = "0 11 * * *"
+working_dir = "/tmp/gamma-project"
+command = "cat"
+prompt = "gamma prompt"
+enabled = true
+"#;
+
 // Drops `alpha`, adds `beta` — a reload must register beta and drop alpha.
 const EDITED: &str = r#"
 [[scheduled_tasks]]
@@ -67,6 +87,68 @@ fn reload_001_reload_swaps_registered_tasks() {
     assert!(
         !registered.iter().any(|n| n == "alpha"),
         "alpha should be gone after reload, got {registered:?}"
+    );
+}
+
+/// Scenario: Start `daemon serve` with idle shutdown disabled and one
+/// registered task, and read `schedule_revision` off a `ListAgents` reply over
+/// the attach socket. Rewrite the global `schedules.toml` to add a second task
+/// in a directory the first does not name, send `ReloadSchedules`, and read the
+/// revision again — it must have moved. Send `ReloadSchedules` a second time
+/// with the file unchanged and read it a third time — it must NOT have moved.
+///
+/// Issue #887: the daemon seeds its project list partly from every registered
+/// schedule's working directory, and no schedule data reaches the desktop at
+/// all — so registering a schedule added a project the picker had no way to
+/// notice. This is the daemon's half: one monotonic integer, riding the reply
+/// the client already polls, that moves exactly when the registered task set
+/// does. The no-op reload is the control: a number that moved on every reload
+/// would key a re-list on nothing and stop being a change signal.
+#[spec("scheduler/reload/003")]
+#[test]
+fn reload_003_schedule_revision_moves_only_when_the_task_set_does() {
+    let daemon = common::spawn_daemon_serve(Some(INITIAL), "0");
+
+    let revision = || {
+        let resp = daemon
+            .send_attach_request(&AttachRequest::ListAgents)
+            .expect("send ListAgents");
+        assert!(resp.ok, "list-agents failed: {:?}", resp.error);
+        resp.schedule_revision
+            .expect("a daemon carrying this field must report a revision on ListAgents")
+    };
+
+    let before = revision();
+
+    // A task registered in a directory nothing else names: the daemon's project
+    // list genuinely grows, which is the case the issue is about.
+    std::fs::write(&daemon.schedules_path, INITIAL_PLUS_GAMMA).expect("rewrite schedules.toml");
+    let resp = daemon
+        .send_attach_request(&AttachRequest::ReloadSchedules)
+        .expect("send ReloadSchedules");
+    assert!(resp.ok, "reload failed: {:?}", resp.error);
+    let registered = resp.agents.unwrap_or_default();
+    assert!(
+        registered.iter().any(|n| n == "gamma"),
+        "precondition: gamma must be registered after the reload, got {registered:?}"
+    );
+
+    let after_add = revision();
+    assert!(
+        after_add > before,
+        "registering a schedule must move the revision ({before} -> {after_add})"
+    );
+
+    // The control: a reload that changes nothing must leave it exactly where it
+    // was, or a client keyed on it re-lists for nothing on every reload.
+    let resp = daemon
+        .send_attach_request(&AttachRequest::ReloadSchedules)
+        .expect("send ReloadSchedules");
+    assert!(resp.ok, "reload failed: {:?}", resp.error);
+    assert_eq!(
+        revision(),
+        after_add,
+        "a reload that changes nothing must not move the revision"
     );
 }
 

@@ -331,6 +331,7 @@ async fn handle_connection(
                         cols: 80,
                         live: None,
                         spawned_at_ms: None,
+                        cli_name: None,
                     }]
                 })
                 .unwrap_or_default();

@@ -2390,6 +2390,82 @@ pub struct AgentRecord {
     /// basis `live` and `last_activity_ms` were added on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spawned_at_ms: Option<i64>,
+    /// Issue #856: the binary name for the agent this record reports — the
+    /// command a user could type — resolved from the **daemon's** copy of
+    /// [`crate::agent_registry`].
+    ///
+    /// **Which binary a running agent is, is a fact about the daemon's world.**
+    /// The daemon forked the process; a client did not. Until this field existed
+    /// the desktop answered the question itself, looking the daemon-sent
+    /// `agent_type` up in its OWN compiled-in registry
+    /// (`map_agent`, `desktop/src-tauri/src/dto.rs`) and printing whatever
+    /// `AgentSpec::default_command` its copy of the table held. That could not
+    /// diverge while `classify_handshake` required an exact `server_version`
+    /// match plus matching build stamps — but that is a property of the GATE,
+    /// and relaxing the gate is precisely what issue #801 is for. PRD #819's
+    /// principle is that a client gets such facts from the daemon, and that
+    /// "the client can compute it locally" is not an answer even on one machine.
+    ///
+    /// **Stamped at the wire boundary, not at record construction**, by
+    /// [`attach_cli_names`] — immediately after the `ListAgents` handler's
+    /// live-session join, so it is resolved from the same identity the reply
+    /// reports (see [`AgentRecord::reported_agent_type`]). Resolving it in
+    /// [`AgentPtyRegistry::agent_records`] instead would read only the registry's
+    /// own `agent_type` and could name a different binary than the `agent_type`
+    /// travelling beside it on the same record.
+    ///
+    /// **`None` is never a licence to guess.** It means this daemon named no
+    /// binary — an agent type whose spec has no `default_command`
+    /// ([`crate::event::AgentType::None`], which also carries `#[serde(other)]`
+    /// and so absorbs a type from a NEWER daemon), a record with no reported
+    /// type at all, or a peer predating this field. Every consumer renders
+    /// nothing for it, the disposition `spawned_at_ms` and
+    /// [`crate::state::SessionSnapshot::last_activity_ms`] already take. A
+    /// consumer that falls back to its own table reinstates exactly the
+    /// divergence this closes.
+    ///
+    /// Additive optional, so no `PROTOCOL_VERSION` bump — same basis as `live`,
+    /// `last_activity_ms` and `spawned_at_ms`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cli_name: Option<String>,
+}
+
+impl AgentRecord {
+    /// The agent identity this record REPORTS: the live session's where the
+    /// `ListAgents` join attached one, else the registry's spawn-time value.
+    ///
+    /// One spelling of a precedence that had two. `map_agent` in the desktop
+    /// crate resolves the wire identity exactly this way and comments that it is
+    /// "resolved ONCE, so the wire identity and the binary name can never
+    /// disagree about which agent this is" — a promise that only holds while
+    /// both halves read the same rule, which is why the daemon's half calls this
+    /// rather than restating it.
+    pub fn reported_agent_type(&self) -> Option<&AgentType> {
+        self.live
+            .as_ref()
+            .and_then(|snapshot| snapshot.agent_type.as_ref())
+            .or(self.agent_type.as_ref())
+    }
+}
+
+/// Issue #856: stamp each record with the binary name the DAEMON's agent
+/// registry gives for the identity that record reports.
+///
+/// The counterpart of [`crate::state::AppState::attach_live_sessions`] and
+/// deliberately shaped like it: one pass over a whole `ListAgents` reply, run at
+/// the wire boundary, writing one field. Run it AFTER the live join — see
+/// [`AgentRecord::cli_name`] for why the order is load-bearing.
+///
+/// Unconditional, including the `None` case: a record whose reported type this
+/// daemon's registry cannot name a binary for reports no binary, rather than
+/// keeping whatever a caller had put there.
+pub fn attach_cli_names(records: &mut [AgentRecord]) {
+    for record in records {
+        record.cli_name = record
+            .reported_agent_type()
+            .and_then(|agent_type| crate::agent_registry::spec(agent_type).default_command)
+            .map(str::to_string);
+    }
 }
 
 /// Skip-predicate for `AgentRecord::rows` / `AgentRecord::cols`
@@ -7195,6 +7271,12 @@ impl AgentPtyRegistry {
             live: None,
             // PRD #745 M11: absent unless THIS registry forked the child.
             spawned_at_ms: agent.spawned_at.map(|at| at.timestamp_millis()),
+            // Issue #856: stamped at the wire boundary by `attach_cli_names`,
+            // after the live join — the registry has no live session here, so
+            // resolving it now would read a narrower identity than the reply
+            // reports. This path (`agent_record_any`) is a CLEANUP lookup and
+            // reaches no client at all.
+            cli_name: None,
         })
     }
 
@@ -7491,6 +7573,10 @@ impl AgentPtyRegistry {
                 // filter above is what keeps a spawn instant from outliving the
                 // process it describes and ticking up as a phantom uptime.
                 spawned_at_ms: agent.spawned_at.map(|at| at.timestamp_millis()),
+                // Issue #856: stamped by `attach_cli_names` at the wire
+                // boundary, after the `ListAgents` handler's live join. See
+                // `AgentRecord::cli_name`.
+                cli_name: None,
             })
             .collect();
         records.sort_by_key(|r| r.id.parse::<u64>().unwrap_or(0));
@@ -11501,6 +11587,110 @@ mod spawn_tests {
     // permanently corrupted (PRD #104 problem statement).
     // ---------------------------------------------------------------------
 
+    // ---------------------------------------------------------------------
+    // Issue #856: the binary name is the DAEMON's answer.
+    //
+    // These moved here from the desktop crate's `dto.rs`, which is where the
+    // resolution used to live — in a client's own compiled-in copy of the agent
+    // registry. The tests came with the responsibility.
+    // ---------------------------------------------------------------------
+
+    /// A record reporting `agent_type`, with an optional live session type on
+    /// top, and nothing else this resolution reads.
+    fn typed_record(
+        record_type: Option<AgentType>,
+        live_type: Option<Option<AgentType>>,
+    ) -> AgentRecord {
+        AgentRecord {
+            id: "1".into(),
+            pane_id_env: None,
+            display_name: None,
+            cwd: None,
+            tab_membership: None,
+            agent_type: record_type,
+            rows: 0,
+            cols: 0,
+            live: live_type.map(|agent_type| crate::state::SessionSnapshot {
+                status: crate::state::SessionStatus::Working,
+                agent_type,
+                active_tool: None,
+                tool_count: 0,
+                first_prompts: Vec::new(),
+                last_user_prompt: None,
+                live_target: None,
+                last_activity_ms: None,
+            }),
+            spawned_at_ms: None,
+            cli_name: None,
+        }
+    }
+
+    /// Every agent type resolves to the binary somebody could type, and the two
+    /// that name none resolve to nothing.
+    ///
+    /// EVERY variant, not just the one a fixture happens to carry: the enum
+    /// names had Claude Code reading `claude_code` and OpenCode reading
+    /// `open_code`, with `codex` right only by coincidence, which is exactly the
+    /// shape of defect a one-variant test misses.
+    #[test]
+    fn attach_cli_names_resolves_every_agent_type_to_its_binary() {
+        let cli_of = |agent_type: Option<AgentType>| {
+            let mut records = [typed_record(agent_type, None)];
+            attach_cli_names(&mut records);
+            records[0].cli_name.clone()
+        };
+        assert_eq!(
+            cli_of(Some(AgentType::ClaudeCode)).as_deref(),
+            Some("claude")
+        );
+        assert_eq!(
+            cli_of(Some(AgentType::OpenCode)).as_deref(),
+            Some("opencode")
+        );
+        assert_eq!(cli_of(Some(AgentType::Pi)).as_deref(), Some("pi"));
+        assert_eq!(cli_of(Some(AgentType::Codex)).as_deref(), Some("codex"));
+        assert_eq!(cli_of(Some(AgentType::Devin)).as_deref(), Some("devin"));
+        // `None` is both "no recognized agent" and the `#[serde(other)]` landing
+        // spot for a type this build has never heard of. Neither has a binary to
+        // name, and a daemon that cannot name one says nothing rather than
+        // guessing — which is what lets the client render nothing.
+        assert_eq!(cli_of(Some(AgentType::None)), None);
+        assert_eq!(cli_of(None), None);
+    }
+
+    /// The live session's type decides the binary, exactly as it decides the
+    /// wire identity beside it — so the two can never name different agents on
+    /// one record. A live session that reports NO type falls through to the
+    /// registry's, which is the same `or` the identity takes.
+    #[test]
+    fn attach_cli_names_follows_the_identity_the_record_reports() {
+        let mut records = [
+            typed_record(Some(AgentType::Codex), Some(Some(AgentType::ClaudeCode))),
+            typed_record(Some(AgentType::Codex), Some(None)),
+        ];
+        attach_cli_names(&mut records);
+        assert_eq!(records[0].cli_name.as_deref(), Some("claude"));
+        assert_eq!(
+            records[0].reported_agent_type(),
+            Some(&AgentType::ClaudeCode)
+        );
+        assert_eq!(records[1].cli_name.as_deref(), Some("codex"));
+        assert_eq!(records[1].reported_agent_type(), Some(&AgentType::Codex));
+    }
+
+    /// Unconditional, including the absent case: a record whose reported type
+    /// names no binary reports none, rather than keeping whatever was already
+    /// on the field. Same rule `attach_live_sessions` follows for `live`, and
+    /// for the same reason — the daemon is the authority, so absence is an
+    /// answer and not a gap to leave a previous value showing through.
+    #[test]
+    fn attach_cli_names_overwrites_rather_than_filling_in() {
+        let mut records = [typed_record(Some(AgentType::None), None)];
+        records[0].cli_name = Some("stale".into());
+        attach_cli_names(&mut records);
+        assert_eq!(records[0].cli_name, None);
+    }
+
     #[test]
     fn agent_record_round_trips_explicit_rows_cols() {
         let rec = AgentRecord {
@@ -11514,6 +11704,7 @@ mod spawn_tests {
             cols: 40,
             live: None,
             spawned_at_ms: None,
+            cli_name: None,
         };
         let json = serde_json::to_string(&rec).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -12093,6 +12284,7 @@ mod spawn_tests {
             cols: 0,
             live: None,
             spawned_at_ms: None,
+            cli_name: None,
         };
         let json = serde_json::to_string(&rec).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();

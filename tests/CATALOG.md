@@ -3593,6 +3593,13 @@ These entries cover PRD #162: on TUI reconnect the daemon's `ListAgents` must at
 - **Does not assert:** that a respawn mints a fresh instant (structural — `respawn_agent_for_pane_declared` removes the record and `spawn_agent` is the only writer, and the registry's respawn behaviour is covered by `orchestration/delegate/*`); the desktop DTO projection or the webview's uptime wording and clock-skew rule (the desktop crate's `dto.rs` tests and `AgentOverview.test.tsx`); the `ListAgents` handler (`session/live/002`, `session/live/003`).
 - **Platform coverage:** mac+linux+windows.
 
+##### session/live/015 — `AgentRecord.cli_name` reports the binary THIS daemon's registry names for the identity the reply reports, and names none where it cannot (issue #856).
+- **Layer:** in-crate integration (in-process attach daemon over a Unix socket; fast tier; spawns two `sleep` PTYs only to populate the registry records, does not drive vt100).
+- **Agent:** none.
+- **Asserts:** with a registry agent whose spawn-time `agent_type` is `Codex` and a live `AppState` session on the same `agent_id` + `pane_id` reporting `ClaudeCode`, the `ListAgents` reply's `cli_name` is `claude` — the binary of the identity the reply itself carries, never the spawn-time one, so the CLI column and the agent-type column beside it can never name different agents. A second agent spawned with no `agent_type` at all reports no binary: absence is the daemon saying it cannot name one, which is what lets a client render nothing. Serving the SAME registry from an empty state so nothing joins, the first record reports `codex` — with no live session the registry's own identity is the one the reply reports, and the binary follows it there too.
+- **Does not assert:** the resolution itself over every `AgentType` variant, or that it overwrites rather than fills in (`attach_cli_names`' own unit tests in `src/agent_pty.rs`); the wire additivity of the field (`cli_name_is_additive_and_optional_in_both_directions` in `src/daemon_protocol.rs`); the wire-boundary scrub (`session/live/007`); the desktop projection and the empty CLI cell (the desktop crate's `dto.rs` tests, `bridge.test.ts` and `AgentOverview.test.tsx`).
+- **Platform coverage:** mac+linux.
+
 ### Session save (snapshot freshness, PRD #89 Phase 1)
 
 These entries cover PRD #89 Phase 1: the saved-session snapshot must be kept continuously fresh — written on meaningful TUI state changes and on detach — not only at clean teardown/quit.
@@ -4502,6 +4509,13 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Agent:** none (rewrites the global `schedules.toml`, sends `ReloadSchedules`, then drives a run-now fire; observes `ListAgents` + the spawned single-agent card's PTY prompt echo).
 - **Asserts:** after registering a single-agent task with prompt `PROMPT_ALPHA`, rewriting the file to change ONLY the prompt to `PROMPT_BRAVO`, and reloading, a run-now fire spawns exactly one agent whose PTY echoes `PROMPT_BRAVO` and never the stale `PROMPT_ALPHA`.
 - **Does not assert:** cron-change reload behavior (covered by `scheduler/reload/001`); reuse vs new-tab semantics; the exact reload diff mechanism (black-box on delivered prompt only).
+- **Platform coverage:** mac+linux.
+
+##### scheduler/reload/003 — `AttachResponse.schedule_revision` moves when the registered task set changes and stays put when a reload changes nothing (issue #887).
+- **Layer:** L2 lane 1 (headless `daemon serve` driven over the attach socket; no PTY, no TUI surface — the value has no rendered surface of its own, and the desktop's project picker is the only consumer).
+- **Agent:** none (the tasks' `command` is `cat` and nothing is ever fired).
+- **Asserts:** a `ListAgents` reply carries a `schedule_revision`; rewriting the global `schedules.toml` to add a task in a directory the first does not name and sending `ReloadSchedules` moves it; a second `ReloadSchedules` with the file unchanged leaves it exactly where it was. The daemon seeds its project list partly from every registered schedule's `working_dir` and no schedule data reaches the desktop at all, so this integer is the only thing a client can key an automatic re-list on — and the no-op control is what keeps it a change signal rather than a number that moves on every reload.
+- **Does not assert:** the counter's own bump rules across `register` / add / update / remove (`the_revision_moves_exactly_when_the_registered_task_set_does` in `src/scheduler.rs`); the wire additivity of the field (`schedule_revision_is_additive_and_optional_in_both_directions` in `src/daemon_protocol.rs`); that the revision survives a daemon restart — it deliberately does not, since it counts from 0 on every start and a restart is a new connection; the desktop's `projectsRevision` key and the re-list it drives (`App.test.tsx`).
 - **Platform coverage:** mac+linux.
 
 #### scheduler/cli

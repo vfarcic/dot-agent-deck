@@ -984,6 +984,9 @@ pub(crate) async fn snapshot_with(
         return DesktopSnapshot {
             connection,
             agents: Vec::new(),
+            // Issue #887: no `ListAgents` was issued on this path, so no
+            // revision was reported. Same rule as `running_agent_count` above.
+            schedule_revision: None,
             protocol_version: PROTOCOL_VERSION,
             source: "daemon",
         };
@@ -992,12 +995,12 @@ pub(crate) async fn snapshot_with(
     if let Some(view) = view {
         if view.needs_fetch(tokio::time::Instant::now()).is_none() {
             let records = view.records();
-            return connected_snapshot(connection, records);
+            return connected_snapshot(connection, records, view.schedule_revision());
         }
-        return match daemon.client.list_agents().await {
-            Ok(records) => {
-                view.install(records, tokio::time::Instant::now());
-                connected_snapshot(connection, view.records())
+        return match daemon.client.list_agents_detailed().await {
+            Ok(listing) => {
+                view.install(listing, tokio::time::Instant::now());
+                connected_snapshot(connection, view.records(), view.schedule_revision())
             }
             Err(error) => {
                 // The fetch failed, so the view's demand stands: it was never
@@ -1009,8 +1012,8 @@ pub(crate) async fn snapshot_with(
         };
     }
 
-    match daemon.client.list_agents().await {
-        Ok(records) => connected_snapshot(connection, records),
+    match daemon.client.list_agents_detailed().await {
+        Ok(listing) => connected_snapshot(connection, listing.records, listing.schedule_revision),
         Err(error) => {
             // The held link just failed to carry a request. Whatever is at the
             // other end is not the daemon this handshake classified, so the
@@ -1046,6 +1049,7 @@ pub(crate) async fn snapshot_with(
 fn connected_snapshot(
     connection: DesktopConnection,
     records: Vec<dot_agent_deck::daemon_client::AgentRecord>,
+    schedule_revision: Option<u64>,
 ) -> DesktopSnapshot {
     DesktopSnapshot {
         connection: DesktopConnection {
@@ -1053,6 +1057,11 @@ fn connected_snapshot(
             ..connection
         },
         agents: records.into_iter().map(map_agent).collect(),
+        // Issue #887: carried beside the records it arrived with — including on
+        // the cached path, where the view replays the revision from the reply
+        // that installed those records. A fresh revision beside a cached list
+        // would make the picker re-list against a list it cannot yet see.
+        schedule_revision,
         protocol_version: PROTOCOL_VERSION,
         source: "daemon",
     }
@@ -2189,6 +2198,7 @@ mod tests {
             cols: 80,
             live: None,
             spawned_at_ms: None,
+            cli_name: None,
         }
     }
 

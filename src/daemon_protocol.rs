@@ -1375,6 +1375,31 @@ pub struct AttachResponse {
     /// cannot answer the question at all.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub orchestration_roles: Option<Vec<crate::state::OrchestrationRoleRecord>>,
+    /// Issue #887: this daemon's registered-schedule revision
+    /// ([`crate::scheduler::Scheduler::revision`]), populated on the
+    /// [`AttachRequest::ListAgents`] reply.
+    ///
+    /// **A change notice, not schedule data.** A client that keys a
+    /// project-list refresh on what it can observe about the daemon's world
+    /// cannot observe schedules — nothing schedule-shaped reaches the desktop —
+    /// so registering a schedule in a directory the daemon has nothing else
+    /// running in silently added a project no automatic re-list could catch
+    /// (issue #887). One monotonic integer closes that without putting any
+    /// schedule's contents on a wire that carries none.
+    ///
+    /// Rides `ListAgents` for the same reason [`Self::orchestration_roles`]
+    /// does: the client polling that reply is exactly the client that needs
+    /// this, so it costs no extra round trip. Additive and optional, so no
+    /// [`PROTOCOL_VERSION`] bump — a daemon predating it omits it and the client
+    /// keeps exactly today's behaviour (the manual Refresh button, which was
+    /// always the remedy and stays one).
+    ///
+    /// **Comparable only against itself, and only within one connection.** It
+    /// counts from 0 on every daemon start, so a client must read it as "differs
+    /// from the last value I saw on this connection", never as an ordering
+    /// between daemons.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schedule_revision: Option<u64>,
 }
 
 impl AttachResponse {
@@ -2304,8 +2329,18 @@ async fn handle_connection(
             // loop above — it is one snapshot of the whole map, not a per-record
             // lookup.
             let orchestration_roles = state.read().await.live_orchestration_roles(&registry);
+            // Issue #856: the binary name each record reports, resolved from
+            // THIS daemon's `agent_registry`. After the live join above, not
+            // before — `attach_cli_names` reads the identity the reply carries
+            // (`AgentRecord::reported_agent_type`), so running it first would
+            // resolve from the registry's spawn-time type while the record
+            // travels with the live one beside it.
+            crate::agent_pty::attach_cli_names(&mut records);
             let mut resp = AttachResponse::agent_records(records);
             resp.orchestration_roles = Some(orchestration_roles);
+            // Issue #887: the client's only observable of the schedule seed the
+            // daemon's project list draws on. See `AttachResponse::schedule_revision`.
+            resp.schedule_revision = Some(scheduler.revision());
             write_resp(&mut stream, &resp).await?;
         }
         AttachRequest::StartAgent {
@@ -5523,6 +5558,7 @@ mod tests {
             cols: 0,
             live: None,
             spawned_at_ms: None,
+            cli_name: None,
         };
         let json = serde_json::to_string(&rec).unwrap();
         let back: AgentRecord = serde_json::from_str(&json).unwrap();
@@ -5542,6 +5578,7 @@ mod tests {
             cols: 0,
             live: None,
             spawned_at_ms: None,
+            cli_name: None,
         };
         let v: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&rec).unwrap()).unwrap();
@@ -5705,6 +5742,7 @@ mod tests {
                 last_activity_ms: None,
             }),
             spawned_at_ms: None,
+            cli_name: None,
         };
         let json = serde_json::to_string(&rec).expect("AgentRecord serializes");
         let back: AgentRecord = serde_json::from_str(&json).expect("AgentRecord deserializes");
@@ -5961,6 +5999,100 @@ mod tests {
             serde_json::from_str(newer).expect("a newer peer's record must decode");
         assert_eq!(forward.spawned_at_ms, Some(1_756_684_800_123));
         assert_eq!(forward.pane_id_env.as_deref(), Some("pane-4"));
+    }
+
+    /// Issue #856: `AgentRecord.cli_name` is additive and optional in BOTH
+    /// directions, which is the whole basis of the no-`PROTOCOL_VERSION`-bump
+    /// decision — proven rather than asserted, the way `spawned_at_ms` above is.
+    ///
+    /// The absent case is not a formality here. Absence is the ONLY signal the
+    /// desktop has that the daemon named no binary, and the disposition it must
+    /// take is to render nothing: if the key were emitted as `null` or as an
+    /// empty string, a client would have to special-case a value the daemon can
+    /// also legitimately send.
+    #[test]
+    fn cli_name_is_additive_and_optional_in_both_directions() {
+        let mut rec = AgentRecord {
+            id: "3".into(),
+            pane_id_env: Some("pane-3".into()),
+            display_name: None,
+            cwd: None,
+            tab_membership: None,
+            agent_type: Some(AgentType::ClaudeCode),
+            rows: 0,
+            cols: 0,
+            live: None,
+            spawned_at_ms: None,
+            cli_name: Some("claude".into()),
+        };
+        let value: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&rec).expect("serializes"))
+                .expect("is JSON");
+        assert_eq!(value["cli_name"], "claude");
+
+        // Absent means NO KEY — not `null`, not `""`.
+        rec.cli_name = None;
+        let json = serde_json::to_string(&rec).expect("serializes");
+        let value: serde_json::Value = serde_json::from_str(&json).expect("is JSON");
+        assert!(
+            value.get("cli_name").is_none(),
+            "an unnamed binary must have no key at all; got {json}"
+        );
+
+        // An OLDER peer's record has no key, and must decode via
+        // `#[serde(default)]` with every other field intact.
+        let legacy = r#"{"id": "5", "pane_id_env": "pane-5", "display_name": "coder"}"#;
+        let old: AgentRecord = serde_json::from_str(legacy)
+            .expect("an older peer's record must decode via #[serde(default)]");
+        assert!(old.cli_name.is_none());
+        assert_eq!(old.display_name.as_deref(), Some("coder"));
+
+        // And a NEWER peer's key must not disturb what an older reader does
+        // understand.
+        let newer = r#"{"id": "6", "pane_id_env": "pane-6", "cli_name": "claude-next"}"#;
+        let forward: AgentRecord =
+            serde_json::from_str(newer).expect("a newer peer's record must decode");
+        assert_eq!(forward.cli_name.as_deref(), Some("claude-next"));
+        assert_eq!(forward.pane_id_env.as_deref(), Some("pane-6"));
+    }
+
+    /// Issue #887: `AttachResponse.schedule_revision` is additive and optional
+    /// in both directions, which is why it costs no `PROTOCOL_VERSION` bump.
+    ///
+    /// `Some(0)` and `None` are deliberately distinct and both must survive the
+    /// round trip: 0 is the revision every daemon starts at, so a client that
+    /// defaulted absence to 0 could not tell "no schedule has ever been
+    /// registered here" from "this daemon does not answer the question" — and
+    /// the second must leave the picker's behaviour exactly as it was.
+    #[test]
+    fn schedule_revision_is_additive_and_optional_in_both_directions() {
+        let mut resp = AttachResponse::agent_records(Vec::new());
+        resp.schedule_revision = Some(0);
+        let json = serde_json::to_string(&resp).expect("serializes");
+        let value: serde_json::Value = serde_json::from_str(&json).expect("is JSON");
+        assert_eq!(value["schedule_revision"], 0);
+
+        resp.schedule_revision = None;
+        let json = serde_json::to_string(&resp).expect("serializes");
+        let value: serde_json::Value = serde_json::from_str(&json).expect("is JSON");
+        assert!(
+            value.get("schedule_revision").is_none(),
+            "a daemon that reports no revision must send no key; got {json}"
+        );
+
+        // An older daemon's reply omits it entirely and must still decode.
+        let legacy = r#"{"ok": true, "agents": ["1"]}"#;
+        let old: AttachResponse = serde_json::from_str(legacy)
+            .expect("an older daemon's reply must decode via #[serde(default)]");
+        assert!(old.schedule_revision.is_none());
+        assert_eq!(old.agents.as_deref(), Some(&["1".to_string()][..]));
+
+        // And a newer daemon's key must not disturb the rest of the reply.
+        let newer = r#"{"ok": true, "agents": ["1"], "schedule_revision": 7}"#;
+        let forward: AttachResponse =
+            serde_json::from_str(newer).expect("a newer daemon's reply must decode");
+        assert_eq!(forward.schedule_revision, Some(7));
+        assert!(forward.ok);
     }
 
     /// Scenario: A newer daemon advertises an `AgentRecord` whose `live.status`
