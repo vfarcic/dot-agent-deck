@@ -1653,6 +1653,9 @@ fn dispatch_return_006_real_single_agent_reports_to_the_dispatcher() {
     // This is one user-visible predicate over the dispatcher's current grid.
     // `search_key` makes the completion and its two security frames
     // wrap-insensitive while the raw-grid check retains the `dispatch:` prefix.
+    // The seed contains literal examples of all three strings, so frame lookup
+    // starts at the latest completion and searches for an opening only before
+    // its close (whose normalized text contains the normalized opening).
     // The full sentinel was absent from every prompt, so seeing it inside the
     // worker-report frame also proves the real unit inspected the checkout.
     const RETURN_WAIT: Duration = Duration::from_secs(240);
@@ -1670,10 +1673,14 @@ fn dispatch_return_006_real_single_agent_reports_to_the_dispatcher() {
                 && key.contains(&completion_stem)
                 && key.contains(&unit_frame)
                 && key
-                    .find(&report_open)
-                    .and_then(|start| {
-                        let report = &key[start + report_open.len()..];
-                        report.find(&report_close).map(|end| &report[..end])
+                    .rfind(&completion_stem)
+                    .and_then(|completion| {
+                        let completion = &key[completion + completion_stem.len()..];
+                        completion.find(&report_close).and_then(|end| {
+                            completion[..end]
+                                .rfind(&report_open)
+                                .map(|start| &completion[start + report_open.len()..end])
+                        })
                     })
                     .is_some_and(|report| report.contains(SENTINEL))
         }),
