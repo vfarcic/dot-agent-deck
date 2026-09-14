@@ -611,12 +611,28 @@ pub async fn handle_dispatch(
             if let Some(caller) = ctx.caller.clone() {
                 tracing::debug!(
                     unit_pane_id = %handle.delivery_pane_id,
+                    unit_agent_id = %handle.delivery_agent_id,
                     caller_pane_id = %caller.pane_id,
-                    unit = %caller.unit_name,
+                    // PRD #220 Phase 2 review (finding A4), missed here and caught
+                    // by PR #1081's review (Greptile finding 3): the unit name is
+                    // producer-supplied and rode into this field raw, where a bare
+                    // LF forges a log line, a CR overwrites the one being written
+                    // and a bidi override reorders whatever renders it.
+                    unit = %crate::config_validation::escape_field_for_log(
+                        &caller.unit_name,
+                        crate::config_validation::MAX_QUOTED_VALUE_CHARS,
+                    ),
                     "dispatch: retained the caller for this unit's completion report"
                 );
-                ctx.registry
-                    .register_dispatch_return(&handle.delivery_pane_id, caller);
+                // Bound to the unit's AGENT as well as its pane: a pane id is a
+                // recycled handle, and a predecessor's late EOF would otherwise
+                // evict this route out from under the agent that now holds the
+                // pane (PR #1081 review, Greptile finding 1).
+                ctx.registry.register_dispatch_return(
+                    &handle.delivery_pane_id,
+                    &handle.delivery_agent_id,
+                    caller,
+                );
             }
             DispatchResult {
                 worktree_dir: paths.worktree_dir.clone(),

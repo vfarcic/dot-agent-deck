@@ -58,34 +58,69 @@ pub struct DispatchCaller {
 /// **That is the set of transitions covered, not a claim that nothing can
 /// linger** (PRD #220 Phase 2 review, finding A5 — the earlier wording said "all
 /// three ways an entry can stop being deliverable", which was wider than the code
-/// has ever guaranteed). One residual is known and accepted: a caller AGENT
-/// replaced on a still-open pane — a respawn — leaves an entry whose recipient
-/// can no longer be written to, since delivery is identity-gated against the
-/// agent id captured at dispatch time. It is not leaked, only deferred: it goes
-/// when the unit completes (delivery is attempted, refused, and the entry
-/// evicted regardless) or when either pane finally closes or exits. The cost is
-/// one map entry held until then, and the report itself is lost either way,
-/// because the agent that asked for it is gone.
+/// has ever guaranteed). Two residuals are known and accepted, one per side of an
+/// entry. On the CALLER side: an agent replaced on a still-open pane — a respawn
+/// — leaves an entry whose recipient can no longer be written to, since delivery
+/// is identity-gated against the agent id captured at dispatch time. It is not
+/// leaked, only deferred: it goes when the unit completes (delivery is attempted,
+/// refused, and the entry evicted regardless) or when either pane finally closes
+/// or exits. The cost is one map entry held until then, and the report itself is
+/// lost either way, because the agent that asked for it is gone. The UNIT side's
+/// mirror image, and why it is the cheap direction to fail in, is on
+/// [`Self::evict_exited`].
 #[derive(Debug, Default)]
 pub struct DispatchReturns {
-    by_unit_pane: HashMap<String, DispatchCaller>,
+    by_unit_pane: HashMap<String, RetainedReturn>,
+}
+
+/// One retained route: the dispatched unit that owes a report, and the caller it
+/// owes it to.
+///
+/// The unit half exists so the EOF sweep can tell a dispatched unit's own exit
+/// from the exit of whatever ELSE has held its pane id (PR #1081 review, Greptile
+/// finding 1) — see [`DispatchReturns::evict_exited`], which is the only thing
+/// that reads it. Delivery does not: a terminal `work-done` carries a pane id and
+/// no agent identity, so [`DispatchReturns::take`] stays keyed by pane alone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetainedReturn {
+    /// The registry agent id occupying the unit's TERMINAL pane when the dispatch
+    /// spawned it — `SpawnHandle::delivery_agent_id`, read from the same handle as
+    /// `delivery_pane_id` so the two are a consistent pair rather than two lookups
+    /// that could straddle a hand-over (the reasoning issue #617 finding 3 already
+    /// applied to the caller half).
+    pub unit_agent_id: String,
+    /// Who its completion report goes to.
+    pub caller: DispatchCaller,
 }
 
 impl DispatchReturns {
     /// Retain `caller` as the recipient for the unit whose terminal pane is
-    /// `unit_pane_id`. Returns the entry it displaced, if any — a pane id is a
-    /// recycled handle, so a stale entry for a pane being re-used is replaced
-    /// rather than kept beside the live one.
+    /// `unit_pane_id` and whose registry agent id is `unit_agent_id`. Returns the
+    /// entry it displaced, if any — a pane id is a recycled handle, so a stale
+    /// entry for a pane being re-used is replaced rather than kept beside the live
+    /// one.
+    ///
+    /// Both halves of the unit's identity are retained, not just its pane: the
+    /// agent id is what lets [`Self::evict_exited`] refuse a dead predecessor's
+    /// late EOF over a live successor's route (PR #1081 review, Greptile finding
+    /// 1).
     pub fn register(
         &mut self,
         unit_pane_id: &str,
+        unit_agent_id: &str,
         caller: DispatchCaller,
-    ) -> Option<DispatchCaller> {
-        self.by_unit_pane.insert(unit_pane_id.to_string(), caller)
+    ) -> Option<RetainedReturn> {
+        self.by_unit_pane.insert(
+            unit_pane_id.to_string(),
+            RetainedReturn {
+                unit_agent_id: unit_agent_id.to_string(),
+                caller,
+            },
+        )
     }
 
-    /// Who the unit at `unit_pane_id` owes a report to, without consuming it.
-    pub fn resolve(&self, unit_pane_id: &str) -> Option<&DispatchCaller> {
+    /// The route the unit at `unit_pane_id` still owes, without consuming it.
+    pub fn resolve(&self, unit_pane_id: &str) -> Option<&RetainedReturn> {
         self.by_unit_pane.get(unit_pane_id)
     }
 
@@ -102,7 +137,7 @@ impl DispatchReturns {
     /// action does not, and it is the action this eviction depends on. A refusal
     /// is not retried because a retry could only re-target whoever now occupies
     /// the caller's pane.
-    pub fn take(&mut self, unit_pane_id: &str) -> Option<DispatchCaller> {
+    pub fn take(&mut self, unit_pane_id: &str) -> Option<RetainedReturn> {
         self.by_unit_pane.remove(unit_pane_id)
     }
 
@@ -116,7 +151,7 @@ impl DispatchReturns {
     pub fn evict_pane(&mut self, pane_id: &str) -> usize {
         let before = self.by_unit_pane.len();
         self.by_unit_pane
-            .retain(|unit_pane, caller| unit_pane != pane_id && caller.pane_id != pane_id);
+            .retain(|unit_pane, entry| unit_pane != pane_id && entry.caller.pane_id != pane_id);
         before - self.by_unit_pane.len()
     }
 
@@ -130,25 +165,48 @@ impl DispatchReturns {
     /// delegation and silence-watch records for precisely this reason; the return
     /// edge shipped without joining them.
     ///
-    /// **The CALLER side is identity-gated; the UNIT side is not**, which is
-    /// the one difference from [`Self::evict_pane`]. `pump_reader` sets `exited`
+    /// **BOTH sides are identity-gated**, which is the one difference from
+    /// [`Self::evict_pane`]: a deliberate close is a fact about a PANE, while an
+    /// EOF is a fact about the AGENT that reached it. `pump_reader` sets `exited`
     /// before it sweeps, and `spawn_agent` lets a new agent onto a `pane_id` whose
     /// previous occupant is `exited`, so a dead predecessor's late EOF can name a
-    /// pane a LIVE successor now holds. On the caller side the retained
-    /// `agent_id` settles it exactly: only the agent that actually dispatched is
-    /// matched, so a successor's own outstanding units survive its predecessor's
-    /// EOF. On the unit side there is no agent id to compare — the map is keyed by
-    /// pane alone — and adding one is not worth the public shape change, because
-    /// the two outcomes are not symmetric: a wrong unit-side eviction loses a
-    /// report, while a missed one leaks an entry. This mirrors the asymmetry
-    /// `AgentPtyRegistry::drain_silence_watches_touching_for_exit` already accepts
-    /// on its orchestrator arm, and for the same reason — the residual is a lost
-    /// safety net, never a misdelivery, since delivery is identity-gated anyway.
+    /// pane a LIVE successor now holds — as the caller of an outstanding dispatch,
+    /// or as the dispatched unit of one. The retained ids settle both: only the
+    /// agent that actually dispatched, and only the agent that was actually
+    /// dispatched to, release an entry by exiting.
+    ///
+    /// **The unit side was pane-only when this shipped, and that was wrong** (PR
+    /// #1081 review, Greptile finding 1). The argument for it was that the two
+    /// outcomes are not symmetric — a wrong eviction loses a report, a missed one
+    /// leaks an entry — and that a unit agent id was not worth the public shape
+    /// change while [`DispatchCaller`]'s construction sites were still in flight.
+    /// The asymmetry is real and still decides the residual below, but it argued
+    /// the opposite way from how it was applied: pane-only matching is what
+    /// PRODUCED the wrong eviction, because a second dispatch onto a recycled unit
+    /// pane registers the successor's route and the predecessor's late EOF then
+    /// removed it. The successor's own terminal `work-done` found no retained
+    /// caller and its report was dropped with nothing said — the worst shape a
+    /// defect in this return edge can take, since the whole point of the edge is
+    /// that a completion stops being something nobody hears about.
+    ///
+    /// The residual left is the cheap direction: an entry whose `unit_agent_id`
+    /// will never be seen exiting lingers until the unit completes or either pane
+    /// closes. Bounded memory, cleaned up by [`Self::evict_pane`] and by daemon
+    /// death. It does not widen who can be WRITTEN to — delivery is identity-gated
+    /// against the caller — but it does leave the entry answerable by whoever
+    /// holds the unit pane at completion, which is the pre-existing hook-socket
+    /// provenance question tracked as issue #1077 rather than anything this
+    /// eviction decides.
+    ///
+    /// An in-place respawn does not reach here at all: `respawn_agent_for_pane`
+    /// removes the registry record before starting the replacement, so
+    /// `pump_reader`'s `is_agent_still_registered` gate is already `false` when the
+    /// predecessor's EOF lands.
     pub fn evict_exited(&mut self, pane_id: &str, exited_agent_id: &str) -> usize {
         let before = self.by_unit_pane.len();
-        self.by_unit_pane.retain(|unit_pane, caller| {
-            unit_pane != pane_id
-                && !(caller.pane_id == pane_id && caller.agent_id == exited_agent_id)
+        self.by_unit_pane.retain(|unit_pane, entry| {
+            !(unit_pane == pane_id && entry.unit_agent_id == exited_agent_id)
+                && !(entry.caller.pane_id == pane_id && entry.caller.agent_id == exited_agent_id)
         });
         before - self.by_unit_pane.len()
     }
@@ -266,19 +324,30 @@ mod tests {
         let mut returns = DispatchReturns::default();
         assert!(returns.is_empty());
         assert_eq!(
-            returns.register("unit-pane", caller("caller-pane", "agent-7", "probe")),
+            returns.register(
+                "unit-pane",
+                "unit-agent",
+                caller("caller-pane", "agent-7", "probe")
+            ),
             None,
             "the first registration displaces nothing"
         );
         assert_eq!(
-            returns.resolve("unit-pane"),
+            returns.resolve("unit-pane").map(|entry| &entry.caller),
             Some(&caller("caller-pane", "agent-7", "probe")),
             "the unit's terminal pane must resolve to the pane that dispatched it"
         );
-        assert_eq!(returns.len(), 1);
         assert_eq!(
-            returns.resolve("some-other-pane"),
-            None,
+            returns
+                .resolve("unit-pane")
+                .map(|entry| entry.unit_agent_id.as_str()),
+            Some("unit-agent"),
+            "the unit's own identity is retained beside its pane, or a successor on that \
+             pane cannot be told from its predecessor"
+        );
+        assert_eq!(returns.len(), 1);
+        assert!(
+            returns.resolve("some-other-pane").is_none(),
             "a pane nobody dispatched owes nobody a report"
         );
     }
@@ -286,14 +355,18 @@ mod tests {
     #[test]
     fn delivering_the_report_evicts_the_entry_so_it_cannot_be_delivered_twice() {
         let mut returns = DispatchReturns::default();
-        returns.register("unit-pane", caller("caller-pane", "agent-7", "probe"));
+        returns.register(
+            "unit-pane",
+            "unit-agent",
+            caller("caller-pane", "agent-7", "probe"),
+        );
 
         assert_eq!(
-            returns.take("unit-pane"),
+            returns.take("unit-pane").map(|entry| entry.caller),
             Some(caller("caller-pane", "agent-7", "probe"))
         );
         assert_eq!(
-            returns.take("unit-pane"),
+            returns.take("unit-pane").map(|entry| entry.caller),
             None,
             "a second terminal work-done from the same pane must resolve to nothing; \
              the report is delivered once and the refusal policy is terminal"
@@ -304,8 +377,16 @@ mod tests {
     #[test]
     fn the_units_own_pane_closing_evicts_the_entry() {
         let mut returns = DispatchReturns::default();
-        returns.register("unit-pane", caller("caller-pane", "agent-7", "probe"));
-        returns.register("other-unit", caller("caller-pane", "agent-7", "second"));
+        returns.register(
+            "unit-pane",
+            "unit-agent",
+            caller("caller-pane", "agent-7", "probe"),
+        );
+        returns.register(
+            "other-unit",
+            "other-unit-agent",
+            caller("caller-pane", "agent-7", "second"),
+        );
 
         assert_eq!(returns.evict_pane("unit-pane"), 1);
         assert_eq!(
@@ -322,9 +403,21 @@ mod tests {
     #[test]
     fn the_callers_pane_going_away_evicts_every_unit_it_dispatched() {
         let mut returns = DispatchReturns::default();
-        returns.register("unit-a", caller("caller-pane", "agent-7", "a"));
-        returns.register("unit-b", caller("caller-pane", "agent-7", "b"));
-        returns.register("unit-c", caller("other-caller", "agent-9", "c"));
+        returns.register(
+            "unit-a",
+            "unit-a-agent",
+            caller("caller-pane", "agent-7", "a"),
+        );
+        returns.register(
+            "unit-b",
+            "unit-b-agent",
+            caller("caller-pane", "agent-7", "b"),
+        );
+        returns.register(
+            "unit-c",
+            "unit-c-agent",
+            caller("other-caller", "agent-9", "c"),
+        );
 
         assert_eq!(
             returns.evict_pane("caller-pane"),
@@ -347,17 +440,27 @@ mod tests {
     #[test]
     fn re_registering_a_recycled_unit_pane_replaces_the_stale_caller() {
         let mut returns = DispatchReturns::default();
-        returns.register("unit-pane", caller("caller-a", "agent-1", "first"));
+        returns.register(
+            "unit-pane",
+            "unit-agent-1",
+            caller("caller-a", "agent-1", "first"),
+        );
 
-        let displaced = returns.register("unit-pane", caller("caller-b", "agent-2", "second"));
+        let displaced = returns.register(
+            "unit-pane",
+            "unit-agent-2",
+            caller("caller-b", "agent-2", "second"),
+        );
         assert_eq!(
-            displaced,
+            displaced.map(|entry| entry.caller),
             Some(caller("caller-a", "agent-1", "first")),
             "the displaced entry is reported so the daemon can log the recycle"
         );
         assert_eq!(returns.len(), 1);
         assert_eq!(
-            returns.resolve("unit-pane").map(|c| c.pane_id.as_str()),
+            returns
+                .resolve("unit-pane")
+                .map(|entry| entry.caller.pane_id.as_str()),
             Some("caller-b"),
             "a pane id is a recycled handle; the newest dispatch owns it"
         );
@@ -370,8 +473,16 @@ mod tests {
     #[test]
     fn a_unit_whose_process_exits_stops_owing_a_report() {
         let mut returns = DispatchReturns::default();
-        returns.register("unit-pane", caller("caller-pane", "agent-7", "probe"));
-        returns.register("other-unit", caller("caller-pane", "agent-7", "second"));
+        returns.register(
+            "unit-pane",
+            "the-units-own-agent",
+            caller("caller-pane", "agent-7", "probe"),
+        );
+        returns.register(
+            "other-unit",
+            "the-other-units-agent",
+            caller("caller-pane", "agent-7", "second"),
+        );
 
         assert_eq!(
             returns.evict_exited("unit-pane", "the-units-own-agent"),
@@ -390,9 +501,21 @@ mod tests {
     #[test]
     fn a_caller_whose_process_exits_releases_every_unit_it_dispatched() {
         let mut returns = DispatchReturns::default();
-        returns.register("unit-a", caller("caller-pane", "agent-7", "a"));
-        returns.register("unit-b", caller("caller-pane", "agent-7", "b"));
-        returns.register("unit-c", caller("other-caller", "agent-9", "c"));
+        returns.register(
+            "unit-a",
+            "unit-a-agent",
+            caller("caller-pane", "agent-7", "a"),
+        );
+        returns.register(
+            "unit-b",
+            "unit-b-agent",
+            caller("caller-pane", "agent-7", "b"),
+        );
+        returns.register(
+            "unit-c",
+            "unit-c-agent",
+            caller("other-caller", "agent-9", "c"),
+        );
 
         assert_eq!(returns.evict_exited("caller-pane", "agent-7"), 2);
         assert!(returns.resolve("unit-a").is_none());
@@ -418,6 +541,7 @@ mod tests {
         let mut returns = DispatchReturns::default();
         returns.register(
             "unit-pane",
+            "unit-agent",
             caller("caller-pane", "successor-agent", "live"),
         );
 
@@ -428,7 +552,9 @@ mod tests {
              belongs to the pane's current occupant and must stand"
         );
         assert_eq!(
-            returns.resolve("unit-pane").map(|c| c.agent_id.as_str()),
+            returns
+                .resolve("unit-pane")
+                .map(|entry| entry.caller.agent_id.as_str()),
             Some("successor-agent")
         );
         assert_eq!(
@@ -436,6 +562,47 @@ mod tests {
             1,
             "the agent that actually dispatched it exiting DOES release the entry"
         );
+    }
+
+    /// The UNIT-side sibling of the test above, and the defect PR #1081's review
+    /// found in the gap between them (Greptile finding 1): the same late-EOF race
+    /// runs on the unit's pane, where a second dispatch onto a recycled pane id
+    /// registers the successor's route and the predecessor's EOF used to remove
+    /// it. That loss is invisible — the successor's terminal `work-done` finds no
+    /// retained caller and its completion report is dropped with nothing said.
+    #[test]
+    fn a_dead_predecessors_exit_cannot_evict_its_successors_return_route() {
+        let mut returns = DispatchReturns::default();
+        returns.register(
+            "unit-pane",
+            "successor-unit-agent",
+            caller("caller-pane", "caller-agent", "live-unit"),
+        );
+
+        assert_eq!(
+            returns.evict_exited("unit-pane", "predecessor-unit-agent"),
+            0,
+            "the agent that exited is not the unit this route was retained for, so a              pane id it merely used to hold must not cancel the live successor"
+        );
+        assert_eq!(
+            returns
+                .take("unit-pane")
+                .map(|entry| entry.caller.unit_name),
+            Some("live-unit".to_string()),
+            "the successor's own completion must still find the caller that dispatched              it, or its report is lost with nothing said"
+        );
+
+        returns.register(
+            "unit-pane",
+            "successor-unit-agent",
+            caller("caller-pane", "caller-agent", "live-unit"),
+        );
+        assert_eq!(
+            returns.evict_exited("unit-pane", "successor-unit-agent"),
+            1,
+            "the unit that was actually dispatched exiting DOES release the entry —              the finding A3 sweep this gate must not disable"
+        );
+        assert!(returns.is_empty());
     }
 
     #[test]

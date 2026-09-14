@@ -4164,21 +4164,34 @@ impl AgentPtyRegistry {
     /// closing it would mean registering a pane id before it is minted, and the
     /// window is the few microseconds between `spawn` returning and this call
     /// against a unit that has yet to read its prompt.
+    ///
+    /// `unit_agent_id` is `SpawnHandle::delivery_agent_id`, read from the same
+    /// handle as the pane id: the EOF sweep matches it before releasing an entry,
+    /// so a dead predecessor cannot evict a live successor's route (PR #1081
+    /// review, Greptile finding 1).
     pub fn register_dispatch_return(
         &self,
         unit_pane_id: &str,
+        unit_agent_id: &str,
         caller: crate::dispatch_return::DispatchCaller,
     ) {
-        let displaced = self
-            .dispatch_returns
-            .lock()
-            .unwrap()
-            .register(unit_pane_id, caller);
+        let displaced =
+            self.dispatch_returns
+                .lock()
+                .unwrap()
+                .register(unit_pane_id, unit_agent_id, caller);
         if let Some(stale) = displaced {
             tracing::debug!(
                 unit_pane_id = %unit_pane_id,
-                stale_caller_pane_id = %stale.pane_id,
-                stale_unit = %stale.unit_name,
+                stale_caller_pane_id = %stale.caller.pane_id,
+                // Producer-supplied: the name the caller typed after `dispatch`
+                // reaches this field raw, and a raw LF forges a whole log line
+                // (PR #1081 review, Greptile finding 3 — the same treatment
+                // `return_dispatch_completion` already applies).
+                stale_unit = %crate::config_validation::escape_field_for_log(
+                    &stale.caller.unit_name,
+                    crate::config_validation::MAX_QUOTED_VALUE_CHARS,
+                ),
                 "dispatch return: a recycled unit pane displaced an undelivered entry"
             );
         }
@@ -4192,7 +4205,14 @@ impl AgentPtyRegistry {
         &self,
         unit_pane_id: &str,
     ) -> Option<crate::dispatch_return::DispatchCaller> {
-        self.dispatch_returns.lock().unwrap().take(unit_pane_id)
+        // The unit half of the retained route is the EOF sweep's business only —
+        // a terminal `work-done` carries no agent identity to check it against —
+        // so the delivery path is handed the caller and nothing else.
+        self.dispatch_returns
+            .lock()
+            .unwrap()
+            .take(unit_pane_id)
+            .map(|entry| entry.caller)
     }
 
     /// How many dispatched units still owe a report. Observability and tests.
@@ -4213,7 +4233,9 @@ impl AgentPtyRegistry {
     /// admits is the case that had no eviction at all: a process that died on its
     /// own while the registry still believed it was running.
     ///
-    /// Identity gating is asymmetric between the two sides of an entry; see
+    /// Both sides of an entry are identity-gated — the caller that dispatched and
+    /// the unit that was dispatched — so a pane id this agent merely used to hold
+    /// releases nothing; see
     /// [`crate::dispatch_return::DispatchReturns::evict_exited`] for why, and for
     /// what the residual is.
     fn sweep_dispatch_returns_on_exit(&self, pane_id: &str, exited_agent_id: &str) {
@@ -12606,9 +12628,9 @@ mod spawn_tests {
             agent_id: "agent-7".to_string(),
             unit_name: unit.to_string(),
         };
-        reg.register_dispatch_return("unit-pane-a", caller("caller-1", "a"));
-        reg.register_dispatch_return("unit-pane-b", caller("caller-1", "b"));
-        reg.register_dispatch_return("unit-pane-c", caller("caller-2", "c"));
+        reg.register_dispatch_return("unit-pane-a", "unit-agent-a", caller("caller-1", "a"));
+        reg.register_dispatch_return("unit-pane-b", "unit-agent-b", caller("caller-1", "b"));
+        reg.register_dispatch_return("unit-pane-c", "unit-agent-c", caller("caller-2", "c"));
         assert_eq!(reg.outstanding_dispatch_returns(), 3);
 
         // The dispatched unit's own tab closing: nothing will ever complete there.
@@ -12647,8 +12669,8 @@ mod spawn_tests {
     /// did not: `pump_reader`'s EOF branch swept delegations and silence watches
     /// and walked straight past this map, so a dispatched unit that exited without
     /// signalling `work-done --done` left its entry resident for the daemon's
-    /// lifetime. The pure-data rules — including why the caller side is
-    /// identity-gated and the unit side cannot be — live in
+    /// lifetime. The pure-data rules — including why BOTH sides are identity-gated
+    /// (PR #1081 review, Greptile finding 1) — live in
     /// [`crate::dispatch_return`].
     #[test]
     fn the_eof_sweep_evicts_dispatch_returns_for_a_pane_that_exited() {
@@ -12658,13 +12680,35 @@ mod spawn_tests {
             agent_id: agent.to_string(),
             unit_name: unit.to_string(),
         };
-        reg.register_dispatch_return("unit-pane-a", caller("caller-1", "agent-7", "a"));
-        reg.register_dispatch_return("unit-pane-b", caller("caller-1", "agent-7", "b"));
-        reg.register_dispatch_return("unit-pane-c", caller("caller-2", "agent-9", "c"));
+        reg.register_dispatch_return(
+            "unit-pane-a",
+            "unit-agent-a",
+            caller("caller-1", "agent-7", "a"),
+        );
+        reg.register_dispatch_return(
+            "unit-pane-b",
+            "unit-agent-b",
+            caller("caller-1", "agent-7", "b"),
+        );
+        reg.register_dispatch_return(
+            "unit-pane-c",
+            "unit-agent-c",
+            caller("caller-2", "agent-9", "c"),
+        );
         assert_eq!(reg.outstanding_dispatch_returns(), 3);
 
-        // The dispatched unit's own process dying: it will never complete now.
+        // A DIFFERENT agent exiting on the dispatched unit's pane changes nothing:
+        // the entry belongs to the unit that was actually dispatched, not to
+        // whoever else has held that recycled pane id.
         reg.sweep_dispatch_returns_on_exit("unit-pane-a", "whatever-agent-ran-there");
+        assert_eq!(
+            reg.outstanding_dispatch_returns(),
+            3,
+            "a predecessor's late EOF must not evict the live unit's return route"
+        );
+
+        // The dispatched unit's own process dying: it will never complete now.
+        reg.sweep_dispatch_returns_on_exit("unit-pane-a", "unit-agent-a");
         assert_eq!(reg.outstanding_dispatch_returns(), 2);
         assert!(
             reg.take_dispatch_return("unit-pane-a").is_none(),

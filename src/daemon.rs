@@ -2536,7 +2536,18 @@ async fn run_hook_loop_with_idle_timeout(
                                 DaemonMessage::Dispatch(signal) => {
                                     info!(
                                         pane_id = %signal.pane_id,
-                                        name = %signal.name,
+                                        // The name arrives raw off the hook socket
+                                        // — nothing between the producer and this
+                                        // line rejects a control or bidi character
+                                        // (`sanitize_name` runs later, and only on
+                                        // the copy that becomes a path). PR #1081
+                                        // review, Greptile finding 3: this is the
+                                        // SOURCE of the two fields that finding
+                                        // named, so it is escaped here too.
+                                        name = %crate::config_validation::escape_field_for_log(
+                                            &signal.name,
+                                            crate::config_validation::MAX_QUOTED_VALUE_CHARS,
+                                        ),
                                         "Received dispatch signal"
                                     );
                                     use crate::dispatch::{self, DispatchContext};

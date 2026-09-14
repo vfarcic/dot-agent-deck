@@ -745,6 +745,7 @@ struct DispatchReturnHarness {
     registry: std::sync::Arc<AgentPtyRegistry>,
     state: AppState,
     caller_agent_id: String,
+    unit_agent_id: String,
 }
 
 impl DispatchReturnHarness {
@@ -775,6 +776,7 @@ impl DispatchReturnHarness {
             registry,
             state: AppState::default(),
             caller_agent_id,
+            unit_agent_id,
         }
     }
 
@@ -785,6 +787,7 @@ impl DispatchReturnHarness {
     fn register(&self, caller_pane: &str, unit_pane: &str, unit_name: &str) {
         self.registry.register_dispatch_return(
             unit_pane,
+            &self.unit_agent_id,
             DispatchCaller {
                 pane_id: caller_pane.to_string(),
                 agent_id: self.caller_agent_id.clone(),

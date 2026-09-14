@@ -188,6 +188,16 @@ pub struct SpawnHandle {
     /// single agent pane, or the orchestrator role pane for an orchestration.
     /// PRD #127 M2.2 reuse re-delivers subsequent fires into this pane.
     pub delivery_pane_id: String,
+    /// The registry agent id occupying [`Self::delivery_pane_id`] — the identity
+    /// the prompt delivery was already gated on, surfaced so a caller can bind to
+    /// the agent rather than to a pane id that will be recycled.
+    ///
+    /// Carried as a field beside the pane id rather than re-derived from
+    /// [`Self::agents`] because the two must be a CONSISTENT pair: both are read
+    /// from the same `SpawnedAgent` here, at the moment the spawn returns, which
+    /// is what the dispatch return edge's eviction gate depends on (PR #1081
+    /// review, Greptile finding 1).
+    pub delivery_agent_id: String,
     /// PRD #120 cleanup seam. `None` until a caller registers one via
     /// [`SpawnHandle::on_tab_closed`].
     pub on_tab_closed: Option<TabClosedCallback>,
@@ -530,7 +540,13 @@ pub async fn spawn(
                 .and_then(|chosen| chosen.diagnostic())
             {
                 tracing::warn!(
-                    task = %req.task_name,
+                    // `task_name` is `dispatch-<name>` on the dispatch path, so it
+                    // carries a producer-supplied name into a tracing field — the
+                    // class PR #1081 review (Greptile finding 3) swept for.
+                    task = %crate::config_validation::escape_field_for_log(
+                        &req.task_name,
+                        crate::config_validation::MAX_QUOTED_VALUE_CHARS,
+                    ),
                     dir = %dir.display(),
                     "{note}"
                 );
@@ -623,11 +639,12 @@ pub async fn spawn(
                 task_name: req.task_name,
                 kind: SpawnKind::SingleAgent,
                 agents: vec![SpawnedAgent {
-                    id,
+                    id: id.clone(),
                     pane_id: pane_id.clone(),
                     role_name: None,
                 }],
                 delivery_pane_id: pane_id,
+                delivery_agent_id: id,
                 on_tab_closed: None,
             })
         }
@@ -920,7 +937,7 @@ pub async fn spawn(
             run_delivery(
                 registry,
                 delivery_pane_id.clone(),
-                delivery_agent_id,
+                delivery_agent_id.clone(),
                 event_rx,
                 prompt,
                 detach_delivery,
@@ -931,6 +948,7 @@ pub async fn spawn(
                 kind: SpawnKind::Orchestration { name },
                 agents,
                 delivery_pane_id,
+                delivery_agent_id,
                 on_tab_closed: None,
             })
         }
