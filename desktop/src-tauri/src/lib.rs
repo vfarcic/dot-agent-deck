@@ -9,6 +9,7 @@ mod endpoint_test;
 #[cfg(test)]
 mod endpoint_field_parity;
 mod endpoint_tunnels;
+mod generation;
 mod settings;
 mod terminal;
 
@@ -823,9 +824,12 @@ fn ensure_snapshot_watchers(app: &AppHandle, state: &DesktopState) {
 /// The watcher loop for **one** deck.
 fn spawn_deck_watcher(app: &AppHandle, state: &DesktopState, endpoint: Endpoint) {
     let key = endpoint.identity();
-    if !state.start_watcher_once_for(&key) {
+    // PRD #742 M8: the claim's TOKEN, carried to `register_watcher` below so it
+    // can tell this claim from one a later `start_watcher_once_for` made for the
+    // same deck. `None` means somebody else already holds the claim.
+    let Some(claim) = state.start_watcher_once_for(&key) else {
         return;
-    }
+    };
     let app = app.clone();
     // PRD #741 M4(a): the watcher holds its own handle on the link store. It is
     // the loop this milestone exists for — it is the thing that was paying two
@@ -911,7 +915,7 @@ fn spawn_deck_watcher(app: &AppHandle, state: &DesktopState, endpoint: Endpoint)
             tokio::time::sleep(WATCH_RETRY_DELAY).await;
         }
     });
-    state.register_watcher(&key, handle);
+    state.register_watcher(&key, claim, handle);
 }
 
 /// Drain one subscription into a channel until it ends.
@@ -2290,7 +2294,7 @@ mod tests {
         let fleet = fleet_of(&["build-box.example.com", "laptop.example.com"]);
         for endpoint in fleet.observed_endpoints() {
             assert!(
-                state.start_watcher_once_for(&endpoint.identity()),
+                state.start_watcher_once_for(&endpoint.identity()).is_some(),
                 "every observed deck starts unwatched: {endpoint:?}"
             );
         }
@@ -2314,7 +2318,7 @@ mod tests {
             "and the decks that stayed must keep the watchers they had"
         );
         assert!(
-            state.start_watcher_once_for(&departed),
+            state.start_watcher_once_for(&departed).is_some(),
             "a deck that rejoins the fleet needs a watcher started again, which \
              is the half a set difference cannot be read backwards from"
         );
@@ -2431,11 +2435,11 @@ mod tests {
         let local = Endpoint::local().identity();
 
         assert!(
-            state.start_watcher_once_for(&local),
+            state.start_watcher_once_for(&local).is_some(),
             "the first claim starts it"
         );
         assert!(
-            !state.start_watcher_once_for(&local),
+            state.start_watcher_once_for(&local).is_none(),
             "a deck that is already watched must not start a second watcher"
         );
 
@@ -2445,9 +2449,83 @@ mod tests {
             "a deck named by no observed set keeps no watcher"
         );
         assert!(
-            state.start_watcher_once_for(&local),
+            state.start_watcher_once_for(&local).is_some(),
             "a deck whose watcher was ended must be startable again"
         );
+    }
+
+    /// **PRD #742 M8's R2.** Scenario: watcher A claims the local deck's slot,
+    /// and before it can register its handle the deck leaves the observed set
+    /// and rejoins — so watcher B claims a fresh slot for the same deck. A's
+    /// handle then arrives. It must be ABORTED, because A is watching under a
+    /// claim nobody holds any more; and B's must be stored, because B is the
+    /// watcher the registry is now tracking.
+    ///
+    /// Before the claim carried a token, `register_watcher` could only ask "is
+    /// there a claim here". A's handle went into B's slot, B's own registration
+    /// then *replaced* it, and replacing a `JoinHandle` drops it rather than
+    /// aborting it — so A ran untracked and unstoppable for the life of the
+    /// process, double-folding every broadcast for that deck.
+    ///
+    /// **What this proves:** the registry's decision, for the exact ordering the
+    /// reviewer described. Abort is observed rather than assumed — each task
+    /// owns a `oneshot::Sender` it never sends on, so the receiver resolves
+    /// (with a closed-channel error) exactly when the task's future is dropped,
+    /// which for a parked `pending()` means it was aborted. The second half is
+    /// the one that fails if `register_watcher` simply aborted everything: B's
+    /// handle has to still be in the slot for `retain_watchers` to end it.
+    ///
+    /// **What it does not prove:** that the interleaving is reachable from the
+    /// real callers. The reviewer rated that low and could not construct an
+    /// ordering — `spawn_deck_watcher` runs claim, spawn and register with no
+    /// `.await` between the two lock acquisitions. The claim here is that the
+    /// registry is correct if it ever happens, not that it does.
+    #[tokio::test]
+    async fn a_watcher_handle_arriving_for_someone_elses_claim_is_aborted() {
+        use dot_agent_deck::daemon_client::Endpoint;
+
+        let state = DesktopState::default();
+        let deck = Endpoint::local().identity();
+
+        let a = state
+            .start_watcher_once_for(&deck)
+            .expect("watcher A claims the slot");
+        // The deck leaves the observed set and rejoins, all before A registers.
+        state.retain_watchers(&std::collections::HashSet::new());
+        let b = state
+            .start_watcher_once_for(&deck)
+            .expect("watcher B claims the slot the deck's return re-created");
+        assert_ne!(a, b, "a re-claim must not mint the token it replaced");
+
+        // A task that never finishes on its own, and whose `Sender` is therefore
+        // dropped only when the task's future is dropped — i.e. when it is
+        // aborted.
+        let parked = |tx: tokio::sync::oneshot::Sender<()>| {
+            tauri::async_runtime::spawn(async move {
+                let _tx = tx;
+                std::future::pending::<()>().await;
+            })
+        };
+
+        let (tx_a, rx_a) = tokio::sync::oneshot::channel::<()>();
+        state.register_watcher(&deck, a, parked(tx_a));
+        tokio::time::timeout(Duration::from_secs(5), rx_a)
+            .await
+            .expect(
+                "watcher A's handle arrived for a claim that is no longer its own, so it must                  be aborted rather than stored — a dropped JoinHandle leaves the task running                  with nothing able to stop it",
+            )
+            .expect_err("the parked task never sends; the channel closes because it was dropped");
+
+        // And the other half: B's handle went into B's slot, so the registry can
+        // still end it. Without this, a `register_watcher` that aborted every
+        // arrival would pass the assertion above.
+        let (tx_b, rx_b) = tokio::sync::oneshot::channel::<()>();
+        state.register_watcher(&deck, b, parked(tx_b));
+        state.retain_watchers(&std::collections::HashSet::new());
+        tokio::time::timeout(Duration::from_secs(5), rx_b)
+            .await
+            .expect("watcher B's handle must be held by the registry, so retain_watchers ends it")
+            .expect_err("the parked task never sends");
     }
 
     /// A remote deck at `host` whose daemon listens on `socket` over there,

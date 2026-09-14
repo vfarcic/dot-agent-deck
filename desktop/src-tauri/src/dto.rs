@@ -100,8 +100,12 @@ pub struct DesktopConnection {
     /// N-deck case and then stopped at the Rust boundary. This is it crossing.
     ///
     /// Opaque on purpose (`deck-<16 hex>`): it is a key, and `socket_path`
-    /// beside it is what the UI renders. Stable across restarts, because the
-    /// webview keys `localStorage`-backed state on it.
+    /// beside it is what the UI renders. Stable across restarts — not because
+    /// anything keys stored state on it today (PRD #742 M8 checked: every
+    /// `localStorage` key the webview writes is scoped by runtime mode and none
+    /// is per deck), but because this is the identity a per-deck preference
+    /// would be keyed on, and `EndpointIdentity::wire_id`'s *Stability* section
+    /// is where that argument and its two caveats live.
     pub deck_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
@@ -929,45 +933,95 @@ impl Default for SelectedDeck {
     }
 }
 
-/// The applied selection.
+/// The applied selection — the deck in force AND the set the fleet observes, as
+/// **one value under one lock** (PRD #742 M8).
 ///
-/// **A process-global, deliberately, and for the same reason
-/// `SESSION_BUILD_MISMATCH_ALLOWED` is one**: every path that names the deck —
-/// `disconnected_snapshot`, the watcher's refresh, the bootstrap's lazy-spawn
-/// guard — needs the answer, and most of them are not handed `DesktopState`.
-/// Threading it would mean changing every one of those signatures to carry a
-/// value that has exactly one writer.
+/// # A process-global, deliberately
 ///
-/// The writer is [`apply_settings_selection`], called from the app's `setup`
-/// hook (where the settings document is already being read for the zoom level)
-/// and from `desktop_set_settings` after a successful save. Unset reads as the
-/// local deck, which is what every caller did before endpoints existed and what
-/// a test that never loads a document sees.
+/// For the same reason `SESSION_BUILD_MISMATCH_ALLOWED` is one: every path that
+/// names the deck — [`disconnected_snapshot`], the watcher's refresh, the
+/// bootstrap's lazy-spawn guard — needs the answer, and most of them are not
+/// handed `DesktopState`. Threading it would mean changing every one of those
+/// signatures to carry a value that has exactly one writer.
 ///
-/// **PRD #742 M3 narrowed what this answers.** It is still the one deck the
-/// *deck screen* and its terminals talk to (DECISION 1 keeps that single-deck),
-/// but it is no longer the deck a snapshot is stamped with — see
-/// [`deck_path_text`] and [`selection_fields`], which take the endpoint they are
-/// describing. The set of decks the fleet *observes* is [`OBSERVED_DECKS`].
-static SELECTED_DECK: std::sync::RwLock<Option<SelectedDeck>> = std::sync::RwLock::new(None);
+/// # Why the two halves are one struct and not two locks
+///
+/// They were two `RwLock`s written in sequence by [`apply_settings_selection`],
+/// and the comment on the second said the pair "can never describe different
+/// saves" because there is one writer. That is true of **saves** and false of
+/// **reads**: a reader scheduled between the two `write()` calls saw one new
+/// value and one old one. [`observed_fleet`] is the one function that reads both
+/// halves in a single call, so it is where a torn pair could be observed
+/// outright; [`deck_is_observed`] and `ensure_snapshot_watchers` read the
+/// observed set alone and could disagree with a `selected_deck()` taken beside
+/// them by their own caller.
+///
+/// The direction that costs something is `endpoint_test::release_if_not_observed`
+/// reading a pre-save observed set while a just-added deck's watcher already
+/// holds a lease: the probe drops the map's handle, the watcher's own lease keeps
+/// the child alive, and the next `establish()` opens a **second** `ssh` child
+/// beside it — the defect PRD #742 M6's rename fixed, reached through the write
+/// gap rather than through the wrong predicate. Neither the reviewer nor the
+/// auditor who found this could convince themselves it was reachable; the gap is
+/// two adjacent lock acquisitions with no `await` between them. It is closed by
+/// construction anyway, because "two adjacent statements never interleave" is
+/// the kind of invariant that stops being true two refactors later and fails
+/// silently when it does.
+///
+/// # Why the halves are not derived from one another
+///
+/// Under [`crate::settings::Selection::All`] the resolved deck is the local one
+/// and the observed set is the whole fleet, so a caller asking "is this deck one
+/// of ours" cannot get the answer from the selection. Under every other
+/// selection the set is exactly the one element `selected` holds, which is why
+/// this could not be noticed before `All` existed.
+#[derive(Debug, Clone)]
+struct AppliedSelection {
+    selected: SelectedDeck,
+    observed: Vec<Endpoint>,
+}
 
-/// The applied observed set — every deck the fleet is watching (PRD #742 M3).
+impl Default for AppliedSelection {
+    /// Unset reads as the local deck alone — what every caller did before
+    /// endpoints existed, what a test that never loads a document sees, and what
+    /// `DesktopSettings::observed_endpoints()` answers for a document with no
+    /// `[endpoints]` section.
+    fn default() -> Self {
+        Self {
+            selected: SelectedDeck::default(),
+            observed: vec![Endpoint::local()],
+        }
+    }
+}
+
+/// The applied selection. Written by [`apply_settings_selection`] and nobody
+/// else; read through [`applied_selection`] and nobody else.
 ///
-/// **Beside [`SELECTED_DECK`] rather than derived from it, because it is not
-/// derivable from it**: under [`crate::settings::Selection::All`] the resolved
-/// deck is the local one and the observed set is the whole fleet, so a caller
-/// asking "is this deck one of ours" cannot get the answer from the selection.
-/// Under every other selection the set is exactly the one element
-/// `SELECTED_DECK` holds, which is why this could not be noticed before `All`
-/// existed.
+/// The writer is called from the app's `setup` hook (where the settings document
+/// is already being read for the zoom level) and from `desktop_set_settings`
+/// after a successful save.
 ///
-/// Written by the same single writer, from the same document, in the same call —
-/// so the two can never describe different saves.
+/// **PRD #742 M3 narrowed what the `selected` half answers.** It is still the one
+/// deck the *deck screen* and its terminals talk to (DECISION 1 keeps that
+/// single-deck), but it is no longer the deck a snapshot is stamped with — see
+/// [`deck_path_text`] and [`selection_fields`], which take the endpoint they are
+/// describing.
+static APPLIED_SELECTION: std::sync::RwLock<Option<AppliedSelection>> =
+    std::sync::RwLock::new(None);
+
+/// The applied selection, as **one** read.
 ///
-/// Unset reads as the local deck alone, matching both `SELECTED_DECK`'s default
-/// and `DesktopSettings::observed_endpoints()`'s answer for a document with no
-/// `[endpoints]` section.
-static OBSERVED_DECKS: std::sync::RwLock<Option<Vec<Endpoint>>> = std::sync::RwLock::new(None);
+/// Every caller goes through here rather than reaching for a half, which is the
+/// whole of what [`AppliedSelection`] is for: two calls are two reads and can
+/// straddle a write, and a caller that needs both halves to agree — every caller
+/// that needs either — would be back where M8 found it.
+fn applied_selection() -> AppliedSelection {
+    APPLIED_SELECTION
+        .read()
+        .ok()
+        .and_then(|slot| slot.clone())
+        .unwrap_or_default()
+}
 
 /// Apply a settings document's selection. Returns the deck now in force.
 ///
@@ -976,10 +1030,12 @@ static OBSERVED_DECKS: std::sync::RwLock<Option<Vec<Endpoint>>> = std::sync::RwL
 /// writes it.
 ///
 /// PRD #742 M3: this also applies the document's **observed set**. The two are
-/// written together on purpose — a probe that asked one and a watcher that asked
+/// applied together on purpose — a probe that asked one and a watcher that asked
 /// the other could otherwise disagree about whether a deck is in the fleet, and
 /// disagreeing is precisely how a live transport gets released out from under a
 /// watcher holding a lease on it (see `endpoint_test::release_if_not_observed`).
+/// **PRD #742 M8 made "together" mean one write of one value** rather than two
+/// writes a reader could land between; see [`AppliedSelection`].
 pub(crate) fn apply_settings_selection(
     settings: &crate::settings::DesktopSettings,
 ) -> SelectedDeck {
@@ -990,11 +1046,11 @@ pub(crate) fn apply_settings_selection(
             .fallback
             .map(|fallback| safe_display_text(fallback.to_string())),
     };
-    if let Ok(mut slot) = SELECTED_DECK.write() {
-        *slot = Some(deck.clone());
-    }
-    if let Ok(mut slot) = OBSERVED_DECKS.write() {
-        *slot = Some(settings.observed_endpoints());
+    if let Ok(mut slot) = APPLIED_SELECTION.write() {
+        *slot = Some(AppliedSelection {
+            selected: deck.clone(),
+            observed: settings.observed_endpoints(),
+        });
     }
     deck
 }
@@ -1006,11 +1062,7 @@ pub(crate) fn apply_settings_selection(
 /// somewhere to connect to — [`crate::settings::EndpointSettings::observed_endpoints`]
 /// is where that judgement is made and this only stores its answer.
 pub(crate) fn observed_decks() -> Vec<Endpoint> {
-    OBSERVED_DECKS
-        .read()
-        .ok()
-        .and_then(|slot| slot.clone())
-        .unwrap_or_else(|| vec![Endpoint::local()])
+    applied_selection().observed
 }
 
 /// Is `endpoint` one of the decks the fleet observes?
@@ -1023,18 +1075,15 @@ pub(crate) fn observed_decks() -> Vec<Endpoint> {
 /// for a deck nothing is watching.
 pub(crate) fn deck_is_observed(endpoint: &Endpoint) -> bool {
     let key = endpoint.identity();
-    observed_decks()
+    applied_selection()
+        .observed
         .iter()
         .any(|observed| observed.identity() == key)
 }
 
 /// The selected deck, with whatever fallback reason came with it.
 pub(crate) fn selected_deck() -> SelectedDeck {
-    SELECTED_DECK
-        .read()
-        .ok()
-        .and_then(|slot| slot.clone())
-        .unwrap_or_default()
+    applied_selection().selected
 }
 
 /// The deck this app is talking to (PRD #741 M2, selected since M7).
@@ -1104,8 +1153,13 @@ pub(crate) fn deck_wire_id(endpoint: &Endpoint) -> String {
 /// rather than dropped: the app is talking to it either way, so a fleet that
 /// omitted it would render the deck screen's own agents under no group at all.
 pub(crate) fn observed_fleet() -> Vec<String> {
-    let selected = deck_wire_id(&selected_endpoint());
-    let mut fleet: Vec<String> = observed_decks().iter().map(deck_wire_id).collect();
+    // ONE read for both halves (PRD #742 M8). It used to be `selected_endpoint()`
+    // followed by `observed_decks()`, which is two, and a save landing between
+    // them produced a fleet whose head named a deck the list did not contain —
+    // repaired below by the prepend, but repaired rather than prevented.
+    let applied = applied_selection();
+    let selected = deck_wire_id(&applied.selected.endpoint);
+    let mut fleet: Vec<String> = applied.observed.iter().map(deck_wire_id).collect();
     match fleet.iter().position(|id| *id == selected) {
         Some(0) => {}
         Some(at) => {
@@ -2235,5 +2289,119 @@ mod tests {
             validate_workflow_shape(&at_ceiling, "/tmp/project", &roles, 32, 120).is_ok(),
             "a workflow and role name at the daemon's projection ceiling must be launchable"
         );
+    }
+
+    /// A document naming `hosts` and observing all of them.
+    fn observing_all(hosts: &[&str]) -> crate::settings::DesktopSettings {
+        use crate::settings::{
+            DesktopSettings, EndpointId, EndpointSettings, RemoteEndpointSettings, Selection,
+        };
+        use dot_agent_deck::remote_tunnel::{Hostname, RemoteSocketPath};
+
+        let remote = hosts
+            .iter()
+            .enumerate()
+            .map(|(index, host)| {
+                let id = EndpointId::parse(&format!("deck00000000000{index}")).expect("a valid id");
+                let mut row =
+                    RemoteEndpointSettings::new(id, Hostname::parse(host).expect("a valid host"));
+                row.socket = Some(RemoteSocketPath::parse("/run/deck.sock").expect("a path"));
+                row
+            })
+            .collect();
+        DesktopSettings {
+            endpoints: Some(EndpointSettings {
+                remote,
+                selection: Selection::All,
+            }),
+            ..DesktopSettings::default()
+        }
+    }
+
+    /// **PRD #742 M8's F2.** Scenario: the applied selection is rewritten over
+    /// and over between a one-deck document and a three-deck fleet, while three
+    /// readers ask [`observed_fleet`] for the answer. Every answer must be one
+    /// document's fleet or the other's — never a head from one save with a list
+    /// from the next.
+    ///
+    /// The selection used to be two `RwLock`s written in sequence, and the
+    /// comment on the second said they "can never describe different saves"
+    /// because there is one writer. That is true of saves and false of reads:
+    /// a reader scheduled between the two `write()` calls saw one new value and
+    /// one old one. The direction that costs something is
+    /// `endpoint_test::release_if_not_observed` reading a pre-save observed set
+    /// while a just-added deck's watcher already holds a lease — the probe drops
+    /// the map's handle, the watcher's lease keeps the child alive, and the next
+    /// `establish()` opens a **second** `ssh` child.
+    ///
+    /// **What this proves:** that the two halves are one value under one lock,
+    /// and that [`observed_fleet`] takes one read of it — a torn pair here would
+    /// be `build-box` at the head of a three-deck list, or the local deck at the
+    /// head of a one-deck list, and both are rejected below.
+    ///
+    /// **And it reproduces, which neither of the two people who found it
+    /// believed it would.** Both rated the window unreachable-in-practice — two
+    /// adjacent lock acquisitions with no `await` between them — and it was
+    /// reported only because F1's remedy keys on the value. Run against a
+    /// faithful reconstruction of the pre-M8 shape (two statics, two writes,
+    /// `observed_fleet` taking two reads) this test failed **6 times out of 6**,
+    /// each time on exactly the torn pair the finding describes: the one-deck
+    /// document's selected deck at the head of the three-deck document's
+    /// observed list, a four-element fleet naming a save that never existed. A
+    /// user-driven save is far rarer than this writer loop, so the measurement
+    /// bounds nothing about production frequency — what it settles is that the
+    /// window is real rather than theoretical, and that this test would have
+    /// caught it.
+    ///
+    /// **What it does NOT prove:** anything about
+    /// `release_if_not_observed`, the reader whose torn view actually costs an
+    /// `ssh` child. That one needs a live watcher holding a lease, which is an
+    /// integration-level setup; this asserts the property they share.
+    #[test]
+    fn no_reader_assembles_a_fleet_from_two_different_saves() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let _guard = SELECTION_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+
+        let one = selecting_a_remote_deck();
+        let all = observing_all(&["build-box.example.com", "laptop.example.com"]);
+        // The two legal answers, each read while nothing else is writing.
+        apply_settings_selection(&one);
+        let fleet_of_one = observed_fleet();
+        apply_settings_selection(&all);
+        let fleet_of_all = observed_fleet();
+        assert_ne!(
+            fleet_of_one, fleet_of_all,
+            "the two documents must disagree, or this test asserts nothing"
+        );
+        assert_eq!(fleet_of_one.len(), 1);
+        assert_eq!(fleet_of_all.len(), 3);
+
+        static WRITING: AtomicBool = AtomicBool::new(true);
+        WRITING.store(true, Ordering::SeqCst);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                for turn in 0..20_000 {
+                    apply_settings_selection(if turn % 2 == 0 { &one } else { &all });
+                }
+                WRITING.store(false, Ordering::SeqCst);
+            });
+            for _ in 0..3 {
+                scope.spawn(|| {
+                    while WRITING.load(Ordering::SeqCst) {
+                        let fleet = observed_fleet();
+                        assert!(
+                            fleet == fleet_of_one || fleet == fleet_of_all,
+                            "a fleet must describe ONE applied document: {fleet:?} is neither \
+                             {fleet_of_one:?} nor {fleet_of_all:?}"
+                        );
+                    }
+                });
+            }
+        });
+
+        apply_settings_selection(&crate::settings::DesktopSettings::default());
     }
 }

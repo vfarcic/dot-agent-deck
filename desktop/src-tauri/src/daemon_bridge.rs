@@ -255,6 +255,31 @@ pub(crate) const HANDSHAKE_REVALIDATE_INTERVAL: Duration = Duration::from_secs(5
 /// The gate map is a **`std::sync::Mutex`** and is never held across an `await`:
 /// it hands out an `Arc` and is released. That is what keeps `clippy::await_holding_lock`
 /// honest here rather than allowed.
+///
+/// # Publishing — the half the split gave up, put back (PRD #742 M8)
+///
+/// The whole-map lock did a second job nobody replaced: it excluded
+/// [`Self::invalidate_all`] *for the duration of an establishment*. The per-deck
+/// gate does not — `invalidate_all` takes the map lock and nothing else — and a
+/// deck being established has no entry to clear, so an invalidation landing
+/// mid-handshake is followed by the establishment publishing the very link it
+/// meant to forget. [`EndpointTunnels::acquire`] has the same shape and the same
+/// remedy; `crate::generation` is the shared mechanism and carries the
+/// reasoning.
+///
+/// **What the compare covers, stated exactly rather than generally.**
+/// [`Self::trusted`] reads the epoch before establishing and compares it under
+/// the same map lock it inserts under — so against `invalidate_all`, which bumps
+/// under that lock, the two are serialised and the result is exact: either the
+/// insert lands first and the `clear()` removes it, or the bump lands first and
+/// the insert is refused. `EndpointTunnels`' own three teardowns bump under the
+/// *tunnel* map's lock instead, so against those this compare is conservative
+/// rather than atomic. It does not need to be: this map's teardown is
+/// `invalidate_all`, and a link that outlives a tunnel `release` was already the
+/// designed behaviour — [`TrustedDaemon`] holds its own lease exactly so a
+/// classified link cannot describe a deck whose transport has gone. The path F1
+/// is about is covered either way, because `retarget_selection` calls
+/// `invalidate_all` and `EndpointTunnels::retain` in consecutive statements.
 pub(crate) struct DaemonLinks {
     links: AsyncMutex<HashMap<EndpointIdentity, Arc<TrustedDaemon>>>,
     /// One establishment gate per deck — see this type's *Concurrency* section.
@@ -303,6 +328,11 @@ impl DaemonLinks {
     /// this type's *Concurrency* section for what that keeps and what it fixes.
     pub(crate) async fn trusted(&self, endpoint: &Endpoint) -> Result<Arc<TrustedDaemon>, String> {
         let key = endpoint.identity();
+        // PRD #742 M8: read before the gate and before the lookup, so every
+        // teardown that could make this deck unwanted lands inside the window
+        // the publish below compares across. See this type's *Publishing*
+        // section for which of them that compare is exact against.
+        let wanted_at = self.tunnels.generation().current();
         // Held across the establishment below, and it is this deck's alone.
         let gate = self.gate(&key);
         let _establishing = gate.lock().await;
@@ -336,7 +366,17 @@ impl DaemonLinks {
         // `WATCH_RETRY_DELAY`, not at the 150 ms coalesce floor, so they were
         // never what this milestone was about; the connected path is the one
         // running 6.667 times a second and it is held in full.
-        if established.connection.status == ConnectionStatus::Connected {
+        //
+        // PRD #742 M8: and only while the deck is still wanted. `invalidate_all`
+        // and `EndpointTunnels`' three teardowns bump the epoch read on the way
+        // in; a link published behind one of those would hold a `DaemonClient`,
+        // its captured capability set and — through `establish` — a lease on an
+        // `ssh` child, for a deck nothing observes. Returning the link without
+        // holding it is the right fallback: the caller gets its answer and
+        // everything it stands on dies with the request.
+        if established.connection.status == ConnectionStatus::Connected
+            && self.tunnels.generation().current() == wanted_at
+        {
             links.insert(key, Arc::clone(&established));
         }
         Ok(established)
@@ -381,8 +421,26 @@ impl DaemonLinks {
     /// not specific to one deck — the watcher losing its event stream, and the
     /// in-app build-mismatch allowance, whose entire effect is that the
     /// handshake must be classified again.
+    ///
+    /// **It also bumps the live set's epoch** (PRD #742 M8), which is the half a
+    /// `clear()` cannot do: a deck whose establishment is in flight has no entry
+    /// to clear, so without this it would publish its link *after* the
+    /// invalidation that was meant to forget it. The epoch lives on
+    /// [`EndpointTunnels`] and is shared with it — see that type's field comment
+    /// for why one counter serves both maps.
     pub(crate) async fn invalidate_all(&self) {
-        self.links.lock().await.clear();
+        let mut links = self.links.lock().await;
+        self.tunnels.generation().bump();
+        links.clear();
+    }
+
+    /// How many links this map holds. Test-only, like [`Self::handshake_count`]:
+    /// PRD #742 M8 needs to assert that an establishment did NOT publish, and
+    /// "the map is empty" is the direct statement of that, where a second
+    /// `trusted()` re-handshaking is an inference from it.
+    #[cfg(test)]
+    pub(crate) async fn held(&self) -> usize {
+        self.links.lock().await.len()
     }
 
     /// How many handshakes have been performed since this store was created.
@@ -3288,6 +3346,152 @@ mod tests {
         let _ = read_frame(&mut reader).await;
         let _ = accepted.send(());
         let _ = release.await;
+    }
+
+    /// A deck that accepts a handshake, stalls until `release`, and then answers
+    /// it properly.
+    ///
+    /// [`unresponsive_daemon`]'s sibling, and the difference is the whole of
+    /// what PRD #742 M8's F1 needs: that one parks a caller inside `establish()`
+    /// forever, which proves another deck is not queued behind it; this one
+    /// parks a caller and then lets it **succeed**, so the test can act on the
+    /// map while an establishment is in flight and then watch what that
+    /// establishment does with its result.
+    #[cfg(unix)]
+    async fn stalled_then_answering_daemon(
+        listener: tokio::net::UnixListener,
+        accepted: tokio::sync::oneshot::Sender<()>,
+        release: tokio::sync::oneshot::Receiver<()>,
+    ) {
+        use dot_agent_deck::daemon_protocol::{KIND_RESP, read_frame, write_frame};
+        let (stream, _peer) = listener.accept().await.expect("accept one client");
+        let (mut reader, mut writer) = stream.into_split();
+        let _ = read_frame(&mut reader).await;
+        let _ = accepted.send(());
+        let _ = release.await;
+        let encoded = serde_json::to_vec(&matching_hello()).expect("serialize the reply");
+        let _ = write_frame(&mut writer, KIND_RESP, &encoded).await;
+    }
+
+    /// **PRD #742 M8's F1, reached end to end rather than at a seam.**
+    /// Scenario: a refresh is mid-handshake against deck `D` when the user
+    /// changes the selection. `retarget_selection`'s `invalidate_all()` runs
+    /// while `D`'s establishment is parked inside `hello()`; the deck then
+    /// answers, and the establishment comes back with a perfectly good
+    /// `Connected` link. It must hand that link to its caller and **not** put it
+    /// in the map: `D` is a deck nothing observes any more, and a link held for
+    /// it holds a `DaemonClient`, a captured capability set and a lease on an
+    /// `ssh` child until the next settings save.
+    ///
+    /// Before M8 the map's own lock did this — it was held across establishment,
+    /// so `invalidate_all` could not run in the middle. The per-deck gate M3
+    /// replaced it with does not exclude `invalidate_all` at all, and `D` has no
+    /// entry to clear while it is being established, so the clear was a no-op
+    /// and the insert landed behind it.
+    ///
+    /// **What this proves:** the real `trusted()`, against a real socket, with
+    /// the invalidation genuinely interleaved — the deck has taken the request
+    /// frame (`accepted`) and has not answered it (`release` has not fired) when
+    /// `invalidate_all` runs. No sleeps and no timing assumptions: both edges
+    /// are `oneshot` channels the test fires itself.
+    ///
+    /// **What it does not prove:** the same property for
+    /// `EndpointTunnels::acquire`, whose stall would have to be an `ssh` spawn.
+    /// That one is pinned at its publish seam instead —
+    /// `endpoint_tunnels::tests::a_transport_whose_deck_left_mid_establishment_is_not_published`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_link_established_across_an_invalidation_is_not_published() {
+        let (dir, socket) = scratch_socket("m8-strand");
+        let listener = bind_trusted(&socket);
+        let (accepted, accepted_rx) = tokio::sync::oneshot::channel::<()>();
+        let (release, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let daemon = tokio::spawn(stalled_then_answering_daemon(
+            listener, accepted, release_rx,
+        ));
+
+        let links = Arc::new(DaemonLinks::default());
+        let deck = Endpoint::Local(LocalEndpoint::at(&socket));
+        let establishing = {
+            let links = Arc::clone(&links);
+            let deck = deck.clone();
+            tokio::spawn(async move { links.trusted(&deck).await })
+        };
+
+        accepted_rx
+            .await
+            .expect("the deck must have taken the handshake before the selection moves");
+        // The user picked a different deck. This is the whole of what
+        // `retarget_selection` does to this map, and `D` is not in it yet.
+        links.invalidate_all().await;
+        assert_eq!(links.held().await, 0);
+
+        let _ = release.send(());
+        let established = establishing
+            .await
+            .expect("the establishing task must finish")
+            .expect("the deck answered, so the handshake itself succeeds");
+
+        assert_eq!(
+            established.connection().status,
+            ConnectionStatus::Connected,
+            "the caller still gets its answer — refusing the publish is not \
+             refusing the request"
+        );
+        assert_eq!(
+            links.held().await,
+            0,
+            "a link established for a deck invalidated mid-handshake must not be \
+             held: nothing observes that deck, and the link holds a client, a \
+             capability set and a lease on an ssh child"
+        );
+
+        let _ = daemon.await;
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The contrast the test above needs to be worth anything. Scenario: the
+    /// same stalled-then-answering deck, with **no** invalidation while the
+    /// handshake is out. The link must be held, so a second caller reuses it.
+    ///
+    /// Without this, a `trusted()` that never published anything would pass the
+    /// test above.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_link_established_with_nothing_moving_under_it_is_published() {
+        let (dir, socket) = scratch_socket("m8-keep");
+        let listener = bind_trusted(&socket);
+        let (accepted, accepted_rx) = tokio::sync::oneshot::channel::<()>();
+        let (release, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let daemon = tokio::spawn(stalled_then_answering_daemon(
+            listener, accepted, release_rx,
+        ));
+
+        let links = Arc::new(DaemonLinks::default());
+        let deck = Endpoint::Local(LocalEndpoint::at(&socket));
+        let establishing = {
+            let links = Arc::clone(&links);
+            let deck = deck.clone();
+            tokio::spawn(async move { links.trusted(&deck).await })
+        };
+
+        accepted_rx.await.expect("the deck took the handshake");
+        let _ = release.send(());
+        let established = establishing
+            .await
+            .expect("the establishing task must finish")
+            .expect("the deck answered");
+        assert_eq!(established.connection().status, ConnectionStatus::Connected);
+
+        assert_eq!(
+            links.held().await,
+            1,
+            "nothing moved under this establishment, so its link is held"
+        );
+        assert_eq!(links.handshake_count(), 1);
+
+        let _ = daemon.await;
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// **Test-plan item 10, and the risk this PRD is most likely to fail on.**

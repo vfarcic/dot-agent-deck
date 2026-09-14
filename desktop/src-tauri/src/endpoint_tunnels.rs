@@ -78,6 +78,8 @@ use std::sync::{Arc, Mutex};
 use dot_agent_deck::daemon_client::{Endpoint, EndpointIdentity};
 use tokio::sync::Mutex as AsyncMutex;
 
+use crate::generation::Generation;
+
 /// The address every [`EndpointTunnels::insert_stand_in`] lease reports. One
 /// value for every key, because nothing that seam is used to test ever reads
 /// it — a lease that is being *connected through* has to come from `acquire`.
@@ -175,8 +177,15 @@ impl std::fmt::Display for AcquireError {
     }
 }
 
-/// The live transports, keyed by [`Endpoint::describe`] — the same key
+/// The live transports, keyed by [`EndpointIdentity`] — the same key
 /// [`DaemonLinks`] uses, so the two maps can be reasoned about together.
+///
+/// **The key is the identity and not [`Endpoint::describe`]**, which this said
+/// until PRD #742 M8 and which was the wrong thing to say about the one property
+/// per-deck isolation rests on: `describe()` renders neither the remote socket
+/// path, the identity file nor the jump host, so two decks differing only in one
+/// of those share a display string. Keying on it would make them one entry in
+/// this map. The claim went stale at PR #1035, which introduced the newtype.
 ///
 /// [`DaemonLinks`]: crate::daemon_bridge::DaemonLinks
 #[cfg(unix)]
@@ -189,6 +198,26 @@ pub(crate) struct EndpointTunnels {
     /// A `std::sync::Mutex` because it is never held across an `await`: it hands
     /// out an `Arc` and is released, and the gate is what gets awaited.
     gates: std::sync::Mutex<HashMap<EndpointIdentity, Arc<AsyncMutex<()>>>>,
+    /// The live set's epoch — bumped by each of this type's three teardowns
+    /// ([`Self::retain`], [`Self::release`], [`Self::close_all`]), read by both
+    /// this map's publish step and [`DaemonLinks`]' (PRD #742 M8).
+    ///
+    /// [`Self::acquire`]'s own `remove` of a dead lease deliberately does not
+    /// bump: it is a replacement in progress under that deck's gate, not a
+    /// statement that the deck has left, and the caller about to re-publish is
+    /// the one that removed it.
+    ///
+    /// **ONE epoch for BOTH maps, deliberately.** `DaemonLinks` owns this type
+    /// by `Arc` and reads this counter through [`Self::generation`] rather than
+    /// keeping one of its own, because the two maps describe one live set and
+    /// are torn down together — `retarget_selection` calls `invalidate_all` and
+    /// `retain` in consecutive statements, and a probe's `release` drops a
+    /// transport out from under any link that would have used it. Two counters
+    /// would mean each map could only see half of what made its in-flight work
+    /// unwanted.
+    ///
+    /// [`DaemonLinks`]: crate::daemon_bridge::DaemonLinks
+    generation: Generation,
 }
 
 #[cfg(unix)]
@@ -226,6 +255,34 @@ impl EndpointTunnels {
     /// holder, and no clone can be taken concurrently because cloning happens
     /// under this same lock.
     ///
+    /// # Publishing is conditional, because the gate does not exclude teardown
+    ///
+    /// PRD #742 M8. The whole-map lock M3 replaced was doing two jobs: it
+    /// collapsed concurrent first-uses of one deck, and it *blocked
+    /// [`Self::retain`] for the duration of an establishment*. The per-deck gate
+    /// replaced the first and nothing replaced the second — `retain` takes only
+    /// the map lock, and the deck being established has no entry in that map
+    /// yet, so a `retain` landing mid-establishment removes nothing for it and
+    /// the publish below re-creates it afterwards.
+    ///
+    /// That is not an abstract window. A refresh against remote deck `D` is
+    /// inside this call for up to `FORWARD_READY_TIMEOUT` (30 s) while the user
+    /// picks a different deck; `retarget_selection` runs `invalidate_all` and
+    /// `retain({the new set})`, neither of which can see `D`; and this function
+    /// then publishes `D`'s lease into a map nothing will ask about again until
+    /// the next settings save. An `ssh -N -L` child, its stderr thread and a
+    /// forwarded socket, to a host the user believes they have disconnected
+    /// from — bounded and eventually reaped, but *"I removed that deck" stops
+    /// meaning "that ssh session is gone"*.
+    ///
+    /// So the final insert compares the epoch it read on the way in. **Not
+    /// inserting is the correct fallback rather than an error**: the lease is
+    /// still returned, the caller's own `Arc` is then the last one, and the
+    /// child dies with the request instead of outliving it. What it costs is
+    /// one re-establishment if the teardown kept this deck after all —
+    /// `crate::generation` states that trade and why the precise alternative was
+    /// refused.
+    ///
     /// The error is **typed**, and that is a security property rather than
     /// tidiness (PRD #741 final audit **F3**). This used to flatten
     /// `TunnelError` with `to_string()`, and `SshError`'s `detail` by then
@@ -242,6 +299,11 @@ impl EndpointTunnels {
         endpoint: &Endpoint,
     ) -> Result<Arc<TunnelLease>, AcquireError> {
         let key = endpoint.identity();
+        // PRD #742 M8: read before the gate and before the lookup, so every
+        // teardown that could make this deck unwanted lands inside the window
+        // the publish below compares across. See the *Publishing* section above
+        // and `crate::generation`.
+        let wanted_at = self.generation.current();
         // Held across the ssh spawn below, and it is this deck's alone.
         let gate = self.gate(&key);
         let _establishing = gate.lock().await;
@@ -273,8 +335,46 @@ impl EndpointTunnels {
             address: connection.connect_address().to_path_buf(),
             connection: Mutex::new(connection),
         });
-        self.tunnels.lock().await.insert(key, Arc::clone(&lease));
+        self.publish(key, &lease, wanted_at).await;
         Ok(lease)
+    }
+
+    /// Put `lease` in the map under `key`, unless the live set moved since
+    /// `wanted_at`. Answers whether it did (PRD #742 M8).
+    ///
+    /// A method rather than three lines inside [`Self::acquire`] so the decision
+    /// can be entered from a test at its own seam: stalling `acquire` itself
+    /// means stalling `EndpointConnection::open`, whose slow path is spawning
+    /// `ssh`, and that is the same wall the *One gate per deck* section above
+    /// records for the gate. What a test cannot reach, a reader can — `acquire`
+    /// reads `wanted_at` before it takes the gate and hands it here at the end.
+    ///
+    /// **The compare and the insert are one hold of the map lock**, which is the
+    /// lock every teardown bumps the epoch under. So the two are serialised:
+    /// either the teardown lands first and is seen here, or it lands after and
+    /// removes what this inserted.
+    async fn publish(
+        &self,
+        key: EndpointIdentity,
+        lease: &Arc<TunnelLease>,
+        wanted_at: u64,
+    ) -> bool {
+        let mut tunnels = self.tunnels.lock().await;
+        if self.generation.current() != wanted_at {
+            return false;
+        }
+        tunnels.insert(key, Arc::clone(lease));
+        true
+    }
+
+    /// The live set's epoch, for [`DaemonLinks`]' publish step (PRD #742 M8).
+    ///
+    /// Exposed rather than duplicated: see the field's own comment for why one
+    /// counter serves both maps.
+    ///
+    /// [`DaemonLinks`]: crate::daemon_bridge::DaemonLinks
+    pub(crate) fn generation(&self) -> &Generation {
+        &self.generation
     }
 
     /// This deck's establishment gate, minting one if it has none. See
@@ -289,8 +389,16 @@ impl EndpointTunnels {
     }
 
     /// Drop the map's handle on `endpoint`'s transport.
+    ///
+    /// Bumps the epoch under the map lock (PRD #742 M8), so an establishment
+    /// already in flight for this deck cannot re-publish behind it. `release` is
+    /// reached from `endpoint_test::release_if_not_observed` — "this deck is not
+    /// one of ours, drop its transport" — which is precisely the statement an
+    /// in-flight `acquire` would otherwise undo.
     pub(crate) async fn release(&self, endpoint: &Endpoint) {
-        self.tunnels.lock().await.remove(&endpoint.identity());
+        let mut tunnels = self.tunnels.lock().await;
+        self.generation.bump();
+        tunnels.remove(&endpoint.identity());
     }
 
     /// Drop the map's handle on every transport except the ones `live` names.
@@ -313,16 +421,27 @@ impl EndpointTunnels {
     /// deck's watcher or terminal holds its own lease keeps running until that
     /// holder lets go (rule 2) — which is what makes a fleet safe to edit while
     /// it is live.
+    /// **It also bumps the epoch, and that is the half a set difference cannot
+    /// do** (PRD #742 M8). A deck whose establishment is still in flight has no
+    /// entry here yet, so the `retain` below removes nothing for it and the
+    /// establishment would publish it afterwards — a deck the user has dropped,
+    /// still holding an authenticated `ssh` child. The epoch is what
+    /// [`Self::acquire`] compares to refuse that publish, and it is bumped under
+    /// this same lock so the two cannot interleave.
     pub(crate) async fn retain(&self, live: &HashSet<EndpointIdentity>) {
-        self.tunnels
-            .lock()
-            .await
-            .retain(|key, _| live.contains(key));
+        let mut tunnels = self.tunnels.lock().await;
+        self.generation.bump();
+        tunnels.retain(|key, _| live.contains(key));
     }
 
     /// Drop every handle. The app-exit teardown.
+    ///
+    /// Bumps the epoch for the same reason [`Self::retain`] does: nothing may
+    /// re-publish into a map the app has finished with.
     pub(crate) async fn close_all(&self) {
-        self.tunnels.lock().await.clear();
+        let mut tunnels = self.tunnels.lock().await;
+        self.generation.bump();
+        tunnels.clear();
     }
 
     /// Seed the map with a stand-in transport under `endpoint`'s key. Test-only.
@@ -389,6 +508,13 @@ impl TunnelLease {
 #[derive(Default)]
 pub(crate) struct EndpointTunnels {
     tunnels: AsyncMutex<HashMap<EndpointIdentity, Arc<TunnelLease>>>,
+    /// The live set's epoch — see the Unix definition's field of the same name.
+    ///
+    /// Present here so `DaemonLinks` compiles against one type, and bumped by
+    /// the same three teardowns. This build's `acquire` needs no compare of its
+    /// own: it holds the map lock across the whole call, so nothing can remove
+    /// an entry in the middle of publishing one.
+    generation: Generation,
 }
 
 #[cfg(not(unix))]
@@ -408,19 +534,26 @@ impl EndpointTunnels {
         Ok(lease)
     }
 
+    pub(crate) fn generation(&self) -> &Generation {
+        &self.generation
+    }
+
     pub(crate) async fn release(&self, endpoint: &Endpoint) {
-        self.tunnels.lock().await.remove(&endpoint.identity());
+        let mut tunnels = self.tunnels.lock().await;
+        self.generation.bump();
+        tunnels.remove(&endpoint.identity());
     }
 
     pub(crate) async fn retain(&self, live: &HashSet<EndpointIdentity>) {
-        self.tunnels
-            .lock()
-            .await
-            .retain(|key, _| live.contains(key));
+        let mut tunnels = self.tunnels.lock().await;
+        self.generation.bump();
+        tunnels.retain(|key, _| live.contains(key));
     }
 
     pub(crate) async fn close_all(&self) {
-        self.tunnels.lock().await.clear();
+        let mut tunnels = self.tunnels.lock().await;
+        self.generation.bump();
+        tunnels.clear();
     }
 
     /// Seed the map with a stand-in transport under `endpoint`'s key. Test-only.
@@ -671,5 +804,91 @@ mod tests {
         tunnels.close_all().await;
 
         assert_eq!(tunnels.held().await, 0);
+    }
+
+    /// **PRD #742 M8's F1, at the seam the publish decision lives on.**
+    /// Scenario: a deck's transport is established, the user drops that deck
+    /// (`release`), and the establishment that was already in flight tries to
+    /// publish what it built. The map must refuse it — otherwise the deck the
+    /// user removed keeps an authenticated `ssh` child in a map nothing will
+    /// consult again until the next settings save.
+    ///
+    /// **What this proves:** that [`EndpointTunnels::publish`] — the exact
+    /// method `acquire` ends on — refuses an epoch that moved and accepts one
+    /// that did not.
+    ///
+    /// **What it does NOT prove:** that `acquire` hands it the epoch it read on
+    /// its own first line, and that the teardown really lands inside that
+    /// window. Reaching that means stalling `EndpointConnection::open`, whose
+    /// slow path is spawning `ssh` — the same wall that left `acquire`'s gate
+    /// without a test in M3. The sibling test in `daemon_bridge` does reach it
+    /// for `DaemonLinks`, whose stall is injectable at `hello()`, and the two
+    /// functions have the same shape.
+    #[tokio::test]
+    async fn a_transport_whose_deck_left_mid_establishment_is_not_published() {
+        let tunnels = EndpointTunnels::default();
+        let endpoint =
+            Endpoint::Local(LocalEndpoint::at("/tmp/dot-agent-deck-lease-stranded.sock"));
+        let key = endpoint.identity();
+
+        // The epoch an establishment starting now would read, and a lease of
+        // the shape it would be holding when it came back.
+        let wanted_at = tunnels.generation.current();
+        let lease = tunnels.acquire(&endpoint).await.expect("lease");
+
+        // The user drops the deck while that establishment is still out.
+        tunnels.release(&endpoint).await;
+        assert_eq!(tunnels.held().await, 0);
+
+        assert!(
+            !tunnels.publish(key.clone(), &lease, wanted_at).await,
+            "a lease built for a deck that has since left the live set must not \
+             be published — the caller keeps it and the child dies with the \
+             request"
+        );
+        assert_eq!(
+            tunnels.held().await,
+            0,
+            "and nothing reached the map, so no Arc outlives the caller's"
+        );
+
+        // The contrast: an establishment that started AFTER the teardown reads
+        // the epoch the teardown left behind, and publishes normally.
+        let wanted_now = tunnels.generation.current();
+        assert!(tunnels.publish(key, &lease, wanted_now).await);
+        assert_eq!(tunnels.held().await, 1);
+    }
+
+    /// Scenario: each of the three teardowns runs against an idle map, and the
+    /// epoch an in-flight establishment compares against must move for every
+    /// one of them.
+    ///
+    /// **What this proves:** that `retain`, `release` and `close_all` each bump
+    /// the counter, so none of them is a teardown an establishment could
+    /// publish straight through. It is the other half of the test above, which
+    /// pins what a moved epoch *means*.
+    ///
+    /// **What it does not prove:** anything about ordering against a concurrent
+    /// establishment — see that test's own note.
+    #[tokio::test]
+    async fn every_teardown_moves_the_epoch_a_publish_compares() {
+        let tunnels = EndpointTunnels::default();
+        let endpoint = Endpoint::Local(LocalEndpoint::at("/tmp/dot-agent-deck-lease-epoch.sock"));
+
+        let before_retain = tunnels.generation.current();
+        tunnels.retain(&HashSet::new()).await;
+        let before_release = tunnels.generation.current();
+        assert_ne!(before_retain, before_release, "retain must move the epoch");
+
+        tunnels.release(&endpoint).await;
+        let before_close = tunnels.generation.current();
+        assert_ne!(before_release, before_close, "release must move the epoch");
+
+        tunnels.close_all().await;
+        assert_ne!(
+            before_close,
+            tunnels.generation.current(),
+            "close_all must move the epoch"
+        );
     }
 }

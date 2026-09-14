@@ -192,10 +192,14 @@ impl Endpoint {
 /// (there is none today) would have to be argued for explicitly by writing
 /// `Hash`/`PartialEq` by hand.
 ///
-/// It is deliberately opaque — no `Display`, no `as_str`. The only thing a
-/// caller may do with one is compare it, hash it, or put it in a map, which is
-/// the whole point: a key that could be *printed* is a key someone will
-/// eventually build by printing.
+/// It is deliberately opaque — no `Display`, no `as_str`. A caller may compare
+/// it, hash it, put it in a map, or ask it for the opaque token
+/// [`EndpointIdentity::wire_id`] mints, and that list is exhaustive because the
+/// type exposes nothing else. What is missing from it is the point: none of the
+/// four hands back any part of the endpoint's text, and a key that could be
+/// *printed* is a key someone will eventually build by printing. (`wire_id` was
+/// added by PRD #742 M5 and made this list wrong for one milestone; its own doc
+/// argues why a hash preserves the opacity rather than spending it.)
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct EndpointIdentity(Endpoint);
 
@@ -234,17 +238,29 @@ impl EndpointIdentity {
     ///
     /// `StableHasher` below is FNV-1a with the algorithm written out in this file
     /// rather than `DefaultHasher`, whose output `std` documents as unspecified
-    /// and free to change between Rust releases. The token therefore survives a
-    /// restart, which is what the webview needs: it keys `localStorage`-backed UI
-    /// state on it, and that state outlives the process.
+    /// and free to change between Rust releases. The token therefore names the
+    /// same deck across a restart.
+    ///
+    /// **Nothing depends on that yet, and the version of this paragraph that
+    /// said otherwise was wrong** (PRD #742 M8). It claimed the webview "keys
+    /// `localStorage`-backed UI state on it"; every `localStorage` key the
+    /// webview writes — the overview's column set, the workflow order, the
+    /// prompt library, the agent profiles, the fixture settings — is scoped by
+    /// runtime *mode* and by nothing else, and a reader who went looking for the
+    /// per-deck key would not find one. The forward-looking reason is the real
+    /// one: this is the identity a per-deck preference *would* be keyed on the
+    /// first time somebody stores one, and a token that silently moved under a
+    /// toolchain upgrade would make that store fail in a way nobody would
+    /// connect to the upgrade. Choosing the stable hash costs one small `impl`;
+    /// discovering later that the obvious key is unusable costs a migration.
     ///
     /// Two things it does **not** promise, stated rather than glossed, because
     /// the honest scope is narrower than "stable": identity across a future
     /// change to `std`'s own `Hash` impl for a component type, and identity
     /// across architectures, since the default `Hasher::write_*` methods feed
-    /// integers in native-endian order. Either would reset a per-deck UI
-    /// preference on one machine. Neither can confuse two decks, because both
-    /// sides of every comparison are minted by one process from one build.
+    /// integers in native-endian order. Either would reset such a preference on
+    /// one machine. Neither can confuse two decks, because both sides of every
+    /// comparison are minted by one process from one build.
     pub fn wire_id(&self) -> String {
         use std::hash::{Hash, Hasher};
         let mut hasher = StableHasher(StableHasher::OFFSET_BASIS);
@@ -259,8 +275,9 @@ impl EndpointIdentity {
 /// The one requirement [`EndpointIdentity::wire_id`] has that
 /// `std::collections::hash_map::DefaultHasher` cannot meet: `DefaultHasher`'s
 /// algorithm is documented as unspecified and free to change between Rust
-/// versions, and a deck id that moves under the app's feet is a deck id the
-/// webview cannot key stored state on.
+/// versions, and a deck id that moves under the app's feet is a deck id nothing
+/// can key stored state on. See that method's *Stability* section for what does
+/// and does not currently rely on it.
 struct StableHasher(u64);
 
 impl StableHasher {

@@ -19,6 +19,34 @@ use crate::dto::{
     validate_dimensions, validate_terminal_input,
 };
 use crate::endpoint_tunnels::EndpointTunnels;
+use crate::generation::Generation;
+
+/// One deck's watcher slot: who claimed it, and the handle that ends it.
+///
+/// PRD #742 M8 gave the claim a name. The slot was a bare
+/// `Option<JoinHandle>` — enough to say *a* watcher is starting, not enough to
+/// say **which**, which is the whole of what
+/// [`DesktopState::register_watcher`] has to decide. See the `watchers` field.
+struct WatcherClaim {
+    /// Minted by [`DesktopState::watcher_claims`]. Unique for the life of the
+    /// process, so a slot re-created for the same deck never compares equal to
+    /// the claim it replaced.
+    token: u64,
+    /// `None` between the claim and the spawn, and for the whole of that window
+    /// there is nothing to abort — which is why the claim is made first and why
+    /// `retain_watchers` removing an un-registered claim is enough to make the
+    /// handle that arrives later abort itself.
+    handle: Option<tauri::async_runtime::JoinHandle<()>>,
+}
+
+impl WatcherClaim {
+    fn new(token: u64) -> Self {
+        Self {
+            token,
+            handle: None,
+        }
+    }
+}
 
 #[derive(Clone)]
 struct TerminalSession {
@@ -89,14 +117,27 @@ pub(crate) struct DesktopState {
     /// emitting that deck's records into a view that no longer has a group for
     /// them.
     ///
-    /// # The value is the handle, and the `Option` is the claim/spawn gap
+    /// # The value is a claim, and the claim carries a token
     ///
-    /// [`DesktopState::start_watcher_once_for`] claims the slot (`None`) and the
-    /// caller spawns the task and hands the handle back through
+    /// [`DesktopState::start_watcher_once_for`] claims the slot and the caller
+    /// spawns the task and hands the handle back through
     /// [`DesktopState::register_watcher`]. Claiming before spawning rather than
     /// after is what makes the claim atomic: two callers racing to start the
     /// same deck's watcher cannot both win, which is the property the
     /// `AtomicBool`'s `swap` had.
+    ///
+    /// **The token is PRD #742 M8, and it is what makes a claim tell itself
+    /// apart from a re-claim.** The slot used to be a bare
+    /// `Option<JoinHandle>`, so `register_watcher` could ask only "is there a
+    /// claim here" — and if the deck left and rejoined the observed set inside
+    /// the claim -> spawn -> register window, watcher A's handle landed in
+    /// watcher B's slot and B's own handle then *replaced* it. Replacing drops a
+    /// `JoinHandle` rather than aborting it, so A went on running untracked and
+    /// unstoppable for the life of the process: a leaked task and a
+    /// double-watched deck, folding the same broadcast twice and emitting twice
+    /// per coalescing window. With a token the slot answers "is this claim
+    /// **mine**", and a handle that arrives for somebody else's claim is aborted
+    /// like one that arrives for no claim at all.
     ///
     /// # A `std::sync::Mutex`, deliberately
     ///
@@ -104,7 +145,14 @@ pub(crate) struct DesktopState {
     /// is sync, so an async mutex would buy nothing and would put
     /// `clippy::await_holding_lock` in front of the `retain_watchers` call site
     /// inside `retarget_selection`.
-    watchers: Mutex<HashMap<EndpointIdentity, Option<tauri::async_runtime::JoinHandle<()>>>>,
+    watchers: Mutex<HashMap<EndpointIdentity, WatcherClaim>>,
+    /// Mints [`WatcherClaim::token`] (PRD #742 M8).
+    ///
+    /// The same counter `crate::generation` gives the two establishment maps,
+    /// used for the other thing a monotonic value answers: every `bump` hands
+    /// back a number no other `bump` hands back, so a claim can be named by one
+    /// and a later claim for the same deck can never be mistaken for it.
+    watcher_claims: Generation,
     /// PRD #741 M4(a): the established daemon links, keyed by endpoint.
     ///
     /// This is the field the milestone is about. Before it, nothing in this
@@ -176,6 +224,7 @@ impl Default for DesktopState {
             attach_gate: AsyncMutex::new(()),
             next_generation: AtomicU64::new(1),
             watchers: Mutex::new(HashMap::new()),
+            watcher_claims: Generation::default(),
             daemon: Arc::clone(&daemon),
             tunnels: daemon.tunnels(),
             selection: tokio::sync::watch::Sender::new(0),
@@ -197,45 +246,57 @@ impl DesktopState {
     /// state a later caller would misread — and refusing here would mean a
     /// panicked watcher permanently stopping every *other* deck from getting
     /// one.
-    fn watchers(
-        &self,
-    ) -> MutexGuard<'_, HashMap<EndpointIdentity, Option<tauri::async_runtime::JoinHandle<()>>>>
-    {
+    fn watchers(&self) -> MutexGuard<'_, HashMap<EndpointIdentity, WatcherClaim>> {
         self.watchers
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Claim the watcher for one deck. `true` if this call is the one that must
-    /// start it (PRD #742 M3).
+    /// Claim the watcher for one deck. `Some(token)` if this call is the one
+    /// that must start it (PRD #742 M3; the token is M8).
     ///
     /// The N-deck form of the `AtomicBool` swap this replaced — one claim per
-    /// deck rather than one per process. The caller that gets `true` spawns the
-    /// task and hands its handle to [`Self::register_watcher`].
-    pub(crate) fn start_watcher_once_for(&self, deck: &EndpointIdentity) -> bool {
+    /// deck rather than one per process. The caller that gets a token spawns the
+    /// task and hands that token and its handle to [`Self::register_watcher`].
+    pub(crate) fn start_watcher_once_for(&self, deck: &EndpointIdentity) -> Option<u64> {
         let mut watchers = self.watchers();
         if watchers.contains_key(deck) {
-            return false;
+            return None;
         }
-        watchers.insert(deck.clone(), None);
-        true
+        // Minted under the map lock, so the token in the slot and the token the
+        // caller holds are written in one critical section.
+        let token = self.watcher_claims.bump();
+        watchers.insert(deck.clone(), WatcherClaim::new(token));
+        Some(token)
     }
 
     /// Hand the spawned task's handle to the claim [`Self::start_watcher_once_for`]
     /// made, so [`Self::retain_watchers`] can end it.
     ///
-    /// A handle arriving for a claim that is **gone** is aborted on the spot: the
-    /// deck left the observed set between the claim and the spawn, and the task
-    /// it belongs to is already watching a deck nobody asked about. Without this
-    /// the task would run untracked and unstoppable for the life of the process.
+    /// A handle is stored **only into the claim that asked for it**. Anything
+    /// else is aborted on the spot, and there are two ways to be anything else:
+    ///
+    /// - *the claim is gone* — the deck left the observed set between the claim
+    ///   and the spawn, so this task is already watching a deck nobody asked
+    ///   about;
+    /// - *the claim is somebody else's* — the deck left **and rejoined** in that
+    ///   window, so the slot now belongs to a later watcher (PRD #742 M8). This
+    ///   is the case the pre-M8 `Some(slot) => *slot = Some(handle)` could not
+    ///   see: it wrote this handle into the newer claim, whose own
+    ///   `register_watcher` then replaced it — *dropping* a `JoinHandle` instead
+    ///   of aborting it, and leaving this task running untracked forever.
+    ///
+    /// Either way the handle is aborted rather than dropped, which is the
+    /// difference between a task that stops and a task nothing can stop.
     pub(crate) fn register_watcher(
         &self,
         deck: &EndpointIdentity,
+        token: u64,
         handle: tauri::async_runtime::JoinHandle<()>,
     ) {
         match self.watchers().get_mut(deck) {
-            Some(slot) => *slot = Some(handle),
-            None => handle.abort(),
+            Some(claim) if claim.token == token => claim.handle = Some(handle),
+            _ => handle.abort(),
         }
     }
 
@@ -252,11 +313,11 @@ impl DesktopState {
     /// that deck reaches the webview — needs a running Tauri app to observe and
     /// is not pinned by any test here; it is stated rather than claimed.
     pub(crate) fn retain_watchers(&self, observed: &HashSet<EndpointIdentity>) {
-        self.watchers().retain(|deck, handle| {
+        self.watchers().retain(|deck, claim| {
             if observed.contains(deck) {
                 return true;
             }
-            if let Some(handle) = handle.take() {
+            if let Some(handle) = claim.handle.take() {
                 handle.abort();
             }
             false
