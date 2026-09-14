@@ -705,6 +705,21 @@ export interface DeckRuntimeState {
   /** Direct PTY-byte path that bypasses React state; absent in tests/fixture. */
   terminalFeed?: TerminalFeed;
   error?: string;
+  /**
+   * Which failure {@link error} is — a number minted per reported failure, so
+   * two failures carrying the same sentence are still two failures (PRD #742
+   * M8).
+   *
+   * The toast's dismissal keys on this rather than on the text. It used to key
+   * on the text, which meant a second distinct failure whose sanitised sentence
+   * happened to match a dismissed one was swallowed silently — and with a fleet
+   * on screen that is likelier than it was, because `safe_message`'s output for
+   * a transport failure is largely deck-independent.
+   *
+   * Optional for the same reason {@link error} is: absent when nothing has
+   * failed, and absent in a fixture runtime that reports no failures at all.
+   */
+  errorId?: number;
   runAction: (action: DeckAction) => Promise<DeckActionResult>;
   sendTerminalInput: (agentId: string, data: string) => Promise<void>;
   resizeTerminal: (agentId: string, cols: number, rows: number) => Promise<void>;

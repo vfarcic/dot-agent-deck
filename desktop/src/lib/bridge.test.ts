@@ -2340,4 +2340,119 @@ describe("TauriDeckBridge across a fleet (PRD 742 M4/M5)", () => {
     expect(fleet[0].handoffs.map((edge) => edge.id)).toEqual(["dlg-none", `dlg-${localId}`]);
     await bridge.dispose();
   });
+
+  /** A hook event as the crate stamps it, PRD 742 M3. */
+  function hookEvent(deck: string, session: string) {
+    return {
+      deck,
+      kind: "event",
+      event_type: "delegation_dispatched",
+      session_id: session,
+      metadata: { to_role: "Reviewer", orchestration: "dot-agent-deck" },
+    };
+  }
+
+  /**
+   * **PRD 742 M8's F4.** Scenario: hook events are recorded while the local deck
+   * is selected, and the user then switches to the remote deck. The remote
+   * deck's snapshot must arrive with an EMPTY evidence drawer and handoff rail —
+   * those entries are the local machine's, carrying its agent ids, roles and
+   * pane ids — and the local deck must keep them.
+   *
+   * The ring was process-global and `foldSnapshot` handed it to whichever deck
+   * was currently selected, so `build-box`'s first snapshot was mapped carrying
+   * every event the local deck had produced: one machine's hook history under
+   * another machine's name. `isSelectedDeckEvent` — the filter M3/M5 added
+   * precisely to stop this — stops LIVE events crossing and does nothing about a
+   * ring that survives the switch, so a reader who saw the filter would
+   * reasonably conclude the drawer was deck-clean.
+   *
+   * **Pre-existing rather than introduced by the fleet** (`4a7ae532` passed the
+   * same global ring, and nothing cleared it on a selection change either) — in
+   * scope because the fleet is what makes it easy to meet, and because a partial
+   * guarantee that reads as a total one is worse than neither.
+   *
+   * **What this proves:** the whole fix, at the level the user sees it. The
+   * switch is driven the way the app drives it — the remote deck's own snapshot
+   * arriving with itself at the head of `fleet` — and every assertion is on the
+   * mapped `DeckFleet` the screen renders.
+   *
+   * **What it does not prove:** that the drawer's React component renders what
+   * it is handed; that is `AgentOverview`/`App`'s business and is not what moved.
+   */
+  it("does not carry one deck's hook history onto another deck's screen", async () => {
+    const { TauriDeckBridge } = await import("./bridge");
+    const bridge = new TauriDeckBridge();
+    const onFleet = vi.fn();
+    await bridge.subscribe(onFleet, vi.fn());
+    await bridge.connect();
+    listeners.get("desktop://snapshot")?.({ payload: remote });
+
+    // Two hook events while the local deck is the one on screen.
+    listeners.get("desktop://daemon-event")?.({ payload: hookEvent(localId, "dlg-local-1") });
+    listeners.get("desktop://daemon-event")?.({ payload: hookEvent(localId, "dlg-local-2") });
+    let fleet = onFleet.mock.calls.at(-1)?.[0] as DeckFleet;
+    expect(fleet[0].connection.deckId).toBe(localId);
+    expect(fleet[0].handoffs).toHaveLength(2);
+    expect(fleet[0].evidence).toHaveLength(2);
+
+    // The user picks the remote deck. Its watcher's next snapshot leads the
+    // fleet with itself, which is how the selection reaches this side.
+    const remoteSelected = deckSnapshot(remoteId, remoteDeck, "remote", ["Remote builder"], [remoteId, localId]);
+    listeners.get("desktop://snapshot")?.({ payload: remoteSelected });
+    fleet = onFleet.mock.calls.at(-1)?.[0] as DeckFleet;
+    const onRemote = fleet.find((deck) => deck.connection.deckId === remoteId);
+    expect(onRemote?.handoffs).toEqual([]);
+    expect(onRemote?.evidence).toEqual([]);
+    // And the local deck's own history is still the local deck's.
+    expect(fleet.find((deck) => deck.connection.deckId === localId)?.handoffs).toHaveLength(2);
+
+    // A hook event from the deck now on screen belongs to it alone.
+    listeners.get("desktop://daemon-event")?.({ payload: hookEvent(remoteId, "dlg-remote-1") });
+    fleet = onFleet.mock.calls.at(-1)?.[0] as DeckFleet;
+    expect(fleet.find((deck) => deck.connection.deckId === remoteId)?.handoffs.map((edge) => edge.id))
+      .toEqual(["dlg-remote-1"]);
+    expect(fleet.find((deck) => deck.connection.deckId === localId)?.handoffs.map((edge) => edge.id))
+      .toEqual(["dlg-local-2", "dlg-local-1"]);
+
+    // Switching back restores the local deck's drawer rather than showing the
+    // remote deck's, and rather than showing nothing.
+    listeners.get("desktop://snapshot")?.({ payload: local });
+    fleet = onFleet.mock.calls.at(-1)?.[0] as DeckFleet;
+    expect(fleet[0].connection.deckId).toBe(localId);
+    expect(fleet[0].handoffs.map((edge) => edge.id)).toEqual(["dlg-local-2", "dlg-local-1"]);
+    await bridge.dispose();
+  });
+
+  /**
+   * The reconnect-shaped half of the same finding. Scenario: hook events are
+   * recorded on the local deck, the stored selection then names the remote deck,
+   * and the user presses Reconnect. `connect()` clears `fleet` and did NOT clear
+   * the ring, so the bootstrap snapshot — a fresh statement of the whole world —
+   * came back carrying the previous deck's hook history.
+   *
+   * **What this proves:** that `connect()` points the ring at the deck it is
+   * bootstrapping before it maps that deck's snapshot.
+   */
+  it("does not hand a reconnect's deck the previous deck's hook history", async () => {
+    const { TauriDeckBridge } = await import("./bridge");
+    const bridge = new TauriDeckBridge();
+    const onFleet = vi.fn();
+    await bridge.subscribe(onFleet, vi.fn());
+    await bridge.connect();
+    listeners.get("desktop://daemon-event")?.({ payload: hookEvent(localId, "dlg-local-1") });
+    expect((onFleet.mock.calls.at(-1)?.[0] as DeckFleet)[0].handoffs).toHaveLength(1);
+
+    const remoteSelected = deckSnapshot(remoteId, remoteDeck, "remote", ["Remote builder"], [remoteId]);
+    invoke.mockImplementation(async (command: string) => {
+      if (command === "desktop_bootstrap") return remoteSelected;
+      return { ok: true };
+    });
+
+    const reconnected = await bridge.connect();
+    expect(reconnected.map((deck) => deck.connection.deckId)).toEqual([remoteId]);
+    expect(reconnected[0].handoffs).toEqual([]);
+    expect(reconnected[0].evidence).toEqual([]);
+    await bridge.dispose();
+  });
 });

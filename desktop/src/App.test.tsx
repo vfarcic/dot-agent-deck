@@ -1588,6 +1588,45 @@ describe("ControlDeck", () => {
   });
 
   /**
+   * **PRD 742 M8's F5.** Scenario: a failure is dismissed, and a SECOND,
+   * distinct failure arrives whose sanitised sentence is identical. It must be
+   * shown — the dismissal was aimed at the first one.
+   *
+   * #1046's fix keyed the dismissal on the message text, which is the right
+   * shape and one identity short: `safe_message`'s output for a transport
+   * failure is largely deck-independent, so with a fleet on screen two decks
+   * producing the same sentence is likelier than it was with one. The runtime
+   * now mints an id per reported failure and the dismissal holds that.
+   *
+   * **What this proves:** the toast's decision, for all three cases that matter
+   * — a dismissed failure stays gone when the same failure is re-asserted on a
+   * later render, and a different failure is shown whether or not its sentence
+   * differs.
+   *
+   * **What it does not prove:** that `useDeckRuntime` mints a fresh id per
+   * failure rather than per message; that is a `useRef` counter incremented in
+   * one place, and this file drives the contract rather than the hook.
+   */
+  it("shows a second failure whose sentence matches a dismissed one", () => {
+    const base = runtime();
+    const same = "The deck stopped answering.";
+    const { rerender } = render(<ControlDeck runtime={{ ...base, error: same, errorId: 1 }} />);
+    expect(screen.getByText(same)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByLabelText("Dismiss message"));
+    expect(screen.queryByText(same)).toBeNull();
+
+    // The same failure, still on screen's worth of re-renders later: still gone.
+    rerender(<ControlDeck runtime={{ ...base, error: same, errorId: 1 }} />);
+    expect(screen.queryByText(same)).toBeNull();
+
+    // A different failure that happens to read identically. Keyed on the text
+    // this was swallowed; keyed on the failure it is shown.
+    rerender(<ControlDeck runtime={{ ...base, error: same, errorId: 2 }} />);
+    expect(screen.getByText(same)).toBeInTheDocument();
+  });
+
+  /**
    * Scenario: an action fails. `perform` catches it into `notice` while
    * `runAction` has already put the same sentence into `runtime.error`, so ONE
    * press of dismiss has to clear both — otherwise dismissing the notice simply

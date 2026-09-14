@@ -552,6 +552,19 @@ export function sameEndpointSection(left: EndpointSettingsDto, right: EndpointSe
  * carries the same hazard — `EndpointsPanel`'s chooser, its row editor, its
  * remove button and its Test-connection write-back, and `DeckSelector`'s menu.
  *
+ * **That list named a site it did not cover until PRD #742 M8.** The
+ * Test-connection write-back called `onSave` directly, because it writes
+ * against `latest.current` — the document as of the newest render — rather than
+ * the one its handler closed over, and `saveSection` closed over `settings`. It
+ * was inert: its `row && !row.socket` find-guard fires only on a genuine change,
+ * and on an unreadable document the fabricated `remote: []` makes the `find`
+ * miss and nothing is written at all. But that is a property of *that*
+ * write-back rather than a rule — a probe write-back that filled in a port, a
+ * user or a jump host, or one that upserted a row instead of patching one, would
+ * have reopened the hazard with three comments asserting it could not. M8 gave
+ * `saveSection` a document parameter so the write-back routes through here too,
+ * and this sentence is now about a mechanism rather than a convention.
+ *
  * # What it does NOT close, deliberately
  *
  * An **intentional** change against an unreadable document still writes

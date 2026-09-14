@@ -1,6 +1,48 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { EndpointsPanel } from "./EndpointsPanel";
+
+/**
+ * The shared write gate, spied but NOT replaced (PRD 742 M8's F3).
+ *
+ * The panel's data-safety property is "every write goes through
+ * `endpointSectionToSave`", and that property is not observable in the panel's
+ * output: the gate returns the section unchanged in every case that reaches it
+ * from here today, so a write that bypasses it and a write that goes through it
+ * produce the same `onSave`. That is precisely why the bypass survived — three
+ * comments asserted the coverage and nothing checked it.
+ *
+ * So the assertion is on the call, and the implementation stays real: the mock
+ * delegates to the original, every other test in this file is unaffected, and
+ * the behavioural tests above and below still do the behavioural work.
+ */
+const writeGate = vi.hoisted(() => vi.fn());
+vi.mock("../lib/endpoints", async () => {
+  const actual = await vi.importActual<typeof import("../lib/endpoints")>("../lib/endpoints");
+  writeGate.mockImplementation(actual.endpointSectionToSave);
+  // Lazy getters rather than a spread. `endpoints.ts` and `bridge.ts` import
+  // each other, so several of this module's exports are re-exports of the
+  // other, and reading them eagerly inside a mock factory takes them before the
+  // cycle has settled — measured: a spread here left
+  // `ALL_ENDPOINT_SELECTION` `undefined` for the panel while the module's own
+  // internal reference to it was fine. A getter defers the read to the moment
+  // the panel actually uses the value, which is after both modules exist.
+  return Object.defineProperties(
+    {},
+    Object.fromEntries(
+      Object.keys(actual).map((name) => [
+        name,
+        {
+          enumerable: true,
+          get: () =>
+            name === "endpointSectionToSave"
+              ? writeGate
+              : (actual as unknown as Record<string, unknown>)[name],
+        },
+      ]),
+    ),
+  );
+});
 import {
   DEFAULT_DESKTOP_SETTINGS,
   type DesktopSettingsDto,
@@ -73,6 +115,13 @@ function renderPanel(
 }
 
 describe("EndpointsPanel", () => {
+  // Braced, not an expression body: `mockClear()` returns the mock for
+  // chaining, and a value returned from `beforeEach` is taken by vitest as a
+  // cleanup function and CALLED after the test — with no arguments.
+  beforeEach(() => {
+    writeGate.mockClear();
+  });
+
   /**
    * Scenario: open the Decks section on a fresh install — a document with no
    * `[endpoints]` section at all. The local deck is listed and chosen, and
@@ -472,6 +521,61 @@ describe("EndpointsPanel", () => {
 
     await waitFor(() => expect(testEndpoint).toHaveBeenCalled());
     expect(onSave).not.toHaveBeenCalled();
+  });
+
+  /**
+   * **PRD 742 M8's F3.** Scenario: a probe discovers a socket and the panel
+   * writes it back. That write must go through the shared gate, like every
+   * other write this panel makes.
+   *
+   * It did not. `runTest`'s write-back called `onSave` directly — because it
+   * writes against `latest.current` (the document as of the newest render)
+   * rather than the one its handler closed over, and `saveSection` closed over
+   * `settings` — while three separate comments said every write in this panel
+   * goes through `endpointSectionToSave`: the doc on `saveSection`, the doc on
+   * the gate itself (which *named* this write-back among the sites it covers),
+   * and the M6 section of `docs/develop/desktop-gui.md`.
+   *
+   * **What this proves:** that the claim is now true, at the one site that
+   * falsified it.
+   *
+   * **What it does NOT prove, and this is why the test is shaped like this:**
+   * that the gate changes the outcome here. It does not, and cannot — the gate
+   * returns the section unchanged in every case that reaches it from this site,
+   * because the `row && !row.socket` find-guard above the write only fires when
+   * the row genuinely gains a socket it did not have. There is therefore **no
+   * input that distinguishes the two implementations**, which is exactly how
+   * three comments came to assert a coverage nothing checked. So the assertion
+   * is on the call rather than on the output, and the implementation stays real
+   * — the tests around this one do the behavioural work and are unaffected.
+   *
+   * What the routing buys is future-tense and structural: on an unreadable
+   * `desktop.toml` the webview is handed a fabricated `{ remote: [] }`, and it
+   * is now the gate rather than this one find-guard that refuses to merge that
+   * over the rows still on disk. A probe write-back that filled in a port, a
+   * user or a jump host — or one that upserted a row instead of patching one —
+   * is covered without anyone having to notice that it needs to be.
+   */
+  it("routes the discovered-socket write-back through the shared write gate", async () => {
+    const testEndpoint = vi.fn(async () =>
+      report({ discoveredSocket: "/run/user/1000/dot-agent-deck-attach.sock" }),
+    );
+    const { onSave } = renderPanel(
+      { endpoints: { remote: [deck()], selection: "deck0000000000aa" } },
+      { testEndpoint },
+    );
+
+    fireEvent.click(screen.getByTestId("test-connection"));
+    await waitFor(() => expect(onSave).toHaveBeenCalled());
+
+    expect(writeGate).toHaveBeenCalledTimes(1);
+    const [received, next] = writeGate.mock.calls[0];
+    // The document as of the newest render, not the one the click closed over —
+    // both halves of the property in one call.
+    expect(received).toEqual({ remote: [deck()], selection: "deck0000000000aa" });
+    expect(next?.remote[0].socket).toBe("/run/user/1000/dot-agent-deck-attach.sock");
+    // And the gate let it through, because it is a genuine change.
+    expect(writeGate.mock.results[0].value).toBe(next);
   });
 
   /**

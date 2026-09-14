@@ -1280,9 +1280,54 @@ export class TauriDeckBridge implements DeckBridge {
   private geometryListeners = new Set<(agentId: string, rows: number, cols: number) => void>();
   private invoke?: typeof import("@tauri-apps/api/core")["invoke"];
   private lifecycle = 0;
-  /** Newest-first ring of mapped hook events, capped at MAX_LIVE_EVIDENCE. */
+  /**
+   * Newest-first ring of mapped hook events for the SELECTED deck, capped at
+   * MAX_LIVE_EVIDENCE. {@link handoffs} is the same thing for the handoff rail.
+   *
+   * **A working copy of one deck's history, not a process-global one** (PRD
+   * #742 M8). It was global, `foldSnapshot` handed it to whichever deck was
+   * currently selected, and `connect()` cleared `fleet` but not this — so hook
+   * events recorded while the local deck was selected survived a switch and
+   * `build-box`'s first snapshot arrived carrying them. One machine's hook
+   * history, with its agent ids, roles and pane ids, under another machine's
+   * name.
+   *
+   * That was **pre-existing** rather than introduced by the fleet — `4a7ae532`
+   * passed the same global ring — but the fleet is what makes it easy to meet,
+   * and `isSelectedDeckEvent` stops *live* events crossing while doing nothing
+   * about a ring that survives the switch. A reader who sees that filter will
+   * reasonably conclude the drawer is deck-clean; it was not.
+   *
+   * {@link adoptEvidenceDeck} is the whole of the fix. The per-deck storage
+   * already existed — each `DeckSnapshot` in {@link fleet} carries its own
+   * `evidence`/`handoffs` — so switching decks swaps this working copy for the
+   * arriving deck's own history rather than carrying it across, and no parallel
+   * per-deck map is needed.
+   */
   private evidence: EvidenceItem[] = [];
   private handoffs: HandoffEdge[] = [];
+  /**
+   * Which deck {@link evidence} and {@link handoffs} describe, or `undefined`
+   * before this bridge knows which deck it is on.
+   *
+   * `undefined` is load-bearing rather than an initial value: `subscribe()` runs
+   * BEFORE `connect()` in `useDeckRuntime`, so hook events genuinely arrive
+   * before any snapshot has said which deck is selected. Those belong to the
+   * first deck that becomes selected — which is what `undefined` means here, and
+   * why {@link adoptEvidenceDeck} adopts rather than clears in that one case.
+   */
+  private evidenceDeckId?: string;
+  /**
+   * Mints `hook-<n>` ids, and NEVER reset — not on a deck switch, not on
+   * `connect()`.
+   *
+   * These ids are React keys on the evidence drawer's rows, and a deck switch
+   * puts another deck's rows on screen; a counter that restarted would mint
+   * `hook-0` for the second deck while the first deck's `hook-0` is still held
+   * in its own snapshot, so switching back would collide two distinct items
+   * under one key. Monotonic for the life of the bridge costs a larger integer
+   * and nothing else.
+   */
   private evidenceSequence = 0;
   private agentIndex: AgentSession[] = [];
 
@@ -1315,6 +1360,38 @@ export class TauriDeckBridge implements DeckBridge {
     if (typeof payload !== "object" || payload === null) return true;
     const deck = (payload as { deck?: unknown }).deck;
     return typeof deck !== "string" || deck === this.selectedDeckId;
+  }
+
+  /**
+   * Point the evidence ring and the handoff rail at `deckId` (PRD #742 M8).
+   *
+   * Called wherever {@link selectedDeckId} is learnt or re-learnt — `connect()`
+   * and `foldSnapshot` — and a no-op whenever it has not moved, so it costs
+   * nothing on the ordinary snapshot and does its work on the first arrival and
+   * on the ones that follow a selection change.
+   *
+   * Three cases, and the middle one is the finding:
+   *
+   * - *same deck* — nothing to do.
+   * - *a different deck* — the working copy is replaced by that deck's OWN
+   *   held history, taken from its snapshot in {@link fleet}, or emptied when it
+   *   has none yet. This is what stops one machine's hook history being handed
+   *   to another machine's snapshot, and it also means switching back restores
+   *   what that deck had rather than showing an empty drawer.
+   * - *no deck yet* (`evidenceDeckId === undefined`) — whatever has accumulated
+   *   is ADOPTED, not cleared. `subscribe()` runs before `connect()`, so events
+   *   that land in that window have no deck of their own and belong to the first
+   *   one selected; clearing here would lose the drawer's earliest entries,
+   *   which is the behaviour that was already deliberate before M8.
+   */
+  private adoptEvidenceDeck(deckId: string): void {
+    if (this.evidenceDeckId === deckId) return;
+    if (this.evidenceDeckId !== undefined) {
+      const held = this.fleet.get(deckId);
+      this.evidence = held?.evidence ?? [];
+      this.handoffs = held?.handoffs ?? [];
+    }
+    this.evidenceDeckId = deckId;
   }
 
   private recordDaemonEvent(payload: unknown): boolean {
@@ -1699,7 +1776,22 @@ export class TauriDeckBridge implements DeckBridge {
     // the daemon owns, so a nine-agent fleet cost nine sockets and nine
     // scrollback replays before a single terminal was on screen. The UI states
     // what it shows through `setShownTerminals`, and that is the only trigger.
-    const snapshot = mapDesktopSnapshot(dto, this.fleet.get(dto.connection.deckId), this.evidence, this.handoffs);
+    /*
+      PRD #742 M8: BEFORE the map, and before the `fleet.clear()` below that
+      would take every deck's held history with it. `connect()` used to hand the
+      ring to `dto.connection.deckId` whatever deck it actually described, which
+      is the reconnect-shaped half of the cross-deck attribution — reconnecting
+      while `build-box` is selected handed it the local deck's drawer.
+    */
+    this.selectedDeckId = dto.fleet?.[0] ?? dto.connection.deckId;
+    this.adoptEvidenceDeck(this.selectedDeckId);
+    const selected = dto.connection.deckId === this.selectedDeckId;
+    const snapshot = mapDesktopSnapshot(
+      dto,
+      this.fleet.get(dto.connection.deckId),
+      selected ? this.evidence : undefined,
+      selected ? this.handoffs : undefined,
+    );
     this.agentIndex = snapshot.agents;
     /*
       PRD #742 M4 reset membership here because this was the ONLY moment a
@@ -1715,7 +1807,6 @@ export class TauriDeckBridge implements DeckBridge {
       immediate for a newly established one, bounded by the crate's reconcile
       interval for a quiet one.
     */
-    this.selectedDeckId = dto.fleet?.[0] ?? dto.connection.deckId;
     this.fleet.clear();
     this.fleet.set(dto.connection.deckId, snapshot);
     return this.fleetView();
@@ -1742,6 +1833,13 @@ export class TauriDeckBridge implements DeckBridge {
       that moved the selection had to re-handshake to be believed.
     */
     if (dto.fleet?.length) this.selectedDeckId = dto.fleet[0];
+    /*
+      PRD #742 M8: and the ring follows the selection, rather than being handed
+      to whoever the selection now names. Before this the ring was global, so a
+      switch to `build-box` mapped its first snapshot carrying every hook event
+      recorded while local was selected.
+    */
+    if (this.selectedDeckId !== undefined) this.adoptEvidenceDeck(this.selectedDeckId);
     /*
       The evidence ring and the handoff edges are the SELECTED deck's — the
       only deck whose events this bridge records at all, since the stamped

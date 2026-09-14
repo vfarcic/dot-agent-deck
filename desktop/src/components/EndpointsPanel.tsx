@@ -93,6 +93,8 @@ import type { SettingsPanelProps } from "../lib/settingsContract";
  * It must never reach a save on its own — `remote: []` is the assertion "this
  * user has no decks", and PRD #742 M6 routes every write through
  * {@link endpointSectionToSave}, which is where that rule is written down.
+ * M8 closed the one exception: {@link runTest}'s write-back wrote directly and
+ * was protected only by its own find-guard.
  */
 function sectionOf(settings: DesktopSettingsDto): EndpointSettingsDto {
   return settings.endpoints ?? { remote: [], selection: LOCAL_ENDPOINT_SELECTION };
@@ -171,20 +173,32 @@ export function EndpointsPanel({ settings, onSave, saveError, mode }: SettingsPa
   const fleetSelected = shown === ALL_ENDPOINT_SELECTION;
 
   /**
-   * Write a new endpoint section back. The whole document goes, with `settings`
-   * spread — see the round-trip note at the top of this file.
+   * Write a new endpoint section back into `document`. The whole document goes,
+   * with it spread — see the round-trip note at the top of this file.
    *
    * Every write in this panel goes through here, and {@link endpointSectionToSave}
    * is what decides whether there is one to make: a change that changes nothing
    * is not written at all, so it cannot merge a fabricated `remote: []` over
    * rows this client was never shown (PRD #742 M6). `DeckSelector` shares the
    * same function for the same reason.
+   *
+   * **It takes the document rather than closing over `settings`** (PRD #742 M8).
+   * Every handler here writes against the document of its own render, but
+   * {@link runTest}'s write-back happens after an `await` and must write against
+   * `latest.current`. It used to call `onSave` directly for exactly that reason,
+   * which took it around this gate — the one write in the file that the three
+   * places claiming "every write goes through here" did not cover. A parameter
+   * is what lets both use the same gate rather than the doc-comment asserting
+   * they do.
    */
-  const saveSection = (next: EndpointSettingsDto) => {
-    const write = endpointSectionToSave(settings.endpoints, next);
+  const saveSectionOf = (document: DesktopSettingsDto, next: EndpointSettingsDto) => {
+    const write = endpointSectionToSave(document.endpoints, next);
     if (!write) return;
-    onSave({ ...settings, endpoints: write });
+    onSave({ ...document, endpoints: write });
   };
+
+  /** {@link saveSectionOf} against the document this render was given. */
+  const saveSection = (next: EndpointSettingsDto) => saveSectionOf(settings, next);
 
   const addDeck = () => {
     // Focused on creation, but NOT stored and NOT selected: an added deck the
@@ -278,14 +292,23 @@ export function EndpointsPanel({ settings, onSave, saveError, mode }: SettingsPa
         const current = sectionOf(latest.current);
         const row = current.remote.find((candidate) => candidate.id === id);
         if (row && !row.socket) {
-          onSave({
-            ...latest.current,
-            endpoints: {
-              ...current,
-              remote: current.remote.map((candidate) =>
-                candidate.id === id ? { ...candidate, socket: report.discoveredSocket } : candidate,
-              ),
-            },
+          // Through the shared gate (PRD #742 M8), against `latest.current`.
+          //
+          // It returns this section unchanged in every case that reaches it
+          // today — the `!row.socket` find-guard above only fires on a genuine
+          // change — so routing it here is behaviour-preserving. What it buys
+          // is that the unreadable-document protection becomes STRUCTURAL: on a
+          // document that failed to parse, `sectionOf` fabricates
+          // `remote: []`, and it is the gate rather than this particular guard
+          // that refuses to merge that over the rows still on disk. A future
+          // write-back that fills in a port, a user or a jump host — or one
+          // that upserts a row instead of patching one — is then covered
+          // without anyone having to notice it needs to be.
+          saveSectionOf(latest.current, {
+            ...current,
+            remote: current.remote.map((candidate) =>
+              candidate.id === id ? { ...candidate, socket: report.discoveredSocket } : candidate,
+            ),
           });
         }
       }

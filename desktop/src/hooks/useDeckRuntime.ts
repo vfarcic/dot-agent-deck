@@ -62,7 +62,22 @@ export function useDeckRuntime(): DeckRuntimeState {
    */
   const [fleet, setFleet] = useState<DeckFleet>(() => [seedSnapshot(mode)]);
   const snapshot = fleet[0];
-  const [error, setError] = useState<string>();
+  /**
+   * The latest reported failure, and a number that tells two of them apart.
+   *
+   * PRD #742 M8: this was a bare `string`, and `App`'s toast keyed its dismissal
+   * on that string — so two DISTINCT failures with the same sanitised sentence
+   * read as one already-dismissed failure and the second was never shown. The id
+   * is minted per report, so identical text is no longer identity.
+   */
+  const [failure, setFailure] = useState<{ message: string; id: number }>();
+  const failureCount = useRef(0);
+  /** Report a failure under an id no earlier report used. */
+  const reportFailure = useCallback((message: string) => {
+    failureCount.current += 1;
+    setFailure({ message, id: failureCount.current });
+  }, []);
+  const clearFailure = useCallback(() => setFailure(undefined), []);
   // PTY bytes deliberately bypass React state. Routing every output chunk
   // through setState re-rendered the whole deck per chunk per agent — with six
   // streaming agents the main thread spent its time reconciling instead of
@@ -120,21 +135,21 @@ export function useDeckRuntime(): DeckRuntimeState {
   }, []);
 
   const reconnect = useCallback(async () => {
-    setError(undefined);
+    clearFailure();
     updateSelected((current) => ({ ...current, connection: { ...current.connection, status: "loading", message: "Reconnecting…" } }));
     try {
       const connected = await bridge.connect();
       adoptFleet(connected);
     } catch (cause) {
       const message = cause instanceof Error ? cause.message : String(cause);
-      setError(message);
+      reportFailure(message);
       updateSelected((current) => ({
         ...current,
         health: "failed",
         connection: { status: "error", message },
       }));
     }
-  }, [adoptFleet, bridge, updateSelected]);
+  }, [adoptFleet, bridge, clearFailure, reportFailure, updateSelected]);
 
   useEffect(() => {
     let active = true;
@@ -155,7 +170,7 @@ export function useDeckRuntime(): DeckRuntimeState {
       } catch (cause) {
         if (!active) return;
         const message = cause instanceof Error ? cause.message : String(cause);
-        setError(message);
+        reportFailure(message);
         updateSelected((current) => ({ ...current, health: "failed", connection: { status: "error", message } }));
       }
     })();
@@ -165,18 +180,18 @@ export function useDeckRuntime(): DeckRuntimeState {
       unsubscribe?.();
       void bridge.dispose();
     };
-  }, [adoptFleet, bridge, updateSelected, updateTerminal]);
+  }, [adoptFleet, bridge, reportFailure, updateSelected, updateTerminal]);
 
   const runAction = useCallback(async (action: DeckAction) => {
-    setError(undefined);
+    clearFailure();
     try {
       return await bridge.runAction(action);
     } catch (cause) {
       const message = cause instanceof Error ? cause.message : String(cause);
-      setError(message);
+      reportFailure(message);
       throw cause;
     }
-  }, [bridge]);
+  }, [bridge, clearFailure, reportFailure]);
 
   const getSettings = useCallback(() => bridge.getSettings(), [bridge]);
   // Stable for the lifetime of the bridge: `useZoom` holds it across a
@@ -184,7 +199,7 @@ export function useDeckRuntime(): DeckRuntimeState {
   // on every render.
   const setZoom = useCallback((level: number) => bridge.setZoom(level), [bridge]);
   const saveSettings = useCallback((settings: DesktopSettingsDto) => bridge.saveSettings(settings), [bridge]);
-  // PRD #741 M10. Not wrapped in the `setError` bookkeeping `runAction` uses,
+  // PRD #741 M10. Not wrapped in the failure bookkeeping `runAction` uses,
   // for the same reason `listProjects` is not: every outcome here is a
   // classified report the panel renders in place, and routing an unreachable
   // deck into the deck's global error toast would present a settings answer as
@@ -200,7 +215,7 @@ export function useDeckRuntime(): DeckRuntimeState {
   // shown set from an effect: an identity that changed every render would fire
   // that effect every render (PRD #745 M7).
   const setShownTerminals = useCallback((agentIds: string[]) => bridge.setShownTerminals(agentIds), [bridge]);
-  // PRD #819 M6. Deliberately NOT wrapped in the `setError` bookkeeping
+  // PRD #819 M6. Deliberately NOT wrapped in the failure bookkeeping
   // `runAction` uses: an empty listing and an unresolvable path are ordinary
   // outcomes of choosing a project, and routing them into the deck's global
   // error toast would present the first-run state as a fault. The picker owns
@@ -231,7 +246,8 @@ export function useDeckRuntime(): DeckRuntimeState {
     fleet,
     terminalData: EMPTY_TERMINAL_DATA,
     terminalFeed,
-    error,
+    error: failure?.message,
+    errorId: failure?.id,
     runAction,
     sendTerminalInput,
     resizeTerminal,
