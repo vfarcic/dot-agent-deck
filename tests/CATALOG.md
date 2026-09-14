@@ -5164,6 +5164,17 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Does not assert:** the real file-watcher / debounce mechanics (the synthetic event stands in for the watcher's apply step); env-override precedence; partial/invalid-TOML reload handling (unit-covered).
 - **Platform coverage:** mac+linux+windows.
 
+### Fleet observation (PRD #742)
+
+#### fleet/observe
+
+##### fleet/observe/001 — One client observes two real `daemon serve` processes as two decks, each agent attributed to the deck it came from.
+- **Layer:** L2 lane 1 (two headless `daemon serve` processes driven over their own attach sockets; no PTY and no TUI surface — the fleet view's only surface is the desktop app, for which no driver-level tier exists ([#953](https://github.com/vfarcic/dot-agent-deck/issues/953))).
+- **Agent:** none (one `sh -c 'sleep 600'` stand-in registered through `AttachRequest::StartAgent` on each daemon, the pattern `tests/e2e_handshake.rs` uses).
+- **Asserts:** two daemon **processes** on isolated endpoints (own socket, hook socket, state dir, HOME, schedules path and log path; idle shutdown disabled) each clear `platform::fsperm::verify_endpoint_trusted` — the uid and exactly-`0o600` predicate `daemon_bridge::establish` runs before it connects — against an inode the client did not create; the two endpoints mint different `EndpointIdentity::wire_id()` values, which is the whole body of the desktop's `deck_wire_id()` and therefore the identity every fleet row is keyed by; one client process handshakes both concurrently and both advertise a capability set; each `ListAgents` carries exactly its own agent, by display name and pane id, and never the other deck's; the two registries mint the **same** first agent id, so only the deck half of the frontend's `(daemonId, agentId)` key separates them; and killing one daemon process leaves the survivor answering with the same agent and the same identity while the dead deck's client fails on its own.
+- **Does not assert:** anything the desktop crate owns — `DaemonLinks`' per-deck gate, `snapshot_with`'s fold, `connection_from_handshake`'s stamp, the generation epoch, fleet membership under `retain` — all of which are `pub(crate)` to `dot-agent-deck-desktop` and are pinned there against two production attach servers bound in process (`daemon_bridge.rs`'s `RealDeck` tests, `cargo test-fast`, three platforms). Nor what the webview renders, nor that each watcher stamps its own endpoint on its emit (#953). Nor a remote deck: two local decks differ in their describe string as well as in their identity, so the pair that only `wire_id` separates — two remote rows differing solely in socket path, identity file or jump host — needs a settings document and stays in the desktop crate's own tier.
+- **Platform coverage:** mac+linux (the file is `#![cfg(all(feature = "e2e", unix))]` — `DaemonProc` binds Unix-domain sockets).
+
 ### Docs cross-reference skips
 
 Per Decision 27, documented user-facing behaviors that are deliberately not catalogued at M1:
