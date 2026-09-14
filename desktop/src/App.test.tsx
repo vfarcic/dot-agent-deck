@@ -759,6 +759,42 @@ describe("ControlDeck", () => {
     expect(listProjects.mock.calls.length).toBe(afterThird);
   });
 
+  /**
+   * Issue #887, Greptile P1: every other component of the re-list key is a fact
+   * about ONE daemon's world — `scheduleRevision` most sharply, since it counts
+   * from 0 on each daemon start — so the key has to carry which daemon it is
+   * about or those comparisons are being made across decks.
+   *
+   * Two decks agreeing on status, agent count, working directories AND schedule
+   * revision is not exotic: it is what a second deck running the same project
+   * looks like. Before the socket path led the key, switching to it left the
+   * key identical and the picker kept offering the projects of the deck the
+   * user had just switched away from.
+   *
+   * The second rerender is the control: the same deck again must not re-list,
+   * or this would pass against a key that changes on every render.
+   */
+  it("re-lists projects when the deck changes, even when everything else about it matches", async () => {
+    const listProjects = vi.fn(async () => ({ projects: [daemonProject("/home/dev/code/deck", "deck")] }));
+    const agents = [agentIn("1", "/home/dev/code/deck")];
+    const onDeck = (socketPath: string) => {
+      const base = liveSnapshot(agents);
+      return { ...base, scheduleRevision: 3, connection: { ...base.connection, socketPath } };
+    };
+    const base = liveWithProject({ listProjects, snapshot: onDeck("/run/deck-a.sock") });
+    const { rerender } = render(<ControlDeck runtime={base} />);
+    await waitFor(() => expect(listProjects.mock.calls.length).toBeGreaterThan(0));
+
+    const afterFirst = listProjects.mock.calls.length;
+    rerender(<ControlDeck runtime={{ ...base, snapshot: onDeck("/run/deck-b.sock") }} />);
+    await waitFor(() => expect(listProjects.mock.calls.length).toBeGreaterThan(afterFirst));
+
+    const afterSecond = listProjects.mock.calls.length;
+    rerender(<ControlDeck runtime={{ ...base, snapshot: onDeck("/run/deck-b.sock") }} />);
+    await new Promise((settle) => setTimeout(settle, 0));
+    expect(listProjects.mock.calls.length).toBe(afterSecond);
+  });
+
   it("explains and disables live workflow launch on Windows before confirmation", () => {
     const live = runtime({ mode: "live" });
     render(<ControlDeck runtime={live} workflowPlatformIssue={WINDOWS_WORKFLOW_BLOCK_REASON} />);

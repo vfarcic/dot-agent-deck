@@ -208,7 +208,19 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
    *
    * The last seed stays deliberately absent and is not a gap: the daemon's own
    * startup cwd is fixed for that daemon's life, so a change in it implies a
-   * different daemon, which the connection status already carries.
+   * different daemon, which `socketPath` below now carries.
+   *
+   * **`socketPath` leads, because the rest of the key is only meaningful
+   * WITHIN one deck** (issue #887, Greptile P1). Every other component is a
+   * fact about a particular daemon's world — and `scheduleRevision` most
+   * sharply so, since it counts from 0 on each daemon start and so is
+   * comparable only against earlier values from the same connection. Switching
+   * between two connected decks that happen to agree on status, agent count,
+   * working directories and revision left the key identical, so `useProjects`
+   * never re-listed and the picker kept offering the deck the user had just
+   * switched AWAY from. `connection.socketPath` is the per-daemon identity the
+   * bridge already uses as `daemonId`, and putting it first makes every
+   * comparison below it a within-deck one.
    */
   const projectsRevision = useMemo(() => {
     const seeds = snapshot.agents.flatMap((agent) => [agent.cwd, agent.tab.kind === "orchestration" ? agent.tab.cwd : undefined]);
@@ -219,12 +231,13 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
     // an unreporting daemon is a value no revision can spell, so it cannot be
     // confused with revision 0.
     return [
+      snapshot.connection.socketPath ?? "",
       snapshot.connection.status,
       String(snapshot.agents.length),
       snapshot.scheduleRevision === undefined ? "" : String(snapshot.scheduleRevision),
       ...distinct,
     ].join("\u0000");
-  }, [snapshot.agents, snapshot.connection.status, snapshot.scheduleRevision]);
+  }, [snapshot.agents, snapshot.connection.socketPath, snapshot.connection.status, snapshot.scheduleRevision]);
   const projectState = useDaemonProjects({
     listProjects: runtime.listProjects,
     resolveProject: runtime.resolveProject,
