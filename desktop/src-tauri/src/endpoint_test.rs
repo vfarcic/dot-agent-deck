@@ -65,7 +65,9 @@ use dot_agent_deck::daemon_protocol::PROTOCOL_VERSION;
 use crate::daemon_bridge::{HandshakeInfo, StampPolicy, hello};
 use crate::dto::{ConnectionStatus, safe_display_text};
 use crate::endpoint_tunnels::EndpointTunnels;
-use crate::settings::{DesktopSettings, EndpointId, LOCAL_SELECTION_TOKEN, RemoteEndpointSettings};
+use crate::settings::{
+    ALL_SELECTION_TOKEN, DesktopSettings, EndpointId, LOCAL_SELECTION_TOKEN, RemoteEndpointSettings,
+};
 
 /// What a `Test connection` found, as one named state.
 ///
@@ -418,13 +420,17 @@ fn apply_handshake(report: &mut EndpointTestReport, info: &HandshakeInfo, stamps
 /// `SelectionFallback` states — a row that is gone, a row with no socket — be
 /// reported as themselves.
 ///
-/// **`all` is not one of them, and lands on the `UnknownDeck` arm.** A probe
-/// tests one deck, and PRD #742's fleet token names a set; the panel reaches
-/// here with it only because its chooser shows no row while a fleet is
-/// selected, which #742 M4 is what settles. `EndpointId::parse` refuses the
-/// reserved word, so the existing malformed-token arm already answers it
-/// safely — the message is merely the wrong sentence for the case, not a wrong
-/// probe.
+/// **`all` is not one of them, and it has a sentence of its own** (PRD #742 M6).
+/// A probe tests one deck and the fleet token names a set, so there is nothing
+/// to probe. `EndpointId::parse` refuses the reserved word, so the malformed-
+/// token arm below already answered it *safely* — but with "that deck is no
+/// longer in this settings document", which is untrue twice over: All Decks is
+/// not a deck and it has not gone anywhere. The state stays `UnknownDeck`,
+/// because no probe was made and the report carries no deck; only the sentence
+/// changes, and a caller reaching here is told what to do instead.
+///
+/// The panel disables **Test connection** under a fleet selection, so this is
+/// the answer for a client that asks anyway rather than the one a user meets.
 pub(crate) async fn test_endpoint(
     settings: &DesktopSettings,
     selection: &str,
@@ -449,6 +455,14 @@ async fn unsealed(
     if selection.eq_ignore_ascii_case(LOCAL_SELECTION_TOKEN) {
         return test_local(tunnels).await;
     }
+    if selection.eq_ignore_ascii_case(ALL_SELECTION_TOKEN) {
+        return EndpointTestReport::new(
+            selection,
+            safe_display_text(selection),
+            EndpointTestState::UnknownDeck,
+            FLEET_IS_NOT_A_DECK.to_string(),
+        );
+    }
     let Ok(id) = EndpointId::parse(selection) else {
         return EndpointTestReport::new(
             selection,
@@ -472,6 +486,17 @@ async fn unsealed(
     };
     test_remote(&id, &row, tunnels).await
 }
+
+/// What a probe says when the selection is the whole fleet.
+///
+/// Not in `message_for`, deliberately: that function answers *per state*, and
+/// this shares [`EndpointTestState::UnknownDeck`] with the row-is-gone case it
+/// is the counterexample to. Giving it a state of its own would be a thirteenth
+/// variant, a thirteenth arm in the TypeScript union and a thirteenth row in
+/// every table that enumerates them, to distinguish two reports that differ
+/// only in one sentence.
+const FLEET_IS_NOT_A_DECK: &str =
+    "All Decks is every deck at once, not a deck to test. Choose one deck, then test it.";
 
 /// The local deck: no ssh, no tunnel, no forwards — just the handshake.
 ///
@@ -515,7 +540,7 @@ async fn test_local(tunnels: &EndpointTunnels) -> EndpointTestReport {
             );
         }
     }
-    release_if_not_selected(tunnels, &endpoint).await;
+    release_if_not_observed(tunnels, &endpoint).await;
     report
 }
 
@@ -629,7 +654,7 @@ async fn test_remote(
         }
     }
 
-    release_if_not_selected(tunnels, &endpoint).await;
+    release_if_not_observed(tunnels, &endpoint).await;
     report
 }
 
@@ -650,8 +675,10 @@ async fn test_remote(
 ///
 /// # The predicate is "observed", not "selected" (PRD #742 M3)
 ///
-/// It compared against `selected_endpoint()` until M3, and the name it still
-/// carries is that version's. The two agreed for every selection but
+/// It compared against `selected_endpoint()` until M3, and carried the name
+/// `release_if_not_selected` until M6 — one milestone longer, because the test
+/// below was written by a role whose brief forbade editing it. The two agreed
+/// for every selection but
 /// [`crate::settings::Selection::All`], under which the resolved deck is the
 /// **local** one — so **Test connection** on any remote deck in a fleet read as
 /// "not the selection" and released the transport of a deck the app was actively
@@ -675,7 +702,7 @@ async fn test_remote(
 /// closes one, so every such click leaked an authenticated `ssh` child — the
 /// exact leak this function exists to prevent, reached by mistaking two decks
 /// for one.
-async fn release_if_not_selected(tunnels: &EndpointTunnels, endpoint: &Endpoint) {
+async fn release_if_not_observed(tunnels: &EndpointTunnels, endpoint: &Endpoint) {
     if !crate::dto::deck_is_observed(endpoint) {
         tunnels.release(endpoint).await;
     }
@@ -1189,6 +1216,35 @@ mod tests {
         assert_eq!(report.state, EndpointTestState::UnknownDeck);
     }
 
+    /// The fleet token is not a missing row, and PRD #742 M6 stops it being
+    /// reported as one.
+    ///
+    /// `EndpointId::parse` refuses the reserved word `all`, so before M6 this
+    /// landed on the malformed-token arm above and came back "That deck is no
+    /// longer in this settings document" — untrue twice over: All Decks is not
+    /// a deck, and it has not gone anywhere. The state is unchanged, because no
+    /// probe was made and the report carries no deck; the sentence is what had
+    /// to move, and it says what to do instead.
+    #[tokio::test]
+    async fn the_fleet_token_is_told_it_is_not_a_deck_rather_than_a_missing_row() {
+        let settings = DesktopSettings::default();
+        let tunnels = EndpointTunnels::default();
+        let report = test_endpoint(&settings, ALL_SELECTION_TOKEN, &tunnels).await;
+
+        assert_eq!(report.state, EndpointTestState::UnknownDeck);
+        assert!(!report.state.is_ok(StampPolicy::Enforced));
+        assert_eq!(report.message, FLEET_IS_NOT_A_DECK);
+        assert_ne!(
+            report.message,
+            message_for(EndpointTestState::UnknownDeck, "", None),
+            "the fleet must not be told a deck it never named has been removed"
+        );
+
+        // Case-insensitively, the way every other reserved token is read.
+        let upper = test_endpoint(&settings, "ALL", &tunnels).await;
+        assert_eq!(upper.message, FLEET_IS_NOT_A_DECK);
+    }
+
     /// Every text field a remote or a planted ssh config can influence is
     /// stripped of bidi characters, not only of control characters.
     #[test]
@@ -1490,10 +1546,11 @@ mod tests {
     // -----------------------------------------------------------------------
     // PRD #742 M3 — the regression guard for a defect M3 CREATES
     //
-    // `release_if_not_selected` compares the probed deck against
-    // `crate::dto::selected_endpoint()`. Under `Selection::All` the selected
-    // deck resolves to the LOCAL one, so **Test connection** on any remote
-    // observed deck releases that deck's transport.
+    // `release_if_not_observed` compared the probed deck against
+    // `crate::dto::selected_endpoint()` before M3, which is what it was called
+    // `release_if_not_selected` for. Under `Selection::All` the selected deck
+    // resolves to the LOCAL one, so **Test connection** on any remote observed
+    // deck released that deck's transport.
     //
     // That is inert today — nothing holds a lease on a non-selected deck, so the
     // release drops the only handle and the next use re-opens. It becomes a real
@@ -1543,7 +1600,7 @@ mod tests {
     /// stores. This test does not care where it is stored; it drives the
     /// behaviour through the applied document.
     ///
-    /// The second half is not decoration: `release_if_not_selected` exists to
+    /// The second half is not decoration: `release_if_not_observed` exists to
     /// stop a tunnel leaking per Test-connection click, and a fix that simply
     /// stopped releasing would trade one leak for another.
     #[cfg(unix)]
@@ -1557,7 +1614,7 @@ mod tests {
         tunnels.insert_stand_in(&observed).await;
         assert_eq!(tunnels.held().await, 1, "the fixture must seed a transport");
 
-        release_if_not_selected(&tunnels, &observed).await;
+        release_if_not_observed(&tunnels, &observed).await;
         assert_eq!(
             tunnels.held().await,
             1,
@@ -1569,7 +1626,7 @@ mod tests {
         // The converse still holds: a deck nothing observes is still released.
         tunnels.insert_stand_in(&stranger).await;
         assert_eq!(tunnels.held().await, 2);
-        release_if_not_selected(&tunnels, &stranger).await;
+        release_if_not_observed(&tunnels, &stranger).await;
         assert_eq!(
             tunnels.held().await,
             1,

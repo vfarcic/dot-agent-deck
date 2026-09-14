@@ -979,7 +979,7 @@ static OBSERVED_DECKS: std::sync::RwLock<Option<Vec<Endpoint>>> = std::sync::RwL
 /// written together on purpose — a probe that asked one and a watcher that asked
 /// the other could otherwise disagree about whether a deck is in the fleet, and
 /// disagreeing is precisely how a live transport gets released out from under a
-/// watcher holding a lease on it (see `endpoint_test::release_if_not_selected`).
+/// watcher holding a lease on it (see `endpoint_test::release_if_not_observed`).
 pub(crate) fn apply_settings_selection(
     settings: &crate::settings::DesktopSettings,
 ) -> SelectedDeck {

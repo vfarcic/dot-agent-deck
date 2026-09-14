@@ -1550,6 +1550,67 @@ describe("ControlDeck", () => {
     expect(reported.container.querySelector(".agent-footer span:nth-child(2)")).toHaveAttribute("title", "Unavailable");
   });
 
+  /*
+    -------------------------------------------------------------------------
+    Issue #1046 — the toast could not clear a daemon error, and with PRD 742's
+    fleet that masks rather than annoys.
+
+    The toast renders on `notice || runtime.error` and its dismiss button
+    cleared `notice` alone. `runtime.error` belongs to `useDeckRuntime` and
+    nothing here could clear it, so one dead deck's stale sentence sat
+    undismissable in the shared toast over a healthy deck's later message.
+    -------------------------------------------------------------------------
+  */
+
+  /**
+   * Scenario: the deck reports a daemon error and the user presses the toast's
+   * dismiss button. The toast goes, and it STAYS gone while the same still-
+   * broken deck re-asserts the same sentence — but a different error is a
+   * different message and shows immediately.
+   */
+  it("dismisses a daemon error without suppressing a later, different one", () => {
+    const base = runtime();
+    const { rerender } = render(<ControlDeck runtime={{ ...base, error: "Deck A stopped answering." }} />);
+    expect(screen.getByText("Deck A stopped answering.")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByLabelText("Dismiss message"));
+    expect(screen.queryByText("Deck A stopped answering.")).toBeNull();
+
+    // Re-asserted by the same broken deck on the next reconcile: still gone.
+    // Dismissed means dismissed, not hidden for one render.
+    rerender(<ControlDeck runtime={{ ...base, error: "Deck A stopped answering." }} />);
+    expect(screen.queryByText("Deck A stopped answering.")).toBeNull();
+
+    // A DIFFERENT failure is a different message, and the dismissal above was
+    // aimed at the old one. This is the masking half of #1046.
+    rerender(<ControlDeck runtime={{ ...base, error: "Deck B refused the handshake." }} />);
+    expect(screen.getByText("Deck B refused the handshake.")).toBeInTheDocument();
+  });
+
+  /**
+   * Scenario: an action fails. `perform` catches it into `notice` while
+   * `runAction` has already put the same sentence into `runtime.error`, so ONE
+   * press of dismiss has to clear both — otherwise dismissing the notice simply
+   * reveals its twin underneath and the toast never goes away, which is how
+   * #1046 was met in practice.
+   */
+  it("clears a failure that reached both the notice and the deck error in one press", () => {
+    const base = runtime();
+    const message = "Stop refused: the deck is not local.";
+    const failing = {
+      ...base,
+      error: message,
+      runAction: vi.fn(async () => { throw new Error(message); }),
+    };
+    render(<ControlDeck runtime={failing} />);
+
+    fireEvent.click(screen.getByTestId("fixture-advance"));
+    return waitFor(() => expect(screen.getByText(message)).toBeInTheDocument()).then(() => {
+      fireEvent.click(screen.getByLabelText("Dismiss message"));
+      expect(screen.queryByText(message)).toBeNull();
+    });
+  });
+
   /**
    * The fixture keeps its own attempt counts: they are legitimate fixture data,
    * and M8's claim is about what LIVE mode presents as fact.

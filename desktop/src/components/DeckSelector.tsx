@@ -63,6 +63,7 @@ import { DISPLAY_LIMITS, displayText } from "../lib/displayText";
 import {
   type DeckSelection,
   deckChoices,
+  endpointSectionToSave,
   parseSelection,
   sameSelection,
   selectionToken,
@@ -132,33 +133,29 @@ export function DeckSelector({ settings, connection }: { settings: DesktopSettin
   const choose = (next: DeckSelection) => {
     setOpen(false);
     /*
-      A no-op guard, and it used to carry a second job that #742 M1 took off it.
+      The no-op guard, which is shared with `EndpointsPanel` since PRD #742 M6
+      and is a data safety property rather than a tidiness one.
 
-      The claim here was that when the document has NO `[endpoints]` section the
-      only choice is the local deck and it is already selected, so every click
-      lands on this line and the section below is only ever built from one that
-      already exists. **All Decks is a second choice that needs no
-      configuration**, so that is no longer true: choosing it on a bare document
-      writes `{ remote: [], selection: "all" }`, which is the shape
-      `normalizeEndpointSettings` preserves absence to avoid fabricating.
+      The claim it used to carry here was that when the document has NO
+      `[endpoints]` section the only choice is the local deck and it is already
+      selected, so every click lands on the guard and the section below is only
+      ever built from one that already exists. **All Decks is a second choice
+      that needs no configuration**, so that stopped being true at M1.
 
-      Which is safe in the ordinary case and not a new hazard in the other one.
-      Ordinarily the webview's section is absent because the DOCUMENT's is —
-      Rust omits a `None` and every other panel round-trips what it was given —
-      so an empty `remote` deletes nothing that exists, and it records a choice
-      the user actually made. The section can also be absent because the
-      document failed to parse and `load_from` fell back to defaults, and there
-      an empty `remote` merges over rows that are still on disk; but
-      `EndpointsPanel`'s own chooser has written that same shape on every click
-      since #741, with no same-selection guard at all, so this adds a click to
-      an existing hazard rather than opening one. Fixing it belongs with that
-      panel and not here.
+      What an unguarded click costs: the webview's section is ordinarily absent
+      because the DOCUMENT's is, so writing `{ remote: [], selection }` deletes
+      nothing. It is also absent when `desktop.toml` failed to parse and
+      `load_from` fell back to defaults — and there `remote: []` merges over
+      rows that are still on disk. `endpointSectionToSave` is where that is
+      refused for every write site at once, and its doc comment carries the rest
+      of the reasoning, including what it deliberately does not close.
     */
-    if (sameSelection(next, selection)) return;
-    settings.save({
-      ...settings.settings,
-      endpoints: { remote: section?.remote ?? [], selection: selectionToken(next) },
+    const write = endpointSectionToSave(section, {
+      remote: section?.remote ?? [],
+      selection: selectionToken(next),
     });
+    if (!write) return;
+    settings.save({ ...settings.settings, endpoints: write });
   };
 
   return (

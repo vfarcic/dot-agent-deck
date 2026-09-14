@@ -219,4 +219,37 @@ test.describe("the Decks settings section", () => {
     await expect(page.getByTestId("deck-choices")).toBeVisible();
     await expect(page.getByLabel("Host", { exact: true })).toHaveValue("build-box");
   });
+
+  /**
+   * PRD 742 M6, and here rather than only in vitest because what broke was what
+   * a reader SAW: with the fleet selected this panel used to paint a chooser
+   * with nothing chosen and no form beneath it, which is indistinguishable from
+   * a panel that failed to render. A radio group's checked state and an
+   * explanatory line under it are the kind of thing worth confirming in the two
+   * engines the app ships on.
+   */
+  test("paints a stored fleet selection as a choice rather than as nothing", async ({ page }) => {
+    await openDecks(page, {
+      remote: [{ host: "build-box", id: "deck0000000000aa", port: 22 }],
+      selection: "all",
+    });
+
+    await expect(page.getByTestId("deck-choice-all")).toContainText("All Decks");
+    await expect(page.getByTestId("deck-choice-all").locator("input")).toBeChecked();
+    await expect(page.getByTestId("deck-choice-local").locator("input")).not.toBeChecked();
+    await expect(page.getByTestId("deck-choice-deck0000000000aa").locator("input")).not.toBeChecked();
+
+    // No fields — the fleet has no host of its own — and a sentence saying so,
+    // so the absence reads as an answer rather than as a missing form.
+    await expect(page.getByTestId("deck-detail")).toHaveCount(0);
+    await expect(page.getByTestId("deck-fleet-note")).toBeVisible();
+    // And nothing to probe: a probe tests one deck.
+    await expect(page.getByTestId("test-connection")).toBeDisabled();
+
+    // Choosing a deck gets the form and the button back, which is what the
+    // sentence told the reader to do.
+    await page.getByTestId("deck-choice-deck0000000000aa").locator("input").click();
+    await expect(page.getByLabel("Host", { exact: true })).toHaveValue("build-box");
+    await expect(page.getByTestId("test-connection")).toBeEnabled();
+  });
 });

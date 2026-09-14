@@ -494,3 +494,79 @@ export function deckChoices(section: EndpointSettingsDto | undefined): DeckChoic
  * only the label on the trigger while that sentence is on screen.
  */
 export const UNKNOWN_DECK_LABEL = "Unknown deck";
+
+/** Whether two stored rows are the same deck described the same way. */
+function sameEndpointRow(left: RemoteEndpointDto, right: RemoteEndpointDto): boolean {
+  return left.id === right.id
+    && left.host === right.host
+    && left.port === right.port
+    && left.user === right.user
+    && left.identity === right.identity
+    && left.jump === right.jump
+    && left.socket === right.socket;
+}
+
+/** Whether two endpoint sections say the same thing, row order included. */
+export function sameEndpointSection(left: EndpointSettingsDto, right: EndpointSettingsDto): boolean {
+  return left.selection === right.selection
+    && left.remote.length === right.remote.length
+    && left.remote.every((row, index) => sameEndpointRow(row, right.remote[index]));
+}
+
+/**
+ * The `endpoints` section a save should carry, or `undefined` for **write
+ * nothing at all** (issue #1046's sibling in PRD #742 M6).
+ *
+ * # What this exists to stop
+ *
+ * `DesktopSettings::endpoints` is an `Option` so that "the client is not
+ * telling you about this section" is representable and the merge can preserve
+ * what is on disk — `a_client_that_cannot_render_endpoints_cannot_delete_them`
+ * in `settings.rs` is the Rust half of it, and
+ * `docs/develop/desktop-gui.md`'s *`Option<EndpointSettings>` is merge
+ * protection* section states the obligation it puts on this side: round-trip
+ * the section, and **never fabricate a default for it**.
+ *
+ * A client that renders decks has to build a section to save one, and it reads
+ * that section through a `?? { remote: [], selection: "local" }` default when
+ * the document declares none. That default is the fabrication the doc names:
+ * `remote: []` is the assertion *"this user has no decks"*, and
+ * `merged_document` writes it over whatever `[[endpoints.remote]]` rows the
+ * file holds. Ordinarily the file holds none either — Rust omitted a `None`
+ * because there was nothing there — but the webview is also handed a
+ * fabricated-looking document when `desktop.toml` **failed to parse**, because
+ * `load_from` logs and falls back to `DesktopSettings::default()` while every
+ * row stays on disk. Every configured deck, deleted by a click that changed
+ * nothing.
+ *
+ * # The property this lands
+ *
+ * **A section is written only when it differs from the one the panel was
+ * given.** That is the whole of the "somebody changing the theme" shape the
+ * `Option` exists to stop, arriving from a client that *does* render decks: a
+ * click that selects the deck already in force, or that abandons a draft
+ * without moving the selection, now writes nothing at all, so it cannot reach
+ * the merge and cannot delete a row it never saw.
+ *
+ * It is shared rather than a guard inside one handler because every write site
+ * carries the same hazard — `EndpointsPanel`'s chooser, its row editor, its
+ * remove button and its Test-connection write-back, and `DeckSelector`'s menu.
+ *
+ * # What it does NOT close, deliberately
+ *
+ * An **intentional** change against an unreadable document still writes
+ * `remote: []`: choosing All Decks on a document that failed to parse stores
+ * the selection and takes the rows with it. Closing that needs the webview to
+ * be able to say "I am changing the selection and asserting nothing about the
+ * rows" — `remote` optional on the wire, so the merge preserves rows the client
+ * was never shown — or `load_from` to stop handing the webview a document that
+ * is not the file. Both are schema-or-load-path changes wider than this
+ * milestone, and both are recorded in the PRD rather than attempted here.
+ */
+export function endpointSectionToSave(
+  received: EndpointSettingsDto | undefined,
+  next: EndpointSettingsDto,
+): EndpointSettingsDto | undefined {
+  const base = received ?? { remote: [], selection: LOCAL_ENDPOINT_SELECTION };
+  return sameEndpointSection(base, next) ? undefined : next;
+}

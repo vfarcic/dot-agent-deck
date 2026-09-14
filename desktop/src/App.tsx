@@ -170,6 +170,27 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
   const [helpOpen, setHelpOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [notice, setNotice] = useState<string>();
+  /**
+   * The daemon error the user has already dismissed
+   * ([#1046](https://github.com/vfarcic/dot-agent-deck/issues/1046)).
+   *
+   * The toast renders on `notice || runtime.error` and its dismiss button used
+   * to clear `notice` alone, so a `runtime.error` could not be got rid of at
+   * all: every failure `perform` catches sets BOTH, and dismissing then revealed
+   * the same sentence underneath. With one deck that is an annoyance. With PRD
+   * #742's fleet it masks: one dead deck's stale error sits undismissable over
+   * a healthy deck's later message, in a toast the whole app shares.
+   *
+   * `runtime.error` belongs to `useDeckRuntime` and only its own calls clear it,
+   * so what is held here is the dismissal rather than the error — suppressed
+   * until a DIFFERENT error arrives, not merely hidden once. Both halves of that
+   * are deliberate: a still-broken deck re-asserting the same sentence must not
+   * put the toast back on every reconcile, and a new failure must never be
+   * swallowed by a dismissal aimed at the old one. Which deck is down is not
+   * this toast's job either way — PRD #742 M4 gave every deck its own
+   * `ConnectionView`, and that is the health display.
+   */
+  const [dismissedError, setDismissedError] = useState<string>();
   const [confirm, setConfirm] = useState<ConfirmState>();
   // Memoised so the context value is stable across renders; `runtime.testEndpoint`
   // is itself stable for the lifetime of the bridge.
@@ -332,6 +353,13 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
   const canControlDaemon = !remoteDeck && (snapshot.connection.status === "connected" || snapshot.connection.daemonDetected === true);
 
   const coordinator = snapshot.agents.find((agent) => agent.isStartRole);
+
+  /**
+   * What the toast says, or nothing. A `notice` is this screen's own sentence
+   * and always wins; a daemon error shows until it is dismissed, and then only
+   * again when the sentence itself changes (see {@link dismissedError}).
+   */
+  const toastMessage = notice ?? (runtime.error === dismissedError ? undefined : runtime.error);
 
   const perform = async (action: DeckAction, success?: string) => {
     try {
@@ -788,7 +816,9 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
       {paletteOpen && <CommandPalette commands={commandItems} onClose={() => setPaletteOpen(false)} />}
       {helpOpen && <ShortcutHelp onClose={() => setHelpOpen(false)} />}
       {confirm && <ConfirmDialog state={confirm} onClose={() => setConfirm(undefined)} />}
-      {(notice || runtime.error) && <div className="toast" role="status"><AlertTriangle size={15} /><span>{notice ?? runtime.error}</span><button aria-label="Dismiss message" onClick={() => setNotice(undefined)}><X size={14} /></button></div>}
+      {/* One press clears what is on screen AND the error behind it, because a
+          failure routed through `perform` puts the same sentence in both. */}
+      {toastMessage && <div className="toast" role="status"><AlertTriangle size={15} /><span>{toastMessage}</span><button aria-label="Dismiss message" onClick={() => { setNotice(undefined); setDismissedError(runtime.error); }}><X size={14} /></button></div>}
     </div>
   );
 }

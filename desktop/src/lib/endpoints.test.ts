@@ -22,6 +22,8 @@ import {
   rowProblems,
   sameSelection,
   selectionToken,
+  endpointSectionToSave,
+  sameEndpointSection,
   socketProblem,
   SPECIMEN_PLACEHOLDER_FIELDS,
   userProblem,
@@ -348,5 +350,60 @@ describe("the universal refusals", () => {
       expect(hostProblem(`a${character}b`), `host refuses ${JSON.stringify(character)}`).toBeDefined();
       expect(identityProblem(`/a${character}b`), `identity refuses ${JSON.stringify(character)}`).toBeDefined();
     }
+  });
+});
+
+/*
+  ---------------------------------------------------------------------------
+  PRD 742 M6 — the client-side half of the `Option<EndpointSettings>` merge
+  protection.
+
+  Rust's `a_client_that_cannot_render_endpoints_cannot_delete_them` pins the
+  half that protects a client which does not render decks. These pin the half
+  that protects a client which DOES: a panel reads an absent section through a
+  `{ remote: [], selection: "local" }` stand-in, and `remote: []` is the
+  assertion "this user has no decks". `merged_document` writes it over whatever
+  rows are on disk, and the webview is handed an absent-looking section not only
+  when there is none but also when `desktop.toml` failed to parse.
+  ---------------------------------------------------------------------------
+*/
+describe("endpointSectionToSave", () => {
+  const row = { host: "build-box", id: "deck0000000000aa", port: 22 };
+
+  /**
+   * The one that matters: the document declares no section, so what the panel
+   * is holding is a stand-in rather than the file's content. A change that
+   * changes nothing must not be written, because the write it would make
+   * asserts an empty deck list this client was never actually told about.
+   */
+  it("writes nothing when a fabricated section would be saved unchanged", () => {
+    expect(endpointSectionToSave(undefined, { remote: [], selection: LOCAL_ENDPOINT_SELECTION })).toBeUndefined();
+  });
+
+  /** The same guard for a section the document really does declare. */
+  it("writes nothing when the section it was given comes back unchanged", () => {
+    const section: EndpointSettingsDto = { remote: [row], selection: row.id };
+    expect(endpointSectionToSave(section, { remote: [{ ...row }], selection: row.id })).toBeUndefined();
+  });
+
+  /** A real change still goes, rows and selection alike. */
+  it("writes a section that differs", () => {
+    const section: EndpointSettingsDto = { remote: [row], selection: row.id };
+    expect(endpointSectionToSave(section, { remote: [row], selection: LOCAL_ENDPOINT_SELECTION }))
+      .toEqual({ remote: [row], selection: LOCAL_ENDPOINT_SELECTION });
+    expect(endpointSectionToSave(section, { remote: [], selection: LOCAL_ENDPOINT_SELECTION }))
+      .toEqual({ remote: [], selection: LOCAL_ENDPOINT_SELECTION });
+    expect(endpointSectionToSave(undefined, { remote: [row], selection: row.id }))
+      .toEqual({ remote: [row], selection: row.id });
+  });
+
+  /** Every field of a row counts, not just its id. */
+  it("compares a row field by field", () => {
+    const section: EndpointSettingsDto = { remote: [row], selection: row.id };
+    expect(sameEndpointSection(section, { remote: [{ ...row }], selection: row.id })).toBe(true);
+    for (const change of [{ host: "ci-box" }, { port: 2222 }, { user: "deploy" }, { identity: "/k" }, { jump: "bastion" }, { socket: "/run/deck.sock" }]) {
+      expect(sameEndpointSection(section, { remote: [{ ...row, ...change }], selection: row.id }), JSON.stringify(change)).toBe(false);
+    }
+    expect(sameEndpointSection(section, { remote: [], selection: row.id })).toBe(false);
   });
 });

@@ -10,8 +10,18 @@
  * `Endpoint::local()` resolves it from the platform paths the way every caller
  * did before endpoints existed, so a fresh install has **no** `[endpoints]`
  * section and still works, and deleting the section gets the local deck back
- * rather than nothing. It is therefore rendered first, always present, never
- * removable — and it is why this panel is useful before anything is configured.
+ * rather than nothing. It is therefore always present and never removable — and
+ * it is why this panel is useful before anything is configured.
+ *
+ * # The chooser is `deckChoices`, the same list the Deck selector offers
+ *
+ * It was not, until PRD #742 M6. This panel built its own list — the local deck
+ * and the stored rows — so when M1 added **All Decks** the panel had no entry
+ * for it, and a document storing `all` rendered with no radio checked, no
+ * detail form, and a **Test connection** button that was still enabled for a
+ * token no probe can answer. One builder means an entry added there arrives
+ * here; what stays local to this panel is the draft row, the remove buttons and
+ * the detail form, none of which the top bar has.
  *
  * # The round trip, which is a silent data-loss bug if it is got wrong
  *
@@ -59,8 +69,10 @@ import type {
 import { LOCAL_ENDPOINT_SELECTION } from "../lib/bridge";
 import { DISPLAY_LIMITS, displayText } from "../lib/displayText";
 import {
+  ALL_ENDPOINT_SELECTION,
   blankEndpoint,
-  describeEndpoint,
+  deckChoices,
+  endpointSectionToSave,
   FIELD_PLACEHOLDERS,
   hostProblem,
   identityProblem,
@@ -73,7 +85,15 @@ import {
 import { useSettingsBridge } from "../lib/settingsBridge";
 import type { SettingsPanelProps } from "../lib/settingsContract";
 
-/** How the panel reads the document's endpoint section without fabricating one. */
+/**
+ * How the panel READS the document's endpoint section.
+ *
+ * The `??` is a render-time stand-in and nothing else: a document with no
+ * `[endpoints]` section still has a local deck and still has to draw a chooser.
+ * It must never reach a save on its own — `remote: []` is the assertion "this
+ * user has no decks", and PRD #742 M6 routes every write through
+ * {@link endpointSectionToSave}, which is where that rule is written down.
+ */
 function sectionOf(settings: DesktopSettingsDto): EndpointSettingsDto {
   return settings.endpoints ?? { remote: [], selection: LOCAL_ENDPOINT_SELECTION };
 }
@@ -125,12 +145,46 @@ export function EndpointsPanel({ settings, onSave, saveError, mode }: SettingsPa
   // What the chooser offers: every stored deck, plus an unsaved draft at the
   // end so a user filling one in can see the row they are typing into.
   const rows = draft ? [...section.remote, draft] : section.remote;
+  /**
+   * The chooser's entries, from {@link deckChoices} — the same list the Deck
+   * selector in the top bar offers, and PRD #742 M6's fix for a panel that had
+   * its own (issue: this one had no **All Decks** entry, so with `all` stored
+   * its `shown` matched no row, nothing was checked and no detail form
+   * rendered). A draft is appended the way it always was, by handing the
+   * builder the rows the panel is showing rather than the ones the document
+   * holds; `deckChoices` reads `remote` and nothing else, so this constructed
+   * section is render-only and is never saved.
+   */
+  const choices = deckChoices({ remote: rows, selection: shown });
+  const removable = new Set(rows.map((row) => row.id));
+  /**
+   * All Decks is selected, so there is no single deck to show fields for or to
+   * probe.
+   *
+   * The detail form's absence is CORRECT here rather than a gap — the fleet has
+   * no host, port or key file of its own — so what this drives is the sentence
+   * that says so, and the Test-connection button. A probe tests one deck:
+   * `endpoint_test::unsealed` reaches its `UnknownDeck` arm for this token
+   * because `EndpointId::parse` refuses the reserved word, which is safe and
+   * still the wrong answer to give a user who has not chosen a deck.
+   */
+  const fleetSelected = shown === ALL_ENDPOINT_SELECTION;
 
   /**
    * Write a new endpoint section back. The whole document goes, with `settings`
    * spread — see the round-trip note at the top of this file.
+   *
+   * Every write in this panel goes through here, and {@link endpointSectionToSave}
+   * is what decides whether there is one to make: a change that changes nothing
+   * is not written at all, so it cannot merge a fabricated `remote: []` over
+   * rows this client was never shown (PRD #742 M6). `DeckSelector` shares the
+   * same function for the same reason.
    */
-  const saveSection = (next: EndpointSettingsDto) => onSave({ ...settings, endpoints: next });
+  const saveSection = (next: EndpointSettingsDto) => {
+    const write = endpointSectionToSave(settings.endpoints, next);
+    if (!write) return;
+    onSave({ ...settings, endpoints: write });
+  };
 
   const addDeck = () => {
     // Focused on creation, but NOT stored and NOT selected: an added deck the
@@ -148,6 +202,12 @@ export function EndpointsPanel({ settings, onSave, saveError, mode }: SettingsPa
    * already the row on screen, and writing its id into `selection` would name a
    * deck the document does not contain, which `EndpointSettings::resolve`
    * answers with the local fallback.
+   *
+   * Clicking the deck ALREADY in force is a no-op too, and that one is a data
+   * safety property rather than a tidiness one — abandoning a draft by clicking
+   * back onto the selected deck used to write a whole section for a selection
+   * that had not moved. {@link saveSection} is where it is refused, because
+   * every other handler here can be reached the same way.
    */
   const chooseDeck = (id: string) => {
     if (draft?.id === id) return;
@@ -275,20 +335,14 @@ export function EndpointsPanel({ settings, onSave, saveError, mode }: SettingsPa
       <div className="settings-row">
         <span className="settings-row-label" id="deck-chooser-label">Deck</span>
         <div className="deck-choices" role="radiogroup" aria-labelledby="deck-chooser-label" data-testid="deck-choices">
-          <DeckChoice
-            id={LOCAL_ENDPOINT_SELECTION}
-            label="This machine"
-            selected={shown === LOCAL_ENDPOINT_SELECTION}
-            onSelect={() => chooseDeck(LOCAL_ENDPOINT_SELECTION)}
-          />
-          {rows.map((row) => (
+          {choices.map((choice) => (
             <DeckChoice
-              key={row.id}
-              id={row.id}
-              label={displayText(describeEndpoint(row) || "New deck", DISPLAY_LIMITS.name)}
-              selected={shown === row.id}
-              onSelect={() => chooseDeck(row.id)}
-              onRemove={() => removeDeck(row.id)}
+              key={choice.token}
+              id={choice.token}
+              label={displayText(choice.label, DISPLAY_LIMITS.name)}
+              selected={shown === choice.token}
+              onSelect={() => chooseDeck(choice.token)}
+              onRemove={removable.has(choice.token) ? () => removeDeck(choice.token) : undefined}
             />
           ))}
           <button className="add-deck" data-testid="add-deck" onClick={addDeck}>
@@ -296,6 +350,13 @@ export function EndpointsPanel({ settings, onSave, saveError, mode }: SettingsPa
           </button>
         </div>
       </div>
+
+      {fleetSelected && (
+        <p className="settings-hint" data-testid="deck-fleet-note">
+          All Decks is every deck at once, so it has no settings and nothing to test. Choose a deck to
+          change or test that deck.
+        </p>
+      )}
 
       {selected && (
         <div className="deck-detail" data-testid="deck-detail">
@@ -362,6 +423,7 @@ export function EndpointsPanel({ settings, onSave, saveError, mode }: SettingsPa
             data-testid="test-connection"
             disabled={
               testing !== undefined
+              || fleetSelected
               || (selected ? rowProblems(selected).length > 0 : false)
             }
             onClick={() => void runTest(shown)}

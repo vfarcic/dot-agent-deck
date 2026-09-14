@@ -144,6 +144,123 @@ describe("EndpointsPanel", () => {
     expect(screen.queryByTestId("deck-detail")).toBeNull();
   });
 
+  /*
+    -------------------------------------------------------------------------
+    PRD 742 M6 — the client-side counterpart of Rust's
+    `a_client_that_cannot_render_endpoints_cannot_delete_them`.
+
+    That test pins the protection a client which CANNOT render decks gets from
+    `DesktopSettings::endpoints` being an `Option`. These pin the other half:
+    this panel CAN render decks, it reads an absent section through a
+    `{ remote: [], selection: "local" }` stand-in, and `remote: []` is the
+    assertion "this user has no decks" — which `merged_document` writes over
+    whatever `[[endpoints.remote]]` rows are on disk. The webview is handed an
+    absent-looking section not only when there genuinely is none, but also when
+    `desktop.toml` failed to parse and `load_from` fell back to defaults with
+    every row still in the file. Nobody reproduces that by hand.
+    -------------------------------------------------------------------------
+  */
+
+  /**
+   * Scenario: a document with no `[endpoints]` section. Press "Add a deck",
+   * then abandon the draft by clicking back onto **This machine** — the deck
+   * that was already in force. Nothing about the document changed, so nothing
+   * may be written: the section this panel would write is a stand-in it
+   * invented, and it would delete rows it was never shown.
+   */
+  it("a client that CAN render endpoints does not delete them by re-choosing the deck already in force", () => {
+    const { onSave } = renderPanel();
+    fireEvent.click(screen.getByTestId("add-deck"));
+    expect(screen.getByTestId("deck-detail")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByTestId("deck-choice-local").querySelector("input")!);
+
+    // The draft is abandoned, which is what the click was for...
+    expect(screen.queryByTestId("deck-detail")).toBeNull();
+    // ...and the document is untouched, which is the property.
+    expect(onSave).not.toHaveBeenCalled();
+  });
+
+  /**
+   * Scenario: the same click against a document that DOES declare a section,
+   * with a deck stored and selected. Re-choosing it is still a no-op, so the
+   * rows are never rewritten — the guard is about the change being empty, not
+   * about the section being absent.
+   */
+  it("does not rewrite a declared section for a selection that has not moved", () => {
+    const row = deck();
+    const { onSave } = renderPanel({ endpoints: { remote: [row], selection: row.id } });
+    fireEvent.click(screen.getByTestId("add-deck"));
+
+    fireEvent.click(screen.getByTestId(`deck-choice-${row.id}`).querySelector("input")!);
+
+    // The draft is gone and the stored deck's own fields are back on screen.
+    expect(screen.getByLabelText("Host")).toHaveValue(row.host);
+    expect(onSave).not.toHaveBeenCalled();
+  });
+
+  /*
+    -------------------------------------------------------------------------
+    PRD 742 M6 — a stored fleet selection.
+
+    M1 added **All Decks** to `deckChoices`, which the top bar's Deck selector
+    is built from. This panel had a chooser of its own, so with `all` stored its
+    `shown` matched no row: no radio checked, no detail form, and a **Test
+    connection** button still enabled for a token no probe can answer.
+    -------------------------------------------------------------------------
+  */
+
+  /**
+   * Scenario: the document stores the fleet selection. The chooser shows **All
+   * Decks** checked and says why there are no fields under it, rather than
+   * rendering a chooser with nothing chosen.
+   */
+  it("shows a stored fleet selection as chosen, with a reason there are no fields", () => {
+    renderPanel({ endpoints: { remote: [deck()], selection: "all" } });
+
+    expect(screen.getByTestId("deck-choice-all").querySelector("input")).toBeChecked();
+    expect(screen.getByTestId("deck-choice-local").querySelector("input")).not.toBeChecked();
+    expect(screen.getByTestId("deck-choice-deck0000000000aa").querySelector("input")).not.toBeChecked();
+    // No fields, and a sentence saying that is correct rather than missing.
+    expect(screen.queryByTestId("deck-detail")).toBeNull();
+    expect(screen.getByTestId("deck-fleet-note")).toHaveTextContent("All Decks is every deck at once");
+    // The fleet is not a row, so there is nothing to remove.
+    expect(screen.queryByTestId("remove-deck-all")).toBeNull();
+  });
+
+  /**
+   * Scenario: press **Test connection** while the fleet is selected. You
+   * cannot: a probe tests one deck, and the fleet token names a set. Before
+   * this the button was live and reached `endpoint_test::unsealed`, which
+   * answered "That deck is no longer in this settings document" — safe, and the
+   * wrong sentence for a selection that is in force.
+   */
+  it("cannot probe under a fleet selection", () => {
+    const testEndpoint = vi.fn(async () => report());
+    renderPanel({ endpoints: { remote: [deck()], selection: "all" } }, { testEndpoint });
+
+    expect(screen.getByTestId("test-connection")).toBeDisabled();
+    fireEvent.click(screen.getByTestId("test-connection"));
+    expect(testEndpoint).not.toHaveBeenCalled();
+  });
+
+  /**
+   * Scenario: choose **All Decks** from this panel on a document that already
+   * declares a section. It is a real change, so it is written — and the stored
+   * rows travel with it rather than being replaced by the chooser's own idea of
+   * the list.
+   */
+  it("stores the fleet selection without disturbing the rows", () => {
+    const row = deck();
+    const { onSave } = renderPanel({ endpoints: { remote: [row], selection: row.id } });
+
+    fireEvent.click(screen.getByTestId("deck-choice-all").querySelector("input")!);
+
+    const saved = onSave.mock.calls[0][0] as DesktopSettingsDto;
+    expect(saved.endpoints?.selection).toBe("all");
+    expect(saved.endpoints?.remote).toEqual([row]);
+  });
+
   /**
    * Scenario: two decks are configured and the second is selected; click the
    * first. The selection moves and both rows survive.
