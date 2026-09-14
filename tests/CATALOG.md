@@ -3261,7 +3261,7 @@ without depending on the config struct API.
 - **Platform coverage:** linux+mac (the suite is `#![cfg(unix)]` — the mock attach servers bind Unix-domain sockets; Windows port tracked by #164).
 
 
-##### orchestration/dispatch/005 — A dispatch result is refused, with no bytes written, when the caller's pane changed hands while the dispatch ran (issue #617, finding 3).
+##### orchestration/dispatch/006 — A dispatch result is refused, with no bytes written, when the caller's pane changed hands while the dispatch ran (issue #617, finding 3).
 - **Layer:** fast integration (the real `daemon::deliver_dispatch_result` seam against daemon-owned PTYs; no daemon process, no `handle_dispatch`, no git, no LLM and no `e2e` feature gate).
 - **Agent:** none — two raw, no-echo `cat` stubs (`stty -echo -icanon -icrnl -opost` then `printf <marker>` then `exec cat -u`), so every byte the daemon submits appears exactly once and nothing else does. The first is the agent that asked for the dispatch; the second merely inherits its `DOT_AGENT_DECK_PANE_ID` after it is closed.
 - **Asserts:** both halves. `deliver_dispatch_result`, bound to the caller's registry agent id, returns `GuardedSend::WrongSession`; and the result text never appears in the successor's scrollback. The absence is barriered rather than slept on — an AUTHORIZED write to the successor is asserted `Applied` and then asserted VISIBLE in its snapshot, so the pane has demonstrably drained past the point where a leaked result would have landed. Both stubs' readiness markers are asserted before the hand-over and before the absence, so neither side can pass because a stub never started.
