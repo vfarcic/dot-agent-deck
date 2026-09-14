@@ -25,7 +25,20 @@ import type { HandoffEdge,
 export interface DesktopSnapshotDto {
   connection: {
     status: "connected" | "disconnected" | "incompatible";
+    /** What the deck is CALLED — `Endpoint::describe()`. A label, never a key. */
     socketPath: string;
+    /**
+     * What the deck IS — `EndpointIdentity::wire_id()`, an opaque
+     * `deck-<16 hex>` token (PRD #742 M5).
+     *
+     * `daemonId` is derived from THIS and never from `socketPath` again.
+     * `socketPath` is `describe()`, which renders neither the remote socket
+     * path, the identity file nor the jump host — so two `[[endpoints.remote]]`
+     * rows naming two daemons on ONE host described identically, folded into one
+     * group, and their agents shared a key. The composite `(daemonId, agentId)`
+     * does not save that, because the key component is the collision.
+     */
+    deckId: string;
     /** `"local"` or `"remote"` — PRD #741 M7. Always present. */
     deckKind: string;
     /** Why Stop and Replace are unavailable; present exactly for a remote deck. */
@@ -68,6 +81,32 @@ export interface DesktopSnapshotDto {
    */
   protocolVersion: number;
   source: "daemon";
+  /**
+   * Every deck the crate is observing, by `connection.deckId`, in observed
+   * order with the SELECTED deck first (PRD #742 M5).
+   *
+   * # What it replaced, and why it had to
+   *
+   * M4 found there is no event for a deck LEAVING the observed set:
+   * `apply_selection` ends the departed deck's watcher, and under `All` ->
+   * `local` the resolved deck does not move, so nothing is emitted at all. A
+   * bridge that only upserts what arrives would have kept that deck's agents on
+   * screen, frozen and looking live. M4 approximated membership by resetting it
+   * at `connect()`; this is the exact version, so the departed deck goes on the
+   * next arrival from ANY deck rather than on the next handshake.
+   *
+   * It also carries "which deck is selected" as `fleet[0]` — a question nothing
+   * on this stream could answer before, since under `All` every observed deck
+   * emits the same shape.
+   *
+   * Every deck's snapshot carries the same list, so folding one may prune all.
+   *
+   * Optional here only so a single-deck DTO literal in a test need not restate
+   * it — the crate always emits it, and never empty. Read an absent or empty
+   * list as "this payload says nothing about membership", which is how
+   * `pruneFleet` treats it: it prunes NOTHING rather than clearing the screen.
+   */
+  fleet?: string[];
 }
 
 export interface DesktopAgentDto {
@@ -835,10 +874,16 @@ function fallbackConnectionMessage(connection: DesktopSnapshotDto["connection"])
 }
 
 export function mapDesktopSnapshot(dto: DesktopSnapshotDto, previous?: DeckSnapshot, evidence?: EvidenceItem[], handoffs?: HandoffEdge[]): DeckSnapshot {
-  // The socket path is the only per-daemon identity the handshake gives us, and
-  // it is exactly what distinguishes one local daemon from another (PRD #745,
-  // ahead of #742).
-  const daemonId = dto.connection.socketPath;
+  /*
+    PRD #742 M5. This was `dto.connection.socketPath` — `Endpoint::describe()`,
+    a sentence for a human — and that string is not an identity: it renders
+    neither the remote socket path, the identity file nor the jump host, so two
+    stored rows naming two daemons on ONE host produced one `daemonId` and one
+    group. The crate now carries `EndpointIdentity` itself, and this reads it.
+
+    `socketPath` is still what the UI renders; it just no longer keys anything.
+  */
+  const daemonId = dto.connection.deckId;
   const agents = dto.agents.map((agent, index) => agentFromDto(agent, index, daemonId));
   // Three tiers since PRD #819 M6, not four. The daemon-reported agent cwd
   // leads, as it always did; the removed tier was the desktop's own guess at a
@@ -866,6 +911,7 @@ export function mapDesktopSnapshot(dto: DesktopSnapshotDto, previous?: DeckSnaps
     worktree: cwd,
     connection: {
       status: dto.connection.status === "incompatible" ? "error" : dto.connection.status,
+      deckId: dto.connection.deckId,
       socketPath: dto.connection.socketPath,
       message: dto.connection.error ?? fallbackConnectionMessage(dto.connection),
       daemonDetected: dto.connection.status === "connected" || dto.connection.status === "incompatible",
@@ -1186,25 +1232,32 @@ export class TauriDeckBridge implements DeckBridge {
   private terminalListener?: TerminalListener;
   /**
    * The fold every `desktop://snapshot` lands in (PRD #742 M4): one entry per
-   * deck, keyed by `connection.socketPath`, in insertion order — which is
-   * observed order, because `connect()` seeds the selected deck and every other
-   * deck is inserted by its own watcher's first emit.
+   * deck, keyed by `connection.deckId`, in insertion order — which is observed
+   * order, because `connect()` seeds the selected deck and every other deck is
+   * inserted by its own watcher's first emit.
    *
    * A `Map` rather than an array because the wire is an UPSERT stream: N
    * watchers each emit their own deck on their own coalescing window, so what
    * arrives is "here is deck X as of now" and never "here is the fleet". The
    * array the listeners see is built from this on every emit.
+   *
+   * **PRD #742 M5 changed the key from `connection.socketPath` to
+   * `connection.deckId`**, and that is the whole of this milestone at this
+   * layer: `socketPath` is `Endpoint::describe()`, which two daemons on one host
+   * share, so `fleet.set(socketPath, …)` folded the second deck ON TOP of the
+   * first — one entry, last writer wins, and a screen that looks like one
+   * healthy deck.
    */
   private fleet = new Map<string, DeckSnapshot>();
   /**
-   * Which deck the single-deck surfaces are bound to, as `connect()` last
-   * answered it — the desktop crate's `resolve()`, which is the one
-   * authoritative statement of it the frontend ever receives.
+   * Which deck the single-deck surfaces are bound to.
    *
-   * Nothing on the snapshot stream says "this one is selected", and it cannot
-   * be inferred: under `All` every observed deck emits the same shape. So it is
-   * re-learnt at `connect()` and nowhere else, which is exactly why a settings
-   * write that touched `[endpoints]` re-connects (see `saveSettings`).
+   * **Read off `DesktopSnapshotDto.fleet[0]` on every arrival since PRD #742
+   * M5**, and seeded from `connect()`. Before M5 nothing on the snapshot stream
+   * said "this one is selected" and it could not be inferred — under `All`
+   * every observed deck emits the same shape — so it was re-learnt at
+   * `connect()` and nowhere else. The crate now states it on every snapshot,
+   * which is why membership no longer depends on a handshake landing.
    */
   private selectedDeckId?: string;
   private fleetListener?: FleetListener;
@@ -1248,10 +1301,14 @@ export class TauriDeckBridge implements DeckBridge {
    * screen is on (PRD #742 M4).
    *
    * `deck` is the flat string PRD #742 M3 stamps beside the event, carrying
-   * exactly what `connection.socketPath` does. An absent or non-string `deck`
-   * reads as YES, deliberately: the field is additive, and treating its absence
-   * as "some other deck" would silence every event from a build that predates
-   * the stamp and every event a fixture synthesises.
+   * exactly what `connection.deckId` does — M5 moved BOTH from the label to the
+   * key in one change, and they have to move together or this compares two
+   * different naming schemes and silently drops every event.
+   *
+   * An absent or non-string `deck` reads as YES, deliberately: the field is
+   * additive, and treating its absence as "some other deck" would silence every
+   * event from a build that predates the stamp and every event a fixture
+   * synthesises.
    */
   private isSelectedDeckEvent(payload: unknown): boolean {
     if (this.selectedDeckId === undefined) return true;
@@ -1588,11 +1645,46 @@ export class TauriDeckBridge implements DeckBridge {
    * fire. Insertion order carries the rest, which is observed order.
    */
   private fleetView(): DeckFleet {
-    const decks = Array.from(this.fleet.values());
-    const selectedAt = decks.findIndex((deck) => deck.connection.socketPath === this.selectedDeckId);
+    const entries = Array.from(this.fleet.entries());
+    const selectedAt = entries.findIndex(([deckId]) => deckId === this.selectedDeckId);
+    const decks = entries.map(([, deck]) => deck);
     if (selectedAt <= 0) return decks;
     const [selected] = decks.splice(selectedAt, 1);
     return [selected, ...decks];
+  }
+
+  /**
+   * Drop every deck the crate no longer observes (PRD #742 M5).
+   *
+   * # Why this is the exact answer M4 could not write
+   *
+   * A deck LEAVING the observed set produces no event. `apply_selection` ends
+   * its watcher and, for `All` -> `local`, does not even take the path that
+   * emits — so the departed deck simply stops arriving, which is
+   * indistinguishable from a quiet deck. Left alone the bridge keeps its last
+   * snapshot and the overview renders its agents, frozen and looking live.
+   *
+   * `DesktopSnapshotDto.fleet` states membership on EVERY snapshot, and every
+   * deck's snapshot carries the same list, so any arrival is enough to prune.
+   *
+   * # It does not seed
+   *
+   * A deck named in `fleet` that has not emitted yet is not invented here: this
+   * bridge has nothing to render for it and a fabricated entry would be a
+   * connection state nobody measured. It appears when its watcher emits, which
+   * for a newly started one is immediate.
+   *
+   * An empty or absent list prunes NOTHING. The crate's invariant is
+   * "never empty" (a deck it cannot reach is still an entry carrying a
+   * `disconnected` connection), so an empty list is a malformed payload rather
+   * than an empty fleet — and acting on it would clear the screen.
+   */
+  private pruneFleet(observed: readonly string[] | undefined): void {
+    if (!Array.isArray(observed) || observed.length === 0) return;
+    const keep = new Set(observed);
+    this.fleet.forEach((_, deckId) => {
+      if (!keep.has(deckId)) this.fleet.delete(deckId);
+    });
   }
 
   async connect(): Promise<DeckFleet> {
@@ -1607,18 +1699,25 @@ export class TauriDeckBridge implements DeckBridge {
     // the daemon owns, so a nine-agent fleet cost nine sockets and nine
     // scrollback replays before a single terminal was on screen. The UI states
     // what it shows through `setShownTerminals`, and that is the only trigger.
-    const snapshot = mapDesktopSnapshot(dto, this.fleet.get(dto.connection.socketPath), this.evidence, this.handoffs);
+    const snapshot = mapDesktopSnapshot(dto, this.fleet.get(dto.connection.deckId), this.evidence, this.handoffs);
     this.agentIndex = snapshot.agents;
-    // PRD #742 M4: membership is RESET here, not merged. `desktop_bootstrap`
-    // answers the deck `resolve()` names, so this is both the authoritative
-    // statement of which deck is selected and the only moment at which a deck
-    // that has LEFT the observed set can be forgotten — the crate emits no
-    // event that says one has. Every still-observed deck reinstates itself on
-    // its watcher's next emit, which for a newly established one is immediate
-    // and for a quiet one is bounded by the crate's reconcile interval.
-    this.selectedDeckId = dto.connection.socketPath;
+    /*
+      PRD #742 M4 reset membership here because this was the ONLY moment a
+      departed deck could be forgotten — the crate emitted no event that said one
+      had left. M5 put `fleet` on every snapshot, so forgetting is no longer this
+      call's job and `foldSnapshot` does it on every arrival.
+
+      The reset stays anyway, and for a reason that outlives the one it replaced:
+      `desktop_bootstrap` is a fresh statement of the whole world, and a
+      `connect()` that MERGED would carry a stale deck across a reconnect that
+      the user reached for precisely because the app looked wrong. Every
+      still-observed deck reinstates itself on its watcher's next emit —
+      immediate for a newly established one, bounded by the crate's reconcile
+      interval for a quiet one.
+    */
+    this.selectedDeckId = dto.fleet?.[0] ?? dto.connection.deckId;
     this.fleet.clear();
-    this.fleet.set(dto.connection.socketPath, snapshot);
+    this.fleet.set(dto.connection.deckId, snapshot);
     return this.fleetView();
   }
 
@@ -1632,7 +1731,17 @@ export class TauriDeckBridge implements DeckBridge {
    * another machine's agent of the same id.
    */
   private foldSnapshot(dto: DesktopSnapshotDto): DeckFleet {
-    const deckId = dto.connection.socketPath;
+    const deckId = dto.connection.deckId;
+    /*
+      PRD #742 M5: the selection comes off the wire now, and it is read BEFORE
+      the fold because `selected` below decides which deck gets the evidence
+      ring and which deck the hook-event resolver indexes.
+
+      `fleet[0]` is the crate's own `resolve()`, restated on every snapshot. M4
+      re-learnt the selection at `connect()` alone, which is why a settings save
+      that moved the selection had to re-handshake to be believed.
+    */
+    if (dto.fleet?.length) this.selectedDeckId = dto.fleet[0];
     /*
       The evidence ring and the handoff edges are the SELECTED deck's — the
       only deck whose events this bridge records at all, since the stamped
@@ -1650,6 +1759,14 @@ export class TauriDeckBridge implements DeckBridge {
       selected ? this.handoffs : undefined,
     );
     this.fleet.set(deckId, mapped);
+    /*
+      AFTER the set, deliberately: a watcher that is itself being torn down can
+      land one last snapshot whose `fleet` — read fresh from the crate's applied
+      document — no longer names its own deck. Pruning first would delete the
+      entry and then this line would put it straight back. Pruning last drops
+      that deck on the emit that announced its own departure.
+    */
+    this.pruneFleet(dto.fleet);
     // The hook-event resolver is the deck screen's, and the deck screen is
     // single-deck — so it indexes the SELECTED deck alone. Indexing the fleet
     // would let a colliding agent id resolve an event to the wrong machine's
@@ -1822,19 +1939,28 @@ export class TauriDeckBridge implements DeckBridge {
     const moved = known && this.lastEndpoints !== undefined && this.lastEndpoints !== fingerprint;
     if (known) this.lastEndpoints = fingerprint;
     /*
-      PRD #742 M4. `[endpoints]` is the only part of this document that decides
-      which decks are OBSERVED, and the desktop crate emits no membership event:
-      `desktop_set_settings` → `apply_selection` ends a departed deck's watcher
-      and starts an arrived one's, but nothing tells the webview that a deck it
-      already holds a group for has left. Left alone, unticking a deck from the
-      fleet would leave its last-known agents frozen on the overview looking
-      live, and moving the selection to another deck would leave the app
-      believing the old one is still the selected one.
+      PRD #742 M4 needed this for CORRECTNESS and M5 does not, so the reason is
+      rewritten rather than inherited — and the call stays.
 
-      Re-connecting answers both at once, because `desktop_bootstrap` is the
-      crate's authoritative statement of `resolve()` AND the one place the fleet
-      map is reset. It is awaited before this resolves so the caller's next
-      render already has the new fleet.
+      M4's version: the crate emitted no membership signal at all, so unticking a
+      deck left its last-known agents frozen on the overview looking live, and
+      moving the selection left the app believing the old deck was still the
+      selected one. Re-connecting was the only way to learn either, because
+      `desktop_bootstrap` was the one place the fleet map was reset and the one
+      statement of `resolve()` the frontend ever received.
+
+      M5 put both on the wire: `DesktopSnapshotDto.fleet` names the observed set
+      and leads with the selected deck, so `foldSnapshot` prunes and re-learns on
+      every arrival, from any deck. The screen is now self-correcting whether or
+      not this fires.
+
+      What it still buys is PROMPTNESS, and the number is what makes it worth a
+      handshake. The self-correction is bounded by the crate's `RECONCILE_INTERVAL`
+      — 5 seconds — because a quiet deck's watcher emits on that timer and the
+      `All` -> `local` case takes `apply_selection`'s no-emit path entirely. Five
+      seconds of a deck the user just removed still sitting on their overview
+      reads as the app ignoring them. One handshake against a deck they are
+      actively editing is the cheapest moment this app ever spends one.
 
       Gated on the section having MOVED, so an appearance save — which sends the
       whole document too — costs no handshake, and `undefined` (nothing read or

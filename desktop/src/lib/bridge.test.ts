@@ -20,6 +20,7 @@ vi.mock("@tauri-apps/api/event", () => ({
 const snapshot: DesktopSnapshotDto = {
   connection: {
     status: "connected",
+    deckId: "deck-000000000000dec1",
     socketPath: "/tmp/deck.sock",
     deckKind: "local",
     clientProtocolVersion: 6,
@@ -521,14 +522,17 @@ describe("TauriDeckBridge", () => {
 
     const mapped = mapDesktopSnapshot(structuredClone(snapshot));
 
-    // The socket path is the only per-daemon identity the handshake reports,
-    // and agent ids are per-daemon integers — so nothing may key on `id` alone.
+    // `deckId` is the deck identity the handshake reports, and agent ids are
+    // per-daemon integers — so nothing may key on `id` alone. It is NOT
+    // `socketPath`: that is the label, and two decks can share one (PRD 742 M5).
     expect(mapped.agents[0]).toMatchObject({
-      daemonId: "/tmp/deck.sock",
+      daemonId: "deck-000000000000dec1",
       activeTool: "apply_patch",
       activeToolDetail: "desktop/src/App.tsx",
       tab: { kind: "orchestration", name: "dot-agent-deck", roleIndex: 1, roleName: "coder", isStartRole: false, displayTitle: "dot-agent-deck" },
     });
+    expect(mapped.agents[0].daemonId).not.toBe(snapshot.connection.socketPath);
+    expect(mapped.connection.socketPath).toBe("/tmp/deck.sock");
   });
 
   /**
@@ -2015,20 +2019,38 @@ describe("desktop settings hold no credential (issue 827)", () => {
  * Everything here is driven through the real `desktop://snapshot` listener, so
  * it exercises the same path a live daemon does rather than a test-only seam.
  */
-describe("TauriDeckBridge across a fleet (PRD 742 M4)", () => {
+describe("TauriDeckBridge across a fleet (PRD 742 M4/M5)", () => {
   const localDeck = "/tmp/deck-local.sock";
   const remoteDeck = "dev@build-box";
+  /*
+    The KEYS, separate from the labels above since PRD 742 M5. In live mode
+    these are `EndpointIdentity::wire_id()` — an opaque `deck-<16 hex>` token —
+    and the labels beside them are `Endpoint::describe()`, which is not unique.
+  */
+  const localId = "deck-00000000000010ca";
+  const remoteId = "deck-000000000000e0e1";
 
   /**
    * One deck's snapshot as a watcher emits it. The agent ids are deliberately
    * IDENTICAL across decks, because that is what a daemon mints — per-daemon
    * monotonic integers from 1 — and a fixture that avoided the collision would
    * let a bare-id key pass this file.
+   *
+   * `fleet` is the observed set the crate stamps on every snapshot (M5),
+   * selected deck first. It defaults to both decks; the membership test below
+   * passes a shorter one, which is exactly how a departure reaches the webview.
    */
-  function deckSnapshot(socketPath: string, deckKind: "local" | "remote", displayNames: string[]): DesktopSnapshotDto {
+  function deckSnapshot(
+    deckId: string,
+    socketPath: string,
+    deckKind: "local" | "remote",
+    displayNames: string[],
+    fleet: string[] = [localId, remoteId],
+  ): DesktopSnapshotDto {
     return {
       connection: {
         status: "connected",
+        deckId,
         socketPath,
         deckKind,
         clientProtocolVersion: 9,
@@ -2051,11 +2073,12 @@ describe("TauriDeckBridge across a fleet (PRD 742 M4)", () => {
       })),
       protocolVersion: 9,
       source: "daemon",
+      fleet,
     };
   }
 
-  const local = deckSnapshot(localDeck, "local", ["Local coder", "Local reviewer"]);
-  const remote = deckSnapshot(remoteDeck, "remote", ["Remote builder"]);
+  const local = deckSnapshot(localId, localDeck, "local", ["Local coder", "Local reviewer"]);
+  const remote = deckSnapshot(remoteId, remoteDeck, "remote", ["Remote builder"]);
 
   beforeEach(() => {
     invoke.mockReset();
@@ -2093,9 +2116,9 @@ describe("TauriDeckBridge across a fleet (PRD 742 M4)", () => {
   /**
    * The property worth pinning above all the others: two decks' agents never
    * collapse under one `daemonId`. `daemonId` is derived from
-   * `connection.socketPath`, so a fold that took the socket path from anywhere
-   * but the arriving DTO would stamp every agent with the selected deck's name
-   * — the #741 mislabel arriving through a different door, and one that looks
+   * `connection.deckId`, so a fold that took the identity from anywhere but the
+   * arriving DTO would stamp every agent with the selected deck's key — the
+   * #741 mislabel arriving through a different door, and one that looks
    * completely right on screen.
    */
   it("never collapses two decks' agents under one daemonId", async () => {
@@ -2112,8 +2135,110 @@ describe("TauriDeckBridge across a fleet (PRD 742 M4)", () => {
     // The ids DO collide — that is the fixture's job — and the composite keys
     // do not.
     expect(stamped.filter((agent) => agent.id === "1")).toHaveLength(2);
-    expect(new Set(stamped.map((agent) => agent.daemonId))).toEqual(new Set([localDeck, remoteDeck]));
+    expect(new Set(stamped.map((agent) => agent.daemonId))).toEqual(new Set([localId, remoteId]));
     expect(new Set(stamped.map((agent) => `${agent.daemonId} ${agent.id}`)).size).toBe(stamped.length);
+    await bridge.dispose();
+  });
+
+  /**
+   * The direct regression test for PRD 742 M5's defect, and the sibling of the
+   * one above it: two decks that `Endpoint::describe()` renders IDENTICALLY are
+   * still two groups with two `daemonId`s.
+   *
+   * This is not a contrived pair. Two `[[endpoints.remote]]` rows pointing at
+   * one `user@host` with different `socket` values are two daemons on one
+   * machine, which is precisely what the `socket` field exists for — and
+   * `describe()` renders neither the socket path, the identity file nor the
+   * jump host. While `daemonId` came from `connection.socketPath` the two
+   * folded into ONE map entry, last writer won per emit, and the screen showed
+   * one healthy deck. The composite `(daemonId, agentId)` key does not save it:
+   * the key component is the collision.
+   *
+   * The `socketPath` equality is the premise rather than decoration — it is what
+   * shows the pair really is indistinguishable to the label.
+   */
+  it("holds two decks that describe identically as two groups with two daemonIds", async () => {
+    const { TauriDeckBridge } = await import("./bridge");
+    const twinFleet = ["deck-000000000000a001", "deck-000000000000b002"];
+    // One host, two daemons: same label, different remote socket path.
+    const first = deckSnapshot(twinFleet[0], remoteDeck, "remote", ["Daemon one builder"], twinFleet);
+    const second = deckSnapshot(twinFleet[1], remoteDeck, "remote", ["Daemon two builder"], twinFleet);
+    expect(first.connection.socketPath).toBe(second.connection.socketPath);
+
+    invoke.mockImplementation(async (command: string) => (command === "desktop_bootstrap" ? first : { ok: true }));
+    const bridge = new TauriDeckBridge();
+    const onFleet = vi.fn();
+    await bridge.subscribe(onFleet, vi.fn());
+    await bridge.connect();
+    listeners.get("desktop://snapshot")?.({ payload: second });
+
+    const fleet = onFleet.mock.calls.at(-1)?.[0] as DeckFleet;
+    expect(fleet).toHaveLength(2);
+    expect(fleet.map((deck) => deck.connection.deckId)).toEqual(twinFleet);
+    expect(fleet.map((deck) => deck.connection.socketPath)).toEqual([remoteDeck, remoteDeck]);
+
+    // The agents are separable, which is the point of the whole key.
+    const stamped = fleet.flatMap((deck) => deck.agents.map((agent) => ({ daemonId: agent.daemonId, id: agent.id })));
+    expect(stamped.filter((agent) => agent.id === "1")).toHaveLength(2);
+    expect(new Set(stamped.map((agent) => agent.daemonId))).toEqual(new Set(twinFleet));
+    expect(new Set(stamped.map((agent) => `${agent.daemonId} ${agent.id}`)).size).toBe(stamped.length);
+    await bridge.dispose();
+  });
+
+  /**
+   * The other half of M5: a deck that leaves the observed set leaves the screen
+   * on the next snapshot from ANY deck, with no reconnect.
+   *
+   * That is what `DesktopSnapshotDto.fleet` buys over M4's reset. The crate
+   * emits no "this deck left" event — `apply_selection` ends the departed
+   * deck's watcher, and for `All` -> `local` the resolved deck does not move so
+   * it emits nothing at all — so M4 could only forget a deck at `connect()`.
+   * Here the departure arrives as a shorter `fleet` on the surviving deck's own
+   * snapshot, and the bootstrap count proves no handshake was involved.
+   */
+  it("drops a deck that left the observed set without a reconnect", async () => {
+    const { TauriDeckBridge } = await import("./bridge");
+    const bridge = new TauriDeckBridge();
+    const onFleet = vi.fn();
+    await bridge.subscribe(onFleet, vi.fn());
+    await bridge.connect();
+    listeners.get("desktop://snapshot")?.({ payload: remote });
+    expect((onFleet.mock.calls.at(-1)?.[0] as DeckFleet).map((deck) => deck.connection.deckId)).toEqual([localId, remoteId]);
+
+    const bootstraps = () => invoke.mock.calls.filter(([command]) => command === "desktop_bootstrap").length;
+    const before = bootstraps();
+
+    // The surviving deck's next emit names a fleet of one. Nothing else happens.
+    listeners.get("desktop://snapshot")?.({ payload: deckSnapshot(localId, localDeck, "local", ["Local coder", "Local reviewer"], [localId]) });
+
+    const fleet = onFleet.mock.calls.at(-1)?.[0] as DeckFleet;
+    expect(fleet.map((deck) => deck.connection.deckId)).toEqual([localId]);
+    expect(bootstraps()).toBe(before);
+    await bridge.dispose();
+  });
+
+  /**
+   * A departing deck's own last emit does not reinstate it.
+   *
+   * The watcher for a deck being torn down can still land one snapshot after
+   * the crate has dropped it from the observed set, and that snapshot's `fleet`
+   * — read fresh from the applied document — no longer names its own deck. A
+   * fold that pruned BEFORE upserting would delete the entry and then put it
+   * straight back, which is a departure that never takes effect until some
+   * other deck happens to emit.
+   */
+  it("does not reinstate a deck whose own last snapshot says it has left", async () => {
+    const { TauriDeckBridge } = await import("./bridge");
+    const bridge = new TauriDeckBridge();
+    const onFleet = vi.fn();
+    await bridge.subscribe(onFleet, vi.fn());
+    await bridge.connect();
+    listeners.get("desktop://snapshot")?.({ payload: remote });
+
+    listeners.get("desktop://snapshot")?.({ payload: deckSnapshot(remoteId, remoteDeck, "remote", ["Remote builder"], [localId]) });
+
+    const fleet = onFleet.mock.calls.at(-1)?.[0] as DeckFleet;
+    expect(fleet.map((deck) => deck.connection.deckId)).toEqual([localId]);
     await bridge.dispose();
   });
 
@@ -2136,12 +2261,17 @@ describe("TauriDeckBridge across a fleet (PRD 742 M4)", () => {
   });
 
   /**
-   * A deck that leaves the observed set has to leave the fleet, and nothing on
-   * the wire says it has: the crate ends the departed deck's watcher and emits
-   * no membership event, so a bridge that only ever upserted would keep its
-   * last-known agents on screen looking live. `saveSettings` re-establishes
-   * when `[endpoints]` moved, which is the one document that decides
-   * membership.
+   * `saveSettings` re-establishes exactly when `[endpoints]` moved, and never
+   * for an appearance save that sent the same document.
+   *
+   * M4 needed this for correctness: nothing on the wire said a deck had left,
+   * so a re-handshake was the only way to learn it. M5 put membership on every
+   * snapshot (see the two tests below), which leaves this buying PROMPTNESS —
+   * the self-correction is otherwise bounded by the crate's five-second
+   * reconcile timer, and five seconds of a deck the user just removed still
+   * sitting on their overview reads as the app ignoring them. The gate is the
+   * half that has to keep holding either way: a theme save must cost no
+   * handshake.
    */
   it("re-establishes the fleet when a settings save changed the endpoints, and not when it changed the theme", async () => {
     const { TauriDeckBridge } = await import("./bridge");
@@ -2166,7 +2296,7 @@ describe("TauriDeckBridge across a fleet (PRD 742 M4)", () => {
     await bridge.saveSettings({ version: 1, appearance: { mode: "dark" }, zoom: { level: 1 }, endpoints: { remote: [], selection: "all" } });
     expect(bootstraps()).toBe(before + 1);
     const fleet = onFleet.mock.calls.at(-1)?.[0] as DeckFleet;
-    expect(fleet.map((deck) => deck.connection.socketPath)).toEqual([localDeck]);
+    expect(fleet.map((deck) => deck.connection.deckId)).toEqual([localId]);
     await bridge.dispose();
   });
 
@@ -2177,6 +2307,11 @@ describe("TauriDeckBridge across a fleet (PRD 742 M4)", () => {
    * reader could tell them apart: agent ids collide across decks, so an
    * unfiltered event would resolve to whichever machine's agent happened to
    * share the id.
+   *
+   * M5 moved the stamp from the label to the KEY, on both sides at once — the
+   * crate stamps `deck_wire_id` and this filter compares `connection.deckId`.
+   * A stamp left on `describe()` would have gone on answering "yes, this is the
+   * deck you are on" for a second daemon on the same host.
    */
   it("drops a daemon event stamped with a deck the screen is not on, and keeps an unstamped one", async () => {
     const { TauriDeckBridge } = await import("./bridge");
@@ -2195,14 +2330,14 @@ describe("TauriDeckBridge across a fleet (PRD 742 M4)", () => {
 
     const calls = () => onFleet.mock.calls.length;
     const beforeForeign = calls();
-    listeners.get("desktop://daemon-event")?.({ payload: event(remoteDeck) });
+    listeners.get("desktop://daemon-event")?.({ payload: event(remoteId) });
     expect(calls()).toBe(beforeForeign);
 
-    listeners.get("desktop://daemon-event")?.({ payload: event(localDeck) });
+    listeners.get("desktop://daemon-event")?.({ payload: event(localId) });
     listeners.get("desktop://daemon-event")?.({ payload: event() });
     const fleet = onFleet.mock.calls.at(-1)?.[0] as DeckFleet;
     // Newest first, and the foreign deck's is absent from both ends of it.
-    expect(fleet[0].handoffs.map((edge) => edge.id)).toEqual(["dlg-none", `dlg-${localDeck}`]);
+    expect(fleet[0].handoffs.map((edge) => edge.id)).toEqual(["dlg-none", `dlg-${localId}`]);
     await bridge.dispose();
   });
 });

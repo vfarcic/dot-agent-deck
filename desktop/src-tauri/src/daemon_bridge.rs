@@ -18,7 +18,8 @@ use tokio::sync::Mutex as AsyncMutex;
 use crate::agent_view::AgentView;
 use crate::dto::{
     BootstrapOptions, ConnectionStatus, DesktopConnection, DesktopSnapshot, deck_path_text,
-    disconnected_snapshot, map_agent, safe_message, selected_endpoint, selection_fields,
+    deck_wire_id, disconnected_snapshot, map_agent, observed_fleet, safe_message,
+    selected_endpoint, selection_fields,
 };
 use crate::endpoint_tunnels::{EndpointTunnels, TunnelLease};
 
@@ -889,6 +890,11 @@ fn connection_from_handshake(endpoint: &Endpoint, handshake: HandshakeInfo) -> D
     DesktopConnection {
         status: handshake.status,
         socket_path: deck_path_text(endpoint),
+        // PRD #742 M5: the KEY beside the label, from the same endpoint and in
+        // the same breath — the two disagreeing is the whole defect, and the
+        // only way to make them disagree now is to hand this function the wrong
+        // deck, which is the mistake M3 already closed.
+        deck_id: deck_wire_id(endpoint),
         deck_kind,
         local_only_reason,
         selection_fallback,
@@ -1067,6 +1073,7 @@ pub(crate) async fn snapshot_with(
             agents: Vec::new(),
             protocol_version: PROTOCOL_VERSION,
             source: "daemon",
+            fleet: observed_fleet(),
         };
     }
 
@@ -1136,6 +1143,10 @@ fn connected_snapshot(
         agents: records.into_iter().map(map_agent).collect(),
         protocol_version: PROTOCOL_VERSION,
         source: "daemon",
+        // The applied document's observed set, not this deck's anything — so
+        // every deck in a fleet carries the same list and a webview may prune
+        // its map on whichever snapshot happens to land first (PRD #742 M5).
+        fleet: observed_fleet(),
     }
 }
 
@@ -3181,11 +3192,18 @@ mod tests {
     ///
     /// This is the failure that looks right on screen, which is why it needs a
     /// test rather than review. `AgentOverview.tsx` keys agents by
-    /// `(daemonId, agentId)` and `daemonId` comes from `connection.socketPath`;
-    /// the DTO carries exactly ONE `connection`. So a merge that emits N decks'
-    /// agents under one identity does not render an error — it renders one fleet
-    /// where there were two, and a later action on such a row sends one deck's
-    /// agent id to the other deck.
+    /// `(daemonId, agentId)`; the DTO carries exactly ONE `connection`. So a
+    /// merge that emits N decks' agents under one identity does not render an
+    /// error — it renders one fleet where there were two, and a later action on
+    /// such a row sends one deck's agent id to the other deck.
+    ///
+    /// **PRD #742 M5 moved `daemonId` off `connection.socketPath` and onto
+    /// `connection.deckId`, and the assertions below follow it.** Two LOCAL
+    /// decks differ in their describe string, so this pair was separable either
+    /// way; what was not is two REMOTE rows differing only in socket path,
+    /// identity file or jump host — `dto::tests::the_snapshot_fleet_is_the_observed_set_selected_first`
+    /// is where that pair is pinned, because it needs a settings document
+    /// rather than a listening socket.
     #[cfg(unix)]
     #[tokio::test]
     async fn two_decks_running_the_same_agent_id_never_share_one_deck_identity() {
@@ -3231,9 +3249,15 @@ mod tests {
         );
 
         assert_ne!(
-            snapshot_a.connection.socket_path, snapshot_b.connection.socket_path,
+            snapshot_a.connection.deck_id, snapshot_b.connection.deck_id,
             "two decks must never be emitted under one identity — the composite \
              key collapses and two fleets render as one"
+        );
+        assert_eq!(snapshot_a.connection.deck_id, deck_wire_id(&deck_a));
+        assert_eq!(snapshot_b.connection.deck_id, deck_wire_id(&deck_b));
+        assert_ne!(
+            snapshot_a.connection.socket_path, snapshot_b.connection.socket_path,
+            "and the LABEL beside it still names each deck for a reader"
         );
         assert_eq!(snapshot_a.connection.socket_path, deck_a.describe());
         assert_eq!(snapshot_b.connection.socket_path, deck_b.describe());

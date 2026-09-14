@@ -29,6 +29,27 @@ export type Verdict = "PASS" | "FIX" | "HUMAN" | "ERROR" | "INFO";
 
 export interface ConnectionView {
   status: ConnectionStatus;
+  /**
+   * This deck's KEY — the crate's `EndpointIdentity::wire_id()`, an opaque
+   * `deck-<16 hex>` token (PRD #742 M5). Every per-deck map, React key and
+   * `agentKey` composite is built on it.
+   *
+   * Optional because the loading and error seeds in `useDeckRuntime` have no
+   * deck to name yet — they are placeholders for a fleet that has not arrived.
+   * Every deck that came off the wire or out of the fixture carries one, so a
+   * consumer keying on it should treat `undefined` as "not a deck", never as a
+   * value to fall back to `socketPath` from: falling back is precisely the
+   * collision this field exists to remove.
+   */
+  deckId?: string;
+  /**
+   * What this deck is CALLED — the crate's `Endpoint::describe()`: a socket path
+   * for a local deck, `user@host[:port]` for a remote one.
+   *
+   * **A label.** It is what the overview prints and what a hover discloses, and
+   * it is deliberately NOT unique: two daemons on one host describe identically.
+   * `deckId` above is what anything keying on a deck uses.
+   */
   socketPath?: string;
   message?: string;
   /**
@@ -496,12 +517,25 @@ export interface DeckSnapshot {
  * agents" and "we cannot see the agents" are different statements, and an
  * absent entry could not tell them apart.
  *
- * # Keyed by `connection.socketPath`
+ * # Keyed by `connection.deckId`
  *
- * That string is `Endpoint::describe()` — the socket path for a local deck,
- * `user@host[:port]` for a remote one — and it is the same value `daemonId` is
- * derived from, so an entry here and the agents inside it agree on identity by
- * construction rather than by care.
+ * That token is the crate's `EndpointIdentity::wire_id()`, and it is the same
+ * value `daemonId` is derived from — so an entry here and the agents inside it
+ * agree on identity by construction rather than by care.
+ *
+ * **It was `connection.socketPath` until PRD #742 M5**, which is `describe()` —
+ * a label that renders neither the remote socket path, the identity file nor
+ * the jump host. Two decks differing only in one of those folded into ONE entry
+ * here and their agents shared a `daemonId`; the composite `(daemonId,
+ * agentId)` key could not separate them, because the key component was the
+ * collision.
+ *
+ * # Membership is exact, and comes from the wire
+ *
+ * `DesktopSnapshotDto.fleet` lists the observed decks on every snapshot, so a
+ * deck that LEAVES the observed set is dropped on the next arrival from any
+ * deck. M4 could only approximate this by resetting at `connect()`, because
+ * nothing on the stream said a deck had gone.
  */
 export type DeckFleet = DeckSnapshot[];
 

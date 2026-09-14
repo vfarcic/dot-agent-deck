@@ -785,14 +785,20 @@ export function AgentOverview({ runtime, settings, onNavigate }: { runtime: Deck
           */}
           {decks.map((deck) => (
             <DeckGroup
-              key={deck.snapshot.connection.socketPath ?? ""}
+              /*
+                PRD #742 M5: the KEY, not the label. `socketPath` is
+                `Endpoint::describe()`, which two daemons on one host share — so
+                two sibling sections took one React key and React kept one of
+                them.
+              */
+              key={deck.snapshot.connection.deckId ?? ""}
               deck={deck}
               now={now}
               columns={columns}
               fleetSize={decks.length}
               onOpenDeck={openDeck}
               onReconnect={() => void runtime.reconnect()}
-              overrideError={deck.snapshot.connection.socketPath === connection.socketPath ? overrideError : undefined}
+              overrideError={deck.snapshot.connection.deckId === connection.deckId ? overrideError : undefined}
               onConnectAnyway={mode === "live" && deck.snapshot.connection.buildStampMismatchOnly ? requestConnectAnyway : undefined}
             />
           ))}
@@ -905,7 +911,12 @@ function DeckGroup({ deck, now, columns, fleetSize, overrideError, onOpenDeck, o
     <section
       className={deck.connected ? "daemon-group" : "daemon-group is-degraded"}
       data-testid="daemon-group"
-      data-daemon-id={socketPath === undefined ? "" : domIdentity(socketPath)}
+      /*
+        The deck's KEY, so a test asserting which section it found cannot be
+        fooled by two decks that describe identically (PRD #742 M5). The name a
+        reader sees is `daemon-identity` below, which is still the label.
+      */
+      data-daemon-id={connection.deckId === undefined ? "" : domIdentity(connection.deckId)}
       data-deck-connected={deck.connected ? "yes" : "no"}
       aria-labelledby={titleId}
     >

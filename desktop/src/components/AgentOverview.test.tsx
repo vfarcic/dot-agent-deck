@@ -487,10 +487,19 @@ describe("AgentOverview", () => {
     const socketPath = `/tmp/de${hostile}ck.sock`;
     const base = createFixtureSnapshot("crowded");
     const [first] = base.agents;
+    /*
+      `deckId` carries it as well as `socketPath` since PRD 742 M5, because the
+      KEY is what reaches `data-daemon-id` now and the label is what reaches the
+      rendered name and its hover. Live mode cannot actually produce a hostile
+      `deckId` — it is a 21-byte ASCII token the crate mints from a hash — so
+      this half is the seam holding rather than the only thing between a user
+      and a reordered attribute, which is exactly why it is worth a test: the
+      scrub must not be dropped on the grounds that today's producer is safe.
+    */
     const { container } = renderOverview({
       snapshot: {
         ...base,
-        connection: { ...base.connection, socketPath },
+        connection: { ...base.connection, deckId: socketPath, socketPath },
         agents: [{ ...(first as AgentSession), daemonId: socketPath, tab: { kind: "mode", name: `re${hostile}view` } }],
       },
     });

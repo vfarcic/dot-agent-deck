@@ -1408,7 +1408,7 @@ describe("ControlDeck", () => {
   it("asserts no attempt count and no branch in live mode", async () => {
     const { mapDesktopSnapshot } = await import("./lib/bridge");
     const snapshot = mapDesktopSnapshot({
-      connection: { status: "connected", socketPath: "/tmp/deck.sock", deckKind: "local", clientProtocolVersion: 8, serverProtocolVersion: 8, clientBuildVersion: "0.1.0", daemonBuildVersion: "0.1.0" },
+      connection: { status: "connected", deckId: "deck-000000000000dec1", socketPath: "/tmp/deck.sock", deckKind: "local", clientProtocolVersion: 8, serverProtocolVersion: 8, clientBuildVersion: "0.1.0", daemonBuildVersion: "0.1.0" },
       agents: [{ id: "7", displayName: "Coder", cwd: "/tmp/project", rows: 32, cols: 120, agentType: "claude_code", status: "working", toolCount: 3, tab: { kind: "dashboard" } }],
       protocolVersion: 8,
       source: "daemon",
@@ -1459,7 +1459,7 @@ describe("ControlDeck", () => {
     // become one DOM text node, once per agent, on every refreshed snapshot.
     const hostile = `${stripped.join("")}${"p".repeat(64 * 1024)}`;
     const snapshot = mapDesktopSnapshot({
-      connection: { status: "connected", socketPath: "/tmp/deck.sock", deckKind: "local", clientProtocolVersion: 8, serverProtocolVersion: 8, clientBuildVersion: "0.1.0", daemonBuildVersion: "0.1.0" },
+      connection: { status: "connected", deckId: "deck-000000000000dec1", socketPath: "/tmp/deck.sock", deckKind: "local", clientProtocolVersion: 8, serverProtocolVersion: 8, clientBuildVersion: "0.1.0", daemonBuildVersion: "0.1.0" },
       agents: [{ id: "7", displayName: "Coder", cwd: "/tmp/project", rows: 32, cols: 120, agentType: "claude_code", status: "working", toolCount: 3, lastUserPrompt: hostile, tab: { kind: "dashboard" } }],
       protocolVersion: 8,
       source: "daemon",
@@ -1498,6 +1498,7 @@ describe("ControlDeck", () => {
     const snapshot = mapDesktopSnapshot({
       connection: {
         status: "connected",
+        deckId: "deck-000000000000dec1",
         socketPath: "/tmp/deck.sock",
         deckKind: "remote",
         clientProtocolVersion: 8,
@@ -1536,7 +1537,7 @@ describe("ControlDeck", () => {
   it("prints the deck's own stand-in for a working directory the daemon did not report", async () => {
     const { mapDesktopSnapshot } = await import("./lib/bridge");
     const agent = { id: "7", displayName: "Coder", rows: 32, cols: 120, agentType: "claude_code" as const, status: "working" as const, toolCount: 3, tab: { kind: "dashboard" as const } };
-    const connection = { status: "connected" as const, socketPath: "/tmp/deck.sock", deckKind: "local", clientProtocolVersion: 8, serverProtocolVersion: 8, clientBuildVersion: "0.1.0", daemonBuildVersion: "0.1.0" };
+    const connection = { status: "connected" as const, deckId: "deck-000000000000dec1", socketPath: "/tmp/deck.sock", deckKind: "local", clientProtocolVersion: 8, serverProtocolVersion: 8, clientBuildVersion: "0.1.0", daemonBuildVersion: "0.1.0" };
 
     const absent = render(<ControlDeck runtime={runtime({ mode: "live", snapshot: mapDesktopSnapshot({ connection, agents: [agent], protocolVersion: 8, source: "daemon" }) })} />);
     expect(absent.container.querySelector(".agent-footer span:nth-child(2)")?.textContent).toBe("Unavailable");

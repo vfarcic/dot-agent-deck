@@ -1116,10 +1116,18 @@ fn drain_pending(
 /// `desktop/src/lib/daemonEvents.ts` reads them today. A wrapper would have been
 /// a frontend change, and the frontend is M4's.
 ///
-/// The value is [`crate::dto::deck_path_text`]'s — the same string
-/// `connection.socketPath` carries, which is what `bridge.ts` derives `daemonId`
-/// from — so a consumer can key an event to the group that a snapshot put on
-/// screen without a second naming scheme to keep in step.
+/// The value is [`crate::dto::deck_wire_id`]'s — the same token
+/// `connection.deckId` carries, which is what `bridge.ts` keys `daemonId` on —
+/// so a consumer can key an event to the group that a snapshot put on screen
+/// without a second naming scheme to keep in step.
+///
+/// **PRD #742 M5 moved it off `deck_path_text`, and the move is the point.**
+/// That was `Endpoint::describe()`, which renders neither the remote socket
+/// path, the identity file nor the jump host — so two decks differing only in
+/// one of those stamped their events identically, and the webview's
+/// "is this event from the deck the screen is on" filter answered yes for the
+/// wrong machine's events. The stamp has to track whatever the snapshot's key
+/// is, or the filter compares two different naming schemes.
 ///
 /// # Unguarded, and stated rather than glossed
 ///
@@ -1132,7 +1140,7 @@ fn drain_pending(
 /// over `R: Runtime` — a real refactor with headless risk, and not M3's. What a
 /// reader should check by hand is one line: with two decks observed, every
 /// `desktop://daemon-event` payload in the webview console carries a `deck`
-/// equal to the `connection.socketPath` of the deck that emitted it.
+/// equal to the `connection.deckId` of the deck that emitted it.
 fn emit_daemon_event(app: &AppHandle, endpoint: &Endpoint, msg: &BroadcastMsg) {
     let _ = app.emit("desktop://daemon-event", DeckStamped::new(endpoint, msg));
 }
@@ -1156,7 +1164,7 @@ struct DeckStamped<'a> {
 impl<'a> DeckStamped<'a> {
     fn new(endpoint: &Endpoint, event: &'a BroadcastMsg) -> Self {
         Self {
-            deck: crate::dto::deck_path_text(endpoint),
+            deck: crate::dto::deck_wire_id(endpoint),
             event,
         }
     }
@@ -2333,7 +2341,13 @@ mod tests {
     /// refactor M3 deliberately did not start. So what stays unguarded is that
     /// the watcher passes its **own** endpoint here — check that by hand with two
     /// decks observed, where every payload's `deck` must equal the
-    /// `connection.socketPath` of the deck that emitted it.
+    /// `connection.deckId` of the deck that emitted it.
+    ///
+    /// **PRD #742 M5 changed the stamp's value from the label to the key**, and
+    /// the assertion below moved with it: the webview compares this against the
+    /// deck id it holds the group under, and a stamp that stayed
+    /// `Endpoint::describe()` would have gone on collapsing two daemons on one
+    /// host into one answer after the snapshot stopped doing so.
     #[test]
     fn a_stamped_daemon_event_adds_the_deck_and_moves_nothing_else() {
         use dot_agent_deck::daemon_client::{Endpoint, LocalEndpoint};
@@ -2362,9 +2376,15 @@ mod tests {
             serde_json::to_value(DeckStamped::new(&deck, &event)).expect("the stamped payload");
 
         assert_eq!(
-            stamped["deck"], "/run/deck-a.sock",
+            stamped["deck"],
+            serde_json::Value::from(crate::dto::deck_wire_id(&deck)),
             "the payload must name the deck it came from, and with the same \
-             string `connection.socketPath` carries"
+             token `connection.deckId` carries"
+        );
+        assert_ne!(
+            stamped["deck"], "/run/deck-a.sock",
+            "the stamp is the KEY, not the label — a deck path here is the \
+             identity that cannot tell two daemons on one host apart"
         );
         assert_eq!(
             stamped["kind"], "event",

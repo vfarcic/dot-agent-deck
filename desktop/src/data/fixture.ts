@@ -1,10 +1,18 @@
 import type { AgentProfile, AgentSession, AgentStatus, AgentTab, DeckSnapshot, EvidenceItem, WorkflowStage } from "../types";
 
 /**
- * The fixture's stand-in for a daemon identity. Live mode uses the daemon's
- * socket path, which is the only thing the handshake gives us that actually
- * distinguishes one local daemon from another; the fixture names the socket a
- * default deployment listens on.
+ * The fixture's stand-in for a deck identity — used as BOTH `deckId` and
+ * `socketPath`, which is the one place the fixture deliberately differs from
+ * live mode.
+ *
+ * Live mode's two values are different things since PRD #742 M5: `deckId` is an
+ * opaque `deck-<16 hex>` token minted from `EndpointIdentity`, and `socketPath`
+ * is the `Endpoint::describe()` label beside it. The fixture keeps one readable
+ * string in both because every deck here is distinct by its label anyway, and a
+ * fake hash would make each of these decks harder to recognise in a DOM dump for
+ * no property gained. The collision case the id exists for — two decks the label
+ * cannot tell apart — is exercised where it belongs, against the real mapping,
+ * in `bridge.test.ts`.
  */
 export const FIXTURE_DAEMON_ID = "/tmp/dot-agent-deck.sock";
 
@@ -592,13 +600,13 @@ export function createFixtureFleet(state: FixtureState = "connected"): DeckSnaps
   return [
     fleetDeck(
       FIXTURE_DAEMON_ID,
-      { status: "connected", socketPath: FIXTURE_DAEMON_ID, message: "Deck responding", deckKind: "local" },
+      { status: "connected", deckId: FIXTURE_DAEMON_ID, socketPath: FIXTURE_DAEMON_ID, message: "Deck responding", deckKind: "local" },
       agents,
       "/home/dev/code/dot-agent-deck-gui",
     ),
     fleetDeck(
       FIXTURE_REMOTE_DAEMON_ID,
-      { status: "connected", socketPath: FIXTURE_REMOTE_DAEMON_ID, message: "Deck responding", deckKind: "remote", localOnlyReason: "Stop daemon acts on a process on this machine." },
+      { status: "connected", deckId: FIXTURE_REMOTE_DAEMON_ID, socketPath: FIXTURE_REMOTE_DAEMON_ID, message: "Deck responding", deckKind: "remote", localOnlyReason: "Stop daemon acts on a process on this machine." },
       remoteAgents,
       "/home/dev/code/dot-agent-deck",
     ),
@@ -618,7 +626,7 @@ export function createFixtureFleet(state: FixtureState = "connected"): DeckSnaps
     */
     fleetDeck(
       FIXTURE_UNREACHABLE_DAEMON_ID,
-      { status: "disconnected", socketPath: FIXTURE_UNREACHABLE_DAEMON_ID, message: "No deck is listening on the configured socket.", deckKind: "remote", localOnlyReason: "Stop daemon acts on a process on this machine." },
+      { status: "disconnected", deckId: FIXTURE_UNREACHABLE_DAEMON_ID, socketPath: FIXTURE_UNREACHABLE_DAEMON_ID, message: "No deck is listening on the configured socket.", deckKind: "remote", localOnlyReason: "Stop daemon acts on a process on this machine." },
       staleAgents,
       "/home/dev/code/dot-agent-deck",
     ),
@@ -632,7 +640,7 @@ export function createFixtureSnapshot(state: FixtureState = "connected"): DeckSn
   if (state === "fleet") return createFixtureFleet(state)[0];
   const connected = state === "connected" || state === "crowded" || state === "empty";
   const connection = connected
-    ? { status: "connected" as const, socketPath: FIXTURE_DAEMON_ID, message: state === "empty" ? "Deck responding · no agents running" : "Deck responding" }
+    ? { status: "connected" as const, deckId: FIXTURE_DAEMON_ID, socketPath: FIXTURE_DAEMON_ID, message: state === "empty" ? "Deck responding · no agents running" : "Deck responding" }
     : state === "error"
       ? { status: "error" as const, message: "Protocol handshake failed. Desktop expects v6; deck reported v5." }
       : { status: "disconnected" as const, message: "No deck is listening on the configured socket." };

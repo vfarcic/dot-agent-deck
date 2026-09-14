@@ -37,13 +37,72 @@ pub struct DesktopSnapshot {
     // preferred.
     pub protocol_version: u32,
     pub source: &'static str,
+    /// Every deck the app is observing, by [`DesktopConnection::deck_id`], in
+    /// observed order with the SELECTED deck first (PRD #742 M5).
+    ///
+    /// # Why membership is on the wire rather than inferred
+    ///
+    /// M4 asked the same question of the frontend and found there is no signal
+    /// to infer it from: a deck LEAVING the observed set produces no event at
+    /// all. `apply_selection` ends the departed deck's watcher, and under
+    /// `All` -> `local` the resolved deck does not move, so it emits nothing
+    /// either. A webview that only upserts what arrives would keep that deck's
+    /// agents on screen, frozen and looking live. M4 approximated it by
+    /// resetting membership at `connect()`; this is the exact version, and it
+    /// costs one `Vec<String>` on a snapshot that already carries an agent list.
+    ///
+    /// # Two invariants, both relied on by the webview
+    ///
+    /// **Selected first**, so `fleet[0]` answers "which deck are the
+    /// single-deck surfaces bound to" — a question nothing on the stream could
+    /// answer before, because under `All` every observed deck emits the same
+    /// shape and the frontend had to re-learn it at `connect()`.
+    ///
+    /// **Never empty.** A deck the app cannot reach is still an entry here and
+    /// still emits its own `disconnected` snapshot, because "no agents" and "we
+    /// cannot see the agents" are different statements and an absent entry
+    /// cannot tell them apart.
+    ///
+    /// Every deck's snapshot carries the same list — it is a property of the
+    /// applied document, not of the deck that happened to emit — so a webview
+    /// may prune on any arrival.
+    pub fleet: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DesktopConnection {
     pub status: ConnectionStatus,
+    /// What this deck is CALLED, for a human to read — `Endpoint::describe()`.
+    ///
+    /// **A label, and never a key**, which is the distinction PRD #742 M5 put on
+    /// the wire: see [`Self::deck_id`] for the value anything keying on a deck
+    /// must use instead.
     pub socket_path: String,
+    /// What this deck IS, for anything keying on it — `EndpointIdentity::wire_id()`
+    /// (PRD #742 M5).
+    ///
+    /// # The defect this field closes
+    ///
+    /// The webview derived its per-deck key from [`Self::socket_path`], which is
+    /// `Endpoint::describe()` — and `describe()` renders a remote deck as
+    /// `user@host[:port]`, omitting the remote socket path, the identity file
+    /// and the jump host. So two `[[endpoints.remote]]` rows pointing at one
+    /// host with different `socket` values — **two daemons on one machine**,
+    /// which is exactly what that field exists for — described identically,
+    /// folded into ONE group, and their agents shared a `daemonId`. The
+    /// composite `(daemonId, agentId)` key does not save that: the key
+    /// component is the collision. The failure is silent, which is the worst
+    /// part of it — the two decks alternate inside one group, last writer wins
+    /// per emit, and the screen looks like one healthy deck.
+    ///
+    /// `EndpointIdentity` was introduced on PR #1035 *specifically* for the
+    /// N-deck case and then stopped at the Rust boundary. This is it crossing.
+    ///
+    /// Opaque on purpose (`deck-<16 hex>`): it is a key, and `socket_path`
+    /// beside it is what the UI renders. Stable across restarts, because the
+    /// webview keys `localStorage`-backed state on it.
+    pub deck_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     pub client_protocol_version: u32,
@@ -1010,6 +1069,54 @@ pub(crate) fn deck_path_text(endpoint: &Endpoint) -> String {
     safe_display_text(endpoint.describe())
 }
 
+/// How **this** deck is KEYED — the other half of the pair [`deck_path_text`]
+/// writes, and the one PRD #742 M5 added (`DesktopConnection::deck_id`).
+///
+/// `EndpointIdentity::wire_id()` and nothing else. The identity is where the
+/// judgement lives — a new `RemoteEndpoint` field joins it by derive — so this
+/// is one call rather than a second opinion about which fields name a deck,
+/// which is the shape the defect took the first time: `describe()` was a
+/// perfectly good display string that nobody had asked to be an identity.
+///
+/// Not run through [`safe_display_text`], deliberately and unlike its sibling.
+/// The value is 21 ASCII bytes this build mints from a hash; a scrub would be
+/// theatre over a string with no user-supplied byte in it, and the reader of
+/// THIS line should be looking at `wire_id` rather than at a sanitiser to see
+/// why the value is safe.
+pub(crate) fn deck_wire_id(endpoint: &Endpoint) -> String {
+    endpoint.identity().wire_id()
+}
+
+/// The observed fleet as [`DesktopSnapshot::fleet`] carries it — every observed
+/// deck's [`deck_wire_id`], selected deck first, never empty (PRD #742 M5).
+///
+/// # The two invariants are enforced here, not assumed
+///
+/// [`crate::settings::EndpointSettings::observed_endpoints`] already yields them
+/// — it is `[resolve().endpoint]` for every selection but `All`, and `All` leads
+/// with the local deck, which is what `All` resolves to. This re-establishes
+/// them anyway, because they are what the webview's `fleet[0]` reads as "the
+/// selected deck" and a silently wrong answer there binds every single-deck
+/// surface to somebody else's machine. Restating a property the producer
+/// already has is cheap; discovering it moved is not.
+///
+/// A selected deck that is somehow absent from the observed set is PREPENDED
+/// rather than dropped: the app is talking to it either way, so a fleet that
+/// omitted it would render the deck screen's own agents under no group at all.
+pub(crate) fn observed_fleet() -> Vec<String> {
+    let selected = deck_wire_id(&selected_endpoint());
+    let mut fleet: Vec<String> = observed_decks().iter().map(deck_wire_id).collect();
+    match fleet.iter().position(|id| *id == selected) {
+        Some(0) => {}
+        Some(at) => {
+            let id = fleet.remove(at);
+            fleet.insert(0, id);
+        }
+        None => fleet.insert(0, selected),
+    }
+    fleet
+}
+
 /// The disconnected snapshot **for one deck** (PRD #742 M3 takes the endpoint).
 ///
 /// Every failure path in `snapshot_with` reaches here, and each of them already
@@ -1025,6 +1132,7 @@ pub(crate) fn disconnected_snapshot(
         connection: DesktopConnection {
             status: ConnectionStatus::Disconnected,
             socket_path: deck_path_text(endpoint),
+            deck_id: deck_wire_id(endpoint),
             error: Some(safe_message(error)),
             client_protocol_version: PROTOCOL_VERSION,
             server_protocol_version: None,
@@ -1043,6 +1151,7 @@ pub(crate) fn disconnected_snapshot(
         agents: Vec::new(),
         protocol_version: PROTOCOL_VERSION,
         source: "daemon",
+        fleet: observed_fleet(),
     }
 }
 
@@ -1348,6 +1457,146 @@ mod tests {
         assert!(
             reason.contains("no remote socket path yet"),
             "this is a different thing to tell a user than a missing row: {reason}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // PRD #742 M5 — the deck id, and exact fleet membership
+    // -----------------------------------------------------------------------
+
+    /// A document observing the whole fleet: two remote rows that
+    /// `Endpoint::describe()` renders IDENTICALLY, differing only in the remote
+    /// socket path.
+    ///
+    /// That is not a contrived pair — it is two daemons on one host, which is
+    /// exactly what the `socket` field exists to distinguish. Under the old
+    /// identity the two rows collapsed onto one key, which is the defect M5
+    /// closes.
+    fn two_daemons_on_one_host() -> crate::settings::DesktopSettings {
+        use crate::settings::{
+            DesktopSettings, EndpointId, EndpointSettings, RemoteEndpointSettings, Selection,
+        };
+        use dot_agent_deck::remote_tunnel::{Hostname, RemoteSocketPath};
+
+        let row = |id: &str, socket: &str| {
+            let mut row = RemoteEndpointSettings::new(
+                EndpointId::parse(id).expect("a valid id"),
+                Hostname::parse("build-box").expect("a valid host"),
+            );
+            row.socket = Some(RemoteSocketPath::parse(socket).expect("a valid remote socket"));
+            row
+        };
+        DesktopSettings {
+            endpoints: Some(EndpointSettings {
+                remote: vec![
+                    row("deck000000000010", "/run/deck-one.sock"),
+                    row("deck000000000011", "/run/deck-two.sock"),
+                ],
+                selection: Selection::All,
+            }),
+            ..DesktopSettings::default()
+        }
+    }
+
+    /// The snapshot's fleet is every observed deck, in observed order, selected
+    /// first — and two decks the label cannot tell apart are two entries.
+    ///
+    /// Scenario: apply a document selecting `All` with two remote rows on one
+    /// host differing only in their remote socket path, then take a snapshot.
+    /// `fleet` must hold three distinct ids, led by the local deck (which is
+    /// what `All` resolves to), and `connection.deckId` must be the local
+    /// deck's — while the two remote rows, whose `socketPath` label is one
+    /// string, hold two different ids.
+    #[test]
+    fn the_snapshot_fleet_is_the_observed_set_selected_first() {
+        let settings = two_daemons_on_one_host();
+        let (fleet, snapshot, labels, ids) = with_selection(&settings, || {
+            let observed = observed_decks();
+            (
+                observed_fleet(),
+                disconnected_snapshot(&selected_endpoint(), "nothing is listening"),
+                observed.iter().map(deck_path_text).collect::<Vec<_>>(),
+                observed.iter().map(deck_wire_id).collect::<Vec<_>>(),
+            )
+        });
+
+        assert_eq!(
+            fleet, ids,
+            "the fleet is the observed set, in observed order"
+        );
+        assert_eq!(
+            fleet.len(),
+            3,
+            "the local deck plus both configured rows: {fleet:?}"
+        );
+        assert_eq!(
+            fleet[0], snapshot.connection.deck_id,
+            "`fleet[0]` is the selected deck, which is what the webview binds \
+             its single-deck surfaces to"
+        );
+        assert_eq!(
+            snapshot.fleet, fleet,
+            "every snapshot carries the same list, so a webview may prune on \
+             whichever one lands first"
+        );
+        assert_eq!(
+            fleet.iter().collect::<HashSet<_>>().len(),
+            3,
+            "three observed decks, three distinct keys: {fleet:?}"
+        );
+        assert_eq!(
+            labels[1], labels[2],
+            "this case only means something while the LABEL cannot tell the two \
+             daemons apart: {labels:?}"
+        );
+        assert_ne!(
+            fleet[1], fleet[2],
+            "two daemons on one host are two decks, however they describe"
+        );
+    }
+
+    /// Every selection but `All` observes exactly the deck it resolved to, so
+    /// the fleet is that one deck and the fleet view is a single group.
+    ///
+    /// The invariant that matters here is "never empty": an unreachable deck is
+    /// still an entry carrying a disconnected connection, because an absent
+    /// entry cannot tell "no agents" from "we cannot see the agents".
+    #[test]
+    fn a_single_deck_selection_is_a_one_entry_fleet() {
+        let snapshot = with_selection(&selecting_a_remote_deck(), || {
+            disconnected_snapshot(&selected_endpoint(), "the tunnel refused")
+        });
+
+        assert_eq!(snapshot.fleet, vec![snapshot.connection.deck_id.clone()]);
+        assert_eq!(snapshot.connection.status, ConnectionStatus::Disconnected);
+    }
+
+    /// The deck id is a KEY and the socket path is a LABEL, and the wire says so
+    /// with two fields rather than with one string doing both jobs.
+    ///
+    /// The second half is the part worth pinning: the id carries no endpoint
+    /// text at all. A `deck_id` that happened to embed the host would be a
+    /// `deck_id` somebody eventually reassembles by hand, which is how
+    /// `describe()` became an identity in the first place.
+    #[test]
+    fn the_deck_id_is_opaque_and_the_socket_path_stays_the_label() {
+        let (kind, snapshot) = with_selection(&selecting_a_remote_deck(), || {
+            let endpoint = selected_endpoint();
+            (
+                selection_fields(&endpoint).0,
+                disconnected_snapshot(&endpoint, "the tunnel refused"),
+            )
+        });
+
+        assert_eq!(kind, "remote");
+        assert_eq!(
+            snapshot.connection.socket_path, "deploy@build-box",
+            "the label is still `Endpoint::describe()`, unchanged"
+        );
+        let id = snapshot.connection.deck_id;
+        assert!(
+            id.starts_with("deck-") && !id.contains("build-box") && !id.contains('@'),
+            "the deck id is opaque and carries no endpoint text: {id}"
         );
     }
 
