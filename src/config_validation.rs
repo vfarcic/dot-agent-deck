@@ -31,7 +31,7 @@ pub struct ValidationIssue {
 /// leaving an absurd one unable to fill a screen. The count that replaces the
 /// tail is what keeps the diagnostic honest: "this is longer than it looks" is
 /// itself the finding when a config carries a 100 KB mode name.
-const MAX_QUOTED_VALUE_CHARS: usize = 120;
+pub(crate) const MAX_QUOTED_VALUE_CHARS: usize = 120;
 
 /// Issue #308 audit (MEDIUM): the per-line ceiling on a whole rendered
 /// `message`.
@@ -195,6 +195,21 @@ fn escape_for_terminal(s: &str) -> std::borrow::Cow<'_, str> {
         }
     }
     std::borrow::Cow::Owned(out)
+}
+
+/// PRD #220 Phase 2 review (finding A4): one producer-supplied field, clamped
+/// and escaped, ready to be interpolated into a `tracing` field value.
+///
+/// Composed from the two halves this module already applies to a
+/// `ValidationIssue` rather than respelled, so there is one definition of "safe
+/// in a diagnostic" to keep correct. The reason a LOG needs it is the same
+/// reason a validation message does and is easy to under-rate: disabling the
+/// subscriber's own ANSI styling escapes nothing INSIDE a field value, so a
+/// newline forges a whole log line, a CR overwrites the one being written, and a
+/// bidi override reorders a line in whatever terminal or viewer renders it.
+/// Clamping first is what stops a field that is not prose from filling the file.
+pub(crate) fn escape_field_for_log(value: &str, max_chars: usize) -> String {
+    escape_for_terminal(&bound_chars(value, max_chars)).into_owned()
 }
 
 /// The predicate behind [`escape_for_terminal`] — see its doc for why the set is

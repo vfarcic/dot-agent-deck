@@ -1713,7 +1713,7 @@ fn format_idle_elapsed(elapsed: std::time::Duration) -> String {
 /// grammar at config validation / the `TabMembership` boundary would reject
 /// existing configs with exotic role names, and the same weakness predates this
 /// PRD on the delegate path. That is tracked as a separate follow-up.
-fn quote_untrusted_role(role: &str) -> String {
+pub(crate) fn quote_untrusted_role(role: &str) -> String {
     let label: String = sanitize_role_name(role)
         .chars()
         .filter(|c| !is_frame_breaking(*c))
@@ -1752,22 +1752,31 @@ fn is_frame_breaking(c: char) -> bool {
 /// unbounded report means an unbounded synthetic paste. The normal path has no
 /// such limit — that is what the file is for — so this only ever caps the
 /// degraded path, and the worker still holds the full text either way.
-const MAX_INLINED_WORK_DONE_REPORT_CHARS: usize = 4000;
+pub(crate) const MAX_INLINED_WORK_DONE_REPORT_CHARS: usize = 4000;
 
 /// Issue #433: a worker-authored report rendered as an inert data block, ready to
 /// be inlined into the orchestrator's feedback.
-struct QuotedReport {
+pub(crate) struct QuotedReport {
     /// The fenced block, safe to interpolate into daemon prose.
-    fenced: String,
+    pub(crate) fenced: String,
     /// Whether [`MAX_INLINED_WORK_DONE_REPORT_CHARS`] cut the report short, so
     /// the surrounding prose can say so.
-    truncated: bool,
+    pub(crate) truncated: bool,
 }
 
 /// Issue #433: render a worker's `work-done` summary as an inert data block for
 /// [`compose_work_done_feedback`]'s inlined paths. `None` when the worker sent no
 /// report text at all (after whitespace collapsing), so the prose can say *that*
 /// rather than present an empty frame.
+///
+/// PRD #220 Phase 2 review (finding A1): the dispatch RETURN edge is the second
+/// caller — [`crate::dispatch_return::compose_completion_report`] — and it is
+/// this function's threat model one step further out again. A `work-done`
+/// summary is authored by a worker inside THIS deck; a dispatched unit's report
+/// is authored in a sibling worktree the caller chose and may be prompt-injected
+/// by whatever that worktree contains. Reused rather than re-implemented on
+/// purpose: two fencing functions drift, and the return edge shipped without one
+/// precisely because the control was a private detail of the delegate leg.
 ///
 /// The threat model is [`quote_untrusted_role`]'s, one step further along. That
 /// function quotes a role name copied from a repository's `.dot-agent-deck.toml`;
@@ -1788,7 +1797,7 @@ struct QuotedReport {
 /// would sit unsent in the orchestrator's input box — the same reasoning that
 /// makes [`compose_delegate_prompt`] the single-line seam for every other
 /// daemon-injected prompt. Markdown formatting is lost; the words are not.
-fn quote_untrusted_report(summary: &str) -> Option<QuotedReport> {
+pub(crate) fn quote_untrusted_report(summary: &str) -> Option<QuotedReport> {
     let collapsed: String = summary
         .split_whitespace()
         .collect::<Vec<_>>()
@@ -1936,11 +1945,26 @@ async fn return_dispatch_completion(signal: &WorkDoneSignal, registry: &AgentPty
     let Some(caller) = registry.take_dispatch_return(&signal.pane_id) else {
         return false;
     };
+    // PRD #220 Phase 2 review (finding A4): the unit name is producer-supplied and
+    // rode into this line raw. Escaped and clamped through the module that already
+    // owns that treatment — a raw newline in a field value forges a whole log line,
+    // a CR overwrites the one being written, and a bidi override reorders whatever
+    // renders it; turning the subscriber's own ANSI styling off does none of that.
+    //
+    // The two pane ids and the agent id are daemon-minted and stay bare. The
+    // REPORT BODY is deliberately absent from this line and from every other one on
+    // this path: `deliver_dispatch_result`'s caller-gone and refusal warnings log
+    // pane/agent ids and the outcome only, so a report that could not be delivered
+    // is not leaked into the log instead. Do not "helpfully" add it back.
     tracing::info!(
         unit_pane_id = %signal.pane_id,
-        unit = %caller.unit_name,
+        unit = %crate::config_validation::escape_field_for_log(
+            &caller.unit_name,
+            crate::config_validation::MAX_QUOTED_VALUE_CHARS,
+        ),
         caller_pane_id = %caller.pane_id,
         caller_agent_id = %caller.agent_id,
+        report_chars = signal.task.chars().count(),
         "dispatch: unit complete; returning its report to the pane that dispatched it"
     );
     let message =
@@ -7073,9 +7097,18 @@ impl AppState {
 
         // Orchestrator's own `--done`: completion signal, no feedback to write.
         if signal.done && self.orchestrator_pane_ids.contains(&signal.pane_id) {
+            // PRD #220 Phase 2 review (finding A4): `signal.task` is the WHOLE
+            // report and used to be logged verbatim at info. Two problems, and the
+            // size is the smaller one: it is agent-authored text that can carry
+            // newlines, CR, ESC, C1 and bidi characters straight into a
+            // line-oriented log, and on a dispatched orchestration it is the same
+            // body the return edge is about to deliver — so logging it here
+            // contradicted the deliberate silence `deliver_dispatch_result` keeps
+            // about undelivered reports. Its LENGTH is what an operator correlating
+            // a truncation actually needs; the text itself is in the caller's pane.
             tracing::info!(
                 pane_id = %signal.pane_id,
-                task = %signal.task,
+                report_chars = signal.task.chars().count(),
                 "orchestration complete (orchestrator --done)"
             );
             // PRD #220 M2.1: ...and if this orchestration was DISPATCHED, that
