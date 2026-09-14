@@ -4,8 +4,9 @@
 // which exists on Windows. This file is FAST tier, so CI's Windows job compiles
 // it — `#![cfg(unix)]` makes the crate empty there instead of failing to build.
 #![cfg(unix)]
-//! Fast-tier behavioral coverage for what the daemon TELLS THE ORCHESTRATOR when
-//! one of its workers reports `work-done` (issues #448 and #433).
+//! Fast-tier behavioral coverage for what the daemon TELLS ANOTHER PANE when a
+//! unit reports `work-done`: ordinary worker-to-orchestrator feedback (issues
+//! #448 and #433), plus a dispatched unit's retained return edge (PRD #220).
 //!
 //! These tests drive the real `AppState::handle_delegate` /
 //! `AppState::handle_work_done` against daemon-owned PTYs, with the role maps
@@ -34,6 +35,7 @@ use tokio::sync::broadcast;
 use dot_agent_deck::agent_pty::{
     AgentPtyRegistry, DOT_AGENT_DECK_PANE_ID, GuardedSend, SpawnOptions, TabMembership,
 };
+use dot_agent_deck::dispatch_return::DispatchCaller;
 use dot_agent_deck::event::{BroadcastMsg, DelegateSignal, WorkDoneSignal};
 use dot_agent_deck::state::{AppState, OrchestrationIdentity};
 use spec::spec;
@@ -625,6 +627,350 @@ fn work_done_006_feedback_is_refused_when_the_orchestrator_pane_changed_hands() 
                 && !snapshot.contains(REPORT_FRAME_NEEDLE),
             "a previous conversation's completion report was typed into — and submitted in — an \
              agent that merely inherited the orchestrator's pane id; snapshot = {snapshot:?}"
+        );
+    });
+}
+
+/// A shareable writer for the two dispatch-return tests' real tracing output.
+#[derive(Clone)]
+struct DispatchReturnLogWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for DispatchReturnLogWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for DispatchReturnLogWriter {
+    type Writer = DispatchReturnLogWriter;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+fn dispatch_return_log_buffer() -> &'static std::sync::Arc<std::sync::Mutex<Vec<u8>>> {
+    static BUFFER: std::sync::OnceLock<std::sync::Arc<std::sync::Mutex<Vec<u8>>>> =
+        std::sync::OnceLock::new();
+    BUFFER.get_or_init(|| {
+        let buffer = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(DispatchReturnLogWriter(std::sync::Arc::clone(&buffer)))
+            .with_max_level(tracing_subscriber::filter::LevelFilter::DEBUG)
+            .with_ansi(false)
+            .without_time()
+            .finish();
+        tracing::subscriber::set_global_default(subscriber)
+            .expect("install the dispatch-return test log subscriber");
+        buffer
+    })
+}
+
+fn dispatch_return_logs() -> String {
+    String::from_utf8(dispatch_return_log_buffer().lock().unwrap().clone())
+        .expect("captured dispatch-return logs are UTF-8")
+}
+
+fn spawn_dispatch_return_observer(
+    registry: &std::sync::Arc<AgentPtyRegistry>,
+    cwd: &str,
+    pane_id: &str,
+    marker: &str,
+) -> String {
+    let command =
+        format!("stty -echo -icanon -icrnl -opost min 1 time 0 && printf {marker} && exec cat -u");
+    registry
+        .spawn_agent(SpawnOptions {
+            command: Some(&command),
+            cwd: Some(cwd),
+            env: vec![
+                (DOT_AGENT_DECK_PANE_ID.to_string(), pane_id.to_string()),
+                ("SHELL".to_string(), "/bin/sh".to_string()),
+            ],
+            ..SpawnOptions::default()
+        })
+        .unwrap_or_else(|error| panic!("spawn raw-cat observer on {pane_id}: {error}"))
+}
+
+fn dispatch_return_snapshot(registry: &AgentPtyRegistry, agent_id: &str) -> String {
+    String::from_utf8_lossy(&registry.snapshot(agent_id).unwrap_or_default()).into_owned()
+}
+
+async fn wait_for_dispatch_return_snapshot(
+    registry: &AgentPtyRegistry,
+    agent_id: &str,
+    needle: &str,
+) -> String {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let snapshot = dispatch_return_snapshot(registry, agent_id);
+        if snapshot.contains(needle) || tokio::time::Instant::now() >= deadline {
+            return snapshot;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+async fn barrier_dispatch_return_observer(
+    registry: &AgentPtyRegistry,
+    pane_id: &str,
+    agent_id: &str,
+    barrier: &str,
+) -> String {
+    let outcome = registry
+        .write_and_submit_guarded(pane_id, barrier, agent_id, || async { true })
+        .await
+        .expect("the barrier write must reach the registry");
+    assert_eq!(
+        outcome,
+        GuardedSend::Applied,
+        "the observer owns the pane, so its barrier write must be applied"
+    );
+    let snapshot = wait_for_dispatch_return_snapshot(registry, agent_id, barrier).await;
+    assert!(
+        snapshot.contains(barrier),
+        "the barrier never reached the observer, so the absence under test is unproven; \
+         snapshot = {snapshot:?}"
+    );
+    snapshot
+}
+
+struct DispatchReturnHarness {
+    cwd: TempDir,
+    registry: std::sync::Arc<AgentPtyRegistry>,
+    state: AppState,
+    caller_agent_id: String,
+}
+
+impl DispatchReturnHarness {
+    async fn new(caller_pane: &str, caller_ready: &str, unit_pane: &str, unit_ready: &str) -> Self {
+        common::init_test_env();
+        let _ = dispatch_return_log_buffer();
+        let cwd = common::race_safe_tempdir();
+        let cwd_string = cwd.path().to_string_lossy().into_owned();
+        let registry = std::sync::Arc::new(AgentPtyRegistry::new());
+        let caller_agent_id =
+            spawn_dispatch_return_observer(&registry, &cwd_string, caller_pane, caller_ready);
+        let unit_agent_id =
+            spawn_dispatch_return_observer(&registry, &cwd_string, unit_pane, unit_ready);
+
+        for (label, agent_id, ready) in [
+            ("caller", &caller_agent_id, caller_ready),
+            ("unit", &unit_agent_id, unit_ready),
+        ] {
+            let snapshot = wait_for_dispatch_return_snapshot(&registry, agent_id, ready).await;
+            assert!(
+                snapshot.contains(ready),
+                "precondition: the {label} observer did not become ready; snapshot = {snapshot:?}"
+            );
+        }
+
+        Self {
+            cwd,
+            registry,
+            state: AppState::default(),
+            caller_agent_id,
+        }
+    }
+
+    fn cwd_string(&self) -> String {
+        self.cwd.path().to_string_lossy().into_owned()
+    }
+
+    fn register(&self, caller_pane: &str, unit_pane: &str, unit_name: &str) {
+        self.registry.register_dispatch_return(
+            unit_pane,
+            DispatchCaller {
+                pane_id: caller_pane.to_string(),
+                agent_id: self.caller_agent_id.clone(),
+                unit_name: unit_name.to_string(),
+            },
+        );
+        assert_eq!(
+            self.registry.outstanding_dispatch_returns(),
+            1,
+            "precondition: registering the dispatched unit must retain exactly one return edge"
+        );
+    }
+
+    async fn complete(&self, unit_pane: &str, report: &str) {
+        self.state
+            .handle_work_done(
+                WorkDoneSignal {
+                    pane_id: unit_pane.to_string(),
+                    task: report.to_string(),
+                    done: true,
+                    timestamp: chrono::Utc::now(),
+                },
+                &self.registry,
+            )
+            .await;
+    }
+}
+
+impl Drop for DispatchReturnHarness {
+    fn drop(&mut self) {
+        self.registry.shutdown_all();
+    }
+}
+
+/// Scenario: Retain a dispatched unit's completion recipient, replace that caller with a different agent on the same pane id, and then complete the unit. The completion must be refused as the old caller's session, leave no bytes in the successor, and consume the return edge without retrying it.
+#[spec("dispatch/return/004")]
+#[test]
+fn dispatch_return_004_completion_is_refused_when_the_caller_pane_changed_hands() {
+    runtime().block_on(async {
+        const CALLER_PANE: &str = "dispatch-return-004-caller";
+        const UNIT_PANE: &str = "dispatch-return-004-unit";
+        const UNIT: &str = "return-handover-unit-4f27";
+        const REPORT: &str = "return-handover-report-must-not-leak-8ab1";
+        const CALLER_READY: &str = "RETURN-004-CALLER-READY";
+        const UNIT_READY: &str = "RETURN-004-UNIT-READY";
+        const SUCCESSOR_READY: &str = "RETURN-004-SUCCESSOR-READY";
+        const BARRIER: &str = "RETURN-004-AUTHORIZED-BARRIER";
+
+        let harness =
+            DispatchReturnHarness::new(CALLER_PANE, CALLER_READY, UNIT_PANE, UNIT_READY).await;
+        harness.register(CALLER_PANE, UNIT_PANE, UNIT);
+
+        harness
+            .registry
+            .close_agent(&harness.caller_agent_id)
+            .expect("close the caller without the deliberate pane-close sweep");
+        let successor = spawn_dispatch_return_observer(
+            &harness.registry,
+            &harness.cwd_string(),
+            CALLER_PANE,
+            SUCCESSOR_READY,
+        );
+        assert_ne!(
+            successor, harness.caller_agent_id,
+            "the pane hand-over must mint a different registry agent id"
+        );
+        let ready =
+            wait_for_dispatch_return_snapshot(&harness.registry, &successor, SUCCESSOR_READY).await;
+        assert!(
+            ready.contains(SUCCESSOR_READY),
+            "precondition: the successor did not become ready; snapshot = {ready:?}"
+        );
+
+        harness.complete(UNIT_PANE, REPORT).await;
+        assert_eq!(
+            harness.registry.outstanding_dispatch_returns(),
+            0,
+            "a refused completion is terminal and must consume its retained return edge"
+        );
+
+        let snapshot =
+            barrier_dispatch_return_observer(&harness.registry, CALLER_PANE, &successor, BARRIER)
+                .await;
+        assert!(
+            !snapshot.contains("dispatch:")
+                && !snapshot.contains(UNIT)
+                && !snapshot.contains(REPORT),
+            "the completion was written into a different agent that merely inherited the caller's \
+             pane id; successor snapshot = {snapshot:?}"
+        );
+
+        let log = dispatch_return_logs();
+        assert!(
+            log.lines().any(|line| {
+                line.contains(CALLER_PANE)
+                    && line.contains("dispatch: identity gate refused the result")
+                    && line.contains("WrongSession")
+                    && line.contains("nothing written")
+            }),
+            "the completion must be observably refused as WrongSession, with nothing written; \
+             captured log = {log:?}"
+        );
+    });
+}
+
+/// Scenario: Retain a dispatched unit's return edge, deliberately close its caller pane, and then let the still-live unit complete while an unrelated pane is observable. The close must evict the edge, the late completion must take the logged unknown-pane drop path without panicking, and no report bytes may reach the unrelated pane.
+#[spec("dispatch/return/005")]
+#[test]
+fn dispatch_return_005_completion_is_dropped_after_the_caller_pane_is_gone() {
+    runtime().block_on(async {
+        const CALLER_PANE: &str = "dispatch-return-005-caller";
+        const UNIT_PANE: &str = "dispatch-return-005-unit";
+        const ALTERNATE_PANE: &str = "dispatch-return-005-alternate";
+        const UNIT: &str = "return-gone-unit-6c39";
+        const REPORT: &str = "return-gone-report-must-not-reroute-5de2";
+        const CALLER_READY: &str = "RETURN-005-CALLER-READY";
+        const UNIT_READY: &str = "RETURN-005-UNIT-READY";
+        const ALTERNATE_READY: &str = "RETURN-005-ALTERNATE-READY";
+        const BARRIER: &str = "RETURN-005-AUTHORIZED-BARRIER";
+
+        let harness =
+            DispatchReturnHarness::new(CALLER_PANE, CALLER_READY, UNIT_PANE, UNIT_READY).await;
+        let alternate = spawn_dispatch_return_observer(
+            &harness.registry,
+            &harness.cwd_string(),
+            ALTERNATE_PANE,
+            ALTERNATE_READY,
+        );
+        let ready =
+            wait_for_dispatch_return_snapshot(&harness.registry, &alternate, ALTERNATE_READY).await;
+        assert!(
+            ready.contains(ALTERNATE_READY),
+            "precondition: the alternate observer did not become ready; snapshot = {ready:?}"
+        );
+        harness.register(CALLER_PANE, UNIT_PANE, UNIT);
+
+        drop(harness.registry.begin_pane_close(CALLER_PANE));
+        assert_eq!(
+            harness.registry.outstanding_dispatch_returns(),
+            0,
+            "begin_pane_close must evict every retained return edge whose caller is going away"
+        );
+        harness
+            .registry
+            .close_agent(&harness.caller_agent_id)
+            .expect("close the caller after its pane-scoped sweep");
+        drop(harness.registry.finish_pane_close(CALLER_PANE, true));
+
+        harness.complete(UNIT_PANE, REPORT).await;
+        assert_eq!(
+            harness.registry.outstanding_dispatch_returns(),
+            0,
+            "the late completion must not recreate or reroute an evicted return edge"
+        );
+
+        let snapshot = barrier_dispatch_return_observer(
+            &harness.registry,
+            ALTERNATE_PANE,
+            &alternate,
+            BARRIER,
+        )
+        .await;
+        assert!(
+            !snapshot.contains("dispatch:")
+                && !snapshot.contains(UNIT)
+                && !snapshot.contains(REPORT),
+            "a completion with no caller was rerouted into an unrelated pane; alternate snapshot = \
+             {snapshot:?}"
+        );
+
+        let log = dispatch_return_logs();
+        assert!(
+            log.lines().any(|line| {
+                line.contains(CALLER_PANE)
+                    && line
+                        .contains("pane close: dropped dispatch return entries touching this pane")
+            }),
+            "the caller close must log that it dropped the retained return edge; captured log = \
+             {log:?}"
+        );
+        assert!(
+            log.lines().any(|line| {
+                line.contains(UNIT_PANE) && line.contains("work-done from unknown pane")
+            }),
+            "the late completion must be dropped on the existing logged unknown-pane path; \
+             captured log = {log:?}"
         );
     });
 }
