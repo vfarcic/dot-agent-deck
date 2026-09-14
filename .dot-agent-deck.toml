@@ -126,7 +126,7 @@ When the user's request relates to a PRD, read only the PRD file from the prds/ 
    - One-sentence Scenario summary.
    - Action: extend / modify / create / skip.
 
-   Surface the plan to the user as a Markdown table and STOP. Wait for explicit approval or refinement. Don't delegate any work until the plan is signed off.
+   Keep the plan for your own use — it is what you delegate against and what you check the finished work against. Do NOT surface it to the user for approval and do NOT wait for a sign-off: the test plan is not a gate. Record it in the conversation so it stays auditable, then go straight to the execution phase. If planning surfaces a genuine product DECISION the PRD leaves open (a behaviour choice, or the experimental-flag question under CLAUDE.md rule 9), state it, say which option you are taking and why, and proceed on that — stop for the user only where proceeding either way would waste the run.
 
 2. **Execution phase.** Per the approved plan:
    - **L2 synthetic + L1 widget items** → TDD chain: delegate to **tester** (writes failing test, confirms RED, reports back), then to **coder** (implements — production code only, never editing the tester's test), then back to **tester** (confirms GREEN).
@@ -151,7 +151,7 @@ When the user's request relates to a PRD, read only the PRD file from the prds/ 
 
 7. **Merge phase.** When the final CI + Greptile pass from the changelog/PR-body commit (step 6) settles **green**, run `cargo xtask list-tests` and present the user with the full picture: the synthetic-test inventory (every #[spec] test created/modified, every catalog prose change, every linkage-allowlist delta) plus the reported CI status and any review findings, and — if one was produced — the demo-reel link as `Demo reel for PRD #NNN: <link>. Watch before merging.`. Then pause — the user reviews the PR (and watches the reel) themselves and gives the final merge go-ahead. Immediately before you pause, send the **merge gate** notification (see **Notifications** below). Send and continue: ignore the result, and pause as normal. If there are CI failures or findings to address first, re-delegate fixes to coder/tester and then re-delegate to release to re-check. Only on the user's explicit go-ahead do you re-delegate to **release** to finish `/pr-create` (merge the PR, close the issue). Never merge without that go-ahead.
 
-There are exactly TWO user gates in this workflow: the test-plan approval (step 1) and the merge confirmation (step 7). The test inventory and the demo-reel link are informational context for the merge gate, not a gate of their own.
+There is exactly ONE user gate in this workflow: the merge confirmation (step 7). The test plan (step 1) is deliberately NOT a gate — see step 1 — and must not be turned back into one. The test inventory and the demo-reel link are informational context for the merge gate, not gates of their own.
 
 **Run finished.** When the run ends — merged and closed, or abandoned for any reason — make your last action the **run finished** notification (see **Notifications** below). Send and continue.
 
@@ -163,7 +163,7 @@ There are exactly TWO user gates in this workflow: the test-plan approval (step 
 
 **Fire-and-forget.** Send and continue — NEVER wait for an acknowledgment, never poll for delivery, never retry, and never let a send result change what you do next. A failed send is a lost notification, not a workflow event.
 
-**The selection rule.** The criterion is not "every pause for a human" but **every pause where the human may have walked away**. A gate that fires seconds into a run, with the user still sitting there watching, earns nothing; a gate that arrives after a long unattended stretch earns a lot. That is why the **test-plan gate (step 1) is deliberately NOT a notify moment** — it fires immediately after the run starts, the user is invariably still there, and a message about it is noise. Do not add it back.
+**The selection rule.** The criterion is not "every pause for a human" but **every pause where the human may have walked away**. A gate that fires seconds into a run, with the user still sitting there watching, earns nothing; a gate that arrives after a long unattended stretch earns a lot. The **test plan (step 1) is not a gate at all** — the orchestrator plans and proceeds — so there is nothing there to pause for and nothing to notify about. Do not re-introduce either the gate or a notification for it.
 
 You notify at exactly these four moments and nowhere else — per-step chatter defeats the purpose. Every message starts with `dot-agent-deck PRD #<n> — ` so that parallel orchestrations are distinguishable, and carries only *done* vs *needs attention* and *what*:
 
