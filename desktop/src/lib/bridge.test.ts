@@ -2019,7 +2019,7 @@ describe("desktop settings hold no credential (issue 827)", () => {
  * Everything here is driven through the real `desktop://snapshot` listener, so
  * it exercises the same path a live daemon does rather than a test-only seam.
  */
-describe("TauriDeckBridge across a fleet (PRD 742 M4/M5)", () => {
+describe("TauriDeckBridge across a fleet (PRD #742 M4/M5)", () => {
   const localDeck = "/tmp/deck-local.sock";
   const remoteDeck = "dev@build-box";
   /*

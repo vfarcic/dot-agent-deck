@@ -53,6 +53,16 @@
 //! tidy: `PR #416` and `(PRD #743)` are three valid hex digits behind a `#` and
 //! appear in both `src/lib/bridge.ts` and the opt-out markers themselves.
 //!
+//! String contents are **not** masked — `"#141817"` is precisely what the scan
+//! is for — so the same three digits behind a `#` come back inside a string
+//! literal, and `describe("AgentOverview across a fleet (PRD #742 M4)")` failed
+//! `cargo test-fast` as a hard-coded colour. Any issue number of 3, 4, 6 or 8
+//! digits does. [`is_issue_reference`] is the narrow exemption: a decimal run
+//! introduced by one of [`ISSUE_CUES`]. Both halves are load-bearing — decimal
+//! alone would exempt `#000` and `#333`, and a cue word alone would let
+//! `PRD #fff` through — and a general "any word then a space" rule was
+//! rejected because `1px solid #333` would satisfy it.
+//!
 //! **Both guards fail closed.** Every filesystem error — a directory that
 //! cannot be listed, an entry that cannot be typed, a file that cannot be read
 //! — fails the test instead of removing files from the scan, and a symlink is
@@ -81,6 +91,15 @@ const COLOUR_FNS: [&str; 10] = [
 /// Bare CSS colour keywords worth catching. Kept to the two that actually
 /// appear as values and cannot be mistaken for anything else.
 const COLOUR_WORDS: [&str; 2] = ["white", "black"];
+
+/// Words that introduce a GitHub issue or pull-request number.
+///
+/// Masking comments covers `// PR #416`, but a `#` inside a **string literal**
+/// is deliberately kept — `"#141817"` is exactly what the scan is for — and a
+/// three-digit issue number is three valid hex digits. `describe("... (PRD
+/// #742 M4)")` therefore failed as a hard-coded colour, and so would any issue
+/// whose number is 3, 4, 6 or 8 digits long. See [`is_issue_reference`].
+const ISSUE_CUES: [&str; 7] = ["issue", "issues", "pr", "prd", "pull", "gh", "github"];
 
 /// The workspace root, from this crate's manifest dir rather than the process
 /// cwd, so the tests do not depend on how the runner was invoked.
@@ -286,7 +305,8 @@ fn literals_in(line: &str) -> Vec<String> {
                 .count()
                 .min(9);
             let next_is_ident = chars.get(i + 1 + run).copied().is_some_and(is_ident);
-            if matches!(run, 3 | 4 | 6 | 8) && !next_is_ident {
+            if matches!(run, 3 | 4 | 6 | 8) && !next_is_ident && !is_issue_reference(&chars, i, run)
+            {
                 found.push(chars[i..=i + run].iter().collect());
             }
             continue;
@@ -324,6 +344,51 @@ fn literals_in(line: &str) -> Vec<String> {
         }
     }
     found
+}
+
+/// Whether the `#` at `at`, carrying a `run`-digit hex run, is an issue or
+/// pull-request reference rather than a colour.
+///
+/// **Both halves are required, and each is what stops the other from being a
+/// hole.**
+///
+/// * *The run is entirely decimal.* An issue number is decimal; a colour is
+///   written for its hex. This is what keeps a cue word from laundering a real
+///   literal — `PRD #fff` is still a finding, because `#fff` is not a number
+///   anyone files.
+/// * *A cue word introduces it.* Decimal alone would exempt `#000`, `#333` and
+///   `#123456`, which are among the most commonly hard-coded colours there are.
+///   Requiring one of [`ISSUE_CUES`] immediately to the left keeps every
+///   CSS-value position flagged: `color: #333`, `1px solid #000` and
+///   `"#000"` have no cue word in front of them and still fail.
+///
+/// Deliberately NOT "any word plus a space": `solid`, `inset` and `outset` are
+/// ordinary alphabetic words that really do precede a colour in a shorthand, so
+/// a general word rule would exempt `1px solid #333`. A fixed list is a little
+/// arbitrary, and that is the price of not widening the hole.
+///
+/// The cue may be followed by any run of spaces or by none at all, so
+/// `PRD #742`, `PRD  #742` and `PRD#742` all read the same way.
+fn is_issue_reference(chars: &[char], at: usize, run: usize) -> bool {
+    if !chars[at + 1..=at + run].iter().all(char::is_ascii_digit) {
+        return false;
+    }
+    let mut end = at;
+    while end > 0 && chars[end - 1] == ' ' {
+        end -= 1;
+    }
+    let mut start = end;
+    while start > 0 && chars[start - 1].is_ascii_alphabetic() {
+        start -= 1;
+    }
+    if start == end {
+        return false;
+    }
+    let word: String = chars[start..end]
+        .iter()
+        .collect::<String>()
+        .to_ascii_lowercase();
+    ISSUE_CUES.contains(&word.as_str())
 }
 
 /// The text between `(` and its matching `)`, or to end of input if the call is
@@ -1158,6 +1223,57 @@ mod tests {
             ),
         ]);
         assert_eq!(scanned(dir.path()), vec![]);
+    }
+
+    /// The string-literal half of the same problem, which the comment masking
+    /// above does not reach. `#742` in a `describe` title is an issue number;
+    /// `#742` in a CSS value is a colour; and the guard has to tell them apart
+    /// without letting a real literal through behind a cue word.
+    #[test]
+    fn issue_references_in_string_literals_are_not_colours_but_real_hexes_still_fail() {
+        let dir = tree(&[
+            ("styles.css", PALETTE),
+            (
+                "ok.tsx",
+                "describe(\"AgentOverview across a fleet (PRD #742 M4)\", () => {});\n\
+                 it(\"regression for issue #1046 and PR #416\", () => {});\n\
+                 const a = \"PRD#742 M6 — no space is still a reference\";\n\
+                 const b = \"see github #74253 for the rest\";\n",
+            ),
+        ]);
+        assert_eq!(scanned(dir.path()), vec![], "issue numbers are not colours");
+
+        let dir = tree(&[
+            ("styles.css", PALETTE),
+            (
+                "bad.tsx",
+                // 1. the plain hard-coded colour a string literal holds;
+                // 2. an all-decimal colour, which the decimal half alone would
+                //    have exempted;
+                // 3. the same, in the shorthand position a general
+                //    \"word then a space\" rule would have exempted;
+                // 4. a cue word in front of a run that is not a number.
+                "const s = { color: \"#fff\" };\n\
+                 const t = { color: \"#333\" };\n\
+                 const u = { border: \"1px solid #000\" };\n\
+                 const v = { color: \"PRD #fff\" };\n",
+            ),
+        ]);
+        let findings = scanned(dir.path());
+        let hits: Vec<(usize, String)> = findings
+            .iter()
+            .map(|f| (f.line, f.literal.clone()))
+            .collect();
+        assert_eq!(
+            hits,
+            vec![
+                (1, "#fff".to_string()),
+                (2, "#333".to_string()),
+                (3, "#000".to_string()),
+                (4, "#fff".to_string()),
+            ],
+            "{findings:#?}"
+        );
     }
 
     #[test]

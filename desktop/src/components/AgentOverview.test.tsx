@@ -1833,7 +1833,7 @@ describe("DeckShell", () => {
  * agent ids — which is the ordinary case, ids being per-daemon monotonic
  * values, and the reason nothing here may key an agent by the bare id.
  */
-describe("AgentOverview across a fleet (PRD 742 M4)", () => {
+describe("AgentOverview across a fleet (PRD #742 M4)", () => {
   beforeEach(() => {
     terminalMounted.mockClear();
     window.localStorage.clear();
