@@ -1,6 +1,6 @@
 ---
 name: reproduce-first
-description: Reproduce first, then fix — turn a reported defect into a failing test, fix it, and confirm that same test goes green. Use whenever the user describes the software behaving differently from what they expected or intended, however they phrase it: a complaint, a neutral observation, a question about whether something is meant to work that way, or an aside that something works "except for" one detail. It applies to a report that arrives mid-task about unrelated work, and to a symptom mentioned in passing. Trigger on the situation, not on any particular wording. Invoke it BEFORE reading code to diagnose the cause and before proposing any fix.
+description: 'Reproduce first, then fix — turn a reported defect into a failing test, fix it, and confirm that same test goes green. Use whenever the user describes the software behaving differently from what they expected or intended, however they phrase it: a complaint, a neutral observation, a question about whether something is meant to work that way, or an aside that something works "except for" one detail. It applies to a report that arrives mid-task about unrelated work, and to a symptom mentioned in passing. Trigger on the situation, not on any particular wording. Invoke it BEFORE reading code to diagnose the cause and before proposing any fix.'
 user-invocable: true
 ---
 

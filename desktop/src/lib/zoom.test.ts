@@ -191,11 +191,11 @@ describe("zoomIntentFromKey", () => {
     }
   });
 
-  // Issue #826 is `App.tsx`'s handler throwing on a keydown whose target is not
-  // an element, because it casts `event.target` to `HTMLElement` and calls
-  // `.matches` on it. This matcher never reads `target`, so it cannot reproduce
-  // that — pinned here so a later "tidy-up" that starts consulting the target
-  // has to come past a test that says why not to.
+  // Issue #826 was `App.tsx`'s handler throwing on a keydown whose target is not
+  // an element, because it cast `event.target` to `HTMLElement` and called
+  // `.matches` on it. This matcher never reads `target`, so it could not
+  // reproduce that — pinned here so a later "tidy-up" that starts consulting the
+  // target has to come past a test that says why not to.
   it("never consults the event target", () => {
     const withHostileTarget = { key: "=", ctrlKey: true, target: window } as unknown as ZoomKeyEvent;
     expect(() => zoomIntentFromKey(withHostileTarget)).not.toThrow();

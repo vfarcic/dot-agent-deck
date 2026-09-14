@@ -63,21 +63,16 @@ export function useDeckRuntime(): DeckRuntimeState {
   const [fleet, setFleet] = useState<DeckFleet>(() => [seedSnapshot(mode)]);
   const snapshot = fleet[0];
   /**
-   * The latest reported failure, and a number that tells two of them apart.
+   * The latest reported failure, or nothing.
    *
-   * PRD #742 M8: this was a bare `string`, and `App`'s toast keyed its dismissal
-   * on that string — so two DISTINCT failures with the same sanitised sentence
-   * read as one already-dismissed failure and the second was never shown. The id
-   * is minted per report, so identical text is no longer identity.
+   * PRD #742 M8 carried a `{ message, id }` here so `App` could suppress one
+   * dismissed failure by id rather than by sentence. Issue #1046 landed on
+   * `main` while that was in flight and made the dismissal CLEAR this instead
+   * (see {@link clearError}), which answers the same question with less: a
+   * cleared error is per-occurrence by construction, so a second failure
+   * carrying an identical sentence sets it again and shows.
    */
-  const [failure, setFailure] = useState<{ message: string; id: number }>();
-  const failureCount = useRef(0);
-  /** Report a failure under an id no earlier report used. */
-  const reportFailure = useCallback((message: string) => {
-    failureCount.current += 1;
-    setFailure({ message, id: failureCount.current });
-  }, []);
-  const clearFailure = useCallback(() => setFailure(undefined), []);
+  const [error, setError] = useState<string>();
   // PTY bytes deliberately bypass React state. Routing every output chunk
   // through setState re-rendered the whole deck per chunk per agent — with six
   // streaming agents the main thread spent its time reconciling instead of
@@ -135,21 +130,21 @@ export function useDeckRuntime(): DeckRuntimeState {
   }, []);
 
   const reconnect = useCallback(async () => {
-    clearFailure();
+    setError(undefined);
     updateSelected((current) => ({ ...current, connection: { ...current.connection, status: "loading", message: "Reconnecting…" } }));
     try {
       const connected = await bridge.connect();
       adoptFleet(connected);
     } catch (cause) {
       const message = cause instanceof Error ? cause.message : String(cause);
-      reportFailure(message);
+      setError(message);
       updateSelected((current) => ({
         ...current,
         health: "failed",
         connection: { status: "error", message },
       }));
     }
-  }, [adoptFleet, bridge, clearFailure, reportFailure, updateSelected]);
+  }, [adoptFleet, bridge, updateSelected]);
 
   useEffect(() => {
     let active = true;
@@ -170,7 +165,7 @@ export function useDeckRuntime(): DeckRuntimeState {
       } catch (cause) {
         if (!active) return;
         const message = cause instanceof Error ? cause.message : String(cause);
-        reportFailure(message);
+        setError(message);
         updateSelected((current) => ({ ...current, health: "failed", connection: { status: "error", message } }));
       }
     })();
@@ -180,18 +175,29 @@ export function useDeckRuntime(): DeckRuntimeState {
       unsubscribe?.();
       void bridge.dispose();
     };
-  }, [adoptFleet, bridge, reportFailure, updateSelected, updateTerminal]);
+  }, [adoptFleet, bridge, updateSelected, updateTerminal]);
 
   const runAction = useCallback(async (action: DeckAction) => {
-    clearFailure();
+    setError(undefined);
     try {
       return await bridge.runAction(action);
     } catch (cause) {
       const message = cause instanceof Error ? cause.message : String(cause);
-      reportFailure(message);
+      setError(message);
       throw cause;
     }
-  }, [bridge, clearFailure, reportFailure]);
+  }, [bridge]);
+
+  /*
+   * Issue #1046: the toast in `App.tsx` renders on `notice || error`, and its
+   * dismiss button could reach `notice` and nothing else — so an error-sourced
+   * message survived the click and the X read as dead. What the button now does
+   * with the two halves is decided there. Clearing is safe because `error` is transient
+   * per-action state, not connection state: `runAction` and `reconnect` already
+   * clear it at the start of each attempt, and what a failed connection leaves
+   * behind for the banner is `snapshot.connection`, which this does not touch.
+   */
+  const clearError = useCallback(() => setError(undefined), []);
 
   const getSettings = useCallback(() => bridge.getSettings(), [bridge]);
   // Stable for the lifetime of the bridge: `useZoom` holds it across a
@@ -199,7 +205,7 @@ export function useDeckRuntime(): DeckRuntimeState {
   // on every render.
   const setZoom = useCallback((level: number) => bridge.setZoom(level), [bridge]);
   const saveSettings = useCallback((settings: DesktopSettingsDto) => bridge.saveSettings(settings), [bridge]);
-  // PRD #741 M10. Not wrapped in the failure bookkeeping `runAction` uses,
+  // PRD #741 M10. Not wrapped in the `setError` bookkeeping `runAction` uses,
   // for the same reason `listProjects` is not: every outcome here is a
   // classified report the panel renders in place, and routing an unreachable
   // deck into the deck's global error toast would present a settings answer as
@@ -215,7 +221,7 @@ export function useDeckRuntime(): DeckRuntimeState {
   // shown set from an effect: an identity that changed every render would fire
   // that effect every render (PRD #745 M7).
   const setShownTerminals = useCallback((agentIds: string[]) => bridge.setShownTerminals(agentIds), [bridge]);
-  // PRD #819 M6. Deliberately NOT wrapped in the failure bookkeeping
+  // PRD #819 M6. Deliberately NOT wrapped in the `setError` bookkeeping
   // `runAction` uses: an empty listing and an unresolvable path are ordinary
   // outcomes of choosing a project, and routing them into the deck's global
   // error toast would present the first-run state as a fault. The picker owns
@@ -246,8 +252,8 @@ export function useDeckRuntime(): DeckRuntimeState {
     fleet,
     terminalData: EMPTY_TERMINAL_DATA,
     terminalFeed,
-    error: failure?.message,
-    errorId: failure?.id,
+    error,
+    clearError,
     runAction,
     sendTerminalInput,
     resizeTerminal,

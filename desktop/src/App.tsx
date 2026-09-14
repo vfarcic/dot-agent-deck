@@ -170,41 +170,6 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
   const [helpOpen, setHelpOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [notice, setNotice] = useState<string>();
-  /**
-   * The daemon error the user has already dismissed
-   * ([#1046](https://github.com/vfarcic/dot-agent-deck/issues/1046)).
-   *
-   * The toast renders on `notice || runtime.error` and its dismiss button used
-   * to clear `notice` alone, so a `runtime.error` could not be got rid of at
-   * all: every failure `perform` catches sets BOTH, and dismissing then revealed
-   * the same sentence underneath. With one deck that is an annoyance. With PRD
-   * #742's fleet it masks: one dead deck's stale error sits undismissable over
-   * a healthy deck's later message, in a toast the whole app shares.
-   *
-   * `runtime.error` belongs to `useDeckRuntime` and only its own calls clear it,
-   * so what is held here is the dismissal rather than the error — suppressed
-   * until a DIFFERENT error arrives, not merely hidden once. Both halves of that
-   * are deliberate: a dismissed failure must not put the toast back on the next
-   * render, and a new failure must never be swallowed by a dismissal aimed at
-   * the old one. Which deck is down is not this toast's job either way — PRD
-   * #742 M4 gave every deck its own `ConnectionView`, and that is the health
-   * display.
-   *
-   * **What is held is `runtime.errorId`, not the sentence** (PRD #742 M8). Keyed
-   * on the text, two DISTINCT failures that sanitise to the same sentence read
-   * as one already-dismissed failure and the second was never shown — likelier
-   * with a fleet, because `safe_message`'s output for a transport failure is
-   * largely deck-independent. The id is minted per reported failure, so
-   * identical text is no longer identity and nothing but the dismissed failure
-   * itself is suppressed.
-   *
-   * `errorId` is optional on the runtime contract, so {@link errorKey} falls
-   * back to the sentence for a runtime that reports none. `useDeckRuntime` — the
-   * only runtime that reports failures at all — always mints one, so the
-   * fallback is what keeps a hand-built runtime in a test or a preview
-   * dismissable rather than what the live path depends on.
-   */
-  const [dismissedError, setDismissedError] = useState<number | string>();
   const [confirm, setConfirm] = useState<ConfirmState>();
   // Memoised so the context value is stable across renders; `runtime.testEndpoint`
   // is itself stable for the lifetime of the bridge.
@@ -368,15 +333,6 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
 
   const coordinator = snapshot.agents.find((agent) => agent.isStartRole);
 
-  /**
-   * What the toast says, or nothing. A `notice` is this screen's own sentence
-   * and always wins; a daemon error shows until it is dismissed, and then only
-   * again when the sentence itself changes (see {@link dismissedError}).
-   */
-  /** Which failure is on screen — see {@link dismissedError}. */
-  const errorKey = runtime.errorId ?? runtime.error;
-  const toastMessage = notice ?? (errorKey !== undefined && errorKey === dismissedError ? undefined : runtime.error);
-
   const perform = async (action: DeckAction, success?: string) => {
     try {
       await runtime.runAction(action);
@@ -403,8 +359,6 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
-      const target = event.target as HTMLElement | null;
-      const editing = target?.matches("input, textarea, select, [contenteditable='true'], .xterm-helper-textarea");
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") {
         event.preventDefault();
         setPaletteOpen((open) => !open);
@@ -414,7 +368,14 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
         setPaletteOpen(false); setHelpOpen(false); setProjectsOpen(false); setProfilesOpen(false); setPromptsOpen(false); setWorkflowOpen(false); setSettingsOpen(false); setConfirm(undefined);
         return;
       }
-      if (editing) return;
+      // Asked here rather than at the top, because the two branches above do not
+      // need it: `event.target` is an `EventTarget`, which the DOM does not
+      // guarantee is an element — a keydown dispatched on `window` has no
+      // `matches` at all. Narrowed with `instanceof` rather than asserted into
+      // an `HTMLElement`, so the type system checks this call and whatever is
+      // added beside it (#826).
+      const target = event.target;
+      if (target instanceof Element && target.matches("input, textarea, select, [contenteditable='true'], .xterm-helper-textarea")) return;
       if (event.key === "?") { event.preventDefault(); setHelpOpen(true); return; }
       if (/^[1-4]$/.test(event.key)) {
         const agent = snapshot.agents[Number(event.key) - 1];
@@ -612,6 +573,27 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
         }
       },
     });
+  };
+
+  /*
+   * Issue #1046. The toast shows `notice ?? runtime.error`, so a click can only
+   * honestly dismiss what is on screen — and until this issue it could not even
+   * do that, since `runtime.error` had no clear and the X was inoperative for
+   * every error-sourced message.
+   *
+   * The error goes with the notice when it IS the notice: a handler that reports
+   * a failed action sets its notice from the same cause `runAction` recorded, so
+   * clearing only one would leave an identical toast behind and the click would
+   * look as dead as the bug this closes. An error saying something DIFFERENT is
+   * not what the user just dismissed — it survives and takes the toast's place,
+   * which is what happened before this change and is the half worth keeping.
+   * It reaches that state when a handler translates the failure it caught into
+   * friendlier words, and when an error arrives while an older notice is still
+   * up — nothing expires a notice.
+   */
+  const dismissToast = () => {
+    if (notice === undefined || notice === runtime.error) runtime.clearError();
+    setNotice(undefined);
   };
 
   const commandItems = [
@@ -832,9 +814,7 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
       {paletteOpen && <CommandPalette commands={commandItems} onClose={() => setPaletteOpen(false)} />}
       {helpOpen && <ShortcutHelp onClose={() => setHelpOpen(false)} />}
       {confirm && <ConfirmDialog state={confirm} onClose={() => setConfirm(undefined)} />}
-      {/* One press clears what is on screen AND the error behind it, because a
-          failure routed through `perform` puts the same sentence in both. */}
-      {toastMessage && <div className="toast" role="status"><AlertTriangle size={15} /><span>{toastMessage}</span><button aria-label="Dismiss message" onClick={() => { setNotice(undefined); setDismissedError(errorKey); }}><X size={14} /></button></div>}
+      {(notice || runtime.error) && <div className="toast" role="status"><AlertTriangle size={15} /><span>{notice ?? runtime.error}</span><button aria-label="Dismiss message" onClick={dismissToast}><X size={14} /></button></div>}
     </div>
   );
 }

@@ -1,6 +1,6 @@
 ---
 name: prd-queue
-description: Build the queue of open PRDs that are actually available to work — those carrying a PRD document and not already in flight — then claim them and dispatch one isolated unit per PRD. Asks the shape per PRD and composes the task DIFFERENTLY for each: a single agent is pointed at /prd-full, while a team is governed by the orchestrator role template and told explicitly not to run it. Use when asked to find a PRD to work on, pick a PRD off the backlog, or run several PRDs in parallel. It does no implementing itself — for one PRD you intend to run yourself, use /prd-full directly.
+description: 'Build the queue of open PRDs that are actually available to work — those carrying a PRD document and not already in flight — then claim them and dispatch one isolated unit per PRD. Asks the shape per PRD and composes the task DIFFERENTLY for each: a single agent is pointed at /prd-full, while a team is governed by the orchestrator role template and told explicitly not to run it. Use when asked to find a PRD to work on, pick a PRD off the backlog, or run several PRDs in parallel. It does no implementing itself — for one PRD you intend to run yourself, use /prd-full directly.'
 user-invocable: true
 ---
 

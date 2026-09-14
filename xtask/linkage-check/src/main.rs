@@ -190,6 +190,12 @@ mod sample_attribution;
 /// runs today because nothing cuts a Tauri bundle yet.
 #[cfg(all(test, unix))]
 mod sidecar_staging;
+/// Issue #1061: every `.claude/skills/*/SKILL.md` frontmatter block is valid
+/// YAML and every skill name matches the spec's `^[a-z0-9-]+$`. Tests only —
+/// nothing compiles a `SKILL.md` and no CI job read one before this, so the
+/// property exists purely at run time in repository files.
+#[cfg(test)]
+mod skill_frontmatter;
 /// Issue #521: the `/verify-pr` scripts' `KEY=value` output contract. Tests
 /// only — there is no runtime rule here, the scripts enforce themselves.
 #[cfg(test)]
