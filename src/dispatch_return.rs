@@ -32,8 +32,11 @@ pub struct DispatchCaller {
     /// requested. The identity gate on delivery compares against this, so a
     /// pane that changed hands in between is refused rather than written to.
     pub agent_id: String,
-    /// The name the caller passed to `dispatch <name>`, quoted back verbatim in
-    /// the completion report so the caller can tell several units apart.
+    /// The name the caller passed to `dispatch <name>`, quoted back in the
+    /// completion report so the caller can tell several units apart. Not
+    /// verbatim: it is producer-supplied, so
+    /// [`compose_completion_report`] bounds it and renders it inside an untrusted
+    /// label frame (PRD #220 Phase 2 review, finding A1).
     pub unit_name: String,
 }
 
@@ -47,10 +50,22 @@ pub struct DispatchCaller {
 /// completion inside a dispatched orchestration can never match: the workers'
 /// panes are not keys.
 ///
-/// The map is bounded by eviction on all three ways an entry can stop being
-/// deliverable — the report is delivered ([`Self::take`]), the caller's pane
-/// goes away, or the unit's own pane closes ([`Self::evict_pane`] covers the
-/// last two).
+/// Entries are evicted on four transitions: the report is delivered
+/// ([`Self::take`]), either pane is deliberately closed ([`Self::evict_pane`],
+/// from `begin_pane_close`), and either pane's process dies on its own
+/// ([`Self::evict_exited`], from the PTY-EOF sweep).
+///
+/// **That is the set of transitions covered, not a claim that nothing can
+/// linger** (PRD #220 Phase 2 review, finding A5 — the earlier wording said "all
+/// three ways an entry can stop being deliverable", which was wider than the code
+/// has ever guaranteed). One residual is known and accepted: a caller AGENT
+/// replaced on a still-open pane — a respawn — leaves an entry whose recipient
+/// can no longer be written to, since delivery is identity-gated against the
+/// agent id captured at dispatch time. It is not leaked, only deferred: it goes
+/// when the unit completes (delivery is attempted, refused, and the entry
+/// evicted regardless) or when either pane finally closes or exits. The cost is
+/// one map entry held until then, and the report itself is lost either way,
+/// because the agent that asked for it is gone.
 #[derive(Debug, Default)]
 pub struct DispatchReturns {
     by_unit_pane: HashMap<String, DispatchCaller>,
@@ -75,9 +90,18 @@ impl DispatchReturns {
     }
 
     /// Resolve AND evict — the delivery path. The eviction is unconditional on
-    /// the delivery's outcome: a refused report is terminal and never retried
-    /// (a retry could only re-target whoever now occupies the caller's pane),
-    /// which is the same policy the acknowledgement already runs under.
+    /// the delivery's outcome: NO OUTCOME IS RETRIED, which is the same policy
+    /// the acknowledgement already runs under.
+    ///
+    /// Stated as "no outcome is retried" rather than as "every non-delivery is a
+    /// refusal" (PRD #220 Phase 2 review, finding A5). The seam this mirrors —
+    /// [`crate::daemon::deliver_dispatch_result`] — says outright that `Ambiguous`
+    /// is deliberately NOT folded in with the refusals, because bytes of ours
+    /// already reached the authorized caller and re-sending would duplicate a
+    /// half-written message rather than repair it. The two reasons differ; the
+    /// action does not, and it is the action this eviction depends on. A refusal
+    /// is not retried because a retry could only re-target whoever now occupies
+    /// the caller's pane.
     pub fn take(&mut self, unit_pane_id: &str) -> Option<DispatchCaller> {
         self.by_unit_pane.remove(unit_pane_id)
     }
@@ -86,10 +110,46 @@ impl DispatchReturns {
     /// pane (its tab closed, so nothing will ever complete) or as the caller's
     /// pane (the recipient is gone, so nothing could be delivered). Returns how
     /// many went, for the caller's log line.
+    ///
+    /// The DELIBERATE-close half of the lifecycle. [`Self::evict_exited`] is the
+    /// natural-exit half, and the two differ in exactly one way — see there.
     pub fn evict_pane(&mut self, pane_id: &str) -> usize {
         let before = self.by_unit_pane.len();
         self.by_unit_pane
             .retain(|unit_pane, caller| unit_pane != pane_id && caller.pane_id != pane_id);
+        before - self.by_unit_pane.len()
+    }
+
+    /// PRD #220 Phase 2 review/audit (finding A3): the same eviction for a pane
+    /// whose process died on its own, rather than being closed.
+    ///
+    /// The gap this closes: a dispatched unit that EXITS without ever signalling
+    /// `work-done --done` — crashed, killed, or simply an agent that quit — went
+    /// through neither [`Self::take`] nor [`Self::evict_pane`], so its entry sat
+    /// resident for the daemon's lifetime. The PTY-EOF path already sweeps
+    /// delegation and silence-watch records for precisely this reason; the return
+    /// edge shipped without joining them.
+    ///
+    /// **The CALLER side is identity-gated; the UNIT side is not**, which is
+    /// the one difference from [`Self::evict_pane`]. `pump_reader` sets `exited`
+    /// before it sweeps, and `spawn_agent` lets a new agent onto a `pane_id` whose
+    /// previous occupant is `exited`, so a dead predecessor's late EOF can name a
+    /// pane a LIVE successor now holds. On the caller side the retained
+    /// `agent_id` settles it exactly: only the agent that actually dispatched is
+    /// matched, so a successor's own outstanding units survive its predecessor's
+    /// EOF. On the unit side there is no agent id to compare — the map is keyed by
+    /// pane alone — and adding one is not worth the public shape change, because
+    /// the two outcomes are not symmetric: a wrong unit-side eviction loses a
+    /// report, while a missed one leaks an entry. This mirrors the asymmetry
+    /// `AgentPtyRegistry::drain_silence_watches_touching_for_exit` already accepts
+    /// on its orchestrator arm, and for the same reason — the residual is a lost
+    /// safety net, never a misdelivery, since delivery is identity-gated anyway.
+    pub fn evict_exited(&mut self, pane_id: &str, exited_agent_id: &str) -> usize {
+        let before = self.by_unit_pane.len();
+        self.by_unit_pane.retain(|unit_pane, caller| {
+            unit_pane != pane_id
+                && !(caller.pane_id == pane_id && caller.agent_id == exited_agent_id)
+        });
         before - self.by_unit_pane.len()
     }
 
@@ -140,7 +200,8 @@ const MAX_INLINED_UNIT_NAME_CHARS: usize = 120;
 /// Three properties fall out of that reuse and are worth naming, because each
 /// closes a finding of its own:
 ///
-/// * **Control and bidi bytes never reach the PTY.** `encode_pane_payload` only
+/// * **Control and bidi bytes do not survive into the delivered turn.**
+///   `encode_pane_payload` only
 ///   inspects payloads containing LF, so a single-line payload's CR, ESC, C0, C1,
 ///   DEL and bidi bytes would otherwise cross that seam byte-for-byte. They are
 ///   gone before this function returns.
@@ -299,6 +360,81 @@ mod tests {
             returns.resolve("unit-pane").map(|c| c.pane_id.as_str()),
             Some("caller-b"),
             "a pane id is a recycled handle; the newest dispatch owns it"
+        );
+    }
+
+    /// PRD #220 Phase 2 review/audit (finding A3): a dispatched unit that exits
+    /// without ever signalling `work-done --done` used to leave its entry resident
+    /// for the daemon's lifetime — the EOF path swept delegations and walked past
+    /// this map.
+    #[test]
+    fn a_unit_whose_process_exits_stops_owing_a_report() {
+        let mut returns = DispatchReturns::default();
+        returns.register("unit-pane", caller("caller-pane", "agent-7", "probe"));
+        returns.register("other-unit", caller("caller-pane", "agent-7", "second"));
+
+        assert_eq!(
+            returns.evict_exited("unit-pane", "the-units-own-agent"),
+            1,
+            "a unit that died will never complete, so nothing may keep waiting on it"
+        );
+        assert!(returns.resolve("unit-pane").is_none());
+        assert!(
+            returns.resolve("other-unit").is_some(),
+            "one unit dying must not cancel the caller's other outstanding unit"
+        );
+    }
+
+    /// The caller side of the same sweep: an agent that dispatched and then died
+    /// has no conversation left to be reported into.
+    #[test]
+    fn a_caller_whose_process_exits_releases_every_unit_it_dispatched() {
+        let mut returns = DispatchReturns::default();
+        returns.register("unit-a", caller("caller-pane", "agent-7", "a"));
+        returns.register("unit-b", caller("caller-pane", "agent-7", "b"));
+        returns.register("unit-c", caller("other-caller", "agent-9", "c"));
+
+        assert_eq!(returns.evict_exited("caller-pane", "agent-7"), 2);
+        assert!(returns.resolve("unit-a").is_none());
+        assert!(returns.resolve("unit-b").is_none());
+        assert!(
+            returns.resolve("unit-c").is_some(),
+            "another caller's outstanding unit is untouched"
+        );
+        assert_eq!(
+            returns.evict_exited("a-pane-in-no-entry", "agent-7"),
+            0,
+            "an unrelated pane's exit evicts nothing"
+        );
+    }
+
+    /// The one behavioural difference from the deliberate-close sweep, and the
+    /// reason it exists: `pump_reader` sets `exited` before sweeping and
+    /// `spawn_agent` admits a successor onto a pane whose occupant is `exited`, so
+    /// a dead PREDECESSOR's late EOF can name a pane a live successor now holds.
+    /// Its own outstanding units must survive that.
+    #[test]
+    fn a_dead_predecessors_exit_cannot_cancel_its_successors_dispatches() {
+        let mut returns = DispatchReturns::default();
+        returns.register(
+            "unit-pane",
+            caller("caller-pane", "successor-agent", "live"),
+        );
+
+        assert_eq!(
+            returns.evict_exited("caller-pane", "predecessor-agent"),
+            0,
+            "the exiting agent is not the one that dispatched this unit, so the entry \
+             belongs to the pane's current occupant and must stand"
+        );
+        assert_eq!(
+            returns.resolve("unit-pane").map(|c| c.agent_id.as_str()),
+            Some("successor-agent")
+        );
+        assert_eq!(
+            returns.evict_exited("caller-pane", "successor-agent"),
+            1,
+            "the agent that actually dispatched it exiting DOES release the entry"
         );
     }
 
