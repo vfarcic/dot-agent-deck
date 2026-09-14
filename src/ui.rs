@@ -714,7 +714,7 @@ One answer can cover several units when the user gives one — take it and stop 
 - The unit works in a copy of THIS REPO, so it already has the code, the docs, the PRDs and the skills. REFERENCE them by path instead of pasting their contents: `--task \"Execute the /prd-full skill for PRD 220\"` is complete as it stands. Never paste a skill's or a file's contents into --task.
 - Use paths RELATIVE to the repo root. An absolute path into this checkout points the unit back at the directory you are in, which defeats the isolation it was just given.
 - Pass --single or --orchestration explicitly. With neither, the shape falls back to whatever the repo's config implies, which is the guess this asking exists to avoid.
-- `dispatch` is fire-and-forget: there is NO return edge yet, so a dispatched unit's completion does NOT come back to this pane. Never tell the user results will report back here — give them the worktree path instead, and point at the unit's own tab on the deck.
+- When a dispatched unit finishes, its report is delivered into THIS pane as a turn — `dispatch: unit '<name>' completed. Report: …`. Expect it, and relay it to the user. Delivery needs this pane to still be running: if it is closed before a unit finishes, that unit's report is dropped and there is no inbox to recover it from — so also give the user the worktree path and point at the unit's own tab on the deck.
 - A <name> is single-use. Removing a worktree keeps its branch, so re-dispatching the same name is refused while agent/dispatch-<name> still exists — pick a different name, or delete that branch once you are done with it.
 - Relay the path that `dispatch` reports for each line of work, so the user can follow it.";
 
@@ -32284,7 +32284,13 @@ mod tests {
             "SELF-CONTAINED",
             "../<repo>-dispatch-<name>",
             "single-use",
-            "fire-and-forget",
+            // PRD #220 Phase 2 shipped the return edge, so the seed pins the
+            // SHAPE of the turn a completed unit arrives as rather than a term
+            // for the behaviour. An agent handed an unexplained "dispatch: unit
+            // '…' completed" turn it was never told to expect answers it as if
+            // the user had typed it, so a future edit that quietly drops the
+            // expectation must fail here.
+            "completed. Report:",
             // The shape choice is a deck mechanic (which spawn shape to start),
             // not a work-methodology opinion — so it belongs, and the seed must
             // tell the agent to ASK rather than infer it.
