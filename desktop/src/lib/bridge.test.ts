@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { DesktopAgentDto, DesktopSnapshotDto, TerminalAttachResult } from "./bridge";
+import type { DesktopAgentDto, DesktopSnapshotDto, ObservedDeckDto, TerminalAttachResult } from "./bridge";
 import type { DeckFleet } from "../types";
 
 const invoke = vi.fn();
@@ -2172,6 +2172,177 @@ describe("TauriDeckBridge across a fleet (PRD #742 M4/M5)", () => {
     const fleet = onFleet.mock.calls.at(-1)?.[0] as DeckFleet;
     expect(fleet.map((deck) => deck.connection.deckId)).toEqual([localId, "deck-0000000000000f1e"]);
     expect(fleet.some((deck) => deck.connection.unconfigured)).toBe(false);
+  });
+
+  /*
+    -------------------------------------------------------------------------
+    PRD #742 M14 — a deck that has not reported yet.
+
+    It HAS a watcher, unlike M12's unaddressed row, and will emit — but not
+    until a tunnel, a handshake and a `ListAgents` have happened, and
+    `desktop_bootstrap` answers the resolved deck alone. So the fleet the app
+    first rendered had one entry for two configured decks, and its own TOTAL
+    climbed a few seconds later. The crate names every observed deck on
+    `observed`; the bridge renders the ones it has not heard from.
+    -------------------------------------------------------------------------
+  */
+
+  /** What the crate states about both decks, whichever of them emitted. */
+  const observedBoth: ObservedDeckDto[] = [
+    { deckId: localId, label: localDeck, deckKind: "local" },
+    { deckId: remoteId, label: remoteDeck, deckKind: "remote" },
+  ];
+
+  /** The same snapshot, plus the crate's naming of the whole observed set. */
+  function withObserved(dto: DesktopSnapshotDto): DesktopSnapshotDto {
+    return { ...dto, observed: observedBoth };
+  }
+
+  /**
+   * Scenario: two decks configured, and only the local one has answered — which
+   * is every first frame, because the bootstrap answers the resolved deck and
+   * nothing else. The fleet has TWO entries: the local deck's snapshot, and a
+   * pending group for the remote one built from the crate's naming of it.
+   *
+   * Before this the fleet had one entry, so the header read `1/1` and then
+   * `2/2` once the remote deck's watcher emitted — a denominator that changed
+   * under the reader, with both readings looking like nothing was wrong.
+   */
+  it("renders a deck that has not reported yet, so the fleet's total is right from the first frame", async () => {
+    const { TauriDeckBridge, PENDING_DECK_MESSAGE } = await import("./bridge");
+    invoke.mockImplementation(async (command: string) => (command === "desktop_bootstrap" ? withObserved(local) : { ok: true }));
+    const bridge = new TauriDeckBridge();
+    const onFleet = vi.fn();
+    await bridge.subscribe(onFleet, vi.fn());
+    const seeded = await bridge.connect();
+
+    expect(seeded.map((deck) => deck.connection.deckId)).toEqual([localId, remoteId]);
+    const waiting = seeded[1];
+    expect(waiting.connection.pending).toBe(true);
+    // `loading`, never `disconnected`: nothing was asked of this deck, so there
+    // is no measurement to report.
+    expect(waiting.connection.status).toBe("loading");
+    expect(waiting.connection.socketPath).toBe(remoteDeck);
+    expect(waiting.connection.deckKind).toBe("remote");
+    expect(waiting.connection.message).toBe(PENDING_DECK_MESSAGE);
+    expect(waiting.agents).toHaveLength(0);
+    await bridge.dispose();
+  });
+
+  /**
+   * Scenario: the same fleet, and the remote deck's watcher finally emits. The
+   * pending group is replaced by that deck's own snapshot — connected, with its
+   * agents — and no placeholder lingers beside it.
+   *
+   * This is the whole reason pending is DERIVED per view rather than stored: a
+   * deck stops being pending the instant its snapshot lands in the map, with
+   * nothing to remember to delete.
+   */
+  it("replaces the pending group with the deck's own snapshot when it reports", async () => {
+    const { TauriDeckBridge } = await import("./bridge");
+    invoke.mockImplementation(async (command: string) => (command === "desktop_bootstrap" ? withObserved(local) : { ok: true }));
+    const bridge = new TauriDeckBridge();
+    const onFleet = vi.fn();
+    await bridge.subscribe(onFleet, vi.fn());
+    const seeded = await bridge.connect();
+    expect(seeded[1].connection.pending, "there must be a pending group to replace").toBe(true);
+
+    listeners.get("desktop://snapshot")?.({ payload: withObserved(remote) });
+
+    const fleet = onFleet.mock.calls.at(-1)?.[0] as DeckFleet;
+    expect(fleet.map((deck) => deck.connection.deckId)).toEqual([localId, remoteId]);
+    expect(fleet[1].connection.status).toBe("connected");
+    expect(fleet[1].connection.pending).toBeUndefined();
+    expect(fleet[1].agents).toHaveLength(1);
+    expect(fleet.some((deck) => deck.connection.pending)).toBe(false);
+    await bridge.dispose();
+  });
+
+  /**
+   * Scenario: the same fleet, and the remote deck's watcher establishes nothing
+   * — it emits a DISCONNECTED snapshot instead, which is what every failure
+   * path in `snapshot_with` reaches.
+   *
+   * That is what bounds the pending state, and it is the half worth pinning:
+   * pending must not be a terminal state a deck can be stuck in. The group is
+   * still degraded afterwards, but for a measured reason and with the
+   * disconnected note's remedy rather than the pending one's silence.
+   */
+  it("turns a pending deck into a disconnected one when that is what its snapshot says", async () => {
+    const { TauriDeckBridge } = await import("./bridge");
+    invoke.mockImplementation(async (command: string) => (command === "desktop_bootstrap" ? withObserved(local) : { ok: true }));
+    const bridge = new TauriDeckBridge();
+    const onFleet = vi.fn();
+    await bridge.subscribe(onFleet, vi.fn());
+    const seeded = await bridge.connect();
+    expect(seeded[1].connection.pending).toBe(true);
+
+    const unreachable: DesktopSnapshotDto = {
+      ...withObserved(deckSnapshot(remoteId, remoteDeck, "remote", [])),
+      connection: {
+        status: "disconnected",
+        deckId: remoteId,
+        socketPath: remoteDeck,
+        deckKind: "remote",
+        error: "No deck is listening on the configured socket.",
+        clientProtocolVersion: 9,
+        clientBuildVersion: "0.1.0",
+      },
+      agents: [],
+    };
+    listeners.get("desktop://snapshot")?.({ payload: unreachable });
+
+    const fleet = onFleet.mock.calls.at(-1)?.[0] as DeckFleet;
+    expect(fleet.map((deck) => deck.connection.deckId)).toEqual([localId, remoteId]);
+    expect(fleet[1].connection.status).toBe("disconnected");
+    expect(fleet[1].connection.pending).toBeUndefined();
+    expect(fleet[1].connection.message).toBe("No deck is listening on the configured socket.");
+    await bridge.dispose();
+  });
+
+  /**
+   * Scenario: a deck leaves the observed set. The crate restates both lists, so
+   * the departed deck is gone from `observed` as well as from `fleet` — and the
+   * bridge must not turn a deck it has just pruned into a pending group, which
+   * would put it straight back on screen under a friendlier name.
+   */
+  it("does not resurrect a departed deck as a pending one", async () => {
+    const { TauriDeckBridge } = await import("./bridge");
+    invoke.mockImplementation(async (command: string) => (command === "desktop_bootstrap" ? withObserved(local) : { ok: true }));
+    const bridge = new TauriDeckBridge();
+    const onFleet = vi.fn();
+    await bridge.subscribe(onFleet, vi.fn());
+    await bridge.connect();
+    listeners.get("desktop://snapshot")?.({ payload: withObserved(remote) });
+    expect((onFleet.mock.calls.at(-1)?.[0] as DeckFleet)).toHaveLength(2);
+
+    // The selection narrowed to the local deck: one member, one name.
+    listeners.get("desktop://snapshot")?.({
+      payload: { ...deckSnapshot(localId, localDeck, "local", ["Local coder", "Local reviewer"], [localId]), observed: [observedBoth[0]] },
+    });
+
+    const fleet = onFleet.mock.calls.at(-1)?.[0] as DeckFleet;
+    expect(fleet.map((deck) => deck.connection.deckId)).toEqual([localId]);
+    expect(fleet.some((deck) => deck.connection.pending)).toBe(false);
+    await bridge.dispose();
+  });
+
+  /**
+   * A payload that says nothing about naming changes nothing, which is the same
+   * reading `adoptUnconfigured` makes of an absent `unconfigured` and what keeps
+   * every DTO literal in this file — none of which carries `observed` — free to
+   * stay as it was.
+   */
+  it("invents no pending group when the payload names no observed decks", async () => {
+    const { TauriDeckBridge } = await import("./bridge");
+    const bridge = new TauriDeckBridge();
+    const onFleet = vi.fn();
+    await bridge.subscribe(onFleet, vi.fn());
+    const seeded = await bridge.connect();
+
+    expect(seeded.map((deck) => deck.connection.deckId)).toEqual([localId]);
+    expect(seeded.some((deck) => deck.connection.pending)).toBe(false);
+    await bridge.dispose();
   });
 
   it("holds both decks when two arrive in one window instead of rendering the last one", async () => {

@@ -82,6 +82,59 @@ pub struct DesktopSnapshot {
     /// property of the applied document and not of the deck that emitted — so
     /// any arrival re-states the whole list and a webview may rebuild from it.
     pub unconfigured: Vec<UnconfiguredDeckDto>,
+    /// The members of [`Self::fleet`] the app CONNECTS to, each NAMED (PRD
+    /// #742 M14).
+    ///
+    /// # Why an id is not enough
+    ///
+    /// A deck joins [`Self::fleet`] the moment the document is applied and
+    /// emits its own snapshot only once its watcher has established — a tunnel,
+    /// a handshake and a `ListAgents` later. Between the two the webview knows
+    /// the deck exists and knows nothing else about it, so it renders a group
+    /// that has not reported yet rather than letting the fleet's own total
+    /// climb under the reader.
+    ///
+    /// It cannot name that group from `fleet` alone. [`deck_wire_id`] mints
+    /// `deck-<16 hex>` from a hash of the endpoint's identity, which is exactly
+    /// what makes it a safe key and exactly what makes it unreadable — and the
+    /// webview has no id-to-row join to reach for, because a stored row's
+    /// [`crate::settings::EndpointId`] is a different value entirely. Without
+    /// this list `deckName` would fall through to "Local deck" for a remote
+    /// deck it has never heard from.
+    ///
+    /// So this is the same statement [`Self::unconfigured`] makes for a row
+    /// with no address, for a row that has one: here is the id, here is what to
+    /// call it, and here is whether it is this machine's. It is what the crate
+    /// KNOWS from the applied document, never a connection state nobody
+    /// measured — the status of a deck in here is still whatever its own
+    /// snapshot says when one arrives.
+    ///
+    /// Every connectable deck is listed, including the ones that have already
+    /// reported: which of them the webview has heard from is the webview's own
+    /// question, and an answer from here would be one the crate would have to
+    /// keep in step with a stream it does not observe.
+    pub observed: Vec<ObservedDeckDto>,
+}
+
+/// One deck the app connects to, named without having been heard from (PRD
+/// #742 M14).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ObservedDeckDto {
+    /// [`deck_wire_id`] — the same key this deck's own snapshot carries in
+    /// [`DesktopConnection::deck_id`], so the webview can tell an entry here
+    /// apart from a deck that has already reported by looking in one map.
+    pub deck_id: String,
+    /// [`deck_path_text`] — the socket path for a local deck, `user@host[:port]`
+    /// for a remote one. The same string this deck's own snapshot will carry in
+    /// [`DesktopConnection::socket_path`], so the group is named the same
+    /// before and after it reports and nothing moves when it does.
+    pub label: String,
+    /// `"local"` or `"remote"`, from [`selection_fields`] — the half of
+    /// [`DesktopConnection::deck_kind`] that is a property of the deck rather
+    /// than of the handshake. It decides whether the group is called "Local
+    /// deck" or called by its address.
+    pub deck_kind: &'static str,
 }
 
 /// One configured-but-unaddressed deck, as the fleet view renders it.
@@ -1220,6 +1273,35 @@ pub(crate) fn unconfigured_fleet() -> Vec<UnconfiguredDeckDto> {
         .collect()
 }
 
+/// The connectable half of the fleet as [`DesktopSnapshot::observed`] carries
+/// it — every observed deck NAMED, whether or not it has reported (PRD #742
+/// M14).
+///
+/// One read of the applied selection, like [`observed_fleet`] and
+/// [`unconfigured_fleet`], and in the same order as the `observed` half of
+/// [`observed_fleet`] before its selected-first rotation. That rotation is
+/// deliberately not applied here: the webview renders a deck out of this list
+/// only while it has not reported, and such a deck is never the one leading the
+/// fleet — the leader is the deck the bootstrap answered.
+///
+/// **The webview derives "has not reported yet" from THIS list and not from
+/// [`DesktopSnapshot::fleet`]**, which is what keeps a torn read between the
+/// two cheap: the three lists are three reads, so a save landing between them
+/// can pair one document's `fleet` with another's `observed`, and an id in
+/// `fleet` with nothing here to name it would otherwise be an unnameable group.
+/// Deriving from here cannot produce one — every entry carries its own name —
+/// and the next arrival restates all three.
+pub(crate) fn observed_fleet_decks() -> Vec<ObservedDeckDto> {
+    observed_decks()
+        .iter()
+        .map(|endpoint| ObservedDeckDto {
+            deck_id: deck_wire_id(endpoint),
+            label: deck_path_text(endpoint),
+            deck_kind: selection_fields(endpoint).0,
+        })
+        .collect()
+}
+
 /// What a deck with no address says instead of a state.
 ///
 /// The fleet view's idiom for the same fact
@@ -1319,6 +1401,7 @@ pub(crate) fn disconnected_snapshot(
         source: "daemon",
         fleet: observed_fleet(),
         unconfigured: unconfigured_fleet(),
+        observed: observed_fleet_decks(),
     }
 }
 
@@ -1590,6 +1673,90 @@ mod tests {
             assert!(
                 stated.iter().all(|deck| !deck.deck_id.starts_with("deck-")),
                 "an unconfigured id must never look like a real one: {stated:?}"
+            );
+        });
+    }
+
+    /// Every connectable deck is NAMED on the wire, so a deck that has not
+    /// reported yet can still be rendered as itself (PRD #742 M14).
+    ///
+    /// The webview draws a group for every observed deck the moment the first
+    /// snapshot lands — that is what keeps the header's denominator still while
+    /// a remote deck's tunnel is being established, instead of `1/1` becoming
+    /// `2/2` under the reader. It cannot name that group from
+    /// [`DesktopSnapshot::fleet`], whose entries are [`deck_wire_id`] hashes,
+    /// and a nameless group would fall through to "Local deck" for a remote
+    /// deck. So the label and the kind ride along, exactly as
+    /// [`unconfigured_fleet`] carries them for a row with no address.
+    ///
+    /// The pairing is what matters and is what is asserted: each entry's
+    /// `deck_id` is the key that deck's own snapshot will arrive under, and its
+    /// `label` is the string that snapshot will carry — so nothing about the
+    /// group moves when the deck finally reports.
+    #[test]
+    fn every_observed_deck_is_named_on_the_wire_before_it_reports() {
+        use crate::settings::{EndpointId, EndpointSettings, RemoteEndpointSettings, Selection};
+        use dot_agent_deck::remote_tunnel::{Hostname, RemoteSocketPath};
+
+        let id = EndpointId::parse("buildbox0000000").expect("a valid id");
+        let mut row = RemoteEndpointSettings::new(
+            id,
+            Hostname::parse("build-box.example.com").expect("a valid host"),
+        );
+        row.socket = Some(RemoteSocketPath::parse("/run/deck.sock").expect("a path"));
+        let settings = crate::settings::DesktopSettings {
+            endpoints: Some(EndpointSettings {
+                remote: vec![row],
+                selection: Selection::All,
+            }),
+            ..crate::settings::DesktopSettings::default()
+        };
+
+        with_selection(&settings, || {
+            let named = observed_fleet_decks();
+            let observed = observed_decks();
+            assert_eq!(
+                named.len(),
+                observed.len(),
+                "one named entry per connectable deck: {named:?}"
+            );
+            for (entry, endpoint) in named.iter().zip(observed.iter()) {
+                assert_eq!(
+                    entry.deck_id,
+                    deck_wire_id(endpoint),
+                    "the key a deck's own snapshot will arrive under"
+                );
+                assert_eq!(
+                    entry.label,
+                    deck_path_text(endpoint),
+                    "the label that snapshot will carry, so the name does not move"
+                );
+                assert_eq!(entry.deck_kind, selection_fields(endpoint).0);
+            }
+
+            let remote = named
+                .iter()
+                .find(|entry| entry.deck_kind == "remote")
+                .expect("the configured row is connectable and remote");
+            assert_eq!(
+                remote.label, "build-box.example.com",
+                "named by its address, which is what the group prints"
+            );
+            assert!(
+                named.iter().any(|entry| entry.deck_kind == "local"),
+                "and the local deck is in here too, so the webview needs no second source"
+            );
+
+            // The three lists describe one document: every named entry is a
+            // member of the fleet, and none of them is an unconfigured id.
+            let wire = observed_fleet();
+            assert!(
+                named.iter().all(|entry| wire.contains(&entry.deck_id)),
+                "a named deck that is not in the fleet could never be rendered: {named:?}"
+            );
+            assert!(
+                unconfigured_fleet().is_empty(),
+                "every configured row here has an address"
             );
         });
     }

@@ -948,7 +948,7 @@ function DeckGroup({ deck, now, columns, fleetSize, overrideError, onOpenDeck, o
           fleet cannot be read reads as UNKNOWN on the same line its
           neighbours read as counted — never as a deck running nothing.
         */}
-        {!deck.connected && <span className="daemon-unknown" data-testid="daemon-unknown" title="Not known — this deck is not answering, so its agents cannot be counted.">—</span>}
+        {!deck.connected && <span className="daemon-unknown" data-testid="daemon-unknown" title={unknownPipsTitle(connection)}>—</span>}
       </header>
 
       <div className="daemon-group-body">
@@ -968,6 +968,21 @@ function DeckGroup({ deck, now, columns, fleetSize, overrideError, onOpenDeck, o
       </div>
     </section>
   );
+}
+
+/**
+ * Why a deck's agent counts read as UNKNOWN (PRD #742 M4; M14 split the
+ * pending case out).
+ *
+ * "Not answering" is a measurement, and for a deck that has simply not reported
+ * yet nothing has been measured — the em dash is right either way, but the
+ * sentence behind it is a different one. The unconfigured case keeps the
+ * general wording: nothing is answering there either, and its own note says
+ * what is actually missing.
+ */
+function unknownPipsTitle(connection: ConnectionView): string {
+  if (connection.pending) return "Not known yet — this deck has not reported, so its agents cannot be counted.";
+  return "Not known — this deck is not answering, so its agents cannot be counted.";
 }
 
 /**
@@ -1011,6 +1026,28 @@ function DaemonBody({ agents, groups, now, columns, connection, message, compact
   onConnectAnyway?: () => void;
 }) {
   const noteClass = compactNote ? "overview-note is-compact" : "overview-note";
+  /*
+    PRD #742 M14, and BEFORE the `loading` branch below because it is a narrower
+    case of the same status. That one is the APP establishing its control
+    channel — the pre-connect seed, one deck, nothing on screen yet. This is one
+    member of a fleet that is already on screen: the others have their tables,
+    and this one is a group with a name, a place in the denominator and nothing
+    inside it yet.
+
+    It is stated as what it is rather than as a failure, in the register the
+    overview's empty state uses, and it offers no button — unlike the
+    disconnected note, there is nothing for the reader to do and Reconnect would
+    re-establish the whole fleet to hurry one deck that is already coming.
+  */
+  if (connection.pending) {
+    return (
+      <OverviewNote className={noteClass} testId="overview-pending" icon={<RefreshCw className="spin" size={24} />} title="Waiting for this deck">
+        <p>{message ?? "This deck has not reported yet."}</p>
+        <p className="overview-note-hint">It is counted in the fleet's total and not among the decks that answered, because nothing has answered for it yet. Its agents appear here as soon as it reports.</p>
+      </OverviewNote>
+    );
+  }
+
   if (connection.status === "loading") {
     return (
       <OverviewNote className={noteClass} testId="overview-loading" icon={<RefreshCw className="spin" size={24} />} title="Establishing control channel">

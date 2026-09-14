@@ -18,8 +18,8 @@ use tokio::sync::Mutex as AsyncMutex;
 use crate::agent_view::AgentView;
 use crate::dto::{
     BootstrapOptions, ConnectionStatus, DesktopConnection, DesktopSnapshot, deck_path_text,
-    deck_wire_id, disconnected_snapshot, map_agent, observed_fleet, safe_message,
-    selected_endpoint, selection_fields, unconfigured_fleet,
+    deck_wire_id, disconnected_snapshot, map_agent, observed_fleet, observed_fleet_decks,
+    safe_message, selected_endpoint, selection_fields, unconfigured_fleet,
 };
 use crate::endpoint_tunnels::{EndpointTunnels, TunnelLease};
 
@@ -981,6 +981,79 @@ pub(crate) async fn hello(
     socket_path: &Path,
     stamps: StampPolicy,
 ) -> Result<(HandshakeInfo, AttachResponse), String> {
+    bounded_reply("the handshake", hello_exchange(socket_path, stamps)).await
+}
+
+/// How long the desktop waits for ONE daemon reply before calling the deck not
+/// answering (PRD #742 M14).
+///
+/// # Why a bound exists at all
+///
+/// Every request this crate sends is a `connect`, a write and a `read_response`,
+/// and `read_response` waits for as long as the peer keeps the socket open. A
+/// daemon that ACCEPTS a connection and never answers it is therefore not a
+/// failure any caller can observe — it is a future that never completes. That is
+/// a different thing from a deck being down, which is an immediate `ECONNREFUSED`
+/// and has always worked.
+///
+/// It costs more than a stuck request. A deck's watcher emits its first snapshot
+/// only *after* its first reply — a handshake, a subscription and a `ListAgents`
+/// — so a peer that stalls any of the three leaves the webview with a deck it
+/// has been told exists and has heard nothing about, forever. M14 renders that
+/// as a pending group, which is right for the seconds an ssh tunnel takes and
+/// wrong as a permanent state: a spinner that never resolves is worse than a
+/// late appearance.
+///
+/// # What this bounds, and what it does not
+///
+/// The three replies above are the ones a first snapshot waits on, and each is
+/// bounded here; the `ssh` forward before them already was, at
+/// `FORWARD_READY_TIMEOUT`. What stays outside any clock is the watcher TASK
+/// itself ending — a panic inside its loop — which leaves the deck with nothing
+/// to emit for it at all. That is bounded by a user action rather than by time:
+/// `WatcherClaim::watching` is what makes the webview's Reconnect start a
+/// replacement, where before M14 the dead claim refused one for the life of the
+/// process.
+///
+/// # Why fifteen seconds
+///
+/// A responsive daemon answers any of the three in sub-milliseconds — the reply
+/// is built from an in-memory registry — so this is three to four orders of
+/// magnitude of headroom rather than a tuned value, and nothing legitimate is
+/// near it. It sits deliberately below the 30s
+/// [`dot_agent_deck::remote_tunnel`] forward-ready timeout that precedes it, so
+/// the two bounds add to something a user will wait through rather than
+/// multiply; and above the watcher's 5s reconcile interval, so a deck that is
+/// merely quiet is never mistaken for one that is stalled.
+///
+/// **Not applied to the event stream**, which is long-lived by design: this
+/// bounds the RESP that confirms a subscription, and never the frames after it.
+pub(crate) const DECK_REPLY_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Bound one daemon round trip at [`DECK_REPLY_TIMEOUT`].
+///
+/// The elapsed case is reported as what it is — a deck that took the connection
+/// and did not answer — rather than folded into the transport error beside it,
+/// because the two send a reader to different places: one says the deck is not
+/// there and the other says it is there and wedged.
+pub(crate) async fn bounded_reply<T, E: std::fmt::Display>(
+    what: &str,
+    reply: impl std::future::Future<Output = Result<T, E>>,
+) -> Result<T, String> {
+    match tokio::time::timeout(DECK_REPLY_TIMEOUT, reply).await {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(error)) => Err(safe_message(error.to_string())),
+        Err(_) => Err(safe_message(format!(
+            "the deck took the connection but did not answer {what} within {}s",
+            DECK_REPLY_TIMEOUT.as_secs()
+        ))),
+    }
+}
+
+async fn hello_exchange(
+    socket_path: &Path,
+    stamps: StampPolicy,
+) -> Result<(HandshakeInfo, AttachResponse), String> {
     let client_build = dot_agent_deck::build_id::local_build_id();
     let stream = IpcStream::connect(socket_path)
         .await
@@ -1133,6 +1206,7 @@ pub(crate) async fn snapshot_with(
             source: "daemon",
             fleet: observed_fleet(),
             unconfigured: unconfigured_fleet(),
+            observed: observed_fleet_decks(),
         };
     }
 
@@ -1141,7 +1215,7 @@ pub(crate) async fn snapshot_with(
             let records = view.records();
             return connected_snapshot(connection, records);
         }
-        return match daemon.client.list_agents().await {
+        return match bounded_reply("ListAgents", daemon.client.list_agents()).await {
             Ok(records) => {
                 view.install(records, tokio::time::Instant::now());
                 connected_snapshot(connection, view.records())
@@ -1151,12 +1225,15 @@ pub(crate) async fn snapshot_with(
                 // cleared, and the next refresh will try again rather than
                 // promoting whatever it was holding into an answer.
                 links.invalidate(endpoint).await;
-                disconnected_snapshot(endpoint, error.to_string())
+                disconnected_snapshot(endpoint, error)
             }
         };
     }
 
-    match daemon.client.list_agents().await {
+    // PRD #742 M14: bounded, like the handshake above it. This is the call that
+    // produces a deck's FIRST snapshot, so a peer that stalls here is a deck the
+    // webview never hears from rather than a request that is merely slow.
+    match bounded_reply("ListAgents", daemon.client.list_agents()).await {
         Ok(records) => connected_snapshot(connection, records),
         Err(error) => {
             // The held link just failed to carry a request. Whatever is at the
@@ -1165,7 +1242,7 @@ pub(crate) async fn snapshot_with(
             // handshakes again rather than reporting a verdict it can no longer
             // support.
             links.invalidate(endpoint).await;
-            disconnected_snapshot(endpoint, error.to_string())
+            disconnected_snapshot(endpoint, error)
         }
     }
 }
@@ -1207,6 +1284,7 @@ fn connected_snapshot(
         // its map on whichever snapshot happens to land first (PRD #742 M5).
         fleet: observed_fleet(),
         unconfigured: unconfigured_fleet(),
+        observed: observed_fleet_decks(),
     }
 }
 
@@ -3494,6 +3572,85 @@ mod tests {
 
         let _ = daemon.await;
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// **PRD #742 M14.** Scenario: a deck accepts the handshake connection and
+    /// never answers it. `hello()` must give up and report that rather than
+    /// waiting for a reply that is not coming.
+    ///
+    /// # What was unbounded, and what it cost
+    ///
+    /// `issue_command` is a write followed by a `read_response`, and
+    /// `read_response` waits for as long as the peer keeps the socket open — so
+    /// an accepting-but-silent deck was a future that never completed rather
+    /// than an error any caller could observe. A deck that is simply DOWN was
+    /// always fine: `connect` fails immediately.
+    ///
+    /// It is M14's boundedness question because a watcher emits its first
+    /// snapshot only after its first reply. Until then the webview renders the
+    /// deck as pending — right for the seconds an ssh tunnel takes, wrong
+    /// forever — so without this the fleet view has a spinner with no terminal
+    /// state, which is worse than the late appearance it replaced.
+    ///
+    /// # Paused time, not fifteen real seconds — and paused at a POINT
+    ///
+    /// The clock is stopped only after `accepted_rx` resolves, which is the
+    /// peer confirming it took the connection and read the request. That
+    /// ordering is the test rather than an optimisation: `start_paused` would
+    /// auto-advance from the first moment the runtime had nothing ready to
+    /// poll, so a clock that jumped while the connect was still in flight would
+    /// produce the same error message for a scenario nobody meant to write.
+    /// Pausing here leaves exactly one thing outstanding — a read against a
+    /// peer that is never going to write — and the runtime advances to the
+    /// timeout because that is the only deadline left. Real socket I/O, real
+    /// silence, and none of the fifteen seconds spent.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_deck_that_takes_the_connection_and_never_answers_is_reported_rather_than_awaited() {
+        let (dir, socket) = scratch_socket("m14-silent");
+        let listener = bind_trusted(&socket);
+        let (accepted, accepted_rx) = tokio::sync::oneshot::channel::<()>();
+        let (release, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let silent = tokio::spawn(unresponsive_daemon(listener, accepted, release_rx));
+
+        let asking = {
+            let socket = socket.clone();
+            tokio::spawn(async move { hello(&socket, StampPolicy::Enforced).await })
+        };
+        accepted_rx
+            .await
+            .expect("the deck must have taken the connection and read the request");
+        // Everything outstanding is now parked: this deck's reply, which is
+        // never coming, and the stall the test releases below.
+        tokio::time::pause();
+        /*
+            The outer bound is what turns a REGRESSION into a failure instead of
+            a hang. Measured: with the timeout taken back out of `hello()` this
+            test does not fail, it never returns — which in CI is a job burning
+            its whole budget with nothing to read. Under a paused clock tokio
+            advances to the NEAREST deadline, so `hello`'s own fifteen seconds
+            fire first while it has one, and this fires only when it does not.
+            Neither costs wall clock.
+        */
+        let outcome = tokio::time::timeout(Duration::from_secs(600), asking)
+            .await
+            .expect("hello() must bound its own wait rather than await a reply that is not coming")
+            .expect("the handshake task must not panic");
+
+        let _ = release.send(());
+        let _ = silent.await;
+        let _ = std::fs::remove_dir_all(dir);
+
+        let error = outcome.expect_err("a deck that never answers must not resolve as connected");
+        assert!(
+            error.contains("did not answer"),
+            "the elapsed case must say the deck took the connection and stalled, \
+             rather than reading as a transport failure: {error}"
+        );
+        assert!(
+            error.contains(&DECK_REPLY_TIMEOUT.as_secs().to_string()),
+            "and name the bound it exceeded: {error}"
+        );
     }
 
     /// **Test-plan item 10, and the risk this PRD is most likely to fail on.**

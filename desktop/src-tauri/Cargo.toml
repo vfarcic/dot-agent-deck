@@ -28,7 +28,14 @@ tokio = { version = "1", features = ["sync", "time"] }
 # property of what ANOTHER crate happens to enable, not a declaration this crate
 # makes. Declaring them means a change over there cannot silently take this
 # crate's tests out.
-tokio = { version = "1", features = ["macros", "net", "rt-multi-thread"] }
+#
+# PRD #742 M14 adds `test-util`, which is NOT in the root crate's `full` and so
+# was never reachable by unification at all. It is what lets the bound on a
+# daemon reply be asserted without spending it: `start_paused` advances the
+# clock whenever the runtime has nothing ready to poll, so a test that parks on
+# a silent socket proves a fifteen-second timeout fires in milliseconds of wall
+# clock. Dev-only — nothing under `src/` may depend on a paused clock.
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "test-util"] }
 # PRD #803: every settings test drives an explicit path inside a temp dir so
 # none of them can touch the developer's real ~/.config/dot-agent-deck.
 tempfile = "3"

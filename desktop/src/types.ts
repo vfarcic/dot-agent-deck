@@ -62,6 +62,28 @@ export interface ConnectionView {
    * is the wrong sentence for it and the overview renders its own.
    */
   unconfigured?: boolean;
+  /**
+   * This deck is in the fleet and HAS NOT REPORTED YET (PRD #742 M14) — a
+   * fourth honest state beside connected, disconnected and unconfigured.
+   *
+   * Set in live mode by `pendingDeckSnapshot` alone, from an entry the crate
+   * states on `DesktopSnapshotDto.observed` that no snapshot has arrived for —
+   * and by the `fleet` fixture, which holds the state still so it can be
+   * looked at. A deck
+   * joins the fleet when the settings document is applied and emits its own
+   * snapshot only once its watcher has a tunnel, a handshake and an agent
+   * list — up to `FORWARD_READY_TIMEOUT` (30s) for a remote deck — so without
+   * this the fleet's own TOTAL climbed while the reader watched: `1/1`, then
+   * `2/2` a few seconds later, both reading as "everything is fine" and only
+   * one of them true.
+   *
+   * `status` is `"loading"` and never `"disconnected"`, which is the whole
+   * distinction: disconnected asserts that something was asked and nothing
+   * answered, and here nothing has been asked yet. The flag is what separates
+   * it from `useDeckRuntime`'s pre-connect loading seed, which is the app
+   * having no deck rather than a deck having no snapshot.
+   */
+  pending?: boolean;
   message?: string;
   /**
    * Which kind of deck this connection is to (PRD #741 M7): `"local"` for a

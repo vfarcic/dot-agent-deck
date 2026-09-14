@@ -46,6 +46,36 @@ impl WatcherClaim {
             handle: None,
         }
     }
+
+    /// Is the task behind this claim still there to watch the deck (PRD #742
+    /// M14)?
+    ///
+    /// A watcher loops forever by construction, so the only way its task ENDS
+    /// is a panic or an abort — and in both cases the claim outlives it and,
+    /// before this, went on refusing every later
+    /// [`DesktopState::start_watcher_once_for`] for that deck. The deck then had
+    /// no watcher and no way to get one short of restarting the app: the four
+    /// paths that re-run `ensure_snapshot_watchers` — `desktop_bootstrap`,
+    /// which the webview's Reconnect reaches, a settings save's
+    /// `apply_selection`, and the two `desktop_run_action` arms that
+    /// re-bootstrap — all go through that same refusal.
+    ///
+    /// M14 is what makes it worth naming. A deck with no watcher emits no
+    /// snapshot, and the fleet view now renders a deck it has heard nothing
+    /// from as PENDING rather than leaving it off the screen, so the cost moved
+    /// from an absence nobody could see to a group that waits forever. Treating
+    /// a finished task as no claim at all makes Reconnect the remedy it looks
+    /// like.
+    ///
+    /// `None` is LIVE, not dead: that is the window between the claim and the
+    /// spawn, where the task exists and its handle has not been handed over yet.
+    /// Reading it as dead would let a second watcher start beside the first.
+    fn watching(&self) -> bool {
+        match &self.handle {
+            Some(handle) => !handle.inner().is_finished(),
+            None => true,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -260,7 +290,11 @@ impl DesktopState {
     /// task and hands that token and its handle to [`Self::register_watcher`].
     pub(crate) fn start_watcher_once_for(&self, deck: &EndpointIdentity) -> Option<u64> {
         let mut watchers = self.watchers();
-        if watchers.contains_key(deck) {
+        // PRD #742 M14: a claim whose task has ENDED is not a claim. See
+        // `WatcherClaim::watching` for why a watcher's task ending at all is
+        // already a bug, and why refusing on the strength of it was the worse
+        // of the two failures.
+        if watchers.get(deck).is_some_and(WatcherClaim::watching) {
             return None;
         }
         // Minted under the map lock, so the token in the slot and the token the

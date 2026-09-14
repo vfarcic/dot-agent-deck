@@ -122,6 +122,28 @@ export interface DesktopSnapshotDto {
    * the same reason: a single-deck DTO literal in a test need not restate it.
    */
   unconfigured?: UnconfiguredDeckDto[];
+  /**
+   * The members of {@link fleet} the app CONNECTS to, each NAMED (PRD #742
+   * M14) — whether or not it has reported yet.
+   *
+   * A deck joins {@link fleet} when the settings document is applied and emits
+   * its own snapshot only once its watcher has established, which for a remote
+   * deck is a tunnel, a handshake and a `ListAgents` away. This is what lets a
+   * deck in that window be RENDERED rather than merely counted: `fleet` carries
+   * `deck-<16 hex>` hashes, and a stored settings row's id is a different value
+   * entirely, so there is no id-to-name join on this side to reach for.
+   *
+   * Every connectable deck is listed, the ones that have already reported
+   * included — which of them this bridge has heard from is a question only this
+   * bridge can answer, and {@link fleetView} answers it by looking in its own
+   * map.
+   *
+   * Carried on every snapshot and optional for the same reasons {@link fleet}
+   * and {@link unconfigured} are. Read an absent field as "this payload says
+   * nothing about naming", exactly as {@link adoptUnconfigured} reads an absent
+   * `unconfigured`.
+   */
+  observed?: ObservedDeckDto[];
 }
 
 /** One configured-but-unaddressed deck (PRD #742 M12). */
@@ -132,6 +154,16 @@ export interface UnconfiguredDeckDto {
   label: string;
   /** Why there is nothing to show. */
   reason: string;
+}
+
+/** One deck the app connects to, named before it has reported (PRD #742 M14). */
+export interface ObservedDeckDto {
+  /** The crate's `deck_wire_id` — the key this deck's own snapshot arrives under. */
+  deckId: string;
+  /** A socket path for a local deck, `user@host[:port]` for a remote one. */
+  label: string;
+  /** Whether this deck runs on this machine; what decides how it is named. */
+  deckKind?: "local" | "remote";
 }
 
 export interface DesktopAgentDto {
@@ -939,6 +971,84 @@ export function unconfiguredDeckSnapshot(deck: UnconfiguredDeckDto, clientProtoc
   return snapshot;
 }
 
+/**
+ * What a deck that has not reported yet says instead of a state (PRD #742 M14).
+ *
+ * Written on THIS side rather than carried from the crate, unlike
+ * `UnconfiguredDeckDto.reason`: the crate does not know which decks the webview
+ * has heard from, so "has not reported yet" is a statement only this bridge is
+ * in a position to make. It is deliberately calm — there is nothing for the
+ * reader to do and nothing has gone wrong — and it names the fleet rather than
+ * the connection, because what the reader is being told is why a group is on
+ * screen with nothing in it.
+ */
+export const PENDING_DECK_MESSAGE = "In the fleet, waiting for it to report.";
+
+/**
+ * What a fleet member that has NOT REPORTED YET renders as (PRD #742 M14).
+ *
+ * # The defect it closes is the moving denominator, not the delay
+ *
+ * `desktop_bootstrap` answers the RESOLVED deck alone. Every other observed
+ * deck appears when its own watcher emits, which for a remote deck means
+ * acquiring an ssh tunnel, handshaking and running `ListAgents` — bounded by
+ * the crate's reconcile interval for a quiet deck and by `FORWARD_READY_TIMEOUT`
+ * (30s) for a tunnel that never comes up. So with two decks configured the
+ * header read `DECKS 1/1` and then, seconds later, `2/2`: two statements that
+ * both read as "everything is fine", with a TOTAL that changed under the
+ * reader. A total that moves is worse than one that is merely incomplete, and
+ * this makes it `1/2` then `2/2` — the denominator right from the first frame,
+ * with only the numerator climbing.
+ *
+ * # Why it is a state of its own and not `disconnected`
+ *
+ * `disconnected` asserts a measurement: something was asked and nothing
+ * answered. Nothing has been asked of this deck yet. `loading` is the honest
+ * status and {@link ConnectionView.pending} is what tells it from the runtime's
+ * own pre-connect seed, which is the app having no deck rather than a deck
+ * having no snapshot.
+ *
+ * # Built through the mapper, like its M12 sibling
+ *
+ * Same reason {@link unconfiguredDeckSnapshot} is: the group then has exactly
+ * the shape every other deck's does and cannot drift from it. The two fields
+ * the mapper cannot express are set after it — `loading` is not a status the
+ * crate can send, and `pending` is something this bridge knows about an entry
+ * it built rather than something a deck reported.
+ *
+ * It keeps the deck out of `decksUp`, which counts decks that ANSWERED, while
+ * leaving it in `decks.length`, which is the denominator the header states —
+ * and out of every agent count beside it, for the same reason a disconnected
+ * deck is out of them: what it is running is unknown, and adding zero for it
+ * would be a wrong number that looks exactly like a right one.
+ */
+export function pendingDeckSnapshot(deck: ObservedDeckDto, clientProtocolVersion: number, clientBuildVersion: string): DeckSnapshot {
+  const snapshot = mapDesktopSnapshot({
+    connection: {
+      /*
+        The nearest thing the wire can say — `loading` is this side's and is set
+        below. The mapper does read it on the way through, and what it derives
+        is right anyway: `health: "idle"` for a deck with nothing to report, and
+        `daemonDetected: false`, since no daemon has answered. The one thing it
+        would get wrong is the message, and `error` below supplies that.
+      */
+      status: "disconnected",
+      socketPath: deck.label,
+      deckId: deck.deckId,
+      deckKind: deck.deckKind === "remote" ? "remote" : "local",
+      error: PENDING_DECK_MESSAGE,
+      clientProtocolVersion,
+      clientBuildVersion,
+    },
+    agents: [],
+    protocolVersion: clientProtocolVersion,
+    source: "daemon",
+  });
+  snapshot.connection.status = "loading";
+  snapshot.connection.pending = true;
+  return snapshot;
+}
+
 export function mapDesktopSnapshot(dto: DesktopSnapshotDto, previous?: DeckSnapshot, evidence?: EvidenceItem[], handoffs?: HandoffEdge[]): DeckSnapshot {
   /*
     PRD #742 M5. This was `dto.connection.socketPath` — `Endpoint::describe()`,
@@ -1344,6 +1454,20 @@ export class TauriDeckBridge implements DeckBridge {
    * has said anything.
    */
   private unconfigured?: { decks: UnconfiguredDeckDto[]; clientProtocolVersion: number; clientBuildVersion: string };
+  /**
+   * Every connectable deck as the crate last NAMED it, with the same two client
+   * facts (PRD #742 M14) — the source {@link fleetView} builds a pending group
+   * from.
+   *
+   * Held, replaced and read exactly like {@link unconfigured} above, and for
+   * the same reason: the crate restates the whole list on every arrival, so the
+   * newest one is the whole truth about what the applied document observes.
+   *
+   * It is deliberately NOT filtered to the decks that have yet to report — that
+   * is decided per view, by looking in {@link fleet}, so a deck that reports
+   * between two emits stops being pending without anything having to notice.
+   */
+  private observed?: { decks: ObservedDeckDto[]; clientProtocolVersion: number; clientBuildVersion: string };
   private fleetListener?: FleetListener;
   /**
    * The `[endpoints]` section as this bridge last saw it, serialised. Compared
@@ -1823,9 +1947,49 @@ export class TauriDeckBridge implements DeckBridge {
     */
     const stated = this.unconfigured;
     const unconfigured = stated ? stated.decks.map((deck) => unconfiguredDeckSnapshot(deck, stated.clientProtocolVersion, stated.clientBuildVersion)) : [];
-    if (selectedAt <= 0) return [...decks, ...unconfigured];
+    const pending = this.pendingDecks();
+    /*
+      PRD #742 M14: after the decks that answered and before the ones with no
+      address, which is the order the three states degrade in — a deck with an
+      agent list, then one whose list is still coming, then one that has nowhere
+      to get a list from. Never first, for the reason the M12 note gives: every
+      single-deck surface binds to `fleet[0]`, and a pending entry has no agents
+      and no terminals to bind them to.
+    */
+    if (selectedAt <= 0) return [...decks, ...pending, ...unconfigured];
     const [selected] = decks.splice(selectedAt, 1);
-    return [selected, ...decks, ...unconfigured];
+    return [selected, ...decks, ...pending, ...unconfigured];
+  }
+
+  /**
+   * The observed decks this bridge has not heard from yet, as groups (PRD #742
+   * M14).
+   *
+   * # Derived, never stored
+   *
+   * Computed per view rather than held, which is what makes the state
+   * self-clearing: a deck stops being pending the instant its own snapshot
+   * lands in {@link fleet}, with nothing to remember to delete. It is also why
+   * this is not a synthesized entry in that map — {@link pruneFleet}
+   * deliberately refuses to invent one for an id it has heard nothing about,
+   * and a fabricated snapshot in there would be fighting that guard rather than
+   * using it. This reads the crate's own statement of what the applied document
+   * observes, which is a fact about the document and not a connection state.
+   *
+   * # Read off `observed` rather than off `fleet`
+   *
+   * `fleet` is ids, and its unconfigured members are ids too — deriving from it
+   * would mean subtracting one list from another and then having nothing to
+   * name what was left. Every entry here carries its own label, so a pending
+   * group is always nameable, and the unconfigured rows are not in this list at
+   * all.
+   */
+  private pendingDecks(): DeckSnapshot[] {
+    const stated = this.observed;
+    if (!stated) return [];
+    return stated.decks
+      .filter((deck) => !this.fleet.has(deck.deckId))
+      .map((deck) => pendingDeckSnapshot(deck, stated.clientProtocolVersion, stated.clientBuildVersion));
   }
 
   /**
@@ -1875,6 +2039,31 @@ export class TauriDeckBridge implements DeckBridge {
     if (!Array.isArray(dto.unconfigured)) return;
     this.unconfigured = {
       decks: dto.unconfigured,
+      clientProtocolVersion: dto.connection.clientProtocolVersion,
+      clientBuildVersion: dto.connection.clientBuildVersion,
+    };
+  }
+
+  /**
+   * Take the crate's statement of what the applied document observes, and what
+   * each of those decks is called (PRD #742 M14).
+   *
+   * Replaces rather than merges, and an ABSENT field changes nothing — the same
+   * two readings {@link adoptUnconfigured} makes, for the same two reasons. An
+   * empty array would be the crate saying it observes nothing, which
+   * `connectable_endpoints` cannot answer: it is the one selected endpoint for
+   * every selection but `All`, and for `All` the local deck plus the rows with
+   * an address.
+   *
+   * Note an empty list here CANNOT blank the screen the way an empty `fleet`
+   * would: this list only ever ADDS groups for decks that have not reported,
+   * and every deck that has reported is rendered from {@link fleet} whatever
+   * this says.
+   */
+  private adoptObserved(dto: DesktopSnapshotDto): void {
+    if (!Array.isArray(dto.observed)) return;
+    this.observed = {
+      decks: dto.observed,
       clientProtocolVersion: dto.connection.clientProtocolVersion,
       clientBuildVersion: dto.connection.clientBuildVersion,
     };
@@ -1934,6 +2123,7 @@ export class TauriDeckBridge implements DeckBridge {
     this.fleet.clear();
     this.fleet.set(dto.connection.deckId, snapshot);
     this.adoptUnconfigured(dto);
+    this.adoptObserved(dto);
     return this.fleetView();
   }
 
@@ -1959,6 +2149,7 @@ export class TauriDeckBridge implements DeckBridge {
     */
     if (dto.fleet?.length) this.selectedDeckId = dto.fleet[0];
     this.adoptUnconfigured(dto);
+    this.adoptObserved(dto);
     /*
       PRD #742 M8: and the ring follows the selection, rather than being handed
       to whoever the selection now names. Before this the ring was global, so a

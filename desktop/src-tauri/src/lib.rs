@@ -861,7 +861,16 @@ fn spawn_deck_watcher(app: &AppHandle, state: &DesktopState, endpoint: Endpoint)
                     continue;
                 }
             };
-            let subscription = match daemon.client.subscribe_events().await {
+            // PRD #742 M14: bounded, like the handshake before it and the
+            // `ListAgents` after it. Only the RESP that CONFIRMS the
+            // subscription is bounded — the event frames that follow are
+            // long-lived by design and are read by `spawn_event_reader`.
+            let subscription = match crate::daemon_bridge::bounded_reply(
+                "SubscribeEvents",
+                daemon.client.subscribe_events(),
+            )
+            .await
+            {
                 Ok(subscription) => subscription,
                 Err(_) => {
                     // Could not even subscribe against a link that just said it
@@ -2160,6 +2169,95 @@ mod tests {
             3,
             "three watchers for four fleet members, which is the whole point of the split"
         );
+    }
+
+    /// **PRD #742 M14.** Scenario: a deck's watcher task ends — the shape a
+    /// panic inside the loop takes — and the deck is then asked for a watcher
+    /// again. It must get one.
+    ///
+    /// # Why a dead claim was worse than no claim
+    ///
+    /// A watcher loops forever by construction, so its task ending at all is a
+    /// bug. What made that bug PERMANENT was the claim outliving it: the slot
+    /// stayed in the map, every later `start_watcher_once_for` for that deck
+    /// answered `None`, and the deck had no watcher for the life of the
+    /// process. Every path that re-runs `ensure_snapshot_watchers` — the
+    /// `desktop_bootstrap` the webview's Reconnect reaches, a settings save's
+    /// `apply_selection`, and the two `desktop_run_action` arms that
+    /// re-bootstrap — goes through that same refusal, so every remedy a user
+    /// could reach for did nothing.
+    ///
+    /// # Why M14 is where it gets fixed
+    ///
+    /// A deck with no watcher emits no snapshot. Before M14 that deck was
+    /// simply absent from the fleet view, which is wrong quietly; now it is a
+    /// group saying it is being waited for, which is wrong loudly and forever.
+    /// Bounding the pending state means the paths that produce a snapshot are
+    /// bounded AND the thing that produces them can be restarted.
+    ///
+    /// The claim handed out afterwards carries a NEW token, which is what keeps
+    /// the dead task's own `register_watcher` — if it is still in flight —
+    /// from writing its handle into the live claim.
+    #[tokio::test]
+    async fn a_watcher_whose_task_has_ended_does_not_hold_the_deck_hostage() {
+        let state = DesktopState::default();
+        let fleet = fleet_of(&["build-box.example.com"]);
+        let deck = fleet
+            .connectable_endpoints()
+            .into_iter()
+            .next()
+            .expect("the fleet has a deck")
+            .identity();
+
+        let first = state
+            .start_watcher_once_for(&deck)
+            .expect("an unwatched deck hands out a claim");
+        assert!(
+            state.start_watcher_once_for(&deck).is_none(),
+            "a live claim refuses a second watcher, which is the whole point of the claim"
+        );
+
+        /*
+            A task that RETURNS stands in for one that panicked: `is_finished`
+            is true for both, and a panicking task would take the test binary's
+            runtime with it in a way a test cannot read back. It is registered
+            while still RUNNING, which is the ordering the real watcher has —
+            registering an already-finished handle would prove nothing about the
+            window this is really about.
+        */
+        let (release, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let ending = tauri::async_runtime::spawn(async move {
+            let _ = release_rx.await;
+        });
+        state.register_watcher(&deck, first, ending);
+        assert!(
+            state.start_watcher_once_for(&deck).is_none(),
+            "and a REGISTERED, still-running watcher refuses one too — an absent \
+             handle and a finished one must not read the same"
+        );
+
+        let _ = release.send(());
+        // Bounded rather than a bare loop: the task is finished the moment the
+        // runtime has polled it after the send, and a run that never gets there
+        // should fail rather than hang.
+        let mut reclaimed = None;
+        for _ in 0..1_000 {
+            if let Some(token) = state.start_watcher_once_for(&deck) {
+                reclaimed = Some(token);
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        let second =
+            reclaimed.expect("a deck whose watcher task has ended must be able to get another");
+        assert_ne!(
+            second, first,
+            "and under a NEW token, so the dead task's own register_watcher cannot \
+             write its handle into the live claim"
+        );
+
+        crate::dto::apply_settings_selection(&DesktopSettings::default());
     }
 
     /// The live set `retain` is given names every observed deck, not the one

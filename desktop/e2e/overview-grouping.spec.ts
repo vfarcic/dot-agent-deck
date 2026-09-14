@@ -249,16 +249,16 @@ test.describe("the overview at fifteen agents", () => {
 /**
  * PRD #742 M4 — the fleet as a reader sees it, in a real engine.
  *
- * The vitest tier already asserts that three deck sections reach the DOM with
- * the right agents inside them. What only an engine can answer is whether they
- * reach the SCREEN: three sections that descend the page in the order the DOM
+ * The vitest tier already asserts that every deck section reaches the DOM with
+ * the right agents inside it. What only an engine can answer is whether they
+ * reach the SCREEN: four sections that descend the page in the order the DOM
  * lists them, none overlapping another, each with a box. A `position: absolute`
  * left over from the single-deck layout, or a `gap` that never applied, would
  * leave every DOM assertion green and stack the fleet on top of itself.
  *
  * The phone width is here because it is where a fleet is most likely to break:
  * the overview's narrow rule hides the status pips and drops the padding, and
- * three stacked sections is three times as much page to get wrong. The contract
+ * four stacked sections is four times as much page to get wrong. The contract
  * is the same one `page-overflow.spec.ts` states for one deck — the page body
  * never slides sideways — asserted against the screen that has the most in it.
  */
@@ -289,11 +289,12 @@ test.describe("the fleet view (PRD #742 M4)", () => {
     await openOverview(page, "fleet");
     const decks = await readDecks(page);
 
-    // DOM shape: three decks, the local one first, and each named the way a
-    // reader is meant to tell them apart.
-    expect(decks.map((deck) => deck.deckId)).toEqual(["/tmp/dot-agent-deck.sock", "dev@build-box", "ci@runner-7"]);
-    expect(decks.map((deck) => deck.connected)).toEqual(["yes", "yes", "no"]);
-    expect(decks.map((deck) => deck.name)).toEqual(["Local deck", "dev@build-box", "ci@runner-7"]);
+    // DOM shape: four decks, the local one first, and each named the way a
+    // reader is meant to tell them apart — the last of them named from the
+    // crate's `observed` list, because nothing has reported for it (M14).
+    expect(decks.map((deck) => deck.deckId)).toEqual(["/tmp/dot-agent-deck.sock", "dev@build-box", "ci@runner-7", "ops@edge-3"]);
+    expect(decks.map((deck) => deck.connected)).toEqual(["yes", "yes", "no", "no"]);
+    expect(decks.map((deck) => deck.name)).toEqual(["Local deck", "dev@build-box", "ci@runner-7", "ops@edge-3"]);
 
     // No deck's rows appear under another deck's heading. The two connected
     // decks mint colliding agent ids, so this is about the section a row is
@@ -323,9 +324,9 @@ test.describe("the fleet view (PRD #742 M4)", () => {
   test("states how many decks answered, and counts only those", async ({ page }) => {
     await openOverview(page, "fleet");
 
-    // Two of three. The literal string is the contract: it is the only thing
+    // Two of four. The literal string is the contract: it is the only thing
     // on the header that says the four counts beside it are partial.
-    await expect(page.getByTestId("overview-count-decks").locator("strong")).toHaveText("2/3");
+    await expect(page.getByTestId("overview-count-decks").locator("strong")).toHaveText("2/4");
 
     // Seven agents across the two answering decks. The unreachable deck was
     // last seen running two more, and adding them would print "9" — a number
@@ -336,10 +337,10 @@ test.describe("the fleet view (PRD #742 M4)", () => {
   test.describe("at 400x780 phone", () => {
     test.use({ viewport: { width: 400, height: 780 } });
 
-    test("stacks three decks down a phone screen without sliding the page sideways", async ({ page }) => {
+    test("stacks four decks down a phone screen without sliding the page sideways", async ({ page }) => {
       await openOverview(page, "fleet");
       const decks = await readDecks(page);
-      expect(decks).toHaveLength(3);
+      expect(decks).toHaveLength(4);
 
       // Every section is inside the viewport horizontally, and still stacked.
       for (const deck of decks) {

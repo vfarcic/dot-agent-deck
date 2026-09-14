@@ -25,6 +25,22 @@ export const FIXTURE_DAEMON_ID = "/tmp/dot-agent-deck.sock";
 export const FIXTURE_REMOTE_DAEMON_ID = "dev@build-box";
 export const FIXTURE_UNREACHABLE_DAEMON_ID = "ci@runner-7";
 
+/**
+ * The deck that is in the fleet and has not reported yet (PRD #742 M14).
+ *
+ * A remote deck, because that is the only kind the state lasts long enough to
+ * see: a local deck is resolved by the bootstrap itself, while a remote one is
+ * a tunnel, a handshake and a `ListAgents` away — bounded by the crate's
+ * reconcile interval for a quiet deck and by `FORWARD_READY_TIMEOUT` (30s) for
+ * one whose tunnel never comes up.
+ *
+ * It stays pending forever in the fixture, which a live deck does not. That is
+ * the same licence the unreachable deck above takes: a fixture is one instant
+ * held still, and holding still is exactly what lets this tier assert that the
+ * instant reads as a deck on its way rather than as a deck that failed.
+ */
+export const FIXTURE_PENDING_DAEMON_ID = "ops@edge-3";
+
 /** Which scenario `createFixtureFleet` builds; selected by `?state=`. */
 export type FixtureState = "connected" | "disconnected" | "error" | "empty" | "crowded" | "fleet";
 
@@ -628,6 +644,29 @@ export function createFixtureFleet(state: FixtureState = "connected"): DeckSnaps
       FIXTURE_UNREACHABLE_DAEMON_ID,
       { status: "disconnected", deckId: FIXTURE_UNREACHABLE_DAEMON_ID, socketPath: FIXTURE_UNREACHABLE_DAEMON_ID, message: "No deck is listening on the configured socket.", deckKind: "remote", localOnlyReason: "Stop daemon acts on a process on this machine." },
       staleAgents,
+      "/home/dev/code/dot-agent-deck",
+    ),
+    /*
+      PRD #742 M14: the deck that has not reported YET, and it carries no
+      agents at all — which is the difference from the one above it.
+
+      A deck that stopped answering was once seen running something, so the
+      fixture gives it a stale list for the header to be wrong about. Nothing
+      has ever been heard from this one, so an agent list would be a fiction
+      with no live counterpart: `pendingDeckSnapshot` builds its group from a
+      name and nothing else. The message is `PENDING_DECK_MESSAGE`'s wording,
+      spelled out here rather than imported — `bridge.ts` imports this module,
+      so importing it back would close a cycle for one string; the vitest suite
+      asserts the two agree instead.
+
+      What it IS for is the denominator: with it the scenario reads `2/4` rather
+      than `2/3`, and a header that quietly dropped an unreported deck would
+      read `2/3` here and look exactly as correct.
+    */
+    fleetDeck(
+      FIXTURE_PENDING_DAEMON_ID,
+      { status: "loading", deckId: FIXTURE_PENDING_DAEMON_ID, socketPath: FIXTURE_PENDING_DAEMON_ID, message: "In the fleet, waiting for it to report.", deckKind: "remote", pending: true },
+      [],
       "/home/dev/code/dot-agent-deck",
     ),
   ];

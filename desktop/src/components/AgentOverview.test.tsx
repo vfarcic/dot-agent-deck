@@ -16,8 +16,8 @@ import "../styles.css";
 */
 import stylesheetSource from "../styles.css?raw";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { createFixtureFleet, createFixtureSnapshot, FIXTURE_DAEMON_ID, FIXTURE_REMOTE_DAEMON_ID, FIXTURE_UNREACHABLE_DAEMON_ID } from "../data/fixture";
-import { DEFAULT_DESKTOP_SETTINGS, type DesktopSettingsDto, unconfiguredDeckSnapshot } from "../lib/bridge";
+import { createFixtureFleet, createFixtureSnapshot, FIXTURE_DAEMON_ID, FIXTURE_PENDING_DAEMON_ID, FIXTURE_REMOTE_DAEMON_ID, FIXTURE_UNREACHABLE_DAEMON_ID } from "../data/fixture";
+import { DEFAULT_DESKTOP_SETTINGS, type DesktopSettingsDto, PENDING_DECK_MESSAGE, pendingDeckSnapshot, unconfiguredDeckSnapshot } from "../lib/bridge";
 import { DISPLAY_LIMITS } from "../lib/displayText";
 import { UNREPORTED } from "../types";
 import type { AgentSession, DeckRuntimeState, DeckSnapshot } from "../types";
@@ -1859,9 +1859,9 @@ describe("AgentOverview across a fleet (PRD #742 M4)", () => {
     const { fleet } = renderFleet();
 
     const sections = deckSections();
-    expect(sections).toHaveLength(3);
+    expect(sections).toHaveLength(4);
     expect(sections.map((section) => section.getAttribute("data-daemon-id")))
-      .toEqual([FIXTURE_DAEMON_ID, FIXTURE_REMOTE_DAEMON_ID, FIXTURE_UNREACHABLE_DAEMON_ID]);
+      .toEqual([FIXTURE_DAEMON_ID, FIXTURE_REMOTE_DAEMON_ID, FIXTURE_UNREACHABLE_DAEMON_ID, FIXTURE_PENDING_DAEMON_ID]);
 
     // Siblings, not nested: a deck inside another deck would still satisfy
     // every count above it.
@@ -1919,9 +1919,9 @@ describe("AgentOverview across a fleet (PRD #742 M4)", () => {
     const up = fleet.filter((deck) => deck.connection.status === "connected");
     const answered = up.flatMap((deck) => deck.agents);
     expect(up).toHaveLength(2);
-    expect(fleet).toHaveLength(3);
+    expect(fleet).toHaveLength(4);
 
-    expect(screen.getByTestId("overview-count-decks").querySelector("strong")).toHaveTextContent("2/3");
+    expect(screen.getByTestId("overview-count-decks").querySelector("strong")).toHaveTextContent("2/4");
     expect(screen.getByTestId("overview-count-agents").querySelector("strong")).toHaveTextContent(String(answered.length));
     expect(screen.getByTestId("overview-count-groups").querySelector("strong"))
       .toHaveTextContent(String(up.reduce((total, deck) => total + groupAgents(deck.agents.map(toOverviewAgent)).length, 0)));
@@ -1930,7 +1930,7 @@ describe("AgentOverview across a fleet (PRD #742 M4)", () => {
       The distinguishing assertion, and the reason the unreachable deck carries
       a STALE fleet: summing over every deck would print a strictly larger
       number, and it would look exactly as correct as this one. The header
-      states `2/3` beside it so the reader knows the total is partial.
+      states `2/4` beside it so the reader knows the total is partial.
     */
     const everyDeck = fleet.flatMap((deck) => deck.agents);
     expect(everyDeck.length).toBeGreaterThan(answered.length);
@@ -2064,5 +2064,159 @@ describe("AgentOverview across a fleet (PRD #742 M4)", () => {
 
     expect(counterText()).toEqual(["—", "—", "—", "—", "—"]);
     expect(screen.getByTestId("overview-count-decks").querySelector("strong")).toHaveTextContent("0/2");
+  });
+
+  /*
+    -------------------------------------------------------------------------
+    PRD #742 M14 — a deck that HAS NOT REPORTED YET is visible, and the total
+    is right from the first frame.
+
+    The same Success Criterion 4 M12 answers, reached by the other route: a
+    configured deck absent from the fleet because nothing has answered for it,
+    rather than because it has no address. `desktop_bootstrap` answers the
+    resolved deck alone and every other deck appears when its own watcher
+    emits, so with two decks configured the header read `1/1` and then `2/2` a
+    few seconds later — two readings of "everything is fine" with a TOTAL that
+    moved under the reader.
+    -------------------------------------------------------------------------
+  */
+
+  /**
+   * One answering deck and one the app has heard nothing from.
+   *
+   * The second is built by `pendingDeckSnapshot` — the production function the
+   * bridge derives its pending groups with — from exactly the three fields the
+   * crate puts on `DesktopSnapshotDto.observed`. A hand-written snapshot here
+   * would pass against a builder that produced the wrong status or forgot the
+   * marker, which is half of what these tests are for.
+   */
+  function fleetWithPending(): DeckSnapshot[] {
+    const [answering] = createFixtureFleet("fleet");
+    expect(answering.connection.status).toBe("connected");
+    const waiting = pendingDeckSnapshot({ deckId: "deck-00000000000e0d03", label: "ops@edge-3", deckKind: "remote" }, 9, "0.1.0");
+    return [answering, waiting];
+  }
+
+  /**
+   * Scenario: two decks configured, one of which has not answered yet. The
+   * header reads `1/2` — the total is the fleet and the numerator is what
+   * answered — and it never reads `1/1`, which is the bug: the denominator
+   * used to climb to 2 only once the second deck arrived.
+   */
+  it("counts a deck that has not reported yet in the total and never among those that answered", () => {
+    const fleet = fleetWithPending();
+    render(<AgentOverview runtime={runtime({ snapshot: fleet[0], fleet })} onNavigate={vi.fn()} />);
+
+    const decks = screen.getByTestId("overview-count-decks").querySelector("strong");
+    expect(decks).toHaveTextContent("1/2");
+    expect(decks).not.toHaveTextContent("1/1");
+    expect(decks).toHaveAttribute("title", expect.stringContaining("1 of 2 decks are answering") as unknown as string);
+  });
+
+  /**
+   * Scenario: the same two decks, looking at the agent instruments. They are
+   * computed over the decks that ANSWERED, so a deck nothing has been heard
+   * from contributes nothing — exactly as a disconnected deck does not, and for
+   * the same reason: what it is running is unknown, and adding zero for it
+   * would be a wrong number that looks like a right one.
+   */
+  it("leaves a deck that has not reported out of every agent count beside the deck count", () => {
+    const fleet = fleetWithPending();
+    render(<AgentOverview runtime={runtime({ snapshot: fleet[0], fleet })} onNavigate={vi.fn()} />);
+
+    const answered = fleet[0].agents;
+    expect(answered.length).toBeGreaterThan(0);
+    expect(screen.getByTestId("overview-count-agents").querySelector("strong")).toHaveTextContent(String(answered.length));
+    expect(fleet[1].agents).toHaveLength(0);
+    /*
+      And the substantive half, which the totals above cannot show: a deck with
+      no agent list adds ZERO to every instrument whether it is counted or not,
+      so the assertion that has teeth is what the deck's own row says. It reads
+      as UNKNOWN — an em dash where its neighbours print pips — and never as a
+      deck running nothing.
+    */
+    const sections = screen.getAllByTestId("daemon-group");
+    expect(sections[1].querySelectorAll(".overview-row")).toHaveLength(0);
+    expect(sections[1].querySelector(".daemon-pips")).toBeNull();
+    expect(within(sections[1]).getByTestId("daemon-unknown")).toHaveTextContent("—");
+    expect(sections[1].textContent).not.toMatch(/\b0 (running|waiting|failed|queued|passed|stopped)\b/);
+  });
+
+  /**
+   * Scenario: the same fleet, looking at the second deck's section. It is a
+   * group of its own, named by its address, saying it is being waited for —
+   * not absent, not an error, and not a deck reporting zero agents.
+   *
+   * The words are the empty state's register rather than the disconnected
+   * note's: nothing stopped answering, so "no deck is listening on the
+   * configured socket" is false, and there is no action for the reader to take,
+   * so the note offers no button at all.
+   */
+  it("renders the deck that has not reported as its own group saying it is being waited for", () => {
+    const fleet = fleetWithPending();
+    render(<AgentOverview runtime={runtime({ snapshot: fleet[0], fleet })} onNavigate={vi.fn()} />);
+
+    const sections = screen.getAllByTestId("daemon-group");
+    expect(sections).toHaveLength(2);
+    const waiting = sections[1];
+    expect(waiting).toHaveAttribute("data-daemon-id", "deck-00000000000e0d03");
+    expect(waiting).toHaveAttribute("data-deck-connected", "no");
+    // Named by its address. Without the crate's `observed` list this would read
+    // "Local deck" — `deckName` has only `deckKind` to go on.
+    expect(within(waiting).getByTestId("daemon-identity")).toHaveTextContent("ops@edge-3");
+
+    const note = within(waiting).getByTestId("overview-pending");
+    expect(note).toHaveTextContent("Waiting for this deck");
+    expect(note).toHaveTextContent(PENDING_DECK_MESSAGE);
+    // Not the disconnected note, and not the app's own pre-connect one.
+    expect(within(waiting).queryByTestId("overview-disconnected")).toBeNull();
+    expect(within(waiting).queryByTestId("overview-loading")).toBeNull();
+    expect(within(waiting).queryByTestId("overview-unconfigured")).toBeNull();
+    // Nothing to press: Reconnect would re-establish the whole fleet to hurry
+    // one deck that is already on its way.
+    expect(within(waiting).queryByRole("button")).toBeNull();
+
+    // Unknown rather than none, and the sentence says which kind of unknown.
+    const unknown = within(waiting).getByTestId("daemon-unknown");
+    expect(unknown).toHaveTextContent("—");
+    expect(unknown).toHaveAttribute("title", expect.stringContaining("has not reported") as unknown as string);
+  });
+
+  /**
+   * Scenario: the fleet fixture, which carries all four states at once — a
+   * local deck answering, a remote deck answering, a remote deck that stopped
+   * answering, and a remote deck nothing has been heard from.
+   *
+   * The pair worth pinning is the last two: both render a degraded group with
+   * an em dash, and they must not render the same NOTE. Reusing `disconnected`
+   * for a deck nothing was asked of is the shortcut this milestone exists to
+   * refuse, and it would leave every count assertion above green.
+   */
+  it("keeps a deck that has not reported distinct from one that stopped answering", () => {
+    renderFleet();
+    const sections = deckSections();
+    expect(sections).toHaveLength(4);
+
+    const down = sections[2];
+    const waiting = sections[3];
+    expect(down).toHaveAttribute("data-daemon-id", FIXTURE_UNREACHABLE_DAEMON_ID);
+    expect(waiting).toHaveAttribute("data-daemon-id", FIXTURE_PENDING_DAEMON_ID);
+
+    // Both degraded, and each with its own note and its own lamp.
+    for (const section of [down, waiting]) {
+      expect(section.className).toContain("is-degraded");
+      expect(within(section).getByTestId("daemon-unknown")).toHaveTextContent("—");
+    }
+    expect(within(down).getByTestId("overview-disconnected")).toBeVisible();
+    expect(within(down).queryByTestId("overview-pending")).toBeNull();
+    expect(within(waiting).getByTestId("overview-pending")).toBeVisible();
+    expect(within(waiting).queryByTestId("overview-disconnected")).toBeNull();
+    expect(down.querySelector(".connection-lamp.connection-disconnected")).not.toBeNull();
+    expect(waiting.querySelector(".connection-lamp.connection-loading")).not.toBeNull();
+
+    // And the fixture's own wording is `PENDING_DECK_MESSAGE`, which it spells
+    // out rather than imports — `bridge.ts` imports the fixture module, so this
+    // assertion is what stands in for the import that would close a cycle.
+    expect(within(waiting).getByTestId("daemon-state")).toHaveTextContent(PENDING_DECK_MESSAGE);
   });
 });
