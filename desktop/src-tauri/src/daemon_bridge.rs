@@ -19,7 +19,7 @@ use crate::agent_view::AgentView;
 use crate::dto::{
     BootstrapOptions, ConnectionStatus, DesktopConnection, DesktopSnapshot, deck_path_text,
     deck_wire_id, disconnected_snapshot, map_agent, observed_fleet, safe_message,
-    selected_endpoint, selection_fields,
+    selected_endpoint, selection_fields, unconfigured_fleet,
 };
 use crate::endpoint_tunnels::{EndpointTunnels, TunnelLease};
 
@@ -1132,6 +1132,7 @@ pub(crate) async fn snapshot_with(
             protocol_version: PROTOCOL_VERSION,
             source: "daemon",
             fleet: observed_fleet(),
+            unconfigured: unconfigured_fleet(),
         };
     }
 
@@ -1205,6 +1206,7 @@ fn connected_snapshot(
         // every deck in a fleet carries the same list and a webview may prune
         // its map on whichever snapshot happens to land first (PRD #742 M5).
         fleet: observed_fleet(),
+        unconfigured: unconfigured_fleet(),
     }
 }
 
@@ -4128,7 +4130,7 @@ mod tests {
     /// **What it does not prove.** The settings-document half. `observed_fleet`
     /// and `DesktopSnapshot.fleet` are derived from the applied
     /// `EndpointSettings`, and a stored `[[endpoints.remote]]` row is remote by
-    /// construction (`EndpointSettings::observed_endpoints` leads with
+    /// construction (`EndpointSettings::connectable_endpoints` leads with
     /// `Endpoint::local()` and extends with remote rows only) — so a fleet of
     /// two *local* real daemons cannot be expressed as a document at all. That
     /// half stays at `dto::tests::the_snapshot_fleet_is_the_observed_set_selected_first`,

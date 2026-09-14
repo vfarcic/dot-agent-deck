@@ -67,6 +67,37 @@ pub struct DesktopSnapshot {
     /// applied document, not of the deck that happened to emit — so a webview
     /// may prune on any arrival.
     pub fleet: Vec<String>,
+    /// The members of [`Self::fleet`] the app cannot connect to, with what they
+    /// need to be rendered (PRD #742 M12).
+    ///
+    /// A configured deck with no socket path yet has no watcher, so it never
+    /// emits a snapshot of its own — and the webview deliberately does not
+    /// invent an entry for an id in `fleet` it has heard nothing about, because
+    /// for a real deck that would be a connection state nobody measured. This
+    /// is the crate saying what it knows without measuring: the row exists, it
+    /// has no address, and here is what to call it. The webview builds the
+    /// group from these three fields rather than guessing at any of them.
+    ///
+    /// Carried on every snapshot for the same reason `fleet` is — it is a
+    /// property of the applied document and not of the deck that emitted — so
+    /// any arrival re-states the whole list and a webview may rebuild from it.
+    pub unconfigured: Vec<UnconfiguredDeckDto>,
+}
+
+/// One configured-but-unaddressed deck, as the fleet view renders it.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UnconfiguredDeckDto {
+    /// [`crate::dto::unconfigured_deck_id`] — disjoint from every real
+    /// `deck_id`, and what the webview keys this group on.
+    pub deck_id: String,
+    /// `user@host[:port]`, the same label a connected row would carry in
+    /// [`DesktopConnection::socket_path`].
+    pub label: String,
+    /// Why there is nothing to show — the fleet view's idiom for
+    /// [`crate::settings::SelectionFallback::NoRemoteSocket`], which says the
+    /// same thing in the selector's.
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -978,18 +1009,26 @@ impl Default for SelectedDeck {
 #[derive(Debug, Clone)]
 struct AppliedSelection {
     selected: SelectedDeck,
+    /// The decks the app CONNECTS to — watchers, tunnels, handshakes.
     observed: Vec<Endpoint>,
+    /// The decks the app SHOWS but cannot connect to (PRD #742 M12). Held
+    /// beside `observed` rather than folded into it because every reader of
+    /// `observed` wants the connectable set and would spin a watcher against an
+    /// endpoint that cannot exist; [`observed_fleet`] is the one reader that
+    /// wants both, and it is the display set.
+    unconfigured: Vec<crate::settings::UnconfiguredDeck>,
 }
 
 impl Default for AppliedSelection {
     /// Unset reads as the local deck alone — what every caller did before
     /// endpoints existed, what a test that never loads a document sees, and what
-    /// `DesktopSettings::observed_endpoints()` answers for a document with no
+    /// `DesktopSettings::connectable_endpoints()` answers for a document with no
     /// `[endpoints]` section.
     fn default() -> Self {
         Self {
             selected: SelectedDeck::default(),
             observed: vec![Endpoint::local()],
+            unconfigured: Vec::new(),
         }
     }
 }
@@ -1049,20 +1088,31 @@ pub(crate) fn apply_settings_selection(
     if let Ok(mut slot) = APPLIED_SELECTION.write() {
         *slot = Some(AppliedSelection {
             selected: deck.clone(),
-            observed: settings.observed_endpoints(),
+            observed: settings.connectable_endpoints(),
+            unconfigured: settings.unconfigured_decks(),
         });
     }
     deck
 }
 
-/// Every deck the fleet observes under the applied document (PRD #742 M3).
+/// Every deck the app CONNECTS to under the applied document (PRD #742 M3).
 ///
 /// One element for every selection but [`crate::settings::Selection::All`], and
 /// for that one the local deck followed by every configured row that has
-/// somewhere to connect to — [`crate::settings::EndpointSettings::observed_endpoints`]
+/// somewhere to connect to — [`crate::settings::EndpointSettings::connectable_endpoints`]
 /// is where that judgement is made and this only stores its answer.
+///
+/// **Not the fleet the screen shows.** A configured row with no socket path is
+/// deliberately absent here and present in [`observed_fleet`]; see
+/// [`unconfigured_decks`] for the other half and why the two are separate.
 pub(crate) fn observed_decks() -> Vec<Endpoint> {
     applied_selection().observed
+}
+
+/// Every configured deck the app cannot connect to under the applied document
+/// (PRD #742 M12) — a row whose socket path is not filled in yet.
+pub(crate) fn unconfigured_decks() -> Vec<crate::settings::UnconfiguredDeck> {
+    applied_selection().unconfigured
 }
 
 /// Is `endpoint` one of the decks the fleet observes?
@@ -1136,18 +1186,70 @@ pub(crate) fn deck_wire_id(endpoint: &Endpoint) -> String {
     endpoint.identity().wire_id()
 }
 
+/// How an UNCONFIGURED deck is keyed on the wire (PRD #742 M12).
+///
+/// The row's own [`crate::settings::EndpointId`] under a prefix that
+/// [`deck_wire_id`] can never produce: that mints `deck-<16 hex>`, so
+/// `unconfigured-…` is disjoint from it whatever a user names a row — which
+/// matters because the webview keys React elements, per-deck maps and the
+/// `agentKey` composite on this value alongside real deck ids.
+///
+/// Not run through [`safe_display_text`], for the same reason [`deck_wire_id`]
+/// is not: `EndpointId` accepts ASCII alphanumerics, `-` and `_` and nothing
+/// else (its `Deserialize` runs the constructor's check), so there is no
+/// user-supplied byte here that a scrub could act on.
+pub(crate) fn unconfigured_deck_id(id: &crate::settings::EndpointId) -> String {
+    format!("unconfigured-{}", id.as_str())
+}
+
+/// The unconfigured half of the fleet as [`DesktopSnapshot::unconfigured`]
+/// carries it (PRD #742 M12).
+///
+/// One read of the applied selection, like [`observed_fleet`], and every
+/// `DesktopSnapshot` construction calls both — the two lists have to describe
+/// the same document or the webview gets an id in `fleet` with nothing to build
+/// its group from.
+pub(crate) fn unconfigured_fleet() -> Vec<UnconfiguredDeckDto> {
+    unconfigured_decks()
+        .into_iter()
+        .map(|deck| UnconfiguredDeckDto {
+            deck_id: unconfigured_deck_id(&deck.id),
+            label: safe_display_text(deck.label),
+            reason: UNCONFIGURED_DECK_REASON.to_string(),
+        })
+        .collect()
+}
+
+/// What a deck with no address says instead of a state.
+///
+/// The fleet view's idiom for the same fact
+/// [`crate::settings::SelectionFallback::NoRemoteSocket`] states in the
+/// selector's — deliberately the settings panel's own vocabulary rather than a
+/// third one, because a user who sees this is being sent to that panel.
+const UNCONFIGURED_DECK_REASON: &str = "Not configured yet — press Test connection in Settings.";
+
 /// The observed fleet as [`DesktopSnapshot::fleet`] carries it — every observed
 /// deck's [`deck_wire_id`], selected deck first, never empty (PRD #742 M5).
 ///
 /// # The two invariants are enforced here, not assumed
 ///
-/// [`crate::settings::EndpointSettings::observed_endpoints`] already yields them
-/// — it is `[resolve().endpoint]` for every selection but `All`, and `All` leads
-/// with the local deck, which is what `All` resolves to. This re-establishes
-/// them anyway, because they are what the webview's `fleet[0]` reads as "the
-/// selected deck" and a silently wrong answer there binds every single-deck
-/// surface to somebody else's machine. Restating a property the producer
-/// already has is cheap; discovering it moved is not.
+/// [`crate::settings::EndpointSettings::connectable_endpoints`] already yields
+/// them — it is `[resolve().endpoint]` for every selection but `All`, and `All`
+/// leads with the local deck, which is what `All` resolves to. This
+/// re-establishes them anyway, because they are what the webview's `fleet[0]`
+/// reads as "the selected deck" and a silently wrong answer there binds every
+/// single-deck surface to somebody else's machine. Restating a property the
+/// producer already has is cheap; discovering it moved is not.
+///
+/// # This is the DISPLAY set, and it is wider than the connectable one
+///
+/// PRD #742 M12: a configured row with no socket path is in here, under
+/// [`unconfigured_deck_id`], and is deliberately not in [`observed_decks`].
+/// It is a deck the user created and should see — so it gets a group and a
+/// place in the fleet's denominator — and there is no address to give a
+/// watcher, a tunnel or a handshake. Conflating the two sets is what made a
+/// socketless deck vanish from the overview entirely: absent from the
+/// numerator, absent from the denominator, and with no group on screen.
 ///
 /// A selected deck that is somehow absent from the observed set is PREPENDED
 /// rather than dropped: the app is talking to it either way, so a fleet that
@@ -1160,6 +1262,16 @@ pub(crate) fn observed_fleet() -> Vec<String> {
     let applied = applied_selection();
     let selected = deck_wire_id(&applied.selected.endpoint);
     let mut fleet: Vec<String> = applied.observed.iter().map(deck_wire_id).collect();
+    // PRD #742 M12: the configured decks with no address, after the ones that
+    // have one. They are members of the fleet and never of the connectable set,
+    // so this is the one place the two lists are added together — and it is the
+    // display side, which is the only side that wants them.
+    fleet.extend(
+        applied
+            .unconfigured
+            .iter()
+            .map(|deck| unconfigured_deck_id(&deck.id)),
+    );
     match fleet.iter().position(|id| *id == selected) {
         Some(0) => {}
         Some(at) => {
@@ -1206,6 +1318,7 @@ pub(crate) fn disconnected_snapshot(
         protocol_version: PROTOCOL_VERSION,
         source: "daemon",
         fleet: observed_fleet(),
+        unconfigured: unconfigured_fleet(),
     }
 }
 
@@ -1405,6 +1518,80 @@ mod tests {
         apply_settings_selection(&crate::settings::DesktopSettings::default());
         drop(guard);
         result
+    }
+
+    /// The fleet on the wire lists the unaddressed deck; the set anything
+    /// connects to does not (PRD #742 M12).
+    ///
+    /// The split at the seam the webview reads. Both halves come from ONE
+    /// applied document, so this also pins that `apply_settings_selection`
+    /// stores them together — a reader that got the two from different saves
+    /// could show an unconfigured group for a deck that had just gained an
+    /// address, beside the real group its new watcher emits.
+    #[test]
+    fn the_wire_fleet_carries_the_unaddressed_deck_and_the_observed_set_does_not() {
+        use crate::settings::{EndpointId, EndpointSettings, RemoteEndpointSettings, Selection};
+        use dot_agent_deck::remote_tunnel::{Hostname, RemoteSocketPath};
+
+        let connectable = |index: usize, host: &str| {
+            let id = EndpointId::parse(&format!("deck00000000000{index}")).expect("a valid id");
+            let mut row =
+                RemoteEndpointSettings::new(id, Hostname::parse(host).expect("a valid host"));
+            row.socket = Some(RemoteSocketPath::parse("/run/deck.sock").expect("a path"));
+            row
+        };
+        let halfway = EndpointId::parse("halfway").expect("a valid id");
+        let settings = crate::settings::DesktopSettings {
+            endpoints: Some(EndpointSettings {
+                remote: vec![
+                    connectable(0, "build-box.example.com"),
+                    connectable(1, "laptop.example.com"),
+                    RemoteEndpointSettings::new(
+                        halfway.clone(),
+                        Hostname::parse("relay.example.com").expect("a valid host"),
+                    ),
+                ],
+                selection: Selection::All,
+            }),
+            ..crate::settings::DesktopSettings::default()
+        };
+
+        with_selection(&settings, || {
+            let wire = observed_fleet();
+            assert_eq!(
+                wire.len(),
+                4,
+                "the local deck, the two with an address, and the one without — the \
+                 denominator the overview header states: {wire:?}"
+            );
+            assert!(
+                wire.contains(&unconfigured_deck_id(&halfway)),
+                "the unaddressed deck is a member of the fleet: {wire:?}"
+            );
+            assert_eq!(
+                wire[0],
+                deck_wire_id(&selected_endpoint()),
+                "and the selected deck still leads, which every single-deck surface reads"
+            );
+            assert_eq!(
+                observed_decks().len(),
+                3,
+                "while the set that gets a watcher, a tunnel and a handshake is unchanged"
+            );
+
+            let stated = unconfigured_fleet();
+            assert_eq!(stated.len(), 1, "one deck to render as unconfigured");
+            assert_eq!(stated[0].deck_id, unconfigured_deck_id(&halfway));
+            assert_eq!(stated[0].label, "relay.example.com");
+            assert!(
+                !stated[0].reason.is_empty(),
+                "the group needs a sentence saying why it is empty"
+            );
+            assert!(
+                stated.iter().all(|deck| !deck.deck_id.starts_with("deck-")),
+                "an unconfigured id must never look like a real one: {stated:?}"
+            );
+        });
     }
 
     /// Selecting a remote deck disables the two daemon-lifecycle controls, and

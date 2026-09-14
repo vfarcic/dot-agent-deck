@@ -17,7 +17,7 @@ import "../styles.css";
 import stylesheetSource from "../styles.css?raw";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createFixtureFleet, createFixtureSnapshot, FIXTURE_DAEMON_ID, FIXTURE_REMOTE_DAEMON_ID, FIXTURE_UNREACHABLE_DAEMON_ID } from "../data/fixture";
-import { DEFAULT_DESKTOP_SETTINGS, type DesktopSettingsDto } from "../lib/bridge";
+import { DEFAULT_DESKTOP_SETTINGS, type DesktopSettingsDto, unconfiguredDeckSnapshot } from "../lib/bridge";
 import { DISPLAY_LIMITS } from "../lib/displayText";
 import { UNREPORTED } from "../types";
 import type { AgentSession, DeckRuntimeState, DeckSnapshot } from "../types";
@@ -1975,6 +1975,87 @@ describe("AgentOverview across a fleet (PRD #742 M4)", () => {
     expect(screen.getAllByTestId("daemon-group")).toHaveLength(1);
     expect(screen.getByTestId("overview-count-decks").querySelector("strong")).toHaveTextContent("1/1");
     expect(screen.getByTestId("daemon-identity")).toHaveTextContent("Local deck");
+  });
+
+  /*
+    -------------------------------------------------------------------------
+    PRD #742 M12 — a configured deck with no socket path is VISIBLE and
+    COUNTED, and the PRD's Success Criterion 4 is what it answers: "a
+    disconnected deck is visible as a degraded group rather than as zero
+    agents, and the number of decks up out of the total is stated."
+
+    Open Question 3 recorded the gap at M1 and M4 did not close it. The
+    denominator is the observed fleet, and the observed set dropped every row
+    with no socket — so three configured decks read as `2/2` with the third
+    nowhere on screen.
+    -------------------------------------------------------------------------
+  */
+
+  /**
+   * Two answering decks and one configured row that has no address yet.
+   *
+   * The third entry is built by `unconfiguredDeckSnapshot` — the production
+   * function the bridge uses — from exactly the three fields the crate puts on
+   * `DesktopSnapshotDto.unconfigured`. A hand-written snapshot here would let
+   * this file pass against a builder that produced the wrong status or forgot
+   * the marker, which is half of what these two tests are for.
+   */
+  function fleetWithUnconfigured(): DeckSnapshot[] {
+    const answering = createFixtureFleet("fleet").filter((deck) => deck.connection.status === "connected");
+    expect(answering).toHaveLength(2);
+    const halfway = unconfiguredDeckSnapshot(
+      { deckId: "unconfigured-halfway", label: "relay.example.com", reason: "Not configured yet — press Test connection in Settings." },
+      9,
+      "0.1.0",
+    );
+    return [...answering, halfway];
+  }
+
+  /**
+   * Scenario: three configured decks, one of which has no socket path yet. The
+   * header states `2/3` — the unconfigured deck is in the denominator and never
+   * in the numerator, because nothing was asked of it and nothing answered.
+   */
+  it("counts a configured deck with no socket path in the total and never among those that answered", () => {
+    const fleet = fleetWithUnconfigured();
+    render(<AgentOverview runtime={runtime({ snapshot: fleet[0], fleet })} onNavigate={vi.fn()} />);
+
+    expect(screen.getByTestId("overview-count-decks").querySelector("strong")).toHaveTextContent("2/3");
+    expect(screen.getByTestId("overview-count-decks").querySelector("strong"))
+      .toHaveAttribute("title", expect.stringContaining("2 of 3 decks are answering") as unknown as string);
+  });
+
+  /**
+   * Scenario: the same fleet, looking at the third deck's section. It is a
+   * group of its own, named by its address, saying it is not configured — not
+   * absent, and not a deck reporting zero agents.
+   *
+   * The words are the settings panel's rather than the disconnected note's:
+   * nothing stopped answering and Reconnect cannot help, so "no deck is
+   * listening on the configured socket" and "start one from the deck screen"
+   * would both be false.
+   */
+  it("renders the unconfigured deck as its own group saying what is missing", () => {
+    const fleet = fleetWithUnconfigured();
+    render(<AgentOverview runtime={runtime({ snapshot: fleet[0], fleet })} onNavigate={vi.fn()} />);
+
+    const sections = screen.getAllByTestId("daemon-group");
+    expect(sections).toHaveLength(3);
+    const halfway = sections[2];
+    expect(halfway).toHaveAttribute("data-daemon-id", "unconfigured-halfway");
+    expect(within(halfway).getByTestId("daemon-identity")).toHaveTextContent("relay.example.com");
+
+    const note = within(halfway).getByTestId("overview-unconfigured");
+    expect(note).toHaveTextContent("Deck not configured");
+    expect(note).toHaveTextContent("press Test connection");
+    // Not the disconnected note, whose remedy is Reconnect — a button that
+    // cannot help a deck with no address.
+    expect(within(halfway).queryByTestId("overview-disconnected")).toBeNull();
+    expect(within(halfway).queryByRole("button", { name: /Reconnect/ })).toBeNull();
+
+    // And never a deck running nothing: the pips read as UNKNOWN.
+    expect(within(halfway).getByTestId("daemon-unknown")).toBeInTheDocument();
+    expect(within(halfway).queryByTestId(/^overview-agent-/)).toBeNull();
   });
 
   it("reads every count as unknown when no deck in the fleet is answering", () => {

@@ -1581,7 +1581,7 @@ mod tests {
             ..DesktopSettings::default()
         };
         let endpoint = settings
-            .observed_endpoints()
+            .connectable_endpoints()
             .into_iter()
             .find(|endpoint| matches!(endpoint, Endpoint::Remote(_)))
             .expect("the fleet observes its remote row");

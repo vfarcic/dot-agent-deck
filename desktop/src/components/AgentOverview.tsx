@@ -1019,6 +1019,29 @@ function DaemonBody({ agents, groups, now, columns, connection, message, compact
     );
   }
 
+  /*
+    PRD #742 M12, and BEFORE the disconnected branch because it is a narrower
+    case of the same status. A configured deck with no socket path yet is not
+    a deck that stopped answering — nothing was asked of it — so "no deck is
+    listening on the configured socket" and "start one from the deck screen,
+    then reconnect" are both false, and Reconnect is a button that cannot help.
+    It says what is actually missing and points at the panel that fills it in,
+    in the same words #741's selector uses for the same state.
+
+    It is still a group, still in the fleet's denominator and still never in
+    `decksUp` — which is the whole of what this milestone closes. Before it, a
+    socketless row was absent from the overview entirely and three configured
+    decks read as `2/2`.
+  */
+  if (connection.unconfigured) {
+    return (
+      <OverviewNote className={noteClass} testId="overview-unconfigured" icon={<ShieldAlert size={24} />} title="Deck not configured">
+        <p>{message ?? "This deck has no address yet."}</p>
+        <p className="overview-note-hint">Nothing has been asked of this deck, so it counts toward the fleet without counting as one that answered.</p>
+      </OverviewNote>
+    );
+  }
+
   if (connection.status === "disconnected") {
     return (
       <OverviewNote className={noteClass} testId="overview-disconnected" icon={<ShieldAlert size={24} />} title="Deck disconnected">

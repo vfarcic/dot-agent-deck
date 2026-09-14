@@ -2093,6 +2093,87 @@ describe("TauriDeckBridge across a fleet (PRD #742 M4/M5)", () => {
 
   afterEach(() => vi.restoreAllMocks());
 
+  /*
+    -------------------------------------------------------------------------
+    PRD #742 M12 — a configured deck with no socket path.
+
+    It gets no watcher, because there is no address to watch, so it emits no
+    snapshot and the bridge would never hear of it. The crate states it on
+    `unconfigured` instead, and the bridge builds its group from that.
+    -------------------------------------------------------------------------
+  */
+
+  const halfwayId = "unconfigured-halfway";
+  const halfwayReason = "Not configured yet — press Test connection in Settings.";
+
+  /** The same two-deck bootstrap, plus the crate's statement about a third row. */
+  function withUnconfigured(dto: DesktopSnapshotDto): DesktopSnapshotDto {
+    return {
+      ...dto,
+      fleet: [...(dto.fleet ?? []), halfwayId],
+      unconfigured: [{ deckId: halfwayId, label: "relay.example.com", reason: halfwayReason }],
+    };
+  }
+
+  /**
+   * Scenario: three configured decks, one of which has no socket path yet. The
+   * fleet the bridge hands the app has THREE entries — the two that answered
+   * and one for the row that cannot answer — and the third is disconnected,
+   * agent-free and marked unconfigured, so the overview counts it in the
+   * denominator and never in `decksUp`.
+   *
+   * Before this the third was absent from the fleet entirely: not in the
+   * numerator, not in the denominator, and with no group on screen, so three
+   * configured decks read as `2/2`.
+   */
+  it("puts a configured deck with no socket path in the fleet, after the decks that answered", async () => {
+    const { TauriDeckBridge } = await import("./bridge");
+    invoke.mockImplementation(async (command: string) => (command === "desktop_bootstrap" ? withUnconfigured(local) : { ok: true }));
+    const bridge = new TauriDeckBridge();
+    const onFleet = vi.fn();
+    await bridge.subscribe(onFleet, vi.fn());
+    await bridge.connect();
+    listeners.get("desktop://snapshot")?.({ payload: withUnconfigured(remote) });
+
+    const fleet = onFleet.mock.calls.at(-1)?.[0] as DeckFleet;
+    expect(fleet.map((deck) => deck.connection.deckId)).toEqual([localId, remoteId, halfwayId]);
+
+    const halfway = fleet[2];
+    expect(halfway.connection.status).toBe("disconnected");
+    expect(halfway.connection.unconfigured).toBe(true);
+    expect(halfway.connection.message).toBe(halfwayReason);
+    expect(halfway.connection.socketPath).toBe("relay.example.com");
+    expect(halfway.agents).toHaveLength(0);
+  });
+
+  /**
+   * Scenario: the same row, after `Test connection` finds its socket path. The
+   * crate stops listing it as unconfigured and starts a watcher for it, so the
+   * next snapshot carries both facts — and the placeholder group must not
+   * linger beside the real one the watcher now emits.
+   *
+   * The whole list is restated on every arrival for exactly this reason, so the
+   * bridge replaces rather than merges.
+   */
+  it("drops the placeholder group once that deck gains an address", async () => {
+    const { TauriDeckBridge } = await import("./bridge");
+    invoke.mockImplementation(async (command: string) => (command === "desktop_bootstrap" ? withUnconfigured(local) : { ok: true }));
+    const bridge = new TauriDeckBridge();
+    const onFleet = vi.fn();
+    await bridge.subscribe(onFleet, vi.fn());
+    const seeded = await bridge.connect();
+    expect(seeded.map((deck) => deck.connection.deckId)).toEqual([localId, halfwayId]);
+
+    // The row now has an address: a real deck id, a watcher, and an empty
+    // unconfigured list.
+    const configured = deckSnapshot("deck-0000000000000f1e", "relay.example.com", "remote", ["Relay builder"], [localId, "deck-0000000000000f1e"]);
+    listeners.get("desktop://snapshot")?.({ payload: { ...configured, unconfigured: [] } });
+
+    const fleet = onFleet.mock.calls.at(-1)?.[0] as DeckFleet;
+    expect(fleet.map((deck) => deck.connection.deckId)).toEqual([localId, "deck-0000000000000f1e"]);
+    expect(fleet.some((deck) => deck.connection.unconfigured)).toBe(false);
+  });
+
   it("holds both decks when two arrive in one window instead of rendering the last one", async () => {
     const { TauriDeckBridge } = await import("./bridge");
     const bridge = new TauriDeckBridge();

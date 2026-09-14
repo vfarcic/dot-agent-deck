@@ -51,6 +51,17 @@ export interface ConnectionView {
    * `deckId` above is what anything keying on a deck uses.
    */
   socketPath?: string;
+  /**
+   * This deck is CONFIGURED but has no address yet (PRD #742 M12) — a stored
+   * row whose socket path `Test connection` has not filled in.
+   *
+   * Set only by `unconfiguredDeckSnapshot`, which builds the entry the crate's
+   * `DesktopSnapshotDto.unconfigured` describes. It is not a connection state:
+   * nothing was contacted and nothing failed, which is exactly why the
+   * `disconnected` note — "no deck is listening", "start one, then reconnect" —
+   * is the wrong sentence for it and the overview renders its own.
+   */
+  unconfigured?: boolean;
   message?: string;
   /**
    * Which kind of deck this connection is to (PRD #741 M7): `"local"` for a

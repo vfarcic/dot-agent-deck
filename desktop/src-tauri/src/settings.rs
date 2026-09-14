@@ -348,10 +348,20 @@ impl DesktopSettings {
     /// [`Selection::All`] leads with the local deck, which is exactly what
     /// [`EndpointSettings::resolve`] returns for it. Pinned by
     /// `lib.rs`'s `the_deck_the_screen_talks_to_is_always_one_the_fleet_observes`.
-    pub fn observed_endpoints(&self) -> Vec<Endpoint> {
+    pub fn connectable_endpoints(&self) -> Vec<Endpoint> {
         match &self.endpoints {
-            Some(endpoints) => endpoints.observed_endpoints(),
+            Some(endpoints) => endpoints.connectable_endpoints(),
             None => vec![Endpoint::local()],
+        }
+    }
+
+    /// Every configured deck with no address yet — see
+    /// [`EndpointSettings::unconfigured_decks`]. Empty without an
+    /// `[endpoints]` section, which has no rows to be half-configured.
+    pub fn unconfigured_decks(&self) -> Vec<UnconfiguredDeck> {
+        match &self.endpoints {
+            Some(endpoints) => endpoints.unconfigured_decks(),
+            None => Vec::new(),
         }
     }
 }
@@ -440,7 +450,8 @@ impl EndpointSettings {
     /// this is the method that answers *that* screen. A fallback would be wrong
     /// as well as noisy — nothing failed to be honoured, and the selector would
     /// print a substitution notice about a selection that is in force.
-    /// [`Self::observed_endpoints`] is where the fleet's set lives.
+    /// [`Self::connectable_endpoints`] is where the connectable set lives, and
+    /// [`Self::unconfigured_decks`] is the rest of what the fleet shows.
     pub fn resolve(&self) -> ResolvedEndpoint {
         let local = || ResolvedEndpoint {
             endpoint: Endpoint::local(),
@@ -467,29 +478,37 @@ impl EndpointSettings {
         }
     }
 
-    /// Every deck a fleet view watches under this selection — the set
+    /// Every deck the app can actually CONNECT to under this selection — the
+    /// set that gets a watcher, a tunnel and a handshake, and the set
     /// [`Self::resolve`] cannot express.
     ///
     /// One element for [`Selection::Local`] and [`Selection::One`], which is
     /// exactly [`Self::resolve`]'s answer, so a single-deck selection observes
     /// the deck it resolves to and nothing else. For [`Selection::All`] it is
-    /// the local deck followed by every stored row, in document order.
+    /// the local deck followed by every stored row that has somewhere to
+    /// connect to, in document order.
     ///
-    /// **A row with no socket path is not in the set, and that is the same
-    /// judgement [`Self::resolve`] already makes.** `endpoint()` is `None`
-    /// while a row has no remote socket (see [`RemoteEndpointSettings::socket`]
-    /// — it cannot be derived, and `Test connection` is what fills it in), so
-    /// there is nothing to connect to and a watcher for it would have no
-    /// address. What that costs is that a half-configured deck is *absent* from
-    /// the fleet rather than present-and-unconfigured; whether the merged view
-    /// should show it as a group with a "press Test connection" state is PRD
-    /// #742 M4's question, and answering it here would be inventing the answer
-    /// before the screen that renders it exists.
+    /// **A row with no socket path is not in here, and that is the whole
+    /// reason this method and [`Self::unconfigured_decks`] are two methods.**
+    /// `endpoint()` is `None` while a row has no remote socket (see
+    /// [`RemoteEndpointSettings::socket`] — it cannot be derived, and `Test
+    /// connection` is what fills it in), so there is no address to open, and a
+    /// watcher or a tunnel for it would be spinning against an endpoint that
+    /// cannot exist. That is a statement about connectability and nothing else.
+    ///
+    /// It used to be the ONLY answer, under the name `observed_endpoints`, and
+    /// the fleet view read it as its display set too. PRD #742's Open Question
+    /// 3 recorded what that cost and M4 did not close it: a half-configured
+    /// deck was *absent* from the fleet rather than present-and-unconfigured —
+    /// not in the numerator, not in the denominator, and with no group on
+    /// screen, so three configured decks read as `2/2`. Answering both
+    /// questions with one list is what made that possible, so there are now
+    /// two lists and each caller names the one it means.
     ///
     /// The local deck leads because it needs no configuration and is therefore
     /// the one deck always in the set — the same reason `deckChoices` leads
     /// with it.
-    pub fn observed_endpoints(&self) -> Vec<Endpoint> {
+    pub fn connectable_endpoints(&self) -> Vec<Endpoint> {
         if !matches!(self.selection, Selection::All) {
             return vec![self.resolve().endpoint];
         }
@@ -502,6 +521,54 @@ impl EndpointSettings {
         );
         observed
     }
+
+    /// Every deck the fleet view SHOWS that [`Self::connectable_endpoints`]
+    /// cannot hold — a configured row with no socket path yet.
+    ///
+    /// These are decks the user created and should see. They get a group, they
+    /// count toward the fleet's denominator, and they never count toward the
+    /// decks that answered, because nothing was asked of them. They get no
+    /// watcher, no tunnel and no handshake: there is no address.
+    ///
+    /// # Only under [`Selection::All`], deliberately
+    ///
+    /// Every other selection names ONE deck, and [`Self::resolve`] already has
+    /// a complete answer for a socketless one: it falls back to the local deck
+    /// and reports [`SelectionFallback::NoRemoteSocket`], which the selector
+    /// prints. Adding a second group there would render the same fact twice and
+    /// break the invariant `lib.rs` pins — that a single-deck selection's fleet
+    /// is exactly `[resolve().endpoint]`. The gap this closes is `All`'s alone,
+    /// where a socketless row has nowhere else to be stated.
+    pub fn unconfigured_decks(&self) -> Vec<UnconfiguredDeck> {
+        if !matches!(self.selection, Selection::All) {
+            return Vec::new();
+        }
+        self.remote
+            .iter()
+            .filter(|deck| deck.socket.is_none())
+            .map(|deck| UnconfiguredDeck {
+                id: deck.id.clone(),
+                label: deck.describe(),
+            })
+            .collect()
+    }
+}
+
+/// A configured deck with no address yet, as the fleet view names it.
+///
+/// Carries the row's own [`EndpointId`] rather than an
+/// [`dot_agent_deck::daemon_client::EndpointIdentity`], because there is no
+/// endpoint to take one from — `wire_id()` hashes a `RemoteEndpoint`, and a
+/// row without a socket cannot build one. The id is what
+/// [`SelectionFallback::NoRemoteSocket`] already names and what the settings
+/// panel already keys on, so this reuses the identity the half-configured state
+/// has always had rather than minting a second one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnconfiguredDeck {
+    /// The stored row's id.
+    pub id: EndpointId,
+    /// `user@host[:port]`, from [`RemoteEndpointSettings::describe`].
+    pub label: String,
 }
 
 /// One `[[endpoints.remote]]` row: a remote deck, stored as **references** and
@@ -705,6 +772,27 @@ impl RemoteEndpointSettings {
         }
         Some(endpoint)
     }
+
+    /// How this row is NAMED, with or without a socket path.
+    ///
+    /// The same `user@host[:port]` [`RemoteEndpoint::describe`] renders, built
+    /// from the ssh destination directly — which needs no socket, so a
+    /// half-configured row can still be labelled. That is the one thing
+    /// [`Self::endpoint`] cannot do for it, and the fleet view needs a name for
+    /// a deck it cannot connect to (see [`EndpointSettings::unconfigured_decks`]).
+    ///
+    /// A label, not an identity: two rows differing only in socket path
+    /// describe identically. Nothing keys on this.
+    pub fn describe(&self) -> String {
+        dot_agent_deck::remote_tunnel::SshDestination::with_parts(
+            self.host.clone(),
+            self.user.clone(),
+            self.port.get(),
+            self.identity.clone(),
+            self.jump.clone(),
+        )
+        .describe()
+    }
 }
 
 /// The stable identity of a stored remote deck.
@@ -846,7 +934,7 @@ impl<'de> Deserialize<'de> for EndpointId {
 /// and that turned out to be one site too many: `resolve` answers "which single
 /// deck do the deck screen and its terminals talk to", `All` has no single
 /// answer, and its `let ... else` already sends every non-[`Self::One`]
-/// selection to the local deck. [`EndpointSettings::observed_endpoints`] is
+/// selection to the local deck. [`EndpointSettings::connectable_endpoints`] is
 /// where a fleet's set lives instead, so neither method has to lie.
 ///
 /// # The wire form, and why an unknown token round-trips
@@ -877,7 +965,8 @@ pub enum Selection {
     /// is PRD #742's fleet view.
     ///
     /// A *set*, and the one variant that does not name a single deck. Ask
-    /// [`EndpointSettings::observed_endpoints`] for it;
+    /// [`EndpointSettings::connectable_endpoints`] and
+    /// [`EndpointSettings::unconfigured_decks`] for it;
     /// [`EndpointSettings::resolve`] answers a different question and sends this
     /// variant to the local deck, exactly as it does [`Self::Local`].
     All,
@@ -4067,7 +4156,7 @@ level = 1.0
             remote: rows.clone(),
             selection: Selection::All,
         };
-        let observed = fleet.observed_endpoints();
+        let observed = fleet.connectable_endpoints();
         assert_eq!(
             observed.len(),
             2,
@@ -4087,11 +4176,123 @@ level = 1.0
                 selection,
             };
             assert_eq!(
-                single.observed_endpoints(),
+                single.connectable_endpoints(),
                 vec![single.resolve().endpoint],
                 "a single-deck selection observes the deck it resolves to and nothing else"
             );
         }
+    }
+
+    /// Scenario: three configured decks under `All`, one of them with no socket
+    /// path. The connectable set holds the two the app can reach; the
+    /// unconfigured set holds the third, with the label a group needs. The two
+    /// lists are disjoint and together they are every configured deck — which
+    /// is what makes the overview's denominator 3 rather than 2.
+    ///
+    /// **PRD #742 Open Question 3, answered.** Before this, one list answered
+    /// both questions and the socketless row was simply absent: not in the
+    /// numerator, not in the denominator, and with no group on screen.
+    #[test]
+    fn a_deck_with_no_socket_is_in_the_fleet_and_not_in_the_connectable_set() {
+        let first = EndpointId::parse("first").unwrap();
+        let second = EndpointId::parse("second").unwrap();
+        let halfway = EndpointId::parse("halfway").unwrap();
+        let rows = vec![
+            connectable_row(&first, "build-box.example.com"),
+            connectable_row(&second, "ci-box.example.com"),
+            // Storable, selectable, and with nowhere to connect to.
+            RemoteEndpointSettings::new(
+                halfway.clone(),
+                Hostname::parse("relay.example.com").unwrap(),
+            ),
+        ];
+        let fleet = EndpointSettings {
+            remote: rows,
+            selection: Selection::All,
+        };
+
+        assert_eq!(
+            fleet.connectable_endpoints().len(),
+            3,
+            "the local deck and the two rows with an address — the socketless row has none"
+        );
+        assert_eq!(
+            fleet.unconfigured_decks(),
+            vec![UnconfiguredDeck {
+                id: halfway,
+                label: "relay.example.com".to_string(),
+            }],
+            "the socketless row is a fleet member, labelled by its address"
+        );
+        assert_eq!(
+            fleet.connectable_endpoints().len() + fleet.unconfigured_decks().len(),
+            4,
+            "the fleet is the local deck plus every configured row, and the two lists partition it"
+        );
+    }
+
+    /// Scenario: a row with a user and a non-default port, and no socket path.
+    /// It is still labelled `user@host:port` — the same sentence a connectable
+    /// row carries — because the label comes from the ssh destination, which
+    /// needs no socket. A deck the fleet cannot reach still has to be nameable.
+    #[test]
+    fn an_unconfigured_deck_is_labelled_by_its_address_without_a_socket() {
+        let id = EndpointId::parse("halfway").unwrap();
+        let mut row =
+            RemoteEndpointSettings::new(id.clone(), Hostname::parse("relay.example.com").unwrap());
+        row.user = Some(SshUser::parse("deploy").unwrap());
+        row.port = SshPort::parse(2222).unwrap();
+        assert!(row.socket.is_none(), "the state under test");
+
+        assert_eq!(row.describe(), "deploy@relay.example.com:2222");
+    }
+
+    /// Scenario: the same half-configured row under every selection that names
+    /// ONE deck. It is not a fleet member there, because `resolve()` already has
+    /// a complete answer — it falls back to the local deck and says
+    /// `NoRemoteSocket`, which the selector prints. A second group would render
+    /// the same fact twice and break the invariant that a single-deck
+    /// selection's fleet is exactly `[resolve().endpoint]`.
+    #[test]
+    fn only_the_all_selection_shows_a_deck_with_no_socket() {
+        let halfway = EndpointId::parse("halfway").unwrap();
+        let rows = vec![RemoteEndpointSettings::new(
+            halfway.clone(),
+            Hostname::parse("relay.example.com").unwrap(),
+        )];
+
+        for selection in [Selection::Local, Selection::One(halfway.clone())] {
+            let single = EndpointSettings {
+                remote: rows.clone(),
+                selection,
+            };
+            assert!(
+                single.unconfigured_decks().is_empty(),
+                "a selection that names one deck has no fleet to add a group to"
+            );
+            assert_eq!(
+                single.connectable_endpoints(),
+                vec![single.resolve().endpoint],
+                "and the observed set is still exactly what it resolves to"
+            );
+        }
+
+        let all = EndpointSettings {
+            remote: rows,
+            selection: Selection::All,
+        };
+        assert_eq!(
+            all.unconfigured_decks().len(),
+            1,
+            "under All the row has nowhere else to be stated, which is the gap this closes"
+        );
+    }
+
+    /// A stored row with an address, for the fleet cases above.
+    fn connectable_row(id: &EndpointId, host: &str) -> RemoteEndpointSettings {
+        let mut row = RemoteEndpointSettings::new(id.clone(), Hostname::parse(host).unwrap());
+        row.socket = Some(RemoteSocketPath::parse("/run/deck.sock").unwrap());
+        row
     }
 
     /// Scenario: minted ids are 16 lowercase hex characters, distinct from each

@@ -1510,14 +1510,23 @@ async fn retarget_selection(state: &DesktopState, settings: &DesktopSettings) ->
 ///
 /// # The resolved deck is always in here
 ///
-/// [`crate::settings::DesktopSettings::observed_endpoints`] guarantees it by
+/// [`crate::settings::DesktopSettings::connectable_endpoints`] guarantees it by
 /// construction, and this is where it is load-bearing: were it not, an ordinary
 /// theme save would release the transport under the deck screen's own terminals.
+///
+/// # A deck with no address is deliberately NOT in here
+///
+/// PRD #742 M12 split the display set off from this one. A configured row with
+/// no socket path is a member of the fleet the overview renders and is not a
+/// member of this set, because there is no address to keep a transport for —
+/// a watcher for it would spin against an endpoint that cannot exist, and
+/// `retain` would be asked to tear down something that was never built. The
+/// display side is [`crate::dto::observed_fleet`].
 fn observed_keys(
     settings: &DesktopSettings,
 ) -> std::collections::HashSet<dot_agent_deck::daemon_client::EndpointIdentity> {
     settings
-        .observed_endpoints()
+        .connectable_endpoints()
         .iter()
         .map(dot_agent_deck::daemon_client::Endpoint::identity)
         .collect()
@@ -2087,6 +2096,72 @@ mod tests {
         }
     }
 
+    /// A configured deck with no socket path gets NO transport and NO watcher,
+    /// however many saves go past it (PRD #742 M12).
+    ///
+    /// The assertion is on the two sets the live halves are driven from, and it
+    /// is the half of this milestone that is easy to get wrong in the other
+    /// direction: having made a socketless deck visible, the tempting next move
+    /// is to make it observable too, and a watcher against an endpoint that
+    /// cannot exist would retry forever against nothing. There is no endpoint to
+    /// assert on, which is precisely why this is asserted by COUNT — a
+    /// socketless row can contribute no key to either set, because
+    /// `EndpointIdentity` is derived from a `RemoteEndpoint` and that row cannot
+    /// build one.
+    #[tokio::test]
+    async fn a_deck_with_no_socket_gets_no_watcher_and_no_tunnel() {
+        use crate::settings::{EndpointId, RemoteEndpointSettings};
+        use dot_agent_deck::remote_tunnel::Hostname;
+
+        let state = DesktopState::default();
+        let mut fleet = fleet_of(&["build-box.example.com", "laptop.example.com"]);
+        let endpoints = fleet.endpoints.as_mut().expect("the fleet has a section");
+        endpoints.remote.push(RemoteEndpointSettings::new(
+            EndpointId::parse("halfway").expect("a valid id"),
+            Hostname::parse("relay.example.com").expect("a valid host"),
+        ));
+
+        assert_eq!(
+            fleet.unconfigured_decks().len(),
+            1,
+            "the state under test: three configured rows, one with no address"
+        );
+        assert_eq!(
+            observed_keys(&fleet).len(),
+            3,
+            "the local deck and the two rows with an address — and nothing for the third"
+        );
+
+        // The watcher fan-out is `ensure_snapshot_watchers`, which iterates
+        // `observed_decks()` — so what it would start is exactly what this loop
+        // starts, and there is no fourth endpoint for it to reach.
+        for endpoint in fleet.connectable_endpoints() {
+            state.tunnels.insert_stand_in(&endpoint).await;
+            assert!(
+                state.start_watcher_once_for(&endpoint.identity()).is_some(),
+                "every connectable deck starts unwatched: {endpoint:?}"
+            );
+        }
+        retarget_selection(&state, &fleet).await;
+
+        assert_eq!(
+            state.tunnels.held().await,
+            3,
+            "a save neither builds a transport for the unaddressed deck nor drops one it never had"
+        );
+        assert_eq!(
+            state.watched_decks(),
+            observed_keys(&fleet),
+            "and the watched set is the connectable set exactly — a watcher for the third \
+             deck would be spinning against an address that does not exist"
+        );
+        assert_eq!(
+            state.watched_decks().len(),
+            3,
+            "three watchers for four fleet members, which is the whole point of the split"
+        );
+    }
+
     /// The live set `retain` is given names every observed deck, not the one
     /// the deck screen resolves to (PRD #742 M2).
     ///
@@ -2103,7 +2178,7 @@ mod tests {
         let keys = observed_keys(&fleet);
         assert_eq!(keys.len(), 3, "the local deck plus both configured rows");
         assert!(keys.contains(&Endpoint::local().identity()));
-        for endpoint in fleet.observed_endpoints() {
+        for endpoint in fleet.connectable_endpoints() {
             assert!(keys.contains(&endpoint.identity()), "{endpoint:?}");
         }
 
@@ -2171,7 +2246,7 @@ mod tests {
 
         let state = DesktopState::default();
         let fleet = fleet_of(&["build-box.example.com", "laptop.example.com"]);
-        let observed = fleet.observed_endpoints();
+        let observed = fleet.connectable_endpoints();
         assert_eq!(observed.len(), 3, "the local deck plus both rows");
         for endpoint in &observed {
             state.tunnels.insert_stand_in(endpoint).await;
@@ -2292,7 +2367,7 @@ mod tests {
     async fn a_deck_that_leaves_the_fleet_stops_being_watched() {
         let state = DesktopState::default();
         let fleet = fleet_of(&["build-box.example.com", "laptop.example.com"]);
-        for endpoint in fleet.observed_endpoints() {
+        for endpoint in fleet.connectable_endpoints() {
             assert!(
                 state.start_watcher_once_for(&endpoint.identity()).is_some(),
                 "every observed deck starts unwatched: {endpoint:?}"

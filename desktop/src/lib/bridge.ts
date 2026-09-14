@@ -107,6 +107,31 @@ export interface DesktopSnapshotDto {
    * `pruneFleet` treats it: it prunes NOTHING rather than clearing the screen.
    */
   fleet?: string[];
+  /**
+   * The members of {@link fleet} the app cannot connect to (PRD #742 M12) — a
+   * configured deck whose socket path is not filled in yet.
+   *
+   * Such a deck gets no watcher, because there is no address to watch, so it
+   * never emits a snapshot of its own and {@link pruneFleet} would never have
+   * anything to keep. The crate states it here instead: the row exists, it has
+   * no address, and here is what to call it and what to say. That is a fact
+   * from the settings document rather than a connection state nobody measured,
+   * which is the distinction {@link pruneFleet} refuses to cross on its own.
+   *
+   * Carried on every snapshot for the same reason `fleet` is, and optional for
+   * the same reason: a single-deck DTO literal in a test need not restate it.
+   */
+  unconfigured?: UnconfiguredDeckDto[];
+}
+
+/** One configured-but-unaddressed deck (PRD #742 M12). */
+export interface UnconfiguredDeckDto {
+  /** The crate's `unconfigured_deck_id` — disjoint from every real `deckId`. */
+  deckId: string;
+  /** `user@host[:port]`. */
+  label: string;
+  /** Why there is nothing to show. */
+  reason: string;
 }
 
 export interface DesktopAgentDto {
@@ -873,6 +898,47 @@ function fallbackConnectionMessage(connection: DesktopSnapshotDto["connection"])
   return `Protocol mismatch: desktop v${connection.clientProtocolVersion}, deck v${connection.serverProtocolVersion ?? "unknown"}`;
 }
 
+/**
+ * The snapshot a configured deck with no address renders as (PRD #742 M12).
+ *
+ * Built as a `DesktopSnapshotDto` and mapped through {@link mapDesktopSnapshot}
+ * rather than hand-assembled, so this group has exactly the shape every other
+ * deck's does and cannot drift from it — the overview's `DeckGroup` then needs
+ * no knowledge of this state at all, because "a deck that is not answering" is
+ * already what it renders as a degraded group.
+ *
+ * `disconnected` is the honest status: nothing answered, and nothing was asked.
+ * It keeps the deck out of `decksUp` — an unconfigured deck must never count as
+ * one that answered — while leaving it in `decks.length`, which is the
+ * denominator the header states.
+ *
+ * Every field here comes from the crate. The rest of the DTO is the minimum
+ * `mapDesktopSnapshot` requires, and each value is a statement about a deck
+ * that was never contacted: no protocol version was exchanged, no build stamp
+ * was reported, and no agent count is known.
+ */
+export function unconfiguredDeckSnapshot(deck: UnconfiguredDeckDto, clientProtocolVersion: number, clientBuildVersion: string): DeckSnapshot {
+  const snapshot = mapDesktopSnapshot({
+    connection: {
+      status: "disconnected",
+      socketPath: deck.label,
+      deckId: deck.deckId,
+      deckKind: "remote",
+      error: deck.reason,
+      clientProtocolVersion,
+      clientBuildVersion,
+    },
+    agents: [],
+    protocolVersion: clientProtocolVersion,
+    source: "daemon",
+  });
+  // Set after the map rather than carried through the DTO: this is what the
+  // BRIDGE knows about an entry it built, not something a deck reported, and
+  // `mapDesktopSnapshot` describes decks that answered.
+  snapshot.connection.unconfigured = true;
+  return snapshot;
+}
+
 export function mapDesktopSnapshot(dto: DesktopSnapshotDto, previous?: DeckSnapshot, evidence?: EvidenceItem[], handoffs?: HandoffEdge[]): DeckSnapshot {
   /*
     PRD #742 M5. This was `dto.connection.socketPath` — `Endpoint::describe()`,
@@ -1260,6 +1326,24 @@ export class TauriDeckBridge implements DeckBridge {
    * which is why membership no longer depends on a handshake landing.
    */
   private selectedDeckId?: string;
+  /**
+   * The unconfigured decks as the crate last stated them, with the two client
+   * facts the payload that stated them carried (PRD #742 M12).
+   *
+   * Held rather than folded into {@link fleet}, because these are not upserts
+   * competing with a watcher's snapshots — the whole list is restated on every
+   * arrival and replaces what was here, so a row that gains a socket path (and
+   * therefore a watcher) simply stops being listed and the group it had is
+   * rebuilt from the snapshot that deck now emits.
+   *
+   * The protocol version and build stamp travel WITH the list rather than being
+   * defaulted, because they are facts about this app that every snapshot
+   * already carries and that a deck nobody contacted has no way to report. One
+   * field rather than three so they cannot be read from different arrivals, and
+   * `undefined` until the first one, so nothing is rendered before the crate
+   * has said anything.
+   */
+  private unconfigured?: { decks: UnconfiguredDeckDto[]; clientProtocolVersion: number; clientBuildVersion: string };
   private fleetListener?: FleetListener;
   /**
    * The `[endpoints]` section as this bridge last saw it, serialised. Compared
@@ -1725,9 +1809,23 @@ export class TauriDeckBridge implements DeckBridge {
     const entries = Array.from(this.fleet.entries());
     const selectedAt = entries.findIndex(([deckId]) => deckId === this.selectedDeckId);
     const decks = entries.map(([, deck]) => deck);
-    if (selectedAt <= 0) return decks;
+    /*
+      PRD #742 M12: the configured decks with no address, last and never first.
+      They are built here rather than held in `fleet` because nothing upserts
+      them — the crate restates the whole list on every arrival, so deriving
+      them per view is what keeps a row that has just gained a socket path from
+      lingering as a ghost beside the real group its new watcher emits.
+
+      Never `fleet[0]`: `selectedDeckId` is a real deck's key, so one of these
+      can only lead when the fleet is otherwise empty — which is the loading
+      seed's job and not a state the crate produces (`observed_fleet` always
+      carries the resolved deck).
+    */
+    const stated = this.unconfigured;
+    const unconfigured = stated ? stated.decks.map((deck) => unconfiguredDeckSnapshot(deck, stated.clientProtocolVersion, stated.clientBuildVersion)) : [];
+    if (selectedAt <= 0) return [...decks, ...unconfigured];
     const [selected] = decks.splice(selectedAt, 1);
-    return [selected, ...decks];
+    return [selected, ...decks, ...unconfigured];
   }
 
   /**
@@ -1756,6 +1854,32 @@ export class TauriDeckBridge implements DeckBridge {
    * `disconnected` connection), so an empty list is a malformed payload rather
    * than an empty fleet — and acting on it would clear the screen.
    */
+  /**
+   * Take the crate's statement of which configured decks have no address yet
+   * (PRD #742 M12).
+   *
+   * Replaces rather than merges: the list is a property of the applied
+   * document, restated on every snapshot from every deck, so the newest
+   * arrival is the whole truth. That is what drops a row the moment `Test
+   * connection` fills its socket path in — it leaves this list, and the watcher
+   * the crate now spawns for it emits the real group.
+   *
+   * An ABSENT field changes nothing, and an empty array clears. The two differ
+   * on purpose: absent is a DTO literal in a test that says nothing about this,
+   * while `[]` is the crate saying every configured deck has an address. This
+   * is the opposite reading from {@link pruneFleet}, and for the opposite
+   * reason — an empty membership list would blank the screen, whereas an empty
+   * unconfigured list is the ordinary, healthy case.
+   */
+  private adoptUnconfigured(dto: DesktopSnapshotDto): void {
+    if (!Array.isArray(dto.unconfigured)) return;
+    this.unconfigured = {
+      decks: dto.unconfigured,
+      clientProtocolVersion: dto.connection.clientProtocolVersion,
+      clientBuildVersion: dto.connection.clientBuildVersion,
+    };
+  }
+
   private pruneFleet(observed: readonly string[] | undefined): void {
     if (!Array.isArray(observed) || observed.length === 0) return;
     const keep = new Set(observed);
@@ -1809,6 +1933,7 @@ export class TauriDeckBridge implements DeckBridge {
     */
     this.fleet.clear();
     this.fleet.set(dto.connection.deckId, snapshot);
+    this.adoptUnconfigured(dto);
     return this.fleetView();
   }
 
@@ -1833,6 +1958,7 @@ export class TauriDeckBridge implements DeckBridge {
       that moved the selection had to re-handshake to be believed.
     */
     if (dto.fleet?.length) this.selectedDeckId = dto.fleet[0];
+    this.adoptUnconfigured(dto);
     /*
       PRD #742 M8: and the ring follows the selection, rather than being handed
       to whoever the selection now names. Before this the ring was global, so a
