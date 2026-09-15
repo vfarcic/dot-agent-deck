@@ -2550,6 +2550,16 @@ async fn handle_connection(
             // closes cannot tell "stopped" from "this daemon is too old to know
             // the verb". A remote caller needs that distinction MORE, not less —
             // over a tunnel a dropped connection has several other causes.
+            //
+            // **And the `?` here is load-bearing: a failed ack ABORTS the stop.**
+            // This deliberately differs from the `KIND_SHUTDOWN` handler above,
+            // which logs a failed ack and proceeds. That frame is a local user at
+            // the Ctrl+C dialog, on this machine, who has already decided; the
+            // worst case there is a stop they asked for happening unobserved.
+            // This verb is reachable over a tunnel, where a dropped connection is
+            // routine and has causes that have nothing to do with intent — so
+            // proceeding would let a flaky network stop somebody's deck and tell
+            // no one why. Not stopping costs a retry; stopping costs the run.
             write_resp(&mut stream, &AttachResponse::ok()).await?;
             // The same graceful drain, with the same grace, as the
             // `KIND_SHUTDOWN` handler: one audited teardown path, not a second
