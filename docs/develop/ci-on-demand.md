@@ -1,0 +1,72 @@
+# Running the full CI matrix on demand, instead of on this box
+
+Issue #896. `.github/workflows/ci.yml` carries a bare `workflow_dispatch:` trigger, so any pushed branch can have the full matrix run on GitHub's runners with no local CPU at all. Nothing said so anywhere an agent would read it. The trigger itself is no secret — `release.yml`, `tag-release.yml` and `docs-publish.yml` are each described as `workflow_dispatch`-able in [`governance.md`](governance.md) and in their own skills — but `ci.yml`'s was written about nowhere, so every dispatched unit compiled everything locally, on a box already running the other units. This page is the mechanism, the commands, and the harder half: when to reach for it, and when reaching for it makes things worse.
+
+**It is a relocation, not a saving.** Nothing here removes work; it moves some of it onto a runner. [`build-gate.md`](build-gate.md) bounds how much of what stays here runs at once, and issue [#864](https://github.com/vfarcic/dot-agent-deck/issues/864) — `sccache`, a shared `CARGO_TARGET_DIR`, and the untouched `[profile.dev] debug` setting — is the change that attacks the cost itself. Reach for this when the box is the constraint today; reach for #864 when the question is how many agents this box can hold.
+
+## The commands
+
+```bash
+git push -u origin <branch>
+gh workflow run ci.yml --ref <branch>
+gh run list --workflow ci.yml --branch <branch> --limit 1
+gh run watch <run-id>                  # follow it
+gh run view <run-id> --log-failed      # read only what broke
+```
+
+`gh workflow run` prints a confirmation and exits immediately; it does **not** print the run id, and the run does not appear in `gh run list` for a few seconds after the dispatch. That gap is normal — poll rather than concluding the dispatch was rejected.
+
+## What a dispatch actually runs
+
+Eleven of `ci.yml`'s twelve jobs: `changes`, `desktop-web`, `desktop-browser`, `build`, `e2e-deterministic`, `windows-cross-check`, `build-windows`, `build-macos`, `security`, `nix` and `devbox`. The twelfth, `notify-main-red`, is gated on `github.event_name == 'push' && github.ref == 'refs/heads/main'` and is silent here by design.
+
+The full matrix, not a subset. The `changes` job skips the Rust jobs for a Renovate PR that touched only `devbox.*` or only the flake, and it reads `github.event.pull_request.user.login` to decide — which a `workflow_dispatch` payload does not carry, so the author check fails, the job exits early with `devbox_only=false` / `flake_only=false`, and every downstream `if:` passes. That is the same fail-safe the `push`-to-`main` runs rely on, and its own comment in `ci.yml` says so.
+
+Five of the eleven are the contexts the `main-protected` ruleset requires: `build`, `build-macos`, `build-windows`, `security`, `e2e-deterministic`. Read from the ruleset on 2026-09-15 and matching `scripts/apply-branch-protection.sh`'s `REQUIRED_CHECKS` default; re-read them with `gh api repos/{owner}/{repo}/rulesets/<id> --jq '.rules[] | select(.type=="required_status_checks") | .parameters.required_status_checks[].context'` rather than trusting this sentence.
+
+## What it will not cancel
+
+Since issue #1088 the concurrency key is `ci-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}` with `cancel-in-progress: ${{ github.event_name == 'pull_request' }}`, so a `workflow_dispatch` run gets a group keyed on its own `github.run_id` and never cancels. Two dispatches on one branch both complete, and a dispatch and a PR run on the same branch are in different groups and ignore each other. (Before #1088 the key was `ci-${{ github.ref }}` with an unconditional `cancel-in-progress: true`, where a second dispatch on one branch *would* have killed the first. Issue #896 was written against that version and its note about self-cancellation no longer applies.)
+
+The cost of that is the other direction: a dispatch you no longer care about keeps a runner busy until it finishes or you cancel it with `gh run cancel <run-id>`.
+
+## What it does not cover, and cannot
+
+- **Lane 2 — anything reaching a real agent.** No test that reaches a real agent runs on a runner, and that is a decision rather than a gap (CLAUDE.md rule 5, [`e2e-lanes.md`](e2e-lanes.md)). `cargo test-e2e-live <filter>` is yours to run whatever CI reports.
+- **The demo reel's `.cast` recordings.** CI records none; they are produced locally by running the relevant tests under `DOT_AGENT_DECK_RECORD=1` (PRD #180).
+- **Anything you have not committed and pushed.** A runner builds the pushed commit, so a green run attests to that commit and not to your working tree. A local gate cannot make that particular mistake, which is worth remembering when the thing you are about to dispatch is a fix you have only just written.
+
+## When to reach for it
+
+- **The box is loaded.** Several units compiling at once is the condition issue [#863](https://github.com/vfarcic/dot-agent-deck/issues/863) measured to `io full avg300=65.95` — two-thirds of a five-minute window with every runnable task blocked on disk, the CPU idle at `cpu some avg300=0.08`, and `ld` then invoking the OOM killer. A unit that has just been dispatched into a fresh worktree is the worst case: it has no `target/` at all, so its first `cargo clippy --workspace --all-targets --features e2e,e2e-live` is a cold build of the whole graph.
+- **A platform you do not have.** On a Linux host there is no local counterpart to `build-macos` at all: `scripts/` holds no Darwin cross-check, and the three test aliases compile for the host and nothing else. `build-windows` has a partial one — `scripts/windows-cross-check.sh` type-checks the workspace for `x86_64-pc-windows-msvc` from a Linux host ([`windows-cross-check.md`](windows-cross-check.md)) — but it runs `cargo check` rather than linking, runs no test and no clippy for that target, and cannot be held to `--features e2e` today. Both jobs are required contexts, so a break in either blocks the merge whether or not anything local could have seen it.
+- **A final pre-PR sweep**, when the unit would rather not pay for one locally. Opening the PR runs the same matrix anyway, so this buys the answer earlier, not an extra check.
+
+## When not to
+
+**Never as the per-edit gate.** CLAUDE.md rule 2's `cargo fmt --check` plus `cargo clippy --workspace --all-targets --features e2e,e2e-live -- -D warnings` and rule 5's `cargo test-fast` stay local. Warm, that clippy is **9.3–10.4s** (rule 2, measured 2026-08-31 on 16 cores) against a CI round trip whose median is **9.5 minutes** — 40 to 60 times slower, depending on how loaded the box is when you measure the local side (14.3s warm here on 2026-09-15 under load, against rule 2's 9.3–10.4s on a quiet box). Nothing about a remote gate makes an inner loop that slow acceptable, and a unit that dispatches CI after each edit will spend its whole run waiting.
+
+**The expensive half is compiling, not testing**, so "just run the tests in CI" fixes little. `cargo test-fast` spends about 26–29s *executing* (CLAUDE.md rule 5, measured 2026-08-31); the minutes go into the build in front of it. And lane 1 of the e2e tier is already off this box — issue #502 moved it to CI on every PR precisely because N units each running it was self-defeating.
+
+## The numbers
+
+Everything in this table was either measured for issue #896 on 2026-09-15 or is cited to where CLAUDE.md records it. Nothing is carried over from issue #896's own text, which measured a differently loaded box on a different day.
+
+| | value | where it came from |
+| --- | --- | --- |
+| a `ci.yml` run, median | **9.5 min** | the 37 completed runs among the last 60 listed, 2026-09-15: `gh run list --workflow ci.yml --limit 60 --json conclusion,createdAt,updatedAt` |
+| the same: min / p90 / max | 7.3 / 16.4 / 26.7 min | same sample |
+| rule 2's clippy, warm, quiet box | 9.3–10.4 s | CLAUDE.md rule 2, measured 2026-08-31 on 16 cores |
+| rule 2's clippy, warm, this box under load | **14.3 s** | measured for #896, 2026-09-15, same worktree once warm |
+| rule 2's clippy, cold, in a fresh dispatch worktree on a loaded box | **2m42s** | measured for #896, 2026-09-15, no `target/` at all, `/proc/pressure/io` at `full avg60=49.23` |
+| `cargo test-fast`, same worktree and box, wall | **4m48s** | measured for #896, 2026-09-15, immediately after that clippy run |
+| the same run: executing the 3118 tests | **37.1 s** | nextest's own summary line from that run |
+| `cargo test-fast`, executing, on a quiet box | ~26–29 s | CLAUDE.md rule 5, measured 2026-08-31 |
+
+Three things that table is saying. **The gap between the two `test-fast` rows is the whole argument**: 37.1 seconds of that 4m48s was running tests and the rest was the build in front of them, so a remote gate aimed at "the tests" relocates about a thirteenth of the cost. **The clippy figure is the cheap gate's cold cost, not the expensive one's** — `clippy` type-checks and never links, while `cargo test-fast` compiles for real and links the test binaries, which is the work [`build-gate.md`](build-gate.md) bounds and the work an OOM kill lands on. And **neither local figure is a true cold worst case**: the `test-fast` run followed the clippy run in the same worktree, so the registry was already unpacked and some artifacts were already there. A unit's genuine first build is worse than 4m48s, not better — which only widens the gap the table is about.
+
+The p90-to-max spread is worth reading before planning around the median: a queued runner or a slow `build-macos` turns a 9-minute answer into a 26-minute one, and nothing in the dispatch tells you which you are getting.
+
+## Where an agent is told this
+
+CLAUDE.md rule 5 carries the short version, next to the three tiers, because the question this answers is *where* a tier runs. The three dispatch skills — [`issue-queue`](../../.claude/skills/issue-queue/SKILL.md), [`prd-queue`](../../.claude/skills/prd-queue/SKILL.md) and [`pr-review-queue`](../../.claude/skills/pr-review-queue/SKILL.md) — put a line in the task text they compose, so a dispatched unit learns it the same way it learns the gates. What those four carry is the *when*, plus the two numbers that make the case; the mechanism, the sample behind the numbers and the narrowings live here, and that is the split to preserve when any of them is edited.

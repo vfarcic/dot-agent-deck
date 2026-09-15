@@ -450,6 +450,18 @@ GATES — CLAUDE.md is the authority, this is the summary:
   rather than reproducing it. Say this explicitly in the unit, because an agent
   reading an older PRD will otherwise run the full tier for tens of minutes on
   its own initiative.
+- WHERE those gates run is your choice. ci.yml carries a bare
+  `workflow_dispatch:`, so `git push -u origin <branch>` followed by
+  `gh workflow run ci.yml --ref <branch>` runs the full matrix on GitHub's
+  runners instead of this box, and `gh run list --workflow ci.yml --branch
+  <branch> --limit 1` finds the run. Use it when the box is loaded with other
+  units compiling, when the change needs build-macos or build-windows (no
+  local gate covers the first and only a partial one covers the second), or
+  as a final pre-PR sweep. NOT as the per-edit gate: a round trip has a
+  9.5-minute median against a 9.3-10.4s warm clippy. It relocates work rather
+  than removing it, the expensive half is compiling rather than testing, and
+  it covers neither lane 2 nor anything you have not pushed.
+  docs/develop/ci-on-demand.md has the detail.
 - Lane 2 — the files that reach a real agent, `cargo test-e2e-live <filter>`
   — runs on NO runner anywhere: no test that reaches a real agent runs in CI.
   Where the PRD touches a real-agent path, the unit runs those tests itself with
@@ -569,6 +581,15 @@ lifecycle, and it covers what /prd-full does not.
   Notifications section of your role template as load-bearing rather than
   optional. Send with `scripts/notify.sh "<message>"`; it enforces the explicit
   chat_id and has no inbound path, so those two rules hold by construction.
+- Where the gates run is a choice, and it is yours to pass on. ci.yml carries
+  a bare `workflow_dispatch:`, so the full matrix can run on GitHub's runners
+  instead of this box — push, then
+  `gh workflow run ci.yml --ref agent/dispatch-prd-<n>`. Reach for it when the
+  box is loaded with other units compiling, when a change needs build-macos or
+  build-windows, or as a final pre-PR sweep; never as a worker's per-edit gate,
+  where a 9.5-minute median round trip would replace a ~10s warm clippy. Your
+  workers run the gates and you do not, so tell whoever you delegate to.
+  docs/develop/ci-on-demand.md has the detail.
 - STOP CONDITION. Your workflow's step 7 pauses for the user's merge go-ahead.
   Under dispatch that pause is where this unit ENDS: send the merge-gate
   notification, report, and stop. Do not merge, and do not delegate a merge.
@@ -583,7 +604,7 @@ lifecycle, and it covers what /prd-full does not.
 > that already landed the document, a coupled PRD deliberately left out>
 ```
 
-Note what is **absent** from that template and deliberately so: the gate list from 8a. Workers get the gates from their own role templates — `compose_worker_task_file` (`src/state.rs:2224`) wraps each delegated task under `{role_template}\n\n## Task\n\n{task}` per delegation, so coder is already told to run `fmt`, `clippy` and the tests before committing, and tester is already told which tier a test belongs in and about rule 7's Scenario comments. Restating them at the orchestrator, which never runs a gate itself, adds a second copy that can disagree with the first. **Workers need no change from this skill at all** — that composition is separate and already correct.
+**The one line about *where* the gates run is not an exception to that.** It is in both templates because it is not a gate — it is a fact about the box, and the orchestrator is the only role in a team that knows how loaded the box is and how many workers it is about to put on it. A worker told to run `cargo clippy` and nothing else has no basis for choosing between here and a runner; the orchestrator does, and it is the one delegating. Note what is **absent** from that template and deliberately so: the gate list from 8a. Workers get the gates from their own role templates — `compose_worker_task_file` (`src/state.rs:2224`) wraps each delegated task under `{role_template}\n\n## Task\n\n{task}` per delegation, so coder is already told to run `fmt`, `clippy` and the tests before committing, and tester is already told which tier a test belongs in and about rule 7's Scenario comments. Restating them at the orchestrator, which never runs a gate itself, adds a second copy that can disagree with the first. **Workers need no change from this skill at all** — that composition is separate and already correct.
 
 ### Immediately before each dispatch
 
