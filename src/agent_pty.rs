@@ -11987,13 +11987,13 @@ mod spawn_tests {
         std::fs::read_to_string(&out).expect("the child must have reported a value")
     }
 
-    /// Run a git command in `dir`, asserting it succeeded. Identity is passed
-    /// per-invocation so the fixture neither depends on nor writes any ambient
-    /// git configuration.
-    fn git_fixture(dir: &std::path::Path, args: &[&str]) {
-        let out = std::process::Command::new("git")
-            .current_dir(dir)
-            .args(["-c", "user.email=t@t.t", "-c", "user.name=T"])
+    /// Run a git command in `dir`, asserting it succeeded. Routed through
+    /// `worktree_owner::fixture_git` — the one definition of the ambient-git
+    /// scrub — so an ambient `GIT_DIR` cannot make an `init`, a `commit` or a
+    /// `worktree add` here target, and move the HEAD of, the repository these
+    /// tests are running inside (issue #834's failure, in a fixture).
+    fn git_fixture(dir: &std::path::Path, sandbox: &std::path::Path, args: &[&str]) {
+        let out = crate::worktree_owner::fixture_git(dir, sandbox)
             .args(args)
             .output()
             .unwrap_or_else(|e| panic!("run git {args:?}: {e}"));
@@ -12012,14 +12012,16 @@ mod spawn_tests {
         let scratch = crate::test_temp::tempdir().expect("scratch tempdir");
         let checkout = scratch.path().join("repo");
         std::fs::create_dir_all(&checkout).expect("create the fixture checkout");
-        git_fixture(&checkout, &["init", "--quiet"]);
+        git_fixture(&checkout, scratch.path(), &["init", "--quiet"]);
         git_fixture(
             &checkout,
+            scratch.path(),
             &["commit", "--quiet", "--allow-empty", "-m", "i"],
         );
         let linked = scratch.path().join("repo-feature");
         git_fixture(
             &checkout,
+            scratch.path(),
             &[
                 "worktree",
                 "add",
@@ -12081,10 +12083,11 @@ mod spawn_tests {
         let plain = scratch.path().join("not-a-repo");
         std::fs::create_dir_all(&plain).expect("create a non-repo dir");
         // Asserted rather than assumed — if the temp root sat inside a
-        // repository this test would pass for the wrong reason.
+        // repository this test would pass for the wrong reason. Run through
+        // the same ambient-git scrub the resolver uses, so the precondition
+        // measures what the resolver will actually see.
         assert!(
-            !std::process::Command::new("git")
-                .current_dir(&plain)
+            !crate::worktree_owner::git_at(&plain)
                 .args(["rev-parse", "--git-dir"])
                 .output()
                 .expect("run git rev-parse")

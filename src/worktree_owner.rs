@@ -120,6 +120,91 @@ pub fn git_dir_of(worktree_path: &Path) -> Option<PathBuf> {
     rev_parse_path(worktree_path, "--git-dir")
 }
 
+/// The environment variables through which git's *location* discovery can be
+/// steered from outside this process (issue #834). Every one of them outranks
+/// the `current_dir` a command passes — measured in
+/// `xtask/linkage-check/src/repo_state.rs`, where an ambient `GIT_DIR` made
+/// `git -C <fixture> log` report a different repository's history entirely.
+///
+/// That matters more here than it does for a fixture, because the answer is
+/// exported into an agent's environment as
+/// [`crate::agent_pty::DOT_AGENT_DECK_MAIN_WORKTREE`]: a daemon lazy-spawned
+/// from inside a `rebase --exec`, a pre-commit hook or a `bisect run` carries
+/// one of these, and without the scrub every pane it starts would be told to
+/// write its durable report into whatever repository that variable named,
+/// however unrelated to the pane's own cwd. That is the one outcome this
+/// module's fail-closed posture exists to prevent, and it is not a failure a
+/// consumer could detect — the variable would be set, and confidently wrong.
+///
+/// Cleared rather than overridden, because for each of these "unset" *is* git's
+/// default. The list mirrors that file's `AMBIENT_LOCATION_VARS`, including
+/// `GIT_DISCOVERY_ACROSS_FILESYSTEM` for the same reason it gives.
+///
+/// `GIT_CEILING_DIRECTORIES` is deliberately NOT cleared, for a different
+/// reason than that file's: it can only *narrow* the upward walk, so an
+/// ambient one can make this return `None` but can never make it return a
+/// different repository — the fail-closed direction. Honouring it also leaves
+/// an operator's guard against walking a slow network mount in place, on a
+/// path that runs at every pane spawn.
+const AMBIENT_LOCATION_VARS: [&str; 8] = [
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_COMMON_DIR",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_NAMESPACE",
+    "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+];
+
+/// `git`, to be run from inside `dir`, with the ambient location environment
+/// switched off so the answer depends on `dir` and nothing else.
+///
+/// Every `git` invocation in this module goes through here, which also makes
+/// [`git_dir_of`] — and so the ownership gate and the reclaim path that deletes
+/// directories behind it — immune to the same ambient override.
+pub(crate) fn git_at(dir: &Path) -> Command {
+    let mut cmd = Command::new("git");
+    cmd.current_dir(dir);
+    for var in AMBIENT_LOCATION_VARS {
+        cmd.env_remove(var);
+    }
+    cmd
+}
+
+/// Test-only: `git`, to be run from inside `dir`, with the ambient git
+/// environment switched off in all three of the groups
+/// `xtask/linkage-check/src/repo_state.rs`'s `Sandbox` documents — so no
+/// fixture command can read or WRITE any repository outside `sandbox_root`,
+/// including the checkout the tests are running inside.
+///
+/// Location comes from [`git_at`], plus `GIT_CEILING_DIRECTORIES` bounding the
+/// upward walk at the sandbox root — production deliberately leaves that
+/// unset, a fixture deliberately sets it. Configuration is neutralized so no
+/// developer `~/.gitconfig` (or `includeIf`, or `init.templateDir` hook) reaches
+/// a fixture, and the commit identity is supplied by environment rather than by
+/// `git config`, so a fixture never writes into a repository to configure one.
+///
+/// Lives here rather than in either test module because both need it and they
+/// cannot share a `#[cfg(test)] mod tests` item — and because a second copy is
+/// exactly how the neutralization drifts out of step with [`git_at`].
+#[cfg(test)]
+pub(crate) fn fixture_git(dir: &Path, sandbox_root: &Path) -> Command {
+    let mut cmd = git_at(dir);
+    let absent = sandbox_root.join("no-such-gitconfig");
+    cmd.env("GIT_CONFIG_GLOBAL", &absent)
+        .env("GIT_CONFIG_SYSTEM", &absent)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("HOME", sandbox_root)
+        .env("XDG_CONFIG_HOME", sandbox_root)
+        .env("GIT_AUTHOR_NAME", "T")
+        .env("GIT_AUTHOR_EMAIL", "t@t.t")
+        .env("GIT_COMMITTER_NAME", "T")
+        .env("GIT_COMMITTER_EMAIL", "t@t.t")
+        .env("GIT_CEILING_DIRECTORIES", sandbox_root);
+    cmd
+}
+
 /// Run `git rev-parse <flag>` from inside `dir` and return the single path it
 /// answers with, or `None` on any failure at all — `git` missing, `dir` gone,
 /// a non-zero exit, an empty answer.
@@ -139,11 +224,7 @@ pub fn git_dir_of(worktree_path: &Path) -> Option<PathBuf> {
 /// relative to the *process* cwd). `--show-toplevel` is always absolute, so
 /// the join is a no-op there.
 fn rev_parse_path(dir: &Path, flag: &str) -> Option<PathBuf> {
-    let out = Command::new("git")
-        .current_dir(dir)
-        .args(["rev-parse", flag])
-        .output()
-        .ok()?;
+    let out = git_at(dir).args(["rev-parse", flag]).output().ok()?;
     if !out.status.success() {
         return None;
     }
@@ -734,20 +815,12 @@ mod tests {
     // either to the exact directory or to `None`; there is no third outcome.
     // ---------------------------------------------------------------------
 
-    /// Run a git command in `dir`, asserting it succeeded. Identity is passed
-    /// per-invocation rather than configured, so the fixture does not depend
-    /// on (or write to) any ambient git configuration.
-    fn git_in(dir: &Path, args: &[&str]) {
-        let out = Command::new("git")
-            .current_dir(dir)
-            .args([
-                "-c",
-                "user.email=t@t.t",
-                "-c",
-                "user.name=T",
-                "-c",
-                "commit.gpgsign=false",
-            ])
+    /// Run a git command in `dir`, asserting it succeeded. Every fixture
+    /// command goes through [`fixture_git`], so an ambient `GIT_DIR` cannot
+    /// make an `init`, a `commit` or a `worktree add` here target — and move
+    /// the HEAD of — the repository these tests are running inside.
+    fn git_in(dir: &Path, sandbox: &Path, args: &[&str]) {
+        let out = fixture_git(dir, sandbox)
             .args(args)
             .output()
             .unwrap_or_else(|e| panic!("run git {args:?}: {e}"));
@@ -761,10 +834,14 @@ mod tests {
 
     /// An ordinary checkout with one commit, so `git worktree add` has a
     /// commit-ish to branch from.
-    fn checkout_with_a_commit(at: &Path) {
+    fn checkout_with_a_commit(at: &Path, sandbox: &Path) {
         std::fs::create_dir_all(at).expect("create the fixture checkout dir");
-        git_in(at, &["init", "--quiet"]);
-        git_in(at, &["commit", "--quiet", "--allow-empty", "-m", "init"]);
+        git_in(at, sandbox, &["init", "--quiet"]);
+        git_in(
+            at,
+            sandbox,
+            &["commit", "--quiet", "--allow-empty", "-m", "init"],
+        );
     }
 
     /// Compare through `canonicalize`: on macOS the temp root is reached via a
@@ -782,7 +859,7 @@ mod tests {
     fn main_worktree_of_answers_the_checkout_itself_for_an_ordinary_repo() {
         let scratch = crate::test_temp::tempdir().expect("scratch tempdir");
         let repo = scratch.path().join("repo");
-        checkout_with_a_commit(&repo);
+        checkout_with_a_commit(&repo, scratch.path());
 
         let got = main_worktree_of(&repo).expect("an ordinary checkout IS a main worktree");
         assert_eq!(canon(&got), canon(&repo));
@@ -796,7 +873,7 @@ mod tests {
     fn main_worktree_of_answers_the_checkout_root_from_a_subdirectory() {
         let scratch = crate::test_temp::tempdir().expect("scratch tempdir");
         let repo = scratch.path().join("repo");
-        checkout_with_a_commit(&repo);
+        checkout_with_a_commit(&repo, scratch.path());
         let deep = repo.join("a/b/c");
         std::fs::create_dir_all(&deep).expect("create a nested subdirectory");
 
@@ -816,10 +893,11 @@ mod tests {
     fn main_worktree_of_answers_the_main_checkout_from_a_linked_worktree() {
         let scratch = crate::test_temp::tempdir().expect("scratch tempdir");
         let repo = scratch.path().join("repo");
-        checkout_with_a_commit(&repo);
+        checkout_with_a_commit(&repo, scratch.path());
         let linked = scratch.path().join("repo-feature");
         git_in(
             &repo,
+            scratch.path(),
             &[
                 "worktree",
                 "add",
@@ -850,7 +928,7 @@ mod tests {
         let scratch = crate::test_temp::tempdir().expect("scratch tempdir");
         let bare = scratch.path().join("repo.git");
         std::fs::create_dir_all(&bare).expect("create the fixture bare dir");
-        git_in(&bare, &["init", "--quiet", "--bare"]);
+        git_in(&bare, scratch.path(), &["init", "--quiet", "--bare"]);
 
         assert_eq!(
             main_worktree_of(&bare),
@@ -866,15 +944,17 @@ mod tests {
     fn main_worktree_of_is_none_for_a_linked_worktree_of_a_bare_repository() {
         let scratch = crate::test_temp::tempdir().expect("scratch tempdir");
         let seed = scratch.path().join("seed");
-        checkout_with_a_commit(&seed);
+        checkout_with_a_commit(&seed, scratch.path());
         let bare = scratch.path().join("repo.git");
         git_in(
             &seed,
+            scratch.path(),
             &["clone", "--quiet", "--bare", ".", &bare.to_string_lossy()],
         );
         let linked = scratch.path().join("bare-worktree");
         git_in(
             &bare,
+            scratch.path(),
             &[
                 "worktree",
                 "add",
@@ -905,6 +985,7 @@ mod tests {
         std::fs::create_dir_all(&checkout).expect("create the fixture checkout dir");
         git_in(
             &checkout,
+            scratch.path(),
             &[
                 "init",
                 "--quiet",
@@ -913,6 +994,7 @@ mod tests {
         );
         git_in(
             &checkout,
+            scratch.path(),
             &["commit", "--quiet", "--allow-empty", "-m", "i"],
         );
 
@@ -939,6 +1021,7 @@ mod tests {
         std::fs::create_dir_all(&checkout).expect("create the fixture checkout dir");
         git_in(
             &checkout,
+            scratch.path(),
             &[
                 "init",
                 "--quiet",
@@ -947,11 +1030,13 @@ mod tests {
         );
         git_in(
             &checkout,
+            scratch.path(),
             &["commit", "--quiet", "--allow-empty", "-m", "i"],
         );
         let linked = scratch.path().join("linked");
         git_in(
             &checkout,
+            scratch.path(),
             &[
                 "worktree",
                 "add",
@@ -996,6 +1081,136 @@ mod tests {
         );
 
         assert_eq!(main_worktree_of(&plain), None);
+    }
+
+    // --- ambient git location environment (issue #834, PR #1110 review) ---
+
+    /// Covers temporary process-env mutation in this module's tests. nextest
+    /// gives each test its own process, so this only serializes the tests that
+    /// share one under a plain `cargo test`.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Set every ambient location variable at `victim` for the duration of
+    /// `body`, restoring whatever was there before. `Command` snapshots the
+    /// parent's environment when it spawns, so setting them here is enough to
+    /// reproduce the condition a daemon inherits mid-`rebase --exec`, in a
+    /// pre-commit hook, or under `bisect run` — no re-exec needed.
+    fn with_ambient_git_dir_at(victim: &Path, body: impl FnOnce()) {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let vars = [
+            ("GIT_DIR", victim.join(".git")),
+            ("GIT_WORK_TREE", victim.to_path_buf()),
+            ("GIT_COMMON_DIR", victim.join(".git")),
+        ];
+        let prior: Vec<_> = vars
+            .iter()
+            .map(|(k, _)| (*k, std::env::var_os(k)))
+            .collect();
+        // SAFETY: serialized by ENV_LOCK; every prior value is restored below.
+        unsafe {
+            for (k, v) in &vars {
+                std::env::set_var(k, v);
+            }
+        }
+        body();
+        unsafe {
+            for (k, v) in prior {
+                match v {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+    }
+
+    /// The resolver must answer for the directory it was given and nothing
+    /// else. An ambient `GIT_DIR` outranks the `current_dir` a command passes
+    /// (issue #834 measured exactly that), and here the consequence is not a
+    /// confusing test failure but a *wrong path exported into an agent's
+    /// environment* — the variable set, and confidently naming a repository
+    /// the pane has nothing to do with. That is the one outcome the
+    /// fail-closed posture cannot catch, because the answer looks fine.
+    #[test]
+    fn main_worktree_of_ignores_an_ambient_git_dir() {
+        let scratch = crate::test_temp::tempdir().expect("scratch tempdir");
+        let repo = scratch.path().join("repo");
+        checkout_with_a_commit(&repo, scratch.path());
+        let linked = scratch.path().join("repo-feature");
+        git_in(
+            &repo,
+            scratch.path(),
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                "feature",
+                &linked.to_string_lossy(),
+            ],
+        );
+        let victim = scratch.path().join("victim");
+        checkout_with_a_commit(&victim, scratch.path());
+
+        with_ambient_git_dir_at(&victim, || {
+            let got = main_worktree_of(&linked).expect("the pane's own repo still resolves");
+            assert_eq!(
+                canon(&got),
+                canon(&repo),
+                "the answer must come from the directory passed in, never from an \
+                 ambient GIT_DIR the daemon happened to inherit"
+            );
+            assert_ne!(canon(&got), canon(&victim));
+        });
+    }
+
+    /// The fixtures themselves must not be steerable either. An ambient
+    /// `GIT_DIR` turns `init` / `commit` / `worktree add` into writes against
+    /// the repository it names — which on a developer's machine is the
+    /// checkout these tests are running inside, whose HEAD then moves. Proved
+    /// by recording the victim's HEAD, building a whole fixture under an
+    /// ambient `GIT_DIR` aimed at it, and requiring the HEAD not to have moved.
+    #[test]
+    fn a_fixture_built_under_an_ambient_git_dir_does_not_touch_it() {
+        let scratch = crate::test_temp::tempdir().expect("scratch tempdir");
+        let victim = scratch.path().join("victim");
+        checkout_with_a_commit(&victim, scratch.path());
+        let head_of = |at: &Path| {
+            let out = fixture_git(at, scratch.path())
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .expect("run git rev-parse HEAD");
+            assert!(
+                out.status.success(),
+                "fixture precondition: HEAD must resolve"
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        let before = head_of(&victim);
+
+        with_ambient_git_dir_at(&victim, || {
+            let repo = scratch.path().join("repo");
+            checkout_with_a_commit(&repo, scratch.path());
+            let linked = scratch.path().join("repo-feature");
+            git_in(
+                &repo,
+                scratch.path(),
+                &[
+                    "worktree",
+                    "add",
+                    "--quiet",
+                    "-b",
+                    "feature",
+                    &linked.to_string_lossy(),
+                ],
+            );
+        });
+
+        assert_eq!(
+            head_of(&victim),
+            before,
+            "a fixture command reached the repository named by the ambient GIT_DIR and \
+             moved its HEAD — on a contributor's machine that repository is this checkout"
+        );
     }
 
     /// A cwd that no longer exists resolves to nothing rather than to
