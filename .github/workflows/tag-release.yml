@@ -103,11 +103,21 @@ jobs:
           fi
 
       # `ref: main` (not the dispatch SHA) so the release is cut from main's tip
-      # at the moment the job starts, and `fetch-depth: 0` so `analyze.sh` can
-      # read the tag list and the existing-tag guard below can see every tag.
+      # at the moment the job starts.
+      #
+      # THE TAGS ARE THE POINT of `fetch-depth: 0` here, not the history:
+      # `analyze.sh` derives the current version from `git tag --list 'v*'`, and
+      # the existing-tag guard below reads the same refs. `fetch-tags: true` is
+      # redundant with `fetch-depth: 0` — which the `build` job already relies on
+      # for `git describe` — but it is one line and it removes the need for a
+      # reader to know that. Worth knowing anyway: an empty tag list would make
+      # `analyze.sh` start from `v0.0.0` and propose `v0.0.1`, which cannot match
+      # the version the operator supplied, so the failure mode is a refusal
+      # rather than a wrong tag.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
+          fetch-tags: true
           ref: main
           token: ${{ secrets.RELEASE_TOKEN }}
 
