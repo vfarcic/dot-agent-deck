@@ -290,13 +290,35 @@ export interface Artifact {
 
 /**
  * Which top-level surface is mounted. A discriminated union from the start even
- * though it carries only two variants today, so PRD #745 iteration 3's group
- * and single-agent views arrive as added variants rather than as a refactor of
- * a boolean. No router library is warranted for this.
+ * though it carried only two variants for its first two PRDs, so PRD #745
+ * iteration 3's group and single-agent views arrive as added variants rather
+ * than as a refactor of a boolean. No router library is warranted for this.
  */
 export type DeckView =
   | { kind: "deck" }
-  | { kind: "overview" };
+  | { kind: "overview" }
+  /**
+   * PRD #1105 M2 — one agent's pane, OVER the screen it was opened from.
+   *
+   * The first two variants REPLACE the mounted screen, and `DeckShell` says so
+   * in its own doc comment. This one deliberately does not: an overlay that
+   * unmounted the screen beneath it would re-declare that screen's shown
+   * terminal set, and a nine-tile deck coming back costs five re-attaches and
+   * five scrollback replays. So `from` names the base screen to keep mounted
+   * underneath, and closing is `setView({ kind: from })`.
+   *
+   * `from` is also the ONLY record of where back goes. There is no history
+   * stack and none is wanted: a view reachable from two screens has to carry
+   * which one it came from anyway, and carrying it in the value makes a direct
+   * initial agent view — one with no prior navigation at all — close to the
+   * right place by construction.
+   *
+   * `deckId` is here even though nothing in M2/M3/M5 reads it, because the
+   * overview merges every observed deck's agents and an agent id is per-daemon
+   * monotonic: `agentId` alone names an agent on the selected deck and a
+   * DIFFERENT agent on any other. M6's cross-deck switch is what consumes it.
+   */
+  | { kind: "agent"; deckId: string; agentId: string; from: "deck" | "overview" };
 
 /**
  * An agent's tab membership exactly as the daemon reports it, mirroring

@@ -20,7 +20,7 @@ import { createFixtureFleet, createFixtureSnapshot, FIXTURE_DAEMON_ID, FIXTURE_P
 import { DEFAULT_DESKTOP_SETTINGS, type DesktopSettingsDto, PENDING_DECK_MESSAGE, pendingDeckSnapshot, unconfiguredDeckSnapshot } from "../lib/bridge";
 import { DISPLAY_LIMITS } from "../lib/displayText";
 import { UNREPORTED } from "../types";
-import type { AgentSession, DeckRuntimeState, DeckSnapshot } from "../types";
+import type { AgentSession, DeckRuntimeState, DeckSnapshot, DeckView } from "../types";
 
 /**
  * The overview's central claim is that it mounts no terminal. Spying on the
@@ -1403,6 +1403,34 @@ describe("AgentOverview", () => {
     expect(container.querySelectorAll(".terminal-viewport, .agent-panel, .agent-tile, canvas")).toHaveLength(0);
   });
 
+  /**
+   * Scenario: render the terminal-free overview and activate the Planner
+   * card's keyboard-reachable open control. It navigates with the card's
+   * composite identity and overview origin without mounting a terminal itself.
+   */
+  it("opens an overview card as an agent view without putting a terminal on the overview", () => {
+    const onNavigate = vi.fn();
+    window.localStorage.setItem(OVERVIEW_COLUMNS_STORAGE_KEY, JSON.stringify({ columns: ALL_OVERVIEW_COLUMNS }));
+    render(<AgentOverview runtime={runtime({ snapshot: createFixtureSnapshot("connected") })} onNavigate={onNavigate} />);
+
+    const card = screen.getByTestId(`overview-agent-${agentKey({ daemonId: FIXTURE_DAEMON_ID, id: "planner" })}`);
+    const open = within(card).getByRole("button", { name: "Open Plan / architecture agent" });
+    expect(open.tagName).toBe("BUTTON");
+    open.focus();
+    expect(open).toHaveFocus();
+
+    fireEvent.click(open);
+    expect(onNavigate).toHaveBeenCalledOnce();
+    expect(onNavigate).toHaveBeenCalledWith({
+      kind: "agent",
+      deckId: FIXTURE_DAEMON_ID,
+      agentId: "planner",
+      from: "overview",
+    });
+    expect(terminalMounted).not.toHaveBeenCalled();
+    expect(screen.queryAllByTestId(/^terminal-/)).toHaveLength(0);
+  });
+
   it("says the control channel is still opening rather than listing a fleet it has not read", () => {
     const snapshot = createFixtureSnapshot("crowded");
     snapshot.connection = { status: "loading", socketPath: FIXTURE_DAEMON_ID, message: "Connecting to the daemon" };
@@ -1805,6 +1833,77 @@ describe("DeckShell", () => {
   });
 
   afterEach(() => vi.unstubAllGlobals());
+
+  const agentView = (from: "deck" | "overview"): DeckView => ({
+    kind: "agent",
+    deckId: FIXTURE_DAEMON_ID,
+    agentId: "planner",
+    from,
+  } as unknown as DeckView);
+
+  /**
+   * Scenario: start directly in a deck-origin agent view, with no navigation
+   * history to consult. The deck grid stays mounted below the named dialog,
+   * and its close control returns to the deck recorded in the view value.
+   */
+  it("renders a deck-origin agent view over the mounted deck and closes back to it", () => {
+    render(<DeckShell runtime={runtime({ snapshot: createFixtureSnapshot("connected") })} initialView={agentView("deck")} />);
+
+    const overlay = screen.getByTestId("agent-pane-overlay");
+    expect(overlay).toHaveAttribute("role", "dialog");
+    expect(overlay).toHaveAccessibleName("Planner agent");
+    expect(overlay).toHaveAttribute("aria-modal", "true");
+    expect(within(overlay).getByRole("heading", { name: "Planner" })).toBeVisible();
+    expect(document.querySelector(".agent-grid")).toBeInTheDocument();
+    expect(screen.getByTestId("agent-tile-builder")).toBeInTheDocument();
+    expect(screen.queryByTestId("overview-table-region")).not.toBeInTheDocument();
+
+    fireEvent.click(within(overlay).getByRole("button", { name: "Close Planner agent" }));
+    expect(screen.queryByTestId("agent-pane-overlay")).not.toBeInTheDocument();
+    expect(document.querySelector(".agent-grid")).toBeVisible();
+    expect(screen.getByTestId("agent-tile-planner")).toBeVisible();
+    expect(screen.queryByTestId("overview-table-region")).not.toBeInTheDocument();
+  });
+
+  /**
+   * Scenario: start directly in an overview-origin agent view, again without
+   * history. The terminal-free overview stays mounted below the pane, whose
+   * sole terminal disappears when Close returns to the recorded overview.
+   */
+  it("renders an overview-origin agent view over the mounted overview and closes back to it", () => {
+    render(<DeckShell runtime={runtime({ snapshot: createFixtureSnapshot("connected") })} initialView={agentView("overview")} />);
+
+    const overview = screen.getByTestId("overview-table-region");
+    const overlay = screen.getByTestId("agent-pane-overlay");
+    expect(overview).toBeInTheDocument();
+    expect(within(overview).queryAllByTestId(/^terminal-/)).toHaveLength(0);
+    expect(within(overlay).getByTestId("terminal-planner")).toBeVisible();
+    expect(terminalMounted).toHaveBeenCalledTimes(1);
+    expect(terminalMounted).toHaveBeenCalledWith("planner");
+    expect(screen.queryByTestId("agent-tile-builder")).not.toBeInTheDocument();
+
+    fireEvent.click(within(overlay).getByRole("button", { name: "Close Planner agent" }));
+    expect(screen.queryByTestId("agent-pane-overlay")).not.toBeInTheDocument();
+    expect(screen.getByTestId("overview-table-region")).toBeVisible();
+    expect(screen.getByTestId(`overview-agent-${agentKey({ daemonId: FIXTURE_DAEMON_ID, id: "planner" })}`)).toBeVisible();
+    expect(screen.queryAllByTestId(/^terminal-/)).toHaveLength(0);
+  });
+
+  /**
+   * Scenario: start directly in an overview-origin agent view and press Escape
+   * at window. The pane closes to the origin carried by that view even though
+   * no browser history entry or prior screen transition exists.
+   */
+  it("closes an agent view on Escape to the origin recorded in the view", () => {
+    render(<DeckShell runtime={runtime({ snapshot: createFixtureSnapshot("connected") })} initialView={agentView("overview")} />);
+
+    expect(screen.getByTestId("agent-pane-overlay")).toBeVisible();
+    fireEvent.keyDown(window, { key: "Escape" });
+
+    expect(screen.queryByTestId("agent-pane-overlay")).not.toBeInTheDocument();
+    expect(screen.getByTestId("overview-table-region")).toBeVisible();
+    expect(screen.queryByTestId("agent-tile-planner")).not.toBeInTheDocument();
+  });
 
   it("opens on the deck and reaches the overview from the rail without mounting a terminal", () => {
     render(<DeckShell runtime={runtime({ snapshot: createFixtureSnapshot("connected") })} />);

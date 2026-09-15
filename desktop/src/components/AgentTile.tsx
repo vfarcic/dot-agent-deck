@@ -9,6 +9,7 @@ import {
   FileCode2,
   GitCompareArrows,
   Handshake,
+  Maximize2,
   Pencil,
   ShieldCheck,
   SquareTerminal,
@@ -36,15 +37,16 @@ const tabs: { id: PanelTab; label: string; icon: typeof SquareTerminal }[] = [
   { id: "artifacts", label: "Artifacts", icon: Box },
 ];
 
-interface AgentTileProps {
+export interface AgentTileProps {
   agent: AgentSession;
   /**
    * PRD #1105 M1 — which of this component's two presentations to render.
    *
    * Required rather than defaulted to `"tile"`, so a new render site has to
-   * say which of the two it is instead of inheriting one silently. There is
-   * exactly one render site today (`App.tsx`'s `.agent-grid`), so the cost of
-   * requiring it is one line.
+   * say which of the two it is instead of inheriting one silently. M3 made
+   * `App.tsx`'s `AgentPaneFrame` the only thing that renders this component,
+   * at either presentation, so the prop is set in exactly one place and the
+   * cost of requiring it stayed one line.
    *
    * The four differences M1 established, recorded here because this prop is
    * where a later implementer will look for them:
@@ -108,6 +110,23 @@ interface AgentTileProps {
   appliedGeometry?: { rows: number; cols: number };
   onEvidenceSelect: (id: string) => void;
   onRename?: (agentId: string, displayName: string) => Promise<void>;
+  /**
+   * PRD #1105 M5 — enlarge this agent, supplied only by a parent that owns the
+   * view. A capability rather than a `presentation` branch, for the reason
+   * `onRename` is one: the affordance exists exactly when somebody can honour
+   * it, and a tile rendered by a caller with no navigation (every standalone
+   * `ControlDeck` in the tests) must not offer a control that does nothing.
+   */
+  onOpen?: () => void;
+  /**
+   * PRD #1105 M2 — close the pane, the mirror of {@link AgentTileProps.onOpen}.
+   *
+   * Deliberately NOT derived from `presentation`: closing acts on the VIEW and
+   * this component holds no view state, so "is this rendered as an overlay" and
+   * "can this be closed" are two facts and only one of them is a presentation.
+   * The wrapper that positions the tile is what supplies it.
+   */
+  onClose?: () => void;
 }
 
 function formatTokens(tokens: number): string {
@@ -131,6 +150,8 @@ export function AgentTile({
   appliedGeometry,
   onEvidenceSelect,
   onRename,
+  onOpen,
+  onClose,
 }: AgentTileProps) {
   const handleInput = useCallback((data: string) => {
     void onTerminalInput(agent.id, data);
@@ -144,6 +165,17 @@ export function AgentTile({
   // inline status condition and the composer's own copy of it could.
   const input = terminalInputState(agent, inputResult);
   const fixture = mode === "fixture";
+  /**
+   * PRD #1105 M1 difference 4. The Reader launcher is `"tile"`-only, and
+   * hiding the BUTTON is not enough: `readerOpen` is reset only when
+   * `agent.id` changes, so a user with the Reader open on this tile who then
+   * enlarges this same agent would carry `true` across and mount an
+   * `OutputReader` inside the overlay — whose `window` `keydown` listener and
+   * the overlay's would both answer one `Escape`, closing the Reader AND the
+   * pane behind it. So the render is gated too, and the state is simply
+   * unreachable at overlay presentation.
+   */
+  const overlay = presentation === "overlay";
   const [renameDraft, setRenameDraft] = useState<string>();
   const [readerOpen, setReaderOpen] = useState(false);
   useEffect(() => { setRenameDraft(undefined); setReaderOpen(false); }, [agent.id]);
@@ -215,9 +247,37 @@ export function AgentTile({
           no attempt was reported. Live mode used to hardcode `1`, so every tile
           printed `ATT 01` as if the daemon tracked retries; it tracks none.
         */}
-        <div className="agent-attempt" title={agent.attempt === undefined ? "No attempt count is reported by the deck" : "Current attempt"}>
-          <span>ATT</span>
-          <strong>{agent.attempt === undefined ? "—" : agent.attempt.toString().padStart(2, "0")}</strong>
+        <div className="agent-header-actions">
+          <div className="agent-attempt" title={agent.attempt === undefined ? "No attempt count is reported by the deck" : "Current attempt"}>
+            <span>ATT</span>
+            <strong>{agent.attempt === undefined ? "—" : agent.attempt.toString().padStart(2, "0")}</strong>
+          </div>
+          {/*
+            PRD #1105 M5's deck entry point, and M2's way back out. Both are
+            native `<button>`s in the header rather than a click handler on the
+            article, because the article already owns `onMouseDown` for
+            selection and a whole-tile activation would have no keyboard
+            equivalent, no role and no accessible name. The name carries the
+            agent so a deck of nine reads as nine distinct controls.
+          */}
+          {onOpen && (
+            <button
+              className="agent-pane-control"
+              aria-label={`Open ${agent.role} agent`}
+              title={`Open ${agent.displayName} in a full-window pane`}
+              onMouseDown={(event) => event.stopPropagation()}
+              onClick={onOpen}
+            ><Maximize2 size={13} /></button>
+          )}
+          {onClose && (
+            <button
+              className="agent-pane-control"
+              aria-label={`Close ${agent.role} agent`}
+              title={`Close ${agent.displayName} and go back`}
+              onMouseDown={(event) => event.stopPropagation()}
+              onClick={onClose}
+            ><X size={14} /></button>
+          )}
         </div>
       </header>
 
@@ -260,19 +320,21 @@ export function AgentTile({
             {id === "checks" && agent.checks.length > 0 && <em>{agent.checks.length}</em>}
           </button>
         ))}
-        <button
-          className="reader-open"
-          data-testid={`reader-open-${agent.id}`}
-          title="Open a large readable view of this agent's output"
-          onMouseDown={(event) => event.stopPropagation()}
-          onClick={() => setReaderOpen(true)}
-        >
-          <BookOpenText size={13} aria-hidden="true" />
-          <span>Reader</span>
-        </button>
+        {!overlay && (
+          <button
+            className="reader-open"
+            data-testid={`reader-open-${agent.id}`}
+            title="Open a large readable view of this agent's output"
+            onMouseDown={(event) => event.stopPropagation()}
+            onClick={() => setReaderOpen(true)}
+          >
+            <BookOpenText size={13} aria-hidden="true" />
+            <span>Reader</span>
+          </button>
+        )}
       </div>
 
-      {readerOpen && <OutputReader agent={agent} onClose={() => setReaderOpen(false)} />}
+      {!overlay && readerOpen && <OutputReader agent={agent} onClose={() => setReaderOpen(false)} />}
 
       <div className="agent-panel" role="tabpanel">
         {tab === "terminal" && (

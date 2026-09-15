@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import {
   Activity,
   AlertTriangle,
@@ -34,7 +34,7 @@ import {
   Zap,
 } from "lucide-react";
 import { AgentOverview } from "./components/AgentOverview";
-import { AgentTile } from "./components/AgentTile";
+import { AgentTile, type AgentTileProps } from "./components/AgentTile";
 import { ConfirmDialog, type ConfirmState } from "./components/ConfirmDialog";
 import { DeckSelector } from "./components/DeckSelector";
 import { HandoffRail } from "./components/HandoffRail";
@@ -116,6 +116,11 @@ export default function App() {
  *
  * The deck stays the default: launching the app lands exactly where it does
  * today.
+ *
+ * PRD #1105 M2 narrowed the first sentence rather than repealing it. The two
+ * SCREEN variants still replace one another; the `"agent"` variant does not —
+ * it names the screen to keep mounted underneath and renders the pane over it,
+ * which is why the switch below reads `base` rather than `view.kind`.
  */
 export function DeckShell({ runtime, workflowPlatformIssue, initialView = { kind: "deck" } }: { runtime: DeckRuntimeState; workflowPlatformIssue?: string; initialView?: DeckView }) {
   const [view, setView] = useState<DeckView>(initialView);
@@ -134,8 +139,143 @@ export function DeckShell({ runtime, workflowPlatformIssue, initialView = { kind
    */
   const settings = useDesktopSettings(runtime);
   useZoom(runtime, settings);
-  if (view.kind === "overview") return <AgentOverview runtime={runtime} settings={settings} onNavigate={setView} />;
-  return <DeckSurface runtime={runtime} settings={settings} workflowPlatformIssue={workflowPlatformIssue} onNavigate={setView} />;
+  const agentView = view.kind === "agent" ? view : undefined;
+  /**
+   * Back, and the whole of it. The destination is read off the view rather
+   * than popped from a stack, so an agent view that was never navigated TO —
+   * the app's `initialView`, a future deep link — closes to a real screen
+   * instead of to nothing.
+   */
+  const closeAgent = useCallback(() => setView((current) => (current.kind === "agent" ? { kind: current.from } : current)), []);
+  /**
+   * `Escape`, bound at `window` because the pane has no single focusable owner
+   * — focus is usually inside xterm's helper textarea, which swallows keys
+   * before React sees them.
+   *
+   * Exactly ONE `window` `keydown` listener exists for the pane, and that is a
+   * property of the pane's contents rather than of this line: `OutputReader`
+   * binds one too, `stopPropagation` does nothing between two listeners on the
+   * same target, and the order is registration order. `AgentTile` therefore
+   * renders no Reader at overlay presentation (see its `presentation` prop), so
+   * the two can never be up together.
+   */
+  useEffect(() => {
+    if (!agentView) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") closeAgent();
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [agentView, closeAgent]);
+  const base = agentView?.from ?? view.kind;
+  if (base === "overview") {
+    return (
+      <>
+        <AgentOverview runtime={runtime} settings={settings} onNavigate={setView} />
+        {/*
+          The overview mounts no terminal of its own (PRD #745's commitment), so
+          there is no tile here to promote and the pane is a sibling of the
+          screen rather than a promotion inside it. That still leaves exactly
+          one live `TerminalViewport` for the agent, which is the property M3
+          actually requires.
+        */}
+        {agentView && <OverviewAgentPane runtime={runtime} view={agentView} onClose={closeAgent} />}
+      </>
+    );
+  }
+  return <DeckSurface runtime={runtime} settings={settings} workflowPlatformIssue={workflowPlatformIssue} onNavigate={setView} openAgentId={agentView?.agentId} onCloseAgent={closeAgent} />;
+}
+
+/**
+ * The pane over the OVERVIEW, with the tile state the deck would otherwise
+ * have owned.
+ *
+ * Split out for the hook, not for the rendering: the panel tab is component
+ * state and the agent lookup can fail, so the two cannot live in
+ * {@link DeckShell}'s body without either a conditional hook or a `tabs` map
+ * kept for a screen that has no tiles.
+ *
+ * An agent that is not in the snapshot renders nothing — the deck can retire a
+ * pane while its overlay is open, and PRD #1105 records what that should LOOK
+ * like as an open question. `Escape` still closes the view, because that
+ * listener is {@link DeckShell}'s and not this component's.
+ */
+function OverviewAgentPane({ runtime, view, onClose }: { runtime: DeckRuntimeState; view: Extract<DeckView, { kind: "agent" }>; onClose: () => void }) {
+  const [tab, setTab] = useState<PanelTab>("terminal");
+  const agent = runtime.snapshot.agents.find((candidate) => candidate.id === view.agentId);
+  if (!agent) return null;
+  return (
+    <AgentPaneFrame
+      open
+      agent={agent}
+      mode={runtime.mode}
+      selected
+      tab={tab}
+      terminalFeed={runtime.terminalFeed}
+      evidence={runtime.snapshot.evidence}
+      inputResult={runtime.terminalInputResults?.[agent.id]}
+      onSelect={() => undefined}
+      onTabChange={setTab}
+      onTerminalInput={runtime.sendTerminalInput}
+      onTerminalResize={runtime.resizeTerminal}
+      appliedGeometry={runtime.appliedGeometry?.[agent.id]}
+      /* The evidence drawer is the deck's, and no screen is mounted here that
+         could open it — so the handoffs tab lists evidence and selecting one
+         does nothing, rather than pretending at a drawer that is not there.
+         `onRename` is absent for the sharper version of the same reason: a
+         rename reports its outcome through the deck's toast, and a rename that
+         fails silently is worse than a header without the pencil. Both are
+         capabilities this screen genuinely lacks rather than presentation
+         differences, which is why neither is expressed through
+         `presentation`. */
+      onEvidenceSelect={() => undefined}
+      onClose={onClose}
+    />
+  );
+}
+
+/**
+ * PRD #1105 M3 — the pane's WRAPPER, and the reason it is rendered whether or
+ * not the pane is open.
+ *
+ * It positions {@link AgentTile} and carries the dialog chrome AROUND it; it
+ * renders no part of the pane itself. That line is what keeps the PRD's "no
+ * `AgentTileLarge`" criterion checkable — everything inside the box is one
+ * component at two presentations, and everything outside it is position and
+ * role.
+ *
+ * **Always rendered, because promote-in-place is a property of the React
+ * tree.** React reconciles children by position, key and TYPE, so this element
+ * has to exist at the tile's position in both states: flipping `open` then
+ * changes this `div`'s attributes and the tile's `presentation`, and React
+ * keeps the same `AgentTile` fiber, the same `TerminalViewport` beneath it and
+ * therefore the same xterm instance with its scrollback, selection and cursor.
+ * Rendering the wrapper only when open would swap a `div` in where an
+ * `AgentTile` was, which is an unmount — a rebuilt xterm and a client-side
+ * transcript re-write on every open and every close.
+ *
+ * Closed, the wrapper is `display: contents`, so `.agent-tile` remains the
+ * grid item it has always been and the deck's layout is untouched.
+ */
+function AgentPaneFrame({ open, onOpen, onClose, ...tile }: Omit<AgentTileProps, "presentation"> & { open: boolean }) {
+  return (
+    <div
+      className={open ? "agent-pane-overlay" : "agent-pane-slot"}
+      data-testid={open ? "agent-pane-overlay" : undefined}
+      role={open ? "dialog" : undefined}
+      aria-modal={open ? "true" : undefined}
+      aria-label={open ? `${tile.agent.role} agent` : undefined}
+    >
+      <AgentTile
+        {...tile}
+        presentation={open ? "overlay" : "tile"}
+        /* One control at a time, and by construction: the pane that is open
+           offers Close and the tiles behind it offer Open. */
+        onOpen={open ? undefined : onOpen}
+        onClose={open ? onClose : undefined}
+      />
+    </div>
+  );
 }
 
 /**
@@ -154,7 +294,7 @@ export function ControlDeck(props: { runtime: DeckRuntimeState; workflowPlatform
   return <DeckSurface {...props} settings={settings} />;
 }
 
-export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktopWorkflowPlatformIssue(), onNavigate }: { runtime: DeckRuntimeState; settings: DesktopSettingsState; workflowPlatformIssue?: string; onNavigate?: (view: DeckView) => void }) {
+export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktopWorkflowPlatformIssue(), onNavigate, openAgentId, onCloseAgent }: { runtime: DeckRuntimeState; settings: DesktopSettingsState; workflowPlatformIssue?: string; onNavigate?: (view: DeckView) => void; openAgentId?: string; onCloseAgent?: () => void }) {
   const { snapshot, mode, setShownTerminals } = runtime;
   const [selectedAgentId, setSelectedAgentId] = useState("");
   const [tabs, setTabs] = useState<Record<string, PanelTab>>({});
@@ -775,11 +915,22 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
           </header>
           {snapshot.connection.status === "loading" && !snapshot.agents.length ? <LoadingDeck /> : snapshot.agents.length ? (
             <div className="agent-grid">
+              {/*
+                PRD #1105 M3. Every tile goes through {@link AgentPaneFrame},
+                including every one that is NOT open, so opening a pane is a
+                change of attributes on an element that is already there rather
+                than a different element in its place. That is what keeps the
+                xterm instance — and with it the one-viewport-per-agent rule,
+                which the module-level `terminalRegistry` needs rather than
+                merely prefers: it is keyed by bare agent id, so a second live
+                viewport would overwrite the first's registration and the
+                first's unmount would then clean up nothing.
+              */}
               {snapshot.agents.map((agent) => (
-                <AgentTile
+                <AgentPaneFrame
                   key={agent.id}
+                  open={agent.id === openAgentId}
                   agent={agent}
-                  presentation="tile"
                   mode={mode}
                   selected={agent.id === selectedAgentId}
                   tab={tabs[agent.id] ?? "terminal"}
@@ -794,6 +945,19 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
                   appliedGeometry={runtime.appliedGeometry?.[agent.id]}
                   onEvidenceSelect={(id) => { setSelectedEvidenceId(id); setEvidenceOpen(true); }}
                   onRename={mode === "live" ? renameAgent : undefined}
+                  /*
+                    Opening SELECTS as well, which is the difference between the
+                    overlay's `selected` being harmlessly degenerate and being
+                    true: one pane is on screen, so it is the selected one. It
+                    also settles `@media (max-width: 680px)`'s
+                    `.agent-tile:not(.is-selected) { display: none }` for the
+                    promoted tile without relying on a specificity race.
+                  */
+                  onOpen={onNavigate && (() => {
+                    setSelectedAgentId(agent.id);
+                    onNavigate({ kind: "agent", deckId: agent.daemonId, agentId: agent.id, from: "deck" });
+                  })}
+                  onClose={onCloseAgent}
                 />
               ))}
             </div>

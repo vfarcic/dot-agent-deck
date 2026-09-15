@@ -1,5 +1,5 @@
-import { useEffect, useId, useMemo, useRef, useState, type CSSProperties, type ReactNode } from "react";
-import { Blocks, Boxes, Columns3, LayoutList, Layers, Network, RefreshCw, RotateCcw, ShieldAlert, Sparkles, SquareTerminal, Wrench } from "lucide-react";
+import { createContext, useCallback, useContext, useEffect, useId, useMemo, useRef, useState, type CSSProperties, type ReactNode } from "react";
+import { Blocks, Boxes, Columns3, LayoutList, Layers, Maximize2, Network, RefreshCw, RotateCcw, ShieldAlert, Sparkles, SquareTerminal, Wrench } from "lucide-react";
 import type { AgentSession, AgentStatus, ConnectionView, DeckRuntimeState, DeckView } from "../types";
 import { modeScopedKey } from "../lib/bridge";
 import { ConfirmDialog, type ConfirmState } from "./ConfirmDialog";
@@ -563,6 +563,25 @@ const WRITE_LEASE_TITLE: Record<"read" | "write" | "none", string> = {
 };
 
 /**
+ * PRD #1105 M5 — how a row's open control reaches the navigation callback.
+ *
+ * A context rather than one more prop on each of `DeckGroup`, `DaemonBody`,
+ * `OverviewGroupCard` and `OverviewRow`, and the reason is the same one
+ * `lib/settingsBridge` gives: three of those four would only FORWARD it. They
+ * are layout components about decks, groups and columns, and a callback about
+ * views threaded through their signatures is noise every later reader has to
+ * re-derive as noise.
+ *
+ * The default is `undefined` rather than a no-op, and the row renders no
+ * control at all when it reads one: a row outside {@link AgentOverview} has no
+ * view to navigate, and a control that silently does nothing is worse than an
+ * absent one. {@link AgentOverview} is the only provider and always supplies a
+ * callback, so today that branch is a guarantee about the type rather than a
+ * state the app reaches.
+ */
+const OpenAgentContext = createContext<((agent: OverviewAgent) => void) | undefined>(undefined);
+
+/**
  * The fleet at a glance: every agent the desktop can see, grouped the way the
  * daemon groups them, described only by things that are actually true — and
  * with no terminal anywhere on it. "Shows no output" and "opens no PTY" are
@@ -687,6 +706,21 @@ export function AgentOverview({ runtime, settings, onNavigate }: { runtime: Deck
   const known = aggregate.decksUp > 0;
   const countOf = (status: AgentStatus) => aggregate.counts.find((entry) => entry.status === status)?.count ?? 0;
   const openDeck = () => onNavigate({ kind: "deck" });
+  /**
+   * PRD #1105 M5 — the overview's entry point into an agent's pane.
+   *
+   * The composite `(daemonId, id)` goes into the view rather than the bare id,
+   * because this screen merges every observed deck and agent ids are per-daemon
+   * monotonic: `"1"` names one agent here and a different one on the deck
+   * beside it. M6 is what consumes `deckId`; it is carried from the start so
+   * the value does not have to change shape to acquire it.
+   *
+   * `from: "overview"` is what closing reads, and it is the whole of the back
+   * behaviour — no history, no stack.
+   */
+  const openAgent = useCallback((agent: OverviewAgent) => {
+    onNavigate({ kind: "agent", deckId: agent.daemonId, agentId: agent.id, from: "overview" });
+  }, [onNavigate]);
   const [confirm, setConfirm] = useState<ConfirmState>();
   const [overrideError, setOverrideError] = useState<string>();
   /**
@@ -722,7 +756,11 @@ export function AgentOverview({ runtime, settings, onNavigate }: { runtime: Deck
     });
   };
 
-  return (
+  /*
+    Named rather than returned directly, so the provider below can wrap it
+    without re-indenting eighty lines of screen for one line of plumbing.
+  */
+  const overviewScreen = (
     <div className="control-deck overview-screen">
       <aside className="rail" aria-label="Primary navigation">
         <div className="brand-mark" aria-label="Agent Deck"><span>AD</span><i aria-hidden="true" /></div>
@@ -807,6 +845,7 @@ export function AgentOverview({ runtime, settings, onNavigate }: { runtime: Deck
       {confirm && <ConfirmDialog state={confirm} onClose={() => setConfirm(undefined)} />}
     </div>
   );
+  return <OpenAgentContext.Provider value={openAgent}>{overviewScreen}</OpenAgentContext.Provider>;
 }
 
 /** One deck of the fleet, as {@link AgentOverview} prepares it for rendering. */
@@ -1420,6 +1459,15 @@ function OverviewRow({ agent, hoistedCwd, now, columns }: { agent: OverviewAgent
     `src/untrusted_text.rs`; it is fixed by saying something visible instead.
   */
   const name = displayIdentity(agent.displayName, DISPLAY_LIMITS.name, unnamedAgentLabel(agent));
+  /*
+    PRD #1105 M5 — the only thing this milestone adds to a card, and the limit
+    is deliberate: #745's commitment is that these rows stay terminal-free, so
+    the row gains a control that NAVIGATES and gains nothing that renders
+    output. Its accessible name is built from `name` rather than from
+    `agent.displayName`, so the sanitised, clamped copy is what a screen reader
+    announces and a hostile display name cannot spell a different button.
+  */
+  const openAgent = useContext(OpenAgentContext);
   // ONE instant for the whole screen, ticked by `useOverviewClock` so these two
   // cells keep counting between daemon events. Passed down rather than read
   // here so every row on a repaint is relative to the same moment rather than
@@ -1464,6 +1512,14 @@ function OverviewRow({ agent, hoistedCwd, now, columns }: { agent: OverviewAgent
             */}
             {agent.writeLease && <span className={`overview-lease lease-${agent.writeLease}`} title={WRITE_LEASE_TITLE[agent.writeLease]}>{agent.writeLease}</span>}
             {roleName && !rendersBlank(roleName) && roleLabel?.toLowerCase() !== agent.displayName.toLowerCase() && <em className="overview-role-name">{roleName}</em>}
+            {openAgent && (
+              <button
+                className="overview-open-agent"
+                aria-label={`Open ${name} agent`}
+                title={`Open ${name} in a full-window pane`}
+                onClick={() => openAgent(agent)}
+              ><Maximize2 size={12} /></button>
+            )}
           </td>
         );
       case "lastActivityMs":

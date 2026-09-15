@@ -1185,3 +1185,59 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
    mystery icon in a menu of words. */
 .overview-columns-reset { margin-top: 6px; padding: 4px 5px; display: flex; align-items: center; gap: 5px; border: 0; border-top: 1px solid var(--line); border-radius: 0 0 3px 3px; background: none; color: var(--muted); font-size: 9.5px; cursor: pointer; }
 .overview-columns-reset:hover { color: var(--ink); background: var(--paper-strong); }
+
+/* ---- PRD #1105: one agent's pane, over the screen it was opened from ---- */
+/* The frame around every tile, open or not. Closed it is `display: contents`,
+   so `.agent-tile` stays the grid item it has always been and nothing about the
+   deck's layout moves — the element exists only so React has a stable position
+   to promote the tile IN, rather than unmounting it into an overlay. */
+.agent-pane-slot { display: contents; }
+/* Open, the same element is the dialog. `position: fixed` takes it out of the
+   grid's flow entirely, so the tiles behind it re-flow one cell and keep their
+   size — `.agent-grid`'s columns are a fixed template, and `ResizeObserver`
+   fires on box size rather than position, so this costs no extra geometry
+   report. `inset: 0` with no margin is what makes the box the window, which is
+   what the browser tier measures. Between `.reader-overlay` (80) and
+   `.dialog-backdrop` (100): a modal dialog still belongs on top of a pane. */
+.agent-pane-overlay { position: fixed; z-index: 90; inset: 0; margin: 0; display: flex; padding: 14px; background: rgb(var(--scrim-rgb) / .74); }
+/* Every rule below is keyed off `data-presentation`, the seam M1 put on the
+   tile, and every one of them exists to outrank something. The compound
+   `.agent-tile[data-presentation="overlay"]` is (0,2,0) rather than the (0,1,0)
+   an attribute selector alone would be, which is what it takes to beat
+   `@media (max-width: 680px)`'s `.agent-tile:not(.is-selected)` — `:not()`
+   carries its argument's specificity, so that rule is (0,2,0) too and this one
+   wins on source order, being last in the file. Media queries add no
+   specificity of their own. */
+.agent-tile[data-presentation="overlay"] { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; border-color: var(--teal-focus); box-shadow: 0 28px 70px rgb(var(--scrim-rgb) / .55); }
+/* The terminal's box, and the whole of "enlarging really enlarges": drop the
+   tile's fixed 42vh band for whatever the window leaves after the header,
+   assignment, instruments, tabs and footer. `TerminalViewport` measures its own
+   host under a `ResizeObserver`, so the bigger box reports a bigger geometry
+   through the path that already exists and no measurement code changes.
+   `display: none` here is what `@media (max-width: 680px)` would otherwise
+   leave, which is a pane with no terminal in it at all. */
+[data-presentation="overlay"] .agent-panel { min-height: 0; height: auto; max-height: none; flex: 1 1 auto; display: flex; }
+[data-presentation="overlay"] .agent-tabs { display: flex; }
+/* The tab labels. They are hidden by a `min-width: 1450px` media query, which
+   asks how wide the WINDOW is when the question is how wide this PANE is — a
+   pane-width question a media query structurally cannot answer, and the overlay
+   is the case where the two answers differ. */
+[data-presentation="overlay"] .agent-tabs button span { display: inline; }
+[data-presentation="overlay"] .agent-tabs button { min-width: 61px; }
+/* The two-line clamp exists for a half-width tile. Nothing else in the header
+   is removed or compacted: in the grid, position tells a reader which tile they
+   are looking at, and in the pane that context is gone, so identity matters
+   MORE here rather than less. */
+[data-presentation="overlay"] .agent-assignment p { display: block; -webkit-line-clamp: none; }
+
+/* The header's right-hand group: the attempt read-out and whichever of Open and
+   Close this tile was given. One `<div>` so the header's `space-between` still
+   has exactly two children and the identity block keeps the whole left side. */
+.agent-header-actions { flex: 0 0 auto; display: flex; align-items: center; gap: 2px; }
+.agent-pane-control { width: 26px; height: 26px; display: grid; place-items: center; border: 1px solid transparent; border-radius: 4px; color: var(--faint); background: transparent; cursor: pointer; }
+.agent-pane-control:hover { color: var(--teal); border-color: var(--teal-focus); background: var(--teal-soft); }
+/* The overview's entry control. `margin-left: auto` puts it at the end of the
+   name cell rather than beside the name, so a long display name is still
+   clamped by its own `text-overflow` and the control never moves. */
+.overview-open-agent { flex: 0 0 auto; margin-left: auto; width: 20px; height: 20px; display: grid; place-items: center; border: 1px solid transparent; border-radius: 4px; color: var(--faint); background: transparent; cursor: pointer; }
+.overview-open-agent:hover, .overview-open-agent:focus-visible { color: var(--teal); border-color: var(--teal-focus); background: var(--teal-soft); }

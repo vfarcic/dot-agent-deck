@@ -1,7 +1,7 @@
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { useMemo, useState } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { createFixtureSnapshot } from "./data/fixture";
+import { createFixtureSnapshot, FIXTURE_DAEMON_ID } from "./data/fixture";
 import { WINDOWS_WORKFLOW_BLOCK_REASON } from "./lib/platform";
 import { DEFAULT_DESKTOP_SETTINGS, type DesktopSettingsDto } from "./lib/bridge";
 import type { AgentSession, DaemonOrchestration, DaemonProject, DaemonResolvedProject, DeckRuntimeState, SendResult } from "./types";
@@ -208,6 +208,31 @@ describe("ControlDeck", () => {
     expect(screen.getByTestId("agent-tile-builder")).toBeVisible();
     expect(screen.getByTestId("terminal-builder")).toBeVisible();
     expect(screen.getByTestId("evidence-drawer")).toBeVisible();
+  });
+
+  /**
+   * Scenario: render the deck and activate Planner's keyboard-reachable open
+   * control. The tile navigates with Planner's composite identity and records
+   * that closing the resulting agent pane must return to the deck.
+   */
+  it("opens a deck tile as an agent view whose origin is the deck", () => {
+    const onNavigate = vi.fn();
+    render(<ControlDeck runtime={runtime()} onNavigate={onNavigate} />);
+
+    const tile = screen.getByTestId("agent-tile-planner");
+    const open = within(tile).getByRole("button", { name: "Open Planner agent" });
+    expect(open.tagName).toBe("BUTTON");
+    open.focus();
+    expect(open).toHaveFocus();
+
+    fireEvent.click(open);
+    expect(onNavigate).toHaveBeenCalledOnce();
+    expect(onNavigate).toHaveBeenCalledWith({
+      kind: "agent",
+      deckId: FIXTURE_DAEMON_ID,
+      agentId: "planner",
+      from: "deck",
+    });
   });
 
   /**
