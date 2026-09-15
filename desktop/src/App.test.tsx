@@ -19,11 +19,13 @@ import { SETTINGS_SECTIONS } from "./lib/settingsRegistry";
  * Backed by a plain object so a remount reads back what an earlier render
  * saved, which is what makes the persistence assertions mean anything.
  */
-function settingsStore(initial?: Partial<DesktopSettingsDto>, path?: string) {
+function settingsStore(initial?: Partial<DesktopSettingsDto>, path?: string, problem?: string) {
   let document: DesktopSettingsDto = { ...DEFAULT_DESKTOP_SETTINGS, ...initial };
   return {
     get current() { return document; },
-    getSettings: vi.fn(async () => ({ settings: structuredClone(document), path })),
+    // `problem` is why the document could not be read (issue #1072); absent for
+    // every store but the one test that is about it.
+    getSettings: vi.fn(async () => ({ settings: structuredClone(document), path, problem })),
     saveSettings: vi.fn(async (next: DesktopSettingsDto) => {
       document = structuredClone(next);
       return structuredClone(document);
@@ -1426,6 +1428,38 @@ describe("ControlDeck", () => {
     // Applied anyway: the user asked for it and can see it.
     expect(document.documentElement.getAttribute("data-theme")).toBe("dark");
     expect(screen.getByRole("radio", { name: /Dark/ })).toBeChecked();
+  });
+
+  /**
+   * Scenario (issue #1072): the `desktop.toml` on disk cannot be read, so the
+   * app came up on defaults. Open Settings and the panel says what is wrong and
+   * where in the file, before the user has touched anything — and the footer
+   * names the file itself, which is the other half of "where".
+   *
+   * The symptom this replaces is the whole point: the app looked like a fresh
+   * install, said nothing anybody would see, and destroyed the document on the
+   * next click.
+   */
+  it("says why the settings look reset when the document on disk cannot be read", async () => {
+    const store = settingsStore(
+      undefined,
+      "/home/dev/.config/dot-agent-deck/desktop.toml",
+      "The desktop settings file cannot be read: line 3, column 9 is not valid settings. This session is using default settings, and nothing will be saved over the file until it is fixed or removed.",
+    );
+    // `live`, because the footer's answer to "where" is the other half of this
+    // and the browser preview has no file to name.
+    render(<ControlDeck runtime={runtime({ mode: "live", getSettings: store.getSettings, saveSettings: store.saveSettings })} />);
+
+    fireEvent.click(screen.getByTestId("open-settings"));
+
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent("line 3, column 9");
+    expect(alert).toHaveTextContent("nothing will be saved over the file");
+    // Not a failed save: the user has made no change, and claiming one would
+    // send them looking for a click they never made.
+    expect(alert).not.toHaveTextContent("saving it failed");
+    expect(store.saveSettings).not.toHaveBeenCalled();
+    expect(screen.getByTestId("settings-location")).toHaveTextContent("desktop.toml");
   });
 
   /**

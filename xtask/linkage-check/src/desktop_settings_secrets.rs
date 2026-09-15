@@ -327,7 +327,7 @@ const KEYLESS_MEMBERS: [&str; 3] = ["clear", "key", "length"];
 /// name scan on this side would repeat the mistake #827 is about: `endpoint:
 /// string` passes any name check and is a free-text field. A diff here is the
 /// review prompt.
-const PINNED_TS_FIELDS: [(&str, &str, &str); 15] = [
+const PINNED_TS_FIELDS: [(&str, &str, &str); 16] = [
     ("DesktopSettingsDto", "version", "number"),
     (
         "DesktopSettingsDto",
@@ -367,6 +367,14 @@ const PINNED_TS_FIELDS: [(&str, &str, &str); 15] = [
     // — and `DesktopSettingsSnapshot`'s Rust doc comment records why that is
     // not in tension with the error paths refusing to name a path.
     ("DesktopSettingsSnapshotDto", "path?", "string"),
+    // The second legitimate string, and it is a DIAGNOSTIC rather than a value
+    // (issue #1072): why the app is on defaults, built from a `line N, column N`
+    // locator plus fixed prose. It is never a byte of the document — which is
+    // precisely the property #827 needs here, because `toml::de::Error`'s own
+    // `Display` echoes the offending value and this string reaches a webview.
+    // Pinned on the Rust side by
+    // `a_document_problem_carries_a_locator_and_never_the_documents_bytes`.
+    ("DesktopSettingsSnapshotDto", "problem?", "string"),
 ];
 
 /// The keys the desktop app stores under, and the literal each one is built

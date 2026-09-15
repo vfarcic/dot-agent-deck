@@ -1738,15 +1738,49 @@ describe("desktop settings (PRD 803)", () => {
     const bridge = new TauriDeckBridge();
     // The read answers with the document AND where it lives, so the settings
     // surface can name the file without a second round trip (PRD #803 M3).
+    // No `problem` key, because the document loaded — the Rust side omits it
+    // rather than sending an empty string (issue #1072).
     expect(await bridge.getSettings()).toEqual({
       settings: DEFAULT_DESKTOP_SETTINGS,
       path: "/home/dev/.config/dot-agent-deck/desktop.toml",
+      problem: undefined,
     });
     expect(invoke).toHaveBeenCalledWith("desktop_get_settings");
 
     expect(await bridge.saveSettings(stored)).toEqual(stored);
     expect(invoke).toHaveBeenCalledWith("desktop_set_settings", { settings: stored });
     await bridge.dispose();
+  });
+
+  /**
+   * Issue #1072: the reason a document could not be read rides on the snapshot,
+   * so the settings surface can explain a reset it would otherwise present as a
+   * fresh install. Coerced like every other field — the normaliser builds its
+   * result rather than copying its input, so a non-string is dropped rather than
+   * handed to a render.
+   */
+  it("carries the unreadable-document reason, and drops one that is not a string", async () => {
+    const { TauriDeckBridge, DEFAULT_DESKTOP_SETTINGS } = await import("./bridge");
+    const problem = "The desktop settings file cannot be read: line 3, column 9 is not valid settings. This session is using default settings, and nothing will be saved over the file until it is fixed or removed.";
+    invoke.mockImplementation(async (command: string) => {
+      if (command === "desktop_get_settings") {
+        return { settings: DEFAULT_DESKTOP_SETTINGS, path: "/home/dev/.config/dot-agent-deck/desktop.toml", problem };
+      }
+      return { ok: true };
+    });
+    const bridge = new TauriDeckBridge();
+    expect((await bridge.getSettings()).problem).toBe(problem);
+    await bridge.dispose();
+
+    invoke.mockImplementation(async (command: string) => {
+      if (command === "desktop_get_settings") {
+        return { settings: DEFAULT_DESKTOP_SETTINGS, problem: { line: 3 } };
+      }
+      return { ok: true };
+    });
+    const coerced = new TauriDeckBridge();
+    expect((await coerced.getSettings()).problem).toBeUndefined();
+    await coerced.dispose();
   });
 
   it("surfaces a failed settings read as well as a failed save, rather than fabricating a document", async () => {

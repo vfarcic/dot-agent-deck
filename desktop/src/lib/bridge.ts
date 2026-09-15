@@ -556,6 +556,24 @@ function normalizeRemoteEndpoint(value: unknown): RemoteEndpointDto | undefined 
 export interface DesktopSettingsSnapshotDto {
   settings: DesktopSettingsDto;
   path?: string;
+  /**
+   * Why `settings` is this build's defaults rather than the user's document
+   * (issue #1072), when it is.
+   *
+   * A whole sentence, ready to render: what is wrong, where in the file, and
+   * that nothing will be written over it meanwhile. Absent means the document
+   * loaded — the Rust side omits the key entirely rather than sending an empty
+   * string, so there is nothing to compare against.
+   *
+   * It is a **locator** (`line 3, column 9`) plus fixed prose and never a byte
+   * of the document or a filesystem path, which is the same rule the parse
+   * diagnostic follows and for the same reason (issue #827): `toml`'s own error
+   * echoes the offending value. The path is carried beside it, in `path`.
+   *
+   * Present also means **saving is refused**: the app will not publish its
+   * defaults over a document it could not read.
+   */
+  problem?: string;
 }
 
 /**
@@ -637,6 +655,7 @@ export function normalizeDesktopSettingsSnapshot(value: unknown): DesktopSetting
   return {
     settings: normalizeDesktopSettings(record.settings),
     path: typeof record.path === "string" && record.path ? record.path : undefined,
+    problem: typeof record.problem === "string" && record.problem ? record.problem : undefined,
   };
 }
 

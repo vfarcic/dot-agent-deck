@@ -18,10 +18,22 @@
 //!
 //! # Failure behaviour
 //!
-//! **Loading never fails.** A missing file, an unparseable file, an unreadable
-//! file, an unusable path and an unknown enum value all yield defaults —
-//! exactly as `DashboardConfig::load()` does. A settings file is not worth
-//! failing an app launch over, so the failure is logged and never propagated.
+//! **Loading never fails, and since issue #1072 it is not silent either.** A
+//! missing file, an unparseable file, an unreadable file, an unusable path and
+//! an unknown enum value all still yield defaults, and the app still comes up —
+//! a settings file is not worth failing an app launch over. What changed is
+//! that [`load_document`] now RETURNS the reason as a
+//! [`SettingsDocumentProblem`] instead of logging it and dropping it, so
+//! [`load_snapshot`] can hand the user a sentence and [`save_to`] can refuse.
+//!
+//! **A document this build cannot read is never overwritten.** That is the whole
+//! of #1072 and it is the property to preserve: defaults in memory plus a merge
+//! that makes the struct authoritative meant the *next save* replaced every key
+//! the schema owns — appearance, zoom, endpoints, the deck selection — with this
+//! build's defaults. The app looked normal, said nothing a user would see, and
+//! the original was gone one click later. [`save_to`] now re-reads the document
+//! and refuses; a user who cannot save a preference is in a better position than
+//! one whose configuration has been destroyed.
 //!
 //! **The path is vetted and the read is bounded.** [`read_document`] requires
 //! an absolute path with a file name whose target is absent or a regular file,
@@ -602,10 +614,15 @@ pub struct UnconfiguredDeck {
 ///
 /// A row with no host is not a row, and a row with no id cannot be selected. A
 /// document whose row is missing one of them fails to parse, which — per
-/// [`load_from`] — means the whole document reads as defaults with a locator
-/// logged. It does **not** mean the file is rewritten: [`merged_document`]
-/// parses the existing document as TOML *syntax*, which a schema-invalid row
-/// still is, so the row survives on disk for the user to fix.
+/// [`load_document`] — means the whole document reads as defaults, with the
+/// reason carried to the settings surface rather than only logged. It does
+/// **not** mean the file is rewritten, and since issue #1072 that is a
+/// **refusal** rather than a lucky property of the merge: [`save_to`] will not
+/// publish over a document this build cannot read, so the row and everything
+/// around it survives on disk for the user to fix. It used to rest on
+/// [`merged_document`] parsing the existing document as TOML *syntax*, which a
+/// schema-invalid row still is — true of the row, and no help at all to the
+/// appearance, zoom and selection the merge replaced with defaults beside it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RemoteEndpointSettings {
     pub host: Hostname,
@@ -1153,9 +1170,11 @@ impl<'de> Deserialize<'de> for ZoomLevel {
 ///
 /// `level = 1` in a hand-edited `desktop.toml` is a TOML *integer*, and `f64`'s
 /// derived deserializer rejects it with `invalid type: integer`. That failure is
-/// not local: [`load_from`] treats an unparseable document as "use defaults", so
-/// one plausible hand edit would silently reset the user's **appearance** too.
-/// Accepting the integer costs three lines and removes that.
+/// not local: [`load_document`] treats an unparseable document as "use
+/// defaults", so one plausible hand edit takes the user's **appearance** with it
+/// for the session — and, before issue #1072 made that refuse to save rather
+/// than publish, took it on disk as well. Accepting the integer costs three
+/// lines and removes the whole shape.
 struct ZoomLevelVisitor;
 
 impl serde::de::Visitor<'_> for ZoomLevelVisitor {
@@ -1207,15 +1226,43 @@ pub struct DesktopSettingsSnapshot {
     /// [`SETTINGS_PATH_ENV`] pointed somewhere else, since the footer's job is
     /// to name the file this process will actually write.
     pub path: String,
+    /// Why `settings` is this build's defaults rather than the user's document
+    /// (issue #1072), when it is.
+    ///
+    /// [`SettingsDocumentProblem::public`], so it carries a **locator** and
+    /// never a byte of the document or a filesystem path — the path is already
+    /// beside it in [`Self::path`], deliberately and for the reason above.
+    ///
+    /// Omitted from the wire when `None`, the way
+    /// [`crate::dto::DesktopConnection::selection_fallback`] is and for the same
+    /// reason: this is a sentence to render, and "no sentence" is exactly what
+    /// absence should mean. Present, it also means **saving is refused** — the
+    /// settings surface says so in those words, because a user whose file is in
+    /// this state needs to know before they start changing things, not after.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub problem: Option<String>,
 }
 
-/// [`load_from`] against [`settings_path`], plus that path, for the settings
-/// surface. This is how the app loads its settings.
+/// [`load_document`] against [`settings_path`], plus that path and the reason
+/// the document could not be used, for the settings surface. This is how the app
+/// loads its settings.
+///
+/// The one place a [`SettingsDocumentProblem`] is both logged and handed onward:
+/// the **detail** half goes to the app's log because it may name the path, and
+/// the **public** half rides to the webview because a user who cannot see why
+/// their settings look reset is the whole of issue #1072.
 pub fn load_snapshot() -> DesktopSettingsSnapshot {
     let path = settings_path();
+    let (settings, problem) = load_document(&path);
+    if let Some(problem) = &problem {
+        log_document_problem(problem);
+    }
     DesktopSettingsSnapshot {
-        settings: load_from(&path),
+        settings,
         path: path.display().to_string(),
+        // The public half and only the public half: this struct is serialised
+        // straight to the webview.
+        problem: problem.map(|problem| problem.public().to_string()),
     }
 }
 
@@ -1273,6 +1320,105 @@ fn path_error(reason: &str, path: &Path) -> SettingsWriteError {
     }
 }
 
+/// The sentence every document problem ends with: what the app did instead, and
+/// what it will not do until the file is readable again.
+///
+/// Carried in the **public** half, because it is the half a user reads and the
+/// half that answers the question they actually have — "why do my settings look
+/// reset?" — which the old `eprintln!` never reached anybody to answer.
+const UNREADABLE_CONSEQUENCE: &str = "This session is using default settings, \
+     and nothing will be saved over the file until it is fixed or removed.";
+
+/// Why the document on disk could not be loaded as settings (issue #1072).
+///
+/// Split exactly the way [`SettingsWriteError`] is and for the same reason:
+/// [`Self::detail`] names the path and belongs in the app's own log,
+/// [`Self::public`] is what crosses the bridge and never does.
+///
+/// # A state the app carries, not an event it logs
+///
+/// Loading answered every failure with `DesktopSettings::default()` and an
+/// `eprintln!` nobody reads, so the app came up looking entirely normal with
+/// every setting at its default — and the next save wrote those defaults over
+/// the user's file, because [`merged_document`] makes the struct authoritative
+/// over every key it owns. A malformed document therefore did not present as an
+/// error at all. It presented as "my settings reset themselves", one save later,
+/// with the original already gone.
+///
+/// So this value is carried rather than dropped: it rides on
+/// [`DesktopSettingsSnapshot`] to the settings surface, and [`save_to`] refuses
+/// for as long as the document is in this state. Preserving the user's bytes is
+/// the property that matters here — a refusal to save is a better outcome than
+/// a destructive save.
+///
+/// # It carries a locator and never the document's bytes
+///
+/// The rule [`invalid_document_log`] already followed (issue #827), now applying
+/// to a string that reaches a **webview** as well as a log: `toml::de::Error`'s
+/// `Display` echoes the offending value twice, so neither half is built from it.
+/// Pinned by [`tests::a_document_problem_carries_a_locator_and_never_the_documents_bytes`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SettingsDocumentProblem {
+    detail: String,
+    public: String,
+}
+
+impl SettingsDocumentProblem {
+    /// The operator-facing message, including the path. Log this.
+    pub fn detail(&self) -> &str {
+        &self.detail
+    }
+
+    /// The webview-facing message. Contains no path.
+    pub fn public(&self) -> &str {
+        &self.public
+    }
+}
+
+impl std::fmt::Display for SettingsDocumentProblem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.detail)
+    }
+}
+
+impl std::error::Error for SettingsDocumentProblem {}
+
+/// A path-level failure is a document problem too.
+///
+/// [`read_document`] refuses a FIFO, a symlink, an over-limit file and one that
+/// is not UTF-8 — and the app is then on defaults for exactly the same reason a
+/// parse failure puts it there. [`save_to`] already refused these before #1072,
+/// by propagating the same error; what was missing is that nothing told the
+/// **user** why their settings looked reset.
+impl From<SettingsWriteError> for SettingsDocumentProblem {
+    fn from(error: SettingsWriteError) -> Self {
+        Self {
+            detail: error.detail,
+            public: format!("{} {UNREADABLE_CONSEQUENCE}", as_sentence(&error.public)),
+        }
+    }
+}
+
+/// A lowercase error fragment rendered as a sentence: first character
+/// capitalised, terminated with a full stop.
+///
+/// Both halves of the split are written as **fragments**, because they are
+/// composed into a larger message at every existing call site. A document
+/// problem is rendered on its own by the settings surface, so it has to read as
+/// a sentence rather than as the tail of one.
+fn as_sentence(fragment: &str) -> String {
+    let mut sentence = String::with_capacity(fragment.len() + 1);
+    let mut chars = fragment.chars();
+    if let Some(first) = chars.next() {
+        sentence.extend(first.to_uppercase());
+        sentence.push_str(chars.as_str());
+    }
+    if !sentence.ends_with(['.', '!', '?']) {
+        sentence.push('.');
+    }
+    sentence
+}
+
 /// The largest settings document this build will read.
 ///
 /// `desktop.toml` is a hand-edited preferences file: today's default document
@@ -1286,8 +1432,8 @@ pub const MAX_SETTINGS_BYTES: u64 = 256 * 1024;
 /// Vet `path` as the settings document and read it, bounded.
 ///
 /// `Ok(None)` is the ordinary first-run case: nothing is there yet. `Err` means
-/// the path cannot be a settings document at all — [`load_from`] logs it and
-/// falls back to defaults, and [`save_to`] refuses rather than writing over
+/// the path cannot be a settings document at all — [`load_document`] reports it
+/// and falls back to defaults, and [`save_to`] refuses rather than writing over
 /// whatever is actually at that name.
 ///
 /// # This is about misconfiguration, not privilege
@@ -1359,8 +1505,8 @@ fn read_document(path: &Path, purpose: ReadPurpose) -> Result<Option<String>, Se
 /// their file became world-readable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReadPurpose {
-    /// [`load_from`] — the app is about to read these settings, so an exposed
-    /// document is worth a line in the log.
+    /// [`load_document`] — the app is about to read these settings, so an
+    /// exposed document is worth a line in the log.
     Load,
     /// [`save_to`] — the existing bytes are being read only so the merge can
     /// preserve what this build does not own.
@@ -1467,7 +1613,7 @@ fn parent_error(reason: &str, parent: &Path) -> SettingsWriteError {
 ///
 /// # Warn, do not refuse, and that is a deliberate inheritance
 ///
-/// [`load_from`] never failing is a #803 property on purpose: a preferences
+/// [`load_document`] never failing is a #803 property on purpose: a preferences
 /// file is not worth failing an app launch over. Now that the document names a
 /// host, a login name and a key path, a `0o644` `desktop.toml` is worth *saying
 /// something* about — but bricking the app over one would be worse than the
@@ -1593,36 +1739,52 @@ pub fn settings_path() -> PathBuf {
     }
 }
 
-/// Load the settings document from `path`. Never fails — see the module docs.
+/// Load the settings document from `path`, and say what was wrong with it.
+///
+/// **Still never fails**, in the sense the module docs mean: a settings file is
+/// not worth failing an app launch over, so every failure yields defaults and
+/// the app comes up. What changed at issue #1072 is that the failure is no
+/// longer *discarded*. The caller gets the reason, so the settings surface can
+/// render it and [`save_to`] can refuse to publish defaults over bytes nobody
+/// understood.
+///
+/// `None` means the document loaded — including the ordinary first-run case
+/// where there is no file at all, and including an **empty** one, which is valid
+/// TOML and genuinely does mean "everything at its default". Only a document
+/// that is there and cannot be used produces a problem.
 ///
 /// Every caller passes a path: the app goes through [`load_snapshot`], which
 /// needs the resolved path anyway to show the user where their settings live,
 /// and every test passes one explicitly so none of them depends on
 /// process-global environment state.
-pub fn load_from(path: &Path) -> DesktopSettings {
+pub fn load_document(path: &Path) -> (DesktopSettings, Option<SettingsDocumentProblem>) {
     match read_document(path, ReadPurpose::Load) {
-        Ok(None) => DesktopSettings::default(),
+        Ok(None) => (DesktopSettings::default(), None),
         Ok(Some(contents)) => match toml::from_str(&contents) {
-            Ok(settings) => settings,
-            Err(error) => {
-                eprintln!(
-                    "{}; using defaults",
-                    invalid_document_log(path, &contents, &error)
-                );
-                DesktopSettings::default()
-            }
+            Ok(settings) => (settings, None),
+            Err(error) => (
+                DesktopSettings::default(),
+                Some(unreadable_document_problem(path, &contents, &error)),
+            ),
         },
-        Err(error) => {
-            // The detail names the path and this is the app's own log, which is
-            // the half of the split that is allowed to.
-            eprintln!("{}; using defaults", error.detail());
-            DesktopSettings::default()
-        }
+        Err(error) => (DesktopSettings::default(), Some(error.into())),
     }
 }
 
-/// The diagnostic [`load_from`] logs for a document this build cannot parse: a
-/// **locator**, deliberately never the document's own bytes.
+/// The one place a document problem reaches the app's own log.
+///
+/// The **detail** half, which is the half of the split that may name a path —
+/// this is stderr and the deck log, not the webview.
+fn log_document_problem(problem: &SettingsDocumentProblem) {
+    eprintln!("{}; using defaults", problem.detail());
+}
+
+/// The diagnostic logged for a document this build cannot parse: a **locator**,
+/// deliberately never the document's own bytes.
+///
+/// The log half of [`unreadable_document_problem`]. Its public sibling follows
+/// the same rule for the same reason, and the rule is now load-bearing on two
+/// sinks rather than one — a webview renders that half.
 ///
 /// # Why the toml error's own message is not logged
 ///
@@ -1644,7 +1806,24 @@ pub fn load_from(path: &Path) -> DesktopSettings {
 /// A separate function because the content of the line is then testable at all:
 /// an `eprintln!` inside a match arm cannot be asserted on.
 fn invalid_document_log(path: &Path, contents: &str, error: &toml::de::Error) -> String {
-    let where_ = match error
+    format!(
+        "Invalid desktop settings at {}: {} could not be read as settings",
+        path.display(),
+        parse_locator(contents, error)
+    )
+}
+
+/// Where the parse went wrong, as a phrase — `line 3, column 9`, and never a
+/// byte of the document.
+///
+/// Extracted from [`invalid_document_log`] at issue #1072 because there are now
+/// three messages built from it and they must not diverge: the log line, the
+/// [`SettingsDocumentProblem`] the settings surface renders, and the refusal
+/// [`save_to`] returns. All three are a locator plus fixed prose, which is what
+/// makes the issue-#827 property — no document bytes in any sink — one check
+/// rather than three.
+fn parse_locator(contents: &str, error: &toml::de::Error) -> String {
+    match error
         .span()
         .and_then(|span| line_and_column(contents, span.start))
     {
@@ -1652,10 +1831,40 @@ fn invalid_document_log(path: &Path, contents: &str, error: &toml::de::Error) ->
         // A span is present for every error this crate has produced, but it is
         // an `Option` on the API and a locator-less message is still useful.
         None => "an unreported position".to_string(),
-    };
-    format!(
-        "Invalid desktop settings at {}: {where_} could not be read as settings",
-        path.display()
+    }
+}
+
+/// The problem [`load_document`] reports for a document this build cannot read.
+fn unreadable_document_problem(
+    path: &Path,
+    contents: &str,
+    error: &toml::de::Error,
+) -> SettingsDocumentProblem {
+    SettingsDocumentProblem {
+        detail: invalid_document_log(path, contents, error),
+        public: format!(
+            "The desktop settings file cannot be read: {} is not valid settings. \
+             {UNREADABLE_CONSEQUENCE}",
+            parse_locator(contents, error)
+        ),
+    }
+}
+
+/// The refusal [`save_to`] returns rather than publishing this build's defaults
+/// over a document it could not read (issue #1072).
+///
+/// A `SettingsWriteError` because that is what a save returns and what the
+/// webview already renders; built through [`write_error`] so it inherits the
+/// split — the path in the log half, never in the public one.
+fn refuse_to_overwrite(path: &Path, contents: &str, error: &toml::de::Error) -> SettingsWriteError {
+    write_error(
+        "refusing to overwrite",
+        path,
+        format!(
+            "{} is not valid settings, and saving would replace it with defaults. \
+             Fix or remove the file, then try again — it has been left exactly as it is",
+            parse_locator(contents, error)
+        ),
     )
 }
 
@@ -1753,6 +1962,31 @@ pub fn save_to(path: &Path, settings: &DesktopSettings) -> Result<(), SettingsWr
     // behind, and an unreadable or over-limit document must not be replaced.
     let existing = read_document(path, ReadPurpose::Save)?;
 
+    // Issue #1072: and neither must a document this build cannot READ. The two
+    // failures above were always refused; this one was not, and it is the one a
+    // user reaches. The load had already answered it with defaults, so the
+    // merge below would publish those defaults over every key the struct owns —
+    // appearance, zoom, endpoints and the deck selection — and the user's own
+    // document would be gone.
+    //
+    // The check is `DesktopSettings` rather than `toml::Table` on purpose,
+    // because it has to catch BOTH shapes of unreadable: a TOML syntax error,
+    // and a document that is valid TOML which this build's SCHEMA rejects. Only
+    // the first fails a `Table` parse. The second is the shape the issue was
+    // filed from and the more dangerous of the two — every field newtype runs
+    // its validator inside `Deserialize`, so tightening any validator converts
+    // previously-valid documents into this case, and this codebase tightens
+    // validators routinely (`port` to a `NonZeroU16`, `EndpointId::parse`
+    // reserving `all`).
+    //
+    // Re-read at save time rather than trusted from load, so a file that became
+    // unreadable while the app was running is caught too.
+    if let Some(contents) = existing.as_deref()
+        && let Err(error) = toml::from_str::<DesktopSettings>(contents)
+    {
+        return Err(refuse_to_overwrite(path, contents, &error));
+    }
+
     let parent = match path.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => parent,
         _ => Path::new("."),
@@ -1800,20 +2034,26 @@ pub fn save_to(path: &Path, settings: &DesktopSettings) -> Result<(), SettingsWr
 /// cost is one small read per save, on a file the app writes only when a user
 /// changes a setting.
 ///
-/// An unparseable or non-table document is treated as empty and therefore
-/// replaced. Nothing can be preserved out of bytes that are not TOML, and
-/// refusing the save instead would leave a user whose file got corrupted unable
-/// to change a setting from inside the app — the same call [`load_from`]
-/// already makes in the other direction.
+/// **An unparseable document is refused, not replaced (issue #1072), and that
+/// reverses what used to be written here.** The old reasoning was that nothing
+/// can be preserved out of bytes that are not TOML, and that refusing would
+/// leave a user whose file got corrupted unable to change a setting from inside
+/// the app. The first half is true and the second was the wrong trade: the
+/// alternative to refusing is not "the user gets their settings back", it is
+/// "the user's file is silently destroyed the first time they touch anything".
+/// Being unable to change a preference is recoverable — the message names the
+/// line to open — and a replaced document is not.
 ///
-/// **"Unparseable" means unparseable by *this* build**, which is a wider set
-/// than "corrupt". A document a *newer* build wrote in a syntax this one does
-/// not accept lands on the same path and is replaced, taking that build's
-/// sections with it — the one case where the unknown-section preservation this
-/// function exists for does not apply. Nothing in the schema can produce such a
-/// document today (it is TOML written by `toml::to_string_pretty` either way),
-/// so this is a property to know rather than a hazard to design around; it
-/// becomes one the moment the format itself changes.
+/// [`save_to`] makes that call before reaching here, against `DesktopSettings`
+/// rather than `toml::Table`, because a document that is valid TOML which this
+/// build's *schema* rejects is equally unreadable and equally destructive to
+/// merge into. By the time this function runs, `existing` has already parsed.
+///
+/// **"Unreadable" means unreadable by *this* build**, which is a wider set than
+/// "corrupt" — and under a refusal that widening is now a feature rather than a
+/// hazard. A document a *newer* build wrote that this one cannot read is exactly
+/// the case where replacing it would take that build's sections with it, so it
+/// lands on the refusal too.
 fn merged_document(
     path: &Path,
     existing: Option<&str>,
@@ -1821,9 +2061,18 @@ fn merged_document(
 ) -> Result<String, SettingsWriteError> {
     // `toml::from_str`, not `str::parse` — `Value`'s `FromStr` parses a single
     // TOML *value* expression, so a whole document fails it on the first key.
-    let mut document = existing
-        .and_then(|contents| toml::from_str::<toml::Table>(contents).ok())
-        .unwrap_or_default();
+    //
+    // Unreachable through [`save_to`], which refuses an unreadable document
+    // before it reaches here (issue #1072). It is still an error rather than the
+    // `unwrap_or_default()` it used to be, because defaulting is precisely what
+    // made the data loss silent: this function would then merge the struct into
+    // an EMPTY table and publish that, which is a whole-file replacement wearing
+    // a merge's clothes.
+    let mut document = match existing {
+        None => toml::Table::new(),
+        Some(contents) => toml::from_str::<toml::Table>(contents)
+            .map_err(|error| refuse_to_overwrite(path, contents, &error))?,
+    };
     let owned = toml::Table::try_from(settings)
         .map_err(|error| write_error("could not serialize", path, error))?;
     merge_tables(&mut document, owned);
@@ -1937,13 +2186,32 @@ mod tests {
 
     /// `settings_path` is the only thing here that reads the environment, and
     /// the environment is process-global while `cargo test` runs a module's
-    /// tests as threads in one process. Every other test drives [`load_from`]
-    /// and [`save_to`] with an explicit path instead, so this lock only ever
-    /// serialises the one test below against itself.
+    /// tests as threads in one process. Every test that does not go through
+    /// [`load_snapshot`] drives [`load_document`] and [`save_to`] with an
+    /// explicit path instead, so this lock serialises only the handful below
+    /// that set [`SETTINGS_PATH_ENV`] — against each other and against
+    /// themselves.
     static ENV_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     fn tempdir() -> tempfile::TempDir {
         tempfile::tempdir().expect("settings tempdir")
+    }
+
+    /// [`load_document`] for the many tests that assert on the document alone,
+    /// logging the problem exactly as [`load_snapshot`] does so a test expecting
+    /// defaults still drives that path.
+    ///
+    /// A test helper rather than the module function it used to be: once
+    /// [`load_snapshot`] carries the reason onward, "load and throw the reason
+    /// away" is not something the app does anywhere, and leaving it on the
+    /// public surface would invite a future caller back into the shape issue
+    /// #1072 was about.
+    fn load_from(path: &Path) -> DesktopSettings {
+        let (settings, problem) = load_document(path);
+        if let Some(problem) = &problem {
+            log_document_problem(problem);
+        }
+        settings
     }
 
     fn dark() -> DesktopSettings {
@@ -2367,19 +2635,313 @@ mod tests {
         assert!(raw.contains("[voice]"), "the merge lost [voice]: {raw}");
     }
 
-    /// A corrupt document cannot be merged into, and refusing the save would
-    /// lock the user out of their own settings from inside the app. It is
-    /// replaced instead — the same call `load_from` makes in the other
-    /// direction.
+    // ---------------------------------------------------------------------
+    // Issue #1072 — a document this build cannot read is never overwritten
+    // ---------------------------------------------------------------------
+
+    /// The two documents this build cannot read, and they fail in **different
+    /// places**, which is the whole reason the guard is written against
+    /// `DesktopSettings` rather than `toml::Table`.
+    ///
+    /// The first is not TOML at all. The second is valid TOML whose `host`
+    /// contains a space and whose `id` is one character, so this build's *schema*
+    /// rejects it while `toml::Table` parses it happily — the case issue #1072
+    /// was filed from, and the one that was silently destructive.
+    const UNREADABLE_DOCUMENTS: [&str; 2] = [
+        "# my own settings, annotated\nthis is not [ valid toml\n",
+        "version = 1\n\n[[endpoints.remote]]\nhost = \"build box\"\nid = \"d\"\n",
+    ];
+
+    /// Scenario (issue #1072): a `desktop.toml` this build cannot read sits on
+    /// disk, the user opens the app — which comes up on defaults — and changes
+    /// their theme. The save must be REFUSED and the user's bytes must still be
+    /// on disk afterwards, because the alternative is that opening the app and
+    /// touching one setting destroys the whole document.
+    ///
+    /// The regression test the issue asks for. It fails on the code it was
+    /// written against: `save_to` returned `Ok(())`, and `merged_document`
+    /// published this build's defaults over every key the schema owns —
+    /// appearance, zoom, endpoints and the deck selection — with nothing said
+    /// anywhere a user would look.
     #[test]
-    fn an_unparseable_document_is_replaced_rather_than_failing_the_save() {
+    fn a_document_this_build_cannot_read_is_never_overwritten() {
+        for original in UNREADABLE_DOCUMENTS {
+            let dir = tempdir();
+            let path = dir.path().join(SETTINGS_FILE_NAME);
+            std::fs::write(&path, original).unwrap();
+
+            let refused = save_to(&path, &dark())
+                .expect_err("saving over a document this build cannot read must be refused");
+
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                original,
+                "the user's own bytes must survive verbatim: {refused}"
+            );
+            // And nothing was created beside it either: the refusal happens
+            // before `create_temp`, so a failed save leaves no debris.
+            assert_eq!(entries(dir.path()), [SETTINGS_FILE_NAME]);
+
+            // The refusal is actionable rather than merely negative: it locates
+            // the problem and says the file is untouched.
+            assert!(
+                refused.public().contains("line ")
+                    || refused.public().contains("an unreported position"),
+                "the refusal must locate the problem: {}",
+                refused.public()
+            );
+            assert!(
+                refused.public().contains("left exactly as it is"),
+                "the refusal must say the file was preserved: {}",
+                refused.public()
+            );
+        }
+    }
+
+    /// The merge's own guard, reached directly because `save_to` refuses first
+    /// and so nothing can drive this through the public path.
+    ///
+    /// It is here because `unwrap_or_default()` — what this line used to be — is
+    /// the exact shape of the defect: defaulting silently turns "I could not
+    /// understand this file" into "this file was empty", and the merge then
+    /// publishes a whole-file replacement wearing a merge's clothes. The guard
+    /// costs four lines and one test; leaving the `unwrap_or_default()` in place
+    /// would leave the failure mode loaded for whoever adds a second caller.
+    #[test]
+    fn the_merge_refuses_a_document_it_cannot_parse_rather_than_treating_it_as_empty() {
+        let path = Path::new("/home/dev/.config/dot-agent-deck/desktop.toml");
+
+        // No document at all is the first-run case and merges into an empty
+        // table, which is a different thing and must stay allowed.
+        let fresh = merged_document(path, None, &dark()).unwrap();
+        assert!(fresh.contains("mode = \"dark\""), "{fresh}");
+
+        let refused = merged_document(path, Some("this is not [ valid toml\n"), &dark())
+            .expect_err("bytes that are not TOML must not be merged into as if empty");
+        assert!(
+            refused.public().contains("refusing to overwrite"),
+            "{refused}"
+        );
+    }
+
+    /// The control, and without it the test above proves only that saving is
+    /// broken. A document this build CAN read still saves, still merges, and
+    /// still keeps the section it does not own — the property PRD #803's
+    /// container promise rests on, which the refusal must not have cost.
+    #[test]
+    fn a_readable_document_still_saves_and_still_merges() {
         let dir = tempdir();
         let path = dir.path().join(SETTINGS_FILE_NAME);
-        std::fs::write(&path, "this is not [ valid toml\n").unwrap();
+        std::fs::write(
+            &path,
+            "version = 1\n\n[appearance]\nmode = \"light\"\n\n[voice]\nbackend = \"whisper\"\n",
+        )
+        .unwrap();
 
         save_to(&path, &dark()).unwrap();
 
-        assert_eq!(load_from(&path), dark());
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(after.contains("mode = \"dark\""), "{after}");
+        assert!(after.contains("backend = \"whisper\""), "{after}");
+    }
+
+    /// Scenario: the same two documents, seen from the load side. The app still
+    /// comes up on defaults — that half is unchanged and deliberate, because a
+    /// settings file is not worth failing an app launch over — but the reason is
+    /// now **returned** rather than logged and dropped, which is what lets the
+    /// settings surface say something and `save_to` refuse.
+    #[test]
+    fn an_unreadable_document_loads_as_defaults_and_reports_why() {
+        for contents in UNREADABLE_DOCUMENTS {
+            let dir = tempdir();
+            let path = dir.path().join(SETTINGS_FILE_NAME);
+            std::fs::write(&path, contents).unwrap();
+
+            let (settings, problem) = load_document(&path);
+            assert_eq!(settings, DesktopSettings::default(), "{contents:?}");
+
+            let problem = problem
+                .unwrap_or_else(|| panic!("an unreadable document must report why: {contents:?}"));
+            assert!(
+                problem.public().contains("cannot be read"),
+                "unexpected message: {}",
+                problem.public()
+            );
+            // The sentence a user acts on: why their settings look reset, and
+            // that nothing is being written over their file meanwhile.
+            assert!(
+                problem.public().contains("default settings")
+                    && problem.public().contains("nothing will be saved"),
+                "the message must explain the reset AND the refusal: {}",
+                problem.public()
+            );
+        }
+    }
+
+    /// The complement, and the line this must not blur: an **absent** document
+    /// and an **empty** one are not problems. Both genuinely mean "everything at
+    /// its default" — an empty file is valid TOML — and reporting either would
+    /// put a permanent error in front of every first-run user and refuse the
+    /// first save they ever make.
+    #[test]
+    fn an_absent_or_empty_document_is_not_a_problem() {
+        let dir = tempdir();
+
+        let absent = dir.path().join(SETTINGS_FILE_NAME);
+        let (settings, problem) = load_document(&absent);
+        assert_eq!(settings, DesktopSettings::default());
+        assert_eq!(problem, None, "a first run must not report a problem");
+        save_to(&absent, &dark()).expect("a first save must not be refused");
+
+        let empty = dir.path().join("empty.toml");
+        std::fs::write(&empty, "").unwrap();
+        let (settings, problem) = load_document(&empty);
+        assert_eq!(settings, DesktopSettings::default());
+        assert_eq!(problem, None, "an empty document is a valid empty document");
+        save_to(&empty, &dark()).expect("saving over an empty document must not be refused");
+    }
+
+    /// A path-level failure is a document problem too.
+    ///
+    /// `save_to` always refused these — `read_document`'s error propagates
+    /// straight out of it, and that was true before #1072 — so what is new here
+    /// is only the other half: the user is now told why the app is on defaults,
+    /// instead of it being a line in a log nobody reads.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_file_reports_a_problem_rather_than_only_logging_one() {
+        let dir = tempdir();
+        let path = dir.path().join(SETTINGS_FILE_NAME);
+        save_to(&path, &dark()).unwrap();
+        set_mode(&path, 0o000);
+        if std::fs::read_to_string(&path).is_ok() {
+            set_mode(&path, 0o600);
+            eprintln!(
+                "SKIP: this process can read a 0o000 file (running privileged), so an \
+                 unreadable document cannot be constructed here"
+            );
+            return;
+        }
+
+        let (settings, problem) = load_document(&path);
+        set_mode(&path, 0o600);
+
+        assert_eq!(settings, DesktopSettings::default());
+        let problem = problem.expect("an unreadable file must report why");
+        assert!(
+            problem.public().contains("nothing will be saved"),
+            "unexpected message: {}",
+            problem.public()
+        );
+    }
+
+    /// The snapshot is how the reason reaches the settings surface, so it is
+    /// pinned on both sides: present for a document that cannot be read, and
+    /// **absent from the wire entirely** for one that can.
+    ///
+    /// Absence matters as much as presence. The field is
+    /// `skip_serializing_if = "Option::is_none"` precisely so the frontend can
+    /// read "no key" as "nothing to say" rather than having to compare against
+    /// an empty string.
+    #[test]
+    fn the_snapshot_reports_an_unreadable_document_and_stays_silent_about_a_good_one() {
+        let _guard = ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let dir = tempdir();
+        let path = dir.path().join(SETTINGS_FILE_NAME);
+
+        std::fs::write(&path, UNREADABLE_DOCUMENTS[1]).unwrap();
+        // SAFETY: the lock above serialises every test that touches this var.
+        unsafe { std::env::set_var(SETTINGS_PATH_ENV, &path) };
+        let broken = load_snapshot();
+
+        save_to(&path, &dark()).unwrap_err();
+        std::fs::write(&path, "version = 1\n[appearance]\nmode = \"dark\"\n").unwrap();
+        let healthy = load_snapshot();
+        unsafe { std::env::remove_var(SETTINGS_PATH_ENV) };
+
+        let reported = broken.problem.expect("the snapshot must carry the reason");
+        assert!(reported.contains("cannot be read"), "{reported}");
+        // The public half, so it names no path — the snapshot carries the path
+        // beside it, deliberately and once.
+        assert!(
+            !reported.contains(&dir.path().display().to_string()),
+            "the reason must not name a filesystem path: {reported}"
+        );
+        assert_eq!(broken.settings, DesktopSettings::default());
+
+        assert_eq!(healthy.problem, None);
+        assert_eq!(healthy.settings, dark());
+        let json = serde_json::to_value(&healthy).unwrap();
+        assert!(
+            json.get("problem").is_none(),
+            "a healthy document must put no `problem` key on the wire: {json}"
+        );
+    }
+
+    /// Issue #827's rule, applied to the sink issue #1072 opened.
+    ///
+    /// A document problem reaches a **webview** as well as a log, so the rule
+    /// that already governed the log line now has two consumers. Both halves are
+    /// asserted, and the raw `toml` error is asserted to carry the value first —
+    /// so the redaction is proven necessary rather than assumed, the way
+    /// `a_parse_diagnostic_carries_a_locator_and_never_the_documents_bytes` does
+    /// for the log half.
+    #[test]
+    fn a_document_problem_carries_a_locator_and_never_the_documents_bytes() {
+        let path = Path::new("/home/dev/.config/dot-agent-deck/desktop.toml");
+        let contents = format!("version = 1\n[zoom]\nlevel = \"{SENTINEL}\"\n");
+        let error = toml::from_str::<DesktopSettings>(&contents).unwrap_err();
+        assert!(
+            error.to_string().contains(SENTINEL),
+            "the toml error stopped echoing the value, so this test proves nothing: {error}"
+        );
+
+        let problem = unreadable_document_problem(path, &contents, &error);
+        assert_free_of_sentinel("a document problem's log detail", problem.detail());
+        assert_free_of_sentinel("a document problem's webview message", problem.public());
+        assert_free_of_sentinel(
+            "`safe_message` of a document problem's public half",
+            &crate::dto::safe_message(problem.public()),
+        );
+        // Pinned whole rather than by substring, because this exact string is
+        // what a user reads and what `desktop/src/App.test.tsx` and
+        // `useDesktopSettings.test.ts` hard-code as the message the settings
+        // surface renders. A reworded sentence should be a deliberate diff on
+        // both sides, not a silent drift on one.
+        assert_eq!(
+            problem.public(),
+            "The desktop settings file cannot be read: line 3, column 9 is not valid settings. \
+             This session is using default settings, and nothing will be saved over the file \
+             until it is fixed or removed."
+        );
+        // The split, in both directions: the log half names the file and the
+        // webview half never does.
+        assert!(problem.detail().contains("desktop.toml"), "{problem}");
+        assert!(
+            !problem.public().contains("/home/dev"),
+            "the webview half must not name a path: {}",
+            problem.public()
+        );
+
+        // The other route into the same type: a path-level refusal, which is
+        // built from a path and an `io::Error` and so cannot carry a value —
+        // but must still come out as a sentence rather than as a fragment.
+        let rejected: SettingsDocumentProblem =
+            read_document(Path::new("relative.toml"), ReadPurpose::Load)
+                .expect_err("a relative path is not a settings document")
+                .into();
+        assert!(
+            rejected.public().starts_with("The ") && rejected.public().ends_with("removed."),
+            "a path refusal must read as a sentence: {}",
+            rejected.public()
+        );
+        assert!(
+            !rejected.public().contains("relative.toml"),
+            "the webview half must not name a path: {}",
+            rejected.public()
+        );
     }
 
     #[test]
@@ -3363,6 +3925,12 @@ forms it is.";
         let snapshot = DesktopSettingsSnapshot {
             settings: settings.clone(),
             path: "/home/dev/.config/dot-agent-deck/desktop.toml".to_string(),
+            // The document loaded, so there is no problem to report. The sink
+            // this field opens is swept separately, by
+            // `a_document_problem_carries_a_locator_and_never_the_documents_bytes`
+            // — it is built from a locator rather than from a loaded document,
+            // so it cannot be reached from a `DesktopSettings`.
+            problem: None,
         };
         assert_free_of_sentinel(
             &format!("{what}: the `desktop_get_settings` snapshot"),
@@ -3504,17 +4072,40 @@ forms it is.";
     }
 
     /// The disk route: a credential hand-written into a field this schema owns
-    /// survives neither the load nor the next save.
+    /// reaches no sink beyond the user's own file.
     ///
     /// Derived from the default document rather than from a hard-coded list, so
     /// a field #802 adds is covered the moment it appears — and if that field
     /// can hold text, this is the test that goes red.
+    ///
+    /// # Issue #1072 narrowed what the DISK half of this claims, and the old
+    /// # claim is worth quoting because it is now false
+    ///
+    /// It read: *saving over the offending document overwrites every key the
+    /// struct owns, so the value does not survive on disk either*. That was
+    /// true, and it was true **because of the data-loss bug** — the scrub was a
+    /// side effect of publishing this build's defaults over a document nobody
+    /// had understood. #1072 stops that, so a value that makes the document
+    /// unreadable now stays in the user's own file.
+    ///
+    /// That is not a weakening of #827, which is about a credential reaching a
+    /// **sink** — a log people paste into bug reports, the IPC, the snapshot.
+    /// Those are all still swept below, and so is the refusal itself. It is the
+    /// same answer this module already gives for a key the schema does not own
+    /// (see [`tests::a_key_this_schema_does_not_own_keeps_its_value_and_reaches_nothing_else`]):
+    /// the file is the user's, it is `0o600`, and destroying their configuration
+    /// is not a proportionate way to scrub a value they typed there themselves.
+    ///
+    /// Both outcomes are exercised, and the counters at the bottom fail the test
+    /// if either arm stops being reached — a one-sided sweep would let the other
+    /// behaviour change unnoticed.
     #[test]
-    fn a_credential_at_a_known_schema_leaf_survives_neither_the_load_nor_the_next_save() {
+    fn a_credential_at_a_known_schema_leaf_reaches_no_sink_beyond_the_users_own_file() {
         let default = toml::Value::try_from(DesktopSettings::default()).unwrap();
         let leaves = leaf_paths(&default);
         assert_eq!(leaves, ["appearance.mode", "version", "zoom.level"]);
 
+        let (mut dropped, mut refused) = (0, 0);
         for leaf in leaves {
             let dir = tempdir();
             let path = dir.path().join(SETTINGS_FILE_NAME);
@@ -3531,18 +4122,44 @@ forms it is.";
             );
             std::fs::write(&path, &raw).unwrap();
 
-            let loaded = load_from(&path);
+            let (loaded, problem) = load_document(&path);
             assert_no_sink_carries_the_sentinel(&leaf, &loaded);
 
-            // The load–modify–save round trip #827 names explicitly: saving
-            // over the offending document overwrites every key the struct
-            // owns, so the value does not survive on disk either.
-            save_to(&path, &loaded).unwrap();
-            assert_free_of_sentinel(
-                &format!("{leaf}: the document after a load-modify-save round trip"),
-                &std::fs::read_to_string(&path).unwrap(),
-            );
+            match problem {
+                // The field read the value and dropped it — `AppearanceMode`
+                // falls back rather than failing — so the document still loads,
+                // the save still goes through, and the load–modify–save round
+                // trip #827 names does take the value off disk.
+                None => {
+                    dropped += 1;
+                    save_to(&path, &loaded).unwrap();
+                    assert_free_of_sentinel(
+                        &format!("{leaf}: the document after a load-modify-save round trip"),
+                        &std::fs::read_to_string(&path).unwrap(),
+                    );
+                }
+                // The value made the whole document unreadable, so the save is
+                // refused and the file is left exactly as the user wrote it.
+                Some(problem) => {
+                    refused += 1;
+                    let error = save_to(&path, &loaded)
+                        .expect_err("a document this build cannot read must not be overwritten");
+                    assert_eq!(
+                        std::fs::read_to_string(&path).unwrap(),
+                        raw,
+                        "{leaf}: the user's file must be preserved"
+                    );
+                    assert_free_of_sentinel(&format!("{leaf}: the load problem"), problem.public());
+                    assert_free_of_sentinel(&format!("{leaf}: the load problem"), problem.detail());
+                    assert_free_of_sentinel(&format!("{leaf}: the refusal"), error.public());
+                    assert_free_of_sentinel(&format!("{leaf}: the refusal"), error.detail());
+                }
+            }
         }
+        assert!(
+            dropped > 0 && refused > 0,
+            "{dropped} dropped, {refused} refused — both arms must stay reachable"
+        );
     }
 
     /// The honest complement, and the reason "a credential cannot be in
@@ -3751,11 +4368,20 @@ forms it is.";
     /// split, with a document that holds the sentinel while the save fails.
     ///
     /// The narrow claim, verified case by case rather than asserted in
-    /// general: every `SettingsWriteError` this module can build is
-    /// constructed from a **path** and an `io::Error` or a serialisation
-    /// error, never from the document's contents — so neither half carries a
-    /// value, and `dto::safe_message` (which is a control-character filter and
-    /// a length cap, **not** a redactor) has nothing to remove.
+    /// general. It used to read: *every `SettingsWriteError` this module can
+    /// build is constructed from a **path** and an `io::Error` or a
+    /// serialisation error, never from the document's contents*. Issue #1072
+    /// added one that **is** built from the document's contents — the refusal to
+    /// overwrite — so the claim is now the narrower and still-sufficient one:
+    ///
+    /// - most are built from a path and an `io::Error` or a serialisation error,
+    ///   and so cannot carry a value at all;
+    /// - the refusal is built from `parse_locator`, which reads the document
+    ///   only to count newlines, and emits `line N, column N` plus fixed prose.
+    ///
+    /// Either way neither half carries a value, and `dto::safe_message` (which
+    /// is a control-character filter and a length cap, **not** a redactor) has
+    /// nothing to remove.
     #[cfg(unix)]
     #[test]
     fn no_settings_write_error_carries_a_value_from_the_document() {
@@ -3787,7 +4413,21 @@ forms it is.";
         let unwritable_dir = save_to(&path, &dark());
         set_mode(dir.path(), 0o700);
 
-        let mut errors = vec![unreadable];
+        // The refusal to overwrite (issue #1072): the one error here whose
+        // message is derived from the document, and therefore the one this test
+        // exists for now. The `[voice]` section is not what makes this document
+        // unreadable — a bare `=` on its own line is, and the sentinel sits two
+        // lines above the reported position.
+        let unreadable_document = dir.path().join("broken.toml");
+        std::fs::write(
+            &unreadable_document,
+            format!("version = 1\n[voice]\napi_key = \"{SENTINEL}\"\n= = =\n"),
+        )
+        .unwrap();
+        let refused = save_to(&unreadable_document, &dark())
+            .expect_err("an unreadable document must not be overwritten");
+
+        let mut errors = vec![unreadable, refused];
         match unwritable_dir {
             Err(error) => errors.push(error),
             Ok(()) => eprintln!(
@@ -4404,24 +5044,30 @@ level = 1.0
 
     /// Scenario: a schema-invalid endpoint row sits in the document and the
     /// user changes their theme. The app must load defaults (it cannot read the
-    /// row) but must **not** destroy the row — the merge parses TOML syntax,
-    /// which the row still is, so it survives for the user to fix.
+    /// row) and must **not** write over the document at all.
+    ///
+    /// # This test used to assert the opposite half of it, and issue #1072 is why
+    ///
+    /// It read: *the merge parses TOML syntax, which the row still is, so it
+    /// survives for the user to fix* — and it proved that by asserting the theme
+    /// change landed beside the row. Both halves were true and the second one
+    /// was the bug: the row survived, and `version`, `appearance`, `zoom` and the
+    /// deck selection were replaced with this build's defaults in the same write.
+    /// Preserving the one table the merge could not touch is not preserving the
+    /// user's settings. The save is refused now, so all of it survives.
     #[test]
-    fn a_row_this_build_cannot_read_survives_the_next_save() {
+    fn a_document_with_a_row_this_build_cannot_read_is_not_written_over() {
         let dir = tempdir();
         let path = dir.path().join(SETTINGS_FILE_NAME);
-        std::fs::write(
-            &path,
-            "version = 1\n\n[[endpoints.remote]]\nhost = \"build box\"\nid = \"d\"\n",
-        )
-        .unwrap();
+        let original = "version = 7\n\n[appearance]\nmode = \"light\"\n\n[[endpoints.remote]]\nhost = \"build box\"\nid = \"d\"\n";
+        std::fs::write(&path, original).unwrap();
 
         assert_eq!(load_from(&path), DesktopSettings::default());
-        save_to(&path, &dark()).unwrap();
+        save_to(&path, &dark()).expect_err("the document must not be written over");
 
-        let after = std::fs::read_to_string(&path).unwrap();
-        assert!(after.contains("build box"), "{after}");
-        assert!(after.contains("mode = \"dark\""), "{after}");
+        // Not "the row survived", which was the old and much weaker claim: the
+        // whole file is byte-identical, appearance and version included.
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
     }
 
     // ---------------------------------------------------------------------

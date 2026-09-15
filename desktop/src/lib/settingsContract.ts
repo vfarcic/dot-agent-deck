@@ -47,9 +47,17 @@ export interface SettingsPanelProps {
    */
   onSave: (next: DesktopSettingsDto) => void;
   /**
-   * Set when the last save failed. The choice is still applied for this
-   * session; what failed is persisting it, and a panel should say so rather
-   * than silently reverting.
+   * Why the settings document cannot be written right now, as a **complete
+   * sentence** — render it verbatim rather than composing around it.
+   *
+   * Two conditions reach this one prop and a panel cannot tell them apart,
+   * which is deliberate: the last save failed (the choice is still applied for
+   * this session; what failed is persisting it), or the document on disk cannot
+   * be read at all, in which case the app is on defaults and every save is
+   * refused so the user's file survives (issue #1072). `useDesktopSettings`
+   * composes the right sentence for each. A panel that prefixed its own
+   * "saving failed" lead-in would be wrong half the time — which is what they
+   * all did before #1072, back when only one of the two existed.
    */
   saveError?: string;
   /**

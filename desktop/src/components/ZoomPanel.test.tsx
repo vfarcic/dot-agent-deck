@@ -78,10 +78,27 @@ describe("ZoomPanel", () => {
 
   // The choice stays applied; what failed is making it survive a restart, and
   // saying so is more use than silently reverting a choice the user just made.
+  //
+  // The sentence is composed by `useDesktopSettings` and rendered verbatim here
+  // (issue #1072), so the test passes the composed string rather than a bare
+  // cause — the panel no longer knows which of the two conditions it is showing.
   it("reports a failed save as an alert without reverting the choice", () => {
-    renderPanel({ zoom: { level: 2 } }, "live", "disk full");
+    renderPanel({ zoom: { level: 2 } }, "live", "This change is applied, but saving it failed, so it will not survive a restart. disk full");
     expect(screen.getByRole("alert")).toHaveTextContent(/will not survive a restart\. disk full/i);
     expect(screen.getByLabelText("Zoom")).toHaveValue("2");
+  });
+
+  /**
+   * Scenario (issue #1072): the settings document on disk cannot be read, so
+   * the app is on defaults and every save is refused. The panel must render
+   * that sentence as it stands — a "saving it failed" preamble would be a claim
+   * about a save the user has not made.
+   */
+  it("renders an unreadable-document message without a failed-save preamble", () => {
+    renderPanel({}, "live", "The desktop settings file cannot be read: line 3, column 9 is not valid settings. This session is using default settings, and nothing will be saved over the file until it is fixed or removed.");
+    const alert = screen.getByRole("alert");
+    expect(alert).toHaveTextContent("line 3, column 9");
+    expect(alert).not.toHaveTextContent("saving it failed");
   });
 
   // `docs/develop/desktop-gui.md`'s heading rule: a section heading is chrome
