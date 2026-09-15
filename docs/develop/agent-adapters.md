@@ -2,7 +2,7 @@
 
 > **Developer / maintainer reference.** This page is the contract for adding a new agent to dot-agent-deck. It is intentionally excluded from the published documentation site and renders as plain Markdown here on GitHub.
 
-dot-agent-deck is a control plane over **external** agent processes: it spawns them, observes their status, and coordinates them. It does not run an agent loop of its own. "Adding an agent" therefore means teaching the deck two things — how to *recognise* the agent, and how the agent's activity *reaches* the deck as [`AgentEvent`](../../src/event.rs)s — and then rendering the result. This guide documents the seams that carry those two things and walks the whole change end to end, using **Codex** (the wrapper-strategy agent shipped by [PRD #20](../../prds/20-multi-agent-support.md)) as the worked example.
+dot-agent-deck is a control plane over **external** agent processes: it spawns them, observes their status, and coordinates them. It does not run an agent loop of its own. "Adding an agent" therefore means teaching the deck two things — how to *recognise* the agent, and how the agent's activity *reaches* the deck as [`AgentEvent`](../../src/event.rs)s — and then rendering the result. This guide documents the seams that carry those two things and walks the whole change end to end, using **Codex** (the wrapper-strategy agent shipped by [PRD #20](../../prds/done/20-multi-agent-support.md)) as the worked example.
 
 ## Design philosophy: a curated registry, not a plugin system
 

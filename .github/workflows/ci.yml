@@ -14,13 +14,74 @@ on:
   # This matters more, not less, with Renovate automerging non-major bumps: those
   # land without a human looking, so the post-merge check is what turns "main is
   # broken" from a discovery into a notification.
+  #
+  # That last clause was a promise this file did not keep for six weeks. On
+  # 2026-09-14 the post-merge run at `430dda26` detected a genuine break, reported
+  # `completed/failure`, and told nobody; five further PRs merged on top before an
+  # unrelated conflict resolution fixed it by accident (issue #1088). The
+  # `notify-main-red` job at the bottom of this file is the missing half —
+  # detection was never the gap.
   push:
     branches: [main]
+  # Issue #1088 — the merge queue's event. A queued PR is tested on a temporary
+  # `refs/heads/gh-readonly-queue/main/...` branch carrying main plus every PR
+  # ahead of it in the queue: the PROJECTED main, which a PR's own `pull_request`
+  # run never sees. The `main-protected` ruleset has
+  # `strict_required_status_checks_policy: false`, so a PR's required checks run
+  # against its merge base and nothing re-tests a stale branch before it merges.
+  # That is how #1066 and #1081 — each green, neither having seen the other —
+  # merged into an `E0063` on main.
+  #
+  # This trigger does not fix that on its own, and it is deliberately not trying
+  # to: enabling the queue is a repository-admin change to the ruleset and is a
+  # separate act. This is its PRECONDITION. No workflow in this directory handled
+  # `merge_group` before, and a queue enabled without one waits forever on five
+  # required contexts that never report against the queue's branches — so the
+  # trigger lands first and sits inert until the setting flips.
+  #
+  # Context names are what a ruleset matches, and they do not move with the event:
+  # no job in this file carries a job-level `name:` or a `strategy:` matrix, so
+  # `build`, `build-macos`, `build-windows`, `security` and `e2e-deterministic`
+  # each report under their own job id here exactly as they do on a
+  # `pull_request`. A job that ran but reported a DIFFERENT context would hang the
+  # queue just as surely as one that never ran.
+  #
+  # The `changes` gate below is safe here for the reason its own comment gives
+  # rather than by accident: `github.event.pull_request.user.login` is empty on a
+  # `merge_group` payload, so PR_AUTHOR is empty, the author check fails, and the
+  # job exits early with `devbox_only=false` / `flake_only=false` — the full
+  # matrix. A path filter that read a base ref instead could silently skip
+  # everything and report green having tested nothing, which is worse than
+  # hanging because it looks like success. The cost of the fail-safe is that a
+  # Renovate devbox-only PR loses its skip once it reaches the queue; that is the
+  # conservative direction and it is left alone.
+  merge_group:
+    types: [checks_requested]
   workflow_dispatch:
 
+# Issue #1088 — cancel a superseded run only where the superseded run is waste.
+#
+# `ci-${{ github.ref }}` with an unconditional `cancel-in-progress: true` put
+# every push to main into ONE group, so each merge killed the previous merge's
+# verification. `2601bed8` and `51b7ee9e` never completed a run at all, and the
+# run list bounced between `failure` and `cancelled` with no result attributable
+# to a commit — which is how a red main is scrolled past.
+#
+# A `pull_request` ref is the case the setting was written for: a new push
+# genuinely obsoletes the run it replaces. That keeps the old behaviour, under
+# its own `refs/pull/N/merge` group.
+#
+# Everything else — a push to main, a `merge_group` check, a `workflow_dispatch`
+# — gets a group of its OWN, keyed on `github.run_id`, so those runs never
+# interact and every one of them completes. Note `cancel-in-progress: false`
+# alone would NOT have been enough: same-group runs then QUEUE, GitHub holds at
+# most one PENDING run per group, and a third arrival evicts the pending one — so
+# the nine-merge batch of 2026-09-14 would still have lost most of its runs, just
+# to a different verb. For a queue check the stake is higher than a lost record:
+# a cancelled `merge_group` check is a stuck merge.
 concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  group: ci-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
@@ -35,7 +96,7 @@ permissions:
 # `.git/config` for the life of the job, readable by anything the job runs.
 # `e2e-deterministic` is the sharp case and has its own note below — it executes
 # the PTY e2e tier, which is contributor-authored code — but the flag is on all
-# nine checkouts rather than that one, because no job here needs the credential
+# eleven checkouts rather than that one, because no job here needs the credential
 # after the fetch:
 #
 #   * none of them pushes, and the `permissions:` block above grants no write
@@ -46,9 +107,15 @@ permissions:
 #     `Cargo.lock` and no `git+` entry in `desktop/pnpm-lock.yaml`, and the git
 #     these jobs do reach is local — `build.rs`'s `describe` / `rev-parse` /
 #     `status` version stamping, `cargo xtask linkage-check`'s `worktree list`
-#     and `rev-parse` reads, and the e2e harness's `git init` inside its own
-#     tempdirs. That survey is what picked the nine; the CI run on the PR that
-#     set the flag is what checked it.
+#     and `rev-parse` reads, the e2e harness's `git init` inside its own
+#     tempdirs, and `notify-main-red`'s `git log -1` for the broken commit's
+#     subject. That survey is what picked the SET; the CI run on the PR that set
+#     the flag is what checked it. The COUNT in this note is maintained by hand
+#     and has drifted before — it read "nine" while there were already ten, and
+#     issue #1088's `notify-main-red` made it eleven — so recount with
+#     `grep -cE '^ +- uses: actions/checkout@' .github/workflows/ci.yml` rather
+#     than trusting the number. The pattern is anchored to a step line on
+#     purpose: an unanchored one matches this comment too and reports twelve.
 #
 # `security`'s `cargo audit` does clone the RustSec advisory DB over the
 # network, but into `~/.cargo/advisory-db` — a separate repository, which a
@@ -462,12 +529,22 @@ jobs:
   # NO AGENT OR TEST CREDENTIAL REACHES THIS JOB, and that is the property the
   # lane rests on rather than a detail: no ANTHROPIC_API_KEY, no OPENAI_API_KEY,
   # no agent CLI credential. It declares no `environment:` and no job-level
-  # `env:` reading `secrets.*`, no other job in `ci.yml` does either, and no
-  # workflow anywhere registers a TEST credential — which is the point, because
-  # a test credential in a public repository's CI is a vulnerability that
-  # running it less often does not remove. If a test here ever fails for want of
-  # a credential then the test is in the wrong lane: re-gate its file into
-  # `e2e-live`. DO NOT add a key here to make it pass.
+  # `env:` reading `secrets.*`, and no workflow anywhere registers a TEST
+  # credential — which is the point, because a test credential in a public
+  # repository's CI is a vulnerability that running it less often does not
+  # remove.
+  #
+  # This sentence used to continue "no other job in `ci.yml` does either", and
+  # since issue #1088 that is false: `notify-main-red` reads
+  # `secrets.TELEGRAM_BOT_TOKEN` and `secrets.TELEGRAM_CHAT_ID` to tell a human
+  # that a post-merge run went red. The narrower fact this lane actually needs is
+  # untouched — neither is an agent or a test credential, neither is registered on
+  # this repository today, and that job runs only on a `push` to main, so it
+  # cannot be reached from a `pull_request` run at all, let alone from this one.
+  #
+  # If a test here ever fails for want of a credential then the test is in the
+  # wrong lane: re-gate its file into `e2e-live`. DO NOT add a key here to make
+  # it pass.
   #
   # That is still NOT the same as "no secrets in this job", which this comment
   # once claimed and which was false. The automatic GITHUB_TOKEN has not gone
@@ -478,7 +555,7 @@ jobs:
   # sitting in the tree for the life of the job while this lane drives the PTY
   # e2e tier — dozens of contributor-authored test binaries spawning the real
   # deck. The note above `jobs:` has the survey behind that flag and why it went
-  # on all nine checkouts rather than only this one.
+  # on all eleven checkouts rather than only this one.
   #
   # SCOPE is still the outer bound and still does the heavier lifting: this
   # workflow's top-level `permissions:` block grants `contents: read` and
@@ -1049,3 +1126,101 @@ jobs:
       # the first version of this job on main (devbox 0.17.5, `invalid version
       # 'set'`). See the header of the script for the detail.
       - run: devbox run -- bash scripts/devbox-smoke.sh
+
+  # Issue #1088 — the half the `push: branches: [main]` comment at the top of this
+  # file promised and never delivered. The post-merge run was already detecting
+  # breaks; on 2026-09-14 it detected a real one at `430dda26`, reported
+  # `completed/failure`, and told nobody, while five more PRs merged on top of a
+  # red main. A run conclusion nobody opens is not a notification.
+  #
+  # FIRES ONLY ON A FAILED POST-MERGE RUN ON MAIN. `github.event_name == 'push'`
+  # excludes the `merge_group` checks (a queue failure stops that merge on its
+  # own, and the PR's author is already looking) and every `pull_request` run (a
+  # red PR is the author's, not main's), and `github.ref` pins it to main since
+  # the `push:` trigger could grow another branch later.
+  #
+  # `contains(needs.*.result, 'failure')` rather than `failure()` so the condition
+  # reads as what it means, and so a CANCELLED job does not page anyone —
+  # `cancelled` is not `failure`, and after the concurrency change above a
+  # post-merge run should not be cancelled at all.
+  #
+  # `needs` lists EVERY other job, not just the five required contexts. A red
+  # `nix`, `devbox`, `desktop-web`, `desktop-browser` or `windows-cross-check`
+  # also means main is broken; which checks a ruleset happens to require is a
+  # separate question from whether main builds. That list is enumerated by hand
+  # and nothing enforces it, so ADD A NEW JOB HERE WHEN YOU ADD ONE ABOVE — a job
+  # missing from `needs` is a job whose failure notifies nobody, which is the
+  # defect this whole job exists to fix, reintroduced one job at a time.
+  #
+  # NEVER FAILS THE BUILD. `scripts/notify.sh` always exits 0 — a lost
+  # notification is not a workflow event (see its header) — and nothing here
+  # parses its output or retries it. The `::error::` annotation and the step
+  # summary are written FIRST and unconditionally, so the run itself carries the
+  # commit and the failing job names whether or not the send goes out.
+  #
+  # CREDENTIALS: this job reads `secrets.TELEGRAM_BOT_TOKEN` and
+  # `secrets.TELEGRAM_CHAT_ID`, which makes it the one job in this file with a
+  # `secrets.*` reference — see the note on `e2e-deterministic`, which says why
+  # that is not the credential class that lane is about. NEITHER SECRET IS
+  # REGISTERED ON THIS REPOSITORY as of 2026-09-15, so the send currently SKIPS:
+  # `notify.sh` prints `notify: TELEGRAM_CHAT_ID unset — skipping send` and
+  # returns 0. That is stated here rather than left to be discovered, because a
+  # notification path that silently never fires is the defect this job exists to
+  # fix. Registering the two secrets is a repository-admin act, like the merge
+  # queue setting; until it happens the annotation and the summary are the whole
+  # of the alert.
+  notify-main-red:
+    needs:
+      - changes
+      - desktop-web
+      - desktop-browser
+      - build
+      - e2e-deterministic
+      - windows-cross-check
+      - build-windows
+      - build-macos
+      - security
+      - nix
+      - devbox
+    if: >-
+      always()
+      && github.event_name == 'push'
+      && github.ref == 'refs/heads/main'
+      && contains(needs.*.result, 'failure')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Say which commit and which job broke main
+        env:
+          # `toJSON(needs)` is the only route to the failing job NAMES: an
+          # expression can test `needs.*.result` but cannot map a result back to
+          # the job it came from, so the mapping is done in `jq` instead.
+          NEEDS_JSON: ${{ toJSON(needs) }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          COMMIT_SHA: ${{ github.sha }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          set -uo pipefail   # deliberately NOT -e: a red main must still be reported
+
+          failed="$(printf '%s' "$NEEDS_JSON" \
+            | jq -r '[to_entries[] | select(.value.result == "failure") | .key] | join(", ")' \
+            || true)"
+          subject="$(git log -1 --format=%s 2>/dev/null || true)"
+
+          message="$(printf 'dot-agent-deck CI — main is RED\ncommit: %s %s\nfailed: %s\n%s\n' \
+            "${COMMIT_SHA:0:8}" "${subject:-(subject unavailable)}" \
+            "${failed:-(job names unavailable)}" "$RUN_URL")"
+
+          # Unconditional, and before the send: this is what survives an unset or
+          # revoked token. Fenced because the step summary is rendered as
+          # Markdown, which would otherwise reflow the four lines into one. A
+          # TILDE fence rather than a backtick one: backticks inside a
+          # single-quoted string are a command substitution to shellcheck, and
+          # actionlint runs shellcheck over every `run:` block in this file.
+          printf '### main is red\n\n~~~\n%s\n~~~\n' "$message" >> "$GITHUB_STEP_SUMMARY"
+          echo "::error title=main is red::${COMMIT_SHA:0:8} — failed: ${failed:-unknown} — ${RUN_URL}"
+
+          scripts/notify.sh "$message"
