@@ -2286,17 +2286,37 @@ mod tests {
         );
 
         let _ = release.send(());
-        // Bounded rather than a bare loop: the task is finished the moment the
-        // runtime has polled it after the send, and a run that never gets there
-        // should fail rather than hang.
-        let mut reclaimed = None;
-        for _ in 0..1_000 {
-            if let Some(token) = state.start_watcher_once_for(&deck) {
-                reclaimed = Some(token);
-                break;
+        // Bounded by TIME, and by a sleep that actually parks this thread —
+        // never by an iteration count on this runtime.
+        //
+        // `tauri::async_runtime::spawn` does not put the task on the runtime
+        // `#[tokio::test]` built. With no `async_runtime::set` anywhere in this
+        // binary it lands on tauri's global `default_runtime()`, a
+        // multi-threaded tokio runtime with its own OS threads, so the release
+        // has to travel across a runtime boundary: a worker thread there must be
+        // scheduled, poll the released task to completion, and only then does
+        // `is_finished` flip for the handle `watching` reads. `yield_now` here
+        // reschedules only this test's own task and hands that worker nothing.
+        //
+        // So the old `for _ in 0..1_000 { yield_now().await }` was a ~4 ms wall
+        // clock budget wearing an iteration count: measured on an idle 16-core
+        // Linux box it resolved in 1–11 iterations and 17–41 us. Under 4x CPU
+        // oversubscription the same loop needed 46–174 iterations and exhausted
+        // all 1000 once in ten runs — reproducing, on Linux, the intermittent
+        // `build-windows` failure that sent it here. Windows loses it far more
+        // readily: its scheduling quantum alone is ~15.6 ms, four times the
+        // budget the loop actually had.
+        const RECLAIM_TIMEOUT: Duration = Duration::from_secs(5);
+        const RECLAIM_POLL: Duration = Duration::from_millis(5);
+        let reclaimed = tokio::time::timeout(RECLAIM_TIMEOUT, async {
+            loop {
+                if let Some(token) = state.start_watcher_once_for(&deck) {
+                    return token;
+                }
+                tokio::time::sleep(RECLAIM_POLL).await;
             }
-            tokio::task::yield_now().await;
-        }
+        })
+        .await;
 
         let second =
             reclaimed.expect("a deck whose watcher task has ended must be able to get another");
