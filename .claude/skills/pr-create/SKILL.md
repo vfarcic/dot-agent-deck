@@ -20,7 +20,7 @@ This file is **project-local and owned by this repository** — it was forked ou
 
 - CLAUDE.md is the authority on the gates. As of writing: `cargo fmt --check` and `cargo clippy --workspace --all-targets --features e2e,e2e-live -- -D warnings` before every commit, `cargo test-fast` per task, plus the tests covering what you touched — **name those in the PR body**, since part of the tier runs on no runner anywhere. Read the rules rather than trusting this list.
 - **Changelog fragment**: `changelog.d/<issue>.<type>.md`, type one of `breaking|feature|bugfix|doc|misc`. Release notes are built from these, not from PR labels.
-- **Rule 12** if the change touches the daemon, protocol, orchestration or hooks: answer the `PROTOCOL_VERSION`-vs-`.breaking.md` question explicitly in the PR body, including the cross-version manual test.
+- **Rule 12** if the change touches the daemon, protocol, orchestration or hooks: answer the `PROTOCOL_VERSION`-vs-`.breaking.md` question explicitly in the PR body, including the cross-version manual test. A `.breaking.md` fragment also needs its `CONTRACT_BREAKS` entry in `src/daemon_protocol.rs` (issue #801) — `xtask/linkage-check` fails the build without it.
 - Working tree clean, branch pushed. Never push to `main` — it is protected and returns `GH013`.
 
 ## 2. Open it

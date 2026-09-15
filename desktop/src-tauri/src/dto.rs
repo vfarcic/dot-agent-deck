@@ -220,9 +220,17 @@ pub struct DesktopConnection {
     pub daemon_version: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub running_agent_count: Option<usize>,
-    /// True when the ONLY thing that failed the handshake is the git-describe
-    /// build stamp — the protocol version agreed on both sides — so the webview
-    /// may offer Connect anyway (issue #801).
+    /// True when the protocol version agreed on both sides and a **declared
+    /// contract break** is what failed the handshake, so the webview may offer
+    /// Connect anyway (issue #801).
+    ///
+    /// **Named for what used to set it**, which was a git-describe build-stamp
+    /// difference the two builds' release digits did not excuse. Since #801 a
+    /// stamp difference sets this — and refuses — never: the classification is
+    /// over `daemon_protocol::CONTRACT_BREAKS`, which lives in the contract's own
+    /// source rather than in a tag. The name is kept because it is the key the
+    /// webview switches Connect anyway on, and renaming it across the bridge
+    /// would buy nothing this doc comment does not.
     ///
     /// Always emitted, including as `false`, because the webview branches on it
     /// to decide whether an override exists: an absent field and an incompatible
