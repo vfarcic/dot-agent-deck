@@ -8,10 +8,18 @@ Issue #896. `.github/workflows/ci.yml` carries a bare `workflow_dispatch:` trigg
 
 ```bash
 git push -u origin <branch>
-gh workflow run ci.yml --ref <branch>
-gh run list --workflow ci.yml --branch <branch> --limit 1
-gh run watch <run-id>                  # follow it
-gh run view <run-id> --log-failed      # read only what broke
+gh workflow run ci.yml --ref <branch>                 # prints the new run's URL
+gh run watch <run-id>                                 # follow it
+gh run view <run-id> --log-failed                     # read only what broke
+```
+
+**Take the run id from the URL that `gh workflow run` prints, not from a listing.** `gh run list --workflow ci.yml --branch <branch> --limit 1` looks like the obvious way to find the run you just started and is wrong twice over: for the first seconds the dispatch is not listed at all, so the newest run is the *previous* one; and a branch with an open pull request also carries `pull_request` runs, which are usually newer. Measured on this branch on 2026-09-15, with the dispatch already complete: that exact command returned the PR's run `35025714262` on head `435e3358`, not the dispatch `35025264144` on head `385e342d`. An agent that trusted it would have read a different run, on a different commit, as the answer to its dispatch.
+
+If you must list — a run started in another session, say — pin the event and check the head:
+
+```bash
+gh run list --workflow ci.yml --branch <branch> --event workflow_dispatch --limit 1 \
+  --json databaseId,headSha,status,conclusion
 ```
 
 `gh workflow run` exits as soon as the dispatch is accepted. On `gh` 2.98.0 it prints the new run's URL, and the last path segment of that URL is the run id — but the run does not show up in `gh run list` straight away. Measured for issue #896 on 2026-09-15: the list was empty immediately after the dispatch and reported the run as `queued` about eleven seconds later. Take the id from the URL, or poll the list; an empty list one second in is not a rejected dispatch.
@@ -22,7 +30,13 @@ That block is not a sketch: it was run end to end against this repository on 202
 
 Eleven of `ci.yml`'s twelve jobs: `changes`, `desktop-web`, `desktop-browser`, `build`, `e2e-deterministic`, `windows-cross-check`, `build-windows`, `build-macos`, `security`, `nix` and `devbox`. The twelfth, `notify-main-red`, is gated on `github.event_name == 'push' && github.ref == 'refs/heads/main'` and is silent here by design.
 
-That list is read off a real dispatch rather than off the file: run `35025264144` reported exactly those eleven and no `notify-main-red`. Confirm it yourself on any dispatch with `gh run view <run-id> --json jobs --jq '[.jobs[].name]'` — a job added to `ci.yml` later joins this list without anyone editing this paragraph.
+That list is read off a real dispatch rather than off the file: run [`35025264144`](https://github.com/vfarcic/dot-agent-deck/actions/runs/35025264144), a `workflow_dispatch` on this repository on 2026-09-15, ran exactly those eleven and reported `notify-main-red` as `skipped`, finishing green in 8.8 minutes. Note the shape of that last part before reading a job list yourself — a completed run reports **twelve** jobs, the twelfth `skipped`, while a run still in progress lists only the eleven, because a skipped job appears only once its condition has resolved. So filter rather than counting:
+
+```bash
+gh run view <run-id> --json jobs --jq '[.jobs[] | select(.conclusion != "skipped") | .name]'
+```
+
+A job added to `ci.yml` later joins that output without anyone editing this paragraph, which is the point of giving the command rather than only the list.
 
 The full matrix, not a subset. The `changes` job skips the Rust jobs for a Renovate PR that touched only `devbox.*` or only the flake, and it reads `github.event.pull_request.user.login` to decide — which a `workflow_dispatch` payload does not carry, so the author check fails, the job exits early with `devbox_only=false` / `flake_only=false`, and every downstream `if:` passes. That is the same fail-safe the `push`-to-`main` runs rely on, and its own comment in `ci.yml` says so.
 
@@ -34,6 +48,12 @@ Since issue #1088 the concurrency key is `ci-${{ github.event_name == 'pull_requ
 
 The cost of that is the other direction: a dispatch you no longer care about keeps a runner busy until it finishes or you cancel it with `gh run cancel <run-id>`.
 
+## It relieves no local gate, because it runs after them
+
+A dispatch is **additional, post-commit** coverage. That is not a caveat bolted on — it is forced by the order of events. CLAUDE.md rule 2's `cargo fmt --check` and `cargo clippy --workspace --all-targets --features e2e,e2e-live -- -D warnings` are a **pre-commit** gate, and there is nothing to dispatch until a commit exists, so by the time this page's first command is available those two have already had to pass. Rule 5's `cargo test-fast` stays a per-task obligation and this page does not move it.
+
+So "run CI instead" is never a thing anyone does here, and a task text that implies otherwise is telling a unit to skip a mandated gate. What a dispatch actually buys is the part **no local gate covers at all** — `build-macos`, `build-windows`, `e2e-deterministic`, `nix`, `devbox`, `security`, `desktop-web`, `desktop-browser`, `windows-cross-check` — at a moment of your choosing rather than only when you open the pull request, and without adding a second broad local sweep to a box that is already busy running the mandatory ones.
+
 ## What it does not cover, and cannot
 
 - **Lane 2 — anything reaching a real agent.** No test that reaches a real agent runs on a runner, and that is a decision rather than a gap (CLAUDE.md rule 5, [`e2e-lanes.md`](e2e-lanes.md)). `cargo test-e2e-live <filter>` is yours to run whatever CI reports.
@@ -42,13 +62,15 @@ The cost of that is the other direction: a dispatch you no longer care about kee
 
 ## When to reach for it
 
-- **The box is loaded.** Several units compiling at once is the condition issue [#863](https://github.com/vfarcic/dot-agent-deck/issues/863) measured to `io full avg300=65.95` — two-thirds of a five-minute window with every runnable task blocked on disk, the CPU idle at `cpu some avg300=0.08`, and `ld` then invoking the OOM killer. A unit that has just been dispatched into a fresh worktree is the worst case: it has no `target/` at all, so its first `cargo clippy --workspace --all-targets --features e2e,e2e-live` is a cold build of the whole graph.
+- **The box is loaded**, and the sweep you are about to run is one of the optional ones. The mandatory gates are already local and already paid for; what you can decline is a *second* broad local pass — a local lane-1 `cargo test-e2e`, a `scripts/windows-cross-check.sh`, a release build — on top of them. Several units compiling at once is the condition issue [#863](https://github.com/vfarcic/dot-agent-deck/issues/863) measured to `io full avg300=65.95` — two-thirds of a five-minute window with every runnable task blocked on disk, the CPU idle at `cpu some avg300=0.08`, and `ld` then invoking the OOM killer. A unit that has just been dispatched into a fresh worktree is the worst case: it has no `target/` at all, so its first `cargo clippy --workspace --all-targets --features e2e,e2e-live` is a cold build of the whole graph.
 - **A platform you do not have.** On a Linux host there is no local counterpart to `build-macos` at all: `scripts/` holds no Darwin cross-check, and the three test aliases compile for the host and nothing else. `build-windows` has a partial one — `scripts/windows-cross-check.sh` type-checks the workspace for `x86_64-pc-windows-msvc` from a Linux host ([`windows-cross-check.md`](windows-cross-check.md)) — but it runs `cargo check` rather than linking, runs no test and no clippy for that target, and cannot be held to `--features e2e` today. Both jobs are required contexts, so a break in either blocks the merge whether or not anything local could have seen it.
 - **A final pre-PR sweep**, when the unit would rather not pay for one locally. Opening the PR runs the same matrix anyway, so this buys the answer earlier, not an extra check.
 
 ## When not to
 
 **Never as the per-edit gate.** CLAUDE.md rule 2's `cargo fmt --check` plus `cargo clippy --workspace --all-targets --features e2e,e2e-live -- -D warnings` and rule 5's `cargo test-fast` stay local. Warm, that clippy is **9.3–10.4s** (rule 2, measured 2026-08-31 on 16 cores) against a CI round trip whose median is **9.5 minutes** — 40 to 60 times slower, depending on how loaded the box is when you measure the local side (14.3s warm here on 2026-09-15 under load, against rule 2's 9.3–10.4s on a quiet box). Nothing about a remote gate makes an inner loop that slow acceptable, and a unit that dispatches CI after each edit will spend its whole run waiting.
+
+**Never as a substitute for rule 2 or rule 5.** It cannot be one, per the section above, and a task text that reads as though it could is worse than saying nothing — it hands a unit a licence to commit without the gate that is supposed to precede the commit.
 
 **The expensive half is compiling, not testing**, so "just run the tests in CI" fixes little. Warm, `cargo test-fast`'s entire wall clock is the 25–30s CLAUDE.md rule 5 measures, because the build in front of the tests is then a no-op; cold, it is minutes, and the tests are still seconds of them. And lane 1 of the e2e tier is already off this box — issue #502 moved it to CI on every PR precisely because N units each running it was self-defeating.
 
@@ -60,6 +82,7 @@ Everything in this table was either measured for issue #896 on 2026-09-15 or is 
 | --- | --- | --- |
 | a `ci.yml` run, median | **9.5 min** | the 37 completed runs among the last 60 listed, 2026-09-15: `gh run list --workflow ci.yml --limit 60 --json conclusion,createdAt,updatedAt` |
 | the same: min / p90 / max | 7.3 / 16.4 / 26.7 min | same sample |
+| this page's own dispatch | **8.8 min**, green | run `35025264144`, 2026-09-15 |
 | rule 2's clippy, warm, quiet box | 9.3–10.4 s | CLAUDE.md rule 2, measured 2026-08-31 on 16 cores |
 | rule 2's clippy, warm, this box under load | **14.3 s** | measured for #896, 2026-09-15, same worktree once warm |
 | rule 2's clippy, cold, in a fresh dispatch worktree on a loaded box | **2m42s** | measured for #896, 2026-09-15, no `target/` at all, `/proc/pressure/io` at `full avg60=49.23` |

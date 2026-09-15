@@ -450,18 +450,19 @@ GATES — CLAUDE.md is the authority, this is the summary:
   rather than reproducing it. Say this explicitly in the unit, because an agent
   reading an older PRD will otherwise run the full tier for tens of minutes on
   its own initiative.
-- WHERE those gates run is your choice. ci.yml carries a bare
-  `workflow_dispatch:`, so `git push -u origin <branch>` followed by
-  `gh workflow run ci.yml --ref <branch>` runs the full matrix on GitHub's
-  runners instead of this box, and `gh run list --workflow ci.yml --branch
-  <branch> --limit 1` finds the run. Use it when the box is loaded with other
-  units compiling, when the change needs build-macos or build-windows (no
-  local gate covers the first and only a partial one covers the second), or
-  as a final pre-PR sweep. NOT as the per-edit gate: a round trip has a
-  9.5-minute median against a warm clippy of ~9-15s. It relocates work rather
-  than removing it, the expensive half is compiling rather than testing, and
-  it covers neither lane 2 nor anything you have not pushed.
-  docs/develop/ci-on-demand.md has the detail.
+- The full matrix can also run on GitHub's runners, and it RELIEVES NOTHING
+  above. ci.yml carries a bare `workflow_dispatch:`, so after a push
+  `gh workflow run ci.yml --ref <branch>` runs it there (take the run id from
+  the URL that prints, not from a listing). But rule 2's fmt+clippy run BEFORE
+  a commit exists, so they have already passed by the time there is anything
+  to dispatch, and `cargo test-fast` stays the per-task gate. What a dispatch
+  buys is the part no local gate covers at all — build-macos, build-windows,
+  e2e-deterministic, nix, devbox, security, the desktop jobs,
+  windows-cross-check — earlier than opening the PR, and the option of NOT
+  adding a second broad local sweep on a box already busy with the mandatory
+  ones. NOT as the per-edit gate: a round trip has a 9.5-minute median against
+  a warm clippy of ~9-15s. It covers neither lane 2 nor anything you have not
+  pushed. docs/develop/ci-on-demand.md has the detail.
 - Lane 2 — the files that reach a real agent, `cargo test-e2e-live <filter>`
   — runs on NO runner anywhere: no test that reaches a real agent runs in CI.
   Where the PRD touches a real-agent path, the unit runs those tests itself with
@@ -581,14 +582,18 @@ lifecycle, and it covers what /prd-full does not.
   Notifications section of your role template as load-bearing rather than
   optional. Send with `scripts/notify.sh "<message>"`; it enforces the explicit
   chat_id and has no inbound path, so those two rules hold by construction.
-- Where the gates run is a choice, and it is yours to pass on. ci.yml carries
-  a bare `workflow_dispatch:`, so the full matrix can run on GitHub's runners
-  instead of this box — push, then
-  `gh workflow run ci.yml --ref agent/dispatch-prd-<n>`. Reach for it when the
-  box is loaded with other units compiling, when a change needs build-macos or
-  build-windows, or as a final pre-PR sweep; never as a worker's per-edit gate,
-  where a 9.5-minute median round trip would replace a warm clippy of ~9-15s. Your
-  workers run the gates and you do not, so tell whoever you delegate to.
+- The full matrix can run on GitHub's runners, and it is yours to pass on.
+  ci.yml carries a bare `workflow_dispatch:`, so after a push
+  `gh workflow run ci.yml --ref agent/dispatch-prd-<n>` runs it there. It
+  relieves NO gate a worker owes: rule 2's fmt+clippy run before a commit
+  exists, so they have already passed by the time there is anything to
+  dispatch. What it buys is the part no local gate covers — build-macos,
+  build-windows, e2e-deterministic, nix, devbox, security, the desktop jobs,
+  windows-cross-check — earlier than opening the PR, and the option of not
+  adding a second broad local sweep on a box already busy. Never a worker's
+  per-edit gate, where a 9.5-minute median round trip would stand in for a
+  warm clippy of ~9-15s. Your workers run the gates and you do not, so tell
+  whoever you delegate to.
   docs/develop/ci-on-demand.md has the detail.
 - STOP CONDITION. Your workflow's step 7 pauses for the user's merge go-ahead.
   Under dispatch that pause is where this unit ENDS: send the merge-gate
