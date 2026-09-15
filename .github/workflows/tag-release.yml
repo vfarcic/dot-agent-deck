@@ -240,12 +240,15 @@ jobs:
         run: |
           set -euo pipefail
           export LC_ALL=C
-          # The same three assertions `release.yml`'s "Verify the flake version
-          # matches the release" step makes, made here BEFORE the edit instead of
-          # after the tag: exactly one anchored `version = "...";` line, a
-          # non-empty extraction, and exactly one `DAD_VERSION = version;` wiring
-          # it to the build. A pin that agrees with the tag but is no longer
-          # handed to the build ships a binary reporting `0.1.0` (issue #250).
+          # The same assertions `release.yml`'s "Verify the flake version matches
+          # the release" step makes, but placed around the edit rather than after
+          # the tag. The two structural counts run BEFORE it — exactly one
+          # anchored `version = "...";` line, and exactly one
+          # `DAD_VERSION = version;` wiring it to the build, since a pin that
+          # agrees with the tag but is no longer handed to the build ships a
+          # binary reporting `0.1.0` (issue #250). The value check runs AFTER:
+          # the pin must read back as exactly the version being released, which
+          # is strictly stronger than release.yml's non-empty-extraction guard.
           matches=$(grep -cE '^[[:space:]]*version = "[^"]+";[[:space:]]*$' flake.nix || true)
           if [ "${matches:-0}" -ne 1 ]; then
             echo "::error::Refusing to release: expected exactly one anchored 'version = \"...\";' line in flake.nix, found ${matches:-0}. The pin cannot be bumped safely."
