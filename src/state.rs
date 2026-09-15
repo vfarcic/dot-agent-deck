@@ -6989,6 +6989,30 @@ impl AppState {
     }
 }
 
+/// Shared by [`handle_restart_role_with_state`]'s early (pre-lock) crash
+/// check and its post-dispatch-lock recheck: `pane_id`'s occupant must be
+/// currently crashed, or `force` must be set, or the restart is refused with
+/// the same wording either check produces.
+fn restart_refusal_for_crashed_pane(
+    registry: &AgentPtyRegistry,
+    pane_id: &str,
+    role: &str,
+    force: bool,
+) -> Option<String> {
+    let crashed = registry
+        .agent_id_for_pane_any(pane_id)
+        .as_deref()
+        .and_then(|id| registry.agent_record_any(id))
+        .is_some_and(|record| record.crashed == Some(true));
+    if crashed || force {
+        return None;
+    }
+    Some(format!(
+        "pane {pane_id} (role `{role}`) has not crashed; pass --force to restart \
+         a healthy pane"
+    ))
+}
+
 /// Issue #868: handle `dot-agent-deck pane restart <role>` — an
 /// orchestrator asking the daemon to restart one of its own worker roles
 /// on demand. Recovery for a role M1 marked `crashed` (the ordinary case),
@@ -7021,6 +7045,23 @@ impl AppState {
 /// `respawn_agent_for_pane`/`respawn_or_recreate_agent_for_pane`
 /// (`dispatch_one_owned`) holds, serializing this restart against a
 /// concurrent `clear = true` delegate on the same pane.
+///
+/// **Locking (PR #918 review)**: serializing against `dispatch_one_owned`
+/// closes the race on lock ACQUISITION ORDER, but the crash check above
+/// still runs under the short-lived read guard, before this function ever
+/// reaches the dispatch lock — so a `dispatch_one_owned` delegate that wins
+/// the dispatch lock and installs a healthy replacement BETWEEN that
+/// read-guard check and this function's own dispatch-lock acquisition would
+/// previously go unnoticed: this function would still respawn on the
+/// strength of the now-stale early check and kill the just-installed
+/// replacement without `--force`. The crash check is now repeated
+/// immediately after `_dispatch_guard` is acquired, below, before
+/// `recreate_identity` is built or `respawn_or_recreate_agent_for_pane` is
+/// called — by the time this second check runs, no concurrent dispatch on
+/// this pane can still be in-flight (this function now holds the same lock
+/// they all serialize on), so its result is authoritative. `--force` skips
+/// both checks identically, by design: it means "restart regardless of
+/// crash state."
 pub async fn handle_restart_role_with_state(
     signal: RestartRoleSignal,
     state: &SharedState,
@@ -7091,18 +7132,11 @@ pub async fn handle_restart_role_with_state(
         // same "who currently holds this pane" fact WITHOUT that live-only
         // filter, so it still names the crashed agent's id until a
         // respawn/recreate replaces it.
-        let target_agent_id = registry.agent_id_for_pane_any(&pane_id);
-        let crashed = target_agent_id
-            .as_deref()
-            .and_then(|id| registry.agent_record_any(id))
-            .is_some_and(|record| record.crashed == Some(true));
-        if !crashed && !signal.force {
+        if let Some(error) =
+            restart_refusal_for_crashed_pane(registry, &pane_id, &signal.role, signal.force)
+        {
             return RestartRoleResponse {
-                error: Some(format!(
-                    "pane {pane_id} (role `{}`) has not crashed; pass --force to restart \
-                     a healthy pane",
-                    signal.role
-                )),
+                error: Some(error),
                 ..Default::default()
             };
         }
@@ -7140,6 +7174,24 @@ pub async fn handle_restart_role_with_state(
     // respawn — see this function's doc comment.
     let dispatch_mutex = registry.pane_dispatch_lock(&resolved.pane_id);
     let _dispatch_guard = dispatch_mutex.lock().await;
+
+    // TOCTOU (PR #918 review): the read-guard check above ran BEFORE this
+    // lock was acquired, so a concurrent `clear = true` delegation
+    // (`dispatch_one_owned`, which takes this same dispatch lock) can have
+    // installed a healthy replacement into the pane while this restart was
+    // queued behind the lock. Repeat the identical crash check now that the
+    // lock is actually held, before touching `recreate_identity` or calling
+    // `respawn_or_recreate_agent_for_pane` — otherwise this function would
+    // blindly respawn whatever now occupies the pane. `--force` is
+    // unaffected: it skips this recheck exactly as it skips the early one.
+    if let Some(error) =
+        restart_refusal_for_crashed_pane(registry, &resolved.pane_id, &signal.role, signal.force)
+    {
+        return RestartRoleResponse {
+            error: Some(error),
+            ..Default::default()
+        };
+    }
 
     let recreate_identity = crate::agent_pty::PaneRecreateIdentity {
         cwd: resolved.cwd.clone(),
