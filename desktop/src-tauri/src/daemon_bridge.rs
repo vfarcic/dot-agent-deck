@@ -462,6 +462,62 @@ impl DaemonLinks {
     }
 }
 
+/// How many break names a refusal sentence prints before it starts counting.
+///
+/// Four, because the sentence is read on a connection banner rather than in a
+/// log: a build is normally one or two breaks behind, and a list long enough to
+/// need scrolling has stopped telling the reader anything the count does not.
+const MAX_NAMED_BREAKS: usize = 4;
+
+/// The break names for one side of a divergence, bounded and charset-checked.
+///
+/// # Why a peer's entries are not rendered as they arrive
+///
+/// One of the two lists is peer-supplied. `this_build_lacks` is what the deck
+/// declared and this build does not, so every string in it came off the wire —
+/// and the connection banner scrubs its sentence with [`safe_message`], which
+/// removes general category `Cc` and lets `Cf`, the **bidi** controls, through.
+/// That is PRD #741 final audit F4's finding about `build_version`, which is
+/// rendered into the same sentence; a new unvalidated wire string beside it
+/// would re-open exactly that. A hostile or merely broken daemon can also send a
+/// list of any length the 16 MiB frame cap allows, which is a banner nobody can
+/// read.
+///
+/// So an entry is printed only when it matches the shape
+/// [`dot_agent_deck::daemon_protocol::CONTRACT_BREAKS`] declares — ASCII digits,
+/// lower-case letters and `-`, which cannot hold a control or a bidi byte — and
+/// at most [`MAX_NAMED_BREAKS`] of them are printed. Everything else is reported
+/// as a count, which is the honest thing to say about a name this app is not
+/// willing to show.
+///
+/// **Applied to BOTH lists although only one needs it.** `peer_lacks` is
+/// `CONTRACT_BREAKS.difference(peer)`, so it is a subset of this build's own
+/// compiled-in strings and is well-formed by construction. Bounding it too costs
+/// nothing and means an edit that later swaps which side is which cannot
+/// silently re-open the hole.
+fn named_breaks(breaks: &[String]) -> String {
+    fn is_declared_shape(entry: &str) -> bool {
+        !entry.is_empty()
+            && entry.len() <= 64
+            && entry
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+    }
+
+    let printable: Vec<&str> = breaks
+        .iter()
+        .map(String::as_str)
+        .filter(|entry| is_declared_shape(entry))
+        .take(MAX_NAMED_BREAKS)
+        .collect();
+    let unprinted = breaks.len() - printable.len();
+    match (printable.is_empty(), unprinted) {
+        (true, count) => format!("{count} break(s) it did not name in a readable form"),
+        (false, 0) => printable.join(", "),
+        (false, count) => format!("{}, and {count} more", printable.join(", ")),
+    }
+}
+
 /// Why the build stamp no longer decides anything, and what does (issue #801).
 ///
 /// # The three layers, kept apart
@@ -546,13 +602,13 @@ fn contract_refusal(response: &AttachResponse) -> Option<String> {
     if !peer_lacks.is_empty() {
         sides.push(format!(
             "the deck is behind this app across {}",
-            peer_lacks.join(", ")
+            named_breaks(&peer_lacks)
         ));
     }
     if !this_build_lacks.is_empty() {
         sides.push(format!(
             "this app is behind the deck across {}",
-            this_build_lacks.join(", ")
+            named_breaks(&this_build_lacks)
         ));
     }
     Some(format!(
@@ -1539,6 +1595,77 @@ mod tests {
         );
         assert!(info.error.is_none(), "{:?}", info.error);
         assert!(!info.build_stamp_mismatch_only);
+    }
+
+    /// A hostile deck cannot write whatever it likes into the connection banner.
+    ///
+    /// The break names on one side of a divergence are PEER-supplied — they are
+    /// what the deck declared and this build did not — and the banner scrubs its
+    /// sentence with `safe_message`, which removes general category `Cc` and lets
+    /// `Cf` (the bidi controls) through. A right-to-left override in one would
+    /// reverse everything printed after it, which is PRD #741 final audit F4's
+    /// finding about `build_version` reached by a new route. Length is the other
+    /// half: a peer may send as many entries as a 16 MiB frame holds.
+    ///
+    /// Both are bounded at the render, not hoped about — see [`named_breaks`].
+    #[test]
+    fn a_hostile_contract_list_reaches_the_banner_as_neither_bidi_nor_a_flood() {
+        let _guard = AllowanceGuard::acquire();
+        let mut hostile = hello_with_build(Some("0.39.0-gdeadbee"));
+        let mut declared: Vec<String> = dot_agent_deck::daemon_protocol::CONTRACT_BREAKS
+            .iter()
+            .map(|entry| (*entry).to_string())
+            .collect();
+        declared.push("999-\u{202e}drowssap".to_string());
+        declared.extend((0..500).map(|n| format!("{n}-flood-entry")));
+        hostile.contract_breaks = Some(declared);
+
+        let error = classify_handshake(&hostile, "0.39.0-gcafe123", BuildMismatchAllowance::Refuse)
+            .error
+            .expect("a divergence refuses");
+
+        assert!(
+            !error.contains('\u{202e}'),
+            "the override reached the banner: {error:?}"
+        );
+        assert!(
+            !error.contains("drowssap"),
+            "a name this app will not vouch for must not be printed at all: {error:?}"
+        );
+        assert!(
+            error.contains("and 497 more"),
+            "the rest must be counted rather than listed: {error:?}"
+        );
+        assert!(
+            error.len() < 600,
+            "a banner sentence must stay readable, got {} bytes",
+            error.len()
+        );
+    }
+
+    /// And when nothing the peer sent is printable, the count is all that is
+    /// said — never an empty list that reads as "no breaks".
+    #[test]
+    fn an_entirely_unprintable_contract_list_is_reported_as_a_count() {
+        let _guard = AllowanceGuard::acquire();
+        let mut hostile = hello_with_build(Some("0.39.0-gdeadbee"));
+        let mut declared: Vec<String> = dot_agent_deck::daemon_protocol::CONTRACT_BREAKS
+            .iter()
+            .map(|entry| (*entry).to_string())
+            .collect();
+        declared.push("\u{202e}\u{0007}".to_string());
+        declared.push("A".repeat(200));
+        hostile.contract_breaks = Some(declared);
+
+        let error = classify_handshake(&hostile, "0.39.0-gcafe123", BuildMismatchAllowance::Refuse)
+            .error
+            .expect("a divergence refuses");
+        assert!(
+            error.contains("2 break(s) it did not name in a readable form"),
+            "{error:?}"
+        );
+        assert!(!error.contains('\u{202e}'), "{error:?}");
+        assert!(!error.contains("AAAA"), "{error:?}");
     }
 
     /// A deck that predates the declaration connects, and that is deliberate.
