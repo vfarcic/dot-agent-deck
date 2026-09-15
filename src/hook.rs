@@ -606,6 +606,26 @@ pub fn send_and_await_restart_role_reply(json: &str) -> SocketReply {
     request_from_socket_inner(json, Some(RESTART_ROLE_REPLY_TIMEOUT))
 }
 
+/// PR #918 review fix round: `pane spawn`'s own CLI round-trip budget. It
+/// used to share [`DELEGATE_REPLY_TIMEOUT`] (5s), which was fine while a
+/// timeout silently mapped to success; now that a `NoReply` timeout is a hard
+/// failure (see [`SocketReply::NoReply`]'s doc), that 5s budget turns a
+/// slow-but-successful spawn under load into a false failure. `pane spawn`
+/// does not need [`RESTART_ROLE_REPLY_TIMEOUT`]'s full margin, though:
+/// `handle_spawn_role_with_state` does no terminate-and-respawn — it's just
+/// `spawn_agent` plus two `state.write().await` acquisitions, with none of
+/// restart's `AGENT_TERMINATE_GRACE` + `PANE_CLOSE_SETTLE_TIMEOUT` worst
+/// case. 10s gives comfortable margin over that without inheriting restart's
+/// larger budget for a cheaper operation.
+pub const SPAWN_ROLE_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// [`send_and_await_reply`], but bounded by [`SPAWN_ROLE_REPLY_TIMEOUT`]
+/// instead of [`DELEGATE_REPLY_TIMEOUT`] — see that constant's doc for why
+/// `pane spawn` needs a larger budget than `delegate`'s.
+pub fn send_and_await_spawn_role_reply(json: &str) -> SocketReply {
+    request_from_socket_inner(json, Some(SPAWN_ROLE_REPLY_TIMEOUT))
+}
+
 pub fn send_to_socket(json: &str) -> Option<()> {
     send_to_socket_at(&socket_path(), json)
 }

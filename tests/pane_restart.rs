@@ -479,3 +479,122 @@ async fn pane_restart_006_two_same_name_cwd_instances_do_not_cross_restart() {
          would make the isolation assertion above meaningless)"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Fix round (upstream PR #918 review): CLI-level RED coverage for `pane
+// restart`'s own handling of `SocketReply::NoReply` and an unparseable reply
+// line. `src/main.rs`'s `PaneCmd::Restart` arm used to fold BOTH into `return
+// ExitCode::SUCCESS`, which reads to an orchestrating agent as "restarted"
+// when nothing happened — wrong for this verb: an old/broken daemon cannot
+// possibly have restarted anything. These drive the REAL CLI binary against a
+// stub Unix-socket "daemon" — exactly `src/hook.rs`'s
+// `socket_006_silent_close_returns_no_reply_not_empty_line` stub-listener
+// technique — rather than calling the handler directly like every test
+// above.
+// ---------------------------------------------------------------------------
+
+/// This test file's own deliberate, documented contract for the fix's stderr
+/// wording (the task spec leaves exact phrasing to the coder): whatever
+/// message the CLI prints when an old daemon silently closes the connection
+/// without replying must say, case-insensitively, that the daemon does not
+/// support this command — distinguishing it from a plain "restart failed"
+/// error. Mirrors this file's own existing convention of asserting a
+/// deliberately chosen keyword rather than exact prose (e.g.
+/// `pane_restart_002`'s `.contains("crash")`).
+const OLD_DAEMON_STDERR_NEEDLE: &str = "does not support";
+
+/// Same contract, for the "reply line does not parse as a
+/// `RestartRoleResponse`" branch: the message must say, case-insensitively,
+/// that the daemon's response was unexpected/unrecognized.
+const MALFORMED_REPLY_STDERR_NEEDLE: &str = "unexpected";
+
+/// Bind a stub Unix-socket "daemon" at a fresh temp path, run the REAL
+/// `dot-agent-deck pane restart <role>` CLI as a subprocess against it, let
+/// `stub_reply` decide what (if anything) the stub writes back once it has
+/// read the CLI's one request line, and return the subprocess's output.
+fn run_pane_restart_against_stub(
+    role: &str,
+    stub_reply: impl FnOnce(std::os::unix::net::UnixStream) + Send + 'static,
+) -> std::process::Output {
+    let tmp = common::harness_tempdir().expect("create temp dir for stub daemon socket");
+    let socket_path = tmp.path().join("s.sock");
+    let listener =
+        std::os::unix::net::UnixListener::bind(&socket_path).expect("bind stub daemon socket");
+
+    let daemon_thread = std::thread::spawn(move || {
+        if let Ok((stream, _)) = listener.accept() {
+            let mut reader = std::io::BufReader::new(&stream);
+            let mut line = String::new();
+            let _ = std::io::BufRead::read_line(&mut reader, &mut line);
+            stub_reply(stream);
+        }
+    });
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
+        .args(["pane", "restart", role])
+        .env(DOT_AGENT_DECK_PANE_ID, "stub-restart-caller-pane")
+        .env("DOT_AGENT_DECK_SOCKET", &socket_path)
+        .output()
+        .expect("run the real `dot-agent-deck pane restart <role>` CLI");
+
+    let _ = daemon_thread.join();
+    output
+}
+
+/// Scenario: an old/broken daemon accepts the connection, reads the CLI's
+/// one request line, then closes without writing anything back at all —
+/// `SocketReply::NoReply`. The real `dot-agent-deck pane restart <role>` CLI
+/// must exit non-zero and say the daemon does not support this command —
+/// today it silently exits 0 with no output, reading as a successful
+/// restart that never happened.
+#[spec("pane/restart/007")]
+#[test]
+fn pane_restart_007_cli_fails_when_an_old_daemon_never_replies() {
+    let output = run_pane_restart_against_stub(WORKER_ROLE, drop);
+
+    assert!(
+        !output.status.success(),
+        "`pane restart` against a daemon that silently closes without replying \
+         must exit non-zero, not the current ExitCode::SUCCESS; status = {:?}, \
+         stdout = {:?}, stderr = {:?}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr).to_lowercase();
+    assert!(
+        stderr.contains(OLD_DAEMON_STDERR_NEEDLE),
+        "stderr must name that the daemon does not support this command (needle \
+         {OLD_DAEMON_STDERR_NEEDLE:?}); got stderr = {stderr:?}"
+    );
+}
+
+/// Scenario: the daemon replies, but with one line of unrelated/malformed
+/// JSON that does not parse as a `RestartRoleResponse`. The real CLI must
+/// exit non-zero and say the daemon's response was unexpected — today it
+/// silently exits 0 with no output.
+#[spec("pane/restart/008")]
+#[test]
+fn pane_restart_008_cli_fails_when_the_reply_does_not_parse_as_a_restart_response() {
+    use std::io::Write as _;
+
+    let output = run_pane_restart_against_stub(WORKER_ROLE, |mut stream| {
+        let _ = stream.write_all(b"{\"type\":\"unrelated-malformed-reply\"}\n");
+    });
+
+    assert!(
+        !output.status.success(),
+        "`pane restart` against a daemon replying with an unparseable line must \
+         exit non-zero, not the current ExitCode::SUCCESS; status = {:?}, \
+         stdout = {:?}, stderr = {:?}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr).to_lowercase();
+    assert!(
+        stderr.contains(MALFORMED_REPLY_STDERR_NEEDLE),
+        "stderr must name that the daemon's response was unexpected (needle \
+         {MALFORMED_REPLY_STDERR_NEEDLE:?}); got stderr = {stderr:?}"
+    );
+}

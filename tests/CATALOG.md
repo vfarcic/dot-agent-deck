@@ -4155,6 +4155,27 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 - **Does not assert:** the TUI-tab-side cross-wiring bug this coverage gap sits next to (`pane/spawn/010` pins that — a genuine defect at the tab-growth layer, unlike this test).
 - **Platform coverage:** mac+linux (unix-only).
 
+##### pane/restart/007 — `pane restart <role>` must fail (non-zero exit, stderr naming that the daemon does not support the command) against a daemon that silently closes the connection without replying (upstream PR #918 review).
+- **Layer:** fast synthetic real-binary-subprocess integration (real subprocess CLI — `env!("CARGO_BIN_EXE_dot-agent-deck")` — against a stub `UnixListener` that reads the one request line and closes without answering; no in-process daemon, no LLM).
+- **Agent:** none (a bare stub socket listener thread).
+- **Asserts:** the real `dot-agent-deck pane restart <role>` CLI, run against a stub socket that reproduces `SocketReply::NoReply` (the same technique `src/hook.rs`'s `socket_006_silent_close_returns_no_reply_not_empty_line` uses to produce that reply variant), exits non-zero and prints a stderr line containing, case-insensitively, "does not support" — this test's own deliberately chosen needle, since the task that commissioned it left exact wording to the fix.
+- **Does not assert:** exact byte-for-byte stderr wording beyond that needle; the reply-parses-but-is-malformed case (`pane/restart/008` owns that); the already-correct handler-level behavior (`pane/restart/001`-`006` own that).
+- **Platform coverage:** mac+linux (unix-only).
+
+##### pane/restart/008 — `pane restart <role>` must fail (non-zero exit, stderr naming an unexpected response) when the daemon replies with one line that does not parse as a `RestartRoleResponse` (upstream PR #918 review).
+- **Layer:** fast synthetic real-binary-subprocess integration (same real-subprocess-against-a-stub-socket technique as `pane/restart/007`, except the stub writes back one line of unrelated/malformed JSON instead of closing silently).
+- **Agent:** none.
+- **Asserts:** the real CLI exits non-zero and prints a stderr line containing, case-insensitively, "unexpected" — this test's own deliberately chosen needle.
+- **Does not assert:** exact byte-for-byte stderr wording beyond that needle; the silent-close case (`pane/restart/007` owns that).
+- **Platform coverage:** mac+linux (unix-only).
+
+##### pane/restart/009 — A pane restarted via `pane restart <role>` stays genuinely reachable through an ALREADY-ATTACHED TUI, not just at the daemon's own registry level (upstream PR #918 review — the coverage gap every prior `pane/restart/*` entry, all handler-level, leaves open).
+- **Layer:** L2/e2e (real TUI driven via PTY, real daemon, real `dot-agent-deck pane restart coder` + `dot-agent-deck delegate` CLI subprocesses). `pane-restart-live` fixture: one orchestration, roles `orchestrator` [start] + `coder`, `coder` running a short-lived boot command so it exits on its own and is marked crashed (M1), mirroring `tests/pane_restart.rs`'s own crash precondition but driven through the real PTY/daemon.
+- **Agent:** none (`cat` stand-ins; `coder`'s boot command is a short-lived `sleep`).
+- **Asserts:** after the tab opens with both roles visible, overwriting the RUNNING orchestration's own config so `coder`'s command becomes the long-lived `cat` (the respawn re-reads this file fresh), then retrying the real `pane restart coder` CLI (no `--force`, since the pane genuinely crashes on its own) until it succeeds — treating a "has not crashed" refusal as "keep waiting" and any other failure as fatal, since `ListAgents`/`agent_records()` deliberately filters out exited-but-not-reaped entries and so can never observe `coder`'s `crashed == Some(true)` marker fire; a successful restart is itself the proof the precondition held. A subsequent real `delegate --to coder` CLI call succeeds, and after focusing coder's own role pane, the delegated task's one-line file-pointer text (`compose_delegate_prompt`'s "Read .dot-agent-deck/worker-task-coder..." — the same substring `tests/e2e_pi_live.rs` already waits for to prove a delegate landed) actually renders in `coder`'s pane through the still-attached TUI.
+- **Does not assert:** the daemon-level `pane restart` verb's own registry correctness (covered by `pane/restart/001`-`006`); the CLI's exit-code handling of an old/unresponsive daemon (`pane/restart/007`/`008` own that); exact card body/status-badge layout; the unfocused role-card preview route for a restarted pane — the `cat` stand-in carries no recognized agent identity, so that route never activates here and this test structurally cannot cover it.
+- **Platform coverage:** mac+linux (unix-only, PTY-backed harness).
+
 #### pane/spawn
 
 ##### pane/spawn/001 — Spawning a configured-but-unspawned role succeeds and it becomes reachable (issue #868).
@@ -4225,6 +4246,20 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 - **Agent:** none (a `sleep 0.2` stand-in whose natural exit marks `crashed == Some(true)` while its role registration stays in place).
 - **Asserts:** spawning `coder` while its registered pane's agent has crashed (but is still registered) reports `spawned: false` with an error naming the role AND pointing at `pane restart` as the remedy — not the flat "already running" wording that fires for a genuinely healthy pane (`pane/spawn/002`).
 - **Does not assert:** the exact error wording beyond containing the role name and the literal `pane restart`.
+- **Platform coverage:** mac+linux (unix-only).
+
+##### pane/spawn/012 — `pane spawn <role>` must fail (non-zero exit, stderr naming that the daemon does not support the command) against a daemon that silently closes the connection without replying (upstream PR #918 review).
+- **Layer:** fast synthetic real-binary-subprocess integration (real subprocess CLI — `env!("CARGO_BIN_EXE_dot-agent-deck")` — against a stub `UnixListener` that reads the one request line and closes without answering; the identical technique `pane/restart/007` pins for `pane restart`).
+- **Agent:** none (a bare stub socket listener thread).
+- **Asserts:** the real `dot-agent-deck pane spawn <role>` CLI, run against a stub socket reproducing `SocketReply::NoReply`, exits non-zero and prints a stderr line containing, case-insensitively, "does not support" — this test file's own deliberately chosen needle, since the task that commissioned it left exact wording to the fix.
+- **Does not assert:** exact byte-for-byte stderr wording beyond that needle; the reply-parses-but-is-malformed case (`pane/spawn/013` owns that); the already-correct handler-level behavior (`pane/spawn/001`-`011` own that).
+- **Platform coverage:** mac+linux (unix-only).
+
+##### pane/spawn/013 — `pane spawn <role>` must fail (non-zero exit, stderr naming an unexpected response) when the daemon replies with one line that does not parse as a `SpawnRoleResponse` (upstream PR #918 review).
+- **Layer:** fast synthetic real-binary-subprocess integration (same real-subprocess-against-a-stub-socket technique as `pane/spawn/012`, except the stub writes back one line of unrelated/malformed JSON instead of closing silently).
+- **Agent:** none.
+- **Asserts:** the real CLI exits non-zero and prints a stderr line containing, case-insensitively, "unexpected" — this test file's own deliberately chosen needle.
+- **Does not assert:** exact byte-for-byte stderr wording beyond that needle; the silent-close case (`pane/spawn/012` owns that).
 - **Platform coverage:** mac+linux (unix-only).
 
 #### pi/live

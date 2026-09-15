@@ -1307,10 +1307,27 @@ fn main() -> ExitCode {
                         );
                         return ExitCode::FAILURE;
                     }
-                    // Same reasoning as `delegate`'s `NoReply`: a daemon that
-                    // doesn't know this verb yet (older build) must not read
-                    // as a proven failure.
-                    SocketReply::NoReply => return ExitCode::SUCCESS,
+                    // Unlike `delegate`'s fire-and-forget `NoReply`, `pane
+                    // restart` must not read a silent close as success — but
+                    // `NoReply` folds several distinct `ReplyReadError`
+                    // causes (see its doc comment above), only one of which
+                    // is "old daemon"; a `DeadlineExpired` here means the
+                    // restart may well have already succeeded, so the
+                    // message below stays cause-agnostic rather than
+                    // asserting "old daemon" and telling the agent to
+                    // restart the whole daemon, which would be the worst
+                    // possible advice in that case (PR #918 review).
+                    SocketReply::NoReply => {
+                        eprintln!(
+                            "Error: the daemon did not answer `pane restart {role}` in time — \
+                             either it does not support this command (an older build; restart \
+                             the daemon to pick up the new one) or the restart is still in \
+                             flight and may have already succeeded. Check the pane before \
+                             retrying — retrying a successful restart will kill and respawn it \
+                             again."
+                        );
+                        return ExitCode::FAILURE;
+                    }
                     SocketReply::Line(line) => line,
                 };
                 let resp =
@@ -1318,7 +1335,12 @@ fn main() -> ExitCode {
                         .ok()
                         .filter(|r| r.is_restart_role_reply());
                 let Some(resp) = resp else {
-                    return ExitCode::SUCCESS;
+                    eprintln!(
+                        "Error: the running daemon sent an unexpected reply to \
+                         `pane restart {role}` — it may not support this command; restart \
+                         the daemon to pick up the new build."
+                    );
+                    return ExitCode::FAILURE;
                 };
                 if resp.restarted {
                     println!("Restarted role {role}");
@@ -1355,7 +1377,11 @@ fn main() -> ExitCode {
                     }
                 };
                 use dot_agent_deck::hook::SocketReply;
-                let line = match dot_agent_deck::hook::send_and_await_reply(&json) {
+                // `pane spawn`'s own, larger reply budget — see
+                // `SPAWN_ROLE_REPLY_TIMEOUT`'s doc for why `delegate`'s 5s is
+                // too small now that a timeout is a hard failure rather than
+                // a silent success (PR #918 review).
+                let line = match dot_agent_deck::hook::send_and_await_spawn_role_reply(&json) {
                     SocketReply::Unreachable => {
                         eprintln!(
                             "Error: could not reach the dot-agent-deck daemon socket, so the \
@@ -1363,17 +1389,35 @@ fn main() -> ExitCode {
                         );
                         return ExitCode::FAILURE;
                     }
-                    // Same reasoning as `delegate`'s `NoReply`: a daemon that
-                    // doesn't know this verb yet (older build) must not read
-                    // as a proven failure.
-                    SocketReply::NoReply => return ExitCode::SUCCESS,
+                    // Unlike `delegate`'s fire-and-forget `NoReply`, `pane
+                    // spawn` must not read a silent close as success — but
+                    // `NoReply` folds several distinct `ReplyReadError`
+                    // causes (see its doc comment above), only one of which
+                    // is "old daemon"; a `DeadlineExpired` here means the
+                    // spawn may still be in flight, so the message below
+                    // stays cause-agnostic rather than asserting "old
+                    // daemon" (PR #918 review).
+                    SocketReply::NoReply => {
+                        eprintln!(
+                            "Error: the daemon did not answer `pane spawn {role}` in time — \
+                             either it does not support this command (an older build; restart \
+                             the daemon to pick up the new one) or the spawn is still in \
+                             flight. Check the pane before retrying."
+                        );
+                        return ExitCode::FAILURE;
+                    }
                     SocketReply::Line(line) => line,
                 };
                 let resp = serde_json::from_str::<dot_agent_deck::event::SpawnRoleResponse>(&line)
                     .ok()
                     .filter(|r| r.is_spawn_role_reply());
                 let Some(resp) = resp else {
-                    return ExitCode::SUCCESS;
+                    eprintln!(
+                        "Error: the running daemon sent an unexpected reply to \
+                         `pane spawn {role}` — it may not support this command; restart \
+                         the daemon to pick up the new build."
+                    );
+                    return ExitCode::FAILURE;
                 };
                 if resp.spawned {
                     println!("Spawned role {role}");

@@ -9445,6 +9445,57 @@ pub fn agent_records_on(socket: &Path) -> Vec<dot_agent_deck::agent_pty::AgentRe
     }
 }
 
+/// Retry the REAL `dot-agent-deck pane restart <role>` CLI as a subprocess
+/// against `socket`, from `caller_pane`'s identity, until it succeeds or
+/// `timeout` elapses (upstream PR #918 review, `tests/e2e_pane_restart_live.rs`,
+/// `pane/restart/009`). A refusal whose stderr contains "has not crashed" —
+/// `handle_restart_role_with_state`'s (`src/state.rs`) exact wording when the
+/// daemon does not yet consider the pane crashed — means keep waiting, since
+/// the polled precondition genuinely cannot be observed any other way:
+/// `ListAgents`/`agent_records()` deliberately filters out exited-but-not-
+/// reaped entries, so polling it for the role's `crashed == Some(true)`
+/// marker can never see that marker fire. Any OTHER failure is a genuine
+/// test failure and panics immediately. A successful restart IS the proof
+/// the precondition held. Lives here rather than in that e2e file's own body
+/// because `cargo xtask linkage-check`'s Decision 21 rule forbids a bare
+/// `std::thread::sleep` inside an `e2e_*.rs` test body —
+/// `wait_for_file_substr_count` just below takes the same escape hatch.
+#[cfg(unix)]
+#[allow(dead_code)]
+pub fn retry_pane_restart_until_success(
+    socket: &Path,
+    caller_pane: &str,
+    role: &str,
+    timeout: Duration,
+) -> std::process::Output {
+    let bin = env!("CARGO_BIN_EXE_dot-agent-deck");
+    let deadline = Instant::now() + timeout;
+    loop {
+        let output = std::process::Command::new(bin)
+            .args(["pane", "restart", role])
+            .env("DOT_AGENT_DECK_PANE_ID", caller_pane)
+            .env("DOT_AGENT_DECK_SOCKET", socket)
+            .output()
+            .expect("run the real `dot-agent-deck pane restart <role>` CLI");
+        if output.status.success() {
+            return output;
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        assert!(
+            stderr.contains("has not crashed"),
+            "`pane restart {role}` failed for a reason other than the pane not \
+             having crashed yet -- stdout={}, stderr={stderr}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert!(
+            Instant::now() < deadline,
+            "`pane restart {role}` kept refusing with \"has not crashed\" for over \
+             {timeout:?} -- the pane never became eligible for restart"
+        );
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
 /// One-shot read of a daemon-side pane's PTY scrollback via
 /// `AttachRequest::Snapshot`, over `socket`. The daemon replies `RESP ok`, then
 /// (when the ring is non-empty) a single `STREAM_OUT` frame carrying the whole

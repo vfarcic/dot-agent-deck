@@ -1,0 +1,28 @@
+# Fixture for the L2 PTY-attached `pane restart` test (pane/restart/009,
+# upstream PR #918 review fix round). Mirrors `pane-spawn-live`'s shape: ONE
+# orchestration with `orchestrator` (start = true) + `coder`, both spawned the
+# instant the tab opens. `coder` runs a short-lived command so it exits on its
+# own shortly after boot -- the same "process exited without work-done"
+# precondition `tests/pane_restart.rs`'s `pane/restart/001` uses at the
+# handler level, driven here through a real PTY/daemon instead -- letting M1's
+# `crashed == Some(true)` marker fire naturally. `orchestrator` stays on `cat`
+# so the tab itself survives for the whole test. The test overwrites this same
+# `[[orchestrations]]` block (name unchanged) inside the running
+# orchestration's own working directory, before restarting `coder`, to swap
+# its command for a long-lived one -- otherwise the restarted pane would race
+# its own second self-exit before the test could prove anything about it.
+# `clear = false` on `coder` keeps a later `delegate` from respawning it a
+# second time, so the test's reachability check exercises the SAME process
+# `pane restart` produced.
+[[orchestrations]]
+name = "restart-orch"
+
+[[orchestrations.roles]]
+name = "orchestrator"
+command = "cat"
+start = true
+
+[[orchestrations.roles]]
+name = "coder"
+command = "sleep 0.3"
+clear = false

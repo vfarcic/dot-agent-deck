@@ -461,3 +461,118 @@ async fn pane_spawn_011_refuses_a_crashed_roles_spawn_with_a_pane_restart_pointe
          'already running' wording; error = {error:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Fix round (upstream PR #918 review): CLI-level RED coverage for `pane
+// spawn`'s own handling of `SocketReply::NoReply` and an unparseable reply
+// line — the identical pattern `tests/pane_restart.rs`'s
+// `pane_restart_007`/`008` pin for `pane restart`. `src/main.rs`'s
+// `PaneCmd::Spawn` arm used to fold BOTH into `return ExitCode::SUCCESS`,
+// which reads to an orchestrating agent as "spawned" when nothing happened.
+// These drive the REAL CLI binary against a stub Unix-socket "daemon" —
+// exactly `src/hook.rs`'s `socket_006_silent_close_returns_no_reply_not_empty_line`
+// stub-listener technique — rather than calling the handler directly like
+// every test above.
+// ---------------------------------------------------------------------------
+
+/// Same deliberate, documented stderr-wording contract as
+/// `tests/pane_restart.rs`'s `OLD_DAEMON_STDERR_NEEDLE` — the task spec
+/// leaves exact phrasing to the coder, so this is this file's own chosen
+/// needle: whatever message the CLI prints when an old daemon silently
+/// closes the connection without replying must say, case-insensitively,
+/// that the daemon does not support this command.
+const OLD_DAEMON_STDERR_NEEDLE: &str = "does not support";
+
+/// Same contract as `tests/pane_restart.rs`'s `MALFORMED_REPLY_STDERR_NEEDLE`,
+/// for the "reply line does not parse as a `SpawnRoleResponse`" branch.
+const MALFORMED_REPLY_STDERR_NEEDLE: &str = "unexpected";
+
+/// Bind a stub Unix-socket "daemon" at a fresh temp path, run the REAL
+/// `dot-agent-deck pane spawn <role>` CLI as a subprocess against it, let
+/// `stub_reply` decide what (if anything) the stub writes back once it has
+/// read the CLI's one request line, and return the subprocess's output.
+fn run_pane_spawn_against_stub(
+    role: &str,
+    stub_reply: impl FnOnce(std::os::unix::net::UnixStream) + Send + 'static,
+) -> std::process::Output {
+    let tmp = common::harness_tempdir().expect("create temp dir for stub daemon socket");
+    let socket_path = tmp.path().join("s.sock");
+    let listener =
+        std::os::unix::net::UnixListener::bind(&socket_path).expect("bind stub daemon socket");
+
+    let daemon_thread = std::thread::spawn(move || {
+        if let Ok((stream, _)) = listener.accept() {
+            let mut reader = std::io::BufReader::new(&stream);
+            let mut line = String::new();
+            let _ = std::io::BufRead::read_line(&mut reader, &mut line);
+            stub_reply(stream);
+        }
+    });
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
+        .args(["pane", "spawn", role])
+        .env(DOT_AGENT_DECK_PANE_ID, "stub-spawn-caller-pane")
+        .env("DOT_AGENT_DECK_SOCKET", &socket_path)
+        .output()
+        .expect("run the real `dot-agent-deck pane spawn <role>` CLI");
+
+    let _ = daemon_thread.join();
+    output
+}
+
+/// Scenario: an old/broken daemon accepts the connection, reads the CLI's
+/// one request line, then closes without writing anything back at all —
+/// `SocketReply::NoReply`. The real `dot-agent-deck pane spawn <role>` CLI
+/// must exit non-zero and say the daemon does not support this command —
+/// today it silently exits 0 with no output, reading as a successful spawn
+/// that never happened.
+#[spec("pane/spawn/012")]
+#[test]
+fn pane_spawn_012_cli_fails_when_an_old_daemon_never_replies() {
+    let output = run_pane_spawn_against_stub(REVIEWER_ROLE, drop);
+
+    assert!(
+        !output.status.success(),
+        "`pane spawn` against a daemon that silently closes without replying must \
+         exit non-zero, not the current ExitCode::SUCCESS; status = {:?}, \
+         stdout = {:?}, stderr = {:?}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr).to_lowercase();
+    assert!(
+        stderr.contains(OLD_DAEMON_STDERR_NEEDLE),
+        "stderr must name that the daemon does not support this command (needle \
+         {OLD_DAEMON_STDERR_NEEDLE:?}); got stderr = {stderr:?}"
+    );
+}
+
+/// Scenario: the daemon replies, but with one line of unrelated/malformed
+/// JSON that does not parse as a `SpawnRoleResponse`. The real CLI must
+/// exit non-zero and say the daemon's response was unexpected — today it
+/// silently exits 0 with no output.
+#[spec("pane/spawn/013")]
+#[test]
+fn pane_spawn_013_cli_fails_when_the_reply_does_not_parse_as_a_spawn_response() {
+    let output = run_pane_spawn_against_stub(REVIEWER_ROLE, |mut stream| {
+        use std::io::Write as _;
+        let _ = stream.write_all(b"{\"type\":\"unrelated-malformed-reply\"}\n");
+    });
+
+    assert!(
+        !output.status.success(),
+        "`pane spawn` against a daemon replying with an unparseable line must \
+         exit non-zero, not the current ExitCode::SUCCESS; status = {:?}, \
+         stdout = {:?}, stderr = {:?}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr).to_lowercase();
+    assert!(
+        stderr.contains(MALFORMED_REPLY_STDERR_NEEDLE),
+        "stderr must name that the daemon's response was unexpected (needle \
+         {MALFORMED_REPLY_STDERR_NEEDLE:?}); got stderr = {stderr:?}"
+    );
+}
