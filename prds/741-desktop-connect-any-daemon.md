@@ -282,7 +282,7 @@ Field naming has one trap: the naming tripwire (`settings.rs:2074`) fails on a k
 
 The order in `classify_handshake` **is** the security property and it does not change: `ok:false` → `PROTOCOL_VERSION` **exact equality** (`daemon_bridge.rs:230`, not bypassable, and the reason a new desktop can never reach an old daemon's verbs) → the build stamp → connect. `DOT_AGENT_DECK_DESKTOP_ALLOW_BUILD_MISMATCH` and the session allowance touch **only** the stamp arm, and never the trust check, which runs before `hello()` is called at all.
 
-Half of #801 is already delivered and should not be rebuilt: `release_versions_are_compatible` (`:192-203`) compares a `compatibility_key` — `(0, minor)` while major is 0 — so a stamp difference *within* a release now falls through silently, fail-safe (`false` unless **both** stamps parsed).
+Half of #801 is already delivered and should not be rebuilt: `release_versions_are_compatible` (`:192-203`) compares a `compatibility_key` — `(0, minor)` while major is 0 — so a stamp difference *within* a release now falls through silently, fail-safe (`false` unless **both** stamps parsed). **Superseded by #801 itself:** that comparison is gone — it read `0.38` off the same `git describe` whose tag timing produced the false positive, and the classification is now over `daemon_protocol::CONTRACT_BREAKS`. Nothing below that names `release_versions_are_compatible`, `compatibility_key`, `release_core` or `StampPolicy` describes the current code; see [`docs/develop/desktop-gui.md`](../docs/develop/desktop-gui.md#compatibility-is-classified-from-the-contract-not-from-a-git-tag-801).
 
 What is left is exactly two things, and only one of them is this PRD's:
 

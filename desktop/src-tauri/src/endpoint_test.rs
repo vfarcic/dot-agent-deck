@@ -62,7 +62,7 @@ use serde::Serialize;
 use dot_agent_deck::daemon_client::Endpoint;
 use dot_agent_deck::daemon_protocol::PROTOCOL_VERSION;
 
-use crate::daemon_bridge::{HandshakeInfo, StampPolicy, hello};
+use crate::daemon_bridge::{HandshakeInfo, hello};
 use crate::dto::{ConnectionStatus, safe_display_text};
 use crate::endpoint_tunnels::EndpointTunnels;
 use crate::settings::{
@@ -108,37 +108,38 @@ pub enum EndpointTestState {
     /// A daemon answered and the wire versions disagree. The two numbers are in
     /// the report; this is the one state no override can reach.
     ProtocolRefused,
-    /// The wire agreed and the two git-describe build stamps did not.
-    BuildStampDiffers,
+    /// The wire agreed and the two builds' DECLARED CONTRACT BREAKS did not, so
+    /// a compatibility break somebody wrote down sits between them (issue #801).
+    ///
+    /// Not a stamp comparison, which is what this state used to be: the stamps
+    /// are reported beside it and are not what was measured.
+    ContractDiffers,
     /// The deck answered and this build can talk to it.
     Reachable,
 }
 
 impl EndpointTestState {
-    /// Whether this state means the deck can be used right now, under the
-    /// build-stamp policy for its kind (PRD #741 M8).
+    /// Whether this state means the deck can be used right now.
     ///
-    /// `BuildStampDiffers` is the one state whose answer depends on the policy,
-    /// and it depends on it because the *connection banner's* answer does:
+    /// `ContractDiffers` is deliberately **not** ok, for either deck kind. The
+    /// protocol agreed, so it is overridable on the connection screen — but an
+    /// override is a judgement the user makes there, and not something a green
+    /// tick here should pre-empt.
     ///
-    /// - [`StampPolicy::Enforced`] — a local deck. Deliberately **not** ok: the
-    ///   protocol agreed, so it is overridable, but an override is a judgement
-    ///   the user makes on the connection screen and not something a green tick
-    ///   here should pre-empt.
-    /// - [`StampPolicy::Informational`] — a remote deck. Ok, because the app
-    ///   *will* connect to it: M8 demoted the stamp to a badge for a deck this
-    ///   app cannot replace. A probe reporting "unusable" for a deck the banner
-    ///   is about to connect to would be the two screens disagreeing about one
-    ///   daemon, which is the failure this module was written to avoid.
+    /// **This used to take a `StampPolicy` and answer differently per kind**
+    /// (PRD #741 M8): a *stamp* difference against a remote deck was noise the
+    /// user could not act on, so a probe reporting "unusable" for a deck the
+    /// banner was about to connect to would have been two screens disagreeing
+    /// about one daemon. Issue #801 removed the stamp from the classification
+    /// entirely, so there is no longer a stamp-difference state to be lenient
+    /// about; what is left is a declared break, which is not noise for a deck of
+    /// either kind. The two screens still agree, because the banner refuses this
+    /// one too.
     ///
-    /// The message says what differs either way — the verdict changes, the
-    /// disclosure does not.
-    pub fn is_ok(self, stamps: StampPolicy) -> bool {
-        match self {
-            Self::Reachable => true,
-            Self::BuildStampDiffers => stamps == StampPolicy::Informational,
-            _ => false,
-        }
+    /// The message says what differs either way — the verdict changed, the
+    /// disclosure did not.
+    pub fn is_ok(self) -> bool {
+        matches!(self, Self::Reachable)
     }
 }
 
@@ -229,23 +230,12 @@ pub struct EndpointTestReport {
     pub daemon_build_version: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub running_agent_count: Option<usize>,
-    /// The build-stamp policy [`Self::state`] was classified under, carried so
-    /// [`Self::sealed`] can stamp [`Self::ok`] without deciding it a second time
-    /// (PRD #741 M8).
-    ///
-    /// Not serialised: it is an input to `ok`, which is what the panel reads.
-    /// Written only by [`apply_handshake`], which is the only producer of the
-    /// only state whose verdict consults it — so on every path that never
-    /// handshakes this holds the placeholder [`StampPolicy::Enforced`] that
-    /// [`Self::new`] wrote, and is never read.
-    #[serde(skip)]
-    stamps: StampPolicy,
 }
 
 impl EndpointTestReport {
     /// Bring [`Self::ok`] into step with [`Self::state`]. The one exit.
     fn sealed(mut self) -> Self {
-        self.ok = self.state.is_ok(self.stamps);
+        self.ok = self.state.is_ok();
         self
     }
 
@@ -264,11 +254,6 @@ impl EndpointTestReport {
             remedy: None,
             detail: None,
             discovered_socket: None,
-            // Never consulted unless `apply_handshake` overwrites it — no
-            // other path can reach the one state that reads it. `Enforced` is
-            // the fail-safe of the two, so a future state that did consult it
-            // would withhold a green tick rather than invent one.
-            stamps: StampPolicy::Enforced,
             disclosure_known: false,
             forwards: Vec::new(),
             known_hosts: Vec::new(),
@@ -295,7 +280,7 @@ pub(crate) fn state_from_handshake(info: &HandshakeInfo) -> EndpointTestState {
         return EndpointTestState::Reachable;
     }
     if info.build_stamp_mismatch_only {
-        return EndpointTestState::BuildStampDiffers;
+        return EndpointTestState::ContractDiffers;
     }
     if info.server_protocol_version != Some(PROTOCOL_VERSION) {
         return EndpointTestState::ProtocolRefused;
@@ -351,9 +336,11 @@ pub(crate) fn state_from_tunnel_error(
 fn message_for(state: EndpointTestState, deck: &str, info: Option<&HandshakeInfo>) -> String {
     match state {
         EndpointTestState::Reachable => format!("{deck} answered and is compatible with this app."),
-        EndpointTestState::BuildStampDiffers => info
+        EndpointTestState::ContractDiffers => info
             .and_then(|info| info.error.clone())
-            .unwrap_or_else(|| format!("{deck} answered; it was built from a different commit.")),
+            .unwrap_or_else(|| {
+                format!("{deck} answered; a declared compatibility break sits between the two builds.")
+            }),
         EndpointTestState::ProtocolRefused => info
             .and_then(|info| info.error.clone())
             .unwrap_or_else(|| format!("{deck} speaks a different protocol version.")),
@@ -385,16 +372,12 @@ fn message_for(state: EndpointTestState, deck: &str, info: Option<&HandshakeInfo
     }
 }
 
-/// Fill a report's handshake half from a classified `Hello`, under the policy
-/// `stamps` — the same value the `hello` that produced `info` was given.
+/// Fill a report's handshake half from a classified `Hello`.
 ///
-/// The policy travels with the handshake rather than being re-derived at the
-/// exit because this is the only place [`EndpointTestState::BuildStampDiffers`]
-/// can be produced, and that is the only state whose verdict reads the policy
-/// (PRD #741 M8). Taking it here is what lets [`EndpointTestReport::sealed`]
-/// stamp `ok` without a second copy of the local/remote decision.
-fn apply_handshake(report: &mut EndpointTestReport, info: &HandshakeInfo, stamps: StampPolicy) {
-    report.stamps = stamps;
+/// Issue #801 took the `StampPolicy` parameter out with the policy itself: the
+/// verdict no longer depends on the deck's kind, because the stamp no longer
+/// decides anything and a declared contract break refuses either kind.
+fn apply_handshake(report: &mut EndpointTestReport, info: &HandshakeInfo) {
     report.state = state_from_handshake(info);
     // Scrubbed here rather than trusted from `HandshakeInfo` (PRD #741 final
     // audit **F4**). Three of the states below take their sentence verbatim
@@ -437,7 +420,7 @@ pub(crate) async fn test_endpoint(
     tunnels: &EndpointTunnels,
 ) -> EndpointTestReport {
     // PRD #741 M8: no policy is decided here. It was, from the selection token,
-    // which made this a third spelling of a rule [`StampPolicy::for_endpoint`]
+    // which made this a third spelling of a rule `StampPolicy::for_endpoint`
     // already owns — the same one-implementation-three-callers shape M4(b) took
     // out of the daemon's session attach. The two arms below each hold a real
     // endpoint and ask `for_endpoint` about it; the report carries the answer up
@@ -516,14 +499,9 @@ async fn test_local(tunnels: &EndpointTunnels) -> EndpointTestReport {
     // inherited forwards and no host-key source — and saying so is an answer:
     // `disclosure_known` with empty lists is what the panel renders as "none".
     report.disclosure_known = true;
-    // PRD #741 M8: asked of the endpoint rather than written out, because
-    // `Test connection` must classify a handshake exactly as the connection
-    // banner does and the banner asks the same function. Writing `Enforced` here
-    // would be a second copy of the rule that could drift from it.
-    let stamps = StampPolicy::for_endpoint(&endpoint);
     match tunnels.acquire(&endpoint).await {
-        Ok(lease) => match hello(lease.address(), stamps).await {
-            Ok((info, _)) => apply_handshake(&mut report, &info, stamps),
+        Ok(lease) => match hello(lease.address()).await {
+            Ok((info, _)) => apply_handshake(&mut report, &info),
             Err(error) => {
                 report.state = EndpointTestState::DeckNotAnswering;
                 report.detail = Some(safe_display_text(error));
@@ -611,11 +589,6 @@ async fn test_remote(
     };
 
     let endpoint = Endpoint::Remote(row.endpoint_at(socket));
-    // PRD #741 M8, as in `test_local`: the policy is the endpoint's to state. A
-    // probe that refused where the banner would connect would be telling the
-    // user the deck is unusable when it is about to work, and the way to keep
-    // the two screens agreeing is to have them consult one function.
-    let stamps = StampPolicy::for_endpoint(&endpoint);
     let lease = match tunnels.acquire(&endpoint).await {
         Ok(lease) => lease,
         Err(error) => {
@@ -645,8 +618,8 @@ async fn test_remote(
         }
     };
 
-    match hello(lease.address(), stamps).await {
-        Ok((info, _)) => apply_handshake(&mut report, &info, stamps),
+    match hello(lease.address()).await {
+        Ok((info, _)) => apply_handshake(&mut report, &info),
         Err(error) => {
             report.state = EndpointTestState::DeckNotAnswering;
             report.detail = Some(safe_display_text(error));
@@ -899,19 +872,27 @@ mod tests {
 
     /// The handshake states, driven through `daemon_bridge`'s own classifier so
     /// this cannot disagree with the connection banner about the same daemon.
-    ///
-    /// The local policy, because that is the one every existing case here is
-    /// about; the M8 remote demotion has its own cases and names its own policy.
     fn info(response: &AttachResponse, client_build: &str) -> HandshakeInfo {
-        crate::daemon_bridge::classify_handshake_for_test(
-            response,
-            client_build,
-            StampPolicy::Enforced,
-        )
+        crate::daemon_bridge::classify_handshake_for_test(response, client_build)
     }
 
+    /// A deck that agrees with this build about the contract, stamped however
+    /// the caller likes.
+    ///
+    /// The stamp is a parameter because several cases below are *about* the
+    /// stamp — that it is reported, that it is scrubbed — and none of them is
+    /// about it deciding anything, which since issue #801 it does not.
     fn hello_with_build(build: Option<&str>) -> AttachResponse {
         let mut reply = AttachResponse::hello(PROTOCOL_VERSION)
+            .with_running_agents(RunningAgentsSummary::default());
+        reply.build_version = build.map(str::to_string);
+        reply
+    }
+
+    /// A deck one declared contract break away from this build, stamped however
+    /// the caller likes — the reply that reaches the contract branch.
+    fn hello_one_break_behind(build: Option<&str>) -> AttachResponse {
+        let mut reply = crate::daemon_bridge::hello_from_a_deck_one_declared_break_behind()
             .with_running_agents(RunningAgentsSummary::default());
         reply.build_version = build.map(str::to_string);
         reply
@@ -925,7 +906,7 @@ mod tests {
     #[test]
     fn a_handshake_scrubs_the_remote_stamp_of_bidi_as_well_as_control() {
         let hostile = "0.38.0-g5a56361\u{202e}drowssap";
-        let response = hello_with_build(Some(hostile));
+        let response = hello_one_break_behind(Some(hostile));
         let classified = info(&response, "0.39.0-gabc1234");
         let mut report = EndpointTestReport::new(
             "deck1",
@@ -934,9 +915,9 @@ mod tests {
             String::new(),
         );
 
-        apply_handshake(&mut report, &classified, StampPolicy::Enforced);
+        apply_handshake(&mut report, &classified);
 
-        assert_eq!(report.state, EndpointTestState::BuildStampDiffers);
+        assert_eq!(report.state, EndpointTestState::ContractDiffers);
         assert!(
             !report.message.contains('\u{202e}'),
             "the sentence still carries the override: {:?}",
@@ -1007,21 +988,35 @@ mod tests {
         let response = hello_with_build(Some("0.39.0-gabc1234"));
         let state = state_from_handshake(&info(&response, "0.39.0-gabc1234"));
         assert_eq!(state, EndpointTestState::Reachable);
-        assert!(state.is_ok(StampPolicy::Enforced));
+        assert!(state.is_ok());
     }
 
-    /// A stamp difference across releases is its own state, distinct from a
-    /// protocol refusal — the user can override one and not the other.
+    /// A declared contract break is its own state, distinct from a protocol
+    /// refusal — the user can override one and not the other.
     #[test]
-    fn a_build_stamp_difference_is_its_own_state() {
-        let response = hello_with_build(Some("0.38.0-gdead111"));
+    fn a_contract_difference_is_its_own_state() {
+        let response = hello_one_break_behind(Some("0.39.0-gdead111"));
         let state = state_from_handshake(&info(&response, "0.39.0-gabc1234"));
-        assert_eq!(state, EndpointTestState::BuildStampDiffers);
+        assert_eq!(state, EndpointTestState::ContractDiffers);
         assert!(
-            !state.is_ok(StampPolicy::Enforced),
-            "a stamp difference must not read as a clean pass: the override is a judgement the \
+            !state.is_ok(),
+            "a declared break must not read as a clean pass: the override is a judgement the \
              user makes on the connection screen"
         );
+    }
+
+    /// Issue #801, the measured false positive at this seam: two builds that
+    /// agree about the contract are `Reachable` however far apart their stamps
+    /// are — including across the minor boundary that used to refuse them.
+    ///
+    /// `0.38.0` against `0.39.0` is the pair from the issue, whose
+    /// `git diff v0.39.0 HEAD -- src/` was empty.
+    #[test]
+    fn stamps_a_release_apart_are_reachable_when_the_contract_agrees() {
+        let response = hello_with_build(Some("0.39.0-g1ea0fe7"));
+        let state = state_from_handshake(&info(&response, "0.38.0-gfa02054-dirty"));
+        assert_eq!(state, EndpointTestState::Reachable);
+        assert!(state.is_ok());
     }
 
     /// The wire disagreeing is the state no override reaches, and the report
@@ -1042,7 +1037,7 @@ mod tests {
             EndpointTestState::TransportFailed,
             String::new(),
         );
-        apply_handshake(&mut report, &classified, StampPolicy::Enforced);
+        apply_handshake(&mut report, &classified);
         assert_eq!(report.state, EndpointTestState::ProtocolRefused);
         assert_eq!(report.client_protocol_version, PROTOCOL_VERSION);
         assert_eq!(report.server_protocol_version, Some(PROTOCOL_VERSION + 1));
@@ -1053,52 +1048,35 @@ mod tests {
         );
     }
 
-    /// The verdict a report seals with is the policy its HANDSHAKE was
-    /// classified under — the wiring that replaced `test_endpoint`'s own copy of
-    /// the local/remote split (PRD #741 M8).
+    /// The verdict a report seals with follows its handshake, and no longer
+    /// follows the deck's kind (issue #801).
     ///
-    /// Both directions on one state, because one stamp difference reading two
-    /// ways by deck kind is the entire behaviour, and `sealed` taking no
-    /// argument is what stops that rule being spelled a third time. The remote
-    /// half is the one nothing else covers: `test_remote` needs ssh, so this is
-    /// where the `Informational` path through `sealed` is pinned.
+    /// PRD #741 M8 had one state read two ways by kind, because a *stamp*
+    /// difference against a remote deck was noise. The stamp no longer
+    /// classifies anything, so the state that survives is a declared contract
+    /// break — which is not noise for a deck of either kind, and which the
+    /// banner refuses for either kind. The two screens still agree; they now
+    /// agree on one answer instead of two.
     #[test]
-    fn a_report_seals_under_the_policy_its_handshake_used() {
-        // Classified AND sealed under the same policy, which is the only
-        // pairing production makes: both call sites now derive one `stamps`
-        // from `for_endpoint` and hand that same value to `hello` and to
-        // `apply_handshake`.
-        let seal = |stamps| {
-            let classified = crate::daemon_bridge::classify_handshake_for_test(
-                &hello_with_build(Some("0.1.0-gfeedface")),
-                "0.39.0-gabc1234",
-                stamps,
-            );
-            let mut report = EndpointTestReport::new(
-                "deck1",
-                "deploy@build-box".into(),
-                EndpointTestState::TransportFailed,
-                String::new(),
-            );
-            apply_handshake(&mut report, &classified, stamps);
-            report.sealed()
-        };
-
-        let remote = seal(StampPolicy::Informational);
-        assert_eq!(remote.state, EndpointTestState::BuildStampDiffers);
-        assert!(
-            remote.ok,
-            "a remote deck's stamp difference must seal as usable: the banner is about to connect \
-             to it, and the two screens disagreeing about one daemon is what this module exists \
-             to avoid"
+    fn a_report_seals_from_its_handshake_whatever_the_deck_kind() {
+        let classified = crate::daemon_bridge::classify_handshake_for_test(
+            &hello_one_break_behind(Some("0.39.0-gfeedface")),
+            "0.39.0-gabc1234",
         );
+        let mut report = EndpointTestReport::new(
+            "deck1",
+            "deploy@build-box".into(),
+            EndpointTestState::TransportFailed,
+            String::new(),
+        );
+        apply_handshake(&mut report, &classified);
+        let sealed = report.sealed();
 
-        let local = seal(StampPolicy::Enforced);
-        assert_eq!(local.state, EndpointTestState::BuildStampDiffers);
+        assert_eq!(sealed.state, EndpointTestState::ContractDiffers);
         assert!(
-            !local.ok,
-            "the same state under the local policy is not a clean pass — the override is a \
-             judgement the user makes on the connection screen"
+            !sealed.ok,
+            "a declared break is not a clean pass — the override is a judgement the user makes \
+             on the connection screen"
         );
     }
 
@@ -1203,7 +1181,7 @@ mod tests {
         let report = test_endpoint(&settings, "0123456789abcdef", &tunnels).await;
         assert_eq!(report.state, EndpointTestState::UnknownDeck);
         assert_eq!(report.endpoint_id, "0123456789abcdef");
-        assert!(!report.state.is_ok(StampPolicy::Enforced));
+        assert!(!report.state.is_ok());
     }
 
     /// A malformed token is the same answer. It is reachable from a hand-edited
@@ -1232,7 +1210,7 @@ mod tests {
         let report = test_endpoint(&settings, ALL_SELECTION_TOKEN, &tunnels).await;
 
         assert_eq!(report.state, EndpointTestState::UnknownDeck);
-        assert!(!report.state.is_ok(StampPolicy::Enforced));
+        assert!(!report.state.is_ok());
         assert_eq!(report.message, FLEET_IS_NOT_A_DECK);
         assert_ne!(
             report.message,
@@ -1407,38 +1385,33 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// A stamp difference over a real socket is a different state from a wire
-    /// disagreement, which is the distinction the panel needs in order to say
-    /// anything useful.
+    /// A declared contract break over a real socket is a different state from a
+    /// wire disagreement, which is the distinction the panel needs in order to
+    /// say anything useful.
     #[cfg(unix)]
     #[tokio::test]
-    async fn a_stamp_difference_over_a_real_socket_is_not_a_wire_disagreement() {
-        let (dir, socket) = scratch_socket("stamp");
+    async fn a_contract_break_over_a_real_socket_is_not_a_wire_disagreement() {
+        let (dir, socket) = scratch_socket("contract");
         let listener = bind_trusted(&socket);
-        // Derived from this build's own stamp rather than written out: the
-        // client half of the comparison is whatever `build.rs` baked in, and a
-        // literal that differs from a tagged checkout can still SHARE a
-        // compatibility key with a tagless one. See
-        // `daemon_bridge::stamp_incompatible_with_this_build`.
-        let daemon_stamp = crate::daemon_bridge::stamp_incompatible_with_this_build("feedface");
+        // Derived from this build's own declared breaks rather than written out:
+        // the client half of the comparison is whatever this build compiled in.
+        // See `daemon_bridge::hello_from_a_deck_one_declared_break_behind`.
+        let daemon_stamp = "0.39.0-gfeedface";
         let daemon = tokio::spawn(scripted_daemon(
             listener,
-            vec![hello_with_build(Some(&daemon_stamp))],
+            vec![hello_one_break_behind(Some(daemon_stamp))],
         ));
 
         let report = against_local_socket(&socket).await;
         daemon.await.expect("no panic");
 
-        assert_eq!(report.state, EndpointTestState::BuildStampDiffers);
+        assert_eq!(report.state, EndpointTestState::ContractDiffers);
         assert!(
             !report.ok,
-            "the local policy must survive the whole probe: `test_endpoint` no longer decides it, \
-             so this is the end-to-end check that `for_endpoint`'s answer reaches `sealed`"
+            "the verdict must survive the whole probe: `test_endpoint` does not decide it, so \
+             this is the end-to-end check that the handshake's answer reaches `sealed`"
         );
-        assert_eq!(
-            report.daemon_build_version.as_deref(),
-            Some(daemon_stamp.as_str())
-        );
+        assert_eq!(report.daemon_build_version.as_deref(), Some(daemon_stamp));
         assert_eq!(report.server_protocol_version, Some(PROTOCOL_VERSION));
         let _ = std::fs::remove_dir_all(dir);
     }
