@@ -4097,10 +4097,11 @@ command = "configured-planner"
     ///
     /// Issue #1084, and the same defect PRD #742 M14 fixed one path over: a deck
     /// that is DOWN fails at once with `ECONNREFUSED`, so the failure this
-    /// covers is the one where the connect succeeds. Against the unbounded code
-    /// this test does not fail, it never returns — which is why the outer
-    /// `timeout` below is here, exactly as in `daemon_bridge`'s sibling test for
-    /// the handshake.
+    /// covers is the one where the connect succeeds. **Measured against the
+    /// unbounded code**, where it fails on the outer bound below rather than on
+    /// either assertion; take that bound away too and it does not fail at all,
+    /// it never returns. That is why the outer bound is here, exactly as in
+    /// `daemon_bridge`'s sibling test for the handshake.
     ///
     /// # Paused time, and paused at a POINT
     ///
