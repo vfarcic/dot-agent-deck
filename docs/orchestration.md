@@ -577,15 +577,13 @@ If your project vendors the `/worktree-prd` skill (from [dot-ai](https://github.
 
 #### Writing something that outlives the worktree
 
-A worktree is temporary — closing a dispatched unit's tab removes its copy, and `dot-agent-deck worktree reclaim` removes one whose branch has merged — so anything a worker leaves inside it goes with it. Reports, findings, and artifacts you want to keep belong in the **main checkout** — the original clone the worktrees were cut from.
-
-Every pane the deck spawns is told where that is, in `DOT_AGENT_DECK_MAIN_WORKTREE`. A role prompt can use it directly, and no task has to carry the path:
+Anything a worker leaves inside a worktree goes when the worktree does. For a report or an artifact you want to keep, point at the **main checkout** instead: every pane the deck spawns carries its path in `DOT_AGENT_DECK_MAIN_WORKTREE`, so a role prompt can use it and no task has to carry the path.
 
 ```
 Write your findings to $DOT_AGENT_DECK_MAIN_WORKTREE/.dot-agent-deck/findings-<role>.md
 ```
 
-In an ordinary checkout the variable names that checkout, so a prompt written this way works whether or not the pane happens to be in a worktree. The deck sets it only when it can actually work the answer out: where the pane's directory is not in a git repository at all, or is in a bare one, the variable is **absent** rather than a guess — so an agent that finds it unset knows the deck does not know, rather than being pointed somewhere wrong. Handle that the way you would any unset variable if your prompt depends on it.
+In an ordinary checkout the variable names that checkout, so the same prompt works whether or not the pane is in a worktree. It is unset when the pane's directory is not in a git repository at all.
 
 ### Same-directory orchestrations are discouraged
 

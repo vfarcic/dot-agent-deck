@@ -94,7 +94,7 @@ There is no way to point a unit at some other starting point, so whatever that b
 
 Closing a unit's tab removes that unit's copy of the repo. Your own repository is never touched. Closing the dispatcher pane itself removes nothing — it never owned a copy.
 
-So anything a unit should leave behind has to be written outside its copy. Every unit is told where your original checkout is, in `DOT_AGENT_DECK_MAIN_WORKTREE` — ask for a report at `$DOT_AGENT_DECK_MAIN_WORKTREE/…` and it survives the tab closing. See [writing something that outlives the worktree](orchestration.md#writing-something-that-outlives-the-worktree).
+So anything a unit should leave behind has to be written outside its copy — see [writing something that outlives the worktree](orchestration.md#writing-something-that-outlives-the-worktree).
 
 If a unit still has **uncommitted changes**, closing it leaves its directory on disk instead of deleting it, so the work is recoverable. A leftover directory costs disk space; a deleted one costs work.
 
