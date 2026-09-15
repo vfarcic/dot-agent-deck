@@ -312,7 +312,7 @@ Goal: dot-agent-deck acts as message bus between orchestrator and workers. Orche
 - [~] **M9: Focused/split view toggle** — deferred; standard stacked/tiled layout (Ctrl+t) already handles this
 - [~] **M10: Status bar** — deferred; role cards already show current status (Working, Waiting, Done) and active role highlighting
 - [x] **M11: Config generation extension** — update `src/config_gen.rs` prompt to suggest orchestrations alongside modes
-- [~] **M14: Documentation** — deferred to separate PRD #59 (Orchestration Documentation). See [prds/59-orchestration-documentation.md](prds/59-orchestration-documentation.md)
+- [~] **M14: Documentation** — deferred to separate PRD #59 (Orchestration Documentation). See [prds/59-orchestration-documentation.md](59-orchestration-documentation.md)
 
 ### Phase 3: Quality
 

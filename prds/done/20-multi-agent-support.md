@@ -157,8 +157,8 @@ Captured here only so the follow-up PRDs have a starting point; **not in this PR
 - [x] Agent type filter support in `/` search (`type:codex`) (`src/ui.rs`, `src/agent_registry.rs::resolve_type_alias`)
 - [x] Documentation: adapter authoring guide for third-party agents (`docs/develop/agent-adapters.md`, linked from `CONTRIBUTING.md`)
 - [x] All existing tests passing unchanged; new tests for the registry, wrapper, and Codex (`tests/codex_adapter.rs`, `tests/codex_hook_ingestion.rs`, `tests/e2e_codex_*.rs`)
-- [x] **Follow-up PRD: Gemini adapter** — [PRD #211](211-gemini-adapter.md) (wrapper strategy; reuses `dot-agent-deck wrap` from this PRD)
-- [x] **Follow-up PRD: Aider adapter** — [PRD #212](212-aider-adapter.md) (introduces the log-watcher strategy + `watch --agent`)
+- [x] **Follow-up PRD: Gemini adapter** — [PRD #211](../211-gemini-adapter.md) (wrapper strategy; reuses `dot-agent-deck wrap` from this PRD)
+- [x] **Follow-up PRD: Aider adapter** — [PRD #212](../212-aider-adapter.md) (introduces the log-watcher strategy + `watch --agent`)
 
 ## Key Files
 
