@@ -1744,6 +1744,8 @@ mod tests {
             worktrees: new_worktree_registry(),
             default_command: None,
             state: Some(state.clone()),
+            // No live caller to report back to — see the sibling tests.
+            caller: None,
         };
 
         let result = handle_dispatch(
