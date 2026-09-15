@@ -38,18 +38,27 @@ function deferredSaves() {
  * The cast is what keeps that honest: a third member would fail to compile here
  * rather than being quietly stubbed.
  */
-function runtime(saveSettings: DeckRuntimeState["saveSettings"]): DeckRuntimeState {
+function runtime(saveSettings: DeckRuntimeState["saveSettings"], problem?: string): DeckRuntimeState {
   return {
-    getSettings: vi.fn(async () => ({ settings: structuredClone(DEFAULT_DESKTOP_SETTINGS), path: "/tmp/desktop.toml" })),
+    getSettings: vi.fn(async () => ({ settings: structuredClone(DEFAULT_DESKTOP_SETTINGS), path: "/tmp/desktop.toml", problem })),
     saveSettings,
   } as unknown as DeckRuntimeState;
 }
 
-async function loadedHook(saveSettings: DeckRuntimeState["saveSettings"]) {
-  const hook = renderHook(() => useDesktopSettings(runtime(saveSettings)));
+async function loadedHook(saveSettings: DeckRuntimeState["saveSettings"], problem?: string) {
+  // Built ONCE, outside the render callback. `useDesktopSettings` keys its load
+  // effect on `getSettings`, and the real runtime memoises that with
+  // `useCallback` — building a fresh runtime per render instead would re-run the
+  // read on every state change and quietly re-seed whatever the read reports,
+  // which is a property of this helper and not of the hook.
+  const value = runtime(saveSettings, problem);
+  const hook = renderHook(() => useDesktopSettings(value));
   await waitFor(() => expect(hook.result.current.loaded).toBe(true));
   return hook;
 }
+
+/** The sentence the Rust side sends when the document on disk cannot be read. */
+const UNREADABLE = "The desktop settings file cannot be read: line 3, column 9 is not valid settings. This session is using default settings, and nothing will be saved over the file until it is fixed or removed.";
 
 describe("useDesktopSettings save ordering", () => {
   it("sends one save at a time and drops a superseded response", async () => {
@@ -100,7 +109,60 @@ describe("useDesktopSettings save ordering", () => {
     // The newest one's failure is the one the user needs, and the choice stays
     // applied: what failed is persisting it, not making it.
     await act(async () => { pending[1].reject(new Error("permission denied")); });
-    expect(result.current.saveError).toBe("permission denied");
+    expect(result.current.saveError).toContain("permission denied");
+    // The lead-in the panels used to compose themselves now lives here, because
+    // the same slot also carries an unreadable-document message (issue #1072).
+    expect(result.current.saveError).toContain("will not survive a restart");
     expect(result.current.settings.appearance.mode).toBe("light");
+  });
+});
+
+/**
+ * An unreadable `desktop.toml` (issue #1072).
+ *
+ * The Rust side comes up on defaults and refuses every save, so the app looks
+ * exactly like a fresh install. Nothing but this message explains why — and
+ * before #1072 there was no message: the reason went to stderr and the next save
+ * overwrote the user's file with the defaults on screen.
+ */
+describe("useDesktopSettings unreadable document", () => {
+  it("surfaces the reason as soon as the load resolves, before any save", async () => {
+    const { saveSettings } = deferredSaves();
+    const { result } = await loadedHook(saveSettings, UNREADABLE);
+
+    expect(result.current.saveError).toBe(UNREADABLE);
+    expect(saveSettings).not.toHaveBeenCalled();
+    // The document shown is this build's defaults, which is what the Rust side
+    // sent — the hook does not invent one.
+    expect(result.current.settings).toEqual(DEFAULT_DESKTOP_SETTINGS);
+  });
+
+  it("keeps the reason visible across the optimistic clear a save begins with", async () => {
+    const { pending, saveSettings } = deferredSaves();
+    const { result } = await loadedHook(saveSettings, UNREADABLE);
+
+    // The click clears the last SAVE failure, and must not clear this: the
+    // message would otherwise blink out at the one moment the user is reading
+    // it, and come back when the refusal lands a round trip later.
+    await act(async () => { result.current.save(withMode("dark")); });
+    expect(result.current.saveError).toBe(UNREADABLE);
+
+    // The refusal arrives and wins, because it is the newer and more specific
+    // answer — and it still says the change is applied but unsaved.
+    await act(async () => { pending[0].reject(new Error("refusing to overwrite the desktop settings file: line 3, column 9 is not valid settings")); });
+    expect(result.current.saveError).toContain("refusing to overwrite");
+    expect(result.current.settings.appearance.mode).toBe("dark");
+  });
+
+  it("stops reporting it once a save gets through", async () => {
+    const { pending, saveSettings } = deferredSaves();
+    const { result } = await loadedHook(saveSettings, UNREADABLE);
+
+    // A save that comes back at all means `save_to` got past its guard, so the
+    // document on disk is readable again — the user fixed or removed the file.
+    await act(async () => { result.current.save(withMode("dark")); });
+    await act(async () => { pending[0].resolve(withMode("dark")); });
+
+    expect(result.current.saveError).toBeUndefined();
   });
 });

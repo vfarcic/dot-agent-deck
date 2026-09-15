@@ -67,10 +67,14 @@ export function ZoomPanel({ settings, onSave, saveError, mode }: SettingsPanelPr
         <p className="settings-hint">Use your browser's own zoom in the preview; this scales the desktop window.</p>
       )}
 
+      {/* Rendered verbatim: `saveError` is a complete sentence composed by
+          `useDesktopSettings`, because the same prop also carries "your
+          settings file cannot be read" (issue #1072) — which must not acquire a
+          "saving it failed" preamble it has not earned. */}
       {saveError && (
         <p className="settings-error" role="alert">
           <AlertTriangle size={13} />
-          <span>This zoom level is applied, but saving it failed, so it will not survive a restart. {saveError}</span>
+          <span>{saveError}</span>
         </p>
       )}
     </div>
