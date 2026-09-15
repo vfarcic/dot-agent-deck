@@ -2405,6 +2405,127 @@ async fn live_002_list_agents_attaches_live_snapshot_inner() {
     let _ = registry.close_agent(&agent_id);
 }
 
+/// Scenario: Spawn two registry agents over the real attach socket — one whose
+/// spawn-time `agent_type` is `Codex` and which then drives a live session
+/// reporting ClaudeCode, and one spawned with no agent type at all — and call
+/// `ListAgents`. The first record must come back naming `claude`, the binary of
+/// the identity the reply itself reports, never `codex`; the second must name
+/// no binary at all. Served again from the same registry with an EMPTY state, so
+/// no live session joins, the first record must name `codex` — the registry's
+/// own identity, which is then the one the reply reports.
+///
+/// Issue #856: this is the daemon's half of the CLI column. The desktop used to
+/// resolve the binary from its own compiled-in `agent_registry`, which is a fact
+/// about the daemon's world answered by a client. The two halves of the
+/// assertion are the two halves of the contract: the value is resolved from the
+/// identity the record REPORTS (so the CLI column and the agent-type column can
+/// never name different agents), and a daemon that can name no binary says
+/// nothing rather than guessing — which is what lets the desktop render nothing
+/// instead of falling back to a table the daemon may not share.
+#[spec("session/live/015")]
+#[test]
+fn live_015_list_agents_reports_the_binary_the_daemon_resolved() {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("build multi-thread runtime");
+    rt.block_on(live_015_list_agents_reports_the_binary_the_daemon_resolved_inner());
+}
+
+async fn live_015_list_agents_reports_the_binary_the_daemon_resolved_inner() {
+    child_lifetime_bound::arm();
+
+    let registry = Arc::new(AgentPtyRegistry::new());
+    let pane = "pane-cli-name";
+
+    // Spawn-time identity Codex; the live session below reports ClaudeCode, so
+    // the two disagree and the reply has to pick the same one for both columns.
+    let typed_id = registry
+        .spawn_agent(SpawnOptions {
+            command: Some("sleep 30"),
+            env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane.to_string())],
+            agent_type: Some(AgentType::Codex),
+            ..SpawnOptions::default()
+        })
+        .expect("spawn should succeed");
+    // No identity at all — the pane the registry can name no binary for.
+    let untyped_id = registry
+        .spawn_agent(SpawnOptions {
+            command: Some("sleep 30"),
+            env: vec![(
+                DOT_AGENT_DECK_PANE_ID.to_string(),
+                "pane-cli-name-2".to_string(),
+            )],
+            agent_type: None,
+            ..SpawnOptions::default()
+        })
+        .expect("spawn should succeed");
+
+    let state: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
+    {
+        let mut guard = state.write().await;
+        drive_session_to_working(&mut guard, "sess-cli-name", pane, &typed_id);
+    }
+
+    let (_dir, path, handle) = start_server_with_state(registry.clone(), state.clone()).await;
+    let client = DaemonClient::new(path);
+    let records = client
+        .list_agents()
+        .await
+        .expect("list_agents should succeed");
+    let typed = records
+        .iter()
+        .find(|r| r.id == typed_id)
+        .expect("the typed agent must appear in list_agents");
+    assert_eq!(
+        typed.live.as_ref().and_then(|live| live.agent_type.clone()),
+        Some(AgentType::ClaudeCode),
+        "precondition: the live session reports ClaudeCode over the registry's Codex"
+    );
+    assert_eq!(
+        typed.cli_name.as_deref(),
+        Some("claude"),
+        "the binary must follow the identity the reply reports, not the spawn-time one"
+    );
+    let untyped = records
+        .iter()
+        .find(|r| r.id == untyped_id)
+        .expect("the untyped agent must appear in list_agents");
+    assert_eq!(
+        untyped.cli_name, None,
+        "a record reporting no agent type names no binary; got {:?}",
+        untyped.cli_name
+    );
+
+    // Same registry, empty state: nothing joins, so the reported identity is
+    // the registry's own and the binary follows it there too.
+    let (_ddir, dpath, dhandle) = start_dummy_server_on(registry.clone()).await;
+    let dclient = DaemonClient::new(dpath);
+    let drecords = dclient
+        .list_agents()
+        .await
+        .expect("list_agents should succeed");
+    let dtyped = drecords
+        .iter()
+        .find(|r| r.id == typed_id)
+        .expect("the typed agent must appear in dummy-state list_agents");
+    assert!(
+        dtyped.live.is_none(),
+        "precondition: the empty dummy state joins no live session"
+    );
+    assert_eq!(
+        dtyped.cli_name.as_deref(),
+        Some("codex"),
+        "with no live session the registry's own identity is what the reply reports"
+    );
+
+    handle.abort();
+    dhandle.abort();
+    let _ = registry.close_agent(&typed_id);
+    let _ = registry.close_agent(&untyped_id);
+}
+
 /// Scenario: With two `SessionState`s in `AppState.sessions` that both map to
 /// the same agent (same `agent_id` + `pane_id`, e.g. a `/clear` restart that
 /// left a stale entry) but different `last_activity` and distinguishing
@@ -2894,6 +3015,7 @@ async fn run_hostile_live_list_server(listener: UnixListener) {
                         last_activity_ms: None,
                     }),
                     spawned_at_ms: None,
+                    cli_name: None,
                 };
                 let resp = AttachResponse {
                     ok: true,

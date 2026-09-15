@@ -102,7 +102,10 @@ describe("SettingsSheet section column", () => {
     expect(screen.getByRole("navigation", { name: "Settings sections" })).toBeVisible();
     // The first row is the one that renders; the rest are reachable buttons.
     expect(screen.getByTestId(`settings-panel-${SETTINGS_SECTIONS[0].id}`)).toBeVisible();
-    expect(screen.getByRole("group", { name: "Appearance" })).toBeVisible();
+    // A `radiogroup`, not a `group`: the row's label is a `<span>` named
+    // through `aria-labelledby` rather than a `<legend>` (issue #1032). The
+    // accessible name is what this asserts, and it survived the change.
+    expect(screen.getByRole("radiogroup", { name: "Appearance" })).toBeVisible();
     for (const section of SETTINGS_SECTIONS) {
       expect(screen.getByTestId(`settings-section-${section.id}`)).toBeVisible();
     }
@@ -114,7 +117,7 @@ describe("SettingsSheet section column", () => {
     expect(screen.getByTestId("settings-panel-zoom")).toBeVisible();
     expect(screen.getByLabelText("Zoom")).toBeVisible();
     // And the Appearance panel is gone rather than both being mounted.
-    expect(screen.queryByRole("group", { name: "Appearance" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("radiogroup", { name: "Appearance" })).not.toBeInTheDocument();
   });
 
   it("says there is nothing to show if the registry is ever emptied", () => {

@@ -17,7 +17,7 @@ use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -345,6 +345,10 @@ pub struct ReloadDiff {
 pub struct Scheduler {
     tasks: Mutex<HashMap<String, Arc<RegisteredTask>>>,
     notifier: Arc<dyn Notifier>,
+    /// Issue #887: how many times the registered task SET has changed since this
+    /// daemon came up. Read by [`Self::revision`]; see it for what the number is
+    /// for and what it deliberately is not.
+    revision: AtomicU64,
 }
 
 impl Scheduler {
@@ -353,6 +357,7 @@ impl Scheduler {
         Self {
             tasks: Mutex::new(HashMap::new()),
             notifier,
+            revision: AtomicU64::new(0),
         }
     }
 
@@ -377,6 +382,10 @@ impl Scheduler {
             .lock()
             .expect("scheduler task map poisoned")
             .insert(name.clone(), task);
+        // Issue #887: the task set moved. Unconditional here — `register`
+        // replaces any same-named task, and a replacement is a change to what
+        // the set fires even when the count is unchanged.
+        self.revision.fetch_add(1, Ordering::SeqCst);
         Ok(TaskHandle { name })
     }
 
@@ -430,6 +439,40 @@ impl Scheduler {
         let mut names: Vec<String> = tasks.keys().cloned().collect();
         names.sort();
         names
+    }
+
+    /// Issue #887: a monotonic counter that moves whenever the registered task
+    /// set changes.
+    ///
+    /// **It exists so a client can notice that the daemon's PROJECT list may
+    /// have moved.** `crate::project_resolve` seeds that list from four places,
+    /// one of which is [`Self::registered_working_dirs`] — so registering a
+    /// schedule in a directory the daemon has nothing else running in adds a
+    /// project. The desktop's re-list key is built from what it can observe, and
+    /// **no schedule data reaches the desktop at all**: `schedule` appears
+    /// nowhere in its types and its snapshot has no field for one. The picker
+    /// therefore could not re-list in response, and the project stayed missing
+    /// until the user pressed Refresh.
+    ///
+    /// **One integer, and that is the point.** The alternative — putting the
+    /// directories themselves on the wire — would leak schedule contents to a
+    /// surface that shows none. A client can tell "this changed" from "this did
+    /// not" without being told what changed.
+    ///
+    /// **Conservative, never under-counting.** It counts task-set MUTATIONS, not
+    /// working-directory changes, so a prompt-only edit moves it and costs one
+    /// re-list that answers with the same projects. That is the safe direction:
+    /// a revision that moves when it need not costs a rare, user-initiated
+    /// round trip, while one that fails to move is the bug this closes. A
+    /// reload that changes nothing does NOT move it — see
+    /// [`Self::reload_apply`].
+    ///
+    /// **Per daemon process, and comparable only against itself.** It starts at
+    /// 0 on every start, so it says nothing across a restart — which costs
+    /// nothing, because a restart is a new connection and the client's key
+    /// already carries the connection status.
+    pub fn revision(&self) -> u64 {
+        self.revision.load(Ordering::SeqCst)
     }
 
     /// PRD #819 M3: the `working_dir` of every currently-registered task,
@@ -613,6 +656,16 @@ impl Scheduler {
                     }
                 }
             }
+        }
+
+        // Issue #887: one bump for the whole reload, and only when something
+        // actually moved. A no-op reload — the common case when some other
+        // schedule field is edited, or when `ReloadSchedules` is sent
+        // speculatively — leaves the revision alone, so a client keyed on it
+        // does not re-list for nothing. Still holding the task-map lock, so the
+        // bump cannot be observed before the set it describes.
+        if !diff.added.is_empty() || !diff.removed.is_empty() || !diff.updated.is_empty() {
+            self.revision.fetch_add(1, Ordering::SeqCst);
         }
 
         diff
@@ -903,6 +956,98 @@ mod tests {
         assert_eq!(diff.removed, vec!["b".to_string()]);
         assert!(scheduler.contains("a") && scheduler.contains("c"));
         assert!(!scheduler.contains("b") && !scheduler.contains("d"));
+    }
+
+    // Issue #887 — the registered-schedule revision, which is a client's only
+    // observable of the schedule seed the daemon's project list draws on.
+    //
+    // Both directions matter and they fail differently. Failing to bump is the
+    // bug itself: the desktop's picker keeps offering a stale project list with
+    // no way to notice. Bumping when nothing moved costs a project re-list per
+    // reload — cheap, but it would make the number meaningless as a change
+    // signal, so the no-op case is pinned rather than tolerated.
+    #[test]
+    fn the_revision_moves_exactly_when_the_registered_task_set_does() {
+        let scheduler = Scheduler::with_stderr_notifier();
+        let counter = Arc::new(AtomicUsize::new(0));
+        let make = |_t: &ScheduledTask| counting_callback(counter.clone());
+
+        let task = |name: &str, prompt: &str| ScheduledTask {
+            name: name.to_string(),
+            cron: "0 9 * * *".to_string(),
+            working_dir: "/tmp/scheduled".to_string(),
+            command: Some("cat".to_string()),
+            prompt: prompt.to_string(),
+            new_tab_per_fire: false,
+            enabled: true,
+            shape: None,
+            issue_dispatch: None,
+        };
+
+        // A fresh daemon starts at 0. Absence and 0 are different things on the
+        // wire, so this is the number a client must be able to see.
+        assert_eq!(scheduler.revision(), 0);
+
+        // Added.
+        let start = scheduler.revision();
+        assert_eq!(
+            scheduler.reload_apply(&[task("a", "p")], make).added,
+            vec!["a".to_string()]
+        );
+        assert!(scheduler.revision() > start, "an added task moves the set");
+
+        // A reload that changes nothing does NOT move it — the control that
+        // makes every other assertion here mean something.
+        let after_add = scheduler.revision();
+        let diff = scheduler.reload_apply(&[task("a", "p")], make);
+        assert!(diff.added.is_empty() && diff.removed.is_empty() && diff.updated.is_empty());
+        assert_eq!(
+            scheduler.revision(),
+            after_add,
+            "a reload that changes nothing must not move the revision"
+        );
+
+        // Updated. A prompt-only edit does not change any WORKING DIRECTORY, so
+        // this is the conservative direction the field documents: the project
+        // list is unchanged and a client re-lists once for nothing. That is the
+        // safe side of the trade, and it is deliberate.
+        let after_noop = scheduler.revision();
+        assert_eq!(
+            scheduler.reload_apply(&[task("a", "q")], make).updated,
+            vec!["a".to_string()]
+        );
+        assert!(scheduler.revision() > after_noop, "an edit moves the set");
+
+        // Removed — the case that SHRINKS the daemon's project list, and the one
+        // an "only grows" reading of this would miss.
+        let after_update = scheduler.revision();
+        assert_eq!(
+            scheduler.reload_apply(&[], make).removed,
+            vec!["a".to_string()]
+        );
+        assert!(
+            scheduler.revision() > after_update,
+            "a removed task moves the set too"
+        );
+        assert!(scheduler.registered_working_dirs().is_empty());
+
+        // And the other registration door: `register` is the path the schedule
+        // harnesses and tests use, and it replaces any same-named task — so it
+        // bumps unconditionally rather than on a count change.
+        let after_remove = scheduler.revision();
+        let noop: Callback = Arc::new(|| Box::pin(async {}));
+        scheduler
+            .register("direct", "0 9 * * *", noop.clone())
+            .expect("valid cron");
+        assert!(scheduler.revision() > after_remove);
+        let after_register = scheduler.revision();
+        scheduler
+            .register("direct", "0 10 * * *", noop)
+            .expect("valid cron");
+        assert!(
+            scheduler.revision() > after_register,
+            "replacing a task under the same name still changes what the set fires"
+        );
     }
 
     // Issue #835 — a SHAPE-only edit is fire-affecting and must re-register the

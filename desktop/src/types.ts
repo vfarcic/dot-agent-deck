@@ -319,8 +319,17 @@ export interface AgentSession {
   role: string;
   /** HONEST. */
   displayName: string;
-  /** HONEST. The daemon's agent type / CLI. */
-  cli: string;
+  /**
+   * HONEST. The BINARY the daemon says this agent runs — `claude`, `opencode`,
+   * `codex` — as reported by the daemon that forked the process (issue #856).
+   *
+   * Optional, and absence renders as nothing. It is absent whenever the daemon
+   * named no binary, which is the only honest answer available: nothing here
+   * may fall back to this app's own copy of the agent registry, because that
+   * copy is the divergence #856 closed. Same disposition as `lastActivityMs`
+   * and `spawnedAtMs`.
+   */
+  cli?: string;
   /** FIXTURE-ONLY — the daemon tracks no model per agent (PRD #745, #633). */
   model: string;
   /** HONEST. */
@@ -528,6 +537,15 @@ export interface DeckSnapshot {
   /** FIXTURE-ONLY — see `AgentSession.attempt`. Absent in live mode. */
   currentAttempt?: number;
   paused: boolean;
+  /**
+   * The daemon's registered-schedule revision (issue #887) — carried solely so
+   * `projectsRevision` can key on it, and rendered by nothing.
+   *
+   * Absent in fixture mode and from a daemon that reports none. See
+   * `DesktopSnapshotDto.scheduleRevision` for what the number is and how it may
+   * be compared.
+   */
+  scheduleRevision?: number;
   stages: WorkflowStage[];
   agents: AgentSession[];
   evidence: EvidenceItem[];

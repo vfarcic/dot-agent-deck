@@ -72,7 +72,7 @@
 
 use std::time::Duration;
 
-use dot_agent_deck::daemon_client::AgentRecord;
+use dot_agent_deck::daemon_client::{AgentListing, AgentRecord};
 use dot_agent_deck::event::{BroadcastMsg, EventType};
 use dot_agent_deck::state::AppState;
 use tokio::time::Instant;
@@ -170,6 +170,11 @@ pub(crate) struct AgentView {
     /// the daemon's answer at that moment and is kept as the fallback for a
     /// record the local fold has no session for.
     records: Vec<AgentRecord>,
+    /// Issue #887: the daemon's registered-schedule revision as of the same
+    /// reply `records` came from, replayed on the cached path so the snapshot
+    /// never pairs a fresh revision with a stale list. `None` from a daemon that
+    /// reports none.
+    schedule_revision: Option<u64>,
     /// The daemon's `AppState`, run here over the same broadcast the daemon
     /// applies to its own.
     fold: AppState,
@@ -187,6 +192,7 @@ impl Default for AgentView {
     fn default() -> Self {
         Self {
             records: Vec::new(),
+            schedule_revision: None,
             fold: AppState::default(),
             due: Some(FetchReason::Initial),
             fetched_at: None,
@@ -212,6 +218,10 @@ impl AgentView {
     pub(crate) fn resubscribed(&mut self) {
         self.fold = AppState::default();
         self.records.clear();
+        // Issue #887: the revision goes with the list it described. Keeping it
+        // across a subscription gap would let the picker conclude "unchanged"
+        // from a number this view is no longer entitled to report.
+        self.schedule_revision = None;
         self.due = Some(FetchReason::Resubscribed);
     }
 
@@ -315,7 +325,11 @@ impl AgentView {
     /// stream — a sequence number on the wire — which is a `PROTOCOL_VERSION`
     /// change and out of M4(b) by its scope fence. A transient +1 on a tool
     /// tally does not buy a wire break.
-    pub(crate) fn install(&mut self, records: Vec<AgentRecord>, now: Instant) {
+    pub(crate) fn install(&mut self, listing: AgentListing, now: Instant) {
+        let AgentListing {
+            records,
+            schedule_revision,
+        } = listing;
         let mut fold = AppState::default();
         for record in &records {
             let Some(pane_id) = record.pane_id_env.clone() else {
@@ -337,6 +351,7 @@ impl AgentView {
         }
         self.fold = fold;
         self.records = records;
+        self.schedule_revision = schedule_revision;
         self.due = None;
         self.fetched_at = Some(now);
         self.fetches += 1;
@@ -369,6 +384,12 @@ impl AgentView {
             .collect()
     }
 
+    /// Issue #887: the schedule revision from the reply that installed the
+    /// current list, or `None` when there is none to report.
+    pub(crate) fn schedule_revision(&self) -> Option<u64> {
+        self.schedule_revision
+    }
+
     fn mark(&mut self, reason: FetchReason) {
         if self.due.is_none() {
             self.due = Some(reason);
@@ -394,6 +415,15 @@ mod tests {
     use dot_agent_deck::event::{AgentEvent, AgentType};
     use dot_agent_deck::state::SessionStatus;
 
+    /// One `ListAgents` reply carrying just these records — the shape every
+    /// test that is not about issue #887's revision field wants.
+    fn listing(records: Vec<AgentRecord>) -> AgentListing {
+        AgentListing {
+            records,
+            schedule_revision: None,
+        }
+    }
+
     fn record(id: &str, pane_id: &str) -> AgentRecord {
         AgentRecord {
             id: id.into(),
@@ -406,6 +436,7 @@ mod tests {
             cols: 120,
             live: None,
             spawned_at_ms: Some(1_700_000_000_000),
+            cli_name: None,
         }
     }
 
@@ -449,7 +480,7 @@ mod tests {
     fn a_status_transition_is_served_from_the_fold_and_costs_no_fetch() {
         let now = Instant::now();
         let mut view = AgentView::default();
-        view.install(vec![record("7", "pane-7")], now);
+        view.install(listing(vec![record("7", "pane-7")]), now);
 
         view.apply(&BroadcastMsg::Event(tool_start("pane-7", "7", "Bash")));
 
@@ -473,7 +504,7 @@ mod tests {
     fn a_burst_of_events_costs_no_fetches_at_all() {
         let now = Instant::now();
         let mut view = AgentView::default();
-        view.install(vec![record("7", "pane-7")], now);
+        view.install(listing(vec![record("7", "pane-7")]), now);
 
         for n in 0..10 {
             view.apply(&BroadcastMsg::Event(tool_start(
@@ -504,7 +535,7 @@ mod tests {
     fn a_session_start_makes_a_fetch_fall_due_at_once() {
         let now = Instant::now();
         let mut view = AgentView::default();
-        view.install(vec![record("7", "pane-7")], now);
+        view.install(listing(vec![record("7", "pane-7")]), now);
         assert_eq!(view.needs_fetch(now), None);
 
         view.apply(&BroadcastMsg::Event(event(
@@ -529,7 +560,7 @@ mod tests {
     fn a_session_end_makes_a_fetch_fall_due_at_once() {
         let now = Instant::now();
         let mut view = AgentView::default();
-        view.install(vec![record("7", "pane-7")], now);
+        view.install(listing(vec![record("7", "pane-7")]), now);
         assert_eq!(view.needs_fetch(now), None);
 
         view.apply(&BroadcastMsg::Event(event(
@@ -559,7 +590,7 @@ mod tests {
     fn the_floor_makes_a_fetch_fall_due_in_silence() {
         let now = Instant::now();
         let mut view = AgentView::default();
-        view.install(vec![record("7", "pane-7")], now);
+        view.install(listing(vec![record("7", "pane-7")]), now);
 
         assert_eq!(view.needs_fetch(now + RECONCILE_INTERVAL / 2), None);
         assert_eq!(
@@ -576,7 +607,7 @@ mod tests {
     fn a_resubscribe_refuses_the_cached_list_until_a_fetch_lands() {
         let now = Instant::now();
         let mut view = AgentView::default();
-        view.install(vec![record("7", "pane-7")], now);
+        view.install(listing(vec![record("7", "pane-7")]), now);
         view.apply(&BroadcastMsg::Event(tool_start("pane-7", "7", "Bash")));
         assert_eq!(view.needs_fetch(now), None);
 
@@ -594,7 +625,7 @@ mod tests {
             "nothing but an installed reply may clear the demand"
         );
 
-        view.install(vec![record("7", "pane-7")], now);
+        view.install(listing(vec![record("7", "pane-7")]), now);
         assert_eq!(view.needs_fetch(now), None);
     }
 
@@ -618,7 +649,7 @@ mod tests {
         });
 
         let mut view = AgentView::default();
-        view.install(vec![paneless], now);
+        view.install(listing(vec![paneless]), now);
 
         let rendered = view.records();
         assert_eq!(
@@ -657,7 +688,7 @@ mod tests {
         });
 
         let mut view = AgentView::default();
-        view.install(vec![seeded], now);
+        view.install(listing(vec![seeded]), now);
         view.apply(&BroadcastMsg::Event(tool_start("pane-7", "7", "Bash")));
         view.apply(&BroadcastMsg::Event(event(
             "pane-7",
@@ -687,7 +718,7 @@ mod tests {
     fn structural_pushes_mark_a_fetch_due() {
         let now = Instant::now();
         let mut view = AgentView::default();
-        view.install(vec![record("7", "pane-7")], now);
+        view.install(listing(vec![record("7", "pane-7")]), now);
 
         view.apply(&BroadcastMsg::WorktreeKept(
             dot_agent_deck::issue_dispatch_run::KeptWorktree {
@@ -710,7 +741,7 @@ mod tests {
     fn an_unreadable_push_marks_a_fetch_rather_than_being_ignored() {
         let now = Instant::now();
         let mut view = AgentView::default();
-        view.install(vec![record("7", "pane-7")], now);
+        view.install(listing(vec![record("7", "pane-7")]), now);
         assert_eq!(view.needs_fetch(now), None, "the install settled the view");
 
         view.apply(&BroadcastMsg::Unknown);
@@ -730,7 +761,7 @@ mod tests {
     fn the_live_pick_is_the_daemons_and_the_newest_session_wins() {
         let now = Instant::now();
         let mut view = AgentView::default();
-        view.install(vec![record("7", "pane-7")], now);
+        view.install(listing(vec![record("7", "pane-7")]), now);
 
         let mut older = tool_start("pane-7", "7", "Read");
         older.timestamp = chrono::Utc::now() - chrono::Duration::seconds(60);
@@ -744,5 +775,56 @@ mod tests {
             Some(SessionStatus::Idle),
             "the newest activity must decide the row"
         );
+    }
+
+    /// Issue #887: the schedule revision belongs to the reply that installed the
+    /// current list, and it is replayed between fetches rather than cleared.
+    ///
+    /// Both halves matter to the picker. Clearing it while the cached list stood
+    /// would make the desktop's `projectsRevision` move on every cached refresh
+    /// and re-list the daemon's projects on a timer; keeping it across a
+    /// subscription gap would let the picker conclude "unchanged" from a number
+    /// this view is no longer entitled to report — the same fail-closed rule the
+    /// records themselves follow.
+    #[test]
+    fn the_schedule_revision_is_replayed_with_the_list_it_arrived_with() {
+        let now = Instant::now();
+        let mut view = AgentView::default();
+        assert_eq!(view.schedule_revision(), None, "nothing fetched yet");
+
+        view.install(
+            AgentListing {
+                records: vec![record("7", "pane-7")],
+                schedule_revision: Some(4),
+            },
+            now,
+        );
+        assert_eq!(view.schedule_revision(), Some(4));
+
+        // Folding an event answers from the cache, and the revision stays the
+        // one the last reply carried.
+        view.apply(&BroadcastMsg::Event(event("pane-7", "7", EventType::Idle)));
+        assert_eq!(view.schedule_revision(), Some(4));
+
+        // A resubscribe discards the fold, so the revision goes with it.
+        view.resubscribed();
+        assert_eq!(
+            view.schedule_revision(),
+            None,
+            "a subscription gap leaves nothing this view may vouch for"
+        );
+
+        // A daemon that reports none installs none, rather than keeping the
+        // previous reply's number.
+        view.install(
+            AgentListing {
+                records: vec![record("7", "pane-7")],
+                schedule_revision: Some(9),
+            },
+            now,
+        );
+        assert_eq!(view.schedule_revision(), Some(9));
+        view.install(listing(vec![record("7", "pane-7")]), now);
+        assert_eq!(view.schedule_revision(), None);
     }
 }

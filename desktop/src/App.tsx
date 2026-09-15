@@ -196,20 +196,48 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
    * keeps the agent count as well: the key is then a strict superset of the old
    * one, and cannot re-list less often than it did.
    *
-   * Two seeds are deliberately absent, and neither is observable from here: the
-   * daemon's own startup cwd, which is fixed for that daemon's life and so is
-   * covered by the connection status; and registered schedule directories, which
-   * reach no desktop surface at all. A schedule registered while the app is open
-   * is therefore picked up by the picker's own refresh rather than automatically
-   * — which is why that button exists.
+   * Issue #887 closed the third seed: registered schedule directories. They
+   * still reach no desktop surface and none should — the app shows no schedule
+   * — so what travels is `scheduleRevision`, one monotonic integer the daemon
+   * bumps whenever its registered task set changes. Registering a schedule in a
+   * directory the daemon has nothing else running in adds a project, and the
+   * key can now move in response instead of leaving the picker a manual
+   * **Refresh** away from the truth. Absent from a daemon that does not report
+   * one, which reverts exactly to the previous behaviour rather than to a
+   * spurious re-list.
+   *
+   * The last seed stays deliberately absent and is not a gap: the daemon's own
+   * startup cwd is fixed for that daemon's life, so a change in it implies a
+   * different daemon, which `socketPath` below now carries.
+   *
+   * **`socketPath` leads, because the rest of the key is only meaningful
+   * WITHIN one deck** (issue #887, Greptile P1). Every other component is a
+   * fact about a particular daemon's world — and `scheduleRevision` most
+   * sharply so, since it counts from 0 on each daemon start and so is
+   * comparable only against earlier values from the same connection. Switching
+   * between two connected decks that happen to agree on status, agent count,
+   * working directories and revision left the key identical, so `useProjects`
+   * never re-listed and the picker kept offering the deck the user had just
+   * switched AWAY from. `connection.socketPath` is the per-daemon identity the
+   * bridge already uses as `daemonId`, and putting it first makes every
+   * comparison below it a within-deck one.
    */
   const projectsRevision = useMemo(() => {
     const seeds = snapshot.agents.flatMap((agent) => [agent.cwd, agent.tab.kind === "orchestration" ? agent.tab.cwd : undefined]);
     const distinct = [...new Set(seeds.filter((cwd): cwd is string => Boolean(cwd)))].sort();
     // NUL as the separator: `is_valid_cwd` refuses it, so no directory can spell
-    // one and no two different seed sets can collapse onto the same key.
-    return [snapshot.connection.status, String(snapshot.agents.length), ...distinct].join("\u0000");
-  }, [snapshot.agents, snapshot.connection.status]);
+    // one and no two different seed sets can collapse onto the same key. The
+    // schedule revision is an integer and joins on the same separator; `""` for
+    // an unreporting daemon is a value no revision can spell, so it cannot be
+    // confused with revision 0.
+    return [
+      snapshot.connection.socketPath ?? "",
+      snapshot.connection.status,
+      String(snapshot.agents.length),
+      snapshot.scheduleRevision === undefined ? "" : String(snapshot.scheduleRevision),
+      ...distinct,
+    ].join("\u0000");
+  }, [snapshot.agents, snapshot.connection.socketPath, snapshot.connection.status, snapshot.scheduleRevision]);
   const projectState = useDaemonProjects({
     listProjects: runtime.listProjects,
     resolveProject: runtime.resolveProject,

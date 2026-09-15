@@ -79,6 +79,20 @@ export interface DesktopSnapshotDto {
    * stays, and the project a launch runs in comes from `desktop_list_projects`
    * / `desktop_resolve_project` instead.
    */
+  /**
+   * The daemon's registered-schedule revision (issue #887) — a monotonic
+   * counter it bumps whenever its registered task set changes, and nothing
+   * else. No schedule reaches this app, and none should: there is no schedule
+   * surface here.
+   *
+   * It exists because the daemon seeds its PROJECT list partly from every
+   * registered schedule's working directory, so registering a schedule can add
+   * a project — and `projectsRevision` in `App.tsx`, built only from what this
+   * client can observe, had no way to move in response. Absent from a daemon
+   * that reports none, and comparable only against earlier values on the same
+   * connection (it counts from 0 on every daemon start).
+   */
+  scheduleRevision?: number;
   protocolVersion: number;
   source: "daemon";
   /**
@@ -181,10 +195,12 @@ export interface DesktopAgentDto {
    * `claude_code`, OpenCode as `open_code`, and `codex` correctly only by
    * coincidence.
    *
-   * Absent — the key is omitted, never blank — when the daemon reported
-   * `none` or no type at all. `none` is also the landing spot for a type this
-   * build has never heard of, so absence here means "this build cannot name
-   * the binary", and nothing invents one.
+   * Absent — the key is omitted, never blank — whenever the DAEMON named no
+   * binary: an agent type whose spec has no default command (`none`, which is
+   * also the landing spot for a type the daemon's peer has never heard of), a
+   * record reporting no type, or a daemon predating the field. Nothing invents
+   * one, and since issue #856 nothing derives one either — the value is the
+   * daemon's, resolved from the registry of the process that forked the agent.
    */
   cliName?: string;
   status: "running" | "thinking" | "working" | "compacting" | "waiting_for_input" | "idle" | "error" | "unknown";
@@ -856,13 +872,20 @@ function agentFromDto(agent: DesktopAgentDto, index: number, daemonId: string): 
     role,
     displayName: agent.displayName || role,
     // The BINARY, not the enum (PRD #745). `agentType` is the wire identity —
-    // `claude_code`, `open_code` — and nobody types either of those. The name
-    // is resolved daemon-side from the agent registry, which is where the deck
-    // already keeps the command each agent launches, so a desktop-side lookup
-    // table cannot drift away from it. `"agent"` is the fallback it always was,
-    // reached now for the case it was written for: a type this build cannot
-    // name a binary for.
-    cli: agent.cliName || "agent",
+    // `claude_code`, `open_code` — and nobody types either of those.
+    //
+    // Issue #856: this is the DAEMON's answer now, resolved from the registry
+    // of the process that forked the agent and copied through untouched. It
+    // used to be looked up here, in this app's own compiled-in copy of that
+    // table — a value the client had no authority over.
+    //
+    // Absent stays absent, and the `"agent"` word that used to stand in for it
+    // is gone with the lookup. A generic word reads as a fact about the agent;
+    // an empty cell reads as "the deck did not say", which is what is true. It
+    // is also the disposition the uptime and activity columns already take, and
+    // — the load-bearing part — it means there is no local table left to fall
+    // back to, which is the whole point of the issue.
+    cli: agent.cliName,
     model: UNREPORTED,
     status,
     task: taskLine(agent),
@@ -1085,6 +1108,9 @@ export function mapDesktopSnapshot(dto: DesktopSnapshotDto, previous?: DeckSnaps
     // this used to carry was a placeholder the topbar printed as if it were the
     // checked-out branch (PRD #745 M8).
     worktree: cwd,
+    // Issue #887: copied through so `projectsRevision` can key on it. Nothing
+    // renders it.
+    scheduleRevision: dto.scheduleRevision,
     connection: {
       status: dto.connection.status === "incompatible" ? "error" : dto.connection.status,
       deckId: dto.connection.deckId,

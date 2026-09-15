@@ -141,6 +141,16 @@ slow-timeout = { period = "60s", terminate-after = 8 }
 filter = 'test(new_pane_016_dispatcher_opens_dashboard_card_with_real_agent)'
 slow-timeout = { period = "60s", terminate-after = 5 }
 
+# PRD #220 M2.3: `dispatch/return/006` waits for TWO sequential real interactive
+# Haiku turns — the dispatcher must invoke `dispatch --single`, then the fresh
+# unit must inspect its worktree and independently submit `work-done --done`.
+# Its explicit 240s completion bound begins only after the dispatcher boot and
+# seed turn, so the default 3 x 60s window could kill a valid loaded run before
+# its assertion prints the grid that distinguishes no dispatch from no return.
+[[profile.default.overrides]]
+filter = 'test(dispatch_return_006_real_single_agent_reports_to_the_dispatcher)'
+slow-timeout = { period = "60s", terminate-after = 6 }
+
 # PRD #220: `orchestration/dispatch/002` dispatches an orchestration whose THREE
 # roles are all real interactive Haiku agents, then waits for every one of them to
 # reach live-agent state in the freshly created worktree. Three concurrent claude

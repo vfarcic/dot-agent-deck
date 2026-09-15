@@ -28,10 +28,10 @@ import {
  * LAYOUT and STACKING: `position: absolute` with a `z-index`, which jsdom does
  * not compute and cannot be asked about.
  *
- * The other three — Escape, the permanent column, Restore defaults — are
- * asserted here on their END STATE: what the legend prints and what the rows
- * show afterwards, in an engine that laid the result out. Where a check is
- * DOM-shape rather than geometry, the comment says so.
+ * The other three — Escape (in both of its focus cases), the permanent column,
+ * Restore defaults — are asserted here on their END STATE: what the legend
+ * prints and what the rows show afterwards, in an engine that laid the result
+ * out. Where a check is DOM-shape rather than geometry, the comment says so.
  */
 
 test.describe("the overview's column picker", () => {
@@ -117,16 +117,93 @@ test.describe("the overview's column picker", () => {
     const menu = await openColumnPicker(page);
 
     /*
-      The keydown handler is on the picker's ROOT, so Escape only reaches it
-      while focus is inside that root. Clicking the trigger puts focus there in
-      both engines — measured, and stated here so that if an engine ever stops
-      focusing a button on click, this line names the cause instead of leaving
-      the Escape below to fail as a mystery.
+      Where a real click leaves focus, asserted rather than assumed: on the
+      trigger, in both engines this tier runs. That is what makes this the
+      picker ROOT's `onKeyDown` case — the key is raised inside the root, so it
+      never reaches the document listener — and it is why the case below exists
+      separately rather than as one test. Stated here so that if an engine ever
+      stops focusing a button on click, this line names the change instead of
+      leaving the Escape below to look like a mystery.
     */
     await expect(page.getByTestId("overview-columns-toggle")).toBeFocused();
 
     await page.keyboard.press("Escape");
     await expect(menu).toBeHidden();
+    await expect(page.getByTestId("overview-columns-toggle")).toHaveAttribute("aria-expanded", "false");
+  });
+
+  test("dismisses on Escape when focus is somewhere else entirely", async ({ page }) => {
+    await openOverview(page, "crowded");
+    const menu = await openColumnPicker(page);
+
+    /*
+      The half the test above cannot reach, and the whole point of issue #957.
+      That one presses Escape with focus on the trigger — where a click leaves
+      it in both engines here — so it exercises the root's own handler and
+      would keep passing with the document listener deleted.
+
+      This one moves focus off the picker FIRST, by script rather than by a
+      pointer: a real click outside would dismiss the menu through the
+      `pointerdown` path and prove nothing about the key. What it leaves behind
+      is the state an engine that does not focus a `<button>` on click would
+      leave behind on its own — the menu open, `document.activeElement` outside
+      the picker root. This is a simulation of that state, not a measurement of
+      any engine that produces it; whether WKWebView does is still open.
+    */
+    const focus = await page.evaluate(() => {
+      (document.activeElement as HTMLElement | null)?.blur();
+      const active = document.activeElement;
+      const root = document.querySelector(".overview-columns-picker")!;
+      return { tag: active?.tagName ?? "nothing", insidePicker: active instanceof Node && root.contains(active) };
+    });
+    expect(
+      focus.insidePicker,
+      `focus is still inside the picker (on <${focus.tag}>), so this test is a duplicate of the one above rather than the outside case`,
+    ).toBe(false);
+    // Losing focus is not itself a dismissal — only the key below is.
+    await expect(menu).toBeVisible();
+
+    await page.keyboard.press("Escape");
+    await expect(menu).toBeHidden();
+    await expect(page.getByTestId("overview-columns-toggle")).toHaveAttribute("aria-expanded", "false");
+  });
+
+  test("dismisses on Escape raised inside a sibling that swallows the key", async ({ page }) => {
+    await openOverview(page, "crowded");
+    const menu = await openColumnPicker(page);
+
+    /*
+      The neighbour problem, found in review on PR #1071. `DeckSelector` sits in
+      this same top bar and stops Escape at its own root on EVERY press, open or
+      shut — so a dismiss listener bound in the bubble phase never sees a key
+      raised while focus is inside it, and the menu would stay open with nothing
+      but the mouse to shut it. This is reachable by keyboard alone: Tab moves
+      focus without a pointer, and no pointer means no `pointerdown`, so the
+      picker is still open when it lands.
+
+      Focus is moved by script for the reason the test above moves it that way —
+      a click would dismiss through the pointer path and prove nothing about the
+      key. The listener captures at `document`, which is what puts it ahead of
+      the sibling's handler.
+    */
+    const focus = await page.evaluate(() => {
+      const sibling = document.querySelector<HTMLElement>('[data-testid="deck-selector-toggle"]');
+      sibling?.focus();
+      const active = document.activeElement;
+      const picker = document.querySelector(".overview-columns-picker")!;
+      return {
+        siblingExists: sibling !== null,
+        onSibling: active === sibling,
+        insidePicker: active instanceof Node && picker.contains(active),
+      };
+    });
+    expect(focus.siblingExists, "the Deck selector is not on this screen, so this test is not exercising the neighbour problem").toBe(true);
+    expect(focus.onSibling, "focus did not land on the Deck selector's trigger").toBe(true);
+    expect(focus.insidePicker).toBe(false);
+    await expect(menu).toBeVisible();
+
+    await page.keyboard.press("Escape");
+    await expect(menu, "the sibling swallowed Escape and the picker stayed open").toBeHidden();
     await expect(page.getByTestId("overview-columns-toggle")).toHaveAttribute("aria-expanded", "false");
   });
 

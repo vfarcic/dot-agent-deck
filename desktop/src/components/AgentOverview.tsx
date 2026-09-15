@@ -1192,9 +1192,42 @@ function OverviewColumnPicker({ columns, onChange }: { columns: OverviewColumnId
     outside, its pointer-down would close the menu and its click would toggle it
     straight back open, so the button would appear not to work at all.
 
-    The listener is bound only while the menu is open and removed when it
+    The listeners are bound only while the menu is open and removed when it
     closes, not merely on unmount — `open` is in the dependency list, so React
     runs the cleanup on the same transition that hides the menu.
+  */
+  /*
+    Escape dismisses wherever the key was raised, for the same reason a pointer
+    does (issue #957). The root's own `onKeyDown` below sees the key only while
+    focus is INSIDE the picker, and what is supposed to put it there is the
+    click that opened the menu — which is the engine-dependent part. Measured
+    during the browser tier's bring-up, a real click leaves
+    `document.activeElement` on the trigger in Chromium and in Playwright's
+    WebKit. WKWebView, which is what the packaged macOS app renders in, was not
+    measured either way, and Safari on macOS is documented not to focus a
+    `<button>` on click; WebKitGTK under Tauri is the distribution's build and
+    moves independently of Playwright's pinned one. #957 was filed as a RISK
+    rather than a defect — no failure was seen while that tier was built, and
+    none has been reported — and this listener removes the dependency rather
+    than settling the question, which the manual macOS walkthrough in
+    `docs/develop/desktop-gui.md` or the driver-level tier in #953 would.
+
+    CAPTURE phase, and that is the difference between "wherever the key was
+    raised" and "wherever nothing else reached it first". Sibling controls in
+    this same top bar stop Escape at their own root — `DeckSelector` does it on
+    every Escape, whether or not its own menu is open — so a bubble-phase
+    listener here would never see a press made while focus sits inside one of
+    them, and the menu would stay open with nothing but the mouse to shut it.
+    Capturing at `document` runs this ahead of every element-level handler on
+    the page.
+
+    It reuses the pointer rule wholesale, INCLUDING the inside-the-root
+    exemption, which is what keeps the two paths from fighting: an Escape
+    raised inside the picker is left to the root handler below, which closes
+    the menu and stops the key propagating so the app-wide Escape in `App.tsx`
+    does not act on the same press. Outside the root the key is deliberately
+    NOT stopped — focus is somewhere else, possibly in an overlay that wants
+    that press, and a dismissal nobody can see must not eat it.
   */
   useEffect(() => {
     if (!open) return;
@@ -1202,8 +1235,16 @@ function OverviewColumnPicker({ columns, onChange }: { columns: OverviewColumnId
       if (event.target instanceof Node && root.current?.contains(event.target)) return;
       setOpen(false);
     };
+    const dismissOnEscape = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      dismiss(event);
+    };
     document.addEventListener("pointerdown", dismiss);
-    return () => document.removeEventListener("pointerdown", dismiss);
+    document.addEventListener("keydown", dismissOnEscape, true);
+    return () => {
+      document.removeEventListener("pointerdown", dismiss);
+      document.removeEventListener("keydown", dismissOnEscape, true);
+    };
   }, [open]);
   return (
     <div
@@ -1457,15 +1498,24 @@ function OverviewRow({ agent, hoistedCwd, now, columns }: { agent: OverviewAgent
         return <td className="overview-uptime" role="cell" key={column} title={uptime && `Spawned by the deck at: ${uptime.title}`}>{uptime?.label ?? ""}</td>;
       case "cli":
         /*
-          The BINARY this agent runs, resolved from the agent registry rather
-          than from the wire identity (PRD #745). It used to print the
-          serialised enum, so Claude Code read `claude_code` and OpenCode read
-          `open_code` — neither of them a name anybody would type — while
-          `codex` happened to be right. The hover is the full value and nothing
-          else: the column header already says what it is, and a sentence
-          restating it would be the screen describing itself.
+          The BINARY this agent runs, as the DAEMON reported it (issue #856). It
+          used to print the serialised wire identity, so Claude Code read
+          `claude_code` and OpenCode read `open_code` — neither a name anybody
+          would type — while `codex` happened to be right; PRD #745 fixed that
+          by resolving the name from the agent registry, and #856 moved the
+          resolution to the side of the wire that forked the process.
+
+          Empty when the daemon named no binary, and deliberately NOT a word
+          standing in for one — exactly what the uptime and activity cells above
+          do with an unreported value. There is no local registry lookup to fall
+          back to here, which is the point: a fallback would reinstate the
+          divergence #856 closed.
+
+          The hover is the full value and nothing else: the column header
+          already says what it is, and a sentence restating it would be the
+          screen describing itself.
         */
-        return <td className="overview-cli" role="cell" key={column} title={displayTitle(agent.cli)}>{displayText(agent.cli, DISPLAY_LIMITS.name)}</td>;
+        return <td className="overview-cli" role="cell" key={column} title={agent.cli && displayTitle(agent.cli)}>{agent.cli ? displayText(agent.cli, DISPLAY_LIMITS.name) : ""}</td>;
       case "activeTool":
         return (
           <td className="overview-tool" role="cell" key={column}>

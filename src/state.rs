@@ -1713,7 +1713,7 @@ fn format_idle_elapsed(elapsed: std::time::Duration) -> String {
 /// grammar at config validation / the `TabMembership` boundary would reject
 /// existing configs with exotic role names, and the same weakness predates this
 /// PRD on the delegate path. That is tracked as a separate follow-up.
-fn quote_untrusted_role(role: &str) -> String {
+pub(crate) fn quote_untrusted_role(role: &str) -> String {
     let label: String = sanitize_role_name(role)
         .chars()
         .filter(|c| !is_frame_breaking(*c))
@@ -1752,22 +1752,31 @@ fn is_frame_breaking(c: char) -> bool {
 /// unbounded report means an unbounded synthetic paste. The normal path has no
 /// such limit — that is what the file is for — so this only ever caps the
 /// degraded path, and the worker still holds the full text either way.
-const MAX_INLINED_WORK_DONE_REPORT_CHARS: usize = 4000;
+pub(crate) const MAX_INLINED_WORK_DONE_REPORT_CHARS: usize = 4000;
 
 /// Issue #433: a worker-authored report rendered as an inert data block, ready to
 /// be inlined into the orchestrator's feedback.
-struct QuotedReport {
+pub(crate) struct QuotedReport {
     /// The fenced block, safe to interpolate into daemon prose.
-    fenced: String,
+    pub(crate) fenced: String,
     /// Whether [`MAX_INLINED_WORK_DONE_REPORT_CHARS`] cut the report short, so
     /// the surrounding prose can say so.
-    truncated: bool,
+    pub(crate) truncated: bool,
 }
 
 /// Issue #433: render a worker's `work-done` summary as an inert data block for
 /// [`compose_work_done_feedback`]'s inlined paths. `None` when the worker sent no
 /// report text at all (after whitespace collapsing), so the prose can say *that*
 /// rather than present an empty frame.
+///
+/// PRD #220 Phase 2 review (finding A1): the dispatch RETURN edge is the second
+/// caller — [`crate::dispatch_return::compose_completion_report`] — and it is
+/// this function's threat model one step further out again. A `work-done`
+/// summary is authored by a worker inside THIS deck; a dispatched unit's report
+/// is authored in a sibling worktree the caller chose and may be prompt-injected
+/// by whatever that worktree contains. Reused rather than re-implemented on
+/// purpose: two fencing functions drift, and the return edge shipped without one
+/// precisely because the control was a private detail of the delegate leg.
 ///
 /// The threat model is [`quote_untrusted_role`]'s, one step further along. That
 /// function quotes a role name copied from a repository's `.dot-agent-deck.toml`;
@@ -1788,7 +1797,7 @@ struct QuotedReport {
 /// would sit unsent in the orchestrator's input box — the same reasoning that
 /// makes [`compose_delegate_prompt`] the single-line seam for every other
 /// daemon-injected prompt. Markdown formatting is lost; the words are not.
-fn quote_untrusted_report(summary: &str) -> Option<QuotedReport> {
+pub(crate) fn quote_untrusted_report(summary: &str) -> Option<QuotedReport> {
     let collapsed: String = summary
         .split_whitespace()
         .collect::<Vec<_>>()
@@ -1895,6 +1904,81 @@ enum WorkDoneReportChannel {
     /// The orchestrator has no outstanding delegation this completion could be
     /// answering (issue #448). The canonical file is deliberately left untouched.
     Unsolicited,
+}
+
+/// PRD #220 M2.1: a dispatched unit has reached TERMINAL completion — resolve
+/// the caller that dispatched it and submit the report into that caller's pane.
+///
+/// Returns whether `signal.pane_id` was a dispatched unit's terminal pane at all,
+/// so the caller can tell "handled here" from "fall through to the ordinary
+/// path". It is `false` for every pane in a deck where nothing was dispatched,
+/// which is what leaves the rest of `handle_work_done` untouched.
+///
+/// Three properties this leans on rather than re-implements:
+///
+/// * **Addressing.** The recipient is the retained `(pane_id, agent_id)` pair, never a
+///   `(name, cwd)` tuple lookup — that tuple can never match, because a dispatched unit
+///   lives in a sibling worktree by construction, which is precisely why the return edge
+///   needed retention rather than a lookup.
+/// * **Identity.** Delivery goes through [`crate::daemon::deliver_dispatch_result`], the
+///   same guarded seam the spawn acknowledgement already uses, so a caller pane that
+///   changed hands between the dispatch and the completion is REFUSED with no bytes
+///   written. Reusing that seam rather than writing a second delivery path is what keeps
+///   one identity policy instead of two that can drift.
+/// * **Delivery mode.** SUBMIT, not a passive notice (PRD #220 decision A). The caller
+///   asked for this work and is waiting on it, so the report is a turn in its
+///   conversation rather than bytes in its scrollback that nothing will ever read.
+///
+/// The entry is evicted as it is resolved, whatever the delivery's outcome,
+/// because NO OUTCOME IS RETRIED. That is the shared property, and it is worth
+/// stating as itself rather than as "every non-delivery is a refusal" (PRD #220
+/// Phase 2 review, finding A5): [`crate::daemon::deliver_dispatch_result`] says
+/// outright that `Ambiguous` is deliberately NOT folded in with the refusals,
+/// since bytes of ours already reached the authorized caller. A refusal is not
+/// retried because a retry could only re-target whoever now occupies the pane; an
+/// ambiguous write is not retried because re-sending would duplicate a
+/// half-written message rather than repair it. A pane that is simply GONE
+/// degrades to drop-and-log (PRD #220 decision B): there is deliberately no queue
+/// and no file-backed outbox here, because an outcome with no live recipient is a
+/// deck-wide attention question that belongs with issue #630.
+async fn return_dispatch_completion(signal: &WorkDoneSignal, registry: &AgentPtyRegistry) -> bool {
+    // Only a TERMINAL completion returns. A dispatched unit reporting progress
+    // without `--done` has not finished, and its caller is owed one report, not a
+    // running commentary.
+    if !signal.done {
+        return false;
+    }
+    let Some(caller) = registry.take_dispatch_return(&signal.pane_id) else {
+        return false;
+    };
+    // PRD #220 Phase 2 review (finding A4): the unit name is producer-supplied and
+    // rode into this line raw. Escaped and clamped through the module that already
+    // owns that treatment — a raw newline in a field value forges a whole log line,
+    // a CR overwrites the one being written, and a bidi override reorders whatever
+    // renders it; turning the subscriber's own ANSI styling off does none of that.
+    //
+    // The two pane ids and the agent id are daemon-minted and stay bare. The
+    // REPORT BODY is deliberately absent from this line, and from the warnings
+    // `deliver_dispatch_result` emits when the caller is gone or the identity gate
+    // refuses — those carry pane/agent ids and the outcome only, so a report that
+    // could not be delivered is not leaked into the log instead. That silence is
+    // the auditor's reasoned negative; do not "helpfully" add the body back.
+    tracing::info!(
+        unit_pane_id = %signal.pane_id,
+        unit = %crate::config_validation::escape_field_for_log(
+            &caller.unit_name,
+            crate::config_validation::MAX_QUOTED_VALUE_CHARS,
+        ),
+        caller_pane_id = %caller.pane_id,
+        caller_agent_id = %caller.agent_id,
+        report_chars = signal.task.chars().count(),
+        "dispatch: unit complete; returning its report to the pane that dispatched it"
+    );
+    let message =
+        crate::dispatch_return::compose_completion_report(&caller.unit_name, &signal.task);
+    crate::daemon::deliver_dispatch_result(registry, &caller.pane_id, &caller.agent_id, &message)
+        .await;
+    true
 }
 
 /// Issue #433 + #448: compose the single-line feedback the daemon submits into
@@ -4259,24 +4343,21 @@ fn resolve_delegate_task_body(
     };
 
     let safe_name = sanitize_role_name(target_role);
-    let dir = std::path::Path::new(cwd).join(".dot-agent-deck");
-    // Not fatal on its own: the directory may already exist, and if it genuinely
-    // cannot be created the `write` below fails too and takes the inline path.
-    if let Err(e) = std::fs::create_dir_all(&dir) {
-        warn!(
-            dir = %dir.display(),
-            role = %target_role,
-            pane_id = %pane_id,
-            error = %e,
-            "delegate: failed to create task directory"
-        );
-    }
-    let file_path = dir.join(format!("worker-task-{safe_name}.md"));
-    match std::fs::write(&file_path, &file_content) {
-        Ok(()) => format!("Read .dot-agent-deck/worker-task-{safe_name}.md for your task."),
+    let file_name = format!("worker-task-{safe_name}.md");
+    // Issue #329 §1: owner-only, directory and file. A delegated task is exactly
+    // the content #303 warns about parking on disk, and `create_dir_all` +
+    // `fs::write` left it at 0664 under a 002 umask for any local account to
+    // read. A failure still takes the inline path, for the reason above.
+    match crate::orchestrator_context::write_coordination_file(
+        std::path::Path::new(cwd),
+        &file_name,
+        &file_content,
+    ) {
+        Ok(_) => format!("Read .dot-agent-deck/{file_name} for your task."),
         Err(e) => {
             warn!(
-                path = %file_path.display(),
+                file = %file_name,
+                cwd = %cwd,
                 role = %target_role,
                 pane_id = %pane_id,
                 error = %e,
@@ -4323,18 +4404,19 @@ fn write_work_done_summary(
         );
         return false;
     };
-    let dir = std::path::Path::new(cwd).join(".dot-agent-deck");
-    // Not fatal on its own: the directory may already exist, and if it genuinely
-    // cannot be created the `write` below fails too and reports it.
-    if let Err(e) = std::fs::create_dir_all(&dir) {
-        warn!(dir = %dir.display(), role = %role, error = %e, "failed to create work-done directory");
-    }
-    let file_path = dir.join(format!("work-done-{safe_role}.md"));
-    match std::fs::write(&file_path, summary) {
-        Ok(()) => true,
+    let file_name = format!("work-done-{safe_role}.md");
+    // Issue #329 §1: owner-only, directory and file — a worker's report is as
+    // sensitive as the task that produced it, and this pair used to land at 0664.
+    match crate::orchestrator_context::write_coordination_file(
+        std::path::Path::new(cwd),
+        &file_name,
+        summary,
+    ) {
+        Ok(_) => true,
         Err(e) => {
             warn!(
-                path = %file_path.display(),
+                file = %file_name,
+                cwd = %cwd,
                 role = %role,
                 error = %e,
                 "failed to write work-done summary — the report is inlined into the \
@@ -7002,6 +7084,17 @@ impl AppState {
         let role_name = match self.pane_role_map.get(&signal.pane_id) {
             Some(name) => name.clone(),
             None => {
+                // PRD #220 M2.3: a dispatched `--single` unit is in NO role map —
+                // `pane_role_map` is populated only when orchestration roles spawn
+                // — so this is the branch its terminal completion arrives in, and
+                // before Phase 2 it was the end of the line for half the dispatch
+                // shapes. The dispatched unit's identity is the retained return
+                // entry itself, held daemon-side against its own delivery pane,
+                // which is what lets this route WITHOUT widening the admission
+                // gate below: a pane nobody dispatched still takes the warning.
+                if return_dispatch_completion(&signal, registry).await {
+                    return;
+                }
                 warn!(pane_id = %signal.pane_id, "work-done from unknown pane");
                 return;
             }
@@ -7009,11 +7102,25 @@ impl AppState {
 
         // Orchestrator's own `--done`: completion signal, no feedback to write.
         if signal.done && self.orchestrator_pane_ids.contains(&signal.pane_id) {
+            // PRD #220 Phase 2 review (finding A4): `signal.task` is the WHOLE
+            // report and used to be logged verbatim at info. Two problems, and the
+            // size is the smaller one: it is agent-authored text that can carry
+            // newlines, CR, ESC, C1 and bidi characters straight into a
+            // line-oriented log, and on a dispatched orchestration it is the same
+            // body the return edge is about to deliver — so logging it here
+            // contradicted the deliberate silence `deliver_dispatch_result` keeps
+            // about undelivered reports. Its LENGTH is what an operator correlating
+            // a truncation actually needs; the text itself is in the caller's pane.
             tracing::info!(
                 pane_id = %signal.pane_id,
-                task = %signal.task,
+                report_chars = signal.task.chars().count(),
                 "orchestration complete (orchestrator --done)"
             );
+            // PRD #220 M2.1: ...and if this orchestration was DISPATCHED, that
+            // completion is also the one thing its caller has been waiting for.
+            // An ordinary orchestration has no retained entry here and is
+            // unchanged: logged, and no feedback written.
+            return_dispatch_completion(&signal, registry).await;
             return;
         }
 
@@ -8588,6 +8695,7 @@ mod tests {
                 cols: 80,
                 live: None,
                 spawned_at_ms: None,
+                cli_name: None,
             }
         }
         let instance = |id: &str| OrchestrationIdentity::Instance {

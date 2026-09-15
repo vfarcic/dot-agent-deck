@@ -1593,6 +1593,12 @@ fn pump_reader(
         && let Some(registry) = registry.upgrade()
         && registry.is_agent_still_registered(&agent_id)
     {
+        // PRD #220 Phase 2 review/audit (finding A3): the dispatch return edge
+        // joins this sweep. A dispatched unit that exits without ever signalling
+        // `work-done --done` — and a caller that exits before its unit finishes —
+        // otherwise left an entry resident for the daemon's lifetime, because
+        // eviction covered only delivery and the deliberate-close transition.
+        registry.sweep_dispatch_returns_on_exit(pane_id, &agent_id);
         let swept = registry.sweep_delegations_on_exit(pane_id, &agent_id);
         // Worker-exit sweep: only the records for which THIS pane was the WORKER
         // side warrant an "exited without work-done" notice — a record this
@@ -2390,6 +2396,82 @@ pub struct AgentRecord {
     /// basis `live` and `last_activity_ms` were added on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spawned_at_ms: Option<i64>,
+    /// Issue #856: the binary name for the agent this record reports — the
+    /// command a user could type — resolved from the **daemon's** copy of
+    /// [`crate::agent_registry`].
+    ///
+    /// **Which binary a running agent is, is a fact about the daemon's world.**
+    /// The daemon forked the process; a client did not. Until this field existed
+    /// the desktop answered the question itself, looking the daemon-sent
+    /// `agent_type` up in its OWN compiled-in registry
+    /// (`map_agent`, `desktop/src-tauri/src/dto.rs`) and printing whatever
+    /// `AgentSpec::default_command` its copy of the table held. That could not
+    /// diverge while `classify_handshake` required an exact `server_version`
+    /// match plus matching build stamps — but that is a property of the GATE,
+    /// and relaxing the gate is precisely what issue #801 is for. PRD #819's
+    /// principle is that a client gets such facts from the daemon, and that
+    /// "the client can compute it locally" is not an answer even on one machine.
+    ///
+    /// **Stamped at the wire boundary, not at record construction**, by
+    /// [`attach_cli_names`] — immediately after the `ListAgents` handler's
+    /// live-session join, so it is resolved from the same identity the reply
+    /// reports (see [`AgentRecord::reported_agent_type`]). Resolving it in
+    /// [`AgentPtyRegistry::agent_records`] instead would read only the registry's
+    /// own `agent_type` and could name a different binary than the `agent_type`
+    /// travelling beside it on the same record.
+    ///
+    /// **`None` is never a licence to guess.** It means this daemon named no
+    /// binary — an agent type whose spec has no `default_command`
+    /// ([`crate::event::AgentType::None`], which also carries `#[serde(other)]`
+    /// and so absorbs a type from a NEWER daemon), a record with no reported
+    /// type at all, or a peer predating this field. Every consumer renders
+    /// nothing for it, the disposition `spawned_at_ms` and
+    /// [`crate::state::SessionSnapshot::last_activity_ms`] already take. A
+    /// consumer that falls back to its own table reinstates exactly the
+    /// divergence this closes.
+    ///
+    /// Additive optional, so no `PROTOCOL_VERSION` bump — same basis as `live`,
+    /// `last_activity_ms` and `spawned_at_ms`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cli_name: Option<String>,
+}
+
+impl AgentRecord {
+    /// The agent identity this record REPORTS: the live session's where the
+    /// `ListAgents` join attached one, else the registry's spawn-time value.
+    ///
+    /// One spelling of a precedence that had two. `map_agent` in the desktop
+    /// crate resolves the wire identity exactly this way and comments that it is
+    /// "resolved ONCE, so the wire identity and the binary name can never
+    /// disagree about which agent this is" — a promise that only holds while
+    /// both halves read the same rule, which is why the daemon's half calls this
+    /// rather than restating it.
+    pub fn reported_agent_type(&self) -> Option<&AgentType> {
+        self.live
+            .as_ref()
+            .and_then(|snapshot| snapshot.agent_type.as_ref())
+            .or(self.agent_type.as_ref())
+    }
+}
+
+/// Issue #856: stamp each record with the binary name the DAEMON's agent
+/// registry gives for the identity that record reports.
+///
+/// The counterpart of [`crate::state::AppState::attach_live_sessions`] and
+/// deliberately shaped like it: one pass over a whole `ListAgents` reply, run at
+/// the wire boundary, writing one field. Run it AFTER the live join — see
+/// [`AgentRecord::cli_name`] for why the order is load-bearing.
+///
+/// Unconditional, including the `None` case: a record whose reported type this
+/// daemon's registry cannot name a binary for reports no binary, rather than
+/// keeping whatever a caller had put there.
+pub fn attach_cli_names(records: &mut [AgentRecord]) {
+    for record in records {
+        record.cli_name = record
+            .reported_agent_type()
+            .and_then(|agent_type| crate::agent_registry::spec(agent_type).default_command)
+            .map(str::to_string);
+    }
 }
 
 /// Skip-predicate for `AgentRecord::rows` / `AgentRecord::cols`
@@ -2995,6 +3077,18 @@ pub struct AgentPtyRegistry {
     /// running daemon can reach, and the drop-driven cancellation below now
     /// retires stale tasks long before they could collide anyway.
     delegation_seq: AtomicU64,
+    /// PRD #220 M2.0: dispatched units that still owe their caller a completion
+    /// report, keyed by the unit's terminal pane. See
+    /// [`crate::dispatch_return::DispatchReturns`] for the eviction rules.
+    ///
+    /// Lives HERE, and not in [`crate::state::AppState`], because the two ends
+    /// of the edge share nothing else: `crate::dispatch::handle_dispatch`
+    /// registers after the spawn, and `AppState::handle_work_done` resolves
+    /// under the state READ lock, which cannot mutate a plain `AppState` field.
+    /// This registry is already the daemon's interior-mutable home for exactly
+    /// this shape of per-pane bookkeeping (delegations, silence watches,
+    /// commissions), and it is the one thing both ends are handed.
+    dispatch_returns: Mutex<crate::dispatch_return::DispatchReturns>,
 }
 
 /// PRD #126: the outstanding-delegation side state — records plus the
@@ -3655,6 +3749,7 @@ impl AgentPtyRegistry {
             delivery_notice_sink: Mutex::new(None),
             delegations: Mutex::new(DelegationTracker::default()),
             delegation_seq: AtomicU64::new(1),
+            dispatch_returns: Mutex::new(crate::dispatch_return::DispatchReturns::default()),
         }
     }
 
@@ -4133,6 +4228,108 @@ impl AgentPtyRegistry {
         )
     }
 
+    /// PRD #220 M2.0: retain `caller` as the recipient for the completion of the
+    /// dispatched unit whose TERMINAL pane is `unit_pane_id` — the single agent's
+    /// pane, or the orchestration's start-role pane
+    /// (`SpawnHandle::delivery_pane_id` in both cases).
+    ///
+    /// Called from `crate::dispatch::handle_dispatch` once the spawn has
+    /// succeeded, which is the first moment the unit's pane id exists. A unit
+    /// fast enough to reach `work-done --done` before this returns would find no
+    /// entry and be dropped — accepted rather than engineered around, since
+    /// closing it would mean registering a pane id before it is minted, and the
+    /// window is the few microseconds between `spawn` returning and this call
+    /// against a unit that has yet to read its prompt.
+    ///
+    /// `unit_agent_id` is `SpawnHandle::delivery_agent_id`, read from the same
+    /// handle as the pane id: the EOF sweep matches it before releasing an entry,
+    /// so a dead predecessor cannot evict a live successor's route (PR #1081
+    /// review, Greptile finding 1).
+    pub fn register_dispatch_return(
+        &self,
+        unit_pane_id: &str,
+        unit_agent_id: &str,
+        caller: crate::dispatch_return::DispatchCaller,
+    ) {
+        let displaced =
+            self.dispatch_returns
+                .lock()
+                .unwrap()
+                .register(unit_pane_id, unit_agent_id, caller);
+        if let Some(stale) = displaced {
+            tracing::debug!(
+                unit_pane_id = %unit_pane_id,
+                stale_caller_pane_id = %stale.caller.pane_id,
+                // Producer-supplied: the name the caller typed after `dispatch`
+                // reaches this field raw, and a raw LF forges a whole log line
+                // (PR #1081 review, Greptile finding 3 — the same treatment
+                // `return_dispatch_completion` already applies).
+                stale_unit = %crate::config_validation::escape_field_for_log(
+                    &stale.caller.unit_name,
+                    crate::config_validation::MAX_QUOTED_VALUE_CHARS,
+                ),
+                "dispatch return: a recycled unit pane displaced an undelivered entry"
+            );
+        }
+    }
+
+    /// PRD #220 M2.1: who the unit at `unit_pane_id` owes its completion report
+    /// to, evicting the entry as it answers. `None` for every pane that is not a
+    /// dispatched unit's terminal pane, which is what keeps the `work-done`
+    /// handler's unknown-pane admission gate intact for arbitrary panes.
+    pub fn take_dispatch_return(
+        &self,
+        unit_pane_id: &str,
+    ) -> Option<crate::dispatch_return::DispatchCaller> {
+        // The unit half of the retained route is the EOF sweep's business only —
+        // a terminal `work-done` carries no agent identity to check it against —
+        // so the delivery path is handed the caller and nothing else.
+        self.dispatch_returns
+            .lock()
+            .unwrap()
+            .take(unit_pane_id)
+            .map(|entry| entry.caller)
+    }
+
+    /// How many dispatched units still owe a report. Observability and tests.
+    pub fn outstanding_dispatch_returns(&self) -> usize {
+        self.dispatch_returns.lock().unwrap().len()
+    }
+
+    /// PRD #220 Phase 2 review/audit (finding A3): the dispatch-return half of
+    /// the PTY-EOF sweep, called from `pump_reader` beside
+    /// [`Self::sweep_delegations_on_exit`] and under the same
+    /// [`Self::is_agent_still_registered`] gate.
+    ///
+    /// Under that gate on purpose: a DELIBERATE close or a respawn removes the
+    /// registry entry before killing the child, so by the time the resulting EOF
+    /// arrives the gate is already `false` — and for a deliberate close
+    /// [`Self::begin_pane_close`] has swept this map already, while a respawn
+    /// leaves the pane itself alive with a successor agent on it. What the gate
+    /// admits is the case that had no eviction at all: a process that died on its
+    /// own while the registry still believed it was running.
+    ///
+    /// Both sides of an entry are identity-gated — the caller that dispatched and
+    /// the unit that was dispatched — so a pane id this agent merely used to hold
+    /// releases nothing; see
+    /// [`crate::dispatch_return::DispatchReturns::evict_exited`] for why, and for
+    /// what the residual is.
+    fn sweep_dispatch_returns_on_exit(&self, pane_id: &str, exited_agent_id: &str) {
+        let dropped = self
+            .dispatch_returns
+            .lock()
+            .unwrap()
+            .evict_exited(pane_id, exited_agent_id);
+        if dropped > 0 {
+            tracing::debug!(
+                pane_id = %pane_id,
+                agent_id = %exited_agent_id,
+                dropped_returns = dropped,
+                "pane EOF: dropped dispatch return entries for a pane whose process exited"
+            );
+        }
+    }
+
     /// PRD #126 M1 review (finding 1) / audit (finding 2): begin a race-safe
     /// pane close. Atomically marks `pane_id` as closing and drops every
     /// outstanding delegation that touches it — as the *worker* (keyed by the
@@ -4157,6 +4354,19 @@ impl AgentPtyRegistry {
     pub fn begin_pane_close(&self, pane_id: &str) -> Vec<OutstandingDelegation> {
         let mut tracker = self.delegations.lock().unwrap();
         tracker.closing_panes.insert(pane_id.to_string());
+        // PRD #220 M2.0: the same sweep for the dispatch return edge, and by the
+        // same two roles. A closing pane is either a dispatched unit that will
+        // now never complete, or a caller with nowhere left to be reported to;
+        // either way the entry is undeliverable and must not sit in the map
+        // waiting for a pane id to be recycled underneath it.
+        let dropped_returns = self.dispatch_returns.lock().unwrap().evict_pane(pane_id);
+        if dropped_returns > 0 {
+            tracing::debug!(
+                pane_id = %pane_id,
+                dropped_returns,
+                "pane close: dropped dispatch return entries touching this pane"
+            );
+        }
         // PRD #249 round-6 review (Greptile): wake anything waiting on this pane
         // BEFORE the up-to-`AGENT_TERMINATE_GRACE` termination starts, by dropping
         // its senders. Same ordering argument as the sweeps below.
@@ -7195,6 +7405,12 @@ impl AgentPtyRegistry {
             live: None,
             // PRD #745 M11: absent unless THIS registry forked the child.
             spawned_at_ms: agent.spawned_at.map(|at| at.timestamp_millis()),
+            // Issue #856: stamped at the wire boundary by `attach_cli_names`,
+            // after the live join — the registry has no live session here, so
+            // resolving it now would read a narrower identity than the reply
+            // reports. This path (`agent_record_any`) is a CLEANUP lookup and
+            // reaches no client at all.
+            cli_name: None,
         })
     }
 
@@ -7491,6 +7707,10 @@ impl AgentPtyRegistry {
                 // filter above is what keeps a spawn instant from outliving the
                 // process it describes and ticking up as a phantom uptime.
                 spawned_at_ms: agent.spawned_at.map(|at| at.timestamp_millis()),
+                // Issue #856: stamped by `attach_cli_names` at the wire
+                // boundary, after the `ListAgents` handler's live join. See
+                // `AgentRecord::cli_name`.
+                cli_name: None,
             })
             .collect();
         records.sort_by_key(|r| r.id.parse::<u64>().unwrap_or(0));
@@ -11501,6 +11721,110 @@ mod spawn_tests {
     // permanently corrupted (PRD #104 problem statement).
     // ---------------------------------------------------------------------
 
+    // ---------------------------------------------------------------------
+    // Issue #856: the binary name is the DAEMON's answer.
+    //
+    // These moved here from the desktop crate's `dto.rs`, which is where the
+    // resolution used to live — in a client's own compiled-in copy of the agent
+    // registry. The tests came with the responsibility.
+    // ---------------------------------------------------------------------
+
+    /// A record reporting `agent_type`, with an optional live session type on
+    /// top, and nothing else this resolution reads.
+    fn typed_record(
+        record_type: Option<AgentType>,
+        live_type: Option<Option<AgentType>>,
+    ) -> AgentRecord {
+        AgentRecord {
+            id: "1".into(),
+            pane_id_env: None,
+            display_name: None,
+            cwd: None,
+            tab_membership: None,
+            agent_type: record_type,
+            rows: 0,
+            cols: 0,
+            live: live_type.map(|agent_type| crate::state::SessionSnapshot {
+                status: crate::state::SessionStatus::Working,
+                agent_type,
+                active_tool: None,
+                tool_count: 0,
+                first_prompts: Vec::new(),
+                last_user_prompt: None,
+                live_target: None,
+                last_activity_ms: None,
+            }),
+            spawned_at_ms: None,
+            cli_name: None,
+        }
+    }
+
+    /// Every agent type resolves to the binary somebody could type, and the two
+    /// that name none resolve to nothing.
+    ///
+    /// EVERY variant, not just the one a fixture happens to carry: the enum
+    /// names had Claude Code reading `claude_code` and OpenCode reading
+    /// `open_code`, with `codex` right only by coincidence, which is exactly the
+    /// shape of defect a one-variant test misses.
+    #[test]
+    fn attach_cli_names_resolves_every_agent_type_to_its_binary() {
+        let cli_of = |agent_type: Option<AgentType>| {
+            let mut records = [typed_record(agent_type, None)];
+            attach_cli_names(&mut records);
+            records[0].cli_name.clone()
+        };
+        assert_eq!(
+            cli_of(Some(AgentType::ClaudeCode)).as_deref(),
+            Some("claude")
+        );
+        assert_eq!(
+            cli_of(Some(AgentType::OpenCode)).as_deref(),
+            Some("opencode")
+        );
+        assert_eq!(cli_of(Some(AgentType::Pi)).as_deref(), Some("pi"));
+        assert_eq!(cli_of(Some(AgentType::Codex)).as_deref(), Some("codex"));
+        assert_eq!(cli_of(Some(AgentType::Devin)).as_deref(), Some("devin"));
+        // `None` is both "no recognized agent" and the `#[serde(other)]` landing
+        // spot for a type this build has never heard of. Neither has a binary to
+        // name, and a daemon that cannot name one says nothing rather than
+        // guessing — which is what lets the client render nothing.
+        assert_eq!(cli_of(Some(AgentType::None)), None);
+        assert_eq!(cli_of(None), None);
+    }
+
+    /// The live session's type decides the binary, exactly as it decides the
+    /// wire identity beside it — so the two can never name different agents on
+    /// one record. A live session that reports NO type falls through to the
+    /// registry's, which is the same `or` the identity takes.
+    #[test]
+    fn attach_cli_names_follows_the_identity_the_record_reports() {
+        let mut records = [
+            typed_record(Some(AgentType::Codex), Some(Some(AgentType::ClaudeCode))),
+            typed_record(Some(AgentType::Codex), Some(None)),
+        ];
+        attach_cli_names(&mut records);
+        assert_eq!(records[0].cli_name.as_deref(), Some("claude"));
+        assert_eq!(
+            records[0].reported_agent_type(),
+            Some(&AgentType::ClaudeCode)
+        );
+        assert_eq!(records[1].cli_name.as_deref(), Some("codex"));
+        assert_eq!(records[1].reported_agent_type(), Some(&AgentType::Codex));
+    }
+
+    /// Unconditional, including the absent case: a record whose reported type
+    /// names no binary reports none, rather than keeping whatever was already
+    /// on the field. Same rule `attach_live_sessions` follows for `live`, and
+    /// for the same reason — the daemon is the authority, so absence is an
+    /// answer and not a gap to leave a previous value showing through.
+    #[test]
+    fn attach_cli_names_overwrites_rather_than_filling_in() {
+        let mut records = [typed_record(Some(AgentType::None), None)];
+        records[0].cli_name = Some("stale".into());
+        attach_cli_names(&mut records);
+        assert_eq!(records[0].cli_name, None);
+    }
+
     #[test]
     fn agent_record_round_trips_explicit_rows_cols() {
         let rec = AgentRecord {
@@ -11514,6 +11838,7 @@ mod spawn_tests {
             cols: 40,
             live: None,
             spawned_at_ms: None,
+            cli_name: None,
         };
         let json = serde_json::to_string(&rec).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -12093,6 +12418,7 @@ mod spawn_tests {
             cols: 0,
             live: None,
             spawned_at_ms: None,
+            cli_name: None,
         };
         let json = serde_json::to_string(&rec).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -12478,6 +12804,131 @@ mod spawn_tests {
     /// workers' watches. Records are keyed by worker pane, so the old
     /// pane-keyed cancellation left them armed against a pane id that a later,
     /// unrelated agent could inherit.
+    /// PRD #220 M2.0, through the registry rather than the map: the retention
+    /// entry a dispatch leaves behind is evicted by the SAME pane-close
+    /// transition that sweeps delegations and watches.
+    ///
+    /// The pure-data rules are asserted in [`crate::dispatch_return`]; what this
+    /// pins is the wiring, which is the half that can silently not happen — a map
+    /// whose eviction call was never made keeps answering correctly in its own
+    /// tests forever.
+    #[test]
+    fn begin_pane_close_evicts_dispatch_returns_touching_the_closing_pane() {
+        let reg = AgentPtyRegistry::new();
+        let caller = |pane: &str, unit: &str| crate::dispatch_return::DispatchCaller {
+            pane_id: pane.to_string(),
+            agent_id: "agent-7".to_string(),
+            unit_name: unit.to_string(),
+        };
+        reg.register_dispatch_return("unit-pane-a", "unit-agent-a", caller("caller-1", "a"));
+        reg.register_dispatch_return("unit-pane-b", "unit-agent-b", caller("caller-1", "b"));
+        reg.register_dispatch_return("unit-pane-c", "unit-agent-c", caller("caller-2", "c"));
+        assert_eq!(reg.outstanding_dispatch_returns(), 3);
+
+        // The dispatched unit's own tab closing: nothing will ever complete there.
+        drop(reg.begin_pane_close("unit-pane-a"));
+        assert_eq!(reg.outstanding_dispatch_returns(), 2);
+        assert!(
+            reg.take_dispatch_return("unit-pane-a").is_none(),
+            "a closed unit must not stay resolvable against a recyclable pane id"
+        );
+
+        // The CALLER's pane closing: every unit it started loses its recipient.
+        drop(reg.begin_pane_close("caller-1"));
+        assert_eq!(
+            reg.outstanding_dispatch_returns(),
+            1,
+            "closing the caller evicts its remaining unit too"
+        );
+        assert!(reg.take_dispatch_return("unit-pane-b").is_none());
+
+        // And the other caller's unit is untouched, then consumed by delivery.
+        assert_eq!(
+            reg.take_dispatch_return("unit-pane-c").map(|c| c.unit_name),
+            Some("c".to_string())
+        );
+        assert_eq!(
+            reg.outstanding_dispatch_returns(),
+            0,
+            "resolving a return evicts it, so no report can be delivered twice"
+        );
+    }
+
+    /// PRD #220 Phase 2 review/audit (finding A3), through the registry rather
+    /// than the map: the PTY-EOF sweep evicts return entries too.
+    ///
+    /// The wiring is the half that can silently not happen, and here it silently
+    /// did not: `pump_reader`'s EOF branch swept delegations and silence watches
+    /// and walked straight past this map, so a dispatched unit that exited without
+    /// signalling `work-done --done` left its entry resident for the daemon's
+    /// lifetime. The pure-data rules — including why BOTH sides are identity-gated
+    /// (PR #1081 review, Greptile finding 1) — live in
+    /// [`crate::dispatch_return`].
+    #[test]
+    fn the_eof_sweep_evicts_dispatch_returns_for_a_pane_that_exited() {
+        let reg = AgentPtyRegistry::new();
+        let caller = |pane: &str, agent: &str, unit: &str| crate::dispatch_return::DispatchCaller {
+            pane_id: pane.to_string(),
+            agent_id: agent.to_string(),
+            unit_name: unit.to_string(),
+        };
+        reg.register_dispatch_return(
+            "unit-pane-a",
+            "unit-agent-a",
+            caller("caller-1", "agent-7", "a"),
+        );
+        reg.register_dispatch_return(
+            "unit-pane-b",
+            "unit-agent-b",
+            caller("caller-1", "agent-7", "b"),
+        );
+        reg.register_dispatch_return(
+            "unit-pane-c",
+            "unit-agent-c",
+            caller("caller-2", "agent-9", "c"),
+        );
+        assert_eq!(reg.outstanding_dispatch_returns(), 3);
+
+        // A DIFFERENT agent exiting on the dispatched unit's pane changes nothing:
+        // the entry belongs to the unit that was actually dispatched, not to
+        // whoever else has held that recycled pane id.
+        reg.sweep_dispatch_returns_on_exit("unit-pane-a", "whatever-agent-ran-there");
+        assert_eq!(
+            reg.outstanding_dispatch_returns(),
+            3,
+            "a predecessor's late EOF must not evict the live unit's return route"
+        );
+
+        // The dispatched unit's own process dying: it will never complete now.
+        reg.sweep_dispatch_returns_on_exit("unit-pane-a", "unit-agent-a");
+        assert_eq!(reg.outstanding_dispatch_returns(), 2);
+        assert!(
+            reg.take_dispatch_return("unit-pane-a").is_none(),
+            "an exited unit must not stay resolvable against a recyclable pane id"
+        );
+
+        // A DIFFERENT agent exiting on the caller's pane changes nothing: the
+        // entry belongs to whoever actually dispatched it.
+        reg.sweep_dispatch_returns_on_exit("caller-1", "some-earlier-occupant");
+        assert_eq!(
+            reg.outstanding_dispatch_returns(),
+            2,
+            "a predecessor's late EOF must not cancel the live caller's units"
+        );
+
+        // The caller itself exiting: its remaining unit loses its recipient.
+        reg.sweep_dispatch_returns_on_exit("caller-1", "agent-7");
+        assert_eq!(reg.outstanding_dispatch_returns(), 1);
+        assert!(reg.take_dispatch_return("unit-pane-b").is_none());
+
+        // The unrelated caller's unit is untouched.
+        assert_eq!(
+            reg.take_dispatch_return("unit-pane-c").map(|c| c.unit_name),
+            Some("c".to_string())
+        );
+        assert_eq!(reg.outstanding_dispatch_returns(), 0);
+    }
+
     #[test]
     fn begin_pane_close_cancels_records_targeting_the_closing_orchestrator() {
         let reg = Arc::new(AgentPtyRegistry::new());

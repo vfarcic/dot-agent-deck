@@ -900,9 +900,9 @@ async fn wait_for_snapshot(registry: &AgentPtyRegistry, agent_id: &str, needle: 
 /// Delivering the dispatch result must be refused as `WrongSession`, and none of
 /// the result text may appear in the successor's scrollback even after a later
 /// authorized write to that successor has demonstrably landed.
-#[spec("orchestration/dispatch/005")]
+#[spec("orchestration/dispatch/006")]
 #[tokio::test]
-async fn dispatch_005_a_dispatch_result_is_refused_when_the_caller_pane_changed_hands() {
+async fn dispatch_006_a_dispatch_result_is_refused_when_the_caller_pane_changed_hands() {
     common::init_test_env();
     const PANE: &str = "dispatch-result-handover-pane";
     const RESULT: &str = "DISPATCH-RESULT-MUST-NOT-REACH-THE-SUCCESSOR-2f7c";

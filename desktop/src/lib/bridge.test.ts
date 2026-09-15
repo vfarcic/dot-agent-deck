@@ -608,28 +608,57 @@ describe("TauriDeckBridge", () => {
   });
 
   /**
-   * PRD #745. `cli` is the BINARY the agent runs, resolved daemon-side from the
-   * agent registry, and never the wire identity beside it: rendering
-   * `agentType` printed `claude_code` and `open_code`, neither of which anybody
-   * types. Where this build cannot name a binary — the daemon reported `none`,
-   * which is also where an agent type from a NEWER daemon lands — the deck's
-   * own generic word stands in rather than an invented one.
+   * PRD #745 + issue #856. `cli` is the BINARY the agent runs, and it is the
+   * DAEMON's answer carried through untouched — never the wire identity beside
+   * it (rendering `agentType` printed `claude_code` and `open_code`, neither of
+   * which anybody types) and never a lookup in this app's own copy of the agent
+   * registry.
+   *
+   * The second half is the load-bearing one. `cliName` here names a binary no
+   * `AgentSpec` in this build holds while `agentType` is a perfectly ordinary
+   * `claude_code`, so a local lookup — which is what this used to do — answers
+   * `claude` and fails the assertion. And where the daemon named NO binary the
+   * cell is left empty rather than filled with the deck's old generic word: a
+   * word reads as a fact about the agent, absence reads as "the deck did not
+   * say", and absence is what is true.
    */
-  it("renders the CLI binary the daemon resolved, and never the agent-type enum", async () => {
+  it("carries the CLI binary the daemon reported, and never derives one locally", async () => {
     const { mapDesktopSnapshot } = await import("./bridge");
     const claude = structuredClone(snapshot);
     claude.agents[0].agentType = "claude_code";
-    claude.agents[0].cliName = "claude";
+    claude.agents[0].cliName = "claude-next";
     // Outside an orchestration the deck's role label is derived from the wire
     // identity, which this leaves untouched.
     claude.agents[0].tab = { kind: "dashboard" };
 
-    expect(mapDesktopSnapshot(claude).agents[0]?.cli).toBe("claude");
+    expect(mapDesktopSnapshot(claude).agents[0]?.cli).toBe("claude-next");
     expect(mapDesktopSnapshot(claude).agents[0]?.role).toBe("Claude code");
 
-    const unnameable = structuredClone(snapshot);
-    unnameable.agents[0].agentType = "none";
-    expect(mapDesktopSnapshot(unnameable).agents[0]?.cli).toBe("agent");
+    const unnamed = structuredClone(snapshot);
+    unnamed.agents[0].agentType = "claude_code";
+    delete unnamed.agents[0].cliName;
+    expect(mapDesktopSnapshot(unnamed).agents[0]?.cli).toBeUndefined();
+  });
+
+  /**
+   * Issue #887. `scheduleRevision` is carried through so `projectsRevision` in
+   * `App.tsx` can key the project re-list on it; nothing renders it. An
+   * unreporting daemon leaves it absent rather than defaulting it to a number,
+   * because `0` is a real revision — the value every daemon starts at — and a
+   * client that invented it could not tell "no schedule has ever been
+   * registered" from "this daemon does not answer the question".
+   */
+  it("carries the daemon's schedule revision through, and leaves an unreported one absent", async () => {
+    const { mapDesktopSnapshot } = await import("./bridge");
+    const reported = structuredClone(snapshot);
+    reported.scheduleRevision = 4;
+    expect(mapDesktopSnapshot(reported).scheduleRevision).toBe(4);
+
+    const zero = structuredClone(snapshot);
+    zero.scheduleRevision = 0;
+    expect(mapDesktopSnapshot(zero).scheduleRevision).toBe(0);
+
+    expect(mapDesktopSnapshot(structuredClone(snapshot)).scheduleRevision).toBeUndefined();
   });
 
   /**

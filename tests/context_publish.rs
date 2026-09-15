@@ -118,10 +118,11 @@ fn a_symlinked_context_directory_is_refused_and_nothing_is_written_through_it() 
 ///
 /// This is not tidiness. `mkdir` under a umask of `002` — the default on hosts
 /// that give each user a private group, including the box this was written on —
-/// produces `0o775`, which the publish now **refuses**
-/// (`a_group_or_world_writable_context_directory_is_refused`). A test whose
-/// subject is symlinks must not depend on the CI host's umask to reach its
-/// assertion, so it says the mode it means.
+/// produces `0o775`, which the publish **repairs to `0o755` on its way through**
+/// (`a_group_or_world_writable_context_directory_is_repaired_and_published_into`).
+/// A test whose subject is symlinks must not have its directory silently
+/// re-permissioned underneath it by the host's umask, so it says the mode it
+/// means.
 fn create_context_dir_owner_only(project: &Path) {
     std::fs::DirBuilder::new()
         .mode(0o700)
@@ -388,9 +389,12 @@ fn a_context_directory_that_is_a_regular_file_is_refused() {
 /// whatever its mode", and its stated reasoning — whoever can write the parent
 /// already controls `.dot-agent-deck.toml` — is true of the parent and does not
 /// transfer to the child: a `.dot-agent-deck` can be group-writable while the
-/// project root is not. So group/other **write** is now refused, which is
-/// `a_group_or_world_writable_context_directory_is_refused`'s half of the pair.
-/// Keeping both halves is the point; either alone reads as the whole rule.
+/// project root is not. So group/other **write** is taken away before anything is
+/// written, which is
+/// `a_group_or_world_writable_context_directory_is_repaired_and_published_into`'s
+/// half of the pair. Keeping both halves is the point; either alone reads as the
+/// whole rule — this one is what pins the repair to the WRITE bits, since a
+/// repair that reached for `0o700` would fail here.
 #[test]
 fn an_existing_acceptable_context_directory_keeps_its_mode() {
     let (_guard, project) = project();
@@ -415,84 +419,116 @@ fn an_existing_acceptable_context_directory_keeps_its_mode() {
     );
 }
 
-/// An existing `.dot-agent-deck` that group or other can **write** is refused,
-/// and nothing is published into it.
+/// An existing `.dot-agent-deck` that group or other can **write** is
+/// **repaired in place and published into** (issues #1047 §1, #329 §1).
 ///
-/// PRD #819's audit finding. A file's mode does not protect its **directory
-/// entry**: another local account with write on that directory can rename or
-/// replace an `orchestrator-context.md` published at `0o600`, and the next
-/// coordinator then reads attacker-controlled instructions. The daemon creates
-/// this directory `0o700` when it creates it at all, so the exposure is entirely
-/// about directories that already exist — which the publish used to accept
-/// without inspecting.
+/// PRD #819's audit finding stands: a file's mode does not protect its
+/// **directory entry**, so another local account with write on that directory
+/// can rename or replace an `orchestrator-context.md` published at `0o600`, and
+/// the next coordinator then reads attacker-controlled instructions. What
+/// changed is the remedy. Refusing meant the publish refused **the default Linux
+/// configuration**: `mkdir` under `umask 002` — Debian/Ubuntu's default, for
+/// hosts that give each user a private group — produces `0o775`, and #1047
+/// enumerated four of four projects on the development machine at exactly that,
+/// group-writable by a group whose only member is the owner. Every first-time
+/// user on a stock install hit it in every repository they owned, with no way out
+/// that did not involve leaving the app for a shell.
 ///
-/// Refusing rather than re-permissioning is deliberate: `chmod`-ing a directory
-/// the operator created is a side effect a publish has no business having, it
-/// races the very attacker it aims at, and it hides the misconfiguration instead
-/// of naming it. Both write bits are covered, because `0o770` (group only) is
-/// the shape a shared-group checkout actually has, and it is every bit as
-/// exposed as `0o777`.
+/// So the publish now does what its own error message had been telling the user
+/// to do — `chmod go-w`, on the descriptor it already holds — and refuses only
+/// when that cannot be done
+/// (`the_repair_refuses_when_the_chmod_fails_or_the_mode_is_re_widened`, the
+/// injected-seam half of this pair in `src/orchestrator_context.rs`).
 ///
-/// **`0o775` is not an exotic mode, and the cost of refusing it is real.** It is
-/// exactly what `mkdir` produces under a umask of `002`, which is the default on
-/// hosts that give each user a private group — so a `.dot-agent-deck` left by
-/// anything other than this publish (a `git` checkout, an operator's `mkdir`, or
-/// this deck's own pre-M4 `create_dir_all`) is likely to carry it, and the
-/// remedy is `chmod go-w .dot-agent-deck`. The check cannot distinguish a
-/// private group from a shared one — group membership is not derivable from the
-/// mode, and NSS makes it unreliable to look up — so it fails closed, which is
-/// the same disposition OpenSSH's `StrictModes` takes for the same reason. That
-/// trade is recorded here rather than discovered by whoever hits it.
-///
-/// Running as root would not defeat this one — the check reads the mode rather
-/// than attempting a write — so unlike
-/// `a_failed_publish_leaves_the_previous_context_intact_and_no_residue` it needs
-/// no root guard.
+/// **The exact target mode is asserted for each case, not merely "no write
+/// bits", and that is #329's own "Care needed" warning made into a test.**
+/// Tightening an existing directory is a behaviour change, and a shared box or a
+/// CI checkout is where an over-broad one bites: `0o770` becomes `0o750`, so the
+/// group keeps read and execute and only loses write. Repairing to `0o700`
+/// instead would lock a shared group out of a directory it legitimately lists,
+/// which is precisely the untested interaction that got this cut from #303's
+/// release.
 #[test]
-fn a_group_or_world_writable_context_directory_is_refused() {
-    for mode in [0o775, 0o777, 0o707, 0o770] {
+fn a_group_or_world_writable_context_directory_is_repaired_and_published_into() {
+    for (mode, repaired) in [
+        (0o775, 0o755),
+        (0o777, 0o755),
+        (0o707, 0o705),
+        (0o770, 0o750),
+        (0o772, 0o750),
+    ] {
         let (_guard, project) = project();
         std::fs::create_dir(context_dir(&project)).expect("create .dot-agent-deck");
         std::fs::set_permissions(context_dir(&project), std::fs::Permissions::from_mode(mode))
             .expect("hand it out to group/other");
 
-        let err =
-            match publish_orchestrator_context(&project, "into a directory anyone can rewrite") {
-                Ok(published) => {
-                    panic!(
-                        "mode {mode:04o} must be refused, but the publish produced {published:?}"
-                    )
-                }
-                Err(e) => e,
-            };
-        let ContextPublishError::ContextDirGroupOrWorldWritable(reported) = err else {
-            panic!("mode {mode:04o}: expected ContextDirGroupOrWorldWritable, got {err:?}");
-        };
-        assert_eq!(reported, mode, "the diagnostic names the offending mode");
+        let published = publish_orchestrator_context(&project, "into a repaired directory")
+            .unwrap_or_else(|e| panic!("mode {mode:04o} must be repaired, not refused: {e:?}"));
 
-        assert!(
-            !context_file(&project).exists(),
-            "mode {mode:04o}: nothing may be published into a directory that fails the check"
+        assert_eq!(
+            mode_of(&context_dir(&project)),
+            repaired,
+            "mode {mode:04o}: the repair clears group/other WRITE and nothing else"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&published.path).expect("read the published context"),
+            "into a repaired directory",
+            "mode {mode:04o}: and the publish goes through"
+        );
+        assert_eq!(
+            mode_of(&context_file(&project)),
+            0o600,
+            "mode {mode:04o}: the file is owner-only regardless"
         );
         assert!(
             residue(&project).is_empty(),
-            "mode {mode:04o}: and no temp file may be left behind either: {:?}",
+            "mode {mode:04o}: no temp file may be left behind: {:?}",
             residue(&project)
         );
-        assert_eq!(
-            mode_of(&context_dir(&project)),
-            mode,
-            "mode {mode:04o}: the directory is refused, not silently re-permissioned"
-        );
     }
+}
+
+/// The whole reason #1047 was filed against *every* project on the machine: a
+/// directory created the way `git checkout`, `mkdir` or an agent writing a task
+/// file creates one — under the ambient `umask 002` — publishes without the user
+/// touching anything.
+///
+/// `a_group_or_world_writable_context_directory_is_repaired_and_published_into`
+/// sets the mode explicitly, which proves the repair but not that the *default*
+/// configuration reaches it. This one never names a mode at all: it sets the
+/// umask a stock Debian/Ubuntu box has and lets `create_dir` produce whatever
+/// that produces, which is the exact shape the field report describes.
+#[test]
+fn a_context_directory_left_by_a_stock_umask_002_host_publishes_without_intervention() {
+    let (_guard, project) = project();
+    // SAFETY: `umask(2)` swaps a per-process value; nextest runs one process per
+    // test, so nothing else here observes it. Same reasoning as
+    // `a_freshly_created_context_directory_satisfies_the_check_it_imposes`.
+    let previous = unsafe { libc::umask(0o002) };
+    let created = std::fs::create_dir(context_dir(&project));
+    unsafe {
+        libc::umask(previous);
+    }
+    created.expect("create .dot-agent-deck the way the ambient umask would");
+    assert_eq!(
+        mode_of(&context_dir(&project)),
+        0o775,
+        "the premise: a 002 umask produces exactly the mode #1047 measured on four of four projects"
+    );
+
+    publish_orchestrator_context(&project, "a stock Linux box")
+        .expect("the default Linux configuration must not be refused");
+
+    assert_eq!(mode_of(&context_dir(&project)), 0o755);
+    assert_eq!(mode_of(&context_file(&project)), 0o600);
 }
 
 /// A directory the publish **creates** is owner-only and therefore always passes
 /// the check above — including under a permissive umask, which can only remove
 /// bits.
 ///
-/// Without this, `a_group_or_world_writable_context_directory_is_refused` would
-/// be consistent with a publish that refused every directory it had just made.
+/// Without this, the repair tests above would be consistent with a publish that
+/// had to re-permission every directory it had just made.
 #[test]
 fn a_freshly_created_context_directory_satisfies_the_check_it_imposes() {
     let (_guard, project) = project();

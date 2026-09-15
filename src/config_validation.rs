@@ -31,7 +31,7 @@ pub struct ValidationIssue {
 /// leaving an absurd one unable to fill a screen. The count that replaces the
 /// tail is what keeps the diagnostic honest: "this is longer than it looks" is
 /// itself the finding when a config carries a 100 KB mode name.
-const MAX_QUOTED_VALUE_CHARS: usize = 120;
+pub(crate) const MAX_QUOTED_VALUE_CHARS: usize = 120;
 
 /// Issue #308 audit (MEDIUM): the per-line ceiling on a whole rendered
 /// `message`.
@@ -195,6 +195,21 @@ fn escape_for_terminal(s: &str) -> std::borrow::Cow<'_, str> {
         }
     }
     std::borrow::Cow::Owned(out)
+}
+
+/// PRD #220 Phase 2 review (finding A4): one producer-supplied field, clamped
+/// and escaped, ready to be interpolated into a `tracing` field value.
+///
+/// Composed from the two halves this module already applies to a
+/// `ValidationIssue` rather than respelled, so there is one definition of "safe
+/// in a diagnostic" to keep correct. The reason a LOG needs it is the same
+/// reason a validation message does and is easy to under-rate: disabling the
+/// subscriber's own ANSI styling escapes nothing INSIDE a field value, so a
+/// newline forges a whole log line, a CR overwrites the one being written, and a
+/// bidi override reorders a line in whatever terminal or viewer renders it.
+/// Clamping first is what stops a field that is not prose from filling the file.
+pub(crate) fn escape_field_for_log(value: &str, max_chars: usize) -> String {
+    escape_for_terminal(&bound_chars(value, max_chars)).into_owned()
 }
 
 /// The predicate behind [`escape_for_terminal`] — see its doc for why the set is
@@ -1028,6 +1043,45 @@ mod tests {
         assert!(
             rendered.contains("known agents:"),
             "bounding the value must not truncate the deck's own advice; got {rendered:?}"
+        );
+    }
+
+    /// PR #1081 review (Greptile finding 3): the helper itself, because it now
+    /// guards four call sites across three modules rather than the one it was
+    /// introduced for. Every one of them interpolates a name an AGENT supplied
+    /// over the hook socket into a line-oriented log.
+    #[test]
+    fn a_producer_supplied_field_cannot_forge_or_reorder_a_log_line() {
+        let hostile = "unit\nINFO forged line\rovershoot\u{1b}[2Jcleared\u{202e}reversed";
+        let escaped = escape_field_for_log(hostile, MAX_QUOTED_VALUE_CHARS);
+
+        assert!(
+            !escaped.chars().any(|c| c.is_control()),
+            "a raw LF forges a whole log line and a raw CR overwrites the one being \
+             written; neither may survive: {escaped:?}"
+        );
+        assert!(
+            !escaped
+                .chars()
+                .any(crate::untrusted_text::is_bidi_format_char),
+            "a bidi override reorders the line in whatever renders it: {escaped:?}"
+        );
+        assert!(
+            escaped.contains("forged line") && escaped.contains("cleared"),
+            "escaping preserves the evidence rather than dropping it: {escaped:?}"
+        );
+        let clamped = escape_field_for_log(&"z".repeat(5_000), MAX_QUOTED_VALUE_CHARS);
+        assert!(
+            clamped.starts_with(&"z".repeat(MAX_QUOTED_VALUE_CHARS))
+                && clamped.contains("(5000 characters total)")
+                && clamped.chars().count() < MAX_QUOTED_VALUE_CHARS + 40,
+            "a field that is not prose is clamped before it can flood the log, and the \
+             true length replaces the tail rather than being dropped: {clamped:?}"
+        );
+        assert_eq!(
+            escape_field_for_log("ordinary-unit-name", MAX_QUOTED_VALUE_CHARS),
+            "ordinary-unit-name",
+            "an ordinary name must pass through untouched, or every log reads worse"
         );
     }
 

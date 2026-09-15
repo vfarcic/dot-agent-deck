@@ -817,6 +817,21 @@ fn clamp_bytes(mut s: String, max_bytes: usize) -> String {
     s
 }
 
+/// One `ListAgents` reply, as [`DaemonClient::list_agents_detailed`] reads it:
+/// the agent records plus the per-daemon facts that ride beside them.
+#[derive(Debug, Clone, Default)]
+pub struct AgentListing {
+    /// The agent records, sanitised at the wire boundary exactly as
+    /// [`DaemonClient::list_agents`] returns them.
+    pub records: Vec<AgentRecord>,
+    /// Issue #887: the daemon's registered-schedule revision, or `None` from a
+    /// daemon that does not report one. See
+    /// [`crate::daemon_protocol::AttachResponse::schedule_revision`] for how a
+    /// client may read it — and, in particular, that it is comparable only
+    /// against earlier values from the same connection.
+    pub schedule_revision: Option<u64>,
+}
+
 /// Sanitize a single `AgentRecord` echoed by the daemon before it reaches the
 /// TUI. Defense in depth at the wire boundary (M2.12 fixup auditor #1, PRD
 /// #162 findings #1/#2): the daemon validates on `StartAgent`, but a malformed
@@ -838,6 +853,14 @@ fn clamp_bytes(mut s: String, max_bytes: usize) -> String {
 ///   of the wire: a daemon too old to carry the gate's bidi half, or one not
 ///   running this code at all, echoes whatever it stored. Same
 ///   defense-in-depth argument as `tab_membership` above.
+///
+/// - `cli_name` (issue #856): the daemon-resolved binary name, scrubbed through
+///   the same [`crate::untrusted_text::sanitize_display_name`] as
+///   `display_name`, for the same defense-in-depth reason. It is a registry
+///   constant on every daemon running this code — but so is the gate on
+///   `display_name`, and this boundary exists for the peer that is not running
+///   it. The value reaches a webview `title` attribute and an overview cell;
+///   nothing printable left becomes `None`, which renders as nothing.
 ///
 /// NOT scrubbed here, and this list is the whole of what is: `id` and
 /// `pane_id_env` (daemon-minted — `id` is a monotonic counter stringified) and
@@ -863,6 +886,26 @@ fn sanitize_record_tab_membership(rec: &mut AgentRecord) {
                 name_len = raw.len(),
                 "list_agents: dropping daemon-supplied display_name with no printable \
                  content — the card falls back to the agent id"
+            );
+        }
+    }
+
+    // Issue #856: the daemon-resolved binary name, scrubbed on the same
+    // defense-in-depth argument as `display_name` above and through the same
+    // function. It is a registry constant on every daemon running this code —
+    // but that is a property of the peer, and this boundary exists precisely for
+    // the peer that is not. It reaches a webview `title` attribute and an
+    // overview cell, so a bidi override or a control byte here is a render
+    // defect in a value nothing else gates. Nothing printable left means the
+    // daemon named no binary this client can render, which renders as nothing.
+    if let Some(raw) = rec.cli_name.take() {
+        rec.cli_name = crate::untrusted_text::sanitize_display_name(&raw);
+        if rec.cli_name.is_none() {
+            tracing::warn!(
+                agent_id = %rec.id,
+                name_len = raw.len(),
+                "list_agents: dropping daemon-supplied cli_name with no printable content \
+                 — the CLI column renders empty"
             );
         }
     }
@@ -1202,6 +1245,18 @@ impl DaemonClient {
     /// drift — we never propagate a control-byte name into
     /// bucketing/logging/tab lookup.
     pub async fn list_agents(&self) -> Result<Vec<AgentRecord>, ClientError> {
+        Ok(self.list_agents_detailed().await?.records)
+    }
+
+    /// [`Self::list_agents`] plus the per-daemon facts that ride the same reply.
+    ///
+    /// Issue #887 added [`AgentListing::schedule_revision`], which is not a
+    /// property of any record and so has nowhere to go in a `Vec<AgentRecord>`.
+    /// Split rather than widened because `list_agents` has twenty-odd callers
+    /// that want exactly the list, and only the desktop's snapshot path wants
+    /// the rest. Both go down one code path, so the sanitisation and the
+    /// older-daemon fallback below cannot differ between them.
+    pub async fn list_agents_detailed(&self) -> Result<AgentListing, ClientError> {
         let (mut rd, mut wr) = self.connect().await?;
         let resp = issue_command(&mut rd, &mut wr, &AttachRequest::ListAgents).await?;
         if !resp.ok {
@@ -1209,34 +1264,46 @@ impl DaemonClient {
                 resp.error.unwrap_or_else(|| "list-agents failed".into()),
             ));
         }
+        let schedule_revision = resp.schedule_revision;
         if let Some(mut records) = resp.agent_records {
             for rec in &mut records {
                 sanitize_record_tab_membership(rec);
             }
-            return Ok(records);
+            return Ok(AgentListing {
+                records,
+                schedule_revision,
+            });
         }
-        Ok(resp
-            .agents
-            .unwrap_or_default()
-            .into_iter()
-            .map(|id| AgentRecord {
-                id,
-                pane_id_env: None,
-                display_name: None,
-                cwd: None,
-                tab_membership: None,
-                agent_type: None,
-                rows: 0,
-                cols: 0,
-                // Legacy `agents`-only daemon shape carries no live session
-                // state; the TUI falls back to a bare placeholder.
-                live: None,
-                // PRD #745 M11: and no spawn instant either — this daemon
-                // predates the field, so it reported no spawn time and none may
-                // be invented for it. Absence renders as nothing.
-                spawned_at_ms: None,
-            })
-            .collect())
+        Ok(AgentListing {
+            records: resp
+                .agents
+                .unwrap_or_default()
+                .into_iter()
+                .map(|id| AgentRecord {
+                    id,
+                    pane_id_env: None,
+                    display_name: None,
+                    cwd: None,
+                    tab_membership: None,
+                    agent_type: None,
+                    rows: 0,
+                    cols: 0,
+                    // Legacy `agents`-only daemon shape carries no live session
+                    // state; the TUI falls back to a bare placeholder.
+                    live: None,
+                    // PRD #745 M11: and no spawn instant either — this daemon
+                    // predates the field, so it reported no spawn time and none may
+                    // be invented for it. Absence renders as nothing.
+                    spawned_at_ms: None,
+                    // Issue #856: and no binary name. This daemon reported only
+                    // ids, so it vouched for no command — and a client that
+                    // filled one in from its own table would be reinstating the
+                    // derivation this field exists to remove.
+                    cli_name: None,
+                })
+                .collect(),
+            schedule_revision,
+        })
     }
 
     /// PRD #127 M1.3: ask a running daemon to re-read the global
@@ -3337,6 +3404,7 @@ mod tests {
             cols: 0,
             live: None,
             spawned_at_ms: None,
+            cli_name: None,
         };
         sanitize_record_tab_membership(&mut rec);
         let name = rec
@@ -3398,6 +3466,7 @@ mod tests {
             cols: 0,
             live: None,
             spawned_at_ms: None,
+            cli_name: None,
         };
         sanitize_record_tab_membership(&mut rec);
         assert!(rec.tab_membership.is_none(), "invalid name must be cleared");
@@ -3422,6 +3491,7 @@ mod tests {
             cols: 0,
             live: None,
             spawned_at_ms: None,
+            cli_name: None,
         };
         sanitize_record_tab_membership(&mut ok);
         assert_eq!(

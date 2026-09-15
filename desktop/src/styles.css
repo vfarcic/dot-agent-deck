@@ -747,19 +747,26 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
    control used to sit at the row's right edge, half a panel away from the word
    naming it, which is what a flush-right control does to a row this wide.
 
-   `float: left` on the legend is load-bearing, not a leftover. A floated legend
-   stops being the fieldset's *rendered* legend, which is the only way it
-   becomes an ordinary box among the fieldset's contents — here the grid item in
-   column one — instead of being laid out above them on a line of its own. The
-   float itself is then ignored, as it is on any grid item; the disqualification
-   is what does the work, and the row has to stay a fieldset so the group keeps
-   its accessible name. */
+   **A row's label is never a `<legend>`, and that is a WebKit finding rather
+   than a preference** (issue #1032). The row used to be a `<fieldset>` whose
+   `<legend>` was floated: a floated legend stops being the fieldset's
+   *rendered* legend, which is what lets it be an ordinary box among the
+   fieldset's contents — the grid item in column one — instead of being laid out
+   above them on a line of its own. Chromium honours that float; WebKit forces a
+   rendered legend's `float` back to `none`. Measured on the browser tier at the
+   same `?fixture=1` page: `getComputedStyle(legend).float` is `"left"` under
+   `chromium` and `"none"` under `webkit`, and the Appearance control sat 148px
+   to the left there — in column one, beside its own label, with the 132px
+   column wasted. The app ships on WebKit, so the fieldset form failed where the
+   users are and held only where the tests looked. Use a `<label for>` for a
+   single control, or `.settings-row-label` below plus `aria-labelledby` for a
+   group; `e2e/settings-rows.spec.ts` measures every panel in both engines. */
 .settings-row { margin: 0; padding: 0; display: grid; grid-template-columns: 132px minmax(0, 1fr); align-items: center; justify-items: start; gap: 16px; border: 0; }
-.settings-row > legend { float: left; padding: 0; color: var(--ink); font-size: 13px; font-weight: 650; }
 
 /* A segmented control: up to about four exclusive options with short labels,
    joined into one row. Still a real radio group — one name gives arrow-key
-   navigation and a single tab stop, and the row's legend labels it. */
+   navigation and a single tab stop, and the row's own label names the group
+   through `aria-labelledby`. */
 .segmented { display: flex; padding: 2px; gap: 2px; border: 1px solid var(--line-strong); border-radius: 5px; background: var(--paper-sunken); }
 .segmented label { display: flex; cursor: pointer; }
 .segmented label > span { padding: 5px 13px; border-radius: 3px; color: var(--muted); font-size: 10px; }
@@ -767,16 +774,15 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .segmented label.is-selected > span { color: var(--teal); background: var(--paper-strong); box-shadow: 0 0 0 1px var(--teal-focus); }
 .segmented input { position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
 .segmented input:focus-visible + span { outline: 2px solid var(--focus-ring); outline-offset: 1px; }
-/* A row whose label is a plain `<label>` rather than a `<legend>`: a single
-   control needs no group, so `for`/`id` is the whole accessible name. The
-   selector carries the same 13px/650 sub-header treatment the legend gets, so
-   a select row and a segmented row read as the same convention. */
+/* A row whose label is a plain `<label>`: a single control needs no group, so
+   `for`/`id` is the whole accessible name. It carries the same 13px/650
+   sub-header treatment as the group label below, so a select row and a
+   segmented row read as the same convention. */
 .settings-row > label,
-/* A group's visible label (PRD #741 M7). A `<span>` with `aria-labelledby`
-   rather than a `<legend>`: the floated-legend trick above is Chromium-only —
-   WebKit forces the rendered legend's `float` to `none`, so the legend never
-   becomes a grid item there and the control lands in column one beside its
-   label. Measured on the browser tier, in both engines. */
+/* A group's visible label (PRD #741 M7, and every group since #1032). A
+   `<span>` with `aria-labelledby` on the control rather than a `<legend>`, for
+   the reason the rule above gives: it lays out identically in both engines and
+   keeps the group's accessible name. */
 .settings-row > .settings-row-label { color: var(--ink); font-size: 13px; font-weight: 650; }
 .settings-row select { min-width: 96px; height: 28px; padding: 0 7px; border: 1px solid var(--line-strong); border-radius: 5px; color: var(--ink); background: var(--paper); font-size: 10px; }
 .settings-row select:disabled { color: var(--faint); background: var(--paper-sunken); cursor: not-allowed; }

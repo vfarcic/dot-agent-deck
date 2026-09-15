@@ -297,6 +297,16 @@ pub struct DispatchContext {
     /// [`crate::state::AppState::register_orchestration_role`]. `None` in unit
     /// tests, which assert on the worktree/spawn result rather than on routing.
     pub state: Option<crate::state::SharedState>,
+    /// PRD #220 M2.0: the pane that asked for this dispatch, retained so the
+    /// unit it starts can report back when it finishes.
+    ///
+    /// Carried in the context rather than resolved here because the daemon reads
+    /// the caller's agent id and cwd from ONE `AgentRecord` (issue #617 finding
+    /// 3) — re-reading the identity down here could straddle a hand-over and
+    /// pair one agent's cwd with another's identity. `None` in unit tests, and
+    /// for any future producer with no live caller to report to, in which case
+    /// the dispatch simply keeps its pre-Phase-2 fire-and-forget behaviour.
+    pub caller: Option<crate::dispatch_return::DispatchCaller>,
 }
 
 /// Translate the wire choice into the spawn-side override.
@@ -312,6 +322,128 @@ fn shape_override_of(shape: Option<&crate::event::DispatchShape>) -> Option<Spaw
             Some(SpawnShapeOverride::Orchestration(name.clone()))
         }
     }
+}
+
+/// PRD #220 Phase 2 review (finding A2): how long a unit name may be before the
+/// generated report filename stops using it.
+///
+/// Not a security bound — [`sanitize_name`] already guarantees the slug is a
+/// single safe path segment — but a filesystem one: Linux and macOS both cap a
+/// single name at 255 bytes, and `sanitize_name` keeps non-ASCII
+/// alphanumerics, which cost up to four bytes each. 48 characters therefore
+/// cannot push the whole name past the limit even in the worst case, while
+/// leaving every realistic slug intact and readable in the prompt.
+const MAX_REPORT_FILENAME_SLUG_CHARS: usize = 48;
+
+/// PRD #220 Phase 2 review (finding A2): the concrete, daemon-chosen path a
+/// dispatched `--single` unit is told to write its completion report to.
+///
+/// **The class of defect this removes is "the model invents a path".** The prompt
+/// used to carry a literal `<slug>` placeholder and instruct the unit to
+/// substitute its own — and then to DELETE exactly that path afterwards. Nothing
+/// derived or validated what it chose, so a slug carrying separators or a
+/// parent-directory component resolved outside `.dot-agent-deck/`, on a write and
+/// on a delete. [`sanitize_name`] did not protect it: that function is only ever
+/// applied to the worktree/branch path. Validating model output would have been
+/// the other fix and is the worse one — the unit has no slug to invent now, so
+/// there is nothing left to validate.
+///
+/// This is a modest win rather than a boundary, and the honest reason is that the
+/// unit already holds file tools: a MALICIOUS unit ignores filename guidance
+/// entirely and writes where it likes. What it stops is an honest model's
+/// malformed slug causing an unintended write or delete, which is a real failure
+/// mode and costs nothing to remove.
+///
+/// `nonce` makes the name unique per dispatch. It is not about collisions between
+/// units — each gets its own fresh worktree — but about a repository that happens
+/// to have a file of this shape COMMITTED at that path: the prompt tells the unit
+/// to delete the file when it is done, and a deterministic name would aim that
+/// delete at a tracked file.
+fn dispatch_report_path(name: &str, nonce: &str) -> String {
+    let slug: String = sanitize_name(name)
+        .chars()
+        .take(MAX_REPORT_FILENAME_SLUG_CHARS)
+        .collect();
+    format!(".dot-agent-deck/dispatch-report-{slug}-{nonce}.md")
+}
+
+/// A per-dispatch nonce for [`dispatch_report_path`]. Process id plus a
+/// monotonic counter, the same shape this repo already uses for its temp-file
+/// names (`agent_hook_config`, `config`), which is enough for a name that only
+/// has to be unlike whatever the cloned repo has committed.
+fn next_report_nonce() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    format!(
+        "{}{:04x}",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed) & 0xffff
+    )
+}
+
+/// PRD #220 M2.3: what a dispatched unit is actually prompted with.
+///
+/// An ORCHESTRATION dispatch passes the task through UNCHANGED. `spawn` composes
+/// the orchestrator context around it — roles, delegation protocol, and the
+/// `work-done --done` call that ends the run — so a completion instruction added
+/// here would be a second, differently-worded copy of one the unit already has,
+/// and the two would disagree the moment either is edited.
+///
+/// A SINGLE dispatch composes nothing: the task IS the whole prompt, so before
+/// this the unit was never told that anyone was waiting on it. The PRD records
+/// the consequence as "`--single` emits no completion signal at all" — half the
+/// dispatch shapes had nothing for the return edge to resolve, however well the
+/// daemon side worked. The instruction is appended rather than prepended so the
+/// caller's own task stays the first thing the agent reads.
+///
+/// `report_path` is generated by the daemon ([`dispatch_report_path`]) and
+/// interpolated as a literal, so the unit has no filename to invent — see that
+/// function for the class of defect that removes.
+///
+/// **This whole prompt can be dropped, silently and in full** (PRD #220 Phase 2
+/// review, finding A6). It is multi-line, so
+/// [`crate::pane_input::encode_pane_payload`] wraps it in bracketed paste — and
+/// that encoder REFUSES a multi-line payload containing a literal
+/// `ESC[200~`/`ESC[201~`, because an embedded marker would close the outer paste
+/// early and let the remainder run as live keystrokes. The refusal drops the
+/// entire write with only a log line: not the completion instruction alone, but
+/// the CALLER'S OWN TASK with it, leaving a unit sitting at an empty prompt in a
+/// worktree nobody is watching. The probability of LLM-authored task text carrying
+/// those bytes is near zero and the behaviour is deliberately unchanged; what was
+/// missing was any note that the failure is total rather than partial.
+fn dispatch_prompt(task: &str, target: &crate::spawn::SpawnTarget, report_path: &str) -> String {
+    if matches!(target, crate::spawn::SpawnTarget::Orchestration { .. }) {
+        return task.to_string();
+    }
+    let bin = crate::platform::paths::binary_name();
+    let mut prompt = String::new();
+    let task = task.trim();
+    if !task.is_empty() {
+        prompt.push_str(task);
+        prompt.push_str("\n\n");
+    }
+    // The `--task` allowlist warning is the same one the orchestrator context
+    // carries, for the same reason: everything after `--task` is rewritten by the
+    // unit's own shell before the CLI sees it, and a summary that loses half its
+    // words still reports success. `--task-file` is read from disk verbatim.
+    prompt.push_str(&format!(
+        "When this work is finished — or if you are blocked and cannot finish it — report \
+         back to the agent that asked for it by running:\n\n\
+         ```bash\n\
+         {bin} work-done --done --task-file '{report_path}'\n\
+         ```\n\n\
+         Write that exact file with your file-writing tool — the path is already chosen for \
+         you, so do not substitute one of your own — and delete exactly that path once the \
+         command has exited successfully. Use \
+         `{bin} work-done --done --task \"One plain line.\"` only when the summary really is \
+         one plain line of text with no backticks, no `$`, no `\"`, no `\\` and no `!` — \
+         anything else is rewritten by your own shell before the CLI sees it, and the \
+         signal still reports success with the words missing.\n\n\
+         That report is delivered straight into the conversation that dispatched you, so \
+         write it for someone who cannot see this pane: what you did, what the outcome was, \
+         and anything they have to act on. Run it exactly once, when you are done."
+    ));
+    prompt
 }
 
 pub async fn handle_dispatch(
@@ -431,7 +563,11 @@ pub async fn handle_dispatch(
         RemovalPolicy::KeepIfDirty,
     );
 
-    let prompt = task.to_string();
+    let prompt = dispatch_prompt(
+        task,
+        &resolved_target,
+        &dispatch_report_path(name, &next_report_nonce()),
+    );
 
     let req = SpawnRequest {
         task_name: format!("dispatch-{name}"),
@@ -443,10 +579,13 @@ pub async fn handle_dispatch(
         resolved_target: Some(resolved_target),
         // PRD #222 parity, dispatch-only for now — see the field's docs.
         //
-        // `Unattended` (issue #703): `dispatch` is fire-and-forget with no return
-        // edge, so nobody has been asked to watch the pane this opens and a
-        // coordinator that takes its template's "STOP and wait for approval" step
-        // literally parks its whole team for the life of the run, silently.
+        // `Unattended` (issue #703): nobody has been asked to WATCH the pane this
+        // opens, so a coordinator that takes its template's "STOP and wait for
+        // approval" step literally parks its whole team for the life of the run,
+        // silently. PRD #220 Phase 2 added a return edge, which does not change
+        // this: it fires exactly once, at terminal completion, so it puts nobody
+        // in front of the pane mid-run and a coordinator waiting for an approval
+        // never reaches the completion that would report it.
         compose_orchestrator_context: Some(crate::orchestrator_context::Attendance::Unattended),
     };
 
@@ -462,45 +601,80 @@ pub async fn handle_dispatch(
     )
     .await
     {
-        Ok(handle) => DispatchResult {
-            worktree_dir: paths.worktree_dir.clone(),
-            success: true,
-            // Report what was ACTUALLY opened, from the spawn's own verdict.
-            // `spawn` → `decide_target` branches on the dispatched worktree's
-            // `.dot-agent-deck.toml`: a repo defining `[[orchestrations]]` gets a
-            // full multi-role orchestration, anything else a single agent (PRD
-            // #220 M1.1). Hardcoding either word makes this message a lie in the
-            // other case — and it is written straight into the caller's pane, so
-            // the dispatching agent repeats it to the user verbatim.
-            //
-            // The base clause is appended rather than interpolated into both
-            // arms so a failed probe degrades to the pre-#674 sentence exactly,
-            // instead of leaving a dangling "cut from ".
-            message: {
-                let opened = match &handle.kind {
-                    SpawnKind::Orchestration { name: orch } => format!(
-                        "dispatch: spawned isolated orchestration '{orch}' for '{name}' in {}",
-                        paths.worktree_dir.display()
+        Ok(handle) => {
+            // PRD #220 M2.0: retain the caller against the unit's TERMINAL pane —
+            // the single agent's pane, or the orchestration's start role — which is
+            // the pane a `work-done --done` will arrive under. Registered here, at
+            // the first moment that pane id exists, rather than by the daemon after
+            // this call returns: every instant between the spawn and the
+            // registration is an instant in which a completion resolves to nothing.
+            if let Some(caller) = ctx.caller.clone() {
+                tracing::debug!(
+                    unit_pane_id = %handle.delivery_pane_id,
+                    unit_agent_id = %handle.delivery_agent_id,
+                    caller_pane_id = %caller.pane_id,
+                    // PRD #220 Phase 2 review (finding A4), missed here and caught
+                    // by PR #1081's review (Greptile finding 3): the unit name is
+                    // producer-supplied and rode into this field raw, where a bare
+                    // LF forges a log line, a CR overwrites the one being written
+                    // and a bidi override reorders whatever renders it.
+                    unit = %crate::config_validation::escape_field_for_log(
+                        &caller.unit_name,
+                        crate::config_validation::MAX_QUOTED_VALUE_CHARS,
                     ),
-                    SpawnKind::SingleAgent => format!(
-                        "dispatch: spawned isolated agent for '{name}' in {}",
-                        paths.worktree_dir.display()
-                    ),
-                };
-                let mut msg = match &base {
-                    Some(base) => format!("{opened}, cut from {base}"),
-                    None => opened,
-                };
-                // Only for an orchestration: a `--single` dispatch consulted no
-                // default, so a note about which one it would have picked is
-                // noise the caller then relays to the user as if it mattered.
-                if let (SpawnKind::Orchestration { .. }, Some(note)) = (&handle.kind, &default_note)
-                {
-                    msg.push_str(&format!("\ndispatch: {note}"));
-                }
-                msg
-            },
-        },
+                    "dispatch: retained the caller for this unit's completion report"
+                );
+                // Bound to the unit's AGENT as well as its pane: a pane id is a
+                // recycled handle, and a predecessor's late EOF would otherwise
+                // evict this route out from under the agent that now holds the
+                // pane (PR #1081 review, Greptile finding 1).
+                ctx.registry.register_dispatch_return(
+                    &handle.delivery_pane_id,
+                    &handle.delivery_agent_id,
+                    caller,
+                );
+            }
+            DispatchResult {
+                worktree_dir: paths.worktree_dir.clone(),
+                success: true,
+                // Report what was ACTUALLY opened, from the spawn's own verdict.
+                // `spawn` → `decide_target` branches on the dispatched worktree's
+                // `.dot-agent-deck.toml`: a repo defining `[[orchestrations]]` gets a
+                // full multi-role orchestration, anything else a single agent (PRD
+                // #220 M1.1). Hardcoding either word makes this message a lie in the
+                // other case — and it is written straight into the caller's pane, so
+                // the dispatching agent repeats it to the user verbatim.
+                //
+                // The base clause is appended rather than interpolated into both
+                // arms so a failed probe degrades to the pre-#674 sentence exactly,
+                // instead of leaving a dangling "cut from ".
+                message: {
+                    let opened = match &handle.kind {
+                        SpawnKind::Orchestration { name: orch } => format!(
+                            "dispatch: spawned isolated orchestration '{orch}' for '{name}' in {}",
+                            paths.worktree_dir.display()
+                        ),
+                        SpawnKind::SingleAgent => format!(
+                            "dispatch: spawned isolated agent for '{name}' in {}",
+                            paths.worktree_dir.display()
+                        ),
+                    };
+                    let mut msg = match &base {
+                        Some(base) => format!("{opened}, cut from {base}"),
+                        None => opened,
+                    };
+                    // Only for an orchestration: a `--single` dispatch consulted no
+                    // default, so a note about which one it would have picked is
+                    // noise the caller then relays to the user as if it mattered.
+                    if let (SpawnKind::Orchestration { .. }, Some(note)) =
+                        (&handle.kind, &default_note)
+                    {
+                        msg.push_str(&format!("\ndispatch: {note}"));
+                    }
+                    msg
+                },
+            }
+        }
         Err(e) => {
             let cleanup_note = match rollback_dispatched_worktree(
                 &ctx.registry,
@@ -1220,6 +1394,160 @@ mod tests {
         assert_eq!(ok.orchestrations[0].roles, 2);
     }
 
+    /// PRD #220 M2.3: a `--single` dispatch must TELL its unit to report back.
+    ///
+    /// The PRD records the gap as "`--single` emits no completion signal at all":
+    /// a single agent gets no orchestrator template, so it is never told that
+    /// `work-done --done` exists or that anyone is waiting on it. However well the
+    /// daemon's return edge resolves, half the dispatch shapes had nothing to
+    /// resolve — which is why the retention half alone would have shipped exactly
+    /// the working-for-orchestrations, silent-for-single dispatcher decision C
+    /// exists to prevent.
+    ///
+    /// A pure composer test rather than a spawned one: the single-agent prompt is
+    /// delivered into a PTY and never written to disk, so there is no artefact to
+    /// assert on the way the orchestration test asserts on
+    /// `orchestrator-context.md`. `dispatch/return/003` covers the same
+    /// instruction arriving at a real dispatched unit end to end.
+    #[test]
+    fn a_single_dispatch_prompt_tells_the_unit_to_report_when_it_finishes() {
+        let bin = crate::platform::paths::binary_name();
+        let prompt = dispatch_prompt(
+            "Verify PR #232 and report back.",
+            &crate::spawn::SpawnTarget::SingleAgent { command: None },
+            ".dot-agent-deck/dispatch-report-verify-pr-99990000.md",
+        );
+
+        assert!(
+            prompt.starts_with("Verify PR #232 and report back."),
+            "the caller's own task must stay the first thing the agent reads:\n{prompt}"
+        );
+        assert!(
+            prompt.contains(&format!("{bin} work-done --done")),
+            "a dispatched single agent must be told how to signal terminal \
+             completion, or the return edge has nothing to fire on:\n{prompt}"
+        );
+        assert!(
+            prompt.contains("--task-file"),
+            "the file form must be offered first — a shell-rewritten `--task` \
+             reports success with the words missing:\n{prompt}"
+        );
+        assert!(
+            prompt.contains("dispatched you"),
+            "the unit must know the report goes to the agent that dispatched it, \
+             not into a log nobody reads:\n{prompt}"
+        );
+        // PRD #220 Phase 2 review (finding A2): the daemon's literal path rides
+        // into the prompt, and no placeholder is left for the model to fill in.
+        assert!(
+            prompt.contains("'.dot-agent-deck/dispatch-report-verify-pr-99990000.md'"),
+            "the generated report path must reach the unit as a literal:\n{prompt}"
+        );
+        assert!(
+            !prompt.contains("<slug>"),
+            "no filename placeholder may survive — a slug the model invents is a slug \
+             nothing validates:\n{prompt}"
+        );
+    }
+
+    /// PRD #220 Phase 2 review (finding A2): the generated report filename must
+    /// stay inside `.dot-agent-deck/` for every name a caller can pass, because
+    /// the unit is told to WRITE it and then DELETE it.
+    #[test]
+    fn the_generated_report_path_cannot_escape_its_directory() {
+        for hostile in [
+            "../../etc/passwd",
+            "../../../root/.ssh/authorized_keys",
+            "a/b/c",
+            "..",
+            "....//....//x",
+            "",
+            "///",
+            "with space and $(echo hi)",
+        ] {
+            let path = dispatch_report_path(hostile, "1234abcd");
+            let tail = path
+                .strip_prefix(".dot-agent-deck/")
+                .unwrap_or_else(|| panic!("{hostile:?} escaped the directory prefix: {path}"));
+            assert!(
+                !tail.contains('/') && !tail.contains('\\'),
+                "{hostile:?} produced more than one path segment: {path}"
+            );
+            assert!(
+                !path.contains(".."),
+                "{hostile:?} left a parent-directory component: {path}"
+            );
+            assert!(
+                path.ends_with("-1234abcd.md"),
+                "{hostile:?} lost the nonce or the extension: {path}"
+            );
+        }
+    }
+
+    /// The filename must stay inside `NAME_MAX` no matter how long a caller's
+    /// unit name is — a write that fails with `ENAMETOOLONG` loses the report as
+    /// surely as a write outside the directory would.
+    #[test]
+    fn an_absurd_unit_name_cannot_blow_the_filename_limit() {
+        let path = dispatch_report_path(&"\u{4e2d}".repeat(5000), "deadbeef");
+        let name = path.strip_prefix(".dot-agent-deck/").expect("the prefix");
+        assert!(
+            name.len() < 255,
+            "the generated filename must fit NAME_MAX, got {} bytes",
+            name.len()
+        );
+    }
+
+    /// Two dispatches must not be told to write — and then delete — the same
+    /// path, so the nonce has to actually move.
+    #[test]
+    fn each_dispatch_gets_its_own_report_filename() {
+        let first = dispatch_report_path("probe", &next_report_nonce());
+        let second = dispatch_report_path("probe", &next_report_nonce());
+        assert_ne!(
+            first, second,
+            "a repeated name must still yield distinct report paths"
+        );
+    }
+
+    /// The orchestration half must NOT gain a second, differently-worded copy.
+    ///
+    /// `spawn` composes the orchestrator context around this prompt, and that
+    /// context already ends with the `work-done --done` call. Appending another
+    /// here would put two instructions in one pane that drift apart the moment
+    /// either is edited.
+    #[test]
+    fn an_orchestration_dispatch_prompt_is_left_to_the_orchestrator_context() {
+        use crate::project_config::{OrchestrationConfig, OrchestrationRoleConfig};
+        let target = crate::spawn::SpawnTarget::Orchestration {
+            name: "demo-orch".to_string(),
+            roles: Vec::new(),
+            config: Box::new(OrchestrationConfig {
+                default: false,
+                name: "demo-orch".to_string(),
+                roles: vec![OrchestrationRoleConfig {
+                    agent: None,
+                    name: "orchestrator".to_string(),
+                    command: "cat".to_string(),
+                    start: true,
+                    description: None,
+                    prompt_template: None,
+                    clear: true,
+                }],
+            }),
+        };
+
+        assert_eq!(
+            dispatch_prompt(
+                "Verify PR #232 and report back.",
+                &target,
+                ".dot-agent-deck/dispatch-report-demo-orch-99990001.md",
+            ),
+            "Verify PR #232 and report back.",
+            "an orchestration's task rides into the composed context verbatim"
+        );
+    }
+
     /// An ORCHESTRATION dispatch must start the team WITH its delegation protocol.
     ///
     /// This is the defect reported from real use: the orchestration came up, its
@@ -1269,6 +1597,10 @@ mod tests {
             // These unit tests assert on the worktree + spawn shape, not on
             // delegate routing (`orchestration/dispatch/001` owns that).
             state: None,
+            // No live caller to report back to: these tests assert on the
+            // worktree/spawn result, and PRD #220's return edge is covered by
+            // `dispatch/return/*` end to end.
+            caller: None,
         };
 
         let result = handle_dispatch(
@@ -1321,12 +1653,13 @@ mod tests {
             "the caller's task must ride inside the context file:\n{content}"
         );
         // Issue #703, on the real dispatch path rather than on the composer
-        // alone: `dispatch` is fire-and-forget with no return edge, so the
-        // composed file must say that nobody is watching the pane — otherwise a
-        // coordinator inheriting an interactive template's "STOP and wait for
-        // explicit approval" step parks its whole team for the life of the run,
-        // silently — and must say which half wins when that template and this
-        // task disagree.
+        // alone: nobody is WATCHING a dispatched pane, so the composed file must
+        // say so — otherwise a coordinator inheriting an interactive template's
+        // "STOP and wait for explicit approval" step parks its whole team for the
+        // life of the run, silently — and must say which half wins when that
+        // template and this task disagree. PRD #220 Phase 2's return edge does
+        // not soften this: it fires once, at terminal completion, which a parked
+        // coordinator never reaches.
         assert!(
             content.contains("## Unattended run")
                 && content.contains("nobody has been asked to watch this pane"),
@@ -1335,6 +1668,155 @@ mod tests {
         assert!(
             content.contains("## Task precedence") && content.contains("WHEN to stop"),
             "the composed file must arbitrate between the template and the task:\n{content}"
+        );
+    }
+
+    /// Issue #1065 — the other half of the test above, at the same altitude: the
+    /// context CANNOT be published, so the dispatch must be REFUSED rather than
+    /// quietly starting the team with the orchestrator holding the bare task.
+    ///
+    /// The test above pins the happy path — the context file lands in the
+    /// worktree carrying the template, the agent list, the delegation protocol
+    /// and the task. Nothing pinned what happens when the publish fails, and
+    /// what happened was: one `warn!`, then six agents whose orchestrator had
+    /// been told none of it. Five sat idle while the first implemented the whole
+    /// PRD solo, and the pane labels, role cards and `daemon status` were
+    /// indistinguishable from a working team throughout. Measured twice on PRD
+    /// #742.
+    ///
+    /// **The trigger is deliberately NOT the mode-0775 condition the field
+    /// report hit** (issue #1047, and the tracked `.dot-agent-deck` files of
+    /// #329 §2 that produce it in a dispatch worktree). Those are being fixed
+    /// separately, and a test keyed to them would stop reproducing the moment
+    /// they land while proving nothing about the fallback — which stays
+    /// reachable through every other `ContextPublishError`. A committed
+    /// `.dot-agent-deck` SYMLINK is checked out into the worktree by `git
+    /// worktree add` and takes `open_context_dir`'s `O_NOFOLLOW` refusal, which
+    /// lands before `refuse_a_writable_context_dir` — the mode check #1047 is
+    /// about — is consulted at all.
+    ///
+    /// What this asserts beyond the refusal itself is that the refusal costs
+    /// nothing: the context is composed BEFORE the role loop, so no role ever
+    /// started, and the rollback reclaims the worktree and its branch — the
+    /// dispatch name is free to retry once the operator fixes the directory.
+    // Unix: `core.symlinks` and the `O_NOFOLLOW` refusal are both POSIX-shaped,
+    // and the fast tier runs on Windows CI too, where git would check the entry
+    // out as a plain file and the test would pass for a different reason.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_dispatch_whose_coordinator_context_cannot_be_published_is_refused_not_degraded() {
+        let tmp = crate::test_temp::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        init_repo(&repo);
+        std::fs::write(
+            repo.join(".dot-agent-deck.toml"),
+            "[[orchestrations]]\nname = \"refused-orch\"\n\n\
+             [[orchestrations.roles]]\nname = \"orchestrator\"\ncommand = \"cat\"\nstart = true\n\n\
+             [[orchestrations.roles]]\nname = \"worker\"\ncommand = \"cat\"\ndescription = \"Does the work\"\n",
+        )
+        .unwrap();
+        // The obstruction: `.dot-agent-deck` is a symlink in the committed tree,
+        // so the worktree `git worktree add` cuts has one too, and the publish
+        // refuses to write the coordinator context through it. Dangling on
+        // purpose — `open_context_dir` refuses the final component by its own
+        // `O_NOFOLLOW`, never by consulting the target.
+        std::os::unix::fs::symlink("nowhere", repo.join(".dot-agent-deck"))
+            .expect("plant the symlinked context dir");
+        // The shape is resolved from the CALLER's repo, but the roles run in a
+        // HEAD checkout, so both the config and the symlink have to be committed.
+        git_in(&repo, &["add", "-A"]);
+        git_in(
+            &repo,
+            &[
+                "commit",
+                "-qm",
+                "add orchestration and a symlinked context dir",
+            ],
+        );
+
+        let (event_tx, _rx) = tokio::sync::broadcast::channel(64);
+        let state: crate::state::SharedState =
+            Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
+        let ctx = DispatchContext {
+            working_dir: repo.clone(),
+            registry: Arc::new(AgentPtyRegistry::new()),
+            event_tx,
+            worktrees: new_worktree_registry(),
+            default_command: None,
+            state: Some(state.clone()),
+            // No live caller to report back to — see the sibling tests.
+            caller: None,
+        };
+
+        let result = handle_dispatch(
+            &ctx,
+            "refused-unit",
+            "Implement PRD #742 end to end.",
+            Some(&crate::event::DispatchShape::Orchestration { name: None }),
+        )
+        .await;
+
+        // Reclaim the sibling worktree regardless of the assertions below.
+        struct Guard(std::path::PathBuf, Arc<AgentPtyRegistry>);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                self.1.shutdown_all();
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _guard = Guard(result.worktree_dir.clone(), ctx.registry.clone());
+
+        assert!(
+            !result.success,
+            "an unpublishable coordinator context must fail the dispatch, not degrade it: {}",
+            result.message
+        );
+        // The dispatcher relays this message to the user verbatim, and for a
+        // fire-and-forget dispatch it is the only return edge there is — so it
+        // has to say both that the orchestration was refused and what to fix.
+        assert!(
+            result
+                .message
+                .contains("refused to start the orchestration"),
+            "the reply must say the orchestration was refused: {}",
+            result.message
+        );
+        assert!(
+            result.message.contains(".dot-agent-deck") && result.message.contains("symlink"),
+            "…and name the obstruction the operator has to clear: {}",
+            result.message
+        );
+
+        // Nothing was started, and nothing is left to clean up by hand. This is
+        // stronger than the #600 teardown the sibling test asserts: the context
+        // is composed before the role loop, so no role was ever forked.
+        let live = ctx.registry.agent_records();
+        assert!(
+            live.is_empty(),
+            "a refused dispatch must start no role at all; found {} live: {:?}",
+            live.len(),
+            live.iter()
+                .map(|r| (r.display_name.clone(), r.cwd.clone()))
+                .collect::<Vec<_>>()
+        );
+        let guard = state.read().await;
+        assert!(
+            guard.pane_role_map.is_empty() && guard.orchestrator_pane_ids.is_empty(),
+            "…and register nothing: roles {:?}, orchestrators {:?}",
+            guard.pane_role_map,
+            guard.orchestrator_pane_ids
+        );
+        drop(guard);
+
+        // …so the rollback reclaims the tree and the branch, and the dispatch
+        // name is free to retry the moment the operator fixes the directory.
+        assert!(
+            !result.worktree_dir.exists(),
+            "with nothing live in it, the worktree must be reclaimed"
+        );
+        assert!(
+            !branch_exists(&repo, "agent/dispatch-refused-unit"),
+            "…and its branch deleted, so the name is not wedged"
         );
     }
 
@@ -1393,6 +1875,8 @@ mod tests {
             worktrees: new_worktree_registry(),
             default_command: None,
             state: Some(state.clone()),
+            // No live caller to report back to — see the sibling tests.
+            caller: None,
         };
 
         let result = handle_dispatch(
@@ -1508,6 +1992,10 @@ mod tests {
             worktrees: new_worktree_registry(),
             default_command: None,
             state: None,
+            // No live caller to report back to: these tests assert on the
+            // worktree/spawn result, and PRD #220's return edge is covered by
+            // `dispatch/return/*` end to end.
+            caller: None,
         };
 
         let result = handle_dispatch(
@@ -1659,6 +2147,10 @@ mod tests {
             // These unit tests assert on the worktree + spawn shape, not on
             // delegate routing (`orchestration/dispatch/001` owns that).
             state: None,
+            // No live caller to report back to: these tests assert on the
+            // worktree/spawn result, and PRD #220's return edge is covered by
+            // `dispatch/return/*` end to end.
+            caller: None,
         };
         let result = handle_dispatch(
             &ctx,

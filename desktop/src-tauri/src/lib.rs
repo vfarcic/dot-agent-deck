@@ -360,7 +360,10 @@ trait WorkflowDaemon {
 }
 
 impl WorkflowDaemon for DaemonClient {
-    type ReadinessWatch = EventSubscription;
+    /// Issue #1028: the cancel-safe end of a drained
+    /// [`EventSubscription`], not the subscription itself. See
+    /// [`Self::begin_coordinator_readiness`].
+    type ReadinessWatch = tokio::sync::mpsc::Receiver<BroadcastMsg>;
 
     async fn prepare_workflow(
         &self,
@@ -417,9 +420,49 @@ impl WorkflowDaemon for DaemonClient {
     }
 
     async fn begin_coordinator_readiness(&self) -> Result<Self::ReadinessWatch, String> {
-        self.subscribe_events()
+        let mut subscription = self
+            .subscribe_events()
             .await
-            .map_err(|error| safe_message(error.to_string()))
+            .map_err(|error| safe_message(error.to_string()))?;
+        let (tx, rx) = tokio::sync::mpsc::channel(EVENT_QUEUE_DEPTH);
+        // Issue #1028: the subscription is owned by this task and by nothing
+        // else, for the reason [`EVENT_QUEUE_DEPTH`] gives — `next_event` is not
+        // cancel-safe, and the readiness wait below is a `timeout`, which drops
+        // whatever future it is holding when it expires. Draining here means the
+        // only future that timeout can drop is the channel's, and an
+        // `mpsc::Receiver::recv` is cancel-safe: a partly-read five-byte frame
+        // header stays in this task's `read_frame`, so the watch survives a
+        // readiness timeout intact rather than misparsing every frame after it.
+        tauri::async_runtime::spawn(async move {
+            loop {
+                let msg = tokio::select! {
+                    // This arm is the one thing in the loop that can drop a
+                    // partly-read `next_event`, and it is harmless where the
+                    // readiness wait was not: `closed()` resolving means the
+                    // receiver is gone, so the subscription is dropped with it
+                    // and a desynchronised stream has no reader left to
+                    // mislead. The arm also keeps the socket's lifetime
+                    // what it was before this split — dropping the watch used to
+                    // drop the `EventSubscription` and half-close immediately,
+                    // and without this arm the task would sit in `read_frame`
+                    // holding the connection open until the daemon next
+                    // broadcast something, which on an idle daemon is never.
+                    _ = tx.closed() => break,
+                    event = subscription.next_event() => match event {
+                        Ok(Some(msg)) => msg,
+                        // An error and a clean end are both "no more readiness
+                        // signals on this stream", and the waiter reports them
+                        // the same way — see the `None` arm below. Closing the
+                        // channel is how it is told.
+                        Ok(None) | Err(_) => break,
+                    },
+                };
+                if tx.send(msg).await.is_err() {
+                    break;
+                }
+            }
+        });
+        Ok(rx)
     }
 
     async fn wait_for_coordinator_readiness(
@@ -431,17 +474,23 @@ impl WorkflowDaemon for DaemonClient {
     ) -> Result<Option<String>, String> {
         let wait = async {
             loop {
-                match watch.next_event().await {
-                    Ok(Some(BroadcastMsg::Event(event)))
+                match watch.recv().await {
+                    Some(BroadcastMsg::Event(event))
                         if event.event_type == EventType::SessionStart
                             && event.pane_id.as_deref() == Some(pane_id)
                             && event.agent_id.as_deref() == Some(agent_id) =>
                     {
                         return Ok(Some(event.session_id));
                     }
-                    Ok(Some(_)) => continue,
-                    Ok(None) => return Err("coordinator readiness stream ended".to_string()),
-                    Err(error) => return Err(safe_message(error.to_string())),
+                    Some(_) => continue,
+                    // Issue #1028: the reader task ended the channel — the
+                    // daemon ended the stream, or the subscription errored.
+                    // Those two used to carry different text and the second is
+                    // now folded into the first; the CALLER's behaviour is
+                    // unchanged, because `deliver_coordinator_prompt` treats
+                    // every `Err` the same way: wait out the rest of the
+                    // readiness budget and deliver the seed with no session id.
+                    None => return Err("coordinator readiness stream ended".to_string()),
                 }
             }
         };
@@ -3505,6 +3554,55 @@ command = "configured-planner"
         }
     }
 
+    /// A publish refusal reaches the caller **whole** — the path, the mode and
+    /// the `chmod` command the daemon composed (issue #1047 §2).
+    ///
+    /// This is the client half of that fix and the reason it needs a guard of
+    /// its own. The daemon has always logged a message naming the mode and the
+    /// remedy; what the desktop showed was the shorter sentence that crossed the
+    /// wire, so a user saw "remove those write bits and retry" with no path and
+    /// no command. The daemon now sends the long one, and nothing between the
+    /// socket and the toast may shorten it again — `safe_message` bounds the
+    /// string at 2048 characters, which this sits far inside, and a future
+    /// tightening of that bound would fail here rather than silently re-open the
+    /// defect that cost three launches and a filesystem-wide `find`.
+    #[tokio::test]
+    async fn a_publish_refusal_reaches_the_caller_with_its_path_and_remedy_intact() {
+        let sentence = "publish-failed: /home/dev/project/.dot-agent-deck is mode 0775, which \
+                        grants write to group or other — another local account could replace the \
+                        coordinator context's directory entry after it is published. The deck \
+                        tried to clear those bits and could not, so publishing is refused. On the \
+                        machine running the deck, run: chmod go-w \
+                        '/home/dev/project/.dot-agent-deck'";
+        let daemon = FakeWorkflowDaemon::new(
+            Ok(Some("unused-session")),
+            std::iter::empty(),
+            Ok(SendResult::Applied),
+        );
+        daemon
+            .prepare_results
+            .lock()
+            .unwrap()
+            .push_back(Err(sentence.to_string()));
+
+        let error = prepare_workflow_launch(
+            &daemon,
+            "loop",
+            "/home/dev/project",
+            "Build it.",
+            &launch_roles("claude"),
+            None,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error, sentence, "the sentence must arrive verbatim");
+        assert!(error.contains("/home/dev/project/.dot-agent-deck"));
+        assert!(error.contains("chmod go-w"));
+        assert!(error.contains("0775"));
+        assert!(daemon.started.lock().unwrap().is_empty());
+    }
+
     /// A Pi coordinator is refused during preparation, before any role is
     /// spawned — the guard moved with the rest of the flow and did not get lost
     /// on the way.
@@ -3834,5 +3932,146 @@ command = "configured-planner"
         connected.connection.status = ConnectionStatus::Connected;
         connected.connection.error = None;
         assert!(ensure_explicit_start_connected(true, &connected).is_ok());
+    }
+
+    /// One event frame, split so the daemon can stall in the middle of its
+    /// five-byte header (issue #1028).
+    ///
+    /// The `SessionStart` the coordinator readiness wait is looking for, encoded
+    /// as the `KIND_EVENT` frame a real daemon would push.
+    #[cfg(unix)]
+    fn session_start_frame(pane_id: &str, agent_id: &str, session_id: &str) -> Vec<u8> {
+        let payload = serde_json::to_vec(&serde_json::json!({
+            "kind": "event",
+            "session_id": session_id,
+            "agent_type": "claude_code",
+            "event_type": "session_start",
+            "timestamp": "2026-01-01T00:00:00Z",
+            "pane_id": pane_id,
+            "agent_id": agent_id,
+        }))
+        .expect("encode the broadcast");
+        let mut frame = Vec::with_capacity(5 + payload.len());
+        frame.push(dot_agent_deck::daemon_protocol::KIND_EVENT);
+        frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        frame.extend_from_slice(&payload);
+        frame
+    }
+
+    /// Scenario: a scripted daemon accepts the coordinator-readiness
+    /// subscription and then stalls **two bytes into** an event frame's
+    /// five-byte header. The desktop's first readiness wait expires on that
+    /// partial header and reports "not ready yet"; the daemon then writes the
+    /// rest of the frame, and a second wait on the SAME watch must still deliver
+    /// the coordinator's `SessionStart`.
+    ///
+    /// This is issue #1028's defect as a runtime ordering, not as a shape:
+    /// `tokio::time::timeout` drops the future it is holding when it expires, and
+    /// `EventSubscription::next_event` is not cancel-safe — the two header bytes
+    /// lived in `read_frame`'s local buffer, so the old code lost them and
+    /// misparsed every frame that followed. Against that code this test fails on
+    /// the second wait.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_readiness_timeout_mid_frame_header_leaves_the_watch_usable() {
+        use dot_agent_deck::daemon_protocol::{
+            AttachResponse, KIND_REQ, KIND_RESP, read_frame, write_frame,
+        };
+        use std::os::unix::fs::PermissionsExt;
+        use tokio::io::AsyncWriteExt;
+
+        let pane_id = "pane-1028";
+        let agent_id = "agent-1028";
+        let session_id = "session-1028";
+        let frame = session_start_frame(pane_id, agent_id, session_id);
+
+        let dir = tempfile::tempdir().expect("a scratch dir for the socket");
+        let socket = dir.path().join("s");
+        let listener = tokio::net::UnixListener::bind(&socket).expect("bind the scripted daemon");
+        // The client refuses a socket the ambient umask left group- or
+        // world-accessible, the same reason `daemon_bridge`'s fixtures restate
+        // the mode rather than borrowing `IpcListener::bind`'s umask dance.
+        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))
+            .expect("restate 0o600 on the socket inode");
+
+        // Raised by the test once its first readiness wait has timed out, so the
+        // daemon completes the header at exactly the moment that matters rather
+        // than on a sleep that could drift either way.
+        let (timed_out_tx, timed_out_rx) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            let (stream, _peer) = listener.accept().await.expect("accept the subscriber");
+            let (mut reader, mut writer) = stream.into_split();
+            let (kind, _payload) = read_frame(&mut reader)
+                .await
+                .expect("read the subscribe-events request")
+                .expect("the client sent a frame");
+            assert_eq!(kind, KIND_REQ);
+            let reply = serde_json::to_vec(&AttachResponse {
+                ok: true,
+                ..Default::default()
+            })
+            .expect("encode the subscribe reply");
+            write_frame(&mut writer, KIND_RESP, &reply)
+                .await
+                .expect("accept the subscription");
+
+            // Two of the five header bytes, and then nothing. A reader parked
+            // here is parked mid-header, which is the whole condition.
+            writer
+                .write_all(&frame[..2])
+                .await
+                .expect("write a partial frame header");
+            writer.flush().await.expect("flush the partial header");
+
+            timed_out_rx
+                .await
+                .expect("the test reports its first timeout");
+
+            writer
+                .write_all(&frame[2..])
+                .await
+                .expect("complete the frame");
+            writer.flush().await.expect("flush the completed frame");
+            // Hold the connection open: an EOF racing the frame above would let
+            // a desynchronised reader end the stream for the wrong reason and
+            // pass this test for the wrong reason with it.
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+
+        let client = DaemonClient::new(socket);
+        let mut watch = client
+            .begin_coordinator_readiness()
+            .await
+            .expect("subscribe to the scripted daemon");
+
+        assert_eq!(
+            client
+                .wait_for_coordinator_readiness(
+                    &mut watch,
+                    pane_id,
+                    agent_id,
+                    Duration::from_millis(200)
+                )
+                .await,
+            Ok(None),
+            "a readiness wait that expires must report 'not ready yet'"
+        );
+        let _ = timed_out_tx.send(());
+
+        assert_eq!(
+            client
+                .wait_for_coordinator_readiness(
+                    &mut watch,
+                    pane_id,
+                    agent_id,
+                    Duration::from_secs(5)
+                )
+                .await,
+            Ok(Some(session_id.to_string())),
+            "the watch must still be synchronised after a timeout dropped a wait \
+             mid-header — issue #1028"
+        );
+
+        server.abort();
     }
 }

@@ -724,6 +724,88 @@ describe("ControlDeck", () => {
     expect(listProjects.mock.calls.length).toBe(afterThird);
   });
 
+  /**
+   * Issue #887: the fourth of the daemon's four project seeds is every
+   * registered schedule's working directory, and no schedule reaches this app
+   * at all — so registering one in a directory the daemon has nothing else
+   * running in added a project the picker could not re-list in response to.
+   *
+   * The daemon now reports a monotonic `scheduleRevision` and the key carries
+   * it. The agent set is deliberately held IDENTICAL across every rerender
+   * here, so the revision is the only thing that moves and nothing else in the
+   * key could account for a re-list.
+   *
+   * The last two rerenders are the controls. Re-sending the same revision must
+   * not re-list, or the test would pass against a key that changes on every
+   * render; and dropping the field entirely (a daemon that reports none) must
+   * not re-list either, or a peer that cannot answer the question would make
+   * the picker churn on every snapshot.
+   */
+  it("re-lists projects when the daemon's schedule revision moves, with the agent set unchanged", async () => {
+    const listProjects = vi.fn(async () => ({ projects: [daemonProject("/home/dev/code/deck", "deck")] }));
+    const agents = [agentIn("1", "/home/dev/code/deck")];
+    const withRevision = (scheduleRevision?: number) => ({ ...liveSnapshot(agents), scheduleRevision });
+    const base = liveWithProject({ listProjects, snapshot: withRevision(0) });
+    const { rerender } = render(<ControlDeck runtime={base} />);
+    await waitFor(() => expect(listProjects.mock.calls.length).toBeGreaterThan(0));
+
+    // A schedule was registered: same agents, same cwds, next revision.
+    const afterFirst = listProjects.mock.calls.length;
+    rerender(<ControlDeck runtime={{ ...base, snapshot: withRevision(1) }} />);
+    await waitFor(() => expect(listProjects.mock.calls.length).toBeGreaterThan(afterFirst));
+
+    // Control: the same revision again is not a change.
+    const afterSecond = listProjects.mock.calls.length;
+    rerender(<ControlDeck runtime={{ ...base, snapshot: withRevision(1) }} />);
+    await new Promise((settle) => setTimeout(settle, 0));
+    expect(listProjects.mock.calls.length).toBe(afterSecond);
+
+    // Control: an unreported revision is stable too — it must not alternate
+    // with the reported one and re-list on every other snapshot.
+    rerender(<ControlDeck runtime={{ ...base, snapshot: withRevision(undefined) }} />);
+    await waitFor(() => expect(listProjects.mock.calls.length).toBeGreaterThan(afterSecond));
+    const afterThird = listProjects.mock.calls.length;
+    rerender(<ControlDeck runtime={{ ...base, snapshot: withRevision(undefined) }} />);
+    await new Promise((settle) => setTimeout(settle, 0));
+    expect(listProjects.mock.calls.length).toBe(afterThird);
+  });
+
+  /**
+   * Issue #887, Greptile P1: every other component of the re-list key is a fact
+   * about ONE daemon's world — `scheduleRevision` most sharply, since it counts
+   * from 0 on each daemon start — so the key has to carry which daemon it is
+   * about or those comparisons are being made across decks.
+   *
+   * Two decks agreeing on status, agent count, working directories AND schedule
+   * revision is not exotic: it is what a second deck running the same project
+   * looks like. Before the socket path led the key, switching to it left the
+   * key identical and the picker kept offering the projects of the deck the
+   * user had just switched away from.
+   *
+   * The second rerender is the control: the same deck again must not re-list,
+   * or this would pass against a key that changes on every render.
+   */
+  it("re-lists projects when the deck changes, even when everything else about it matches", async () => {
+    const listProjects = vi.fn(async () => ({ projects: [daemonProject("/home/dev/code/deck", "deck")] }));
+    const agents = [agentIn("1", "/home/dev/code/deck")];
+    const onDeck = (socketPath: string) => {
+      const base = liveSnapshot(agents);
+      return { ...base, scheduleRevision: 3, connection: { ...base.connection, socketPath } };
+    };
+    const base = liveWithProject({ listProjects, snapshot: onDeck("/run/deck-a.sock") });
+    const { rerender } = render(<ControlDeck runtime={base} />);
+    await waitFor(() => expect(listProjects.mock.calls.length).toBeGreaterThan(0));
+
+    const afterFirst = listProjects.mock.calls.length;
+    rerender(<ControlDeck runtime={{ ...base, snapshot: onDeck("/run/deck-b.sock") }} />);
+    await waitFor(() => expect(listProjects.mock.calls.length).toBeGreaterThan(afterFirst));
+
+    const afterSecond = listProjects.mock.calls.length;
+    rerender(<ControlDeck runtime={{ ...base, snapshot: onDeck("/run/deck-b.sock") }} />);
+    await new Promise((settle) => setTimeout(settle, 0));
+    expect(listProjects.mock.calls.length).toBe(afterSecond);
+  });
+
   it("explains and disables live workflow launch on Windows before confirmation", () => {
     const live = runtime({ mode: "live" });
     render(<ControlDeck runtime={live} workflowPlatformIssue={WINDOWS_WORKFLOW_BLOCK_REASON} />);
@@ -1134,11 +1216,15 @@ describe("ControlDeck", () => {
     expect(screen.getByRole("navigation", { name: "Settings sections" })).toBeVisible();
 
     expect(screen.getByTestId(`settings-panel-${SETTINGS_SECTIONS[0].id}`)).toBeVisible();
-    expect(screen.getByRole("group", { name: "Appearance" })).toBeVisible();
+    // A `radiogroup` rather than a `group`, because the row's label is a
+    // `<span>` named through `aria-labelledby` rather than a `<legend>` (issue
+    // #1032, and the test below for why). The accessible name is the property
+    // being asserted, and it is unchanged.
+    expect(screen.getByRole("radiogroup", { name: "Appearance" })).toBeVisible();
 
     // One row of chrome, then the setting (PRD #803, and the heading rule in
     // `docs/develop/desktop-gui.md`). The sheet carries exactly one heading —
-    // its own title — and the panel carries none: the row's legend is already
+    // its own title — and the panel carries none: the row's label is already
     // its visible label AND its accessible group name, which is what the
     // assertion above rides on, so a heading over it was the word "Appearance"
     // on screen twice. There are no eyebrows left on the surface either.
@@ -1146,6 +1232,25 @@ describe("ControlDeck", () => {
     expect(within(sheet).getAllByRole("heading").map((h) => h.textContent)).toEqual(["Settings"]);
     expect(within(screen.getByTestId(`settings-panel-${SETTINGS_SECTIONS[0].id}`)).queryByRole("heading")).not.toBeInTheDocument();
     expect(sheet.querySelectorAll(".eyebrow, .form-heading")).toHaveLength(0);
+  });
+
+  it("labels the Appearance row with a span, never a legend (issue 1032)", () => {
+    render(<ControlDeck runtime={runtime()} />);
+    fireEvent.click(screen.getByTestId("open-settings"));
+
+    // WebKit forces a rendered legend's `float` to `none`, so the floated-legend
+    // form this row used to take collapsed the 132px label column on the engine
+    // the app actually ships on. jsdom computes no layout, so what this tier can
+    // pin is the FORM; `e2e/settings-rows.spec.ts` measures the geometry in both
+    // engines, which is where the defect was visible at all.
+    const panel = screen.getByTestId(`settings-panel-${SETTINGS_SECTIONS[0].id}`);
+    expect(panel.querySelector("legend")).toBeNull();
+    expect(panel.querySelector("fieldset")).toBeNull();
+    // And the accessible group name still comes from somewhere — dropping the
+    // legend without `aria-labelledby` would leave an unnamed group that reads
+    // as nothing to a screen reader.
+    expect(screen.getByRole("radiogroup")).toHaveAccessibleName("Appearance");
+    expect(panel.querySelector(".settings-row > .settings-row-label")).toHaveTextContent("Appearance");
   });
 
   it("applies each appearance choice to the document root, and System CLEARS the attribute", async () => {

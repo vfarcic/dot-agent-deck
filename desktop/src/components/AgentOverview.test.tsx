@@ -302,12 +302,34 @@ describe("AgentOverview", () => {
   });
 
   /**
+   * Scenario: an agent whose record carried no `cliName` — the daemon named no
+   * binary for it — is rendered with the whole fleet. Its CLI cell is EMPTY,
+   * with no hover text, rather than carrying a generic word or a name looked up
+   * locally from its agent type (issue #856).
+   *
+   * The agent left in the snapshot is one the deck knows perfectly well: the
+   * fixture's first, whose type a local table has an answer for. So the empty
+   * cell is a property of the absent field and not of an unrecognisable agent —
+   * which is what makes this the regression guard for the fallback the issue
+   * forbids. An empty cell says "the deck did not say"; a word says something
+   * about the agent that nothing reported.
+   */
+  it("leaves the CLI cell empty when the daemon named no binary", () => {
+    const { container } = renderOverview({ snapshot: snapshotWithAgent({ cli: undefined }) });
+
+    const cell = container.querySelector(".overview-cli");
+    expect(cell).not.toBeNull();
+    expect(cell?.textContent).toBe("");
+    expect(cell).not.toHaveAttribute("title");
+  });
+
+  /**
    * Scenario: read the CLI column down the whole fleet. Every cell names a
    * BINARY somebody could type. It used to render the serialised agent-type
    * enum, so Claude Code read `claude_code` and OpenCode read `open_code`,
-   * with `codex` right only by coincidence — the name now comes from the agent
-   * registry, which is where the deck already keeps each agent's command
-   * (PRD #745).
+   * with `codex` right only by coincidence — PRD #745 took the name off the
+   * agent registry, and issue #856 moved that resolution to the daemon, which
+   * is the side that forked the process.
    */
   it("names the binary each agent runs, never the enum the wire keys it by", () => {
     const { container } = renderOverview();
@@ -700,6 +722,67 @@ describe("AgentOverview", () => {
     fireEvent.pointerDown(screen.getByTestId("overview-refresh"));
     expect(screen.queryByTestId("overview-columns-menu")).not.toBeInTheDocument();
     expect(screen.getByTestId("overview-columns-toggle")).toHaveAttribute("aria-expanded", "false");
+  });
+
+  /**
+   * Scenario: open the Columns menu, then press Escape with the key arriving at
+   * the page body rather than anywhere inside the picker. The menu closes
+   * anyway, because dismissal is bound to `document` and not to wherever the
+   * click that opened it left focus (issue #957).
+   */
+  it("closes the column picker on Escape raised outside it", () => {
+    renderOverviewWithStoredColumns(undefined);
+    fireEvent.click(screen.getByTestId("overview-columns-toggle"));
+    expect(screen.getByTestId("overview-columns-menu")).toBeVisible();
+
+    /*
+      `document.body` is outside React's root container, so this key reaches
+      NOTHING of the picker's own except the document listener — which is the
+      state an engine that does not move focus to a `<button>` on click would
+      leave the page in. Whether any engine the app ships on does that is not
+      settled here or anywhere; the listener is what makes the answer not
+      matter.
+    */
+    fireEvent.keyDown(document.body, { key: "Escape" });
+    expect(screen.queryByTestId("overview-columns-menu")).not.toBeInTheDocument();
+    expect(screen.getByTestId("overview-columns-toggle")).toHaveAttribute("aria-expanded", "false");
+
+    // And the listener went with the menu: a second Escape has nothing left to
+    // act on, so the picker stays shut rather than toggling back open.
+    fireEvent.keyDown(document.body, { key: "Escape" });
+    expect(screen.queryByTestId("overview-columns-menu")).not.toBeInTheDocument();
+  });
+
+  /**
+   * Scenario: open the Columns menu, then press Escape somewhere that stops the
+   * key at its own root — which is what every sibling control in this top bar
+   * does, `DeckSelector` included, whether or not its own menu is open. The
+   * picker closes anyway, because its listener captures at `document` and so
+   * runs before anything on the page can swallow the press (found in review on
+   * PR #1071).
+   */
+  it("closes the column picker on an Escape a sibling control would swallow", () => {
+    renderOverviewWithStoredColumns(undefined);
+    fireEvent.click(screen.getByTestId("overview-columns-toggle"));
+    expect(screen.getByTestId("overview-columns-menu")).toBeVisible();
+
+    /*
+      A stand-in for that sibling rather than the sibling itself: `DeckSelector`
+      renders only when the overview is given `settings`, which this harness
+      does not, and the property under test is about the PHASE the picker
+      listens in — that nothing between the key and `document` can take the
+      press first — not about which neighbour does the swallowing.
+    */
+    const swallower = document.createElement("button");
+    swallower.addEventListener("keydown", (event) => event.stopPropagation());
+    document.body.append(swallower);
+    try {
+      fireEvent.keyDown(swallower, { key: "Escape" });
+      expect(screen.queryByTestId("overview-columns-menu")).not.toBeInTheDocument();
+      expect(screen.getByTestId("overview-columns-toggle")).toHaveAttribute("aria-expanded", "false");
+    } finally {
+      swallower.remove();
+    }
   });
 
   /**

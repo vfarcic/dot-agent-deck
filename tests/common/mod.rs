@@ -452,6 +452,11 @@ impl TuiDeckBuilder {
     /// this flag defers the seeding until it exists. Both the raw and the
     /// canonicalized form are trusted, because the agent's own `cwd` may come
     /// back symlink-resolved and the trust key is matched verbatim.
+    ///
+    /// Composes with a later [`seed_claude_trust_in_home`] rather than being
+    /// undone by one: since PRD #220 that call merges into the HOME this wrote
+    /// instead of re-basing from the host, so trusting a sibling directory
+    /// after launch no longer un-trusts the work dir.
     pub fn with_claude_trust_workdir(mut self) -> Self {
         self.claude_trust_workdir = true;
         self
@@ -5817,6 +5822,17 @@ pub(crate) fn import_claude_plugins_enabled() -> bool {
 /// global onboarding flow is skipped), then mark each `trust_paths` entry as a
 /// trusted project.
 ///
+/// **Calling this repeatedly against one HOME ADDS trust rather than replacing
+/// it** (PRD #220). The host re-base happens only when the test HOME has no
+/// `~/.claude.json` yet; once one is there it is the base, so every path an
+/// earlier call trusted survives a later one. Two calls against a single HOME
+/// is the ordinary shape, not an edge case — [`TuiDeckBuilder::with_claude_trust_workdir`]
+/// seeds the fixture work dir during `launch` and a test then seeds a directory
+/// that only came into existence afterwards — and before the merge the second
+/// call re-based from a host config holding no entry for either tempdir and
+/// quietly un-trusted the first. See the comment on the base selection below
+/// for what that cost.
+///
 /// `trust_paths` are the EXACT cwd strings the spawned agent will run in. The
 /// destination is written atomically with mode 0o600 — `.claude.json` carries
 /// the host `oauthAccount` (M3.1 auditor S2, same stance as the other imported
@@ -5887,20 +5903,27 @@ pub(crate) fn seed_claude_project_trust(
     trust_paths: &[String],
 ) -> std::io::Result<Vec<String>> {
     install_credential_redaction();
-    let host_cfg_path = host_home().join(".claude.json");
-    let mut cfg: serde_json::Value = std::fs::read_to_string(&host_cfg_path)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
+    let test_cfg_path = test_home.join(".claude.json");
+    // MERGE into the test HOME's own document when one is already there, and
+    // re-base from the host only when it is not. The host re-base is what
+    // carries `oauthAccount`, `hasCompletedOnboarding` and the operator's MCP
+    // configuration into a FRESH test HOME, so it stays — but it is only ever
+    // the base for the FIRST call against a given HOME.
+    //
+    // PRD #220: it used to be the base for every call, and the second call then
+    // dropped what the first wrote. `with_claude_trust_workdir` seeds the
+    // fixture work dir during `launch`; a test that afterwards calls
+    // [`seed_claude_trust_in_home`] for a sibling directory that did not exist
+    // at launch time re-based from the host, wrote a `projects` map holding only
+    // the sibling, and silently un-trusted the work dir. The host config holds
+    // no entry for a tempdir created seconds ago, so nothing restored it.
+    // Measured on `dispatch/return/006`: the dispatcher agent sat at claude's
+    // "Is this a project you created or one you trust?" prompt — which defaults
+    // to "No", so it never times out on its own — for the full 120s, and the
+    // cast reads as a product failure rather than a harness one.
+    let mut cfg: serde_json::Value = read_claude_json_object(&test_cfg_path)
+        .or_else(|| read_claude_json_object(&host_home().join(".claude.json")))
         .unwrap_or_else(|| serde_json::json!({ "hasCompletedOnboarding": true }));
-    // A host `~/.claude.json` that is valid JSON but not an OBJECT — `[]`,
-    // `"x"`, `null` — parses fine and then PANICS on the `cfg["projects"] = …`
-    // below, because indexing a non-object `Value` with a string key panics on
-    // assignment. Pre-existing (it predates the API-key work) and cheap, so it
-    // is closed here rather than left as a follow-up: treated exactly like an
-    // unparsable file, which is the same amount of host state either carries.
-    if !cfg.is_object() {
-        cfg = serde_json::json!({ "hasCompletedOnboarding": true });
-    }
     if !cfg["projects"].is_object() {
         cfg["projects"] = serde_json::json!({});
     }
@@ -5912,6 +5935,15 @@ pub(crate) fn seed_claude_project_trust(
         });
     }
     if let Some(key) = anthropic_api_key() {
+        // Re-deciding this against the MERGED base rather than against the host
+        // reaches the same answer, which is why the merge does not move the
+        // billing policy the doc block above sets out. The `oauth_usable` branch
+        // is unconditional, so it is idempotent by construction; the key-only
+        // branch reads back the response the FIRST call wrote, and that call
+        // derived it from the host under the same two policy inputs. A host
+        // rejection this run is not authorised to override therefore survives
+        // every later call, because the first call left it in place and the
+        // merged base carries it forward.
         seed_claude_api_key_response(
             &mut cfg,
             &key,
@@ -5921,12 +5953,30 @@ pub(crate) fn seed_claude_project_trust(
     }
     let bytes = serde_json::to_vec(&cfg)
         .map_err(|e| std::io::Error::other(format!("serialize .claude.json: {e}")))?;
-    write_credential_file_atomic_0o600(&test_home.join(".claude.json"), &bytes)?;
+    write_credential_file_atomic_0o600(&test_cfg_path, &bytes)?;
     // Registered from `cfg` — the document actually written — rather than from a
     // second read of the host, the same rule the credential importers follow.
     let identity = claude_identity_redactions(&cfg);
     register_diagnostic_redactions(identity.clone());
     Ok(identity)
+}
+
+/// Read a `~/.claude.json` and hand it back only if it parsed as a JSON
+/// OBJECT — the shape [`seed_claude_project_trust`] can merge into.
+///
+/// The object check is not cosmetic. A file that is valid JSON but not an
+/// object — `[]`, `"x"`, `null` — parses fine and then PANICS on the
+/// `cfg["projects"] = …` assignment, because indexing a non-object `Value` with
+/// a string key panics on assignment. Anything that fails either half is
+/// treated exactly like an unreadable file, which is the same amount of state
+/// it carries: none this code can use. Applied to BOTH candidate bases, so a
+/// test HOME whose `~/.claude.json` a wedged agent left as a fragment falls
+/// through to the host re-base rather than taking the harness down with it.
+fn read_claude_json_object(path: &Path) -> Option<serde_json::Value> {
+    let cfg: serde_json::Value = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())?;
+    cfg.is_object().then_some(cfg)
 }
 
 /// Field names inside `oauthAccount` whose values IDENTIFY the developer rather
@@ -6078,6 +6128,11 @@ fn set_response_membership(cfg: &mut serde_json::Value, field: &str, id: &str, w
 /// [`TuiDeck::home_dir`] BEFORE the pane that runs `claude` in `trust_paths` is
 /// spawned; claude reads `~/.claude.json` at agent start, so the seeding only
 /// has to beat the spawn, not the launch.
+///
+/// Safe to combine with [`TuiDeckBuilder::with_claude_trust_workdir`] and safe
+/// to call more than once: since PRD #220 the callee merges into whatever the
+/// HOME already holds rather than re-basing from the host, so this ADDS
+/// `trust_paths` instead of replacing the trusted set.
 #[allow(dead_code)]
 pub fn seed_claude_trust_in_home(home: &Path, trust_paths: &[String]) -> std::io::Result<()> {
     // The identity values are registered process-globally by the callee, and
