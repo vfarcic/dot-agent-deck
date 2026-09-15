@@ -779,6 +779,7 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
                 <AgentTile
                   key={agent.id}
                   agent={agent}
+                  presentation="tile"
                   mode={mode}
                   selected={agent.id === selectedAgentId}
                   tab={tabs[agent.id] ?? "terminal"}

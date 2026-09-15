@@ -25,6 +25,27 @@ export type RunHealth = "healthy" | "attention" | "failed" | "idle";
 export type AgentStatus = "queued" | "running" | "waiting" | "passed" | "failed" | "stopped";
 export type StageStatus = "queued" | "active" | "passed" | "failed" | "waiting";
 export type PanelTab = "terminal" | "diff" | "checks" | "handoffs" | "artifacts";
+
+/**
+ * Which of `AgentTile`'s two presentations to render (PRD #1105 M1).
+ *
+ * The grid tile and the agent-pane overlay are the SAME component at two
+ * sizes, and this is the one prop the differences are derived from — the whole
+ * point of the milestone that introduced it is that there is no
+ * `AgentTileOverlay`. A string union rather than an `isOverlay` boolean for
+ * three reasons a boolean cannot give: a third presentation (#745's deferred
+ * group view) arrives as a member rather than as a second boolean, whose four
+ * combinations include one that means nothing; `grep -rn '"overlay"'` finds
+ * every derivation; and where a derivation is written as a total map or a
+ * checked `switch`, an added member fails to compile instead of silently
+ * taking a `false` branch.
+ *
+ * The values name WHERE the pane appears, not how big it is, because not every
+ * difference is dimensional — the Reader launcher's fate is an affordance
+ * question, not a size one.
+ */
+export type AgentPanePresentation = "tile" | "overlay";
+
 export type Verdict = "PASS" | "FIX" | "HUMAN" | "ERROR" | "INFO";
 
 export interface ConnectionView {

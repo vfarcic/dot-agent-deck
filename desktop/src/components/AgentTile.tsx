@@ -15,7 +15,15 @@ import {
   X,
 } from "lucide-react";
 import { UNREPORTED } from "../types";
-import type { AgentSession, EvidenceItem, PanelTab, RuntimeMode, SendResult, TerminalFeed } from "../types";
+import type {
+  AgentPanePresentation,
+  AgentSession,
+  EvidenceItem,
+  PanelTab,
+  RuntimeMode,
+  SendResult,
+  TerminalFeed,
+} from "../types";
 import { terminalInputState } from "../lib/terminalInput";
 import { OutputReader } from "./OutputReader";
 import { TerminalViewport } from "./TerminalViewport";
@@ -30,6 +38,55 @@ const tabs: { id: PanelTab; label: string; icon: typeof SquareTerminal }[] = [
 
 interface AgentTileProps {
   agent: AgentSession;
+  /**
+   * PRD #1105 M1 — which of this component's two presentations to render.
+   *
+   * Required rather than defaulted to `"tile"`, so a new render site has to
+   * say which of the two it is instead of inheriting one silently. There is
+   * exactly one render site today (`App.tsx`'s `.agent-grid`), so the cost of
+   * requiring it is one line.
+   *
+   * The four differences M1 established, recorded here because this prop is
+   * where a later implementer will look for them:
+   *
+   * 1. **Panel tabs — all five at BOTH sizes.** The tab set is a property of
+   *    the agent, not of the box. `tab` is controlled by `App` and keyed by
+   *    agent id, so the overlay inherits the tile's tab and hands it back on
+   *    close; a presentation that dropped tabs would have to coerce that
+   *    shared state behind the user's back. What the presentation DOES change
+   *    is the strip's labels — today they are shown by a `min-width: 1450px`
+   *    media query, which asks about the WINDOW when the question is how wide
+   *    this pane is.
+   * 2. **Header — same content, relaxed clamps.** Everything in the header
+   *    identifies the agent, and identity matters MORE in the overlay, where
+   *    the grid position that used to say which agent you are looking at is
+   *    gone. So nothing is removed; `.agent-assignment`'s two-line clamp is
+   *    relaxed because it exists for a half-width tile. The close control is
+   *    NOT derived from this prop — closing acts on the view, not on the
+   *    agent, so it arrives as an optional `onClose` callback gating an
+   *    affordance, the pattern `onRename` already uses here.
+   * 3. **The terminal's box — CSS only, no measurement change.**
+   *    `TerminalViewport` measures its host with `FitAddon` under a
+   *    `ResizeObserver`, so a bigger box reports a bigger geometry through the
+   *    path that already exists. `"overlay"` drops `.agent-panel`'s fixed
+   *    `height: 42vh` band for `flex: 1 1 auto`. Note the overlay must
+   *    override the tile's media queries too, `max-width: 680px`'s
+   *    `.agent-panel, .agent-tabs { display: none }` above all — an overlay
+   *    that inherited it would show no terminal at all.
+   * 4. **The Reader launcher — `"tile"` only.** `OutputReader` binds `Escape`
+   *    on `window`, and so will the overlay; two listeners on the same target
+   *    both fire, so one `Escape` inside the overlay would close the Reader
+   *    AND the overlay. Beyond that the overlay already IS reading width, with
+   *    colour and a cursor. Hiding the button is not sufficient on its own:
+   *    `readerOpen` is local state reset only on `agent.id`, so the overlay
+   *    must also not RENDER `<OutputReader>`.
+   *
+   * What this prop deliberately CANNOT express: that the tile and the overlay
+   * share one xterm instance. That is a property of where the element sits in
+   * the React tree, not of what it is rendered with — which is why M3 has to
+   * promote the tile's element in place rather than re-parent it.
+   */
+  presentation: AgentPanePresentation;
   mode: RuntimeMode;
   selected: boolean;
   tab: PanelTab;
@@ -59,6 +116,7 @@ function formatTokens(tokens: number): string {
 
 export function AgentTile({
   agent,
+  presentation,
   mode,
   selected,
   tab,
@@ -102,6 +160,11 @@ export function AgentTile({
       className={`agent-tile ${selected ? "is-selected" : ""}`}
       data-testid={`agent-tile-${agent.role.toLowerCase().replaceAll(" ", "-")}`}
       data-status={agent.status}
+      /* The seam the presentation differences key off. An attribute selector
+         outranks a bare class even inside a media query, so
+         `[data-presentation="overlay"]` can override the tile's own responsive
+         rules with no stylesheet reordering. Nothing matches it yet. */
+      data-presentation={presentation}
       onMouseDown={onSelect}
     >
       <header className="agent-header">

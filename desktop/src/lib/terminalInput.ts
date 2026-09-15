@@ -100,8 +100,12 @@ function verdictState(verdict: SendResult | undefined): SendResult | undefined {
  *   `wrong-session` disables a pane the snapshot says is live. That is the
  *   reachable-in-principle false disable, and nothing in this function
  *   prevents it: what does is that `useDeckRuntime` drops every recorded
- *   verdict as soon as a newer snapshot arrives, so no record can outlive the
- *   state that contradicts it.
+ *   verdict as soon as a newer snapshot arrives, so no record survives the
+ *   NEXT snapshot. That is narrower than "no record outlives the state that
+ *   contradicts it", and deliberately so: a verdict recorded while the lease
+ *   ALREADY says writable does coexist with that lease until the following
+ *   snapshot lands, so this bounds the false disable to one snapshot window
+ *   rather than preventing it.
  */
 export function terminalInputState(agent: AgentSession, verdict?: SendResult): TerminalInputState {
   const reported = leaseState(agent) ?? verdictState(verdict);

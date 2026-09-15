@@ -82,7 +82,10 @@ describe("TerminalViewport input gate", () => {
    * All three seams have to move together — `disableStdin`, the `onData` guard
    * and the helper textarea's native `disabled` — because a terminal that
    * announces itself disabled while still accepting keystrokes is worse than
-   * the rebuild this avoids.
+   * the rebuild this avoids. The fake terminal above fires its handlers
+   * directly, which is what lets each seam be asserted on its own; against the
+   * real xterm they are layered rather than independent, and the seam-2 note
+   * below says what that means for what this proves.
    */
   it("reconciles all three input seams in place when the write lease is taken away", () => {
     const onInput = vi.fn();
@@ -109,8 +112,16 @@ describe("TerminalViewport input gate", () => {
     expect(terminal.options.disableStdin).toBe(true);
     // Seam 3: the helper textarea takes no focus and shows no caret.
     expect(terminal.textarea.disabled).toBe(true);
-    // Seam 2: the guard reads the CURRENT value, not the one captured when the
-    // terminal was built — this is the assertion a stale closure fails.
+    // Seam 2: the guard reads the CURRENT value of `readOnly`, not the one
+    // captured when the terminal was built — the assertion a stale closure
+    // fails. What it proves is that the guard tracks current state, NOT that
+    // the guard is the only thing standing between a read-only pane and the
+    // agent: against the installed `@xterm/xterm@6.0.0`, `triggerDataEvent`
+    // re-reads `rawOptions.disableStdin` on every keystroke and returns before
+    // firing `onData` (`CoreService.ts:61-64`), so seam 1 suppresses a real
+    // keystroke first and this guard is defense in depth behind it. A stale
+    // closure here leaves one seam out of step with the other two, which is
+    // what the fake terminal's direct handler call makes visible.
     onInput.mockClear();
     terminal.typeKey("b");
     expect(onInput).not.toHaveBeenCalled();
