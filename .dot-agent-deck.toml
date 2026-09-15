@@ -102,6 +102,7 @@ watch = false
 # clear flag — the daemon logs a warning saying so. Close the tab first.
 
 # Dogfood: mixed agents — orchestrator/coder=claude (Opus), release=claude (Sonnet), reviewer=pi (Opus, high thinking), and two GPT harnesses on gpt-5.6-sol: auditor=opencode, tester=codex — each at xhigh reasoning effort (opencode's comes from the `agent.build.variant` in opencode.json, since its TUI has no CLI flag for it). Flip any role via the commented alternative under it, or switch the whole team with `--orchestration 'anthropic'` / `--orchestration 'GPT'`.
+# DO NOT commit a provider outage here. `mixed` has been flipped to all-Claude twice for exhausted OpenAI credits (2026-08-26/09-06, restored by #1024; 2026-09-13, restored by #1079) and each time it silently became a near-duplicate of `anthropic`, removing the cross-provider choice this file exists to offer. One machine's billing state is not a repo-wide default: if a provider is unavailable to you, dispatch with `--orchestration 'anthropic'` instead of editing this.
 [[orchestrations]]
 name = "mixed"
 default = true
@@ -199,15 +200,15 @@ prompt_template = "Review the change. Report findings only — do not modify cod
 
 [[orchestrations.roles]]
 name = "auditor"
-command = "devbox run agent-auditor"
-# command = "devbox run oc-big"   # opencode (gpt-5.6-sol) — OpenAI credits exhausted 2026-09-13
+command = "devbox run oc-big"   # opencode (gpt-5.6-sol)
+# command = "devbox run agent-auditor"   # all-claude default
 description = "Audits code for security vulnerabilities and unsafe patterns"
 prompt_template = "Audit the change for security vulnerabilities, unsafe patterns, and OWASP top-10 class issues. Report findings only — do not modify code. If the task references a file or diff, read it before starting. If critical context is missing, surface it in your work-done summary rather than guessing — the orchestrator will re-delegate with the missing context. Whenever you are blocked or missing critical context, report it back through `work-done` and stop there: never notify the user yourself and never wait on the user — the orchestrator is the only agent that does either, and it escalates for you."
 
 [[orchestrations.roles]]
 name = "tester"
-command = "devbox run agent-tester"
-# command = "devbox run codex-big"   # codex — OpenAI credits exhausted 2026-09-13
+command = "devbox run codex-big"   # codex
+# command = "devbox run agent-tester"   # all-claude default
 description = "Writes failing synthetic L2 tests under the TUI test harness; verifies they pass after coder implements. Sweet spot is L2 synthetic flows (hooks, status transitions, prompts, focus, lifecycle, resize, error paths) and L1 widget redesigns. Skips pure refactors, pure-data fixes, and chain-smoke (all stay with coder). Prefers extending or modifying existing tests over creating new ones."
 prompt_template = """
 You author synthetic tests under the TUI test harness (`tests/render_*.rs` for L1, `tests/e2e_*.rs` for L2 synthetic). You operate in TDD mode: when the orchestrator delegates a behavior-changing task, write/extend/modify a failing test that pins the requested behavior, run it to confirm it fails for the right reason (RED), and report back with the failure signature so coder can implement. When the orchestrator re-delegates after coder finishes, re-run the test to confirm GREEN. Assert on the observable end-state (rendered output / behavior), not on internal routing or state, so your tests survive refactors.
