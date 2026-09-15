@@ -145,12 +145,26 @@ jobs:
         # flake.nix pins the released version in a let-binding and hands it to
         # the build as DAD_VERSION, because a `nix run github:...` build gets a
         # source tarball with no `.git` for `build.rs` to describe and would
-        # otherwise fall back to the `0.1.0` placeholder. That pin is a
-        # hand-maintained line: a release that bumps the tag without bumping the
-        # flake ships a source build reporting the wrong version, which is the
-        # same class of bug the DAD_VERSION seam (#250) was added to prevent, and
-        # the `Build` job below already uses that seam for the same reason.
-        # Fail the release loudly here rather than publish the mismatch.
+        # otherwise fall back to the `0.1.0` placeholder. A release that bumps
+        # the tag without bumping the flake ships a source build reporting the
+        # wrong version, which is the same class of bug the DAD_VERSION seam
+        # (#250) was added to prevent, and the `Build` job below already uses
+        # that seam for the same reason. Fail the release loudly here rather
+        # than publish the mismatch.
+        #
+        # WHAT THIS STEP NOW PROTECTS IS NARROWER THAN IT WAS (issue #1089). The
+        # pin used to be a hand-maintained line, bumped by a maintainer in a
+        # separate commit from the tag, so this step guarded against the obvious
+        # human error of moving one and not the other. Since #1089
+        # `tag-release.yml` derives both from a single dispatch input, asserts
+        # the pin it just wrote, and creates the tag from that same commit — so
+        # on that path this step is checking the output of one workflow against
+        # another output of the same workflow. Keep it: it is nearly free, and it
+        # still catches a bug in `tag-release.yml`, an out-of-band edit to
+        # `flake.nix`, and a `workflow_dispatch` of THIS workflow with a version
+        # that does not match the tree (a path #1089 did not touch). But do not
+        # read it as the guard against a forgotten manual bump any more; nothing
+        # is bumped manually on the blessed path.
         #
         # Bound through `env:` for the reason spelled out on the step above: a
         # `${{ }}` expression is substituted as raw text before bash parses the

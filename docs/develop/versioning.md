@@ -32,7 +32,7 @@ While the major version is `0`, the bump rules are deliberately shifted down one
 | feature (new user-facing functionality) | **patch** (`0.31.1 → 0.31.2`) | minor |
 | bugfix | **patch** | patch |
 
-The consequence worth internalizing: while in `0.x`, a feature-only release is a *patch* release, and **only a protocol-breaking change bumps the minor**. So the minor digit stops meaning "has new features" and starts meaning "compatibility broke" — if `0.31.x` becomes `0.32.0`, an older peer can no longer safely talk to a `0.32.x` one. This is already implemented on the release side in the vendored `.claude/skills/dot-ai-tag-release/analyze.sh` (the `breaking → minor`, `feature/bugfix → patch` recalibration); the table above is the policy that script encodes.
+The consequence worth internalizing: while in `0.x`, a feature-only release is a *patch* release, and **only a protocol-breaking change bumps the minor**. So the minor digit stops meaning "has new features" and starts meaning "compatibility broke" — if `0.31.x` becomes `0.32.0`, an older peer can no longer safely talk to a `0.32.x` one. This is already implemented on the release side in [`.claude/skills/tag-release/analyze.sh`](../../.claude/skills/tag-release/analyze.sh) (the `breaking → minor`, `feature/bugfix → patch` recalibration); the table above is the policy that script encodes. That script has two callers and they run the same code: a maintainer, from `/tag-release` Step 1, to see the proposed version; and `.github/workflows/tag-release.yml`, to re-derive it at release time and refuse when it disagrees with the version the maintainer supplied.
 
 ## Cross-version manual-test discipline
 
@@ -81,6 +81,6 @@ The resolution logic itself lives in `build_version_resolve.rs` at the repo root
 
 ## Where this lives across repos
 
-- The **0.x recalibration** in `analyze.sh` and the generic changelog-fragment guidance are generically correct and belong in the shared skill **source** (the `prompts` repo); the vendored copy here is kept in sync.
+- The **0.x recalibration** in `analyze.sh` is generically correct and was contributed to the shared skill **source** (the `prompts` repo), but the copy here is no longer vendored: issue #1089 forked `dot-ai-tag-release` to the project-local `tag-release` for the same reason #1052 forked `pr-create`, so it is now ours to edit and no sync will revert or update it. The generic changelog-fragment guidance stays in the `dot-ai-changelog-fragment` mirror, which is *not* forked.
 - The **dot-agent-deck-specific** parts — this breaking definition and the protocol-surface specifics — stay local (this doc + the `pyproject.toml` comment).
 - The **cross-version manual-test step** and the "did this change the TUI↔daemon contract?" prompt are enforced in-repo by **CLAUDE.md permanent instruction 12** (loaded by every agent, including the `release` role that runs `/pr-create`) and by the `pr-create` skill itself. That skill is project-local and owned here — it was forked out of the `dot-ai` mirror under issue #1052 precisely so this check cannot be reverted by a sync.

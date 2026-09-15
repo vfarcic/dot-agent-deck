@@ -15,7 +15,7 @@ Publishes a docs-only image to `ghcr.io/vfarcic/dot-agent-deck-docs` with a `mai
 
 ## When NOT to Use
 
-- You're cutting a versioned release — use `/dot-ai-tag-release` instead. The release workflow already publishes docs as part of the release via the same underlying `docs-publish.yml` workflow.
+- You're cutting a versioned release — use `/tag-release` instead. The release workflow already publishes docs as part of the release via the same underlying `docs-publish.yml` workflow.
 - You have un-released non-docs (code) changes that should also ship — cut a release.
 
 ## Workflow
@@ -72,7 +72,7 @@ On success, tell the user:
 - The image tag that was pushed (`main-<sha>`).
 - That a `chore: publish docs image main-<sha> [skip ci]` commit was pushed to `main` — they should `git pull` to pick it up.
 - Argo CD will detect the `values.yaml` change and sync within a minute or two; the site at https://agent-deck.devopstoolkit.ai will update shortly after.
-- The chart now points at a `main-<sha>` tag. The next `/dot-ai-tag-release` will re-pin it to `v<semver>` automatically.
+- The chart now points at a `main-<sha>` tag. The next `/tag-release` will re-pin it to `v<semver>` automatically.
 
 ## Notes
 

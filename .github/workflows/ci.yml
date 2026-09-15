@@ -60,10 +60,10 @@ permissions:
 # block says (`.claude/skills/verify-pr/SKILL.md`). Both still hold; the flag is
 # a layer under them.
 #
-# It says nothing about the other workflows in this directory. `release.yml` and
-# `docs-publish.yml` push to `main` and MUST keep a usable credential in the
-# checkout — they check out under the RELEASE_TOKEN admin PAT for exactly that
-# reason (CLAUDE.md rule 8). Do not copy this flag onto them.
+# It says nothing about the other workflows in this directory. `release.yml`,
+# `docs-publish.yml` and `tag-release.yml` push to `main` and MUST keep a usable
+# credential in the checkout — they check out under the RELEASE_TOKEN admin PAT
+# for exactly that reason (CLAUDE.md rule 8). Do not copy this flag onto them.
 
 jobs:
   # Renovate automerges devbox digest/pin/patch/minor bumps (renovate.json), and

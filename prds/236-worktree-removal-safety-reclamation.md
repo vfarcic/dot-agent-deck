@@ -12,7 +12,7 @@ Two halves of one lifecycle gap.
 
 **Half 1 — removal is unconditional.** `remove_worktree` (`src/issue_dispatch_run.rs:133`) runs `git worktree remove <wt> --force`. The `--force` flag is precisely what overrides git's refusal to remove a worktree holding uncommitted changes or untracked files, and there is no dirty check, no open-PR check, and no merged check anywhere on the path to it. The trigger is a normal pane close: `AttachRequest::StopAgent` (`src/daemon_protocol.rs:1339`) captures the closing agent's record, confirms via `worktree_still_in_use` (`:123`) that it was the last agent rooted in the tree, then removes the tree. So closing the last pane of a dispatched tab destroys any uncommitted work in it, silently and with no confirmation. Committed work survives (the branch is never deleted); uncommitted and untracked work does not. Ctrl+W reads to a user as "close this view", not "destroy this".
 
-**Half 2 — nothing reclaims a tree we keep.** The `WorktreeRegistry` (`:75`) is an in-memory `Arc<Mutex<HashMap<PathBuf, PathBuf>>>`, wiped on daemon restart — a post-restart close finds no entry and leaves the tree in place (documented at `:63-68`). Quitting the TUI is a *detach*, not a stop, so it never triggers cleanup either. Issue-dispatch (#120) tolerates this because the next scheduled fire sees the tree present and treats it as already-claimed, which reclaims it implicitly. A **user-driven** dispatch (#220) has no next fire, so a leaked tree is permanent until someone prunes it by hand. The only existing reclamation is `dot-ai-tag-release`'s step 6, which prunes *merged* worktrees and branches at release time — the wrong granularity and the wrong cadence for this.
+**Half 2 — nothing reclaims a tree we keep.** The `WorktreeRegistry` (`:75`) is an in-memory `Arc<Mutex<HashMap<PathBuf, PathBuf>>>`, wiped on daemon restart — a post-restart close finds no entry and leaves the tree in place (documented at `:63-68`). Quitting the TUI is a *detach*, not a stop, so it never triggers cleanup either. Issue-dispatch (#120) tolerates this because the next scheduled fire sees the tree present and treats it as already-claimed, which reclaims it implicitly. A **user-driven** dispatch (#220) has no next fire, so a leaked tree is permanent until someone prunes it by hand. The only existing reclamation is `/tag-release`'s cleanup step, which prunes *merged* worktrees and branches at release time — the wrong granularity and the wrong cadence for this.
 
 These halves are coupled, which is why they belong in one PRD: the fix for half 1 is to **keep** trees we would previously have force-removed, which deliberately makes leaks more common. Shipping half 1 alone trades silent data loss for unbounded disk growth. That is the right trade, but it must not be the end state.
 
@@ -41,7 +41,7 @@ One policy governs every worktree-creating feature — #120 today, #220 next, #1
 - **Changing what creates worktrees** or where they live — that is #220's decision (siblings for user-driven dispatch; #120 keeps `.worktrees/` inside its dedicated clone, kept out of `git status` via the clone-local `.git/info/exclude`, `:446-457`).
 - **Branch cleanup.** Branches are deliberately never deleted here; committed work must stay recoverable. A branch-pruning policy is separate work.
 - **Cross-project dispatch** (#174) — it inherits this policy but adds nothing to it.
-- **Replacing `dot-ai-tag-release`'s merged-worktree prune.** That stays; this adds a mechanism for the not-yet-merged case it cannot reach.
+- **Replacing `/tag-release`'s merged-worktree prune.** That stays; this adds a mechanism for the not-yet-merged case it cannot reach.
 
 ## Success Criteria
 
@@ -77,7 +77,7 @@ One policy governs every worktree-creating feature — #120 today, #220 next, #1
 - `src/issue_dispatch_run.rs` — `remove_worktree` and its `--force` (`:133`); `WorktreeRegistry` type + in-memory caveat (`:75`, `:63-68`); `new_worktree_registry` (`:78`); `record_worktree` (`:85`); `worktree_of_record` (`:95`); `take_worktree` (`:110`); `worktree_still_in_use` (`:123`); clone-local exclude precedent (`:446-457`).
 - `src/daemon_protocol.rs` — `AttachRequest::StopAgent` arm (`:1339`) and the tab-close cleanup that calls `take_worktree` → `remove_worktree` (~`:1400-1408`).
 - `src/daemon.rs` — the `Daemon::worktree_registry` field threaded through the daemon (`:250`).
-- `.claude/skills/dot-ai-tag-release/SKILL.md` — step 6, the existing merged-only prune this complements.
+- `.claude/skills/tag-release/SKILL.md` — the cleanup step, the existing merged-only prune this complements.
 - `.claude/skills/dot-ai-worktree-prd/create.sh` — the human worktree convention: sibling path (`:54`) and refuse-on-existing-branch (`:60-61`).
 
 ## Risks and Mitigations

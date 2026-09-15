@@ -3,6 +3,17 @@ set -euo pipefail
 
 # Analyze changelog fragments and propose a semantic version bump.
 # This script is read-only — it never creates commits, tags, or pushes.
+#
+# TWO CALLERS, and both matter (issue #1089). A maintainer runs it from
+# `/tag-release` Step 1 to see the proposed version before dispatching; and
+# `.github/workflows/tag-release.yml` runs it again at release time to re-derive
+# that version and refuse when it disagrees with the one the operator supplied.
+# Keeping it as ONE script is the point — the 0.x recalibration below is what
+# `docs/develop/versioning.md` cites as the implementation of its bump table, and
+# a second copy inlined in the workflow is exactly how the two would drift.
+#
+# The workflow runs this in a job holding the RELEASE_TOKEN admin PAT. Treat a
+# change here as a change to release-path code, not to a helper script.
 
 CHANGELOG_DIR="changelog.d"
 
@@ -106,10 +117,17 @@ else
 fi
 
 # --- Check HEAD for skip-ci ---
-
+#
+# ADVISORY ONLY since issue #1089. Nothing acts on this value any more: the
+# release workflow makes its own check against GitHub's five documented markers
+# immediately before tagging, which is the only moment at which the answer is
+# binding. It is still printed because it tells a maintainer, up front, whether
+# the workflow is going to insert an empty preparation commit — the usual cause
+# being `docs-publish.yml`, which ends every release by committing
+# `chore: update docs chart to <tag> [skip ci]` to `main`.
 head_message=$(git log -1 --format="%B" HEAD 2>/dev/null || echo "")
 skip_ci=false
-if echo "$head_message" | grep -qiE '\[(skip ci|ci skip|no ci)\]'; then
+if echo "$head_message" | grep -qiE '\[(skip ci|ci skip|no ci|skip actions|actions skip)\]'; then
   skip_ci=true
 fi
 

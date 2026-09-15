@@ -49,9 +49,13 @@
       # the misreport `VersionSource::Placeholder` was added to name.
       #
       # So this flake uses the injection seam that issue #250 built for packagers
-      # (the same one release.yml uses) and pins the version here. The
-      # dot-ai-tag-release skill bumps this line as part of cutting a tag, and
-      # release.yml refuses to release when it disagrees with the tag.
+      # (the same one release.yml uses) and pins the version here. Since issue
+      # #1089 this line is bumped by .github/workflows/tag-release.yml, which
+      # commits it and then creates the tag from that same commit; before that it
+      # was a hand-edit in the /tag-release skill, pushed to main by a person. Do
+      # not bump it by hand — the workflow derives the pin and the tag from one
+      # input, so an out-of-band edit can only disagree with one of them.
+      # release.yml still refuses to release when the pin disagrees with the tag.
       version = "0.40.1";
 
       # `<version>-g<short-sha>`, the same shape build.rs composes out of git

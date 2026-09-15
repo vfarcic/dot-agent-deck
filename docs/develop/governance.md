@@ -8,7 +8,7 @@ This page describes how changes reach `main`, who may approve them, and — beca
 
 Two properties of that arrangement are worth stating plainly rather than discovering later.
 
-**The admin bypass is what keeps releases alive, and it also softens the rule for the owner.** CI pushes two commits directly to `main`, so *something* has to be allowed past the gate. Granting the bypass to the `admin` repository role covers CI's PAT and, unavoidably, covers the owner's own hands at the same time. Enforcement against the owner is therefore a matter of habit, not of mechanism. The stricter arrangement — no admin bypass, with a GitHub App token as the sole bypass actor — is available and is described under [Making the gate bind the owner too](#making-the-gate-bind-the-owner-too).
+**The admin bypass is what keeps releases alive, and it also softens the rule for the owner.** CI pushes to `main` directly — three commits per release since issue #1089, two before it — so *something* has to be allowed past the gate. Granting the bypass to the `admin` repository role covers CI's PAT and, unavoidably, covers the owner's own hands at the same time. Enforcement against the owner is therefore a matter of habit, not of mechanism. The stricter arrangement — no admin bypass, with a GitHub App token as the sole bypass actor — is available and is described under [Making the gate bind the owner too](#making-the-gate-bind-the-owner-too).
 
 **A gate needs two maintainers before it means anything.** Nobody can approve their own pull request. With a single collaborator, "requires one approving review" means every pull request that person opens is unmergeable without a bypass, so every merge becomes a bypass and the rule decays into ceremony within a week. The rollout below is sequenced around that fact.
 
@@ -45,14 +45,17 @@ Three rules about sequencing, each of which exists because of a specific ruleset
 
 ## Why CI has to change first
 
-Two workflows push straight to `main`:
+Three workflows push straight to `main`, and no other file under `.github/workflows/` contains a `git push` or commits through an action:
 
+- `.github/workflows/tag-release.yml` — the `flake.nix` version pin, in the `tag` job, followed by the release tag itself (issue #1089)
 - `.github/workflows/release.yml` — the changelog commit, in the `prepare` job
 - `.github/workflows/docs-publish.yml` — the docs chart bump, in the `publish` job
 
-Neither push carries check runs, and the default `GITHUB_TOKEN` is not an admin. Under a protected `main` both are rejected with `GH006: Protected branch update failed`, which kills the tag in `prepare` and breaks standalone `/publish-docs` runs. This is not hypothetical: it is precisely what happened to v0.35.6 when required status checks were briefly enabled, and it is why they stayed off for as long as they did (CLAUDE.md rule 8). Both pieces are now in place — the `RELEASE_TOKEN` admin identity below, plus the fail-fast guard that replaced its `|| github.token` fallback — and required checks went back on 2026-08-11.
+`tag-release.yml` is the newest and the reason the list grew. Cutting a release used to begin with a *maintainer* doing by hand what it now does: bump the pin, commit it, `git push origin HEAD`. That succeeded, because the admin bypass covers the owner's own hands as well as CI's PAT — printing `remote: Bypassed rule violations for refs/heads/main`, which is the silent-success failure mode this page warns about two paragraphs up. Every pin from v0.39.1 to v0.40.1 landed that way. The commit is unavoidable (Nix never sees tag names, so the version has to be in the tagged tree); the person pushing it was not. It creates the tag too, because a workflow triggered *by* a tag cannot create the commit that tag points at — which is why the release entry point is now a `workflow_dispatch` rather than a tag push.
 
-The fix is a `RELEASE_TOKEN` secret holding a fine-grained PAT with **Contents: read and write** on this repository, owned by an account with admin access. Both workflows now pass it to `actions/checkout`:
+None of the three pushes carries check runs, and the default `GITHUB_TOKEN` is not an admin. Under a protected `main` each is rejected with `GH006: Protected branch update failed`, which kills the tag in `prepare`, breaks standalone `/publish-docs` runs, and — since #1089 — stops a release before it is tagged at all. This is not hypothetical: it is precisely what happened to v0.35.6 when required status checks were briefly enabled, and it is why they stayed off for as long as they did (CLAUDE.md rule 8). Both pieces are now in place — the `RELEASE_TOKEN` admin identity below, plus the fail-fast guard that replaced its `|| github.token` fallback — and required checks went back on 2026-08-11.
+
+The fix is a `RELEASE_TOKEN` secret holding a fine-grained PAT with **Contents: read and write** on this repository, owned by an account with admin access. All three workflows pass it to `actions/checkout`:
 
 ```yaml
 token: ${{ secrets.RELEASE_TOKEN }}
