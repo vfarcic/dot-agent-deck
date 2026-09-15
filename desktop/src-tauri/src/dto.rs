@@ -1130,6 +1130,43 @@ impl Default for AppliedSelection {
 static APPLIED_SELECTION: std::sync::RwLock<Option<AppliedSelection>> =
     std::sync::RwLock::new(None);
 
+/// Serializes the TESTS that write [`APPLIED_SELECTION`], wherever they live.
+///
+/// [`apply_settings_selection`] is a process-global write, so a test that makes
+/// one and asserts on what it reads back needs every other test's write to be
+/// outside its own window. Under nextest each test owns its process and this is
+/// always free; under a plain `cargo test` the crate's tests are threads in one
+/// process and this is the only thing keeping those writes out of each other's
+/// windows.
+///
+/// It lives here rather than in [`tests`] because the writers do not: issue
+/// #1078 found eight tests across `endpoint_test::tests` and `lib::tests`
+/// writing the global without it, six of them by way of
+/// `lib::retarget_selection`.
+///
+/// **It is one of three process-globals `cargo test --lib` raced on, not the
+/// only one**, so taking it does not on its own make that command green —
+/// measured, with the tests that move the other two excluded, at 6 runs red
+/// before this lock and 6 green after. The other two are the
+/// `DOT_AGENT_DECK_ATTACH_SOCKET` override that `endpoint_test::tests` sets
+/// process-wide (every `Endpoint::local()` in the crate reads it, and only
+/// `endpoint_test` holds `ATTACH_ENV_LOCK` while it moves) and the umask
+/// `bind_attach_listener` flips inside `daemon_bridge::tests`' `RealDeck`
+/// (documented and accepted there). Both need their own change and neither is
+/// what this guards.
+///
+/// **Async-aware on purpose**, matching `endpoint_test::tests`'
+/// `ATTACH_ENV_LOCK`: most of the writers are `#[tokio::test]`s that hold the
+/// selection across an `.await`, and a `std::sync::MutexGuard` doing that is
+/// `clippy::await_holding_lock` — an error under the workspace's `-D warnings`.
+/// It also has no poisoning, so a test that panics mid-selection releases the
+/// lock rather than turning its own failure into one in every sibling.
+///
+/// So take it with `.lock().await` from an async test and `blocking_lock()`
+/// from a synchronous one — the latter panics in an async context.
+#[cfg(test)]
+pub(crate) static SELECTION_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// The applied selection, as **one** read.
 ///
 /// Every caller goes through here rather than reaching for a half, which is the
@@ -1589,11 +1626,6 @@ mod tests {
     // PRD #741 M7 — the selection, and the two things it decides on screen
     // -----------------------------------------------------------------------
 
-    /// The applied selection is a process-global, so every test that writes it
-    /// takes this first and puts it back. Under nextest each test owns its
-    /// process and the lock is free.
-    static SELECTION_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     /// A document whose `[endpoints]` selection names a connectable remote row.
     fn selecting_a_remote_deck() -> crate::settings::DesktopSettings {
         use crate::settings::{
@@ -1624,9 +1656,7 @@ mod tests {
         settings: &crate::settings::DesktopSettings,
         body: impl FnOnce() -> T,
     ) -> T {
-        let guard = SELECTION_LOCK
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+        let guard = SELECTION_LOCK.blocking_lock();
         apply_settings_selection(settings);
         let result = body();
         apply_settings_selection(&crate::settings::DesktopSettings::default());
@@ -2738,9 +2768,7 @@ mod tests {
     fn no_reader_assembles_a_fleet_from_two_different_saves() {
         use std::sync::atomic::{AtomicBool, Ordering};
 
-        let _guard = SELECTION_LOCK
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+        let _guard = SELECTION_LOCK.blocking_lock();
 
         let one = selecting_a_remote_deck();
         let all = observing_all(&["build-box.example.com", "laptop.example.com"]);
