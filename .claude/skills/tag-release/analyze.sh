@@ -119,9 +119,9 @@ fi
 # --- Check HEAD for skip-ci ---
 #
 # ADVISORY ONLY since issue #1089. Nothing acts on this value any more: the
-# release workflow makes its own check against GitHub's five documented markers
-# immediately before tagging, which is the only moment at which the answer is
-# binding. It is still printed because it tells a maintainer, up front, whether
+# release workflow makes its own check immediately before tagging, which is the
+# only moment at which the answer is binding — and a wider one, covering the
+# `skip-checks: true` commit trailer as well as the bracket markers below. It is still printed because it tells a maintainer, up front, whether
 # the workflow is going to insert an empty preparation commit — the usual cause
 # being `docs-publish.yml`, which ends every release by committing
 # `chore: update docs chart to <tag> [skip ci]` to `main`.

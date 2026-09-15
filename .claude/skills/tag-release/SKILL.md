@@ -18,7 +18,11 @@ Several PRs have merged with changelog fragments in `changelog.d/` and you are r
 
 ## Step 1 — Analyze
 
+Run this from a checkout of `main` that is level with `origin/main`, because `analyze.sh` reads the working tree's `changelog.d/`. Record the SHA: it is what binds the release to the tree you are about to review.
+
 ```bash
+git fetch --quiet origin main
+git rev-parse origin/main          # record this — it becomes expected_head in Step 3
 bash .claude/skills/tag-release/analyze.sh
 ```
 
@@ -30,7 +34,7 @@ Stop and show the user the `MESSAGE` if the script exits non-zero or prints `ERR
 
 1. `CURRENT_VERSION` and `PROPOSED_VERSION`, with the `BUMP_TYPE` that produced it.
 2. The `FRAGMENTS` list with their types, so the user can see what the bump was derived from.
-3. `SKIP_CI`, if it is `true` — `main`'s tip carries a skip marker, and a tag pointing at such a commit would stop `release.yml` running at all. Usually this resolves itself, because the pin commit becomes the new tip and carries no marker; the workflow inserts an empty preparation commit only in the case where the pin was already correct and so no commit was made.
+3. `SKIP_CI`, if it is `true` — `main`'s tip carries a skip marker, and a tag pointing at such a commit would stop `release.yml` running at all. Usually this resolves itself, because the pin commit becomes the new tip and carries no marker; the workflow inserts an empty preparation commit only in the case where the pin was already correct and so no commit was made. (`analyze.sh`'s check is advisory and matches only the bracket markers; the workflow's own check is the binding one and also covers GitHub's `skip-checks: true` trailer.)
 
 Ask the user to confirm the version or give you a different one. Ask for a one- or two-sentence summary of the release for the tag message, or offer one drawn from the fragments.
 
@@ -39,16 +43,29 @@ Ask the user to confirm the version or give you a different one. Ask for a one- 
 ```bash
 gh workflow run tag-release.yml --ref main \
   -f version=<X.Y.Z> \
+  -f expected_head=<the SHA from Step 1> \
   -f tag_message="<the one- or two-sentence summary>"
 ```
 
-`version` carries **no leading `v`** (the tag is `v0.40.2`, the flake pin is `0.40.2`; the workflow trims a `v` if you type one anyway). It must equal what the fragments compute, or the workflow refuses without committing or tagging anything — that re-derivation is what catches a typo, a stale reading of Step 1, and a fragment that landed on `main` in between. To release a version that deliberately differs from the computed one, add `-f allow_mismatch=true`, and say in your report why.
+`version` carries **no leading `v`** (the tag is `v0.40.2`, the flake pin is `0.40.2`; the workflow trims a `v` if you type one anyway). It must equal what the fragments compute, or the workflow refuses without committing or tagging anything — that re-derivation catches a typo, a stale reading of Step 1, and a fragment that landed in between **and changed the bump**. To release a version that deliberately differs from the computed one, add `-f allow_mismatch=true`, and say in your report why.
+
+**Always pass `expected_head`.** It is optional in the workflow only so a dispatch from the GitHub UI still works, and omitting it downgrades the checkpoint: a fragment of the *same* bump class merging between Step 1 and the job leaves the computed version identical, so the version check passes and the release carries content nobody reviewed. With the SHA, the workflow refuses instead and you re-run Step 1 against the new tip. The run's job summary also lists the fragments it actually released, read from the tree it tagged.
 
 ## Step 4 — Watch the run
 
+Pick the run **this dispatch** created, not merely the newest one — the workflow serialises on a `tag-release` concurrency group, so a queued second dispatch is exactly the case where `.[0]` watches the wrong thing:
+
 ```bash
-gh run watch "$(gh run list --workflow=tag-release.yml --limit 1 --json databaseId --jq '.[0].databaseId')"
+before=$(gh run list --workflow=tag-release.yml --limit 1 --json databaseId --jq '.[0].databaseId // 0')
+# ... dispatch as in Step 3 ...
+until run=$(gh run list --workflow=tag-release.yml --limit 20 --json databaseId \
+              --jq "[.[].databaseId] | map(select(. > ${before})) | min // empty") && [ -n "$run" ]; do
+  sleep 3
+done
+gh run watch "$run"
 ```
+
+Run IDs increase, so "the lowest id greater than the one that existed before I dispatched" is this dispatch's run even when others queue behind it. Capture `before` **before** the `gh workflow run` in Step 3.
 
 Then report to the user: the tag, its URL, and that `release.yml` is now running and will generate the release notes from the fragments. `ci.yml` also runs against the tagged tree, because the pin commit deliberately carries no skip marker — a red there is worth surfacing even though nothing gates on it.
 
@@ -56,7 +73,7 @@ Then report to the user: the tag, its URL, and that `release.yml` is now running
 
 The workflow pushes twice — the pin commit to `main`, then the tag — so a failure between them leaves a real state. Read where it stopped before doing anything.
 
-- **It refused before the pin push** (missing `RELEASE_TOKEN`, dispatched off `main`, invalid version, tag already exists, no fragments, version mismatch, a `flake.nix` assertion). Nothing was committed, pushed or tagged. Fix the cause and dispatch again.
+- **It refused before the pin push** (missing `RELEASE_TOKEN`, dispatched off `main`, `main` moved since the SHA you inspected, invalid version, tag already exists, no fragments, version mismatch, a `flake.nix` assertion). Nothing was committed, pushed or tagged. Fix the cause and dispatch again — for the moved-`main` case that means re-running Step 1, since the fragment list you reviewed is no longer the one that would ship.
 - **The pin push was rejected because `main` advanced.** Same state as above: nothing tagged. The workflow deliberately does not rebase and retry, because a rebase would move the pin onto a tree nobody inspected whose fragments may no longer compute this version. Dispatch again; it re-derives from the new tip.
 - **The pin landed but the tag push failed.** `main` carries `chore: pin flake version to v<X.Y.Z>` and there is no tag and no release. Do not revert it. Dispatch again with the same version: the fragments are untouched so it computes the same value, the pin edit is a no-op so no second commit is made, and it retries the tag.
 - **The tag landed but `release.yml` failed.** Which recovery depends on whether its `prepare` job finished, because `prepare` commits the assembled changelog and consumes `changelog.d/`. If the fragments are still there, delete the tag (`git push origin :refs/tags/v<X.Y.Z>`) and the GitHub Release if one was created, fix the cause, and dispatch this workflow again. If the fragments are gone, the tag and the pin are already correct — re-run `release.yml` from its own `workflow_dispatch` with `version=<X.Y.Z>` instead, and do not re-dispatch this one (it would refuse with `NO_FRAGMENTS`).

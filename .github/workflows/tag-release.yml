@@ -44,6 +44,11 @@ on:
         description: 'Tag `version` even though it differs from what the fragments compute. Deliberate override only.'
         type: boolean
         default: false
+      expected_head:
+        description: "The full 40-hex SHA of main's tip as you inspected it (git rev-parse origin/main). The workflow refuses if main has moved since. Omitting it releases whatever main's tip is when the job starts."
+        required: false
+        type: string
+        default: ''
       tag_message:
         description: 'Annotated tag message. Defaults to "Release v<version>".'
         required: false
@@ -120,6 +125,45 @@ jobs:
           fetch-tags: true
           ref: main
           token: ${{ secrets.RELEASE_TOKEN }}
+
+      # The version check alone does NOT make the human checkpoint binding, and
+      # the gap is narrow enough to be easy to miss: the operator reviews a
+      # fragment list at one moment and this job checks out `main` at another, so
+      # a fragment of the SAME bump class merging in between leaves the computed
+      # version identical, passes the comparison, and ships content nobody
+      # reviewed. The version is what the operator asserts; the SHA is what binds
+      # the assertion to a tree.
+      #
+      # Refusing is the whole design here — it deliberately does not check out
+      # the older SHA instead. The pin commit has to land on `main`, so building
+      # on a superseded tip would either need a non-fast-forward push or would
+      # tag a commit that is not on the branch. Re-deriving against the new tip
+      # is the operator's call, not this workflow's.
+      - name: Bind the release to the tree the operator inspected
+        env:
+          EXPECTED_HEAD: ${{ inputs.expected_head }}
+        run: |
+          set -euo pipefail
+          export LC_ALL=C
+          HEAD_SHA=$(git rev-parse HEAD)
+          echo "main is at ${HEAD_SHA}"
+          if [ -z "${EXPECTED_HEAD}" ]; then
+            echo "::warning::expected_head was not supplied, so this release is bound to whatever main's tip is right now rather than to the tree whose fragments were reviewed. A fragment of the same bump class landing in between leaves the computed version identical, so the version check below would not notice. The /tag-release skill always passes it."
+            exit 0
+          fi
+          # Enumerated ASCII, anchored: an exact 40-hex object name and nothing
+          # else. A short SHA is refused rather than resolved, because the whole
+          # point is an exact comparison against a value the operator recorded.
+          if [[ ! "${EXPECTED_HEAD}" =~ ^[0123456789abcdefABCDEF]{40}$ ]]; then
+            printf 'Rejected expected_head (escaped): %q\n' "${EXPECTED_HEAD}" >&2
+            echo "::error::Refusing to release: expected_head must be a full 40-character hex SHA (git rev-parse origin/main). The escaped value is in this step's log."
+            exit 1
+          fi
+          if [ "${EXPECTED_HEAD}" != "${HEAD_SHA}" ]; then
+            echo "::error::Refusing to release: main is at ${HEAD_SHA} but you inspected ${EXPECTED_HEAD}. Something merged in between, so this release would carry fragments nobody reviewed. Re-run analyze.sh against the new tip and dispatch again. Nothing has been committed or tagged."
+            exit 1
+          fi
+          echo "main's tip matches the inspected tree."
 
       - name: Validate the requested version
         id: input
@@ -233,6 +277,14 @@ jobs:
             fi
           fi
           echo "computed=${COMPUTED}" >> "$GITHUB_OUTPUT"
+          # On the record in the run's own summary: which fragments this release
+          # actually carried, as read from the tree being tagged rather than from
+          # the operator's earlier local run.
+          {
+            echo "### Fragments in this release"
+            echo ""
+            sed -n '/^FRAGMENTS:$/,$p' "${ANALYSIS}" | tail -n +2 | sed 's/^  /- `/; s/$/`/'
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Pin the flake version
         env:
@@ -316,10 +368,18 @@ jobs:
           # a `git log | grep -q` pipeline: `grep -q` exits on its first match,
           # which can SIGPIPE the writer, and under `pipefail` that turns a
           # successful match into a non-zero pipeline — i.e. "no marker found"
-          # exactly when one was. All five of GitHub's documented markers are
-          # listed; `analyze.sh`'s SKIP_CI is a narrower, advisory heuristic.
+          # exactly when one was.
+          #
+          # GitHub documents TWO ways to skip a run and both have to be here: the
+          # five bracket markers anywhere in the message, and a `skip-checks:
+          # true` TRAILER. The trailer is matched anywhere rather than only as a
+          # real trailer block, which errs toward inserting a preparation commit
+          # that was not strictly needed — harmless — instead of tagging a commit
+          # that silently never triggers the release. `analyze.sh`'s SKIP_CI is a
+          # narrower, advisory heuristic; this is the binding check.
           shopt -s nocasematch
-          if [[ "${HEAD_MSG}" == *"[skip ci]"* || "${HEAD_MSG}" == *"[ci skip]"* || "${HEAD_MSG}" == *"[no ci]"* || "${HEAD_MSG}" == *"[skip actions]"* || "${HEAD_MSG}" == *"[actions skip]"* ]]; then
+          if [[ "${HEAD_MSG}" == *"[skip ci]"* || "${HEAD_MSG}" == *"[ci skip]"* || "${HEAD_MSG}" == *"[no ci]"* || "${HEAD_MSG}" == *"[skip actions]"* || "${HEAD_MSG}" == *"[actions skip]"* ]] \
+             || [[ "${HEAD_MSG}" =~ skip-checks[[:space:]]*:[[:space:]]*true ]]; then
             echo "HEAD carries a skip-ci marker, which would stop the tag push from triggering release.yml. Adding an empty preparation commit."
             git commit --allow-empty -m "chore: prepare release"
             git push origin HEAD:refs/heads/main
