@@ -2109,6 +2109,11 @@ mod tests {
     /// that also detaches.
     #[tokio::test]
     async fn an_ordinary_settings_save_does_not_retarget_the_deck() {
+        // `retarget_selection` writes the process-global applied selection, so
+        // every test here that calls it holds this for its duration (issue
+        // #1078) — otherwise a sibling's write lands between this one and the
+        // `selected_endpoint()` read that decides whether the deck moved.
+        let _selection = crate::dto::SELECTION_LOCK.lock().await;
         let state = DesktopState::default();
         let settings = DesktopSettings::default();
         // The selection in force starts as this document's, so the save below is
@@ -2171,6 +2176,7 @@ mod tests {
         use crate::settings::{EndpointId, RemoteEndpointSettings};
         use dot_agent_deck::remote_tunnel::Hostname;
 
+        let _selection = crate::dto::SELECTION_LOCK.lock().await;
         let state = DesktopState::default();
         let mut fleet = fleet_of(&["build-box.example.com", "laptop.example.com"]);
         let endpoints = fleet.endpoints.as_mut().expect("the fleet has a section");
@@ -2249,6 +2255,7 @@ mod tests {
     /// from writing its handle into the live claim.
     #[tokio::test]
     async fn a_watcher_whose_task_has_ended_does_not_hold_the_deck_hostage() {
+        let _selection = crate::dto::SELECTION_LOCK.lock().await;
         let state = DesktopState::default();
         let fleet = fleet_of(&["build-box.example.com"]);
         let deck = fleet
@@ -2391,6 +2398,7 @@ mod tests {
     async fn the_fleet_keeps_every_observed_decks_transport_and_one_selection_keeps_one() {
         use crate::settings::{EndpointSettings, Selection};
 
+        let _selection = crate::dto::SELECTION_LOCK.lock().await;
         let state = DesktopState::default();
         let fleet = fleet_of(&["build-box.example.com", "laptop.example.com"]);
         let observed = fleet.connectable_endpoints();
@@ -2447,6 +2455,7 @@ mod tests {
     /// survives with them — `retain` over the grown set still names it.
     #[tokio::test]
     async fn growing_the_fleet_does_not_retarget_the_deck_screen() {
+        let _selection = crate::dto::SELECTION_LOCK.lock().await;
         let state = DesktopState::default();
         let one = fleet_of(&["build-box.example.com"]);
         retarget_selection(&state, &one).await;
@@ -2512,6 +2521,7 @@ mod tests {
     /// snapshot.
     #[tokio::test]
     async fn a_deck_that_leaves_the_fleet_stops_being_watched() {
+        let _selection = crate::dto::SELECTION_LOCK.lock().await;
         let state = DesktopState::default();
         let fleet = fleet_of(&["build-box.example.com", "laptop.example.com"]);
         for endpoint in fleet.connectable_endpoints() {

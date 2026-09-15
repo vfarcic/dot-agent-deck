@@ -1478,9 +1478,15 @@ mod tests {
         let daemon = tokio::spawn(scripted_daemon(listener, vec![matching(), matching()]));
 
         let guard = ATTACH_ENV_LOCK.lock().await;
-        // SAFETY: as in `against_local_socket` — the mutation is under the lock
-        // and the prior value is restored before it is released. The selection
-        // is a process-global for the same reason and is restored with it.
+        // And the selection is a process-global too, so the writes below are
+        // under its own lock (issue #1078). Taken INSIDE `ATTACH_ENV_LOCK`
+        // rather than before it: it is the only site that holds both, so a
+        // consistent order is a free deadlock-freedom argument.
+        let _selection = crate::dto::SELECTION_LOCK.lock().await;
+        // SAFETY: as in `against_local_socket` — the mutation is under
+        // `ATTACH_ENV_LOCK` and the prior value is restored before it is
+        // released. That lock covers this variable only; the selection has its
+        // own, taken above.
         let prior = std::env::var(ATTACH_SOCKET_ENV).ok();
         unsafe { std::env::set_var(ATTACH_SOCKET_ENV, &socket) };
 
@@ -1608,6 +1614,11 @@ mod tests {
     async fn testing_an_observed_deck_keeps_its_transport() {
         let (fleet, observed) = fleet_with("build-box.example.com");
         let (_unobserved_doc, stranger) = fleet_with("not-in-the-fleet.example.com");
+        // The applied selection is a process-global (issue #1078): held for the
+        // whole test, because `release_if_not_observed` reads the observed set
+        // this writes and a sibling's write landing between the two would decide
+        // the assertion.
+        let _selection = crate::dto::SELECTION_LOCK.lock().await;
         crate::dto::apply_settings_selection(&fleet);
 
         let tunnels = EndpointTunnels::default();
