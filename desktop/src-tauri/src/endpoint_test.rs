@@ -384,9 +384,11 @@ fn apply_handshake(report: &mut EndpointTestReport, info: &HandshakeInfo) {
     // from `info.error`, which `daemon_bridge` builds with `safe_message` —
     // general category `Cc` only — around the **remote** daemon's
     // `build_version`, an unvalidated `Option<String>` on the wire. `Cf`, the
-    // bidi controls, passes straight through that. For a remote deck the
-    // stamp-mismatch sentence is the ordinary path, not an edge case: a
-    // released daemon never matches a branch build.
+    // bidi controls, passes straight through that. Issue #801 bounded the other
+    // unvalidated string in that sentence at its own render
+    // (`daemon_bridge::named_breaks`, which prints no byte outside the declared
+    // charset), and left `build_version` where F4 found it — so this scrub is
+    // still what stands between a hostile stamp and this panel.
     //
     // `strip_control_and_bidi` removes rather than escapes, so scrubbing a
     // string that is already scrubbed — `deck` is — changes nothing.
