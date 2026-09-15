@@ -239,6 +239,15 @@ def required_contexts(repo):
     read. Fail-closed on an unreadable ruleset would mean a reviewer that
     silently selects nothing at all, which is the outage this whole gate exists
     to avoid.
+
+    A ruleset that requires NOTHING is a different case and is taken at its word
+    (PR #1097 review). Falling back to the five there would reintroduce this
+    issue one level up: the reviewer would hold out for checks GitHub no longer
+    requires, and an advisory red would again withhold the approval. The cost of
+    believing it is that the gate then admits a head with a failing build, so it
+    is announced with a `::warning::` rather than passed over — the silent half
+    is what `ALLOW_NO_REQUIRED_CHECKS` in the applier script exists to prevent,
+    and a warning is the same remedy.
     """
     if repo in _REQUIRED_CACHE:
         return _REQUIRED_CACHE[repo]
@@ -253,12 +262,18 @@ def required_contexts(repo):
             )
             # Several rulesets can apply to one branch; the union is what the
             # merge button waits for. Order is fixed so the log line is stable.
-            names = sorted({c for c in rules if c})
-            if names:
-                contexts = tuple(names)
+            contexts = tuple(sorted({c for c in rules if c}))
+            if contexts:
                 # Said out loud once per run: the gate is now data rather than a
                 # constant, so a reader debugging a skip needs to see what it was.
                 print(f"required contexts, from the {target!r} ruleset: {list(contexts)}")
+            else:
+                print(
+                    "::warning::branch protection requires no status checks on "
+                    f"{target!r}, so the review gate is checking none — a head with "
+                    "a failing build is now eligible. Restore the contexts with "
+                    "scripts/apply-branch-protection.sh if this was not deliberate."
+                )
     except (OSError, RuntimeError, ValueError, KeyError, TypeError) as exc:
         print(f"::warning::could not read the required contexts from the ruleset: {exc}")
     if contexts is None:
@@ -269,6 +284,29 @@ def required_contexts(repo):
         contexts = FALLBACK_REQUIRED_CONTEXTS
     _REQUIRED_CACHE[repo] = contexts
     return contexts
+
+
+def _newest_key(run):
+    """Order two check runs sharing a name, newest last. PR #1097 review.
+
+    This used to be positional — the loop below overwrote per name, keeping
+    whichever entry came last — under a comment asserting that "re-runs append".
+    They do not, and the assertion was backwards: `GET /commits/{sha}/check-runs`
+    returns NEWEST FIRST, measured on `4afd7498`: all six of its duplicated
+    names carry their later `started_at` and higher `id` at the LOWER index —
+    indices 11 to 16 of the response hold the newer run of each pair and 17 to
+    22 the older, with no exception.
+    So the old loop kept the OLDEST run for every such name, and a check
+    re-run from red to green went on reading as red — which on a required
+    context is this issue's own symptom, arrived at by a different route.
+
+    Keyed on the data rather than on arrival order, so it does not matter which
+    way the endpoint sorts, or whether it keeps sorting that way. `started_at` is
+    ISO-8601 UTC and sorts lexicographically; `id` breaks a tie and rises with
+    creation. A run missing both sorts oldest, so a synthetic or partial record
+    never displaces a real one.
+    """
+    return (run.get("started_at") or "", run.get("id") or 0)
 
 
 def classify_check_runs(runs, required):
@@ -298,8 +336,10 @@ def classify_check_runs(runs, required):
     """
     by_name = {}
     for run in runs or ():
-        # Keep the newest entry per name; re-runs append.
-        by_name[run["name"]] = run
+        name = run["name"]
+        current = by_name.get(name)
+        if current is None or _newest_key(run) > _newest_key(current):
+            by_name[name] = run
     required = tuple(required)
     advisory = [
         f"{name}={run.get('conclusion')}"
@@ -327,7 +367,10 @@ def check_status(repo, sha):
     """`checks_green` plus the advisory failures the gate ignored."""
     runs = gh_json_paginated(
         "api", f"repos/{repo}/commits/{sha}/check-runs", "--paginate",
-        "--jq", "[.check_runs[] | {name, status, conclusion}]",
+        # `started_at` and `id` are what _newest_key orders re-runs by; without
+        # them a re-run is decided by the endpoint's sort order, which is not
+        # ours to rely on.
+        "--jq", "[.check_runs[] | {name, status, conclusion, started_at, id}]",
     )
     return classify_check_runs(runs, required_contexts(repo))
 
