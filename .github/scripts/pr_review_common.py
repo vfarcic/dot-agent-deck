@@ -1,6 +1,6 @@
 """Shared helpers for the agent PR reviewer (.github/workflows/pr-review-batch.yml).
 
-Kept in one module on purpose: REQUIRED_CONTEXTS, DENY_PATHS and DENY_PRECEDENCE
+Kept in one module on purpose: the check gate, DENY_PATHS and DENY_PRECEDENCE
 must not drift between selection and voting. If they did, a pull request could be
 selected under one policy and voted on under another — which is not hypothetical,
 since DENY_PRECEDENCE was added after exactly that happened to the truncated
@@ -12,12 +12,21 @@ import re
 import subprocess
 import sys
 
-# The contexts the `main-protected` ruleset requires. That ruleset is the source
-# of truth; read it back with `scripts/apply-branch-protection.sh status` if you
-# suspect drift. Drift in the "ruleset added one we do not list" direction would
-# be fail-OPEN, so checks_green() also rejects ANY failed check on the head, not
-# only these five.
-REQUIRED_CONTEXTS = (
+# The contexts the `main-protected` ruleset requires, as a LAST-RESORT FALLBACK.
+#
+# The live ruleset is the source of truth and `required_contexts()` below reads
+# it at run time; this tuple is only what that falls back to when the API cannot
+# be read. It is still a copy, so a linkage-check test pins it against
+# `scripts/apply-branch-protection.sh`'s REQUIRED_CHECKS default — what keeps it
+# from behaving as a third source of truth is that nothing consults it on a
+# healthy run, and the path that does prints a note saying so.
+#
+# Verified against the live ruleset on 2026-09-15: the legacy branch-protection
+# API returns nothing useful here (`required_status_checks` empty, `strict:
+# null`), because enforcement moved to a ruleset. `GET /repos/{repo}/rules/
+# branches/{branch}` is what reports it, and it agreed with these five and with
+# the applier script.
+FALLBACK_REQUIRED_CONTEXTS = (
     "build",
     "build-macos",
     "build-windows",
@@ -189,32 +198,153 @@ def gh_json_paginated(*args):
     return concat_json_documents(gh(*args))
 
 
-def checks_green(repo, sha):
-    """True when every required context succeeded and nothing else failed.
+# Memoised per process. One sweep asks about a dozen pull requests and re-reading
+# the ruleset for each would buy nothing, so this is two API calls per run rather
+# than two per pull request.
+_REQUIRED_CACHE = {}
 
-    Deliberately stricter than "the five are green": a check run that failed is
-    disqualifying even if it is not required, so that adding a required context
-    to the ruleset without updating REQUIRED_CONTEXTS fails closed rather than
-    open. A context that produced no check run at all is NOT success.
+
+def default_branch(repo):
+    """The branch a pull request here merges into, from the API rather than a
+    hardcoded "main".
+
+    `gh`, not `gh_json`: `--jq` on a string field prints it UNQUOTED, so `main`
+    is not valid JSON and `json.loads` raises on it.
     """
+    return gh("api", f"repos/{repo}", "--jq", ".default_branch").strip()
+
+
+def required_contexts(repo):
+    """The status checks branch protection actually requires, read from the live
+    ruleset.
+
+    Derived rather than hardcoded because the enforced list has already moved
+    once: the legacy branch-protection API this repository's tooling was written
+    against now returns an empty `required_status_checks` with `strict: null`,
+    and enforcement lives in the `main-protected` ruleset instead. Reading it per
+    run means the gate does not have to be kept in step with the ruleset by hand
+    — which is what makes it reasonable to gate on the required contexts ALONE
+    (see classify_check_runs) instead of on every check on the head.
+
+    Asked about the DEFAULT branch, and about nothing else, in both the selection
+    and the vote job — so both ask the same question rather than each inventing
+    its own, which is the drift this module exists to prevent. A pull request
+    targeting some other branch is therefore judged against `main`'s contexts.
+    That errs strict: no ruleset targets a feature branch here today, so deriving
+    per base branch would ask LESS of a stacked pull request than of an ordinary
+    one, and every pull request in this repository targets the default branch
+    anyway.
+
+    Falls back to FALLBACK_REQUIRED_CONTEXTS, loudly, when the API cannot be
+    read. Fail-closed on an unreadable ruleset would mean a reviewer that
+    silently selects nothing at all, which is the outage this whole gate exists
+    to avoid.
+    """
+    if repo in _REQUIRED_CACHE:
+        return _REQUIRED_CACHE[repo]
+    contexts = None
+    try:
+        target = default_branch(repo)
+        if target:
+            rules = gh_json_paginated(
+                "api", f"repos/{repo}/rules/branches/{target}", "--paginate",
+                "--jq", "[.[] | select(.type == \"required_status_checks\")"
+                        " | .parameters.required_status_checks[]? | .context]",
+            )
+            # Several rulesets can apply to one branch; the union is what the
+            # merge button waits for. Order is fixed so the log line is stable.
+            names = sorted({c for c in rules if c})
+            if names:
+                contexts = tuple(names)
+                # Said out loud once per run: the gate is now data rather than a
+                # constant, so a reader debugging a skip needs to see what it was.
+                print(f"required contexts, from the {target!r} ruleset: {list(contexts)}")
+    except (OSError, RuntimeError, ValueError, KeyError, TypeError) as exc:
+        print(f"::warning::could not read the required contexts from the ruleset: {exc}")
+    if contexts is None:
+        print(
+            "note: falling back to the hardcoded required contexts "
+            f"{list(FALLBACK_REQUIRED_CONTEXTS)} — the live ruleset reported none"
+        )
+        contexts = FALLBACK_REQUIRED_CONTEXTS
+    _REQUIRED_CACHE[repo] = contexts
+    return contexts
+
+
+def classify_check_runs(runs, required):
+    """Decide whether a head is mergeable-green. Pure, so it is testable.
+
+    Returns `(green, why, advisory_failures)`.
+
+    Gates on the REQUIRED contexts and nothing else (issue #1086). It used to
+    reject any failed check run on the head, required or not, as a fail-closed
+    hedge against the ruleset requiring a context this module did not list — and
+    that hedge cost more than it bought. Branch protection deliberately leaves
+    the other jobs out of its required list, so they do not hold the merge
+    button; but the reviewer's approval IS what satisfies the required-review
+    rule, so refusing to review on an advisory red blocked the only thing that
+    could unblock the merge. Measured on PR #1076: all five required contexts
+    green, `devbox` red on a 504 from a third-party CDN inside someone else's
+    action, and the approval withheld. The hedge is answered rather than merely
+    accepted: `required_contexts()` reads the live ruleset each run, so the list
+    is not one a human has to remember to update.
+
+    A required context that produced no check run at all is still NOT success,
+    and `skipped` still is — both unchanged from before, the second because a
+    required job may legitimately skip on a path filter.
+
+    Advisory failures are returned rather than swallowed, so the log says which
+    red the gate deliberately ignored instead of leaving the reader to guess.
+    """
+    by_name = {}
+    for run in runs or ():
+        # Keep the newest entry per name; re-runs append.
+        by_name[run["name"]] = run
+    required = tuple(required)
+    advisory = [
+        f"{name}={run.get('conclusion')}"
+        for name, run in sorted(by_name.items())
+        if name not in required
+        and (run.get("conclusion") or "").lower() in BAD_CONCLUSIONS
+    ]
+    for name in required:
+        run = by_name.get(name)
+        if run is None or run.get("status") != "completed":
+            return False, f"required context {name!r} has not concluded", advisory
+        if run.get("conclusion") not in ("success", "skipped"):
+            return (
+                False,
+                f"required context {name!r} concluded {run.get('conclusion')!r}",
+                advisory,
+            )
+    why = "all required contexts green"
+    if advisory:
+        why += f" (ignoring advisory failure(s): {', '.join(advisory)})"
+    return True, why, advisory
+
+
+def check_status(repo, sha):
+    """`checks_green` plus the advisory failures the gate ignored."""
     runs = gh_json_paginated(
         "api", f"repos/{repo}/commits/{sha}/check-runs", "--paginate",
         "--jq", "[.check_runs[] | {name, status, conclusion}]",
     )
-    by_name = {}
-    for run in runs:
-        # Keep the newest entry per name; re-runs append.
-        by_name[run["name"]] = run
-    for name in REQUIRED_CONTEXTS:
-        run = by_name.get(name)
-        if run is None or run.get("status") != "completed":
-            return False, f"required context {name!r} has not concluded"
-        if run.get("conclusion") not in ("success", "skipped"):
-            return False, f"required context {name!r} concluded {run.get('conclusion')!r}"
-    for run in by_name.values():
-        if (run.get("conclusion") or "").lower() in BAD_CONCLUSIONS:
-            return False, f"check {run['name']!r} concluded {run['conclusion']!r}"
-    return True, "all required contexts green, no failures"
+    return classify_check_runs(runs, required_contexts(repo))
+
+
+def checks_green(repo, sha):
+    """True when every context branch protection requires has succeeded.
+
+    The vote job's own re-validation, unchanged in what it asks: it re-fetches
+    the head's check runs itself rather than trusting the selection job. What
+    moved under it is the policy both jobs share — required contexts only — and
+    it has to move in both or a pull request is selected under one rule and
+    voted on under another, which is the drift this module exists to prevent.
+    The ignored advisory reds are named in the returned reason, so the vote
+    job's log still shows them.
+    """
+    green, why, _advisory = check_status(repo, sha)
+    return green, why
 
 
 def unresolved_threads(repo, pr_number):
