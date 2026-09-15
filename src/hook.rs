@@ -611,8 +611,10 @@ pub fn send_and_await_reply(json: &str) -> SocketReply {
 /// no compile-time constant can honestly bound it. The buffer term is not a
 /// fixed 1s: `dispatch_one_owned` pays one of `DELEGATE_READINESS_BUFFER`
 /// (1s), `WRAPPER_INTERFACE_READINESS_BUFFER` (5s) or
-/// `NO_SIGNAL_READINESS_BUFFER` (8s) depending on which readiness fact
-/// released the gate, and an operator can override it via
+/// `NO_SIGNAL_READINESS_BUFFER` (8s) depending on the readiness path — the
+/// 8s one is a SKIP of the wait rather than a release from it, and the 1s
+/// one also covers the timeout fallback and an unresolved agent. An
+/// operator can override the buffer via
 /// `DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS` up to
 /// `MAX_DELEGATE_READINESS_BUFFER` (30s) — a runtime value nothing here can
 /// see. The lock also has no cap on queue depth, so queued same-pane
