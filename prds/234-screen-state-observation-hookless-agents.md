@@ -4,7 +4,7 @@
 **Priority**: Medium
 **Created**: 2026-07-28
 **GitHub Issue**: [#234](https://github.com/vfarcic/dot-agent-deck/issues/234)
-**Related**: [PRD #20](20-multi-agent-support.md) (the integration-strategy seam this adds a mechanism to), [PRD #225](225-wrapper-agent-readiness-and-stable-launch-shape.md) (fixes the readiness race for Codex via native hooks; this PRD covers the hookless case #225 defers), [PRD #211](211-gemini-adapter.md) (first consumer — likely replaces its planned per-agent rule set), [PRD #212](212-aider-adapter.md) (whose log-watcher premise this PRD re-tests)
+**Related**: [PRD #20](done/20-multi-agent-support.md) (the integration-strategy seam this adds a mechanism to), [PRD #225](225-wrapper-agent-readiness-and-stable-launch-shape.md) (fixes the readiness race for Codex via native hooks; this PRD covers the hookless case #225 defers), [PRD #211](211-gemini-adapter.md) (first consumer — likely replaces its planned per-agent rule set), [PRD #212](212-aider-adapter.md) (whose log-watcher premise this PRD re-tests)
 **Feature flag**: None. Rule 9 applies to a new user-visible *surface* (pane, field, command, tab, footer, keybinding); this adds none — it improves the fidelity of status already rendered on shipped cards. A wrapper card that previously sat on a stale status will start reporting `Idle` correctly, which is a defect-class improvement, not a new surface to gate.
 **Prior art**: [`coder/agentapi`](https://github.com/coder/agentapi) (MIT), `lib/screentracker` and `lib/msgfmt/agent_readiness.go`. Technique only — see "Relationship to agentapi" for why we are not adopting the binary.
 
