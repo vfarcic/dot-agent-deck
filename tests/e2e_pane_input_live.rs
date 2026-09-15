@@ -26,6 +26,12 @@ const ERASE_PANE_NAME_SUFFIX: &str = "erase-burst-claude";
 const ERASE_KEPT_WORD: &str = "erase_keep_4c71";
 const ERASE_PAYLOAD_WORD: &str = "erase_payload_8d20";
 const ERASE_TAIL_WORD: &str = "erase_tail_9e33";
+/// Issue #876: a burst the size of a real one-shot payload. The production
+/// idle-worker prompt encodes to ~524 bytes, so a drain of it is an erase burst
+/// of that many keypresses arriving as ONE write — which is the shape a TUI's
+/// bulk-input heuristic is most likely to misread. `MAX_DRAINABLE_STRANDED_BYTES`
+/// is 1024, so this sits between the real payload and the cap.
+const ERASE_BULK_LEN: usize = 600;
 
 /// Scenario: Runtime-skip unless Claude credentials are available, then launch a genuine interactive Claude Haiku pane with project trust and allowed tools configured. Type two sentinel words at the live agent prompt, press Ctrl+W, and verify the second word disappears before returning to command mode; the same Claude pane and daemon agent must still exist.
 #[spec("prompt/pane-input/022")]
@@ -119,7 +125,7 @@ fn pane_input_022_ctrl_w_does_not_tear_down_interactive_claude() {
     );
 }
 
-/// Scenario: Runtime-skip unless Claude credentials are available, then launch a genuine interactive Claude Haiku pane with project trust and allowed tools configured. Type a sentinel word, a space and a stand-in for a daemon payload at the live agent prompt, then send exactly as many `DEL` bytes as that payload has characters — the byte sequence issue #876's drain writes. Type a third sentinel straight after and verify the prompt now reads the first word, one space and the third, which holds only if exactly the payload was erased.
+/// Scenario: Runtime-skip unless Claude credentials are available, then launch a genuine interactive Claude Haiku pane with project trust and allowed tools configured. Type a sentinel word, a space and a stand-in for a daemon payload at the live agent prompt, then send exactly as many `DEL` bytes as that payload has characters — the byte sequence issue #876's drain writes. Type a third sentinel straight after and verify the prompt now reads the first word, one space and the third, which holds only if exactly the payload was erased. Then type 600 filler characters — the size of a real one-shot payload — erase exactly that many in one write, and verify the prompt collapses back to the same two words.
 #[spec("prompt/pane-input/038")]
 #[test]
 fn pane_input_038_erase_burst_undoes_a_payload_in_a_live_claude_prompt() {
@@ -224,6 +230,21 @@ fn pane_input_038_erase_burst_undoes_a_payload_in_a_live_claude_prompt() {
     assert!(
         !grid.contains(ERASE_PAYLOAD_WORD),
         "every payload character must be gone from the live prompt; grid:\n{grid}"
+    );
+
+    // A burst the size of a REAL drain. The short one above proves the count is
+    // exact; this proves the SHAPE survives — `ERASE_BULK_LEN` erases arriving
+    // as one write, which is what draining a production idle prompt looks like
+    // and the case where a TUI that classifies bulk input heuristically could
+    // read the burst as a paste and insert it as text instead.
+    deck.send_keys(&vec![b'x'; ERASE_BULK_LEN]);
+    deck.wait_until_grid("the bulk filler in the live Claude prompt", |grid| {
+        grid.contains(&"x".repeat(40))
+    });
+    deck.send_keys(&vec![0x7fu8; ERASE_BULK_LEN]);
+    deck.wait_until_grid(
+        "a real-sized erase burst collapsed the prompt back to what preceded it",
+        |grid| grid.contains(&joined) && !grid.contains(&"x".repeat(40)),
     );
 
     deck.send_keys(b"\x04");
