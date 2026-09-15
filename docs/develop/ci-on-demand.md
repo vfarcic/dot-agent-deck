@@ -14,7 +14,9 @@ gh run watch <run-id>                  # follow it
 gh run view <run-id> --log-failed      # read only what broke
 ```
 
-`gh workflow run` prints a confirmation and exits immediately; it does **not** print the run id, and the run does not appear in `gh run list` for a few seconds after the dispatch. That gap is normal — poll rather than concluding the dispatch was rejected.
+`gh workflow run` exits as soon as the dispatch is accepted. On `gh` 2.98.0 it prints the new run's URL, and the last path segment of that URL is the run id — but the run does not show up in `gh run list` straight away. Measured for issue #896 on 2026-09-15: the list was empty immediately after the dispatch and reported the run as `queued` about eleven seconds later. Take the id from the URL, or poll the list; an empty list one second in is not a rejected dispatch.
+
+That block is not a sketch: it was run end to end against this repository on 2026-09-15 while this page was being written, from a dispatch worktree on `agent/dispatch-issue-896`, and produced run [`35025264144`](https://github.com/vfarcic/dot-agent-deck/actions/runs/35025264144).
 
 ## What a dispatch actually runs
 
