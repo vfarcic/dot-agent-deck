@@ -1147,7 +1147,10 @@ jobs:
   # `needs` lists EVERY other job, not just the five required contexts. A red
   # `nix`, `devbox`, `desktop-web`, `desktop-browser` or `windows-cross-check`
   # also means main is broken; which checks a ruleset happens to require is a
-  # separate question from whether main builds.
+  # separate question from whether main builds. That list is enumerated by hand
+  # and nothing enforces it, so ADD A NEW JOB HERE WHEN YOU ADD ONE ABOVE — a job
+  # missing from `needs` is a job whose failure notifies nobody, which is the
+  # defect this whole job exists to fix, reintroduced one job at a time.
   #
   # NEVER FAILS THE BUILD. `scripts/notify.sh` always exits 0 — a lost
   # notification is not a workflow event (see its header) — and nothing here
