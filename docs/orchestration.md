@@ -575,6 +575,18 @@ git worktree add ../myproject-feature-x -b feature-x
 
 If your project vendors the `/worktree-prd` skill (from [dot-ai](https://github.com/vfarcic/dot-ai)), ask an agent in the deck to run it and it creates the worktree and branch for you. Then open a new orchestration tab with `Ctrl+n` and point the directory field at the worktree.
 
+#### Writing something that outlives the worktree
+
+A worktree is temporary — closing a dispatched unit's tab removes its copy, and `dot-agent-deck worktree reclaim` removes one whose branch has merged — so anything a worker leaves inside it goes with it. Reports, findings, and artifacts you want to keep belong in the **main checkout** — the original clone the worktrees were cut from.
+
+Every pane the deck spawns is told where that is, in `DOT_AGENT_DECK_MAIN_WORKTREE`. A role prompt can use it directly, and no task has to carry the path:
+
+```
+Write your findings to $DOT_AGENT_DECK_MAIN_WORKTREE/.dot-agent-deck/findings-<role>.md
+```
+
+In an ordinary checkout the variable names that checkout, so a prompt written this way works whether or not the pane happens to be in a worktree. The deck sets it only when it can actually work the answer out: where the pane's directory is not in a git repository at all, or is in a bare one, the variable is **absent** rather than a guess — so an agent that finds it unset knows the deck does not know, rather than being pointed somewhere wrong. Handle that the way you would any unset variable if your prompt depends on it.
+
 ### Same-directory orchestrations are discouraged
 
 Opening a second orchestration in a directory that already runs one is allowed, and routing stays correct — but two resources cannot be partitioned, no matter what the deck does:

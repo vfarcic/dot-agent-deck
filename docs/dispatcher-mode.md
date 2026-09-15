@@ -94,6 +94,8 @@ There is no way to point a unit at some other starting point, so whatever that b
 
 Closing a unit's tab removes that unit's copy of the repo. Your own repository is never touched. Closing the dispatcher pane itself removes nothing — it never owned a copy.
 
+So anything a unit should leave behind has to be written outside its copy. Every unit is told where your original checkout is, in `DOT_AGENT_DECK_MAIN_WORKTREE` — ask for a report at `$DOT_AGENT_DECK_MAIN_WORKTREE/…` and it survives the tab closing. See [writing something that outlives the worktree](orchestration.md#writing-something-that-outlives-the-worktree).
+
 If a unit still has **uncommitted changes**, closing it leaves its directory on disk instead of deleting it, so the work is recoverable. A leftover directory costs disk space; a deleted one costs work.
 
 The close confirmation tells you when that is about to happen, and where: before you answer it, the dialog names the directory the work would be kept in. That warning is a forecast — the unit is still running while you read it, so it can commit its work between the dialog and the close — so the deck checks again once the unit has actually stopped, and the status line afterwards reports what really happened. A unit whose copy turned out to be clean is simply removed and nothing is said, which is why the message appearing is worth reading. If you dismiss the status line and want the path back, `dot-agent-deck worktree list` reports every worktree the deck knows about.

@@ -51,6 +51,15 @@
 //! that it exists, and that it is not empty. The length is not a format
 //! check and cannot go stale the way a parse can; it is there only so the
 //! zero-byte residue of a torn write does not read as a claim.
+//!
+//! One thing here is not about the marker: [`main_worktree_of`] (issue #550),
+//! which answers "which checkout outlives this worktree". It lives beside
+//! [`git_dir_of`] because it is that function's exact sibling — the same
+//! `rev-parse` shape, the same byte-exact [`path_from_bytes`] /
+//! [`trim_trailing_newline`] handling, the same join of a relative answer, the
+//! same fail-closed `None`. Re-deriving that machinery somewhere else is how
+//! two readings of git's geometry drift apart, which is the failure this
+//! module's first paragraph is already about.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -108,9 +117,31 @@ fn trim_trailing_newline(bytes: &[u8]) -> &[u8] {
 /// bare `.git` — for a main checkout), so the writer and the reader compute
 /// the same path for a worktree whose name is not valid UTF-8.
 pub fn git_dir_of(worktree_path: &Path) -> Option<PathBuf> {
+    rev_parse_path(worktree_path, "--git-dir")
+}
+
+/// Run `git rev-parse <flag>` from inside `dir` and return the single path it
+/// answers with, or `None` on any failure at all — `git` missing, `dir` gone,
+/// a non-zero exit, an empty answer.
+///
+/// One flag per invocation on purpose. `rev-parse` happily takes several and
+/// answers one line each, but splitting that output on `\n` is only safe for
+/// paths that contain no newline, and this module went to the trouble of
+/// reading git's bytes verbatim ([`path_from_bytes`], [`trim_trailing_newline`])
+/// precisely so a path it cannot round-trip through `String` still resolves.
+/// Trimming exactly one trailing newline from a single-value answer keeps that
+/// property; splitting a multi-value one gives it up. The cost is a process per
+/// flag, on paths that run at pane spawn and at reclaim time — never in a loop.
+///
+/// Joined against `dir` when git answers relatively (it does for `--git-dir`
+/// and `--git-common-dir` in a main checkout — a bare `.git` — and for
+/// `--git-common-dir` from a subdirectory, where the answer is `../../.git`
+/// relative to the *process* cwd). `--show-toplevel` is always absolute, so
+/// the join is a no-op there.
+fn rev_parse_path(dir: &Path, flag: &str) -> Option<PathBuf> {
     let out = Command::new("git")
-        .current_dir(worktree_path)
-        .args(["rev-parse", "--git-dir"])
+        .current_dir(dir)
+        .args(["rev-parse", flag])
         .output()
         .ok()?;
     if !out.status.success() {
@@ -120,12 +151,113 @@ pub fn git_dir_of(worktree_path: &Path) -> Option<PathBuf> {
     if raw.is_empty() {
         return None;
     }
-    let git_dir = path_from_bytes(raw);
-    Some(if git_dir.is_absolute() {
-        git_dir
+    let path = path_from_bytes(raw);
+    Some(if path.is_absolute() {
+        path
     } else {
-        worktree_path.join(git_dir)
+        dir.join(path)
     })
+}
+
+/// Whether two paths name the same existing directory, compared through
+/// [`std::fs::canonicalize`] so `..` segments and symlinks cannot make equal
+/// directories compare unequal — `--git-common-dir` answered from a
+/// subdirectory is literally `../../.git`, which never matches `--git-dir`'s
+/// `/repo/.git` textually.
+///
+/// Fails closed: a path that cannot be canonicalized (gone, unreadable) is
+/// never "the same as" anything, so an unresolvable comparison can only make
+/// [`main_worktree_of`] return `None`, never make it return a wrong path.
+/// Comparison only — the canonical forms are deliberately discarded rather
+/// than returned, so a checkout reached through a symlink keeps the spelling
+/// git itself reports.
+fn same_dir(a: &Path, b: &Path) -> bool {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
+/// The root of the **main worktree** of the repository `dir` belongs to — the
+/// checkout that outlives every linked worktree cut from it (issue #550).
+///
+/// A linked worktree is temporary — closing a dispatched unit's tab removes
+/// its copy, and `dot-agent-deck worktree reclaim` removes one whose branch has
+/// merged — so an agent working in one has nowhere durable to leave a report or
+/// an artifact. This
+/// answers where that durable place is, once, at spawn, so no task has to
+/// carry the path and no role prompt has to embed a `git rev-parse`
+/// incantation. [`crate::agent_pty::DOT_AGENT_DECK_MAIN_WORKTREE`] is the one
+/// consumer today.
+///
+/// **Fail-closed, and that is the point.** Every unresolvable case returns
+/// `None` rather than a best guess, so a consumer can tell "the deck could not
+/// work out where the main checkout is" (variable absent) from "the deck
+/// believes it is here" (variable set) — a wrong path is far worse than a
+/// missing one, because the agent writes its report into it and nobody
+/// notices. `None` covers: `dir` is not in a git repository at all, `git` is
+/// not installed, and the two cases below where git's own answer is not
+/// enough to locate a main worktree.
+///
+/// How it decides, and why it is not simply `dirname` of the common dir (which
+/// is how the issue proposed it, and is wrong in two of these six layouts):
+///
+/// | layout | `--git-dir` vs `--git-common-dir` | answer |
+/// | --- | --- | --- |
+/// | ordinary checkout, from its root | same | `--show-toplevel` |
+/// | ordinary checkout, from a subdirectory | same | `--show-toplevel` |
+/// | `--separate-git-dir` main checkout | same (both the relocated store) | `--show-toplevel` |
+/// | linked worktree, default `<repo>/.git` layout | differ | the directory holding the common dir |
+/// | linked worktree of a `--separate-git-dir` repo | differ | `None` — unrecoverable |
+/// | bare repository, with or without linked worktrees | either | `None` — no working tree |
+///
+/// The `--git-dir == --git-common-dir` test is what separates "I am already in
+/// the main worktree" from "I am in a linked one". In the first case git
+/// itself has the answer: `--show-toplevel`, which is right even from a
+/// subdirectory and even when the repository's store was relocated with
+/// `--separate-git-dir`, where the common dir's parent is not the checkout at
+/// all. In a bare repository the two also match, and `--show-toplevel` fails
+/// with "this operation must be run in a work tree" — which is exactly the
+/// `None` a bare repository should produce.
+///
+/// In the second case the main worktree is the directory that *holds* the
+/// common dir, because a linked worktree's admin dir always lives at
+/// `<common-dir>/worktrees/<name>`. That inference is then **proved rather
+/// than trusted**: the candidate's own `--git-dir` has to be the common dir.
+/// Two real layouts fail that check and correctly yield `None` — a linked
+/// worktree of a repository whose store was relocated (the store's parent is
+/// some unrelated directory, and git keeps no back-pointer from the store to
+/// the checkout, so the main worktree is genuinely unrecoverable from here),
+/// and a linked worktree of a *bare* repository (which has no main worktree to
+/// find). Without the proof both would inject a confidently wrong path.
+///
+/// A submodule's checkout answers "same" and so resolves to the submodule's
+/// own root rather than the superproject's. That is deliberate: the submodule
+/// checkout is a durable directory, which is what the caller is asking for.
+///
+/// **What it costs, measured rather than assumed**: three `git rev-parse`
+/// processes for a main worktree and four for a linked one. On a 16-core box
+/// with every core saturated by concurrent agent work, the four-call path
+/// takes 31–39ms; on an idle one it is a third of that. That is spent once per
+/// pane spawn, inside [`crate::agent_pty::spawn`], which already blocks its
+/// caller on `openpty` plus a real `fork`/`exec` and is followed by an agent
+/// CLI that takes seconds to boot — so it is not a hot path, and it is not
+/// worth a cache whose staleness would have to be reasoned about every time a
+/// worktree moved. One flag per process is deliberate; [`rev_parse_path`] has
+/// the reason.
+pub fn main_worktree_of(dir: &Path) -> Option<PathBuf> {
+    let git_dir = git_dir_of(dir)?;
+    let common = rev_parse_path(dir, "--git-common-dir")?;
+
+    if same_dir(&git_dir, &common) {
+        return rev_parse_path(dir, "--show-toplevel");
+    }
+
+    let candidate = common.parent()?;
+    if !same_dir(&git_dir_of(candidate)?, &common) {
+        return None;
+    }
+    rev_parse_path(candidate, "--show-toplevel")
 }
 
 /// Where this worktree's marker file is, or would be. `None` for the same
@@ -592,6 +724,290 @@ mod tests {
             matches!(err, MarkerWriteError::ClaimRemains(_)),
             "a non-empty file at the marker path IS read as this deck's claim, whoever wrote \
              it, so the warning must not promise a prompt; got {err:?}"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // Issue #550 — `main_worktree_of`. The value gets injected into every
+    // spawned agent's environment, so a WRONG answer is silently written into
+    // by whatever agent trusts it. Each layout below is therefore asserted
+    // either to the exact directory or to `None`; there is no third outcome.
+    // ---------------------------------------------------------------------
+
+    /// Run a git command in `dir`, asserting it succeeded. Identity is passed
+    /// per-invocation rather than configured, so the fixture does not depend
+    /// on (or write to) any ambient git configuration.
+    fn git_in(dir: &Path, args: &[&str]) {
+        let out = Command::new("git")
+            .current_dir(dir)
+            .args([
+                "-c",
+                "user.email=t@t.t",
+                "-c",
+                "user.name=T",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .output()
+            .unwrap_or_else(|e| panic!("run git {args:?}: {e}"));
+        assert!(
+            out.status.success(),
+            "fixture precondition: `git {args:?}` in {} failed: {}",
+            dir.display(),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// An ordinary checkout with one commit, so `git worktree add` has a
+    /// commit-ish to branch from.
+    fn checkout_with_a_commit(at: &Path) {
+        std::fs::create_dir_all(at).expect("create the fixture checkout dir");
+        git_in(at, &["init", "--quiet"]);
+        git_in(at, &["commit", "--quiet", "--allow-empty", "-m", "init"]);
+    }
+
+    /// Compare through `canonicalize`: on macOS the temp root is reached via a
+    /// symlink (`/tmp` → `/private/tmp`), and git reports the resolved
+    /// spelling while `TempDir` hands back the symlinked one.
+    fn canon(p: &Path) -> PathBuf {
+        std::fs::canonicalize(p).unwrap_or_else(|e| panic!("canonicalize {}: {e}", p.display()))
+    }
+
+    /// The ordinary case, and the one that makes the variable safe to read
+    /// unconditionally: a pane that is NOT in a linked worktree still gets a
+    /// durable checkout rather than nothing, so a role prompt can use
+    /// `$DOT_AGENT_DECK_MAIN_WORKTREE` without branching on which it is.
+    #[test]
+    fn main_worktree_of_answers_the_checkout_itself_for_an_ordinary_repo() {
+        let scratch = crate::test_temp::tempdir().expect("scratch tempdir");
+        let repo = scratch.path().join("repo");
+        checkout_with_a_commit(&repo);
+
+        let got = main_worktree_of(&repo).expect("an ordinary checkout IS a main worktree");
+        assert_eq!(canon(&got), canon(&repo));
+    }
+
+    /// A pane's cwd is routinely a subdirectory rather than the repo root, and
+    /// git answers `--git-common-dir` RELATIVELY from one (`../../.git`) — so
+    /// this is the case that would break a naive textual comparison against
+    /// `--git-dir`'s absolute answer, and the reason `same_dir` canonicalizes.
+    #[test]
+    fn main_worktree_of_answers_the_checkout_root_from_a_subdirectory() {
+        let scratch = crate::test_temp::tempdir().expect("scratch tempdir");
+        let repo = scratch.path().join("repo");
+        checkout_with_a_commit(&repo);
+        let deep = repo.join("a/b/c");
+        std::fs::create_dir_all(&deep).expect("create a nested subdirectory");
+
+        let got = main_worktree_of(&deep).expect("a subdirectory resolves like its checkout");
+        assert_eq!(
+            canon(&got),
+            canon(&repo),
+            "the ROOT of the checkout, not the subdirectory the pane happens to sit in"
+        );
+    }
+
+    /// The case the feature exists for: an agent working in a linked worktree
+    /// is told where the checkout that outlives it is. The worktree is created
+    /// OUTSIDE the repo (a sibling), which is how this repo's own tooling
+    /// places them, so a passing assertion cannot be an accident of nesting.
+    #[test]
+    fn main_worktree_of_answers_the_main_checkout_from_a_linked_worktree() {
+        let scratch = crate::test_temp::tempdir().expect("scratch tempdir");
+        let repo = scratch.path().join("repo");
+        checkout_with_a_commit(&repo);
+        let linked = scratch.path().join("repo-feature");
+        git_in(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                "feature",
+                &linked.to_string_lossy(),
+            ],
+        );
+
+        let got = main_worktree_of(&linked).expect("a linked worktree has a main worktree");
+        assert_eq!(
+            canon(&got),
+            canon(&repo),
+            "a linked worktree must resolve to the MAIN checkout, never to itself — \
+             resolving to itself is the stall this exists to remove, dressed as a success"
+        );
+        assert_ne!(canon(&got), canon(&linked));
+    }
+
+    /// A bare repository has no working tree at all, so there is nothing
+    /// durable to point at. `--git-dir` and `--git-common-dir` both answer the
+    /// bare directory, and its PARENT — what the issue proposed returning — is
+    /// some unrelated directory that would be handed to an agent as a place to
+    /// write.
+    #[test]
+    fn main_worktree_of_is_none_for_a_bare_repository() {
+        let scratch = crate::test_temp::tempdir().expect("scratch tempdir");
+        let bare = scratch.path().join("repo.git");
+        std::fs::create_dir_all(&bare).expect("create the fixture bare dir");
+        git_in(&bare, &["init", "--quiet", "--bare"]);
+
+        assert_eq!(
+            main_worktree_of(&bare),
+            None,
+            "a bare repository has no working tree; the parent of its git dir is not one"
+        );
+    }
+
+    /// A bare repository CAN have linked worktrees, and they take the "differ"
+    /// branch — where the candidate is the bare repo's parent directory. The
+    /// proof step is the only thing standing between that and a wrong answer.
+    #[test]
+    fn main_worktree_of_is_none_for_a_linked_worktree_of_a_bare_repository() {
+        let scratch = crate::test_temp::tempdir().expect("scratch tempdir");
+        let seed = scratch.path().join("seed");
+        checkout_with_a_commit(&seed);
+        let bare = scratch.path().join("repo.git");
+        git_in(
+            &seed,
+            &["clone", "--quiet", "--bare", ".", &bare.to_string_lossy()],
+        );
+        let linked = scratch.path().join("bare-worktree");
+        git_in(
+            &bare,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                "feature",
+                &linked.to_string_lossy(),
+            ],
+        );
+
+        assert_eq!(
+            main_worktree_of(&linked),
+            None,
+            "the bare repo's parent is the fixture scratch dir — a directory an agent would \
+             have been told to write its durable report into"
+        );
+    }
+
+    /// `git init --separate-git-dir` relocates the store, so the common dir's
+    /// parent is NOT the checkout. The main-worktree branch still resolves it
+    /// correctly because git itself is asked (`--show-toplevel`) rather than
+    /// the path being derived.
+    #[test]
+    fn main_worktree_of_answers_the_checkout_of_a_relocated_store() {
+        let scratch = crate::test_temp::tempdir().expect("scratch tempdir");
+        let checkout = scratch.path().join("checkout");
+        let store = scratch.path().join("store");
+        std::fs::create_dir_all(&checkout).expect("create the fixture checkout dir");
+        git_in(
+            &checkout,
+            &[
+                "init",
+                "--quiet",
+                &format!("--separate-git-dir={}", store.display()),
+            ],
+        );
+        git_in(
+            &checkout,
+            &["commit", "--quiet", "--allow-empty", "-m", "i"],
+        );
+
+        let got = main_worktree_of(&checkout).expect("a relocated store still has a checkout");
+        assert_eq!(
+            canon(&got),
+            canon(&checkout),
+            "the checkout, not the store and not the store's parent"
+        );
+    }
+
+    /// The layout with no answer: from a linked worktree of a repository whose
+    /// store was relocated, git keeps no back-pointer from the store to the
+    /// main checkout, so the main worktree is genuinely unrecoverable. Both
+    /// techniques the issue considered return a confidently wrong path here
+    /// (`dirname` of the common dir gives the store's parent; `git worktree
+    /// list --porcelain` reports the store itself as the first worktree).
+    /// Unset is the only honest answer.
+    #[test]
+    fn main_worktree_of_is_none_for_a_linked_worktree_of_a_relocated_store() {
+        let scratch = crate::test_temp::tempdir().expect("scratch tempdir");
+        let checkout = scratch.path().join("checkout");
+        let store = scratch.path().join("store");
+        std::fs::create_dir_all(&checkout).expect("create the fixture checkout dir");
+        git_in(
+            &checkout,
+            &[
+                "init",
+                "--quiet",
+                &format!("--separate-git-dir={}", store.display()),
+            ],
+        );
+        git_in(
+            &checkout,
+            &["commit", "--quiet", "--allow-empty", "-m", "i"],
+        );
+        let linked = scratch.path().join("linked");
+        git_in(
+            &checkout,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                "feature",
+                &linked.to_string_lossy(),
+            ],
+        );
+
+        assert_eq!(
+            main_worktree_of(&linked),
+            None,
+            "the store's parent is the fixture scratch dir, which is not a checkout — \
+             answering it would be worse than answering nothing"
+        );
+    }
+
+    /// The plainest fail-closed case, and the one a consumer relies on to tell
+    /// "not a git worktree" from "wrong path": a directory in no repository at
+    /// all yields nothing.
+    #[test]
+    fn main_worktree_of_is_none_outside_any_repository() {
+        let scratch = crate::test_temp::tempdir().expect("scratch tempdir");
+        let plain = scratch.path().join("plain");
+        std::fs::create_dir_all(&plain).expect("create a non-repo dir");
+
+        // Asserted, not assumed. If the temp root itself sat inside a
+        // repository (or this process carries an ambient `GIT_DIR`), the case
+        // below would not be the one this test claims to cover — fail loudly
+        // rather than pass for the wrong reason.
+        let discovery = Command::new("git")
+            .current_dir(&plain)
+            .args(["rev-parse", "--git-dir"])
+            .output()
+            .expect("run git rev-parse");
+        assert!(
+            !discovery.status.success(),
+            "fixture precondition: {} unexpectedly resolves to a git dir, so this test would \
+             not be exercising the no-repository case",
+            plain.display()
+        );
+
+        assert_eq!(main_worktree_of(&plain), None);
+    }
+
+    /// A cwd that no longer exists resolves to nothing rather than to
+    /// whatever the resolving process's own cwd happens to be — the daemon
+    /// runs in a checkout of this repo often enough that "falls back to mine"
+    /// would look convincing and be wrong.
+    #[test]
+    fn main_worktree_of_is_none_for_a_directory_that_is_gone() {
+        let scratch = crate::test_temp::tempdir().expect("scratch tempdir");
+        assert_eq!(
+            main_worktree_of(&scratch.path().join("never-created")),
+            None
         );
     }
 }
