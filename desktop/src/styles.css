@@ -194,7 +194,7 @@
     --violet-soft: #29223a;
     /* Live status. Unchanged: these were already picked to read against the dark */
     /* instrument chrome, and every one of their call sites is on it -- the rail's */
-    /* connection lamp, the composer's caution/error lines, the check rows. */
+    /* connection lamp, the terminal input-state notices, the check rows. */
     --status-ok: #6db58b;
     --status-warn: #c69a4e;
     --status-error: #d0685f;
@@ -298,7 +298,7 @@
   --violet-soft: #29223a;
   /* Live status. Unchanged: these were already picked to read against the dark */
   /* instrument chrome, and every one of their call sites is on it -- the rail's */
-  /* connection lamp, the composer's caution/error lines, the check rows. */
+  /* connection lamp, the terminal input-state notices, the check rows. */
   --status-ok: #6db58b;
   --status-warn: #c69a4e;
   --status-error: #d0685f;
@@ -504,32 +504,23 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .agent-tabs button:hover, .agent-tabs button.is-active { color: var(--shell-ink); }
 .agent-tabs button.is-active { border-bottom-color: var(--shell-teal); }
 .agent-panel { min-height: 320px; height: 42vh; max-height: 560px; display: flex; flex-direction: column; background: var(--terminal); }
-/* The terminal fills whatever the composer leaves; min-height:0 lets it shrink
-   instead of shoving the composer past the tile's overflow:hidden edge. A
-   bounded terminal also makes FitAddon report real rows to the PTY, so the
+/* The terminal fills whatever the input-state notice leaves; min-height:0 lets
+   it shrink instead of shoving that line past the tile's overflow:hidden edge.
+   A bounded terminal also makes FitAddon report real rows to the PTY, so the
    CLI's own input line stays on screen. */
 .agent-terminal-stack { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; }
 .terminal-viewport { flex: 1 1 auto; min-height: 120px; }
 .terminal-viewport, .terminal-host { width: 100%; }
 .terminal-host { height: 100%; }
 .terminal-viewport { padding: 6px 4px 3px 8px; overflow: hidden; }
-/* Always-visible external prompt box, pinned below the terminal. */
-.agent-composer { flex: 0 0 auto; display: flex; flex-direction: column; gap: 4px; padding: 7px 9px 8px; border-top: 1px solid var(--shell-line); background: var(--paper-strong); }
-.agent-composer.is-coordinator { background: var(--shell); border-top-color: var(--shell-teal-edge); }
-.composer-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
-.composer-title { color: var(--faint); font-size: 8px; font-weight: 800; letter-spacing: .1em; text-transform: uppercase; }
-.composer-prompt-picker { display: flex; align-items: center; gap: 3px; color: var(--faint); }
-.composer-prompt-picker select { border: 1px solid var(--line-strong); border-radius: 5px; padding: 1px 4px; color: var(--ink); background: var(--paper); font-size: 9px; }
-.agent-composer textarea { width: 100%; resize: none; padding: 6px 8px; border: 1px solid var(--line-strong); border-radius: 6px; color: var(--ink); background: var(--paper); font-family: "JetBrains Mono", "SFMono-Regular", Consolas, monospace; font-size: 11.5px; line-height: 1.45; }
-.agent-composer textarea:focus { outline: none; border-color: var(--teal-focus); box-shadow: 0 0 0 1px var(--teal-focus); }
-.agent-composer textarea:disabled { opacity: .55; cursor: not-allowed; }
-.composer-actions { display: flex; align-items: center; gap: 8px; }
-.composer-spacer { flex: 1 1 auto; }
-.composer-caution { display: flex; align-items: center; gap: 4px; color: var(--status-warn); font-size: 8px; line-height: 1.3; }
-.composer-error { display: flex; align-items: center; gap: 4px; color: var(--status-error); font-size: 8.5px; }
-.composer-status { display: flex; align-items: center; gap: 4px; margin: 0; font-size: 9px; }
-.composer-status.is-delivered { color: var(--status-ok); }
-.composer-status.is-failed { color: var(--status-error); }
+/* Issue #1042 — the terminal's own delivery state, pinned under the pane it
+   describes. A blocked pane dims its terminal so the disabled input reads as
+   disabled rather than as an agent that has gone quiet. */
+.terminal-input-status { flex: 0 0 auto; margin: 0; padding: 5px 9px 6px; display: flex; align-items: flex-start; gap: 5px; border-top: 1px solid var(--shell-line); background: var(--shell); font-size: 9px; line-height: 1.35; }
+.terminal-input-status svg { flex: 0 0 auto; margin-top: 1px; }
+.terminal-input-status.is-blocked { color: var(--status-error); }
+.terminal-input-status.is-unconfirmed { color: var(--status-warn); }
+.terminal-viewport[aria-disabled="true"] { opacity: .62; }
 .button.compact { padding: 3px 9px; font-size: 10px; gap: 4px; }
 
 /* ---- Output Reader: a large readable rendering of an agent's CLI output ---- */
@@ -547,9 +538,8 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .reader-tail.is-live { color: var(--shell-teal); background: var(--shell-teal-surface); }
 .reader-scroll { flex: 1 1 auto; min-height: 0; overflow: auto; overscroll-behavior: contain; padding: 18px 26px 22px; scrollbar-color: var(--shell-thumb) var(--shell-deep); scrollbar-width: thin; }
 .reader-text { margin: 0; white-space: pre-wrap; word-break: break-word; color: var(--shell-ink); font-family: "JetBrains Mono", "SFMono-Regular", Consolas, monospace; font-size: 13.5px; line-height: 1.7; user-select: text; }
-.reader-jump { position: absolute; bottom: 148px; left: 50%; transform: translateX(-50%); display: flex; align-items: center; gap: 6px; padding: 6px 14px; border: 1px solid var(--shell-teal-edge); border-radius: 16px; color: var(--shell-teal-text-strong); background: var(--shell); cursor: pointer; font-size: 10.5px; box-shadow: 0 6px 18px rgb(var(--scrim-rgb) / .4); }
+.reader-jump { position: absolute; bottom: 26px; left: 50%; transform: translateX(-50%); display: flex; align-items: center; gap: 6px; padding: 6px 14px; border: 1px solid var(--shell-teal-edge); border-radius: 16px; color: var(--shell-teal-text-strong); background: var(--shell); cursor: pointer; font-size: 10.5px; box-shadow: 0 6px 18px rgb(var(--scrim-rgb) / .4); }
 .reader-jump:hover { background: var(--shell-teal-surface); }
-.reader-panel .agent-composer { border-top: 1px solid var(--shell-line); }
 .terminal-host .xterm { height: 100%; }
 .terminal-host .xterm-viewport { scrollbar-color: var(--shell-thumb) var(--terminal); scrollbar-width: thin; }
 .text-panel { width: 100%; height: 100%; padding: 10px; overflow: auto; color: var(--shell-ink); background: var(--terminal); font-size: 9px; }

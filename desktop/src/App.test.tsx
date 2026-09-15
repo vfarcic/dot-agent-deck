@@ -4,10 +4,25 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createFixtureSnapshot } from "./data/fixture";
 import { WINDOWS_WORKFLOW_BLOCK_REASON } from "./lib/platform";
 import { DEFAULT_DESKTOP_SETTINGS, type DesktopSettingsDto } from "./lib/bridge";
-import type { AgentSession, DaemonOrchestration, DaemonProject, DaemonResolvedProject, DeckRuntimeState } from "./types";
+import type { AgentSession, DaemonOrchestration, DaemonProject, DaemonResolvedProject, DeckRuntimeState, SendResult } from "./types";
 
 vi.mock("./components/TerminalViewport", () => ({
-  TerminalViewport: ({ agentId }: { agentId: string }) => <pre data-testid={`terminal-${agentId}`}>terminal</pre>,
+  TerminalViewport: ({ agentId, label, inputState, readOnly = false }: {
+    agentId: string;
+    label: string;
+    inputState?: SendResult;
+    readOnly?: boolean;
+  }) => (
+    <div
+      data-testid={`terminal-${agentId}`}
+      data-input-state={inputState}
+      role="group"
+      aria-label={`${label} terminal`}
+      aria-disabled={readOnly}
+    >
+      <textarea className="xterm-helper-textarea" aria-label={`${label} terminal input`} disabled={readOnly} />
+    </div>
+  ),
 }));
 
 import { ControlDeck } from "./App";
@@ -193,6 +208,143 @@ describe("ControlDeck", () => {
     expect(screen.getByTestId("agent-tile-builder")).toBeVisible();
     expect(screen.getByTestId("terminal-builder")).toBeVisible();
     expect(screen.getByTestId("evidence-drawer")).toBeVisible();
+  });
+
+  /**
+   * Scenario: render the crowded deck, including its coordinator tiles, on the
+   * default terminal tab. Each tile must expose just xterm's own input surface;
+   * the role-labelled composer, its textarea, and its Send control are absent.
+   */
+  it("mounts one terminal input per agent and no per-tile message composer", () => {
+    const snapshot = createFixtureSnapshot("crowded");
+    render(<ControlDeck runtime={runtime({ snapshot })} />);
+
+    const tiles = screen.getAllByTestId(/^agent-tile-/);
+    const terminalInputs = tiles.flatMap((tile) => Array.from(tile.querySelectorAll("textarea.xterm-helper-textarea")));
+    const secondInputs = tiles.flatMap((tile) => Array.from(tile.querySelectorAll("textarea:not(.xterm-helper-textarea)")));
+
+    expect(tiles).toHaveLength(snapshot.agents.length);
+    expect(terminalInputs).toHaveLength(snapshot.agents.length);
+    expect.soft(screen.queryAllByTestId(/^composer-/)).toHaveLength(0);
+    expect.soft(secondInputs).toHaveLength(0);
+    expect.soft(screen.queryAllByText("Message coordinator", { exact: true })).toHaveLength(0);
+    const sendControls = tiles.flatMap((tile) => within(tile).queryAllByRole("button", { name: "Send" }));
+    expect.soft(sendControls).toHaveLength(0);
+  });
+
+  /**
+   * Scenario: render a running agent whose daemon-reported write lease is live.
+   * Its terminal remains enabled, carries the applied state, and shows no
+   * input-unavailable notice.
+   */
+  it("keeps a terminal input enabled when delivery is applied", () => {
+    const id = "input-applied";
+    const snapshot = liveSnapshot([{ ...agentIn("input-applied", "/tmp/project"), status: "running", writeLease: "write" }]);
+    const deck = {
+      ...runtime({ mode: "live", snapshot }),
+      terminalInputResults: { [id]: "applied" },
+    } as DeckRuntimeState & { terminalInputResults: Record<string, SendResult> };
+    render(<ControlDeck runtime={deck} />);
+
+    const terminal = screen.getByTestId("terminal-input-applied");
+    expect(terminal).toHaveAttribute("data-input-state", "applied");
+    expect(terminal).toHaveAttribute("aria-disabled", "false");
+    expect(within(terminal).getByRole("textbox", { name: "Planner terminal input" })).toBeEnabled();
+    expect(screen.queryByTestId("terminal-input-status-input-applied")).toBeNull();
+  });
+
+  /**
+   * Scenario: render running panes that the deck classifies as history-only or
+   * without a live target. Their terminal input is disabled and a named status
+   * region explains the exact non-delivery instead of accepting keystrokes.
+   */
+  it.each([
+    ["history-only", "read", "the agent has no live pane — only its history remains"],
+    ["no-live-target", "none", "there is nothing live to write to"],
+  ] satisfies [SendResult, AgentSession["writeLease"], string][])(
+    "marks and disables terminal input for %s",
+    (inputState, writeLease, reason) => {
+      const id = `input-${inputState}`;
+      const snapshot = liveSnapshot([{ ...agentIn(id, "/tmp/project"), status: "running", writeLease }]);
+      render(<ControlDeck runtime={runtime({ mode: "live", snapshot })} />);
+
+      const terminal = screen.getByTestId(`terminal-${id}`);
+      expect.soft(terminal).toHaveAttribute("data-input-state", inputState);
+      expect.soft(terminal).toHaveAttribute("aria-disabled", "true");
+      expect.soft(within(terminal).getByRole("textbox", { name: "Planner terminal input" })).toBeDisabled();
+      const status = screen.queryByTestId(`terminal-input-status-${id}`);
+      expect(status, `missing terminal-input-status-${id}`).not.toBeNull();
+      expect(status!).toHaveAttribute("role", "status");
+      expect(status!).toHaveTextContent(`Terminal input unavailable — ${reason}.`);
+    },
+  );
+
+  /**
+   * Scenario: a running, normally writable pane receives a wrong-session
+   * delivery verdict after its session rolls over. The terminal is marked and
+   * disabled, and its status region tells the operator that the pane handle no
+   * longer maps to the current agent session.
+   */
+  it("marks and disables terminal input after a wrong-session verdict", () => {
+    const id = "input-wrong-session";
+    const snapshot = liveSnapshot([{ ...agentIn(id, "/tmp/project"), status: "running", writeLease: "write" }]);
+    const deck = {
+      ...runtime({ mode: "live", snapshot }),
+      terminalInputResults: { [id]: "wrong-session" },
+    } as DeckRuntimeState & { terminalInputResults: Record<string, SendResult> };
+    render(<ControlDeck runtime={deck} />);
+
+    const terminal = screen.getByTestId(`terminal-${id}`);
+    expect.soft(terminal).toHaveAttribute("data-input-state", "wrong-session");
+    expect.soft(terminal).toHaveAttribute("aria-disabled", "true");
+    expect.soft(within(terminal).getByRole("textbox", { name: "Planner terminal input" })).toBeDisabled();
+    const status = screen.queryByTestId(`terminal-input-status-${id}`);
+    expect(status, `missing terminal-input-status-${id}`).not.toBeNull();
+    expect(status!).toHaveAttribute("role", "status");
+    expect(status!).toHaveTextContent(
+      "Terminal input unavailable — the pane handle no longer maps to that agent's session.",
+    );
+  });
+
+  /**
+   * Scenario: open the Reader over an agent and read what it offers. Issue
+   * #1042 took the composer out of this overlay too — it was the Reader's ONLY
+   * send path rather than a duplicate of one, and a second input box floating
+   * in a reading overlay is the parallel-input surface that issue collapses. So
+   * the Reader is what its construction always said it was: read-only.
+   */
+  it("opens the Reader with no input surface of its own", () => {
+    render(<ControlDeck runtime={runtime()} />);
+    fireEvent.click(screen.getByTestId("reader-open-planner"));
+
+    const reader = screen.getByTestId("reader-planner");
+    expect(within(reader).getByRole("button", { name: /Copy all/ })).toBeVisible();
+    expect(reader.querySelectorAll("textarea")).toHaveLength(0);
+    expect(within(reader).queryAllByTestId(/^composer-/)).toHaveLength(0);
+    expect(within(reader).queryAllByRole("button", { name: "Send" })).toHaveLength(0);
+  });
+
+  /**
+   * Scenario: run the command palette's "Message coordinator…" entry. It used
+   * to focus a composer that issue #1042 deletes, so it now selects the
+   * coordinator and puts its TERMINAL on screen — the input path that carries
+   * the agent CLI's own grammar. It still sends nothing.
+   */
+  it("points the palette's coordinator entry at the coordinator's terminal", () => {
+    const coordinator = { ...agentIn("coordinator", "/tmp/project"), status: "running" as const, isStartRole: true };
+    render(<ControlDeck runtime={runtime({ mode: "live", snapshot: liveSnapshot([coordinator]) })} />);
+
+    // Off the terminal tab first, so switching back is observable rather than
+    // the default the tile already opens on.
+    const tile = screen.getByTestId("agent-tile-planner");
+    fireEvent.click(within(tile).getByRole("tab", { name: "Diff" }));
+    expect(screen.queryByTestId("terminal-coordinator")).toBeNull();
+
+    fireEvent.keyDown(document.body, { key: "k", metaKey: true });
+    fireEvent.click(screen.getByRole("button", { name: /Message coordinator/ }));
+
+    expect(screen.getByTestId("terminal-coordinator")).toBeVisible();
+    expect(screen.getByTestId("agent-tile-planner").className).toContain("is-selected");
   });
 
   /**
@@ -526,7 +678,12 @@ describe("ControlDeck", () => {
       expect(launch).not.toHaveProperty("displayPath");
     });
     // And the success notice is the escaped twin as well.
-    await waitFor(() => expect(screen.getByRole("status")).toHaveTextContent("dot-agent-deck launched with 6 configured roles."));
+    //
+    // Addressed by test id rather than by `getByRole("status")`: issue #1042
+    // put a `role="status"` line under every terminal whose pane cannot take
+    // input, so the deck now has several live regions and a bare role query is
+    // ambiguous. The assertion itself is unchanged.
+    await waitFor(() => expect(screen.getByTestId("toast")).toHaveTextContent("dot-agent-deck launched with 6 configured roles."));
     expect(document.body.textContent).not.toContain("\u0001");
   });
 
@@ -551,11 +708,13 @@ describe("ControlDeck", () => {
     fireEvent.click(screen.getByTestId("launch-live-loop"));
     fireEvent.click(screen.getAllByRole("button", { name: "Launch live loop" }).at(-1)!);
 
+    // By test id for the reason given on the launch test above: the terminals
+    // carry `role="status"` notices of their own since issue #1042.
     await waitFor(() => {
-      expect(screen.getByRole("status")).toHaveTextContent("no longer matches what the deck approved");
+      expect(screen.getByTestId("toast")).toHaveTextContent("no longer matches what the deck approved");
     });
-    expect(screen.getByRole("status")).toHaveTextContent("Nothing was started");
-    expect(screen.getByRole("status")).toHaveTextContent("launch again");
+    expect(screen.getByTestId("toast")).toHaveTextContent("Nothing was started");
+    expect(screen.getByTestId("toast")).toHaveTextContent("launch again");
     // Re-read, so the next attempt carries the project's current revision.
     expect(vi.mocked(live.resolveProject).mock.calls.length).toBeGreaterThan(resolvesAfterPick);
   });
@@ -581,8 +740,9 @@ describe("ControlDeck", () => {
     fireEvent.click(screen.getByTestId("launch-live-loop"));
     fireEvent.click(screen.getAllByRole("button", { name: "Launch live loop" }).at(-1)!);
 
+    // By test id for the reason given on the launch test above.
     await waitFor(() => {
-      expect(screen.getByRole("status")).toHaveTextContent("Launch this workflow from the TUI on that deck's own host");
+      expect(screen.getByTestId("toast")).toHaveTextContent("Launch this workflow from the TUI on that deck's own host");
     });
     expect(screen.queryByTestId("workflow-editor")).toBeNull();
     // No re-resolve: nothing about the project changed, and trying again cannot
@@ -1444,9 +1604,11 @@ describe("ControlDeck", () => {
    * keys need no teaching — that is not what the row is for.
    *
    * Note this overlay is not today a complete list of everything the app binds:
-   * `AgentComposer` distinguishes `Enter` from `Shift+Enter` and neither
-   * appears. That predates PRD #744 and is recorded as its Open Question 5
-   * rather than fixed here.
+   * the `⌘ K` row below has the same pre-existing gap. That predates PRD #744
+   * and is recorded as its Open Question 5 rather than fixed here. The
+   * `AgentComposer` Enter/Shift+Enter binding this note used to cite went with
+   * the widget in issue #1042; the terminal's own input is the agent CLI's, and
+   * the app binds nothing in it.
    */
   it("lists the zoom keys in the shortcut overlay", () => {
     render(<ControlDeck runtime={runtime()} />);

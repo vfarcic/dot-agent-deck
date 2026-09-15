@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import {
+  AlertTriangle,
   BookOpenText,
   Box,
   Check,
@@ -14,8 +15,8 @@ import {
   X,
 } from "lucide-react";
 import { UNREPORTED } from "../types";
-import type { AgentSession, DeckActionResult, DeckPrompt, EvidenceItem, PanelTab, RuntimeMode, TerminalFeed } from "../types";
-import { AgentComposer } from "./AgentComposer";
+import type { AgentSession, EvidenceItem, PanelTab, RuntimeMode, SendResult, TerminalFeed } from "../types";
+import { terminalInputState } from "../lib/terminalInput";
 import { OutputReader } from "./OutputReader";
 import { TerminalViewport } from "./TerminalViewport";
 
@@ -34,9 +35,14 @@ interface AgentTileProps {
   tab: PanelTab;
   terminalFeed?: TerminalFeed;
   evidence: EvidenceItem[];
-  prompts: DeckPrompt[];
-  /** Increments when the command palette asks this tile's composer to focus. */
-  composerFocusToken?: number;
+  /**
+   * Issue #1042 — the last non-delivered verdict the guarded send verb returned
+   * for this agent, if any. The only condition #1042 names that the snapshot
+   * cannot express (`wrong-session`) arrives this way and no other.
+   */
+  inputResult?: SendResult;
+  /** Increments when the command palette asks this tile's terminal to focus. */
+  terminalFocusToken?: number;
   onSelect: () => void;
   onTabChange: (tab: PanelTab) => void;
   onTerminalInput: (agentId: string, data: string) => Promise<void>;
@@ -44,7 +50,6 @@ interface AgentTileProps {
   /** PRD #882 — the geometry the daemon has applied for this agent, if known. */
   appliedGeometry?: { rows: number; cols: number };
   onEvidenceSelect: (id: string) => void;
-  onSubmitText: (agentId: string, text: string) => Promise<DeckActionResult>;
   onRename?: (agentId: string, displayName: string) => Promise<void>;
 }
 
@@ -59,15 +64,14 @@ export function AgentTile({
   tab,
   terminalFeed,
   evidence,
-  prompts,
-  composerFocusToken,
+  inputResult,
+  terminalFocusToken,
   onSelect,
   onTabChange,
   onTerminalInput,
   onTerminalResize,
   appliedGeometry,
   onEvidenceSelect,
-  onSubmitText,
   onRename,
 }: AgentTileProps) {
   const handleInput = useCallback((data: string) => {
@@ -77,6 +81,10 @@ export function AgentTile({
     void onTerminalResize(agent.id, cols, rows);
   }, [agent.id, onTerminalResize]);
   const agentEvidence = evidence.filter((item) => agent.handoffIds.includes(item.id) || item.agentId === agent.id);
+  // Issue #1042: one derivation for the terminal's state, its read-only gate
+  // and the sentence beside it, so the three cannot disagree the way the tile's
+  // inline status condition and the composer's own copy of it could.
+  const input = terminalInputState(agent, inputResult);
   const fixture = mode === "fixture";
   const [renameDraft, setRenameDraft] = useState<string>();
   const [readerOpen, setReaderOpen] = useState(false);
@@ -201,9 +209,7 @@ export function AgentTile({
         </button>
       </div>
 
-      {readerOpen && (
-        <OutputReader agent={agent} prompts={prompts} onSubmit={onSubmitText} onClose={() => setReaderOpen(false)} />
-      )}
+      {readerOpen && <OutputReader agent={agent} onClose={() => setReaderOpen(false)} />}
 
       <div className="agent-panel" role="tabpanel">
         {tab === "terminal" && (
@@ -213,13 +219,24 @@ export function AgentTile({
               label={agent.role}
               transcript={agent.transcript}
               terminalFeed={terminalFeed}
-              readOnly={agent.status === "queued" || agent.status === "passed" || agent.status === "stopped"}
+              readOnly={input.readOnly}
+              inputState={input.state}
+              focusToken={terminalFocusToken}
               onInput={handleInput}
               onResize={handleResize}
               applied={appliedGeometry}
               onFocus={onSelect}
             />
-            <AgentComposer agent={agent} prompts={prompts} focusToken={composerFocusToken} onSubmit={onSubmitText} />
+            {input.notice && (
+              <p
+                className={`terminal-input-status is-${input.tone}`}
+                data-testid={`terminal-input-status-${agent.id}`}
+                role="status"
+              >
+                <AlertTriangle size={12} aria-hidden="true" />
+                {input.notice}
+              </p>
+            )}
           </div>
         )}
         {tab === "diff" && (

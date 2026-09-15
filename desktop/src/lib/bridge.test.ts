@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { DesktopAgentDto, DesktopSnapshotDto, ObservedDeckDto, TerminalAttachResult } from "./bridge";
-import type { DeckFleet } from "../types";
+import type { DeckFleet, SendResult } from "../types";
 
 const invoke = vi.fn();
 const listeners = new Map<string, (event: { payload: unknown }) => void>();
@@ -353,6 +353,43 @@ describe("TauriDeckBridge", () => {
 
     expect(invoke).toHaveBeenCalledWith("desktop_run_action", { action: { type: "restart_daemon" } });
     await bridge.dispose();
+  });
+
+  /**
+   * Scenario: submit one guarded message for every delivery verdict the daemon
+   * can return. The live bridge must hand each named state to its caller
+   * unchanged, including delivered, uncertain, stale, and non-live outcomes.
+   */
+  it("preserves every SendResult verdict from the guarded submit verb", async () => {
+    const { TauriDeckBridge } = await import("./bridge");
+    const bridge = new TauriDeckBridge();
+    const verdicts = [
+      "applied",
+      "queued",
+      "stale",
+      "wrong-session",
+      "history-only",
+      "no-live-target",
+      "ambiguous",
+      "unknown",
+    ] satisfies SendResult[];
+    const observed: SendResult[] = [];
+
+    for (const [index, sendResult] of verdicts.entries()) {
+      const ok = sendResult === "applied" || sendResult === "queued";
+      invoke.mockResolvedValueOnce({ ok, sendResult, message: `verdict:${sendResult}` });
+
+      const result = await bridge.runAction({ type: "submit_text", agentId: "agent-1", text: `message-${index}` });
+
+      expect(result).toEqual({ ok, sendResult, message: `verdict:${sendResult}` });
+      expect(invoke).toHaveBeenNthCalledWith(index + 1, "desktop_run_action", {
+        action: { type: "submit_text", agentId: "agent-1", text: `message-${index}` },
+      });
+      observed.push(result.sendResult as SendResult);
+    }
+
+    expect(observed).toEqual(verdicts);
+    expect(new Set(observed).size).toBe(verdicts.length);
   });
 
   /**

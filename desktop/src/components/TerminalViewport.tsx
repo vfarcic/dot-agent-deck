@@ -2,7 +2,7 @@ import { useEffect, useRef } from "react";
 import { FitAddon } from "@xterm/addon-fit";
 import { WebglAddon } from "@xterm/addon-webgl";
 import { Terminal } from "@xterm/xterm";
-import type { TerminalBuffer, TerminalFeed } from "../types";
+import type { SendResult, TerminalBuffer, TerminalFeed } from "../types";
 import { registerRefit, registerTerminal, unregisterRefit, unregisterTerminal } from "../lib/terminalRegistry";
 
 interface TerminalViewportProps {
@@ -11,6 +11,24 @@ interface TerminalViewportProps {
   transcript: string;
   terminalFeed?: TerminalFeed;
   readOnly?: boolean;
+  /**
+   * Issue #1042 — the pane's input-acceptance state in the `SendResult`
+   * vocabulary, published as `data-input-state` on the wrapper so the state is
+   * readable from the DOM rather than inferred from a disabled cursor.
+   *
+   * Undefined when nothing about the pane is being claimed: the agent-status
+   * gate disables the input without saying anything about its lease, and an
+   * attribute asserting `applied` there would be a claim this component cannot
+   * support. The sentence that goes with either case is rendered by the tile,
+   * beside this viewport, so it survives this component being mocked.
+   */
+  inputState?: SendResult;
+  /**
+   * Increments when something outside asks this terminal to take focus — the
+   * command palette's "Message coordinator…" entry is the only caller today.
+   * `onFocus` reports focus outward; this is the way in.
+   */
+  focusToken?: number;
   onInput: (data: string) => void;
   onResize: (cols: number, rows: number) => void;
   /**
@@ -32,6 +50,8 @@ export function TerminalViewport({
   transcript,
   terminalFeed,
   readOnly,
+  inputState,
+  focusToken = 0,
   onInput,
   onResize,
   applied,
@@ -54,6 +74,9 @@ export function TerminalViewport({
   // rebuilding the terminal on that would destroy scroll position and selection
   // every time somebody opened the TUI.
   const appliedRef = useRef(applied);
+  // Read through a ref for the same reason: a renamed agent must not cost the
+  // operator their scroll position and selection.
+  const labelRef = useRef(label);
   // Set by the terminal effect below so the geometry effect can re-run the
   // grid reconciliation without owning the xterm instance.
   const applyGridRef = useRef<(() => void) | undefined>(undefined);
@@ -61,6 +84,7 @@ export function TerminalViewport({
   onInputRef.current = onInput;
   onResizeRef.current = onResize;
   appliedRef.current = applied;
+  labelRef.current = label;
 
   useEffect(() => {
     const host = hostRef.current;
@@ -128,6 +152,16 @@ export function TerminalViewport({
       webglAddon = undefined;
     }
     terminalRef.current = terminal;
+    // xterm's own `promptLabel` is a module-level string shared by every
+    // instance, so the per-agent name has to be written onto this terminal's
+    // helper textarea directly. `disabled` goes with it: `disableStdin` only
+    // makes xterm ignore what is typed, and an input that still takes focus and
+    // a caret while swallowing every keystroke is the void #1042 is about.
+    const textarea = terminal.textarea;
+    if (textarea) {
+      textarea.setAttribute("aria-label", `${labelRef.current} terminal input`);
+      textarea.disabled = Boolean(readOnly);
+    }
     // Expose the instance so the Reader overlay can snapshot the resolved buffer.
     registerTerminal(agentId, terminal);
     terminal.write(transcriptRef.current);
@@ -204,6 +238,20 @@ export function TerminalViewport({
     };
   }, [agentId, readOnly]);
 
+  // A rename changes the accessible name of the input without touching the
+  // terminal, so this reconciles the attribute the effect above wrote at
+  // construction rather than rebuilding the pane to change one string.
+  useEffect(() => {
+    const textarea = terminalRef.current?.textarea;
+    if (textarea) textarea.setAttribute("aria-label", `${label} terminal input`);
+  }, [label]);
+
+  // Issue #1042 — take focus on request. Zero is the never-asked value, so a
+  // freshly mounted deck does not steal focus into a terminal nobody named.
+  useEffect(() => {
+    if (focusToken > 0) terminalRef.current?.focus();
+  }, [focusToken]);
+
   // PRD #882: the daemon changed the applied geometry — because another client
   // attached, detached or resized this agent — so reshape the grid to match.
   // Separate from the terminal effect above so a geometry change reconciles the
@@ -267,9 +315,11 @@ export function TerminalViewport({
     <div
       className="terminal-viewport"
       data-testid={`terminal-${agentId}`}
+      data-input-state={inputState}
       onFocusCapture={onFocus}
       role="group"
       aria-label={`${label} terminal`}
+      aria-disabled={Boolean(readOnly)}
     >
       <div ref={hostRef} className="terminal-host" />
     </div>

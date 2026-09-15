@@ -4,7 +4,8 @@ import { createDeckBridge, selectRuntimeMode } from "../lib/bridge";
 import type { DesktopSettingsDto } from "../lib/bridge";
 import { applyTerminalChunk } from "../lib/terminalBuffer";
 const EMPTY_TERMINAL_DATA: Record<string, TerminalBuffer> = {};
-import type { DeckAction, DeckFleet, DeckRuntimeState, DeckSnapshot, RuntimeMode, TerminalBuffer } from "../types";
+import { isDelivered } from "../types";
+import type { DeckAction, DeckFleet, DeckRuntimeState, DeckSnapshot, RuntimeMode, SendResult, TerminalBuffer } from "../types";
 
 /**
  * The snapshot a runtime starts with, before any deck has answered. Lifted out
@@ -80,6 +81,31 @@ export function useDeckRuntime(): DeckRuntimeState {
   const terminalBuffersRef = useRef<Record<string, TerminalBuffer>>({});
   const terminalListenersRef = useRef<Map<string, Set<(buffer: TerminalBuffer) => void>>>(new Map());
 
+  /**
+   * Issue #1042 — the last non-delivered verdict per agent, which is the only
+   * route by which `wrong-session` (and its `stale`/`ambiguous`/`unknown`
+   * siblings) can reach the screen: the daemon decides them at write time and
+   * carries them in no snapshot field.
+   *
+   * Held here rather than in a tile because the send that produces one is not
+   * the tile's — the composer that used to own this is gone, and what remains
+   * are PROGRAMMATIC sends: the coordinator's seed prompt at workflow launch,
+   * and whatever else dispatches through the guarded verb.
+   */
+  const [terminalInputResults, setTerminalInputResults] = useState<Record<string, SendResult>>({});
+  const noteTerminalInputResult = useCallback((agentId: string, verdict: SendResult | undefined) => {
+    setTerminalInputResults((current) => {
+      if (current[agentId] === verdict) return current;
+      if (verdict === undefined) {
+        if (!(agentId in current)) return current;
+        const next = { ...current };
+        delete next[agentId];
+        return next;
+      }
+      return { ...current, [agentId]: verdict };
+    });
+  }, []);
+
   const terminalFeed = useMemo(() => ({
     get: (agentId: string) => terminalBuffersRef.current[agentId],
     subscribe: (agentId: string, listener: (buffer: TerminalBuffer) => void) => {
@@ -100,8 +126,20 @@ export function useDeckRuntime(): DeckRuntimeState {
     const next = applyTerminalChunk(current, { ...event, data });
     if (next === current) return;
     terminalBuffersRef.current[event.agentId] = next;
+    // A new stream generation means the PTY was respawned, so any recorded
+    // verdict describes a pane that no longer exists. Without this a
+    // `wrong-session` would disable the input forever: the condition is only
+    // knowable by SENDING, and the input it disabled is the thing that would
+    // have sent again.
+    //
+    // Reached on the `replace` a fresh attach delivers, which is how a respawn
+    // arrives. `applyTerminalChunk` DROPS an `append` whose generation does not
+    // match the buffer's — returning the buffer unchanged — so that case exits
+    // above and never reaches here, which is correct: a dropped chunk changed
+    // no state to reconcile against.
+    if (current && next.generation !== current.generation) noteTerminalInputResult(event.agentId, undefined);
     for (const listener of terminalListenersRef.current.get(event.agentId) ?? []) listener(next);
-  }, []);
+  }, [noteTerminalInputResult]);
 
   /**
    * Replace the SELECTED deck and leave the rest of the fleet where it is.
@@ -180,13 +218,21 @@ export function useDeckRuntime(): DeckRuntimeState {
   const runAction = useCallback(async (action: DeckAction) => {
     setError(undefined);
     try {
-      return await bridge.runAction(action);
+      const result = await bridge.runAction(action);
+      // The guarded verb reports a non-delivery as `ok: false` with a named
+      // verdict rather than by raising, so a caller that only awaits the promise
+      // cannot tell delivery from silent loss (`types.ts`). Recording it here is
+      // what puts that verdict on the agent's terminal.
+      if (action.type === "submit_text") {
+        noteTerminalInputResult(action.agentId, isDelivered(result) ? undefined : result.sendResult);
+      }
+      return result;
     } catch (cause) {
       const message = cause instanceof Error ? cause.message : String(cause);
       setError(message);
       throw cause;
     }
-  }, [bridge]);
+  }, [bridge, noteTerminalInputResult]);
 
   /*
    * Issue #1046: the toast in `App.tsx` renders on `notice || error`, and its
@@ -255,6 +301,7 @@ export function useDeckRuntime(): DeckRuntimeState {
     error,
     clearError,
     runAction,
+    terminalInputResults,
     sendTerminalInput,
     resizeTerminal,
     setShownTerminals,

@@ -172,7 +172,7 @@ export function PromptLibraryPanel({ open, prompts, selectedId, onSelect, onClos
               </div>
               <div className="project-fields">
                 <label><span>Name</span><input aria-label="Prompt name" value={prompt.name} onChange={(event) => onUpdate(prompt.id, { name: event.target.value })} placeholder="Fix the failing test" /></label>
-                <label><span>Prompt body</span><textarea aria-label="Prompt body" rows={10} value={prompt.body} onChange={(event) => onUpdate(prompt.id, { body: event.target.value })} placeholder="The text to send to the coordinator or insert at launch…" /></label>
+                <label><span>Prompt body</span><textarea aria-label="Prompt body" rows={10} value={prompt.body} onChange={(event) => onUpdate(prompt.id, { body: event.target.value })} placeholder="The task prompt to insert when launching a workflow…" /></label>
                 <label><span>Note</span><input aria-label="Prompt note" value={prompt.note ?? ""} onChange={(event) => onUpdate(prompt.id, { note: event.target.value })} placeholder="When you reach for this one" /></label>
               </div>
               <footer className="sheet-footer project-footer">
@@ -180,7 +180,7 @@ export function PromptLibraryPanel({ open, prompts, selectedId, onSelect, onClos
                 <div><span>Auto-saved locally</span></div>
               </footer>
             </form>
-          ) : <div className="configuration-empty">Add a prompt to reuse it at launch and in the agent composer.</div>}
+          ) : <div className="configuration-empty">Add a prompt to reuse it when launching a workflow.</div>}
         </div>
       </section>
     </div>

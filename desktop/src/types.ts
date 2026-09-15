@@ -766,6 +766,21 @@ export interface DeckRuntimeState {
    */
   clearError: () => void;
   runAction: (action: DeckAction) => Promise<DeckActionResult>;
+  /**
+   * Issue #1042 — the last NON-DELIVERED `SendResult` the guarded send verb
+   * returned, per agent id. An agent with no entry has nothing unresolved.
+   *
+   * This is the post-hoc half of the terminal's input state. `history-only` and
+   * `no-live-target` are read off `AgentSession.writeLease` and need no send;
+   * `wrong-session` is decided at write time, is carried by no snapshot field,
+   * and after a rollover the pane reads `writeLease === "write"` — it looks
+   * deliverable precisely when a send would fail. So it can only be known by
+   * trying, which makes a returned verdict the only place it can come from.
+   *
+   * Optional, and absence is a real state rather than an oversight: a runtime
+   * through which nothing has ever been submitted has no verdicts to report.
+   */
+  terminalInputResults?: Record<string, SendResult>;
   sendTerminalInput: (agentId: string, data: string) => Promise<void>;
   resizeTerminal: (agentId: string, cols: number, rows: number) => Promise<void>;
   /**

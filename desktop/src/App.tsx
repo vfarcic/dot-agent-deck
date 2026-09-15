@@ -50,7 +50,7 @@ import { useDesktopSettings, type DesktopSettingsState } from "./hooks/useDeskto
 import { useZoom } from "./hooks/useZoom";
 import { applyAppearance } from "./lib/appearance";
 import { desktopWorkflowPlatformIssue } from "./lib/platform";
-import type { DeckAction, DeckActionResult, DeckRuntimeState, DeckView, EvidenceItem, PanelTab, WorkflowLaunchConfig } from "./types";
+import type { DeckAction, DeckRuntimeState, DeckView, EvidenceItem, PanelTab, WorkflowLaunchConfig } from "./types";
 import { modeScopedKey } from "./lib/bridge";
 
 const WORKFLOW_STORAGE_KEY = modeScopedKey("dot-agent-deck.desktop.workflow-preview.v1");
@@ -164,7 +164,7 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
   const [profilesOpen, setProfilesOpen] = useState(false);
   const [promptsOpen, setPromptsOpen] = useState(false);
   const [selectedPromptId, setSelectedPromptId] = useState("");
-  const [composerFocus, setComposerFocus] = useState<{ agentId: string; token: number }>();
+  const [terminalFocus, setTerminalFocus] = useState<{ agentId: string; token: number }>();
   const [workflowOpen, setWorkflowOpen] = useState(false);
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [helpOpen, setHelpOpen] = useState(false);
@@ -370,19 +370,21 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
     }
   };
 
-  // Returned to the composer rather than swallowed here: only the composer can
-  // show a per-message delivered/failed state next to the text that produced it.
-  const submitText = async (agentId: string, text: string): Promise<DeckActionResult> =>
-    runtime.runAction({ type: "submit_text", agentId, text });
-
   const renameAgent = async (agentId: string, displayName: string) => {
     await perform({ type: "rename_agent", agentId, displayName }, `Agent renamed to ${displayName}.`);
   };
 
-  const focusComposer = (agentId: string) => {
+  /**
+   * Issue #1042: the terminal IS the input path now, so the palette's
+   * "Message coordinator…" entry puts the caret where the agent's own CLI
+   * grammar lives instead of in a composer that no longer exists. It still
+   * sends nothing — it selects the agent, shows its terminal, and asks that
+   * terminal to take focus.
+   */
+  const focusTerminal = (agentId: string) => {
     setSelectedAgentId(agentId);
     setTabs((current) => ({ ...current, [agentId]: "terminal" }));
-    setComposerFocus((current) => ({ agentId, token: (current?.token ?? 0) + 1 }));
+    setTerminalFocus((current) => ({ agentId, token: (current?.token ?? 0) + 1 }));
   };
 
   useEffect(() => {
@@ -625,9 +627,9 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
   };
 
   const commandItems = [
-    ...(coordinator ? [{ label: "Message coordinator…", hint: `Send text to ${coordinator.displayName}`, icon: Send, run: () => focusComposer(coordinator.id) }] : []),
+    ...(coordinator ? [{ label: "Message coordinator…", hint: `Focus ${coordinator.displayName}'s terminal`, icon: Send, run: () => focusTerminal(coordinator.id) }] : []),
     { label: "Manage projects", hint: "Choose repositories & workflows", icon: FolderGit2, run: () => setProjectsOpen(true) },
-    { label: "Open prompt library", hint: "Reusable launch and message prompts", icon: BookMarked, run: () => setPromptsOpen(true) },
+    { label: "Open prompt library", hint: "Reusable workflow launch prompts", icon: BookMarked, run: () => setPromptsOpen(true) },
     { label: "Open agent profiles", hint: "Configure models & permissions", icon: Bot, run: () => setProfilesOpen(true) },
     { label: "Edit workflow order", hint: "Enable, skip, or reorder roles", icon: Network, run: () => setWorkflowOpen(true) },
     { label: "Open settings", hint: "Appearance and other app preferences", icon: Settings2, run: () => setSettingsOpen(true) },
@@ -782,15 +784,14 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
                   tab={tabs[agent.id] ?? "terminal"}
                   terminalFeed={runtime.terminalFeed}
                   evidence={snapshot.evidence}
-                  prompts={prompts}
-                  composerFocusToken={composerFocus?.agentId === agent.id ? composerFocus.token : 0}
+                  inputResult={runtime.terminalInputResults?.[agent.id]}
+                  terminalFocusToken={terminalFocus?.agentId === agent.id ? terminalFocus.token : 0}
                   onSelect={() => setSelectedAgentId(agent.id)}
                   onTabChange={(tab) => setTabs((current) => ({ ...current, [agent.id]: tab }))}
                   onTerminalInput={runtime.sendTerminalInput}
                   onTerminalResize={runtime.resizeTerminal}
                   appliedGeometry={runtime.appliedGeometry?.[agent.id]}
                   onEvidenceSelect={(id) => { setSelectedEvidenceId(id); setEvidenceOpen(true); }}
-                  onSubmitText={submitText}
                   onRename={mode === "live" ? renameAgent : undefined}
                 />
               ))}
@@ -842,7 +843,7 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
       {paletteOpen && <CommandPalette commands={commandItems} onClose={() => setPaletteOpen(false)} />}
       {helpOpen && <ShortcutHelp onClose={() => setHelpOpen(false)} />}
       {confirm && <ConfirmDialog state={confirm} onClose={() => setConfirm(undefined)} />}
-      {(notice || runtime.error) && <div className="toast" role="status"><AlertTriangle size={15} /><span>{notice ?? runtime.error}</span><button aria-label="Dismiss message" onClick={dismissToast}><X size={14} /></button></div>}
+      {(notice || runtime.error) && <div className="toast" data-testid="toast" role="status"><AlertTriangle size={15} /><span>{notice ?? runtime.error}</span><button aria-label="Dismiss message" onClick={dismissToast}><X size={14} /></button></div>}
     </div>
   );
 }
