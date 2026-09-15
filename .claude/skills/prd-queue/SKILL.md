@@ -450,6 +450,19 @@ GATES — CLAUDE.md is the authority, this is the summary:
   rather than reproducing it. Say this explicitly in the unit, because an agent
   reading an older PRD will otherwise run the full tier for tens of minutes on
   its own initiative.
+- The full matrix can also run on GitHub's runners, and it RELIEVES NOTHING
+  above. ci.yml carries a bare `workflow_dispatch:`, so after a push
+  `gh workflow run ci.yml --ref <branch>` runs it there (take the run id from
+  the URL that prints, not from a listing). But rule 2's fmt+clippy run BEFORE
+  a commit exists, so they have already passed by the time there is anything
+  to dispatch, and `cargo test-fast` stays the per-task gate. What a dispatch
+  buys is the part no local gate covers at all — build-macos, build-windows,
+  e2e-deterministic, nix, devbox, security, the desktop jobs,
+  windows-cross-check — earlier than opening the PR, and the option of NOT
+  adding a second broad local sweep on a box already busy with the mandatory
+  ones. NOT as the per-edit gate: a round trip has a 9.5-minute median against
+  a warm clippy of ~9-15s. It covers neither lane 2 nor anything you have not
+  pushed. docs/develop/ci-on-demand.md has the detail.
 - Lane 2 — the files that reach a real agent, `cargo test-e2e-live <filter>`
   — runs on NO runner anywhere: no test that reaches a real agent runs in CI.
   Where the PRD touches a real-agent path, the unit runs those tests itself with
@@ -569,6 +582,19 @@ lifecycle, and it covers what /prd-full does not.
   Notifications section of your role template as load-bearing rather than
   optional. Send with `scripts/notify.sh "<message>"`; it enforces the explicit
   chat_id and has no inbound path, so those two rules hold by construction.
+- The full matrix can run on GitHub's runners, and it is yours to pass on.
+  ci.yml carries a bare `workflow_dispatch:`, so after a push
+  `gh workflow run ci.yml --ref agent/dispatch-prd-<n>` runs it there. It
+  relieves NO gate a worker owes: rule 2's fmt+clippy run before a commit
+  exists, so they have already passed by the time there is anything to
+  dispatch. What it buys is the part no local gate covers — build-macos,
+  build-windows, e2e-deterministic, nix, devbox, security, the desktop jobs,
+  windows-cross-check — earlier than opening the PR, and the option of not
+  adding a second broad local sweep on a box already busy. Never a worker's
+  per-edit gate, where a 9.5-minute median round trip would stand in for a
+  warm clippy of ~9-15s. Your workers run the gates and you do not, so tell
+  whoever you delegate to.
+  docs/develop/ci-on-demand.md has the detail.
 - STOP CONDITION. Your workflow's step 7 pauses for the user's merge go-ahead.
   Under dispatch that pause is where this unit ENDS: send the merge-gate
   notification, report, and stop. Do not merge, and do not delegate a merge.
@@ -584,6 +610,8 @@ lifecycle, and it covers what /prd-full does not.
 ```
 
 Note what is **absent** from that template and deliberately so: the gate list from 8a. Workers get the gates from their own role templates — `compose_worker_task_file` (`src/state.rs:2224`) wraps each delegated task under `{role_template}\n\n## Task\n\n{task}` per delegation, so coder is already told to run `fmt`, `clippy` and the tests before committing, and tester is already told which tier a test belongs in and about rule 7's Scenario comments. Restating them at the orchestrator, which never runs a gate itself, adds a second copy that can disagree with the first. **Workers need no change from this skill at all** — that composition is separate and already correct.
+
+**The one line about *where* those gates run is not an exception to that absence.** It is in both templates because it is not a gate — it is a fact about the box, and the orchestrator is the only role in a team that knows how loaded the box is and how many workers it is about to put on it. A worker told to run `cargo clippy` and nothing else has no basis for choosing between here and a runner; the orchestrator does, and it is the one delegating.
 
 ### Immediately before each dispatch
 

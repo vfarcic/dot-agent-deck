@@ -153,7 +153,7 @@ Print every included PR with **number, title, author, whether it is the runner's
 
 Then **ask how many to dispatch**, recommending **2–3**. Do not assume "all of them", and do not offer "all" as the recommended option.
 
-Each unit that verifies runs `/verify-pr`, which since issue #502 **reads** the PR's `e2e-deterministic` CI run rather than reproducing lane 1 locally — so a verification is now dominated by the release build, `test-fast` and the windows cross-check rather than by tens of minutes of PTY time. It still builds its own multi-GB `target/`, and a unit may opt into a local lane-1 run with `--e2e` where CI's is missing. How much of that to spend at once is the user's call, not yours.
+Each unit that verifies runs `/verify-pr`, which since issue #502 **reads** the PR's `e2e-deterministic` CI run rather than reproducing lane 1 locally — so a verification is now dominated by the release build, `test-fast` and the windows cross-check rather than by tens of minutes of PTY time. It still builds its own multi-GB `target/`, and a unit may opt into a local lane-1 run with `--e2e` where CI's is missing. How much of that to spend at once is the user's call, not yours. Some of that need not land here at all: `ci.yml` is `workflow_dispatch`-able, so a unit working on **its own** branch can run the full matrix on GitHub's runners ([`docs/develop/ci-on-demand.md`](../../../docs/develop/ci-on-demand.md)). It relieves no gate — rule 2's run before a commit exists — and it buys nothing at all on someone else's PR, where the run already exists and is the unit's to read rather than to restart.
 
 **The count is a security decision, not only a cost one.** N units means N concurrent agents, N independent chances for the untrusted-content problem in step 5 to land, and N simultaneous `cargo build` / `nextest` / `xtask` runs over code nobody has read yet. That is what a "just do all of them" answer is really buying.
 
@@ -421,6 +421,34 @@ head; do not stop there and report "merge result unverified". Resolve the
 conflicts where the intent of both sides is clear, verify the resolved tree, and
 state exactly which files you resolved and what you chose. Where the intent is
 NOT clear, stop and ask the user rather than guessing.
+
+WHERE THE COMPUTE GOES. /verify-pr builds locally, and on a loaded box that is
+the expensive part of this job. The first lever needs no permission at all:
+this PR already has a CI run, so READ it rather than reproducing it, which is
+what /verify-pr already does with e2e-deterministic.
+EVERY OTHER LEVER STARTS A RUN, AND STARTING A RUN IS KEYED TO AUTHORSHIP
+EXACTLY AS PUSHING IS — a rerun and a dispatch are the same act by two names.
+  <if authored by the runner:>
+    On YOUR branch you may start runs. `gh run rerun --failed <run-id>`
+    re-runs only what broke, with no commit. And the full matrix can run on
+    GitHub's runners instead of this box: ci.yml carries a bare
+    `workflow_dispatch:`, so `gh workflow run ci.yml --ref <headRefName>`
+    dispatches it — take the run id from the URL it prints, because a listing
+    on a branch with an open PR returns the PR's run, not yours. Reach for it
+    when the box is loaded, when a change needs build-macos or build-windows,
+    or as a sweep after your fixes. It relieves no gate: rule 2's fmt+clippy
+    run before a commit exists, so they have already passed by the time there
+    is anything to dispatch. Never as a per-edit gate either, where a
+    9.5-minute median round trip would stand in for a warm clippy of ~9-15s.
+    It covers neither lane 2 nor anything you have not pushed.
+  <if authored by anyone else:>
+    READ-ONLY. NEVER dispatch a workflow run against <login>'s branch and
+    NEVER rerun their jobs — not the failed ones, not any of them — for the
+    same reason you never push to it: it is their branch and their pull
+    request, and starting a run on it is an act on their PR that they did not
+    ask for. Read the run their own push already produced. If it is missing or
+    stale, that is a finding for your report, not a button for you to press.
+docs/develop/ci-on-demand.md has the detail.
 
 RISK NOTE: <one to three tailored sentences, per the table above>
 
