@@ -159,6 +159,14 @@ jobs:
             echo "::error::Refusing to release: expected_head must be a full 40-character hex SHA (git rev-parse origin/main). The escaped value is in this step's log."
             exit 1
           fi
+          # Case-fold before comparing. `git rev-parse` always emits lowercase,
+          # so an uppercase value can only come from a human or a tool that
+          # uppercased it — and comparing those raw fails with an error naming
+          # two SHAs that look identical to the reader, which is a worse outcome
+          # than either accepting or plainly rejecting it. Bash 4 `${,,}` is fine
+          # here (the runner is bash 5); `cleanup.sh` avoids it only because a
+          # maintainer's macOS ships bash 3.2.
+          EXPECTED_HEAD="${EXPECTED_HEAD,,}"
           if [ "${EXPECTED_HEAD}" != "${HEAD_SHA}" ]; then
             echo "::error::Refusing to release: main is at ${HEAD_SHA} but you inspected ${EXPECTED_HEAD}. Something merged in between, so this release would carry fragments nobody reviewed. Re-run analyze.sh against the new tip and dispatch again. Nothing has been committed or tagged."
             exit 1
