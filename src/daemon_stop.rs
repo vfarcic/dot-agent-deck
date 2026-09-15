@@ -39,7 +39,9 @@ use tracing::debug;
 
 use crate::build_version_handshake::{HandshakeError, TerminateOutcome, terminate_daemon_graceful};
 use crate::daemon_client::{LocalEndpoint, issue_command};
-use crate::daemon_protocol::AttachRequest;
+use crate::daemon_protocol::{
+    AttachRequest, CAP_STOP_DAEMON, StopDaemonRefusal, StopRefusalReason,
+};
 use crate::platform::ipc::IpcStream;
 use crate::platform::peercred::peer_pid;
 use crate::state::OrchestrationRoleRecord;
@@ -90,6 +92,39 @@ pub enum StopError {
     /// ESRCH if the daemon already exited between probe and signal),
     /// `OpenProcess`/`TerminateProcess` on Windows.
     KillFailed(io::Error),
+    /// Issue #1049, wire path only: the daemon refused, and said why in a shape
+    /// this side did not have to reconstruct.
+    ///
+    /// Distinct from [`Self::LiveAgents`] / [`Self::LiveOrchestrations`] rather
+    /// than folded into them, because the two say different things about where
+    /// the verdict came from. Those two are *this* process deciding, from a
+    /// `ListAgents` reply it read itself; this one is the daemon's own verdict,
+    /// arriving already rendered. Folding them would mean re-deriving a message
+    /// the daemon already sent, and a remote client cannot check the daemon's
+    /// reasoning anyway — it has no view of the pane list except this reply.
+    Refused(StopDaemonRefusal),
+    /// Issue #1049, wire path only: the daemon answered `ok = false` with no
+    /// structured refusal. Either a genuine unrelated error, or — the case worth
+    /// naming — a daemon predating [`AttachRequest::StopDaemon`], whose serde
+    /// decode fails with `unknown variant`.
+    ///
+    /// There is no fallback to offer a remote caller here: the PID path needs a
+    /// [`LocalEndpoint`], which is exactly what a remote caller does not have.
+    /// Read [`CAP_STOP_DAEMON`] off a `Hello` first if you want to tell the two
+    /// apart before spending a round trip on it.
+    WireRejected(String),
+}
+
+/// Does `capabilities`, as advertised on a `Hello` reply, include the wire stop?
+///
+/// `None` means the daemon withheld the field entirely, which per
+/// [`crate::daemon_protocol::AttachResponse::capabilities`] a client reads as
+/// "withhold", not as "everything". So a daemon too old to advertise anything
+/// answers `false` here, which is the safe direction: the caller reports that
+/// the deck cannot be stopped over the wire instead of sending a frame that
+/// will come back as `unknown variant`.
+pub fn supports_wire_stop(capabilities: Option<&[String]>) -> bool {
+    capabilities.is_some_and(|caps| caps.iter().any(|c| c == CAP_STOP_DAEMON))
 }
 
 impl std::fmt::Display for StopError {
@@ -121,6 +156,10 @@ impl std::fmt::Display for StopError {
                 )
             }
             Self::KillFailed(e) => write!(f, "kill syscall failed: {e}"),
+            // The daemon already rendered this; re-wording it here would give
+            // the operator a second, subtly different account of one refusal.
+            Self::Refused(refusal) => write!(f, "{}", refusal.summary),
+            Self::WireRejected(msg) => write!(f, "daemon refused stop-daemon: {msg}"),
         }
     }
 }
@@ -385,6 +424,206 @@ pub fn format_live_orchestrations_refusal(roles: &[OrchestrationRoleRecord]) -> 
     out
 }
 
+/// Issue #1049: the wire form of [`stop_refusal`], for
+/// [`crate::daemon_protocol::AttachRequest::StopDaemon`].
+///
+/// A thin adapter on purpose. The *policy* is `stop_refusal` and the *wording*
+/// is [`format_live_orchestrations_refusal`] / [`format_live_agents_refusal`],
+/// both unchanged and both still what the CLI uses — so the wire stop and the
+/// CLI stop cannot reach different verdicts or describe the same verdict
+/// differently. That mattered enough to shape the function: the obvious
+/// alternative, deciding the refusal again from the two slices, is how the two
+/// paths would have drifted the first time either policy was touched.
+///
+/// `None` means nothing stands in the way of the stop.
+pub fn wire_stop_refusal(
+    orchestration_roles: &[OrchestrationRoleRecord],
+    agent_ids: &[String],
+    force: bool,
+) -> Option<StopDaemonRefusal> {
+    let err = stop_refusal(orchestration_roles, agent_ids, force)?;
+    let summary = err.to_string();
+    let (reason, message) = match &err {
+        StopError::LiveOrchestrations { roles } => (
+            StopRefusalReason::LiveOrchestrations,
+            format_live_orchestrations_refusal(roles),
+        ),
+        StopError::LiveAgents { ids } => (
+            StopRefusalReason::LiveAgents,
+            format_live_agents_refusal(ids),
+        ),
+        // `stop_refusal` returns only those two, and its signature is the whole
+        // reason this is unreachable rather than defensive. If a third guard is
+        // ever added there, this arm is what stops it reaching the wire as a
+        // silent "nothing in the way" — the daemon refuses, generically, rather
+        // than stopping a deck whose new guard this function did not understand.
+        other => (StopRefusalReason::Unknown, format!("{other}\n")),
+    };
+    Some(StopDaemonRefusal {
+        reason,
+        roles: orchestration_roles.to_vec(),
+        agent_ids: agent_ids.to_vec(),
+        message,
+        summary,
+    })
+}
+
+/// How long to wait for a wire-stopped daemon to actually stop answering.
+///
+/// The same 5 s the PID path gives SIGTERM ([`STOP_GRACE_TIMEOUT`]), for the
+/// same reason: the daemon's own drain gives each agent
+/// `AGENT_TERMINATE_GRACE` before escalating, and the teardown follows.
+const WIRE_STOP_CONFIRM_TIMEOUT: Duration = STOP_GRACE_TIMEOUT;
+
+/// Gap between confirmation probes. Matches the PID path's poll cadence.
+const WIRE_STOP_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Issue #1049: what a wire stop can end as.
+///
+/// Deliberately NOT [`StopOutcome`], whose two success variants both carry a
+/// pid. A wire caller has no pid — that is the entire point of the verb — and
+/// inventing one to reuse the type would put a number in front of an operator
+/// that names nothing they can act on. `ForceKilled` has no meaning here
+/// either: escalating past a graceful stop needs a signal, and a caller on
+/// another machine has nothing to signal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WireStopOutcome {
+    /// Nothing was listening. Idempotent, exactly like
+    /// [`StopOutcome::NoDaemonRunning`].
+    NoDaemonRunning,
+    /// The daemon accepted the stop AND stopped answering within
+    /// [`WIRE_STOP_CONFIRM_TIMEOUT`].
+    Stopped,
+    /// The daemon accepted the stop and was still answering when the
+    /// confirmation budget ran out.
+    ///
+    /// Not an error, and reported separately rather than as one: the daemon
+    /// said yes and began its drain, which can legitimately outlast the budget
+    /// with slow-exiting agents, and over a tunnel every probe carries the
+    /// round-trip too. What the caller must not do is *report* it as stopped —
+    /// PRD #741's own cautionary case is a stop path that printed success for a
+    /// daemon it had not touched.
+    AcceptedNotConfirmed,
+}
+
+/// Issue #1049: stop a deck over the wire, from a client that need not be on
+/// its machine.
+///
+/// `address` is what the caller already holds for every other request —
+/// [`crate::remote_tunnel::EndpointConnection::connect_address`] — so this is
+/// the same address a remote `ListAgents` goes to, and for a remote deck that is
+/// the local end of an `ssh -L` tunnel.
+///
+/// **The whole difference from [`run_daemon_stop`] is who does the terminating.**
+/// That function reads the daemon's pid off the socket with `SO_PEERCRED` and
+/// signals it, which needs a kernel-level view of a peer on this machine; over a
+/// tunnel the credential names the local `ssh` client, so it would signal the
+/// tunnel and report the daemon stopped. Here the daemon stops itself, and
+/// nothing in the path consults a pid, a credential, or a signal. That is why it
+/// works remotely — and also why it is strictly weaker: there is no `--force`
+/// escalation, because a caller on another machine has nothing to escalate with.
+/// A wedged daemon is reported as [`WireStopOutcome::AcceptedNotConfirmed`] and
+/// has to be dealt with where it runs.
+///
+/// **The refusal is carried, not re-derived.** The daemon runs
+/// [`stop_refusal`] itself and answers with
+/// [`crate::daemon_protocol::StopDaemonRefusal`], which arrives here as
+/// [`StopError::Refused`] with the panes, the roles and both renderings. A
+/// remote caller has no other view of that pane list, so a refusal that crossed
+/// as a bare string would leave it unable to present the choice #770 exists to
+/// present.
+pub async fn run_daemon_stop_over_wire(
+    address: &std::path::Path,
+    force: bool,
+) -> Result<WireStopOutcome, StopError> {
+    let stream = match IpcStream::connect(address).await {
+        Ok(s) => s,
+        Err(e)
+            if e.kind() == io::ErrorKind::ConnectionRefused
+                || e.kind() == io::ErrorKind::NotFound =>
+        {
+            // Same idempotent reading as `run_daemon_stop`'s connect arm.
+            debug!(
+                target: "daemon_stop",
+                path = %address.display(),
+                err = %e,
+                "no daemon answering (connect failed)"
+            );
+            return Ok(WireStopOutcome::NoDaemonRunning);
+        }
+        Err(e) => return Err(StopError::ConnectFailed(e)),
+    };
+
+    let (mut rd, mut wr) = stream.into_split();
+    let resp = issue_command(&mut rd, &mut wr, &AttachRequest::StopDaemon { force })
+        .await
+        .map_err(|e| StopError::WireRejected(e.to_string()))?;
+    drop(rd);
+    drop(wr);
+
+    if !resp.ok {
+        // The structured refusal when the daemon sent one; otherwise whatever it
+        // said, which for a daemon predating the verb is serde's `unknown
+        // variant` — see `StopError::WireRejected`.
+        return Err(match resp.stop_refusal {
+            Some(refusal) => StopError::Refused(refusal),
+            None => StopError::WireRejected(
+                resp.error
+                    .unwrap_or_else(|| "stop-daemon failed with no reason given".into()),
+            ),
+        });
+    }
+
+    debug!(
+        target: "daemon_stop",
+        path = %address.display(),
+        force,
+        "daemon acknowledged stop-daemon; confirming it stops answering"
+    );
+    if poll_daemon_gone_over_wire(address, WIRE_STOP_CONFIRM_TIMEOUT).await {
+        Ok(WireStopOutcome::Stopped)
+    } else {
+        Ok(WireStopOutcome::AcceptedNotConfirmed)
+    }
+}
+
+/// Poll until `address` stops answering a real request, or `budget` elapses.
+///
+/// **Not** `build_version_handshake`'s `poll_daemon_gone`, and the difference is
+/// the point. That one short-circuits on the endpoint's filesystem presence,
+/// which its own comment scopes to a local endpoint — for a remote deck the
+/// socket being polled belongs to the *tunnel*, so presence says nothing about
+/// the daemon. A connect is no better for the same reason: `ssh -L` keeps
+/// accepting locally after the remote daemon has gone, and only the forward
+/// behind it fails.
+///
+/// So this spends a real round trip. `Hello` is the cheapest request every
+/// daemon answers and it mutates nothing, and any failure of it — connect
+/// refused, EOF from a collapsed forward, a decode error — is "gone".
+async fn poll_daemon_gone_over_wire(address: &std::path::Path, budget: Duration) -> bool {
+    let start = std::time::Instant::now();
+    loop {
+        if daemon_answers(address).await.is_none() {
+            return true;
+        }
+        if start.elapsed() >= budget {
+            return false;
+        }
+        tokio::time::sleep(WIRE_STOP_POLL_INTERVAL).await;
+    }
+}
+
+/// One `Hello` round trip. `Some(())` if the daemon answered, `None` otherwise.
+async fn daemon_answers(address: &std::path::Path) -> Option<()> {
+    let stream = IpcStream::connect(address).await.ok()?;
+    let (mut rd, mut wr) = stream.into_split();
+    let req = AttachRequest::Hello {
+        client_version: crate::daemon_protocol::PROTOCOL_VERSION,
+        client_build_version: None,
+    };
+    issue_command(&mut rd, &mut wr, &req).await.ok().map(|_| ())
+}
+
 /// `daemon restart`: PRD #103 M3.3 — same logic as `daemon stop`. The
 /// next TUI invocation lazy-spawns a fresh daemon (PRD #93). This is
 /// intentionally a thin wrapper rather than a stop-then-spawn flow,
@@ -518,6 +757,126 @@ mod tests {
                 .to_string()
                 .contains("--force")
         );
+    }
+
+    /// Issue #1049: the wire refusal is the CLI refusal, not a second opinion.
+    /// If these ever diverge, a deck is safe to stop from one path and not the
+    /// other — the single worst outcome for a guard that exists to be trusted.
+    #[test]
+    fn wire_stop_refusal_agrees_with_the_cli_refusal() {
+        let roles = vec![role("sched-issue-work-1-r0", "orchestrator", true)];
+        let agents = vec!["7".to_string()];
+
+        for (rs, ids) in [
+            (roles.clone(), vec![]),
+            (vec![], agents.clone()),
+            (roles.clone(), agents.clone()),
+            (vec![], vec![]),
+        ] {
+            for force in [false, true] {
+                assert_eq!(
+                    stop_refusal(&rs, &ids, force).is_some(),
+                    wire_stop_refusal(&rs, &ids, force).is_some(),
+                    "the wire and CLI paths must agree on WHETHER to refuse                      (roles={}, agents={}, force={force})",
+                    rs.len(),
+                    ids.len()
+                );
+            }
+        }
+
+        // …and on WHICH guard, including the ordering when both apply.
+        let both = wire_stop_refusal(&roles, &agents, false).expect("both guards apply");
+        assert_eq!(
+            both.reason,
+            StopRefusalReason::LiveOrchestrations,
+            "with both present the orchestration refusal wins on the wire too — it is the one              that says the survivors are STRANDED, not merely killed"
+        );
+        assert_eq!(
+            both.message,
+            format_live_orchestrations_refusal(&roles),
+            "one rendering, shared with the CLI"
+        );
+        assert_eq!(
+            both.summary,
+            StopError::LiveOrchestrations {
+                roles: roles.clone()
+            }
+            .to_string(),
+            "the one-line form is StopError's Display, so the wire and the terminal say the              same sentence"
+        );
+        // Both lists cross regardless of which guard tripped: a caller
+        // presenting the orchestration refusal still wants to know how many
+        // agents go down with it.
+        assert_eq!(both.roles, roles);
+        assert_eq!(both.agent_ids, agents);
+
+        let agents_only = wire_stop_refusal(&[], &agents, false).expect("agents guard applies");
+        assert_eq!(agents_only.reason, StopRefusalReason::LiveAgents);
+        assert_eq!(
+            agents_only.message,
+            format_live_agents_refusal(&agents),
+            "the agents refusal keeps its own wording"
+        );
+        assert!(
+            agents_only.roles.is_empty(),
+            "no roles registered, so none may be claimed"
+        );
+    }
+
+    /// Issue #1049: a withheld capability set means "withhold", never
+    /// "everything". Getting this backwards would have a remote client send a
+    /// verb an old daemon answers with `unknown variant`, and report the
+    /// resulting error as though the deck had refused.
+    #[test]
+    fn wire_stop_capability_is_read_conservatively() {
+        assert!(
+            !supports_wire_stop(None),
+            "a daemon that advertises nothing cannot be assumed to speak this verb"
+        );
+        assert!(
+            !supports_wire_stop(Some(&[])),
+            "an empty set is an explicit no"
+        );
+        assert!(!supports_wire_stop(Some(&["list-projects".to_string()])));
+        assert!(supports_wire_stop(Some(&[
+            "list-projects".to_string(),
+            CAP_STOP_DAEMON.to_string(),
+        ])));
+        // The advertised set must actually contain it, or the check above is
+        // pinning a string no daemon sends.
+        assert!(
+            crate::daemon_protocol::DAEMON_CAPABILITIES.contains(&CAP_STOP_DAEMON),
+            "this build must advertise the verb it answers"
+        );
+    }
+
+    /// Issue #1049: the refusal survives a serde round trip with its structure
+    /// intact. It crosses a socket in production, and a remote caller has no
+    /// other view of the panes it names.
+    #[test]
+    fn wire_stop_refusal_round_trips_over_serde() {
+        let roles = vec![
+            role("sched-issue-work-1-r0", "orchestrator", true),
+            role("sched-issue-work-1-r1", "coder", false),
+        ];
+        let refusal = wire_stop_refusal(&roles, &["7".to_string()], false).expect("refusal");
+        let wire = serde_json::to_string(&refusal).expect("serialize");
+        let back: StopDaemonRefusal = serde_json::from_str(&wire).expect("deserialize");
+        assert_eq!(back, refusal);
+
+        // A newer daemon's unknown reason must not fail an older client's whole
+        // decode — it still gets the message and the lists, which is enough to
+        // present the choice, and loses only the ability to branch on the kind.
+        let forward = wire.replace(
+            "\"reason\":\"live-orchestrations\"",
+            "\"reason\":\"some-future-guard\"",
+        );
+        assert_ne!(forward, wire, "the rename_all spelling must be what ships");
+        let tolerated: StopDaemonRefusal =
+            serde_json::from_str(&forward).expect("an unknown reason must not fail the decode");
+        assert_eq!(tolerated.reason, StopRefusalReason::Unknown);
+        assert_eq!(tolerated.roles, refusal.roles);
+        assert_eq!(tolerated.message, refusal.message);
     }
 
     #[test]

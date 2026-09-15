@@ -1979,6 +1979,33 @@ impl DaemonClient {
         }
     }
 
+    /// Issue #1049: stop the deck this client is pointed at, over the wire, with
+    /// the #770 refusal carried back intact.
+    ///
+    /// The remote-capable stop. Unlike
+    /// [`crate::daemon_stop::run_daemon_stop`] nothing here reads a pid or
+    /// sends a signal — the daemon terminates itself — so it works wherever
+    /// this client works, including a [`Self::for_connection`] client pointed at
+    /// the local end of an `ssh -L` tunnel.
+    ///
+    /// **Prefer this over [`Self::send_shutdown`] for anything that is not the
+    /// user pressing `Stop` in front of the pane list.** `send_shutdown` is the
+    /// PRD #92 `KIND_SHUTDOWN` frame and has no guard at all: it drains every
+    /// managed agent unconditionally and names nothing it destroys. This verb
+    /// runs the same policy `dot-agent-deck daemon stop` runs and answers a
+    /// refusal with [`crate::daemon_protocol::StopDaemonRefusal`].
+    ///
+    /// Thin by design — the whole flow, including the post-ack confirmation
+    /// poll, is [`crate::daemon_stop::run_daemon_stop_over_wire`], so a caller
+    /// holding a `DaemonClient` and a caller holding only an address take the
+    /// same path.
+    pub async fn stop_daemon(
+        &self,
+        force: bool,
+    ) -> Result<crate::daemon_stop::WireStopOutcome, crate::daemon_stop::StopError> {
+        crate::daemon_stop::run_daemon_stop_over_wire(&self.socket_path, force).await
+    }
+
     /// Open an attach-stream connection. Returns once the daemon has
     /// confirmed the attach with a successful RESP — i.e. the next frame on
     /// the wire is the consistent scrollback snapshot, followed by live
