@@ -22,6 +22,8 @@ That block is not a sketch: it was run end to end against this repository on 202
 
 Eleven of `ci.yml`'s twelve jobs: `changes`, `desktop-web`, `desktop-browser`, `build`, `e2e-deterministic`, `windows-cross-check`, `build-windows`, `build-macos`, `security`, `nix` and `devbox`. The twelfth, `notify-main-red`, is gated on `github.event_name == 'push' && github.ref == 'refs/heads/main'` and is silent here by design.
 
+That list is read off a real dispatch rather than off the file: run `35025264144` reported exactly those eleven and no `notify-main-red`. Confirm it yourself on any dispatch with `gh run view <run-id> --json jobs --jq '[.jobs[].name]'` — a job added to `ci.yml` later joins this list without anyone editing this paragraph.
+
 The full matrix, not a subset. The `changes` job skips the Rust jobs for a Renovate PR that touched only `devbox.*` or only the flake, and it reads `github.event.pull_request.user.login` to decide — which a `workflow_dispatch` payload does not carry, so the author check fails, the job exits early with `devbox_only=false` / `flake_only=false`, and every downstream `if:` passes. That is the same fail-safe the `push`-to-`main` runs rely on, and its own comment in `ci.yml` says so.
 
 Five of the eleven are the contexts the `main-protected` ruleset requires: `build`, `build-macos`, `build-windows`, `security`, `e2e-deterministic`. Read from the ruleset on 2026-09-15 and matching `scripts/apply-branch-protection.sh`'s `REQUIRED_CHECKS` default; re-read them with `gh api repos/{owner}/{repo}/rulesets/<id> --jq '.rules[] | select(.type=="required_status_checks") | .parameters.required_status_checks[].context'` rather than trusting this sentence.
@@ -48,7 +50,7 @@ The cost of that is the other direction: a dispatch you no longer care about kee
 
 **Never as the per-edit gate.** CLAUDE.md rule 2's `cargo fmt --check` plus `cargo clippy --workspace --all-targets --features e2e,e2e-live -- -D warnings` and rule 5's `cargo test-fast` stay local. Warm, that clippy is **9.3–10.4s** (rule 2, measured 2026-08-31 on 16 cores) against a CI round trip whose median is **9.5 minutes** — 40 to 60 times slower, depending on how loaded the box is when you measure the local side (14.3s warm here on 2026-09-15 under load, against rule 2's 9.3–10.4s on a quiet box). Nothing about a remote gate makes an inner loop that slow acceptable, and a unit that dispatches CI after each edit will spend its whole run waiting.
 
-**The expensive half is compiling, not testing**, so "just run the tests in CI" fixes little. `cargo test-fast` spends about 26–29s *executing* (CLAUDE.md rule 5, measured 2026-08-31); the minutes go into the build in front of it. And lane 1 of the e2e tier is already off this box — issue #502 moved it to CI on every PR precisely because N units each running it was self-defeating.
+**The expensive half is compiling, not testing**, so "just run the tests in CI" fixes little. Warm, `cargo test-fast`'s entire wall clock is the 25–30s CLAUDE.md rule 5 measures, because the build in front of the tests is then a no-op; cold, it is minutes, and the tests are still seconds of them. And lane 1 of the e2e tier is already off this box — issue #502 moved it to CI on every PR precisely because N units each running it was self-defeating.
 
 ## The numbers
 
@@ -63,7 +65,7 @@ Everything in this table was either measured for issue #896 on 2026-09-15 or is 
 | rule 2's clippy, cold, in a fresh dispatch worktree on a loaded box | **2m42s** | measured for #896, 2026-09-15, no `target/` at all, `/proc/pressure/io` at `full avg60=49.23` |
 | `cargo test-fast`, same worktree and box, wall | **4m48s** | measured for #896, 2026-09-15, immediately after that clippy run |
 | the same run: executing the 3118 tests | **37.1 s** | nextest's own summary line from that run |
-| `cargo test-fast`, executing, on a quiet box | ~26–29 s | CLAUDE.md rule 5, measured 2026-08-31 |
+| `cargo test-fast`, whole wall clock, warm cache, quiet box | 25–30 s | CLAUDE.md rule 5's own measurements, 2026-08-31 — warm, the build in front of the tests is a no-op |
 
 Three things that table is saying. **The gap between the two `test-fast` rows is the whole argument**: 37.1 seconds of that 4m48s was running tests and the rest was the build in front of them, so a remote gate aimed at "the tests" relocates about a thirteenth of the cost. **The clippy figure is the cheap gate's cold cost, not the expensive one's** — `clippy` type-checks and never links, while `cargo test-fast` compiles for real and links the test binaries, which is the work [`build-gate.md`](build-gate.md) bounds and the work an OOM kill lands on. And **neither local figure is a true cold worst case**: the `test-fast` run followed the clippy run in the same worktree, so the registry was already unpacked and some artifacts were already there. A unit's genuine first build is worse than 4m48s, not better — which only widens the gap the table is about.
 

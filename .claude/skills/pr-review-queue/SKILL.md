@@ -436,7 +436,7 @@ broke, with no commit.
     run. Reach for it when the box is loaded with other units compiling, when
     a change needs build-macos or build-windows, or as a sweep after your
     fixes — not as a per-edit gate, where a 9.5-minute median round trip would
-    replace a 9.3-10.4s warm clippy. It relocates work rather than removing
+    replace a warm clippy of ~9-15s. It relocates work rather than removing
     it, the expensive half is compiling rather than testing, and it covers
     neither lane 2 nor anything you have not pushed.
   <if authored by anyone else:>
