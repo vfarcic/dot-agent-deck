@@ -26,14 +26,24 @@
 //! [`SettingsDocumentProblem`] instead of logging it and dropping it, so
 //! [`load_snapshot`] can hand the user a sentence and [`save_to`] can refuse.
 //!
-//! **A document this build cannot read is never overwritten.** That is the whole
-//! of #1072 and it is the property to preserve: defaults in memory plus a merge
-//! that makes the struct authoritative meant the *next save* replaced every key
-//! the schema owns — appearance, zoom, endpoints, the deck selection — with this
-//! build's defaults. The app looked normal, said nothing a user would see, and
-//! the original was gone one click later. [`save_to`] now re-reads the document
-//! and refuses; a user who cannot save a preference is in a better position than
-//! one whose configuration has been destroyed.
+//! **A document this build cannot read AT SAVE TIME is never overwritten.**
+//! That is the whole of #1072 and it is the property to preserve: defaults in
+//! memory plus a merge that makes the struct authoritative meant the *next save*
+//! replaced every key the schema owns — appearance, zoom, endpoints, the deck
+//! selection — with this build's defaults. The app looked normal, said nothing a
+//! user would see, and the original was gone one click later. [`save_to`] now
+//! re-reads the document and refuses; a user who cannot save a preference is in
+//! a better position than one whose configuration has been destroyed.
+//!
+//! The qualifier is meant. [`save_to`] reads, vets and then renames, so a
+//! document that becomes unreadable *inside that window* is still replaced —
+//! the same shape of residual the path vet accepts a few paragraphs down, and
+//! the same one an anchored `renameat` would be needed to close. It is a
+//! microsecond-wide race between two writers, which is issue #828's subject and
+//! not this one's; what #1072 was about is the ordinary single-writer case,
+//! where the app read the document at launch, could not use it, and overwrote it
+//! anyway. Re-reading at save time rather than trusting the launch read is what
+//! makes the window that narrow.
 //!
 //! **The path is vetted and the read is bounded.** [`read_document`] requires
 //! an absolute path with a file name whose target is absent or a regular file,

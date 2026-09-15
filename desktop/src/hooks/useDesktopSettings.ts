@@ -54,8 +54,9 @@ export interface DesktopSettingsState {
    *   build's schema rejects. The app is then running on defaults and the Rust
    *   side refuses every save rather than publishing those defaults over the
    *   user's file, so this is set from the moment the load resolves, before any
-   *   save has been attempted. It is the only thing that explains why a user's
-   *   settings look reset.
+   *   save has been attempted. Nothing else on screen explains why a user's
+   *   settings look reset — the footer names the file but not what is wrong
+   *   with it.
    *
    * A save failure wins while both are set: it is the newer answer, and the
    * refusal message carries the same locator the load problem does.
