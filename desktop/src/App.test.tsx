@@ -684,6 +684,9 @@ describe("ControlDeck", () => {
     // input, so the deck now has several live regions and a bare role query is
     // ambiguous. The assertion itself is unchanged.
     await waitFor(() => expect(screen.getByTestId("toast")).toHaveTextContent("dot-agent-deck launched with 6 configured roles."));
+    // The test id only disambiguates the query; the toast is still expected to
+    // be a live region, which is what `getByRole("status")` used to prove.
+    expect(screen.getByTestId("toast")).toHaveAttribute("role", "status");
     expect(document.body.textContent).not.toContain("\u0001");
   });
 
@@ -715,6 +718,7 @@ describe("ControlDeck", () => {
     });
     expect(screen.getByTestId("toast")).toHaveTextContent("Nothing was started");
     expect(screen.getByTestId("toast")).toHaveTextContent("launch again");
+    expect(screen.getByTestId("toast")).toHaveAttribute("role", "status");
     // Re-read, so the next attempt carries the project's current revision.
     expect(vi.mocked(live.resolveProject).mock.calls.length).toBeGreaterThan(resolvesAfterPick);
   });
@@ -744,6 +748,7 @@ describe("ControlDeck", () => {
     await waitFor(() => {
       expect(screen.getByTestId("toast")).toHaveTextContent("Launch this workflow from the TUI on that deck's own host");
     });
+    expect(screen.getByTestId("toast")).toHaveAttribute("role", "status");
     expect(screen.queryByTestId("workflow-editor")).toBeNull();
     // No re-resolve: nothing about the project changed, and trying again cannot
     // help until the daemon does.

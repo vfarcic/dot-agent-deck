@@ -91,6 +91,14 @@ export function useDeckRuntime(): DeckRuntimeState {
    * the tile's — the composer that used to own this is gone, and what remains
    * are PROGRAMMATIC sends: the coordinator's seed prompt at workflow launch,
    * and whatever else dispatches through the guarded verb.
+   *
+   * A record here is one PAST ATTEMPT, never current state, which is why
+   * {@link adoptFleet} drops it the moment a newer snapshot arrives. Without
+   * that rule a recorded `wrong-session` outranks a writable lease
+   * (`terminalInput.ts`) and holds a live pane disabled with no route back: the
+   * user's own typing goes through `sendTerminalInput`, never `submit_text`, so
+   * nothing the user can do clears it, and a write lease can return to this
+   * client with no PTY respawn to trip the generation route below.
    */
   const [terminalInputResults, setTerminalInputResults] = useState<Record<string, SendResult>>({});
   const noteTerminalInputResult = useCallback((agentId: string, verdict: SendResult | undefined) => {
@@ -164,7 +172,24 @@ export function useDeckRuntime(): DeckRuntimeState {
    * actually true, and the next snapshot replaces it.
    */
   const adoptFleet = useCallback((next: DeckFleet) => {
-    if (next.length) setFleet(next);
+    if (!next.length) return;
+    setFleet(next);
+    // Issue #1042 — a snapshot supersedes every recorded verdict, because a
+    // verdict is a record of one attempt that has already happened and this is
+    // newer state about the same panes. The notice is therefore transient —
+    // shown until the next push — rather than sticky, which is the honest
+    // trade: a permanent false-disable of a pane the snapshot says is writable
+    // is the worse failure of the two.
+    //
+    // This is the whole of the "drop it on the next snapshot" rule, and a
+    // per-entry snapshot epoch would be inert beside it. The state has exactly
+    // three mutation sites — this one, and `noteTerminalInputResult` reached
+    // from `runAction`'s verdict and from `updateTerminal`'s generation clear —
+    // and neither of the other two runs inside this funnel, which every
+    // snapshot passes through synchronously. So every record that survives to
+    // here is by construction older than the snapshot arriving, and an epoch
+    // tag could never read otherwise.
+    setTerminalInputResults((current) => (Object.keys(current).length ? {} : current));
   }, []);
 
   const reconnect = useCallback(async () => {

@@ -21,6 +21,13 @@ interface TerminalViewportProps {
    * attribute asserting `applied` there would be a claim this component cannot
    * support. The sentence that goes with either case is rendered by the tile,
    * beside this viewport, so it survives this component being mocked.
+   *
+   * So this attribute is the pane's CLAIM, not the input's disabled-ness, and
+   * the two are different axes: `aria-disabled` on the same wrapper is the
+   * authoritative disabled signal and is emitted for every disabling reason,
+   * including the status-gate one that leaves this attribute absent. Anything
+   * reading `data-input-state` to infer enabled/disabled will misread a
+   * status-disabled pane.
    */
   inputState?: SendResult;
   /**
@@ -77,6 +84,21 @@ export function TerminalViewport({
   // Read through a ref for the same reason: a renamed agent must not cost the
   // operator their scroll position and selection.
   const labelRef = useRef(label);
+  // Issue #1042 — and read through a ref for the strongest version of that
+  // reason. `readOnly` used to be status-only, and a status is effectively
+  // monotonic (queued -> running -> passed), so rebuilding on it was rare.
+  // It is now also derived from the WRITE LEASE, which is bidirectional and
+  // flips during ordinary multi-client operation (PRD #882 hand-off): baking it
+  // into the build effect's dependencies tore the pane down and rebuilt it —
+  // losing scroll position and any in-progress selection — every time a TUI
+  // attached, and again when the lease came back.
+  //
+  // The ref is what keeps the `onData` guard below honest across that flip: it
+  // reads the CURRENT value rather than the one captured when the terminal was
+  // built, so a terminal can never announce itself disabled while still
+  // accepting keystrokes. The other two seams — `disableStdin` and the helper
+  // textarea's native `disabled` — are reconciled by the effect below.
+  const readOnlyRef = useRef(readOnly);
   // Set by the terminal effect below so the geometry effect can re-run the
   // grid reconciliation without owning the xterm instance.
   const applyGridRef = useRef<(() => void) | undefined>(undefined);
@@ -85,6 +107,7 @@ export function TerminalViewport({
   onResizeRef.current = onResize;
   appliedRef.current = applied;
   labelRef.current = label;
+  readOnlyRef.current = readOnly;
 
   useEffect(() => {
     const host = hostRef.current;
@@ -93,9 +116,9 @@ export function TerminalViewport({
     const terminal = new Terminal({
       allowProposedApi: false,
       convertEol: false,
-      cursorBlink: !readOnly,
+      cursorBlink: !readOnlyRef.current,
       cursorStyle: "bar",
-      disableStdin: readOnly,
+      disableStdin: Boolean(readOnlyRef.current),
       drawBoldTextInBrightColors: false,
       fontFamily: '"JetBrains Mono", "SFMono-Regular", Consolas, monospace',
       fontSize: 13.5,
@@ -160,14 +183,14 @@ export function TerminalViewport({
     const textarea = terminal.textarea;
     if (textarea) {
       textarea.setAttribute("aria-label", `${labelRef.current} terminal input`);
-      textarea.disabled = Boolean(readOnly);
+      textarea.disabled = Boolean(readOnlyRef.current);
     }
     // Expose the instance so the Reader overlay can snapshot the resolved buffer.
     registerTerminal(agentId, terminal);
     terminal.write(transcriptRef.current);
 
     const inputDisposable = terminal.onData((data) => {
-      if (!readOnly) onInputRef.current(data);
+      if (!readOnlyRef.current) onInputRef.current(data);
     });
     // PRD #882 — `fit()` PROPOSES a size; the daemon disposes.
     //
@@ -236,7 +259,33 @@ export function TerminalViewport({
       terminalRef.current = undefined;
       lastStreamRef.current = undefined;
     };
-  }, [agentId, readOnly]);
+  }, [agentId]);
+
+  // Issue #1042 — reconcile the input gate in place when the lease flips.
+  //
+  // Three seams have to agree, and they are kept in agreement here rather than
+  // by rebuilding the terminal (see `readOnlyRef` above for why a rebuild is
+  // not acceptable on this input):
+  //
+  // 1. `options.disableStdin`, which is what makes xterm ignore keystrokes;
+  // 2. the `onData` guard in the effect above, which reads `readOnlyRef` so it
+  //    can never be one flip behind the other two;
+  // 3. the helper textarea's native `disabled`, which is what stops the input
+  //    taking focus and showing a caret it would swallow.
+  //
+  // The wrapper's `aria-disabled` is React's own render below, so it moves with
+  // this prop by construction. A seam left behind would produce the one failure
+  // worse than the rebuild it replaces: a terminal announcing itself disabled
+  // while still accepting what is typed into it.
+  useEffect(() => {
+    const terminal = terminalRef.current;
+    if (!terminal) return;
+    const blocked = Boolean(readOnly);
+    terminal.options.disableStdin = blocked;
+    terminal.options.cursorBlink = !blocked;
+    const textarea = terminal.textarea;
+    if (textarea) textarea.disabled = blocked;
+  }, [readOnly]);
 
   // A rename changes the accessible name of the input without touching the
   // terminal, so this reconciles the attribute the effect above wrote at

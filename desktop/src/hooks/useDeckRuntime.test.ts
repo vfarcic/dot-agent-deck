@@ -2,6 +2,7 @@ import { act, renderHook, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { createFixtureSnapshot } from "../data/fixture";
 import type { DeckBridge } from "../lib/bridge";
+import { terminalInputState } from "../lib/terminalInput";
 import type { TerminalChunk } from "../types";
 
 /*
@@ -150,5 +151,49 @@ describe("useDeckRuntime", () => {
     act(() => feedTerminal?.(chunk(2, "replace")));
 
     expect(result.current.terminalInputResults).toEqual({});
+  });
+
+  /**
+   * Scenario: a verdict is recorded against an agent, and the daemon then
+   * pushes a fresh snapshot in which that agent's pane reads a writable lease.
+   * The record is one PAST attempt and the snapshot is newer state, so the
+   * record is dropped and the terminal goes back to accepting input.
+   *
+   * Without this rule the recorded `wrong-session` outranks a writable lease in
+   * `terminalInputState`, and nothing the user can do clears it: their typing
+   * goes through `sendTerminalInput` (the raw stream), never `submit_text`, and
+   * a write lease can return to this client with no PTY respawn to trip the
+   * generation route above.
+   */
+  it("drops a recorded verdict when a fresh snapshot reports a writable lease", async () => {
+    let pushFleet: ((fleet: unknown) => void) | undefined;
+    bridge.subscribe.mockImplementation(async (onFleet, _onTerminal) => {
+      pushFleet = onFleet;
+      return () => {};
+    });
+    bridge.runAction.mockResolvedValue({ ok: false, sendResult: "wrong-session" });
+    const { result } = renderHook(() => useDeckRuntime());
+    await waitFor(() => expect(result.current.snapshot.connection.status).toBe("connected"));
+    await act(async () => {
+      await result.current.runAction({ type: "submit_text", agentId: "planner", text: "hello" });
+    });
+    expect(result.current.terminalInputResults).toEqual({ planner: "wrong-session" });
+
+    // The lease is back with this client and the pane is live — which is
+    // exactly the state a rollover leaves behind, so the snapshot says
+    // "writable" while the verdict says "wrong-session".
+    const fresh = createFixtureSnapshot("connected");
+    const writable = {
+      ...fresh,
+      agents: fresh.agents.map((agent) => (agent.id === "planner" ? { ...agent, status: "running" as const, writeLease: "write" as const } : agent)),
+    };
+    act(() => pushFleet?.([writable]));
+
+    expect(result.current.terminalInputResults).toEqual({});
+    // And the consequence the user sees: the input the snapshot says is
+    // writable is no longer held disabled by the record.
+    const planner = result.current.snapshot.agents.find((agent) => agent.id === "planner")!;
+    expect(planner.writeLease).toBe("write");
+    expect(terminalInputState(planner, result.current.terminalInputResults?.[planner.id]).readOnly).toBe(false);
   });
 });

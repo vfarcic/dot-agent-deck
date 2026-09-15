@@ -89,9 +89,19 @@ function verdictState(verdict: SendResult | undefined): SendResult | undefined {
  * Resolve one agent's terminal-input state.
  *
  * `verdict` is the last non-delivered `SendResult` the guarded send verb
- * returned for this agent, if any; the lease outranks it, because a lease that
- * says the pane is gone is current state while a verdict is a record of one
- * past attempt.
+ * returned for this agent, if any. Precedence runs BOTH ways and it is worth
+ * stating both, because the second direction is the dangerous one:
+ *
+ * - When the lease itself says the pane is unwritable (`read`, `none`) it
+ *   outranks the verdict, because a lease that says the pane is gone is current
+ *   state while a verdict is a record of one past attempt.
+ * - When the lease says the pane IS writable (`write`, `unknown`, absent) the
+ *   lease reports nothing here and the VERDICT wins — so a recorded
+ *   `wrong-session` disables a pane the snapshot says is live. That is the
+ *   reachable-in-principle false disable, and nothing in this function
+ *   prevents it: what does is that `useDeckRuntime` drops every recorded
+ *   verdict as soon as a newer snapshot arrives, so no record can outlive the
+ *   state that contradicts it.
  */
 export function terminalInputState(agent: AgentSession, verdict?: SendResult): TerminalInputState {
   const reported = leaseState(agent) ?? verdictState(verdict);
