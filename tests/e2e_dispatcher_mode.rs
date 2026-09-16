@@ -534,6 +534,8 @@ fn open_orchestration_tab(deck: &TuiDeck, orch: &str) {
 fn new_pane_016_dispatcher_opens_dashboard_card_with_real_agent() {
     skip_unless!(common::check_claude_available());
 
+    const HAIKU_MODEL: &str = "claude-haiku-4-5-20251001";
+
     // Issue #1006: route the real agent behind a LAUNCHER, because without one
     // this test cannot reach the ordering it exists to exercise. The harness
     // exec'd `claude` directly with a pre-seeded HOME and it announced fast enough
@@ -553,13 +555,25 @@ fn new_pane_016_dispatcher_opens_dashboard_card_with_real_agent() {
     let staging = common::harness_tempdir().expect("launcher staging dir");
     // `command` is interpolated raw into the launcher's `exec` line (it has to
     // carry arguments), so the quoting is this caller's job — single quotes plus
-    // the POSIX escape for a `'` inside the resolved path.
+    // the POSIX escape for a `'` inside the resolved path. The `--model` pin rides
+    // after it as a plain argument (issue #1013): without one the pane ran on
+    // whatever the host's managed settings selected — measured as Opus 5 at xhigh
+    // reasoning effort — which is the opposite of what a `[reel]`-marked lane-2
+    // test should bill, and silent, since nothing reports the model it picked.
+    // Pinned HERE rather than in `real_claude_path`, which must keep returning the
+    // launcher-safe absolute PATH of the bare binary so the `exec` line cannot
+    // re-enter the launcher (itself named `claude`). Both agents this test brings
+    // up run on it: the dispatcher, and the unit it dispatches, which inherits the
+    // same `default_command`.
     let real_claude = real_claude_path();
     let launcher = common::write_late_announcing_real_agent(
         staging.path(),
         LAUNCHER_LOG,
         LAUNCHER_DELAY_SECS,
-        &format!("'{}'", real_claude.to_string_lossy().replace('\'', r"'\''")),
+        &format!(
+            "'{}' --model {HAIKU_MODEL}",
+            real_claude.to_string_lossy().replace('\'', r"'\''")
+        ),
     );
     let config = write_default_command_config(&launcher.to_string_lossy());
 

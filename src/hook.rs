@@ -586,13 +586,52 @@ pub fn send_and_await_reply(json: &str) -> SocketReply {
 /// Issue #868: `pane restart`'s own CLI round-trip budget —
 /// [`DELEGATE_REPLY_TIMEOUT`] (5s) is smaller than the respawn's own worst
 /// case inside the daemon (`AGENT_TERMINATE_GRACE` + `PANE_CLOSE_SETTLE_TIMEOUT`
-/// = up to 9s), and a timeout here silently maps to `ExitCode::SUCCESS` with
-/// no output ([`SocketReply::NoReply`]'s documented "must stay a success"
-/// contract) — so a `--force` restart of an agent that ignores SIGTERM, or
-/// any recreate-leg restart, would print nothing and exit 0 while the
-/// outcome was genuinely unknown. Comfortably above the daemon-side worst
-/// case (a few seconds of margin for the round trip itself, connect, and
-/// scheduling jitter) rather than exactly matching it.
+/// = up to 9s), and at the time this constant was written a timeout here
+/// silently mapped to `ExitCode::SUCCESS` with no output — so a `--force`
+/// restart of an agent that ignores SIGTERM, or any recreate-leg restart,
+/// would have printed nothing and exited 0 while the outcome was genuinely
+/// unknown. That "must stay a success" contract is `delegate`'s, not this
+/// verb's: since `40178393` a `NoReply` here is a hard `ExitCode::FAILURE`
+/// (see the `SocketReply::NoReply` arm behind `pane restart` in `main.rs`).
+///
+/// **This budget is DERIVED FROM THE RESPAWN ALONE, and is deliberately not
+/// the end-to-end worst case** (issue #1095).
+/// `handle_restart_role_with_state` blocks on
+/// [`crate::agent_pty::AgentPtyRegistry::pane_dispatch_lock`] *before* it
+/// respawns, and `dispatch_one_owned` takes that same per-pane lock as its
+/// first statement and holds it across `wait_for_session_start`
+/// (`SESSION_START_WAIT_TIMEOUT`, 30s) plus one readiness buffer. So a
+/// `pane restart <role>` issued while a `clear = true` delegate to that same
+/// role is mid-flight waits behind the lock, blows this 14s budget, and
+/// surfaces to the caller as [`SocketReply::NoReply`] — a reported failure
+/// for a restart the daemon is still holding and will carry out (or refuse,
+/// per the post-lock crash recheck) once the lock frees.
+///
+/// **Sizing the constant to cover that was considered and rejected**, because
+/// no compile-time constant can honestly bound it. The buffer term is not a
+/// fixed 1s: `dispatch_one_owned` pays one of `DELEGATE_READINESS_BUFFER`
+/// (1s), `WRAPPER_INTERFACE_READINESS_BUFFER` (5s) or
+/// `NO_SIGNAL_READINESS_BUFFER` (8s) depending on the readiness path — the
+/// 8s one is a SKIP of the wait rather than a release from it, and the 1s
+/// one also covers the timeout fallback and an unresolved agent. An
+/// operator can override the buffer via
+/// `DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS` up to
+/// `MAX_DELEGATE_READINESS_BUFFER` (30s) — a runtime value nothing here can
+/// see. The lock also has no cap on queue depth, so queued same-pane
+/// delegates compound. A derivation ending in
+/// `+ DELEGATE_READINESS_BUFFER` would therefore reproduce exactly the
+/// over-claim this paragraph exists to correct, while making a genuinely
+/// failing `pane restart` take ~45s to say so.
+///
+/// The mitigation is the caller-facing text instead: this verb's `NoReply`
+/// arm in `main.rs` is deliberately cause-agnostic — it tells the operator
+/// the restart "is still in flight and may have already succeeded", and to
+/// check the pane before retrying because retrying a successful restart
+/// kills and respawns it again. The residue is an over-reported failure with
+/// accurate advice attached, not a silent wrong answer.
+///
+/// [`SPAWN_ROLE_REPLY_TIMEOUT`] is unaffected by any of this:
+/// `handle_spawn_role_with_state` takes no dispatch lock.
 pub const RESTART_ROLE_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
     crate::agent_pty::AGENT_TERMINATE_GRACE.as_secs()
         + crate::agent_pty::PANE_CLOSE_SETTLE_TIMEOUT.as_secs()

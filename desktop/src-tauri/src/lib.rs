@@ -425,10 +425,24 @@ impl WorkflowDaemon for DaemonClient {
     }
 
     async fn begin_coordinator_readiness(&self) -> Result<Self::ReadinessWatch, String> {
-        let mut subscription = self
-            .subscribe_events()
-            .await
-            .map_err(|error| safe_message(error.to_string()))?;
+        // Issue #1084: bounded, like the fleet path's own `SubscribeEvents`
+        // and the handshake before it. A deck that is down fails at once with
+        // `ECONNREFUSED`, but one that takes the connection and never answers
+        // left this await with no deadline at all — a launch parked for as long
+        // as the peer held the socket open, with nothing on screen saying why.
+        //
+        // Only the RESP that CONFIRMS the subscription is bounded, and the
+        // ordering is what keeps that true: this completes BEFORE the draining
+        // task below exists, so the single future this timeout can drop is
+        // `subscribe_events()`'s own round trip. It is never `next_event`, whose
+        // cancel-unsafety issue #1028 is about, and never the long-lived event
+        // frames that follow — those are read inside that task, under no
+        // deadline.
+        let mut subscription = crate::daemon_bridge::bounded_reply(
+            "SubscribeEvents for coordinator readiness",
+            self.subscribe_events(),
+        )
+        .await?;
         let (tx, rx) = tokio::sync::mpsc::channel(EVENT_QUEUE_DEPTH);
         // Issue #1028: the subscription is owned by this task and by nothing
         // else, for the reason [`EVENT_QUEUE_DEPTH`] gives — `next_event` is not
@@ -2182,6 +2196,11 @@ mod tests {
     /// that also detaches.
     #[tokio::test]
     async fn an_ordinary_settings_save_does_not_retarget_the_deck() {
+        // `retarget_selection` writes the process-global applied selection, so
+        // every test here that calls it holds this for its duration (issue
+        // #1078) — otherwise a sibling's write lands between this one and the
+        // `selected_endpoint()` read that decides whether the deck moved.
+        let _selection = crate::dto::SELECTION_LOCK.lock().await;
         let state = DesktopState::default();
         let settings = DesktopSettings::default();
         // The selection in force starts as this document's, so the save below is
@@ -2244,6 +2263,7 @@ mod tests {
         use crate::settings::{EndpointId, RemoteEndpointSettings};
         use dot_agent_deck::remote_tunnel::Hostname;
 
+        let _selection = crate::dto::SELECTION_LOCK.lock().await;
         let state = DesktopState::default();
         let mut fleet = fleet_of(&["build-box.example.com", "laptop.example.com"]);
         let endpoints = fleet.endpoints.as_mut().expect("the fleet has a section");
@@ -2322,6 +2342,7 @@ mod tests {
     /// from writing its handle into the live claim.
     #[tokio::test]
     async fn a_watcher_whose_task_has_ended_does_not_hold_the_deck_hostage() {
+        let _selection = crate::dto::SELECTION_LOCK.lock().await;
         let state = DesktopState::default();
         let fleet = fleet_of(&["build-box.example.com"]);
         let deck = fleet
@@ -2359,17 +2380,37 @@ mod tests {
         );
 
         let _ = release.send(());
-        // Bounded rather than a bare loop: the task is finished the moment the
-        // runtime has polled it after the send, and a run that never gets there
-        // should fail rather than hang.
-        let mut reclaimed = None;
-        for _ in 0..1_000 {
-            if let Some(token) = state.start_watcher_once_for(&deck) {
-                reclaimed = Some(token);
-                break;
+        // Bounded by TIME, and by a sleep that actually parks this thread —
+        // never by an iteration count on this runtime.
+        //
+        // `tauri::async_runtime::spawn` does not put the task on the runtime
+        // `#[tokio::test]` built. With no `async_runtime::set` anywhere in this
+        // binary it lands on tauri's global `default_runtime()`, a
+        // multi-threaded tokio runtime with its own OS threads, so the release
+        // has to travel across a runtime boundary: a worker thread there must be
+        // scheduled, poll the released task to completion, and only then does
+        // `is_finished` flip for the handle `watching` reads. `yield_now` here
+        // reschedules only this test's own task and hands that worker nothing.
+        //
+        // So the old `for _ in 0..1_000 { yield_now().await }` was a ~4 ms wall
+        // clock budget wearing an iteration count: measured on an idle 16-core
+        // Linux box it resolved in 1–11 iterations and 17–41 us. Under 4x CPU
+        // oversubscription the same loop needed 46–174 iterations and exhausted
+        // all 1000 once in ten runs — reproducing, on Linux, the intermittent
+        // `build-windows` failure that sent it here. Windows loses it far more
+        // readily: its scheduling quantum alone is ~15.6 ms, four times the
+        // budget the loop actually had.
+        const RECLAIM_TIMEOUT: Duration = Duration::from_secs(5);
+        const RECLAIM_POLL: Duration = Duration::from_millis(5);
+        let reclaimed = tokio::time::timeout(RECLAIM_TIMEOUT, async {
+            loop {
+                if let Some(token) = state.start_watcher_once_for(&deck) {
+                    return token;
+                }
+                tokio::time::sleep(RECLAIM_POLL).await;
             }
-            tokio::task::yield_now().await;
-        }
+        })
+        .await;
 
         let second =
             reclaimed.expect("a deck whose watcher task has ended must be able to get another");
@@ -2464,6 +2505,7 @@ mod tests {
     async fn the_fleet_keeps_every_observed_decks_transport_and_one_selection_keeps_one() {
         use crate::settings::{EndpointSettings, Selection};
 
+        let _selection = crate::dto::SELECTION_LOCK.lock().await;
         let state = DesktopState::default();
         let fleet = fleet_of(&["build-box.example.com", "laptop.example.com"]);
         let observed = fleet.connectable_endpoints();
@@ -2520,6 +2562,7 @@ mod tests {
     /// survives with them — `retain` over the grown set still names it.
     #[tokio::test]
     async fn growing_the_fleet_does_not_retarget_the_deck_screen() {
+        let _selection = crate::dto::SELECTION_LOCK.lock().await;
         let state = DesktopState::default();
         let one = fleet_of(&["build-box.example.com"]);
         retarget_selection(&state, &one).await;
@@ -2585,6 +2628,7 @@ mod tests {
     /// snapshot.
     #[tokio::test]
     async fn a_deck_that_leaves_the_fleet_stops_being_watched() {
+        let _selection = crate::dto::SELECTION_LOCK.lock().await;
         let state = DesktopState::default();
         let fleet = fleet_of(&["build-box.example.com", "laptop.example.com"]);
         for endpoint in fleet.connectable_endpoints() {
@@ -4146,5 +4190,99 @@ command = "configured-planner"
         );
 
         server.abort();
+    }
+
+    /// Scenario: a scripted daemon accepts the coordinator-readiness
+    /// subscription, reads the `SubscribeEvents` request and then answers
+    /// nothing at all, holding the socket open. `begin_coordinator_readiness`
+    /// must come back with an error naming the deck as wedged rather than
+    /// parking the launch for as long as the peer keeps the connection.
+    ///
+    /// Issue #1084, and the same defect PRD #742 M14 fixed one path over: a deck
+    /// that is DOWN fails at once with `ECONNREFUSED`, so the failure this
+    /// covers is the one where the connect succeeds. **Measured against the
+    /// unbounded code**, where it fails on the outer bound below rather than on
+    /// either assertion; take that bound away too and it does not fail at all,
+    /// it never returns. That is why the outer bound is here, exactly as in
+    /// `daemon_bridge`'s sibling test for the handshake.
+    ///
+    /// # Paused time, and paused at a POINT
+    ///
+    /// The clock is stopped only once `accepted_rx` resolves, which is the peer
+    /// confirming it took the connection and read the request. `start_paused`
+    /// would auto-advance from the first moment the runtime had nothing to poll,
+    /// so a clock that jumped while the connect was still in flight would report
+    /// the same error for a scenario nobody wrote. Pausing here leaves exactly
+    /// one thing outstanding — a read against a peer that will never write — and
+    /// the runtime advances to the only deadline left. Real socket I/O, real
+    /// silence, none of the fifteen seconds spent.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_deck_that_never_answers_the_readiness_subscription_is_reported_rather_than_awaited()
+    {
+        use dot_agent_deck::daemon_protocol::read_frame;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("a scratch dir for the socket");
+        let socket = dir.path().join("s");
+        let listener = tokio::net::UnixListener::bind(&socket).expect("bind the scripted daemon");
+        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))
+            .expect("restate 0o600 on the socket inode");
+
+        let (accepted, accepted_rx) = tokio::sync::oneshot::channel::<()>();
+        let (release, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let silent = tokio::spawn(async move {
+            let (stream, _peer) = listener.accept().await.expect("accept the subscriber");
+            // The write half is kept bound rather than dropped: dropping it
+            // shuts the socket down and the client would read EOF instead of
+            // the stall this test is about.
+            let (mut reader, _writer) = stream.into_split();
+            let _ = read_frame(&mut reader).await;
+            let _ = accepted.send(());
+            let _ = release_rx.await;
+        });
+
+        let subscribing = {
+            let socket = socket.clone();
+            tokio::spawn(async move {
+                DaemonClient::new(socket)
+                    .begin_coordinator_readiness()
+                    .await
+            })
+        };
+        accepted_rx
+            .await
+            .expect("the deck must have taken the connection and read the request");
+        tokio::time::pause();
+
+        // Under a paused clock tokio advances to the NEAREST deadline, so the
+        // bound under test fires first while it has one, and this outer bound
+        // fires only when it does not. Neither costs wall clock; without it a
+        // regression is a hung job rather than a red test.
+        let outcome = tokio::time::timeout(Duration::from_secs(600), subscribing)
+            .await
+            .expect(
+                "begin_coordinator_readiness() must bound its own wait rather than await a \
+                 reply that is not coming",
+            )
+            .expect("the subscribing task must not panic");
+
+        let _ = release.send(());
+        let _ = silent.await;
+
+        let error = outcome.expect_err("a deck that never answers must not resolve as subscribed");
+        assert!(
+            error.contains("did not answer"),
+            "the elapsed case must say the deck took the connection and stalled, rather than \
+             reading as a transport failure: {error}"
+        );
+        assert!(
+            error.contains(
+                &crate::daemon_bridge::DECK_REPLY_TIMEOUT
+                    .as_secs()
+                    .to_string()
+            ),
+            "and name the bound it exceeded: {error}"
+        );
     }
 }

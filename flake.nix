@@ -56,7 +56,7 @@
       # not bump it by hand — the workflow derives the pin and the tag from one
       # input, so an out-of-band edit can only disagree with one of them.
       # release.yml still refuses to release when the pin disagrees with the tag.
-      version = "0.40.1";
+      version = "0.40.2";
 
       # `<version>-g<short-sha>`, the same shape build.rs composes out of git
       # metadata (build_version_resolve.rs:180-196).
