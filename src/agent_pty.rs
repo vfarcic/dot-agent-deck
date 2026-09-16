@@ -9019,12 +9019,13 @@ impl AgentPtyRegistry {
     /// each one. That is a deliberate trade of a zombie for a bounded shutdown,
     /// on three grounds:
     ///
-    /// * **Waiting buys nothing.** Pass 1 has already delivered the SIGKILL, so
-    ///   nothing this function can still do makes the child exit sooner. A child
-    ///   the kernel has not finished tearing down — macOS `ps` state `?Es`,
-    ///   "trying to exit", measured 18 times in 4500 executions in issue #959 —
-    ///   answers `Ok(None)` for exactly as long as it stays in that state, which
-    ///   is not a duration this process controls or can observe an end to.
+    /// * **Waiting buys nothing.** Pass 1 has already ISSUED the force-kill (not
+    ///   necessarily landed it — see below), so nothing this function can still
+    ///   do makes the child exit sooner. A child the kernel has not finished
+    ///   tearing down — macOS `ps` state `?Es`, "trying to exit", measured 18
+    ///   times in 4500 executions in issue #959 — answers `Ok(None)` for exactly
+    ///   as long as it stays in that state, which is not a duration this process
+    ///   controls or can observe an end to.
     /// * **Nothing downstream reads the statuses.** Both callers only
     ///   `change_notify.notify_one()` afterwards, and the `RunningAgent`s are
     ///   dropped when this function returns whichever way it left the loop.
