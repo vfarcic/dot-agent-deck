@@ -598,11 +598,11 @@ async fn delegate_023_a_replacement_that_dies_is_reported_to_the_orchestrator() 
 /// one cannot expire early on the thing it is waiting for: anywhere inside the
 /// 6 s window it stays under, over-holding is safe in BOTH directions. A fixed
 /// build parks in the respawn's wait for as long as the hold is up and then
-/// re-creates the pane, and a broken one has already failed by then. All the value has to be is long enough
-/// that a delegate cannot still be on its way to `spawn_agent`, and short enough
-/// to stay inside the 6 s `PANE_CLOSE_SETTLE_TIMEOUT` the daemon allows a close
-/// before it stops waiting for one. One second is ~1000x the first and 6x under
-/// the second.
+/// re-creates the pane, and a broken one has already failed by then. All the
+/// value has to be is long enough that a delegate cannot still be on its way to
+/// `spawn_agent`, and short enough to stay inside the 6 s
+/// `PANE_CLOSE_SETTLE_TIMEOUT` the daemon allows a close before it stops waiting
+/// for one. One second is ~1000x the first and 6x under the second.
 ///
 /// There is deliberately no early exit on "the record has gone", tempting as it
 /// is — the record going IS the defect, so ending the hold on it hands the

@@ -7522,9 +7522,10 @@ impl AgentPtyRegistry {
     /// The create leg of [`Self::respawn_or_recreate_agent_for_pane`]: a fresh
     /// agent on a pane that has no record to replace.
     ///
-    /// Split out so the recovery above can call it more than once without
-    /// rebuilding the option struct inline — the caller's `identity` is borrowed
-    /// and `SpawnOptions` owns its `env`, so each attempt needs its own clone.
+    /// Split out because the recovery above may attempt it more than once
+    /// (issue #1114) and `SpawnOptions` consumes what it is handed: the caller's
+    /// `identity` is borrowed and the options own their `env`, so every attempt
+    /// needs its own clone rather than a struct built once outside the loop.
     fn create_agent_for_pane(
         self: &Arc<Self>,
         pane_id_env: &str,
