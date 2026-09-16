@@ -31,7 +31,7 @@ fn harness_clears_inherited_deck_endpoints() {
         ("DOT_AGENT_DECK_PANE_ID", "8"),
         ("DOT_AGENT_DECK_AGENT_ID", "8"),
         (
-            "DOT_AGENT_DECK_HOOK_TOKEN",
+            "DOT_AGENT_DECK_PANE_CAPABILITY",
             "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
         ),
     ] {
@@ -46,7 +46,7 @@ fn harness_clears_inherited_deck_endpoints() {
         "DOT_AGENT_DECK_ATTACH_SOCKET",
         "DOT_AGENT_DECK_PANE_ID",
         "DOT_AGENT_DECK_AGENT_ID",
-        "DOT_AGENT_DECK_HOOK_TOKEN",
+        "DOT_AGENT_DECK_PANE_CAPABILITY",
     ] {
         assert!(
             std::env::var_os(var).is_none(),

@@ -1227,7 +1227,7 @@ pub fn spawn(opts: SpawnOptions<'_>) -> Result<AgentPty, AgentPtyError> {
     // pane in a DIFFERENT deck, and `spawn_agent`'s injection below is what
     // makes the correct value win. The unpinned case goes from "presents a
     // stranger's capability" to "presents this spawn's own".
-    cmd.env_remove(crate::hook_provenance::DOT_AGENT_DECK_HOOK_TOKEN);
+    cmd.env_remove(crate::hook_provenance::DOT_AGENT_DECK_PANE_CAPABILITY);
     // PRD #93 tuning env var: same scrub rationale — a deck launched
     // with this set would otherwise leak it into every child it spawns,
     // where it's meaningless to the child's environment.
@@ -2258,7 +2258,7 @@ pub struct RunningAgent {
     pub spawn_env: Vec<(String, String)>,
     /// Issue #1077 — the per-spawn hook capability token injected into this
     /// child's environment as
-    /// [`crate::hook_provenance::DOT_AGENT_DECK_HOOK_TOKEN`], and the only thing
+    /// [`crate::hook_provenance::DOT_AGENT_DECK_PANE_CAPABILITY`], and the only thing
     /// that ties a hook-socket message to the pane it claims to come from.
     ///
     /// Held **here** and not on [`AgentRecord`], which is the projection clients
@@ -5969,10 +5969,10 @@ impl AgentPtyRegistry {
         // replays the old generation's `spawn_env`, so without the strip a
         // respawned pane would keep answering to its predecessor's token.
         opts.env
-            .retain(|(k, _)| k != crate::hook_provenance::DOT_AGENT_DECK_HOOK_TOKEN);
+            .retain(|(k, _)| k != crate::hook_provenance::DOT_AGENT_DECK_PANE_CAPABILITY);
         let hook_token_for_record = crate::hook_provenance::mint();
         opts.env.push((
-            crate::hook_provenance::DOT_AGENT_DECK_HOOK_TOKEN.to_string(),
+            crate::hook_provenance::DOT_AGENT_DECK_PANE_CAPABILITY.to_string(),
             hook_token_for_record.clone(),
         ));
 
@@ -15468,7 +15468,7 @@ mod spawn_tests {
             inner.agents[&id]
                 .spawn_env
                 .iter()
-                .find(|(k, _)| k == crate::hook_provenance::DOT_AGENT_DECK_HOOK_TOKEN)
+                .find(|(k, _)| k == crate::hook_provenance::DOT_AGENT_DECK_PANE_CAPABILITY)
                 .map(|(_, v)| v.clone())
         };
         assert_eq!(
@@ -15506,7 +15506,7 @@ mod spawn_tests {
                 env: vec![
                     (DOT_AGENT_DECK_PANE_ID.to_string(), "plant-pane".to_string()),
                     (
-                        crate::hook_provenance::DOT_AGENT_DECK_HOOK_TOKEN.to_string(),
+                        crate::hook_provenance::DOT_AGENT_DECK_PANE_CAPABILITY.to_string(),
                         planted.clone(),
                     ),
                 ],
@@ -15528,7 +15528,7 @@ mod spawn_tests {
             inner.agents[&id]
                 .spawn_env
                 .iter()
-                .filter(|(k, _)| k == crate::hook_provenance::DOT_AGENT_DECK_HOOK_TOKEN)
+                .filter(|(k, _)| k == crate::hook_provenance::DOT_AGENT_DECK_PANE_CAPABILITY)
                 .map(|(_, v)| v.clone())
                 .collect()
         };
@@ -15586,7 +15586,7 @@ mod spawn_tests {
             inner.agents[&second]
                 .spawn_env
                 .iter()
-                .filter(|(k, _)| k == crate::hook_provenance::DOT_AGENT_DECK_HOOK_TOKEN)
+                .filter(|(k, _)| k == crate::hook_provenance::DOT_AGENT_DECK_PANE_CAPABILITY)
                 .map(|(_, v)| v.clone())
                 .collect::<Vec<_>>()
         };

@@ -35,7 +35,7 @@ use std::sync::OnceLock;
 /// them. Kept in step with `tests/common/mod.rs`'s `DECK_ENDPOINT_VARS`; the two
 /// cannot share a constant because the lib target does not link that file.
 ///
-/// Issue #1077 added `DOT_AGENT_DECK_HOOK_TOKEN`. It is not an endpoint, but it
+/// Issue #1077 added `DOT_AGENT_DECK_PANE_CAPABILITY`. It is not an endpoint, but it
 /// has the same failure mode as the pane and agent ids beside it, and a sharper
 /// one: a test process started from inside a live deck pane inherits that pane's
 /// real capability token, and a CLI it launches forwards it. Against the test's
@@ -49,7 +49,7 @@ pub const DECK_ENDPOINT_VARS: [&str; 5] = [
     "DOT_AGENT_DECK_ATTACH_SOCKET",
     "DOT_AGENT_DECK_PANE_ID",
     "DOT_AGENT_DECK_AGENT_ID",
-    "DOT_AGENT_DECK_HOOK_TOKEN",
+    "DOT_AGENT_DECK_PANE_CAPABILITY",
 ];
 
 /// Clear every inherited deck endpoint from this test process. Idempotent, and

@@ -25,7 +25,7 @@
 //!
 //! The daemon mints 256 bits of OS randomness per spawn ([`mint`]), keeps it on
 //! the agent's registry record, and injects it into the child's environment as
-//! [`DOT_AGENT_DECK_HOOK_TOKEN`] beside the pane id. The CLI presents it on every
+//! [`DOT_AGENT_DECK_PANE_CAPABILITY`] beside the pane id. The CLI presents it on every
 //! hook-socket message, and the daemon resolves **token → record → pane** and
 //! refuses a message whose claimed pane is not the one the token was minted for
 //! ([`classify`]).
@@ -122,7 +122,23 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// same token, and [`classify`]'s token → record resolution has no answer for
 /// that: whichever record the scan reached first would decide which pane a
 /// message is allowed to name.
-pub const DOT_AGENT_DECK_HOOK_TOKEN: &str = "DOT_AGENT_DECK_HOOK_TOKEN";
+///
+/// **The name deliberately contains none of `KEY`, `SECRET` or `TOKEN`**, and
+/// that is load-bearing, not taste. Agents scrub environment variables with
+/// those words in their names out of the shell their model runs commands in:
+/// Codex's `shell_environment_policy` drops every name matching `*KEY*`,
+/// `*SECRET*` or `*TOKEN*` (case-insensitive) whenever
+/// `ignore_default_excludes = false` — a documented hardening switch (checked
+/// against `openai/codex` `codex-rs/protocol/src/shell_environment.rs`, whose
+/// TOML default is `true`). Named `…_HOOK_TOKEN`, as the first cut of this was,
+/// the value would vanish for exactly the users who enabled that switch, their
+/// Codex workers' `work-done` would arrive with no token, and the daemon would
+/// refuse it — invisibly, because `work-done` reads no reply. The capability has
+/// to reach the command the agent runs, which is precisely what those filters
+/// exist to stop for API credentials; `DOT_AGENT_DECK_PANE_ID` already passes
+/// them for the same reason. `hook_provenance::tests::
+/// the_capability_variable_survives_agents_secret_name_filters` pins it.
+pub const DOT_AGENT_DECK_PANE_CAPABILITY: &str = "DOT_AGENT_DECK_PANE_CAPABILITY";
 
 /// Operator override for what the daemon does with a message that presents **no**
 /// token for a pane that was issued one — see [`Policy`].
@@ -458,7 +474,7 @@ impl Refusal {
 /// empty value would present as a token, be refused as malformed, and read in a
 /// log as a forgery rather than as an environment that never carried one.
 pub fn token_from_env() -> Option<String> {
-    std::env::var(DOT_AGENT_DECK_HOOK_TOKEN)
+    std::env::var(DOT_AGENT_DECK_PANE_CAPABILITY)
         .ok()
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty())
@@ -706,6 +722,22 @@ mod tests {
             !msg.contains("pane-orchestrator"),
             "the reply told the caller which pane the token belongs to: {msg}"
         );
+    }
+
+    /// See [`DOT_AGENT_DECK_PANE_CAPABILITY`] for why this is a real constraint:
+    /// Codex's shell environment filter, when enabled, removes any variable whose
+    /// name contains one of these, and a capability that never reaches the
+    /// agent's shell makes every legitimate signal from that agent a refusal.
+    #[test]
+    fn the_capability_variable_survives_agents_secret_name_filters() {
+        let upper = DOT_AGENT_DECK_PANE_CAPABILITY.to_ascii_uppercase();
+        for filtered in ["KEY", "SECRET", "TOKEN"] {
+            assert!(
+                !upper.contains(filtered),
+                "{DOT_AGENT_DECK_PANE_CAPABILITY} contains {filtered:?}, so an agent that scrubs \
+                 secret-looking names from its shell tool would strip it"
+            );
+        }
     }
 
     #[test]

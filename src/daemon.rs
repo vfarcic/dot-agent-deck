@@ -4520,7 +4520,7 @@ mod hook_ingestion_tests {
                 pane_id: pane_id.to_string(),
                 agent_id: agent_id.map(|a| a.to_string()),
                 // Issue #1077: the pane's own hook capability token, which the
-                // real `get-seed` CLI reads out of `DOT_AGENT_DECK_HOOK_TOKEN`.
+                // real `get-seed` CLI reads out of `DOT_AGENT_DECK_PANE_CAPABILITY`.
                 // Supplied on every arm below so each one still tests the
                 // identity question #916 is about rather than being refused one
                 // layer earlier for want of provenance.

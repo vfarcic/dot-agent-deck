@@ -6940,7 +6940,7 @@ static LOCK_DIR: OnceLock<PathBuf> = OnceLock::new();
 /// Env vars that tie a process to a *specific* deck — its daemon's endpoints,
 /// and the pane identity and capability that daemon issued.
 ///
-/// `DOT_AGENT_DECK_HOOK_TOKEN` (issue #1077) is here for the reason
+/// `DOT_AGENT_DECK_PANE_CAPABILITY` (issue #1077) is here for the reason
 /// `src/test_isolation.rs` gives at length: inherited from a live pane, it is
 /// forwarded by any CLI a test launches and refused by the test's own daemon as a
 /// token it never minted — a refusal the `warn` policy does not relax.
@@ -6950,7 +6950,7 @@ const DECK_ENDPOINT_VARS: [&str; 5] = [
     "DOT_AGENT_DECK_ATTACH_SOCKET",
     "DOT_AGENT_DECK_PANE_ID",
     "DOT_AGENT_DECK_AGENT_ID",
-    "DOT_AGENT_DECK_HOOK_TOKEN",
+    "DOT_AGENT_DECK_PANE_CAPABILITY",
 ];
 
 /// Detach this test process from any real deck before it can spawn anything.

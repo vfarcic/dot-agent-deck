@@ -1135,7 +1135,7 @@ pub struct GetSeedRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_id: Option<String>,
     /// Issue #1077: the per-spawn hook capability token from the sender's
-    /// `DOT_AGENT_DECK_HOOK_TOKEN`, which is what ties this message to the pane
+    /// `DOT_AGENT_DECK_PANE_CAPABILITY`, which is what ties this message to the pane
     /// `pane_id` names. The daemon resolves **token → record → pane** and
     /// refuses a message whose claimed pane is not the one the token was minted
     /// for, so a caller holding a valid token of its own still cannot name a
@@ -1176,7 +1176,7 @@ pub struct GetSeedResponse {
 pub struct ListTargetsRequest {
     pub pane_id: String,
     /// Issue #1077: the per-spawn hook capability token from the sender's
-    /// `DOT_AGENT_DECK_HOOK_TOKEN`, which is what ties this message to the pane
+    /// `DOT_AGENT_DECK_PANE_CAPABILITY`, which is what ties this message to the pane
     /// `pane_id` names. The daemon resolves **token → record → pane** and
     /// refuses a message whose claimed pane is not the one the token was minted
     /// for, so a caller holding a valid token of its own still cannot name a
@@ -1488,7 +1488,7 @@ pub struct DelegateSignal {
     /// Role names to delegate to (one or more).
     pub to: Vec<String>,
     /// Issue #1077: the per-spawn hook capability token from the sender's
-    /// `DOT_AGENT_DECK_HOOK_TOKEN`, which is what ties this message to the pane
+    /// `DOT_AGENT_DECK_PANE_CAPABILITY`, which is what ties this message to the pane
     /// `pane_id` names. The daemon resolves **token → record → pane** and
     /// refuses a message whose claimed pane is not the one the token was minted
     /// for, so a caller holding a valid token of its own still cannot name a
@@ -1519,7 +1519,7 @@ pub struct RestartRoleSignal {
     /// worker, not interrupting a live one.
     pub force: bool,
     /// Issue #1077: the per-spawn hook capability token from the sender's
-    /// `DOT_AGENT_DECK_HOOK_TOKEN`, which is what ties this message to the pane
+    /// `DOT_AGENT_DECK_PANE_CAPABILITY`, which is what ties this message to the pane
     /// `pane_id` names. The daemon resolves **token → record → pane** and
     /// refuses a message whose claimed pane is not the one the token was minted
     /// for, so a caller holding a valid token of its own still cannot name a
@@ -1585,7 +1585,7 @@ pub struct SpawnRoleSignal {
     pub pane_id: String,
     pub role: String,
     /// Issue #1077: the per-spawn hook capability token from the sender's
-    /// `DOT_AGENT_DECK_HOOK_TOKEN`, which is what ties this message to the pane
+    /// `DOT_AGENT_DECK_PANE_CAPABILITY`, which is what ties this message to the pane
     /// `pane_id` names. The daemon resolves **token → record → pane** and
     /// refuses a message whose claimed pane is not the one the token was minted
     /// for, so a caller holding a valid token of its own still cannot name a
@@ -1808,7 +1808,7 @@ pub struct DispatchSignal {
     #[serde(default)]
     pub shape: Option<DispatchShape>,
     /// Issue #1077: the per-spawn hook capability token from the sender's
-    /// `DOT_AGENT_DECK_HOOK_TOKEN`, which is what ties this message to the pane
+    /// `DOT_AGENT_DECK_PANE_CAPABILITY`, which is what ties this message to the pane
     /// `pane_id` names. The daemon resolves **token → record → pane** and
     /// refuses a message whose claimed pane is not the one the token was minted
     /// for, so a caller holding a valid token of its own still cannot name a
@@ -1853,7 +1853,7 @@ pub struct WorkDoneSignal {
     #[serde(default)]
     pub done: bool,
     /// Issue #1077: the per-spawn hook capability token from the sender's
-    /// `DOT_AGENT_DECK_HOOK_TOKEN`, which is what ties this message to the pane
+    /// `DOT_AGENT_DECK_PANE_CAPABILITY`, which is what ties this message to the pane
     /// `pane_id` names. The daemon resolves **token → record → pane** and
     /// refuses a message whose claimed pane is not the one the token was minted
     /// for, so a caller holding a valid token of its own still cannot name a

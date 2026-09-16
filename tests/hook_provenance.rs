@@ -7,7 +7,7 @@
 //! can see. `crate::hook_provenance` decides the policy, `crate::daemon`'s
 //! `hook_provenance_*` tests drive that decision over a real socket, and both
 //! build the message themselves — so a CLI that never read
-//! `DOT_AGENT_DECK_HOOK_TOKEN` would leave every one of them green while every
+//! `DOT_AGENT_DECK_PANE_CAPABILITY` would leave every one of them green while every
 //! real signal was refused. Here the daemon is a **stub** that captures the raw
 //! line, which is what makes the assertion about the bytes the CLI emits rather
 //! than about anything the daemon decides.
@@ -49,13 +49,13 @@ fn capture_one_line(args: &[&str], token: Option<&str>) -> String {
         .env("DOT_AGENT_DECK_PANE_ID", "cli-pane");
     match token {
         Some(t) => {
-            cmd.env("DOT_AGENT_DECK_HOOK_TOKEN", t);
+            cmd.env("DOT_AGENT_DECK_PANE_CAPABILITY", t);
         }
         // Explicitly removed rather than merely unset: this test binary can be
         // run from inside a real deck pane, which would otherwise hand the
         // child a genuine token and make the omission case vacuous.
         None => {
-            cmd.env_remove("DOT_AGENT_DECK_HOOK_TOKEN");
+            cmd.env_remove("DOT_AGENT_DECK_PANE_CAPABILITY");
         }
     }
     let output = cmd.output().expect("run the real CLI");
@@ -78,7 +78,7 @@ fn work_done_forwards_the_hook_token_from_its_environment() {
     let line = capture_one_line(&["work-done", "--task", "done"], Some(TOKEN));
     assert!(
         line.contains(&format!("\"token\":\"{TOKEN}\"")),
-        "the work-done CLI did not forward DOT_AGENT_DECK_HOOK_TOKEN: {line}"
+        "the work-done CLI did not forward DOT_AGENT_DECK_PANE_CAPABILITY: {line}"
     );
 }
 
@@ -90,7 +90,7 @@ fn delegate_forwards_the_hook_token_from_its_environment() {
     );
     assert!(
         line.contains(&format!("\"token\":\"{TOKEN}\"")),
-        "the delegate CLI did not forward DOT_AGENT_DECK_HOOK_TOKEN: {line}"
+        "the delegate CLI did not forward DOT_AGENT_DECK_PANE_CAPABILITY: {line}"
     );
 }
 
@@ -121,6 +121,6 @@ fn a_blank_hook_token_is_treated_as_absent() {
     let line = capture_one_line(&["work-done", "--task", "done"], Some("   "));
     assert!(
         !line.contains("token"),
-        "a blank DOT_AGENT_DECK_HOOK_TOKEN must be omitted, not presented: {line}"
+        "a blank DOT_AGENT_DECK_PANE_CAPABILITY must be omitted, not presented: {line}"
     );
 }
