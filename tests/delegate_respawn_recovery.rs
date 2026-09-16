@@ -108,6 +108,71 @@ async fn wait_for_pane_needle(
     }
 }
 
+/// The `StopAgent` request's own outcome, published by its task the moment it
+/// has one.
+///
+/// It exists because the test used to throw that outcome away — `let _ =
+/// closing.await` — while the precondition below reported only
+/// `JoinHandle::is_finished()`. A request that failed and a close that ran are
+/// indistinguishable through that lens, and the difference is the entire
+/// diagnosis. See [`CloseWindow::RequestEnded`].
+type StopOutcome = Arc<std::sync::Mutex<Option<Result<(), String>>>>;
+
+/// What [`wait_for_close_in_flight`] actually found, so a failing precondition
+/// names its cause instead of listing candidates.
+///
+/// # The cause that is NOT in here, and why it cannot be
+///
+/// A previous reading of this failure was "the window opened and shut between
+/// two 5 ms samples". That is not reachable, and the two facts that rule it out
+/// are both in `src/agent_pty.rs`:
+///
+/// - the window OPENS at `hold_pane_for_cleanup`, before `close_agent` is
+///   called at all, and stays open until the end of the `StopAgent` arm — which
+///   includes `terminate_child_with_grace_and_wait` spending up to
+///   `AGENT_TERMINATE_GRACE` (**3 seconds**) against a stand-in that traps
+///   `TERM`. A 5 ms poll cannot miss a three-second window.
+/// - `close_agent`'s **first** statement removes the agent from the registry,
+///   so `agent_is_live` is false for every instant after the close begins. Any
+///   state in which the window has already shut is a state in which the
+///   stand-in reads as dead.
+///
+/// So a failure reporting `stand-in still live = true` is a failure in which
+/// the close never began. That is [`Self::RequestEnded`], and it is the cause
+/// the old comment's two candidates ("the request failed, or the pane was never
+/// closed at all") could not tell apart because the request's result was
+/// discarded.
+enum CloseWindow {
+    /// `pane_close_in_flight` was observed true: the delegate below lands
+    /// inside the grace window, which is the scenario.
+    Entered,
+    /// The `StopAgent` request ended without the window ever opening, carrying
+    /// what it reported. Nothing was arranged, so the precondition is right to
+    /// fail — the value of this variant is that it says whose fault it was.
+    RequestEnded(String),
+    /// Neither the window nor the request resolved inside the budget.
+    BudgetExpired,
+}
+
+impl CloseWindow {
+    /// What to print when the precondition fails.
+    ///
+    /// A method rather than `{:?}`, so the [`Self::RequestEnded`] payload is
+    /// genuinely read: a field reachable only through a derived `Debug` is dead
+    /// code as far as `-D warnings` is concerned, and silencing that with an
+    /// `allow` would leave the diagnosis one refactor away from being dropped
+    /// on the floor again — which is the whole thing this type exists to stop.
+    fn cause(&self) -> String {
+        match self {
+            Self::Entered => "the window was entered".to_string(),
+            Self::RequestEnded(reported) => reported.clone(),
+            Self::BudgetExpired => "the budget expired with the window never opening and the \
+                 StopAgent request still in flight"
+                .to_string(),
+        }
+    }
+}
+
 /// Issue #709: wait until `pane_id`'s close has OBSERVABLY entered its grace
 /// window, so a delegate aimed at that window lands inside it rather than at a
 /// guessed offset from when the close was asked for.
@@ -120,24 +185,38 @@ async fn wait_for_close_in_flight<T>(
     registry: &AgentPtyRegistry,
     pane_id: &str,
     request: &tokio::task::JoinHandle<T>,
-) -> bool {
+    outcome: &StopOutcome,
+) -> CloseWindow {
     let deadline = tokio::time::Instant::now() + common::child_boot_budget();
     loop {
         if registry.pane_close_in_flight(pane_id) {
-            return true;
+            return CloseWindow::Entered;
         }
-        // The `StopAgent` request returns only once the close has run to
-        // completion (measured: `is_finished` flips in the same 100 ms tick that
-        // `pane_close_in_flight` goes back to false), so a finished request with
-        // no window ever observed means there is nothing left to wait for — the
-        // request failed, or the pane was never closed at all. Ending here turns
-        // that into a prompt, legible failure instead of one that spends the
-        // whole budget and then reports the wrong cause.
+        // A finished request with no window ever observed means there is
+        // nothing left to wait for. Ending here turns that into a prompt,
+        // legible failure instead of one that spends the whole budget and then
+        // reports the wrong cause — and, since the request publishes its result
+        // into `outcome` BEFORE its task ends, the failure can now name which
+        // of the reachable causes it was rather than listing them.
         if request.is_finished() {
-            return false;
+            return CloseWindow::RequestEnded(
+                match outcome.lock().ok().and_then(|slot| slot.clone()) {
+                    Some(Ok(())) => "the StopAgent request SUCCEEDED without the pane ever \
+                         entering its close window, which means the close skipped its \
+                         pane-scoped path — see `hold_pane_for_cleanup`'s two refusals"
+                        .to_string(),
+                    Some(Err(error)) => format!(
+                        "the StopAgent request FAILED, so nothing was closed and the \
+                         scenario was never set up: {error}"
+                    ),
+                    None => "the StopAgent task ended without publishing an outcome, so it \
+                         panicked or was cancelled"
+                        .to_string(),
+                },
+            );
         }
         if tokio::time::Instant::now() >= deadline {
-            return false;
+            return CloseWindow::BudgetExpired;
         }
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
@@ -354,7 +433,21 @@ async fn delegate_022_delegate_during_an_in_flight_close_brings_the_role_back() 
     );
 
     let closing_id = fx.worker_agent_id.clone();
-    let closing = tokio::spawn(async move { client.stop_agent(&closing_id).await });
+    // The request's own outcome, published into the slot BEFORE the task ends.
+    // That ordering is what lets the precondition below print a cause: by the
+    // time `JoinHandle::is_finished()` is true, the slot is populated. See
+    // [`CloseWindow`].
+    let stop_outcome: StopOutcome = Arc::new(std::sync::Mutex::new(None));
+    let closing = {
+        let sink = Arc::clone(&stop_outcome);
+        tokio::spawn(async move {
+            let result = client.stop_agent(&closing_id).await;
+            if let Ok(mut slot) = sink.lock() {
+                *slot = Some(result.as_ref().map(|_| ()).map_err(|e| e.to_string()));
+            }
+            result
+        })
+    };
 
     // Issue #709: this was a flat `sleep(200 ms)` — the reporter's own interval
     // — followed by the assertion below, and it was the SECOND fixed deadline in
@@ -375,13 +468,23 @@ async fn delegate_022_delegate_during_an_in_flight_close_brings_the_role_back() 
     // `NotFound` in. Waiting for it puts the delegate inside that window by
     // construction rather than by arithmetic, and it cannot report a window that
     // has not opened as one that has closed.
-    let entered_grace = wait_for_close_in_flight(&fx.daemon.registry, WORKER_PANE, &closing).await;
+    //
+    // What the wait now reports is a CAUSE rather than a bool. This assertion
+    // was met red on `main` and mis-diagnosed as "the window opened and shut
+    // between two samples" — a cause [`CloseWindow`]'s docs show is not
+    // reachable, because the window is at least the three-second termination
+    // grace wide and `agent_is_live` goes false the instant the close begins.
+    // The occurrence that produced that reading printed `stand-in still live =
+    // true`, so the close had not started at all; the request's own result
+    // would have said why, and the test was discarding it.
+    let window =
+        wait_for_close_in_flight(&fx.daemon.registry, WORKER_PANE, &closing, &stop_outcome).await;
     assert!(
-        entered_grace,
+        matches!(window, CloseWindow::Entered),
         "precondition: the close never entered its grace window, so the delegate below would be \
-         an ordinary post-close delegate instead of #606's race; stop_agent finished = {}, \
+         an ordinary post-close delegate instead of #606's race; cause = {}, \
          stand-in still live = {}, records = {:?}",
-        closing.is_finished(),
+        window.cause(),
         fx.daemon.registry.agent_is_live(&fx.worker_agent_id),
         fx.daemon.registry.agent_records()
     );
