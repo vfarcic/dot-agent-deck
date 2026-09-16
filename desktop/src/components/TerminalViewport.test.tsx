@@ -95,6 +95,24 @@ function triggerResize(agentId: string): void {
   observer.trigger();
 }
 
+/**
+ * The fake xterm behind a given agent's viewport — the handle the applied-grid
+ * assertion needs, since `resizeTerminal` only ever sees what `fit()` PROPOSED
+ * and never the grid xterm is left parsing at.
+ */
+function terminalFor(agentId: string) {
+  const terminal = terminals.find((candidate) => candidate.host?.closest(`[data-testid="terminal-${agentId}"]`));
+  if (!terminal) throw new Error(`no terminal for ${agentId}`);
+  return terminal;
+}
+
+/**
+ * The geometry the daemon has APPLIED for Planner. The fixture below hands it
+ * to the runtime and the test asserts xterm is held at it, so the two can never
+ * drift into agreeing by accident.
+ */
+const APPLIED_GRID = { cols: 80, rows: 24 };
+
 function overlayRuntime(resizeTerminal: DeckRuntimeState["resizeTerminal"]): DeckRuntimeState {
   const snapshot = createFixtureSnapshot("connected");
   let document: DesktopSettingsDto = { ...DEFAULT_DESKTOP_SETTINGS };
@@ -107,7 +125,7 @@ function overlayRuntime(resizeTerminal: DeckRuntimeState["resizeTerminal"]): Dec
     // #1105's security audit. Only the FIXTURE moved: a bare id here would
     // simply never be found, and this test would then assert nothing about the
     // applied geometry it exists to hold xterm at.
-    appliedGeometry: { [agentKey(snapshot.connection.deckId, "planner")]: { cols: 80, rows: 24 } },
+    appliedGeometry: { [agentKey(snapshot.connection.deckId, "planner")]: APPLIED_GRID },
     clearError: vi.fn(),
     runAction: vi.fn(async () => ({ ok: true }) as DeckActionResult),
     sendTerminalInput: vi.fn(async () => undefined),
@@ -278,12 +296,21 @@ describe("TerminalViewport agent pane geometry", () => {
   /**
    * Scenario: measure Planner as a deck tile, open its promoted full-window
    * pane, then close it. The resize callback reports a larger proposed grid
-   * while open and the original tile grid after close, even though the daemon's
-   * applied geometry deliberately puts xterm back at the tile grid each time.
+   * while open and the original tile grid after close — and xterm itself is put
+   * straight back to the daemon-applied grid after the pane's larger proposal,
+   * because the PTY is still at that size and parsing its bytes at the pane's
+   * geometry is PRD #104's mis-parse relocated into the desktop.
+   *
+   * The two halves need separate observations and only one of them is
+   * `resizeTerminal`: `fit()` reports the proposal BEFORE `applyAppliedGrid()`
+   * runs, so the reported numbers are identical whether the applied geometry is
+   * found, missing or ignored. The restoration is only visible on the terminal
+   * instance, which is why `terminalFor` exists.
   */
-  it("reports the pane's larger proposed grid and the tile grid again on close", () => {
+  it("reports the pane's larger proposed grid and restores the applied grid", () => {
     const resizeTerminal = vi.fn(async (_agentId: string, _cols: number, _rows: number) => undefined);
     render(<DeckShell runtime={overlayRuntime(resizeTerminal)} />);
+    const terminal = terminalFor("planner");
 
     triggerResize("planner");
     expect(resizeTerminal).toHaveBeenLastCalledWith("planner", 80, 24);
@@ -296,6 +323,9 @@ describe("TerminalViewport agent pane geometry", () => {
     const [, overlayCols, overlayRows] = resizeTerminal.mock.calls[0];
     expect(overlayCols).toBeGreaterThan(tileCols);
     expect(overlayRows).toBeGreaterThan(tileRows);
+    // The pane PROPOSED 160x48 and the daemon has not applied it, so the grid
+    // xterm is left at is the applied one — not the one just reported above.
+    expect({ cols: terminal.cols, rows: terminal.rows }).toEqual(APPLIED_GRID);
     resizeTerminal.mockClear();
 
     fireEvent.click(screen.getByRole("button", { name: "Close Planner agent" }));
