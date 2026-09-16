@@ -154,8 +154,11 @@ mod pin_lockstep;
 /// PR #966: the authorization boundary the PR-review agent's verdict crosses to
 /// reach the job that casts an approving review with an App credential. Which
 /// comments count as a verdict is a runtime property — the first version
-/// accepted a forged one from any GitHub account. Tests only; the rule lives in
-/// `.github/scripts/pr_review_common.py`, driven here under `python3`.
+/// accepted a forged one from any GitHub account. Issue #1086 added the other
+/// runtime decision in the same script: which checks gate selection, where
+/// counting an advisory red as a veto withheld the approval the merge needs.
+/// Tests only; the rules live in `.github/scripts/pr_review_common.py`, driven
+/// here under `python3`.
 #[cfg(test)]
 mod pr_review_verdict;
 /// Issue #1019 review: `scripts/reap-orphans.sh` SIGKILLs processes selected by
