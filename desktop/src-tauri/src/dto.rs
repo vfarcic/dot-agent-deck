@@ -1300,10 +1300,15 @@ impl DeckScope {
     /// here by which a value from the webview becomes an address.
     ///
     /// `None` keeps the previous behaviour for a caller that names no deck.
-    /// Nothing in this tree sends one today — the webview always names the deck
-    /// it is attaching to — and it is kept because the parameter is optional on
-    /// the IPC boundary, so absence must mean something defined rather than an
-    /// error the user cannot act on.
+    /// No production webview path sends one — the webview's own attach always
+    /// names the deck it is attaching to — but callers in this tree do:
+    /// `DesktopAction::AttachTerminal` is the legacy declarative attach path
+    /// and passes `None`, for which it legitimately means "the selected
+    /// deck". That action is not reachable from the frontend today, which
+    /// defines the variant in its action union and dispatches it from
+    /// nowhere. `Option` is kept because the parameter is optional on the IPC
+    /// boundary, so absence must mean something defined rather than an error
+    /// the user cannot act on.
     pub(crate) fn resolve(deck_id: Option<&str>) -> Result<Self, String> {
         // ONE read, so the endpoint and the epoch describe the same fleet.
         let applied = applied_selection();
