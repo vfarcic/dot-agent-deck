@@ -47,9 +47,22 @@ fn repo_root() -> PathBuf {
 /// Parsed from text on purpose: `xtask/linkage-check` does not depend on the
 /// root crate, and a text read also catches the constant being renamed or moved
 /// out of the file the rule names — which a `use` would silently follow.
-fn declared_entries() -> Vec<String> {
-    let source = std::fs::read_to_string(repo_root().join("src/daemon_protocol.rs"))
-        .expect("src/daemon_protocol.rs is readable");
+///
+/// **Comments are stripped before the literals are read, and that is the
+/// difference between a rule and a rule-shaped thing.** Splitting the body on
+/// quotes alone treats every odd segment as an entry, so `// see "999-example"`
+/// in the comment above a real entry would satisfy the check for
+/// `999.breaking.md` with nothing in the runtime constant — and, worse, a single
+/// unbalanced quote anywhere in a comment flips the parity and misreads every
+/// entry after it. Both failures are silent and both are in the permissive
+/// direction, which is the one this file exists to close.
+///
+/// Stripping `//` to end of line is safe for this constant specifically: an
+/// entry is `<issue>-<kebab-slug>`, a charset with no `/` in it (asserted by
+/// `the_entries_are_read_out_of_the_real_source` here and by
+/// `declared_contract_breaks_are_well_formed_and_unique` in the constant's own
+/// crate), so no string literal here can contain the sequence being stripped.
+fn parse_entries(source: &str) -> Vec<String> {
     let start = source
         .find("pub const CONTRACT_BREAKS: &[&str] = &[")
         .expect("`CONTRACT_BREAKS` is still declared in src/daemon_protocol.rs with that spelling");
@@ -59,13 +72,28 @@ fn declared_entries() -> Vec<String> {
         .find("];")
         .expect("the slice literal closes with `];`");
     let list = &body[open + 1..open + close];
-    list.split('"')
-        // A quoted string literal is every ODD segment of a split on `"`, and
-        // the comment lines between entries are the even ones.
+    let code: String = list
+        .lines()
+        .map(|line| match line.find("//") {
+            Some(at) => &line[..at],
+            None => line,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    code.split('"')
+        // A quoted string literal is every ODD segment of a split on `"`; with
+        // the comments gone, nothing else in this body can carry one.
         .skip(1)
         .step_by(2)
         .map(str::to_string)
         .collect()
+}
+
+/// [`parse_entries`] against the real file.
+fn declared_entries() -> Vec<String> {
+    let source = std::fs::read_to_string(repo_root().join("src/daemon_protocol.rs"))
+        .expect("src/daemon_protocol.rs is readable");
+    parse_entries(&source)
 }
 
 /// The issue numbers of the `*.breaking.md` fragments waiting in `changelog.d/`.
@@ -122,6 +150,58 @@ fn the_entries_are_read_out_of_the_real_source() {
             !issue.is_empty() && issue.bytes().all(|b| b.is_ascii_digit()),
             "`{entry}` must open with the issue number its fragment is named for"
         );
-        assert!(!slug.is_empty(), "`{entry}` must carry a slug");
+        // The charset is what makes stripping `//` before the split safe: no
+        // entry can contain the sequence being stripped. `parse_entries`'s doc
+        // comment cites this assertion, so the two must not drift.
+        assert!(
+            !slug.is_empty()
+                && slug
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-'),
+            "`{entry}`'s slug must be lower-case kebab, with no `/` in it"
+        );
     }
+}
+
+/// A quoted string in a COMMENT cannot satisfy the rule, and cannot derail the
+/// entries that follow it either.
+///
+/// Both halves matter and only the first is obvious. A comment mentioning an
+/// issue in quotes would have been read as a declaration — the rule passing on
+/// prose while the runtime constant declares nothing. The second half is the
+/// one that bites without anybody writing anything odd: an apostrophe-free but
+/// quote-bearing comment shifts the parity of every split that follows, so the
+/// real entries after it are read as the gaps between them. A permissive
+/// misparse of a gate is a gate that reports success, which is the failure this
+/// file exists to prevent.
+#[test]
+fn a_quoted_string_in_a_comment_is_not_a_declaration() {
+    let source = r#"
+pub const CONTRACT_BREAKS: &[&str] = &[
+    // An issue mentioned in prose, as "999-not-a-declaration", declares nothing.
+    "617-pane-write-agent-binding",
+    // A lone quote in a comment " used to flip the parity of everything below.
+    "704-orchestration-default",
+];
+"#;
+    assert_eq!(
+        parse_entries(source),
+        vec![
+            "617-pane-write-agent-binding".to_string(),
+            "704-orchestration-default".to_string()
+        ],
+        "only the string literals are entries"
+    );
+}
+
+/// The empty list parses as empty rather than as anything else — the shape the
+/// constant takes the day a `PROTOCOL_VERSION` bump makes every entry moot.
+#[test]
+fn an_empty_constant_parses_as_no_entries() {
+    let source = r#"
+pub const CONTRACT_BREAKS: &[&str] = &[
+    // Nothing declared yet.
+];
+"#;
+    assert!(parse_entries(source).is_empty());
 }

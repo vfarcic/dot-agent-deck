@@ -510,22 +510,34 @@ pub const CONTRACT_BREAKS: &[&str] = &[
 pub enum ContractComparison {
     /// The peer advertised no list at all, so there is nothing to compare.
     ///
-    /// **Read as "connect", not as "refuse", and the reason is a date rather
-    /// than a principle.** The field ships in the same commit as the empty
-    /// baseline it started from, so a build that omits it is a build that
-    /// predates the mechanism — and every such build is at that baseline by
-    /// construction. Refusing them would refuse every released daemon up to and
-    /// including `v0.40.2` for saying nothing, which is the false-positive class
+    /// **Read as "connect", not as "refuse" — and that reading is an ASSUMPTION
+    /// about a population, not a deduction.** Stated that way deliberately: this
+    /// list does not ship empty, so "a build that omits the field is at this
+    /// build's contract by construction" would be false, and the paragraph below
+    /// would contradict it.
+    ///
+    /// What actually holds is narrower and is about *which* builds can reach
+    /// this arm. A reply without the field comes from a build that predates the
+    /// field, and [`PROTOCOL_VERSION`] has to match for the comparison to be
+    /// reached at all — so the peer is a protocol-9 build older than this
+    /// commit. **Every released build in that set carries #617** (`v0.40.0`
+    /// onward contains `ed4e24f7`; `v0.39.4` is protocol 8 and never reaches
+    /// here), so it is at this build's declared contract and merely cannot say
+    /// so. Refusing the set would refuse every released daemon up to and
+    /// including `v0.40.2` for staying silent, which is the false-positive class
     /// issue #801 exists to remove rather than relocate.
     ///
-    /// **The residual, stated rather than implied:** a protocol-9 build made in
-    /// the window between PRD #882's bump and issue #617 genuinely predates a
-    /// declared break and still lands here, so this arm connects it. That window
-    /// is 73 minutes wide (`6932ae2a` to `ed4e24f7`, both 2026-09-10) and no
-    /// release falls inside it — `v0.39.4` is protocol 8 and `v0.40.0` already
-    /// carries #617 — so reaching it means running a dev build from that hour.
+    /// **The residual, stated rather than implied:** an UNRELEASED protocol-9
+    /// build from the window between PRD #882's bump and #617 genuinely predates
+    /// a declared break, is not at this build's contract, and is connected
+    /// anyway. That window is 73 minutes wide (`6932ae2a` to `ed4e24f7`, both
+    /// 2026-09-10), so reaching it means running a dev build from that hour.
     /// [`PROTOCOL_VERSION`] still gates the connection, and the operator still
     /// has both build stamps in front of them.
+    ///
+    /// The assumption shrinks on its own: every build made from this commit
+    /// onward declares, so the population that can land here is fixed and
+    /// ageing rather than growing.
     Undeclared,
     /// Both builds declared a list and the two agree.
     Agreed,
@@ -1523,11 +1535,12 @@ pub struct AttachResponse {
     /// which the honest answer is "I would rather not say".
     ///
     /// **Absence is NOT "withhold" here, and that is the one place this field's
-    /// rule differs from the capability set's.** The field ships in the same
-    /// commit as the baseline list, so a reply without it comes from a build
-    /// that predates the mechanism and is at that baseline by construction — see
-    /// [`ContractComparison::Undeclared`], which is the only place that reading
-    /// is made, and which states the residual it costs.
+    /// rule differs from the capability set's.** A reply without it comes from a
+    /// build that predates the field, and is read as being at this build's
+    /// declared contract — an assumption about which builds can reach that arm,
+    /// not a deduction from an empty baseline (this list does not ship empty).
+    /// [`ContractComparison::Undeclared`] is the only place that reading is
+    /// made; it carries the argument for it and the residual it costs.
     ///
     /// Additive and optional, so no [`PROTOCOL_VERSION`] bump: an older client
     /// ignores the extra key and an older daemon omits it.
