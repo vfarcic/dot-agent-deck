@@ -120,6 +120,58 @@ async fn wait_for_pane_needle(
 /// read.
 const CLOSE_GRACE_ATTEMPTS: usize = 3;
 
+/// What [`wait_for_pane_record_to_clear`] established.
+enum RecordCleared {
+    /// The pane has no registry entry and its close is still in flight — a
+    /// delegate issued now reaches `respawn_or_recreate_agent_for_pane`'s
+    /// `NotFound` arm, which is #606's recovery.
+    WhileClosing,
+    /// The close completed before the entry cleared. Not a verdict: the attempt
+    /// simply did not reach the state it was aiming at.
+    WindowShutFirst,
+    /// Neither happened inside the budget.
+    BudgetExpired,
+}
+
+/// PR #1115 review (Greptile P1): wait until `pane_id` has no registry entry,
+/// while its close is still in flight.
+///
+/// See [`close_pane_into_its_grace_window`]'s doc for why the close having
+/// BEGUN is not enough, and for why polling for this particular state is sound
+/// when polling for the window was not.
+async fn wait_for_pane_record_to_clear(
+    registry: &AgentPtyRegistry,
+    pane_id: &str,
+    budget: Duration,
+) -> RecordCleared {
+    let deadline = tokio::time::Instant::now() + budget;
+    loop {
+        // `agent_id_for_pane_any`, not `pane_current_agent_id`: the respawn's
+        // own lookup carries no `exited` filter, so an entry whose child had
+        // died would still be found by it and still route away from the
+        // recovery. (The one difference left is `pane_handed_over`, which this
+        // helper skips and the respawn does not — no handover happens in this
+        // test, and a stricter reading would only make this wait end later.)
+        if registry.agent_id_for_pane_any(pane_id).is_none() {
+            // Re-read rather than trust the earlier signal: the entry could
+            // have cleared because the whole close finished, and a delegate
+            // aimed after that is an ordinary post-close delegate.
+            return if registry.pane_close_in_flight(pane_id) {
+                RecordCleared::WhileClosing
+            } else {
+                RecordCleared::WindowShutFirst
+            };
+        }
+        if !registry.pane_close_in_flight(pane_id) {
+            return RecordCleared::WindowShutFirst;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return RecordCleared::BudgetExpired;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+}
+
 /// Issue #709/#954: put `pane_id`'s close into its grace window and hand back
 /// the still-running request, so a delegate aimed at that window lands inside it
 /// rather than at a guessed offset from when the close was asked for.
@@ -143,6 +195,31 @@ const CLOSE_GRACE_ATTEMPTS: usize = 3;
 /// and retried, and only a run of [`CLOSE_GRACE_ATTEMPTS`] failed attempts is a
 /// failure — reported with each attempt's own outcome, which is the fact the old
 /// `let _ = closing.await` discarded.
+///
+/// **The close BEGINNING is not enough, and waiting only for it silently loses
+/// the coverage** (PR #1115 review, Greptile P1). `begin_pane_close` — which is
+/// what resolves the signal — runs BEFORE `close_agent`, and `close_agent` is
+/// what removes the pane's registry entry. A delegate aimed at the gap between
+/// them finds a record and takes `respawn_agent_for_pane_declared`'s ORDINARY
+/// path, not the `NotFound` recreation path that is all #606 is about. What
+/// actually happens then is worse than a silent pass: that path removes the
+/// record itself and only then calls `spawn_agent`, which REFUSES a pane still
+/// in `cleanup_holds` with `DuplicatePaneId` — an error
+/// `respawn_or_recreate_agent_for_pane` returns untouched, since only `NotFound`
+/// routes to the recovery. The delegate fails, no replacement ever appears, and
+/// the test reports #606's own symptom for a scenario it never reached. The
+/// predecessor's gap was WIDER still: it returned on `pane_close_in_flight`,
+/// true from `hold_pane_for_cleanup`, a step earlier again.
+///
+/// So the second half of the precondition waits for the pane's entry to be
+/// GONE, with the close still in flight. That wait may poll, and the difference
+/// from the defect above is not a matter of degree: "no entry for this pane" is
+/// MONOTONIC for the rest of the close, because nothing can publish onto a pane
+/// in `cleanup_holds` — `spawn_agent` refuses it — so once true it stays true
+/// until the hold lifts, which is ~3 s of `AGENT_TERMINATE_GRACE` away. A poll
+/// cannot miss a state that cannot be left. It re-reads `pane_close_in_flight`
+/// on every turn as well, so it can never draw a conclusion from a window that
+/// has since shut; that, too, is an inconclusive attempt rather than a verdict.
 ///
 /// Bounded by [`common::child_boot_budget`] for the same reason the boot waits
 /// are: the quantity being waited on is a freshly scheduled task getting its
@@ -196,21 +273,30 @@ async fn close_pane_into_its_grace_window(
             // returns is read as the window it is, never as a failed attempt.
             biased;
             _ = close_began => {
-                // `pane_close_in_flight` is true from `hold_pane_for_cleanup`,
-                // which the handler takes BEFORE `begin_pane_close`, and stays
-                // true until the hold is dropped at the end of the arm — so at
-                // the instant the signal resolves the window is open by
-                // construction. Checked anyway, because the one shape that
-                // would falsify it is issue #954's own hypothesis (a window
-                // that opens and shuts before anyone can deliver into it), and
-                // that is an inconclusive attempt rather than a verdict.
-                if registry.pane_close_in_flight(pane_id) {
-                    return request;
+                // The close has begun. Now wait for the half that makes the
+                // delegate below reach #606's path at all: the pane's registry
+                // entry gone, with the window still open. The doc above has the
+                // ordering and why this poll is sound where the one it replaced
+                // was not.
+                match wait_for_pane_record_to_clear(registry, pane_id, ceiling).await {
+                    RecordCleared::WhileClosing => return request,
+                    RecordCleared::WindowShutFirst => attempts.push(format!(
+                        "attempt {attempt}: the close began and had already finished before the \
+                         pane's registry entry cleared, so the delegate could not be aimed \
+                         inside the window"
+                    )),
+                    RecordCleared::BudgetExpired => panic!(
+                        "precondition: {pane_id}'s close entered its grace window but its \
+                         registry entry was still there {ceiling:?} later, so a delegate now \
+                         would take the ordinary respawn path instead of #606's recreation \
+                         path; attempt {attempt} of {CLOSE_GRACE_ATTEMPTS}, earlier attempts \
+                         = {attempts:?}, stop_agent finished = {}, close still in flight = {}, \
+                         records = {:?}",
+                        request.is_finished(),
+                        registry.pane_close_in_flight(pane_id),
+                        registry.agent_records()
+                    ),
                 }
-                attempts.push(format!(
-                    "attempt {attempt}: the close began and had already finished before the \
-                     delegate could be aimed at it"
-                ));
             }
             outcome = &mut request => {
                 attempts.push(format!(
