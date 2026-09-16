@@ -1128,9 +1128,11 @@ const _: () = assert!(
 ///
 /// `kill=` carries what pass 1's force-kill reported for this agent (issue
 /// #1118, Greptile P1), and it is the field that separates the two very
-/// different reasons a child can still be here. `kill=ok` and no exit status
-/// means the signal went out and the kernel has not finished tearing the child
-/// down — the `?Es` case, which resolves itself. `kill=FAILED` means the
+/// different reasons a child can still be here. `kill=ok` means nothing reported
+/// a failure, which is most likely a child the kernel has not finished tearing
+/// down — the `?Es` case, which resolves itself — but is NOT a delivery receipt:
+/// Unix's pid-unavailable branch returns `true` having discarded its own
+/// `child.kill()` result. `kill=FAILED` means the
 /// force-kill's own mechanism reported an error
 /// ([`crate::platform::proc::force_kill_child_group`] has the per-platform
 /// meaning), so this child was very likely never signalled and may still be
@@ -9153,9 +9155,10 @@ impl AgentPtyRegistry {
             deadline_ms = FORCE_REAP_DEADLINE.as_millis() as u64,
             elapsed_ms,
             "force-kill reap gave up: these agents never reported an exit status within the \
-             deadline and are left un-reaped. `kill=ok` means the force-kill went out and the \
-             kernel has not finished tearing the child down; `kill=FAILED` means the force-kill \
-             itself reported an error and that child may still be running"
+             deadline and are left un-reaped. `kill=ok` means NO force-kill failure was reported \
+             — most likely a child the kernel has not finished tearing down, though it does not \
+             establish that the signal was delivered; `kill=FAILED` means the force-kill itself \
+             reported an error and that child may still be running"
         );
     }
 
