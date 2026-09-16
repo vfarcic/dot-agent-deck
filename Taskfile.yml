@@ -31,73 +31,64 @@ tasks:
       trying a branch build never bounces your everyday deck. Run it from the
       directory holding your .dot-agent-deck.toml. Vars: DIR (config dir, default
       the dir you invoke from), SANDBOX (isolation state dir, default DIR/.dad-sandbox),
-      PROFILE (release|debug, default release).
+      PROFILE (release|debug, default release). See docs/develop/local-run.md.
     vars:
       DIR: '{{.DIR | default .USER_WORKING_DIR}}'
+      SANDBOX: '{{.SANDBOX | default ""}}'
       PROFILE: '{{.PROFILE | default "release"}}'
     cmds:
       # Build from the Taskfile's own checkout, so the binary always matches the
       # branch you are sitting on rather than whatever is installed on PATH.
       - cargo build {{if eq .PROFILE "release"}}--release{{end}}
-      - |
-        set -eu
-        dir="{{.DIR}}"
-        sandbox="${SANDBOX:-$dir/.dad-sandbox}"
-        bin="{{.TASKFILE_DIR}}/target/{{.PROFILE}}/dot-agent-deck"
+      # The isolation itself — every override, and why — lives in the script, so
+      # run, run-desktop, run-all and run-stop cannot drift apart on it.
+      - bash "{{.TASKFILE_DIR}}/scripts/sandbox-run.sh" tui "{{.TASKFILE_DIR}}" "{{.DIR}}" "{{.SANDBOX}}" "{{.PROFILE}}"
 
-        if [ ! -f "$dir/.dot-agent-deck.toml" ]; then
-          echo "note: no .dot-agent-deck.toml in $dir — the deck will start with no" >&2
-          echo "      modes/orchestrations configured. Pass DIR=<dir> to point elsewhere." >&2
-        fi
-        mkdir -p "$sandbox"
-
-        # Isolation. Without these, a branch build's build-version handshake
-        # (PRD #103/#161) SIGTERMs the daemon your installed build is using —
-        # silently when no agents are live — and switching back bounces it again.
-        # These four are the documented production overrides (src/config.rs).
-        export DOT_AGENT_DECK_ATTACH_SOCKET="$sandbox/attach.sock"
-        export DOT_AGENT_DECK_SOCKET="$sandbox/hook.sock"
-        export DOT_AGENT_DECK_STATE_DIR="$sandbox/state"
-        export DOT_AGENT_DECK_SESSION="$sandbox/session.toml"
-
-        # Panes inherit this PATH, so an agent inside the sandbox that types a
-        # bare `dot-agent-deck` must reach the branch build — not whatever is
-        # installed. Without this the release binary on PATH wins and the miss is
-        # SILENT for every verb that exists in both builds, so a pane can "test
-        # the branch" while actually exercising the installed release.
-        export PATH="$(dirname "$bin"):$PATH"
-
-        # ...and the PATH prepend above is NOT enough on its own. Agents here are
-        # launched through `devbox run <script>` (see .dot-agent-deck.toml's role
-        # commands), and a NESTED devbox re-derives PATH from its own environment:
-        # the prepend above is DISCARDED, and devbox.json's init_hook then puts
-        # $HOME/.local/bin first — so a bare `dot-agent-deck` in a pane reaches the
-        # INSTALLED RELEASE. Measured: level-1 PATH starts with the build dir,
-        # level-2 (the agent) starts with $HOME/.local/bin and has no build dir at
-        # all. Ordinary env vars DO survive that nesting, so hand the dir over as
-        # one and let init_hook re-prepend it inside every devbox layer.
-        export DAD_DEV_BIN="$(dirname "$bin")"
-
-        echo "deck:    $bin"
-        echo "config:  $dir"
-        echo "sandbox: $sandbox   (task run-stop to shut its daemon down)"
-        cd "$dir" && exec "$bin"
-
-  run-stop:
-    desc: Stop the sandbox daemon started by `task run` (leaves your real daemon alone). Same DIR/SANDBOX vars.
+  run-desktop:
+    desc: >-
+      Build this checkout and start the desktop GUI (pnpm tauri dev, from THIS
+      checkout's desktop/) against the same isolated sandbox as `task run`, with
+      its own desktop.toml. Its Start deck launches the sandbox daemon. Same
+      DIR/SANDBOX vars; PROFILE defaults to debug, the profile tauri dev builds.
+      Do not run it from a worktree agents are editing — vite reloads the window
+      on every save.
     vars:
       DIR: '{{.DIR | default .USER_WORKING_DIR}}'
-      PROFILE: '{{.PROFILE | default "release"}}'
+      SANDBOX: '{{.SANDBOX | default ""}}'
+      PROFILE: '{{.PROFILE | default "debug"}}'
     cmds:
-      - |
-        set -eu
-        dir="{{.DIR}}"
-        sandbox="${SANDBOX:-$dir/.dad-sandbox}"
-        export DOT_AGENT_DECK_ATTACH_SOCKET="$sandbox/attach.sock"
-        export DOT_AGENT_DECK_SOCKET="$sandbox/hook.sock"
-        export DOT_AGENT_DECK_STATE_DIR="$sandbox/state"
-        export DOT_AGENT_DECK_SESSION="$sandbox/session.toml"
-        "{{.TASKFILE_DIR}}/target/{{.PROFILE}}/dot-agent-deck" daemon stop "$@"
+      - cargo build {{if eq .PROFILE "release"}}--release{{end}}
+      - bash "{{.TASKFILE_DIR}}/scripts/sandbox-run.sh" desktop "{{.TASKFILE_DIR}}" "{{.DIR}}" "{{.SANDBOX}}" "{{.PROFILE}}"
+
+  run-all:
+    desc: >-
+      Build this checkout and run the TUI AND the desktop GUI against ONE isolated
+      sandbox daemon — the TUI in this terminal, the desktop in the background with
+      its output in SANDBOX/desktop.log, and the desktop stopped when the TUI exits.
+      Same DIR/SANDBOX vars as `task run`; PROFILE defaults to debug, the profile
+      tauri dev builds. Do not run it from a worktree agents are editing — vite
+      reloads the window on every save. See docs/develop/local-run.md.
+    vars:
+      DIR: '{{.DIR | default .USER_WORKING_DIR}}'
+      SANDBOX: '{{.SANDBOX | default ""}}'
+      PROFILE: '{{.PROFILE | default "debug"}}'
+    cmds:
+      - cargo build {{if eq .PROFILE "release"}}--release{{end}}
+      - bash "{{.TASKFILE_DIR}}/scripts/sandbox-run.sh" all "{{.TASKFILE_DIR}}" "{{.DIR}}" "{{.SANDBOX}}" "{{.PROFILE}}"
+
+  run-stop:
+    desc: >-
+      Stop what `task run`, `task run-desktop` or `task run-all` started in the
+      sandbox — a background desktop, then the sandbox daemon — and leave your real
+      daemon alone. Same DIR/SANDBOX vars; PROFILE defaults to the build that
+      started the sandbox. Arguments after -- go to `daemon stop`, e.g.
+      `task run-stop -- --force` to stop a sandbox daemon that still has agents.
+    vars:
+      DIR: '{{.DIR | default .USER_WORKING_DIR}}'
+      SANDBOX: '{{.SANDBOX | default ""}}'
+      PROFILE: '{{.PROFILE | default ""}}'
+    cmds:
+      - bash "{{.TASKFILE_DIR}}/scripts/sandbox-run.sh" stop "{{.TASKFILE_DIR}}" "{{.DIR}}" "{{.SANDBOX}}" "{{.PROFILE}}" {{.CLI_ARGS}}
 
   reel-smoke:
     desc: Build a demo reel from a tiny fixture and assert the stitched MP4 with ffprobe (local-only; no network, no upload)
