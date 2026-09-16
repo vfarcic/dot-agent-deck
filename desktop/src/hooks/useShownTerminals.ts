@@ -43,22 +43,27 @@
  *
  * The key is a dependency key and nothing else — never split back apart. Agent
  * ids are raw daemon identities, not display strings, so an id containing a
- * newline would come back out of a `split` as two shown agents.
+ * newline would come back out of a `split` as two shown agents. Each element is
+ * itself an {@link agentKey}, because the declaration names `(deckId, agentId)`
+ * pairs since PRD #1105's cross-deck pane: a set that changed only which DECK
+ * an id is on would otherwise produce an identical key and make no call.
  */
 import { useEffect, useRef } from "react";
+import { agentKey } from "../lib/agentKey";
+import type { AgentTarget } from "../types";
 
 export function useShownTerminals(
-  setShownTerminals: (agentIds: string[]) => Promise<void>,
-  agentIds: string[] | undefined,
+  setShownTerminals: (targets: AgentTarget[]) => Promise<void>,
+  targets: AgentTarget[] | undefined,
 ): void {
-  const key = agentIds?.join("\n");
-  const latest = useRef(agentIds);
-  latest.current = agentIds;
+  const key = targets?.map((target) => agentKey(target.deckId, target.agentId)).join("\n");
+  const latest = useRef(targets);
+  latest.current = targets;
   useEffect(() => {
-    const ids = latest.current;
+    const declared = latest.current;
     // Not the owner in this state. See the header: this is the one case that
     // must not reach the bridge, because `[]` is itself a declaration.
-    if (!ids) return;
-    void setShownTerminals(ids);
+    if (!declared) return;
+    void setShownTerminals(declared);
   }, [setShownTerminals, key]);
 }

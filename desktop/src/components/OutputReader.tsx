@@ -41,13 +41,16 @@ export function OutputReader({ agent, onClose }: OutputReaderProps) {
 
   useEffect(() => {
     const snapshot = () => {
-      const terminal = getTerminal(agent.id);
+      /* By the composite identity: two decks' same-id agents can both have a
+         live xterm since PRD #1105's cross-deck pane, and a bare-id lookup
+         would snapshot whichever mounted last under either agent's heading. */
+      const terminal = getTerminal(agent.daemonId, agent.id);
       setText(terminal ? terminalSnapshotText(terminal) : stripAnsi(transcriptRef.current));
     };
     snapshot();
     const timer = window.setInterval(snapshot, REFRESH_MS);
     return () => window.clearInterval(timer);
-  }, [agent.id]);
+  }, [agent.daemonId, agent.id]);
 
   // Follow new output only while the reader is pinned to the bottom.
   useEffect(() => {

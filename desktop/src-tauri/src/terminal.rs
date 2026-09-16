@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use dot_agent_deck::daemon_client::EndpointIdentity;
+use dot_agent_deck::daemon_client::{Endpoint, EndpointIdentity};
 use dot_agent_deck::daemon_protocol::{
     KIND_DETACH, KIND_GEOMETRY, KIND_STREAM_END, KIND_STREAM_IN, KIND_STREAM_OUT,
     KIND_STREAM_REJECT, parse_geometry_frame, read_frame, write_frame,
@@ -13,7 +13,7 @@ use tauri::ipc::{Channel, Response};
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::Mutex as AsyncMutex;
 
-use crate::daemon_bridge::{DaemonLinks, trusted_daemon};
+use crate::daemon_bridge::DaemonLinks;
 use crate::dto::{
     TerminalAttachResult, TerminalState, TerminalStateEvent, safe_message, validate_agent_id,
     validate_dimensions, validate_terminal_input,
@@ -81,6 +81,24 @@ impl WatcherClaim {
 #[derive(Clone)]
 struct TerminalSession {
     agent_id: String,
+    /// The deck this session was attached over, captured at creation (PRD
+    /// #1105's cross-deck pane, issue #1116).
+    ///
+    /// # Why the endpoint and not just the wire id
+    ///
+    /// [`resize`] has to reach that deck's daemon, and the only way to do that
+    /// is to hand [`DaemonLinks::trusted`] an [`Endpoint`]. Holding the
+    /// endpoint itself means the resize resolves through the deck the session
+    /// belongs to rather than re-deriving one from the applied selection — a
+    /// second lookup that could answer differently, which is exactly the
+    /// read-at-use-time shape issue #1116 is about.
+    ///
+    /// It is also the registry's key: [`DesktopState::insert_unique_session`]
+    /// evicts by `(deck, agent)` rather than by agent id alone, because agent
+    /// ids are per-daemon monotonic integers and two decks routinely mint the
+    /// same one. Evicting by the bare id meant attaching deck B's `planner`
+    /// silently tore down the live pane showing deck A's.
+    endpoint: Endpoint,
     channel_id: u32,
     generation: u64,
     /// PRD #741 M3: a boxed transport half, not the IPC backend's concrete one.
@@ -370,16 +388,73 @@ impl DesktopState {
         self.selection.send_modify(|generation| *generation += 1);
     }
 
+    /// Install one session, replacing any earlier session for **the same agent
+    /// on the same deck**.
+    ///
+    /// The deck half is PRD #1105's cross-deck pane. It read
+    /// `existing.agent_id != session.agent_id`, which is a statement about a
+    /// name that is unique only within a daemon — so attaching `planner` on
+    /// build-box evicted the live `planner` session on the local deck, closing
+    /// a pane the user was watching and leaving its webview channel talking to
+    /// a torn-down stream. One session per agent per deck is the invariant the
+    /// single-deck version was reaching for.
     fn insert_unique_session(
         &self,
         session_id: String,
         session: TerminalSession,
     ) -> Result<(), String> {
+        let deck = session.endpoint.identity();
         let mut sessions = self.sessions()?;
-        sessions.retain(|_, existing| existing.agent_id != session.agent_id);
+        sessions.retain(|_, existing| {
+            existing.agent_id != session.agent_id || existing.endpoint.identity() != deck
+        });
         sessions.insert(session_id, session);
         Ok(())
     }
+}
+
+/// The endpoint one wire deck id names, or the selected deck when the caller
+/// named none.
+///
+/// # Why this exists instead of `trusted_daemon`
+///
+/// `trusted_daemon` resolves `selected_endpoint()` — the process-global applied
+/// selection, read at the instant the call runs. Every terminal verb went
+/// through it, so an attach declared for an agent on build-box reached whatever
+/// deck happened to be selected when the command was dispatched, and agent ids
+/// are per-daemon monotonic integers: it found a `planner` there and streamed
+/// it. That is issue
+/// [#1116](https://github.com/vfarcic/dot-agent-deck/issues/1116)'s whole shape
+/// — identity read from mutable current selection at use time — at the one
+/// layer where it decides which machine the bytes come from.
+///
+/// # The resolution is against the OBSERVED set, and that is a security
+/// boundary rather than a lookup detail
+///
+/// A deck id from the webview is untrusted input. Matching it against
+/// `observed_decks()` means the only endpoints reachable are the ones the
+/// applied settings document already tells this app to connect to, so a
+/// malformed or stale id yields a refusal rather than a connection: there is no
+/// path here by which a value from the webview becomes an address.
+///
+/// `None` keeps the previous behaviour for a caller that names no deck. Nothing
+/// in this tree sends one today — the webview always names the deck it is
+/// attaching to — and it is kept because the parameter is optional on the IPC
+/// boundary, so absence must mean something defined rather than an error the
+/// user cannot act on.
+fn endpoint_for_deck(deck_id: Option<&str>) -> Result<Endpoint, String> {
+    let Some(deck_id) = deck_id else {
+        return Ok(crate::dto::selected_endpoint());
+    };
+    crate::dto::observed_decks()
+        .into_iter()
+        .find(|endpoint| crate::dto::deck_wire_id(endpoint) == deck_id)
+        .ok_or_else(|| {
+            format!(
+                "that deck is not one this app is observing: {}",
+                safe_message(deck_id)
+            )
+        })
 }
 
 fn session_id(generation: u64) -> String {
@@ -419,6 +494,10 @@ fn rejection_notice(reason: &[u8]) -> Vec<u8> {
 pub(crate) async fn attach(
     app: &AppHandle,
     state: &DesktopState,
+    // PRD #1105 — which deck's `agent_id` this is. `None` means the selected
+    // deck; see [`endpoint_for_deck`] for why that fallback exists and why the
+    // resolution is against the observed set.
+    deck_id: Option<String>,
     agent_id: String,
     on_output: Channel<Response>,
     // PRD #882 — the geometry this tile can draw the agent at, measured by
@@ -428,13 +507,20 @@ pub(crate) async fn attach(
     viewport: Option<(u16, u16)>,
 ) -> Result<TerminalAttachResult, String> {
     validate_agent_id(&agent_id)?;
+    // Resolved BEFORE the gate, so a bad deck id is refused without queueing
+    // behind somebody else's handshake.
+    let endpoint = endpoint_for_deck(deck_id.as_deref())?;
+    let deck = endpoint.identity();
     let _attach_guard = state.attach_gate.lock().await;
     let channel_id = on_output.id();
-    if let Some((session_id, session)) = state
-        .sessions()?
-        .iter()
-        .find(|(_, session)| session.agent_id == agent_id && session.channel_id == channel_id)
-    {
+    // The deck is part of the reuse check for the same reason it is part of the
+    // registry key: `(agent_id, channel_id)` alone would answer "you already
+    // have this" for another deck's namesake.
+    if let Some((session_id, session)) = state.sessions()?.iter().find(|(_, session)| {
+        session.agent_id == agent_id
+            && session.channel_id == channel_id
+            && session.endpoint.identity() == deck
+    }) {
         return Ok(TerminalAttachResult {
             session_id: session_id.clone(),
             agent_id,
@@ -446,8 +532,9 @@ pub(crate) async fn attach(
             applied_cols: None,
         });
     }
-    detach_agent(state, &agent_id).await;
-    let daemon = trusted_daemon(&state.daemon).await?;
+    // This deck's earlier session for this agent, never another deck's.
+    detach_agent_on(state, &deck, &agent_id).await;
+    let daemon = state.daemon.trusted(&endpoint).await?;
     daemon.require_compatible()?;
     // PRD #882: a half-measured tile (one axis zero) declares nothing rather
     // than a geometry it does not mean — under a smallest-wins policy a bogus
@@ -482,6 +569,7 @@ pub(crate) async fn attach(
         session_id.clone(),
         TerminalSession {
             agent_id: agent_id.clone(),
+            endpoint,
             channel_id,
             generation,
             writer: Arc::new(AsyncMutex::new(writer)),
@@ -663,6 +751,20 @@ pub(crate) async fn write(
         .map_err(|error| safe_message(error.to_string()))
 }
 
+/// PRD #1105 — the daemon is resolved from the **session's own** endpoint, not
+/// from the applied selection.
+///
+/// This was `trusted_daemon(&state.daemon)`, and it is the sharpest instance of
+/// issue #1116's pattern left in the crate: a resize carries a session id, so
+/// the deck it belongs to is knowable exactly, and reading the current
+/// selection instead sent this pane's measured grid to another machine's
+/// same-id agent. Under the daemon's smallest-viewer policy that is not a
+/// display blemish — it reflows that agent's PTY and every other client
+/// watching it.
+///
+/// No deck parameter is added for this. The session id names one attach on one
+/// deck, so asking the caller to repeat the deck would introduce a second
+/// opinion about it — and a wrong one would be trusted over the session's.
 pub(crate) async fn resize(
     state: &DesktopState,
     session_id: &str,
@@ -670,12 +772,18 @@ pub(crate) async fn resize(
     rows: u16,
 ) -> Result<(), String> {
     let (rows, cols) = validate_dimensions(rows, cols)?;
-    let (agent_id, viewer) = state
+    let (agent_id, viewer, endpoint) = state
         .sessions()?
         .get(session_id)
-        .map(|session| (session.agent_id.clone(), session.viewer.clone()))
+        .map(|session| {
+            (
+                session.agent_id.clone(),
+                session.viewer.clone(),
+                session.endpoint.clone(),
+            )
+        })
         .ok_or_else(|| format!("terminal session not found: {}", safe_message(session_id)))?;
-    let daemon = trusted_daemon(&state.daemon).await?;
+    let daemon = state.daemon.trusted(&endpoint).await?;
     daemon.require_compatible()?;
     // PRD #882: name this tile's viewer so the request updates its constraint
     // rather than overriding every other client's. The daemon answers with what
@@ -700,23 +808,73 @@ pub(crate) async fn detach(state: &DesktopState, session_id: &str) -> Result<boo
     Ok(true)
 }
 
-pub(crate) async fn detach_agent(state: &DesktopState, agent_id: &str) {
+/// Every session for one agent **on one deck**.
+///
+/// The deck term is PRD #1105's: without it this tore down another machine's
+/// live pane whenever its agent happened to share an id, which is the ordinary
+/// case rather than a contrived one.
+pub(crate) async fn detach_agent_on(state: &DesktopState, deck: &EndpointIdentity, agent_id: &str) {
+    detach_matching(state, |session| {
+        session.agent_id == agent_id && session.endpoint.identity() == *deck
+    })
+    .await;
+}
+
+/// Every session on a deck the app no longer observes (PRD #1105).
+///
+/// # The rule this replaced, and why
+///
+/// `retarget_selection` called [`detach_all`] whenever the SELECTED deck moved.
+/// That was right while attach was process-global: every session belonged to
+/// the selected deck by construction, so moving the selection meant every one
+/// of them was about to be talking to the wrong daemon.
+///
+/// A session now names its own deck and resolves its own link, so a selection
+/// move says nothing about it — and tearing one down would close a pane the
+/// user deliberately opened on another machine, which is the whole feature.
+/// What DOES end a session is its deck leaving the observed set: `retain` is
+/// about to drop that deck's transport and `retain_watchers` its watcher, so
+/// there is nothing left for the stream to ride on or report through.
+///
+/// That makes this the exact sibling of `EndpointTunnels::retain` and
+/// `DesktopState::retain_watchers` — the same set difference, one line earlier
+/// so a DETACH frame still has a transport to travel over — and it is why the
+/// call site is no longer gated on `moved`: a deck can leave the observed set
+/// without the selected deck changing at all.
+pub(crate) async fn detach_decks_outside(
+    state: &DesktopState,
+    observed: &HashSet<EndpointIdentity>,
+) {
+    detach_matching(state, |session| {
+        !observed.contains(&session.endpoint.identity())
+    })
+    .await;
+}
+
+/// Every session on one deck — used where that deck's daemon is being stopped
+/// or replaced, which ends its streams whatever the selection says.
+pub(crate) async fn detach_deck(state: &DesktopState, endpoint: &Endpoint) {
+    let deck = endpoint.identity();
+    detach_matching(state, |session| session.endpoint.identity() == deck).await;
+}
+
+/// Every session, on every deck. App exit only — see [`detach_decks_outside`]
+/// for why a selection change is no longer one of its callers.
+pub(crate) async fn detach_all(state: &DesktopState) {
+    detach_matching(state, |_| true).await;
+}
+
+/// The one teardown loop the four verbs above share.
+///
+/// Bounded per session, because a detach writes a frame over a transport that
+/// may be an `ssh` child on its way out and app exit is behind this.
+async fn detach_matching(state: &DesktopState, mut wanted: impl FnMut(&TerminalSession) -> bool) {
     let session_ids = match state.sessions() {
         Ok(sessions) => sessions
             .iter()
-            .filter(|(_, session)| session.agent_id == agent_id)
+            .filter(|(_, session)| wanted(session))
             .map(|(id, _)| id.clone())
             .collect::<Vec<_>>(),
-        Err(_) => return,
-    };
-    for session_id in session_ids {
-        let _ = detach(state, &session_id).await;
-    }
-}
-
-pub(crate) async fn detach_all(state: &DesktopState) {
-    let session_ids = match state.sessions() {
-        Ok(sessions) => sessions.keys().cloned().collect::<Vec<_>>(),
         Err(_) => return,
     };
     for session_id in session_ids {
@@ -769,8 +927,30 @@ mod tests {
             .expect("a local deck always leases")
     }
 
+    /// A deck to file a fixture session under, named by its socket path.
+    #[cfg(unix)]
+    fn fixture_deck(path: &str) -> Endpoint {
+        use dot_agent_deck::daemon_client::LocalEndpoint;
+        Endpoint::Local(LocalEndpoint::at(path))
+    }
+
     #[cfg(unix)]
     fn fixture_session(
+        agent_id: &str,
+        generation: u64,
+        transport: Arc<crate::endpoint_tunnels::TunnelLease>,
+    ) -> TerminalSession {
+        fixture_session_on(
+            fixture_deck("/tmp/dot-agent-deck-terminal-fixture.sock"),
+            agent_id,
+            generation,
+            transport,
+        )
+    }
+
+    #[cfg(unix)]
+    fn fixture_session_on(
+        endpoint: Endpoint,
         agent_id: &str,
         generation: u64,
         transport: Arc<crate::endpoint_tunnels::TunnelLease>,
@@ -784,6 +964,7 @@ mod tests {
         let writer = TransportWriteHalf::new(writer);
         TerminalSession {
             agent_id: agent_id.into(),
+            endpoint,
             channel_id: generation as u32,
             generation,
             writer: Arc::new(AsyncMutex::new(writer)),
@@ -814,6 +995,417 @@ mod tests {
         let sessions = state.sessions().unwrap();
         assert_eq!(sessions.len(), 1);
         assert!(sessions.contains_key("terminal-2"));
+    }
+
+    /// A settings document selecting the whole fleet, with one remote row per
+    /// host — the state under which two decks are observed at once.
+    #[cfg(unix)]
+    fn fleet_settings(hosts: &[&str]) -> crate::settings::DesktopSettings {
+        fleet_selecting(hosts, crate::settings::Selection::All)
+    }
+
+    /// The same document under an explicit selection, so a test can move the
+    /// SELECTED deck without changing which decks are observed and vice versa —
+    /// the two axes PRD #1105 separated.
+    #[cfg(unix)]
+    fn fleet_selecting(
+        hosts: &[&str],
+        selection: crate::settings::Selection,
+    ) -> crate::settings::DesktopSettings {
+        use crate::settings::{
+            DesktopSettings, EndpointId, EndpointSettings, RemoteEndpointSettings,
+        };
+        use dot_agent_deck::remote_tunnel::{Hostname, RemoteSocketPath};
+
+        let remote = hosts
+            .iter()
+            .enumerate()
+            .map(|(index, host)| {
+                let id = EndpointId::parse(&row_id(index)).expect("a valid id");
+                let mut row =
+                    RemoteEndpointSettings::new(id, Hostname::parse(host).expect("a valid host"));
+                row.socket = Some(RemoteSocketPath::parse("/run/deck.sock").expect("a path"));
+                row
+            })
+            .collect();
+        DesktopSettings {
+            endpoints: Some(EndpointSettings { remote, selection }),
+            ..DesktopSettings::default()
+        }
+    }
+
+    #[cfg(unix)]
+    fn row_id(index: usize) -> String {
+        format!("deck00000000000{index}")
+    }
+
+    /// The endpoint the row at `index` resolves to, read off the `All` form of
+    /// the same hosts — where `connectable_endpoints()` is the local deck
+    /// followed by each row in order.
+    #[cfg(unix)]
+    fn row_endpoint(hosts: &[&str], index: usize) -> Endpoint {
+        fleet_settings(hosts)
+            .connectable_endpoints()
+            .into_iter()
+            .nth(index + 1)
+            .expect("the row is connectable")
+    }
+
+    /// PRD #1105 — a deck id from the webview resolves to THAT deck's endpoint,
+    /// and to nothing else.
+    ///
+    /// The control is the second assertion: the two wire ids resolve to
+    /// different endpoints, so the first is about the id rather than about the
+    /// function answering with the selected deck whatever it is handed — which
+    /// is exactly what `trusted_daemon` did and what this replaces.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_deck_id_resolves_to_its_own_observed_endpoint() {
+        let settings = fleet_settings(&["build-box.example.com", "laptop.example.com"]);
+        crate::dto::apply_settings_selection(&settings);
+
+        let observed = crate::dto::observed_decks();
+        assert_eq!(observed.len(), 3, "the local deck and the two rows");
+        for endpoint in &observed {
+            let wire = crate::dto::deck_wire_id(endpoint);
+            let resolved = endpoint_for_deck(Some(&wire)).expect("an observed deck resolves");
+            assert_eq!(
+                resolved.identity(),
+                endpoint.identity(),
+                "{wire} must resolve to the deck it names"
+            );
+        }
+
+        let ids: HashSet<String> = observed.iter().map(crate::dto::deck_wire_id).collect();
+        assert_eq!(
+            ids.len(),
+            3,
+            "the three decks are distinguishable by wire id"
+        );
+    }
+
+    /// An id this app is not observing is REFUSED rather than falling back to
+    /// the selected deck.
+    ///
+    /// Falling back is the failure mode worth naming: it would turn a stale or
+    /// forged deck id into a silent attach against whatever deck is in force —
+    /// the original defect, reachable through the new parameter.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_unobserved_deck_id_is_refused_rather_than_falling_back() {
+        let settings = fleet_settings(&["build-box.example.com"]);
+        crate::dto::apply_settings_selection(&settings);
+
+        let error = endpoint_for_deck(Some("deck-ffffffffffffffff"))
+            .expect_err("an unknown deck id must not resolve");
+        assert!(error.contains("observing"), "the refusal says why: {error}");
+
+        // `None` is the documented "the selected deck" case, and stays that way.
+        let selected = endpoint_for_deck(None).expect("no deck id means the selected deck");
+        assert_eq!(
+            selected.identity(),
+            crate::dto::selected_endpoint().identity()
+        );
+    }
+
+    /// PRD #1105 — two decks' same-id agents are two sessions, and replacing one
+    /// leaves the other alone.
+    ///
+    /// Agent ids are per-daemon monotonic integers, so `planner` on build-box
+    /// and `planner` on the local deck are the ordinary case. The registry
+    /// evicted by bare agent id, so attaching the second closed the first —
+    /// tearing down a pane the user was watching on another machine.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_session_registry_keeps_one_session_per_agent_per_deck() {
+        let lease = fixture_lease().await;
+        let state = DesktopState::default();
+        let deck_a = fixture_deck("/tmp/dot-agent-deck-registry-a.sock");
+        let deck_b = fixture_deck("/tmp/dot-agent-deck-registry-b.sock");
+
+        state
+            .insert_unique_session(
+                "terminal-a1".into(),
+                fixture_session_on(deck_a.clone(), "planner", 1, Arc::clone(&lease)),
+            )
+            .unwrap();
+        state
+            .insert_unique_session(
+                "terminal-b1".into(),
+                fixture_session_on(deck_b.clone(), "planner", 2, Arc::clone(&lease)),
+            )
+            .unwrap();
+
+        {
+            let sessions = state.sessions().unwrap();
+            assert_eq!(sessions.len(), 2, "one `planner` per deck, both live");
+            assert!(sessions.contains_key("terminal-a1"));
+            assert!(sessions.contains_key("terminal-b1"));
+        }
+
+        // Re-attaching deck A's `planner` replaces deck A's session and only it.
+        state
+            .insert_unique_session(
+                "terminal-a2".into(),
+                fixture_session_on(deck_a, "planner", 3, Arc::clone(&lease)),
+            )
+            .unwrap();
+        let sessions = state.sessions().unwrap();
+        assert_eq!(sessions.len(), 2);
+        assert!(
+            !sessions.contains_key("terminal-a1"),
+            "deck A's old session went"
+        );
+        assert!(
+            sessions.contains_key("terminal-b1"),
+            "deck B's same-id session is untouched"
+        );
+        assert!(sessions.contains_key("terminal-a2"));
+    }
+
+    /// `detach_agent_on` ends one deck's `planner` and leaves the other's.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn detaching_one_decks_agent_leaves_the_other_decks_namesake() {
+        let lease = fixture_lease().await;
+        let state = DesktopState::default();
+        let deck_a = fixture_deck("/tmp/dot-agent-deck-detach-agent-a.sock");
+        let deck_b = fixture_deck("/tmp/dot-agent-deck-detach-agent-b.sock");
+        state
+            .insert_unique_session(
+                "terminal-a".into(),
+                fixture_session_on(deck_a.clone(), "planner", 1, Arc::clone(&lease)),
+            )
+            .unwrap();
+        state
+            .insert_unique_session(
+                "terminal-b".into(),
+                fixture_session_on(deck_b, "planner", 2, Arc::clone(&lease)),
+            )
+            .unwrap();
+
+        detach_agent_on(&state, &deck_a.identity(), "planner").await;
+
+        let sessions = state.sessions().unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert!(sessions.contains_key("terminal-b"));
+    }
+
+    /// PRD #1105's `detach_all` decision, as a test rather than a comment: a
+    /// deck that is still OBSERVED keeps its terminal when the selection moves,
+    /// and a deck that left loses it.
+    ///
+    /// The selected deck is deliberately not an input here, which is the point.
+    /// `retarget_selection` used to detach everything whenever the selected deck
+    /// moved; what ends a session now is its deck leaving the set this app
+    /// connects to, because that is when its transport and its watcher go.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn only_the_departed_decks_sessions_are_detached() {
+        let lease = fixture_lease().await;
+        let state = DesktopState::default();
+        let staying = fixture_deck("/tmp/dot-agent-deck-retain-staying.sock");
+        let leaving = fixture_deck("/tmp/dot-agent-deck-retain-leaving.sock");
+        state
+            .insert_unique_session(
+                "terminal-staying".into(),
+                fixture_session_on(staying.clone(), "planner", 1, Arc::clone(&lease)),
+            )
+            .unwrap();
+        state
+            .insert_unique_session(
+                "terminal-leaving".into(),
+                fixture_session_on(leaving, "planner", 2, Arc::clone(&lease)),
+            )
+            .unwrap();
+
+        let observed: HashSet<EndpointIdentity> = [staying.identity()].into_iter().collect();
+        detach_decks_outside(&state, &observed).await;
+
+        let sessions = state.sessions().unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert!(
+            sessions.contains_key("terminal-staying"),
+            "a still-observed deck's pane survives a selection move"
+        );
+    }
+
+    /// `detach_deck` ends one deck's sessions — what Stop/Replace daemon does —
+    /// and no other deck's.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn detaching_one_deck_leaves_every_other_decks_sessions() {
+        let lease = fixture_lease().await;
+        let state = DesktopState::default();
+        let stopped = fixture_deck("/tmp/dot-agent-deck-stop-local.sock");
+        let untouched = fixture_deck("/tmp/dot-agent-deck-stop-remote.sock");
+        state
+            .insert_unique_session(
+                "terminal-stopped".into(),
+                fixture_session_on(stopped.clone(), "planner", 1, Arc::clone(&lease)),
+            )
+            .unwrap();
+        state
+            .insert_unique_session(
+                "terminal-untouched".into(),
+                fixture_session_on(untouched, "planner", 2, Arc::clone(&lease)),
+            )
+            .unwrap();
+
+        detach_deck(&state, &stopped).await;
+
+        let sessions = state.sessions().unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert!(sessions.contains_key("terminal-untouched"));
+    }
+
+    /// PRD #1105's `detach_all` decision, pinned at the CALL SITE that used to
+    /// implement the old one.
+    ///
+    /// # Why this exists beside `only_the_departed_decks_sessions_are_detached`
+    ///
+    /// That test drives `detach_decks_outside` directly, so it says the helper
+    /// is right and nothing about whether `retarget_selection` calls it.
+    /// Restoring the previous rule there — `if moved { detach_all }` — left it
+    /// green, which is the "a test written alongside a fix that passes either
+    /// way" trap. This one moves the SELECTED deck while the session's deck
+    /// stays observed, which is exactly the case the two rules disagree about:
+    /// the old one tore the pane down, the new one keeps it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_selection_move_keeps_a_still_observed_decks_terminal() {
+        use crate::settings::{EndpointId, Selection};
+
+        let hosts = ["build-box.example.com", "laptop.example.com"];
+        let build_box = row_endpoint(&hosts, 0);
+        // The user is on build-box alone, with a pane open on one of its agents.
+        let only_build_box = fleet_selecting(
+            &hosts,
+            Selection::One(EndpointId::parse(&row_id(0)).expect("a valid id")),
+        );
+        let state = DesktopState::default();
+        crate::retarget_selection(&state, &only_build_box).await;
+
+        let lease = fixture_lease().await;
+        state
+            .insert_unique_session(
+                "terminal-build-box".into(),
+                fixture_session_on(build_box.clone(), "planner", 1, lease),
+            )
+            .unwrap();
+
+        // They switch to All Decks. The selected deck MOVES — `All` resolves to
+        // the local one — and build-box is still observed.
+        let whole_fleet = fleet_settings(&hosts);
+        let moved = crate::retarget_selection(&state, &whole_fleet).await;
+
+        assert!(
+            moved,
+            "the selected deck moved from build-box to the local one"
+        );
+        let sessions = state.sessions().unwrap();
+        assert!(
+            sessions.contains_key("terminal-build-box"),
+            "a pane on a deck the app still observes survives a selection move"
+        );
+    }
+
+    /// The other half of the same decision: a deck that LEAVES the observed set
+    /// loses its sessions, even though the selected deck did not move.
+    ///
+    /// Under `All` the selection always resolves to the local deck, so removing
+    /// a row changes the observed set and nothing else — the case the old
+    /// `if moved` gate could not see at all. Its transport is about to be
+    /// retained away and its watcher ended, so there is nothing left for the
+    /// stream to ride on.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_deck_leaving_the_fleet_loses_its_terminal_without_the_selection_moving() {
+        let both = ["build-box.example.com", "laptop.example.com"];
+        let build_box = row_endpoint(&both, 0);
+        let laptop = row_endpoint(&both, 1);
+        let state = DesktopState::default();
+        crate::retarget_selection(&state, &fleet_settings(&both)).await;
+
+        let lease = fixture_lease().await;
+        state
+            .insert_unique_session(
+                "terminal-build-box".into(),
+                fixture_session_on(build_box, "planner", 1, Arc::clone(&lease)),
+            )
+            .unwrap();
+        state
+            .insert_unique_session(
+                "terminal-laptop".into(),
+                fixture_session_on(laptop, "planner", 2, lease),
+            )
+            .unwrap();
+
+        // The laptop row is removed from the document.
+        let moved = crate::retarget_selection(&state, &fleet_settings(&both[..1])).await;
+
+        assert!(
+            !moved,
+            "under All the selected deck is the local one either way"
+        );
+        let sessions = state.sessions().unwrap();
+        assert!(
+            !sessions.contains_key("terminal-laptop"),
+            "the departed deck's session is torn down although the selection did not move"
+        );
+        assert!(
+            sessions.contains_key("terminal-build-box"),
+            "and the deck that stayed keeps its pane"
+        );
+    }
+
+    /// PRD #1105 — a resize reaches the deck the SESSION was attached over,
+    /// not whichever deck is selected when it lands.
+    ///
+    /// Observed through the refusal, which names the address it refused: the
+    /// session is on a local socket that does not exist, while the selected
+    /// deck is a remote row. Under `trusted_daemon` the refusal named the
+    /// remote deck, which is the whole defect — this client's measured grid
+    /// went to another machine's same-id agent, and under the daemon's
+    /// smallest-viewer policy that reflows its PTY and every other client
+    /// watching it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_resize_reaches_the_deck_its_session_was_attached_over() {
+        use crate::settings::{EndpointId, Selection};
+
+        let hosts = ["build-box.example.com"];
+        crate::dto::apply_settings_selection(&fleet_selecting(
+            &hosts,
+            Selection::One(EndpointId::parse(&row_id(0)).expect("a valid id")),
+        ));
+        let selected = crate::dto::selected_endpoint();
+        assert!(
+            matches!(selected, Endpoint::Remote(_)),
+            "the state under test: a REMOTE deck is selected"
+        );
+
+        let session_socket = "/tmp/dot-agent-deck-resize-session-deck.sock";
+        let lease = fixture_lease().await;
+        let state = DesktopState::default();
+        state
+            .insert_unique_session(
+                "terminal-probe".into(),
+                fixture_session_on(fixture_deck(session_socket), "planner", 1, lease),
+            )
+            .unwrap();
+
+        let error = resize(&state, "terminal-probe", 80, 24)
+            .await
+            .expect_err("that socket does not exist, so the resize cannot land");
+        assert!(
+            error.contains(session_socket),
+            "the resize went to the session's own deck: {error}"
+        );
+        assert!(
+            !error.contains("build-box"),
+            "and never to the selected one: {error}"
+        );
     }
 
     /// A live session holds the transport open on its own account, so dropping

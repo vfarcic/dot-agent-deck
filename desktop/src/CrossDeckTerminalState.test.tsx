@@ -13,22 +13,27 @@ import type { DeckSnapshot, TerminalChunk } from "./types";
  * Hoisted so the `vi.mock` factories below — which vitest lifts above the
  * imports — can close over it.
  */
-const { writes, FakeTerminal, FakeFitAddon } = vi.hoisted(() => {
+const { writes, terminalInstances, FakeTerminal, FakeFitAddon } = vi.hoisted(() => {
   const writes: string[] = [];
+  const terminalInstances: FakeTerminal[] = [];
   const decoder = new TextDecoder();
   class FakeTerminal {
     options: Record<string, unknown>;
     textarea: HTMLTextAreaElement;
+    writes: string[] = [];
     cols = 80;
     rows = 24;
     constructor(options: Record<string, unknown>) {
       this.options = { ...options };
       this.textarea = document.createElement("textarea");
+      terminalInstances.push(this);
     }
     loadAddon(addon: { activate?: (terminal: FakeTerminal) => void }): void { addon.activate?.(this); }
     open(host: HTMLElement): void { host.appendChild(this.textarea); }
     write(data: string | Uint8Array): void {
-      writes.push(typeof data === "string" ? data : decoder.decode(data));
+      const decoded = typeof data === "string" ? data : decoder.decode(data);
+      writes.push(decoded);
+      this.writes.push(decoded);
     }
     reset(): void {}
     focus(): void {}
@@ -41,7 +46,7 @@ const { writes, FakeTerminal, FakeFitAddon } = vi.hoisted(() => {
     fit(): void {}
     dispose(): void {}
   }
-  return { writes, FakeTerminal, FakeFitAddon };
+  return { writes, terminalInstances, FakeTerminal, FakeFitAddon };
 });
 
 vi.mock("@xterm/xterm", () => ({ Terminal: FakeTerminal as unknown as typeof import("@xterm/xterm").Terminal }));
@@ -82,11 +87,14 @@ vi.mock("./lib/bridge", async (importOriginal) => ({
 
 import { TerminalViewport } from "./components/TerminalViewport";
 import { useDeckRuntime } from "./hooks/useDeckRuntime";
+import { getTerminal } from "./lib/terminalRegistry";
 
 /** The second deck, running the same per-daemon monotonic agent ids as the first. */
 const REMOTE_DECK_ID = "deck-00000000000000b2";
 /** Bytes only deck A's `planner` ever produced. Nothing on deck B may show them. */
 const DECK_A_OUTPUT = "sentinel-output-that-belongs-to-deck-a";
+/** Bytes only deck B's `planner` ever produced. Nothing on deck A may show them. */
+const DECK_B_OUTPUT = "sentinel-output-that-belongs-to-deck-b";
 
 function remoteDeck(): DeckSnapshot {
   const local = createFixtureSnapshot("connected");
@@ -118,6 +126,7 @@ describe("cross-deck terminal state", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     writes.length = 0;
+    terminalInstances.length = 0;
     bridge.connect.mockResolvedValue([createFixtureSnapshot("connected")]);
     bridge.onTerminalGeometry.mockReturnValue(() => {});
   });
@@ -184,6 +193,80 @@ describe("cross-deck terminal state", () => {
       />,
     );
     expect(writes.join("")).toContain(DECK_A_OUTPUT);
+  });
+
+  /**
+   * Scenario: deck A's tile and an overview pane for deck B are mounted at the
+   * same time, and both agents are named `planner`. Each xterm receives only
+   * its own deck's sentinel and both remain independently discoverable, so the
+   * module-level terminal registry cannot let the later mount replace the
+   * earlier same-id terminal.
+   */
+  it("keeps concurrent same-id terminals from two decks independently live", async () => {
+    let feedTerminal: ((event: TerminalChunk) => void) | undefined;
+    bridge.subscribe.mockImplementation(async (_onFleet, onTerminal) => {
+      feedTerminal = onTerminal;
+      return () => {};
+    });
+    const { result } = renderHook(() => useDeckRuntime());
+    await waitFor(() => expect(result.current.snapshot.connection.status).toBe("connected"));
+
+    act(() => {
+      feedTerminal?.({
+        agentId: "planner",
+        deckId: FIXTURE_DAEMON_ID,
+        data: new TextEncoder().encode(DECK_A_OUTPUT),
+        stream: "output",
+        operation: "replace",
+        generation: 1,
+      });
+      feedTerminal?.({
+        agentId: "planner",
+        deckId: REMOTE_DECK_ID,
+        data: new TextEncoder().encode(DECK_B_OUTPUT),
+        stream: "output",
+        operation: "replace",
+        generation: 1,
+      });
+    });
+
+    const mounted = render(
+      <>
+        <TerminalViewport
+          agentId="planner"
+          deckId={FIXTURE_DAEMON_ID}
+          label="Local Planner"
+          transcript=""
+          terminalFeed={result.current.terminalFeed}
+          onInput={() => {}}
+          onResize={() => {}}
+        />
+        <TerminalViewport
+          agentId="planner"
+          deckId={REMOTE_DECK_ID}
+          label="Build-box Planner"
+          transcript=""
+          terminalFeed={result.current.terminalFeed}
+          onInput={() => {}}
+          onResize={() => {}}
+        />
+      </>,
+    );
+
+    expect(terminalInstances).toHaveLength(2);
+    expect(terminalInstances[0].writes.join("")).toContain(DECK_A_OUTPUT);
+    expect(terminalInstances[0].writes.join("")).not.toContain(DECK_B_OUTPUT);
+    expect(terminalInstances[1].writes.join("")).toContain(DECK_B_OUTPUT);
+    expect(terminalInstances[1].writes.join("")).not.toContain(DECK_A_OUTPUT);
+
+    // The output is visibly isolated above. These two assertions pin the
+    // registry lifetime that makes the pair stay independently addressable by
+    // Reader/zoom after both have mounted.
+    const getCompositeTerminal = getTerminal as unknown as (deckId: string, agentId: string) => unknown;
+    expect(getCompositeTerminal(FIXTURE_DAEMON_ID, "planner")).toBe(terminalInstances[0]);
+    expect(getCompositeTerminal(REMOTE_DECK_ID, "planner")).toBe(terminalInstances[1]);
+
+    mounted.unmount();
   });
 
   /**

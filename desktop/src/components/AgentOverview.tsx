@@ -583,18 +583,26 @@ const WRITE_LEASE_TITLE: Record<"read" | "write" | "none", string> = {
  * selected
  *
  * This screen merges every observed deck (PRD [#742](https://github.com/vfarcic/dot-agent-deck/issues/742))
- * while a tile's terminal is always the *selected* deck's, so it lists agents
- * this app cannot attach to — and it offers **every one of them** the same
- * control. If an agent is on the screen there is a way into its pane; a listed
- * row with no way to open it is a dead row, and which deck an agent happens to
- * be on is not something a reader can see from the row they are pointing at.
+ * and offers **every one of its rows** the same control. If an agent is on the
+ * screen there is a way into its pane; a listed row with no way to open it is a
+ * dead row, and which deck an agent happens to be on is not something a reader
+ * can see from the row they are pointing at.
  *
- * What the deck decides is what the PANE can do, not whether it opens: an
- * agent on a non-selected deck opens a pane with no terminal in it, which says
- * which deck it is on and that selecting that deck attaches it (`App.tsx`'s
- * `OverviewAgentPane`, and `otherDeckTerminalState` in `lib/terminalInput.ts`).
- * That is the honest division — the overview knows nothing about attach, and
- * the pane is where the attach either happens or is explained.
+ * The pane it opens has a LIVE terminal whichever deck the agent is on: it
+ * carries the composite `(deckId, agentId)` through attach, output, input and
+ * resize, and the crate resolves that deck's own link through `DaemonLinks`
+ * (`App.tsx`'s `OverviewAgentPane`, `lib/bridge.ts`, `src-tauri/terminal.rs`).
+ * That is the desktop app's reason to exist over the TUI — one place from which
+ * any agent on any deck can be worked with (PRD
+ * [#802](https://github.com/vfarcic/dot-agent-deck/issues/802)) — and nothing
+ * here moves the selected deck to achieve it.
+ *
+ * What the deck decides is what the PANE can do, not whether it opens. A deck
+ * with no live link — disconnected, not yet reporting, no address — has nothing
+ * to attach over, and the pane says so instead of showing a black rectangle
+ * (`unreachableDeckTerminalState` in `lib/terminalInput.ts`). That is the
+ * honest division: the overview knows nothing about attach, and the pane is
+ * where the attach either happens or is explained.
  */
 const OpenAgentContext = createContext<((agent: OverviewAgent) => void) | undefined>(undefined);
 

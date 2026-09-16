@@ -1308,10 +1308,26 @@ async fn desktop_bootstrap(
 }
 
 #[tauri::command]
+// Eight, and the shape is the IPC boundary's rather than a design choice: Tauri
+// deserialises a command's arguments from the webview's payload by NAME, so each
+// wire field has to be a parameter. Grouping them into a struct would change the
+// JSON the frontend sends, not the number of things being passed.
+#[allow(clippy::too_many_arguments)]
 async fn desktop_terminal_attach(
     app: AppHandle,
     webview: Webview,
     state: State<'_, DesktopState>,
+    // PRD #1105 — the deck this agent is on, so the attach resolves THAT deck's
+    // link through `DaemonLinks` instead of the process-global selected
+    // endpoint. Agent ids are per-daemon monotonic integers, so without it an
+    // attach for an agent on build-box streamed whatever `planner` the selected
+    // deck happened to be running.
+    //
+    // Optional on the wire, and `None` means the selected deck — the behaviour
+    // every caller had before this. The webview always names one; see
+    // `terminal::endpoint_for_deck` for why the value is resolved against the
+    // observed set rather than trusted as an address.
+    deck_id: Option<String>,
     agent_id: String,
     on_output: Channel<Response>,
     // PRD #882 — the geometry this tile measured, declared so the agent is sized
@@ -1328,7 +1344,7 @@ async fn desktop_terminal_attach(
         // missing axis would register a constraint nobody asked for.
         _ => None,
     };
-    terminal::attach(&app, &state, agent_id, on_output, viewport).await
+    terminal::attach(&app, &state, deck_id, agent_id, on_output, viewport).await
 }
 
 #[tauri::command]
@@ -1510,12 +1526,15 @@ async fn retarget_selection(state: &DesktopState, settings: &DesktopSettings) ->
     let deck = crate::dto::apply_settings_selection(settings);
     let key = deck.endpoint.identity();
     let moved = selection_moved(&previous, &key);
-    // Before the tunnels are released, so a DETACH frame still has a transport.
-    if moved {
-        terminal::detach_all(state).await;
-    }
-    state.daemon.invalidate_all().await;
     let observed = observed_keys(settings);
+    // PRD #1105 — the sessions on decks that LEFT the observed set, and no
+    // others. This was `detach_all` gated on `moved`; see
+    // `terminal::detach_decks_outside` for why a selection move is no longer a
+    // reason to tear a terminal down, and why this one is not gated.
+    //
+    // Before the tunnels are released, so a DETACH frame still has a transport.
+    terminal::detach_decks_outside(state, &observed).await;
+    state.daemon.invalidate_all().await;
     state.tunnels.retain(&observed).await;
     // PRD #742 M3: the watcher half of the same teardown, and the natural
     // sibling of the `retain` above it — a deck that left the observed set must
@@ -1837,7 +1856,11 @@ async fn desktop_run_action(
             // confirms the stop, remove any registry entry promptly; the
             // stream reader will also observe STREAM_END and is generation-
             // guarded against removing a newer attachment.
-            terminal::detach_agent(&state, &agent_id).await;
+            // The SELECTED deck's session for this agent, which is the deck
+            // `trusted_daemon` above just stopped it on. PRD #1105 made the
+            // deck term necessary: another deck can be running an agent of the
+            // same per-daemon monotonic id, and it was not stopped.
+            terminal::detach_agent_on(&state, &selected_endpoint().identity(), &agent_id).await;
             result_agent_id = Some(agent_id);
         }
         DesktopAction::StopDaemon { force } => {
@@ -1858,7 +1881,11 @@ async fn desktop_run_action(
             // process that is going away. Drop it here rather than waiting for
             // the watcher to notice its stream end.
             state.daemon.invalidate(&endpoint).await;
-            terminal::detach_all(&state).await;
+            // PRD #1105: this deck's sessions only. Stop is refused for
+            // anything but the local deck, so tearing down every deck's
+            // terminals would close panes on machines this action never
+            // touched.
+            terminal::detach_deck(&state, &endpoint).await;
             result_message = Some(match outcome {
                 StopOutcome::NoDaemonRunning => "No deck was running.".into(),
                 StopOutcome::Stopped { pid } => format!("Deck stopped gracefully (pid {pid})."),
@@ -1881,7 +1908,8 @@ async fn desktop_run_action(
             // terminated, and the `bootstrap` below is about to start a
             // different one at the same address.
             state.daemon.invalidate(&endpoint).await;
-            terminal::detach_all(&state).await;
+            // This deck's sessions only, for the same reason Stop's are.
+            terminal::detach_deck(&state, &endpoint).await;
             let snapshot = bootstrap(
                 &BootstrapOptions {
                     start_if_missing: true,
@@ -1959,7 +1987,11 @@ async fn desktop_run_action(
             // declarative attach path, not the tile's own), so it declares no
             // viewport and constrains nothing. The tile's first resize registers
             // its size a frame later.
-            let attached = terminal::attach(&app, &state, agent_id.clone(), channel, None).await?;
+            // No deck: this action is the legacy declarative attach path and has
+            // always meant the selected deck. The webview's own attach command
+            // names one.
+            let attached =
+                terminal::attach(&app, &state, None, agent_id.clone(), channel, None).await?;
             result_agent_id = Some(agent_id);
             result_terminal = Some(attached);
         }

@@ -20,6 +20,7 @@ import { UNREPORTED } from "../types";
 import type {
   AgentPanePresentation,
   AgentSession,
+  AgentTarget,
   EvidenceItem,
   PanelTab,
   RuntimeMode,
@@ -131,8 +132,13 @@ export interface AgentTileProps {
   terminalFocusToken?: number;
   onSelect: () => void;
   onTabChange: (tab: PanelTab) => void;
-  onTerminalInput: (agentId: string, data: string) => Promise<void>;
-  onTerminalResize: (agentId: string, cols: number, rows: number) => Promise<void>;
+  /**
+   * Both take the COMPOSITE identity since PRD #1105's cross-deck pane: this
+   * tile's agent may be on a deck that is not the selected one, and an id alone
+   * names an agent on every deck (`AgentTarget`).
+   */
+  onTerminalInput: (target: AgentTarget, data: string) => Promise<void>;
+  onTerminalResize: (target: AgentTarget, cols: number, rows: number) => Promise<void>;
   /** PRD #882 — the geometry the daemon has applied for this agent, if known. */
   appliedGeometry?: { rows: number; cols: number };
   onEvidenceSelect: (id: string) => void;
@@ -198,11 +204,11 @@ export function AgentTile({
   onClose,
 }: AgentTileProps) {
   const handleInput = useCallback((data: string) => {
-    void onTerminalInput(agent.id, data);
-  }, [agent.id, onTerminalInput]);
+    void onTerminalInput({ deckId: agent.daemonId, agentId: agent.id }, data);
+  }, [agent.daemonId, agent.id, onTerminalInput]);
   const handleResize = useCallback((cols: number, rows: number) => {
-    void onTerminalResize(agent.id, cols, rows);
-  }, [agent.id, onTerminalResize]);
+    void onTerminalResize({ deckId: agent.daemonId, agentId: agent.id }, cols, rows);
+  }, [agent.daemonId, agent.id, onTerminalResize]);
   const agentEvidence = evidence.filter((item) => agent.handoffIds.includes(item.id) || item.agentId === agent.id);
   // Issue #1042: one derivation for the terminal's state, its read-only gate
   // and the sentence beside it, so the three cannot disagree the way the tile's

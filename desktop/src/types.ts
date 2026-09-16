@@ -796,6 +796,36 @@ export interface TerminalFeed {
   subscribe(deckId: string | undefined, agentId: string, listener: (buffer: TerminalBuffer) => void): () => void;
 }
 
+/**
+ * One agent on one deck — the whole identity of a terminal seam, passed as a
+ * value rather than assembled from a bare id and whatever deck happens to be
+ * selected when the call lands.
+ *
+ * # Why this is a parameter and not something the bridge can look up
+ *
+ * Every terminal verb used to take a bare `agentId` and resolve the daemon
+ * through the process-global selected endpoint. Agent ids are per-daemon
+ * monotonic integers, so `"planner"` names an agent on every deck: with the
+ * agent pane able to attach a terminal on a deck that is NOT the selected one,
+ * a bare id routes this client's keystrokes to whichever machine happens to be
+ * selected at the instant the write lands. Issue
+ * [#1116](https://github.com/vfarcic/dot-agent-deck/issues/1116) is two audit
+ * rounds of that one shape — identity read from mutable current selection at
+ * use time rather than captured at creation.
+ *
+ * # It is compared BY VALUE, never by reference
+ *
+ * Nothing may key a `Map` on a `AgentTarget` object. The same target is
+ * re-allocated on every render — `{ deckId: agent.daemonId, agentId: agent.id }`
+ * is a fresh object each time — so an identity-keyed lookup passes a test that
+ * happens to reuse one object and fails in production. {@link agentKey} is the
+ * one way to turn a target into a key.
+ */
+export interface AgentTarget {
+  deckId: string;
+  agentId: string;
+}
+
 export interface DeckRuntimeState {
   mode: RuntimeMode;
   /**
@@ -850,8 +880,8 @@ export interface DeckRuntimeState {
    * heading — the ids collide across decks by construction.
    */
   terminalInputResults?: Record<string, SendResult>;
-  sendTerminalInput: (agentId: string, data: string) => Promise<void>;
-  resizeTerminal: (agentId: string, cols: number, rows: number) => Promise<void>;
+  sendTerminalInput: (target: AgentTarget, data: string) => Promise<void>;
+  resizeTerminal: (target: AgentTarget, cols: number, rows: number) => Promise<void>;
   /**
    * PRD #882 — the geometry the daemon has APPLIED per agent, keyed by
    * `agentKey(deckId, agentId)`.
@@ -875,10 +905,15 @@ export interface DeckRuntimeState {
   /**
    * States the whole set of agents whose terminal is on screen (PRD #745 M7).
    * A screen that mounts terminals calls this once per render commit with every
-   * shown id; a screen that mounts none calls it with `[]`. Attach follows this
-   * and nothing else, so a screen that renders no output opens no PTYs either.
+   * shown target; a screen that mounts none calls it with `[]`. Attach follows
+   * this and nothing else, so a screen that renders no output opens no PTYs
+   * either.
+   *
+   * A target rather than a bare id since PRD #1105's cross-deck pane: the
+   * overview can show one deck's agents while a pane holds a terminal on
+   * another, and both declarations travel in the same array.
    */
-  setShownTerminals: (agentIds: string[]) => Promise<void>;
+  setShownTerminals: (targets: AgentTarget[]) => Promise<void>;
   reconnect: () => Promise<void>;
   /**
    * PRD #819 M6: the projects the connected daemon knows about. There is no

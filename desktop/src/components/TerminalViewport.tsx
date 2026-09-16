@@ -204,7 +204,7 @@ export function TerminalViewport({
       textarea.disabled = Boolean(readOnlyRef.current);
     }
     // Expose the instance so the Reader overlay can snapshot the resolved buffer.
-    registerTerminal(agentId, terminal);
+    registerTerminal(deckId, agentId, terminal);
     terminal.write(transcriptRef.current);
 
     const inputDisposable = terminal.onData((data) => {
@@ -263,21 +263,38 @@ export function TerminalViewport({
     // PRD #882: `fit` reports the tile's box as a REQUEST and then restores the
     // applied grid, so a zoom-driven refit proposes a new size without ever
     // leaving xterm parsing at a geometry the PTY is not using.
-    registerRefit(agentId, fit);
+    registerRefit(deckId, agentId, fit);
 
     return () => {
       applyGridRef.current = undefined;
       window.cancelAnimationFrame(frame);
       observer.disconnect();
       inputDisposable.dispose();
-      unregisterRefit(agentId, fit);
-      unregisterTerminal(agentId, terminal);
+      unregisterRefit(deckId, agentId, fit);
+      unregisterTerminal(deckId, agentId, terminal);
       webglAddon?.dispose();
       terminal.dispose();
       terminalRef.current = undefined;
       lastStreamRef.current = undefined;
     };
-  }, [agentId]);
+    /*
+      `deckId` is a dependency, not a passenger — issue
+      [#1116](https://github.com/vfarcic/dot-agent-deck/issues/1116)'s open item
+      3. This effect built and disposed the xterm on `agentId` alone, so moving
+      from deck A's `planner` to deck B's reused the same component, the same
+      xterm, the same helper textarea, the same focus and the same
+      `lastStreamRef` — the deck changed only which feed was subscribed to.
+      B's backlog is then correctly absent, nothing resets the bytes already
+      rendered, and the transcript effect below refuses to reset while
+      `lastStreamRef.current` still holds A's buffer: A's scrollback stays on
+      screen inside B's tile, indefinitely where B has no frame yet or its
+      attach failed.
+
+      The cost of having it here is a rebuilt terminal when the identity
+      changes, which is exactly right — it is a different agent on a different
+      machine, and carrying one pixel of the old one across is the defect.
+    */
+  }, [agentId, deckId]);
 
   // Issue #1042 — reconcile the input gate in place when the lease flips.
   //

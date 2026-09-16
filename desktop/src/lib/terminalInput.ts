@@ -143,13 +143,18 @@ export function terminalInputState(agent: AgentSession, verdict?: SendResult): T
  *
  * The overview lists every observed deck's agents (PRD
  * [#742](https://github.com/vfarcic/dot-agent-deck/issues/742)) and every one
- * of them is openable, while a terminal in this app is always the *selected*
- * deck's: `terminal::attach` resolves its daemon through `trusted_daemon()`,
- * the process-global selected endpoint. So a pane can be open for an agent
- * this app declares no attach for — and a `TerminalViewport` mounted there
- * receives no bytes, which renders as a black rectangle that reads *"this
- * agent is producing no output"*. That is a lie about an agent working
- * normally on another machine, and it is the state this replaces.
+ * of them is openable. Most of them attach: the pane carries its own
+ * `(deckId, agentId)` all the way through attach, output, input and resize, and
+ * the crate resolves that deck's link through `DaemonLinks`, so a non-selected
+ * deck's agent opens with the same live terminal as a selected one.
+ *
+ * What is left is the deck with **no link to attach over** — one that is
+ * disconnected, one that has not reported yet, one configured with no address,
+ * or one this app is not observing at all. A `TerminalViewport` mounted there
+ * receives no bytes, which renders as a black rectangle that reads *"this agent
+ * is producing no output"*. That is a lie about an agent that may be working
+ * normally on a machine this app has merely lost contact with, and it is the
+ * state this replaces.
  *
  * # Why this is not a value inside {@link TerminalInputState}
  *
@@ -168,7 +173,7 @@ export function terminalInputState(agent: AgentSession, verdict?: SendResult): T
  * mounted, so there is nothing to type into and nothing a lease could say about
  * it. One sentence, and it is this one.
  */
-export type NoTerminalReason = "other-deck";
+export type NoTerminalReason = "unreachable-deck";
 
 export interface NoTerminalState {
   /** Rendered as `data-terminal-state`. `"attached"` is the absence of this. */
@@ -181,24 +186,30 @@ export interface NoTerminalState {
 }
 
 /**
- * The pane's agent is on a deck that is not the selected one, so nothing is
- * attached — said in full, with the deck named and the remedy stated.
+ * The pane's agent is on a deck this app cannot reach, so nothing is attached —
+ * said in full, with the deck named and what would change it stated.
  *
- * The remedy is stated and **not performed**. Switching the selected deck on
- * the user's behalf was built and withdrawn under this same PRD (decision 5),
- * because state created under one deck was then attributed to another; and a
- * control here that switched decks for them is #1073's design question rather
- * than this pane's to answer. Telling them what to do is right; doing it for
- * them is the withdrawn behaviour.
+ * # This trigger was NARROWED rather than invented
+ *
+ * It read *"this agent is on `<deck>`, which is not the selected deck"* and
+ * fired for every non-selected deck, because attach was process-global. Being
+ * non-selected is no longer a reason to have no terminal — that is the whole of
+ * the cross-deck pane — so the sentence would now be false about the ordinary
+ * case. What survives is the case it was always also covering: a deck with no
+ * live link, where a mounted viewport really would sit black forever.
+ *
+ * `reason` is the deck's own connection message where it has one, because that
+ * sentence is written by whatever failed and says more than this function can
+ * infer; the fallback covers a deck that reported nothing at all.
  *
  * `deckLabel` is `deckName`'s (`lib/displayText.ts`), which is what every other
- * surface in the app calls a deck — the overview's group header above all, so
- * the name in this sentence is the one the user reads in the Deck selector they
- * are being pointed at.
+ * surface in the app calls a deck — the overview's group header the user came
+ * from, and the label in the Deck selector.
  */
-export function otherDeckTerminalState(deckLabel: string): NoTerminalState {
+export function unreachableDeckTerminalState(deckLabel: string, reason?: string): NoTerminalState {
+  const detail = reason?.trim() ? ` ${reason.trim()}` : "";
   return {
-    reason: "other-deck",
-    notice: `No terminal here: this agent is on ${deckLabel}, which is not the selected deck. The desktop attaches terminals on the selected deck only — select ${deckLabel} and this pane's terminal attaches.`,
+    reason: "unreachable-deck",
+    notice: `No terminal here: the desktop has no live connection to ${deckLabel}, so there is nothing to attach to.${detail} The terminal appears on its own once that deck answers again.`,
   };
 }

@@ -72,10 +72,10 @@ vi.mock("@xterm/addon-webgl", () => ({
 }));
 
 import { DeckShell } from "../App";
-import { createFixtureSnapshot } from "../data/fixture";
+import { createFixtureSnapshot, FIXTURE_DAEMON_ID } from "../data/fixture";
 import { agentKey } from "../lib/agentKey";
 import { DEFAULT_DESKTOP_SETTINGS, type DesktopSettingsDto } from "../lib/bridge";
-import type { DeckActionResult, DeckRuntimeState } from "../types";
+import type { AgentTarget, DeckActionResult, DeckRuntimeState } from "../types";
 import { TerminalViewport } from "./TerminalViewport";
 
 const resizeObservers: ControlledResizeObserver[] = [];
@@ -308,12 +308,12 @@ describe("TerminalViewport agent pane geometry", () => {
    * instance, which is why `terminalFor` exists.
   */
   it("reports the pane's larger proposed grid and restores the applied grid", () => {
-    const resizeTerminal = vi.fn(async (_agentId: string, _cols: number, _rows: number) => undefined);
+    const resizeTerminal = vi.fn(async (_target: AgentTarget, _cols: number, _rows: number) => undefined);
     render(<DeckShell runtime={overlayRuntime(resizeTerminal)} />);
     const terminal = terminalFor("planner");
 
     triggerResize("planner");
-    expect(resizeTerminal).toHaveBeenLastCalledWith("planner", 80, 24);
+    expect(resizeTerminal).toHaveBeenLastCalledWith({ deckId: FIXTURE_DAEMON_ID, agentId: "planner" }, 80, 24);
     const [, tileCols, tileRows] = resizeTerminal.mock.calls.at(-1)!;
     resizeTerminal.mockClear();
 
@@ -331,6 +331,6 @@ describe("TerminalViewport agent pane geometry", () => {
     fireEvent.click(screen.getByRole("button", { name: "Close Planner agent" }));
     triggerResize("planner");
     expect(resizeTerminal).toHaveBeenCalledTimes(1);
-    expect(resizeTerminal).toHaveBeenLastCalledWith("planner", tileCols, tileRows);
+    expect(resizeTerminal).toHaveBeenLastCalledWith({ deckId: FIXTURE_DAEMON_ID, agentId: "planner" }, tileCols, tileRows);
   });
 });

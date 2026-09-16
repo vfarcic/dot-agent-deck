@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { DesktopAgentDto, DesktopSnapshotDto, ObservedDeckDto, TerminalAttachResult } from "./bridge";
-import type { DeckFleet, SendResult } from "../types";
+import type { AgentTarget, DeckFleet, SendResult } from "../types";
 
 const invoke = vi.fn();
 const listeners = new Map<string, (event: { payload: unknown }) => void>();
@@ -46,6 +46,17 @@ const snapshot: DesktopSnapshotDto = {
   source: "daemon",
 };
 
+/**
+ * The LOCAL deck's target for a bare agent id.
+ *
+ * Every terminal seam on the bridge takes the composite `(deckId, agentId)`
+ * since PRD #1105's cross-deck pane, and every call site below predates it and
+ * meant "the deck this fixture is on". This says that once instead of
+ * scattering the fixture's deck id through a hundred calls; the tests that are
+ * ABOUT crossing decks build their targets explicitly.
+ */
+const on = (agentId: string): AgentTarget => ({ deckId: snapshot.connection.deckId!, agentId });
+
 describe("TauriDeckBridge", () => {
   beforeEach(() => {
     invoke.mockReset();
@@ -85,7 +96,7 @@ describe("TauriDeckBridge", () => {
     // PRD #745 M7: attach is demand-driven, so a test that needs a session has
     // to declare the terminal shown. This test is about the DTO mapping and the
     // session-id RPCs, not about what triggers an attach.
-    await bridge.setShownTerminals(["agent-1"]);
+    await bridge.setShownTerminals([on("agent-1")]);
 
     expect(view.agents[0]).toMatchObject({ role: "Coder", model: "Unavailable", duration: "—", writeLease: "unknown", activeTool: "apply_patch" });
     const attachCall = invoke.mock.calls.find(([command]) => command === "desktop_terminal_attach");
@@ -94,11 +105,11 @@ describe("TauriDeckBridge", () => {
     channel.onmessage?.(new Uint8Array([65, 66]).buffer);
     expect(output).toHaveBeenCalledWith(expect.objectContaining({ agentId: "agent-1", data: new Uint8Array([65, 66]) }));
 
-    await bridge.sendTerminalInput("agent-1", "x");
+    await bridge.sendTerminalInput(on("agent-1"), "x");
     expect(invoke).toHaveBeenCalledWith("desktop_terminal_write", { sessionId: "session-7", data: [120] });
 
-    await bridge.resizeTerminal("agent-1", 130, 35);
-    await bridge.resizeTerminal("agent-1", 140, 40);
+    await bridge.resizeTerminal(on("agent-1"), 130, 35);
+    await bridge.resizeTerminal(on("agent-1"), 140, 40);
     await vi.waitFor(() => expect(invoke).toHaveBeenCalledWith("desktop_terminal_resize", { sessionId: "session-7", cols: 140, rows: 40 }));
     expect(invoke).not.toHaveBeenCalledWith("desktop_terminal_resize", { sessionId: "session-7", cols: 130, rows: 35 });
     await bridge.dispose();
@@ -114,7 +125,7 @@ describe("TauriDeckBridge", () => {
     // for. The property is unchanged — `dispose()` clears `sessions`
     // synchronously, so the reattach below goes through while its detach is
     // still pending — only the trigger moved off `connect()`.
-    await bridge.setShownTerminals(["agent-1"]);
+    await bridge.setShownTerminals([on("agent-1")]);
 
     let releaseDetach!: () => void;
     invoke.mockImplementation(async (command: string) => {
@@ -127,7 +138,7 @@ describe("TauriDeckBridge", () => {
     const disposing = bridge.dispose();
     const reconnecting = bridge.connect();
     await reconnecting;
-    await bridge.setShownTerminals(["agent-1"]);
+    await bridge.setShownTerminals([on("agent-1")]);
     expect(invoke.mock.calls.filter(([command]) => command === "desktop_terminal_attach")).toHaveLength(2);
     releaseDetach();
     await disposing;
@@ -145,7 +156,7 @@ describe("TauriDeckBridge", () => {
     await expect(bridge.connect()).resolves.toMatchObject([{ agents: [{ id: "agent-1" }] }]);
     // PRD #745 M7: the attach that fails is the one the shown terminal asked
     // for, and asking must not surface the failure as a rejection either.
-    await expect(bridge.setShownTerminals(["agent-1"])).resolves.toBeUndefined();
+    await expect(bridge.setShownTerminals([on("agent-1")])).resolves.toBeUndefined();
 
     const terminal = vi.fn();
     await bridge.subscribe(vi.fn(), terminal);
@@ -191,7 +202,7 @@ describe("TauriDeckBridge", () => {
     await bridge.connect();
     // PRD #745 M7: demand-driven attach. Nothing else about this test changes —
     // it is the only coverage of the generation guards.
-    await bridge.setShownTerminals(["agent-1"]);
+    await bridge.setShownTerminals([on("agent-1")]);
 
     const firstAttach = invoke.mock.calls.find(([command]) => command === "desktop_terminal_attach");
     const firstChannel = firstAttach?.[1].onOutput as MockChannel<ArrayBuffer>;
@@ -211,7 +222,7 @@ describe("TauriDeckBridge", () => {
     // The `end` event above dropped agent-1's session while the terminal stayed
     // on screen. Re-declaring the unchanged shown set is what brings it back —
     // `connect()` no longer attaches anything of its own.
-    const reattaching = bridge.setShownTerminals(["agent-1"]);
+    const reattaching = bridge.setShownTerminals([on("agent-1")]);
     await vi.waitFor(() => {
       expect(invoke.mock.calls.filter(([command]) => command === "desktop_terminal_attach")).toHaveLength(2);
     });
@@ -794,7 +805,7 @@ describe("FixtureDeckBridge scenarios", () => {
     // PRD #745 M7: the fixture preview drives the same screens as the live
     // bridge, so it has to answer the attach seam too — as a no-op, since it
     // owns no PTYs. Nothing in the UI may have to know which bridge it holds.
-    await expect(bridge.setShownTerminals(view.agents.map((agent) => agent.id))).resolves.toBeUndefined();
+    await expect(bridge.setShownTerminals(view.agents.map((agent) => on(agent.id)))).resolves.toBeUndefined();
     await expect(bridge.setShownTerminals([])).resolves.toBeUndefined();
   });
 
@@ -1029,7 +1040,7 @@ describe("TauriDeckBridge demand-driven attach (PRD 745 M7)", () => {
     // Whatever attaches below is demand-driven: connect() left nothing behind.
     expect(attachedAgentIds()).toEqual([]);
 
-    await bridge.setShownTerminals(["agent-4"]);
+    await bridge.setShownTerminals([on("agent-4")]);
     await settle();
 
     expect(attachedAgentIds()).toEqual(["agent-4"]);
@@ -1073,13 +1084,13 @@ describe("TauriDeckBridge demand-driven attach (PRD 745 M7)", () => {
     // is exactly full after MAX_WARM_TERMINALS + 1 agents and overflows on the
     // next one.
     const untilFull = fleetAgentIds(MAX_WARM_TERMINALS + 1);
-    for (const agentId of untilFull) await bridge.setShownTerminals([agentId]);
+    for (const agentId of untilFull) await bridge.setShownTerminals([on(agentId)]);
     await settle();
     expect(attachedAgentIds()).toEqual(untilFull);
     expect(detachCalls()).toHaveLength(0);
 
     const overflowing = `agent-${MAX_WARM_TERMINALS + 2}`;
-    await bridge.setShownTerminals([overflowing]);
+    await bridge.setShownTerminals([on(overflowing)]);
     await settle();
 
     expect(attachedAgentIds()).toEqual([...untilFull, overflowing]);
@@ -1090,7 +1101,7 @@ describe("TauriDeckBridge demand-driven attach (PRD 745 M7)", () => {
 
     // The evicted agent is genuinely gone, not merely detached on the daemon:
     // writing to it must fail rather than reach a dead session id.
-    await expect(bridge.sendTerminalInput("agent-1", "x")).rejects.toThrow(/not attached/);
+    await expect(bridge.sendTerminalInput(on("agent-1"), "x")).rejects.toThrow(/not attached/);
     await bridge.dispose();
   });
 
@@ -1110,11 +1121,11 @@ describe("TauriDeckBridge demand-driven attach (PRD 745 M7)", () => {
     // Whatever attaches below is demand-driven: connect() left nothing behind.
     expect(attachedAgentIds()).toEqual([]);
 
-    await bridge.setShownTerminals(["agent-1"]);
-    await bridge.setShownTerminals(["agent-2"]);
+    await bridge.setShownTerminals([on("agent-1")]);
+    await bridge.setShownTerminals([on("agent-2")]);
     const replacesBeforeRevisit = output.mock.calls.filter(([event]) => event.agentId === "agent-1" && event.operation === "replace").length;
 
-    await bridge.setShownTerminals(["agent-1"]);
+    await bridge.setShownTerminals([on("agent-1")]);
     await settle();
 
     expect(attachedAgentIds()).toEqual(["agent-1", "agent-2"]);
@@ -1141,7 +1152,7 @@ describe("TauriDeckBridge demand-driven attach (PRD 745 M7)", () => {
     // Whatever attaches below is demand-driven: connect() left nothing behind.
     expect(attachedAgentIds()).toEqual([]);
 
-    await bridge.setShownTerminals(fleetAgentIds());
+    await bridge.setShownTerminals(fleetAgentIds().map((agentId) => on(agentId)));
     await settle();
 
     expect(attachedAgentIds().sort()).toEqual(fleetAgentIds().sort());
@@ -1149,7 +1160,7 @@ describe("TauriDeckBridge demand-driven attach (PRD 745 M7)", () => {
     // Not merely "no detach was invoked": every one still resolves to a live
     // session, so none was dropped client-side either.
     for (const agentId of fleetAgentIds()) {
-      await expect(bridge.sendTerminalInput(agentId, "x")).resolves.toBeUndefined();
+      await expect(bridge.sendTerminalInput(on(agentId), "x")).resolves.toBeUndefined();
     }
     await bridge.dispose();
   });
@@ -1168,7 +1179,7 @@ describe("TauriDeckBridge demand-driven attach (PRD 745 M7)", () => {
     await bridge.connect();
 
     const shown = fleetAgentIds();
-    await bridge.setShownTerminals(shown);
+    await bridge.setShownTerminals(shown.map((agentId) => on(agentId)));
     await settle();
     const attachesBeforeOverlay = attachCalls().length;
     const detachesBeforeOverlay = detachCalls().length;
@@ -1178,15 +1189,15 @@ describe("TauriDeckBridge demand-driven attach (PRD 745 M7)", () => {
     // declaration. Re-declaring it here is intentionally conservative: even
     // if a render owner invokes the bridge for an unchanged commit, the bridge
     // must make the same no-cost decision as an effect that does not re-fire.
-    await bridge.setShownTerminals(shown);
-    await bridge.setShownTerminals(shown);
+    await bridge.setShownTerminals(shown.map((agentId) => on(agentId)));
+    await bridge.setShownTerminals(shown.map((agentId) => on(agentId)));
     await settle();
 
     expect(attachCalls()).toHaveLength(attachesBeforeOverlay);
     expect(detachCalls()).toHaveLength(detachesBeforeOverlay);
     expect(output.mock.calls.filter(([event]) => event.operation === "replace")).toHaveLength(replaysBeforeOverlay);
     for (const agentId of shown) {
-      await expect(bridge.sendTerminalInput(agentId, "x")).resolves.toBeUndefined();
+      await expect(bridge.sendTerminalInput(on(agentId), "x")).resolves.toBeUndefined();
     }
     await bridge.dispose();
   });
@@ -1209,7 +1220,7 @@ describe("TauriDeckBridge demand-driven attach (PRD 745 M7)", () => {
     expect(attachCalls()).toHaveLength(0);
     expect(detachCalls()).toHaveLength(0);
 
-    await bridge.setShownTerminals(["agent-4"]);
+    await bridge.setShownTerminals([on("agent-4")]);
     await settle();
 
     expect(attachedAgentIds()).toEqual(["agent-4"]);
@@ -1222,8 +1233,159 @@ describe("TauriDeckBridge demand-driven attach (PRD 745 M7)", () => {
     expect(attachedAgentIds()).toEqual(["agent-4"]);
     expect(detachedAgentIds()).toEqual(["agent-4"]);
     expect(output.mock.calls.filter(([event]) => event.operation === "replace")).toHaveLength(1);
-    await expect(bridge.sendTerminalInput("agent-4", "x")).rejects.toThrow(/not attached/);
+    await expect(bridge.sendTerminalInput(on("agent-4"), "x")).rejects.toThrow(/not attached/);
     await bridge.dispose();
+  });
+
+  /**
+   * Scenario: the overview is showing the local deck first, then opens the
+   * same-id agent on build-box. Opening costs one attach naming build-box and
+   * closing costs one detach of that exact session — no selection switch and
+   * no attach to the local namesake.
+   */
+  it("attaches and detaches exactly one terminal on the cross-deck pane's own deck", async () => {
+    const { TauriDeckBridge } = await import("./bridge");
+    const remoteDeckId = "deck-00000000000000b2";
+    const target = { deckId: remoteDeckId, agentId: "agent-4" };
+    invoke.mockImplementation(async (command: string, args?: { agentId?: string | typeof target; deckId?: string }) => {
+      if (command === "desktop_bootstrap") return fleetSnapshot();
+      if (command === "desktop_terminal_attach") {
+        const agentId = typeof args?.agentId === "string" ? args.agentId : args?.agentId?.agentId ?? "";
+        const deckId = args?.deckId ?? (typeof args?.agentId === "object" ? args.agentId.deckId : "missing-deck");
+        return { sessionId: `session-${deckId}-${agentId}`, agentId, generation: 1, reused: false } satisfies TerminalAttachResult;
+      }
+      return { ok: true };
+    });
+
+    const bridge = new TauriDeckBridge();
+    await bridge.subscribe(vi.fn(), vi.fn());
+    await bridge.connect();
+    const setShownTargets = bridge.setShownTerminals.bind(bridge) as unknown as (targets: Array<{ deckId: string; agentId: string }>) => Promise<void>;
+
+    await setShownTargets([target]);
+    await settle();
+    await setShownTargets([]);
+    await settle();
+
+    const attaches = attachCalls();
+    const detaches = detachCalls();
+    await bridge.dispose();
+
+    expect(attaches).toHaveLength(1);
+    expect(attaches[0][1]).toMatchObject({ deckId: remoteDeckId, agentId: "agent-4" });
+    expect(detaches).toHaveLength(1);
+    expect(detaches[0][1]).toEqual({ sessionId: `session-${remoteDeckId}-agent-4` });
+  });
+
+  /**
+   * Scenario: build-box's cross-deck Planner is attached while another deck is
+   * selected, selection moves again, and build-box then emits output. No detach
+   * occurs; the bytes and applied geometry remain stamped with build-box, not
+   * either mutable selection.
+   */
+  it("keeps a cross-deck session's output and geometry on its creating deck across selection moves", async () => {
+    const { TauriDeckBridge } = await import("./bridge");
+    const remoteDeckId = "deck-00000000000000b2";
+    const movedDeckId = "deck-00000000000000c3";
+    const target = { deckId: remoteDeckId, agentId: "agent-4" };
+    invoke.mockImplementation(async (command: string, args?: { agentId?: string | typeof target; deckId?: string }) => {
+      if (command === "desktop_bootstrap") return fleetSnapshot();
+      if (command === "desktop_terminal_attach") {
+        const agentId = typeof args?.agentId === "string" ? args.agentId : args?.agentId?.agentId ?? "";
+        return {
+          sessionId: `session-${remoteDeckId}-${agentId}`,
+          agentId,
+          generation: 7,
+          reused: false,
+          appliedRows: 48,
+          appliedCols: 160,
+        } satisfies TerminalAttachResult;
+      }
+      return { ok: true };
+    });
+
+    const bridge = new TauriDeckBridge();
+    const output = vi.fn();
+    const geometry = vi.fn();
+    await bridge.subscribe(vi.fn(), output);
+    bridge.onTerminalGeometry(geometry);
+    await bridge.connect();
+    const setShownTargets = bridge.setShownTerminals.bind(bridge) as unknown as (targets: Array<{ deckId: string; agentId: string }>) => Promise<void>;
+    await setShownTargets([target]);
+    await settle();
+
+    const moved = fleetSnapshot();
+    moved.connection.deckId = movedDeckId;
+    moved.connection.socketPath = "dev@third-box";
+    moved.fleet = [movedDeckId, remoteDeckId];
+    listeners.get("desktop://snapshot")?.({ payload: moved });
+    expect(detachCalls()).toHaveLength(0);
+
+    const channel = attachCalls()[0][1].onOutput as MockChannel<ArrayBuffer>;
+    channel.onmessage?.(new TextEncoder().encode("sentinel-from-build-box").buffer);
+    const live = output.mock.calls.map(([event]) => event).find((event) => new TextDecoder().decode(event.data).includes("sentinel-from-build-box"));
+
+    await bridge.dispose();
+
+    expect.soft(live).toMatchObject({ agentId: "agent-4", deckId: remoteDeckId, operation: "append" });
+    expect.soft(geometry).toHaveBeenCalledWith("agent-4", 48, 160, remoteDeckId);
+  });
+
+  /**
+   * Scenario: deck A and deck B both attach an agent named `agent-4`. Typing
+   * and resizing through a newly-created identity for B resolve by composite
+   * value and use B's session only, never the selected deck's namesake.
+   */
+  it("routes input and geometry to the requested deck when two attached agents share an id", async () => {
+    const { TauriDeckBridge } = await import("./bridge");
+    const localDeckId = snapshot.connection.deckId!;
+    const remoteDeckId = "deck-00000000000000b2";
+    type Target = { deckId: string; agentId: string };
+    const local: Target = { deckId: localDeckId, agentId: "agent-4" };
+    const remote: Target = { deckId: remoteDeckId, agentId: "agent-4" };
+    invoke.mockImplementation(async (command: string, args?: { agentId?: string | Target; deckId?: string }) => {
+      if (command === "desktop_bootstrap") return fleetSnapshot();
+      if (command === "desktop_terminal_attach") {
+        const agentId = typeof args?.agentId === "string" ? args.agentId : args?.agentId?.agentId ?? "";
+        const deckId = args?.deckId ?? (typeof args?.agentId === "object" ? args.agentId.deckId : "missing-deck");
+        return { sessionId: `session-${deckId}-${agentId}`, agentId, generation: deckId === localDeckId ? 1 : 2, reused: false } satisfies TerminalAttachResult;
+      }
+      return { ok: true };
+    });
+
+    const bridge = new TauriDeckBridge();
+    await bridge.subscribe(vi.fn(), vi.fn());
+    await bridge.connect();
+    const setShownTargets = bridge.setShownTerminals.bind(bridge) as unknown as (targets: Target[]) => Promise<void>;
+    const sendToTarget = bridge.sendTerminalInput.bind(bridge) as unknown as (target: Target, data: string) => Promise<void>;
+    const resizeTarget = bridge.resizeTerminal.bind(bridge) as unknown as (target: Target, cols: number, rows: number) => Promise<void>;
+    await setShownTargets([local, remote]);
+    await settle();
+
+    try {
+      // A distinct object with the same values proves lookup is composite-key
+      // based, not accidental object identity from the shown declaration.
+      await expect(sendToTarget({ ...remote }, "keys-for-build-box")).resolves.toBeUndefined();
+      const writes = invoke.mock.calls.filter(([command]) => command === "desktop_terminal_write");
+      expect(writes).toEqual([[
+        "desktop_terminal_write",
+        { sessionId: `session-${remoteDeckId}-agent-4`, data: Array.from(new TextEncoder().encode("keys-for-build-box")) },
+      ]]);
+
+      await resizeTarget({ ...remote }, 160, 48);
+      await vi.waitFor(() => {
+        expect(invoke).toHaveBeenCalledWith("desktop_terminal_resize", {
+          sessionId: `session-${remoteDeckId}-agent-4`,
+          cols: 160,
+          rows: 48,
+        });
+      });
+      expect(invoke).not.toHaveBeenCalledWith("desktop_terminal_resize", expect.objectContaining({
+        sessionId: `session-${localDeckId}-agent-4`,
+      }));
+    } finally {
+      await bridge.dispose();
+    }
   });
 
   /**
@@ -1240,7 +1402,7 @@ describe("TauriDeckBridge demand-driven attach (PRD 745 M7)", () => {
     // Whatever attaches below is demand-driven: connect() left nothing behind.
     expect(attachedAgentIds()).toEqual([]);
 
-    await bridge.setShownTerminals(fleetAgentIds());
+    await bridge.setShownTerminals(fleetAgentIds().map((agentId) => on(agentId)));
     await settle();
     const attachesWhileShown = attachCalls().length;
 
@@ -1250,7 +1412,7 @@ describe("TauriDeckBridge demand-driven attach (PRD 745 M7)", () => {
     expect(detachedAgentIds().sort()).toEqual(fleetAgentIds().sort());
     expect(attachCalls()).toHaveLength(attachesWhileShown);
     for (const agentId of fleetAgentIds()) {
-      await expect(bridge.sendTerminalInput(agentId, "x")).rejects.toThrow(/not attached/);
+      await expect(bridge.sendTerminalInput(on(agentId), "x")).rejects.toThrow(/not attached/);
     }
     await bridge.dispose();
   });
@@ -1277,7 +1439,7 @@ describe("TauriDeckBridge demand-driven attach (PRD 745 M7)", () => {
     expect(attachedAgentIds()).toEqual([]);
 
     attach.hold(heldAgentId);
-    const showing = bridge.setShownTerminals(fleetAgentIds());
+    const showing = bridge.setShownTerminals(fleetAgentIds().map((agentId) => on(agentId)));
     await vi.waitFor(() => expect(attachedAgentIds().sort()).toEqual(fleetAgentIds().sort()));
     await settle();
 
@@ -1294,7 +1456,7 @@ describe("TauriDeckBridge demand-driven attach (PRD 745 M7)", () => {
     // The late attach is detached, not installed.
     expect(detachedAgentIds().sort()).toEqual(fleetAgentIds().sort());
     expect(attachCalls()).toHaveLength(FLEET_SIZE);
-    await expect(bridge.sendTerminalInput(heldAgentId, "x")).rejects.toThrow(/not attached/);
+    await expect(bridge.sendTerminalInput(on(heldAgentId), "x")).rejects.toThrow(/not attached/);
     // And its scrollback never lands in a pane that is no longer on screen.
     const replays = output.mock.calls.filter(([event]) => event.agentId === heldAgentId && event.operation === "replace");
     expect(replays).toHaveLength(0);
@@ -1322,14 +1484,14 @@ describe("TauriDeckBridge demand-driven attach (PRD 745 M7)", () => {
     expect(attachedAgentIds()).toEqual([]);
 
     attach.hold(heldAgentId);
-    const showing = bridge.setShownTerminals([heldAgentId]);
+    const showing = bridge.setShownTerminals([on(heldAgentId)]);
     await vi.waitFor(() => expect(attachedAgentIds()).toEqual([heldAgentId]));
 
     // Leaving it moves it into the warm set; MAX_WARM_TERMINALS + 1 further
     // agents shown one at a time overflow that set and make it the least
     // recently used — all while its first attach is still unresolved.
     for (let index = 2; index <= MAX_WARM_TERMINALS + 2; index += 1) {
-      await bridge.setShownTerminals([`agent-${index}`]);
+      await bridge.setShownTerminals([on(`agent-${index}`)]);
     }
     await settle();
 
@@ -1338,7 +1500,7 @@ describe("TauriDeckBridge demand-driven attach (PRD 745 M7)", () => {
     await settle();
 
     expect(detachedAgentIds()).toEqual([heldAgentId]);
-    await expect(bridge.sendTerminalInput(heldAgentId, "x")).rejects.toThrow(/not attached/);
+    await expect(bridge.sendTerminalInput(on(heldAgentId), "x")).rejects.toThrow(/not attached/);
     // The bound holds: one shown plus a full warm set, and the evicted agent
     // did not reinstate itself on the way out.
     expect(attachCalls()).toHaveLength(MAX_WARM_TERMINALS + 2);
@@ -1382,7 +1544,7 @@ describe("TauriDeckBridge demand-driven attach (PRD 745 M7)", () => {
     // Whatever attaches below is demand-driven: connect() left nothing behind.
     expect(attachedAgentIds()).toEqual([]);
 
-    await bridge.setShownTerminals(["agent-1"]);
+    await bridge.setShownTerminals([on("agent-1")]);
     const firstChannel = attachCalls()[0][1].onOutput as MockChannel<ArrayBuffer>;
     firstChannel.onmessage?.(new TextEncoder().encode("first\r\n").buffer);
     const firstGeneration = attachCalls().length;
@@ -1390,13 +1552,13 @@ describe("TauriDeckBridge demand-driven attach (PRD 745 M7)", () => {
     // Push agent-1 out of the warm set: one agent shown at a time, so agent-1
     // is the least recently used the moment the warm set overflows.
     for (let index = 2; index <= MAX_WARM_TERMINALS + 2; index += 1) {
-      await bridge.setShownTerminals([`agent-${index}`]);
+      await bridge.setShownTerminals([on(`agent-${index}`)]);
     }
     expect(detachedSessionIds()).toEqual([`session-agent-1-${firstGeneration}`]);
 
     // Come back to it. The daemon replays everything before it streams.
     holdAgentId = "agent-1";
-    const reshowing = bridge.setShownTerminals(["agent-1"]);
+    const reshowing = bridge.setShownTerminals([on("agent-1")]);
     // agent-1 already appears once in the attach log from before its eviction,
     // so the wait has to be for a SECOND attach naming it, not for any.
     await vi.waitFor(() => expect(attachedAgentIds().filter((agentId) => agentId === "agent-1")).toHaveLength(2));
@@ -1420,7 +1582,7 @@ describe("TauriDeckBridge demand-driven attach (PRD 745 M7)", () => {
     expect(output).toHaveBeenCalledTimes(callsBeforeStale);
 
     // And writes now route through the NEW session, not the evicted one.
-    await bridge.sendTerminalInput("agent-1", "x");
+    await bridge.sendTerminalInput(on("agent-1"), "x");
     expect(invoke).toHaveBeenCalledWith("desktop_terminal_write", { sessionId: `session-agent-1-${reattachGeneration}`, data: [120] });
     await bridge.dispose();
   });
@@ -1445,11 +1607,11 @@ describe("TauriDeckBridge demand-driven attach (PRD 745 M7)", () => {
     // Whatever attaches below is demand-driven: connect() left nothing behind.
     expect(attachedAgentIds()).toEqual([]);
 
-    await bridge.setShownTerminals(["agent-1"]);
+    await bridge.setShownTerminals([on("agent-1")]);
     await settle();
     const firstGeneration = attachCalls().length;
     expect(attachedAgentIds()).toEqual(["agent-1"]);
-    await expect(bridge.sendTerminalInput("agent-1", "x")).resolves.toBeUndefined();
+    await expect(bridge.sendTerminalInput(on("agent-1"), "x")).resolves.toBeUndefined();
 
     // The daemon ends the session under a terminal that is still on screen.
     listeners.get("desktop://terminal-state")?.({
@@ -1460,7 +1622,7 @@ describe("TauriDeckBridge demand-driven attach (PRD 745 M7)", () => {
         state: "end",
       },
     });
-    await expect(bridge.sendTerminalInput("agent-1", "x")).rejects.toThrow(/not attached/);
+    await expect(bridge.sendTerminalInput(on("agent-1"), "x")).rejects.toThrow(/not attached/);
 
     listeners.get("desktop://snapshot")?.({ payload: fleetSnapshot() });
 
@@ -1472,7 +1634,7 @@ describe("TauriDeckBridge demand-driven attach (PRD 745 M7)", () => {
 
     // Usable again, and through the NEW session rather than the dead one.
     const reattachGeneration = attachCalls().length;
-    await expect(bridge.sendTerminalInput("agent-1", "x")).resolves.toBeUndefined();
+    await expect(bridge.sendTerminalInput(on("agent-1"), "x")).resolves.toBeUndefined();
     expect(invoke).toHaveBeenCalledWith("desktop_terminal_write", { sessionId: `session-agent-1-${reattachGeneration}`, data: [120] });
     // Healing the dead pane must not drag in the eight nobody is looking at.
     expect(attachedAgentIds()).toEqual(["agent-1", "agent-1"]);
@@ -1495,7 +1657,7 @@ describe("TauriDeckBridge demand-driven attach (PRD 745 M7)", () => {
     // Whatever attaches below is demand-driven: connect() left nothing behind.
     expect(attachedAgentIds()).toEqual([]);
 
-    await bridge.setShownTerminals(["agent-1"]);
+    await bridge.setShownTerminals([on("agent-1")]);
     await settle();
     const attachesWhileShown = attachCalls().length;
     expect(attachedAgentIds()).toEqual(["agent-1"]);
@@ -1508,9 +1670,9 @@ describe("TauriDeckBridge demand-driven attach (PRD 745 M7)", () => {
     expect(detachCalls()).toHaveLength(0);
     // Not merely "no attach was invoked": the eight have no session either.
     for (const agentId of fleetAgentIds().filter((agentId) => agentId !== "agent-1")) {
-      await expect(bridge.sendTerminalInput(agentId, "x")).rejects.toThrow(/not attached/);
+      await expect(bridge.sendTerminalInput(on(agentId), "x")).rejects.toThrow(/not attached/);
     }
-    await expect(bridge.sendTerminalInput("agent-1", "x")).resolves.toBeUndefined();
+    await expect(bridge.sendTerminalInput(on("agent-1"), "x")).resolves.toBeUndefined();
     await bridge.dispose();
   });
 
@@ -1533,9 +1695,9 @@ describe("TauriDeckBridge demand-driven attach (PRD 745 M7)", () => {
     // Whatever attaches below is demand-driven: connect() left nothing behind.
     expect(attachedAgentIds()).toEqual([]);
 
-    await bridge.setShownTerminals(["agent-1"]);
+    await bridge.setShownTerminals([on("agent-1")]);
     const warmGeneration = attachCalls().length;
-    await bridge.setShownTerminals(["agent-2"]);
+    await bridge.setShownTerminals([on("agent-2")]);
     await settle();
     expect(attachedAgentIds()).toEqual(["agent-1", "agent-2"]);
 
@@ -1551,12 +1713,12 @@ describe("TauriDeckBridge demand-driven attach (PRD 745 M7)", () => {
     await settle();
 
     expect(attachedAgentIds()).toEqual(["agent-1", "agent-2"]);
-    await expect(bridge.sendTerminalInput("agent-1", "x")).rejects.toThrow(/not attached/);
+    await expect(bridge.sendTerminalInput(on("agent-1"), "x")).rejects.toThrow(/not attached/);
 
-    await bridge.setShownTerminals(["agent-1"]);
+    await bridge.setShownTerminals([on("agent-1")]);
     await settle();
     expect(attachedAgentIds()).toEqual(["agent-1", "agent-2", "agent-1"]);
-    await expect(bridge.sendTerminalInput("agent-1", "x")).resolves.toBeUndefined();
+    await expect(bridge.sendTerminalInput(on("agent-1"), "x")).resolves.toBeUndefined();
     await bridge.dispose();
   });
   /**
@@ -1581,10 +1743,10 @@ describe("TauriDeckBridge demand-driven attach (PRD 745 M7)", () => {
     expect(attachedAgentIds()).toEqual([]);
 
     attach.hold("agent-1");
-    const showing = bridge.setShownTerminals(["agent-1"]);
+    const showing = bridge.setShownTerminals([on("agent-1")]);
     await vi.waitFor(() => expect(attachedAgentIds()).toEqual(["agent-1"]));
 
-    const redeclaring = bridge.setShownTerminals(["agent-1"]);
+    const redeclaring = bridge.setShownTerminals([on("agent-1")]);
     await settle();
     expect(attachedAgentIds()).toEqual(["agent-1"]);
 
@@ -1594,7 +1756,7 @@ describe("TauriDeckBridge demand-driven attach (PRD 745 M7)", () => {
 
     expect(attachedAgentIds()).toEqual(["agent-1"]);
     expect(detachCalls()).toHaveLength(0);
-    await expect(bridge.sendTerminalInput("agent-1", "x")).resolves.toBeUndefined();
+    await expect(bridge.sendTerminalInput(on("agent-1"), "x")).resolves.toBeUndefined();
     const replays = output.mock.calls.filter(([event]) => event.agentId === "agent-1" && event.operation === "replace");
     expect(replays).toHaveLength(1);
     await bridge.dispose();
@@ -1623,12 +1785,12 @@ describe("TauriDeckBridge demand-driven attach (PRD 745 M7)", () => {
     expect(attachedAgentIds()).toEqual([]);
 
     attach.hold("agent-1");
-    const showing = bridge.setShownTerminals(["agent-1"]);
+    const showing = bridge.setShownTerminals([on("agent-1")]);
     await vi.waitFor(() => expect(attachedAgentIds()).toEqual(["agent-1"]));
 
     for (let cycle = 0; cycle < 5; cycle += 1) {
       await bridge.setShownTerminals([]);
-      await bridge.setShownTerminals(["agent-1"]);
+      await bridge.setShownTerminals([on("agent-1")]);
     }
     await settle();
 
@@ -1663,12 +1825,12 @@ describe("TauriDeckBridge demand-driven attach (PRD 745 M7)", () => {
     expect(attachedAgentIds()).toEqual([]);
 
     attach.hold("agent-1");
-    const showing = bridge.setShownTerminals(["agent-1"]);
+    const showing = bridge.setShownTerminals([on("agent-1")]);
     await vi.waitFor(() => expect(attachedAgentIds()).toEqual(["agent-1"]));
 
     // Away and straight back, faster than the attach round trip.
     await bridge.setShownTerminals([]);
-    await bridge.setShownTerminals(["agent-1"]);
+    await bridge.setShownTerminals([on("agent-1")]);
     await settle();
     expect(attachedAgentIds()).toEqual(["agent-1"]);
 
@@ -1682,7 +1844,7 @@ describe("TauriDeckBridge demand-driven attach (PRD 745 M7)", () => {
     // The first session belonged to a pane that had gone; it is detached rather
     // than installed, and the pane on screen now takes input through the second.
     expect(detachedSessionIds()).toEqual(["session-agent-1-1"]);
-    await expect(bridge.sendTerminalInput("agent-1", "x")).resolves.toBeUndefined();
+    await expect(bridge.sendTerminalInput(on("agent-1"), "x")).resolves.toBeUndefined();
     expect(invoke).toHaveBeenCalledWith("desktop_terminal_write", { sessionId: "session-agent-1-2", data: [120] });
     await bridge.dispose();
   });
@@ -1707,12 +1869,12 @@ describe("TauriDeckBridge demand-driven attach (PRD 745 M7)", () => {
     await bridge.connect();
 
     attach.hold("agent-1");
-    const showing = bridge.setShownTerminals(["agent-1"]);
+    const showing = bridge.setShownTerminals([on("agent-1")]);
     await vi.waitFor(() => expect(attachedAgentIds()).toEqual(["agent-1"]));
 
     // Away and back while the daemon stays silent: suppressed, as designed.
     await bridge.setShownTerminals([]);
-    await bridge.setShownTerminals(["agent-1"]);
+    await bridge.setShownTerminals([on("agent-1")]);
     await settle();
     expect(attachedAgentIds()).toEqual(["agent-1"]);
 
@@ -1751,11 +1913,11 @@ describe("TauriDeckBridge demand-driven attach (PRD 745 M7)", () => {
     const bridge = new TauriDeckBridge();
     await bridge.connect();
 
-    await bridge.setShownTerminals(["agent-1"]);
+    await bridge.setShownTerminals([on("agent-1")]);
     await settle();
     await bridge.setShownTerminals([]);
     await settle();
-    await bridge.setShownTerminals(["agent-1"]);
+    await bridge.setShownTerminals([on("agent-1")]);
     await settle();
 
     const output = vi.fn();

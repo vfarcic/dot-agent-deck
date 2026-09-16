@@ -6,7 +6,7 @@ import { agentKey } from "../lib/agentKey";
 import { applyTerminalChunk } from "../lib/terminalBuffer";
 const EMPTY_TERMINAL_DATA: Record<string, TerminalBuffer> = {};
 import { isDelivered } from "../types";
-import type { DeckAction, DeckFleet, DeckRuntimeState, DeckSnapshot, RuntimeMode, SendResult, TerminalBuffer } from "../types";
+import type { AgentTarget, DeckAction, DeckFleet, DeckRuntimeState, DeckSnapshot, RuntimeMode, SendResult, TerminalBuffer } from "../types";
 
 /**
  * The snapshot a runtime starts with, before any deck has answered. Lifted out
@@ -316,12 +316,12 @@ export function useDeckRuntime(): DeckRuntimeState {
     [bridge],
   );
 
-  const sendTerminalInput = useCallback((agentId: string, data: string) => bridge.sendTerminalInput(agentId, data), [bridge]);
-  const resizeTerminal = useCallback((agentId: string, cols: number, rows: number) => bridge.resizeTerminal(agentId, cols, rows), [bridge]);
+  const sendTerminalInput = useCallback((target: AgentTarget, data: string) => bridge.sendTerminalInput(target, data), [bridge]);
+  const resizeTerminal = useCallback((target: AgentTarget, cols: number, rows: number) => bridge.resizeTerminal(target, cols, rows), [bridge]);
   // Stable for the lifetime of the bridge, because the screens declare their
   // shown set from an effect: an identity that changed every render would fire
   // that effect every render (PRD #745 M7).
-  const setShownTerminals = useCallback((agentIds: string[]) => bridge.setShownTerminals(agentIds), [bridge]);
+  const setShownTerminals = useCallback((targets: AgentTarget[]) => bridge.setShownTerminals(targets), [bridge]);
   // PRD #819 M6. Deliberately NOT wrapped in the `setError` bookkeeping
   // `runAction` uses: an empty listing and an unresolvable path are ordinary
   // outcomes of choosing a project, and routing them into the deck's global

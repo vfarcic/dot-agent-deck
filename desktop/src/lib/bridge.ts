@@ -1,4 +1,5 @@
 import { createFixtureFleet, DEFAULT_PROFILES, type FixtureState } from "../data/fixture";
+import { agentKey } from "./agentKey";
 import { getTerminal } from "./terminalRegistry";
 import { applyHandoffEvent, mapDaemonEvent, MAX_LIVE_EVIDENCE } from "./daemonEvents";
 import { DISPLAY_LIMITS, displayText } from "./displayText";
@@ -7,6 +8,7 @@ import { clampZoom, DEFAULT_ZOOM } from "./zoom";
 import { UNREPORTED } from "../types";
 import type { HandoffEdge,
   AgentSession,
+  AgentTarget,
   AgentStatus,
   AgentTab,
   DaemonProjectListing,
@@ -709,8 +711,20 @@ export interface DeckBridge {
   connect(): Promise<DeckFleet>;
   subscribe(onFleet: FleetListener, onTerminal: TerminalListener): Promise<Unsubscribe>;
   runAction(action: DeckAction): Promise<DeckActionResult>;
-  sendTerminalInput(agentId: string, data: string): Promise<void>;
-  resizeTerminal(agentId: string, cols: number, rows: number): Promise<void>;
+  /**
+   * Type into one agent's terminal, named by the composite `(deckId, agentId)`.
+   *
+   * PRD #1105's cross-deck pane. It took a bare `agentId` and resolved the
+   * frontend session keyed by it, which under two attached same-id agents
+   * routed the keystrokes to whichever deck's session happened to be in the
+   * map — the write half of issue
+   * [#1116](https://github.com/vfarcic/dot-agent-deck/issues/1116)'s open item
+   * 2. The target is matched BY VALUE (see {@link AgentTarget}); an
+   * unattached target rejects rather than writing anywhere.
+   */
+  sendTerminalInput(target: AgentTarget, data: string): Promise<void>;
+  /** This pane's measured grid, for the agent named by the composite identity. */
+  resizeTerminal(target: AgentTarget, cols: number, rows: number): Promise<void>;
   /**
    * PRD #882 — subscribe to the geometry the daemon has APPLIED for an agent,
    * replaying anything already known, and return an unsubscribe function.
@@ -718,9 +732,12 @@ export interface DeckBridge {
    * The replay matters: an agent can be constrained by another client long
    * before a tile here mounts, and the push that said so is not repeated.
    *
-   * `deckId` is the deck the bridge was on when the geometry was applied (PRD
-   * #1105's security audit). Agent ids collide across decks, so a listener that
-   * caches by bare id applies one machine's grid to another's namesake.
+   * `deckId` is the deck the SESSION THIS GEOMETRY BELONGS TO was created
+   * against — never whichever deck is selected when the event lands (PRD
+   * #1105's security audit, and issue #1116's open item 4). Agent ids collide
+   * across decks, so a listener that caches by bare id applies one machine's
+   * grid to another's namesake, and a stamp read from mutable current selection
+   * defeats a composite cache with a confidently wrong producer.
    */
   onTerminalGeometry(listener: (agentId: string, rows: number, cols: number, deckId?: string) => void): () => void;
   /**
@@ -768,9 +785,14 @@ export interface DeckBridge {
    * are different claims. Declarative, not imperative: the two facts the UI has
    * to state are "these nine tiles are showing a terminal" and "now none is",
    * and neither can be expressed by a per-agent show. Call it once per render
-   * commit with every shown id.
+   * commit with every shown target.
+   *
+   * A target rather than a bare id since PRD #1105's cross-deck pane: the set
+   * can name agents on more than one deck at once — a deck screen's tiles on
+   * the selected deck, or an overview pane holding a terminal on another — and
+   * each attach resolves its own deck's link.
    */
-  setShownTerminals(agentIds: string[]): Promise<void>;
+  setShownTerminals(targets: AgentTarget[]): Promise<void>;
   /**
    * The projects the connected daemon knows about (PRD #819 M6). Enumerated
    * from what the daemon already holds — its startup cwd, live agent cwds,
@@ -1246,12 +1268,18 @@ class FixtureDeckBridge implements DeckBridge {
   }
 
   /**
-   * The deck stamp is the selected deck's, for the same reason the live
-   * bridge's is (PRD #1105's security audit): the runtime keys its buffers by
+   * The deck stamp is the TARGET's, for the same reason the live bridge's is
+   * (PRD #1105's security audit): the runtime keys its buffers by
    * `(deckId, agentId)` and the fixture's own decks run colliding agent ids.
+   *
+   * It read `this.snapshot.connection.deckId` — the selected deck — until the
+   * cross-deck pane made that wrong rather than merely redundant: the preview
+   * can type into a non-selected deck's agent, and echoing those bytes under
+   * the selected deck's key is the same wrong-producer stamp issue #1116's open
+   * item 1 describes, reproduced in the fixture.
    */
-  async sendTerminalInput(agentId: string, data: string): Promise<void> {
-    this.terminalListeners.forEach((listener) => listener({ agentId, deckId: this.snapshot.connection.deckId, data: new TextEncoder().encode(data), stream: "output", operation: "append" }));
+  async sendTerminalInput(target: AgentTarget, data: string): Promise<void> {
+    this.terminalListeners.forEach((listener) => listener({ agentId: target.agentId, deckId: target.deckId, data: new TextEncoder().encode(data), stream: "output", operation: "append" }));
     await Promise.resolve();
   }
 
@@ -1393,10 +1421,53 @@ class FixtureDeckBridge implements DeckBridge {
  */
 export const MAX_WARM_TERMINALS = 3;
 
+/**
+ * One installed terminal session, and the deck it was created against.
+ *
+ * The target is stored WITH the session rather than re-derived when a frame
+ * arrives, which is the whole of issue #1116's fix at this layer: everything
+ * the session produces — its bytes, its geometry, the authority to write to it
+ * — is attributed to the deck that created it, not to whichever deck the bridge
+ * has since accepted as selected.
+ */
+interface InstalledTerminalSession {
+  target: AgentTarget;
+  result: TerminalAttachResult;
+}
+
 export class TauriDeckBridge implements DeckBridge {
   readonly mode = "live" as const;
+  /*
+   * # Every per-agent map below is keyed by `agentKey(deckId, agentId)`
+   *
+   * PRD #1105's cross-deck pane, and issue
+   * [#1116](https://github.com/vfarcic/dot-agent-deck/issues/1116). Agent ids
+   * are per-daemon monotonic integers, so `"planner"` names an agent on every
+   * deck — and since the agent pane can hold a terminal on a deck that is not
+   * the selected one, two of them can be attached at once. Under bare-id keys
+   * the second attach's session replaced the first's, `sendTerminalInput`
+   * resolved whichever was in the map, and `evictTerminal` for one deck's agent
+   * tore down the other's.
+   *
+   * The key is `agentKey`'s NUL-joined string and is never split back apart.
+   * Where the pair itself is needed again — to attach, to stamp a chunk, to
+   * notify a geometry listener — it travels as an {@link AgentTarget} value
+   * beside the key rather than being reassembled from it.
+   */
   private attached = new Set<string>();
-  private sessions = new Map<string, TerminalAttachResult>();
+  private sessions = new Map<string, InstalledTerminalSession>();
+  /**
+   * `sessionId` -> the composite key its session is filed under.
+   *
+   * The daemon's own events (`desktop://terminal-state`,
+   * `desktop://terminal-geometry`) name a session id and a bare agent id, and
+   * the session id is the unambiguous half: it is minted from a process-wide
+   * counter in the desktop crate, so it names one attach on one deck with no
+   * further context. Resolving through this index is what lets those two
+   * listeners find the right deck's session without reading the current
+   * selection — issue #1116's open items 1 and 4.
+   */
+  private sessionKeys = new Map<string, string>();
   private terminalChannels = new Map<string, import("@tauri-apps/api/core").Channel<ArrayBuffer>>();
   private pendingAttachments = new Map<string, PendingTerminalAttachment>();
   private pendingTerminal = new Map<string, TerminalChunk[]>();
@@ -1406,16 +1477,20 @@ export class TauriDeckBridge implements DeckBridge {
   /**
    * Agents whose terminal is on screen right now, as last declared by
    * `setShownTerminals`. Unbounded, and never an eviction candidate.
+   *
+   * A `Map` to its {@link AgentTarget} rather than a `Set` of keys, because the
+   * attach that follows needs the deck back and a key may never be split.
    */
-  private shown = new Set<string>();
+  private shown = new Map<string, AgentTarget>();
   /**
    * Agents whose terminal has been left but is still attached, insertion-ordered
    * least-recently-left first so eviction takes the head. Bounded by
-   * `MAX_WARM_TERMINALS`. Membership is by agent id and does NOT require the
-   * attach to have landed — a pending attach that is never a warm member is
-   * never selected for eviction, and installs itself afterwards past the bound.
+   * `MAX_WARM_TERMINALS`. Membership is by composite identity and does NOT
+   * require the attach to have landed — a pending attach that is never a warm
+   * member is never selected for eviction, and installs itself afterwards past
+   * the bound.
    */
-  private warm = new Set<string>();
+  private warm = new Map<string, AgentTarget>();
   /**
    * Agents with a `desktop_terminal_attach` invocation still outstanding —
    * added before the invoke, removed when it settles either way. It is what
@@ -1439,7 +1514,7 @@ export class TauriDeckBridge implements DeckBridge {
    * hide/reshow that raced an attach still ends with a live pane — suppressing
    * without this would trade an unbounded queue for a dead terminal.
    */
-  private attachRequested = new Set<string>();
+  private attachRequested = new Map<string, AgentTarget>();
   private terminalListener?: TerminalListener;
   /**
    * The fold every `desktop://snapshot` lands in (PRD #742 M4): one entry per
@@ -1518,13 +1593,18 @@ export class TauriDeckBridge implements DeckBridge {
    * because the push that carried it may well have arrived before the tile
    * existed — a second client can shrink an agent long before anyone opens a
    * terminal on it here.
+   *
+   * Keyed by the composite identity and carrying its {@link AgentTarget}, which
+   * is what retired `adoptGeometryDeck` (issue #1116's open item 4). That method
+   * emptied the whole cache when the selected deck moved, and emptying is not an
+   * identity boundary: a deck-A geometry event arriving after the clear rewrote
+   * the bare-id cache and notified listeners with the deck selected NOW, so
+   * both caches recorded A's dimensions as B's and B's next attach submitted
+   * another machine's viewport to it. An entry keyed and stamped with its own
+   * session's deck cannot be read for any other deck at all, so there is
+   * nothing left for a clear to protect against.
    */
-  private appliedGeometry = new Map<string, { rows: number; cols: number }>();
-  /**
-   * Which deck {@link appliedGeometry} describes, or `undefined` before this
-   * bridge knows which deck it is on. See {@link adoptGeometryDeck}.
-   */
-  private geometryDeckId?: string;
+  private appliedGeometry = new Map<string, { target: AgentTarget; rows: number; cols: number }>();
   private geometryListeners = new Set<(agentId: string, rows: number, cols: number, deckId?: string) => void>();
   private invoke?: typeof import("@tauri-apps/api/core")["invoke"];
   private lifecycle = 0;
@@ -1642,35 +1722,6 @@ export class TauriDeckBridge implements DeckBridge {
     this.evidenceDeckId = deckId;
   }
 
-  /**
-   * Point {@link appliedGeometry} at `deckId`, emptying it when the deck moved
-   * (PRD #1105's security audit).
-   *
-   * That map is read at attach time — `attachAgents` declares
-   * `pendingResizes.get(id) ?? appliedGeometry.get(id)` as this client's
-   * viewport — and it is keyed by **bare** agent id, which collides across
-   * decks. Nothing evicted it on a selection change, so the first attach after
-   * a switch could submit the *previous* deck's cached grid for the new deck's
-   * same-id agent, before this app's own pane had measured anything. The
-   * daemon takes the smallest reported viewer, so that is not a display
-   * blemish: it transiently reflows the new agent's PTY and every other client
-   * watching it, from a viewport on another machine.
-   *
-   * Emptying rather than re-keying, because there is nothing worth carrying: a
-   * geometry is a fact about a live attach, every one of which
-   * `retarget_selection`'s `detach_all` has just torn down. The next attach
-   * answers with the new deck's own applied size.
-   *
-   * Adopt-on-first, like {@link adoptEvidenceDeck}: `undefined` means this
-   * bridge has not learnt a deck yet, and whatever accumulated before that
-   * belongs to the first deck selected rather than to no deck.
-   */
-  private adoptGeometryDeck(deckId: string): void {
-    if (this.geometryDeckId === deckId) return;
-    if (this.geometryDeckId !== undefined) this.appliedGeometry.clear();
-    this.geometryDeckId = deckId;
-  }
-
   private recordDaemonEvent(payload: unknown): boolean {
     const edges = applyHandoffEvent(this.handoffs, payload);
     const edgesChanged = edges !== this.handoffs;
@@ -1697,20 +1748,20 @@ export class TauriDeckBridge implements DeckBridge {
    * per tile: nine single-id calls would leave eight of the nine warm and evict
    * five of them, which is the same broken deck the bound exists to avoid.
    */
-  async setShownTerminals(agentIds: string[]): Promise<void> {
-    const next = new Set(agentIds);
+  async setShownTerminals(targets: AgentTarget[]): Promise<void> {
+    const next = new Map(targets.map((target) => [agentKey(target.deckId, target.agentId), target] as const));
 
     // Leaving a terminal does not detach it. It moves to the warm set, delete-
     // then-add so the tail is the most recently left and the head is the LRU.
-    for (const agentId of this.shown) {
-      if (next.has(agentId)) continue;
-      this.warm.delete(agentId);
-      this.warm.add(agentId);
+    for (const [key, target] of this.shown) {
+      if (next.has(key)) continue;
+      this.warm.delete(key);
+      this.warm.set(key, target);
     }
     // A shown terminal is never an eviction candidate, so showing a warm one
     // takes it back out of the warm set. It stays in `attached`, so coming back
     // costs no attach and produces no replay — the whole point of warm.
-    for (const agentId of next) this.warm.delete(agentId);
+    for (const key of next.keys()) this.warm.delete(key);
     this.shown = next;
 
     // Bounded against `warm.size` ALONE — never against the shown or the
@@ -1723,13 +1774,13 @@ export class TauriDeckBridge implements DeckBridge {
     // `evictTerminal` is synchronous up to its `desktop_terminal_detach`, so
     // every evicted agent is out of `sessions` / `terminalChannels` /
     // `pendingAttachments` BEFORE the attach below writes its new entries.
-    const evictions = Array.from(this.warm).slice(0, overflow).map((agentId) => this.evictTerminal(agentId));
+    const evictions = Array.from(this.warm.keys()).slice(0, overflow).map((key) => this.evictTerminal(key));
 
-    // Every shown id, not only the newly shown ones: `attachAgents` filters out
-    // whatever is already attached, so re-declaring an unchanged set is a no-op
-    // except where a shown terminal lost its session to a daemon `end`/`error`
-    // state event and has to be brought back.
-    const attaching = this.shown.size ? this.attachAgents(Array.from(this.shown)) : Promise.resolve();
+    // Every shown target, not only the newly shown ones: `attachAgents` filters
+    // out whatever is already attached, so re-declaring an unchanged set is a
+    // no-op except where a shown terminal lost its session to a daemon
+    // `end`/`error` state event and has to be brought back.
+    const attaching = this.shown.size ? this.attachAgents(Array.from(this.shown.values())) : Promise.resolve();
     await Promise.all([...evictions, attaching]);
   }
 
@@ -1756,31 +1807,40 @@ export class TauriDeckBridge implements DeckBridge {
    * whole-bridge generation, and bumping it here would also void every SHOWN
    * attach still in flight and leak `resizeInFlight` for any agent mid-resize.
    */
-  private async evictTerminal(agentId: string): Promise<void> {
-    const session = this.sessions.get(agentId);
-    this.shown.delete(agentId);
-    this.warm.delete(agentId);
-    this.sessions.delete(agentId);
-    this.attached.delete(agentId);
-    this.terminalChannels.delete(agentId);
-    this.pendingAttachments.delete(agentId);
+  private async evictTerminal(key: string): Promise<void> {
+    const session = this.sessions.get(key);
+    this.shown.delete(key);
+    this.warm.delete(key);
+    this.sessions.delete(key);
+    if (session) this.sessionKeys.delete(session.result.sessionId);
+    this.attached.delete(key);
+    /*
+      `appliedGeometry` is deliberately NOT dropped here, and the composite key
+      is what makes leaving it correct rather than merely tolerated. PRD #882
+      wants a re-attach to declare the grid this agent was last known to be at,
+      so the entry is worth keeping; the audit's objection was that a bare-id
+      entry left behind by deck A was then read as deck B's. An entry filed
+      under `(A, planner)` can only ever be read back for `(A, planner)`.
+    */
+    this.terminalChannels.delete(key);
+    this.pendingAttachments.delete(key);
     // Chunks buffered while no listener was installed belong to the session
     // being torn down here. Keeping them would replay a dead pane's scrollback
     // ahead of the live one at the next `subscribe` drain.
-    this.pendingTerminal.delete(agentId);
-    this.attachRequested.delete(agentId);
-    this.pendingResizes.delete(agentId);
-    const frame = this.resizeFrames.get(agentId);
+    this.pendingTerminal.delete(key);
+    this.attachRequested.delete(key);
+    this.pendingResizes.delete(key);
+    const frame = this.resizeFrames.get(key);
     if (frame !== undefined) {
       window.cancelAnimationFrame(frame);
-      this.resizeFrames.delete(agentId);
+      this.resizeFrames.delete(key);
     }
-    this.resizeInFlight.delete(agentId);
+    this.resizeInFlight.delete(key);
     // Nothing installed yet: the teardown above is the whole cancellation, and
     // the pending attach detaches its own late-arriving session.
     if (!session) return;
     const invoke = await this.getInvoke();
-    await invoke("desktop_terminal_detach", { sessionId: session.sessionId }).catch(() => undefined);
+    await invoke("desktop_terminal_detach", { sessionId: session.result.sessionId }).catch(() => undefined);
   }
 
   /**
@@ -1808,7 +1868,7 @@ export class TauriDeckBridge implements DeckBridge {
     this.attachRequested.clear();
   }
 
-  private async attachAgents(agentIds: string[], expectedLifecycle = this.lifecycle): Promise<void> {
+  private async attachAgents(targets: AgentTarget[], expectedLifecycle = this.lifecycle): Promise<void> {
     if (expectedLifecycle !== this.lifecycle) return;
     const invoke = await this.getInvoke();
     if (expectedLifecycle !== this.lifecycle) return;
@@ -1818,19 +1878,29 @@ export class TauriDeckBridge implements DeckBridge {
     // shown when this call started can have been hidden and evicted while they
     // resolved, and attaching it then would leave a live PTY behind a screen
     // that shows no terminal at all.
-    await Promise.allSettled(agentIds.filter((agentId) => {
-      if (this.attached.has(agentId) || !(this.shown.has(agentId) || this.warm.has(agentId))) return false;
+    await Promise.allSettled(targets.filter((target) => {
+      const key = agentKey(target.deckId, target.agentId);
+      if (this.attached.has(key) || !(this.shown.has(key) || this.warm.has(key))) return false;
       // One outstanding invocation per agent, whatever the frontend has since
       // forgotten about it. Queue the declaration instead of starting a second
       // command — the settling invocation replays it.
-      if (this.attachInvocations.has(agentId)) {
-        this.attachRequested.add(agentId);
+      if (this.attachInvocations.has(key)) {
+        this.attachRequested.set(key, target);
         return false;
       }
       return true;
-    }).map(async (agentId) => {
+    }).map(async (target) => {
       const lifecycle = expectedLifecycle;
-      this.attached.add(agentId);
+      /*
+        The composite key AND the target are both captured here, once, before
+        the first await — this is the "origin stamping at creation" issue #1116
+        asks for. Everything downstream of this closure (the channel callback,
+        the replay, the geometry notification, the error chunk) reads `target`
+        and never `this.selectedDeckId`, so a frame that arrives after the
+        selection has moved is still attributed to the deck that produced it.
+      */
+      const key = agentKey(target.deckId, target.agentId);
+      this.attached.add(key);
       const onOutput = new Channel<ArrayBuffer>();
       const attempt: PendingTerminalAttachment = {
         lifecycle,
@@ -1842,25 +1912,28 @@ export class TauriDeckBridge implements DeckBridge {
       onOutput.onmessage = (chunk) => {
         if (
           lifecycle !== this.lifecycle
-          || this.terminalChannels.get(agentId) !== onOutput
+          || this.terminalChannels.get(key) !== onOutput
         ) return;
         const data = new Uint8Array(chunk);
         if (!attempt.activated) {
           attempt.output.push(data);
           return;
         }
-        if (attempt.session) this.deliverOutput(agentId, data, attempt.session.generation);
+        if (attempt.session) this.deliverOutput(target, data, attempt.session.generation);
       };
-      this.terminalChannels.set(agentId, onOutput);
-      this.pendingAttachments.set(agentId, attempt);
-      this.attachInvocations.add(agentId);
+      this.terminalChannels.set(key, onOutput);
+      this.pendingAttachments.set(key, attempt);
+      this.attachInvocations.add(key);
       try {
         // PRD #882: declare this tile's measured geometry so the agent is sized
         // to the smallest pane among every client watching it — including this
         // one — rather than to whichever client resized last.
-        const viewport = this.pendingResizes.get(agentId) ?? this.appliedGeometry.get(agentId);
+        const viewport = this.pendingResizes.get(key) ?? this.appliedGeometry.get(key);
         const session = await invoke<TerminalAttachResult>("desktop_terminal_attach", {
-          agentId,
+          /* The deck is named explicitly so the crate resolves ITS link through
+             `DaemonLinks` rather than the process-global selected endpoint. */
+          deckId: target.deckId,
+          agentId: target.agentId,
           onOutput,
           rows: viewport?.rows,
           cols: viewport?.cols,
@@ -1868,7 +1941,7 @@ export class TauriDeckBridge implements DeckBridge {
         const appliedRows = session.appliedRows;
         const appliedCols = session.appliedCols;
         if (appliedRows && appliedCols) {
-          this.appliedGeometry.set(agentId, { rows: appliedRows, cols: appliedCols });
+          this.appliedGeometry.set(key, { target, rows: appliedRows, cols: appliedCols });
           // PRD #882 (raised by Greptile on PR #895): reshape the grid
           // SYNCHRONOUSLY, before the buffered replay is delivered a few lines
           // below.
@@ -1883,26 +1956,37 @@ export class TauriDeckBridge implements DeckBridge {
           // live instance first closes that window; the listener below still
           // fires so React state and any later re-render agree with it.
           try {
-            const terminal = getTerminal(agentId);
+            const terminal = getTerminal(target.deckId, target.agentId);
             if (terminal && (terminal.cols !== appliedCols || terminal.rows !== appliedRows)) {
               terminal.resize(appliedCols, appliedRows);
             }
           } catch {
             // A tile mid-mount can reject a resize; the effect reconciles it.
           }
-          this.geometryListeners.forEach((listener) => listener(agentId, appliedRows, appliedCols, this.selectedDeckId));
+          this.geometryListeners.forEach((listener) => listener(target.agentId, appliedRows, appliedCols, target.deckId));
         }
         if (
           lifecycle !== this.lifecycle
-          || this.terminalChannels.get(agentId) !== onOutput
-          || this.pendingAttachments.get(agentId) !== attempt
+          || this.terminalChannels.get(key) !== onOutput
+          || this.pendingAttachments.get(key) !== attempt
         ) {
           await invoke("desktop_terminal_detach", { sessionId: session.sessionId }).catch(() => undefined);
           return;
         }
         attempt.session = session;
-        this.sessions.set(agentId, session);
-        this.pendingAttachments.delete(agentId);
+        /*
+          Installed under ITS OWN deck's key, which is issue #1116's open item 3
+          — "a pending attach that resolves after the selection moved must
+          install against its own deck". It used to install into a bare-id map,
+          so an attach started for deck A and settling after the selection moved
+          to B became the session `sendTerminalInput("planner", …)` resolved
+          while the user was looking at B's namesake. There is nothing to
+          discard here and nothing to reattribute: the pane that asked for this
+          stream is still showing it.
+        */
+        this.sessions.set(key, { target, result: session });
+        this.sessionKeys.set(session.sessionId, key);
+        this.pendingAttachments.delete(key);
 
         const replayLength = attempt.output.reduce((total, chunk) => total + chunk.byteLength, 0);
         const replay = new Uint8Array(replayLength);
@@ -1912,8 +1996,8 @@ export class TauriDeckBridge implements DeckBridge {
           replayOffset += chunk.byteLength;
         }
         attempt.output = [];
-        this.deliverTerminal({
-          agentId,
+        this.deliverTerminal(target, {
+          agentId: target.agentId,
           data: replay,
           stream: "output",
           operation: "replace",
@@ -1921,14 +2005,14 @@ export class TauriDeckBridge implements DeckBridge {
         });
         attempt.activated = true;
         attempt.stateEvents.forEach((event) => this.handleTerminalState(event));
-        if (this.pendingResizes.has(agentId)) this.scheduleResize(agentId);
+        if (this.pendingResizes.has(key)) this.scheduleResize(key);
       } catch (cause) {
         if (lifecycle === this.lifecycle) {
-          if (this.pendingAttachments.get(agentId) === attempt) this.pendingAttachments.delete(agentId);
-          this.attached.delete(agentId);
-          if (this.terminalChannels.get(agentId) === onOutput) this.terminalChannels.delete(agentId);
-          this.deliverTerminal({
-            agentId,
+          if (this.pendingAttachments.get(key) === attempt) this.pendingAttachments.delete(key);
+          this.attached.delete(key);
+          if (this.terminalChannels.get(key) === onOutput) this.terminalChannels.delete(key);
+          this.deliverTerminal(target, {
+            agentId: target.agentId,
             data: new Uint8Array(),
             stream: "error",
             operation: "append",
@@ -1937,67 +2021,86 @@ export class TauriDeckBridge implements DeckBridge {
         }
         throw cause;
       } finally {
-        this.attachInvocations.delete(agentId);
+        this.attachInvocations.delete(key);
         // A declaration suppressed while this invocation was outstanding is
         // coalesced rather than dropped: replay exactly one, and only while the
         // agent is still wanted and still unattached. A failed attach queues no
         // request of its own, so this cannot become a retry loop.
+        const requested = this.attachRequested.get(key);
         if (
-          this.attachRequested.delete(agentId)
+          requested !== undefined
+          && this.attachRequested.delete(key)
           && lifecycle === this.lifecycle
-          && !this.attached.has(agentId)
-          && (this.shown.has(agentId) || this.warm.has(agentId))
+          && !this.attached.has(key)
+          && (this.shown.has(key) || this.warm.has(key))
         ) {
-          void this.attachAgents([agentId], lifecycle);
+          void this.attachAgents([requested], lifecycle);
         }
       }
     }));
   }
 
-  private deliverOutput(agentId: string, data: Uint8Array, generation: number): void {
-    this.deliverTerminal({ agentId, data, stream: "output", operation: "append", generation });
+  private deliverOutput(target: AgentTarget, data: Uint8Array, generation: number): void {
+    this.deliverTerminal(target, { agentId: target.agentId, data, stream: "output", operation: "append", generation });
   }
 
   /**
    * Hand one chunk to the runtime, stamped with the deck that produced it.
    *
-   * **The stamp is applied HERE, at the one funnel every chunk passes through**
-   * (PRD #1105's security audit). Agent ids are per-daemon monotonic, so a
-   * consumer keying buffers by bare id replays the previous deck's output under
-   * the next deck's namesake; the consumer cannot repair that after the fact,
-   * because by the time it reads the chunk the only deck it can name is the one
-   * selected now. `selectedDeckId` here is read off `fleet[0]` on every
-   * snapshot arrival, so it is the deck in force at the instant the bytes were
-   * delivered — which is what the stamp has to mean.
+   * **The stamp is the ORIGIN deck, supplied by the caller, and never
+   * `selectedDeckId`** — issue
+   * [#1116](https://github.com/vfarcic/dot-agent-deck/issues/1116)'s open item
+   * 1, and the finding the second audit round called central. Agent ids are
+   * per-daemon monotonic, so a consumer keying buffers by bare id replays the
+   * previous deck's output under the next deck's namesake — and the composite
+   * key that was supposed to fix it was defeated by *this* line, which read the
+   * deck selected when the chunk was DELIVERED rather than the deck that
+   * created the channel. `foldSnapshot` moves `selectedDeckId` before React
+   * receives the fleet, while existing channel callbacks stay valid, so a late
+   * frame from deck A was filed under deck B's composite key with complete
+   * confidence.
    *
-   * A queued chunk is stamped at push time for exactly the same reason: it is
-   * drained after the listener installs, potentially after a switch.
+   * Every producer holds its session's `target` in scope from before the attach
+   * was invoked, so there is no path here that has to guess.
+   *
+   * A queued chunk keeps that stamp for the same reason: it is drained after
+   * the listener installs, potentially long after a switch.
    */
-  private deliverTerminal(event: TerminalChunk): void {
-    const stamped: TerminalChunk = { ...event, deckId: this.selectedDeckId };
+  private deliverTerminal(target: AgentTarget, event: TerminalChunk): void {
+    const stamped: TerminalChunk = { ...event, deckId: target.deckId };
     if (this.terminalListener) {
       this.terminalListener(stamped);
       return;
     }
-    const pending = this.pendingTerminal.get(stamped.agentId) ?? [];
+    const key = agentKey(target.deckId, target.agentId);
+    const pending = this.pendingTerminal.get(key) ?? [];
     pending.push(stamped);
-    this.pendingTerminal.set(stamped.agentId, pending);
+    this.pendingTerminal.set(key, pending);
   }
 
+  /**
+   * Resolved through the SESSION ID, not the bare agent id the event also
+   * carries: the id is minted per attach by the desktop crate, so it names one
+   * stream on one deck. Looking the agent up by name would be the same
+   * cross-deck collision one layer down.
+   */
   private handleTerminalState(event: DesktopTerminalStateDto): void {
     if (event.state === "attached") return;
-    const session = this.sessions.get(event.agentId);
+    const key = this.sessionKeys.get(event.sessionId);
+    const session = key === undefined ? undefined : this.sessions.get(key);
     if (
-      !session
-      || session.sessionId !== event.sessionId
-      || session.generation !== event.generation
+      !key
+      || !session
+      || session.result.sessionId !== event.sessionId
+      || session.result.generation !== event.generation
     ) return;
 
-    this.sessions.delete(event.agentId);
-    this.attached.delete(event.agentId);
-    this.terminalChannels.delete(event.agentId);
-    this.deliverTerminal({
-      agentId: event.agentId,
+    this.sessions.delete(key);
+    this.sessionKeys.delete(event.sessionId);
+    this.attached.delete(key);
+    this.terminalChannels.delete(key);
+    this.deliverTerminal(session.target, {
+      agentId: session.target.agentId,
       data: new Uint8Array(),
       stream: event.state,
       operation: "append",
@@ -2183,7 +2286,6 @@ export class TauriDeckBridge implements DeckBridge {
     */
     this.selectedDeckId = dto.fleet?.[0] ?? dto.connection.deckId;
     this.adoptEvidenceDeck(this.selectedDeckId);
-    this.adoptGeometryDeck(this.selectedDeckId);
     const selected = dto.connection.deckId === this.selectedDeckId;
     const snapshot = mapDesktopSnapshot(
       dto,
@@ -2244,7 +2346,6 @@ export class TauriDeckBridge implements DeckBridge {
     */
     if (this.selectedDeckId !== undefined) {
       this.adoptEvidenceDeck(this.selectedDeckId);
-      this.adoptGeometryDeck(this.selectedDeckId);
     }
     /*
       The evidence ring and the handoff edges are the SELECTED deck's — the
@@ -2301,7 +2402,7 @@ export class TauriDeckBridge implements DeckBridge {
       // healing it off screen would spend a socket and a scrollback replay for
       // nothing.
       emit(event.payload);
-      void this.attachAgents(Array.from(this.shown));
+      void this.attachAgents(Array.from(this.shown.values()));
     });
     // The daemon emits a coalesced snapshot after each event, but not every hook
     // event produces one within the coalescing window; republishing the last
@@ -2326,17 +2427,26 @@ export class TauriDeckBridge implements DeckBridge {
     });
     const stopTerminalState = await listen<DesktopTerminalStateDto>("desktop://terminal-state", (event) => {
       if (event.payload.state === "attached") return;
-      const session = this.sessions.get(event.payload.agentId);
-      if (
-        session
-        && session.sessionId === event.payload.sessionId
-        && session.generation === event.payload.generation
-      ) {
+      if (this.sessionKeys.has(event.payload.sessionId)) {
         this.handleTerminalState(event.payload);
         return;
       }
-      const pending = this.pendingAttachments.get(event.payload.agentId);
-      if (pending && pending.lifecycle === this.lifecycle) pending.stateEvents.push(event.payload);
+      /*
+        No installed session answers to this id. It can still belong to an
+        attach that has not finished installing, and the only identity that
+        attach has published yet is the agent NAME — the session id is minted on
+        the far side of the await. Matching on the name here is therefore both
+        necessary and safe: the queued event is re-checked against the session
+        id and generation by `handleTerminalState` once the attach activates, so
+        a same-name event from another deck is dropped there rather than acted
+        on. Deliberately narrowed to pending attempts for exactly that reason.
+      */
+      for (const [key, pending] of this.pendingAttachments) {
+        if (pending.lifecycle !== this.lifecycle) continue;
+        if (this.sessions.has(key)) continue;
+        if ((this.shown.get(key) ?? this.warm.get(key))?.agentId !== event.payload.agentId) continue;
+        pending.stateEvents.push(event.payload);
+      }
     });
     // PRD #882: the daemon changed this agent's applied geometry. Route it to
     // the tile so it reshapes its grid. Gated on the session AND generation
@@ -2344,25 +2454,36 @@ export class TauriDeckBridge implements DeckBridge {
     // that has been replaced would otherwise resize the tile now showing a
     // different attach.
     const stopTerminalGeometry = await listen<DesktopTerminalGeometryDto>("desktop://terminal-geometry", (event) => {
-      const session = this.sessions.get(event.payload.agentId);
+      // Resolved through the session id, and the deck it answers with is the
+      // one that session was CREATED against (issue #1116's open item 4). It
+      // used to look the agent up by bare id and notify with the current
+      // `selectedDeckId`, so a late frame from the deck the user had just left
+      // recorded that machine's dimensions as the new deck's — and the next
+      // attach submitted them to it, which the daemon's smallest-viewer policy
+      // turns into a real reflow of that PTY and of every other client watching
+      // it.
+      const key = this.sessionKeys.get(event.payload.sessionId);
+      const session = key === undefined ? undefined : this.sessions.get(key);
       if (
-        !session
-        || session.sessionId !== event.payload.sessionId
-        || session.generation !== event.payload.generation
+        key === undefined
+        || !session
+        || session.result.sessionId !== event.payload.sessionId
+        || session.result.generation !== event.payload.generation
       ) return;
-      this.appliedGeometry.set(event.payload.agentId, { rows: event.payload.rows, cols: event.payload.cols });
+      const target = session.target;
+      this.appliedGeometry.set(key, { target, rows: event.payload.rows, cols: event.payload.cols });
       // Same reasoning as the attach path: reshape the live grid synchronously,
       // because output keeps arriving while a React state update waits for its
       // commit, and those bytes were drawn for the new geometry.
       try {
-        const terminal = getTerminal(event.payload.agentId);
+        const terminal = getTerminal(target.deckId, target.agentId);
         if (terminal && (terminal.cols !== event.payload.cols || terminal.rows !== event.payload.rows)) {
           terminal.resize(event.payload.cols, event.payload.rows);
         }
       } catch {
         // A tile mid-mount can reject a resize; the effect reconciles it.
       }
-      this.geometryListeners.forEach((listener) => listener(event.payload.agentId, event.payload.rows, event.payload.cols, this.selectedDeckId));
+      this.geometryListeners.forEach((listener) => listener(target.agentId, event.payload.rows, event.payload.cols, target.deckId));
     });
     return () => {
       stopSnapshot();
@@ -2381,6 +2502,7 @@ export class TauriDeckBridge implements DeckBridge {
       const result = await invoke<DesktopActionResultDto>("desktop_run_action", { action: action satisfies DesktopRunActionDto });
       if (action.type === "stop_daemon" || action.type === "restart_daemon") {
         this.sessions.clear();
+        this.sessionKeys.clear();
         this.attached.clear();
         this.terminalChannels.clear();
         // Nothing is attached any more, so nothing is warm. `shown` is left
@@ -2488,20 +2610,26 @@ export class TauriDeckBridge implements DeckBridge {
     return invoke<EndpointTestReportDto>("desktop_test_endpoint", { settings, selection });
   }
 
-  async sendTerminalInput(agentId: string, data: string): Promise<void> {
+  /**
+   * Resolved by composite VALUE, never by object identity: the caller allocates
+   * a fresh `{ deckId, agentId }` on every render, so a `Map` keyed on the
+   * object would find nothing in production while passing any test that reused
+   * one reference.
+   */
+  async sendTerminalInput(target: AgentTarget, data: string): Promise<void> {
     const invoke = await this.getInvoke();
-    const session = this.sessions.get(agentId);
-    if (!session) throw new Error(`Terminal for ${agentId} is not attached.`);
-    await invoke("desktop_terminal_write", { sessionId: session.sessionId, data: Array.from(new TextEncoder().encode(data)) });
+    const session = this.sessions.get(agentKey(target.deckId, target.agentId));
+    if (!session) throw new Error(`Terminal for ${target.agentId} is not attached.`);
+    await invoke("desktop_terminal_write", { sessionId: session.result.sessionId, data: Array.from(new TextEncoder().encode(data)) });
   }
 
   onTerminalGeometry(listener: (agentId: string, rows: number, cols: number, deckId?: string) => void): () => void {
     this.geometryListeners.add(listener);
     // Replay what is already known: an agent can have been constrained by
     // another client long before this tile mounted, and the push that said so
-    // is not repeated. Everything in the map belongs to the deck the map is
-    // currently adopted to — `adoptGeometryDeck` empties it on a switch.
-    this.appliedGeometry.forEach((geometry, agentId) => listener(agentId, geometry.rows, geometry.cols, this.selectedDeckId));
+    // is not repeated. Each entry carries the deck its session was created
+    // against, so the replay names the producer rather than the selection.
+    this.appliedGeometry.forEach((geometry) => listener(geometry.target.agentId, geometry.rows, geometry.cols, geometry.target.deckId));
     return () => {
       this.geometryListeners.delete(listener);
     };
@@ -2517,37 +2645,41 @@ export class TauriDeckBridge implements DeckBridge {
     return clampZoom(await invoke<number>("desktop_set_zoom", { level: clampZoom(level) }));
   }
 
-  async resizeTerminal(agentId: string, cols: number, rows: number): Promise<void> {
+  async resizeTerminal(target: AgentTarget, cols: number, rows: number): Promise<void> {
     if (cols < 1 || rows < 1) return;
-    this.pendingResizes.set(agentId, { cols, rows });
-    this.scheduleResize(agentId);
+    const key = agentKey(target.deckId, target.agentId);
+    this.pendingResizes.set(key, { cols, rows });
+    this.scheduleResize(key);
     await Promise.resolve();
   }
 
-  private scheduleResize(agentId: string): void {
-    if (this.resizeFrames.has(agentId) || this.resizeInFlight.has(agentId)) return;
+  private scheduleResize(key: string): void {
+    if (this.resizeFrames.has(key) || this.resizeInFlight.has(key)) return;
     const frame = window.requestAnimationFrame(() => {
-      this.resizeFrames.delete(agentId);
-      void this.flushResize(agentId);
+      this.resizeFrames.delete(key);
+      void this.flushResize(key);
     });
-    this.resizeFrames.set(agentId, frame);
+    this.resizeFrames.set(key, frame);
   }
 
-  private async flushResize(agentId: string): Promise<void> {
-    if (this.resizeInFlight.has(agentId)) return;
+  private async flushResize(key: string): Promise<void> {
+    if (this.resizeInFlight.has(key)) return;
     const lifecycle = this.lifecycle;
-    const size = this.pendingResizes.get(agentId);
-    const session = this.sessions.get(agentId);
+    const size = this.pendingResizes.get(key);
+    const session = this.sessions.get(key);
     if (!size || !session) return;
-    this.pendingResizes.delete(agentId);
-    this.resizeInFlight.add(agentId);
+    this.pendingResizes.delete(key);
+    this.resizeInFlight.add(key);
     try {
       const invoke = await this.getInvoke();
-      await invoke("desktop_terminal_resize", { sessionId: session.sessionId, cols: size.cols, rows: size.rows });
+      // The session id carries the deck: the crate resolves the daemon from the
+      // endpoint this session was attached over, so a resize can never reach
+      // another machine's same-id agent however the selection has moved.
+      await invoke("desktop_terminal_resize", { sessionId: session.result.sessionId, cols: size.cols, rows: size.rows });
     } finally {
       if (lifecycle === this.lifecycle) {
-        this.resizeInFlight.delete(agentId);
-        if (this.pendingResizes.has(agentId)) this.scheduleResize(agentId);
+        this.resizeInFlight.delete(key);
+        if (this.pendingResizes.has(key)) this.scheduleResize(key);
       }
     }
   }
@@ -2569,6 +2701,7 @@ export class TauriDeckBridge implements DeckBridge {
     this.resizeFrames.forEach((frame) => window.cancelAnimationFrame(frame));
     this.attached.clear();
     this.sessions.clear();
+    this.sessionKeys.clear();
     this.terminalChannels.clear();
     this.pendingAttachments.clear();
     this.pendingTerminal.clear();
@@ -2580,14 +2713,13 @@ export class TauriDeckBridge implements DeckBridge {
     // declare, which under a smallest-wins policy would shrink the agent to a
     // pane nobody is looking at any more.
     this.appliedGeometry.clear();
-    this.geometryDeckId = undefined;
     this.geometryListeners.clear();
     this.shown.clear();
     this.warm.clear();
     this.clearAttachSuppression();
     this.terminalListener = undefined;
     if (!invoke) return;
-    await Promise.allSettled(sessions.map((session) => invoke("desktop_terminal_detach", { sessionId: session.sessionId })));
+    await Promise.allSettled(sessions.map((session) => invoke("desktop_terminal_detach", { sessionId: session.result.sessionId })));
   }
 }
 

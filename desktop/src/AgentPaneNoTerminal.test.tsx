@@ -30,18 +30,31 @@ import { DeckShell } from "./App";
  */
 const REMOTE_DECK_ID = "deck-00000000000000b2";
 const REMOTE_DECK_LABEL = "dev@build-box";
+/** The deck's own account of why it is not answering, which the pane repeats. */
+const REMOTE_DECK_FAILURE = "No deck is listening on the configured socket.";
 
 /**
  * Two decks running the SAME agent ids, which is the ordinary case rather than
  * a contrived one: agent ids are per-daemon monotonic integers and are unique
  * only within a daemon. The names differ so a test can say which deck's agent
  * it is looking at; the ids deliberately do not.
+ *
+ * `remoteStatus` is the whole variable this file turns: the remote deck is
+ * either answering, in which case its agents attach exactly like the selected
+ * deck's, or it is not, in which case they cannot.
  */
-function harness() {
+function harness(remoteStatus: "connected" | "disconnected" = "disconnected") {
   const local = createFixtureSnapshot("connected");
   const remote: DeckSnapshot = {
     ...local,
-    connection: { ...local.connection, deckId: REMOTE_DECK_ID, socketPath: REMOTE_DECK_LABEL, deckKind: "remote" },
+    connection: {
+      ...local.connection,
+      deckId: REMOTE_DECK_ID,
+      socketPath: REMOTE_DECK_LABEL,
+      deckKind: "remote",
+      status: remoteStatus,
+      message: remoteStatus === "connected" ? "Deck responding" : REMOTE_DECK_FAILURE,
+    },
     agents: local.agents.map((agent) => ({ ...agent, daemonId: REMOTE_DECK_ID, role: `${agent.role} on build-box`, displayName: `${agent.displayName} on build-box` })),
   };
   const setShownTerminals = vi.fn(async () => undefined);
@@ -86,40 +99,37 @@ const openControl = (name: string) => screen.getByRole("button", { name: `Open $
  * PRD #1105 — a pane can be open for an agent this app has attached no terminal
  * to, and what it renders there is a STATE rather than an empty box.
  *
- * # The two halves, and why they are one condition
+ * # The trigger was NARROWED, and the narrowing is the point of this file
  *
- * The overview merges every observed deck (PRD
- * [#742](https://github.com/vfarcic/dot-agent-deck/issues/742)) and **every
- * agent it lists is openable** — a listed row with no way into it is a dead
- * row, and nothing on a row tells a reader which deck they are pointing at. A
- * terminal in this app is always the *selected* deck's, though: `overviewShown`
- * declares an attach only once the pane's deck is the one in force, because
- * `terminal::attach` resolves its daemon through the process-global
- * `trusted_daemon()` and agent ids collide across decks, so declaring
- * `[agentId]` under another deck attaches **that** deck's agent of the same id.
+ * This state used to fire for every agent on a deck that was not the SELECTED
+ * one, because `terminal::attach` resolved its daemon through the
+ * process-global `trusted_daemon()` — declaring an attach for an agent on
+ * another deck would have streamed whatever agent of the same per-daemon
+ * monotonic id that deck happened to be running. The product owner reversed
+ * that: the desktop app's reason to exist over the TUI is being a control plane
+ * for every deck at once, and an agent it lists but cannot open as a working
+ * pane is the feature failing on its own terms. The attach now names its deck.
  *
- * So the pane opens, attaches nothing, and says so. `DeckShell`'s
- * `paneDeckSelected` is the single expression behind both, which is what stops
- * the two from ever disagreeing — a pane rendering a terminal nothing attached
- * to is precisely the lie this state replaces.
+ * So what is left here is the case the old trigger was also covering and which
+ * no amount of plumbing removes: **a deck with no live link**. A disconnected
+ * deck, one still waiting to report, one configured with no address, one this
+ * app is not observing. There is nothing to attach over, and a
+ * `TerminalViewport` mounted there sits black for as long as the pane is open —
+ * a black rectangle that reads *"this agent is producing no output"* about an
+ * agent that may be working normally on a machine this app has merely lost
+ * contact with.
  *
  * # Why not a mounted terminal
  *
- * With no attach a `TerminalViewport` sits there receiving no bytes for as long
- * as the pane is open. That is a black rectangle reading *"this agent is
- * producing no output"* about an agent working normally on another machine.
- * Hence no viewport at all, and the mount-recording mock above rather than a
- * DOM query.
+ * Because that lie is the whole defect. Hence no viewport at all, and the
+ * mount-recording mock above rather than a DOM query.
  *
- * # What this file does NOT claim
+ * # The two halves are one condition
  *
- * Nothing here says a non-selected deck's terminal *cannot* attach — only that
- * today it does not, and that the pane is honest about it. Making it attach is
- * cross-deck attach, [#1073](https://github.com/vfarcic/dot-agent-deck/issues/1073),
- * a `PROTOCOL_VERSION` bump by construction (the attach frame header carries no
- * stream id) with four open identity findings in
- * [#1116](https://github.com/vfarcic/dot-agent-deck/issues/1116). When it lands
- * these tests are what it replaces.
+ * `DeckShell`'s `paneDeckAttachable` decides both whether an attach is declared
+ * and whether the pane renders a terminal, so the two cannot disagree — a pane
+ * showing a terminal nothing attached to, and a pane explaining a state it is
+ * not in, are the two ways this drifts.
  */
 describe("a pane with no terminal", () => {
   beforeEach(() => {
@@ -128,40 +138,58 @@ describe("a pane with no terminal", () => {
   });
 
   /**
-   * Scenario: with the local deck selected, open build-box's Planner from the
-   * overview — a deck this app is not attached to. The pane opens and works;
-   * its terminal tab carries no `TerminalViewport` at all but an explicit
-   * no-terminal state naming build-box and saying that selecting build-box
-   * attaches the terminal. Nothing is declared shown.
+   * Scenario: build-box's Planner is open in a pane — a working one, with a
+   * live terminal — and build-box then stops answering. The pane does not
+   * close and does not go blank: the terminal is replaced by an explicit
+   * no-terminal state naming build-box and repeating that deck's own account of
+   * why, and nothing is declared shown any more.
+   *
+   * Entered through `initialView` rather than the overview's Open control, and
+   * for a reason worth stating: the overview LISTS no agents for a deck that
+   * stopped answering, because such a deck cannot vouch for what it was
+   * running. So a disconnected deck's pane is reached by having been opened
+   * while the deck was healthy — which is exactly the case this state exists
+   * for, and the only one a user meets.
    */
-  it("opens a non-selected deck's agent with an explicit no-terminal state naming its deck", async () => {
-    const deck = harness();
-    render(<DeckShell runtime={deck.runtime("local")} initialView={{ kind: "overview" }} />);
-    await waitFor(() => expect(deck.setShownTerminals).toHaveBeenCalledTimes(1));
-    expect(deck.setShownTerminals).toHaveBeenLastCalledWith([]);
+  it("replaces an unreachable deck's terminal with an explicit state naming that deck", async () => {
+    const paneView = { kind: "agent" as const, deckId: REMOTE_DECK_ID, agentId: "planner", from: "overview" as const };
+    const answering = harness("connected");
+    const { rerender } = render(<DeckShell runtime={answering.runtime("local")} initialView={paneView} />);
+    await waitFor(() => expect(answering.setShownTerminals).toHaveBeenCalledTimes(1));
 
-    fireEvent.click(openControl("Plan / architecture on build-box"));
+    // The premise: a live terminal on a deck that is not the selected one.
+    const before = screen.getByTestId("agent-pane-overlay");
+    expect(within(before).getByTestId("terminal-planner")).toBeVisible();
+    expect(answering.setShownTerminals).toHaveBeenLastCalledWith([{ deckId: REMOTE_DECK_ID, agentId: "planner" }]);
+
+    viewportProps.length = 0;
+    const lost = harness("disconnected");
+    await act(async () => { rerender(<DeckShell runtime={lost.runtime("local")} initialView={paneView} />); });
 
     const pane = screen.getByTestId("agent-pane-overlay");
+    // The same pane, not a replacement: losing a deck is a state, not a close.
+    expect(pane).toBe(before);
     expect(within(pane).getByRole("heading", { name: "Planner on build-box" })).toBeVisible();
 
     // The state, readable from the DOM rather than inferred from a blank box.
-    expect(pane.querySelector(".agent-terminal-stack")).toHaveAttribute("data-terminal-state", "other-deck");
+    expect(pane.querySelector(".agent-terminal-stack")).toHaveAttribute("data-terminal-state", "unreachable-deck");
     const absent = within(pane).getByTestId("terminal-absent-planner");
     expect(absent).toHaveAttribute("role", "status");
-    // Which deck, and what selecting it does. Named the way the rest of the UI
-    // names it — `deckName`, which is also the overview group header the user
-    // just came from and the label in the Deck selector they are pointed at.
+    // Which deck, and why. Named the way the rest of the UI names it —
+    // `deckName`, which is also the overview group header — and carrying the
+    // deck's own failure sentence rather than a guess.
     expect(absent).toHaveTextContent(REMOTE_DECK_LABEL);
-    expect(absent).toHaveTextContent(/not the selected deck/);
-    expect(absent).toHaveTextContent(/select .*attaches/i);
+    expect(absent).toHaveTextContent(/no live connection/i);
+    expect(absent).toHaveTextContent(REMOTE_DECK_FAILURE);
+    // And it does NOT say the old thing, which was about selection and is now
+    // false about every reachable deck.
+    expect(absent).not.toHaveTextContent(/not the selected deck/);
 
-    // No terminal was MOUNTED for it, and nothing was declared shown — the two
+    // No terminal is MOUNTED any more, and nothing is declared shown — the two
     // halves that must agree, since either alone is a lie about the other.
     expect(viewportProps).toHaveLength(0);
     expect(screen.queryByTestId("terminal-planner")).not.toBeInTheDocument();
-    expect(deck.setShownTerminals).toHaveBeenLastCalledWith([]);
-    expect(deck.setShownTerminals).toHaveBeenCalledTimes(1);
+    expect(lost.setShownTerminals).toHaveBeenLastCalledWith([]);
     // And no input gate is rendered beside it: there is no terminal to type
     // into, so a `data-input-state` claim there would be about nothing.
     expect(screen.queryByTestId("terminal-input-status-planner")).not.toBeInTheDocument();
@@ -170,49 +198,79 @@ describe("a pane with no terminal", () => {
     // agent's own identity, all five tabs, and the way out.
     expect(within(pane).getByRole("button", { name: "Close Planner on build-box agent" })).toBeVisible();
     expect(within(pane).getAllByRole("tab")).toHaveLength(5);
-    // Nothing here moves the selection for the user, which is the line the
-    // descope draws: the remedy is stated, not performed.
-    expect(deck.saveSettings).not.toHaveBeenCalled();
+    // Nothing here writes the settings document, which is the line the descope
+    // draws: opening a pane is navigation.
+    expect(lost.saveSettings).not.toHaveBeenCalled();
   });
 
   /**
-   * Scenario: that pane is open on build-box's Planner when the user selects
-   * build-box. The terminal attaches under the pane — same pane, same agent, no
-   * close and no reopen — and the notice goes away.
+   * Scenario: that pane is open on build-box's Planner while build-box is not
+   * answering, and build-box then answers again. The terminal attaches under
+   * the pane — same pane, same agent, no close and no reopen — and the notice
+   * goes away.
    *
-   * This is the reverse of `keeps an overview pane … when the selection moves
-   * under it` (`AgentPaneDeckIdentity.test.tsx`), and it is the direction that
-   * proves the no-terminal state is a STATE. A pane that could only ever lose
-   * its terminal would be indistinguishable from one the move had broken; this
-   * one recovers, on the same DOM node, which is what `expect(after).toBe(
-   * before)` asserts rather than a rendering detail.
+   * This is the direction that proves the no-terminal state is a STATE. A pane
+   * that could only ever lose its terminal would be indistinguishable from one
+   * the failure had broken; this one recovers, on the same DOM node, which is
+   * what `expect(after).toBe(before)` asserts rather than a rendering detail.
+   *
+   * The selected deck does not move in either test, and that is deliberate: it
+   * is the deck's REACHABILITY that flips, which is now the only thing that
+   * decides whether a pane has a terminal.
    */
-  it("attaches the terminal and clears the notice when the pane's own deck is selected", async () => {
-    const deck = harness();
-    const { rerender } = render(<DeckShell runtime={deck.runtime("local")} initialView={{ kind: "overview" }} />);
-    await waitFor(() => expect(deck.setShownTerminals).toHaveBeenCalledTimes(1));
+  it("attaches the terminal and clears the notice when the pane's own deck answers again", async () => {
+    const paneView = { kind: "agent" as const, deckId: REMOTE_DECK_ID, agentId: "planner", from: "overview" as const };
+    const unreachable = harness("disconnected");
+    const { rerender } = render(<DeckShell runtime={unreachable.runtime("local")} initialView={paneView} />);
+    await waitFor(() => expect(unreachable.setShownTerminals).toHaveBeenCalledTimes(1));
+    expect(unreachable.setShownTerminals).toHaveBeenLastCalledWith([]);
 
-    fireEvent.click(openControl("Plan / architecture on build-box"));
     const before = screen.getByTestId("agent-pane-overlay");
     expect(within(before).getByTestId("terminal-absent-planner")).toBeVisible();
 
-    await act(async () => { rerender(<DeckShell runtime={deck.runtime("remote")} initialView={{ kind: "overview" }} />); });
+    const answering = harness("connected");
+    await act(async () => { rerender(<DeckShell runtime={answering.runtime("local")} initialView={paneView} />); });
 
     const after = screen.getByTestId("agent-pane-overlay");
     // The same pane, not a replacement: no unmount, no identity change.
     expect(after).toBe(before);
     expect(within(after).getByRole("heading", { name: "Planner on build-box" })).toBeVisible();
 
-    // The notice is gone and a terminal is there, keyed to the pane's own deck.
+    // The notice is gone and a terminal is there, keyed to the pane's own deck
+    // — which is still NOT the selected one.
     expect(within(after).queryByTestId("terminal-absent-planner")).toBeNull();
     expect(after.querySelector(".agent-terminal-stack")).toHaveAttribute("data-terminal-state", "attached");
     expect(within(after).getByTestId("terminal-planner")).toBeVisible();
     expect(viewportProps.at(-1)).toMatchObject({ agentId: "planner", deckId: REMOTE_DECK_ID });
-    expect(deck.setShownTerminals).toHaveBeenLastCalledWith(["planner"]);
+    expect(answering.setShownTerminals).toHaveBeenLastCalledWith([{ deckId: REMOTE_DECK_ID, agentId: "planner" }]);
   });
 
   /**
-   * The control for both tests above, stated as a fact about the fixture rather
+   * Scenario: the same overview, same non-selected deck, but it is ANSWERING.
+   * Opening its agent mounts a real terminal and declares it shown against
+   * build-box — no explanation, no empty box, and no change to the selection.
+   *
+   * This is the control that stops the two tests above passing for the wrong
+   * reason. Without it, a production change that rendered the no-terminal state
+   * for *every* non-selected deck — the behaviour the product owner reversed —
+   * would leave both of them green.
+   */
+  it("gives a non-selected but reachable deck's agent a live terminal instead", async () => {
+    const deck = harness("connected");
+    render(<DeckShell runtime={deck.runtime("local")} initialView={{ kind: "overview" }} />);
+    await waitFor(() => expect(deck.setShownTerminals).toHaveBeenCalledTimes(1));
+
+    fireEvent.click(openControl("Plan / architecture on build-box"));
+
+    const pane = screen.getByTestId("agent-pane-overlay");
+    expect(within(pane).queryByTestId("terminal-absent-planner")).toBeNull();
+    expect(pane.querySelector(".agent-terminal-stack")).toHaveAttribute("data-terminal-state", "attached");
+    expect(viewportProps.at(-1)).toMatchObject({ agentId: "planner", deckId: REMOTE_DECK_ID });
+    expect(deck.setShownTerminals).toHaveBeenLastCalledWith([{ deckId: REMOTE_DECK_ID, agentId: "planner" }]);
+  });
+
+  /**
+   * The control for every test above, stated as a fact about the fixture rather
    * than as an argument: both decks run an agent called `planner`, so "the
    * other deck's namesake" names a real, different agent on a real, different
    * machine. A fixture that avoided the collision would make the assertions

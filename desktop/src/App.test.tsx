@@ -1661,7 +1661,7 @@ describe("ControlDeck", () => {
     render(<ControlDeck runtime={runtime({ setShownTerminals })} />);
 
     expect(setShownTerminals).toHaveBeenCalledTimes(1);
-    expect(setShownTerminals).toHaveBeenCalledWith(["planner", "builder", "reviewer", "tester"]);
+    expect(setShownTerminals).toHaveBeenCalledWith([{ deckId: FIXTURE_DAEMON_ID, agentId: "planner" }, { deckId: FIXTURE_DAEMON_ID, agentId: "builder" }, { deckId: FIXTURE_DAEMON_ID, agentId: "reviewer" }, { deckId: FIXTURE_DAEMON_ID, agentId: "tester" }]);
   });
 
   /**
@@ -1679,7 +1679,7 @@ describe("ControlDeck", () => {
     fireEvent.click(within(tile).getByRole("tab", { name: "Diff" }));
 
     expect(setShownTerminals).toHaveBeenCalledTimes(2);
-    expect(setShownTerminals).toHaveBeenLastCalledWith(["planner", "reviewer", "tester"]);
+    expect(setShownTerminals).toHaveBeenLastCalledWith([{ deckId: FIXTURE_DAEMON_ID, agentId: "planner" }, { deckId: FIXTURE_DAEMON_ID, agentId: "reviewer" }, { deckId: FIXTURE_DAEMON_ID, agentId: "tester" }]);
   });
 
   /**
@@ -1703,7 +1703,7 @@ describe("ControlDeck", () => {
     render(<ControlDeck runtime={runtime({ snapshot: hostile, setShownTerminals })} />);
 
     expect(setShownTerminals).toHaveBeenCalledTimes(1);
-    expect(setShownTerminals).toHaveBeenCalledWith(["agent-a\nagent-b"]);
+    expect(setShownTerminals).toHaveBeenCalledWith([{ deckId: FIXTURE_DAEMON_ID, agentId: "agent-a\nagent-b" }]);
   });
 
   it("declares an empty shown set when the daemon owns no agents", () => {

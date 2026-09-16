@@ -71,4 +71,28 @@ test.describe("agent pane overlay", () => {
     await expect(overview).toBeVisible();
     await expect(page.getByRole("button", { name: "Open Plan / architecture agent" })).toBeVisible();
   });
+
+  /**
+   * Scenario: choose All Decks, open build-box's same-id agent while the local
+   * deck remains the selected deck, and inspect the built bundle. The remote
+   * pane has a real terminal and input element immediately; it never degrades
+   * to an explanation or an empty terminal because its deck is not selected.
+   */
+  test("opens a non-selected deck's overview agent with a live terminal", async ({ page }) => {
+    await openOverview(page, "fleet");
+    await page.getByTestId("deck-selector-toggle").click();
+    await page.getByTestId("deck-selector-option-all").click();
+    await expect(page.getByTestId("deck-selector-current")).toHaveText("All Decks");
+
+    await page.getByRole("button", { name: "Open Nightly build watch agent" }).click();
+
+    const overlay = page.getByTestId("agent-pane-overlay");
+    await expect(overlay).toBeVisible();
+    await expect(overlay.getByRole("heading", { name: "Builder" })).toBeVisible();
+    await expect(overlay.locator(".agent-terminal-stack")).toHaveAttribute("data-terminal-state", "attached");
+    await expect(overlay.locator(".terminal-viewport")).toBeVisible();
+    await expect(overlay.getByLabel("Builder terminal input")).toBeAttached();
+    await expect(overlay.getByTestId("terminal-absent-planner")).toHaveCount(0);
+    await expect(page.getByTestId("deck-selector-current")).toHaveText("All Decks");
+  });
 });

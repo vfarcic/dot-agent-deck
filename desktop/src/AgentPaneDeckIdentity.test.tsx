@@ -10,11 +10,17 @@ import type { AgentSession, DeckRuntimeState, DeckSnapshot } from "./types";
  * an id alone names an agent on every deck, so neither is observable from the
  * DOM the way a wrong heading would be.
  */
+const TERMINAL_INPUT_SENTINEL = "typed-only-into-build-box-planner";
 const viewportProps: { agentId: string; deckId?: string; applied?: { rows: number; cols: number } }[] = [];
 vi.mock("./components/TerminalViewport", () => ({
-  TerminalViewport: ({ agentId, deckId, label, applied }: { agentId: string; deckId?: string; label: string; applied?: { rows: number; cols: number } }) => {
+  TerminalViewport: ({ agentId, deckId, label, applied, onInput }: { agentId: string; deckId?: string; label: string; applied?: { rows: number; cols: number }; onInput: (data: string) => void }) => {
     viewportProps.push({ agentId, deckId, applied });
-    return <pre data-testid={`terminal-${agentId}`} aria-label={`${label} terminal`}>terminal</pre>;
+    return (
+      <pre data-testid={`terminal-${agentId}`} aria-label={`${label} terminal`}>
+        terminal
+        <button aria-label={`Type into ${label} terminal`} onClick={() => onInput(TERMINAL_INPUT_SENTINEL)}>type</button>
+      </pre>
+    );
   },
 }));
 
@@ -74,12 +80,13 @@ function harness(
   });
   const getSettings = vi.fn(async () => ({ settings: structuredClone(stored), path: "/tmp/desktop.toml" }));
   const setShownTerminals = vi.fn(async () => undefined);
+  const sendTerminalInput = vi.fn(async () => undefined);
   const base = {
     mode: "live",
     terminalData: {},
     clearError: vi.fn(),
     runAction: vi.fn(async () => ({ ok: true })),
-    sendTerminalInput: vi.fn(async () => undefined),
+    sendTerminalInput,
     resizeTerminal: vi.fn(async () => undefined),
     setShownTerminals,
     reconnect: vi.fn(async () => undefined),
@@ -101,6 +108,7 @@ function harness(
     remote,
     runtime,
     setShownTerminals,
+    sendTerminalInput,
     saveSettings,
     /** Whatever the last save left on disk. */
     onDisk: () => structuredClone(stored),
@@ -119,19 +127,23 @@ const openControl = (name: string) => screen.getByRole("button", { name: `Open $
  *
  * It was `CrossDeckAgentPane.test.tsx`, and it covered opening a NON-SELECTED
  * deck's agent by switching the selected deck first and reverting on close.
- * That behaviour was **descoped** after two security audits: the switch left
- * state created under deck A attributed to deck B, because identity was read
- * from the current selection at use time rather than captured at creation. The
- * overview now renders no open control for a non-selected deck's agent at all
- * (`components/AgentOverview.test.tsx` has that), and cross-deck opening
- * belongs to [#1073](https://github.com/vfarcic/dot-agent-deck/issues/1073).
+ * **The SWITCH was descoped** after two security audits: it left state created
+ * under deck A attributed to deck B, because identity was read from the current
+ * selection at use time rather than captured at creation. Cross-deck attach
+ * itself is [#1073](https://github.com/vfarcic/dot-agent-deck/issues/1073), a
+ * wire change by construction.
  *
- * What survives is everything that is **not** about opening across decks: the
- * pane's own composite lookup, the identity fence that refuses to retarget it,
- * and the composite keying of the terminal state it reads. Those close a
- * defect the overlay did not cause and cannot reach — the selected deck moves
- * for reasons that are nobody's gesture, and agent ids collide across decks
- * whether or not a pane is open.
+ * **Opening was not descoped, and an intermediate commit that also removed it
+ * went too far.** Every agent the overview lists is openable, whichever deck it
+ * is on: a listed row with no way into it is a dead row. The pane carries the
+ * creating deck all the way through attach, output, input and resize, so a
+ * non-selected deck's agent opens with the same live terminal as a selected
+ * one without switching the process-global selection.
+ *
+ * So this file covers the full cross-deck pane, its composite lookup, and the
+ * identity fence that refuses to retarget a deck-origin pane. Selection is no
+ * longer terminal ownership: moving it must not tear down, relabel or retarget
+ * a pane whose stream was created for another deck.
  */
 describe("agent pane deck identity", () => {
   beforeEach(() => {
@@ -167,42 +179,116 @@ describe("agent pane deck identity", () => {
 
   /**
    * Scenario: an overview-origin pane is open on the local deck's Planner when
-   * the selected deck moves to build-box, which runs a Planner of its own with
-   * the same per-daemon monotonic id. The pane keeps showing the agent it was
-   * opened for — the heading still names the local deck's Planner — rather
-   * than adopting the arriving deck's namesake.
-   *
-   * # Why this path exists at all after the descope
-   *
-   * The overview offers no control that opens a non-selected deck's agent, so
-   * a pane always starts on the selected deck. It does not always stay there:
-   * a `selectionFallback` the crate reports, another window writing the
-   * settings document, or a reconnect can move the selection with no gesture
-   * in this window. `OverviewAgentPane` resolves its agent from the fleet entry
-   * `view.deckId` names, so the pane's identity survives that; a bare-id lookup
-   * would read the SELECTED deck's snapshot and silently find build-box's
-   * Planner instead, under the heading the user opened.
-   *
-   * It keeps its identity and loses its terminal, which is the honest outcome:
-   * `overviewShown` declares nothing while the pane's deck is not in force, so
-   * nothing attaches on the wrong machine.
+   * the selected deck moves to build-box, which runs a same-id Planner. The
+   * original pane, terminal DOM node and local-deck declaration stay in place;
+   * neither output nor input authority follows the mutable selection.
    */
-  it("keeps an overview pane on the agent the view names when the selection moves under it", async () => {
+  it("keeps an overview pane and its live terminal on their creating deck when selection moves", async () => {
     const deck = harness();
     const { rerender } = render(<DeckShell runtime={deck.runtime("local")} initialView={{ kind: "overview" }} />);
     await waitFor(() => expect(deck.setShownTerminals).toHaveBeenCalledTimes(1));
 
     fireEvent.click(openControl("Plan / architecture"));
-    expect(within(screen.getByTestId("agent-pane-overlay")).getByRole("heading", { name: "Planner" })).toBeVisible();
+    const beforePane = screen.getByTestId("agent-pane-overlay");
+    const beforeTerminal = within(beforePane).getByTestId("terminal-planner");
+    expect(within(beforePane).getByRole("heading", { name: "Planner" })).toBeVisible();
 
     await act(async () => { rerender(<DeckShell runtime={deck.runtime("remote")} initialView={{ kind: "overview" }} />); });
 
+    const afterPane = screen.getByTestId("agent-pane-overlay");
+    expect(afterPane).toBe(beforePane);
+    expect(within(afterPane).getByTestId("terminal-planner")).toBe(beforeTerminal);
+    expect(within(afterPane).getByRole("heading", { name: "Planner" })).toBeVisible();
+    expect(within(afterPane).queryByRole("heading", { name: "Planner on build-box" })).toBeNull();
+    expect(within(afterPane).queryByTestId("terminal-absent-planner")).toBeNull();
+    expect(viewportProps.at(-1)).toMatchObject({ agentId: "planner", deckId: FIXTURE_DAEMON_ID });
+    const declaration = JSON.stringify(deck.setShownTerminals.mock.calls.at(-1));
+    expect(declaration).toContain(FIXTURE_DAEMON_ID);
+    expect(declaration).not.toContain(REMOTE_DECK_ID);
+  });
+
+  /**
+   * Scenario: with the local deck selected, open build-box's same-id Planner
+   * from All Decks. A real terminal mounts immediately, the declaration names
+   * build-box, and a keystroke is sent with build-box's identity rather than to
+   * the selected local Planner.
+   */
+  it("opens a non-selected deck's agent with a live terminal and routes its input to that deck", async () => {
+    const deck = harness(
+      documentWithFleet(),
+      {
+        terminalInputResults: {
+          planner: "wrong-session",
+          [agentKey(FIXTURE_DAEMON_ID, "planner")]: "wrong-session",
+        },
+        appliedGeometry: {
+          planner: { rows: 24, cols: 80 },
+          [agentKey(FIXTURE_DAEMON_ID, "planner")]: { rows: 24, cols: 80 },
+          [agentKey(REMOTE_DECK_ID, "planner")]: { rows: 48, cols: 160 },
+        },
+      },
+      (agent) => (agent.id === "planner" ? { ...agent, status: "running", writeLease: "write" } : agent),
+    );
+    render(<DeckShell runtime={deck.runtime("local")} initialView={{ kind: "overview" }} />);
+    await waitFor(() => expect(deck.setShownTerminals).toHaveBeenCalledTimes(1));
+
+    fireEvent.click(openControl("Plan / architecture on build-box"));
+
     const pane = screen.getByTestId("agent-pane-overlay");
-    expect(within(pane).getByRole("heading", { name: "Planner" })).toBeVisible();
-    expect(within(pane).queryByRole("heading", { name: "Planner on build-box" })).toBeNull();
-    // And nothing of this app's is attached on the deck that IS in force: the
-    // declaration for the pane's agent is withdrawn rather than re-pointed.
-    expect(deck.setShownTerminals).toHaveBeenLastCalledWith([]);
+    expect(within(pane).getByRole("heading", { name: "Planner on build-box" })).toBeVisible();
+    expect(within(pane).queryByTestId("terminal-absent-planner")).toBeNull();
+    expect(within(pane).getByTestId("terminal-planner")).toBeVisible();
+    expect(pane.querySelector(".agent-terminal-stack")).toHaveAttribute("data-terminal-state", "attached");
+    expect(viewportProps.at(-1)).toMatchObject({
+      agentId: "planner",
+      deckId: REMOTE_DECK_ID,
+      applied: { rows: 48, cols: 160 },
+    });
+    expect(screen.queryByTestId("terminal-input-status-planner")).not.toBeInTheDocument();
+
+    const declaration = JSON.stringify(deck.setShownTerminals.mock.calls.at(-1));
+    expect(declaration).toContain(REMOTE_DECK_ID);
+    expect(declaration).toContain("planner");
+    expect(declaration).not.toContain(FIXTURE_DAEMON_ID);
+
+    fireEvent.click(within(pane).getByRole("button", { name: "Type into Planner on build-box terminal" }));
+    expect(deck.sendTerminalInput).toHaveBeenCalledTimes(1);
+    const routedInput = JSON.stringify(deck.sendTerminalInput.mock.calls[0]);
+    expect(routedInput).toContain(REMOTE_DECK_ID);
+    expect(routedInput).toContain("planner");
+    expect(routedInput).toContain(TERMINAL_INPUT_SENTINEL);
+    expect(routedInput).not.toContain(FIXTURE_DAEMON_ID);
+  });
+
+  /**
+   * Scenario: open build-box's Planner while the local deck is selected, move
+   * selection to build-box and back, and keep using the pane. The same terminal
+   * node stays live throughout and every declaration continues to name the
+   * pane's deck rather than whichever deck became selected.
+   */
+  it("does not detach or retarget a cross-deck pane when the selected deck moves", async () => {
+    const deck = harness();
+    const { rerender } = render(<DeckShell runtime={deck.runtime("local")} initialView={{ kind: "overview" }} />);
+    await waitFor(() => expect(deck.setShownTerminals).toHaveBeenCalledTimes(1));
+
+    fireEvent.click(openControl("Plan / architecture on build-box"));
+    const pane = screen.getByTestId("agent-pane-overlay");
+    const terminal = within(pane).getByTestId("terminal-planner");
+
+    await act(async () => { rerender(<DeckShell runtime={deck.runtime("remote")} initialView={{ kind: "overview" }} />); });
+    expect(screen.getByTestId("agent-pane-overlay")).toBe(pane);
+    expect(within(pane).getByTestId("terminal-planner")).toBe(terminal);
+
+    await act(async () => { rerender(<DeckShell runtime={deck.runtime("local")} initialView={{ kind: "overview" }} />); });
+    expect(screen.getByTestId("agent-pane-overlay")).toBe(pane);
+    expect(within(pane).getByTestId("terminal-planner")).toBe(terminal);
+    expect(within(pane).getByRole("heading", { name: "Planner on build-box" })).toBeVisible();
+    expect(within(pane).queryByTestId("terminal-absent-planner")).toBeNull();
+    for (const call of deck.setShownTerminals.mock.calls.slice(1)) {
+      const declaration = JSON.stringify(call);
+      expect(declaration).toContain(REMOTE_DECK_ID);
+      expect(declaration).not.toContain(FIXTURE_DAEMON_ID);
+    }
   });
 
   /**
@@ -271,7 +357,7 @@ describe("agent pane deck identity", () => {
  * `sendTerminalInput(agentId, …)` resolved to it — under the same role, the
  * same display text, and no deck identity anywhere in the dialog.
  *
- * Descoping cross-deck opening does not retire either half. The selection still
+ * Native cross-deck attach does not retire either half. The selection still
  * moves for reasons this window did not cause, and `aria-modal` is a claim that
  * has to be true whatever the deck story.
  */

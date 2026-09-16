@@ -279,7 +279,7 @@ describe("agent pane overlay", () => {
     render(<DeckShell runtime={runtime({ setShownTerminals })} />);
 
     expect(setShownTerminals).toHaveBeenCalledTimes(1);
-    expect(setShownTerminals).toHaveBeenLastCalledWith(["planner", "builder", "reviewer", "tester"]);
+    expect(setShownTerminals).toHaveBeenLastCalledWith([{ deckId: FIXTURE_DAEMON_ID, agentId: "planner" }, { deckId: FIXTURE_DAEMON_ID, agentId: "builder" }, { deckId: FIXTURE_DAEMON_ID, agentId: "reviewer" }, { deckId: FIXTURE_DAEMON_ID, agentId: "tester" }]);
     setShownTerminals.mockClear();
 
     fireEvent.click(screen.getByRole("button", { name: "Open Planner agent" }));
@@ -307,7 +307,7 @@ describe("agent pane overlay", () => {
     fireEvent.click(screen.getByRole("button", { name: "Open Plan / architecture agent" }));
     expect(screen.getByTestId("agent-pane-overlay")).toBeVisible();
     expect(setShownTerminals).toHaveBeenCalledTimes(1);
-    expect(setShownTerminals).toHaveBeenLastCalledWith(["planner"]);
+    expect(setShownTerminals).toHaveBeenLastCalledWith([{ deckId: FIXTURE_DAEMON_ID, agentId: "planner" }]);
     setShownTerminals.mockClear();
 
     fireEvent.click(screen.getByRole("button", { name: "Close Planner agent" }));
