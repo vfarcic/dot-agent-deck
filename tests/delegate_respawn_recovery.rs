@@ -850,6 +850,160 @@ async fn delegate_033_a_close_that_outruns_the_settle_timeout_still_brings_the_r
     );
 }
 
+/// Issue #1114 (Greptile P1 on PR #1119): how long `delegate/034` keeps the
+/// cleanup hold up once it has taken it — a `StopAgent` whose remaining steps
+/// are starved, modelled the same way `delegate/033` models a starved close
+/// tail.
+///
+/// It has to outlast the respawn's own `AGENT_TERMINATE_GRACE`, because that
+/// grace is what separates the record removal this test waits for from the
+/// `spawn_agent` the hold has to refuse. Hold for less and the spawn lands after
+/// the hold is down, succeeds, and the test proves nothing. Five seconds is 1.7x
+/// the 3 s grace, and a `sleep` can only overshoot, so load moves it in the safe
+/// direction — while staying far under the recovery's own 30 s ceiling, above
+/// which a FIXED build would fail too.
+const STARVED_STOPAGENT_HOLD: Duration = Duration::from_secs(5);
+
+/// Scenario: delegate to a `clear = true` role whose worker IGNORES SIGTERM, so
+/// the respawn spends its full three-second termination grace between lifting
+/// the pane's record out and spawning the replacement. Take the pane's cleanup
+/// hold inside that gap — a `StopAgent` that read its record a moment before the
+/// respawn removed it, and whose own remaining steps are then starved — and keep
+/// it up past the grace, so the replacement spawn is refused. The role must
+/// still come back once the hold goes down.
+#[tokio::test(flavor = "multi_thread")]
+#[spec("orchestration/delegate/034")]
+async fn delegate_034_a_hold_taken_after_the_record_was_lifted_still_brings_the_role_back() {
+    use std::os::unix::fs::PermissionsExt;
+
+    // Same stand-in `delegate/022` uses, and for the same reason: `close_agent`
+    // and the respawn's terminate both spend the full `AGENT_TERMINATE_GRACE`
+    // only while the child is still running. A plain `cat` dies on the first
+    // signal, the gap this test aims at is a few milliseconds wide, and the hold
+    // below could not be placed inside it.
+    let fx = fixture(|dir| {
+        let script = dir.join("stubborn-worker.sh");
+        let marker = String::from_utf8_lossy(STUBBORN_WORKER_ARMED).into_owned();
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\ntrap '' TERM\nprintf '{marker}'\nexec cat\n"),
+        )
+        .expect("write SIGTERM-ignoring worker stand-in");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod SIGTERM-ignoring worker stand-in");
+        script.to_string_lossy().into_owned()
+    })
+    .await;
+
+    // The marker proves the `trap '' TERM` is already installed, so the grace
+    // below is a fact rather than a hope — issue #709's fix, borrowed.
+    let armed = common::wait_for_child_first_output(
+        &fx.daemon.registry,
+        &fx.worker_agent_id,
+        STUBBORN_WORKER_ARMED,
+    )
+    .await;
+    assert!(
+        snapshot_contains(&armed, STUBBORN_WORKER_ARMED),
+        "precondition: the worker stand-in never got as far as installing its `trap '' TERM`, so \
+         the respawn below would terminate it instantly and leave no gap to place the hold in; \
+         snapshot = {:?}",
+        String::from_utf8_lossy(&armed)
+    );
+    assert!(
+        !fx.daemon.registry.pane_close_in_flight(WORKER_PANE),
+        "precondition: NOTHING is closing this pane when the delegate lands — that is what makes \
+         this the ordinary respawn leg rather than `delegate/032`'s window, and the whole point \
+         is that the ordinary leg can still meet a hold on its way to `spawn_agent`"
+    );
+
+    delegate(&fx, "list the files in this directory").await;
+
+    // The gap: the respawn has lifted the record out and is now inside
+    // `terminate_child_with_grace_and_wait`, which the stand-in will make spend
+    // the full three seconds. "The record has gone" is the observable edge of
+    // it, so the hold lands inside the gap by construction rather than by
+    // arithmetic.
+    let removed_by_deadline = tokio::time::Instant::now() + common::child_boot_budget();
+    while fx
+        .daemon
+        .registry
+        .pane_current_agent_id(WORKER_PANE)
+        .is_some()
+        && tokio::time::Instant::now() < removed_by_deadline
+    {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(
+        fx.daemon
+            .registry
+            .pane_current_agent_id(WORKER_PANE)
+            .is_none(),
+        "precondition: the respawn never lifted the pane's record out, so there is no gap to take \
+         the hold in and the assertion below would pass for the wrong reason; records = {:?}",
+        fx.daemon.registry.agent_records()
+    );
+
+    // The `StopAgent` that lost this race: it read the worker's record just
+    // before the respawn removed it, so `pane_claimed_by_other` sees nothing and
+    // the hold is granted. Its own `close_agent` then fails against an id that
+    // is gone — which is exactly what the real handler does here, and why it
+    // rolls the closing mark back rather than completing.
+    let hold = fx
+        .daemon
+        .registry
+        .hold_pane_for_cleanup(WORKER_PANE, &fx.worker_agent_id)
+        .expect("a pane nobody claims is grantable to the stopping agent");
+    fx.daemon.registry.begin_pane_close(WORKER_PANE);
+    let stale_close = fx.daemon.registry.close_agent(&fx.worker_agent_id);
+    assert!(
+        stale_close.is_err(),
+        "precondition: this models a `StopAgent` whose record the respawn already took, so its \
+         own close MUST fail — if it succeeded the respawn had not removed anything and the gap \
+         was never entered"
+    );
+
+    let registry = Arc::clone(&fx.daemon.registry);
+    let releasing = tokio::spawn(async move {
+        tokio::time::sleep(STARVED_STOPAGENT_HOLD).await;
+        registry.finish_pane_close(WORKER_PANE, false);
+        drop(hold);
+    });
+
+    let replacement = wait_for_replacement_agent(
+        &fx.daemon.registry,
+        WORKER_PANE,
+        &fx.worker_agent_id,
+        STARVED_STOPAGENT_HOLD + Duration::from_secs(20),
+    )
+    .await
+    .unwrap_or_else(|| {
+        panic!(
+            "a cleanup hold taken AFTER the respawn lifted the pane's record out left the role \
+             with no agent at all — the ordinary respawn leg had already terminated the worker, \
+             and `spawn_agent`'s `DuplicatePaneId` was returned instead of entering the recovery \
+             that knows how to wait for the hold (#1114). records = {:?}",
+            fx.daemon.registry.agent_records()
+        )
+    });
+    releasing
+        .await
+        .expect("the hold-release task must not panic");
+
+    let state = fx.daemon.state.read().await;
+    assert_eq!(
+        state.pane_role_map.get(WORKER_PANE).map(String::as_str),
+        Some(WORKER_ROLE),
+        "the role must still route afterwards, or the NEXT delegate is rejected with \
+         `reached no worker for role(s)` — the permanent breakage #606 reports"
+    );
+    assert!(
+        fx.daemon.registry.agent_is_live(&replacement),
+        "and the replacement has to be a LIVE agent rather than a record: this pane's whole \
+         history in this test is a worker that was terminated and a spawn that was refused"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // #584's control: the two spawn paths' respawns, side by side.
 // ---------------------------------------------------------------------------

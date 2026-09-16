@@ -4870,6 +4870,29 @@ impl AgentPtyRegistry {
         held_for_cleanup || self.is_pane_closing(pane_id)
     }
 
+    /// Issue #1114: is `pane_id` currently excluded from [`Self::spawn_agent`]
+    /// by a cleanup hold?
+    ///
+    /// The NARROW half of [`Self::pane_close_in_flight`], and the two are not
+    /// interchangeable. That one answers "is a close taking this pane apart?"
+    /// and is what a WAIT should be keyed on, because a close is not finished
+    /// until both its marks are down. This one answers the much more specific
+    /// question "is the hold the reason `spawn_agent` just said
+    /// `DuplicatePaneId`?", which is the only reading that makes that error
+    /// retryable — a live occupant produces the identical error and is a real
+    /// conflict. `closing_panes` does not enter into it: `spawn_agent` does not
+    /// consult it, so a `DuplicatePaneId` is never attributable to it.
+    fn pane_held_for_cleanup(&self, pane_id: &str) -> bool {
+        let Ok(inner) = self.inner.lock() else {
+            // A poisoned registry lock is not evidence the pane is free — the
+            // same call [`Self::pane_close_in_flight`] makes, and here it fails
+            // toward retrying inside a deadline rather than toward reporting a
+            // role dead. The recovery's own bound still terminates it.
+            return true;
+        };
+        inner.cleanup_holds.contains(pane_id)
+    }
+
     /// Remove every record that names `pane_id` as its worker key or as its
     /// orchestrator target. Caller holds the tracker lock.
     fn drain_delegations_touching(
@@ -7379,6 +7402,10 @@ impl AgentPtyRegistry {
     /// 4. Only then create a fresh agent from `identity`, going back to 2 if the
     ///    pane fell under a cleanup hold again in between.
     ///
+    /// Step 1 enters step 2 on a `DuplicatePaneId` that a cleanup hold caused,
+    /// as well as on `NotFound` — see the arm itself for why that is not the
+    /// same as swallowing a spawn conflict.
+    ///
     /// Errors other than `NotFound` are returned untouched: a spawn that failed
     /// to exec, a shutting-down registry or a validation refusal are all real
     /// failures, and retrying them would just fail twice.
@@ -7432,6 +7459,23 @@ impl AgentPtyRegistry {
                 });
             }
             Err(AgentPtyError::NotFound(_)) => {}
+            // Issue #1114 (Greptile P1 on PR #1119): this leg can ALSO be
+            // refused by the very hold the recovery below knows how to wait for,
+            // and returning here is then the issue's own failure by its narrowest
+            // route. The refusal under the lock above closes the case where the
+            // hold is up when this call starts; it cannot close the case where a
+            // `StopAgent` read its record just BEFORE that lock and takes the
+            // hold just after — `agent_record_any` and `hold_pane_for_cleanup`
+            // are two separate statements in that handler. The record is gone by
+            // the time we learn this (this call removed it, and terminated its
+            // child), so there is nothing left to protect by bailing out: fall
+            // into the recovery, which waits for the hold and re-creates the
+            // pane. Pinned by `orchestration/delegate/034`.
+            //
+            // Keyed on the cleanup hold specifically rather than on
+            // `pane_close_in_flight`, because the hold is the only thing that
+            // makes this error a timing accident — see `pane_held_for_cleanup`.
+            Err(AgentPtyError::DuplicatePaneId(_)) if self.pane_held_for_cleanup(pane_id_env) => {}
             Err(other) => return Err(other),
         }
 
@@ -7509,10 +7553,10 @@ impl AgentPtyRegistry {
                 //
                 // Narrow on purpose. `DuplicatePaneId` from a pane with a LIVE
                 // occupant is a real conflict and is returned untouched —
-                // `pane_close_in_flight` is what separates the two, and it is
+                // `pane_held_for_cleanup` is what separates the two, and it is
                 // re-read here rather than inferred from the wait above.
                 Err(AgentPtyError::DuplicatePaneId(_))
-                    if self.pane_close_in_flight(pane_id_env)
+                    if self.pane_held_for_cleanup(pane_id_env)
                         && tokio::time::Instant::now() < deadline => {}
                 Err(other) => return Err(other),
             }
