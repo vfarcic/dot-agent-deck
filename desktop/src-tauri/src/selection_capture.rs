@@ -62,6 +62,10 @@
 //! these accessors are named dozens of times in doc comments, so the number
 //! would track documentation edits instead of code, which is the substring-noise
 //! trap `CLAUDE.md` rule 17 describes from the other direction.
+//!
+//! The guard normalizes CRLF to LF in every file it reads before scanning it.
+//! The marker holds two line endings, and a CRLF checkout ends them with
+//! `\r\n`, so against the raw text the guard would find no test module at all.
 
 #[cfg(test)]
 mod tests {
@@ -123,9 +127,23 @@ mod tests {
     /// the production half of each file ends.
     const TEST_MODULE_MARKER: &str = "\n#[cfg(test)]\nmod tests {";
 
+    /// `source` with every CRLF line ending turned into LF — the text this
+    /// guard scans in every file it reads.
+    ///
+    /// `include_str!` embeds a file exactly as checked out, `.gitattributes`
+    /// pins no line ending for `.rs`, and a Windows checkout with
+    /// `core.autocrlf` set — the GitHub runner's default — gets CRLF.
+    /// [`TEST_MODULE_MARKER`] holds two line endings, so against the raw text
+    /// it matches nothing there and the guard fails on the first module it
+    /// reads with `found 0` — which is what `build-windows` did on PR #1126.
+    fn lf(source: &str) -> String {
+        source.replace("\r\n", "\n")
+    }
+
     /// One module's production half with its comment lines removed — see the
     /// module docs for why both steps are load-bearing.
     fn production_code(name: &str, source: &str) -> String {
+        let source = lf(source);
         let markers = source.matches(TEST_MODULE_MARKER).count();
         assert_eq!(
             markers, 1,
@@ -143,6 +161,13 @@ mod tests {
             .join("\n")
     }
 
+    /// How many reads of each [`ACCESSORS`] entry, in order, one module's
+    /// production half holds.
+    fn raw_reads(name: &str, source: &str) -> [usize; 4] {
+        let code = production_code(name, source);
+        ACCESSORS.map(|accessor| code.matches(accessor).count())
+    }
+
     /// Scenario: read the production code of every consumer module and count
     /// its raw reads of the applied selection. Each count must equal
     /// [`BUDGET`]'s exactly — so a new read fails here, and so does a stale
@@ -153,13 +178,12 @@ mod tests {
     #[test]
     fn no_module_grows_a_new_raw_read_of_the_applied_selection() {
         for (module, allowed) in BUDGET {
-            let source = MODULES
+            let reads = MODULES
                 .iter()
                 .find(|(name, _)| *name == module)
-                .map(|(name, source)| production_code(name, source))
+                .map(|(name, source)| raw_reads(name, source))
                 .unwrap_or_else(|| panic!("{module} must be in MODULES to be budgeted"));
-            for (accessor, allowed) in ACCESSORS.iter().zip(allowed) {
-                let found = source.matches(accessor).count();
+            for ((accessor, found), allowed) in ACCESSORS.iter().zip(reads).zip(allowed) {
                 assert_eq!(
                     found, allowed,
                     "{module} holds {found} raw `{accessor}` read(s) outside its tests, and \
@@ -170,6 +194,59 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A module shaped like a consumer: two production reads, an accessor
+    /// named in a comment line, and a test module holding two more reads — so
+    /// a count that ignored either the truncation or the comment stripping
+    /// would differ from `[1, 0, 1, 0]`.
+    const FIXTURE: &str = concat!(
+        "fn operation() {\n",
+        "    // selected_endpoint() named in prose is not a read\n",
+        "    let endpoint = selected_endpoint();\n",
+        "    let decks = observed_decks();\n",
+        "}\n",
+        "\n",
+        "#[cfg(test)]\n",
+        "mod tests {\n",
+        "    fn fixture() {\n",
+        "        selected_deck();\n",
+        "        deck_is_observed(&deck);\n",
+        "    }\n",
+        "}\n",
+    );
+
+    /// Scenario: scan one module's text as an LF checkout gives it to
+    /// `include_str!` and again as a Windows CRLF checkout does. Both must find
+    /// exactly one test module and yield the same counts. The exactly-one
+    /// check is [`production_code`]'s own assertion rather than a copy of it,
+    /// so this exercises the code the guard runs.
+    #[test]
+    fn a_crlf_checkout_scans_the_same_as_an_lf_one() {
+        let crlf = FIXTURE.replace('\n', "\r\n");
+        assert!(
+            !crlf.contains(TEST_MODULE_MARKER),
+            "the raw CRLF fixture must NOT match the marker as written — if it does, it no \
+             longer reproduces a Windows checkout and this test proves nothing"
+        );
+
+        let from_lf = raw_reads("lf.rs", FIXTURE);
+        assert_eq!(from_lf, [1, 0, 1, 0], "the LF fixture's own counts");
+        assert_eq!(
+            raw_reads("crlf.rs", &crlf),
+            from_lf,
+            "line endings must not change what the guard counts"
+        );
+    }
+
+    /// Scenario: give the scanner a CRLF module holding a second test module.
+    /// It must still fail loudly with `found 2` — normalizing line endings
+    /// must not relax "exactly one test module" into "at least one".
+    #[test]
+    #[should_panic(expected = "found 2")]
+    fn a_crlf_checkout_with_a_second_test_module_still_fails_loudly() {
+        let two_test_modules = format!("{FIXTURE}#[cfg(test)]\nmod tests {{\n}}\n");
+        raw_reads("crlf.rs", &two_test_modules.replace('\n', "\r\n"));
     }
 
     /// Scenario: every module named in [`BUDGET`] is one [`MODULES`] can supply,
@@ -199,7 +276,7 @@ mod tests {
     /// a name nothing calls any more.
     #[test]
     fn the_accessors_this_guard_counts_still_exist() {
-        let dto = include_str!("dto.rs");
+        let dto = lf(include_str!("dto.rs"));
         for signature in [
             "pub(crate) fn selected_endpoint()",
             "pub(crate) fn selected_deck()",
