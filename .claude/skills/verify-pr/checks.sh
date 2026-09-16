@@ -194,7 +194,7 @@ wanted fmt && { run_step fmt "cargo fmt --check" || true; } || skip fmt "not in 
 # touching only `xtask/*` — linkage-check, the docs generator, the `spec`
 # macro — was reviewed against a lint that never read a line of it.
 #
-# `e2e-live` (issue #502) is the same hole reopened for the 24 real-agent
+# `e2e-live` (issue #502) is the same hole reopened for the real-agent
 # files, which open with
 # `#![cfg(all(feature = "e2e", feature = "e2e-live"))]` and are empty crates
 # under `--features e2e` alone. This gate is where a reviewer catches a break in
@@ -277,7 +277,7 @@ fi
 
 # --- e2e lane 1: OPT-IN, because CI already runs it on this PR ------------
 #
-# OFF BY DEFAULT since issue #502 (CLAUDE.md rule 5). Lane 1 — the 47
+# OFF BY DEFAULT since issue #502 (CLAUDE.md rule 5). Lane 1 — the
 # `tests/e2e_*.rs` files that reach no real agent, `--features e2e` — runs in CI
 # on every PR as the `e2e-deterministic` job, so the reviewer's job is to READ
 # that run: `gh pr checks <n>` for its conclusion, `gh run view <id> --log-failed`
