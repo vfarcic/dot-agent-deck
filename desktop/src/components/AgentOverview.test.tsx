@@ -2409,4 +2409,63 @@ describe("AgentOverview across a fleet (PRD #742 M4)", () => {
     // assertion is what stands in for the import that would close a cycle.
     expect(within(waiting).getByTestId("daemon-state")).toHaveTextContent(PENDING_DECK_MESSAGE);
   });
+
+  /**
+   * Scenario: the four-deck fleet is on screen with the local deck selected.
+   * The local deck's Planner row carries the open control; the remote deck's
+   * rows carry none at all, and each says in its place that the agent is on a
+   * deck that is not selected.
+   *
+   * # Why there is no control rather than a disabled one
+   *
+   * PRD #1105 originally opened a non-selected deck's agent by switching the
+   * selected deck first and reverting on close. Two security audits found that
+   * the switch left state created under one deck attributed to another, and the
+   * decision was to **descope cross-deck opening** rather than to keep
+   * repairing it; cross-deck attach itself is
+   * [#1073](https://github.com/vfarcic/dot-agent-deck/issues/1073), a wire
+   * change by construction. So these rows are still LISTED — the overview
+   * merges every observed deck (#742) and always did — and they are not
+   * openable. A `<button disabled>` would be an affordance that refuses every
+   * press, which reads as a broken feature; text that names the reason reads as
+   * a state with a remedy.
+   */
+  it("offers no open control for an agent on a deck that is not selected, and says why", () => {
+    const onNavigate = vi.fn();
+    const fleet = createFixtureFleet("fleet");
+    window.localStorage.setItem(OVERVIEW_COLUMNS_STORAGE_KEY, JSON.stringify({ columns: ALL_OVERVIEW_COLUMNS }));
+    render(<AgentOverview runtime={runtime({ snapshot: fleet[0], fleet })} onNavigate={onNavigate} />);
+
+    const [local, remote] = fleet;
+    expect(local.connection.deckId).toBe(FIXTURE_DAEMON_ID);
+    expect(remote.connection.deckId).toBe(FIXTURE_REMOTE_DAEMON_ID);
+
+    // The selected deck's rows are unchanged: a real control that navigates.
+    for (const agent of local.agents) {
+      const row = screen.getByTestId(`overview-agent-${agentDomKey(agent)}`);
+      expect(within(row).getByRole("button", { name: `Open ${agent.displayName} agent` })).toBeVisible();
+      expect(within(row).queryByTestId(`overview-open-elsewhere-${agentDomKey(agent)}`)).toBeNull();
+    }
+
+    /*
+      The non-selected deck's rows carry NO control of any kind — asserted as
+      "no button in the row named Open …" rather than as "the button is
+      disabled", because a disabled button is exactly what this must not be.
+      The reason is discoverable from the row itself, visibly and on hover.
+    */
+    for (const agent of remote.agents) {
+      const row = screen.getByTestId(`overview-agent-${agentDomKey(agent)}`);
+      expect(within(row).queryByRole("button", { name: /^Open .* agent$/ })).toBeNull();
+      const reason = within(row).getByTestId(`overview-open-elsewhere-${agentDomKey(agent)}`);
+      expect(reason).toBeVisible();
+      expect(reason.tagName).not.toBe("BUTTON");
+      expect(reason).toHaveTextContent("other deck");
+      expect(reason.getAttribute("title")).toContain("not selected");
+    }
+
+    // And nothing on this screen navigated: the refusal is silent, not a click
+    // that opens a pane the app cannot attach.
+    fireEvent.click(screen.getByTestId(`overview-open-elsewhere-${agentDomKey(remote.agents[0])}`));
+    expect(onNavigate).not.toHaveBeenCalled();
+  });
 });

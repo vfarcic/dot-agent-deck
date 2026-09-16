@@ -24,9 +24,7 @@ import type { DesktopSettingsState } from "./hooks/useDesktopSettings";
 
 /**
  * The second deck, described exactly as the crate describes a remote one —
- * `Endpoint::describe()` renders `user@host[:port]` and never a socket path —
- * so the label this fixture carries is the label `describeEndpoint` derives
- * from the stored row below it.
+ * `Endpoint::describe()` renders `user@host[:port]` and never a socket path.
  */
 const REMOTE_DECK_ID = "deck-00000000000000b2";
 const REMOTE_DECK_LABEL = "dev@build-box";
@@ -114,75 +112,47 @@ function harness(
 const openControl = (name: string) => screen.getByRole("button", { name: `Open ${name} agent` });
 
 /**
- * PRD #1105 M6 — opening a NON-SELECTED deck's agent.
+ * PRD #1105 — the pane names a deck as well as an agent, and everything it
+ * reads is addressed by that pair.
  *
- * The overview merges every observed deck, while a tile's terminal is always
- * the selected deck's — so this is the one path where the pane and the deck in
- * force disagree, and the whole milestone is about closing that disagreement
- * and then putting the selection back.
+ * # What this file is, and what it used to be
+ *
+ * It was `CrossDeckAgentPane.test.tsx`, and it covered opening a NON-SELECTED
+ * deck's agent by switching the selected deck first and reverting on close.
+ * That behaviour was **descoped** after two security audits: the switch left
+ * state created under deck A attributed to deck B, because identity was read
+ * from the current selection at use time rather than captured at creation. The
+ * overview now renders no open control for a non-selected deck's agent at all
+ * (`components/AgentOverview.test.tsx` has that), and cross-deck opening
+ * belongs to [#1073](https://github.com/vfarcic/dot-agent-deck/issues/1073).
+ *
+ * What survives is everything that is **not** about opening across decks: the
+ * pane's own composite lookup, the identity fence that refuses to retarget it,
+ * and the composite keying of the terminal state it reads. Those close a
+ * defect the overlay did not cause and cannot reach — the selected deck moves
+ * for reasons that are nobody's gesture, and agent ids collide across decks
+ * whether or not a pane is open.
  */
-describe("cross-deck agent pane", () => {
+describe("agent pane deck identity", () => {
   beforeEach(() => {
     window.localStorage.clear();
     viewportProps.length = 0;
   });
 
   /**
-   * Scenario: with All Decks selected and the local deck in force, open the
-   * build-box deck's Planner from the overview. The app writes the settings
-   * document once, moving the selection to that deck's stored row and changing
-   * nothing else; then, once the switch has taken effect, it closes the pane
-   * and writes the document back. The DTO after the round trip is equal to the
-   * one it started from, remote rows included.
+   * Scenario: open an agent's pane from the overview and close it again. The
+   * settings document is never written — opening a pane is navigation, and a
+   * navigation that rewrites `desktop.toml` is what the descope removed.
    *
-   * **What this establishes, stated at its real width** (PRD #1105's security
-   * audit). `onDisk` below is an in-memory object and both saves are mocked, so
-   * what round-trips here is the **settings DTO** — every field this app sends
-   * and reads back, which is what "a selection move asserts nothing about the
-   * stored rows" needs. It is NOT a claim about the bytes of `desktop.toml`,
-   * and that claim would be false: `desktop_set_settings` re-reads the file
-   * into a `toml::Table` and rewrites it with `toml::to_string_pretty`
-   * (`desktop/src-tauri/src/settings.rs`), and a `Table` represents neither
-   * comments nor the original layout. So a hand-formatted or commented document
-   * is rewritten by the first automatic cross-deck switch, and the second write
-   * goes down the same path and restores nothing. Semantically identical, byte
-   * for byte not.
+   * This is the guard on the descope rather than a restatement of it. The
+   * withdrawn implementation wrote the selection on open and wrote it back on
+   * close, through `desktop_set_settings` — which persists to disk before it
+   * applies, so a reader who hand-formatted or commented that file lost both.
+   * Nothing on this path may write it again without turning this red.
    */
-  it("switches the selected deck on open and restores the settings DTO unchanged on close", async () => {
+  it("writes no settings document when a pane opens or closes", async () => {
     const deck = harness();
     const before = JSON.stringify(deck.onDisk());
-    const { rerender } = render(<DeckShell runtime={deck.runtime("local")} initialView={{ kind: "overview" }} />);
-    await waitFor(() => expect(deck.saveSettings).not.toHaveBeenCalled());
-
-    fireEvent.click(openControl("Plan / architecture on build-box"));
-    await waitFor(() => expect(deck.saveSettings).toHaveBeenCalledTimes(1));
-
-    const switched = deck.savedDocuments()[0];
-    expect(switched.endpoints).toEqual({ remote: [remoteRow], selection: REMOTE_ROW_ID });
-    // Everything else the document says is untouched — a deck switch is a
-    // selection move and nothing more, and `endpointSectionToSave` is what
-    // keeps it from asserting `remote: []` over rows it never rendered.
-    expect({ ...switched, endpoints: undefined }).toEqual({ ...JSON.parse(before), endpoints: undefined });
-
-    // The crate applies the save: it detaches every session and the newly
-    // selected deck becomes the one the single-deck surfaces are on.
-    await act(async () => { rerender(<DeckShell runtime={deck.runtime("remote")} initialView={{ kind: "overview" }} />); });
-    expect(screen.getByTestId("agent-pane-overlay")).toBeVisible();
-
-    fireEvent.click(within(screen.getByTestId("agent-pane-overlay")).getByRole("button", { name: "Close Planner on build-box agent" }));
-    await waitFor(() => expect(deck.saveSettings).toHaveBeenCalledTimes(2));
-
-    expect(JSON.stringify(deck.onDisk())).toBe(before);
-  });
-
-  /**
-   * Scenario: open an agent on the deck that is ALREADY selected, from the
-   * overview, and close it again. Nothing is written: a switch costs a disk
-   * write and a full terminal teardown on the crate's side, so the path that
-   * does not need one must not take it.
-   */
-  it("writes nothing when the pane's deck is already the selected one", async () => {
-    const deck = harness();
     render(<DeckShell runtime={deck.runtime("local")} initialView={{ kind: "overview" }} />);
     await waitFor(() => expect(deck.saveSettings).not.toHaveBeenCalled());
 
@@ -192,92 +162,96 @@ describe("cross-deck agent pane", () => {
 
     await waitFor(() => expect(screen.queryByTestId("agent-pane-overlay")).not.toBeInTheDocument());
     expect(deck.saveSettings).not.toHaveBeenCalled();
+    expect(JSON.stringify(deck.onDisk())).toBe(before);
   });
 
   /**
-   * Scenario: two stored rows describe the same address, so the deck the pane
-   * wants cannot be named from this document — `dev@build-box` matches both and
-   * neither is more likely than the other. The app opens the pane and writes
-   * nothing rather than selecting one of them.
+   * Scenario: an overview-origin pane is open on the local deck's Planner when
+   * the selected deck moves to build-box, which runs a Planner of its own with
+   * the same per-daemon monotonic id. The pane keeps showing the agent it was
+   * opened for — the heading still names the local deck's Planner — rather
+   * than adopting the arriving deck's namesake.
    *
-   * The refusal is the safe direction and not timidity: agent ids are
-   * per-daemon monotonic, so selecting the wrong row would attach a different
-   * machine's agent of the same id under the right name.
+   * # Why this path exists at all after the descope
+   *
+   * The overview offers no control that opens a non-selected deck's agent, so
+   * a pane always starts on the selected deck. It does not always stay there:
+   * a `selectionFallback` the crate reports, another window writing the
+   * settings document, or a reconnect can move the selection with no gesture
+   * in this window. `OverviewAgentPane` resolves its agent from the fleet entry
+   * `view.deckId` names, so the pane's identity survives that; a bare-id lookup
+   * would read the SELECTED deck's snapshot and silently find build-box's
+   * Planner instead, under the heading the user opened.
+   *
+   * It keeps its identity and loses its terminal, which is the honest outcome:
+   * `overviewShown` declares nothing while the pane's deck is not in force, so
+   * nothing attaches on the wrong machine.
    */
-  it("does not guess when two stored rows describe the pane's deck", async () => {
-    const ambiguous = documentWithFleet();
-    ambiguous.endpoints = {
-      remote: [structuredClone(remoteRow), { ...structuredClone(remoteRow), id: "row-build-box-2", socket: "/run/other.sock" }],
-      selection: ALL_ENDPOINT_SELECTION,
-    };
-    const deck = harness(ambiguous);
-    render(<DeckShell runtime={deck.runtime("local")} initialView={{ kind: "overview" }} />);
-    await waitFor(() => expect(deck.saveSettings).not.toHaveBeenCalled());
+  it("keeps an overview pane on the agent the view names when the selection moves under it", async () => {
+    const deck = harness();
+    const { rerender } = render(<DeckShell runtime={deck.runtime("local")} initialView={{ kind: "overview" }} />);
+    await waitFor(() => expect(deck.setShownTerminals).toHaveBeenCalledTimes(1));
 
-    fireEvent.click(openControl("Plan / architecture on build-box"));
-    await act(async () => { await Promise.resolve(); });
+    fireEvent.click(openControl("Plan / architecture"));
+    expect(within(screen.getByTestId("agent-pane-overlay")).getByRole("heading", { name: "Planner" })).toBeVisible();
 
-    expect(screen.getByTestId("agent-pane-overlay")).toBeVisible();
-    expect(deck.saveSettings).not.toHaveBeenCalled();
+    await act(async () => { rerender(<DeckShell runtime={deck.runtime("remote")} initialView={{ kind: "overview" }} />); });
+
+    const pane = screen.getByTestId("agent-pane-overlay");
+    expect(within(pane).getByRole("heading", { name: "Planner" })).toBeVisible();
+    expect(within(pane).queryByRole("heading", { name: "Planner on build-box" })).toBeNull();
+    // And nothing of this app's is attached on the deck that IS in force: the
+    // declaration for the pane's agent is withdrawn rather than re-pointed.
+    expect(deck.setShownTerminals).toHaveBeenLastCalledWith([]);
   });
 
   /**
-   * Scenario: the pane's identity is composite, so the pane opened for the
-   * build-box deck's `planner` shows THAT deck's agent — not the identically
-   * identified `planner` on the deck that is still in force while the switch is
-   * being applied.
+   * Scenario: the local deck's Planner has a `wrong-session` verdict recorded
+   * against it and a geometry the daemon applied to it — filed both under the
+   * bare agent id and under the local deck's composite key. Open build-box's
+   * Planner, on build-box, which is the same id on another machine. Its pane
+   * carries neither: no rejection notice, no disabled input, and no inherited
+   * grid to submit to that agent's PTY.
+   *
+   * The bare-keyed decoy is what makes this discriminate. Both maps are keyed
+   * by `agentKey(deckId, agentId)` in production, so a fixture holding only
+   * composite keys would pass against a bare-id lookup too — it would simply
+   * find nothing. A bare `"planner"` entry is the state a reverted production
+   * would read.
    */
-  it("resolves the pane's agent on the deck the view names, not on the selected one", async () => {
-    const deck = harness();
-    render(<DeckShell runtime={deck.runtime("local")} initialView={{ kind: "overview" }} />);
+  it("reads neither the verdict nor the geometry recorded for another deck's namesake", async () => {
+    const deck = harness(
+      documentWithFleet(),
+      {
+        terminalInputResults: {
+          planner: "wrong-session",
+          [agentKey(FIXTURE_DAEMON_ID, "planner")]: "wrong-session",
+        },
+        appliedGeometry: {
+          planner: { rows: 24, cols: 80 },
+          [agentKey(FIXTURE_DAEMON_ID, "planner")]: { rows: 24, cols: 80 },
+        },
+      },
+      // Writable and running on BOTH decks, so the notice below can only come
+      // from the leaked verdict: `terminalInputState` reads the lease first and
+      // the fixture's default `read` lease would print the same sentence for a
+      // reason that has nothing to do with this fix.
+      (agent) => (agent.id === "planner" ? { ...agent, status: "running", writeLease: "write" } : agent),
+    );
+    render(<DeckShell runtime={deck.runtime("remote")} initialView={{ kind: "overview" }} />);
     await waitFor(() => expect(deck.saveSettings).not.toHaveBeenCalled());
 
     fireEvent.click(openControl("Plan / architecture on build-box"));
 
     const pane = screen.getByTestId("agent-pane-overlay");
     expect(within(pane).getByRole("heading", { name: "Planner on build-box" })).toBeVisible();
-  });
-
-  /**
-   * The M6 ORDERING TEST, and the question it exists to answer: across the
-   * overview round trip, is there an interval in which the app has declared
-   * something the bridge cannot honour — a shown terminal on a deck that is not
-   * in force, or a shown set left stale after the switch?
-   *
-   * The adverse interval is the one between the save and the crate applying it.
-   * `terminal::attach` attaches against `trusted_daemon` — whichever deck is
-   * linked at the instant it runs — and the ids collide across decks, so a
-   * declaration made in that interval would attach the OLD deck's `planner`,
-   * which the switch then detaches. Repair would wait on an `End` and a
-   * snapshot, in an order nothing guarantees.
-   *
-   * What this asserts is that the interval is never entered: the owner declares
-   * the empty set until the pane's deck IS the selected one, then declares that
-   * one agent exactly once, then the empty set again on close. Three commits,
-   * three declarations, none of them against the wrong deck.
-   */
-  it("declares no terminal on the pane's deck until that deck is the one in force", async () => {
-    const deck = harness();
-    const { rerender } = render(<DeckShell runtime={deck.runtime("local")} initialView={{ kind: "overview" }} />);
-    await waitFor(() => expect(deck.setShownTerminals).toHaveBeenCalledTimes(1));
-    expect(deck.setShownTerminals).toHaveBeenLastCalledWith([]);
-
-    fireEvent.click(openControl("Plan / architecture on build-box"));
-    await waitFor(() => expect(deck.saveSettings).toHaveBeenCalledTimes(1));
-
-    // The pane is up, the save is out, and the local deck is still in force.
-    // Nothing may have been declared shown in that window.
-    expect(screen.getByTestId("agent-pane-overlay")).toBeVisible();
-    expect(deck.setShownTerminals).toHaveBeenCalledTimes(1);
-
-    await act(async () => { rerender(<DeckShell runtime={deck.runtime("remote")} initialView={{ kind: "overview" }} />); });
-
-    expect(deck.setShownTerminals).toHaveBeenCalledTimes(2);
-    expect(deck.setShownTerminals).toHaveBeenLastCalledWith(["planner"]);
-
-    fireEvent.click(within(screen.getByTestId("agent-pane-overlay")).getByRole("button", { name: "Close Planner on build-box agent" }));
-    await waitFor(() => expect(deck.setShownTerminals).toHaveBeenCalledTimes(3));
-    expect(deck.setShownTerminals).toHaveBeenLastCalledWith([]);
+    // The verdict's whole user-visible consequence is this notice and the
+    // read-only input it goes with. Neither belongs to this agent.
+    expect(screen.queryByTestId("terminal-input-status-planner")).not.toBeInTheDocument();
+    const mounted = viewportProps.filter((props) => props.agentId === "planner");
+    expect(mounted).not.toHaveLength(0);
+    expect(mounted.at(-1)).toMatchObject({ deckId: REMOTE_DECK_ID });
+    expect(mounted.at(-1)?.applied).toBeUndefined();
   });
 });
 
@@ -296,6 +270,10 @@ describe("cross-deck agent pane", () => {
  * monotonic id was promoted into the open pane, its session attached, and
  * `sendTerminalInput(agentId, …)` resolved to it — under the same role, the
  * same display text, and no deck identity anywhere in the dialog.
+ *
+ * Descoping cross-deck opening does not retire either half. The selection still
+ * moves for reasons this window did not cause, and `aria-modal` is a claim that
+ * has to be true whatever the deck story.
  */
 describe("agent pane identity fence", () => {
   beforeEach(() => {
@@ -350,6 +328,12 @@ describe("agent pane identity fence", () => {
    * The last step is the one that separates a fence from a curtain: a pane that
    * only stopped RENDERING would resurrect itself on the way back, which is the
    * same retargeting one step later.
+   *
+   * A deck-origin pane CLOSES where the overview-origin pane above keeps its
+   * identity, and the difference is the screen underneath. The deck surface
+   * renders the selected deck and nothing else, so a deck-origin pane's claim —
+   * *"this agent, on the deck you are looking at"* — stops being true of
+   * anything on screen; there is nothing left for it to be a pane over.
    */
   it("closes a deck-origin pane when the selected deck moves out from under it", async () => {
     const deck = harness();
@@ -426,68 +410,14 @@ describe("agent pane identity fence", () => {
 });
 
 /**
- * PRD #1105's security audit, SHOULD-FIX — the other bare-id maps carried
- * wrong-deck state into the pane. `terminalInputResults` and `appliedGeometry`
- * were both read out of the runtime by bare agent id, so a pane opened for one
- * deck's agent answered with whatever had been recorded for another deck's
- * agent of the same id. See `CrossDeckTerminalState.test.tsx` for the runtime
- * half; this is the pane reading it.
+ * The control for every test above, stated as a fact about the fixture rather
+ * than as an argument: both decks run an agent called `planner`, so "the wrong
+ * deck's namesake" names a real, different agent on a real, different machine
+ * rather than a hypothetical one. A fixture that avoided the collision would
+ * make each of those tests pass for the wrong reason.
  */
-describe("cross-deck pane state", () => {
-  beforeEach(() => {
-    window.localStorage.clear();
-    viewportProps.length = 0;
-  });
-
-  /**
-   * Scenario: the local deck's Planner has a `wrong-session` verdict recorded
-   * against it and a geometry the daemon applied to it. Open build-box's
-   * Planner — same id, another machine — from the overview. Its pane carries
-   * neither: no rejection notice, no disabled input, and no inherited grid to
-   * submit to that agent's PTY.
-   */
-  it("reads neither the verdict nor the geometry recorded for the other deck's namesake", async () => {
-    const deck = harness(
-      documentWithFleet(),
-      {
-        terminalInputResults: { [agentKey(FIXTURE_DAEMON_ID, "planner")]: "wrong-session" },
-        appliedGeometry: { [agentKey(FIXTURE_DAEMON_ID, "planner")]: { rows: 24, cols: 80 } },
-      },
-      // Writable and running on BOTH decks, so the notice below can only come
-      // from the leaked verdict: `terminalInputState` reads the lease first and
-      // the fixture's default `read` lease would print the same sentence for a
-      // reason that has nothing to do with this fix.
-      (agent) => (agent.id === "planner" ? { ...agent, status: "running", writeLease: "write" } : agent),
-    );
-    render(<DeckShell runtime={deck.runtime("local")} initialView={{ kind: "overview" }} />);
-    await waitFor(() => expect(deck.saveSettings).not.toHaveBeenCalled());
-
-    fireEvent.click(openControl("Plan / architecture on build-box"));
-
-    const pane = screen.getByTestId("agent-pane-overlay");
-    expect(within(pane).getByRole("heading", { name: "Planner on build-box" })).toBeVisible();
-    // The verdict's whole user-visible consequence is this notice and the
-    // read-only input it goes with. Neither belongs to this agent.
-    expect(screen.queryByTestId("terminal-input-status-planner")).not.toBeInTheDocument();
-    const mounted = viewportProps.filter((props) => props.agentId === "planner");
-    expect(mounted).not.toHaveLength(0);
-    expect(mounted.at(-1)).toMatchObject({ deckId: REMOTE_DECK_ID });
-    expect(mounted.at(-1)?.applied).toBeUndefined();
-  });
-});
-
-/**
- * The control for the ordering test above: the same component tree, driven by
- * hand into the state the gate refuses to enter, so the test that proves the
- * gate holds is not merely asserting an arrangement nothing would have broken.
- *
- * This is the cost being avoided, stated as a fact about the fixture rather
- * than as an argument: both decks run an agent called `planner`, so a
- * declaration made while the wrong deck is in force is not a harmless early
- * attach — it names a real, different agent on a real, different machine.
- */
-describe("cross-deck agent ids", () => {
-  it("has the same agent id on both decks, which is what makes the ordering matter", () => {
+describe("colliding agent ids across decks", () => {
+  it("has the same agent id on both decks, which is what makes the identity fence matter", () => {
     const { local, remote } = decks();
 
     expect(local.connection.deckId).toBe(FIXTURE_DAEMON_ID);
@@ -495,4 +425,3 @@ describe("cross-deck agent ids", () => {
     expect(local.agents.map((agent) => agent.id)).toEqual(remote.agents.map((agent) => agent.id));
   });
 });
-

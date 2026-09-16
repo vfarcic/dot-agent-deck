@@ -1241,3 +1241,5 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
    clamped by its own `text-overflow` and the control never moves. */
 .overview-open-agent { flex: 0 0 auto; margin-left: auto; width: 20px; height: 20px; display: grid; place-items: center; border: 1px solid transparent; border-radius: 4px; color: var(--faint); background: transparent; cursor: pointer; }
 .overview-open-agent:hover, .overview-open-agent:focus-visible { color: var(--teal); border-color: var(--teal-focus); background: var(--teal-soft); }
+/* The row that offers no open control, and says why. Not a disabled button — see `OverviewRow`. */
+.overview-open-elsewhere { flex: 0 0 auto; margin-left: auto; color: var(--faint); font-size: 9px; font-style: normal; white-space: nowrap; cursor: help; }

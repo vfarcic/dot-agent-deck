@@ -12,7 +12,7 @@ import { expect, test } from "@playwright/test";
  * same role and display text, with the user's keystrokes following it.
  *
  * The vitest tier can assert that the `inert` attribute is applied — it does,
- * in `src/CrossDeckAgentPane.test.tsx` — and can assert nothing about what the
+ * in `src/AgentPaneDeckIdentity.test.tsx` — and can assert nothing about what the
  * attribute DOES, because jsdom implements no focus semantics for it. So the
  * claim that actually matters, that Tab cannot leave the pane, is only
  * observable here, against a real engine's tab order. Both engines, because

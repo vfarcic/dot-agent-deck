@@ -47,7 +47,6 @@ import { useDeckRuntime } from "./hooks/useDeckRuntime";
 import { useDaemonProjects } from "./hooks/useDaemonProjects";
 import { usePromptLibrary } from "./hooks/usePromptLibrary";
 import { useDesktopSettings, type DesktopSettingsState } from "./hooks/useDesktopSettings";
-import { useCrossDeckSelection } from "./hooks/useCrossDeckSelection";
 import { useInertBackground } from "./hooks/useInertBackground";
 import { useShownTerminals } from "./hooks/useShownTerminals";
 import { useZoom } from "./hooks/useZoom";
@@ -181,17 +180,6 @@ export function DeckShell({ runtime, workflowPlatformIssue, initialView = { kind
   }, [agentView, closeAgent]);
   const base = agentView?.from ?? view.kind;
   /**
-   * PRD #1105 M6 — the cross-deck round trip. A no-op on every path but one:
-   * the pane's deck is compared against the selected deck first, and a
-   * deck-origin pane's agent is always on the selected deck.
-   */
-  useCrossDeckSelection({
-    settings,
-    fleet: runtime.fleet,
-    selectedDeckId: runtime.snapshot.connection.deckId,
-    openDeckId: agentView?.deckId,
-  });
-  /**
    * PRD #1105 M4 — the shown set for the OVERVIEW tree, declared here because
    * this is the only component that can see the overview and the pane over it
    * in one commit. `undefined` on the deck path hands ownership to
@@ -200,14 +188,19 @@ export function DeckShell({ runtime, workflowPlatformIssue, initialView = { kind
    * The pane's agent is declared shown only once its deck IS the selected one,
    * and that condition is load-bearing rather than defensive. Attach targets
    * whichever deck is linked at the instant it runs (`terminal::attach` takes
-   * `trusted_daemon`), the M6 switch above is a disk write and a re-link away,
-   * and agent ids are per-daemon monotonic integers — so declaring `[agentId]`
-   * while the previous deck is still in force attaches *that* deck's agent of
-   * the same id. The fleet fixture has a `planner` on two decks, which is the
-   * ordinary case and not a contrived one.
+   * `trusted_daemon`), and agent ids are per-daemon monotonic integers — so
+   * declaring `[agentId]` while another deck is in force attaches *that* deck's
+   * agent of the same id, on another machine, under the right name. The fleet
+   * fixture has a `planner` on two decks, which is the ordinary case and not a
+   * contrived one.
    *
-   * On the same-deck path the condition is already true when the pane opens, so
-   * it costs nothing there.
+   * **Since cross-deck opening was descoped, the overview offers no control
+   * that opens a non-selected deck's agent**, so this condition is true at
+   * open time on every supported path and costs nothing there. It stays
+   * because the selected deck can still move under an open pane for reasons
+   * that are nobody's gesture — a `selectionFallback` the crate reports,
+   * another window writing the settings document — and an attach declared
+   * across that move is exactly the invisible wrong-target attach above.
    */
   const overviewShown = base === "overview"
     ? (agentView && agentView.deckId === runtime.snapshot.connection.deckId ? [agentView.agentId] : [])
