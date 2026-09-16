@@ -774,13 +774,19 @@ fn is_hooks_list_response(value: &Value) -> bool {
 /// peer that floods messages makes the loop iterate faster, not for longer —
 /// each iteration consumes one message and the total wait is still capped at
 /// [`HOOKS_LIST_TIMEOUT`]. What the loop *accumulates* is bounded too, which is
-/// [`SkippedLog`]'s whole job: it counts every skip and names only the first few.
+/// [`SkippedLog`]'s whole job: it counts every skip and names only the first few,
+/// each field clipped to [`MAX_FIELD`] so the peer chooses neither how many
+/// descriptions we keep nor how long one is. What the loop *writes* is bounded by
+/// [`MAX_DECLINES`], which is what stops a synchronous `writeln!` onto a stdin
+/// nobody is draining from blocking past `deadline` — both bounds are Greptile
+/// P2s on PR #1124, and both were holes in the first version of this fix.
 fn read_hooks_list_reply(
     rx: &mpsc::Receiver<String>,
     to_server: &mut dyn io::Write,
     deadline: Instant,
 ) -> std::io::Result<Vec<CodexHookEntry>> {
     let mut skipped = SkippedLog::default();
+    let mut declines = 0_usize;
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
@@ -791,7 +797,9 @@ fn read_hooks_list_reply(
                 Ok(value) if is_hooks_list_response(&value) => return parse_hooks_list(&value),
                 Ok(value) => {
                     skipped.record(&value);
-                    decline_server_request(&value, to_server);
+                    if declines < MAX_DECLINES && decline_server_request(&value, to_server) {
+                        declines += 1;
+                    }
                 }
                 Err(_) => skipped.record_unparsable(),
             },
@@ -809,6 +817,48 @@ fn read_hooks_list_reply(
     }
 }
 
+/// Longest peer-supplied field this module will repeat into a log line or an
+/// outgoing reply.
+///
+/// `method` and `id` come off the wire, so anything that echoes them is as long
+/// as the peer chose to make it. Naming only eight messages bounds the COUNT and
+/// not the SIZE, which is half a bound (Greptile P2 on PR #1124).
+const MAX_FIELD: usize = 80;
+
+/// Longest `id` [`decline_server_request`] will echo back.
+///
+/// JSON-RPC says a response echoes the request's id verbatim, so this one cannot
+/// be clipped and still be correct — an absurd id is therefore not answered at
+/// all, which is exactly the pre-#1033 behaviour for that message and costs a
+/// request nobody sane sends.
+const MAX_ID_BYTES: usize = 128;
+
+/// How many requests one [`read_hooks_list_reply`] call will answer.
+///
+/// **This is what keeps a blocking write from outliving `deadline`** (Greptile
+/// P2 on PR #1124). `writeln!` onto the child's stdin is synchronous, so a peer
+/// that stops reading its own stdin could fill the pipe and block us with the
+/// deadline unchecked — and a wedged peer is precisely the case this code exists
+/// for, so that is not a hypothetical shape. With the two caps above, one reply
+/// is at most ~`MAX_ID_BYTES + MAX_FIELD` plus a fixed envelope, so this many of
+/// them is a few KB against a pipe buffer of 64 KiB on Linux: the write cannot
+/// fill it and therefore cannot block. Answering the first few is also all the
+/// fix needs — the point is to release a server WAITING on an outstanding
+/// request, and a peer that sends hundreds is not waiting on one.
+const MAX_DECLINES: usize = 8;
+
+/// Clip a peer-supplied string to [`MAX_FIELD`], on a char boundary.
+fn clip(text: &str) -> String {
+    if text.len() <= MAX_FIELD {
+        return text.to_string();
+    }
+    let mut end = MAX_FIELD;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &text[..end])
+}
+
 /// How many messages [`read_hooks_list_reply`] skipped, and what the first few
 /// were, so a failure can say what arrived *instead of* the reply.
 ///
@@ -819,9 +869,11 @@ fn read_hooks_list_reply(
 /// Formatting happens only on the failure paths, so a call that succeeds pays
 /// for nothing but the counting.
 ///
-/// Bounded deliberately: `total` counts every skip while `named` holds at most
-/// [`SKIPPED_NAMES`] descriptions, so a peer that floods the stream cannot grow
-/// this — the same property the read loop's `deadline` gives the wait.
+/// Bounded deliberately, in BOTH directions: `total` counts every skip while
+/// `named` holds at most [`SKIPPED_NAMES`] descriptions, and each description
+/// clips its peer-supplied fields to [`MAX_FIELD`]. Capping the count alone was
+/// half a bound — eight descriptions of a megabyte apiece is still a megabyte of
+/// log line, and `method` and `id` come straight off the wire.
 #[derive(Default)]
 struct SkippedLog {
     total: usize,
@@ -883,9 +935,11 @@ impl SkippedLog {
 fn describe_message(value: &Value) -> String {
     let id = value.get("id").filter(|id| !id.is_null());
     match (value.get("method").and_then(Value::as_str), id) {
-        (Some(method), Some(id)) => format!("request {method} id={id}"),
-        (Some(method), None) => format!("notification {method}"),
-        (None, Some(id)) => format!("response id={id}"),
+        (Some(method), Some(id)) => {
+            format!("request {} id={}", clip(method), clip(&id.to_string()))
+        }
+        (Some(method), None) => format!("notification {}", clip(method)),
+        (None, Some(id)) => format!("response id={}", clip(&id.to_string())),
         (None, None) => "message with neither method nor id".to_string(),
     }
 }
@@ -903,23 +957,33 @@ fn describe_message(value: &Value) -> String {
 /// an app-server accepts such a line on stdin without complaint and still answers
 /// `initialize` and `hooks/list` normally, so answering cannot cost us the case
 /// that already works.
-fn decline_server_request(value: &Value, to_server: &mut dyn io::Write) {
+fn decline_server_request(value: &Value, to_server: &mut dyn io::Write) -> bool {
     let Some(method) = value.get("method").and_then(Value::as_str) else {
-        return;
+        return false;
     };
     let Some(id) = value.get("id").filter(|id| !id.is_null()) else {
-        return;
+        return false;
     };
+    // An id too large to echo is left unanswered rather than answered wrongly;
+    // see `MAX_ID_BYTES`. Checked BEFORE building the reply so the oversized
+    // value is never copied into one.
+    if id.to_string().len() > MAX_ID_BYTES {
+        return false;
+    }
     let decline = json!({
         "jsonrpc": "2.0",
         "id": id,
         "error": {
             "code": -32601,
-            "message": format!("dot-agent-deck implements no server-initiated method ({method})"),
+            "message": format!(
+                "dot-agent-deck implements no server-initiated method ({})",
+                clip(method)
+            ),
         }
     });
     // Discarded deliberately — see `read_hooks_list_reply`.
     let _ = writeln!(to_server, "{decline}").and_then(|()| to_server.flush());
+    true
 }
 
 /// Decode the `id: 2` `hooks/list` reply into entries, tolerating both the
@@ -2319,6 +2383,84 @@ mod tests {
             message.matches("notification codex/event/").count(),
             SKIPPED_NAMES,
             "exactly SKIPPED_NAMES messages may be named; got {message}"
+        );
+    }
+
+    /// A peer cannot choose how LONG a named description is, only that there is
+    /// one (Greptile P2 on PR #1124).
+    ///
+    /// Capping the count alone left half a bound: `method` and `id` come off the
+    /// wire, so eight descriptions of a megabyte apiece is still a megabyte of
+    /// log line — written by whatever is on the other end of the pipe.
+    #[test]
+    fn a_huge_peer_field_is_clipped_out_of_the_description() {
+        let (tx, rx) = mpsc::channel::<String>();
+        let huge_method = "m".repeat(50_000);
+        let huge_id = "i".repeat(50_000);
+        tx.send(json!({"jsonrpc": "2.0", "method": huge_method, "id": huge_id}).to_string())
+            .expect("queue a line");
+
+        let err = read_hooks_list_reply(
+            &rx,
+            &mut Vec::new(),
+            Instant::now() + Duration::from_millis(250),
+        )
+        .expect_err("no reply must fail the call");
+        drop(tx);
+
+        let message = err.to_string();
+        assert!(
+            message.len() < 1_000,
+            "a 100 KB pair of peer fields must not reach the log; message was {} bytes",
+            message.len()
+        );
+        assert!(
+            message.contains('…'),
+            "the clip must be visible rather than silent; got {message}"
+        );
+    }
+
+    /// A flood of REQUESTS draws at most [`MAX_DECLINES`] replies, and an
+    /// unechoable id draws none (Greptile P2 on PR #1124).
+    ///
+    /// `writeln!` onto the child's stdin is synchronous, so a peer that stops
+    /// draining its own stdin could fill the pipe and block the loop with
+    /// `deadline` unchecked — and a wedged peer is the very case this code is
+    /// for. The cap is what keeps everything this call can write far inside a
+    /// 64 KiB pipe buffer, so the write cannot fill it and therefore cannot
+    /// block.
+    #[test]
+    fn a_flood_of_requests_draws_a_bounded_number_of_replies() {
+        let (tx, rx) = mpsc::channel::<String>();
+        for i in 0..(MAX_DECLINES + 20) {
+            tx.send(json!({"jsonrpc": "2.0", "method": "server/ask", "id": i}).to_string())
+                .expect("queue a line");
+        }
+        // An id too large to echo verbatim is not answered at all.
+        tx.send(
+            json!({"jsonrpc": "2.0", "method": "server/ask", "id": "x".repeat(4096)}).to_string(),
+        )
+        .expect("queue a line");
+
+        let mut sent = Vec::new();
+        read_hooks_list_reply(&rx, &mut sent, Instant::now() + Duration::from_millis(250))
+            .expect_err("no reply must fail the call");
+        drop(tx);
+
+        let sent = String::from_utf8(sent).expect("replies are utf-8");
+        assert_eq!(
+            sent.lines().count(),
+            MAX_DECLINES,
+            "at most MAX_DECLINES replies may be written; got {sent:?}"
+        );
+        assert!(
+            sent.len() < 4_096,
+            "everything written must stay far inside a 64 KiB pipe buffer; wrote {} bytes",
+            sent.len()
+        );
+        assert!(
+            !sent.contains(&"x".repeat(200)),
+            "an id too large to echo must draw no reply at all"
         );
     }
 }
