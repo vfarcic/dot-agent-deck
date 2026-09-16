@@ -1868,7 +1868,16 @@ enum PayloadDelivery {
     /// Some bytes were written but the sequence did not complete — a partial
     /// write. The bytes may already have reached the target; the caller must NOT
     /// blind-retry (that could duplicate the partial input).
-    Ambiguous,
+    ///
+    /// Issue #876: `stranded` is how many PAYLOAD bytes are believed to be
+    /// sitting un-submitted in the target's input box once
+    /// [`drain_stranded_payload`] has had its attempt — `0` when every byte that
+    /// landed was taken straight back out, and the count that landed when the
+    /// drain abstained or failed. The delivery is ambiguous either way (the
+    /// agent still SAW those bytes, whatever its editor then did with them), so
+    /// this narrows what the daemon has to record about the pane, not what it
+    /// reports to the caller.
+    Ambiguous { stranded: usize },
     /// The very first byte could not be written — nothing reached the target, so
     /// a retry is safe. Carries the error text for surfacing.
     CleanFailure(String),
@@ -1877,8 +1886,11 @@ enum PayloadDelivery {
 /// How far a single `write_all`-style loop got before an error.
 enum WriteProgress {
     Complete,
-    /// >0 bytes written, then an error / write-zero.
-    Partial,
+    /// At least one byte written, then an error / write-zero. Carries the count,
+    /// which is what issue #876's drain needs: the bytes the writer ACCEPTED are
+    /// exactly the ones now sitting in the target's input box, so an exact undo
+    /// is only possible while this number is kept rather than thrown away.
+    Partial(usize),
     /// 0 bytes written — the first write failed (nothing reached the target).
     NothingWritten(String),
 }
@@ -1894,7 +1906,7 @@ fn write_all_tracked(w: &mut (dyn std::io::Write + Send), buf: &[u8]) -> WritePr
                 return if written == 0 {
                     WriteProgress::NothingWritten("writer accepted zero bytes".to_string())
                 } else {
-                    WriteProgress::Partial
+                    WriteProgress::Partial(written)
                 };
             }
             Ok(n) => written += n,
@@ -1903,7 +1915,7 @@ fn write_all_tracked(w: &mut (dyn std::io::Write + Send), buf: &[u8]) -> WritePr
                 return if written == 0 {
                     WriteProgress::NothingWritten(e.to_string())
                 } else {
-                    WriteProgress::Partial
+                    WriteProgress::Partial(written)
                 };
             }
         }
@@ -1911,11 +1923,157 @@ fn write_all_tracked(w: &mut (dyn std::io::Write + Send), buf: &[u8]) -> WritePr
     WriteProgress::Complete
 }
 
+/// Issue #876: `DEL`, the byte a terminal sends for the Backspace key under the
+/// default `stty erase ^?`, and so the byte an agent TUI reading from a PTY has
+/// to read as "erase the character before the cursor" for its own users to be
+/// able to fix a typo.
+///
+/// **That is an assumption about the agent, and it is the one this drain rests
+/// on**, so it is written down rather than implied. It is not a blind one — the
+/// terminal libraries the agents this project drives are built on all decode it
+/// that way (crossterm's `KeyCode::Backspace`, Ink's `key.backspace`, bubbletea's
+/// `KeyBackspace`), and `erase_bytes_undo_exactly_our_write_and_leave_the_users_draft`
+/// pins it against the kernel's own line discipline, whose `CERASE` is this
+/// byte. But an agent that answered only to `0x08` would swallow the erases,
+/// leave the payload in its box, and — because the drain reports success — lose
+/// the payload record that issue #715 put there. Sending both bytes is not the
+/// remedy: a TUI honouring each would then delete twice as much as we wrote,
+/// which is the one thing an exact undo may never do.
+///
+/// Deliberately NOT `Ctrl+U`. A kill-line is the obvious drain and it is the
+/// wrong one twice over: its binding genuinely varies across agent TUIs (a byte
+/// that is not a line-kill is still input), and even where it IS a line-kill it
+/// takes the whole line, including a draft the user typed BEFORE our write and
+/// that our payload was appended to. An exact number of erases removes exactly
+/// our characters and nothing else, which is what makes draining a partial write
+/// defensible at all — see [`drain_stranded_payload`].
+const PANE_ERASE_BYTE: u8 = 0x7f;
+
+/// Issue #876: the largest partial write the daemon will try to erase.
+///
+/// Every erase is a keypress the agent's TUI has to process and re-render, so a
+/// very large burst is both slow and the shape most likely to be mistaken for a
+/// paste by a TUI that heuristically classifies bulk input. The three one-shot
+/// SUBMIT-mode payloads that reach this path are a fixed one-line pointer and
+/// two composed single-line reports, all comfortably under this; a spawn-time
+/// prompt can be far larger, and for those the honest answer is to report the
+/// stranded bytes rather than to fire thousands of erases at a pane.
+const MAX_DRAINABLE_STRANDED_BYTES: usize = 1024;
+
+/// Issue #876: take a partial write's bytes back OUT of the target's input box,
+/// returning how many of them are still believed to be sitting in it (`0` on a
+/// complete drain).
+///
+/// # Why this exists
+///
+/// An `Ambiguous` submit leaves payload bytes un-submitted in the pane's input
+/// box and, before this, nothing anywhere removed them. Issue #715 stopped those
+/// bytes being merged into a LATER turn by keeping the payload record — but a
+/// record is not an empty box, and the record's guard lapses with
+/// [`PAYLOAD_RECORD_TTL`] (60 s) while the bytes persist indefinitely, so at
+/// T+61 s the next byte-identical write was admitted and submitted the leftovers
+/// plus the user's unsent draft as one turn (issue #876). Draining is the only
+/// thing that actually removes them; making the record untimed instead is the
+/// pre-#424 design and its own prompt-loss failure (see
+/// [`AutomaticWrite::payloads`]).
+///
+/// # Why it cannot destroy what the user typed
+///
+/// Two independent reasons, and both are needed:
+///
+/// * **It runs inside the writer's critical section.** The caller holds the
+///   target's [`PaneWriter`] across the failed write and this drain, and the
+///   attach input path reaches the PTY through that same mutex (it is the whole
+///   point of [`PaneWriter`] — issue #424 H1) — so no keystroke of the user's
+///   can REACH the pane between our partial write and this erase, however fast
+///   they type. That is a property of the lock rather than of a sampled clock,
+///   which is what distinguishes it from the guard at the top of
+///   [`AgentPtyRegistry::write_and_submit_guarded`].
+/// * **It erases a COUNT, not a line.** A draft the user typed *before* our
+///   write is still in the box underneath our bytes, and our payload was
+///   appended at the cursor. Erasing exactly as many characters as we wrote puts
+///   the cursor back where it started and leaves that draft byte-for-byte
+///   intact. A kill-line would take it.
+///
+/// # When it abstains, and why each condition is needed
+///
+/// * **Not every landed byte is printable ASCII** (`0x20..=0x7e`). This is the
+///   condition that makes "one byte written" equal "one erase" without needing
+///   to know how the agent's editor steps backwards: a printable-ASCII prefix is
+///   complete, well-formed UTF-8 whose every character is its own grapheme
+///   cluster, so a char-stepping editor and a grapheme-aware one remove the same
+///   amount. It also puts the TUI's escape parser and UTF-8 decoder in their
+///   ground state at the cut, so an erase byte that follows is read as a
+///   keypress rather than swallowed as an escape-sequence parameter or a UTF-8
+///   continuation byte. A partial write that stops inside an `ESC[200~` paste
+///   marker, or halfway through a multi-byte character, fails exactly this test.
+/// * **The burst would exceed [`MAX_DRAINABLE_STRANDED_BYTES`]** — see there.
+/// * **The flush that proves the bytes reached the target fails.** `write`
+///   returning a count only means the writer accepted them; the drain's whole
+///   arithmetic is about bytes that are really in the box, so an erase count is
+///   only earned once they are known to have left us.
+/// * **The erases themselves do not all land.** The writer just failed, so this
+///   is the ordinary case for a dead PTY; whatever could not be erased is
+///   reported back as still stranded.
+///
+/// In every abstaining case the caller keeps issue #715's payload record and
+/// reports the pane, which is the pre-#876 behaviour, bounded and now stated
+/// rather than silent.
+async fn drain_stranded_payload(w: &mut (dyn std::io::Write + Send), landed: &[u8]) -> usize {
+    if landed.is_empty() {
+        return 0;
+    }
+    if landed.len() > MAX_DRAINABLE_STRANDED_BYTES
+        || !landed.iter().all(|b| (0x20..=0x7e).contains(b))
+    {
+        return landed.len();
+    }
+    // Accepted by the writer is not the same as delivered to the PTY. Only a
+    // successful flush turns the count above into a fact about the input box.
+    if w.flush().is_err() {
+        return landed.len();
+    }
+    // The same reason [`SUBMIT_DELAY`] exists on the submit CR: agent TUIs
+    // classify input partly by how it arrives, and an erase burst fused to the
+    // text it is undoing is the shape a bulk-input heuristic is most likely to
+    // read as a paste. Cheap here — this only ever runs on a write that has
+    // already failed.
+    tokio::time::sleep(SUBMIT_DELAY).await;
+    let erases = vec![PANE_ERASE_BYTE; landed.len()];
+    let erased = match write_all_tracked(w, &erases) {
+        WriteProgress::Complete => landed.len(),
+        WriteProgress::Partial(n) => n,
+        WriteProgress::NothingWritten(_) => 0,
+    };
+    // The same reasoning as the flush above, in the other direction: erases the
+    // writer accepted but could not deliver did not clear anything. There is no
+    // way to tell how many of them got out, so the honest answer is the
+    // conservative one — report the whole write as still stranded, which keeps
+    // issue #715's record and reports the pane. The cost of being wrong that way
+    // is a suppressed repeat for at most `PAYLOAD_RECORD_TTL`; the cost of being
+    // wrong the other way is the record gone and the bytes still there.
+    if w.flush().is_err() {
+        return landed.len();
+    }
+    landed.len() - erased
+}
+
 /// PRD #20 R20-004 (finding #3): write `payload`, wait `SUBMIT_DELAY`, then write
 /// a submit CR — reporting a partial write as [`PayloadDelivery::Ambiguous`]
 /// rather than a clean failure. Extracted from
 /// [`AgentPtyRegistry::write_and_submit_guarded`] so the ambiguity classification
 /// is unit-testable against a fault-injecting writer.
+///
+/// Issue #876: on either ambiguous path it now also attempts to erase whatever
+/// landed back out of the target's input box, and reports how much is left —
+/// see [`drain_stranded_payload`]. Note what that leaves provable and what it
+/// does not: a submit CR is ONE byte, so `write_all_tracked` can only report it
+/// `Complete` or `NothingWritten` and never `Partial`. Reaching either ambiguous
+/// arm below therefore means no submit CR was ever accepted by the writer, so
+/// the box is certainly NOT already empty and the erases cannot be landing on
+/// text of the user's. What stays genuinely ambiguous is what the agent's editor
+/// did with the bytes while they were there, which is why the outcome is
+/// unchanged.
 async fn deliver_payload_and_submit(
     w: &mut (dyn std::io::Write + Send),
     payload: &[u8],
@@ -1923,7 +2081,11 @@ async fn deliver_payload_and_submit(
     match write_all_tracked(w, payload) {
         WriteProgress::Complete => {}
         // Payload partially written — bytes may have reached the PTY.
-        WriteProgress::Partial => return PayloadDelivery::Ambiguous,
+        WriteProgress::Partial(landed) => {
+            return PayloadDelivery::Ambiguous {
+                stranded: drain_stranded_payload(w, &payload[..landed]).await,
+            };
+        }
         // Nothing written — safe to retry.
         WriteProgress::NothingWritten(e) => return PayloadDelivery::CleanFailure(e),
     }
@@ -1933,8 +2095,10 @@ async fn deliver_payload_and_submit(
     // the target holding un-submitted payload bytes — ambiguous, not clean.
     match write_all_tracked(w, b"\r") {
         WriteProgress::Complete => {}
-        WriteProgress::Partial | WriteProgress::NothingWritten(_) => {
-            return PayloadDelivery::Ambiguous;
+        WriteProgress::Partial(_) | WriteProgress::NothingWritten(_) => {
+            return PayloadDelivery::Ambiguous {
+                stranded: drain_stranded_payload(w, payload).await,
+            };
         }
     }
     let _ = w.flush();
@@ -1952,20 +2116,31 @@ async fn deliver_payload_and_submit(
 /// to: LF is not an Enter for the agents this project drives, so the pause that
 /// `SUBMIT_DELAY` exists to create has no meaning here (matching
 /// [`AgentPtyRegistry::write_notice_guarded`]'s tail).
+///
+/// Issue #876: and no DRAIN either, which is a decision rather than an omission.
+/// A notice's bytes are MEANT to stay in the input box — that is the whole
+/// deferral contract ([`crate::state::compose_worker_exited_notice`]) — so
+/// erasing a partial one would delete the feature rather than a hazard. It also
+/// leaves no payload record to lapse: `note_automatic_write` ignores
+/// [`SubmitMode::Notice`] entirely, so issue #876's "the guard expires while the
+/// bytes do not" has nothing to expire here. The count is still reported so the
+/// caller can say honestly how much is sitting there.
 async fn deliver_payload_as_notice(
     w: &mut (dyn std::io::Write + Send),
     payload: &[u8],
 ) -> PayloadDelivery {
     match write_all_tracked(w, payload) {
         WriteProgress::Complete => {}
-        WriteProgress::Partial => return PayloadDelivery::Ambiguous,
+        WriteProgress::Partial(landed) => return PayloadDelivery::Ambiguous { stranded: landed },
         WriteProgress::NothingWritten(e) => return PayloadDelivery::CleanFailure(e),
     }
     let _ = w.flush();
     match write_all_tracked(w, b"\n") {
         WriteProgress::Complete => {}
-        WriteProgress::Partial | WriteProgress::NothingWritten(_) => {
-            return PayloadDelivery::Ambiguous;
+        WriteProgress::Partial(_) | WriteProgress::NothingWritten(_) => {
+            return PayloadDelivery::Ambiguous {
+                stranded: payload.len(),
+            };
         }
     }
     let _ = w.flush();
@@ -2564,6 +2739,13 @@ struct AutomaticWrite {
     /// Cleared on the lifecycle points in [`PaneInputState::note_user_bytes`] /
     /// [`PaneInputState::forget_payload`] / [`PaneInputState::forget_pane`],
     /// plus the [`PAYLOAD_RECORD_TTL`] backstop.
+    ///
+    /// Issue #876: an ambiguous (partial) write pushes an entry here only when
+    /// its bytes could NOT be erased back out of the input box — see
+    /// [`drain_stranded_payload`]. A write that left nothing behind has nothing
+    /// to guard, and recording one would refuse an ordinary later delivery of
+    /// the same fixed text into a clean pane, which is this field's own
+    /// prompt-loss failure mode wearing a different hat.
     payloads: Vec<PayloadWrite>,
 }
 
@@ -3748,6 +3930,82 @@ pub type DeliveryNoticeSink = Arc<dyn Fn(DeliveryNotice) + Send + Sync>;
 enum SubmitMode {
     Submit,
     Notice,
+}
+
+/// Issue #876 test-only fault seam: a [`std::io::Write`] that accepts `budget`
+/// bytes and then fails — either once, healing so that everything after it is
+/// accepted, or permanently. Both halves are needed, because the drain
+/// necessarily runs on the writer that has just failed:
+///
+/// * [`Self::healing`] is the writer whose erases CAN land — the transient
+///   short-write, where the fix removes the stranded bytes.
+/// * [`Self::never_healing`] is a PTY whose slave has gone, the ordinary cause
+///   of a partial write, where no erase can land and issue #715's payload record
+///   is still the only thing protecting those bytes.
+///
+/// Every accepted byte is appended to the returned log, so a test can assert on
+/// the exact byte sequence that reached the PTY — the erases included, or their
+/// absence.
+#[cfg(test)]
+pub(crate) struct HealingFaultyWriter {
+    budget: usize,
+    accepted: usize,
+    faulted: bool,
+    heals: bool,
+    log: Arc<Mutex<Vec<u8>>>,
+}
+
+#[cfg(test)]
+impl HealingFaultyWriter {
+    fn build(budget: usize, heals: bool) -> (Self, Arc<Mutex<Vec<u8>>>) {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        (
+            Self {
+                budget,
+                accepted: 0,
+                faulted: false,
+                heals,
+                log: log.clone(),
+            },
+            log,
+        )
+    }
+
+    /// Accepts at most `budget` bytes, fails the next write, then accepts
+    /// everything.
+    pub(crate) fn healing(budget: usize) -> (Self, Arc<Mutex<Vec<u8>>>) {
+        Self::build(budget, true)
+    }
+
+    /// Accepts at most `budget` bytes, then fails every write for ever.
+    pub(crate) fn never_healing(budget: usize) -> (Self, Arc<Mutex<Vec<u8>>>) {
+        Self::build(budget, false)
+    }
+}
+
+#[cfg(test)]
+impl std::io::Write for HealingFaultyWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.faulted {
+            self.log.lock().unwrap().extend_from_slice(buf);
+            return Ok(buf.len());
+        }
+        if self.accepted >= self.budget {
+            self.faulted = self.heals;
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "faulty writer budget exhausted",
+            ));
+        }
+        let n = buf.len().min(self.budget - self.accepted);
+        self.accepted += n;
+        self.log.lock().unwrap().extend_from_slice(&buf[..n]);
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 impl Default for AgentPtyRegistry {
@@ -5034,6 +5292,15 @@ impl AgentPtyRegistry {
     ///   `pane_id_env` is a new input box ([`Self::forget_pane_input`]).
     /// * **[`PAYLOAD_RECORD_TTL`] elapses** — the backstop for a delivery whose
     ///   completion this daemon never sees, e.g. one the TUI confirms.
+    ///
+    /// Issue #876 added a fifth, which is really a case of the record never
+    /// existing: **a partial write whose bytes were erased back out of the box**
+    /// records nothing at all ([`drain_stranded_payload`]). It belongs on this
+    /// list rather than above it because the failure it closes was the TTL's:
+    /// that backstop bounds a DELIVERY's lifetime, which is the right bound for
+    /// a retry guard and the wrong one for bytes physically sitting in an input
+    /// box, and an `Ambiguous` submit produced exactly the second thing. The
+    /// guard expired at 60 s; the bytes did not expire at all.
     ///
     /// What deliberately remains: inside that window, an independent delivery of
     /// the *same* bytes into a pane holding an unsent draft is indistinguishable
@@ -6403,8 +6670,70 @@ impl AgentPtyRegistry {
                 self.note_automatic_write(pane_id, mode, &payload);
                 Ok(GuardedSendDetail::Outcome(GuardedSend::Applied))
             }
-            PayloadDelivery::Ambiguous => {
-                self.note_automatic_write(pane_id, mode, &payload);
+            // Issue #876: an ambiguous write is recorded only while bytes of
+            // ours are still sitting in that input box.
+            //
+            // Before the drain, this arm recorded unconditionally and the record
+            // was the ONLY thing standing between the stranded bytes and a later
+            // byte-identical delivery submitting them together with the user's
+            // unsent draft — for the 60 s the record lasts, against bytes that
+            // last forever. `deliver_payload_and_submit` now erases what it
+            // wrote back out of the box where it can do so exactly
+            // ([`drain_stranded_payload`]), and a write that left nothing behind
+            // has nothing to guard: recording it would only refuse an ordinary
+            // later delivery of the same fixed text into a clean pane, which is
+            // the #424 prompt-loss half wearing #715's clothes.
+            //
+            // An EMPTY payload is the blind submit-only probe: it writes no
+            // payload bytes, so it can strand none and `stranded` is trivially
+            // 0 — but it is still recorded, exactly as before, because
+            // `note_automatic_write` reads it for the probe clock
+            // (`submitted_at`) and ignores it for the payload records. A DRAINED
+            // write is deliberately not recorded at all: it put bytes in the box
+            // and took the same bytes back out, so it left no trace and must
+            // advance no clock.
+            PayloadDelivery::Ambiguous { stranded } => {
+                let leaves_bytes_behind = stranded > 0;
+                let is_submit = matches!(mode, SubmitMode::Submit);
+                if leaves_bytes_behind || payload.is_empty() {
+                    self.note_automatic_write(pane_id, mode, &payload);
+                }
+                if leaves_bytes_behind && is_submit {
+                    tracing::warn!(
+                        pane_id = %pane_id,
+                        agent_id = %target.agent_id,
+                        payload_len = payload.len(),
+                        stranded,
+                        "guarded submit was ambiguous and its bytes could not be erased back out \
+                         of the input box; the payload record is kept and the pane reported"
+                    );
+                    // Issue #876 (the issue's option 2, applied exactly where
+                    // option 1 cannot reach): only the user can safely resolve a
+                    // box holding a partial daemon write mixed with their own
+                    // text, so tell them on the card instead of leaving a silent
+                    // hazard that outlives its own guard.
+                    self.publish_delivery_notice(DeliveryNotice {
+                        pane_id: pane_id.to_string(),
+                        agent_id: target.agent_id.clone(),
+                        delivery_id: crate::prompt_delivery::mint_delivery_id(pane_id),
+                        session_id: None,
+                        detail: "a daemon write into this pane stopped part-way and its bytes \
+                                 could not be erased again, so the input box may hold a partial \
+                                 prompt above whatever you had typed: clear or submit it before \
+                                 typing on",
+                    });
+                } else if is_submit && !payload.is_empty() {
+                    // `is_submit` matters: a NOTICE reaching this arm was never
+                    // offered to the drain (its bytes are meant to stay), so
+                    // saying they were erased would be a lie in the log.
+                    tracing::warn!(
+                        pane_id = %pane_id,
+                        agent_id = %target.agent_id,
+                        payload_len = payload.len(),
+                        "guarded submit was ambiguous; every byte that landed was erased back \
+                         out of the input box, so no payload record is kept"
+                    );
+                }
                 Ok(GuardedSendDetail::Outcome(GuardedSend::Ambiguous))
             }
             PayloadDelivery::CleanFailure(e) => Err(AgentPtyError::Writer(e)),
@@ -8004,6 +8333,44 @@ impl AgentPtyRegistry {
             .unwrap_or_else(|| panic!("no such agent to stamp a spawn type onto: {agent_id}"));
         agent.agent_type = Some(agent_type.clone());
         agent.spawn_agent_type = Some(agent_type);
+    }
+
+    /// Issue #876 test-only seam: swap a live agent's PTY writer for one a test
+    /// can FAULT, keeping everything else about that agent exactly as
+    /// [`Self::spawn_agent`] built it — its pane binding, its registry identity,
+    /// and the shared [`PaneInputState`] every guard on the write path reads.
+    ///
+    /// A real `/bin/cat` PTY writer cannot be coaxed into a partial write, which
+    /// is why `scheduler/idle-worker/018` and its two siblings could only drive
+    /// the settle decision with a hand-supplied outcome and had to record "does
+    /// not assert that a real `Ambiguous` arises from this seam". Through this
+    /// seam the classification, issue #876's drain and the payload record are
+    /// all produced by the production path instead of asserted about it.
+    ///
+    /// **Returns the displaced writer, and the caller must hold it for as long
+    /// as it wants the agent alive.** `portable_pty`'s `UnixMasterWriter` sends
+    /// `\n` plus the terminal's VEOF character from its `Drop`, so letting the
+    /// original fall here delivers a Ctrl+D to the stand-in, which promptly
+    /// exits — after which the next guarded send resolves `NoLiveTarget` and the
+    /// test stops testing what it names.
+    #[cfg(test)]
+    #[must_use = "hold the displaced writer or its Drop sends EOF and kills the stand-in"]
+    pub(crate) async fn replace_agent_writer_for_test(
+        &self,
+        agent_id: &str,
+        inner: Box<dyn std::io::Write + Send>,
+    ) -> Box<dyn std::io::Write + Send> {
+        let writer = {
+            let guard = self.inner.lock().unwrap();
+            guard
+                .agents
+                .get(agent_id)
+                .unwrap_or_else(|| panic!("no such agent to fault a writer on: {agent_id}"))
+                .writer
+                .clone()
+        };
+        let mut guard = writer.lock().await;
+        std::mem::replace(&mut guard.inner, inner)
     }
 
     /// Issue #581 test-only seam: register a synthetic agent that owns `child`,
@@ -12653,25 +13020,411 @@ mod spawn_tests {
         ));
 
         // Some payload bytes reached the target, then the writer errored →
-        // AMBIGUOUS (must not be blind-retried into a duplicate).
+        // AMBIGUOUS (must not be blind-retried into a duplicate). This writer
+        // stays broken, so issue #876's drain cannot land a single erase and
+        // every byte that reached the target is still stranded.
         let mut w = FaultyWriter {
             budget: 2,
             written: 0,
         };
         assert_eq!(
             deliver_payload_and_submit(&mut w, b"hello").await,
-            PayloadDelivery::Ambiguous
+            PayloadDelivery::Ambiguous { stranded: 2 }
         );
 
         // Payload fully written but the submit CR fails → still AMBIGUOUS (the
-        // target holds un-submitted payload bytes).
+        // target holds un-submitted payload bytes), and again undrainable
+        // because the writer never recovers.
         let mut w = FaultyWriter {
             budget: b"hello".len(),
             written: 0,
         };
         assert_eq!(
             deliver_payload_and_submit(&mut w, b"hello").await,
-            PayloadDelivery::Ambiguous
+            PayloadDelivery::Ambiguous {
+                stranded: b"hello".len()
+            }
+        );
+    }
+
+    /// Issue #876: an `Ambiguous` submit used to leave its payload bytes sitting
+    /// in the target's input box with nothing anywhere to remove them — #715
+    /// stopped them being merged into a later turn by keeping the payload
+    /// record, but the record lapses after 60 s while the bytes do not. The
+    /// delivery now erases exactly what it wrote back out, on both ambiguous
+    /// paths, and reports that nothing is stranded.
+    #[tokio::test]
+    async fn deliver_payload_erases_a_partial_write_back_out_of_the_input_box() {
+        // Partial PAYLOAD write: two bytes of "hello" landed, then the writer
+        // errored. Exactly two erases must follow them.
+        let (mut w, log) = HealingFaultyWriter::healing(2);
+        assert_eq!(
+            deliver_payload_and_submit(&mut w, b"hello").await,
+            PayloadDelivery::Ambiguous { stranded: 0 },
+            "the two bytes that landed were erased again, so nothing is left in the box"
+        );
+        assert_eq!(
+            log.lock().unwrap().as_slice(),
+            b"he\x7f\x7f",
+            "the drain must be an EXACT undo — one erase per byte that landed, and no kill-line"
+        );
+
+        // Payload fully written, submit CR failed: the whole payload is in the
+        // box and the whole payload must come back out.
+        let (mut w, log) = HealingFaultyWriter::healing(b"hello".len());
+        assert_eq!(
+            deliver_payload_and_submit(&mut w, b"hello").await,
+            PayloadDelivery::Ambiguous { stranded: 0 }
+        );
+        assert_eq!(
+            log.lock().unwrap().as_slice(),
+            b"hello\x7f\x7f\x7f\x7f\x7f",
+            "a submit CR is ONE byte, so reaching this arm means it was never accepted: the box \
+             still holds the entire payload and the erase count is the whole of it"
+        );
+    }
+
+    /// Issue #876: the drain is an exact undo or it is nothing. Each condition
+    /// below is one way the arithmetic stops being provable, and each must leave
+    /// the bytes recorded as stranded — which is what keeps issue #715's payload
+    /// record in place for exactly the cases the drain cannot reach.
+    #[tokio::test]
+    async fn deliver_payload_refuses_to_erase_what_it_cannot_undo_exactly() {
+        // NON-ASCII: a partial write can cut a multi-byte character in half, and
+        // a TUI may delete a whole grapheme cluster per erase — so "one byte
+        // written" stops meaning "one erase". The production silence report
+        // opens with a `⚠`, which is exactly this case.
+        let payload = "⚠ went quiet".as_bytes();
+        let (mut w, log) = HealingFaultyWriter::healing(payload.len());
+        assert_eq!(
+            deliver_payload_and_submit(&mut w, payload).await,
+            PayloadDelivery::Ambiguous {
+                stranded: payload.len()
+            }
+        );
+        assert_eq!(
+            log.lock().unwrap().as_slice(),
+            payload,
+            "not one erase may be written when the undo cannot be proven exact"
+        );
+
+        // ESCAPE BYTES: a cut inside `ESC[200~` leaves the agent's TUI mid-paste
+        // or mid-escape-sequence, where an erase byte is swallowed as content or
+        // as a parameter rather than read as a keypress.
+        let payload = b"\x1b[200~one\ntwo\x1b[201~";
+        let (mut w, log) = HealingFaultyWriter::healing(4);
+        assert_eq!(
+            deliver_payload_and_submit(&mut w, payload).await,
+            PayloadDelivery::Ambiguous { stranded: 4 }
+        );
+        assert_eq!(log.lock().unwrap().as_slice(), b"\x1b[20");
+
+        // TOO LARGE: every erase is a keypress the agent has to process, and a
+        // burst this size is both slow and the shape a bulk-input heuristic is
+        // most likely to misread as a paste.
+        let payload = vec![b'x'; MAX_DRAINABLE_STRANDED_BYTES + 1];
+        let (mut w, log) = HealingFaultyWriter::healing(payload.len());
+        assert_eq!(
+            deliver_payload_and_submit(&mut w, &payload).await,
+            PayloadDelivery::Ambiguous {
+                stranded: payload.len()
+            }
+        );
+        assert_eq!(
+            log.lock().unwrap().len(),
+            payload.len(),
+            "over the cap the payload is written and nothing is erased"
+        );
+        // One byte under the cap the same payload IS drained, so the boundary is
+        // the cap rather than some other property of a long payload.
+        let payload = vec![b'x'; MAX_DRAINABLE_STRANDED_BYTES];
+        let (mut w, _log) = HealingFaultyWriter::healing(payload.len());
+        assert_eq!(
+            deliver_payload_and_submit(&mut w, &payload).await,
+            PayloadDelivery::Ambiguous { stranded: 0 }
+        );
+    }
+
+    /// Issue #876: a drain that only partly lands reports the remainder rather
+    /// than claiming the box is clean — the writer has just failed once, so a
+    /// second failure part-way through the erases is the ordinary case, not an
+    /// exotic one.
+    #[tokio::test]
+    async fn deliver_payload_reports_the_erases_that_did_not_land() {
+        // Accepts the payload, fails the CR, then accepts only 3 of the 5
+        // erases before failing again.
+        struct TwiceFaultyWriter {
+            budget: usize,
+            accepted: usize,
+            second_budget: usize,
+            second_accepted: usize,
+            faulted: bool,
+        }
+        impl std::io::Write for TwiceFaultyWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                let (used, cap) = if self.faulted {
+                    (&mut self.second_accepted, self.second_budget)
+                } else {
+                    (&mut self.accepted, self.budget)
+                };
+                if *used >= cap {
+                    if self.faulted {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::BrokenPipe,
+                            "second budget exhausted",
+                        ));
+                    }
+                    self.faulted = true;
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "first budget exhausted",
+                    ));
+                }
+                let n = buf.len().min(cap - *used);
+                *used += n;
+                Ok(n)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut w = TwiceFaultyWriter {
+            budget: b"hello".len(),
+            accepted: 0,
+            second_budget: 3,
+            second_accepted: 0,
+            faulted: false,
+        };
+        assert_eq!(
+            deliver_payload_and_submit(&mut w, b"hello").await,
+            PayloadDelivery::Ambiguous { stranded: 2 },
+            "three of the five erases landed, so two payload bytes are still in the input box"
+        );
+    }
+
+    /// Issue #876, at the registry seam rather than at the writer: a guarded
+    /// submit that goes `Ambiguous` and is fully drained records NO payload, so
+    /// a later byte-identical delivery into a pane the user has typed into is
+    /// admitted — while one whose drain cannot land keeps issue #715's record
+    /// and still refuses that delivery.
+    ///
+    /// This is the pairing the fix turns on. #715's refusal is the right answer
+    /// while bytes of ours are sitting in that input box and the wrong one once
+    /// they are gone: kept unconditionally it costs a delegation (the worker
+    /// pointer is the same fixed one-liner on every hand-off) to guard a box
+    /// that is already clean, which is #424's prompt-loss half wearing #715's
+    /// clothes.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_drained_ambiguous_submit_keeps_no_payload_record_and_a_stranded_one_does() {
+        const DRAINED_PANE: &str = "issue-876-drained-pane";
+        const STRANDED_PANE: &str = "issue-876-stranded-pane";
+        const TEXT: &str = "Read .dot-agent-deck/worker-task-coder.md for your task.";
+
+        let registry = Arc::new(AgentPtyRegistry::new());
+        // Issue #876's other half: where the drain cannot reach, the pane is
+        // REPORTED rather than left silently holding a fragment. Collected here
+        // so the same pairing pins which pane gets a notice and which does not.
+        let notices: Arc<Mutex<Vec<DeliveryNotice>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink_notices = notices.clone();
+        registry.set_delivery_notice_sink(Arc::new(move |notice| {
+            sink_notices.lock().unwrap().push(notice);
+        }));
+        let spawn = |pane: &str| {
+            registry
+                .spawn_agent(SpawnOptions {
+                    command: Some("/bin/cat"),
+                    env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane.to_string())],
+                    ..SpawnOptions::default()
+                })
+                .expect("spawn stand-in")
+        };
+        let drained_agent = spawn(DRAINED_PANE);
+        let stranded_agent = spawn(STRANDED_PANE);
+
+        let payload_len = crate::pane_input::encode_pane_payload(TEXT)
+            .expect("encode")
+            .len();
+        // Both writers accept the whole payload and then fail the submit CR —
+        // the ambiguous shape where the ENTIRE payload is sitting in the input
+        // box. They differ in one thing only: whether the writer recovers in
+        // time for the erases.
+        let (healing, drained_log) = HealingFaultyWriter::healing(payload_len);
+        let (never_healing, stranded_log) = HealingFaultyWriter::never_healing(payload_len);
+        // Held to the end of the test: dropping a displaced `UnixMasterWriter`
+        // sends EOF into the stand-in and kills it — see the seam's own doc.
+        let _displaced = (
+            registry
+                .replace_agent_writer_for_test(&drained_agent, Box::new(healing))
+                .await,
+            registry
+                .replace_agent_writer_for_test(&stranded_agent, Box::new(never_healing))
+                .await,
+        );
+
+        for (pane, agent) in [
+            (DRAINED_PANE, &drained_agent),
+            (STRANDED_PANE, &stranded_agent),
+        ] {
+            assert_eq!(
+                registry
+                    .write_and_submit_guarded(pane, TEXT, agent, || async { true })
+                    .await
+                    .expect("first delivery"),
+                GuardedSend::Ambiguous,
+                "precondition: the faulted writer must make {pane}'s submit genuinely ambiguous, \
+                 produced by the production classification rather than supplied to it"
+            );
+        }
+        assert_eq!(
+            drained_log.lock().unwrap().len(),
+            payload_len * 2,
+            "the drained pane must have received one erase for every payload byte"
+        );
+        assert_eq!(
+            stranded_log.lock().unwrap().len(),
+            payload_len,
+            "the stranded pane's writer never recovered, so not one erase reached it"
+        );
+
+        let reported: Vec<String> = notices
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|n| n.pane_id.clone())
+            .collect();
+        assert_eq!(
+            reported,
+            vec![STRANDED_PANE.to_string()],
+            "only the pane still holding a fragment may be reported: a box the daemon emptied \
+             again needs nothing of the user, and a notice there would be noise on a card"
+        );
+
+        // The user types into both panes — the clock that arms the repeat-payload
+        // refusal. Without it the guard abstains and both assertions below would
+        // pass for the wrong reason.
+        registry.note_user_input(DRAINED_PANE);
+        registry.note_user_input(STRANDED_PANE);
+
+        let drained_repeat = registry
+            .write_and_submit_guarded(DRAINED_PANE, TEXT, &drained_agent, || async { true })
+            .await
+            .expect("repeat after a drained ambiguous submit");
+        let stranded_repeat = registry
+            .write_and_submit_guarded(STRANDED_PANE, TEXT, &stranded_agent, || async { true })
+            .await
+            .expect("repeat after a stranded ambiguous submit");
+        registry.shutdown_all();
+
+        assert_eq!(
+            drained_repeat,
+            GuardedSend::Applied,
+            "every byte came back out of that input box, so there is nothing of ours left for a \
+             later identical delivery to submit on top of the user's draft — refusing it would \
+             cost a delegation to guard a clean pane"
+        );
+        assert_eq!(
+            stranded_repeat,
+            GuardedSend::Stale,
+            "the erases never landed, so the payload bytes ARE still in that box: issue #715's \
+             record must survive and refuse the repeat rather than submit the leftovers together \
+             with the user's unsent draft"
+        );
+    }
+
+    /// Issue #876: the one premise the fault-injection tests above cannot check
+    /// — that a real line editor reads our erase bytes as an exact undo, and
+    /// that the user's own draft survives it.
+    ///
+    /// Driven against the kernel's TTY line discipline rather than against an
+    /// agent, deliberately: in canonical mode the discipline IS the reference
+    /// implementation of ERASE (`CERASE` is `0x7f` on Linux and macOS), it needs
+    /// no credential, and it is the same contract every agent TUI's own editor
+    /// is imitating. The shell reads ONE line and prints it fenced, so the
+    /// assertion is made on what was SUBMITTED rather than on the terminal's
+    /// echo — which necessarily still carries the erased characters.
+    #[cfg(unix)]
+    #[test]
+    fn erase_bytes_undo_exactly_our_write_and_leave_the_users_draft() {
+        use std::io::{Read as _, Write as _};
+
+        let pair = NativePtySystem::default()
+            .openpty(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .expect("openpty");
+        let mut cmd = CommandBuilder::new("/bin/sh");
+        cmd.args(["-c", "IFS= read -r line; printf '<<%s>>\\n' \"$line\""]);
+        let mut child = pair.slave.spawn_command(cmd).expect("spawn /bin/sh");
+        drop(pair.slave);
+        let mut reader = pair.master.try_clone_reader().expect("clone reader");
+        let mut writer = pair.master.take_writer().expect("take_writer");
+
+        // The USER's draft, typed before any daemon write and never submitted.
+        writer.write_all(b"draft").expect("write user draft");
+        writer.flush().expect("flush");
+        std::thread::sleep(SUBMIT_DELAY);
+        // The daemon's payload, appended at the cursor — the state an
+        // `Ambiguous` submit leaves behind.
+        let payload = b"PAYLOAD";
+        writer.write_all(payload).expect("write daemon payload");
+        writer.flush().expect("flush");
+        std::thread::sleep(SUBMIT_DELAY);
+        // The drain: one erase per byte we wrote, and not one more.
+        writer
+            .write_all(&vec![PANE_ERASE_BYTE; payload.len()])
+            .expect("write erases");
+        writer.flush().expect("flush");
+        std::thread::sleep(SUBMIT_DELAY);
+        // The user presses Enter on what is left.
+        writer.write_all(b"\r").expect("submit");
+        writer.flush().expect("flush");
+
+        let mut seen = String::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline && !seen.contains(">>") {
+            let mut buf = [0u8; 1024];
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => seen.push_str(&String::from_utf8_lossy(&buf[..n])),
+                Err(_) => break,
+            }
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        drop(writer);
+        drop(pair.master);
+
+        assert!(
+            seen.contains("<<draft>>"),
+            "the erases must remove exactly the daemon's bytes and leave the user's draft \
+             submittable; the line discipline delivered: {seen:?}"
+        );
+        assert!(
+            !seen.contains("PAYLOAD>>"),
+            "no payload byte may survive the drain into the submitted line; got: {seen:?}"
+        );
+    }
+
+    /// Issue #876: a NOTICE is deliberately not drained. Its bytes are meant to
+    /// sit in the input box — that is the deferral contract the family is
+    /// defined by — and it leaves no payload record to lapse, so there is no
+    /// #876 hazard to close and erasing one would delete the feature instead.
+    #[tokio::test]
+    async fn deliver_notice_never_erases_its_own_partial_write() {
+        let (mut w, log) = HealingFaultyWriter::healing(2);
+        assert_eq!(
+            deliver_payload_as_notice(&mut w, b"hello").await,
+            PayloadDelivery::Ambiguous { stranded: 2 }
+        );
+        assert_eq!(
+            log.lock().unwrap().as_slice(),
+            b"he",
+            "a notice's partial bytes stay exactly where they landed"
         );
     }
 
