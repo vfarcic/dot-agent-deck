@@ -10,6 +10,11 @@ mod endpoint_test;
 mod endpoint_field_parity;
 mod endpoint_tunnels;
 mod generation;
+// Tests only: the counted sweep that keeps `dto::DeckScope` from decaying into
+// a convention (issue #1116). No item outside `#[cfg(test)]`, so it adds
+// nothing to a normal build.
+#[cfg(test)]
+mod selection_capture;
 mod settings;
 mod terminal;
 
@@ -1515,6 +1520,58 @@ async fn apply_selection(app: &AppHandle, state: &DesktopState, settings: &Deskt
     refresh_and_emit(app, &state.daemon).await;
 }
 
+/// Stop one agent on the selected deck, and tear down **that deck's** terminal
+/// session for it.
+///
+/// # ONE capture, and why this used to be two reads
+///
+/// This read `selected_endpoint()` twice: once through `trusted_daemon`, before
+/// `DaemonLinks::trusted`, and again *after* `stop_agent(…).await` returned, to
+/// decide which deck's session to detach. The first read pinned the stop to
+/// deck A correctly. The second was a fresh question about a mutable global,
+/// asked on the far side of a daemon round trip — so moving the selection while
+/// the request was in flight stopped A's `planner` and detached **B's** same-id
+/// session, closing a terminal on a machine this action never touched. Agent
+/// ids are per-daemon monotonic integers, so the collision is the ordinary case
+/// rather than a contrived one; editing the selected deck's *address* mid-stop
+/// has the same shape.
+///
+/// The comment that used to sit at the detach asserted the two reads named the
+/// same deck. They are separated by asynchronous daemon work and nothing holds
+/// the selection still, so it was simply wrong.
+///
+/// [`crate::dto::DeckScope`] is the fix and the general form of it: capture the
+/// deck once, before the first await, and let every later step — cleanup very
+/// much included — read only the captured value.
+///
+/// # Split out for the same reason [`retarget_selection`] is
+///
+/// Everything here is testable and the snapshot emit around it is not. That is
+/// what lets a test drive the *caller* against a scripted daemon with the
+/// selection moved underneath it, rather than pinning `detach_agent_on` in
+/// isolation and proving nothing about who calls it.
+async fn stop_agent_action(state: &DesktopState, agent_id: &str) -> Result<(), String> {
+    validate_agent_id(agent_id)?;
+    let scope = crate::dto::DeckScope::selected();
+    let daemon = state.daemon.trusted(scope.endpoint()).await?;
+    daemon.require_compatible()?;
+    daemon
+        .client
+        .stop_agent(agent_id)
+        .await
+        .map_err(|error| safe_message(error.to_string()))?;
+    // Preserve a working attachment when stop fails: this line is after the `?`
+    // above, so a refused stop leaves the terminal alone. Once the daemon
+    // confirms, remove the registry entry promptly; the stream reader will also
+    // observe STREAM_END and is generation-guarded against removing a newer
+    // attachment.
+    //
+    // The deck is the SCOPE's — the one this operation authenticated against
+    // and stopped the agent on — and never a fresh read of the selection.
+    terminal::detach_agent_on(state, &scope.identity(), agent_id).await;
+    Ok(())
+}
+
 /// [`apply_selection`] minus the emit, reporting whether the deck moved.
 ///
 /// Split out because everything above the emit is testable and the emit is not —
@@ -1844,23 +1901,7 @@ async fn desktop_run_action(
             );
         }
         DesktopAction::StopAgent { agent_id } => {
-            validate_agent_id(&agent_id)?;
-            let daemon = trusted_daemon(&state.daemon).await?;
-            daemon.require_compatible()?;
-            daemon
-                .client
-                .stop_agent(&agent_id)
-                .await
-                .map_err(|error| safe_message(error.to_string()))?;
-            // Preserve a working attachment when stop fails. Once the daemon
-            // confirms the stop, remove any registry entry promptly; the
-            // stream reader will also observe STREAM_END and is generation-
-            // guarded against removing a newer attachment.
-            // The SELECTED deck's session for this agent, which is the deck
-            // `trusted_daemon` above just stopped it on. PRD #1105 made the
-            // deck term necessary: another deck can be running an agent of the
-            // same per-daemon monotonic id, and it was not stopped.
-            terminal::detach_agent_on(&state, &selected_endpoint().identity(), &agent_id).await;
+            stop_agent_action(&state, &agent_id).await?;
             result_agent_id = Some(agent_id);
         }
         DesktopAction::StopDaemon { force } => {

@@ -19,7 +19,7 @@ use crate::agent_view::AgentView;
 use crate::dto::{
     BootstrapOptions, ConnectionStatus, DesktopConnection, DesktopSnapshot, deck_path_text,
     deck_wire_id, disconnected_snapshot, map_agent, observed_fleet, observed_fleet_decks,
-    safe_message, selected_endpoint, selection_fields, unconfigured_fleet,
+    safe_message, selection_fields, unconfigured_fleet,
 };
 use crate::endpoint_tunnels::{EndpointTunnels, TunnelLease};
 
@@ -1150,12 +1150,23 @@ async fn establish(
 /// rather than rebuilt here. The endpoint is still
 /// [`selected_endpoint`]'s — M9 is what makes that a user choice — so this
 /// remains the one function every desktop call site goes through.
+/// **For an operation whose only later step is the daemon reply.** It reads the
+/// applied selection at the instant it runs, so an operation that still needs
+/// to know which deck it was talking to *after* the await — to clean up, to
+/// publish, to pick a second address — must capture a
+/// [`crate::dto::DeckScope`] instead and hand its endpoint to
+/// [`DaemonLinks::trusted`] directly. `DesktopAction::StopAgent` is the site
+/// that proved the distinction matters; see `crate::stop_agent_action`.
 pub(crate) async fn trusted_daemon(links: &DaemonLinks) -> Result<Arc<TrustedDaemon>, String> {
-    links.trusted(&selected_endpoint()).await
+    links
+        .trusted(crate::dto::DeckScope::selected().endpoint())
+        .await
 }
 
+/// The selected deck's snapshot. Same caveat as [`trusted_daemon`]: this is a
+/// read of the selection, not a statement about an operation's deck.
 pub(crate) async fn get_snapshot(links: &DaemonLinks) -> DesktopSnapshot {
-    snapshot_of(&selected_endpoint(), links).await
+    snapshot_of(crate::dto::DeckScope::selected().endpoint(), links).await
 }
 
 /// [`get_snapshot`] against a named deck rather than the selected one.
@@ -1365,8 +1376,22 @@ fn resolve_daemon_executable() -> Result<PathBuf, String> {
     )
 }
 
+/// Snapshot the selected deck, and lazy-spawn a daemon for it if nothing is
+/// answering.
+///
+/// # ONE capture, found by the sweep the third identity audit asked for
+///
+/// This read the applied selection **three times across two awaits** — once
+/// inside the opening `get_snapshot`, once for the address to spawn at, and
+/// once inside the closing `get_snapshot`. A settings save landing mid-bootstrap
+/// could therefore decide "deck A is not answering" and then start a daemon at
+/// **deck B's** address, reporting the result as B's. Same shape as
+/// `crate::stop_agent_action`'s, one module over, and not a blocker only
+/// because the lazy-spawn is already confined to a *local* address the applied
+/// document names (`as_local` below refuses a remote one).
 pub(crate) async fn bootstrap(options: &BootstrapOptions, links: &DaemonLinks) -> DesktopSnapshot {
-    let current = get_snapshot(links).await;
+    let scope = crate::dto::DeckScope::selected();
+    let current = snapshot_of(scope.endpoint(), links).await;
     if current.connection.status != ConnectionStatus::Disconnected || !options.start_if_missing {
         return current;
     }
@@ -1375,7 +1400,7 @@ pub(crate) async fn bootstrap(options: &BootstrapOptions, links: &DaemonLinks) -
     // reachable only from a local endpoint. A remote deck that is not answering
     // is reported as such — starting a local daemon in its place is the exact
     // silently-wrong outcome the endpoint split exists to prevent.
-    let endpoint = selected_endpoint();
+    let endpoint = scope.endpoint();
     let Some(local) = endpoint.as_local() else {
         return current;
     };
@@ -1399,10 +1424,10 @@ pub(crate) async fn bootstrap(options: &BootstrapOptions, links: &DaemonLinks) -
             // A daemon process was just started at this address, so nothing
             // held about the one that was not answering a moment ago describes
             // it. Drop the link before the snapshot that will re-establish it.
-            links.invalidate(&endpoint).await;
-            get_snapshot(links).await
+            links.invalidate(endpoint).await;
+            snapshot_of(endpoint, links).await
         }
-        Err(error) => disconnected_snapshot(&endpoint, error.to_string()),
+        Err(error) => disconnected_snapshot(endpoint, error.to_string()),
     }
 }
 

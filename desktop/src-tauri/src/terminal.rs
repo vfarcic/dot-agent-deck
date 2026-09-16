@@ -93,7 +93,7 @@ struct TerminalSession {
     /// second lookup that could answer differently, which is exactly the
     /// read-at-use-time shape issue #1116 is about.
     ///
-    /// It is also the registry's key: [`DesktopState::insert_unique_session`]
+    /// It is also the registry's key: [`DesktopState::publish_scoped_session`]
     /// evicts by `(deck, agent)` rather than by agent id alone, because agent
     /// ids are per-daemon monotonic integers and two decks routinely mint the
     /// same one. Evicting by the bare id meant attaching deck B's `planner`
@@ -389,72 +389,100 @@ impl DesktopState {
     }
 
     /// Install one session, replacing any earlier session for **the same agent
-    /// on the same deck**.
+    /// on the same deck** — but only if `scope` is still the fleet's.
     ///
-    /// The deck half is PRD #1105's cross-deck pane. It read
-    /// `existing.agent_id != session.agent_id`, which is a statement about a
-    /// name that is unique only within a daemon — so attaching `planner` on
+    /// The deck half of the eviction rule is PRD #1105's cross-deck pane. It
+    /// read `existing.agent_id != session.agent_id`, which is a statement about
+    /// a name that is unique only within a daemon — so attaching `planner` on
     /// build-box evicted the live `planner` session on the local deck, closing
     /// a pane the user was watching and leaving its webview channel talking to
     /// a torn-down stream. One session per agent per deck is the invariant the
     /// single-deck version was reaching for.
-    fn insert_unique_session(
+    ///
+    /// # The revalidation is the observed-set boundary, and the LOCK is what
+    /// makes it exact
+    ///
+    /// `crate::retarget_selection` writes the applied selection (bumping the
+    /// epoch) and *then* calls [`detach_decks_outside`], which takes this same
+    /// registry lock to collect what it will tear down. So the two orderings
+    /// are both correct and there is no third:
+    ///
+    /// - this call takes the lock first → it may still see the old epoch and
+    ///   publish, and the teardown's collect then finds the session and detaches
+    ///   it;
+    /// - the teardown's collect takes the lock first → the selection write has
+    ///   already landed, so the read below sees the bumped epoch and refuses.
+    ///
+    /// Checking outside the lock would leave exactly the window the third audit
+    /// described: check, teardown, insert.
+    ///
+    /// # It refuses a scope that is not about this session's deck
+    ///
+    /// Not defensive tidiness — the scope is the operation's single statement of
+    /// which deck it is, and a session built for another one would make that
+    /// statement false while still revalidating happily. Nothing in the tree
+    /// does this; the refusal is here so that a future caller which does gets a
+    /// message instead of a silently mis-filed session.
+    fn publish_scoped_session(
         &self,
         session_id: String,
         session: TerminalSession,
-    ) -> Result<(), String> {
+        scope: &crate::dto::DeckScope,
+    ) -> Result<(), Box<RejectedSession>> {
         let deck = session.endpoint.identity();
-        let mut sessions = self.sessions()?;
+        if deck != scope.identity() {
+            return Err(Box::new(RejectedSession {
+                reason: "a terminal session may only be published under a scope for its own deck"
+                    .to_string(),
+                session,
+            }));
+        }
+        let mut sessions = match self.sessions() {
+            Ok(sessions) => sessions,
+            Err(reason) => return Err(Box::new(RejectedSession { reason, session })),
+        };
+        if let Err(reason) = scope.revalidate() {
+            drop(sessions);
+            return Err(Box::new(RejectedSession { reason, session }));
+        }
         sessions.retain(|_, existing| {
             existing.agent_id != session.agent_id || existing.endpoint.identity() != deck
         });
         sessions.insert(session_id, session);
         Ok(())
     }
+
+    /// [`Self::publish_scoped_session`] for a test pinning the eviction rule
+    /// rather than the boundary.
+    ///
+    /// **`#[cfg(test)]` is load-bearing.** It is what makes
+    /// `publish_scoped_session` the *only* way production code can put a session
+    /// in this registry — a fact the compiler enforces rather than a convention
+    /// a reviewer has to check. Half of the boundary's proof is that: the other
+    /// half is a test of the refusal itself.
+    ///
+    /// The scope it supplies is captured now and names this session's own deck,
+    /// so the boundary stays armed and simply has nothing to object to.
+    #[cfg(test)]
+    fn insert_unique_session(
+        &self,
+        session_id: String,
+        session: TerminalSession,
+    ) -> Result<(), String> {
+        let scope = crate::dto::DeckScope::capturing(session.endpoint.clone());
+        self.publish_scoped_session(session_id, session, &scope)
+            .map_err(|rejected| rejected.reason)
+    }
 }
 
-/// The endpoint one wire deck id names, or the selected deck when the caller
-/// named none.
+/// A session that was built and then refused publication, handed back so the
+/// caller can DETACH it rather than leaking a viewer the daemon still sizes for.
 ///
-/// # Why this exists instead of `trusted_daemon`
-///
-/// `trusted_daemon` resolves `selected_endpoint()` — the process-global applied
-/// selection, read at the instant the call runs. Every terminal verb went
-/// through it, so an attach declared for an agent on build-box reached whatever
-/// deck happened to be selected when the command was dispatched, and agent ids
-/// are per-daemon monotonic integers: it found a `planner` there and streamed
-/// it. That is issue
-/// [#1116](https://github.com/vfarcic/dot-agent-deck/issues/1116)'s whole shape
-/// — identity read from mutable current selection at use time — at the one
-/// layer where it decides which machine the bytes come from.
-///
-/// # The resolution is against the OBSERVED set, and that is a security
-/// boundary rather than a lookup detail
-///
-/// A deck id from the webview is untrusted input. Matching it against
-/// `observed_decks()` means the only endpoints reachable are the ones the
-/// applied settings document already tells this app to connect to, so a
-/// malformed or stale id yields a refusal rather than a connection: there is no
-/// path here by which a value from the webview becomes an address.
-///
-/// `None` keeps the previous behaviour for a caller that names no deck. Nothing
-/// in this tree sends one today — the webview always names the deck it is
-/// attaching to — and it is kept because the parameter is optional on the IPC
-/// boundary, so absence must mean something defined rather than an error the
-/// user cannot act on.
-fn endpoint_for_deck(deck_id: Option<&str>) -> Result<Endpoint, String> {
-    let Some(deck_id) = deck_id else {
-        return Ok(crate::dto::selected_endpoint());
-    };
-    crate::dto::observed_decks()
-        .into_iter()
-        .find(|endpoint| crate::dto::deck_wire_id(endpoint) == deck_id)
-        .ok_or_else(|| {
-            format!(
-                "that deck is not one this app is observing: {}",
-                safe_message(deck_id)
-            )
-        })
+/// The session travels with the reason because the only useful thing to do with
+/// a refusal here is to say goodbye on the wire — see [`detach_unpublished`].
+struct RejectedSession {
+    reason: String,
+    session: TerminalSession,
 }
 
 fn session_id(generation: u64) -> String {
@@ -491,27 +519,54 @@ fn rejection_notice(reason: &[u8]) -> Vec<u8> {
     format!("\r\n[agent-deck] terminal input rejected: {reason}\r\n").into_bytes()
 }
 
-pub(crate) async fn attach(
-    app: &AppHandle,
+/// What [`establish`] hands [`attach`].
+///
+/// The read half travels separately from the [`TerminalAttachResult`] because a
+/// **reused** session has one and not the other: nothing was attached, so there
+/// is no new stream to read and no `Attached` event to emit.
+#[derive(Debug)]
+struct Established {
+    result: TerminalAttachResult,
+    stream: Option<dot_agent_deck::platform::transport::TransportReadHalf>,
+}
+
+/// Everything [`attach`] does except emitting and spawning — which is to say,
+/// the whole of the operation that has a **deck**.
+///
+/// # Why this is split out
+///
+/// The same reason `crate::retarget_selection` is: reaching an emit needs an
+/// `AppHandle`, which needs a running Tauri app, and every interesting decision
+/// here happens before the first one. What that buys is specific rather than
+/// tidy — the observed-set boundary below is reachable from a test, over a
+/// scripted socket, with the fleet moved underneath it mid-flight. It was not
+/// before, and the third identity audit found the hole where the tests could
+/// not go.
+///
+/// [`attach`] holds no deck at all after this returns, so there is nothing left
+/// up there to get wrong.
+async fn establish(
     state: &DesktopState,
-    // PRD #1105 — which deck's `agent_id` this is. `None` means the selected
-    // deck; see [`endpoint_for_deck`] for why that fallback exists and why the
-    // resolution is against the observed set.
     deck_id: Option<String>,
     agent_id: String,
-    on_output: Channel<Response>,
-    // PRD #882 — the geometry this tile can draw the agent at, measured by
-    // `FitAddon` in the webview. Declaring it registers the tile as a viewer, so
-    // the daemon sizes the agent to the smallest pane among every client
-    // watching it and tells this tile whenever that changes.
+    on_output: &Channel<Response>,
     viewport: Option<(u16, u16)>,
-) -> Result<TerminalAttachResult, String> {
+) -> Result<Established, String> {
     validate_agent_id(&agent_id)?;
-    // Resolved BEFORE the gate, so a bad deck id is refused without queueing
-    // behind somebody else's handshake.
-    let endpoint = endpoint_for_deck(deck_id.as_deref())?;
-    let deck = endpoint.identity();
+    // ONE capture for the whole operation, before the first await (issue
+    // #1116). Resolved BEFORE the gate too, so a bad deck id is refused
+    // without queueing behind somebody else's handshake.
+    let scope = crate::dto::DeckScope::resolve(deck_id.as_deref())?;
+    let deck = scope.identity();
     let _attach_guard = state.attach_gate.lock().await;
+    // The gate is process-wide and a handshake over `ssh` can hold it for
+    // tens of seconds, so the fleet can have moved entirely while this attach
+    // sat in the queue. Refusing here is HARM REDUCTION rather than the
+    // boundary: it means no `ssh` child is spawned and no credential is
+    // presented to a host the user has just removed. The boundary itself is
+    // `publish_scoped_session` below, which is the check that cannot be
+    // outrun — this one can, by a removal that lands after it.
+    scope.revalidate()?;
     let channel_id = on_output.id();
     // The deck is part of the reuse check for the same reason it is part of the
     // registry key: `(agent_id, channel_id)` alone would answer "you already
@@ -521,20 +576,23 @@ pub(crate) async fn attach(
             && session.channel_id == channel_id
             && session.endpoint.identity() == deck
     }) {
-        return Ok(TerminalAttachResult {
-            session_id: session_id.clone(),
-            agent_id,
-            generation: session.generation,
-            reused: true,
-            // A reused session keeps whatever geometry it already has; the
-            // frontend's grid is already sized to it and no attach happened.
-            applied_rows: None,
-            applied_cols: None,
+        return Ok(Established {
+            result: TerminalAttachResult {
+                session_id: session_id.clone(),
+                agent_id,
+                generation: session.generation,
+                reused: true,
+                // A reused session keeps whatever geometry it already has; the
+                // frontend's grid is already sized to it and no attach happened.
+                applied_rows: None,
+                applied_cols: None,
+            },
+            stream: None,
         });
     }
     // This deck's earlier session for this agent, never another deck's.
     detach_agent_on(state, &deck, &agent_id).await;
-    let daemon = state.daemon.trusted(&endpoint).await?;
+    let daemon = state.daemon.trusted(scope.endpoint()).await?;
     daemon.require_compatible()?;
     // PRD #882: a half-measured tile (one axis zero) declares nothing rather
     // than a geometry it does not mean — under a smallest-wins policy a bogus
@@ -562,21 +620,78 @@ pub(crate) async fn attach(
     .map_err(|error| safe_message(error.to_string()))?;
     let viewer = connection.viewer().map(|v| v.to_string());
     let applied = connection.applied();
-    let (mut reader, writer) = connection.into_split();
+    let (reader, writer) = connection.into_split();
     let generation = state.next_generation.fetch_add(1, Ordering::Relaxed);
     let session_id = session_id(generation);
-    state.insert_unique_session(
-        session_id.clone(),
-        TerminalSession {
-            agent_id: agent_id.clone(),
-            endpoint,
-            channel_id,
+    let session = TerminalSession {
+        agent_id: agent_id.clone(),
+        // From the SCOPE, so the session's deck and the deck this operation
+        // authenticated against are one value rather than two that agree.
+        endpoint: scope.endpoint().clone(),
+        channel_id,
+        generation,
+        writer: Arc::new(AsyncMutex::new(writer)),
+        viewer,
+        _transport: transport,
+    };
+    match state.publish_scoped_session(session_id.clone(), session, &scope) {
+        Ok(()) => {}
+        Err(rejected) => {
+            // The audit's point about the tunnel/link epoch: refusing to
+            // publish is not enough on its own, because the lease and the open
+            // stream reached this frame anyway. So say goodbye on the wire
+            // before dropping them — otherwise the daemon carries this viewer
+            // until it notices a half-closed transport, and until then it is
+            // sizing the agent to a pane that will never be drawn.
+            detach_unpublished(rejected.session).await;
+            return Err(rejected.reason);
+        }
+    }
+
+    Ok(Established {
+        result: TerminalAttachResult {
+            session_id,
+            agent_id,
             generation,
-            writer: Arc::new(AsyncMutex::new(writer)),
-            viewer,
-            _transport: transport,
+            reused: false,
+            // PRD #882: the geometry in force at attach time, resolved under the
+            // same daemon lock as the scrollback replay that is about to arrive
+            // on the channel. The frontend sizes its grid from this before
+            // writing those bytes, so the replay is parsed at the geometry it
+            // was written at rather than at whatever the tile happened to
+            // measure.
+            applied_rows: applied.map(|(rows, _)| rows),
+            applied_cols: applied.map(|(_, cols)| cols),
         },
-    )?;
+        stream: Some(reader),
+    })
+}
+
+pub(crate) async fn attach(
+    app: &AppHandle,
+    state: &DesktopState,
+    // PRD #1105 — which deck's `agent_id` this is. `None` means the selected
+    // deck; see [`crate::dto::DeckScope::resolve`] for why that fallback exists
+    // and why the resolution is against the observed set.
+    deck_id: Option<String>,
+    agent_id: String,
+    on_output: Channel<Response>,
+    // PRD #882 — the geometry this tile can draw the agent at, measured by
+    // `FitAddon` in the webview. Declaring it registers the tile as a viewer, so
+    // the daemon sizes the agent to the smallest pane among every client
+    // watching it and tells this tile whenever that changes.
+    viewport: Option<(u16, u16)>,
+) -> Result<TerminalAttachResult, String> {
+    let Established { result, stream } =
+        establish(state, deck_id, agent_id, &on_output, viewport).await?;
+    let Some(mut reader) = stream else {
+        // A reused session: the caller already has a live stream task and an
+        // `Attached` event from the attach that created it.
+        return Ok(result);
+    };
+    let generation = result.generation;
+    let session_id = result.session_id.clone();
+    let agent_id = result.agent_id.clone();
 
     emit_terminal_state(
         app,
@@ -719,19 +834,23 @@ pub(crate) async fn attach(
         }
     });
 
-    Ok(TerminalAttachResult {
-        session_id,
-        agent_id,
-        generation,
-        reused: false,
-        // PRD #882: the geometry in force at attach time, resolved under the
-        // same daemon lock as the scrollback replay that is about to arrive on
-        // the channel. The frontend sizes its grid from this before writing
-        // those bytes, so the replay is parsed at the geometry it was written
-        // at rather than at whatever the tile happened to measure.
-        applied_rows: applied.map(|(rows, _)| rows),
-        applied_cols: applied.map(|(_, cols)| cols),
+    Ok(result)
+}
+
+/// A best-effort DETACH over a session that was built and then **not**
+/// published, so the daemon drops this viewer now rather than when it notices a
+/// half-closed transport.
+///
+/// Bounded for the reason [`detach_matching`]'s loop is: the write travels over
+/// a transport that may be an `ssh` child on its way out. Consuming the session
+/// rather than borrowing it is the other half of the job — its `_transport`
+/// lease is released on drop, which is what lets that child go.
+async fn detach_unpublished(session: TerminalSession) {
+    let _ = tokio::time::timeout(std::time::Duration::from_millis(250), async {
+        let mut writer = session.writer.lock().await;
+        let _ = write_frame(&mut *writer, KIND_DETACH, &[]).await;
     })
+    .await;
 }
 
 pub(crate) async fn write(
@@ -1068,7 +1187,8 @@ mod tests {
         assert_eq!(observed.len(), 3, "the local deck and the two rows");
         for endpoint in &observed {
             let wire = crate::dto::deck_wire_id(endpoint);
-            let resolved = endpoint_for_deck(Some(&wire)).expect("an observed deck resolves");
+            let resolved =
+                crate::dto::DeckScope::resolve(Some(&wire)).expect("an observed deck resolves");
             assert_eq!(
                 resolved.identity(),
                 endpoint.identity(),
@@ -1096,12 +1216,13 @@ mod tests {
         let settings = fleet_settings(&["build-box.example.com"]);
         crate::dto::apply_settings_selection(&settings);
 
-        let error = endpoint_for_deck(Some("deck-ffffffffffffffff"))
+        let error = crate::dto::DeckScope::resolve(Some("deck-ffffffffffffffff"))
             .expect_err("an unknown deck id must not resolve");
         assert!(error.contains("observing"), "the refusal says why: {error}");
 
         // `None` is the documented "the selected deck" case, and stays that way.
-        let selected = endpoint_for_deck(None).expect("no deck id means the selected deck");
+        let selected =
+            crate::dto::DeckScope::resolve(None).expect("no deck id means the selected deck");
         assert_eq!(
             selected.identity(),
             crate::dto::selected_endpoint().identity()
@@ -1449,6 +1570,407 @@ mod tests {
 
         // Detaching is what lets it go.
         assert!(detach(&state, "terminal-1").await.unwrap());
+        assert!(state.sessions().unwrap().is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #1116 — the two await-races the third identity audit found, tested
+    // at their CALLERS.
+    //
+    // # Why these need a scripted daemon and an env var, when the nine tests
+    // above needed neither
+    //
+    // Both defects are a second read of the applied selection on the far side
+    // of a daemon round trip. A test that never reaches a daemon cannot put
+    // anything between the two reads, so it cannot tell a fixed caller from a
+    // broken one — which is exactly how `detach_agent_on`'s own green test
+    // proved the helper and said nothing about the caller that misused it.
+    //
+    // So the local deck's address has to be a socket this test controls, and
+    // `DOT_AGENT_DECK_ATTACH_SOCKET` is the only way to move it: the local
+    // endpoint is resolved from config and no settings document can name it.
+    // Under nextest each test owns its process, which is what makes writing a
+    // process-global variable safe here — the same reason the selection tests
+    // in this file can write `APPLIED_SELECTION` without a lock, and the
+    // reason this crate's five selection-touching tests fail under a plain
+    // `cargo test` (one process, threads) while passing under `cargo
+    // test-fast`.
+    // -----------------------------------------------------------------------
+
+    /// Point the LOCAL deck at `socket` and bind a listener on it, owner-only.
+    ///
+    /// The 0o600 restatement is `daemon_bridge`'s `bind_trusted` reason
+    /// verbatim: the client refuses a socket the ambient umask left group- or
+    /// world-accessible, and flipping the process umask around `bind(2)` is the
+    /// wrong tool in a shared-process test run.
+    #[cfg(unix)]
+    fn bind_local_deck(socket: &std::path::Path) -> tokio::net::UnixListener {
+        use std::os::unix::fs::PermissionsExt;
+        // SAFETY: under nextest this test owns its process, so no other thread
+        // is reading the environment here. See the module comment above.
+        unsafe { std::env::set_var("DOT_AGENT_DECK_ATTACH_SOCKET", socket) };
+        let listener = tokio::net::UnixListener::bind(socket).expect("bind the scripted deck");
+        std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o600))
+            .expect("restate 0o600 on the socket inode");
+        listener
+    }
+
+    /// A short socket path in a fresh temp dir. Deliberately short — a Unix
+    /// socket path is capped near 100 bytes and a long temp root silently
+    /// fails to bind.
+    #[cfg(unix)]
+    fn scratch_socket(tag: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::Builder::new()
+            .prefix(tag)
+            .tempdir_in("/tmp")
+            .expect("a scratch dir for the socket");
+        let socket = dir.path().join("s");
+        (dir, socket)
+    }
+
+    /// An output channel whose sends go nowhere.
+    ///
+    /// [`establish`] reads only [`Channel::id`] from it — the frames travel to
+    /// the webview from the stream task [`attach`] spawns, which is on the
+    /// other side of the split this milestone made. So a channel that drops
+    /// what it is handed is not a stub standing in for a tested thing; it is
+    /// the whole of what this code path uses.
+    #[cfg(unix)]
+    fn fixture_channel() -> Channel<Response> {
+        Channel::new(|_body: tauri::ipc::InvokeResponseBody| Ok(()))
+    }
+
+    /// A `Hello` reply this build classifies as `Connected`, so
+    /// `require_compatible()` passes.
+    #[cfg(unix)]
+    fn matching_hello() -> dot_agent_deck::daemon_protocol::AttachResponse {
+        use dot_agent_deck::daemon_protocol::{AttachResponse, PROTOCOL_VERSION};
+        let mut reply = AttachResponse::hello(PROTOCOL_VERSION)
+            .with_running_agents(dot_agent_deck::daemon_protocol::RunningAgentsSummary::default());
+        reply.build_version = Some(dot_agent_deck::build_id::local_build_id());
+        reply
+    }
+
+    /// Answer one connection with one reply, after `hold` resolves.
+    ///
+    /// One request per connection is not a simplification — the real daemon's
+    /// `handle_connection` reads exactly ONE frame, dispatches it and returns.
+    /// `hold` is what lets a test stand inside the window between a request
+    /// arriving and its answer, which is where both defects live.
+    #[cfg(unix)]
+    async fn answer_one(
+        listener: &tokio::net::UnixListener,
+        reply: dot_agent_deck::daemon_protocol::AttachResponse,
+        arrived: Option<tokio::sync::oneshot::Sender<()>>,
+        hold: Option<tokio::sync::oneshot::Receiver<()>>,
+    ) -> (
+        Vec<u8>,
+        dot_agent_deck::platform::transport::TransportWriteHalf,
+    ) {
+        use dot_agent_deck::daemon_protocol::{KIND_REQ, KIND_RESP};
+        let (stream, _peer) = listener.accept().await.expect("accept one client");
+        let (reader, writer) = stream.into_split();
+        let mut reader = dot_agent_deck::platform::transport::TransportReadHalf::new(reader);
+        let mut writer = TransportWriteHalf::new(writer);
+        let (kind, payload) = read_frame(&mut reader)
+            .await
+            .expect("read the request frame")
+            .expect("the client sent a frame");
+        assert_eq!(kind, KIND_REQ, "the desktop opens with a request frame");
+        if let Some(arrived) = arrived {
+            let _ = arrived.send(());
+        }
+        if let Some(hold) = hold {
+            let _ = hold.await;
+        }
+        let encoded = serde_json::to_vec(&reply).expect("serialize the reply");
+        write_frame(&mut writer, KIND_RESP, &encoded)
+            .await
+            .expect("answer the client");
+        (payload, writer)
+    }
+
+    /// Issue #1116 BLOCKER 1, at the caller.
+    ///
+    /// Scenario: two decks each run an agent called `planner` and both have a
+    /// live terminal session. Stop Agent is invoked on deck A (the local,
+    /// scripted deck); while the daemon is holding the request, the user
+    /// changes the deck selection to deck B. When the stop completes, A's
+    /// session must be gone and **B's must still be there**.
+    ///
+    /// # What this fails against, and why the existing green test does not
+    /// catch it
+    ///
+    /// `stop_agent_action` read `selected_endpoint()` a second time, after the
+    /// await, to pick the deck whose session to detach. So the daemon stopped
+    /// A's `planner` and the cleanup detached **B's** — a terminal closed on a
+    /// machine the action never touched. Agent ids are per-daemon monotonic
+    /// integers, so two decks minting `planner` is the ordinary case.
+    ///
+    /// `detaching_one_decks_agent_leaves_the_other_decks_namesake` is green
+    /// either way: it proves `detach_agent_on` honours its deck argument, and
+    /// the defect was in the argument.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_selection_move_during_a_stop_detaches_the_stopped_decks_session() {
+        let (_dir, socket) = scratch_socket("dad-stop-race");
+        let listener = bind_local_deck(&socket);
+
+        // A fleet: the local (scripted) deck A plus one remote row B.
+        let fleet = fleet_settings(&["build-box.example.com"]);
+        crate::dto::apply_settings_selection(&fleet);
+        let deck_a = crate::dto::selected_endpoint();
+        let deck_b = row_endpoint(&["build-box.example.com"], 0);
+        assert_ne!(
+            deck_a.identity(),
+            deck_b.identity(),
+            "the two decks must be distinguishable for this test to mean anything"
+        );
+
+        let lease = fixture_lease().await;
+        let state = DesktopState::default();
+        state
+            .insert_unique_session(
+                "terminal-a".into(),
+                fixture_session_on(deck_a.clone(), "planner", 1, Arc::clone(&lease)),
+            )
+            .unwrap();
+        state
+            .insert_unique_session(
+                "terminal-b".into(),
+                fixture_session_on(deck_b.clone(), "planner", 2, Arc::clone(&lease)),
+            )
+            .unwrap();
+
+        let (stop_arrived_tx, stop_arrived_rx) = tokio::sync::oneshot::channel();
+        let (release_stop_tx, release_stop_rx) = tokio::sync::oneshot::channel();
+        let deck = tokio::spawn(async move {
+            // The handshake, answered immediately.
+            let _hello = answer_one(&listener, matching_hello(), None, None).await;
+            // The stop, held open so the test can move the selection while it
+            // is in flight. This is the whole point of the fixture.
+            let (payload, _writer) = answer_one(
+                &listener,
+                dot_agent_deck::daemon_protocol::AttachResponse {
+                    ok: true,
+                    ..Default::default()
+                },
+                Some(stop_arrived_tx),
+                Some(release_stop_rx),
+            )
+            .await;
+            payload
+        });
+
+        // `join!` rather than `spawn`: the action borrows `state`, and the two
+        // halves have to interleave inside one task anyway — the whole
+        // condition is "the selection moves while the stop is in flight".
+        let stopping = crate::stop_agent_action(&state, "planner");
+        let moving = async {
+            stop_arrived_rx
+                .await
+                .expect("the scripted deck received the stop request");
+            // The user picks deck B while the daemon is still holding the stop.
+            crate::dto::apply_settings_selection(&fleet_selecting(
+                &["build-box.example.com"],
+                crate::settings::Selection::One(
+                    crate::settings::EndpointId::parse(&row_id(0)).expect("a valid id"),
+                ),
+            ));
+            assert_eq!(
+                crate::dto::selected_endpoint().identity(),
+                deck_b.identity(),
+                "the fixture must actually have moved the selection"
+            );
+            let _ = release_stop_tx.send(());
+        };
+        let (stopped, ()) = tokio::join!(stopping, moving);
+        stopped.expect("the scripted deck accepted the stop");
+
+        let request = deck.await.expect("the scripted deck must finish");
+        let request: serde_json::Value =
+            serde_json::from_slice(&request).expect("the request must be JSON");
+        assert_eq!(
+            request["op"], "stop-agent",
+            "the action must have reached the daemon it captured"
+        );
+
+        let sessions = state.sessions().unwrap();
+        assert!(
+            !sessions.contains_key("terminal-a"),
+            "the stopped deck's session must be detached"
+        );
+        assert!(
+            sessions.contains_key("terminal-b"),
+            "the deck that merely became SELECTED mid-stop keeps its terminal — its \
+             agent was never stopped"
+        );
+    }
+
+    /// Issue #1116 BLOCKER 2, at the caller — the publication boundary.
+    ///
+    /// Scenario: an attach for the local deck resolves its endpoint,
+    /// handshakes and opens its PTY stream. While the daemon is still holding
+    /// the attach-stream request, the user removes that deck from the fleet, so
+    /// `retarget_selection` invalidates its link, releases its tunnel and ends
+    /// its watcher — finding no session, because there is not one yet. The
+    /// attach then completes. It must publish **nothing**.
+    ///
+    /// # What this fails against
+    ///
+    /// `establish` validated `deck_id` against the observed set once, before a
+    /// process-wide gate, and then performed the handshake and the stream
+    /// attach with no further check — so the session went into the registry
+    /// after the user removed the deck, streaming from a daemon the app is no
+    /// longer meant to be talking to and holding the `ssh` child alive through
+    /// its own transport lease. The tunnel/link epoch does not close it: the
+    /// lease still reaches the caller and `TerminalSession::_transport` keeps
+    /// it alive.
+    ///
+    /// # Why the assertion is on the registry and not on the error
+    ///
+    /// The refusal's wording is `DeckScope::revalidate`'s business. What the
+    /// audit requires is that nothing durable is installed, and an empty
+    /// registry says that whatever the message.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_attach_whose_deck_is_removed_mid_handshake_publishes_no_session() {
+        let (_dir, socket) = scratch_socket("dad-attach-race");
+        let listener = bind_local_deck(&socket);
+
+        let fleet = fleet_settings(&["build-box.example.com"]);
+        crate::dto::apply_settings_selection(&fleet);
+        let deck_a = crate::dto::selected_endpoint();
+        let wire_a = crate::dto::deck_wire_id(&deck_a);
+
+        let state = DesktopState::default();
+        let (attach_arrived_tx, attach_arrived_rx) = tokio::sync::oneshot::channel();
+        let (release_attach_tx, release_attach_rx) = tokio::sync::oneshot::channel();
+        let deck = tokio::spawn(async move {
+            let _hello = answer_one(&listener, matching_hello(), None, None).await;
+            // The attach stream, held open. `into_split` on the desktop side
+            // keeps this connection as the stream, so the reply has to look
+            // like a real one.
+            let mut reply = dot_agent_deck::daemon_protocol::AttachResponse {
+                ok: true,
+                ..Default::default()
+            };
+            reply.viewer = Some("viewer-1".into());
+            let (payload, writer) = answer_one(
+                &listener,
+                reply,
+                Some(attach_arrived_tx),
+                Some(release_attach_rx),
+            )
+            .await;
+            // Hold the write half so the stream does not EOF, which would let
+            // this test pass for the wrong reason.
+            (payload, writer)
+        });
+
+        let channel = fixture_channel();
+        let attaching = establish(&state, Some(wire_a), "planner".into(), &channel, None);
+        let removing = async {
+            attach_arrived_rx
+                .await
+                .expect("the scripted deck received the attach-stream request");
+            // The user removes the local deck from the fleet by selecting only
+            // the remote row. This is the real teardown, not a stand-in: it
+            // invalidates links, retains tunnels and ends watchers, and finds
+            // no session for the attach that is still in flight.
+            let moved = crate::retarget_selection(
+                &state,
+                &fleet_selecting(
+                    &["build-box.example.com"],
+                    crate::settings::Selection::One(
+                        crate::settings::EndpointId::parse(&row_id(0)).expect("a valid id"),
+                    ),
+                ),
+            )
+            .await;
+            assert!(moved, "the fixture must actually have moved the deck");
+            assert!(
+                !crate::dto::deck_is_observed(&deck_a),
+                "the deck being attached must genuinely have left the observed set"
+            );
+            let _ = release_attach_tx.send(());
+        };
+        let (attached, ()) = tokio::join!(attaching, removing);
+
+        attached.expect_err("an attach for a removed deck must not succeed");
+        assert!(
+            state.sessions().unwrap().is_empty(),
+            "no session may be published for a deck the user removed while the attach \
+             was in flight"
+        );
+        deck.abort();
+    }
+
+    /// Issue #1116 BLOCKER 2, at the caller — the queued half.
+    ///
+    /// Scenario: an attach for deck D is queued behind a slower attach holding
+    /// the process-wide attach gate. While it waits, the user removes D. When
+    /// the gate opens, the queued attach must refuse **without connecting** —
+    /// so the scripted deck accepts no connection at all.
+    ///
+    /// # Why the assertion is a connection count
+    ///
+    /// Both the fixed and the unfixed code return `Err` here, so asserting on
+    /// the result proves nothing. What separates them is whether a credential
+    /// was presented to a host the user had already removed: the unfixed code
+    /// opens the handshake connection, and the fixed code never reaches
+    /// `DaemonLinks::trusted`. `try_accept` after the fact is the discriminator,
+    /// and it needs no message matching.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_attach_queued_behind_the_gate_never_reaches_a_deck_removed_while_it_waited() {
+        let (_dir, socket) = scratch_socket("dad-gate-race");
+        let listener = bind_local_deck(&socket);
+
+        let fleet = fleet_settings(&["build-box.example.com"]);
+        crate::dto::apply_settings_selection(&fleet);
+        let deck_a = crate::dto::selected_endpoint();
+        let wire_a = crate::dto::deck_wire_id(&deck_a);
+
+        let state = DesktopState::default();
+        // Stand in for the slower attach ahead of this one in the queue.
+        let ahead = state.attach_gate.lock().await;
+
+        let channel = fixture_channel();
+        let attaching = establish(&state, Some(wire_a), "planner".into(), &channel, None);
+        let removing = async {
+            // The attach is now parked on the gate with its scope captured.
+            crate::dto::apply_settings_selection(&fleet_selecting(
+                &["build-box.example.com"],
+                crate::settings::Selection::One(
+                    crate::settings::EndpointId::parse(&row_id(0)).expect("a valid id"),
+                ),
+            ));
+            assert!(
+                !crate::dto::deck_is_observed(&deck_a),
+                "the queued attach's deck must genuinely have left the observed set"
+            );
+            drop(ahead);
+        };
+        let (attached, ()) = tokio::join!(attaching, removing);
+
+        attached.expect_err("an attach for a deck removed while it queued must not succeed");
+        // Non-blocking rather than a timeout, and that is a correctness point
+        // rather than a saving: `attached` has already resolved, and the
+        // unfixed code cannot fail without first connecting — so any connection
+        // it opened is already sitting in this listener's backlog. There is
+        // nothing left to wait for, and a timeout would only add a way for the
+        // mutation check to pass for the wrong reason under load.
+        let raw = listener.into_std().expect("take the std listener back");
+        raw.set_nonblocking(true).expect("ask for WouldBlock");
+        assert!(
+            matches!(
+                raw.accept(),
+                Err(ref error) if error.kind() == std::io::ErrorKind::WouldBlock
+            ),
+            "the refusal must land BEFORE the handshake, so no credential is presented \
+             to a host the user has removed"
+        );
         assert!(state.sessions().unwrap().is_empty());
     }
 }
