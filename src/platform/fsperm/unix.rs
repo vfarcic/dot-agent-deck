@@ -192,6 +192,14 @@ pub fn set_endpoint_mode_owner_only(path: &Path) -> std::io::Result<()> {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
 }
 
+/// Why [`verify_endpoint_trusted`] refuses a symlink at the endpoint path
+/// (issue #1020). A named constant rather than an inline literal so the tests
+/// can assert it exactly, which is what pins that the symlink clause runs
+/// *before* the type and uid clauses — a link to a regular file otherwise
+/// refuses for being a regular file and the test still passes.
+const SYMLINK_REFUSAL: &str = "it is a symlink, so its own owner and mode decide nothing — an \
+                               endpoint must be the socket inode itself, not a link to one";
+
 /// The pure-data core of [`verify_endpoint_trusted`]'s ownership clause: an
 /// endpoint is trusted only when its owning uid is exactly ours.
 ///
@@ -224,10 +232,43 @@ fn endpoint_uid_is_trusted(owner_uid: u32, our_uid: u32) -> Result<(), String> {
 /// then connect to is anchored to the inode the kernel resolves during this
 /// single call (and any swap underneath us produces an obvious connection error
 /// from `UnixStream::connect`).
+///
+/// **The stat is an `lstat`, so a symlink at the endpoint path is refused on its
+/// own account and its target decides nothing** (issue #1020). It used to be
+/// `std::fs::metadata`, which reads *through* a link: the owner and mode tested
+/// were the target's, so a link owned by anyone at all was accepted as long as
+/// it pointed at some socket of ours. Same trade, same reasoning as
+/// [`ensure_owner_only_dir`]'s refusal — refuse the link rather than try to
+/// distinguish a planted one from a deliberate one.
+///
+/// **What that is worth depends on the directory, and it is worth nothing under
+/// the premise the paragraph above states.** A same-uid attacker who can plant a
+/// link can bind a real `0o600` socket of their own at the same path instead, so
+/// against *that* actor this clause adds no refusal. What it closes is the
+/// foreign-uid case the `/tmp` fallback in
+/// [`crate::platform::paths::attach_socket_path`] opens: with `XDG_RUNTIME_DIR`
+/// unset — an ordinary ssh session or a container — the endpoint lands in a
+/// world-writable directory, where another uid can create a symlink they own
+/// and, before this, have it accepted. Under `XDG_RUNTIME_DIR` (mode `0o700`,
+/// ours) no foreign uid can create the entry in the first place.
+///
+/// Only the **final** component is lstat'd; a symlinked ancestor is resolved as
+/// usual, which is deliberate — macOS's `/tmp` is a symlink to `/private/tmp`
+/// and a `$TMPDIR` or `$XDG_RUNTIME_DIR` under one is ordinary. The property is
+/// "the endpoint is the inode we check", not "no link is involved in reaching
+/// it".
 pub fn verify_endpoint_trusted(path: &Path) -> Result<(), String> {
     use std::os::unix::fs::{FileTypeExt, MetadataExt};
 
-    let metadata = std::fs::metadata(path).map_err(|source| format!("stat failed: {source}"))?;
+    let metadata =
+        std::fs::symlink_metadata(path).map_err(|source| format!("stat failed: {source}"))?;
+
+    // Ahead of the type clause so the reason names the link. Reported as "not a
+    // Unix domain socket" it would be true but actively misleading about a path
+    // that does resolve to one.
+    if metadata.file_type().is_symlink() {
+        return Err(SYMLINK_REFUSAL.to_string());
+    }
 
     if !metadata.file_type().is_socket() {
         return Err("not a Unix domain socket".to_string());
@@ -506,23 +547,38 @@ mod tests {
         assert!(err.starts_with("stat failed:"), "{err}");
         assert!(err.contains("os error 2"), "ENOENT must be named: {err}");
 
-        // A dangling symlink reads as absent, for the same reason the test
-        // below reads through a live one: `metadata` follows links.
+        // A dangling symlink used to read as absent, because `metadata`
+        // followed links and the `ENOENT` came from the target. Since issue
+        // #1020 it reads as what it is — something squatting the path — which
+        // is the distinction this test exists to draw. The symlink test below
+        // owns the assertion; here we only pin that it is no longer filed under
+        // "the daemon never bound".
         let dangling = root.path().join("dangling.sock");
         std::os::unix::fs::symlink(root.path().join("nowhere"), &dangling)
             .expect("plant the dangling symlink");
         let err = verify_endpoint_trusted(&dangling).expect_err("a dangling symlink is refused");
-        assert!(err.starts_with("stat failed:"), "{err}");
+        assert!(
+            !err.starts_with("stat failed:"),
+            "a planted link must not be reported as an absent endpoint: {err}"
+        );
+        assert!(err.contains("symlink"), "{err}");
     }
 
-    /// Characterization, not endorsement: the check stats **through** symlinks
-    /// (`std::fs::metadata`, not `symlink_metadata`), so a link to a trusted
-    /// socket is trusted and the link's own mode never decides anything. Recon
-    /// did not list this case; it is pinned because PRD #741's `Endpoint` split
-    /// is about to move this code and a switch to `symlink_metadata` would flip
-    /// it silently.
+    /// Issue #1020: a symlink at the endpoint path is refused, and the socket it
+    /// points at is **not** what decides.
+    ///
+    /// This inverts the `…_stats_through_a_symlink_to_a_trusted_socket`
+    /// characterization test PRD #741 M1 left here to make exactly this change
+    /// go red deliberately. The old body asserted that a
+    /// link to a perfectly trusted socket was itself trusted; under the `/tmp`
+    /// fallback that link can be owned by another uid, so accepting it hands
+    /// our client to an endpoint a stranger chose.
+    ///
+    /// The strong form of the property is the *second* half: the same target,
+    /// named directly, is still trusted. A refusal that also broke the real
+    /// socket would be a regression wearing a fix's clothes.
     #[test]
-    fn verify_endpoint_trusted_stats_through_a_symlink_to_a_trusted_socket() {
+    fn verify_endpoint_trusted_refuses_a_symlink_to_a_trusted_socket() {
         let root = tempfile::tempdir().expect("tempdir");
         let real = root.path().join("real.sock");
         let _listener = bind_trusted_socket(&real);
@@ -530,15 +586,90 @@ mod tests {
         let link = root.path().join("link.sock");
         std::os::unix::fs::symlink(&real, &link).expect("plant the symlink");
 
-        verify_endpoint_trusted(&link)
-            .expect("today's check follows the link and trusts its target");
-
-        // …and it is the target's mode, not the link's, that decides.
-        chmod(&real, 0o644);
-        assert_eq!(
-            verify_endpoint_trusted(&link).expect_err("the target's mode must decide"),
-            "mode is 0o644 (expected 0o600)"
+        let err = verify_endpoint_trusted(&link)
+            .expect_err("a symlink must be refused however trusted its target is");
+        assert!(
+            err.contains("symlink"),
+            "the reason must name the link, not the target: {err}"
         );
+
+        // The target is untouched and still reachable by its own name — the
+        // refusal is about the link, not about the socket.
+        verify_endpoint_trusted(&real).expect("the real socket is still trusted by its own name");
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .expect("lstat the planted link")
+                .file_type()
+                .is_symlink(),
+            "verification must not mutate the path it refuses"
+        );
+    }
+
+    /// …and the target decides nothing *at all*, which is the property that
+    /// makes the refusal worth having. Every shape of target — a trusted
+    /// socket, a regular file, a directory, nothing — produces the same single
+    /// refusal, so no attacker-controlled target can steer which clause fires.
+    ///
+    /// Without this, a `symlink_metadata` that had been placed *after* the type
+    /// or uid clause would still pass the test above while reporting the
+    /// target's business for three of these four cases.
+    #[test]
+    fn verify_endpoint_trusted_refuses_a_symlink_whatever_it_points_at() {
+        let root = tempfile::tempdir().expect("tempdir");
+
+        let socket = root.path().join("real.sock");
+        let _listener = bind_trusted_socket(&socket);
+        let plain = root.path().join("plain");
+        std::fs::write(&plain, b"").expect("write the plain file");
+        chmod(&plain, 0o600);
+        let dir = root.path().join("dir");
+        std::fs::create_dir(&dir).expect("create the directory");
+        let nowhere = root.path().join("nowhere");
+
+        for (label, target) in [
+            ("a trusted socket", &socket),
+            ("a 0o600 regular file", &plain),
+            ("a directory", &dir),
+            ("nothing at all", &nowhere),
+        ] {
+            let link = root
+                .path()
+                .join(format!("link-{}", label.replace(' ', "-")));
+            std::os::unix::fs::symlink(target, &link).expect("plant the symlink");
+            assert_eq!(
+                verify_endpoint_trusted(&link)
+                    .expect_err(&format!("a symlink to {label} must be refused")),
+                SYMLINK_REFUSAL,
+                "a symlink to {label} must refuse for being a symlink, not for what it points at"
+            );
+        }
+    }
+
+    /// The legitimate case that a clumsier fix would break: only the **final**
+    /// component is lstat'd, so a socket reached through a symlinked *ancestor*
+    /// is still trusted.
+    ///
+    /// This is not a hypothetical. macOS's `/tmp` is a symlink to
+    /// `/private/tmp`, and the per-user `$TMPDIR` that `tempfile` uses there
+    /// lives under `/var`, itself a symlink to `/private/var` — so on the
+    /// `build-macos` runner the sibling tests here are *already* resolving
+    /// through links. An implementation that reached for `canonicalize` and a
+    /// path comparison, or `O_NOFOLLOW` over the whole path, would refuse every
+    /// endpoint on that platform and pass every test that only plants a link at
+    /// the endpoint itself.
+    #[test]
+    fn verify_endpoint_trusted_accepts_a_socket_under_a_symlinked_ancestor() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let real_dir = root.path().join("real-dir");
+        std::fs::create_dir(&real_dir).expect("create the real directory");
+        let endpoint = real_dir.join("attach.sock");
+        let _listener = bind_trusted_socket(&endpoint);
+
+        let via_link = root.path().join("linked-dir");
+        std::os::unix::fs::symlink(&real_dir, &via_link).expect("symlink the parent directory");
+
+        verify_endpoint_trusted(&via_link.join("attach.sock"))
+            .expect("a symlinked ancestor is ordinary and must not be refused");
     }
 
     /// The foreign-uid denial, at the level where it is decidable without a
