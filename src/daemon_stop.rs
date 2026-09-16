@@ -113,6 +113,23 @@ pub enum StopError {
     /// Read [`CAP_STOP_DAEMON`] off a `Hello` first if you want to tell the two
     /// apart before spending a round trip on it.
     WireRejected(String),
+    /// Issue #1049, wire path only: the daemon accepted the connection but never
+    /// answered within [`WIRE_STOP_REQUEST_TIMEOUT`].
+    ///
+    /// Its own variant because the recovery differs from every other error here:
+    /// this side does **not** know whether the daemon saw the request, so the
+    /// honest report is "unknown", not "failed". Retrying is safe — if the first
+    /// attempt landed and the daemon stopped, the retry answers
+    /// [`WireStopOutcome::NoDaemonRunning`]; if it was refused, the retry is
+    /// refused the same way.
+    ///
+    /// Reachable specifically over a forwarded socket, which is the transport
+    /// this verb exists for: `ssh -L` accepts locally whether or not anything
+    /// upstream is healthy, so a stalled remote produces a connection that is
+    /// open and permanently silent. Without this bound the call would block
+    /// forever and the confirmation budget below would never be reached
+    /// (Greptile P1 on PR #1113).
+    WireTimedOut,
 }
 
 /// Does `capabilities`, as advertised on a `Hello` reply, include the wire stop?
@@ -160,6 +177,11 @@ impl std::fmt::Display for StopError {
             // the operator a second, subtly different account of one refusal.
             Self::Refused(refusal) => write!(f, "{}", refusal.summary),
             Self::WireRejected(msg) => write!(f, "daemon refused stop-daemon: {msg}"),
+            Self::WireTimedOut => write!(
+                f,
+                "daemon accepted the connection but did not answer stop-daemon within {}s;                  whether it saw the request is unknown — retrying is safe",
+                WIRE_STOP_REQUEST_TIMEOUT.as_secs()
+            ),
         }
     }
 }
@@ -478,6 +500,34 @@ const WIRE_STOP_CONFIRM_TIMEOUT: Duration = STOP_GRACE_TIMEOUT;
 /// Gap between confirmation probes. Matches the PID path's poll cadence.
 const WIRE_STOP_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
+/// Bound on the `StopDaemon` round trip itself.
+///
+/// The daemon answers this verb *before* it drains anything — a refusal is
+/// immediate and an accept is written ahead of the teardown — so a healthy peer
+/// replies in well under a second plus the transport's round trip. Ten seconds
+/// is slack for a loaded host or a slow tunnel, not a budget anything is
+/// expected to use. Exceeding it yields [`StopError::WireTimedOut`].
+const WIRE_STOP_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Bound on one confirmation probe.
+///
+/// Tighter than the request bound because a probe is only ever a `Hello`, and
+/// because several of them have to fit inside
+/// [`WIRE_STOP_CONFIRM_TIMEOUT`].
+const WIRE_STOP_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// How many CONSECUTIVE unreachable probes confirm the daemon is gone.
+///
+/// Not one. A single failed probe used to be treated as proof the daemon had
+/// exited, which over a forwarded socket meant a momentary tunnel hiccup could
+/// return [`WireStopOutcome::Stopped`] for a daemon that was still running
+/// (Greptile P1 on PR #1113) — a **false success**, and false successes on the
+/// stop path are the specific defect issue #1049 was filed about: over `ssh -L`
+/// the old PID path reported "Daemon stopped gracefully (pid N)" having killed
+/// the tunnel. Requiring the absence to persist across three probes costs
+/// ~200 ms on the ordinary path and removes that class of report.
+const WIRE_STOP_GONE_CONFIRMATIONS: u32 = 3;
+
 /// Issue #1049: what a wire stop can end as.
 ///
 /// Deliberately NOT [`StopOutcome`], whose two success variants both carry a
@@ -494,13 +544,13 @@ pub enum WireStopOutcome {
     /// The daemon accepted the stop AND stopped answering within
     /// [`WIRE_STOP_CONFIRM_TIMEOUT`].
     Stopped,
-    /// The daemon accepted the stop and was still answering when the
+    /// The daemon accepted the stop and had not demonstrably gone when the
     /// confirmation budget ran out.
     ///
     /// Not an error, and reported separately rather than as one: the daemon
     /// said yes and began its drain, which can legitimately outlast the budget
     /// with slow-exiting agents, and over a tunnel every probe carries the
-    /// round-trip too. What the caller must not do is *report* it as stopped —
+    /// round trip too. What the caller must not do is *report* it as stopped —
     /// PRD #741's own cautionary case is a stop path that printed success for a
     /// daemon it had not touched.
     AcceptedNotConfirmed,
@@ -536,6 +586,30 @@ pub async fn run_daemon_stop_over_wire(
     address: &std::path::Path,
     force: bool,
 ) -> Result<WireStopOutcome, StopError> {
+    run_daemon_stop_over_wire_with(
+        address,
+        force,
+        WIRE_STOP_REQUEST_TIMEOUT,
+        WIRE_STOP_CONFIRM_TIMEOUT,
+    )
+    .await
+}
+
+/// [`run_daemon_stop_over_wire`] with its two budgets spelled out.
+///
+/// Public because a caller with its own latency expectations has a legitimate
+/// reason to choose them — a GUI that wants to surface "still stopping" sooner
+/// than [`WIRE_STOP_CONFIRM_TIMEOUT`] would, say — and because the timeout and
+/// confirmation behaviour has to be testable in the fast tier, where spending
+/// the production 10 s and 5 s would not be acceptable. Every decision other
+/// than the two budgets is shared with the wrapper, so a test through this
+/// exercises the real path.
+pub async fn run_daemon_stop_over_wire_with(
+    address: &std::path::Path,
+    force: bool,
+    request_timeout: Duration,
+    confirm_timeout: Duration,
+) -> Result<WireStopOutcome, StopError> {
     let stream = match IpcStream::connect(address).await {
         Ok(s) => s,
         Err(e)
@@ -555,9 +629,19 @@ pub async fn run_daemon_stop_over_wire(
     };
 
     let (mut rd, mut wr) = stream.into_split();
-    let resp = issue_command(&mut rd, &mut wr, &AttachRequest::StopDaemon { force })
-        .await
-        .map_err(|e| StopError::WireRejected(e.to_string()))?;
+    // Bounded: `issue_command` has no timeout of its own, and over a forwarded
+    // socket a stalled upstream yields a connection that is open and silent
+    // forever. See `StopError::WireTimedOut`.
+    let resp = match tokio::time::timeout(
+        request_timeout,
+        issue_command(&mut rd, &mut wr, &AttachRequest::StopDaemon { force }),
+    )
+    .await
+    {
+        Ok(Ok(resp)) => resp,
+        Ok(Err(e)) => return Err(StopError::WireRejected(e.to_string())),
+        Err(_) => return Err(StopError::WireTimedOut),
+    };
     drop(rd);
     drop(wr);
 
@@ -580,14 +664,34 @@ pub async fn run_daemon_stop_over_wire(
         force,
         "daemon acknowledged stop-daemon; confirming it stops answering"
     );
-    if poll_daemon_gone_over_wire(address, WIRE_STOP_CONFIRM_TIMEOUT).await {
+    if poll_daemon_gone_over_wire(address, confirm_timeout).await {
         Ok(WireStopOutcome::Stopped)
     } else {
         Ok(WireStopOutcome::AcceptedNotConfirmed)
     }
 }
 
-/// Poll until `address` stops answering a real request, or `budget` elapses.
+/// What one confirmation probe established.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Probe {
+    /// The daemon answered. It is still up.
+    Answered,
+    /// Nothing is there: the connect was refused, or the connection produced an
+    /// EOF or transport error instead of a reply. Over `ssh -L` a dead remote
+    /// daemon looks exactly like this — the tunnel accepts, then the forward
+    /// collapses — which is why this and not `Stalled` is the evidence of death.
+    Unreachable,
+    /// The connection is open and silent: no reply, and no EOF either, within
+    /// [`WIRE_STOP_PROBE_TIMEOUT`].
+    ///
+    /// **Deliberately not evidence of death.** A daemon that exits closes its
+    /// socket, so its peer sees EOF rather than silence; silence is a peer that
+    /// is stalled or a forward that is wedged. Counting it as gone is how a hung
+    /// tunnel would be reported as a successful stop.
+    Stalled,
+}
+
+/// Poll until `address` has demonstrably stopped answering, or `budget` elapses.
 ///
 /// **Not** `build_version_handshake`'s `poll_daemon_gone`, and the difference is
 /// the point. That one short-circuits on the endpoint's filesystem presence,
@@ -597,14 +701,25 @@ pub async fn run_daemon_stop_over_wire(
 /// accepting locally after the remote daemon has gone, and only the forward
 /// behind it fails.
 ///
-/// So this spends a real round trip. `Hello` is the cheapest request every
-/// daemon answers and it mutates nothing, and any failure of it — connect
-/// refused, EOF from a collapsed forward, a decode error — is "gone".
+/// So this spends a real round trip, and requires
+/// [`WIRE_STOP_GONE_CONFIRMATIONS`] CONSECUTIVE unreachable probes before it
+/// says gone. Anything else — an answer, or a stall — resets the count, so a
+/// momentary hiccup cannot be reported as a completed stop.
 async fn poll_daemon_gone_over_wire(address: &std::path::Path, budget: Duration) -> bool {
     let start = std::time::Instant::now();
+    let mut consecutive_unreachable = 0u32;
     loop {
-        if daemon_answers(address).await.is_none() {
-            return true;
+        match probe_daemon(address).await {
+            Probe::Unreachable => {
+                consecutive_unreachable += 1;
+                if consecutive_unreachable >= WIRE_STOP_GONE_CONFIRMATIONS {
+                    return true;
+                }
+            }
+            // Both reset. `Answered` is proof it is up; `Stalled` proves nothing
+            // either way, and treating "proves nothing" as progress toward "gone"
+            // is exactly the false success this counter exists to stop.
+            Probe::Answered | Probe::Stalled => consecutive_unreachable = 0,
         }
         if start.elapsed() >= budget {
             return false;
@@ -613,15 +728,29 @@ async fn poll_daemon_gone_over_wire(address: &std::path::Path, budget: Duration)
     }
 }
 
-/// One `Hello` round trip. `Some(())` if the daemon answered, `None` otherwise.
-async fn daemon_answers(address: &std::path::Path) -> Option<()> {
-    let stream = IpcStream::connect(address).await.ok()?;
+/// One `Hello` round trip, classified. `Hello` is the cheapest request every
+/// daemon answers and it mutates nothing.
+async fn probe_daemon(address: &std::path::Path) -> Probe {
+    let Ok(stream) = IpcStream::connect(address).await else {
+        return Probe::Unreachable;
+    };
     let (mut rd, mut wr) = stream.into_split();
     let req = AttachRequest::Hello {
         client_version: crate::daemon_protocol::PROTOCOL_VERSION,
         client_build_version: None,
     };
-    issue_command(&mut rd, &mut wr, &req).await.ok().map(|_| ())
+    match tokio::time::timeout(
+        WIRE_STOP_PROBE_TIMEOUT,
+        issue_command(&mut rd, &mut wr, &req),
+    )
+    .await
+    {
+        Ok(Ok(_)) => Probe::Answered,
+        // An EOF or transport error on an established connection is what a dead
+        // daemon behind a live tunnel looks like.
+        Ok(Err(_)) => Probe::Unreachable,
+        Err(_) => Probe::Stalled,
+    }
 }
 
 /// `daemon restart`: PRD #103 M3.3 — same logic as `daemon stop`. The

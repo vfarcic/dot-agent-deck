@@ -2077,6 +2077,21 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** the conservative reading of an absent set (`daemon_stop::tests::wire_stop_capability_is_read_conservatively`); `PROTOCOL_VERSION` negotiation, which the desktop's `classify_handshake` owns.
 - **Platform coverage:** linux+mac (`#![cfg(unix)]`).
 
+##### lifecycle/wire-stop/007 — A peer that accepts and stays silent times out instead of hanging the caller forever (issue #1049, Greptile P1 on PR #1113).
+- **Layer:** L1/synthetic (a Unix socket that accepts connections and then never writes and never closes).
+- **Agent:** none.
+- **Asserts:** `run_daemon_stop_over_wire_with` returns on its own budget rather than blocking, surfaces `StopError::WireTimedOut`, and says in its message that the outcome is UNKNOWN and a retry is safe — this side cannot tell whether the daemon saw the request. `issue_command` carries no timeout of its own, and over `ssh -L` a stalled upstream yields a connection that is open and permanently silent, so without this bound the call never returns and the confirmation budget is never reached.
+- **Does not assert:** the production 10 s budget itself (the test passes a short one through the budget-explicit entry point); the confirmation half (`lifecycle/wire-stop/008`).
+- **Platform coverage:** linux+mac (`#![cfg(unix)]`).
+
+##### lifecycle/wire-stop/008 — An accepted stop whose confirmation probes HANG is reported as unconfirmed, never as stopped (issue #1049, Greptile P1 on PR #1113).
+- **Layer:** L1/synthetic (a socket that answers the first request `ok` and then holds every later connection open and silent — an accepted stop behind a wedged forward).
+- **Agent:** none.
+- **Asserts:** the outcome is `WireStopOutcome::AcceptedNotConfirmed`, not `Stopped`. A daemon that exits CLOSES its socket, so its peer sees EOF; silence is a stalled peer and proves nothing, which is why a stalled probe resets the consecutive-unreachable count rather than advancing it. Reporting success for a daemon the caller cannot see is the precise defect #1049 was filed about — over `ssh -L` the PID path printed "Daemon stopped gracefully (pid N)" having killed the tunnel.
+- **Does not assert:** the three-probe confirmation threshold in isolation; the request-timeout half (`lifecycle/wire-stop/007`).
+- **Platform coverage:** linux+mac (`#![cfg(unix)]`).
+
+
 #### lifecycle/restart
 
 ##### lifecycle/restart/001 — `daemon restart` reuses the next-launch lazy-spawn — a subsequent `dot-agent-deck` launch comes up against a fresh daemon process.

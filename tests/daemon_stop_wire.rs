@@ -60,7 +60,7 @@ use dot_agent_deck::platform::ipc::IpcStream;
 use dot_agent_deck::state::{AppState, OrchestrationIdentity};
 use spec::spec;
 use tempfile::TempDir;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::task::JoinHandle;
 
 /// `bind_attach_listener` flips the process-global umask while binding; the
@@ -491,6 +491,84 @@ fn wire_stop_006_capability_is_advertised() {
     });
 }
 
+/// Scenario: Point the wire stop at a socket that ACCEPTS connections and then
+/// stays permanently silent — what a forwarded socket does when its upstream is
+/// stalled. The call must give up on its own budget rather than blocking
+/// forever, and must report the outcome as unknown rather than as a stop.
+#[spec("lifecycle/wire-stop/007")]
+#[test]
+fn wire_stop_007_a_silent_peer_times_out_instead_of_hanging() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let sink = start_black_hole().await;
+
+        let started = std::time::Instant::now();
+        let err = tokio::time::timeout(
+            Duration::from_secs(20),
+            dot_agent_deck::daemon_stop::run_daemon_stop_over_wire_with(
+                &sink.path,
+                false,
+                Duration::from_millis(400),
+                Duration::from_millis(400),
+            ),
+        )
+        .await
+        .expect("the call must return on its own — a hang here is the bug")
+        .expect_err("a peer that never answers is not a successful stop");
+
+        assert!(
+            matches!(err, StopError::WireTimedOut),
+            "a silent peer must surface as WireTimedOut, got {err:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the request budget must bound the wait, took {:?}",
+            started.elapsed()
+        );
+        // The message must not claim the daemon did or did not see the request —
+        // this side genuinely does not know, and a retry is the recovery.
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unknown") && msg.contains("retrying is safe"),
+            "the error must say the outcome is unknown and that a retry is safe: {msg:?}"
+        );
+    });
+}
+
+/// Scenario: Accept the stop, then make every confirmation probe hang rather
+/// than refuse — a wedged forward, not a dead daemon. The call must report
+/// `AcceptedNotConfirmed`, never `Stopped`: a stop path that reports success for
+/// a daemon it cannot see is the exact defect issue #1049 was filed about.
+#[spec("lifecycle/wire-stop/008")]
+#[test]
+fn wire_stop_008_a_wedged_probe_is_never_reported_as_stopped() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let sink = start_accept_then_hang().await;
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(20),
+            dot_agent_deck::daemon_stop::run_daemon_stop_over_wire_with(
+                &sink.path,
+                true,
+                Duration::from_secs(5),
+                Duration::from_millis(600),
+            ),
+        )
+        .await
+        .expect("must return on its own")
+        .expect("the stop was accepted, so this is not an error");
+
+        assert_eq!(
+            outcome,
+            WireStopOutcome::AcceptedNotConfirmed,
+            "a probe that hangs proves nothing about the daemon, so it must NOT be \
+             promoted to Stopped — silence is a stalled peer, while a daemon that \
+             exits closes its socket and its peer sees EOF"
+        );
+    });
+}
+
 // ---------------------------------------------------------------------------
 // The relay
 // ---------------------------------------------------------------------------
@@ -560,6 +638,94 @@ async fn start_relay(upstream: &std::path::Path) -> Relay {
         }
     });
     Relay {
+        _dir: dir,
+        path,
+        handle,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Stand-in peers for the timeout / confirmation tests
+// ---------------------------------------------------------------------------
+
+struct Sink {
+    _dir: TempDir,
+    path: PathBuf,
+    handle: JoinHandle<()>,
+}
+
+impl Drop for Sink {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
+
+fn bind_sink() -> (TempDir, PathBuf, tokio::net::UnixListener) {
+    let _g = HARNESS_BIND_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let dir = test_temp::tempdir().unwrap();
+    let path = dir.path().join("sink.sock");
+    let listener = tokio::net::UnixListener::bind(&path).expect("bind sink");
+    (dir, path, listener)
+}
+
+/// Accepts, then never writes and never closes — a forwarded socket whose
+/// upstream is stalled. Holding the connection is the point: a peer that closed
+/// would produce an EOF, which is a different and much easier case.
+async fn start_black_hole() -> Sink {
+    let (dir, path, listener) = bind_sink();
+    let handle = tokio::spawn(async move {
+        let mut held = Vec::new();
+        loop {
+            match listener.accept().await {
+                Ok((conn, _)) => held.push(conn),
+                Err(_) => return,
+            }
+        }
+    });
+    Sink {
+        _dir: dir,
+        path,
+        handle,
+    }
+}
+
+/// Answers the FIRST request (the stop, which it accepts) and then hangs on
+/// every later connection — an accepted stop followed by a wedged forward.
+async fn start_accept_then_hang() -> Sink {
+    let (dir, path, listener) = bind_sink();
+    let handle = tokio::spawn(async move {
+        let mut first = true;
+        let mut held = Vec::new();
+        loop {
+            let Ok((mut conn, _)) = listener.accept().await else {
+                return;
+            };
+            if first {
+                first = false;
+                // Read the request frame, then answer `ok` exactly as the daemon's
+                // accept path does.
+                let mut hdr = [0u8; 5];
+                if conn.read_exact(&mut hdr).await.is_err() {
+                    continue;
+                }
+                let n = u32::from_be_bytes([hdr[1], hdr[2], hdr[3], hdr[4]]) as usize;
+                let mut body = vec![0u8; n];
+                if conn.read_exact(&mut body).await.is_err() {
+                    continue;
+                }
+                let payload = br#"{"ok":true}"#;
+                let mut out = vec![0x02u8];
+                out.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+                out.extend_from_slice(payload);
+                let _ = conn.write_all(&out).await;
+                let _ = conn.flush().await;
+            } else {
+                // Hold it open and silent.
+                held.push(conn);
+            }
+        }
+    });
+    Sink {
         _dir: dir,
         path,
         handle,
