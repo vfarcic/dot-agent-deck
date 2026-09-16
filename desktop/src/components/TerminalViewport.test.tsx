@@ -1,5 +1,5 @@
-import { render, screen } from "@testing-library/react";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { fireEvent, render, screen } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 /*
  * A fake xterm rather than the real one, for the reason this file exists: what
@@ -11,7 +11,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
  * Hoisted so the `vi.mock` factories below — which vitest lifts above the
  * imports — can close over it.
  */
-const { terminals, FakeTerminal } = vi.hoisted(() => {
+const { terminals, FakeTerminal, FakeFitAddon } = vi.hoisted(() => {
   const terminals: FakeTerminal[] = [];
   /** Only the surface `TerminalViewport` actually touches. */
   class FakeTerminal {
@@ -20,18 +20,19 @@ const { terminals, FakeTerminal } = vi.hoisted(() => {
     cols = 80;
     rows = 24;
     disposed = false;
+    host?: HTMLElement;
     private readonly handlers = new Set<(data: string) => void>();
     constructor(options: Record<string, unknown>) {
       this.options = { ...options };
       this.textarea = document.createElement("textarea");
       terminals.push(this);
     }
-    loadAddon(): void {}
-    open(host: HTMLElement): void { host.appendChild(this.textarea); }
+    loadAddon(addon: { activate?: (terminal: FakeTerminal) => void }): void { addon.activate?.(this); }
+    open(host: HTMLElement): void { this.host = host; host.appendChild(this.textarea); }
     write(): void {}
     reset(): void {}
     focus(): void {}
-    resize(): void {}
+    resize(cols: number, rows: number): void { this.cols = cols; this.rows = rows; }
     onData(handler: (data: string) => void): { dispose: () => void } {
       this.handlers.add(handler);
       return { dispose: () => { this.handlers.delete(handler); } };
@@ -40,12 +41,28 @@ const { terminals, FakeTerminal } = vi.hoisted(() => {
     typeKey(data: string): void { for (const handler of [...this.handlers]) handler(data); }
     dispose(): void { this.disposed = true; }
   }
-  return { terminals, FakeTerminal };
+  /**
+   * A deterministic layout stand-in. jsdom has no box model, so the fit addon
+   * reads the component's presentation seam and supplies the two geometries a
+   * browser layout produces for this test.
+   */
+  class FakeFitAddon {
+    private terminal?: FakeTerminal;
+    activate(terminal: FakeTerminal): void { this.terminal = terminal; }
+    fit(): void {
+      if (!this.terminal) return;
+      const overlay = this.terminal.host?.closest('[data-presentation="overlay"]');
+      this.terminal.cols = overlay ? 160 : 80;
+      this.terminal.rows = overlay ? 48 : 24;
+    }
+    dispose(): void {}
+  }
+  return { terminals, FakeTerminal, FakeFitAddon };
 });
 
 vi.mock("@xterm/xterm", () => ({ Terminal: FakeTerminal as unknown as typeof import("@xterm/xterm").Terminal }));
 vi.mock("@xterm/addon-fit", () => ({
-  FitAddon: class { fit(): void {} } as unknown as typeof import("@xterm/addon-fit").FitAddon,
+  FitAddon: FakeFitAddon as unknown as typeof import("@xterm/addon-fit").FitAddon,
 }));
 vi.mock("@xterm/addon-webgl", () => ({
   WebglAddon: class {
@@ -54,7 +71,54 @@ vi.mock("@xterm/addon-webgl", () => ({
   } as unknown as typeof import("@xterm/addon-webgl").WebglAddon,
 }));
 
+import { DeckShell } from "../App";
+import { createFixtureSnapshot } from "../data/fixture";
+import { DEFAULT_DESKTOP_SETTINGS, type DesktopSettingsDto } from "../lib/bridge";
+import type { DeckActionResult, DeckRuntimeState } from "../types";
 import { TerminalViewport } from "./TerminalViewport";
+
+const resizeObservers: ControlledResizeObserver[] = [];
+
+class ControlledResizeObserver implements ResizeObserver {
+  target?: Element;
+  constructor(private readonly callback: ResizeObserverCallback) { resizeObservers.push(this); }
+  observe(target: Element): void { this.target = target; }
+  unobserve(): void {}
+  disconnect(): void {}
+  trigger(): void { this.callback([], this); }
+}
+
+function triggerResize(agentId: string): void {
+  const observer = resizeObservers.find((candidate) => candidate.target?.closest(`[data-testid="terminal-${agentId}"]`));
+  if (!observer) throw new Error(`no resize observer for ${agentId}`);
+  observer.trigger();
+}
+
+function overlayRuntime(resizeTerminal: DeckRuntimeState["resizeTerminal"]): DeckRuntimeState {
+  const snapshot = createFixtureSnapshot("connected");
+  let document: DesktopSettingsDto = { ...DEFAULT_DESKTOP_SETTINGS };
+  return {
+    mode: "fixture",
+    snapshot,
+    fleet: [snapshot],
+    terminalData: {},
+    appliedGeometry: { planner: { cols: 80, rows: 24 } },
+    clearError: vi.fn(),
+    runAction: vi.fn(async () => ({ ok: true }) as DeckActionResult),
+    sendTerminalInput: vi.fn(async () => undefined),
+    resizeTerminal,
+    setShownTerminals: vi.fn(async () => undefined),
+    reconnect: vi.fn(async () => undefined),
+    listProjects: vi.fn(async () => ({ projects: [] })),
+    resolveProject: vi.fn(async () => { throw new Error("unresolved: no such project"); }),
+    setZoom: vi.fn(async (level: number) => level),
+    getSettings: vi.fn(async () => ({ settings: structuredClone(document), path: undefined })),
+    saveSettings: vi.fn(async (next: DesktopSettingsDto) => {
+      document = structuredClone(next);
+      return structuredClone(document);
+    }),
+  } as unknown as DeckRuntimeState;
+}
 
 function renderViewport(readOnly: boolean, onInput: (data: string) => void, agentId = "planner") {
   return render(
@@ -187,5 +251,51 @@ describe("TerminalViewport input gate", () => {
 
     expect(terminals).toHaveLength(2);
     expect(first.disposed).toBe(true);
+  });
+});
+
+describe("TerminalViewport agent pane geometry", () => {
+  const originalResizeObserver = globalThis.ResizeObserver;
+
+  beforeEach(() => {
+    terminals.length = 0;
+    resizeObservers.length = 0;
+    Object.defineProperty(window, "ResizeObserver", { value: ControlledResizeObserver, writable: true });
+    Object.defineProperty(globalThis, "ResizeObserver", { value: ControlledResizeObserver, writable: true });
+    window.localStorage.clear();
+  });
+
+  afterEach(() => {
+    Object.defineProperty(window, "ResizeObserver", { value: originalResizeObserver, writable: true });
+    Object.defineProperty(globalThis, "ResizeObserver", { value: originalResizeObserver, writable: true });
+  });
+
+  /**
+   * Scenario: measure Planner as a deck tile, open its promoted full-window
+   * pane, then close it. The resize callback reports a larger proposed grid
+   * while open and the original tile grid after close, even though the daemon's
+   * applied geometry deliberately puts xterm back at the tile grid each time.
+  */
+  it("reports the pane's larger proposed grid and the tile grid again on close", () => {
+    const resizeTerminal = vi.fn(async (_agentId: string, _cols: number, _rows: number) => undefined);
+    render(<DeckShell runtime={overlayRuntime(resizeTerminal)} />);
+
+    triggerResize("planner");
+    expect(resizeTerminal).toHaveBeenLastCalledWith("planner", 80, 24);
+    const [, tileCols, tileRows] = resizeTerminal.mock.calls.at(-1)!;
+    resizeTerminal.mockClear();
+
+    fireEvent.click(screen.getByRole("button", { name: "Open Planner agent" }));
+    triggerResize("planner");
+    expect(resizeTerminal).toHaveBeenCalledTimes(1);
+    const [, overlayCols, overlayRows] = resizeTerminal.mock.calls[0];
+    expect(overlayCols).toBeGreaterThan(tileCols);
+    expect(overlayRows).toBeGreaterThan(tileRows);
+    resizeTerminal.mockClear();
+
+    fireEvent.click(screen.getByRole("button", { name: "Close Planner agent" }));
+    triggerResize("planner");
+    expect(resizeTerminal).toHaveBeenCalledTimes(1);
+    expect(resizeTerminal).toHaveBeenLastCalledWith("planner", tileCols, tileRows);
   });
 });

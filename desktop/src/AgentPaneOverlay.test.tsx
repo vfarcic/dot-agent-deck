@@ -1,7 +1,8 @@
 import { fireEvent, render, screen, within } from "@testing-library/react";
 import { useEffect } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { createFixtureSnapshot } from "./data/fixture";
+import type { AgentTileProps } from "./components/AgentTile";
+import { createFixtureSnapshot, FIXTURE_DAEMON_ID } from "./data/fixture";
 import { DEFAULT_DESKTOP_SETTINGS, type DesktopSettingsDto } from "./lib/bridge";
 import type { DeckActionResult, DeckRuntimeState } from "./types";
 
@@ -19,6 +20,8 @@ import type { DeckActionResult, DeckRuntimeState } from "./types";
  */
 const terminalBuilt = vi.fn();
 const terminalDisposed = vi.fn();
+const agentTileMounted = vi.fn();
+const agentTileDisposed = vi.fn();
 vi.mock("./components/TerminalViewport", () => ({
   TerminalViewport: ({ agentId, label }: { agentId: string; label: string }) => {
     useEffect(() => {
@@ -28,6 +31,20 @@ vi.mock("./components/TerminalViewport", () => ({
     return <pre data-testid={`terminal-${agentId}`} aria-label={`${label} terminal`}>terminal</pre>;
   },
 }));
+vi.mock("./components/AgentTile", async () => {
+  const actual = await vi.importActual<typeof import("./components/AgentTile")>("./components/AgentTile");
+  const RealAgentTile = actual.AgentTile;
+  return {
+    ...actual,
+    AgentTile: (props: AgentTileProps) => {
+      useEffect(() => {
+        agentTileMounted(props.agent.id);
+        return () => agentTileDisposed(props.agent.id);
+      }, [props.agent.id]);
+      return <RealAgentTile {...props} />;
+    },
+  };
+});
 
 import { DeckShell } from "./App";
 
@@ -42,7 +59,7 @@ function settingsStore() {
   };
 }
 
-function runtime(): DeckRuntimeState {
+function runtime(overrides: Partial<DeckRuntimeState> = {}): DeckRuntimeState {
   const snapshot = createFixtureSnapshot("connected");
   const settings = settingsStore();
   return {
@@ -61,6 +78,7 @@ function runtime(): DeckRuntimeState {
     setZoom: vi.fn(async (level: number) => level),
     getSettings: settings.getSettings,
     saveSettings: settings.saveSettings,
+    ...overrides,
   } as unknown as DeckRuntimeState;
 }
 
@@ -83,7 +101,33 @@ describe("agent pane overlay", () => {
   beforeEach(() => {
     terminalBuilt.mockClear();
     terminalDisposed.mockClear();
+    agentTileMounted.mockClear();
+    agentTileDisposed.mockClear();
     window.localStorage.clear();
+  });
+
+  /**
+   * Scenario: start directly in Planner's pane once from each origin. The same
+   * real AgentTile component mounts at overlay presentation in both paths, so
+   * a parallel large-pane component cannot impersonate it with matching DOM.
+   */
+  it("renders the same AgentTile component from the deck and overview origins", () => {
+    const deckView = { kind: "agent" as const, deckId: FIXTURE_DAEMON_ID, agentId: "planner", from: "deck" as const };
+    const deck = render(<DeckShell runtime={runtime()} initialView={deckView} />);
+
+    expect(screen.getByTestId("agent-tile-planner")).toHaveAttribute("data-presentation", "overlay");
+    expect(agentTileMounted.mock.calls.filter(([id]) => id === "planner")).toHaveLength(1);
+    deck.unmount();
+    agentTileMounted.mockClear();
+    agentTileDisposed.mockClear();
+
+    const overviewView = { ...deckView, from: "overview" as const };
+    render(<DeckShell runtime={runtime()} initialView={overviewView} />);
+
+    expect(screen.getByTestId("agent-tile-planner")).toHaveAttribute("data-presentation", "overlay");
+    expect(agentTileMounted).toHaveBeenCalledTimes(1);
+    expect(agentTileMounted).toHaveBeenCalledWith("planner");
+    expect(agentTileDisposed).not.toHaveBeenCalled();
   });
 
   /**
@@ -191,5 +235,52 @@ describe("agent pane overlay", () => {
     expect(screen.getByRole("button", { name: "Close Planner agent" })).toBeVisible();
     // The tiles underneath keep theirs — the deck is mounted, not frozen.
     expect(screen.getByRole("button", { name: "Open Builder agent" })).toBeInTheDocument();
+  });
+
+  /**
+   * Scenario: open and close Planner over the deck after its four-terminal
+   * shown set has been declared. Neither transition declares the unchanged set
+   * again, so promoting a tile cannot create per-tile or per-pane ownership.
+   */
+  it("does not redeclare the unchanged deck shown set while the pane opens or closes", () => {
+    const setShownTerminals = vi.fn(async () => undefined);
+    render(<DeckShell runtime={runtime({ setShownTerminals })} />);
+
+    expect(setShownTerminals).toHaveBeenCalledTimes(1);
+    expect(setShownTerminals).toHaveBeenLastCalledWith(["planner", "builder", "reviewer", "tester"]);
+    setShownTerminals.mockClear();
+
+    fireEvent.click(screen.getByRole("button", { name: "Open Planner agent" }));
+    expect(screen.getByTestId("agent-pane-overlay")).toBeVisible();
+    expect(setShownTerminals).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole("button", { name: "Close Planner agent" }));
+    expect(screen.queryByTestId("agent-pane-overlay")).not.toBeInTheDocument();
+    expect(setShownTerminals).not.toHaveBeenCalled();
+  });
+
+  /**
+   * Scenario: start on the terminal-free overview, open Planner, then close it
+   * again. Each changed render commit makes one whole-set declaration: empty,
+   * Planner alone, then empty — never competing screen and pane declarations.
+   */
+  it("declares one whole shown set per overview pane transition", () => {
+    const setShownTerminals = vi.fn(async () => undefined);
+    render(<DeckShell runtime={runtime({ setShownTerminals })} initialView={{ kind: "overview" }} />);
+
+    expect(setShownTerminals).toHaveBeenCalledTimes(1);
+    expect(setShownTerminals).toHaveBeenLastCalledWith([]);
+    setShownTerminals.mockClear();
+
+    fireEvent.click(screen.getByRole("button", { name: "Open Plan / architecture agent" }));
+    expect(screen.getByTestId("agent-pane-overlay")).toBeVisible();
+    expect(setShownTerminals).toHaveBeenCalledTimes(1);
+    expect(setShownTerminals).toHaveBeenLastCalledWith(["planner"]);
+    setShownTerminals.mockClear();
+
+    fireEvent.click(screen.getByRole("button", { name: "Close Planner agent" }));
+    expect(screen.queryByTestId("agent-pane-overlay")).not.toBeInTheDocument();
+    expect(setShownTerminals).toHaveBeenCalledTimes(1);
+    expect(setShownTerminals).toHaveBeenLastCalledWith([]);
   });
 });
