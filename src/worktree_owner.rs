@@ -127,8 +127,7 @@ pub fn git_dir_of(worktree_path: &Path) -> Option<PathBuf> {
 /// `git -C <fixture> log` report a different repository's history entirely.
 ///
 /// That matters more here than it does for a fixture, because the answer is
-/// exported into an agent's environment as
-/// [`crate::agent_pty::DOT_AGENT_DECK_MAIN_WORKTREE`]: a daemon lazy-spawned
+/// interpolated into the prompt an agent is started with: a daemon lazy-spawned
 /// from inside a `rebase --exec`, a pre-commit hook or a `bisect run` carries
 /// one of these, and without the scrub every pane it starts would be told to
 /// write its durable report into whatever repository that variable named,
@@ -268,8 +267,10 @@ fn same_dir(a: &Path, b: &Path) -> bool {
 /// an artifact. This
 /// answers where that durable place is, once, at spawn, so no task has to
 /// carry the path and no role prompt has to embed a `git rev-parse`
-/// incantation. [`crate::agent_pty::DOT_AGENT_DECK_MAIN_WORKTREE`] is the one
-/// consumer today.
+/// incantation. The consumers are the two prompts the deck composes itself —
+/// [`crate::orchestrator_context`]'s published context and `crate::dispatch`'s
+/// single-unit prompt — each of which interpolates the resolved path as a
+/// literal, so the agent reads a path rather than resolving anything.
 ///
 /// **Fail-closed, and that is the point.** Every unresolvable case returns
 /// `None` rather than a best guess, so a consumer can tell "the deck could not
@@ -327,18 +328,55 @@ fn same_dir(a: &Path, b: &Path) -> bool {
 /// worktree moved. One flag per process is deliberate; [`rev_parse_path`] has
 /// the reason.
 pub fn main_worktree_of(dir: &Path) -> Option<PathBuf> {
+    resolve_main_worktree(dir).map(|(_, path)| path)
+}
+
+/// The main worktree, but only when `dir` is inside a **linked** one — `None`
+/// when `dir` is already in the main worktree, on top of every case
+/// [`main_worktree_of`] returns `None` for.
+///
+/// The distinction is what makes this worth telling an agent about at all. In
+/// an ordinary checkout the main worktree *is* the directory the agent is
+/// working in, so naming it says nothing and costs prompt text every
+/// orchestration pays for. In a linked worktree it names the one place whose
+/// contents survive the worktree being removed, which is the whole of issue
+/// #550.
+pub fn main_worktree_if_linked(dir: &Path) -> Option<PathBuf> {
+    match resolve_main_worktree(dir)? {
+        (Placement::Linked, path) => Some(path),
+        (Placement::Main, _) => None,
+    }
+}
+
+/// Where `dir` sits relative to the repository's main worktree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Placement {
+    /// `dir` is inside the main worktree already (an ordinary checkout, a
+    /// subdirectory of one, a relocated-store checkout, a submodule).
+    Main,
+    /// `dir` is inside a linked worktree — one `git worktree add` created, and
+    /// one `git worktree remove` will take away again.
+    Linked,
+}
+
+/// The shared body of [`main_worktree_of`] and [`main_worktree_if_linked`]:
+/// the main worktree plus which side of it `dir` is on.
+fn resolve_main_worktree(dir: &Path) -> Option<(Placement, PathBuf)> {
     let git_dir = git_dir_of(dir)?;
     let common = rev_parse_path(dir, "--git-common-dir")?;
 
     if same_dir(&git_dir, &common) {
-        return rev_parse_path(dir, "--show-toplevel");
+        return Some((Placement::Main, rev_parse_path(dir, "--show-toplevel")?));
     }
 
     let candidate = common.parent()?;
     if !same_dir(&git_dir_of(candidate)?, &common) {
         return None;
     }
-    rev_parse_path(candidate, "--show-toplevel")
+    Some((
+        Placement::Linked,
+        rev_parse_path(candidate, "--show-toplevel")?,
+    ))
 }
 
 /// Where this worktree's marker file is, or would be. `None` for the same
@@ -851,10 +889,9 @@ mod tests {
         std::fs::canonicalize(p).unwrap_or_else(|e| panic!("canonicalize {}: {e}", p.display()))
     }
 
-    /// The ordinary case, and the one that makes the variable safe to read
-    /// unconditionally: a pane that is NOT in a linked worktree still gets a
-    /// durable checkout rather than nothing, so a role prompt can use
-    /// `$DOT_AGENT_DECK_MAIN_WORKTREE` without branching on which it is.
+    /// An ordinary checkout is its own main worktree. Asserted because the
+    /// "same" branch is what covers every non-worktree caller, and because
+    /// [`main_worktree_if_linked`] filters exactly this case back out.
     #[test]
     fn main_worktree_of_answers_the_checkout_itself_for_an_ordinary_repo() {
         let scratch = crate::test_temp::tempdir().expect("scratch tempdir");
@@ -916,6 +953,46 @@ mod tests {
              resolving to itself is the stall this exists to remove, dressed as a success"
         );
         assert_ne!(canon(&got), canon(&linked));
+    }
+
+    /// The linked-only variant exists so the deck can stay quiet when there is
+    /// nothing to say. Both directions asserted on one fixture, so they cannot
+    /// drift into disagreeing about the same repository.
+    #[test]
+    fn main_worktree_if_linked_answers_only_from_a_linked_worktree() {
+        let scratch = crate::test_temp::tempdir().expect("scratch tempdir");
+        let repo = scratch.path().join("repo");
+        checkout_with_a_commit(&repo, scratch.path());
+        let linked = scratch.path().join("repo-feature");
+        git_in(
+            &repo,
+            scratch.path(),
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                "feature",
+                &linked.to_string_lossy(),
+            ],
+        );
+
+        assert_eq!(
+            main_worktree_if_linked(&linked).as_deref().map(canon),
+            Some(canon(&repo)),
+            "from a linked worktree it must name the checkout that outlives it"
+        );
+        assert_eq!(
+            main_worktree_if_linked(&repo),
+            None,
+            "from the main checkout there is nothing to say — naming the directory the \
+             agent is already working in is prompt text every orchestration would pay for"
+        );
+        assert_eq!(
+            main_worktree_if_linked(&repo.join("sub")),
+            None,
+            "a subdirectory of the main checkout is still the main checkout"
+        );
     }
 
     /// A bare repository has no working tree at all, so there is nothing
