@@ -521,6 +521,14 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .terminal-input-status.is-blocked { color: var(--status-error); }
 .terminal-input-status.is-unconfirmed { color: var(--status-warn); }
 .terminal-viewport[aria-disabled="true"] { opacity: .62; }
+/* PRD #1105 — what stands where the terminal would be when this pane has none,
+   which today means an agent on a deck that is not the selected one. It reuses
+   `.panel-empty` on purpose: this IS one of that state's family, and the thing
+   it replaces is a black rectangle that reads as an agent gone quiet. Wider
+   measure than the other empty panels because it carries a sentence rather than
+   a label. */
+.terminal-absent { padding: 12px 18px; }
+.terminal-absent span { max-width: 52ch; font-size: 9px; line-height: 1.5; }
 .button.compact { padding: 3px 9px; font-size: 10px; gap: 4px; }
 
 /* ---- Output Reader: a large readable rendering of an agent's CLI output ---- */
@@ -1241,5 +1249,3 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
    clamped by its own `text-overflow` and the control never moves. */
 .overview-open-agent { flex: 0 0 auto; margin-left: auto; width: 20px; height: 20px; display: grid; place-items: center; border: 1px solid transparent; border-radius: 4px; color: var(--faint); background: transparent; cursor: pointer; }
 .overview-open-agent:hover, .overview-open-agent:focus-visible { color: var(--teal); border-color: var(--teal-focus); background: var(--teal-soft); }
-/* The row that offers no open control, and says why. Not a disabled button — see `OverviewRow`. */
-.overview-open-elsewhere { flex: 0 0 auto; margin-left: auto; color: var(--faint); font-size: 9px; font-style: normal; white-space: nowrap; cursor: help; }

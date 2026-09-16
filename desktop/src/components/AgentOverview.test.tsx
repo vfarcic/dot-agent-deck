@@ -2412,25 +2412,27 @@ describe("AgentOverview across a fleet (PRD #742 M4)", () => {
 
   /**
    * Scenario: the four-deck fleet is on screen with the local deck selected.
-   * The local deck's Planner row carries the open control; the remote deck's
-   * rows carry none at all, and each says in its place that the agent is on a
-   * deck that is not selected.
+   * Every row on every deck carries a real open control, and pressing the one
+   * on a NON-selected deck's row navigates to that agent's pane with that
+   * agent's own deck in the view.
    *
-   * # Why there is no control rather than a disabled one
+   * # Why every row, including the ones this app cannot attach
    *
-   * PRD #1105 originally opened a non-selected deck's agent by switching the
-   * selected deck first and reverting on close. Two security audits found that
-   * the switch left state created under one deck attributed to another, and the
-   * decision was to **descope cross-deck opening** rather than to keep
-   * repairing it; cross-deck attach itself is
-   * [#1073](https://github.com/vfarcic/dot-agent-deck/issues/1073), a wire
-   * change by construction. So these rows are still LISTED — the overview
-   * merges every observed deck (#742) and always did — and they are not
-   * openable. A `<button disabled>` would be an affordance that refuses every
-   * press, which reads as a broken feature; text that names the reason reads as
-   * a state with a remedy.
+   * The overview merges every observed deck (#742) while a tile's terminal is
+   * always the *selected* deck's, so it lists agents no attach can reach. An
+   * earlier build of this milestone gated the control on that and rendered a
+   * two-word marker instead; that was reverted. If an agent is on the screen
+   * there has to be a way into its pane — a listed row with no way to open it
+   * is a dead row, and nothing on the row tells the reader which deck they are
+   * pointing at in the first place.
+   *
+   * The deck decides what the PANE can do, not whether it opens: it comes up
+   * with an explicit no-terminal state naming the deck
+   * (`desktop/src/AgentPaneDeckIdentity.test.tsx` has that half). What stays
+   * withdrawn is the deck SWITCH — this screen moves no selection, and
+   * `writes no settings document when a pane opens or closes` is its guard.
    */
-  it("offers no open control for an agent on a deck that is not selected, and says why", () => {
+  it("offers an open control on every row, whichever deck the agent is on", () => {
     const onNavigate = vi.fn();
     const fleet = createFixtureFleet("fleet");
     window.localStorage.setItem(OVERVIEW_COLUMNS_STORAGE_KEY, JSON.stringify({ columns: ALL_OVERVIEW_COLUMNS }));
@@ -2439,33 +2441,33 @@ describe("AgentOverview across a fleet (PRD #742 M4)", () => {
     const [local, remote] = fleet;
     expect(local.connection.deckId).toBe(FIXTURE_DAEMON_ID);
     expect(remote.connection.deckId).toBe(FIXTURE_REMOTE_DAEMON_ID);
+    // The fleet has to contain a non-selected deck with agents on it, or the
+    // loop below would pass by covering nothing.
+    expect(remote.agents.length).toBeGreaterThan(0);
 
-    // The selected deck's rows are unchanged: a real control that navigates.
-    for (const agent of local.agents) {
+    for (const agent of [...local.agents, ...remote.agents]) {
       const row = screen.getByTestId(`overview-agent-${agentDomKey(agent)}`);
-      expect(within(row).getByRole("button", { name: `Open ${agent.displayName} agent` })).toBeVisible();
-      expect(within(row).queryByTestId(`overview-open-elsewhere-${agentDomKey(agent)}`)).toBeNull();
+      const open = within(row).getByRole("button", { name: `Open ${agent.displayName} agent` });
+      expect(open).toBeVisible();
+      expect(open.tagName).toBe("BUTTON");
+      expect(open).not.toBeDisabled();
     }
 
     /*
-      The non-selected deck's rows carry NO control of any kind — asserted as
-      "no button in the row named Open …" rather than as "the button is
-      disabled", because a disabled button is exactly what this must not be.
-      The reason is discoverable from the row itself, visibly and on hover.
+      And the control on a non-selected deck's row is live rather than
+      decorative, carrying that agent's OWN deck into the view — which is what
+      the pane resolves through, and what keeps it off the selected deck's
+      same-id namesake.
     */
-    for (const agent of remote.agents) {
-      const row = screen.getByTestId(`overview-agent-${agentDomKey(agent)}`);
-      expect(within(row).queryByRole("button", { name: /^Open .* agent$/ })).toBeNull();
-      const reason = within(row).getByTestId(`overview-open-elsewhere-${agentDomKey(agent)}`);
-      expect(reason).toBeVisible();
-      expect(reason.tagName).not.toBe("BUTTON");
-      expect(reason).toHaveTextContent("other deck");
-      expect(reason.getAttribute("title")).toContain("not selected");
-    }
-
-    // And nothing on this screen navigated: the refusal is silent, not a click
-    // that opens a pane the app cannot attach.
-    fireEvent.click(screen.getByTestId(`overview-open-elsewhere-${agentDomKey(remote.agents[0])}`));
-    expect(onNavigate).not.toHaveBeenCalled();
+    const stranger = remote.agents[0];
+    fireEvent.click(screen.getByRole("button", { name: `Open ${stranger.displayName} agent` }));
+    expect(onNavigate).toHaveBeenCalledOnce();
+    expect(onNavigate).toHaveBeenCalledWith({
+      kind: "agent",
+      deckId: FIXTURE_REMOTE_DAEMON_ID,
+      agentId: stranger.id,
+      from: "overview",
+    });
+    expect(terminalMounted).not.toHaveBeenCalled();
   });
 });

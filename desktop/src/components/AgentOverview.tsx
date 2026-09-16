@@ -5,7 +5,7 @@ import { modeScopedKey } from "../lib/bridge";
 import { ConfirmDialog, type ConfirmState } from "./ConfirmDialog";
 import { DeckSelector } from "./DeckSelector";
 import type { DesktopSettingsState } from "../hooks/useDesktopSettings";
-import { DISPLAY_LIMITS, displayActivity, displayIdentity, displayPath, displayText, displayTitle, displayUptime, domIdentity, rendersBlank } from "../lib/displayText";
+import { DISPLAY_LIMITS, deckName, displayActivity, displayIdentity, displayPath, displayText, displayTitle, displayUptime, domIdentity, rendersBlank } from "../lib/displayText";
 
 /**
  * The honest subset of `AgentSession`: every field a daemon genuinely reports
@@ -563,8 +563,7 @@ const WRITE_LEASE_TITLE: Record<"read" | "write" | "none", string> = {
 };
 
 /**
- * PRD #1105 M5 — how a row's open control reaches the navigation callback, and
- * how it learns which deck it may offer that control for.
+ * PRD #1105 M5 — how a row's open control reaches the navigation callback.
  *
  * A context rather than one more prop on each of `DeckGroup`, `DaemonBody`,
  * `OverviewGroupCard` and `OverviewRow`, and the reason is the same one
@@ -573,25 +572,31 @@ const WRITE_LEASE_TITLE: Record<"read" | "write" | "none", string> = {
  * views threaded through their signatures is noise every later reader has to
  * re-derive as noise.
  *
- * The default is `undefined` rather than a no-op, and the row renders nothing
- * at all when it reads one: a row outside {@link AgentOverview} has no view to
- * navigate, and a control that silently does nothing is worse than an absent
- * one. {@link AgentOverview} is the only provider and always supplies a value,
- * so today that branch is a guarantee about the type rather than a state the
- * app reaches.
+ * The default is `undefined` rather than a no-op, and the row renders no
+ * control at all when it reads one: a row outside {@link AgentOverview} has no
+ * view to navigate, and a control that silently does nothing is worse than an
+ * absent one. {@link AgentOverview} is the only provider and always supplies a
+ * callback, so today that branch is a guarantee about the type rather than a
+ * state the app reaches.
  *
- * # `selectedDeckId` travels with the callback, and it is the whole of the
- * cross-deck answer
+ * # Every listed agent is openable, including one on a deck that is not
+ * selected
  *
  * This screen merges every observed deck (PRD [#742](https://github.com/vfarcic/dot-agent-deck/issues/742))
  * while a tile's terminal is always the *selected* deck's, so it lists agents
- * this app cannot attach to. A row whose `daemonId` is not this value offers
- * **no open control** and says why instead. `undefined` means no deck is
- * identified — the loading and error seeds in `useDeckRuntime` carry no
- * `deckId` — and no row matches it, which is the safe direction: nothing this
- * app cannot name a deck for is openable.
+ * this app cannot attach to — and it offers **every one of them** the same
+ * control. If an agent is on the screen there is a way into its pane; a listed
+ * row with no way to open it is a dead row, and which deck an agent happens to
+ * be on is not something a reader can see from the row they are pointing at.
+ *
+ * What the deck decides is what the PANE can do, not whether it opens: an
+ * agent on a non-selected deck opens a pane with no terminal in it, which says
+ * which deck it is on and that selecting that deck attaches it (`App.tsx`'s
+ * `OverviewAgentPane`, and `otherDeckTerminalState` in `lib/terminalInput.ts`).
+ * That is the honest division — the overview knows nothing about attach, and
+ * the pane is where the attach either happens or is explained.
  */
-const OpenAgentContext = createContext<{ open: (agent: OverviewAgent) => void; selectedDeckId: string | undefined } | undefined>(undefined);
+const OpenAgentContext = createContext<((agent: OverviewAgent) => void) | undefined>(undefined);
 
 /**
  * The fleet at a glance: every agent the desktop can see, grouped the way the
@@ -733,17 +738,13 @@ export function AgentOverview({ runtime, settings, onNavigate }: { runtime: Deck
    * `from: "overview"` is what closing reads, and it is the whole of the back
    * behaviour — no history, no stack.
    *
-   * **Only the selected deck's agents reach this**, because only their rows
-   * render a control that calls it; see {@link OpenAgentContext}.
+   * **Every agent on this screen reaches this**, whichever deck it is on. This
+   * screen makes no attach decision and asks no question about the selected
+   * deck; see {@link OpenAgentContext}.
    */
   const openAgent = useCallback((agent: OverviewAgent) => {
     onNavigate({ kind: "agent", deckId: agent.daemonId, agentId: agent.id, from: "overview" });
   }, [onNavigate]);
-  /*
-    Recomposed only when one of its two members moves, so a clock tick does not
-    invalidate every row that reads it.
-  */
-  const openAgentContext = useMemo(() => ({ open: openAgent, selectedDeckId: connection.deckId }), [openAgent, connection.deckId]);
   const [confirm, setConfirm] = useState<ConfirmState>();
   const [overrideError, setOverrideError] = useState<string>();
   /**
@@ -868,7 +869,7 @@ export function AgentOverview({ runtime, settings, onNavigate }: { runtime: Deck
       {confirm && <ConfirmDialog state={confirm} onClose={() => setConfirm(undefined)} />}
     </div>
   );
-  return <OpenAgentContext.Provider value={openAgentContext}>{overviewScreen}</OpenAgentContext.Provider>;
+  return <OpenAgentContext.Provider value={openAgent}>{overviewScreen}</OpenAgentContext.Provider>;
 }
 
 /** One deck of the fleet, as {@link AgentOverview} prepares it for rendering. */
@@ -1045,24 +1046,6 @@ function DeckGroup({ deck, now, columns, fleetSize, overrideError, onOpenDeck, o
 function unknownPipsTitle(connection: ConnectionView): string {
   if (connection.pending) return "Not known yet — this deck has not reported, so its agents cannot be counted.";
   return "Not known — this deck is not answering, so its agents cannot be counted.";
-}
-
-/**
- * What a deck is CALLED on screen — and it is never "daemon" (PRD #741 M9's
- * vocabulary rule, which #742 inherits).
- *
- * A local deck is "Local deck", exactly as it was when there was only one. A
- * remote one is named by its address, because that is what distinguishes it
- * from the other decks beside it and it is the same string the user typed into
- * the settings row. `Endpoint::describe()` renders a remote deck as
- * `user@host[:port]`, every byte of which came through a validated ASCII
- * charset — it goes through `displayText` anyway, because bounding a
- * daemon-supplied string at the render seam is this screen's rule and not a
- * judgement about any one field.
- */
-function deckName(connection: ConnectionView): string {
-  if (connection.deckKind !== "remote") return "Local deck";
-  return connection.socketPath ? displayText(connection.socketPath, DISPLAY_LIMITS.path) : "Remote deck";
 }
 
 function DaemonBody({ agents, groups, now, columns, connection, message, compactNote, overrideError, onOpenDeck, onReconnect, onConnectAnyway }: {
@@ -1490,19 +1473,19 @@ function OverviewRow({ agent, hoistedCwd, now, columns }: { agent: OverviewAgent
     `agent.displayName`, so the sanitised, clamped copy is what a screen reader
     announces and a hostile display name cannot spell a different button.
 
-    `openable` is what remains of the cross-deck story after #1105 descoped it.
-    This screen merges every observed deck, so it lists agents on decks that are
-    not selected — and a tile's terminal is always the SELECTED deck's, so a
-    pane opened for one of them could not attach. It says so in place of the
-    control rather than rendering one that does nothing: a dead affordance
-    teaches the user that the feature is broken, where an absent one with a
-    reason teaches them what to do instead. Switching the deck FOR them was
-    tried and withdrawn (see the PRD's decision 5); attaching without switching
-    is a wire change and is
+    **Every row gets one, whichever deck its agent is on.** This screen merges
+    every observed deck, and a tile's terminal is always the SELECTED deck's —
+    so a pane opened for a non-selected deck's agent attaches nothing. That is
+    a fact about the pane and it is the pane that states it: it opens with an
+    explicit no-terminal state naming the deck rather than with a blank
+    terminal. Gating the control here instead was tried and reverted, because a
+    listed agent with no way to open it is a dead row and nothing on the row
+    tells the reader which deck they are pointing at. The deck SWITCH is the
+    thing that stays withdrawn (see the PRD's decision 5), and attaching
+    without switching is a wire change and is
     [#1073](https://github.com/vfarcic/dot-agent-deck/issues/1073).
   */
   const openAgent = useContext(OpenAgentContext);
-  const openable = openAgent !== undefined && agent.daemonId === openAgent.selectedDeckId;
   // ONE instant for the whole screen, ticked by `useOverviewClock` so these two
   // cells keep counting between daemon events. Passed down rather than read
   // here so every row on a repaint is relative to the same moment rather than
@@ -1547,29 +1530,14 @@ function OverviewRow({ agent, hoistedCwd, now, columns }: { agent: OverviewAgent
             */}
             {agent.writeLease && <span className={`overview-lease lease-${agent.writeLease}`} title={WRITE_LEASE_TITLE[agent.writeLease]}>{agent.writeLease}</span>}
             {roleName && !rendersBlank(roleName) && roleLabel?.toLowerCase() !== agent.displayName.toLowerCase() && <em className="overview-role-name">{roleName}</em>}
-            {openAgent && (openable
-              ? (
-                <button
-                  className="overview-open-agent"
-                  aria-label={`Open ${name} agent`}
-                  title={`Open ${name} in a full-window pane`}
-                  onClick={() => openAgent.open(agent)}
-                ><Maximize2 size={12} /></button>
-              )
-              : (
-                /*
-                  Not a disabled button: a `<button disabled>` is still an
-                  affordance, and one that refuses every press reads as a bug
-                  rather than as an explanation. This is text, and the reason is
-                  on it twice — visibly, for anyone looking at the row, and in
-                  `title` for the detail that does not fit in two words.
-                */
-                <em
-                  className="overview-open-elsewhere"
-                  data-testid={`overview-open-elsewhere-${agentDomKey(agent)}`}
-                  title="This agent is on a deck that is not selected. The desktop attaches terminals on the selected deck only, so select that deck first to open it."
-                >other deck</em>
-              ))}
+            {openAgent && (
+              <button
+                className="overview-open-agent"
+                aria-label={`Open ${name} agent`}
+                title={`Open ${name} in a full-window pane`}
+                onClick={() => openAgent(agent)}
+              ><Maximize2 size={12} /></button>
+            )}
           </td>
         );
       case "lastActivityMs":

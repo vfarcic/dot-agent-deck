@@ -41,7 +41,7 @@ import { HandoffRail } from "./components/HandoffRail";
 import { ProfilesPanel, ProjectsPanel, PromptLibraryPanel, WorkflowPanel } from "./components/ConfigurationPanels";
 import { SettingsSheet } from "./components/SettingsSheet";
 import { SettingsBridgeProvider } from "./lib/settingsBridge";
-import { DISPLAY_LIMITS, displayText } from "./lib/displayText";
+import { DISPLAY_LIMITS, deckName, displayText } from "./lib/displayText";
 import { useAgentProfiles } from "./hooks/useAgentProfiles";
 import { useDeckRuntime } from "./hooks/useDeckRuntime";
 import { useDaemonProjects } from "./hooks/useDaemonProjects";
@@ -51,6 +51,7 @@ import { useInertBackground } from "./hooks/useInertBackground";
 import { useShownTerminals } from "./hooks/useShownTerminals";
 import { useZoom } from "./hooks/useZoom";
 import { agentKey } from "./lib/agentKey";
+import { otherDeckTerminalState } from "./lib/terminalInput";
 import { applyAppearance } from "./lib/appearance";
 import { desktopWorkflowPlatformIssue } from "./lib/platform";
 import type { DeckAction, DeckRuntimeState, DeckView, EvidenceItem, PanelTab, WorkflowLaunchConfig } from "./types";
@@ -179,31 +180,51 @@ export function DeckShell({ runtime, workflowPlatformIssue, initialView = { kind
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [agentView, closeAgent]);
   const base = agentView?.from ?? view.kind;
+  const selectedDeckId = runtime.snapshot.connection.deckId;
+  /**
+   * PRD #1105 — whether the open pane's agent is on the deck that is IN FORCE,
+   * which is the one condition two different things read.
+   *
+   * It decides whether an attach may be declared for that agent, and it decides
+   * whether the pane shows a terminal or says why it has none. Those must agree
+   * — a pane showing a terminal nothing attached to is the black rectangle this
+   * feature exists to replace, and a pane explaining itself while an attach is
+   * live would be explaining a state it is not in. One expression is how they
+   * are kept in agreement; two comparisons of the same two values is how they
+   * would drift.
+   *
+   * **The comparison is load-bearing rather than defensive, and since every
+   * listed agent is openable it is now reachable on the ordinary path.** Attach
+   * targets whichever deck is linked at the instant it runs (`terminal::attach`
+   * takes `trusted_daemon`), and agent ids are per-daemon monotonic integers —
+   * so declaring `[agentId]` while another deck is in force attaches *that*
+   * deck's agent of the same id, on another machine, under the right name, and
+   * routes this client's keystrokes to it. The fleet fixture has a `planner` on
+   * two decks, which is the ordinary case and not a contrived one. Opening a
+   * non-selected deck's agent from the overview reaches this directly; so does
+   * the selected deck moving under an already-open pane for reasons that are
+   * nobody's gesture — a `selectionFallback` the crate reports, another window
+   * writing the settings document, a reconnect.
+   *
+   * An UNKNOWN selected deck matches nothing. The loading and error seeds in
+   * `useDeckRuntime` carry no `deckId`, and `agentView.deckId` is a string, so
+   * the strict comparison lands on "not attached" with no special case — which
+   * is the safe direction: an app that cannot name the deck in force must not
+   * promise an attach.
+   */
+  const paneDeckSelected = agentView !== undefined && agentView.deckId === selectedDeckId;
   /**
    * PRD #1105 M4 — the shown set for the OVERVIEW tree, declared here because
    * this is the only component that can see the overview and the pane over it
    * in one commit. `undefined` on the deck path hands ownership to
    * {@link DeckSurface} without declaring anything; see {@link useShownTerminals}.
    *
-   * The pane's agent is declared shown only once its deck IS the selected one,
-   * and that condition is load-bearing rather than defensive. Attach targets
-   * whichever deck is linked at the instant it runs (`terminal::attach` takes
-   * `trusted_daemon`), and agent ids are per-daemon monotonic integers — so
-   * declaring `[agentId]` while another deck is in force attaches *that* deck's
-   * agent of the same id, on another machine, under the right name. The fleet
-   * fixture has a `planner` on two decks, which is the ordinary case and not a
-   * contrived one.
-   *
-   * **Since cross-deck opening was descoped, the overview offers no control
-   * that opens a non-selected deck's agent**, so this condition is true at
-   * open time on every supported path and costs nothing there. It stays
-   * because the selected deck can still move under an open pane for reasons
-   * that are nobody's gesture — a `selectionFallback` the crate reports,
-   * another window writing the settings document — and an attach declared
-   * across that move is exactly the invisible wrong-target attach above.
+   * An agent is declared shown only once its deck IS the selected one, per
+   * `paneDeckSelected` above. So a pane over a non-selected deck's agent costs
+   * **no** attach at all, where one over the selected deck's costs exactly one.
    */
   const overviewShown = base === "overview"
-    ? (agentView && agentView.deckId === runtime.snapshot.connection.deckId ? [agentView.agentId] : [])
+    ? (agentView && paneDeckSelected ? [agentView.agentId] : [])
     : undefined;
   useShownTerminals(runtime.setShownTerminals, overviewShown);
   /**
@@ -232,11 +253,14 @@ export function DeckShell({ runtime, workflowPlatformIssue, initialView = { kind
    * lookup, its shown declaration and its input authority never degrade to a
    * bare id, not even for one frame.
    *
-   * An UNKNOWN selected deck is not a mismatch. `reconnect`'s failure path
-   * rebuilds `connection` without a `deckId`, and a transiently unidentified
-   * deck is not evidence that the pane's deck changed.
+   * An UNKNOWN selected deck is not a mismatch, which is why this is its own
+   * comparison rather than `!paneDeckSelected` above. `reconnect`'s failure
+   * path rebuilds `connection` without a `deckId`, and a transiently
+   * unidentified deck is not evidence that the pane's deck changed — where for
+   * the attach declaration it is exactly grounds to declare nothing. The two
+   * conditions genuinely differ on that one input, and collapsing them would
+   * close a deck-origin pane every time a reconnect failed.
    */
-  const selectedDeckId = runtime.snapshot.connection.deckId;
   const deckPaneRetargeted = agentView?.from === "deck" && selectedDeckId !== undefined && agentView.deckId !== selectedDeckId;
   useEffect(() => {
     if (deckPaneRetargeted) closeAgent();
@@ -252,7 +276,7 @@ export function DeckShell({ runtime, workflowPlatformIssue, initialView = { kind
           one live `TerminalViewport` for the agent, which is the property M3
           actually requires.
         */}
-        {agentView && <OverviewAgentPane runtime={runtime} view={agentView} onClose={closeAgent} />}
+        {agentView && <OverviewAgentPane runtime={runtime} view={agentView} attached={paneDeckSelected} onClose={closeAgent} />}
       </>
     );
   }
@@ -278,15 +302,33 @@ export function DeckShell({ runtime, workflowPlatformIssue, initialView = { kind
  *
  * # The lookup is by the COMPOSITE identity, not by the bare id
  *
- * PRD #1105 M6. This screen merges every observed deck, so it can open an agent
- * on a deck that is not the selected one — and the selected deck's snapshot is
- * exactly where a bare-id lookup would find a *different* agent wearing the
- * same per-daemon monotonic id. Resolving against the fleet entry named by
- * `view.deckId` is what the variant carries a `deckId` for, and it is also what
- * makes the pane show the right agent for the moment or two before the M6
- * switch has taken effect, rather than the old deck's namesake.
+ * PRD #1105 M6. This screen merges every observed deck and every agent it lists
+ * is openable, so this pane can be for an agent on a deck that is not the
+ * selected one — and the selected deck's snapshot is exactly where a bare-id
+ * lookup would find a *different* agent wearing the same per-daemon monotonic
+ * id. Resolving against the fleet entry named by `view.deckId` is what the
+ * variant carries a `deckId` for, and it is what keeps the pane on the agent
+ * the user opened when the selection moves under it.
+ *
+ * # `attached` is the pane's whole deck story, and it is a state rather than a
+ * refusal
+ *
+ * A terminal in this app is always the *selected* deck's, so a pane for an
+ * agent on another deck attaches nothing — {@link DeckShell}'s
+ * `paneDeckSelected` is the one condition that decides both that and this, so
+ * the two cannot disagree. The pane opens either way: everything that is a
+ * property of the AGENT works — header, status, prompt, tool, all five panel
+ * tabs, `Esc` and the close control — and the terminal tab renders an explicit
+ * no-terminal state naming the deck instead of a `TerminalViewport` that would
+ * receive no bytes.
+ *
+ * Saying it is the right half of the job; doing something about it is not this
+ * pane's. Switching the selected deck on open was built and withdrawn under
+ * this PRD (decision 5), and a control here that switches decks is
+ * [#1073](https://github.com/vfarcic/dot-agent-deck/issues/1073)'s design
+ * question.
  */
-function OverviewAgentPane({ runtime, view, onClose }: { runtime: DeckRuntimeState; view: Extract<DeckView, { kind: "agent" }>; onClose: () => void }) {
+function OverviewAgentPane({ runtime, view, attached, onClose }: { runtime: DeckRuntimeState; view: Extract<DeckView, { kind: "agent" }>; attached: boolean; onClose: () => void }) {
   const [tab, setTab] = useState<PanelTab>("terminal");
   const deck = runtime.fleet.find((entry) => entry.connection.deckId === view.deckId);
   const agent = deck?.agents.find((candidate) => candidate.id === view.agentId);
@@ -299,6 +341,11 @@ function OverviewAgentPane({ runtime, view, onClose }: { runtime: DeckRuntimeSta
       selected
       tab={tab}
       terminalFeed={runtime.terminalFeed}
+      /* The deck named by the fleet entry this pane resolved through — so the
+         sentence names the agent's OWN deck, not whichever one is selected, and
+         it names it with `deckName`, which is what the overview's group header
+         the user just came from calls it. */
+      noTerminal={attached ? undefined : otherDeckTerminalState(deckName(deck.connection))}
       /* This deck's, for the same reason the agent above is: the selected
          deck's ring belongs to a different machine until the M6 switch lands,
          and the bridge records events for the selected deck alone — so a

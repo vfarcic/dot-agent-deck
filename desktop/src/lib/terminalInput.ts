@@ -136,3 +136,69 @@ export function terminalInputState(agent: AgentSession, verdict?: SendResult): T
 
   return { state: "applied", readOnly: false, tone: "open" };
 }
+
+/**
+ * PRD #1105 — why a pane has NO TERMINAL AT ALL, which is a different question
+ * from whether the terminal it has will accept input.
+ *
+ * The overview lists every observed deck's agents (PRD
+ * [#742](https://github.com/vfarcic/dot-agent-deck/issues/742)) and every one
+ * of them is openable, while a terminal in this app is always the *selected*
+ * deck's: `terminal::attach` resolves its daemon through `trusted_daemon()`,
+ * the process-global selected endpoint. So a pane can be open for an agent
+ * this app declares no attach for — and a `TerminalViewport` mounted there
+ * receives no bytes, which renders as a black rectangle that reads *"this
+ * agent is producing no output"*. That is a lie about an agent working
+ * normally on another machine, and it is the state this replaces.
+ *
+ * # Why this is not a value inside {@link TerminalInputState}
+ *
+ * That function answers *"will what is typed here be delivered"* in the
+ * `SendResult` vocabulary, and that vocabulary is the WIRE's — `SendResult`
+ * mirrors the Rust enum the daemon sends, so a desktop-only condition cannot
+ * be spelled in it without inventing a value no daemon will ever produce.
+ * `data-input-state` is therefore left to the daemon's answers and this gets
+ * its own attribute, `data-terminal-state`, on the wrapper around the
+ * terminal's place. The SHAPE is deliberately the same as #1042's — one state
+ * attribute readable from the DOM, plus one `role="status"` sentence — because
+ * a second vocabulary for the same kind of fact is how two seams come to
+ * disagree.
+ *
+ * There is no input gate to render beside it: where this is set no terminal is
+ * mounted, so there is nothing to type into and nothing a lease could say about
+ * it. One sentence, and it is this one.
+ */
+export type NoTerminalReason = "other-deck";
+
+export interface NoTerminalState {
+  /** Rendered as `data-terminal-state`. `"attached"` is the absence of this. */
+  reason: NoTerminalReason;
+  /**
+   * The operator-facing sentence, and never absent: a box with no explanation
+   * is the blank rectangle this exists to replace.
+   */
+  notice: string;
+}
+
+/**
+ * The pane's agent is on a deck that is not the selected one, so nothing is
+ * attached — said in full, with the deck named and the remedy stated.
+ *
+ * The remedy is stated and **not performed**. Switching the selected deck on
+ * the user's behalf was built and withdrawn under this same PRD (decision 5),
+ * because state created under one deck was then attributed to another; and a
+ * control here that switched decks for them is #1073's design question rather
+ * than this pane's to answer. Telling them what to do is right; doing it for
+ * them is the withdrawn behaviour.
+ *
+ * `deckLabel` is `deckName`'s (`lib/displayText.ts`), which is what every other
+ * surface in the app calls a deck — the overview's group header above all, so
+ * the name in this sentence is the one the user reads in the Deck selector they
+ * are being pointed at.
+ */
+export function otherDeckTerminalState(deckLabel: string): NoTerminalState {
+  return {
+    reason: "other-deck",
+    notice: `No terminal here: this agent is on ${deckLabel}, which is not the selected deck. The desktop attaches terminals on the selected deck only — select ${deckLabel} and this pane's terminal attaches.`,
+  };
+}

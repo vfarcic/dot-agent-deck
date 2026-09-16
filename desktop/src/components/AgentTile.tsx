@@ -13,6 +13,7 @@ import {
   Pencil,
   ShieldCheck,
   SquareTerminal,
+  Unplug,
   X,
 } from "lucide-react";
 import { UNREPORTED } from "../types";
@@ -25,7 +26,7 @@ import type {
   SendResult,
   TerminalFeed,
 } from "../types";
-import { terminalInputState } from "../lib/terminalInput";
+import { terminalInputState, type NoTerminalState } from "../lib/terminalInput";
 import { OutputReader } from "./OutputReader";
 import { TerminalViewport } from "./TerminalViewport";
 
@@ -109,6 +110,23 @@ export interface AgentTileProps {
    * cannot express (`wrong-session`) arrives this way and no other.
    */
   inputResult?: SendResult;
+  /**
+   * PRD #1105 — set when this pane has no terminal at all, and why.
+   *
+   * Absent means one is attached, which is every tile on the deck and every
+   * overview-origin pane whose agent is on the selected deck. Set, the terminal
+   * tab renders the state and its sentence INSTEAD of a `TerminalViewport`:
+   * mounting one that will receive no bytes paints a black rectangle reading
+   * "this agent is producing no output", which is false about an agent working
+   * normally elsewhere. See {@link NoTerminalState} for why it is not a value
+   * inside the `SendResult` input vocabulary.
+   *
+   * A capability-shaped prop rather than a `presentation` branch, for the
+   * reason {@link AgentTileProps.onOpen} is one: it describes what this render
+   * site can honour, and only a caller that can see both the agent's deck and
+   * the selected one is able to answer it.
+   */
+  noTerminal?: NoTerminalState;
   /** Increments when the command palette asks this tile's terminal to focus. */
   terminalFocusToken?: number;
   onSelect: () => void;
@@ -166,6 +184,7 @@ export function AgentTile({
   terminalFeed,
   evidence,
   inputResult,
+  noTerminal,
   terminalFocusToken,
   onSelect,
   onTabChange,
@@ -381,32 +400,61 @@ export function AgentTile({
 
       <div className="agent-panel" role="tabpanel">
         {tab === "terminal" && (
-          <div className="agent-terminal-stack">
-            <TerminalViewport
-              agentId={agent.id}
-              /* The agent's OWN deck, never the selected one: the feed is keyed
-                 by the composite identity because ids collide across decks. */
-              deckId={agent.daemonId}
-              label={agent.role}
-              transcript={agent.transcript}
-              terminalFeed={terminalFeed}
-              readOnly={input.readOnly}
-              inputState={input.state}
-              focusToken={terminalFocusToken}
-              onInput={handleInput}
-              onResize={handleResize}
-              applied={appliedGeometry}
-              onFocus={onSelect}
-            />
-            {input.notice && (
-              <p
-                className={`terminal-input-status is-${input.tone}`}
-                data-testid={`terminal-input-status-${agent.id}`}
+          /*
+            PRD #1105 — `data-terminal-state` is the sibling of the viewport's
+            own `data-input-state`, and it answers the outer question: is there
+            a terminal here at all. `"attached"` is written positively rather
+            than left absent so both directions can be asserted, and so a
+            reader of the DOM never has to infer a state from a missing
+            attribute.
+          */
+          <div className="agent-terminal-stack" data-terminal-state={noTerminal?.reason ?? "attached"}>
+            {noTerminal ? (
+              /*
+                No `TerminalViewport` — this is the whole point rather than a
+                saving. One mounted here would allocate an xterm and a WebGL
+                context to render nothing, and what the user would read off that
+                black rectangle is a claim about the agent. The box carries the
+                sentence itself and is its own live region: there is no terminal
+                beside it for the sentence to be beside.
+              */
+              <div
+                className="panel-empty terminal-absent"
+                data-testid={`terminal-absent-${agent.id}`}
                 role="status"
               >
-                <AlertTriangle size={12} aria-hidden="true" />
-                {input.notice}
-              </p>
+                <Unplug size={15} aria-hidden="true" />
+                <span>{noTerminal.notice}</span>
+              </div>
+            ) : (
+              <>
+                <TerminalViewport
+                  agentId={agent.id}
+                  /* The agent's OWN deck, never the selected one: the feed is keyed
+                     by the composite identity because ids collide across decks. */
+                  deckId={agent.daemonId}
+                  label={agent.role}
+                  transcript={agent.transcript}
+                  terminalFeed={terminalFeed}
+                  readOnly={input.readOnly}
+                  inputState={input.state}
+                  focusToken={terminalFocusToken}
+                  onInput={handleInput}
+                  onResize={handleResize}
+                  applied={appliedGeometry}
+                  onFocus={onSelect}
+                />
+                {input.notice && (
+                  <p
+                    className={`terminal-input-status is-${input.tone}`}
+                    data-testid={`terminal-input-status-${agent.id}`}
+                    role="status"
+                  >
+                    <AlertTriangle size={12} aria-hidden="true" />
+                    {input.notice}
+                  </p>
+                )}
+              </>
             )}
           </div>
         )}
