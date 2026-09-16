@@ -7613,7 +7613,16 @@ impl AppState {
         let mut commissioning_orchestrator: Option<(String, String)> = None;
         match registry.retire_outstanding_delegation(&signal.pane_id) {
             crate::agent_pty::DelegationRetirement::Nothing => {}
-            crate::agent_pty::DelegationRetirement::Retired(delegation) => {
+            // Issue #1080: the whole record goes, superseded generations
+            // included. A worker that has just answered is not silent, and any
+            // record left armed here fires later against work that is already
+            // done — see `AgentPtyRegistry::retire_outstanding_delegation` for
+            // the production trace that reversed PRD #126 M1 finding 6's
+            // oldest-first accounting, and for what that costs.
+            crate::agent_pty::DelegationRetirement::Retired {
+                delegation,
+                superseded_dropped,
+            } => {
                 commissioning_orchestrator = Some((
                     delegation.orchestrator_pane_id.clone(),
                     delegation.orchestrator_agent_id.clone(),
@@ -7621,27 +7630,9 @@ impl AppState {
                 tracing::debug!(
                     pane_id = %signal.pane_id,
                     role = %delegation.role,
+                    armed_seq = delegation.seq,
+                    superseded_dropped,
                     "work-done: retired the outstanding delegation and cancelled its idle watch"
-                );
-            }
-            // PRD #126 M1 review (finding 6): a late completion from a
-            // superseded delegation retires THAT one; the newest delegation's
-            // record and watch survive, so a re-delegated worker that then goes
-            // silent is still reported instead of never being nudged again.
-            crate::agent_pty::DelegationRetirement::RetiredSuperseded {
-                role,
-                seq,
-                remaining,
-                orchestrator_pane_id,
-                orchestrator_agent_id,
-            } => {
-                commissioning_orchestrator = Some((orchestrator_pane_id, orchestrator_agent_id));
-                tracing::debug!(
-                    pane_id = %signal.pane_id,
-                    role = %role,
-                    armed_seq = seq,
-                    remaining_superseded = remaining,
-                    "work-done: retired a superseded delegation; the newest one stays armed"
                 );
             }
         }
