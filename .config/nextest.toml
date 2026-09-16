@@ -77,6 +77,61 @@
 # test-ordering defect for the length of issue #818, and a green cap is
 # indistinguishable from a fix.
 
+# Issue #959: there is deliberately NO override for
+# `live_014_spawn_time_is_observed_and_additive` (`src/daemon_protocol.rs`, spec
+# `session/live/014`), and this records why, because a window carve-out is what
+# the evidence said NOT to add and the next person to meet a red here will be
+# tempted by one.
+#
+# It was killed once by the default 3 x 60s window on `build-macos`, at
+# `time="180.616"` in run 34326700831's `nextest-macos-attempt-1` artifact. What
+# settles that it STALLED rather than ran slowly is the same run's attempt-2
+# artifact — a job-level re-run of the identical SHA, no code change — in which
+# this test took **0.194s**. On the Linux `build` job of that run it took 0.115s.
+# 180.616s against 0.194s on the same runner image is 931x. Nor was the machine
+# slow: across the 2440 tests both attempts recorded, the median fail/pass
+# duration ratio is 1.40 and the 90th percentile 2.25, exactly one other test
+# over a second was more than 2x slower (1.608s -> 3.239s), and 1535 other tests
+# started AND finished inside the 180.6s window. The runner was scheduling work
+# normally throughout — one test stalled, not the machine.
+#
+# A wider window could not have helped, and that is now a fact rather than a
+# principle: the stall is an unbounded wait, so a carve-out only moves when the
+# kill lands. The cause was found by REPRODUCING it on a real runner — 4500
+# executions of this test, three at a time, on `macos-latest`: **18 stalled**
+# (about 1 in 250, against roughly 1 in 450 observed in CI), while the same
+# 4500 on `ubuntu-latest` stalled **0** times. All 18 stopped at the same phase
+# marker, `shutdown_all (adopted agent)`, with the stack in
+# `AgentPtyRegistry::force_kill_and_reap_all`'s `try_wait` poll loop and the
+# child in macOS `ps` state `?<Es` — "trying to exit" — every single time. The
+# test, not the window, was the thing to change: its adopted half held both ends
+# of a PTY nobody read while a bare `sleep` wrote a usage line to it and exited,
+# a shape the production spawn path never has. See the comment at that line.
+#
+# The TIER is not the lever either, which is the other thing #959 asked. This
+# test forks a real PTY child, but so do at least 76 of the 1838
+# `#[test]`/`#[tokio::test]` functions under `src/` — counted as bodies
+# containing `.spawn_agent(` or `spawn_command(`, which misses every one that
+# forks through a helper, so 76 is a floor rather than a figure. Moving this one
+# test to the e2e tier would have left the other 75 on the same three required
+# jobs, would not have touched the actual defect, and would have deleted the only
+# part of it that proves its property — that the daemon records the instant it
+# forked the child rather than minting a value at snapshot time, which needs a
+# real fork.
+#
+# The phase markers that named the stall site are still in the test, and they are
+# why this comment can be specific. nextest stores a timed-out test's
+# stdout/stderr and drops a passing test's (`store-success-output` is at its
+# default of false below), so they are invisible on the green path and name the
+# last phase entered on the red one — including in the JUnit artifact each build
+# job uploads per attempt, whose `<failure type="test timeout"/>` carries no
+# message of its own. That last part is why the FIRST occurrence told nobody
+# anything, and it was verified against nextest 0.9.143 rather than assumed.
+#
+# So if this test ever goes red on a timeout again, read its captured stderr
+# first: the phase it names is the wait that hung, and `force_kill_and_reap_all`
+# still has no deadline of its own.
+
 [profile.default]
 retries = 0
 slow-timeout = { period = "60s", terminate-after = 3 }
