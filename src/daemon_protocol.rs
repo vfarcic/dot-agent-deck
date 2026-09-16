@@ -414,6 +414,172 @@ pub const DAEMON_CAPABILITIES: &[&str] = &[
 #[cfg(not(unix))]
 pub const DAEMON_CAPABILITIES: &[&str] = &[CAP_LIST_PROJECTS, CAP_RESOLVE_PROJECT];
 
+// ---------------------------------------------------------------------------
+// Issue #801: the declared contract breaks, and how two builds compare them.
+// ---------------------------------------------------------------------------
+
+/// The TUI↔daemon **contract breaks this build declares**, appended to by the
+/// commit that makes each one.
+///
+/// # The question this answers, and the two it does not
+///
+/// Compatibility here has three layers and they are not the same question
+/// (issue #801):
+///
+/// | question | mechanism |
+/// |---|---|
+/// | can we decode each other's frames at all? | [`PROTOCOL_VERSION`] — a hard floor, never bypassable |
+/// | may I use *this* verb? | [`DAEMON_CAPABILITIES`] on the `Hello` reply — per-feature, degrades |
+/// | do we agree what the fields MEAN? | **this list** |
+///
+/// The third is the one nothing could see before. `docs/develop/versioning.md`
+/// is explicit that a **semantic break behind a stable wire** — a field whose
+/// meaning changes, a role-map value type that shifts — is real, deliberately
+/// does **not** bump [`PROTOCOL_VERSION`], and cannot be derived from the
+/// source. At least six of the sixteen `.breaking.md` fragments in this repo's
+/// history are that shape — #140, #243, #608, #617, #702 and #704 each say
+/// `PROTOCOL_VERSION` unchanged in their own text — so it is routine rather than
+/// a corner case.
+///
+/// # Why a list in the contract's own source, rather than the version
+///
+/// The desktop used to classify a daemon by comparing `git describe` build
+/// stamps, then by comparing the release digits it could read off them. Both
+/// read a **tag**, and a tag is applied by the release workflow *after* the
+/// content lands — so a branch cut between a release's content and its tag
+/// describes as the PREVIOUS release while being functionally the new one.
+/// Measured, on issue #801: a branch whose `git diff v0.39.0 HEAD -- src/` was
+/// **empty** was reported `build mismatch: desktop is 0.38.0-gfa02054-dirty,
+/// daemon is 0.39.0-g1ea0fe7` and refused. Two identical trees, classified
+/// incompatible, because the check measured where a tag sits in the commit
+/// graph.
+///
+/// This list cannot do that: it is content in the contract's own source file,
+/// compiled into both binaries, and it moves in the commit that moves the
+/// contract. Two builds of the same tree always agree on it whatever any tag
+/// says, and — once both are new enough to carry the list at all — two builds
+/// that a declared break separates disagree on it however close their tags are.
+/// [`ContractComparison::Undeclared`] is the arm for the builds that predate it,
+/// and states what that costs.
+///
+/// **And nothing is lost by retiring the release-digit comparison**, which is
+/// worth stating rather than hoping: by this project's own bump policy only a
+/// *declared* break bumps the minor while `0.x` (`docs/develop/versioning.md`),
+/// so the digits could only ever refuse on a break somebody had already
+/// declared — exactly what is listed here, minus the tag-timing error, and
+/// minus the blind spot that a break declared on an *unreleased* branch has no
+/// digit to move yet.
+///
+/// # The rule for adding one
+///
+/// **One entry per `changelog.d/<issue>.breaking.md` fragment**, spelled
+/// `<issue>-<kebab-slug>`, appended in the same commit as the fragment. The
+/// `breaking` changelog type already *is* this project's declaration that a
+/// change is a cross-process contract break, so the correspondence is
+/// definitional rather than a second judgement call — and
+/// `xtask/linkage-check`'s `contract_breaks` rule fails the build when a
+/// fragment in the tree has no entry here.
+///
+/// **Append only. Never edit or remove an entry**, including when
+/// [`PROTOCOL_VERSION`] bumps past it: a stale entry costs one string on both
+/// sides of a comparison that then agree about it, while a removed one silently
+/// re-marries two builds a break separates.
+///
+/// # Why the seed is what it is
+///
+/// Only breaks declared at the **current** [`PROTOCOL_VERSION`] can ever be the
+/// deciding difference — the desktop compares protocol versions first and
+/// returns on a difference, and it is the only caller that refuses — so this
+/// starts at protocol 9 rather than backfilling all sixteen fragments in the
+/// repo's history, which would be decoration a reader has to see through.
+/// PRD #882 and PRD #819 are not listed for the same reason: they *are* the
+/// 8 → 9 bump, so the floor already separates every build on either side of
+/// them. Issue #617 is listed because it is the one declared break that landed
+/// **at** 9 without moving it, which is precisely the case nothing else sees.
+pub const CONTRACT_BREAKS: &[&str] = &[
+    // `ed4e24f7`, after PRD #882 took PROTOCOL_VERSION to 9. Automatic pane
+    // writes and seed pulls are now bound to the agent they were meant for and
+    // refuse rather than land somewhere else. Nothing on the wire moved; what
+    // moved is who gets refused, which is a semantic break by
+    // `docs/develop/versioning.md`'s definition.
+    "617-pane-write-agent-binding",
+];
+
+/// What comparing this build's [`CONTRACT_BREAKS`] against a peer's found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ContractComparison {
+    /// The peer advertised no list at all, so there is nothing to compare.
+    ///
+    /// **Read as "connect", not as "refuse" — and that reading is an ASSUMPTION
+    /// about a population, not a deduction.** Stated that way deliberately: this
+    /// list does not ship empty, so "a build that omits the field is at this
+    /// build's contract by construction" would be false, and the paragraph below
+    /// would contradict it.
+    ///
+    /// What actually holds is narrower and is about *which* builds can reach
+    /// this arm. A reply without the field comes from a build that predates the
+    /// field, and [`PROTOCOL_VERSION`] has to match for the comparison to be
+    /// reached at all — so the peer is a protocol-9 build older than this
+    /// commit. **Every released build in that set carries #617** (`v0.40.0`
+    /// onward contains `ed4e24f7`; `v0.39.4` is protocol 8 and never reaches
+    /// here), so it is at this build's declared contract and merely cannot say
+    /// so. Refusing the set would refuse every released daemon up to and
+    /// including `v0.40.2` for staying silent, which is the false-positive class
+    /// issue #801 exists to remove rather than relocate.
+    ///
+    /// **The residual, stated rather than implied:** an UNRELEASED protocol-9
+    /// build from the window between PRD #882's bump and #617 genuinely predates
+    /// a declared break, is not at this build's contract, and is connected
+    /// anyway. That window is 73 minutes wide (`6932ae2a` to `ed4e24f7`, both
+    /// 2026-09-10), so reaching it means running a dev build from that hour.
+    /// [`PROTOCOL_VERSION`] still gates the connection, and the operator still
+    /// has both build stamps in front of them.
+    ///
+    /// The assumption shrinks on its own: every build made from this commit
+    /// onward declares, so the population that can land here is fixed and
+    /// ageing rather than growing.
+    Undeclared,
+    /// Both builds declared a list and the two agree.
+    Agreed,
+    /// Both builds declared a list and the two differ, so a break somebody
+    /// declared sits between them.
+    Diverged {
+        /// Declared here and not by the peer: the peer is older across those
+        /// breaks.
+        peer_lacks: Vec<String>,
+        /// Declared by the peer and not here: this build is older across those
+        /// breaks.
+        this_build_lacks: Vec<String>,
+    },
+}
+
+/// Compare a peer's declared contract breaks against this build's.
+///
+/// Set comparison rather than a count or an ordering, because a break is not a
+/// scalar: two branches can each carry one the other does not, and naming which
+/// is what lets a message say something an operator can act on.
+///
+/// Lives here rather than in the desktop so the one client that refuses today
+/// and any that refuses later read the same implementation — the shape issue
+/// #405 is open about for [`PROTOCOL_VERSION`], not repeated.
+pub fn compare_contract_breaks(peer: Option<&[String]>) -> ContractComparison {
+    let Some(peer) = peer else {
+        return ContractComparison::Undeclared;
+    };
+    let peer: std::collections::BTreeSet<&str> = peer.iter().map(String::as_str).collect();
+    let mine: std::collections::BTreeSet<&str> = CONTRACT_BREAKS.iter().copied().collect();
+    let peer_lacks: Vec<String> = mine.difference(&peer).map(|s| (*s).to_string()).collect();
+    let this_build_lacks: Vec<String> = peer.difference(&mine).map(|s| (*s).to_string()).collect();
+    if peer_lacks.is_empty() && this_build_lacks.is_empty() {
+        ContractComparison::Agreed
+    } else {
+        ContractComparison::Diverged {
+            peer_lacks,
+            this_build_lacks,
+        }
+    }
+}
+
 /// PRD #819 M2: the project verbs' refusal carries a stable machine-readable
 /// code as the first token of [`AttachResponse::error`], followed by `": "` and
 /// a generic human sentence.
@@ -1358,6 +1524,28 @@ pub struct AttachResponse {
     /// stability contract. Nothing may branch on that error text.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capabilities: Option<Vec<String>>,
+    /// Issue #801: the contract breaks this build declares — [`CONTRACT_BREAKS`],
+    /// verbatim — so a peer can classify compatibility from the **contract**
+    /// instead of from where a git tag happens to sit in the commit graph.
+    ///
+    /// Populated on every [`Self::hello`], unconditionally and with nothing to
+    /// withhold: unlike [`Self::capabilities`], which is a per-platform claim
+    /// about which verbs this build answers, this is a flat statement of which
+    /// declared breaks this build is on the far side of. There is no build for
+    /// which the honest answer is "I would rather not say".
+    ///
+    /// **Absence is NOT "withhold" here, and that is the one place this field's
+    /// rule differs from the capability set's.** A reply without it comes from a
+    /// build that predates the field, and is read as being at this build's
+    /// declared contract — an assumption about which builds can reach that arm,
+    /// not a deduction from an empty baseline (this list does not ship empty).
+    /// [`ContractComparison::Undeclared`] is the only place that reading is
+    /// made; it carries the argument for it and the residual it costs.
+    ///
+    /// Additive and optional, so no [`PROTOCOL_VERSION`] bump: an older client
+    /// ignores the extra key and an older daemon omits it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contract_breaks: Option<Vec<String>>,
     /// Issue #770: the orchestration ROLE registrations the daemon is holding
     /// in memory, populated on the [`AttachRequest::ListAgents`] reply.
     ///
@@ -1490,6 +1678,10 @@ impl AttachResponse {
             // reply — including the static `daemon hello` CLI probe. Additive
             // and optional; a future option B classifies on this field.
             daemon_version: Some(env!("DAD_VERSION").to_string()),
+            // Issue #801: the contract signal rides every hello reply, including
+            // the static `daemon hello` CLI probe — a compile-time constant with
+            // no registry to consult, exactly like the two fields above it.
+            contract_breaks: Some(CONTRACT_BREAKS.iter().map(|b| (*b).to_string()).collect()),
             ..Default::default()
         }
     }
@@ -4167,6 +4359,130 @@ mod tests {
                 "the refusal must carry the stable code, got {message:?}"
             );
         }
+    }
+
+    /// Issue #801: every entry is `<issue>-<kebab-slug>`, and no entry appears
+    /// twice.
+    ///
+    /// The shape is not cosmetic — `xtask/linkage-check`'s `contract_breaks`
+    /// rule pairs a `changelog.d/<issue>.breaking.md` fragment with an entry by
+    /// matching the leading issue number, so an entry that does not open with
+    /// one can never satisfy the rule it exists to satisfy. A duplicate is worth
+    /// catching for a different reason: the comparison is a set, so a second
+    /// copy of an entry changes nothing and would sit there reading as a second
+    /// declared break.
+    #[test]
+    fn declared_contract_breaks_are_well_formed_and_unique() {
+        let mut seen = std::collections::BTreeSet::new();
+        for entry in CONTRACT_BREAKS {
+            let (issue, slug) = entry
+                .split_once('-')
+                .unwrap_or_else(|| panic!("`{entry}` must be `<issue>-<kebab-slug>`"));
+            assert!(
+                !issue.is_empty() && issue.bytes().all(|b| b.is_ascii_digit()),
+                "`{entry}` must open with the issue number the `.breaking.md` fragment is named for"
+            );
+            assert!(
+                !slug.is_empty()
+                    && slug
+                        .bytes()
+                        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-'),
+                "`{entry}`'s slug must be lower-case kebab"
+            );
+            assert!(seen.insert(*entry), "`{entry}` is listed twice");
+        }
+    }
+
+    /// Issue #801, the measured false positive as a test: two builds of the same
+    /// contract agree however far apart their tags are.
+    ///
+    /// This is what the branch in the issue could not get. Its `git diff
+    /// v0.39.0 HEAD -- src/` was empty and it was still refused, because the
+    /// stamp it was judged by named the tag *reachable from* its commit rather
+    /// than the contract compiled into it.
+    #[test]
+    fn a_peer_declaring_this_builds_list_agrees_whatever_its_tag_says() {
+        let peer: Vec<String> = CONTRACT_BREAKS.iter().map(|b| (*b).to_string()).collect();
+        assert_eq!(
+            compare_contract_breaks(Some(&peer)),
+            ContractComparison::Agreed
+        );
+    }
+
+    /// The other half, and the one that stops this being a classifier that only
+    /// ever says yes: a peer one declared break behind diverges, and the
+    /// divergence NAMES the break and its direction.
+    ///
+    /// Both halves are asserted from one fixture because the direction is the
+    /// part a message has to get right — "you are older" and "I am older" call
+    /// for different remedies from the operator reading it.
+    #[test]
+    fn a_peer_that_lacks_a_declared_break_diverges_in_the_named_direction() {
+        let older: Vec<String> = Vec::new();
+        match compare_contract_breaks(Some(&older)) {
+            ContractComparison::Diverged {
+                peer_lacks,
+                this_build_lacks,
+            } => {
+                assert_eq!(
+                    peer_lacks,
+                    CONTRACT_BREAKS
+                        .iter()
+                        .map(|b| (*b).to_string())
+                        .collect::<Vec<_>>()
+                );
+                assert!(this_build_lacks.is_empty());
+            }
+            other => panic!("expected a divergence, got {other:?}"),
+        }
+
+        let newer = vec!["999-a-break-this-build-predates".to_string()];
+        match compare_contract_breaks(Some(&newer)) {
+            ContractComparison::Diverged {
+                this_build_lacks, ..
+            } => assert_eq!(this_build_lacks, vec!["999-a-break-this-build-predates"]),
+            other => panic!("expected a divergence, got {other:?}"),
+        }
+    }
+
+    /// A reply that carries no list at all is a build predating the mechanism,
+    /// and is reported as its own state rather than being flattened into
+    /// "declares nothing".
+    ///
+    /// The two are the same *set* and deliberately not the same *answer*: the
+    /// desktop connects through `Undeclared` and refuses `Diverged`, so flattening
+    /// them would refuse every released daemon up to `v0.40.2` for omitting a
+    /// field it was built before.
+    #[test]
+    fn an_absent_list_is_undeclared_rather_than_an_empty_one() {
+        assert_eq!(
+            compare_contract_breaks(None),
+            ContractComparison::Undeclared
+        );
+        assert!(matches!(
+            compare_contract_breaks(Some(&[])),
+            ContractComparison::Diverged { .. } | ContractComparison::Agreed
+        ));
+    }
+
+    /// Issue #801: the list rides every `hello` reply, including the static
+    /// `daemon hello` CLI probe that has no registry to consult.
+    #[test]
+    fn hello_advertises_the_declared_contract_breaks() {
+        let resp = AttachResponse::hello(PROTOCOL_VERSION);
+        let advertised = resp
+            .contract_breaks
+            .as_deref()
+            .expect("hello advertises the contract-break list");
+        assert_eq!(
+            compare_contract_breaks(Some(advertised)),
+            ContractComparison::Agreed
+        );
+        // And it survives the wire, which is the only form the desktop ever
+        // reads it in.
+        let json = serde_json::to_string(&resp).unwrap();
+        let back: AttachResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.contract_breaks.as_deref(), Some(advertised));
     }
 
     /// Issue #454, the root cause pinned at its own seam: a `StartAgent` for an

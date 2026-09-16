@@ -2286,16 +2286,39 @@ mod tests {
         );
 
         let _ = release.send(());
-        // Bounded rather than a bare loop: the task is finished the moment the
+        // Bounded rather than a bare loop: the task is finished the moment its
         // runtime has polled it after the send, and a run that never gets there
         // should fail rather than hang.
+        //
+        // **Bounded by the CLOCK and waited on with a real sleep**, which this
+        // was not, and the difference is why it failed on `build-windows` and
+        // nowhere else. `tauri::async_runtime::spawn` puts `ending` on Tauri's
+        // own multi-threaded runtime, not on this `#[tokio::test]`'s
+        // current-thread one — so `yield_now()` here reschedules the only task
+        // on THIS runtime and returns immediately, never parking the thread and
+        // never giving the OS a reason to run the other runtime's worker. On an
+        // idle box with cores to spare the worker gets one anyway and the spin
+        // wins; when it has to share, a thousand instant iterations can pass
+        // without it being scheduled once, and the reclaim reads as impossible
+        // rather than as slow.
+        //
+        // **The margin was 1.6x, measured rather than assumed.** Instrumented
+        // with a counter and pinned to a single core with `taskset -c 0` on an
+        // otherwise-idle Linux box, the old loop spent **473-620** of its 1000
+        // iterations over ten runs — so it was already most of the way through
+        // its budget with nothing else competing, and `build-windows` on a
+        // loaded two-core runner is what finally spent the rest (CI run
+        // 35036531902). A 1 ms sleep parks this thread, which is the thing that
+        // actually lets the other one run: the same fifteen pinned runs reclaim
+        // on the first or second iteration and the test finishes in under 10 ms.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         let mut reclaimed = None;
-        for _ in 0..1_000 {
+        while std::time::Instant::now() < deadline {
             if let Some(token) = state.start_watcher_once_for(&deck) {
                 reclaimed = Some(token);
                 break;
             }
-            tokio::task::yield_now().await;
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
         }
 
         let second =

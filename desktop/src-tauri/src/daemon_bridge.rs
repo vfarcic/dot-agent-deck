@@ -11,7 +11,9 @@ use dot_agent_deck::daemon_attach::{
 use dot_agent_deck::daemon_client::{DaemonClient, Endpoint, EndpointIdentity, issue_command};
 #[cfg(test)]
 use dot_agent_deck::daemon_protocol::RunningAgentsSummary;
-use dot_agent_deck::daemon_protocol::{AttachRequest, AttachResponse, PROTOCOL_VERSION};
+use dot_agent_deck::daemon_protocol::{
+    AttachRequest, AttachResponse, ContractComparison, PROTOCOL_VERSION, compare_contract_breaks,
+};
 use dot_agent_deck::platform::ipc::IpcStream;
 use tokio::sync::Mutex as AsyncMutex;
 
@@ -33,10 +35,15 @@ pub(crate) struct HandshakeInfo {
     pub(crate) daemon_build_version: Option<String>,
     pub(crate) daemon_version: Option<String>,
     pub(crate) running_agent_count: Option<usize>,
-    /// The protocol agreed and the two builds' release versions still disagreed
-    /// (or one of them could not be read), so an override is legitimate. Never
-    /// set when the wire itself is incompatible, and no longer set by a stamp
-    /// difference *within* one release — see [`release_versions_are_compatible`].
+    /// The protocol agreed and something ABOVE the wire did not, so an override
+    /// is legitimate. Never set when the wire itself is incompatible.
+    ///
+    /// **Named for what used to set it.** Until issue #801 that was a build-stamp
+    /// difference the two builds' release digits did not excuse. A build stamp
+    /// now sets this — and refuses — never; what sets it is a declared contract
+    /// break ([`contract_refusal`]). The name is kept because it is the key the
+    /// webview switches `Connect anyway` on, and renaming it across the bridge
+    /// would buy nothing this doc comment does not.
     pub(crate) build_stamp_mismatch_only: bool,
     /// Why the project-aware surfaces are unavailable against this daemon, or
     /// `None` when they are available (PRD #741 M8).
@@ -455,102 +462,161 @@ impl DaemonLinks {
     }
 }
 
-/// What a build-stamp difference MEANS for this kind of deck (PRD #741 M8).
+/// How many break names a refusal sentence prints before it starts counting.
+///
+/// Four, because the sentence is read on a connection banner rather than in a
+/// log: a build is normally one or two breaks behind, and a list long enough to
+/// need scrolling has stopped telling the reader anything the count does not.
+const MAX_NAMED_BREAKS: usize = 4;
+
+/// The break names for one side of a divergence, bounded and charset-checked.
+///
+/// # Why a peer's entries are not rendered as they arrive
+///
+/// One of the two lists is peer-supplied. `this_build_lacks` is what the deck
+/// declared and this build does not, so every string in it came off the wire —
+/// and the connection banner scrubs its sentence with [`safe_message`], which
+/// removes general category `Cc` and lets `Cf`, the **bidi** controls, through.
+/// That is PRD #741 final audit F4's finding about `build_version`, which is
+/// rendered into the same sentence; a new unvalidated wire string beside it
+/// would re-open exactly that. A hostile or merely broken daemon can also send a
+/// list of any length the 16 MiB frame cap allows, which is a banner nobody can
+/// read.
+///
+/// So an entry is printed only when it matches the shape
+/// [`dot_agent_deck::daemon_protocol::CONTRACT_BREAKS`] declares — ASCII digits,
+/// lower-case letters and `-`, which cannot hold a control or a bidi byte — and
+/// at most [`MAX_NAMED_BREAKS`] of them are printed. Everything else is reported
+/// as a count, which is the honest thing to say about a name this app is not
+/// willing to show.
+///
+/// **Applied to BOTH lists although only one needs it.** `peer_lacks` is
+/// `CONTRACT_BREAKS.difference(peer)`, so it is a subset of this build's own
+/// compiled-in strings and is well-formed by construction. Bounding it too costs
+/// nothing and means an edit that later swaps which side is which cannot
+/// silently re-open the hole.
+fn named_breaks(breaks: &[String]) -> String {
+    fn is_declared_shape(entry: &str) -> bool {
+        !entry.is_empty()
+            && entry.len() <= 64
+            && entry
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+    }
+
+    let printable: Vec<&str> = breaks
+        .iter()
+        .map(String::as_str)
+        .filter(|entry| is_declared_shape(entry))
+        .take(MAX_NAMED_BREAKS)
+        .collect();
+    let unprinted = breaks.len() - printable.len();
+    match (printable.is_empty(), unprinted) {
+        (true, count) => format!("{count} break(s) it did not name in a readable form"),
+        (false, 0) => printable.join(", "),
+        (false, count) => format!("{}, and {count} more", printable.join(", ")),
+    }
+}
+
+/// Why the build stamp no longer decides anything, and what does (issue #801).
 ///
 /// # The three layers, kept apart
 ///
-/// Issue #801's framing, adopted here for the `Remote` arm only:
-///
-/// | question | mechanism | this type |
+/// | question | mechanism | where |
 /// |---|---|---|
-/// | can we decode each other's frames at all? | [`PROTOCOL_VERSION`] | untouched — exact equality, for every deck kind, never bypassable |
+/// | can we decode each other's frames at all? | [`PROTOCOL_VERSION`] | exact equality, first, never bypassable |
+/// | do we agree what the fields MEAN? | the declared contract breaks | [`contract_refusal`] |
 /// | may I use *this* verb? | the `Hello` reply's advertised capability set | [`project_actions_reason`] |
-/// | are we the same build? | the git-describe stamp | **this type** |
+/// | are we the same build? | the git-describe stamp | **nothing — reported, never classified** |
 ///
-/// # Why the answer differs by deck kind
+/// # What the stamp was measuring, and why it had to stop
 ///
-/// For a **local** deck the desktop bundles its own sidecar and starts it, so
-/// lockstep is a property the app can actually hold — and **Replace daemon** is
-/// a remedy the user can actually take. Refusing is right there and nothing
-/// about it changes.
+/// `git describe` reports the nearest tag **reachable from HEAD**, and a tag is
+/// applied by the release workflow *after* the content it names has landed. So a
+/// branch cut in between describes as the PREVIOUS release while being
+/// functionally the new one, and the comparison reports a difference between two
+/// trees that are byte-identical. Measured on issue #801: a branch whose
+/// `git diff v0.39.0 HEAD -- src/` was **empty** was refused with
+/// `build mismatch: desktop is 0.38.0-gfa02054-dirty, daemon is 0.39.0-g1ea0fe7`.
 ///
-/// For a **remote** deck neither half survives. The remedy `:263-273` offers is
-/// *"use Replace daemon to start the matching bundled build"*, which against a
-/// deck on another host means terminating a daemon someone else may be using —
-/// and PRD #741 M2 made that structurally impossible anyway, so the sentence
-/// names an action whose button is disabled on the same screen that prints it.
-/// **A remedy that cannot be taken is worse than none**: it reads as the user's
-/// fault for not taking it. And the refusal is not rare. A released daemon never
-/// matches a branch build, and the far host's daemon upgrades on its own
-/// cadence, so "refuse on any stamp difference" against a remote deck is
-/// "refuse most of the time".
+/// Reading the release digits off that stamp instead — which is what this module
+/// did until now, via a `compatibility_key` over `0.MINOR` — is the same
+/// measurement with fewer characters: `0.38` comes off the same `git describe`.
+/// It narrowed the false positive to a minor boundary rather than removing it,
+/// and a minor boundary is exactly where the interesting case lives.
 ///
-/// # When this type is consulted at all — read this before testing it by hand
+/// # Nothing is lost by retiring it, and one thing is gained
 ///
-/// [`classify_handshake`] reaches the stamp branch only when the protocol
-/// versions are **equal** and [`release_versions_are_compatible`] says `false`,
-/// so two conditions must hold at once and the obvious hand test satisfies
-/// neither. Building two commits of the same branch gives two stamps like
-/// `0.39.4-g…`, [`compatibility_key`] maps both to `(0, 39)`, and the
-/// classification falls through to `Connected` **for both deck kinds without
-/// consulting this type** — which looks exactly like the remote demotion
-/// working. It is not: a tester who concludes M8 works from that has tested
-/// nothing, and would see the same result with this type deleted.
+/// While `0.x` only a **declared** break bumps the minor
+/// (`docs/develop/versioning.md`), so the digit comparison could only ever
+/// refuse across a break somebody had already written a `changelog.d/*.breaking.md`
+/// fragment for. [`dot_agent_deck::daemon_protocol::CONTRACT_BREAKS`] is that
+/// same declaration, read from the contract's own source instead of from a tag —
+/// so it refuses the same pairs, minus the tag-timing error, and **plus** the
+/// pairs a digit cannot reach at all: a break declared on an unreleased branch
+/// has no minor to move yet, and used to read as compatible with the release it
+/// was cut from.
 ///
-/// Two situations do reach it. A **released pair whose compatibility keys
-/// differ** — while `0.x`, a minor bump, which by CLAUDE.md rule 12's bump
-/// policy is exactly what a compatibility break is versioned as — provided the
-/// two builds still agree on [`PROTOCOL_VERSION`], since the protocol check
-/// returns first otherwise. And the **unreadable-stamp fail-safe**: a stamp
-/// absent or unparseable on either side makes `release_versions_are_compatible`
-/// return `false` on no positive evidence, which is the cheaper of the two to
-/// stage by hand. Note the corollary for the current tree — protocol 9 is
-/// unreleased, so no released build pairs with it across a key difference, and
-/// the fail-safe is the only route there is today. The assertion in
-/// `the_stamp_policy_follows_the_deck_kind` is therefore what pins the policy;
-/// an end-to-end hand test is not a substitute for it.
+/// # What is still NOT detectable, stated rather than implied
 ///
-/// # What is LOST by demoting it, stated rather than implied
+/// An **undeclared** semantic break. If the author does not write the fragment
+/// and does not append the entry, no mechanism here sees it — the verb is still
+/// advertised and still answers, and the wire shape is unchanged. The stamp did
+/// not see it either (an undeclared break bumps only the patch, which the digit
+/// comparison passed), so this is a residual carried over rather than one
+/// introduced. What stands behind it is CLAUDE.md rule 12's cross-version manual
+/// test, run before such a change merges, and the fragment its outcome demands.
 ///
-/// A **semantic break behind a stable wire** — a field whose meaning changed
-/// while its shape did not — is **not mechanically detectable**. No capability
-/// string sees it, because the verb is still advertised and still answers. No
-/// version digit sees it, because `docs/develop/versioning.md` is explicit that
-/// such a break deliberately does not move [`PROTOCOL_VERSION`]. And the stamp
-/// does not see it either, in the case that matters most: a development build's
-/// `git describe` names the **last** release, so a branch carrying an unreleased
-/// semantic break describes as compatible with the release it was cut from (see
-/// [`release_versions_are_compatible`]'s own residual note).
+/// # The deck kind no longer changes the answer
 ///
-/// What actually stands between a remote user and a silently wrong field is
-/// CLAUDE.md rule 12's cross-version manual test, run against the previous
-/// release before such a change merges, and the `.breaking.md` fragment its
-/// outcome demands — which is what turns the break into a minor bump that
-/// [`release_versions_are_compatible`] can then see. Before this type there were
-/// two backstops for a remote deck and one of them was noisy; there is now
-/// **one**, and it is a procedure rather than a mechanism. That is the price of
-/// the demotion and it is accepted, not hidden.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum StampPolicy {
-    /// `Local`: a stamp difference the release versions do not excuse refuses
-    /// the connection, exactly as it did before this type existed.
-    Enforced,
-    /// `Remote`: a stamp difference is reported and connected through.
-    Informational,
-}
-
-impl StampPolicy {
-    /// The policy for a deck, decided by its kind and by nothing else.
-    ///
-    /// Deliberately a `match` on the endpoint rather than a flag somebody sets:
-    /// the kind is the whole of the argument above, so anything that could set
-    /// it independently would be a way to get the remote policy on a local deck.
-    pub(crate) fn for_endpoint(endpoint: &Endpoint) -> Self {
-        match endpoint {
-            Endpoint::Local(_) => Self::Enforced,
-            Endpoint::Remote(_) => Self::Informational,
-        }
+/// PRD #741 M8 split the policy by kind because a stamp difference against a
+/// **remote** deck was noise the user could not act on — the remedy it offered,
+/// Replace daemon, means terminating a daemon on a host you do not own, and that
+/// button is disabled there anyway. That reasoning was right about the stamp and
+/// is now moot: the stamp refuses nobody, of either kind. A **declared contract
+/// break** is not noise — it is the one signal that says these two builds cannot
+/// safely interoperate — so it refuses for both kinds, and `Connect anyway`
+/// (PR #779) is the escape hatch it leaves, for both kinds.
+///
+/// # What this function returns
+///
+/// The refusal sentence for a deck a declared break separates this build from,
+/// or `None` when there is nothing to refuse — which covers both "we agree" and
+/// "this build predates the declaration and there is nothing to compare"
+/// ([`ContractComparison::Undeclared`], whose own doc states what that costs).
+///
+/// The sentence names the breaks and the direction, because the two directions
+/// call for different actions from whoever reads it: a deck that lacks breaks
+/// this build has is the older of the two, and a deck that has breaks this build
+/// lacks means the app is the stale one.
+fn contract_refusal(response: &AttachResponse) -> Option<String> {
+    let (peer_lacks, this_build_lacks) =
+        match compare_contract_breaks(response.contract_breaks.as_deref()) {
+            ContractComparison::Undeclared | ContractComparison::Agreed => return None,
+            ContractComparison::Diverged {
+                peer_lacks,
+                this_build_lacks,
+            } => (peer_lacks, this_build_lacks),
+        };
+    let mut sides = Vec::new();
+    if !peer_lacks.is_empty() {
+        sides.push(format!(
+            "the deck is behind this app across {}",
+            named_breaks(&peer_lacks)
+        ));
     }
+    if !this_build_lacks.is_empty() {
+        sides.push(format!(
+            "this app is behind the deck across {}",
+            named_breaks(&this_build_lacks)
+        ));
+    }
+    Some(format!(
+        "contract mismatch: {}. Protocol {PROTOCOL_VERSION} matched on both sides, so the frames \
+         decode — but a declared compatibility break sits between these two builds, so a field can \
+         be read with the wrong meaning rather than failing outright",
+        sides.join(", and ")
+    ))
 }
 
 /// The verbs the desktop's project-aware surfaces need (PRD #819 M6).
@@ -671,143 +737,57 @@ fn build_mismatch_allowance() -> BuildMismatchAllowance {
     }
 }
 
-/// The `MAJOR.MINOR.PATCH` a build stamp opens with, or `None` when it does not
-/// open with one.
+/// A daemon reply that THIS build is guaranteed to classify as incompatible,
+/// whatever this build happens to be stamped with.
 ///
-/// A stamp is `<version>-g<short-sha>` with an optional commit distance and an
-/// optional `-dirty` suffix — `0.39.0-g1ea0fe7`, `0.39.0-49-ga0165f8`,
-/// `0.39.0-g1ea0fe7-dirty` — and `<version>` may itself carry a SemVer
-/// prerelease or build-metadata suffix (`0.25.0-alpha.0-g1ea0fe7`). Everything
-/// from the first `-` or `+` onward is therefore discarded and only the three
-/// core digits are read. A leading `v` is tolerated because that is the shape a
-/// git tag has, even though `DAD_BUILD_ID` strips it.
-fn release_core(stamp: &str) -> Option<(u64, u64, u64)> {
-    fn field(text: &str) -> Option<u64> {
-        // `u64::from_str` accepts a leading `+`; the explicit digit test keeps
-        // the accepted set to exactly what a version field can look like.
-        if text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_digit()) {
-            return None;
-        }
-        text.parse().ok()
-    }
-
-    let stamp = stamp.trim();
-    let stamp = stamp.strip_prefix(['v', 'V']).unwrap_or(stamp);
-    let core = stamp.split(['-', '+']).next()?;
-    let mut fields = core.split('.');
-    let (major, minor, patch) = (fields.next()?, fields.next()?, fields.next()?);
-    if fields.next().is_some() {
-        return None;
-    }
-    Some((field(major)?, field(minor)?, field(patch)?))
-}
-
-/// The digits of a release version that move when a compatibility break is
-/// declared, per `docs/develop/versioning.md`.
-///
-/// While the major version is `0` the bump rules are deliberately shifted down
-/// one level from standard SemVer, so a protocol/handler break bumps the
-/// **minor** while a feature or a bugfix bumps the patch: the key is
-/// `0.MINOR`. From `1.0` onward the rules are standard and only the **major**
-/// moves on a break, so the minor is dropped from the key rather than left in
-/// it. Both arms are encoded because a hardcoded `major.minor` would silently
-/// start refusing compatible peers the day this repo ships `1.0`.
-fn compatibility_key(stamp: &str) -> Option<(u64, u64)> {
-    let (major, minor, _patch) = release_core(stamp)?;
-    Some(if major == 0 { (0, minor) } else { (major, 0) })
-}
-
-/// Whether the two builds' *release versions* declare them compatible.
-///
-/// `false` unless BOTH stamps parsed and their keys matched, so an absent,
-/// truncated or otherwise unreadable stamp on either side falls back to the
-/// prompt. Silent connection is the permissive answer and is reached only on
-/// positive evidence — the fail-safe direction is what the tests below pin.
-///
-/// **The residual this does not close, and must not be read as closing.** A
-/// development build's `git describe` names the LAST release, so a branch
-/// carrying an *unreleased* semantic break describes as the release it was cut
-/// from and reads as compatible with it. Nothing in a build stamp can see that
-/// break: the whole point of the `.breaking.md` discipline is that a same-wire,
-/// different-meaning change is not mechanically detectable. It is backstopped
-/// by CLAUDE.md rule 12's cross-version manual test — run against the previous
-/// release before such a change merges — and by the fragment that test's
-/// outcome demands, which is what turns the break into a minor bump this
-/// function can then see. This reads released versions; it says nothing about
-/// unreleased ones.
-fn release_versions_are_compatible(client_build: &str, daemon_build: Option<&str>) -> bool {
-    let Some(daemon_build) = daemon_build else {
-        return false;
-    };
-    match (
-        compatibility_key(client_build),
-        compatibility_key(daemon_build),
-    ) {
-        (Some(client), Some(daemon)) => client == daemon,
-        _ => false,
-    }
-}
-
-/// A daemon build stamp that THIS build is guaranteed to classify as
-/// incompatible, whatever this build happens to be stamped with.
-///
-/// # Why this exists, rather than a literal in each test
+/// # Why this is derived rather than a literal
 ///
 /// A test driving the live handshake — [`hello`], and everything above it —
-/// supplies only the *daemon* half of the comparison. The client half is
-/// [`dot_agent_deck::build_id::local_build_id`], i.e. whatever `build.rs`
-/// baked in, and that is decided by the build ENVIRONMENT: `build.rs`'s
-/// resolution order is injected env -> git tag -> `CARGO_PKG_VERSION`, and
-/// `CARGO_PKG_VERSION` is the `0.1.0` placeholder. So a checkout with tags
-/// stamps `0.39.x-g…` and a checkout without them stamps `0.1.0-g…` — and
-/// `actions/checkout` sets no `fetch-depth`, so CI is the second kind.
+/// supplies only the *daemon* half of the comparison; the client half is this
+/// build's own compiled-in [`dot_agent_deck::daemon_protocol::CONTRACT_BREAKS`].
+/// A literal fixture would therefore encode an assumption about what that list
+/// happens to hold today, and the previous incarnation of this helper — which
+/// derived a *build stamp* — is the cautionary case: its literal predecessors
+/// (`0.1.0-gdeadbee`) refused locally and, on a CI checkout with no tags, shared
+/// the placeholder's release key with the client, so two tests asserting a
+/// refusal quietly got `Connected` instead.
 ///
-/// A literal fixture stamp therefore encodes an assumption about the machine.
-/// `0.1.0-gdeadbee` and `0.1.0-gfeedface` both did: they refused locally and,
-/// on CI, shared the placeholder's `(0, 1)` [`compatibility_key`] with the
-/// client, so [`release_versions_are_compatible`] said `true`, the stamp branch
-/// was never entered, and two tests asserting a refusal got `Connected`
-/// instead. This is exactly the trap [`StampPolicy`]'s own doc comment warns a
-/// hand-tester about, reached from the other direction.
-///
-/// So the fixture is DERIVED: it takes the client's own compatibility key and
-/// moves the digit that key reads — the minor while `0.x`, the major from `1.0`
-/// on — which puts the pair on opposite sides of the rule by construction, at
-/// `0.1.0` and at `0.39.4` alike. The two `assert!`s below are the point of the
-/// helper as much as the arithmetic is: they re-check both halves of the
-/// condition [`classify_handshake`]'s stamp branch is guarded by, so a fixture
-/// that stops reaching that branch fails HERE, naming the reason, instead of
-/// letting a caller's `assert_eq!` pass for the wrong reason.
+/// So the fixture is derived from the client's own list by taking a break the
+/// client declares away from the daemon, which puts the pair on opposite sides
+/// of a declared break by construction — at an empty list and at a long one
+/// alike. The `assert!` is part of the point: a fixture that stops reaching the
+/// contract branch fails HERE, naming the reason, rather than letting a caller's
+/// `assert_eq!` pass for the wrong reason.
 #[cfg(test)]
-pub(crate) fn stamp_incompatible_with_this_build(sha: &str) -> String {
-    let client = dot_agent_deck::build_id::local_build_id();
-    let candidate = match release_core(&client) {
-        Some((0, minor, _)) => format!("0.{}.0-g{sha}", minor + 1),
-        Some((major, _, _)) => format!("{}.0.0-g{sha}", major + 1),
-        // An unreadable client stamp makes `release_versions_are_compatible`
-        // answer `false` against every daemon stamp, so any value that differs
-        // textually reaches the branch. `0.0.0` is not a version this project
-        // can ever have released, which keeps the `assert_ne!` below honest.
-        None => format!("0.0.0-g{sha}"),
-    };
-    assert_ne!(
-        candidate, client,
-        "the fixture must differ from this build's own stamp, or the stamp \
-         branch is never entered"
-    );
+pub(crate) fn hello_from_a_deck_one_declared_break_behind() -> AttachResponse {
+    let mut response = AttachResponse::hello(PROTOCOL_VERSION);
+    let mut declared: Vec<String> = dot_agent_deck::daemon_protocol::CONTRACT_BREAKS
+        .iter()
+        .map(|entry| (*entry).to_string())
+        .collect();
+    // Dropping one is what an older deck looks like. With nothing to drop there
+    // is no older deck to describe, so name a break this build does not have and
+    // the divergence runs the other way — still a divergence, still the branch
+    // under test.
+    if declared.pop().is_none() {
+        declared.push("0-a-break-this-build-does-not-declare".to_string());
+    }
     assert!(
-        !release_versions_are_compatible(&client, Some(&candidate)),
-        "the fixture must be release-INcompatible with this build's own stamp \
-         ({client}), or the stamp branch is never entered: {candidate}"
+        matches!(
+            compare_contract_breaks(Some(&declared)),
+            ContractComparison::Diverged { .. }
+        ),
+        "the fixture must diverge from this build's own declared breaks, or the \
+         contract branch is never entered: {declared:?}"
     );
-    candidate
+    response.contract_breaks = Some(declared);
+    response
 }
 
 fn classify_handshake(
     response: &AttachResponse,
     client_build: &str,
     allowance: BuildMismatchAllowance,
-    stamps: StampPolicy,
 ) -> HandshakeInfo {
     let server_protocol_version = response.server_version;
     let daemon_build_version = response.build_version.clone();
@@ -817,7 +797,7 @@ fn classify_handshake(
         .as_ref()
         .map(|summary| summary.count);
 
-    // Set ONLY inside the stamp branch, which the protocol check guards. A
+    // Set ONLY inside the contract branch, which the protocol check guards. A
     // rejected Hello and a protocol mismatch both return before it, so neither
     // can advertise an override that the bypass would refuse to honour anyway.
     let mut build_stamp_mismatch_only = false;
@@ -836,45 +816,31 @@ fn classify_handshake(
                 .map(|version| version.to_string())
                 .unwrap_or_else(|| "no version".into())
         ))
-    } else if daemon_build_version.as_deref() != Some(client_build)
-        && !release_versions_are_compatible(client_build, daemon_build_version.as_deref())
-    {
+    } else if let Some(contract) = contract_refusal(response) {
         // Reached only AFTER the protocol check above returned equal, so the
-        // wire shape is already agreed. Two builds get here: ones whose release
-        // versions declare a compatibility break between them, and ones where a
-        // stamp could not be read at all — the fail-safe fallback. A stamp
-        // difference WITHIN one release falls through to the silent arm below,
-        // because by this project's own bump policy nothing incompatible sits
-        // between two builds that share a compatibility key (issue #801).
+        // wire shape is already agreed and what is left is meaning. Issue #801:
+        // the build stamps are named in the sentence but are not what was
+        // compared — the comparison is over the two builds' declared contract
+        // breaks, which live in the contract's own source and move with it
+        // rather than with a tag.
         build_stamp_mismatch_only = true;
         let builds = format!(
-            "build mismatch: desktop is {client_build}, deck is {}",
+            "Builds: desktop is {client_build}, deck is {}",
             daemon_build_version.as_deref().unwrap_or("unreported")
         );
-        // PRD #741 M8: for a remote deck the stamp is an informational badge and
-        // never a refusal, so the connection is made and the caveat travels with
-        // it. Checked BEFORE the allowance switches because it is not one of
-        // them — nothing is being bypassed here, and the message must not tell a
-        // user they overrode something they were never offered.
-        if stamps == StampPolicy::Informational {
-            build_mismatch_was_bypassed = true;
-            Some(format!(
-                "{builds}. Connected: protocol {PROTOCOL_VERSION} matched on both sides, and a deck on another host is not this app's to replace. A stamp difference can still mean divergent behaviour behind an identical wire — see the release notes for both builds before trusting a field that looks wrong."
-            ))
-        } else {
-            // Whichever switch is armed, the mismatch is kept in `error` (not
-            // dropped) so the caveat stays on screen for the whole session rather
-            // than being silently forgotten.
-            build_mismatch_was_bypassed = allowance.allows();
-            match allowance {
-                BuildMismatchAllowance::Env => Some(format!(
-                    "{builds}. Bypassed by {BUILD_MISMATCH_BYPASS_ENV}; protocol {PROTOCOL_VERSION} matched on both sides. Development only — a stamp difference can still mean divergent behaviour behind an identical wire."
-                )),
-                BuildMismatchAllowance::Session => Some(format!(
-                    "{builds}. Connected anyway for this session; protocol {PROTOCOL_VERSION} matched on both sides. A stamp difference can still mean divergent behaviour behind an identical wire."
-                )),
-                BuildMismatchAllowance::Refuse => {
-                    let recovery = match running_agent_count {
+        // Whichever switch is armed, the mismatch is kept in `error` (not
+        // dropped) so the caveat stays on screen for the whole session rather
+        // than being silently forgotten.
+        build_mismatch_was_bypassed = allowance.allows();
+        match allowance {
+            BuildMismatchAllowance::Env => Some(format!(
+                "{contract}. {builds}. Bypassed by {BUILD_MISMATCH_BYPASS_ENV}. Development only."
+            )),
+            BuildMismatchAllowance::Session => Some(format!(
+                "{contract}. {builds}. Connected anyway for this session."
+            )),
+            BuildMismatchAllowance::Refuse => {
+                let recovery = match running_agent_count {
                     Some(0) => "No live agents are reported; use Replace deck to start the matching bundled build, or Connect anyway to keep this one.".into(),
                     Some(count) => format!(
                         "The deck reports {count} live agent{}; stop them individually before replacing the deck, or Connect anyway to keep this one.",
@@ -882,8 +848,7 @@ fn classify_handshake(
                     ),
                     None => "The deck could not report its live-agent count, so automatic replacement is disabled; Connect anyway keeps this one.".into(),
                 };
-                    Some(format!("{builds}. {recovery}"))
-                }
+                Some(format!("{contract}. {builds}. {recovery}"))
             }
         }
     } else {
@@ -926,9 +891,8 @@ fn classify_handshake(
 pub(crate) fn classify_handshake_for_test(
     response: &AttachResponse,
     client_build: &str,
-    stamps: StampPolicy,
 ) -> HandshakeInfo {
-    classify_handshake(response, client_build, build_mismatch_allowance(), stamps)
+    classify_handshake(response, client_build, build_mismatch_allowance())
 }
 
 /// The classified handshake as a [`DesktopConnection`], stamped with the deck it
@@ -977,11 +941,8 @@ fn connection_from_handshake(endpoint: &Endpoint, handshake: HandshakeInfo) -> D
 /// the set here costs nothing, while letting `DaemonClient::capabilities()`
 /// learn it on its own would spend a second `Hello` on a connection whose
 /// handshake reply is already in hand.
-pub(crate) async fn hello(
-    socket_path: &Path,
-    stamps: StampPolicy,
-) -> Result<(HandshakeInfo, AttachResponse), String> {
-    bounded_reply("the handshake", hello_exchange(socket_path, stamps)).await
+pub(crate) async fn hello(socket_path: &Path) -> Result<(HandshakeInfo, AttachResponse), String> {
+    bounded_reply("the handshake", hello_exchange(socket_path)).await
 }
 
 /// How long the desktop waits for ONE daemon reply before calling the deck not
@@ -1050,10 +1011,7 @@ pub(crate) async fn bounded_reply<T, E: std::fmt::Display>(
     }
 }
 
-async fn hello_exchange(
-    socket_path: &Path,
-    stamps: StampPolicy,
-) -> Result<(HandshakeInfo, AttachResponse), String> {
+async fn hello_exchange(socket_path: &Path) -> Result<(HandshakeInfo, AttachResponse), String> {
     let client_build = dot_agent_deck::build_id::local_build_id();
     let stream = IpcStream::connect(socket_path)
         .await
@@ -1069,7 +1027,7 @@ async fn hello_exchange(
     )
     .await
     .map_err(|error| safe_message(error.to_string()))?;
-    let info = classify_handshake(&response, &client_build, build_mismatch_allowance(), stamps);
+    let info = classify_handshake(&response, &client_build, build_mismatch_allowance());
     Ok((info, response))
 }
 
@@ -1119,7 +1077,7 @@ async fn establish(
     // an `IpcStream`, deliberately. Under DECISION 1A a remote deck is reached
     // through a forwarded Unix socket, so the handshake needs no transport of
     // its own — M5 supplies the address, not a different way of opening it.
-    let (info, response) = hello(transport.address(), StampPolicy::for_endpoint(endpoint)).await?;
+    let (info, response) = hello(transport.address()).await?;
     let connection = connection_from_handshake(endpoint, info);
     // Built from the TRANSPORT rather than the address, so the client carries
     // what a `stat` of that address is allowed to mean. `DaemonClient::new`
@@ -1409,8 +1367,7 @@ pub(crate) async fn bootstrap(options: &BootstrapOptions, links: &DaemonLinks) -
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dot_agent_deck::daemon_client::{LocalEndpoint, RemoteEndpoint};
-    use dot_agent_deck::remote_tunnel::{Hostname, RemoteSocketPath};
+    use dot_agent_deck::daemon_client::LocalEndpoint;
     use std::sync::{Mutex, MutexGuard};
 
     /// The env var and the session flag are both process-global, so the tests
@@ -1467,72 +1424,264 @@ mod tests {
         }
     }
 
-    /// A remote deck's build stamp is an informational badge, never a refusal
-    /// (PRD #741 M8).
+    /// A deck one declared contract break behind this build, stamped however you
+    /// like.
     ///
-    /// The same `Hello` that refuses a LOCAL deck below connects here, and the
-    /// pair is the milestone: `Local` keeps today's verdict because the desktop
-    /// bundles its own sidecar and **Replace daemon** is a remedy the user can
-    /// take; `Remote` cannot be replaced from here at all — M2 made it
-    /// impossible by type — so refusing would offer an action that does not
-    /// exist.
-    #[test]
-    fn a_remote_decks_build_stamp_never_refuses_the_connection() {
-        let _guard = AllowanceGuard::acquire();
-        let response = hello_with_build(Some("0.38.0-gdeadbee"));
-
-        let remote = classify_handshake(
-            &response,
-            "0.39.0-gcafe123",
-            BuildMismatchAllowance::Refuse,
-            StampPolicy::Informational,
-        );
-        assert_eq!(remote.status, ConnectionStatus::Connected);
-
-        let local = classify_handshake(
-            &response,
-            "0.39.0-gcafe123",
-            BuildMismatchAllowance::Refuse,
-            StampPolicy::Enforced,
-        );
-        assert_eq!(
-            local.status,
-            ConnectionStatus::Incompatible,
-            "a local deck keeps today's verdict exactly"
-        );
+    /// Two things had to be separable to test issue #801 at all, and this is the
+    /// half that carries the contract: the stamp is now an argument to the
+    /// *other* helper, because it no longer decides anything.
+    fn hello_one_break_behind(stamp: Option<&str>) -> AttachResponse {
+        let mut response = hello_from_a_deck_one_declared_break_behind()
+            .with_running_agents(RunningAgentsSummary::default());
+        response.build_version = stamp.map(str::to_string);
+        response
     }
 
-    /// The stamp is demoted, not hidden: both builds are still named, and the
-    /// sentence is honest about what it cannot rule out (PRD #741 M8).
+    /// Issue #801, the measured false positive: two builds that agree about the
+    /// contract connect however far apart their git-describe stamps are.
+    ///
+    /// The pair is the one from the issue — a branch cut after v0.39.0's content
+    /// landed but before its tag was applied, so `git describe` named `0.38.0`
+    /// while `git diff v0.39.0 HEAD -- src/` was **empty**. Under the old
+    /// classification the release keys `(0, 38)` and `(0, 39)` differed and the
+    /// connection was refused; the contract is identical, so it is not.
+    ///
+    /// The `-dirty` half matters too: a stamp is dirty for an unsaved buffer, and
+    /// a rebuild of an unchanged tree is a different stamp again.
     #[test]
-    fn a_remote_decks_stamp_difference_is_disclosed_and_offers_no_impossible_remedy() {
+    fn stamps_a_release_apart_connect_when_the_contract_agrees() {
         let _guard = AllowanceGuard::acquire();
         let info = classify_handshake(
-            &hello_with_build(Some("0.38.0-gdeadbee")),
-            "0.39.0-gcafe123",
+            &hello_with_build(Some("0.39.0-g1ea0fe7")),
+            "0.38.0-gfa02054-dirty",
             BuildMismatchAllowance::Refuse,
-            StampPolicy::Informational,
         );
+        assert_eq!(
+            info.status,
+            ConnectionStatus::Connected,
+            "two identical contracts must not be refused for where a tag sits: {:?}",
+            info.error
+        );
+        assert!(info.error.is_none(), "{:?}", info.error);
+        assert!(!info.build_stamp_mismatch_only);
+    }
 
-        let error = info.error.expect("the caveat travels with the connection");
-        assert!(error.contains("0.38.0-gdeadbee"), "{error}");
-        assert!(error.contains("0.39.0-gcafe123"), "{error}");
-        assert!(
-            error.contains("divergent behaviour behind an identical wire"),
-            "the limit a stamp cannot see is stated rather than implied: {error}"
+    /// And the half that stops this being a classifier that only ever says yes:
+    /// a declared contract break refuses even when the two stamps are a *patch*
+    /// apart — the case the release-key comparison passed silently.
+    ///
+    /// This is the shape issue #801 names as the one nothing could see. The wire
+    /// is identical, both sides report the same `PROTOCOL_VERSION`, and the
+    /// digits the old check read are equal; the only difference is a break
+    /// somebody declared.
+    #[test]
+    fn a_declared_break_refuses_even_within_one_release() {
+        let _guard = AllowanceGuard::acquire();
+        let info = classify_handshake(
+            &hello_one_break_behind(Some("0.39.0-g1111111")),
+            "0.39.0-g2222222",
+            BuildMismatchAllowance::Refuse,
         );
+        assert_eq!(info.status, ConnectionStatus::Incompatible);
+        let error = info.error.expect("a refusal says why");
+        assert!(error.contains("contract mismatch"), "{error}");
         assert!(
-            !error.contains("Replace deck"),
-            "a remedy that cannot be taken is worse than none: {error}"
-        );
-        assert!(
-            !error.contains("Bypassed") && !error.contains("anyway"),
-            "nothing was overridden, so the user must not be told they overrode it: {error}"
+            error.contains(dot_agent_deck::daemon_protocol::CONTRACT_BREAKS[0]),
+            "the sentence names the break: {error}"
         );
         assert!(
             info.build_stamp_mismatch_only,
-            "the badge is what the screens key on"
+            "the protocol agreed, so `Connect anyway` stays available"
         );
+    }
+
+    /// The deck's KIND no longer changes the verdict (issue #801, superseding
+    /// PRD #741 M8).
+    ///
+    /// M8 let a remote deck connect through a stamp difference because the
+    /// remedy a refusal offered — Replace daemon — is not available on a host
+    /// you do not own. That reasoning was about the *stamp*, which now refuses
+    /// nobody of either kind. What is left refusing is a declared break, which
+    /// is not noise for either kind, so the answer is one answer.
+    #[test]
+    fn a_declared_break_refuses_whatever_the_deck_kind() {
+        let _guard = AllowanceGuard::acquire();
+        // One classifier, one reply, one verdict — and `classify_handshake` has
+        // no endpoint parameter left to make it two.
+        let info = classify_handshake(
+            &hello_one_break_behind(Some("0.39.0-gdeadbee")),
+            "0.39.0-gcafe123",
+            BuildMismatchAllowance::Refuse,
+        );
+        assert_eq!(info.status, ConnectionStatus::Incompatible);
+        let error = info.error.expect("the refusal says why");
+        assert!(error.contains("0.39.0-gdeadbee"), "{error}");
+        assert!(error.contains("0.39.0-gcafe123"), "{error}");
+        assert!(
+            error.contains("read with the wrong meaning"),
+            "what a decoding wire cannot rule out is stated rather than implied: {error}"
+        );
+        assert!(error.contains("Connect anyway"), "{error}");
+    }
+
+    /// The direction is named, because the two directions call for different
+    /// actions from whoever reads the sentence.
+    #[test]
+    fn the_refusal_names_which_side_is_behind() {
+        let _guard = AllowanceGuard::acquire();
+        let mut ahead = hello_with_build(Some("0.39.0-gdeadbee"));
+        ahead.contract_breaks = Some(vec!["999-a-break-this-build-predates".to_string()]);
+        let error = classify_handshake(&ahead, "0.39.0-gcafe123", BuildMismatchAllowance::Refuse)
+            .error
+            .expect("a refusal says why");
+        assert!(
+            error.contains("this app is behind the deck"),
+            "a deck ahead of the app must say so: {error}"
+        );
+
+        let error = classify_handshake(
+            &hello_one_break_behind(Some("0.39.0-gdeadbee")),
+            "0.39.0-gcafe123",
+            BuildMismatchAllowance::Refuse,
+        )
+        .error
+        .expect("a refusal says why");
+        assert!(
+            error.contains("the deck is behind this app"),
+            "a deck behind the app must say so: {error}"
+        );
+    }
+
+    /// The reply a REAL released daemon sends, classified.
+    ///
+    /// Captured verbatim from `dot-agent-deck 0.40.2 daemon hello` on
+    /// 2026-09-15 — the current release at the time issue #801 was fixed, and
+    /// the daemon a user of this app is most likely to meet. It is a literal
+    /// rather than a constructed fixture because the property under test is
+    /// about a build this repo can no longer produce: it reports
+    /// `server_version: 9` and carries no `contract_breaks` key at all.
+    ///
+    /// Two things it pins. That the reply still DESERIALIZES — a field added to
+    /// `AttachResponse` must stay additive — and that it CONNECTS, because
+    /// refusing every released daemon for omitting a field it was built before
+    /// would relocate issue #801's false positive rather than remove it.
+    ///
+    /// The stamps are a minor-and-a-patch apart from anything this branch builds
+    /// (`0.40.2` against `0.40.1-…`, since `v0.40.2` is not reachable from this
+    /// branch's HEAD — the tag-timing shape the issue is about, live), and that
+    /// no longer has any bearing on the verdict.
+    #[test]
+    fn the_real_v0_40_2_daemon_hello_deserializes_and_connects() {
+        let _guard = AllowanceGuard::acquire();
+        let captured = r#"{"ok":true,"server_version":9,"build_version":"0.40.2-g7e87d7f","daemon_version":"0.40.2"}"#;
+        let response: AttachResponse =
+            serde_json::from_str(captured).expect("a released daemon's reply must still decode");
+        assert_eq!(response.server_version, Some(PROTOCOL_VERSION));
+        assert!(
+            response.contract_breaks.is_none(),
+            "the capture is only evidence while it predates the field"
+        );
+
+        let info = classify_handshake(
+            &response,
+            "0.40.1-ga41acea6-dirty",
+            BuildMismatchAllowance::Refuse,
+        );
+        assert_eq!(
+            info.status,
+            ConnectionStatus::Connected,
+            "a released daemon must not be refused for omitting a field it predates: {:?}",
+            info.error
+        );
+        assert!(info.error.is_none(), "{:?}", info.error);
+        assert!(!info.build_stamp_mismatch_only);
+    }
+
+    /// A hostile deck cannot write whatever it likes into the connection banner.
+    ///
+    /// The break names on one side of a divergence are PEER-supplied — they are
+    /// what the deck declared and this build did not — and the banner scrubs its
+    /// sentence with `safe_message`, which removes general category `Cc` and lets
+    /// `Cf` (the bidi controls) through. A right-to-left override in one would
+    /// reverse everything printed after it, which is PRD #741 final audit F4's
+    /// finding about `build_version` reached by a new route. Length is the other
+    /// half: a peer may send as many entries as a 16 MiB frame holds.
+    ///
+    /// Both are bounded at the render, not hoped about — see [`named_breaks`].
+    #[test]
+    fn a_hostile_contract_list_reaches_the_banner_as_neither_bidi_nor_a_flood() {
+        let _guard = AllowanceGuard::acquire();
+        let mut hostile = hello_with_build(Some("0.39.0-gdeadbee"));
+        let mut declared: Vec<String> = dot_agent_deck::daemon_protocol::CONTRACT_BREAKS
+            .iter()
+            .map(|entry| (*entry).to_string())
+            .collect();
+        declared.push("999-\u{202e}drowssap".to_string());
+        declared.extend((0..500).map(|n| format!("{n}-flood-entry")));
+        hostile.contract_breaks = Some(declared);
+
+        let error = classify_handshake(&hostile, "0.39.0-gcafe123", BuildMismatchAllowance::Refuse)
+            .error
+            .expect("a divergence refuses");
+
+        assert!(
+            !error.contains('\u{202e}'),
+            "the override reached the banner: {error:?}"
+        );
+        assert!(
+            !error.contains("drowssap"),
+            "a name this app will not vouch for must not be printed at all: {error:?}"
+        );
+        assert!(
+            error.contains("and 497 more"),
+            "the rest must be counted rather than listed: {error:?}"
+        );
+        assert!(
+            error.len() < 600,
+            "a banner sentence must stay readable, got {} bytes",
+            error.len()
+        );
+    }
+
+    /// And when nothing the peer sent is printable, the count is all that is
+    /// said — never an empty list that reads as "no breaks".
+    #[test]
+    fn an_entirely_unprintable_contract_list_is_reported_as_a_count() {
+        let _guard = AllowanceGuard::acquire();
+        let mut hostile = hello_with_build(Some("0.39.0-gdeadbee"));
+        let mut declared: Vec<String> = dot_agent_deck::daemon_protocol::CONTRACT_BREAKS
+            .iter()
+            .map(|entry| (*entry).to_string())
+            .collect();
+        declared.push("\u{202e}\u{0007}".to_string());
+        declared.push("A".repeat(200));
+        hostile.contract_breaks = Some(declared);
+
+        let error = classify_handshake(&hostile, "0.39.0-gcafe123", BuildMismatchAllowance::Refuse)
+            .error
+            .expect("a divergence refuses");
+        assert!(
+            error.contains("2 break(s) it did not name in a readable form"),
+            "{error:?}"
+        );
+        assert!(!error.contains('\u{202e}'), "{error:?}");
+        assert!(!error.contains("AAAA"), "{error:?}");
+    }
+
+    /// A deck that predates the declaration connects, and that is deliberate.
+    ///
+    /// Every released daemon up to `v0.40.2` omits the field. Refusing them for
+    /// saying nothing would relocate issue #801's false positive rather than
+    /// remove it — see `ContractComparison::Undeclared`, which states the
+    /// residual the arm costs.
+    #[test]
+    fn a_deck_that_declares_no_contract_at_all_connects() {
+        let _guard = AllowanceGuard::acquire();
+        let mut older = hello_with_build(Some("0.40.2-gfeedfac"));
+        older.contract_breaks = None;
+        let info = classify_handshake(&older, "0.41.0-gcafe123", BuildMismatchAllowance::Refuse);
+        assert_eq!(info.status, ConnectionStatus::Connected);
+        assert!(info.error.is_none(), "{:?}", info.error);
     }
 
     /// `PROTOCOL_VERSION` is the hard floor for **every** deck kind, and the
@@ -1550,7 +1699,6 @@ mod tests {
             &response,
             response.build_version.as_deref().unwrap(),
             build_mismatch_allowance(),
-            StampPolicy::Informational,
         );
 
         assert_eq!(info.status, ConnectionStatus::Incompatible);
@@ -1559,48 +1707,6 @@ mod tests {
             "a wire mismatch must never advertise an override"
         );
         assert!(info.error.unwrap().contains("protocol mismatch"));
-    }
-
-    /// The policy comes from the endpoint's KIND and from nothing else.
-    ///
-    /// **The `Remote` arm is the assertion that matters**, and it was the one
-    /// missing: `Enforced` for a local deck is the behaviour that existed before
-    /// this type did, so a refactor that regressed to it would leave the local
-    /// cases green while silently restoring the refusal M8 removed.
-    ///
-    /// Other tests pin what `Informational` *does* once something has chosen it
-    /// — the classifier's own arm, and the probe's verdict. This is the only one
-    /// that pins **which deck kind gets it**, which is why it is the one the
-    /// mutation reaches: `for_endpoint` returning `Enforced` unconditionally
-    /// reddens here and nowhere else in the crate's 204 tests, measured both
-    /// before and after this assertion was added.
-    #[test]
-    fn the_stamp_policy_follows_the_deck_kind() {
-        assert_eq!(
-            StampPolicy::for_endpoint(&Endpoint::Local(LocalEndpoint::at("/tmp/deck.sock"))),
-            StampPolicy::Enforced
-        );
-        assert_eq!(
-            StampPolicy::for_endpoint(&Endpoint::local()),
-            StampPolicy::Enforced
-        );
-        assert_eq!(
-            StampPolicy::for_endpoint(&Endpoint::Remote(remote_deck())),
-            StampPolicy::Informational,
-            "a remote deck's stamp is informational: this is the whole of M8, and the branch that \
-             makes a remote deck connect through a stamp difference is pinned by this assertion \
-             alone"
-        );
-    }
-
-    /// A remote deck to decide a policy about. The host and socket are the ones
-    /// the endpoint tests already use; nothing here connects to either.
-    fn remote_deck() -> RemoteEndpoint {
-        RemoteEndpoint::new(
-            Hostname::parse("build-box").expect("a plain host name is valid"),
-            RemoteSocketPath::parse("/run/user/1000/dot-agent-deck-attach.sock")
-                .expect("an absolute remote socket path is valid"),
-        )
     }
 
     /// A daemon advertising every project verb offers the project surfaces; one
@@ -1634,7 +1740,6 @@ mod tests {
                 &full,
                 full.build_version.as_deref().unwrap(),
                 BuildMismatchAllowance::Refuse,
-                StampPolicy::Enforced,
             )
             .project_actions_reason,
             None,
@@ -1646,7 +1751,6 @@ mod tests {
             &bare,
             bare.build_version.as_deref().unwrap(),
             BuildMismatchAllowance::Refuse,
-            StampPolicy::Enforced,
         )
         .project_actions_reason
         .expect("an unadvertised daemon withholds every verb");
@@ -1677,7 +1781,6 @@ mod tests {
             &partial,
             partial.build_version.as_deref().unwrap(),
             BuildMismatchAllowance::Refuse,
-            StampPolicy::Enforced,
         )
         .project_actions_reason
         .expect("three of four is not four");
@@ -1699,7 +1802,6 @@ mod tests {
             &response,
             response.build_version.as_deref().unwrap(),
             BuildMismatchAllowance::Refuse,
-            StampPolicy::Enforced,
         );
         assert_eq!(info.status, ConnectionStatus::Connected);
         assert!(info.error.is_none());
@@ -1713,40 +1815,37 @@ mod tests {
             &response,
             response.build_version.as_deref().unwrap(),
             BuildMismatchAllowance::Refuse,
-            StampPolicy::Enforced,
         );
         assert_eq!(info.status, ConnectionStatus::Incompatible);
         assert!(info.error.unwrap().contains("protocol mismatch"));
     }
 
     #[test]
-    fn zero_agent_build_mismatch_points_to_safe_replacement() {
-        let response = AttachResponse::hello(PROTOCOL_VERSION)
-            .with_running_agents(RunningAgentsSummary::default());
+    fn zero_agent_contract_mismatch_points_to_safe_replacement() {
+        let _guard = AllowanceGuard::acquire();
         let info = classify_handshake(
-            &response,
+            &hello_one_break_behind(Some("0.39.0-gdeadbee")),
             "desktop-other-build",
             BuildMismatchAllowance::Refuse,
-            StampPolicy::Enforced,
         );
         assert_eq!(info.status, ConnectionStatus::Incompatible);
         let error = info.error.unwrap();
-        assert!(error.contains("build mismatch"));
+        assert!(error.contains("contract mismatch"));
         assert!(error.contains("use Replace deck"));
     }
 
     #[test]
-    fn live_agent_build_mismatch_blocks_replacement() {
-        let response =
-            AttachResponse::hello(PROTOCOL_VERSION).with_running_agents(RunningAgentsSummary {
-                count: 2,
-                names: vec!["coder".into(), "tester".into()],
-            });
+    fn live_agent_contract_mismatch_blocks_replacement() {
+        let _guard = AllowanceGuard::acquire();
+        let mut response = hello_from_a_deck_one_declared_break_behind();
+        response.running_agents = Some(RunningAgentsSummary {
+            count: 2,
+            names: vec!["coder".into(), "tester".into()],
+        });
         let info = classify_handshake(
             &response,
             "desktop-other-build",
             BuildMismatchAllowance::Refuse,
-            StampPolicy::Enforced,
         );
         assert_eq!(info.status, ConnectionStatus::Incompatible);
         let error = info.error.unwrap();
@@ -1760,22 +1859,20 @@ mod tests {
         assert!(error.contains("Connect anyway"), "{error}");
     }
 
-    /// A stamp difference is downgraded to a warning, not silence: the deck
-    /// connects, but the connection message still names both builds so the
-    /// caveat survives for the whole session.
+    /// A declared break is downgraded to a warning, not silence: the deck
+    /// connects, but the connection message still names the break and both
+    /// builds so the caveat survives for the whole session.
     #[test]
-    fn bypassed_build_mismatch_connects_and_keeps_the_warning_visible() {
-        let response = AttachResponse::hello(PROTOCOL_VERSION)
-            .with_running_agents(RunningAgentsSummary::default());
+    fn bypassed_contract_mismatch_connects_and_keeps_the_warning_visible() {
+        let _guard = AllowanceGuard::acquire();
         let info = classify_handshake(
-            &response,
+            &hello_one_break_behind(Some("0.39.0-gdeadbee")),
             "desktop-other-build",
             BuildMismatchAllowance::Env,
-            StampPolicy::Enforced,
         );
         assert_eq!(info.status, ConnectionStatus::Connected);
         let error = info.error.expect("bypass must not swallow the mismatch");
-        assert!(error.contains("build mismatch"), "{error}");
+        assert!(error.contains("contract mismatch"), "{error}");
         assert!(error.contains(BUILD_MISMATCH_BYPASS_ENV), "{error}");
     }
 
@@ -1785,30 +1882,27 @@ mod tests {
     /// have received one anyway (issue #801).
     #[test]
     fn session_override_connects_and_names_itself_rather_than_the_env_var() {
-        let response =
-            AttachResponse::hello(PROTOCOL_VERSION).with_running_agents(RunningAgentsSummary {
-                count: 9,
-                names: vec!["coder".into()],
-            });
+        let _guard = AllowanceGuard::acquire();
+        let mut response = hello_from_a_deck_one_declared_break_behind();
+        response.running_agents = Some(RunningAgentsSummary {
+            count: 9,
+            names: vec!["coder".into()],
+        });
         let info = classify_handshake(
             &response,
             "desktop-other-build",
             BuildMismatchAllowance::Session,
-            StampPolicy::Enforced,
         );
         assert_eq!(info.status, ConnectionStatus::Connected);
         let error = info
             .error
             .expect("the override must not swallow the mismatch");
-        assert!(error.contains("build mismatch"), "{error}");
+        assert!(error.contains("contract mismatch"), "{error}");
         assert!(
             error.contains("Connected anyway for this session"),
             "{error}"
         );
-        assert!(
-            error.contains("divergent behaviour behind an identical wire"),
-            "{error}"
-        );
+        assert!(error.contains("read with the wrong meaning"), "{error}");
         assert!(!error.contains(BUILD_MISMATCH_BYPASS_ENV), "{error}");
     }
 
@@ -1820,12 +1914,7 @@ mod tests {
     fn bypass_never_rescues_a_protocol_mismatch() {
         let response = AttachResponse::hello(PROTOCOL_VERSION + 1);
         for allowance in [BuildMismatchAllowance::Env, BuildMismatchAllowance::Session] {
-            let info = classify_handshake(
-                &response,
-                "desktop-other-build",
-                allowance,
-                StampPolicy::Enforced,
-            );
+            let info = classify_handshake(&response, "desktop-other-build", allowance);
             assert_eq!(info.status, ConnectionStatus::Incompatible, "{allowance:?}");
             assert!(
                 info.error.unwrap().contains("protocol mismatch"),
@@ -1847,12 +1936,7 @@ mod tests {
             BuildMismatchAllowance::Env,
             BuildMismatchAllowance::Session,
         ] {
-            let info = classify_handshake(
-                &response,
-                "desktop-other-build",
-                allowance,
-                StampPolicy::Enforced,
-            );
+            let info = classify_handshake(&response, "desktop-other-build", allowance);
             assert!(!info.build_stamp_mismatch_only, "{allowance:?}");
         }
     }
@@ -1868,47 +1952,45 @@ mod tests {
             &response,
             response.build_version.as_deref().unwrap(),
             BuildMismatchAllowance::Refuse,
-            StampPolicy::Enforced,
         );
         assert_eq!(info.status, ConnectionStatus::Incompatible);
         assert!(!info.build_stamp_mismatch_only);
     }
 
-    /// What the UI switches on: the protocol agreed and only the stamp differs,
-    /// so an override is legitimate. True whether or not one is already armed —
-    /// the flag describes the mismatch, not the response to it.
+    /// What the UI switches on: the protocol agreed and the disagreement is
+    /// above the wire, so an override is legitimate. True whether or not one is
+    /// already armed — the flag describes the mismatch, not the response to it.
+    ///
+    /// **The field is still spelled `build_stamp_mismatch_only`** and is named
+    /// for what used to set it. Since issue #801 a build-stamp difference sets
+    /// nothing at all and this is set by a declared contract break; the name is
+    /// kept because it is the key the webview switches `Connect anyway` on.
     #[test]
-    fn build_mismatch_advertises_a_stamp_only_override() {
-        let response = AttachResponse::hello(PROTOCOL_VERSION)
-            .with_running_agents(RunningAgentsSummary::default());
+    fn contract_mismatch_advertises_an_overridable_refusal() {
+        let _guard = AllowanceGuard::acquire();
+        let response = hello_one_break_behind(Some("0.39.0-gdeadbee"));
         for allowance in [
             BuildMismatchAllowance::Refuse,
             BuildMismatchAllowance::Env,
             BuildMismatchAllowance::Session,
         ] {
-            let info = classify_handshake(
-                &response,
-                "desktop-other-build",
-                allowance,
-                StampPolicy::Enforced,
-            );
+            let info = classify_handshake(&response, "desktop-other-build", allowance);
             assert!(info.build_stamp_mismatch_only, "{allowance:?}");
         }
     }
 
-    /// A daemon that reports no build stamp at all is still a mismatch, and the
-    /// bypass covers it the same way — otherwise the escape hatch would have a
-    /// hole exactly where the least is known about the peer.
+    /// A daemon that reports no build stamp at all is still refused on the
+    /// contract, and the bypass covers it the same way — otherwise the escape
+    /// hatch would have a hole exactly where the least is known about the peer.
+    ///
+    /// The absent stamp is now only a hole in the *sentence*, which says
+    /// `unreported` rather than pretending to a value. It is no longer a hole in
+    /// the classification: the contract is what was compared.
     #[test]
     fn bypass_covers_an_unreported_daemon_stamp() {
-        let mut response = AttachResponse::hello(PROTOCOL_VERSION);
-        response.build_version = None;
-        let info = classify_handshake(
-            &response,
-            "desktop-build",
-            BuildMismatchAllowance::Env,
-            StampPolicy::Enforced,
-        );
+        let _guard = AllowanceGuard::acquire();
+        let response = hello_one_break_behind(None);
+        let info = classify_handshake(&response, "desktop-build", BuildMismatchAllowance::Env);
         assert_eq!(info.status, ConnectionStatus::Connected);
         assert!(info.build_stamp_mismatch_only);
         assert!(info.error.unwrap().contains("unreported"));
@@ -1947,12 +2029,7 @@ mod tests {
         assert_eq!(build_mismatch_allowance(), BuildMismatchAllowance::Session);
         let response = AttachResponse::hello(PROTOCOL_VERSION)
             .with_running_agents(RunningAgentsSummary::default());
-        let info = classify_handshake(
-            &response,
-            "desktop-other-build",
-            build_mismatch_allowance(),
-            StampPolicy::Enforced,
-        );
+        let info = classify_handshake(&response, "desktop-other-build", build_mismatch_allowance());
         assert_eq!(info.status, ConnectionStatus::Connected);
     }
 
@@ -1989,50 +2066,47 @@ mod tests {
     #[test]
     fn the_next_handshake_after_arming_the_session_allowance_connects() {
         let _guard = AllowanceGuard::acquire();
-        let response = AttachResponse::hello(PROTOCOL_VERSION)
-            .with_running_agents(RunningAgentsSummary::default());
+        let response = hello_one_break_behind(Some("0.39.0-gdeadbee"));
 
-        let refused = classify_handshake(
-            &response,
-            "desktop-other-build",
-            build_mismatch_allowance(),
-            StampPolicy::Enforced,
-        );
+        let refused =
+            classify_handshake(&response, "desktop-other-build", build_mismatch_allowance());
         assert_eq!(refused.status, ConnectionStatus::Incompatible);
         assert!(refused.build_stamp_mismatch_only);
 
         allow_build_mismatch_this_session();
 
-        let retried = classify_handshake(
-            &response,
-            "desktop-other-build",
-            build_mismatch_allowance(),
-            StampPolicy::Enforced,
-        );
+        let retried =
+            classify_handshake(&response, "desktop-other-build", build_mismatch_allowance());
         assert_eq!(retried.status, ConnectionStatus::Connected);
         assert!(
             retried
                 .error
                 .expect("the caveat must survive the override")
-                .contains("build mismatch")
+                .contains("contract mismatch")
         );
     }
 
-    /// The case issue #801 was filed about. A released daemon and a branch
-    /// desktop that describe as the same release: the protocol agreed, and by
-    /// this project's bump policy a compatibility break would have moved the
-    /// minor, so nothing incompatible sits between them. Connect, silently —
-    /// under EVERY allowance, because this must be the ordinary verdict and not
-    /// something an override rescues.
+    /// The case issue #801 was filed about, at every distance a stamp can sit.
+    ///
+    /// A released daemon and a branch desktop, agreeing about the contract:
+    /// connect, silently — under EVERY allowance, because this must be the
+    /// ordinary verdict and not something an override rescues. The list runs
+    /// from a rebuild of one commit through a whole MINOR apart, which is the
+    /// distance the old release-key comparison refused and the distance issue
+    /// #801 measured a false positive at.
     #[test]
-    fn a_stamp_difference_within_one_release_connects_silently() {
+    fn a_stamp_difference_at_any_distance_connects_silently() {
         for (desktop, daemon) in [
             ("0.39.0-ga0165f8", "0.39.0-g1ea0fe7"),
             ("0.39.0-49-ga0165f8", "0.39.0-g1ea0fe7"),
             ("0.39.0-49-ga0165f8-dirty", "0.39.0-g1ea0fe7"),
-            // The patch digit tracks features and bugfixes while the major is
-            // `0`, so it is deliberately not part of the compatibility key.
             ("0.39.2-ga0165f8", "0.39.0-g1ea0fe7"),
+            // The issue's own pair: a branch cut before v0.39.0's tag was
+            // applied, against the daemon that tag names.
+            ("0.38.0-gfa02054-dirty", "0.39.0-g1ea0fe7"),
+            // And the other direction, plus a major boundary for good measure.
+            ("0.40.0-g1ea0fe7", "0.39.0-ga0165f8"),
+            ("1.9.2-ga0165f8", "2.0.0-g1ea0fe7"),
         ] {
             for allowance in [
                 BuildMismatchAllowance::Refuse,
@@ -2040,12 +2114,7 @@ mod tests {
                 BuildMismatchAllowance::Session,
             ] {
                 let case = format!("{desktop} vs {daemon} under {allowance:?}");
-                let info = classify_handshake(
-                    &hello_with_build(Some(daemon)),
-                    desktop,
-                    allowance,
-                    StampPolicy::Enforced,
-                );
+                let info = classify_handshake(&hello_with_build(Some(daemon)), desktop, allowance);
                 assert_eq!(info.status, ConnectionStatus::Connected, "{case}");
                 assert!(!info.build_stamp_mismatch_only, "{case}");
                 assert!(info.error.is_none(), "{case}: {:?}", info.error);
@@ -2053,38 +2122,52 @@ mod tests {
         }
     }
 
-    /// A minor bump while the major is `0` IS the declared compatibility break,
-    /// so this is the pair that must keep prompting — and must keep offering
+    /// The declared break is what must keep prompting — and must keep offering
     /// the override, because the wire itself still agreed.
+    ///
+    /// This replaces a test that asserted the same thing of a differing MINOR
+    /// digit. The digit was a proxy for "somebody declared a break", since only
+    /// a declared break bumps it while `0.x`; this reads the declaration
+    /// itself, so it holds on a branch whose tag has not been applied yet and on
+    /// a build with no tags at all.
     #[test]
-    fn a_differing_minor_while_zerover_still_prompts_with_an_override() {
+    fn a_declared_break_still_prompts_with_an_override() {
+        let _guard = AllowanceGuard::acquire();
         let info = classify_handshake(
-            &hello_with_build(Some("0.40.0-g1ea0fe7")),
+            &hello_one_break_behind(Some("0.39.0-g1ea0fe7")),
             "0.39.0-ga0165f8",
             BuildMismatchAllowance::Refuse,
-            StampPolicy::Enforced,
         );
         assert_eq!(info.status, ConnectionStatus::Incompatible);
         assert!(info.build_stamp_mismatch_only);
         let error = info.error.unwrap();
-        assert!(error.contains("build mismatch"), "{error}");
+        assert!(error.contains("contract mismatch"), "{error}");
         assert!(error.contains("Connect anyway"), "{error}");
     }
 
-    /// The failure direction that matters. Silent connection is the permissive
-    /// answer, so it is reached only on positive evidence that BOTH stamps
-    /// parsed and their keys matched; anything unreadable on either side falls
-    /// back to the prompt rather than through it.
+    /// An unreadable stamp is no longer a refusal, on either side.
+    ///
+    /// It used to be, and the reason it used to be is instructive: the old
+    /// comparison needed to parse release digits out of both stamps, and could
+    /// only connect on positive evidence that both had parsed and matched — so
+    /// anything it could not read fell back to the prompt. Nothing parses a
+    /// stamp any more, so a nightly build, a truncated stamp, or a deck that
+    /// reports no stamp at all is simply a deck whose contract this build can
+    /// still compare.
+    ///
+    /// Worth keeping as a test rather than deleting with the parser: these are
+    /// the exact inputs that produced a refusal a user could not act on, and
+    /// `None` in particular is what a deck built from a `.git`-less tarball
+    /// reports.
     #[test]
-    fn an_unreadable_stamp_on_either_side_falls_back_to_the_prompt() {
+    fn an_unreadable_stamp_no_longer_refuses_on_either_side() {
+        let _guard = AllowanceGuard::acquire();
         for (desktop, daemon) in [
             ("0.39.0-ga0165f8", Some("nightly")),
             ("nightly", Some("0.39.0-g1ea0fe7")),
             ("0.39-ga0165f8", Some("0.39.0-g1ea0fe7")),
             ("0.39.0.1-ga0165f8", Some("0.39.0-g1ea0fe7")),
             ("", Some("0.39.0-g1ea0fe7")),
-            // The daemon reported no stamp at all, which is the least that can
-            // be known about a peer and so the least it may be trusted with.
             ("0.39.0-ga0165f8", None),
         ] {
             let case = format!("{desktop} vs {daemon:?}");
@@ -2092,82 +2175,30 @@ mod tests {
                 &hello_with_build(daemon),
                 desktop,
                 BuildMismatchAllowance::Refuse,
-                StampPolicy::Enforced,
             );
-            assert_eq!(info.status, ConnectionStatus::Incompatible, "{case}");
-            assert!(info.build_stamp_mismatch_only, "{case}");
+            assert_eq!(info.status, ConnectionStatus::Connected, "{case}");
+            assert!(!info.build_stamp_mismatch_only, "{case}");
+            assert!(info.error.is_none(), "{case}: {:?}", info.error);
         }
     }
 
-    /// Every stamp form the build script can emit reduces to its release core,
-    /// and everything else reduces to nothing.
+    /// And the same inputs still refuse when a declared break separates them:
+    /// an unreadable stamp does not become a way *through* the contract check.
     #[test]
-    fn stamp_forms_parse_down_to_their_release_core() {
-        assert_eq!(release_core("0.39.0-g1ea0fe7"), Some((0, 39, 0)));
-        assert_eq!(release_core("0.39.0-49-ga0165f8"), Some((0, 39, 0)));
-        assert_eq!(release_core("0.39.0-g1ea0fe7-dirty"), Some((0, 39, 0)));
-        assert_eq!(release_core("0.25.0-alpha.0-g1ea0fe7"), Some((0, 25, 0)));
-        assert_eq!(release_core("1.2.3+meta-g1ea0fe7"), Some((1, 2, 3)));
-        assert_eq!(release_core("0.1.0-unknown"), Some((0, 1, 0)));
-        assert_eq!(release_core("v1.2.3"), Some((1, 2, 3)));
-        for unreadable in [
-            "", "nightly", "1.2", "1.2.3.4", "1.2.x", "-1.2.3", "1.-2.3", "+1.2.3",
-        ] {
-            assert_eq!(release_core(unreadable), None, "{unreadable}");
+    fn an_unreadable_stamp_is_not_a_way_past_a_declared_break() {
+        let _guard = AllowanceGuard::acquire();
+        for daemon in [Some("nightly"), None] {
+            let info = classify_handshake(
+                &hello_one_break_behind(daemon),
+                "nightly",
+                BuildMismatchAllowance::Refuse,
+            );
+            assert_eq!(
+                info.status,
+                ConnectionStatus::Incompatible,
+                "{daemon:?} must still be refused on the contract"
+            );
         }
-    }
-
-    /// Both arms of the bump policy, at the key rather than at the handshake.
-    #[test]
-    fn the_compatibility_key_tracks_the_minor_while_zerover_and_the_major_after() {
-        // While `0.x` the minor is the compatibility digit and the patch is not.
-        assert_eq!(
-            compatibility_key("0.39.0-ga0"),
-            compatibility_key("0.39.7-g1e")
-        );
-        assert_ne!(
-            compatibility_key("0.39.0-ga0"),
-            compatibility_key("0.40.0-g1e")
-        );
-        // From `1.0` the rules are standard SemVer and only the major moves.
-        assert_eq!(
-            compatibility_key("1.4.0-ga0"),
-            compatibility_key("1.9.2-g1e")
-        );
-        assert_ne!(
-            compatibility_key("1.9.2-ga0"),
-            compatibility_key("2.0.0-g1e")
-        );
-        // Dropping the minor on the `1.x` arm must not let the two arms collide.
-        assert_ne!(
-            compatibility_key("0.1.0-ga0"),
-            compatibility_key("1.0.0-g1e")
-        );
-    }
-
-    /// The `1.x` arm end to end. This repo has not shipped `1.0` yet; the arm
-    /// exists so that the day it does, a differing minor stops being a refusal
-    /// without anyone having to remember to come back here.
-    #[test]
-    fn from_one_zero_onward_only_a_differing_major_refuses() {
-        let compatible = classify_handshake(
-            &hello_with_build(Some("1.9.2-g1ea0fe7")),
-            "1.4.0-ga0165f8",
-            BuildMismatchAllowance::Refuse,
-            StampPolicy::Enforced,
-        );
-        assert_eq!(compatible.status, ConnectionStatus::Connected);
-        assert!(!compatible.build_stamp_mismatch_only);
-        assert!(compatible.error.is_none(), "{:?}", compatible.error);
-
-        let broken = classify_handshake(
-            &hello_with_build(Some("2.0.0-g1ea0fe7")),
-            "1.9.2-ga0165f8",
-            BuildMismatchAllowance::Refuse,
-            StampPolicy::Enforced,
-        );
-        assert_eq!(broken.status, ConnectionStatus::Incompatible);
-        assert!(broken.build_stamp_mismatch_only);
     }
 
     // -----------------------------------------------------------------------
@@ -2261,9 +2292,7 @@ mod tests {
         ]);
         let daemon = tokio::spawn(scripted_daemon(listener, reply));
 
-        let (info, response) = hello(&socket, StampPolicy::Enforced)
-            .await
-            .expect("the handshake must complete");
+        let (info, response) = hello(&socket).await.expect("the handshake must complete");
 
         assert_eq!(info.status, ConnectionStatus::Connected);
         assert!(info.error.is_none(), "{:?}", info.error);
@@ -2301,9 +2330,7 @@ mod tests {
             AttachResponse::hello(PROTOCOL_VERSION + 1),
         ));
 
-        let (info, _response) = hello(&socket, StampPolicy::Enforced)
-            .await
-            .expect("the exchange still completes");
+        let (info, _response) = hello(&socket).await.expect("the exchange still completes");
 
         assert_eq!(info.status, ConnectionStatus::Incompatible);
         let error = info.error.expect("a refusal must say why");
@@ -2325,9 +2352,7 @@ mod tests {
     #[tokio::test]
     async fn hello_reports_a_missing_daemon_as_a_transport_failure() {
         let (dir, socket) = scratch_socket("hello-gone");
-        let error = hello(&socket, StampPolicy::Enforced)
-            .await
-            .expect_err("nothing is listening");
+        let error = hello(&socket).await.expect_err("nothing is listening");
         assert!(!error.is_empty());
         std::fs::remove_dir_all(dir).ok();
     }
@@ -2345,12 +2370,7 @@ mod tests {
             BuildMismatchAllowance::Env,
             BuildMismatchAllowance::Session,
         ] {
-            let info = classify_handshake(
-                &response,
-                "0.39.0-ga0165f8",
-                allowance,
-                StampPolicy::Enforced,
-            );
+            let info = classify_handshake(&response, "0.39.0-ga0165f8", allowance);
             assert_eq!(info.status, ConnectionStatus::Incompatible, "{allowance:?}");
             assert!(!info.build_stamp_mismatch_only, "{allowance:?}");
             assert!(
@@ -3135,11 +3155,10 @@ mod tests {
         let (dir, socket) = scratch_socket("m4a-incompat");
         let listener = bind_trusted(&socket);
 
-        let mut busy = AttachResponse::hello(PROTOCOL_VERSION);
-        // Derived from this build's own stamp rather than written out, so the
-        // refusal this test is about happens on a tagless CI checkout too —
-        // see `stamp_incompatible_with_this_build`.
-        busy.build_version = Some(stamp_incompatible_with_this_build("deadbee"));
+        // Derived from this build's own declared breaks rather than written
+        // out, so the refusal this test is about happens whatever this build's
+        // list holds — see `hello_from_a_deck_one_declared_break_behind`.
+        let mut busy = hello_from_a_deck_one_declared_break_behind();
         busy.running_agents = Some(RunningAgentsSummary {
             count: 2,
             names: vec!["a".into(), "b".into()],
@@ -3626,7 +3645,7 @@ mod tests {
 
         let asking = {
             let socket = socket.clone();
-            tokio::spawn(async move { hello(&socket, StampPolicy::Enforced).await })
+            tokio::spawn(async move { hello(&socket).await })
         };
         accepted_rx
             .await
