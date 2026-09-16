@@ -3212,7 +3212,8 @@ fn delegate_025_superseded_generation_is_silent_while_new_watch_stays_armed() {
                         task: "Generation A must remain silent.".to_string(),
                         to: vec![WORKER_ROLE.to_string()],
                         timestamp: chrono::Utc::now(),
-                    token: None,},
+                        token: None,
+                    },
                     &registry,
                     &event_tx,
                 )
@@ -3264,7 +3265,8 @@ fn delegate_025_superseded_generation_is_silent_while_new_watch_stays_armed() {
                         task: "Generation B must supersede A and remain silent.".to_string(),
                         to: vec![WORKER_ROLE.to_string()],
                         timestamp: chrono::Utc::now(),
-                    token: None,},
+                        token: None,
+                    },
                     &registry,
                     &event_tx,
                 )
