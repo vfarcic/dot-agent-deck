@@ -196,9 +196,8 @@ fn run_pane_spawn_reviewer(deck: &TuiDeck, orchestrator_pane_id: &str) {
 /// back from the daemon's registry) to add a THIRD role, `reviewer`, that
 /// was never part of the config this tab was opened from — inserted BETWEEN
 /// `orchestrator` and `coder` (issue #1096's shape), not at the end. Invoke
-/// the REAL
-/// `dot-agent-deck pane spawn reviewer` CLI subcommand and assert reviewer's
-/// card joins the SAME orchestration tab that is still active (this test
+/// the REAL `dot-agent-deck pane spawn reviewer` CLI subcommand and assert
+/// reviewer's card joins the SAME orchestration tab that is still active (this test
 /// never switches tabs) and that the tab bar still shows exactly one
 /// Dashboard tab + one orchestration tab — not two orchestration tabs for
 /// the same orchestration.
