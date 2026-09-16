@@ -110,9 +110,28 @@
 # soon as `spawn_command` returns, and `spawn_agent` starts a `pump_reader`
 # thread that drains the master for the agent's whole life — which is what the
 # fix makes the test do too. Dropping the pair took the same 4500-execution
-# stress on the same runner type from 18 stalls to 0; which of the two handles
-# mattered, or whether the child's write to the PTY was needed at all, was not
-# established and did not need to be. See the comment at that line.
+# stress on the same runner type from 18 stalls to 0.
+#
+# The shape needs FOUR things at once, isolated on `macos-latest` by varying one
+# at a time against the same `killpg(SIGKILL)` + `try_wait` loop. Each row is a
+# standalone reproduction, not the test:
+#
+#   variant                                            macOS      ubuntu
+#   as the test was: bare `sleep`, both ends held      40 / 40     0 / 40
+#   `/usr/bin/true` instead (writes nothing)            0 / 800    0 / 800
+#   master dropped before the kill                      0 / 800    0 / 800
+#   slave dropped before the kill                       0 / 800    0 / 800
+#   a thread draining the master                        0 / 800    0 / 800
+#   `sleep 300`, still running when killed              0 / 800    0 / 800
+#
+# So: a child that WRITES to a PTY, that NOBODY drains, whose BOTH ends are still
+# open, and that is EXITING of its own accord when the kill lands. Remove any one
+# and the stall disappears entirely. That last condition is also the likeliest
+# reading of why the real test stalled on only 0.4% of executions while the
+# standalone shape stalls on all of them: the test's own markers put just ~1.3 ms
+# between the spawn and the kill, so the SIGKILL normally wins the race and the
+# child never reaches its own exit — the `sleep 300` row is exactly that case.
+# See the comment at that line.
 #
 # The TIER is not the lever either, which is the other thing #959 asked. This
 # test forks a real PTY child, but so do at least 76 of the 1838

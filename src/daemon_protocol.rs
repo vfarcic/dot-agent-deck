@@ -6002,10 +6002,8 @@ mod tests {
         // opens a PTY of its OWN for the synthetic `RunningAgent`, so this pair
         // exists only to give the child a terminal to be born on.
         //
-        // Holding them and reading neither is what wedged this test — measured
-        // as a before/after on this exact change, not reasoned from the
-        // mechanism, which is only partly known. The child is a bare `sleep`,
-        // which writes a usage line to this slave and exits;
+        // Holding them and reading neither is what wedged this test. The child
+        // is a bare `sleep`, which writes a usage line to this slave and exits;
         // on macOS it then got stuck in the kernel's exit path (`ps` state
         // `?<Es`, "trying to exit") often enough to matter, and
         // `shutdown_all` -> `force_kill_and_reap_all` polls `try_wait` in a loop
@@ -6015,6 +6013,18 @@ mod tests {
         // this phase and with the child in that state, against 0 of 4500 on
         // `ubuntu-latest`. With this `drop`, the same 4500-execution stress on
         // the same runner type stalled 0 times.
+        //
+        // The shape needs four things at once, isolated on `macos-latest` by
+        // varying one at a time: the child WRITES to the PTY, NOBODY drains it,
+        // BOTH ends are still open, and the child is EXITING of its own accord
+        // when the kill lands. A standalone reproduction of all four stalls 40
+        // of 40 times; swap the child for `/usr/bin/true`, drop either end, add
+        // a draining thread, or use a `sleep 300` that is still running when
+        // killed, and each is 0 of 800. The last of those is also why the real
+        // test stalled on only 0.4% of executions: the markers above put ~1.3 ms
+        // between this spawn and the kill, so the SIGKILL usually wins the race
+        // and the child never reaches the exit path it gets stuck in.
+        // `.config/nextest.toml`'s #959 tombstone has the table.
         drop(pair);
         let adopted_id = adopted.insert_test_agent(child);
         let adopted_records = adopted.agent_records();
