@@ -189,18 +189,20 @@ fn run_pane_spawn_reviewer(deck: &TuiDeck, orchestrator_pane_id: &str) {
     );
 }
 
-/// Scenario: Open a real Orchestration tab (`pane-spawn-live` fixture: one
-/// orchestration, roles `orchestrator` [start] + `coder`, both spawned the
-/// instant the tab opens) and confirm both role cards are visible together.
-/// Then mutate the RUNNING orchestration's own `.dot-agent-deck.toml` (read
-/// back from the daemon's registry) to add a THIRD role, `reviewer`, that
-/// was never part of the config this tab was opened from — inserted BETWEEN
-/// `orchestrator` and `coder` (issue #1096's shape), not at the end. Invoke
-/// the REAL `dot-agent-deck pane spawn reviewer` CLI subcommand and assert
-/// reviewer's card joins the SAME orchestration tab that is still active (this test
-/// never switches tabs) and that the tab bar still shows exactly one
-/// Dashboard tab + one orchestration tab — not two orchestration tabs for
-/// the same orchestration.
+/// Scenario: Open a real Orchestration tab (`pane-spawn-live` fixture:
+/// `orchestrator` [start] + `coder`, both spawned the instant the tab opens)
+/// and confirm both role cards are visible on it. Mutate the RUNNING
+/// orchestration's own `.dot-agent-deck.toml` to insert a third role,
+/// `reviewer`, between the two, then invoke the real `dot-agent-deck pane
+/// spawn reviewer` CLI subcommand. Reviewer's card must join the SAME
+/// orchestration tab that is still active — this test never switches tabs —
+/// as its own bordered role-pane box, with the tab bar still showing exactly
+/// one Dashboard tab plus one orchestration tab rather than a duplicate.
+// The config edit goes in the MIDDLE rather than at the end because that is
+// issue #1096's shape; an end-of-list role appends into the correct slot
+// either way, so the old fixture could not tell placement from appending.
+// This test's own pins are unaffected by which slot reviewer lands in —
+// `pane/drift/001` is the one that asserts the resulting order.
 #[spec("pane/spawn/005")]
 #[test]
 fn spawn_005_pane_spawn_joins_the_already_open_orchestration_tab() {
@@ -284,30 +286,27 @@ fn spawn_005_pane_spawn_joins_the_already_open_orchestration_tab() {
 /// Scenario: Open a real orchestration tab (`pane-spawn-live` fixture:
 /// `orchestrator` [start] + `coder`) with `DOT_AGENT_DECK_SESSION` redirected
 /// to a test-owned path, confirm the leading-edge snapshot write already
-/// captures both roles in `[panes.orchestration]`, then grow the SAME
-/// already-open tab with a third role (`reviewer`, inserted BETWEEN the two
-/// existing roles) via the real `pane spawn` CLI exactly as `pane/spawn/005`
-/// does. Force one more snapshot flush (spawning an unrelated plain
-/// dashboard pane, since the growth branch itself never marks the session
-/// dirty) and assert the re-flushed `[panes.orchestration]` block's role
-/// list both includes `reviewer` AND lists the three roles in the on-disk
-/// config's order. This is the issue #868 save/restore config-drift
-/// question: does the snapshot writer read the role list from the tab's own
-/// live, M4-grown `config.roles`, or from a stale copy captured once at
-/// tab-open time? The only place `ui.pane_metadata`'s
-/// `OrchestrationSnapshot.roles` is written is `open_orchestration_tab`'s
-/// one-time capture at tab-open — `surface_one_orchestration`'s M4 growth
-/// branch (`add_role_to_existing_orchestration`) extends the live
-/// `Tab::Orchestration` but must ALSO carry that into the snapshot, or every
-/// later snapshot flush keeps re-serializing the ORIGINAL two-role list. A
-/// restored session would then see `resolve_orchestration_for_restore`'s
-/// drift guard false-positive (`current_roles` re-read from the now-3-role
-/// `.dot-agent-deck.toml` vs. `saved_roles` frozen at 2) and fall back to a
-/// plain pane, discarding the whole orchestration tab reconstruction even
-/// though nothing on disk ever actually diverged. Issue #1096 adds the ORDER
-/// half: the guard is an element-by-element sequence comparison, so a
-/// snapshot that carries `reviewer` but appended it is rejected exactly like
-/// one that never captured it.
+/// captured both roles, then insert `reviewer` between them in the running
+/// config and bring it up with the real `pane spawn` CLI. Force one more
+/// coalesced flush by spawning an unrelated plain dashboard pane, since the
+/// growth branch alone does not reliably mark the session dirty. The
+/// re-flushed `[panes.orchestration]` block must list exactly `[orchestrator,
+/// reviewer, coder]` — the on-disk config's order — parsed as TOML rather
+/// than substring-matched.
+// Why both halves of that last assertion matter.
+//
+// Issue #868: `ui.pane_metadata`'s `OrchestrationSnapshot.roles` is written
+// once, by `open_orchestration_tab`'s capture at tab-open.
+// `surface_one_orchestration`'s growth branch
+// (`add_role_to_existing_orchestration`) extends the live
+// `Tab::Orchestration` but must ALSO carry that into the snapshot, or every
+// later flush keeps re-serializing the ORIGINAL two-role list.
+//
+// Issue #1096 adds the ORDER half. `resolve_orchestration_for_restore`'s
+// drift guard is an element-by-element sequence comparison, so a snapshot
+// that carries `reviewer` but appended it is rejected exactly like one that
+// never captured it — and the restored session falls back to a plain pane,
+// discarding the whole orchestration tab, though nothing on disk diverged.
 #[spec("pane/drift/001")]
 #[test]
 fn drift_001_role_grown_via_pane_spawn_survives_session_capture() {
