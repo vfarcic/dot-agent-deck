@@ -420,10 +420,24 @@ impl WorkflowDaemon for DaemonClient {
     }
 
     async fn begin_coordinator_readiness(&self) -> Result<Self::ReadinessWatch, String> {
-        let mut subscription = self
-            .subscribe_events()
-            .await
-            .map_err(|error| safe_message(error.to_string()))?;
+        // Issue #1084: bounded, like the fleet path's own `SubscribeEvents`
+        // and the handshake before it. A deck that is down fails at once with
+        // `ECONNREFUSED`, but one that takes the connection and never answers
+        // left this await with no deadline at all — a launch parked for as long
+        // as the peer held the socket open, with nothing on screen saying why.
+        //
+        // Only the RESP that CONFIRMS the subscription is bounded, and the
+        // ordering is what keeps that true: this completes BEFORE the draining
+        // task below exists, so the single future this timeout can drop is
+        // `subscribe_events()`'s own round trip. It is never `next_event`, whose
+        // cancel-unsafety issue #1028 is about, and never the long-lived event
+        // frames that follow — those are read inside that task, under no
+        // deadline.
+        let mut subscription = crate::daemon_bridge::bounded_reply(
+            "SubscribeEvents for coordinator readiness",
+            self.subscribe_events(),
+        )
+        .await?;
         let (tx, rx) = tokio::sync::mpsc::channel(EVENT_QUEUE_DEPTH);
         // Issue #1028: the subscription is owned by this task and by nothing
         // else, for the reason [`EVENT_QUEUE_DEPTH`] gives — `next_event` is not
@@ -4103,5 +4117,99 @@ command = "configured-planner"
         );
 
         server.abort();
+    }
+
+    /// Scenario: a scripted daemon accepts the coordinator-readiness
+    /// subscription, reads the `SubscribeEvents` request and then answers
+    /// nothing at all, holding the socket open. `begin_coordinator_readiness`
+    /// must come back with an error naming the deck as wedged rather than
+    /// parking the launch for as long as the peer keeps the connection.
+    ///
+    /// Issue #1084, and the same defect PRD #742 M14 fixed one path over: a deck
+    /// that is DOWN fails at once with `ECONNREFUSED`, so the failure this
+    /// covers is the one where the connect succeeds. **Measured against the
+    /// unbounded code**, where it fails on the outer bound below rather than on
+    /// either assertion; take that bound away too and it does not fail at all,
+    /// it never returns. That is why the outer bound is here, exactly as in
+    /// `daemon_bridge`'s sibling test for the handshake.
+    ///
+    /// # Paused time, and paused at a POINT
+    ///
+    /// The clock is stopped only once `accepted_rx` resolves, which is the peer
+    /// confirming it took the connection and read the request. `start_paused`
+    /// would auto-advance from the first moment the runtime had nothing to poll,
+    /// so a clock that jumped while the connect was still in flight would report
+    /// the same error for a scenario nobody wrote. Pausing here leaves exactly
+    /// one thing outstanding — a read against a peer that will never write — and
+    /// the runtime advances to the only deadline left. Real socket I/O, real
+    /// silence, none of the fifteen seconds spent.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_deck_that_never_answers_the_readiness_subscription_is_reported_rather_than_awaited()
+    {
+        use dot_agent_deck::daemon_protocol::read_frame;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("a scratch dir for the socket");
+        let socket = dir.path().join("s");
+        let listener = tokio::net::UnixListener::bind(&socket).expect("bind the scripted daemon");
+        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))
+            .expect("restate 0o600 on the socket inode");
+
+        let (accepted, accepted_rx) = tokio::sync::oneshot::channel::<()>();
+        let (release, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let silent = tokio::spawn(async move {
+            let (stream, _peer) = listener.accept().await.expect("accept the subscriber");
+            // The write half is kept bound rather than dropped: dropping it
+            // shuts the socket down and the client would read EOF instead of
+            // the stall this test is about.
+            let (mut reader, _writer) = stream.into_split();
+            let _ = read_frame(&mut reader).await;
+            let _ = accepted.send(());
+            let _ = release_rx.await;
+        });
+
+        let subscribing = {
+            let socket = socket.clone();
+            tokio::spawn(async move {
+                DaemonClient::new(socket)
+                    .begin_coordinator_readiness()
+                    .await
+            })
+        };
+        accepted_rx
+            .await
+            .expect("the deck must have taken the connection and read the request");
+        tokio::time::pause();
+
+        // Under a paused clock tokio advances to the NEAREST deadline, so the
+        // bound under test fires first while it has one, and this outer bound
+        // fires only when it does not. Neither costs wall clock; without it a
+        // regression is a hung job rather than a red test.
+        let outcome = tokio::time::timeout(Duration::from_secs(600), subscribing)
+            .await
+            .expect(
+                "begin_coordinator_readiness() must bound its own wait rather than await a \
+                 reply that is not coming",
+            )
+            .expect("the subscribing task must not panic");
+
+        let _ = release.send(());
+        let _ = silent.await;
+
+        let error = outcome.expect_err("a deck that never answers must not resolve as subscribed");
+        assert!(
+            error.contains("did not answer"),
+            "the elapsed case must say the deck took the connection and stalled, rather than \
+             reading as a transport failure: {error}"
+        );
+        assert!(
+            error.contains(
+                &crate::daemon_bridge::DECK_REPLY_TIMEOUT
+                    .as_secs()
+                    .to_string()
+            ),
+            "and name the bound it exceeded: {error}"
+        );
     }
 }
