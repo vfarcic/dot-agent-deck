@@ -369,7 +369,9 @@ pub fn force_kill_child_and_wait(
     child: &mut Box<dyn portable_pty::Child + Send + Sync>,
     group: &AgentProcessGroup,
 ) {
-    force_kill_child_group(child, group);
+    // Deliberately discarded, for the same reason as the Unix twin: the blocking
+    // `wait()` below is this caller's own answer.
+    let _ = force_kill_child_group(child, group);
     let _ = child.wait();
 }
 
@@ -391,6 +393,9 @@ pub fn force_kill_child_and_wait(
 /// single-process fallback ran and any descendant survives. `true` says nothing
 /// reported a failure. `force_kill_and_reap_all` reports it on the agents it
 /// gives up on.
+#[must_use = "this is how a caller learns the force-kill did not land; issue #1118's Greptile P1 \
+              was exactly this value being dropped. Discard it with `let _ =` only where you have \
+              another answer (a blocking `wait()` right after), never by accident"]
 pub fn force_kill_child_group(
     child: &mut Box<dyn portable_pty::Child + Send + Sync>,
     group: &AgentProcessGroup,
