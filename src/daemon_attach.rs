@@ -94,8 +94,8 @@ pub enum AttachError {
     #[error(
         "refusing to connect to daemon attach socket {path}: {reason}. \
          Another user (or a hostile same-uid process) may have placed this file. \
-         The deck cannot clear it — if it sits in a world-writable directory such as /tmp, \
-         the sticky bit stops us unlinking an entry another user owns — so set \
+         The deck will not remove it — it refuses rather than unlink an entry it cannot \
+         vouch for, and in a sticky directory such as /tmp it could not anyway. Set \
          DOT_AGENT_DECK_ATTACH_SOCKET to a path only you can write, for example under \
          $XDG_RUNTIME_DIR or your home directory."
     )]
