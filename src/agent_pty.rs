@@ -1125,13 +1125,29 @@ const _: () = assert!(
 /// could still influence. `?` where the field is absent — a pid is `None` once
 /// the backend has let go of the child, and `pane_id_env` is `None` for any
 /// agent spawned without `DOT_AGENT_DECK_PANE_ID`.
-fn describe_unreaped_agent(agent: &RunningAgent) -> String {
-    let pid = agent
-        .child
-        .process_id()
-        .map_or_else(|| "?".to_string(), |p| p.to_string());
-    let pane = agent.pane_id_env.as_deref().unwrap_or("?");
-    format!("pid={pid} pane={pane}")
+///
+/// `kill=` carries what pass 1's force-kill reported for this agent (issue
+/// #1118, Greptile P1), and it is the field that separates the two very
+/// different reasons a child can still be here. `kill=ok` and no exit status
+/// means the signal went out and the kernel has not finished tearing the child
+/// down — the `?Es` case, which resolves itself. `kill=FAILED` means the
+/// force-kill's own mechanism reported an error
+/// ([`crate::platform::proc::force_kill_child_group`] has the per-platform
+/// meaning), so this child was very likely never signalled and may still be
+/// running after the daemon exits. Without the distinction both read as "left
+/// un-reaped", and only one of them is somebody's problem.
+///
+/// Takes the three fields rather than a `&RunningAgent` so both arms are
+/// unit-testable on every platform. That is not cosmetic: a synthetic test agent
+/// holds `AgentProcessGroup::adopt(None)`, which reports `ok` on Unix (the
+/// `killpg` fallback) and `FAILED` on Windows (no job object), so a test that
+/// went through a registry could only ever assert one arm, and a different one
+/// per platform.
+fn describe_unreaped_agent(pid: Option<u32>, pane: Option<&str>, kill_reported_ok: bool) -> String {
+    let pid = pid.map_or_else(|| "?".to_string(), |p| p.to_string());
+    let pane = pane.unwrap_or("?");
+    let kill = if kill_reported_ok { "ok" } else { "FAILED" };
+    format!("pid={pid} pane={pane} kill={kill}")
 }
 
 fn force_kill_and_wait(pty: &mut AgentPty) {
@@ -9012,30 +9028,62 @@ impl AgentPtyRegistry {
     /// * **Nothing downstream reads the statuses.** Both callers only
     ///   `change_notify.notify_one()` afterwards, and the `RunningAgent`s are
     ///   dropped when this function returns whichever way it left the loop.
-    /// * **Every PRODUCTION caller is on a teardown path** — `Drop for
-    ///   AgentPtyRegistry`, the daemon's termination-signal handler, and
-    ///   `daemon_protocol`'s `KIND_SHUTDOWN` handler; every other
-    ///   call site in the tree is inside a `#[cfg(test)]` module. So an abandoned
-    ///   Unix child is re-parented — to init, or to the nearest subreaper — as
-    ///   soon as this process exits, which is the next thing each of those paths
-    ///   does, and reaped there; on Windows dropping the `Child` closes the
-    ///   handle and the kernel releases the process object when it finally exits.
-    ///   The give-up therefore costs one process-table entry for the remainder of
-    ///   this process's life, not a permanent leak.
+    /// * **Every PRODUCTION caller is on a teardown path.** Enumerated rather
+    ///   than asserted, because it is the load-bearing half of this argument:
+    ///   under `src/`, outside a `#[cfg(test)]` module, the callers are `Drop for
+    ///   AgentPtyRegistry`, the daemon's termination-signal handler
+    ///   (`daemon.rs`), and `daemon_protocol`'s `KIND_SHUTDOWN` handler. The
+    ///   remaining call sites in the tree are `tests/`, `#[cfg(test)]` modules
+    ///   and `examples/perf_baseline_probe.rs` — each tearing down a registry it
+    ///   owns, at the end of its own run. So an abandoned Unix child is
+    ///   re-parented — to init, or to the nearest subreaper — as soon as this
+    ///   process exits, which is the next thing each of those paths does, and
+    ///   reaped there; on Windows dropping the `Child` closes the handle and the
+    ///   kernel releases the process object when it finally exits. The give-up
+    ///   therefore costs one process-table entry for the remainder of this
+    ///   process's life, not a permanent leak.
     ///
-    /// What it does NOT cost is a surviving agent process: the give-up abandons
-    /// the *status collection*, never the kill, which pass 1 already delivered to
-    /// every agent in the vector.
-    fn force_kill_and_reap_all(mut agents: Vec<RunningAgent>) {
+    /// **The give-up abandons the status collection and never the kill — but
+    /// "the kill was issued" is not "the kill landed"** (issue #1118, Greptile
+    /// P1). Pass 1 asks for every agent before pass 2 waits for any, so no agent
+    /// can have its kill *withheld* by this deadline. What the deadline cannot
+    /// do is make a kill that FAILED succeed:
+    /// [`crate::platform::proc::force_kill_child_group`] returns `false` when
+    /// its own mechanism reported an error (a non-`ESRCH` `killpg`; a
+    /// `TerminateJobObject` that did not fire), and such a child may well still
+    /// be running when this returns. That is why each agent's kill outcome is
+    /// carried through pass 2 and reported in the give-up warning rather than
+    /// being swallowed.
+    ///
+    /// It is not a reason to keep waiting, though, and that is the one thing
+    /// worth being explicit about: a child that was never signalled is *less*
+    /// likely to exit on its own than one the kernel is already tearing down, so
+    /// waiting on it is strictly worse than waiting on the `?Es` case this
+    /// deadline exists for. Nor is there an escalation left to try — `SIGKILL`
+    /// is the strongest signal there is, and the realistic non-`ESRCH` failure
+    /// (`EPERM`) returns `EPERM` again on a retry. Reporting it is the remedy
+    /// actually available. Before the deadline the same failed kill produced a
+    /// loop that never returned, which left the child running too and said
+    /// nothing at all.
+    fn force_kill_and_reap_all(agents: Vec<RunningAgent>) {
         if agents.is_empty() {
             return;
         }
         let total = agents.len();
 
-        // Pass 1: signal only.
-        for agent in &mut agents {
-            crate::platform::proc::force_kill_child_group(&mut agent.child, &agent.process_group);
-        }
+        // Pass 1: signal only. Each agent is paired with what its force-kill
+        // REPORTED, which pass 2 carries so the give-up below can tell a child
+        // the kernel is still tearing down from one that was never signalled.
+        let mut agents: Vec<(RunningAgent, bool)> = agents
+            .into_iter()
+            .map(|mut agent| {
+                let kill_reported_ok = crate::platform::proc::force_kill_child_group(
+                    &mut agent.child,
+                    &agent.process_group,
+                );
+                (agent, kill_reported_ok)
+            })
+            .collect();
 
         // Pass 2: reap, dropping each agent as its status is collected.
         //
@@ -9055,7 +9103,7 @@ impl AgentPtyRegistry {
         // which is the near-miss of the give-up below and worth seeing.
         let mut waited = false;
         loop {
-            agents.retain_mut(|agent| matches!(agent.child.try_wait(), Ok(None)));
+            agents.retain_mut(|(agent, _)| matches!(agent.child.try_wait(), Ok(None)));
             if agents.is_empty() || Instant::now() >= deadline {
                 break;
             }
@@ -9085,15 +9133,28 @@ impl AgentPtyRegistry {
         // The give-up. `?` on the list rather than a joined string so a pane id
         // carrying control bytes is escaped by `str`'s `Debug` rather than
         // forging log structure.
-        let unreaped: Vec<String> = agents.iter().map(describe_unreaped_agent).collect();
+        let unreaped: Vec<String> = agents
+            .iter()
+            .map(|(agent, kill_reported_ok)| {
+                describe_unreaped_agent(
+                    agent.child.process_id(),
+                    agent.pane_id_env.as_deref(),
+                    *kill_reported_ok,
+                )
+            })
+            .collect();
+        let kill_failed = agents.iter().filter(|(_, ok)| !ok).count();
         tracing::warn!(
             agents = total,
             unreaped = unreaped.len(),
+            kill_failed,
             unreaped_agents = ?unreaped,
             deadline_ms = FORCE_REAP_DEADLINE.as_millis() as u64,
             elapsed_ms,
-            "force-kill reap gave up: these agents were SIGKILLed but never reported an exit \
-             status, so they are left un-reaped and the shutdown continues without them"
+            "force-kill reap gave up: these agents never reported an exit status within the \
+             deadline and are left un-reaped. `kill=ok` means the force-kill went out and the \
+             kernel has not finished tearing the child down; `kill=FAILED` means the force-kill \
+             itself reported an error and that child may still be running"
         );
     }
 
@@ -15123,6 +15184,45 @@ mod spawn_tests {
             log.contains("unreaped=1"),
             "…and must count only the agent it actually gave up on, not the reaped sibling. \
              Captured WARN output was: {log}"
+        );
+        // Deliberately not asserting WHICH kill outcome: a synthetic agent holds
+        // `AgentProcessGroup::adopt(None)`, which reports `ok` on Unix and
+        // `FAILED` on Windows. That the two render distinguishably is
+        // `describe_unreaped_agent_separates_a_stuck_exit_from_a_failed_kill`'s
+        // job; what matters here is that the outcome is carried through pass 2
+        // at all rather than being swallowed by the `retain_mut`.
+        assert!(
+            log.contains(&format!("pane={WEDGED_PANE} kill=")),
+            "the warning must carry the agent's kill outcome beside its identity. Captured WARN \
+             output was: {log}"
+        );
+    }
+
+    /// Issue #1118 (Greptile P1): the give-up report must separate a child the
+    /// kernel has not finished tearing down from one that was never signalled.
+    ///
+    /// Both leave an agent un-reaped and both used to read identically, but only
+    /// the second may still be RUNNING after the daemon exits — so "left
+    /// un-reaped" alone tells an operator nothing about whether they have a
+    /// problem. `FAILED` is deliberately the shouty one: it is the arm worth
+    /// grepping for.
+    #[test]
+    fn describe_unreaped_agent_separates_a_stuck_exit_from_a_failed_kill() {
+        assert_eq!(
+            describe_unreaped_agent(Some(4321), Some("orch-1"), true),
+            "pid=4321 pane=orch-1 kill=ok",
+            "a kill that reported no failure, on a child that is merely slow to finish exiting"
+        );
+        assert_eq!(
+            describe_unreaped_agent(Some(4321), Some("orch-1"), false),
+            "pid=4321 pane=orch-1 kill=FAILED",
+            "a kill whose own mechanism reported an error — this child may still be running"
+        );
+        assert_eq!(
+            describe_unreaped_agent(None, None, true),
+            "pid=? pane=? kill=ok",
+            "both identity fields are legitimately absent (a backend that let go of the pid, an \
+             agent spawned without DOT_AGENT_DECK_PANE_ID) and must not be rendered as empty"
         );
     }
 

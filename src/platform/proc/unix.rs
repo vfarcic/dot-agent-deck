@@ -148,13 +148,24 @@ pub fn force_kill_child_and_wait(
 /// signal out lets such a caller deliver every kill first and reap afterwards —
 /// see `AgentPtyRegistry::force_kill_and_reap_all`, the only caller.
 ///
+/// **The return value is a NEGATIVE signal, not a delivery receipt** (issue
+/// #1118, Greptile P1). `false` means the `killpg` reported an error other than
+/// `ESRCH`, so the signal did not reach the group and the child may still be
+/// running. `true` means the syscall fired, the group was already gone
+/// (`ESRCH`), *or* the pgid-unavailable branch took the weaker
+/// `portable_pty::Child::kill` fallback, whose own `Result` that branch
+/// discards — so `true` is "nothing reported a failure", which is weaker than
+/// "the process is dead". `force_kill_and_reap_all` reports it on the agents it
+/// gives up on, so a reader can tell a child the kernel has not finished
+/// tearing down from one this process could not signal at all.
+///
 /// `_group` is unused on Unix for the same reason as in
 /// [`force_kill_child_and_wait`].
 pub fn force_kill_child_group(
     child: &mut Box<dyn portable_pty::Child + Send + Sync>,
     _group: &AgentProcessGroup,
-) {
-    signal_child_pgroup_or_fallback(child, libc::SIGKILL, "force-kill");
+) -> bool {
+    signal_child_pgroup_or_fallback(child, libc::SIGKILL, "force-kill")
 }
 
 /// SIGTERM-then-SIGKILL escalation used by the single-pane Ctrl+W path. Sends

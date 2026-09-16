@@ -307,13 +307,18 @@ impl AgentProcessGroup {
 
 /// Tear the agent's whole tree down, falling back to `portable-pty`'s
 /// single-process kill when there is no job (see [`AgentProcessGroup::adopt`]).
+///
+/// Returns whether the JOB-object teardown succeeded. `false` means the
+/// single-process fallback below ran instead, so any descendant the agent
+/// spawned survives; see the Unix twin for why issue #1118 surfaces this rather
+/// than swallowing it.
 fn reap_tree_or_fallback(
     child: &mut Box<dyn portable_pty::Child + Send + Sync>,
     group: &AgentProcessGroup,
     phase: &'static str,
-) {
+) -> bool {
     if group.terminate_tree(phase) {
-        return;
+        return true;
     }
     tracing::warn!(
         pid = ?child.process_id(),
@@ -322,6 +327,7 @@ fn reap_tree_or_fallback(
          spawned will leak"
     );
     let _ = child.kill();
+    false
 }
 
 /// Best-effort `CTRL_BREAK_EVENT` to the child's process group — the closest
@@ -377,11 +383,19 @@ pub fn force_kill_child_and_wait(
 /// handle signals, and a caller that interleaves terminate-then-wait per agent
 /// leaves every later agent's job un-terminated for as long as one child takes
 /// to go away.
+///
+/// **The return value is a NEGATIVE signal, not a delivery receipt** (issue
+/// #1118, Greptile P1), and it means the same thing as the Unix twin's even
+/// though the mechanism differs: `false` says the primary teardown —
+/// `TerminateJobObject` over the agent's whole tree — reported a failure, so the
+/// single-process fallback ran and any descendant survives. `true` says nothing
+/// reported a failure. `force_kill_and_reap_all` reports it on the agents it
+/// gives up on.
 pub fn force_kill_child_group(
     child: &mut Box<dyn portable_pty::Child + Send + Sync>,
     group: &AgentProcessGroup,
-) {
-    reap_tree_or_fallback(child, group, "force-kill");
+) -> bool {
+    reap_tree_or_fallback(child, group, "force-kill")
 }
 
 /// Best-effort-graceful-then-force teardown used by the single-pane Ctrl+W path:
