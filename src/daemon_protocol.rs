@@ -6002,8 +6002,10 @@ mod tests {
         // opens a PTY of its OWN for the synthetic `RunningAgent`, so this pair
         // exists only to give the child a terminal to be born on.
         //
-        // Holding them and reading neither is what wedged this test. The child
-        // is a bare `sleep`, which writes a usage line to this slave and exits;
+        // Holding them and reading neither is what wedged this test — measured
+        // as a before/after on this exact change, not reasoned from the
+        // mechanism, which is only partly known. The child is a bare `sleep`,
+        // which writes a usage line to this slave and exits;
         // on macOS it then got stuck in the kernel's exit path (`ps` state
         // `?<Es`, "trying to exit") often enough to matter, and
         // `shutdown_all` -> `force_kill_and_reap_all` polls `try_wait` in a loop

@@ -105,8 +105,14 @@
 # `AgentPtyRegistry::force_kill_and_reap_all`'s `try_wait` poll loop and the
 # child in macOS `ps` state `?<Es` — "trying to exit" — every single time. The
 # test, not the window, was the thing to change: its adopted half held both ends
-# of a PTY nobody read while a bare `sleep` wrote a usage line to it and exited,
-# a shape the production spawn path never has. See the comment at that line.
+# of a PTY nobody read while a bare `sleep` wrote a usage line to it and exited.
+# `agent_pty::spawn` does not leave a PTY in that state — it drops the slave as
+# soon as `spawn_command` returns, and `spawn_agent` starts a `pump_reader`
+# thread that drains the master for the agent's whole life — which is what the
+# fix makes the test do too. Dropping the pair took the same 4500-execution
+# stress on the same runner type from 18 stalls to 0; which of the two handles
+# mattered, or whether the child's write to the PTY was needed at all, was not
+# established and did not need to be. See the comment at that line.
 #
 # The TIER is not the lever either, which is the other thing #959 asked. This
 # test forks a real PTY child, but so do at least 76 of the 1838
