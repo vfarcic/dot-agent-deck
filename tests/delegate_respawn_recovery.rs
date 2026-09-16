@@ -591,6 +591,265 @@ async fn delegate_023_a_replacement_that_dies_is_reported_to_the_orchestrator() 
     );
 }
 
+/// Issue #1114: how long `delegate/032` keeps the worker pane in the window
+/// between `begin_pane_close` and `close_agent` before finishing the close.
+///
+/// Unlike the two fixed deadlines issue #709 took out of `delegate/022`, this
+/// one cannot expire early on the thing it is waiting for: anywhere inside the
+/// 6 s window it stays under, over-holding is safe in BOTH directions. A fixed
+/// build parks in the respawn's wait for as long as the hold is up and then
+/// re-creates the pane, and a broken one has already failed by then. All the value has to be is long enough
+/// that a delegate cannot still be on its way to `spawn_agent`, and short enough
+/// to stay inside the 6 s `PANE_CLOSE_SETTLE_TIMEOUT` the daemon allows a close
+/// before it stops waiting for one. One second is ~1000x the first and 6x under
+/// the second.
+///
+/// There is deliberately no early exit on "the record has gone", tempting as it
+/// is — the record going IS the defect, so ending the hold on it hands the
+/// broken build's `spawn_agent` a pane that is no longer held and lets it
+/// succeed. Measured: with a 25 ms poll on that condition the pre-fix build came
+/// back green in 1.18 s. The hold has to outlast the failure it is provoking,
+/// not race it.
+const CLOSE_WINDOW_HOLD: Duration = Duration::from_secs(1);
+
+/// Issue #1114: how long `delegate/033` keeps the pane's cleanup hold up AFTER
+/// `close_agent` has already removed the record — the starved tail of a close,
+/// which is what outrunning `PANE_CLOSE_SETTLE_TIMEOUT` means in production.
+///
+/// It has to EXCEED that 6 s constant, or the test is `delegate/022`'s ordinary
+/// in-flight close wearing a different fixture and says nothing about the
+/// give-up this scenario is named for. Eight seconds clears it by two, and a
+/// `sleep` can only overshoot, so load moves this in the safe direction. The
+/// other end is the recovery's own ceiling — `PANE_CLOSE_RECREATE_TIMEOUT`,
+/// 30 s — which this sits comfortably under.
+const STARVED_CLOSE_TAIL: Duration = Duration::from_secs(8);
+
+/// Finish a close the way `daemon_protocol.rs`'s `StopAgent` arm finishes one:
+/// `close_agent`, then `unregister_pane` under the state write guard, then
+/// `finish_pane_close`, and only then drop the cleanup hold.
+///
+/// The two tests below are ABOUT the interior of that sequence, so a faithful
+/// reproduction has to be able to stand between its statements — which is why
+/// they assemble it here rather than driving `StopAgent` over the socket the way
+/// `delegate/022` does. Everything else about them is the production path: a
+/// real `handle_delegate_with_state`, a real registry, real PTYs.
+async fn finish_the_close(
+    registry: &Arc<AgentPtyRegistry>,
+    state: &dot_agent_deck::state::SharedState,
+    agent_id: &str,
+    hold: dot_agent_deck::agent_pty::PaneCleanupHold,
+) -> Result<(), dot_agent_deck::agent_pty::AgentPtyError> {
+    let closed = registry.close_agent(agent_id);
+    state.write().await.unregister_pane(WORKER_PANE);
+    registry.finish_pane_close(WORKER_PANE, closed.is_ok());
+    drop(hold);
+    closed
+}
+
+/// Scenario: put the worker's pane into the exact state the daemon's `StopAgent`
+/// handler is in between `begin_pane_close` and `close_agent` — cleanup hold
+/// taken, closing mark set, and the pane's registry record still there — then
+/// delegate to the `clear = true` role and let the close finish a moment later.
+/// The role must come back with a live agent that receives the task pointer, and
+/// the delegate must not have destroyed the pane's record on its way past, which
+/// the close itself reports by failing `NotFound` against an id that is gone.
+#[tokio::test(flavor = "multi_thread")]
+#[spec("orchestration/delegate/032")]
+async fn delegate_032_a_delegate_inside_the_pre_close_window_leaves_the_record_alone() {
+    let fx = fixture(|_| "cat".to_string()).await;
+
+    // The window. `begin_pane_close` runs first and `close_agent` — the step
+    // that removes the pane's entry — runs behind a `spawn_blocking` hop, so a
+    // delegate landing between them finds a RECORD and takes the ordinary
+    // respawn path instead of issue #606's recreation.
+    let hold = fx
+        .daemon
+        .registry
+        .hold_pane_for_cleanup(WORKER_PANE, &fx.worker_agent_id)
+        .expect("the stopping agent must be able to hold its own pane for cleanup");
+    fx.daemon.registry.begin_pane_close(WORKER_PANE);
+
+    assert!(
+        fx.daemon.registry.pane_close_in_flight(WORKER_PANE),
+        "precondition: the pane must read as mid-close, or the delegate below is an ordinary \
+         delegate to a healthy worker"
+    );
+    assert_eq!(
+        fx.daemon
+            .registry
+            .pane_current_agent_id(WORKER_PANE)
+            .as_deref(),
+        Some(fx.worker_agent_id.as_str()),
+        "precondition: the pane's record must still be PRESENT — a pane with no record is \
+         `delegate/022`'s window, not this one, and it reaches the recovery by a different route"
+    );
+
+    // Finish the close the way the handler does, once the hold has been up long
+    // enough that no delegate can still be on its way to `spawn_agent`. See
+    // `CLOSE_WINDOW_HOLD` for why this does not end early on the defect it is
+    // provoking.
+    let registry = Arc::clone(&fx.daemon.registry);
+    let state = fx.daemon.state.clone();
+    let closing_id = fx.worker_agent_id.clone();
+    let closing = tokio::spawn(async move {
+        tokio::time::sleep(CLOSE_WINDOW_HOLD).await;
+        finish_the_close(&registry, &state, &closing_id, hold).await
+    });
+
+    delegate(&fx, "list the files in this directory").await;
+
+    let closed = closing.await.expect("the close task must not panic");
+    assert!(
+        closed.is_ok(),
+        "the close could not find the agent it was already taking apart, so the delegate had \
+         lifted the pane's record out from under it — `respawn_agent_for_pane_declared` removes \
+         the entry and only THEN calls `spawn_agent`, which refuses a pane still held for \
+         cleanup (#1114). error = {:?}",
+        closed.unwrap_err()
+    );
+
+    let replacement = wait_for_replacement_agent(
+        &fx.daemon.registry,
+        WORKER_PANE,
+        &fx.worker_agent_id,
+        Duration::from_secs(20),
+    )
+    .await
+    .unwrap_or_else(|| {
+        panic!(
+            "delegating to a `clear = true` role in the window before its close removed the \
+             pane's record left the role with no live agent at all — the pane is dead for the \
+             rest of the session (#1114, #606). records = {:?}",
+            fx.daemon.registry.agent_records()
+        )
+    });
+
+    // A `cat` stand-in emits no readiness signal of its own, so stand in for the
+    // agent's hook exactly as the rest of the fast delegate suite does.
+    common::write_hook_line(
+        &fx.daemon.hook_path,
+        &session_start(WORKER_PANE, &replacement),
+    )
+    .expect("deliver synthetic SessionStart for the replacement worker");
+
+    let snapshot = wait_for_pane_needle(
+        &fx.daemon.registry,
+        WORKER_PANE,
+        POINTER,
+        Duration::from_secs(20),
+    )
+    .await;
+    assert!(
+        snapshot_contains(&snapshot, POINTER),
+        "the recovered worker never received the task pointer; snapshot = {:?}",
+        String::from_utf8_lossy(&snapshot)
+    );
+
+    let state = fx.daemon.state.read().await;
+    assert_eq!(
+        state.pane_role_map.get(WORKER_PANE).map(String::as_str),
+        Some(WORKER_ROLE),
+        "the role must still route after the recovery, or the NEXT delegate is rejected with \
+         `reached no worker for role(s)` — the permanent breakage #606 reports"
+    );
+}
+
+/// Scenario: close the worker's pane for real but leave the close's pane-scoped
+/// cleanup running for longer than the six seconds the respawn allows it — a
+/// starved close tail — and delegate to the `clear = true` role while it runs.
+/// The role must still come back once the close finally lets go, instead of the
+/// delegate giving up at the settle timeout and leaving the pane dead for the
+/// rest of the session.
+#[tokio::test(flavor = "multi_thread")]
+#[spec("orchestration/delegate/033")]
+async fn delegate_033_a_close_that_outruns_the_settle_timeout_still_brings_the_role_back() {
+    let fx = fixture(|_| "cat".to_string()).await;
+
+    let hold = fx
+        .daemon
+        .registry
+        .hold_pane_for_cleanup(WORKER_PANE, &fx.worker_agent_id)
+        .expect("the stopping agent must be able to hold its own pane for cleanup");
+    fx.daemon.registry.begin_pane_close(WORKER_PANE);
+    fx.daemon
+        .registry
+        .close_agent(&fx.worker_agent_id)
+        .expect("close the worker stand-in");
+
+    assert!(
+        fx.daemon
+            .registry
+            .pane_current_agent_id(WORKER_PANE)
+            .is_none(),
+        "precondition: `close_agent` must have removed the pane's record, or this is \
+         `delegate/032`'s window rather than the give-up this test is named for"
+    );
+    assert!(
+        fx.daemon.registry.pane_close_in_flight(WORKER_PANE),
+        "precondition: the close's cleanup hold must still be up — it is what `spawn_agent` \
+         refuses a fresh pane on, and without it the recovery has nothing to wait for"
+    );
+
+    // The starved tail: everything after `close_agent` in the `StopAgent` arm,
+    // stretched past `PANE_CLOSE_SETTLE_TIMEOUT`. Measured on a real box at 80
+    // concurrent copies, not invented — see issue #1114.
+    let registry = Arc::clone(&fx.daemon.registry);
+    let state = fx.daemon.state.clone();
+    let closing = tokio::spawn(async move {
+        tokio::time::sleep(STARVED_CLOSE_TAIL).await;
+        state.write().await.unregister_pane(WORKER_PANE);
+        registry.finish_pane_close(WORKER_PANE, true);
+        drop(hold);
+    });
+
+    delegate(&fx, "list the files in this directory").await;
+
+    let replacement = wait_for_replacement_agent(
+        &fx.daemon.registry,
+        WORKER_PANE,
+        &fx.worker_agent_id,
+        STARVED_CLOSE_TAIL + Duration::from_secs(20),
+    )
+    .await
+    .unwrap_or_else(|| {
+        panic!(
+            "the close outran the respawn's settle window, so the `clear = true` delegate gave \
+             up and left the role with no agent at all — the pane is dead for the rest of the \
+             session (#1114). close still in flight = {}, records = {:?}",
+            fx.daemon.registry.pane_close_in_flight(WORKER_PANE),
+            fx.daemon.registry.agent_records()
+        )
+    });
+    closing.await.expect("the close task must not panic");
+
+    common::write_hook_line(
+        &fx.daemon.hook_path,
+        &session_start(WORKER_PANE, &replacement),
+    )
+    .expect("deliver synthetic SessionStart for the replacement worker");
+
+    let snapshot = wait_for_pane_needle(
+        &fx.daemon.registry,
+        WORKER_PANE,
+        POINTER,
+        Duration::from_secs(20),
+    )
+    .await;
+    assert!(
+        snapshot_contains(&snapshot, POINTER),
+        "the recovered worker never received the task pointer; snapshot = {:?}",
+        String::from_utf8_lossy(&snapshot)
+    );
+
+    let state = fx.daemon.state.read().await;
+    assert_eq!(
+        state.pane_role_map.get(WORKER_PANE).map(String::as_str),
+        Some(WORKER_ROLE),
+        "the role must still route after the recovery, or the NEXT delegate is rejected with \
+         `reached no worker for role(s)` — the permanent breakage #606 reports"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // #584's control: the two spawn paths' respawns, side by side.
 // ---------------------------------------------------------------------------

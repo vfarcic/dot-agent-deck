@@ -7061,9 +7061,13 @@ fn restart_refusal_for_crashed_pane(
 /// not dropped until the whole statement (including the `.await`)
 /// completes, so the guard would stay held for the ENTIRE respawn, which
 /// can spend up to `AGENT_TERMINATE_GRACE` + `PANE_CLOSE_SETTLE_TIMEOUT`
-/// (~9s) inside `respawn_or_recreate_agent_for_pane`. `tokio::sync::RwLock`
-/// is write-preferring, so that would stall every other daemon
-/// reader/writer for the duration. A short-lived READ guard resolves
+/// (~9s) inside `respawn_or_recreate_agent_for_pane` — and, since issue
+/// #1114, up to `AGENT_TERMINATE_GRACE` + `PANE_CLOSE_RECREATE_TIMEOUT`
+/// (~33s) when a close of that pane outruns its settle window, which is the
+/// case where holding a read guard would matter most: the close's own
+/// `unregister_pane` needs the WRITE guard to finish and let go.
+/// `tokio::sync::RwLock` is write-preferring, so that would stall every
+/// other daemon reader/writer for the duration. A short-lived READ guard resolves
 /// caller validation, target resolution, the crashed check, and the role
 /// config lookup, then drops BEFORE the respawn — no state-lock dependency
 /// held across it. The `recreated: true` re-registration case still needs
