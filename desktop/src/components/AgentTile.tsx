@@ -83,6 +83,15 @@ export interface AgentTileProps {
    *    `readerOpen` is local state reset only on `agent.id`, so the overlay
    *    must also not RENDER `<OutputReader>`.
    *
+   *    **This difference is necessary and was not sufficient**, which is the
+   *    correction the PR review made. It governs the tile being promoted and
+   *    says nothing about the other tiles the pane is drawn over, which stay at
+   *    `"tile"` and keep any Reader they already had — a second `window`
+   *    listener, behind the scrim, answering the same `Escape`. The screen-wide
+   *    half is {@link AgentTileProps.panePresent}, and the two are deliberately
+   *    separate: one is a fact about this box, the other a fact about the
+   *    screen, and only the first is a presentation.
+   *
    * What this prop deliberately CANNOT express: that the tile and the overlay
    * share one xterm instance. That is a property of where the element sits in
    * the React tree, not of what it is rendered with — which is why M3 has to
@@ -119,6 +128,21 @@ export interface AgentTileProps {
    */
   onOpen?: () => void;
   /**
+   * True while an agent pane is open ANYWHERE in this screen — including over
+   * a different agent's tile.
+   *
+   * This is not `presentation === "overlay"` and cannot be derived from it. The
+   * promoted tile renders no Reader, but the tiles it is drawn over stay at
+   * `presentation="tile"`, and a background tile whose Reader was already open
+   * keeps an `OutputReader` mounted behind the scrim with its own `window`
+   * `keydown` listener. Two listeners on one target both answer one `Escape` —
+   * `stopPropagation` does nothing between them — so opening the Reader on tile
+   * A and then the pane on tile B made one `Escape` close both. Dismissing a
+   * Reader nobody can see costs the user nothing and is what makes
+   * `DeckShell`'s "exactly one listener" true rather than documented-as-false.
+   */
+  panePresent?: boolean;
+  /**
    * PRD #1105 M2 — close the pane, the mirror of {@link AgentTileProps.onOpen}.
    *
    * Deliberately NOT derived from `presentation`: closing acts on the VIEW and
@@ -151,6 +175,7 @@ export function AgentTile({
   onEvidenceSelect,
   onRename,
   onOpen,
+  panePresent,
   onClose,
 }: AgentTileProps) {
   const handleInput = useCallback((data: string) => {
@@ -174,11 +199,29 @@ export function AgentTile({
    * the overlay's would both answer one `Escape`, closing the Reader AND the
    * pane behind it. So the render is gated too, and the state is simply
    * unreachable at overlay presentation.
+   *
+   * That closes the SAME-tile route and no other; the cross-tile one is
+   * `panePresent`, folded in at `readerSuppressed` below.
    */
   const overlay = presentation === "overlay";
+  /**
+   * The Reader is suppressed at overlay presentation (M1 difference 4, above)
+   * AND whenever any pane is open over this screen (see `panePresent`). The
+   * second term is the cross-tile half the first cannot express: it is a fact
+   * about the screen, not about this tile's own box.
+   *
+   * Gating the render as well as the state is deliberate. The effect below
+   * dismisses an open Reader, but effects run after the commit, so for one
+   * commit both listeners would still be bound without this.
+   */
+  const readerSuppressed = overlay || Boolean(panePresent);
   const [renameDraft, setRenameDraft] = useState<string>();
   const [readerOpen, setReaderOpen] = useState(false);
   useEffect(() => { setRenameDraft(undefined); setReaderOpen(false); }, [agent.id]);
+  // Dismissed, not merely hidden: a Reader that came back when the pane closed
+  // would answer the NEXT `Escape` instead of the deck, which is the same
+  // surprise one step later.
+  useEffect(() => { if (readerSuppressed) setReaderOpen(false); }, [readerSuppressed]);
 
   const commitRename = () => {
     const next = renameDraft?.trim();
@@ -320,7 +363,7 @@ export function AgentTile({
             {id === "checks" && agent.checks.length > 0 && <em>{agent.checks.length}</em>}
           </button>
         ))}
-        {!overlay && (
+        {!readerSuppressed && (
           <button
             className="reader-open"
             data-testid={`reader-open-${agent.id}`}
@@ -334,13 +377,16 @@ export function AgentTile({
         )}
       </div>
 
-      {!overlay && readerOpen && <OutputReader agent={agent} onClose={() => setReaderOpen(false)} />}
+      {!readerSuppressed && readerOpen && <OutputReader agent={agent} onClose={() => setReaderOpen(false)} />}
 
       <div className="agent-panel" role="tabpanel">
         {tab === "terminal" && (
           <div className="agent-terminal-stack">
             <TerminalViewport
               agentId={agent.id}
+              /* The agent's OWN deck, never the selected one: the feed is keyed
+                 by the composite identity because ids collide across decks. */
+              deckId={agent.daemonId}
               label={agent.role}
               transcript={agent.transcript}
               terminalFeed={terminalFeed}

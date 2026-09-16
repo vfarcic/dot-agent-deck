@@ -151,6 +151,10 @@ describe("TauriDeckBridge", () => {
     await bridge.subscribe(vi.fn(), terminal);
     expect(terminal).toHaveBeenCalledWith({
       agentId: "agent-1",
+      // PRD #1105's security audit: every chunk carries the deck that produced
+      // it, stamped at the one funnel they all pass through, because the
+      // runtime keys its retained buffers by `(deckId, agentId)`.
+      deckId: "deck-000000000000dec1",
       data: new Uint8Array(),
       stream: "error",
       operation: "append",

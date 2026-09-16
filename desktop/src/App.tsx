@@ -48,8 +48,10 @@ import { useDaemonProjects } from "./hooks/useDaemonProjects";
 import { usePromptLibrary } from "./hooks/usePromptLibrary";
 import { useDesktopSettings, type DesktopSettingsState } from "./hooks/useDesktopSettings";
 import { useCrossDeckSelection } from "./hooks/useCrossDeckSelection";
+import { useInertBackground } from "./hooks/useInertBackground";
 import { useShownTerminals } from "./hooks/useShownTerminals";
 import { useZoom } from "./hooks/useZoom";
+import { agentKey } from "./lib/agentKey";
 import { applyAppearance } from "./lib/appearance";
 import { desktopWorkflowPlatformIssue } from "./lib/platform";
 import type { DeckAction, DeckRuntimeState, DeckView, EvidenceItem, PanelTab, WorkflowLaunchConfig } from "./types";
@@ -157,9 +159,17 @@ export function DeckShell({ runtime, workflowPlatformIssue, initialView = { kind
    * Exactly ONE `window` `keydown` listener exists for the pane, and that is a
    * property of the pane's contents rather than of this line: `OutputReader`
    * binds one too, `stopPropagation` does nothing between two listeners on the
-   * same target, and the order is registration order. `AgentTile` therefore
-   * renders no Reader at overlay presentation (see its `presentation` prop), so
-   * the two can never be up together.
+   * same target, and the order is registration order.
+   *
+   * It takes TWO gates in `AgentTile` to make that true, and the PR review
+   * found the second missing. `presentation="overlay"` renders no Reader, which
+   * covers the tile being promoted; the other tiles the pane is drawn OVER stay
+   * at `"tile"` and kept any Reader they already had, so opening the Reader on
+   * one tile and the pane on another left two listeners answering one
+   * `Escape` — closing the pane and that Reader together. `panePresent` is the
+   * screen-wide gate that closes it, and it dismisses rather than hides: a
+   * Reader restored on close would answer the next `Escape` instead of the
+   * deck.
    */
   useEffect(() => {
     if (!agentView) return;
@@ -203,6 +213,41 @@ export function DeckShell({ runtime, workflowPlatformIssue, initialView = { kind
     ? (agentView && agentView.deckId === runtime.snapshot.connection.deckId ? [agentView.agentId] : [])
     : undefined;
   useShownTerminals(runtime.setShownTerminals, overviewShown);
+  /**
+   * PRD #1105's security audit — the deck-origin pane is FENCED on identity,
+   * and closes rather than retargets.
+   *
+   * A deck-origin pane means "this agent, on the deck you are looking at": the
+   * deck surface renders the selected deck and no other, so the pane's claim
+   * and the view's `deckId` are the same claim. When the selected deck moves
+   * out from under it — by the deck selector under an open pane, by a
+   * `selectionFallback` the crate reports, or by another window writing the
+   * settings document — that claim is no longer true of anything on screen.
+   * Holding the pane open would promote the NEW deck's agent of the same
+   * per-daemon monotonic id under the old one's name, with matching role text
+   * and no deck identity in the dialog, and would route the user's keystrokes
+   * to it.
+   *
+   * Closing is chosen over suspending because it is the only option that
+   * leaves nothing to be wrong about: a suspended pane still has to say whose
+   * agent it is showing, and the honest answer is "nobody's". The user lands on
+   * the deck they just selected, which is what they asked for.
+   *
+   * The render below does not wait for this effect. `DeckSurface` promotes a
+   * tile only on the full `(deckId, agentId)` match, so the mismatch commit
+   * shows no pane at all and this closes the view behind it — the pane's
+   * lookup, its shown declaration and its input authority never degrade to a
+   * bare id, not even for one frame.
+   *
+   * An UNKNOWN selected deck is not a mismatch. `reconnect`'s failure path
+   * rebuilds `connection` without a `deckId`, and a transiently unidentified
+   * deck is not evidence that the pane's deck changed.
+   */
+  const selectedDeckId = runtime.snapshot.connection.deckId;
+  const deckPaneRetargeted = agentView?.from === "deck" && selectedDeckId !== undefined && agentView.deckId !== selectedDeckId;
+  useEffect(() => {
+    if (deckPaneRetargeted) closeAgent();
+  }, [deckPaneRetargeted, closeAgent]);
   if (base === "overview") {
     return (
       <>
@@ -218,7 +263,10 @@ export function DeckShell({ runtime, workflowPlatformIssue, initialView = { kind
       </>
     );
   }
-  return <DeckSurface runtime={runtime} settings={settings} workflowPlatformIssue={workflowPlatformIssue} onNavigate={setView} openAgentId={agentView?.agentId} onCloseAgent={closeAgent} />;
+  /* The COMPOSITE identity, never the bare id. See `deckPaneRetargeted` above
+     and `DeckSurface`'s own promotion condition. */
+  const openAgent = agentView ? { deckId: agentView.deckId, agentId: agentView.agentId } : undefined;
+  return <DeckSurface runtime={runtime} settings={settings} workflowPlatformIssue={workflowPlatformIssue} onNavigate={setView} openAgent={openAgent} onCloseAgent={closeAgent} />;
 }
 
 /**
@@ -263,12 +311,18 @@ function OverviewAgentPane({ runtime, view, onClose }: { runtime: DeckRuntimeSta
          and the bridge records events for the selected deck alone — so a
          non-selected deck's entry carries none rather than somebody else's. */
       evidence={deck.evidence}
-      inputResult={runtime.terminalInputResults?.[agent.id]}
+      /* By the COMPOSITE key, for the same reason the agent above is resolved
+         that way: a verdict recorded against the previously selected deck's
+         `planner` would otherwise disable this pane and print that deck's
+         rejection notice under this agent's heading, and that deck's cached
+         grid would be submitted to this agent's PTY — reflowing it, and every
+         other viewer attached to it, from a viewport on another machine. */
+      inputResult={runtime.terminalInputResults?.[agentKey(view.deckId, agent.id)]}
       onSelect={() => undefined}
       onTabChange={setTab}
       onTerminalInput={runtime.sendTerminalInput}
       onTerminalResize={runtime.resizeTerminal}
-      appliedGeometry={runtime.appliedGeometry?.[agent.id]}
+      appliedGeometry={runtime.appliedGeometry?.[agentKey(view.deckId, agent.id)]}
       /* The evidence drawer is the deck's, and no screen is mounted here that
          could open it — so the handoffs tab lists evidence and selecting one
          does nothing, rather than pretending at a drawer that is not there.
@@ -308,13 +362,29 @@ function OverviewAgentPane({ runtime, view, onClose }: { runtime: DeckRuntimeSta
  * grid item it has always been and the deck's layout is untouched.
  */
 function AgentPaneFrame({ open, onOpen, onClose, ...tile }: Omit<AgentTileProps, "presentation"> & { open: boolean }) {
+  /*
+    The `aria-modal` below is a claim about the whole interface, and until the
+    PRD's security audit it was false: the base screen is deliberately still
+    mounted underneath, so every control on it — the rail, the other tiles, and
+    the `DeckSelector` that can retarget the app to another deck — stayed
+    keyboard-reachable behind a full-window dialog. `useInertBackground` is what
+    makes the attribute true, by marking every element that is not an ancestor
+    of this one inert and moving focus inside. See that hook for why it walks
+    siblings rather than marking one subtree.
+  */
+  const paneRef = useInertBackground<HTMLDivElement>(open);
   return (
     <div
+      ref={paneRef}
       className={open ? "agent-pane-overlay" : "agent-pane-slot"}
       data-testid={open ? "agent-pane-overlay" : undefined}
       role={open ? "dialog" : undefined}
       aria-modal={open ? "true" : undefined}
       aria-label={open ? `${tile.agent.role} agent` : undefined}
+      /* Focusable only as a focus TARGET, never as a tab stop: the hook moves
+         focus here when the pane opens over a control that had it, and Tab then
+         proceeds into the pane's own controls. */
+      tabIndex={open ? -1 : undefined}
     >
       <AgentTile
         {...tile}
@@ -344,8 +414,27 @@ export function ControlDeck(props: { runtime: DeckRuntimeState; workflowPlatform
   return <DeckSurface {...props} settings={settings} />;
 }
 
-export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktopWorkflowPlatformIssue(), onNavigate, openAgentId, onCloseAgent }: { runtime: DeckRuntimeState; settings: DesktopSettingsState; workflowPlatformIssue?: string; onNavigate?: (view: DeckView) => void; openAgentId?: string; onCloseAgent?: () => void }) {
+export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktopWorkflowPlatformIssue(), onNavigate, openAgent, onCloseAgent }: { runtime: DeckRuntimeState; settings: DesktopSettingsState; workflowPlatformIssue?: string; onNavigate?: (view: DeckView) => void; openAgent?: { deckId: string; agentId: string }; onCloseAgent?: () => void }) {
   const { snapshot, mode, setShownTerminals } = runtime;
+  /**
+   * Which tile is promoted, decided on the FULL `(deckId, agentId)` identity.
+   *
+   * PRD #1105's security audit. This prop was a bare `openAgentId`, and agent
+   * ids are per-daemon monotonic — so when the selected deck moved under an
+   * open pane, the arriving deck's namesake matched and was promoted into it.
+   * Same role, same display text, no deck identity in the dialog, and
+   * `sendTerminalInput(agentId, …)` resolving the bare-id session that now
+   * belonged to the other machine. `DeckShell` closes the view when that
+   * happens; this is the render-synchronous half, so no such commit exists even
+   * before the effect runs.
+   *
+   * Every agent here carries the selected deck's `daemonId`, so this is exactly
+   * the comparison `DeckShell` makes — expressed per tile, at the seam that
+   * decides what the user sees, rather than trusted from the caller.
+   */
+  const paneAgentId = openAgent && snapshot.agents.some((agent) => agent.id === openAgent.agentId && agent.daemonId === openAgent.deckId)
+    ? openAgent.agentId
+    : undefined;
   const [selectedAgentId, setSelectedAgentId] = useState("");
   const [tabs, setTabs] = useState<Record<string, PanelTab>>({});
   const [selectedEvidenceId, setSelectedEvidenceId] = useState("");
@@ -967,20 +1056,21 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
               {snapshot.agents.map((agent) => (
                 <AgentPaneFrame
                   key={agent.id}
-                  open={agent.id === openAgentId}
+                  open={agent.id === paneAgentId}
+                  panePresent={paneAgentId !== undefined}
                   agent={agent}
                   mode={mode}
                   selected={agent.id === selectedAgentId}
                   tab={tabs[agent.id] ?? "terminal"}
                   terminalFeed={runtime.terminalFeed}
                   evidence={snapshot.evidence}
-                  inputResult={runtime.terminalInputResults?.[agent.id]}
+                  inputResult={runtime.terminalInputResults?.[agentKey(agent.daemonId, agent.id)]}
                   terminalFocusToken={terminalFocus?.agentId === agent.id ? terminalFocus.token : 0}
                   onSelect={() => setSelectedAgentId(agent.id)}
                   onTabChange={(tab) => setTabs((current) => ({ ...current, [agent.id]: tab }))}
                   onTerminalInput={runtime.sendTerminalInput}
                   onTerminalResize={runtime.resizeTerminal}
-                  appliedGeometry={runtime.appliedGeometry?.[agent.id]}
+                  appliedGeometry={runtime.appliedGeometry?.[agentKey(agent.daemonId, agent.id)]}
                   onEvidenceSelect={(id) => { setSelectedEvidenceId(id); setEvidenceOpen(true); }}
                   onRename={mode === "live" ? renameAgent : undefined}
                   /*

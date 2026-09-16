@@ -2,6 +2,7 @@ import { act, fireEvent, render, screen, waitFor, within } from "@testing-librar
 import { useMemo, useState } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createFixtureSnapshot, FIXTURE_DAEMON_ID } from "./data/fixture";
+import { agentKey } from "./lib/agentKey";
 import { WINDOWS_WORKFLOW_BLOCK_REASON } from "./lib/platform";
 import { DEFAULT_DESKTOP_SETTINGS, type DesktopSettingsDto } from "./lib/bridge";
 import type { AgentSession, DaemonOrchestration, DaemonProject, DaemonResolvedProject, DeckRuntimeState, SendResult } from "./types";
@@ -267,7 +268,9 @@ describe("ControlDeck", () => {
     const snapshot = liveSnapshot([{ ...agentIn("input-applied", "/tmp/project"), status: "running", writeLease: "write" }]);
     const deck = {
       ...runtime({ mode: "live", snapshot }),
-      terminalInputResults: { [id]: "applied" },
+      // By the composite `(deckId, agentId)` key the runtime uses since PRD
+      // #1105's security audit — a bare id names an agent on every deck.
+      terminalInputResults: { [agentKey(FIXTURE_DAEMON_ID, id)]: "applied" },
     } as DeckRuntimeState & { terminalInputResults: Record<string, SendResult> };
     render(<ControlDeck runtime={deck} />);
 
@@ -315,7 +318,7 @@ describe("ControlDeck", () => {
     const snapshot = liveSnapshot([{ ...agentIn(id, "/tmp/project"), status: "running", writeLease: "write" }]);
     const deck = {
       ...runtime({ mode: "live", snapshot }),
-      terminalInputResults: { [id]: "wrong-session" },
+      terminalInputResults: { [agentKey(FIXTURE_DAEMON_ID, id)]: "wrong-session" },
     } as DeckRuntimeState & { terminalInputResults: Record<string, SendResult> };
     render(<ControlDeck runtime={deck} />);
 

@@ -717,8 +717,12 @@ export interface DeckBridge {
    *
    * The replay matters: an agent can be constrained by another client long
    * before a tile here mounts, and the push that said so is not repeated.
+   *
+   * `deckId` is the deck the bridge was on when the geometry was applied (PRD
+   * #1105's security audit). Agent ids collide across decks, so a listener that
+   * caches by bare id applies one machine's grid to another's namesake.
    */
-  onTerminalGeometry(listener: (agentId: string, rows: number, cols: number) => void): () => void;
+  onTerminalGeometry(listener: (agentId: string, rows: number, cols: number, deckId?: string) => void): () => void;
   /**
    * Scale the whole window, terminals included (PRD #744).
    *
@@ -1220,7 +1224,7 @@ class FixtureDeckBridge implements DeckBridge {
       this.snapshot.agents = this.snapshot.agents.map((agent) => agent.id === action.agentId ? { ...agent, displayName: action.displayName } : agent);
     } else if (action.type === "submit_text") {
       this.snapshot.agents = this.snapshot.agents.map((agent) => agent.id === action.agentId ? { ...agent, transcript: `${agent.transcript}\r\n> ${action.text}\r\n` } : agent);
-      this.terminalListeners.forEach((listener) => listener({ agentId: action.agentId, data: new TextEncoder().encode(`\r\n> ${action.text}\r\n`), stream: "output", operation: "append" }));
+      this.terminalListeners.forEach((listener) => listener({ agentId: action.agentId, deckId: this.snapshot.connection.deckId, data: new TextEncoder().encode(`\r\n> ${action.text}\r\n`), stream: "output", operation: "append" }));
     } else if (action.type === "advance_fixture") {
       this.fixtureStep = (this.fixtureStep + 1) % 3;
       if (this.fixtureStep === 1) {
@@ -1241,8 +1245,13 @@ class FixtureDeckBridge implements DeckBridge {
     return { ok: true, sendResult: action.type === "submit_text" ? "applied" : undefined };
   }
 
+  /**
+   * The deck stamp is the selected deck's, for the same reason the live
+   * bridge's is (PRD #1105's security audit): the runtime keys its buffers by
+   * `(deckId, agentId)` and the fixture's own decks run colliding agent ids.
+   */
   async sendTerminalInput(agentId: string, data: string): Promise<void> {
-    this.terminalListeners.forEach((listener) => listener({ agentId, data: new TextEncoder().encode(data), stream: "output", operation: "append" }));
+    this.terminalListeners.forEach((listener) => listener({ agentId, deckId: this.snapshot.connection.deckId, data: new TextEncoder().encode(data), stream: "output", operation: "append" }));
     await Promise.resolve();
   }
 
@@ -1511,7 +1520,12 @@ export class TauriDeckBridge implements DeckBridge {
    * terminal on it here.
    */
   private appliedGeometry = new Map<string, { rows: number; cols: number }>();
-  private geometryListeners = new Set<(agentId: string, rows: number, cols: number) => void>();
+  /**
+   * Which deck {@link appliedGeometry} describes, or `undefined` before this
+   * bridge knows which deck it is on. See {@link adoptGeometryDeck}.
+   */
+  private geometryDeckId?: string;
+  private geometryListeners = new Set<(agentId: string, rows: number, cols: number, deckId?: string) => void>();
   private invoke?: typeof import("@tauri-apps/api/core")["invoke"];
   private lifecycle = 0;
   /**
@@ -1626,6 +1640,35 @@ export class TauriDeckBridge implements DeckBridge {
       this.handoffs = held?.handoffs ?? [];
     }
     this.evidenceDeckId = deckId;
+  }
+
+  /**
+   * Point {@link appliedGeometry} at `deckId`, emptying it when the deck moved
+   * (PRD #1105's security audit).
+   *
+   * That map is read at attach time — `attachAgents` declares
+   * `pendingResizes.get(id) ?? appliedGeometry.get(id)` as this client's
+   * viewport — and it is keyed by **bare** agent id, which collides across
+   * decks. Nothing evicted it on a selection change, so the first attach after
+   * a switch could submit the *previous* deck's cached grid for the new deck's
+   * same-id agent, before this app's own pane had measured anything. The
+   * daemon takes the smallest reported viewer, so that is not a display
+   * blemish: it transiently reflows the new agent's PTY and every other client
+   * watching it, from a viewport on another machine.
+   *
+   * Emptying rather than re-keying, because there is nothing worth carrying: a
+   * geometry is a fact about a live attach, every one of which
+   * `retarget_selection`'s `detach_all` has just torn down. The next attach
+   * answers with the new deck's own applied size.
+   *
+   * Adopt-on-first, like {@link adoptEvidenceDeck}: `undefined` means this
+   * bridge has not learnt a deck yet, and whatever accumulated before that
+   * belongs to the first deck selected rather than to no deck.
+   */
+  private adoptGeometryDeck(deckId: string): void {
+    if (this.geometryDeckId === deckId) return;
+    if (this.geometryDeckId !== undefined) this.appliedGeometry.clear();
+    this.geometryDeckId = deckId;
   }
 
   private recordDaemonEvent(payload: unknown): boolean {
@@ -1847,7 +1890,7 @@ export class TauriDeckBridge implements DeckBridge {
           } catch {
             // A tile mid-mount can reject a resize; the effect reconciles it.
           }
-          this.geometryListeners.forEach((listener) => listener(agentId, appliedRows, appliedCols));
+          this.geometryListeners.forEach((listener) => listener(agentId, appliedRows, appliedCols, this.selectedDeckId));
         }
         if (
           lifecycle !== this.lifecycle
@@ -1915,14 +1958,30 @@ export class TauriDeckBridge implements DeckBridge {
     this.deliverTerminal({ agentId, data, stream: "output", operation: "append", generation });
   }
 
+  /**
+   * Hand one chunk to the runtime, stamped with the deck that produced it.
+   *
+   * **The stamp is applied HERE, at the one funnel every chunk passes through**
+   * (PRD #1105's security audit). Agent ids are per-daemon monotonic, so a
+   * consumer keying buffers by bare id replays the previous deck's output under
+   * the next deck's namesake; the consumer cannot repair that after the fact,
+   * because by the time it reads the chunk the only deck it can name is the one
+   * selected now. `selectedDeckId` here is read off `fleet[0]` on every
+   * snapshot arrival, so it is the deck in force at the instant the bytes were
+   * delivered — which is what the stamp has to mean.
+   *
+   * A queued chunk is stamped at push time for exactly the same reason: it is
+   * drained after the listener installs, potentially after a switch.
+   */
   private deliverTerminal(event: TerminalChunk): void {
+    const stamped: TerminalChunk = { ...event, deckId: this.selectedDeckId };
     if (this.terminalListener) {
-      this.terminalListener(event);
+      this.terminalListener(stamped);
       return;
     }
-    const pending = this.pendingTerminal.get(event.agentId) ?? [];
-    pending.push(event);
-    this.pendingTerminal.set(event.agentId, pending);
+    const pending = this.pendingTerminal.get(stamped.agentId) ?? [];
+    pending.push(stamped);
+    this.pendingTerminal.set(stamped.agentId, pending);
   }
 
   private handleTerminalState(event: DesktopTerminalStateDto): void {
@@ -2124,6 +2183,7 @@ export class TauriDeckBridge implements DeckBridge {
     */
     this.selectedDeckId = dto.fleet?.[0] ?? dto.connection.deckId;
     this.adoptEvidenceDeck(this.selectedDeckId);
+    this.adoptGeometryDeck(this.selectedDeckId);
     const selected = dto.connection.deckId === this.selectedDeckId;
     const snapshot = mapDesktopSnapshot(
       dto,
@@ -2182,7 +2242,10 @@ export class TauriDeckBridge implements DeckBridge {
       switch to `build-box` mapped its first snapshot carrying every hook event
       recorded while local was selected.
     */
-    if (this.selectedDeckId !== undefined) this.adoptEvidenceDeck(this.selectedDeckId);
+    if (this.selectedDeckId !== undefined) {
+      this.adoptEvidenceDeck(this.selectedDeckId);
+      this.adoptGeometryDeck(this.selectedDeckId);
+    }
     /*
       The evidence ring and the handoff edges are the SELECTED deck's — the
       only deck whose events this bridge records at all, since the stamped
@@ -2299,7 +2362,7 @@ export class TauriDeckBridge implements DeckBridge {
       } catch {
         // A tile mid-mount can reject a resize; the effect reconciles it.
       }
-      this.geometryListeners.forEach((listener) => listener(event.payload.agentId, event.payload.rows, event.payload.cols));
+      this.geometryListeners.forEach((listener) => listener(event.payload.agentId, event.payload.rows, event.payload.cols, this.selectedDeckId));
     });
     return () => {
       stopSnapshot();
@@ -2432,12 +2495,13 @@ export class TauriDeckBridge implements DeckBridge {
     await invoke("desktop_terminal_write", { sessionId: session.sessionId, data: Array.from(new TextEncoder().encode(data)) });
   }
 
-  onTerminalGeometry(listener: (agentId: string, rows: number, cols: number) => void): () => void {
+  onTerminalGeometry(listener: (agentId: string, rows: number, cols: number, deckId?: string) => void): () => void {
     this.geometryListeners.add(listener);
     // Replay what is already known: an agent can have been constrained by
     // another client long before this tile mounted, and the push that said so
-    // is not repeated.
-    this.appliedGeometry.forEach((geometry, agentId) => listener(agentId, geometry.rows, geometry.cols));
+    // is not repeated. Everything in the map belongs to the deck the map is
+    // currently adopted to — `adoptGeometryDeck` empties it on a switch.
+    this.appliedGeometry.forEach((geometry, agentId) => listener(agentId, geometry.rows, geometry.cols, this.selectedDeckId));
     return () => {
       this.geometryListeners.delete(listener);
     };
@@ -2516,6 +2580,7 @@ export class TauriDeckBridge implements DeckBridge {
     // declare, which under a smallest-wins policy would shrink the agent to a
     // pane nobody is looking at any more.
     this.appliedGeometry.clear();
+    this.geometryDeckId = undefined;
     this.geometryListeners.clear();
     this.shown.clear();
     this.warm.clear();

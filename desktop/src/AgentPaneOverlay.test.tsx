@@ -182,6 +182,38 @@ describe("agent pane overlay", () => {
   });
 
   /**
+   * Scenario: open the Reader on Planner's tile, then open the pane on a
+   * DIFFERENT agent, and press `Escape` once. Planner's Reader is already gone
+   * by the time the key is pressed, so the one `Escape` reaches the pane and
+   * nothing else.
+   *
+   * The test above covers the same agent being enlarged, which the
+   * `presentation` prop settles on its own. This is the case it cannot see: the
+   * tiles the pane is drawn OVER stay at `presentation="tile"`, so a background
+   * Reader kept its own `window` `keydown` listener behind the scrim and both
+   * answered the same key — closing the pane and a Reader the user could not
+   * see, which falsified the "exactly one listener" claim in `DeckShell` and in
+   * `AgentTile`.
+   */
+  it("dismisses a Reader open on another tile when a pane opens over it", () => {
+    render(<DeckShell runtime={runtime()} />);
+    fireEvent.click(screen.getByTestId("reader-open-planner"));
+    expect(screen.getByTestId("reader-planner")).toBeVisible();
+
+    fireEvent.click(screen.getByRole("button", { name: "Open Builder agent" }));
+    expect(screen.getByTestId("agent-pane-overlay")).toBeVisible();
+    // The discriminating assertion: dismissed on OPEN, not left mounted for
+    // `Escape` to find.
+    expect(screen.queryByTestId("reader-planner")).not.toBeInTheDocument();
+
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(screen.queryByTestId("agent-pane-overlay")).not.toBeInTheDocument();
+    // And it does not come back, which would only move the collision one key
+    // press later.
+    expect(screen.queryByTestId("reader-planner")).not.toBeInTheDocument();
+  });
+
+  /**
    * Scenario: compare Planner's tab strip at tile size with the same strip
    * inside the pane. All five stay, because the tab set is a property of the
    * agent and `DeckSurface` owns the chosen tab keyed by agent id — a pane that

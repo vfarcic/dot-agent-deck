@@ -1,6 +1,7 @@
 import { act, renderHook, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { createFixtureSnapshot } from "../data/fixture";
+import { createFixtureSnapshot, FIXTURE_DAEMON_ID } from "../data/fixture";
+import { agentKey } from "../lib/agentKey";
 import type { DeckBridge } from "../lib/bridge";
 import { terminalInputState } from "../lib/terminalInput";
 import type { TerminalChunk } from "../types";
@@ -40,6 +41,14 @@ vi.mock("../lib/bridge", async (importOriginal) => ({
 }));
 
 import { useDeckRuntime } from "./useDeckRuntime";
+
+/**
+ * How the runtime's per-agent maps are addressed since PRD #1105's security
+ * audit: the COMPOSITE `(deckId, agentId)`, because agent ids are per-daemon
+ * monotonic and collide across decks. The fixture's deck is the one every
+ * record below is made against.
+ */
+const key = (agentId: string) => agentKey(FIXTURE_DAEMON_ID, agentId);
 
 describe("useDeckRuntime", () => {
   beforeEach(() => {
@@ -91,7 +100,7 @@ describe("useDeckRuntime", () => {
       await result.current.runAction({ type: "submit_text", agentId: "planner", text: "hello" });
     });
 
-    expect(result.current.terminalInputResults).toEqual({ planner: "wrong-session" });
+    expect(result.current.terminalInputResults).toEqual({ [key("planner")]: "wrong-session" });
   });
 
   /**
@@ -106,7 +115,7 @@ describe("useDeckRuntime", () => {
     await act(async () => {
       await result.current.runAction({ type: "submit_text", agentId: "planner", text: "hello" });
     });
-    expect(result.current.terminalInputResults).toEqual({ planner: "wrong-session" });
+    expect(result.current.terminalInputResults).toEqual({ [key("planner")]: "wrong-session" });
 
     bridge.runAction.mockResolvedValue({ ok: true, sendResult: "applied" });
     await act(async () => {
@@ -145,7 +154,7 @@ describe("useDeckRuntime", () => {
 
     // Ordinary output on the generation the verdict was recorded against.
     act(() => feedTerminal?.(chunk(1, "append")));
-    expect(result.current.terminalInputResults).toEqual({ planner: "wrong-session" });
+    expect(result.current.terminalInputResults).toEqual({ [key("planner")]: "wrong-session" });
 
     // The respawn: a fresh attach replays its scrollback as a `replace`.
     act(() => feedTerminal?.(chunk(2, "replace")));
@@ -177,7 +186,7 @@ describe("useDeckRuntime", () => {
     await act(async () => {
       await result.current.runAction({ type: "submit_text", agentId: "planner", text: "hello" });
     });
-    expect(result.current.terminalInputResults).toEqual({ planner: "wrong-session" });
+    expect(result.current.terminalInputResults).toEqual({ [key("planner")]: "wrong-session" });
 
     // The lease is back with this client and the pane is live — which is
     // exactly the state a rollover leaves behind, so the snapshot says
@@ -194,6 +203,6 @@ describe("useDeckRuntime", () => {
     // writable is no longer held disabled by the record.
     const planner = result.current.snapshot.agents.find((agent) => agent.id === "planner")!;
     expect(planner.writeLease).toBe("write");
-    expect(terminalInputState(planner, result.current.terminalInputResults?.[planner.id]).readOnly).toBe(false);
+    expect(terminalInputState(planner, result.current.terminalInputResults?.[key(planner.id)]).readOnly).toBe(false);
   });
 });

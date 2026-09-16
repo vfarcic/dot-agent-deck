@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createFixtureSnapshot } from "../data/fixture";
 import { createDeckBridge, selectRuntimeMode } from "../lib/bridge";
 import type { DesktopSettingsDto } from "../lib/bridge";
+import { agentKey } from "../lib/agentKey";
 import { applyTerminalChunk } from "../lib/terminalBuffer";
 const EMPTY_TERMINAL_DATA: Record<string, TerminalBuffer> = {};
 import { isDelivered } from "../types";
@@ -64,6 +65,17 @@ export function useDeckRuntime(): DeckRuntimeState {
   const [fleet, setFleet] = useState<DeckFleet>(() => [seedSnapshot(mode)]);
   const snapshot = fleet[0];
   /**
+   * The deck every per-agent map below is keyed against when the producer of a
+   * value could not name one itself.
+   *
+   * A ref rather than a dependency: `runAction`'s verdict and the geometry
+   * subscription are both callbacks that must not be rebuilt on every snapshot,
+   * and what they need is the deck in force at the instant they fire rather
+   * than the one that was in force when they were created.
+   */
+  const selectedDeckIdRef = useRef<string | undefined>(snapshot.connection.deckId);
+  selectedDeckIdRef.current = snapshot.connection.deckId;
+  /**
    * The latest reported failure, or nothing.
    *
    * PRD #742 M8 carried a `{ message, id }` here so `App` could suppress one
@@ -78,6 +90,13 @@ export function useDeckRuntime(): DeckRuntimeState {
   // through setState re-rendered the whole deck per chunk per agent — with six
   // streaming agents the main thread spent its time reconciling instead of
   // letting xterm scroll. Buffers live in a ref; terminals subscribe directly.
+  //
+  // Both are keyed by `agentKey(deckId, agentId)` since PRD #1105's security
+  // audit. Leaving a deck detaches its sessions but clears no buffer, so a
+  // bare-id map handed the next deck's same-id agent up to a megabyte of the
+  // previous deck's output — written straight into the new xterm by
+  // `TerminalViewport`'s `!previous` branch, under a correctly resolved
+  // heading, with the live transcript empty and nothing on screen saying so.
   const terminalBuffersRef = useRef<Record<string, TerminalBuffer>>({});
   const terminalListenersRef = useRef<Map<string, Set<(buffer: TerminalBuffer) => void>>>(new Map());
 
@@ -101,25 +120,26 @@ export function useDeckRuntime(): DeckRuntimeState {
    * client with no PTY respawn to trip the generation route below.
    */
   const [terminalInputResults, setTerminalInputResults] = useState<Record<string, SendResult>>({});
-  const noteTerminalInputResult = useCallback((agentId: string, verdict: SendResult | undefined) => {
+  const noteTerminalInputResult = useCallback((key: string, verdict: SendResult | undefined) => {
     setTerminalInputResults((current) => {
-      if (current[agentId] === verdict) return current;
+      if (current[key] === verdict) return current;
       if (verdict === undefined) {
-        if (!(agentId in current)) return current;
+        if (!(key in current)) return current;
         const next = { ...current };
-        delete next[agentId];
+        delete next[key];
         return next;
       }
-      return { ...current, [agentId]: verdict };
+      return { ...current, [key]: verdict };
     });
   }, []);
 
   const terminalFeed = useMemo(() => ({
-    get: (agentId: string) => terminalBuffersRef.current[agentId],
-    subscribe: (agentId: string, listener: (buffer: TerminalBuffer) => void) => {
-      const listeners = terminalListenersRef.current.get(agentId) ?? new Set();
+    get: (deckId: string | undefined, agentId: string) => terminalBuffersRef.current[agentKey(deckId, agentId)],
+    subscribe: (deckId: string | undefined, agentId: string, listener: (buffer: TerminalBuffer) => void) => {
+      const key = agentKey(deckId, agentId);
+      const listeners = terminalListenersRef.current.get(key) ?? new Set();
       listeners.add(listener);
-      terminalListenersRef.current.set(agentId, listeners);
+      terminalListenersRef.current.set(key, listeners);
       return () => { listeners.delete(listener); };
     },
   }), []);
@@ -130,10 +150,15 @@ export function useDeckRuntime(): DeckRuntimeState {
       : event.message
         ? new TextEncoder().encode(`\r\n[terminal] ${event.message}\r\n`)
         : event.data;
-    const current = terminalBuffersRef.current[event.agentId];
+    // The producer names the deck; a producer that cannot falls back to the one
+    // this runtime currently believes is selected, which is what a bare-id
+    // producer implicitly meant. Never the other way round — the bridge's own
+    // notion of the selection is a snapshot ahead of React's.
+    const key = agentKey(event.deckId ?? selectedDeckIdRef.current, event.agentId);
+    const current = terminalBuffersRef.current[key];
     const next = applyTerminalChunk(current, { ...event, data });
     if (next === current) return;
-    terminalBuffersRef.current[event.agentId] = next;
+    terminalBuffersRef.current[key] = next;
     // A new stream generation means the PTY was respawned, so any recorded
     // verdict describes a pane that no longer exists. Without this a
     // `wrong-session` would disable the input forever: the condition is only
@@ -145,8 +170,8 @@ export function useDeckRuntime(): DeckRuntimeState {
     // match the buffer's — returning the buffer unchanged — so that case exits
     // above and never reaches here, which is correct: a dropped chunk changed
     // no state to reconcile against.
-    if (current && next.generation !== current.generation) noteTerminalInputResult(event.agentId, undefined);
-    for (const listener of terminalListenersRef.current.get(event.agentId) ?? []) listener(next);
+    if (current && next.generation !== current.generation) noteTerminalInputResult(key, undefined);
+    for (const listener of terminalListenersRef.current.get(key) ?? []) listener(next);
   }, [noteTerminalInputResult]);
 
   /**
@@ -242,6 +267,7 @@ export function useDeckRuntime(): DeckRuntimeState {
 
   const runAction = useCallback(async (action: DeckAction) => {
     setError(undefined);
+    const sentToDeckId = selectedDeckIdRef.current;
     try {
       const result = await bridge.runAction(action);
       // The guarded verb reports a non-delivery as `ok: false` with a named
@@ -249,7 +275,11 @@ export function useDeckRuntime(): DeckRuntimeState {
       // cannot tell delivery from silent loss (`types.ts`). Recording it here is
       // what puts that verdict on the agent's terminal.
       if (action.type === "submit_text") {
-        noteTerminalInputResult(action.agentId, isDelivered(result) ? undefined : result.sendResult);
+        // The deck the action was SENT to, read before the await settles: every
+        // action this runtime dispatches goes to the selected deck, and a
+        // verdict about it must not be filed under whichever deck happens to be
+        // selected by the time the reply lands.
+        noteTerminalInputResult(agentKey(sentToDeckId, action.agentId), isDelivered(result) ? undefined : result.sendResult);
       }
       return result;
     } catch (cause) {
@@ -305,13 +335,19 @@ export function useDeckRuntime(): DeckRuntimeState {
   // bridge-wide subscription — and because a tile has to be able to read a
   // value that was pushed before it mounted (another client can constrain an
   // agent long before anyone opens a terminal on it here).
+  //
+  // Keyed by `agentKey(deckId, agentId)` since PRD #1105's security audit: no
+  // per-agent eviction removes an entry, so a bare-id map handed the pane for
+  // deck B's `planner` deck A's grid, and an attach that beat the pane's first
+  // fit submitted A's cached dimensions to B's PTY.
   const [appliedGeometry, setAppliedGeometry] = useState<Record<string, { rows: number; cols: number }>>({});
   useEffect(() => {
-    return bridge.onTerminalGeometry((agentId, rows, cols) => {
+    return bridge.onTerminalGeometry((agentId, rows, cols, deckId) => {
+      const key = agentKey(deckId ?? selectedDeckIdRef.current, agentId);
       setAppliedGeometry((current) => {
-        const existing = current[agentId];
+        const existing = current[key];
         if (existing && existing.rows === rows && existing.cols === cols) return current;
-        return { ...current, [agentId]: { rows, cols } };
+        return { ...current, [key]: { rows, cols } };
       });
     });
   }, [bridge]);

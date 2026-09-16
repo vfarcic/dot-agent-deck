@@ -7,6 +7,23 @@ import { registerRefit, registerTerminal, unregisterRefit, unregisterTerminal } 
 
 interface TerminalViewportProps {
   agentId: string;
+  /**
+   * PRD #1105's security audit — which deck's `agentId` this is.
+   *
+   * The feed below is addressed by the composite `(deckId, agentId)` because a
+   * bare agent id is not an identity: ids are per-daemon monotonic, and leaving
+   * a deck detaches its sessions without clearing its retained buffers. A
+   * viewport mounted for the next deck's namesake therefore read the previous
+   * deck's backlog and wrote it straight into the new xterm — up to the feed's
+   * 1 MiB retention of another machine's output, under a correctly resolved
+   * heading, and indefinitely where no replacement stream ever arrives.
+   *
+   * Supplied by `AgentTile` from `agent.daemonId`, so it is the deck of the
+   * agent being rendered rather than whichever deck happens to be selected.
+   * Optional only because a caller with no fleet at all (the standalone-render
+   * tests) has no deck to name; such a caller also supplies no feed.
+   */
+  deckId?: string;
   label: string;
   transcript: string;
   terminalFeed?: TerminalFeed;
@@ -53,6 +70,7 @@ interface TerminalViewportProps {
 
 export function TerminalViewport({
   agentId,
+  deckId,
   label,
   transcript,
   terminalFeed,
@@ -355,10 +373,10 @@ export function TerminalViewport({
       }
       lastStreamRef.current = buffer;
     };
-    const backlog = terminalFeed.get(agentId);
+    const backlog = terminalFeed.get(deckId, agentId);
     if (backlog) apply(backlog);
-    return terminalFeed.subscribe(agentId, apply);
-  }, [agentId, terminalFeed]);
+    return terminalFeed.subscribe(deckId, agentId, apply);
+  }, [agentId, deckId, terminalFeed]);
 
   return (
     <div

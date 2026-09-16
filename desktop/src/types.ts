@@ -757,6 +757,18 @@ export interface WorkflowLaunchConfig {
 
 export interface TerminalChunk {
   agentId: string;
+  /**
+   * PRD #1105 security audit — the deck whose daemon produced these bytes, as
+   * the bridge knew it at delivery time.
+   *
+   * Stamped by the producer rather than inferred by the consumer, because the
+   * bridge learns the selected deck off `DesktopSnapshotDto.fleet[0]`
+   * synchronously while React state is a commit behind it. Optional so a
+   * producer that cannot name a deck stays valid; the runtime then falls back
+   * to the deck it currently believes is selected, which is what a bare-id
+   * producer implicitly meant.
+   */
+  deckId?: string;
   data: Uint8Array;
   stream: "output" | "end" | "error";
   operation: "append" | "replace";
@@ -770,9 +782,18 @@ export interface TerminalBuffer {
   generation?: number;
 }
 
+/**
+ * The direct PTY-byte path, addressed by the COMPOSITE `(deckId, agentId)`.
+ *
+ * PRD #1105's security audit is why the deck travels here. Buffers used to be
+ * keyed by bare agent id, and nothing cleared them when the selected deck moved
+ * — so mounting a viewport for deck B's `planner` read deck A's retained
+ * buffer and wrote up to a megabyte of another machine's output into the new
+ * xterm, under B's correctly resolved heading. See {@link agentKey}.
+ */
 export interface TerminalFeed {
-  get(agentId: string): TerminalBuffer | undefined;
-  subscribe(agentId: string, listener: (buffer: TerminalBuffer) => void): () => void;
+  get(deckId: string | undefined, agentId: string): TerminalBuffer | undefined;
+  subscribe(deckId: string | undefined, agentId: string, listener: (buffer: TerminalBuffer) => void): () => void;
 }
 
 export interface DeckRuntimeState {
@@ -822,12 +843,24 @@ export interface DeckRuntimeState {
    *
    * Optional, and absence is a real state rather than an oversight: a runtime
    * through which nothing has ever been submitted has no verdicts to report.
+   *
+   * **Keyed by `agentKey(deckId, agentId)` since PRD #1105's security audit**,
+   * not by the bare id. A verdict recorded for deck A's `planner` would
+   * otherwise disable deck B's pane and render A's rejection notice under B's
+   * heading — the ids collide across decks by construction.
    */
   terminalInputResults?: Record<string, SendResult>;
   sendTerminalInput: (agentId: string, data: string) => Promise<void>;
   resizeTerminal: (agentId: string, cols: number, rows: number) => Promise<void>;
   /**
-   * PRD #882 — the geometry the daemon has APPLIED per agent, keyed by agent id.
+   * PRD #882 — the geometry the daemon has APPLIED per agent, keyed by
+   * `agentKey(deckId, agentId)`.
+   *
+   * **The deck is part of that key since PRD #1105's security audit.** Nothing
+   * evicts an entry per agent, so a pane opened for deck B's `planner` applied
+   * deck A's grid, and an attach that won the race against the pane's first fit
+   * submitted A's cached dimensions to B — transiently reflowing B's PTY, and
+   * every other viewer attached to it, from a viewport on another machine.
    *
    * A terminal must render at this, not at the size of its own tile: a PTY has
    * one window size, so the daemon sizes each agent to the smallest pane among

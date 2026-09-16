@@ -25,7 +25,16 @@
  * A transient navigation writing persistent configuration also means the
  * residue after an *unclean* exit is the selection the pane set. That is known,
  * accepted and documented; what is guaranteed is the clean round trip, which
- * restores the document byte for byte.
+ * restores the same selection and the same stored rows.
+ *
+ * **Not the same BYTES**, and the distinction is a user-visible one rather than
+ * a pedantic one (PRD #1105's security audit). `desktop_set_settings` re-reads
+ * the file into a `toml::Table` and rewrites it with `toml::to_string_pretty`,
+ * and a `Table` represents neither comments nor the original layout — so the
+ * first automatic cross-deck switch reformats a hand-written `desktop.toml`,
+ * and the write on the way back out goes down the same path and restores
+ * nothing. The round-trip test asserts the settings **DTO**, which is what the
+ * merge-protection obligation below actually needs.
  *
  * # Why the same-deck path reaches none of that
  *
