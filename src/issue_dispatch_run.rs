@@ -2755,9 +2755,16 @@ mod tests {
              this proves nothing about what happens to a slow one"
         );
 
-        // Well past the stand-in's own runtime: it either finished on its own or
-        // it was killed when we stopped waiting.
-        tokio::time::sleep(Duration::from_secs(5)).await;
+        // Wait for the stand-in to finish on its own. A killed one never writes
+        // the marker, so the deadline is the red path; it is a diagnostic bound,
+        // not a guess at how long ~2 s of stand-in takes on a loaded runner. A
+        // fixed 5 s sleep here read a merely slow stand-in as a killed one.
+        let _ = tokio::time::timeout(Duration::from_secs(30), async {
+            while !finished.is_file() {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await;
         assert!(
             finished.is_file(),
             "a devbox that outlives the bound must be left running — killing it \
