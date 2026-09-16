@@ -185,7 +185,11 @@ async fn close_pane_into_its_grace_window(
         let client = dot_agent_deck::daemon_client::DaemonClient::new(attach_path.to_path_buf());
         let closing_id = agent_id.to_string();
         let mut request = tokio::spawn(async move { client.stop_agent(&closing_id).await });
-        let budget = tokio::time::sleep(common::child_boot_budget());
+        // Captured, not re-read in the panic below: `child_boot_budget` samples
+        // the machine's load each call, so reporting a second sample would name
+        // a duration this attempt never actually waited.
+        let ceiling = common::child_boot_budget();
+        let budget = tokio::time::sleep(ceiling);
         tokio::pin!(budget);
         tokio::select! {
             // `biased` so a close that begins in the same instant the request
@@ -221,7 +225,7 @@ async fn close_pane_into_its_grace_window(
                      teardown that has not started instead of landing in #606's window; \
                      attempt {attempt} of {CLOSE_GRACE_ATTEMPTS}, earlier attempts = {attempts:?}, \
                      stand-in still live = {}, records = {:?}",
-                    common::child_boot_budget(),
+                    ceiling,
                     registry.agent_is_live(agent_id),
                     registry.agent_records()
                 );
