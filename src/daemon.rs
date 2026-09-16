@@ -2482,6 +2482,84 @@ async fn run_hook_loop_with_idle_timeout(
                             }
                         };
                         if let Ok(msg) = serde_json::from_str::<DaemonMessage>(&line) {
+                            // Issue #1077: ONE provenance gate for every verb on
+                            // this socket, ahead of the match rather than inside
+                            // each arm.
+                            //
+                            // Here rather than in the handlers, deliberately.
+                            // `handle_delegate` / `handle_work_done` and the
+                            // role verbs are also called directly — by the TUI,
+                            // and by the test harnesses that drive the routing
+                            // decision without a socket — and provenance is a
+                            // property of *how a message arrived*, not of the
+                            // routing it asks for. Gating at the boundary is
+                            // also what makes "every `DaemonMessage` is
+                            // attested" a statement about one function instead
+                            // of seven.
+                            //
+                            // Read `crate::hook_provenance` before changing any
+                            // of this, including the part that says plainly what
+                            // it does not defend against.
+                            let provenance = crate::hook_provenance::classify(
+                                msg.claimed_pane(),
+                                msg.presented_token(),
+                                &*pty_registry,
+                            );
+                            match crate::hook_provenance::admits(
+                                &provenance,
+                                crate::hook_provenance::policy(),
+                            ) {
+                                Err(refusal) => {
+                                    // The claimed pane id is logged and the
+                                    // token never is — logging a capability
+                                    // would put it in `deck.log`, which is
+                                    // world-of-the-same-uid readable and is
+                                    // exactly the surface this check exists to
+                                    // take the token off.
+                                    warn!(
+                                        verb = msg.verb(),
+                                        claimed_pane = %msg.claimed_pane(),
+                                        reason = refusal.code(),
+                                        "hook socket: refused a message whose hook \
+                                         capability token does not attest the pane it \
+                                         names; see docs/develop/hook-provenance.md"
+                                    );
+                                    if let Some(json) =
+                                        msg.provenance_refusal_reply(&refusal.caller_message())
+                                    {
+                                        let line = format!("{json}\n");
+                                        let _ = write_half.write_all(line.as_bytes()).await;
+                                        let _ = write_half.flush().await;
+                                    }
+                                    continue;
+                                }
+                                Ok(()) => {
+                                    if matches!(
+                                        provenance,
+                                        crate::hook_provenance::Provenance::Refused(
+                                            crate::hook_provenance::Refusal::Missing
+                                        )
+                                    ) {
+                                        // Only reachable under
+                                        // `DOT_AGENT_DECK_HOOK_PROVENANCE=warn`.
+                                        // Warned per message rather than once at
+                                        // startup: the operator needs to know
+                                        // WHICH pane is sending unattested, since
+                                        // the remedy is to update the
+                                        // `dot-agent-deck` binary that pane
+                                        // invokes.
+                                        warn!(
+                                            verb = msg.verb(),
+                                            claimed_pane = %msg.claimed_pane(),
+                                            "hook socket: acting on a message with no hook \
+                                             capability token because \
+                                             DOT_AGENT_DECK_HOOK_PROVENANCE=warn; this pane's \
+                                             dot-agent-deck binary is older than the daemon \
+                                             that spawned it"
+                                        );
+                                    }
+                                }
+                            }
                             match msg {
                                 DaemonMessage::Delegate(signal) => {
                                     info!(
@@ -4404,6 +4482,9 @@ mod hook_ingestion_tests {
                 ..SpawnOptions::default()
             })
             .expect("spawn shell agent");
+        let token_gs = registry
+            .hook_token_of(&agent_gs)
+            .expect("a spawned agent carries a hook capability token");
         registry.set_pending_seed(
             "pane-gs",
             "Acknowledge your role and wait for instructions.",
@@ -4433,10 +4514,17 @@ mod hook_ingestion_tests {
             sock: &std::path::Path,
             pane_id: &str,
             agent_id: Option<&str>,
+            token: &str,
         ) -> String {
             let req = crate::event::DaemonMessage::GetSeed(crate::event::GetSeedRequest {
                 pane_id: pane_id.to_string(),
                 agent_id: agent_id.map(|a| a.to_string()),
+                // Issue #1077: the pane's own hook capability token, which the
+                // real `get-seed` CLI reads out of `DOT_AGENT_DECK_HOOK_TOKEN`.
+                // Supplied on every arm below so each one still tests the
+                // identity question #916 is about rather than being refused one
+                // layer earlier for want of provenance.
+                token: Some(token.to_string()),
             });
             let line = format!("{}\n", serde_json::to_string(&req).unwrap());
             let mut stream = UnixStream::connect(sock).await.expect("connect");
@@ -4452,7 +4540,7 @@ mod hook_ingestion_tests {
         // is refused, and refused without consuming anything — the seed is still
         // there for its owner two blocks down. Asserted first for that reason:
         // after a successful pull there is nothing left to prove it did not eat.
-        let stranger = ask_get_seed_as(&sock, "pane-gs", Some("agent-999")).await;
+        let stranger = ask_get_seed_as(&sock, "pane-gs", Some("agent-999"), &token_gs).await;
         let stranger_resp: crate::event::GetSeedResponse =
             serde_json::from_str(stranger.trim()).expect("parse stranger get-seed reply");
         assert!(
@@ -4465,7 +4553,7 @@ mod hook_ingestion_tests {
         );
 
         // First pull: the daemon returns the seed…
-        let reply = ask_get_seed_as(&sock, "pane-gs", Some(&agent_gs)).await;
+        let reply = ask_get_seed_as(&sock, "pane-gs", Some(&agent_gs), &token_gs).await;
         let resp: crate::event::GetSeedResponse =
             serde_json::from_str(reply.trim()).expect("parse get-seed reply");
         assert_eq!(
@@ -4479,7 +4567,7 @@ mod hook_ingestion_tests {
         );
 
         // Second pull: nothing left — the seed was delivered exactly once.
-        let reply2 = ask_get_seed_as(&sock, "pane-gs", Some(&agent_gs)).await;
+        let reply2 = ask_get_seed_as(&sock, "pane-gs", Some(&agent_gs), &token_gs).await;
         let resp2: crate::event::GetSeedResponse =
             serde_json::from_str(reply2.trim()).expect("parse second get-seed reply");
         assert!(
@@ -4491,7 +4579,7 @@ mod hook_ingestion_tests {
         // agent id, and the take falls back to the pane's LIVE occupant rather
         // than refusing — the decision recorded on `take_pending_seed_native_for`.
         registry.set_pending_seed("pane-gs", "a second opening task");
-        let legacy = ask_get_seed_as(&sock, "pane-gs", None).await;
+        let legacy = ask_get_seed_as(&sock, "pane-gs", None, &token_gs).await;
         let legacy_resp: crate::event::GetSeedResponse =
             serde_json::from_str(legacy.trim()).expect("parse id-less get-seed reply");
         assert_eq!(
@@ -4501,11 +4589,18 @@ mod hook_ingestion_tests {
         );
 
         // Unknown pane → null, harmless, whether or not an id is presented.
-        let reply3 = ask_get_seed_as(&sock, "pane-unknown", None).await;
+        //
+        // Issue #1077 made these hold for a STRONGER reason than they used to:
+        // the token presented here was minted for `pane-gs`, so naming any other
+        // pane is refused at the boundary (`Refusal::WrongPane`) before the
+        // registry is consulted at all, and a refused `get-seed` answers exactly
+        // as "no seed pending" does. The assertions are unchanged because the
+        // observable answer is unchanged.
+        let reply3 = ask_get_seed_as(&sock, "pane-unknown", None, &token_gs).await;
         let resp3: crate::event::GetSeedResponse =
             serde_json::from_str(reply3.trim()).expect("parse unknown-pane get-seed reply");
         assert!(resp3.seed.is_none());
-        let reply4 = ask_get_seed_as(&sock, "pane-unknown", Some(&agent_gs)).await;
+        let reply4 = ask_get_seed_as(&sock, "pane-unknown", Some(&agent_gs), &token_gs).await;
         let resp4: crate::event::GetSeedResponse =
             serde_json::from_str(reply4.trim()).expect("parse cross-pane get-seed reply");
         assert!(
@@ -4516,6 +4611,264 @@ mod hook_ingestion_tests {
         handle.abort();
         let _ = handle.await;
         registry.shutdown_all();
+    }
+
+    // ---------------------------------------------------------------------
+    // Issue #1077: the hook-socket provenance gate, driven through the REAL
+    // `run_hook_loop` over a REAL socket against REAL spawned agents.
+    //
+    // These are the tests of the gate as it actually sits: the decision matrix
+    // itself is unit-tested in `crate::hook_provenance`, but only here is the
+    // wiring exercised — that the daemon reads the token off the message, looks
+    // it up in the live registry, refuses on the connection, and does not run
+    // the handler.
+    // ---------------------------------------------------------------------
+
+    /// One two-role orchestration behind a live hook loop: an orchestrator pane
+    /// and a worker pane, both `cat`, with the role maps the delegate path
+    /// routes on.
+    struct ProvenanceFixture {
+        _cwd: tempfile::TempDir,
+        _dir: tempfile::TempDir,
+        sock: std::path::PathBuf,
+        registry: Arc<AgentPtyRegistry>,
+        orchestrator_token: String,
+        worker_token: String,
+        worker_agent: String,
+        handle: tokio::task::JoinHandle<Result<(), DaemonError>>,
+    }
+
+    const PROV_ORCH_PANE: &str = "prov-orchestrator-pane";
+    const PROV_WORKER_PANE: &str = "prov-worker-pane";
+
+    impl ProvenanceFixture {
+        async fn start() -> Self {
+            use crate::state::OrchestrationIdentity;
+
+            let cwd = tempfile::tempdir().unwrap();
+            let cwd_str = cwd.path().to_string_lossy().into_owned();
+            let registry = Arc::new(AgentPtyRegistry::new());
+            let orchestrator_agent = registry
+                .spawn_agent(SpawnOptions {
+                    command: Some("cat"),
+                    cwd: Some(&cwd_str),
+                    env: vec![(
+                        DOT_AGENT_DECK_PANE_ID.to_string(),
+                        PROV_ORCH_PANE.to_string(),
+                    )],
+                    ..SpawnOptions::default()
+                })
+                .expect("spawn orchestrator stub");
+            let worker_agent = registry
+                .spawn_agent(SpawnOptions {
+                    command: Some("cat"),
+                    cwd: Some(&cwd_str),
+                    env: vec![(
+                        DOT_AGENT_DECK_PANE_ID.to_string(),
+                        PROV_WORKER_PANE.to_string(),
+                    )],
+                    ..SpawnOptions::default()
+                })
+                .expect("spawn worker stub");
+
+            let orchestration = OrchestrationIdentity::Instance {
+                id: "prov-instance".to_string(),
+                name: "prov-orchestration".to_string(),
+            };
+            let mut app = crate::state::AppState::default();
+            for (pane, role, is_orch) in [
+                (PROV_ORCH_PANE, "orchestrator", true),
+                (PROV_WORKER_PANE, "worker", false),
+            ] {
+                app.register_pane(pane.to_string());
+                app.pane_role_map.insert(pane.to_string(), role.to_string());
+                app.pane_orchestration_map
+                    .insert(pane.to_string(), orchestration.clone());
+                app.pane_cwd_map.insert(pane.to_string(), cwd_str.clone());
+                if is_orch {
+                    app.orchestrator_pane_ids.insert(pane.to_string());
+                }
+            }
+
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))
+                .expect("chmod tempdir");
+            let sock = dir.path().join("hook.sock");
+            let listener = IpcListener::from_tokio_listener(
+                UnixListener::bind(&sock).expect("bind hook socket"),
+            );
+            let state: SharedState = Arc::new(tokio::sync::RwLock::new(app));
+            let (event_tx, _rx) = broadcast::channel(EVENT_BROADCAST_CAPACITY);
+            let shutdown = Arc::new(Notify::new());
+            let handle = tokio::spawn({
+                let registry = registry.clone();
+                let wtr = crate::issue_dispatch_run::new_worktree_registry();
+                async move { run_hook_loop(listener, state, event_tx, registry, shutdown, wtr).await }
+            });
+
+            Self {
+                orchestrator_token: registry
+                    .hook_token_of(&orchestrator_agent)
+                    .expect("orchestrator token"),
+                worker_token: registry.hook_token_of(&worker_agent).expect("worker token"),
+                worker_agent,
+                registry,
+                sock,
+                _cwd: cwd,
+                _dir: dir,
+                handle,
+            }
+        }
+
+        /// Send one `delegate` line and read the daemon's reply.
+        async fn delegate(
+            &self,
+            claimed_pane: &str,
+            token: Option<&str>,
+        ) -> crate::event::DelegateResponse {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let msg = crate::event::DaemonMessage::Delegate(crate::event::DelegateSignal {
+                pane_id: claimed_pane.to_string(),
+                task: "PROVENANCE-TASK".to_string(),
+                to: vec!["worker".to_string()],
+                timestamp: chrono::Utc::now(),
+                token: token.map(str::to_string),
+            });
+            let line = format!("{}\n", serde_json::to_string(&msg).unwrap());
+            let mut stream = UnixStream::connect(&self.sock).await.expect("connect");
+            stream.write_all(line.as_bytes()).await.unwrap();
+            stream.flush().await.unwrap();
+            stream.shutdown().await.unwrap();
+            let mut buf = String::new();
+            stream.read_to_string(&mut buf).await.unwrap();
+            serde_json::from_str(buf.trim()).unwrap_or_else(|e| {
+                panic!("delegate reply was not a DelegateResponse ({e}): {buf:?}")
+            })
+        }
+
+        /// Whether the worker's PTY has seen the delegate pointer yet, polled
+        /// for `budget`. The pointer is what `handle_delegate` writes, so its
+        /// presence is proof the handler ran and its absence (after a wait) is
+        /// proof it did not.
+        async fn worker_saw_pointer(&self, budget: Duration) -> bool {
+            let deadline = tokio::time::Instant::now() + budget;
+            loop {
+                if let Ok(bytes) = self.registry.snapshot(&self.worker_agent)
+                    && String::from_utf8_lossy(&bytes).contains("worker-task-worker.md")
+                {
+                    return true;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    return false;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+
+        async fn stop(self) {
+            self.handle.abort();
+            let _ = self.handle.await;
+            self.registry.shutdown_all();
+        }
+    }
+
+    /// Scenario: run the real hook loop against two live orchestration panes and
+    /// send the orchestrator's `delegate` carrying the hook capability token the
+    /// daemon minted for that pane. The daemon must act on it exactly as before
+    /// — the worker role resolves and the task pointer reaches the worker's PTY
+    /// — because a gate that refuses legitimate traffic is worse than the bug it
+    /// closes.
+    #[tokio::test]
+    async fn hook_provenance_admits_a_delegate_carrying_its_own_pane_s_token() {
+        let fx = ProvenanceFixture::start().await;
+        let token = fx.orchestrator_token.clone();
+        let resp = fx.delegate(PROV_ORCH_PANE, Some(&token)).await;
+        assert_eq!(resp.error, None, "an attested delegate must not be refused");
+        assert_eq!(
+            resp.delivered,
+            vec!["worker".to_string()],
+            "the attested delegate must still route: {resp:?}"
+        );
+        assert!(
+            fx.worker_saw_pointer(Duration::from_secs(20)).await,
+            "the daemon never wrote the delegate pointer into the worker's PTY, so the gate \
+             let the message through but the delegation did not happen"
+        );
+        fx.stop().await;
+    }
+
+    /// Scenario: the same delegate, naming the same orchestrator pane, with no
+    /// token — the shape any process on this box could send after reading a pane
+    /// id off `daemon status`. The daemon must refuse it on the connection and
+    /// must not write anything into the worker's PTY.
+    #[tokio::test]
+    async fn hook_provenance_refuses_a_delegate_with_no_token() {
+        let fx = ProvenanceFixture::start().await;
+        let resp = fx.delegate(PROV_ORCH_PANE, None).await;
+        let err = resp
+            .error
+            .clone()
+            .expect("a refusal must be reported to the caller");
+        assert!(
+            err.contains("hook capability token"),
+            "the refusal must say why, so the one legitimate cause (an older CLI in the pane) \
+             is diagnosable: {err}"
+        );
+        assert!(
+            resp.delivered.is_empty(),
+            "a refused delegate must claim nothing was delivered: {resp:?}"
+        );
+        assert!(
+            !fx.worker_saw_pointer(Duration::from_secs(2)).await,
+            "the refused delegate still reached the worker's PTY — the gate ran but the \
+             handler ran too"
+        );
+        fx.stop().await;
+    }
+
+    /// Scenario: the forgery a token-holding sibling would actually attempt —
+    /// the WORKER's own, entirely valid token, presented alongside the
+    /// ORCHESTRATOR's pane id. This is the case a naive "does the message carry
+    /// a token we minted?" check would wave through, and it is why the daemon
+    /// resolves token → pane instead.
+    #[tokio::test]
+    async fn hook_provenance_refuses_a_sibling_s_valid_token_naming_another_pane() {
+        let fx = ProvenanceFixture::start().await;
+        let sibling = fx.worker_token.clone();
+        let resp = fx.delegate(PROV_ORCH_PANE, Some(&sibling)).await;
+        assert!(
+            resp.error.is_some(),
+            "a valid token must not authorise a pane it was not minted for: {resp:?}"
+        );
+        assert!(
+            !resp
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains(PROV_WORKER_PANE),
+            "the refusal must not tell the caller which pane the token belongs to"
+        );
+        assert!(
+            !fx.worker_saw_pointer(Duration::from_secs(2)).await,
+            "the cross-pane forgery reached the worker's PTY"
+        );
+        fx.stop().await;
+    }
+
+    /// Scenario: a well-formed token this daemon never minted — the shape an
+    /// agent that outlived the daemon which started it presents, and the shape a
+    /// guess presents. Refused, and refused without the worker's PTY seeing
+    /// anything.
+    #[tokio::test]
+    async fn hook_provenance_refuses_a_token_this_daemon_never_minted() {
+        let fx = ProvenanceFixture::start().await;
+        let resp = fx.delegate(PROV_ORCH_PANE, Some(&"ab".repeat(32))).await;
+        assert!(
+            resp.error.is_some(),
+            "a token from some other daemon must not attest anything here: {resp:?}"
+        );
+        assert!(!fx.worker_saw_pointer(Duration::from_secs(2)).await);
+        fx.stop().await;
     }
 
     /// Is `pid` gone? Mirrors `agent_pty::spawn_tests::pid_is_dead`, which is

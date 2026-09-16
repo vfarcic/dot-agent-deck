@@ -449,6 +449,7 @@ async fn run_slow_readiness_delegate(buffer_ms: u64) -> SlowReadinessResult {
         task: "List the files in the current directory.".to_string(),
         to: vec![WORKER_ROLE.to_string()],
         timestamp: chrono::Utc::now(),
+        token: None,
     };
     daemon
         .state
@@ -706,6 +707,7 @@ async fn delegate_injects_single_line_pointer_and_keeps_footer_in_task_file() {
         task: task.to_string(),
         to: vec![WORKER_ROLE.to_string()],
         timestamp: chrono::Utc::now(),
+        token: None,
     };
 
     // `handle_delegate` fans the dispatch out onto a `tokio::spawn`d task
@@ -835,6 +837,7 @@ async fn delegate_007_wrapper_fork_start_does_not_release_native_hook_agent_inne
         task: "List the files in the current directory.".to_string(),
         to: vec![WORKER_ROLE.to_string()],
         timestamp: chrono::Utc::now(),
+        token: None,
     };
     daemon
         .state
@@ -928,6 +931,7 @@ async fn delegate_008_hookless_wrapper_fork_start_still_releases_prompt_inner() 
         task: "List the files in the current directory.".to_string(),
         to: vec![WORKER_ROLE.to_string()],
         timestamp: chrono::Utc::now(),
+        token: None,
     };
     state.handle_delegate(signal, &registry, &event_tx).await;
     let new_agent_id = wait_for_replacement_agent(&registry, WORKER_PANE, &old_agent_id).await;
@@ -1006,6 +1010,7 @@ async fn delegate_010_observed_session_start_waits_for_readiness_buffer_inner() 
         task: "List the files in the current directory.".to_string(),
         to: vec![WORKER_ROLE.to_string()],
         timestamp: chrono::Utc::now(),
+        token: None,
     };
     daemon
         .state
@@ -1125,6 +1130,7 @@ async fn delegate_011_timeout_fallback_also_waits_for_readiness_buffer_inner() {
         task: "List the files in the current directory.".to_string(),
         to: vec![WORKER_ROLE.to_string()],
         timestamp: chrono::Utc::now(),
+        token: None,
     };
     state.handle_delegate(signal, &registry, &event_tx).await;
     let new_agent_id = wait_for_replacement_agent(&registry, WORKER_PANE, &old_agent_id).await;
@@ -1199,6 +1205,7 @@ async fn delegate_011_one_millisecond_buffer_is_a_real_wait_inner() {
                 task: "List the files in the current directory.".to_string(),
                 to: vec![WORKER_ROLE.to_string()],
                 timestamp: chrono::Utc::now(),
+                token: None,
             },
             &registry,
             &event_tx,
@@ -1263,6 +1270,7 @@ async fn delegate_011_overflow_buffer_clamps_to_thirty_seconds_inner() {
                 task: "List the files in the current directory.".to_string(),
                 to: vec![WORKER_ROLE.to_string()],
                 timestamp: chrono::Utc::now(),
+                token: None,
             },
             &registry,
             &event_tx,
@@ -1522,6 +1530,7 @@ async fn delegate_029_wrapped_worker_without_native_session_start_is_delivered_p
                 task: "List the files in the current directory.".to_string(),
                 to: vec![WORKER_ROLE.to_string()],
                 timestamp: chrono::Utc::now(),
+                token: None,
             },
             &daemon.registry,
             &daemon.event_tx,
@@ -1838,6 +1847,7 @@ async fn run_wrapped_interface_delegate(script: &str, banner: &str) -> WrappedIn
                 task: "List the files in the current directory.".to_string(),
                 to: vec![WORKER_ROLE.to_string()],
                 timestamp: chrono::Utc::now(),
+                token: None,
             },
             &daemon.registry,
             &daemon.event_tx,
@@ -2440,6 +2450,7 @@ async fn delegate_028_forged_interface_marker_is_priced_as_an_ordinary_fact_inne
                 task: "List the files in the current directory.".to_string(),
                 to: vec![WORKER_ROLE.to_string()],
                 timestamp: chrono::Utc::now(),
+                token: None,
             },
             &daemon.registry,
             &daemon.event_tx,
@@ -2648,6 +2659,7 @@ async fn delegate_030_agent_with_no_pre_prompt_signal_skips_the_dead_wait_inner(
                 task: "List the files in the current directory.".to_string(),
                 to: vec![WORKER_ROLE.to_string()],
                 timestamp: chrono::Utc::now(),
+                token: None,
             },
             &registry,
             &event_tx,
@@ -2974,6 +2986,7 @@ impl SilentWorkerArm {
                     task: "List the files in the current directory.".to_string(),
                     to: vec![WORKER_ROLE.to_string()],
                     timestamp: chrono::Utc::now(),
+                    token: None,
                 },
                 &self.registry,
                 &self.event_tx,
@@ -3199,7 +3212,7 @@ fn delegate_025_superseded_generation_is_silent_while_new_watch_stays_armed() {
                         task: "Generation A must remain silent.".to_string(),
                         to: vec![WORKER_ROLE.to_string()],
                         timestamp: chrono::Utc::now(),
-                    },
+                    token: None,},
                     &registry,
                     &event_tx,
                 )
@@ -3251,7 +3264,7 @@ fn delegate_025_superseded_generation_is_silent_while_new_watch_stays_armed() {
                         task: "Generation B must supersede A and remain silent.".to_string(),
                         to: vec![WORKER_ROLE.to_string()],
                         timestamp: chrono::Utc::now(),
-                    },
+                    token: None,},
                     &registry,
                     &event_tx,
                 )
@@ -3427,6 +3440,7 @@ impl SilenceHarness {
                     task: "Perform the delegated silence-watch task.".to_string(),
                     to: vec![WORKER_ROLE.to_string()],
                     timestamp: chrono::Utc::now(),
+                    token: None,
                 },
                 &self.registry,
                 &self.event_tx,
@@ -3468,6 +3482,7 @@ impl SilenceHarness {
                     task: "Perform the newer delegated silence-watch task.".to_string(),
                     to: vec![WORKER_ROLE.to_string()],
                     timestamp: chrono::Utc::now(),
+                    token: None,
                 },
                 &self.registry,
                 &self.event_tx,
@@ -3728,6 +3743,7 @@ fn delegate_021_work_done_releases_only_its_own_delivery_state() {
                             task: "Completed without hook activity.".to_string(),
                             done: false,
                             timestamp: chrono::Utc::now(),
+                            token: None,
                         },
                         &harness.registry,
                     )
@@ -3757,6 +3773,7 @@ fn delegate_021_work_done_releases_only_its_own_delivery_state() {
                         task: "The superseded task completed late.".to_string(),
                         done: false,
                         timestamp: chrono::Utc::now(),
+                        token: None,
                     },
                     &harness.registry,
                 )

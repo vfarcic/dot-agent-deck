@@ -10657,6 +10657,7 @@ mod tests {
                     task: "probe".to_string(),
                     to: to.iter().map(|s| s.to_string()).collect(),
                     timestamp: Utc::now(),
+                    token: None,
                 },
                 &registry,
                 &event_tx,

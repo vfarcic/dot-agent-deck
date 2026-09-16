@@ -1220,6 +1220,14 @@ pub fn spawn(opts: SpawnOptions<'_>) -> Result<AgentPty, AgentPtyError> {
     // unfiltered inherit would tag every spawned agent with the
     // parent deck's id and the hook script would misroute events.
     cmd.env_remove(DOT_AGENT_DECK_AGENT_ID);
+    // Issue #1077: same scrub-then-overlay rule for the hook capability token,
+    // and the failure mode of NOT scrubbing it is the sharpest on this list. A
+    // daemon launched from inside another deck's pane inherits that pane's
+    // token; every agent it spawned would then present a token minted for a
+    // pane in a DIFFERENT deck, and `spawn_agent`'s injection below is what
+    // makes the correct value win. The unpinned case goes from "presents a
+    // stranger's capability" to "presents this spawn's own".
+    cmd.env_remove(crate::hook_provenance::DOT_AGENT_DECK_HOOK_TOKEN);
     // PRD #93 tuning env var: same scrub rationale — a deck launched
     // with this set would otherwise leak it into every child it spawns,
     // where it's meaningless to the child's environment.
@@ -2248,6 +2256,24 @@ pub struct RunningAgent {
     /// without this capture the respawn ran with a leaner env than the
     /// original and silently dropped role-supplied vars.
     pub spawn_env: Vec<(String, String)>,
+    /// Issue #1077 — the per-spawn hook capability token injected into this
+    /// child's environment as
+    /// [`crate::hook_provenance::DOT_AGENT_DECK_HOOK_TOKEN`], and the only thing
+    /// that ties a hook-socket message to the pane it claims to come from.
+    ///
+    /// Held **here** and not on [`AgentRecord`], which is the projection clients
+    /// receive over the attach socket: a capability that appears in
+    /// `list-agents` is not a capability. It is also never logged. Together
+    /// those two are what make the token something an adversary has to read out
+    /// of the agent's process environment rather than off the daemon's own
+    /// status surface — the whole of the improvement, and its limit. See
+    /// [`crate::hook_provenance`].
+    ///
+    /// Re-minted on every spawn, including a respawn, so a token names exactly
+    /// one generation of one pane. `spawn_env` carries the previous
+    /// generation's value and the respawn strips it, the same way it strips
+    /// [`DOT_AGENT_DECK_AGENT_ID`].
+    pub hook_token: String,
     /// Last-known PTY size (rows, cols), captured at spawn and
     /// refreshed by [`AgentPtyRegistry::resize`]. Replayed on respawn
     /// so the fresh PTY comes up at the same geometry instead of the
@@ -2484,6 +2510,16 @@ pub struct ShellActivityCandidate {
     /// Empty for every kind that has never been measured, which leaves the
     /// structural session-id test standing alone.
     pub shapes: Vec<crate::platform::proc::ShellToolShape>,
+}
+
+impl crate::hook_provenance::HookTokenDirectory for AgentPtyRegistry {
+    fn owner_of_hook_token(&self, token: &str) -> Option<crate::hook_provenance::TokenOwner> {
+        AgentPtyRegistry::owner_of_hook_token(self, token)
+    }
+
+    fn pane_was_issued_a_hook_token(&self, pane_id: &str) -> bool {
+        AgentPtyRegistry::pane_was_issued_a_hook_token(self, pane_id)
+    }
 }
 
 /// Snapshot of one daemon-side agent that the M2.x rehydration path needs.
@@ -3723,6 +3759,26 @@ struct RegistryInner {
     /// never silently overwrite somebody else's constraint.
     next_viewer_id: u64,
     agents: HashMap<String, RunningAgent>,
+    /// Issue #1077 — every pane id this daemon has ever issued a hook capability
+    /// token for, kept for the life of the daemon and deliberately NOT derived
+    /// from `agents`.
+    ///
+    /// This is what [`AgentPtyRegistry::pane_was_issued_a_hook_token`] reads,
+    /// and the reason it is a separate set is a window, not tidiness. A record's
+    /// lifetime is not the pane's: `respawn_agent_for_pane` REMOVES the old
+    /// record before `spawn_agent` inserts the new one, and a `clear = true` role
+    /// respawns on every delegation, so that window recurs. A lookup derived
+    /// from `agents` answers "never issued" for the whole of it while the
+    /// daemon's role maps — which survive the respawn — still grant the pane its
+    /// authority, so a token-less forgery landing in the window would read as
+    /// `Unattested` and be admitted. Recording the pane at the moment its token
+    /// is minted closes that for every removal path at once, including ones
+    /// added later.
+    ///
+    /// Never pruned. It grows by one entry per distinct pane id a daemon spawns,
+    /// which is bounded by the panes a person or a schedule actually opens, and
+    /// pruning it is exactly the operation that would re-open the window.
+    hook_token_panes: HashSet<String>,
     /// Issue #454: spawns that have been ADMITTED but whose `RunningAgent` is
     /// not in `agents` yet — keyed by the pre-allocated agent id, valued by the
     /// spawn's validated `pane_id_env` (`None` for a paneless agent).
@@ -4035,6 +4091,7 @@ impl AgentPtyRegistry {
                 next_id: 1,
                 next_viewer_id: 1,
                 agents: HashMap::new(),
+                hook_token_panes: HashSet::new(),
                 pending_spawns: HashMap::new(),
                 cleanup_holds: HashSet::new(),
                 exit_waiters: HashMap::new(),
@@ -5878,6 +5935,16 @@ impl AgentPtyRegistry {
             let id = inner.next_id.to_string();
             inner.next_id += 1;
             inner.pending_spawns.insert(id.clone(), pane_id_env.clone());
+            // Issue #1077: from this instant the pane requires a token, and it
+            // keeps requiring one for the life of the daemon — see
+            // `RegistryInner::hook_token_panes`. Recorded under the SAME lock
+            // that reserves the pane, before the fork, so there is no moment at
+            // which a child could exist for this pane without the requirement.
+            // A spawn that then fails leaves the entry behind; that is harmless,
+            // because nothing legitimate signals for a pane with no process.
+            if let Some(ref pane) = pane_id_env {
+                inner.hook_token_panes.insert(pane.clone());
+            }
             id
         };
         let reservation = SpawnReservation {
@@ -5887,6 +5954,27 @@ impl AgentPtyRegistry {
         opts.env.retain(|(k, _)| k != DOT_AGENT_DECK_AGENT_ID);
         opts.env
             .push((DOT_AGENT_DECK_AGENT_ID.to_string(), preallocated_id.clone()));
+
+        // Issue #1077: mint this spawn's hook capability token in the same
+        // breath as its agent id, and for the same reason — the child's
+        // environment is the only channel the daemon has to the CLI the agent
+        // will invoke, so the value has to exist before the fork.
+        //
+        // A caller-supplied value is STRIPPED, not honoured. That is the
+        // opposite of `DOT_AGENT_DECK_SOCKET`, where a caller's value wins and
+        // the injection only fills the gap, and the asymmetry is deliberate:
+        // two records carrying one token would make `owner_of_hook_token`'s
+        // token -> pane resolution ambiguous, and an ambiguous capability
+        // resolves to whichever record a scan reached first. `respawn_agent_for_pane`
+        // replays the old generation's `spawn_env`, so without the strip a
+        // respawned pane would keep answering to its predecessor's token.
+        opts.env
+            .retain(|(k, _)| k != crate::hook_provenance::DOT_AGENT_DECK_HOOK_TOKEN);
+        let hook_token_for_record = crate::hook_provenance::mint();
+        opts.env.push((
+            crate::hook_provenance::DOT_AGENT_DECK_HOOK_TOKEN.to_string(),
+            hook_token_for_record.clone(),
+        ));
 
         // Capture the full env vec and the requested PTY size BEFORE
         // `spawn(opts)` consumes the options. Stored on `RunningAgent`
@@ -6096,6 +6184,7 @@ impl AgentPtyRegistry {
             agent_type,
             spawn_agent_type,
             spawn_env: captured_env,
+            hook_token: hook_token_for_record,
             pty_rows: captured_rows,
             pty_cols: captured_cols,
             // PRD #882: a fresh agent has no registered viewers. Its spawn-time
@@ -7099,6 +7188,13 @@ impl AgentPtyRegistry {
             agent_type: observed_agent_type,
             spawn_agent_type,
             spawn_env,
+            // Issue #1077: the OLD generation's hook capability token is
+            // deliberately dropped, not carried over. A token names one spawn,
+            // and `spawn_agent` mints the fresh child its own — which is what
+            // makes a respawned pane stop answering to the token the previous
+            // occupant's environment still holds. `spawn_env` below carries that
+            // stale value and the injection strips it there for the same reason.
+            hook_token: _,
             pty_rows,
             pty_cols,
             // PRD #882: the old record's viewers are deliberately NOT carried
@@ -8428,6 +8524,12 @@ impl AgentPtyRegistry {
                 agent_type: None,
                 spawn_agent_type: None,
                 spawn_env: Vec::new(),
+                // A synthetic agent holds no pane (`pane_id_env: None`), so its
+                // token can never attest a pane claim — but it still gets a real
+                // one rather than a placeholder, so that "every record carries a
+                // distinct minted token" holds for every record in the map and
+                // `owner_of_hook_token` has no special case to get wrong.
+                hook_token: crate::hook_provenance::mint(),
                 pty_rows: 24,
                 pty_cols: 80,
                 exited: Arc::new(AtomicBool::new(false)),
@@ -8685,6 +8787,70 @@ impl AgentPtyRegistry {
         let seed = agent.pending_seed.take()?;
         agent.seed_delivered_native = true;
         Some(seed)
+    }
+
+    /// Issue #1077: the record a hook capability token was minted for, or `None`
+    /// when this daemon did not mint it.
+    ///
+    /// A linear scan under one lock, comparing without an early return
+    /// ([`crate::hook_provenance::tokens_match`]). Linear because the map is
+    /// keyed by agent id and a token index would be a second thing to keep
+    /// consistent across insert, respawn and removal for a set that is a handful
+    /// of entries; a per-message scan of it is not measurable next to the PTY
+    /// write the message is about to cause.
+    ///
+    /// **Exited records are included.** An agent that has detached from the PTY
+    /// it was born under outlives its record's live flag and can still signal —
+    /// see `CLAUDE.md` rule 15 — and refusing it because of that flag would turn
+    /// a survivor into a forger. Liveness is not what the check rests on: the
+    /// token names exactly one spawn whether or not that spawn's child is still
+    /// running.
+    pub fn owner_of_hook_token(&self, token: &str) -> Option<crate::hook_provenance::TokenOwner> {
+        let inner = self.inner.lock().unwrap();
+        inner
+            .agents
+            .iter()
+            .find(|(_, agent)| crate::hook_provenance::tokens_match(&agent.hook_token, token))
+            .map(|(id, agent)| crate::hook_provenance::TokenOwner {
+                agent_id: id.clone(),
+                pane_id: agent.pane_id_env.clone(),
+            })
+    }
+
+    /// Test probe for one record's hook capability token.
+    ///
+    /// `#[cfg(test)]` on purpose, and that gate is load-bearing rather than
+    /// tidiness: a capability that any in-process caller can read back is one
+    /// more surface it can leak from, and keeping the reader out of a non-test
+    /// build is what makes "the token is readable from the agent's own
+    /// environment and nowhere else this daemon offers" true by construction
+    /// instead of by review. Tests need it because the in-crate hook-loop tests
+    /// have to send an ATTESTED message, which is exactly what a real CLI does
+    /// with the value out of its own environment.
+    #[cfg(test)]
+    pub fn hook_token_of(&self, agent_id: &str) -> Option<String> {
+        self.inner
+            .lock()
+            .unwrap()
+            .agents
+            .get(agent_id)
+            .map(|a| a.hook_token.clone())
+    }
+
+    /// Issue #1077: whether this daemon has EVER issued a hook capability token
+    /// for `pane_id` — which is what separates a message that omitted its token
+    /// from one about a pane this daemon never spawned.
+    ///
+    /// Read from `RegistryInner::hook_token_panes`, not from the live records,
+    /// and the difference is load-bearing: a pane can be momentarily without
+    /// any record (a respawn removes the old one before inserting the new) while
+    /// the daemon's role maps still grant it authority. See that field.
+    pub fn pane_was_issued_a_hook_token(&self, pane_id: &str) -> bool {
+        self.inner
+            .lock()
+            .unwrap()
+            .hook_token_panes
+            .contains(pane_id)
     }
 
     /// Test probe for the NATIVE pull, ignoring identity AND liveness: takes
@@ -15267,6 +15433,241 @@ mod spawn_tests {
         // successor's seed was demonstrably in the store, asserted two lines up.
         // `prompt/pane-input/035` probes natively instead, and can, because its
         // hand-over goes through `close_agent` and leaves exactly one record.
+
+        registry.shutdown_all();
+    }
+
+    // ---------------------------------------------------------------------
+    // Issue #1077: the per-spawn hook capability token.
+    // ---------------------------------------------------------------------
+
+    /// Every spawn gets a token, the token resolves back to that spawn's own
+    /// pane, and the value the daemon kept is the same one it put in the child's
+    /// environment — which is the whole chain the CLI relies on.
+    #[test]
+    fn spawn_mints_a_hook_token_and_injects_the_same_value_into_the_child() {
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let id = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("cat"),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), "prov-pane".to_string())],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn");
+
+        let token = registry.hook_token_of(&id).expect("record carries a token");
+        assert!(
+            crate::hook_provenance::is_well_formed(&token),
+            "a minted token must be the shape the gate accepts: {token:?}"
+        );
+
+        // The child's environment is the only channel to the CLI, so a token the
+        // daemon kept but did not export would refuse every legitimate message.
+        let exported = {
+            let inner = registry.inner.lock().unwrap();
+            inner.agents[&id]
+                .spawn_env
+                .iter()
+                .find(|(k, _)| k == crate::hook_provenance::DOT_AGENT_DECK_HOOK_TOKEN)
+                .map(|(_, v)| v.clone())
+        };
+        assert_eq!(
+            exported.as_deref(),
+            Some(token.as_str()),
+            "the child must be given exactly the token the daemon will check against"
+        );
+
+        assert_eq!(
+            registry
+                .owner_of_hook_token(&token)
+                .expect("the token resolves"),
+            crate::hook_provenance::TokenOwner {
+                agent_id: id.clone(),
+                pane_id: Some("prov-pane".to_string()),
+            }
+        );
+        assert!(registry.pane_was_issued_a_hook_token("prov-pane"));
+        assert!(!registry.pane_was_issued_a_hook_token("some-other-pane"));
+
+        registry.shutdown_all();
+    }
+
+    /// A caller-supplied token is stripped rather than honoured. Two records
+    /// carrying one token would make the token → pane resolution answer whichever
+    /// record a scan reached first, which is precisely the ambiguity the gate
+    /// cannot tolerate.
+    #[test]
+    fn a_caller_supplied_hook_token_is_replaced_by_the_minted_one() {
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let planted = "de".repeat(32);
+        let id = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("cat"),
+                env: vec![
+                    (DOT_AGENT_DECK_PANE_ID.to_string(), "plant-pane".to_string()),
+                    (
+                        crate::hook_provenance::DOT_AGENT_DECK_HOOK_TOKEN.to_string(),
+                        planted.clone(),
+                    ),
+                ],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn");
+
+        assert_ne!(
+            registry.hook_token_of(&id).as_deref(),
+            Some(planted.as_str()),
+            "a spawn must not adopt a token its caller chose"
+        );
+        assert!(
+            registry.owner_of_hook_token(&planted).is_none(),
+            "the planted value must attest nothing"
+        );
+        let exported: Vec<String> = {
+            let inner = registry.inner.lock().unwrap();
+            inner.agents[&id]
+                .spawn_env
+                .iter()
+                .filter(|(k, _)| k == crate::hook_provenance::DOT_AGENT_DECK_HOOK_TOKEN)
+                .map(|(_, v)| v.clone())
+                .collect()
+        };
+        assert_eq!(
+            exported.len(),
+            1,
+            "exactly one token must reach the child, or the last one wins by accident: {exported:?}"
+        );
+
+        registry.shutdown_all();
+    }
+
+    /// A respawn is a new generation, so it gets a new token and the previous
+    /// one stops attesting anything. Without this, an environment held by a
+    /// departed occupant would keep authorising messages about a pane it no
+    /// longer occupies — the stale-generation class #617 and #916 each had to
+    /// close on their own paths.
+    #[tokio::test]
+    async fn a_respawn_mints_a_fresh_token_and_retires_the_old_one() {
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let first = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("cat"),
+                env: vec![(
+                    DOT_AGENT_DECK_PANE_ID.to_string(),
+                    "respawn-pane".to_string(),
+                )],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn");
+        let old_token = registry.hook_token_of(&first).expect("first token");
+
+        let second = registry
+            .respawn_agent_for_pane("respawn-pane", "cat")
+            .await
+            .expect("respawn");
+        let new_token = registry.hook_token_of(&second).expect("second token");
+
+        assert_ne!(old_token, new_token, "a respawn must re-mint");
+        assert!(
+            registry.owner_of_hook_token(&old_token).is_none(),
+            "the departed generation's token must attest nothing once its record is gone"
+        );
+        assert_eq!(
+            registry
+                .owner_of_hook_token(&new_token)
+                .and_then(|o| o.pane_id),
+            Some("respawn-pane".to_string())
+        );
+        // The replayed `spawn_env` carries the OLD value, and the injection has
+        // to win over it — otherwise the fresh child would present a token the
+        // daemon has just retired.
+        let exported = {
+            let inner = registry.inner.lock().unwrap();
+            inner.agents[&second]
+                .spawn_env
+                .iter()
+                .filter(|(k, _)| k == crate::hook_provenance::DOT_AGENT_DECK_HOOK_TOKEN)
+                .map(|(_, v)| v.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(exported, vec![new_token]);
+
+        registry.shutdown_all();
+    }
+
+    /// The token must not travel to any client. `AgentRecord` is what
+    /// `list_agents` hands over the attach socket, and a capability that appears
+    /// there is not a capability — an agent that can reach the attach socket
+    /// would simply read every pane's token off it.
+    #[test]
+    fn the_wire_projection_of_a_record_carries_no_hook_token() {
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let id = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("cat"),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), "wire-pane".to_string())],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn");
+        let token = registry.hook_token_of(&id).expect("token");
+
+        let json = serde_json::to_string(&registry.agent_records()).expect("serialize records");
+        assert!(
+            !json.contains(&token),
+            "the token reached the attach-socket projection: {json}"
+        );
+        assert!(
+            !json.contains("hook_token"),
+            "no key resembling the token may appear on the wire: {json}"
+        );
+
+        registry.shutdown_all();
+    }
+
+    /// The token requirement belongs to the PANE and outlives any one record.
+    ///
+    /// A respawn removes the old record before inserting the new one, and the
+    /// daemon's role maps survive it, so for that window the pane still carries
+    /// delegate authority with no record behind it. If "was this pane issued a
+    /// token" were answered from the live records it would say no, the gate would
+    /// classify a token-less forgery as `Unattested`, and admit it. `close_agent`
+    /// is used here because it removes the record outright and deterministically,
+    /// which is the property under test, rather than racing a respawn for its
+    /// window.
+    #[test]
+    fn a_pane_keeps_requiring_a_token_after_its_record_is_gone() {
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let id = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("cat"),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), "gone-pane".to_string())],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn");
+        let token = registry.hook_token_of(&id).expect("token");
+
+        registry.close_agent(&id).expect("close");
+        assert!(
+            registry.agent_records().iter().all(|r| r.id != id),
+            "precondition: the record must really be gone, or this proves nothing"
+        );
+
+        assert!(
+            registry.pane_was_issued_a_hook_token("gone-pane"),
+            "a pane with no record at this instant must still require a token, or a forgery \
+             landing in a respawn window is admitted as unattested"
+        );
+        assert_eq!(
+            crate::hook_provenance::classify("gone-pane", None, &*registry),
+            crate::hook_provenance::Provenance::Refused(crate::hook_provenance::Refusal::Missing),
+        );
+        // And the departed record's own token no longer attests anything.
+        assert_eq!(
+            crate::hook_provenance::classify("gone-pane", Some(&token), &*registry),
+            crate::hook_provenance::Provenance::Refused(
+                crate::hook_provenance::Refusal::UnknownToken
+            ),
+        );
 
         registry.shutdown_all();
     }

@@ -433,6 +433,7 @@ fn dispatch_return_001_orchestration_completion_reaches_the_caller() {
     let scratch = common::race_safe_tempdir();
     let (config, log) = write_submit_probe(scratch.path());
     let deck = TuiDeck::builder()
+        .impersonating_pane_signals()
         .with_pty_size(200, 50)
         .with_env("PATH", path_with_binary_dir())
         .with_env("DOT_AGENT_DECK_CONFIG", config.to_string_lossy())
@@ -476,6 +477,7 @@ fn dispatch_return_002_callback_survives_caller_detach_and_reattach() {
     let scratch = common::race_safe_tempdir();
     let (config, log) = write_submit_probe(scratch.path());
     let deck = TuiDeck::builder()
+        .impersonating_pane_signals()
         .with_pty_size(200, 50)
         .with_env("PATH", path_with_binary_dir())
         .with_env("DOT_AGENT_DECK_CONFIG", config.to_string_lossy())
@@ -550,6 +552,7 @@ fn dispatch_return_003_single_completion_routes_while_unknown_pane_stays_inert()
     let scratch = common::race_safe_tempdir();
     let (config, log) = write_submit_probe(scratch.path());
     let deck = TuiDeck::builder()
+        .impersonating_pane_signals()
         .with_pty_size(200, 50)
         .with_env("PATH", path_with_binary_dir())
         .with_env("DOT_AGENT_DECK_CONFIG", config.to_string_lossy())

@@ -113,6 +113,7 @@ fn run_delegate_cli(
 #[test]
 fn restart_009_restarted_pane_stays_reachable_in_an_already_attached_tui() {
     let deck = TuiDeck::builder()
+        .impersonating_pane_signals()
         .with_pty_size(120, 40)
         .launch_with_fixture("pane-restart-live");
     deck.wait_for_string("No active sessions");
