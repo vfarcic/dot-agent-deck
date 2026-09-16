@@ -2286,16 +2286,30 @@ mod tests {
         );
 
         let _ = release.send(());
-        // Bounded rather than a bare loop: the task is finished the moment the
-        // runtime has polled it after the send, and a run that never gets there
-        // should fail rather than hang.
+        // Bounded by WALL-CLOCK TIME, not by iteration count (issue #1102).
+        //
+        // `ending` was spawned on `tauri::async_runtime`, which is not the
+        // runtime this `#[tokio::test]` is driving — so what this loop is
+        // waiting for is another runtime's worker being SCHEDULED BY THE OS,
+        // not more polls of its own. The previous bound was 1000 ×
+        // `yield_now()`, which on a current-thread runtime with nothing else
+        // queued returns immediately: the whole budget could be spent in
+        // roughly 4ms without the other runtime's thread having run at all.
+        // That is why this failed only on `build-windows`, and only sometimes
+        // — a loaded runner is exactly where a thread waits longest, and the
+        // budget did not grow to match.
+        //
+        // `sleep` rather than `yield_now` for the same reason: it parks this
+        // thread, which is what lets the other one be scheduled. Five seconds
+        // is far past any real hand-off and still fails rather than hangs.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         let mut reclaimed = None;
-        for _ in 0..1_000 {
+        while std::time::Instant::now() < deadline {
             if let Some(token) = state.start_watcher_once_for(&deck) {
                 reclaimed = Some(token);
                 break;
             }
-            tokio::task::yield_now().await;
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
 
         let second =
