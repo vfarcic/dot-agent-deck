@@ -5888,6 +5888,37 @@ mod tests {
         use crate::agent_pty::{AgentPtyRegistry, AgentRecord, SpawnOptions};
         use portable_pty::{CommandBuilder, PtySize, PtySystem};
 
+        // Issue #959: this test was killed once by nextest's default 3 x 60s
+        // window on `build-macos`, at `time="180.616"`, against 0.194s for the
+        // same test on the same runner image in the same run's passing
+        // re-attempt — 931x. WHERE it stalled is unknown, because the test
+        // printed nothing and a kill leaves no assertion behind: nextest's JUnit
+        // records a timeout as `<failure type="test timeout"/>` with no message
+        // of its own, so the artifact from that attempt says only that 180.6
+        // seconds went somewhere.
+        //
+        // These markers are the instrument. nextest stores a FAILED or
+        // TIMED-OUT test's stdout and stderr and drops a passing one's
+        // (`store-success-output` is at its default of false — see
+        // `.config/nextest.toml`), so they cost nothing on the green path and
+        // name the last phase entered on the red one, in the JUnit artifact CI
+        // uploads per attempt as well as in the terminal.
+        //
+        // One marker per UNBOUNDED wait, which is what each phase below
+        // contains. `spawn_agent` blocks inside `Command::spawn` until the
+        // forked child clears portable-pty's `pre_exec` hook, with no timeout
+        // anywhere on that path — measured directly: a `pre_exec` that sleeps
+        // 3000 ms makes the parent's `spawn()` return in 3000.8 ms, and a hook
+        // that never returns is never given up on. `shutdown_all` polls
+        // `try_wait` in a loop that has no deadline either. Which one ran long
+        // is the difference between a dependency's problem and ours, and no
+        // carve-out in `.config/nextest.toml` can answer it (see the #959
+        // tombstone there for why there is deliberately none).
+        let started = std::time::Instant::now();
+        let phase = |name: &str| {
+            eprintln!("live_014 phase: {name} (t+{:?})", started.elapsed());
+        };
+
         // (a) RECORDED, and recorded as an OBSERVATION of our own fork.
         //
         // This is the property that made a duration shippable where the PRD had
@@ -5898,6 +5929,7 @@ mod tests {
         // A spawn is something the daemon DID, so it needs no signal and no
         // inference. Bracketing the spawn is what would fail if anyone ever
         // "helpfully" stamped this at snapshot time instead.
+        phase("spawn_agent");
         let before = chrono::Utc::now().timestamp_millis();
         let registry = Arc::new(AgentPtyRegistry::new());
         let id = registry
@@ -5935,12 +5967,14 @@ mod tests {
         let json = serde_json::to_string(rec).expect("AgentRecord serializes");
         let back: AgentRecord = serde_json::from_str(&json).expect("deserializes");
         assert_eq!(back.spawned_at_ms, Some(spawned_at_ms));
+        phase("shutdown_all (spawned agent)");
         registry.shutdown_all();
 
         // (b) ABSENT when this registry did not do the spawning, and omitted
         // from the wire entirely rather than sent as a null. There is no
         // `Utc::now()` fallback anywhere on this path — an invented value is
         // exactly the failure the PRD's original duration rejection was about.
+        phase("openpty + spawn_command (adopted child)");
         let adopted = Arc::new(AgentPtyRegistry::new());
         let pair = portable_pty::NativePtySystem::default()
             .openpty(PtySize {
@@ -5970,6 +6004,7 @@ mod tests {
             value.get("spawned_at_ms").is_none(),
             "an absent spawn time must have no key at all; got {json}"
         );
+        phase("shutdown_all (adopted agent)");
         adopted.shutdown_all();
 
         // (c) FORWARD-COMPATIBLE with an older peer, which is the entire basis
@@ -6002,6 +6037,7 @@ mod tests {
             serde_json::from_str(newer).expect("a newer peer's record must decode");
         assert_eq!(forward.spawned_at_ms, Some(1_756_684_800_123));
         assert_eq!(forward.pane_id_env.as_deref(), Some("pane-4"));
+        phase("done");
     }
 
     /// Issue #856: `AgentRecord.cli_name` is additive and optional in BOTH

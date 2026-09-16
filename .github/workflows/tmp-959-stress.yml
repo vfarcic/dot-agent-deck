@@ -1,0 +1,41 @@
+# TEMPORARY probe for issue #959. Lives only on the branch
+# `agent/959-macos-fork-probe` and is deleted with it. Not merged.
+name: TMP 959 live_014 stress
+on:
+  push:
+    branches: [agent/959-macos-fork-probe]
+permissions:
+  contents: read
+jobs:
+  stress:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: 1.97.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: environment
+        run: |
+          uname -a
+          echo "SHELL=${SHELL:-<unset>}"
+          (sysctl -n hw.ncpu || nproc) 2>/dev/null
+      - name: build the lib test binary
+        run: cargo test --lib --no-run
+      - name: locate it
+        id: bin
+        run: |
+          BIN=$(cargo test --lib --no-run --message-format=json 2>/dev/null \
+                | jq -r 'select(.profile.test == true) | .executable' | tail -1)
+          echo "bin=$BIN" >> "$GITHUB_OUTPUT"
+          echo "binary: $BIN"
+          "$BIN" --exact daemon_protocol::tests::live_014_spawn_time_is_observed_and_additive --nocapture
+      - name: stress — 3 workers x 1500 executions
+        run: bash tmp-959-probe/stress.sh "${{ steps.bin.outputs.bin }}" 1500 3 25
