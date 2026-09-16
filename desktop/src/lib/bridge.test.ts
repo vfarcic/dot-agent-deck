@@ -1151,6 +1151,78 @@ describe("TauriDeckBridge demand-driven attach (PRD 745 M7)", () => {
   });
 
   /**
+   * Scenario: show a nine-agent deck, then carry that same whole shown set
+   * through the commits that open and close one agent's overlay. Neither
+   * commit may attach, detach, evict, or replay a terminal, and all nine
+   * original sessions must remain writable throughout the round trip.
+   */
+  it("keeps all nine deck terminals attached across an overlay round trip", async () => {
+    const { TauriDeckBridge } = await import("./bridge");
+    const bridge = new TauriDeckBridge();
+    const output = vi.fn();
+    await bridge.subscribe(vi.fn(), output);
+    await bridge.connect();
+
+    const shown = fleetAgentIds();
+    await bridge.setShownTerminals(shown);
+    await settle();
+    const attachesBeforeOverlay = attachCalls().length;
+    const detachesBeforeOverlay = detachCalls().length;
+    const replaysBeforeOverlay = output.mock.calls.filter(([event]) => event.operation === "replace").length;
+
+    // Opening over the deck and closing back to it preserve the deck's whole
+    // declaration. Re-declaring it here is intentionally conservative: even
+    // if a render owner invokes the bridge for an unchanged commit, the bridge
+    // must make the same no-cost decision as an effect that does not re-fire.
+    await bridge.setShownTerminals(shown);
+    await bridge.setShownTerminals(shown);
+    await settle();
+
+    expect(attachCalls()).toHaveLength(attachesBeforeOverlay);
+    expect(detachCalls()).toHaveLength(detachesBeforeOverlay);
+    expect(output.mock.calls.filter(([event]) => event.operation === "replace")).toHaveLength(replaysBeforeOverlay);
+    for (const agentId of shown) {
+      await expect(bridge.sendTerminalInput(agentId, "x")).resolves.toBeUndefined();
+    }
+    await bridge.dispose();
+  });
+
+  /**
+   * Scenario: start on the terminal-free overview, open one agent's overlay,
+   * then close it back to the overview. The open commit attaches and replays
+   * exactly that one agent rather than the nine-agent fleet, and the close
+   * commit detaches exactly that session when the shown set returns to empty.
+   */
+  it("attaches exactly one terminal for an overview-origin overlay", async () => {
+    const { TauriDeckBridge } = await import("./bridge");
+    const bridge = new TauriDeckBridge();
+    const output = vi.fn();
+    await bridge.subscribe(vi.fn(), output);
+    await bridge.connect();
+
+    await bridge.setShownTerminals([]);
+    await settle();
+    expect(attachCalls()).toHaveLength(0);
+    expect(detachCalls()).toHaveLength(0);
+
+    await bridge.setShownTerminals(["agent-4"]);
+    await settle();
+
+    expect(attachedAgentIds()).toEqual(["agent-4"]);
+    expect(detachCalls()).toHaveLength(0);
+    expect(output.mock.calls.filter(([event]) => event.operation === "replace")).toHaveLength(1);
+
+    await bridge.setShownTerminals([]);
+    await settle();
+
+    expect(attachedAgentIds()).toEqual(["agent-4"]);
+    expect(detachedAgentIds()).toEqual(["agent-4"]);
+    expect(output.mock.calls.filter(([event]) => event.operation === "replace")).toHaveLength(1);
+    await expect(bridge.sendTerminalInput("agent-4", "x")).rejects.toThrow(/not attached/);
+    await bridge.dispose();
+  });
+
+  /**
    * Scenario: show all nine agents, then declare that none is shown — the
    * deck→overview transition. All nine detach and none survives as warm, so the
    * overview really does hold zero PTYs however you arrived at it. Nothing new

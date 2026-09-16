@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
 import {
   Activity,
   AlertTriangle,
@@ -47,6 +47,8 @@ import { useDeckRuntime } from "./hooks/useDeckRuntime";
 import { useDaemonProjects } from "./hooks/useDaemonProjects";
 import { usePromptLibrary } from "./hooks/usePromptLibrary";
 import { useDesktopSettings, type DesktopSettingsState } from "./hooks/useDesktopSettings";
+import { useCrossDeckSelection } from "./hooks/useCrossDeckSelection";
+import { useShownTerminals } from "./hooks/useShownTerminals";
 import { useZoom } from "./hooks/useZoom";
 import { applyAppearance } from "./lib/appearance";
 import { desktopWorkflowPlatformIssue } from "./lib/platform";
@@ -168,6 +170,39 @@ export function DeckShell({ runtime, workflowPlatformIssue, initialView = { kind
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [agentView, closeAgent]);
   const base = agentView?.from ?? view.kind;
+  /**
+   * PRD #1105 M6 — the cross-deck round trip. A no-op on every path but one:
+   * the pane's deck is compared against the selected deck first, and a
+   * deck-origin pane's agent is always on the selected deck.
+   */
+  useCrossDeckSelection({
+    settings,
+    fleet: runtime.fleet,
+    selectedDeckId: runtime.snapshot.connection.deckId,
+    openDeckId: agentView?.deckId,
+  });
+  /**
+   * PRD #1105 M4 — the shown set for the OVERVIEW tree, declared here because
+   * this is the only component that can see the overview and the pane over it
+   * in one commit. `undefined` on the deck path hands ownership to
+   * {@link DeckSurface} without declaring anything; see {@link useShownTerminals}.
+   *
+   * The pane's agent is declared shown only once its deck IS the selected one,
+   * and that condition is load-bearing rather than defensive. Attach targets
+   * whichever deck is linked at the instant it runs (`terminal::attach` takes
+   * `trusted_daemon`), the M6 switch above is a disk write and a re-link away,
+   * and agent ids are per-daemon monotonic integers — so declaring `[agentId]`
+   * while the previous deck is still in force attaches *that* deck's agent of
+   * the same id. The fleet fixture has a `planner` on two decks, which is the
+   * ordinary case and not a contrived one.
+   *
+   * On the same-deck path the condition is already true when the pane opens, so
+   * it costs nothing there.
+   */
+  const overviewShown = base === "overview"
+    ? (agentView && agentView.deckId === runtime.snapshot.connection.deckId ? [agentView.agentId] : [])
+    : undefined;
+  useShownTerminals(runtime.setShownTerminals, overviewShown);
   if (base === "overview") {
     return (
       <>
@@ -195,15 +230,26 @@ export function DeckShell({ runtime, workflowPlatformIssue, initialView = { kind
  * {@link DeckShell}'s body without either a conditional hook or a `tabs` map
  * kept for a screen that has no tiles.
  *
- * An agent that is not in the snapshot renders nothing — the deck can retire a
+ * An agent that is not in the fleet renders nothing — the deck can retire a
  * pane while its overlay is open, and PRD #1105 records what that should LOOK
  * like as an open question. `Escape` still closes the view, because that
  * listener is {@link DeckShell}'s and not this component's.
+ *
+ * # The lookup is by the COMPOSITE identity, not by the bare id
+ *
+ * PRD #1105 M6. This screen merges every observed deck, so it can open an agent
+ * on a deck that is not the selected one — and the selected deck's snapshot is
+ * exactly where a bare-id lookup would find a *different* agent wearing the
+ * same per-daemon monotonic id. Resolving against the fleet entry named by
+ * `view.deckId` is what the variant carries a `deckId` for, and it is also what
+ * makes the pane show the right agent for the moment or two before the M6
+ * switch has taken effect, rather than the old deck's namesake.
  */
 function OverviewAgentPane({ runtime, view, onClose }: { runtime: DeckRuntimeState; view: Extract<DeckView, { kind: "agent" }>; onClose: () => void }) {
   const [tab, setTab] = useState<PanelTab>("terminal");
-  const agent = runtime.snapshot.agents.find((candidate) => candidate.id === view.agentId);
-  if (!agent) return null;
+  const deck = runtime.fleet.find((entry) => entry.connection.deckId === view.deckId);
+  const agent = deck?.agents.find((candidate) => candidate.id === view.agentId);
+  if (!deck || !agent) return null;
   return (
     <AgentPaneFrame
       open
@@ -212,7 +258,11 @@ function OverviewAgentPane({ runtime, view, onClose }: { runtime: DeckRuntimeSta
       selected
       tab={tab}
       terminalFeed={runtime.terminalFeed}
-      evidence={runtime.snapshot.evidence}
+      /* This deck's, for the same reason the agent above is: the selected
+         deck's ring belongs to a different machine until the M6 switch lands,
+         and the bridge records events for the selected deck alone — so a
+         non-selected deck's entry carries none rather than somebody else's. */
+      evidence={deck.evidence}
       inputResult={runtime.terminalInputResults?.[agent.id]}
       onSelect={() => undefined}
       onTabChange={setTab}
@@ -452,34 +502,22 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
     .map((agent) => agent.id);
 
   /**
-   * The same ids joined into one dependency so the effect below fires when the
-   * SET changes rather than on every render. It is a dependency KEY and nothing
-   * else — never split back apart. Agent ids are raw daemon identities, not
-   * display strings, so an id containing a newline would come back out of a
-   * `split` as two shown agents: two attach paths from one tile, and one
-   * invalid identity turned into several valid-looking ones behind
-   * `validate_agent_id`, which rejects control characters only when it is
-   * handed the id whole.
-   */
-  const shownTerminalKey = shownTerminals.join("\n");
-  /**
-   * The array the effect actually passes on, held in a ref because the effect
-   * must key on the joined string (stable across renders that change nothing)
-   * while carrying the ids themselves (a fresh array every render).
-   */
-  const shownTerminalsRef = useRef(shownTerminals);
-  shownTerminalsRef.current = shownTerminals;
-
-  /**
    * ONE call per render commit carrying ALL the shown ids, never one call per
    * tile: `setShownTerminals` is declarative, so nine tiles declaring
    * themselves one at a time would leave eight of the nine in the warm set and
-   * evict five of them. Deleting this effect does not fail a bridge test — it
+   * evict five of them. Deleting this line does not fail a bridge test — it
    * silently leaves the deck with no attached terminals at all.
+   *
+   * PRD #1105 M4 moved the mechanism into {@link useShownTerminals} without
+   * changing what the deck declares, so the deck path's most useful property
+   * survives by construction: opening the agent pane over the grid changes
+   * neither `snapshot.agents` nor `tabs`, so the set is unchanged, so **no call
+   * is made at all** on open or on close.
+   *
+   * This is the deck tree's owner. The overview tree's is `DeckShell`, and the
+   * two screens are mutually exclusive, so exactly one is ever mounted.
    */
-  useEffect(() => {
-    void setShownTerminals(shownTerminalsRef.current);
-  }, [setShownTerminals, shownTerminalKey]);
+  useShownTerminals(setShownTerminals, shownTerminals);
 
   const orderedStages = snapshot.stages;
   const selectedAgent = snapshot.agents.find((agent) => agent.id === selectedAgentId);

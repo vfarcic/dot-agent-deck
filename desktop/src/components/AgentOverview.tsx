@@ -608,27 +608,29 @@ const OpenAgentContext = createContext<((agent: OverviewAgent) => void) | undefi
  * standalone gets everything except the control that needs a document.
  */
 export function AgentOverview({ runtime, settings, onNavigate }: { runtime: DeckRuntimeState; settings?: DesktopSettingsState; onNavigate: (view: DeckView) => void }) {
-  const { fleet, snapshot, mode, setShownTerminals } = runtime;
-  /**
-   * The screen's whole claim, stated to the bridge rather than merely printed in
-   * its own header (PRD #745 M7): this screen shows no terminal, so it opens no
-   * PTY. Declaring the empty set also flushes the warm set to zero, which is
-   * what makes the claim true when you arrive here from a nine-tile deck rather
-   * than only on a cold start.
+  const { fleet, snapshot, mode } = runtime;
+  /*
+   * This screen shows no terminal and opens no PTY (PRD #745 M7), and it no
+   * longer says so to the bridge itself.
    *
-   * PRD #742 M4 did not widen it and must not: a tile's terminal is always the
-   * SELECTED deck's, so the set of shown terminals is still one deck's set and
-   * the empty declaration is still the whole claim.
+   * It used to: `setShownTerminals([])` on mount, which is also what flushes
+   * the warm set to zero and makes the claim true when you arrive here from a
+   * nine-tile deck rather than only on a cold start. PRD #1105 M4 moved that
+   * declaration UP to `DeckShell` without weakening it — the empty set is still
+   * declared for this screen, by the only component that can also see the agent
+   * pane when one is open over it.
    *
-   * What it cannot claim is that every socket a previous screen opened is
-   * already gone by the time this renders: the declaration is fire-and-forget,
-   * and an attach command still outstanding is cancelled by marking, so its
-   * daemon-side tear-down completes afterwards. The copy below says exactly
-   * that rather than the stronger thing.
+   * The move is the whole of M4 and not tidying. `setShownTerminals` must be
+   * called once per render commit with the whole shown set; an overview that
+   * declares `[]` for itself while a pane above it needs `[agentId]` is two
+   * declarations in one commit, and which one the bridge saw last decided
+   * whether that pane had a terminal. Neither outcome failed loudly.
+   *
+   * So: nothing here may declare a shown set again. A caller that renders this
+   * screen standalone — every test that does, since `DeckShell` is the only
+   * production caller — declares nothing, which is a statement about the
+   * harness rather than about the screen.
    */
-  useEffect(() => {
-    void setShownTerminals([]);
-  }, [setShownTerminals]);
   /**
    * The SELECTED deck's connection — the Deck selector's, and the rail lamp's.
    *

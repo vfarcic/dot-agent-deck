@@ -1670,16 +1670,24 @@ describe("AgentOverview", () => {
   });
 
   /**
-   * Scenario: render the overview against the crowded fifteen-agent fleet and
-   * watch what it tells the bridge. Its header claims "no terminals attached",
-   * and this is that claim as an instruction rather than as prose: declaring the
-   * empty shown set is what detaches whatever the deck left warm on the way here
-   * (PRD #745 M7). Rendering no terminal is NOT the same as attaching none —
-   * mounting nothing was already true before M7 and the sockets stayed open.
+   * Scenario: land on the overview against the crowded fifteen-agent fleet and
+   * watch what the app tells the bridge. Its header claims "no terminals
+   * attached", and this is that claim as an instruction rather than as prose:
+   * declaring the empty shown set is what detaches whatever the deck left warm
+   * on the way here (PRD #745 M7). Rendering no terminal is NOT the same as
+   * attaching none — mounting nothing was already true before M7 and the
+   * sockets stayed open.
+   *
+   * Driven through `DeckShell` rather than through `AgentOverview` alone
+   * because PRD #1105 M4 moved the declaration up to the one component that can
+   * see this screen and an agent pane over it together. What is asserted is
+   * unchanged and is the point of the move: exactly ONE call, carrying the
+   * empty set. The screen rendered standalone now declares nothing at all,
+   * which is a fact about a harness with no owner above it.
    */
   it("declares an empty shown set so the screen holds no PTY", () => {
     const setShownTerminals = vi.fn(async () => undefined);
-    renderOverview({ setShownTerminals });
+    render(<DeckShell runtime={runtime({ setShownTerminals })} initialView={{ kind: "overview" }} />);
 
     expect(terminalMounted).not.toHaveBeenCalled();
     expect(setShownTerminals).toHaveBeenCalledTimes(1);
