@@ -130,12 +130,14 @@ mod tests {
     /// `source` with every CRLF line ending turned into LF — the text this
     /// guard scans in every file it reads.
     ///
-    /// `include_str!` embeds a file exactly as checked out, `.gitattributes`
-    /// pins no line ending for `.rs`, and a Windows checkout with
-    /// `core.autocrlf` set — the GitHub runner's default — gets CRLF.
-    /// [`TEST_MODULE_MARKER`] holds two line endings, so against the raw text
-    /// it matches nothing there and the guard fails on the first module it
-    /// reads with `found 0` — which is what `build-windows` did on PR #1126.
+    /// `include_str!` embeds a file exactly as checked out, and a Windows
+    /// checkout with `core.autocrlf` set — the GitHub runner's default — got
+    /// CRLF. [`TEST_MODULE_MARKER`] holds two line endings, so against the raw
+    /// text it matched nothing there and the guard failed on the first module
+    /// it read with `found 0` — which is what `build-windows` did on PR #1126.
+    /// The root `.gitattributes` now checks text out with LF on every platform,
+    /// so this is defense in depth: a clone made before that attribute landed
+    /// still has CRLF files until they are checked out again.
     fn lf(source: &str) -> String {
         source.replace("\r\n", "\n")
     }

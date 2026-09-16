@@ -84,11 +84,12 @@ mod tests {
 
     /// Read a file with CRLF normalised to LF.
     ///
-    /// `.gitattributes` does not pin the working-tree line ending for `.md`, so
-    /// a Windows checkout gets `\r\n` and the `---` fence below would not match.
-    /// `build-windows` runs `cargo nextest run --workspace`, so this is load
-    /// bearing rather than theoretical — it is what `issue_labeler_memory.rs`
-    /// and `issue_labeler_policy.rs` already do for the same reason.
+    /// A Windows checkout got `\r\n` for `.md` files, and the `---` fence below
+    /// did not match — `build-windows` runs `cargo nextest run --workspace`, so
+    /// this was load bearing rather than theoretical. The root `.gitattributes`
+    /// now checks text out with LF everywhere; the normalisation stays as
+    /// defense in depth, for a clone made before that attribute landed, as
+    /// `issue_labeler_memory.rs` and `issue_labeler_policy.rs` keep theirs.
     fn read_lf(path: &Path) -> String {
         std::fs::read_to_string(path)
             .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()))
