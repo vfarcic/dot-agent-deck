@@ -1094,6 +1094,43 @@ fn cached_capabilities_for(
 // Unix-socket transport
 // ---------------------------------------------------------------------------
 
+/// PRD #1105 — what [`DaemonClient::focus_gained`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FocusReport {
+    /// The daemon accepted the claim and recorded this client as last-focused.
+    Recorded,
+    /// The daemon does not advertise `focus-gained`, so nothing was sent.
+    Withheld,
+}
+
+/// PRD #1105 — a fresh client identity for [`DaemonClient::with_client_id`]:
+/// `c-` followed by 32 lowercase hex digits.
+///
+/// A process calls this **once** and reuses the value for every handle and every
+/// deck, because focus belongs to the process a person is looking at, not to one
+/// of its connections. Two processes must not share one, and a restarted process
+/// should not inherit its predecessor's, which is why it is random rather than
+/// derived from a PID or a path.
+///
+/// Built the way `prep_token` mints its tokens — two OS-seeded
+/// [`std::hash::RandomState`] hashers plus a process-wide counter — so it needs
+/// no new dependency. Uniqueness is the only property wanted: the id is not a
+/// secret and not authentication (see `daemon_protocol::is_valid_client_id`).
+pub fn generate_client_id() -> String {
+    use std::hash::{BuildHasher, Hasher, RandomState};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let mut high = RandomState::new().build_hasher();
+    high.write_u64(seq);
+    high.write_u64(std::process::id() as u64);
+    let high = high.finish();
+    let mut low = RandomState::new().build_hasher();
+    low.write_u64(high);
+    low.write_u64(seq);
+    format!("c-{high:016x}{:016x}", low.finish())
+}
+
 /// Thin handle around the daemon's attach socket path. Cheap to clone — every
 /// operation opens its own short-lived [`IpcStream`] (matching the daemon's
 /// per-connection state machine in [`crate::daemon_protocol`]).
@@ -1121,6 +1158,11 @@ pub struct DaemonClient {
     /// held across an `.await` — [`Self::capabilities`] reads it, drops it,
     /// handshakes, then re-takes it to store.
     capabilities: Arc<Mutex<Option<CapabilitySnapshot>>>,
+    /// PRD #1105 — the identity this handle attaches and claims focus under, set
+    /// by [`Self::with_client_id`]. `None` (every constructor's default) sends no
+    /// `client_id` on an attach and cannot claim focus, which is exactly what a
+    /// client predating focus-driven sizing does.
+    client_id: Option<String>,
 }
 
 impl DaemonClient {
@@ -1136,6 +1178,7 @@ impl DaemonClient {
             socket_path,
             presence: LOCAL_ENDPOINT_PRESENCE,
             capabilities: Arc::new(Mutex::new(None)),
+            client_id: None,
         }
     }
 
@@ -1153,6 +1196,7 @@ impl DaemonClient {
             socket_path: endpoint.connect_address()?.to_path_buf(),
             presence: endpoint.presence(),
             capabilities: Arc::new(Mutex::new(None)),
+            client_id: None,
         })
     }
 
@@ -1182,7 +1226,28 @@ impl DaemonClient {
             socket_path: connection.connect_address().to_path_buf(),
             presence: connection.presence(),
             capabilities: Arc::new(Mutex::new(None)),
+            client_id: None,
         }
+    }
+
+    /// PRD #1105 — attach and claim focus as the client `client_id`.
+    ///
+    /// Every attach this handle (and every clone of it) makes afterwards carries
+    /// the id as `AttachStream::client_id`, and [`Self::focus_gained`] claims
+    /// focus under it. A process should pass the same id to every handle it
+    /// builds, for every deck — the id names the process, not the connection —
+    /// and generate it once with [`generate_client_id`].
+    ///
+    /// Sending it on an attach needs no capability check: an older daemon
+    /// ignores the key.
+    pub fn with_client_id(mut self, client_id: impl Into<String>) -> Self {
+        self.client_id = Some(client_id.into());
+        self
+    }
+
+    /// The identity set by [`Self::with_client_id`], if any.
+    pub fn client_id(&self) -> Option<&str> {
+        self.client_id.as_deref()
     }
 
     pub fn socket_path(&self) -> &Path {
@@ -1852,6 +1917,44 @@ impl DaemonClient {
         })
     }
 
+    /// PRD #1105 — tell the daemon this client has just gained focus.
+    ///
+    /// **Withholds unless the daemon advertises
+    /// [`crate::daemon_protocol::CAP_FOCUS_GAINED`]**, and a withhold is
+    /// [`FocusReport::Withheld`] rather than an error: against an older daemon
+    /// not reporting focus is the correct behaviour, and a caller reporting on
+    /// every keystroke should not have to tell that apart from a failure. The
+    /// capability comes from [`Self::capabilities`], so the check costs one
+    /// `Hello` per endpoint until that cache is invalidated.
+    ///
+    /// A handle with no [`Self::with_client_id`] identity has nothing to claim
+    /// focus as, and that is a caller bug rather than a daemon's answer, so it is
+    /// an `Err` and nothing is sent.
+    pub async fn focus_gained(&self) -> Result<FocusReport, ClientError> {
+        let Some(client_id) = self.client_id.clone() else {
+            return Err(ClientError::Malformed(
+                "focus-gained needs a client identity; build the handle with `with_client_id`"
+                    .into(),
+            ));
+        };
+        if !self
+            .capabilities()
+            .await?
+            .supports(crate::daemon_protocol::CAP_FOCUS_GAINED)
+        {
+            return Ok(FocusReport::Withheld);
+        }
+        let (mut rd, mut wr) = self.connect().await?;
+        let resp =
+            issue_command(&mut rd, &mut wr, &AttachRequest::FocusGained { client_id }).await?;
+        if !resp.ok {
+            return Err(ClientError::Server(
+                resp.error.unwrap_or_else(|| "focus-gained failed".into()),
+            ));
+        }
+        Ok(FocusReport::Recorded)
+    }
+
     /// Update the daemon-side display_name and/or cwd for an agent (M2.11).
     /// Passing `None` for either field clears it. The daemon validates both
     /// values independently and silently drops anything that fails — see
@@ -2040,6 +2143,7 @@ impl DaemonClient {
                 rows: viewport.map(|(r, _)| r),
                 cols: viewport.map(|(_, c)| c),
                 geometry_updates,
+                client_id: self.client_id.clone(),
             },
         )
         .await?;
@@ -2641,6 +2745,7 @@ mod tests {
             socket_path: absent.clone(),
             presence: EndpointPresence::NoFilesystemName,
             capabilities: Arc::new(Mutex::new(None)),
+            client_id: None,
         };
         assert!(
             pipe_client.ensure_socket_exists().is_ok(),
@@ -2653,6 +2758,7 @@ mod tests {
             socket_path: absent,
             presence: EndpointPresence::Elsewhere,
             capabilities: Arc::new(Mutex::new(None)),
+            client_id: None,
         };
         assert!(
             remote_client.ensure_socket_exists().is_ok(),
@@ -2852,6 +2958,260 @@ mod tests {
             .await
             .expect_err("blank command should fail");
         assert!(matches!(err, ClientError::Server(_)));
+    }
+
+    /// PRD #1105 — the focus claim end to end against a real daemon: the claim
+    /// is recorded, and the LAST claim wins, including a client reclaiming focus
+    /// it held before.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn focus_gained_records_the_last_claiming_client() {
+        let (_dir, path, registry) = spawn_test_server().await;
+        let tui = DaemonClient::new(path.clone()).with_client_id(generate_client_id());
+        let desktop = DaemonClient::new(path).with_client_id(generate_client_id());
+        assert_eq!(
+            registry.focused_client(),
+            None,
+            "a daemon nobody has claimed focus on records no client — the fallback case"
+        );
+
+        assert_eq!(tui.focus_gained().await.unwrap(), FocusReport::Recorded);
+        assert_eq!(registry.focused_client().as_deref(), tui.client_id());
+
+        assert_eq!(desktop.focus_gained().await.unwrap(), FocusReport::Recorded);
+        assert_eq!(
+            registry.focused_client().as_deref(),
+            desktop.client_id(),
+            "a later claim replaces the earlier one"
+        );
+
+        assert_eq!(tui.focus_gained().await.unwrap(), FocusReport::Recorded);
+        assert_eq!(
+            registry.focused_client().as_deref(),
+            tui.client_id(),
+            "switching back is just another claim"
+        );
+    }
+
+    /// PRD #1105 — an attach that registers a viewer records which client it
+    /// belongs to; one from a client with no identity records none; a resize
+    /// through the viewer token moves the geometry and leaves the client alone;
+    /// and an attach that registers no viewer records nothing at all.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_attach_records_its_client_on_the_viewer_it_registers() {
+        let (_dir, path, registry) = spawn_test_server().await;
+        let legacy = DaemonClient::new(path.clone());
+        let desktop = DaemonClient::new(path).with_client_id(generate_client_id());
+        let id = legacy
+            .start_agent(StartAgentOptions {
+                command: Some("/bin/cat".into()),
+                ..Default::default()
+            })
+            .await
+            .expect("start should succeed");
+
+        let desktop_conn = desktop
+            .attach_as_viewer(&id, Some((22, 153)))
+            .await
+            .expect("desktop attach");
+        let legacy_conn = legacy
+            .attach_as_viewer(&id, Some((42, 58)))
+            .await
+            .expect("legacy attach");
+        let observer = desktop.attach(&id).await.expect("non-viewer attach");
+        assert_eq!(
+            observer.viewer(),
+            None,
+            "fixture: this attach registers no viewer"
+        );
+
+        let desktop_token = desktop_conn
+            .viewer()
+            .expect("desktop viewer token")
+            .to_string();
+        let legacy_token = legacy_conn
+            .viewer()
+            .expect("legacy viewer token")
+            .to_string();
+        let viewers = registry.viewers_of(&id);
+        assert_eq!(
+            viewers.len(),
+            2,
+            "only the two viewer attaches are viewers, whatever identity the third carried: \
+             {viewers:?}"
+        );
+        assert_eq!(
+            viewers[&desktop_token],
+            crate::agent_pty::Viewer {
+                geometry: Some((22, 153)),
+                client_id: desktop.client_id().map(str::to_string),
+            }
+        );
+        assert_eq!(
+            viewers[&legacy_token],
+            crate::agent_pty::Viewer {
+                geometry: Some((42, 58)),
+                client_id: None,
+            },
+            "a client that sends no identity is recorded as having none"
+        );
+
+        desktop
+            .resize_agent_as_viewer(&id, 30, 120, Some(&desktop_token))
+            .await
+            .expect("resize as the desktop viewer");
+        assert_eq!(
+            registry.viewers_of(&id)[&desktop_token],
+            crate::agent_pty::Viewer {
+                geometry: Some((30, 120)),
+                client_id: desktop.client_id().map(str::to_string),
+            },
+            "a resize moves the viewer's geometry and keeps the client it attached as"
+        );
+
+        drop((desktop_conn, legacy_conn, observer));
+        registry.shutdown_all();
+    }
+
+    /// PRD #1105 — a malformed client id is refused on both verbs that carry
+    /// one, and the refusal changes no state: no focus recorded, no viewer
+    /// registered.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_malformed_client_id_is_refused_and_changes_nothing() {
+        let (_dir, path, registry) = spawn_test_server().await;
+        let setup = DaemonClient::new(path.clone());
+        let id = setup
+            .start_agent(StartAgentOptions {
+                command: Some("/bin/cat".into()),
+                ..Default::default()
+            })
+            .await
+            .expect("start should succeed");
+        let malformed = DaemonClient::new(path).with_client_id("not a valid id");
+
+        let err = malformed
+            .focus_gained()
+            .await
+            .expect_err("the daemon advertises the verb, so the claim is sent and refused");
+        assert!(
+            matches!(&err, ClientError::Server(msg) if msg.contains("invalid client_id")),
+            "{err:?}"
+        );
+        assert_eq!(registry.focused_client(), None);
+
+        let err = malformed
+            .attach_as_viewer(&id, Some((22, 153)))
+            .await
+            .err()
+            .expect("an attach naming a malformed client must be refused");
+        assert!(
+            matches!(&err, ClientError::Server(msg) if msg.contains("invalid client_id")),
+            "{err:?}"
+        );
+        assert!(
+            registry.viewers_of(&id).is_empty(),
+            "a refused attach must register no viewer"
+        );
+        registry.shutdown_all();
+    }
+
+    /// PRD #1105 — a handle with no identity has nothing to claim focus as. That
+    /// is the caller's bug, so it errors, and it errors before touching the
+    /// socket (the path here does not exist, so a connect would surface as I/O).
+    #[tokio::test]
+    async fn focus_gained_without_an_identity_sends_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let client = DaemonClient::new(dir.path().join("never-bound.sock"));
+        let err = client
+            .focus_gained()
+            .await
+            .expect_err("no identity, no claim");
+        assert!(matches!(err, ClientError::Malformed(_)), "{err:?}");
+    }
+
+    /// PRD #1105 — the withhold, against the two older daemons a focus-capable
+    /// client will actually meet: one that advertises no capabilities at all
+    /// (pre-PRD #819), and one that advertises the PRD #819 project verbs but not
+    /// `focus-gained` (every release through v0.40.2). Neither is sent the claim.
+    #[cfg(unix)]
+    #[test]
+    fn focus_gained_is_withheld_by_a_daemon_that_does_not_advertise_it() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("build older-daemon runtime");
+        runtime.block_on(async {
+            focus_gained_is_withheld_inner(None).await;
+            focus_gained_is_withheld_inner(Some(&[
+                CAP_LIST_PROJECTS,
+                CAP_RESOLVE_PROJECT,
+                CAP_PREPARE_WORKFLOW,
+                crate::daemon_protocol::CAP_START_PREPARED_AGENT,
+            ]))
+            .await;
+        });
+    }
+
+    #[cfg(unix)]
+    async fn focus_gained_is_withheld_inner(advertised: Option<&'static [&'static str]>) {
+        let (dir, path, listener) = {
+            let _g = BIND_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("older-daemon.sock");
+            let listener = bind_attach_listener(&path).expect("bind older daemon");
+            (dir, path, listener)
+        };
+        let other_requests = Arc::new(AtomicUsize::new(0));
+        let server_other_requests = other_requests.clone();
+        let server = tokio::spawn(async move {
+            while let Ok(Ok(mut stream)) =
+                tokio::time::timeout(std::time::Duration::from_millis(500), listener.accept()).await
+            {
+                let Some((KIND_REQ, payload)) = read_frame(&mut stream)
+                    .await
+                    .expect("read older-daemon request frame")
+                else {
+                    continue;
+                };
+                let request: serde_json::Value =
+                    serde_json::from_slice(&payload).expect("decode older-daemon request");
+                let response = if request.get("op").and_then(|op| op.as_str()) == Some("hello") {
+                    AttachResponse {
+                        capabilities: advertised
+                            .map(|list| list.iter().map(|cap| cap.to_string()).collect()),
+                        ..AttachResponse::hello(PROTOCOL_VERSION)
+                    }
+                } else {
+                    server_other_requests.fetch_add(1, Ordering::SeqCst);
+                    AttachResponse::err("malformed request: unknown variant `focus-gained`")
+                };
+                crate::daemon_protocol::write_resp(&mut stream, &response)
+                    .await
+                    .expect("write older-daemon response");
+            }
+        });
+        let client = DaemonClient::new(path).with_client_id(generate_client_id());
+
+        assert_eq!(
+            client
+                .focus_gained()
+                .await
+                .expect("a withhold is not an error"),
+            FocusReport::Withheld,
+            "advertised {advertised:?}: no `focus-gained`, no claim"
+        );
+        assert_eq!(
+            other_requests.load(Ordering::SeqCst),
+            0,
+            "advertised {advertised:?}: withholding means the claim never reaches the socket"
+        );
+
+        drop(client);
+        server.await.unwrap();
+        drop(dir);
     }
 
     #[cfg(unix)]

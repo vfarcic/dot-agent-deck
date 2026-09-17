@@ -2147,6 +2147,24 @@ async fn deliver_payload_as_notice(
     PayloadDelivery::Applied
 }
 
+/// PRD #882 / PRD #1105 — one registered viewer of an agent: one attach that
+/// opted into the size policy. Stored in [`RunningAgent::viewers`] under the
+/// viewer token that attach was given.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Viewer {
+    /// The geometry `(rows, cols)` this viewer last reported, or `None` while it
+    /// has not measured itself yet. See [`RunningAgent::viewers`] for why an
+    /// unmeasured viewer is still a viewer.
+    pub geometry: Option<(u16, u16)>,
+    /// PRD #1105 — the client this attach belongs to, from
+    /// `AttachStream::client_id`. `None` for a client that predates focus, which
+    /// takes part in sizing only through the per-axis-minimum fallback.
+    ///
+    /// Recorded at attach and not changed afterwards: a resize carries only the
+    /// viewer token, so no later request names a client for this entry.
+    pub client_id: Option<String>,
+}
+
 /// One agent owned by the registry: child + master + shared writer + bus.
 /// Field names are stable — tests and tooling that peek into the registry
 /// (e.g. for `process_id()`) rely on `child` existing here.
@@ -2280,7 +2298,11 @@ pub struct RunningAgent {
     /// No entries with a geometry means the size is left exactly as it is: a
     /// legacy client that never registers still drives the PTY through the
     /// unattributed path in [`AgentPtyRegistry::resize_for_viewer`].
-    pub viewers: HashMap<String, Option<(u16, u16)>>,
+    ///
+    /// PRD #1105 — each entry also records which CLIENT the attach belongs to
+    /// ([`Viewer::client_id`]). Keying stays per attach for every reason above;
+    /// the client is a property of the attach, not a second key.
+    pub viewers: HashMap<String, Viewer>,
     /// PRD #882 — geometry changes pushed to participating viewers.
     ///
     /// A viewer has to be told when the applied size moved because somebody
@@ -3712,6 +3734,24 @@ const PANE_CLOSE_SETTLE_POLL: Duration = Duration::from_millis(50);
 
 struct RegistryInner {
     next_id: u64,
+    /// PRD #1105 — the client id carried by the most recent
+    /// `focus-gained` request this daemon process accepted
+    /// ([`AgentPtyRegistry::record_focus`]); `None` until one arrives.
+    ///
+    /// Registry-wide rather than per agent, because focus belongs to a client
+    /// and a client views many agents. Held under this lock so that
+    /// [`AgentPtyRegistry::effective_dims`]'s callers — every one of which
+    /// already holds it — can read it beside the agent they are sizing.
+    ///
+    /// **Recorded, not yet consulted.** Sizing is still PRD #882's per-axis
+    /// minimum; the step that makes the last-focused client win reads this.
+    ///
+    /// Never cleared except by a newer claim. A focused client that detaches
+    /// everything leaves its id here, and that is correct rather than a leak: it
+    /// holds no viewer, so the fallback applies to every agent, and if the same
+    /// process attaches again it is still the last client that was focused. A
+    /// daemon restart loses it, which is also the fallback.
+    focused_client: Option<String>,
     /// PRD #882 — monotonic source of viewer tokens, kept separate from
     /// `next_id` so the two sequences cannot entangle.
     ///
@@ -4033,6 +4073,7 @@ impl AgentPtyRegistry {
         Self {
             inner: Mutex::new(RegistryInner {
                 next_id: 1,
+                focused_client: None,
                 next_viewer_id: 1,
                 agents: HashMap::new(),
                 pending_spawns: HashMap::new(),
@@ -7450,6 +7491,25 @@ impl AgentPtyRegistry {
         viewport: Option<(u16, u16)>,
         geometry_updates: bool,
     ) -> Result<AttachHandle, AgentPtyError> {
+        self.subscribe_with_viewport_for_client(id, viewport, geometry_updates, None)
+    }
+
+    /// PRD #1105 — [`Self::subscribe_with_viewport`], recording which client the
+    /// attach belongs to on the viewer it registers.
+    ///
+    /// `client_id` is stored on the [`Viewer`] entry and is otherwise inert: it
+    /// does not change what is registered, what geometry is applied, or what the
+    /// handle carries. An attach that registers no viewer has nowhere to record
+    /// it, so it is dropped there. The caller validates it; the attach handler
+    /// refuses an id that fails `daemon_protocol::is_valid_client_id` before
+    /// reaching this.
+    pub fn subscribe_with_viewport_for_client(
+        &self,
+        id: &str,
+        viewport: Option<(u16, u16)>,
+        geometry_updates: bool,
+        client_id: Option<&str>,
+    ) -> Result<AttachHandle, AgentPtyError> {
         if let Some((rows, cols)) = viewport
             && (rows == 0 || cols == 0)
         {
@@ -7469,7 +7529,13 @@ impl AgentPtyRegistry {
             Some(viewport) => {
                 let token = format!("v{seq}");
                 let seeded = viewport.map(|(rows, cols)| clamp_pty_dims_reporting(id, rows, cols));
-                agent.viewers.insert(token.clone(), seeded);
+                agent.viewers.insert(
+                    token.clone(),
+                    Viewer {
+                        geometry: seeded,
+                        client_id: client_id.map(str::to_string),
+                    },
+                );
                 // Apply BEFORE the snapshot below.
                 //
                 // A failed ioctl does NOT fail the attach. Streaming this
@@ -7532,8 +7598,9 @@ impl AgentPtyRegistry {
         // A viewer registered but not yet measured is deliberately inert rather
         // than defaulted: a guessed value under a smallest-wins policy would
         // shrink the agent for every other client.
-        let rows = agent.viewers.values().flatten().map(|(r, _)| *r).min()?;
-        let cols = agent.viewers.values().flatten().map(|(_, c)| *c).min()?;
+        let geometries = || agent.viewers.values().filter_map(|viewer| viewer.geometry);
+        let rows = geometries().map(|(r, _)| r).min()?;
+        let cols = geometries().map(|(_, c)| c).min()?;
         Some((rows, cols))
     }
 
@@ -7560,6 +7627,41 @@ impl AgentPtyRegistry {
         if let Err(e) = Self::apply_effective_locked(agent) {
             tracing::debug!(agent_id = %id, error = %e, "releasing a viewer could not re-apply the effective geometry");
         }
+    }
+
+    /// PRD #1105 — record `client_id` as the last-focused client, replacing any
+    /// earlier one. The daemon's handling of a `focus-gained` request.
+    ///
+    /// **This step records and does not resize.** No agent's geometry moves and
+    /// no viewer is told anything; [`Self::effective_dims`] does not read the
+    /// value yet. The step that makes the last-focused client win has to add the
+    /// re-apply here, because a claim changes the answer for every agent the
+    /// newly focused client views without any of those agents' viewers changing.
+    ///
+    /// Takes the id as given; the protocol handler validates it first.
+    pub fn record_focus(&self, client_id: &str) {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.focused_client.as_deref() != Some(client_id) {
+            inner.focused_client = Some(client_id.to_string());
+        }
+    }
+
+    /// PRD #1105 — the last-focused client recorded by [`Self::record_focus`],
+    /// or `None` if no claim has arrived since this daemon started.
+    pub fn focused_client(&self) -> Option<String> {
+        self.inner.lock().unwrap().focused_client.clone()
+    }
+
+    /// PRD #1105 — the registered viewers of agent `id`, keyed by viewer token.
+    /// Empty for an unknown agent. A copy, taken under the registry lock, for
+    /// tests and diagnostics; the sizing policy reads the live map.
+    pub fn viewers_of(&self, id: &str) -> HashMap<String, Viewer> {
+        let inner = self.inner.lock().unwrap();
+        inner
+            .agents
+            .get(id)
+            .map(|agent| agent.viewers.clone())
+            .unwrap_or_default()
     }
 
     /// PRD #882 — record a viewer's new geometry and re-apply the policy.
@@ -7606,8 +7708,11 @@ impl AgentPtyRegistry {
                 // A known token: set (or first establish) this viewer's
                 // geometry. `contains_key` rather than a blind insert is what
                 // keeps a stale or forged token from creating a phantom viewer
-                // that nothing will ever prune.
-                agent.viewers.insert(token.to_string(), Some((rows, cols)));
+                // that nothing will ever prune. Only the geometry moves — the
+                // entry's client (PRD #1105) was fixed at attach.
+                if let Some(entry) = agent.viewers.get_mut(token) {
+                    entry.geometry = Some((rows, cols));
+                }
                 Self::apply_effective_locked(agent)
             }
             // A token that was minted and has since been released — its attach
