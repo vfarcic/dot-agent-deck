@@ -2162,15 +2162,13 @@ pub fn run() {
         // PRD #1105 M11 step 4: the window's focus changes are the desktop's
         // focus signal — see `terminal::window_focus_changed` for why this event
         // rather than the webview's own, which decks it claims on, and why typing
-        // does not also claim. Spawned: the handler runs on the event loop, and a
-        // claim is a round trip per deck.
+        // does not also claim. Handled right here rather than in a task spawned
+        // per event, so reports are recorded in the order the event loop
+        // delivers them; the claims themselves are spawned inside it, and are
+        // dropped by the next report if still unsent.
         .on_window_event(|window, event| {
             if let Some(focused) = window_focus(event) {
-                let app = window.app_handle().clone();
-                tauri::async_runtime::spawn(async move {
-                    let state = app.state::<DesktopState>();
-                    terminal::window_focus_changed(&state, focused).await;
-                });
+                let _ = terminal::window_focus_changed(&window.state::<DesktopState>(), focused);
             }
         })
         .invoke_handler(tauri::generate_handler![

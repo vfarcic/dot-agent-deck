@@ -1101,6 +1101,10 @@ pub enum FocusReport {
     Recorded,
     /// The daemon does not advertise `focus-gained`, so nothing was sent.
     Withheld,
+    /// The caller's [`DaemonClient::focus_gained_while`] condition no longer
+    /// held at the last moment the claim could still be dropped — something
+    /// newer made it out of date — so nothing was sent.
+    Superseded,
 }
 
 /// PRD #1105 — a fresh client identity for [`DaemonClient::with_client_id`]:
@@ -1933,6 +1937,33 @@ impl DaemonClient {
     /// focus as, and that is a caller bug rather than a daemon's answer, so it is
     /// an `Err` and nothing is sent.
     pub async fn focus_gained(&self) -> Result<FocusReport, ClientError> {
+        self.focus_gained_while(|| true).await
+    }
+
+    /// PRD #1105 — [`Self::focus_gained`], dropped rather than sent if
+    /// `still_wanted` returns `false` at the last point it can be.
+    ///
+    /// A claim can wait before it is written — on the capability handshake, a
+    /// round trip to the daemon that crosses the tunnel for a remote deck, and on
+    /// opening its connection — and a caller may have waited longer still before
+    /// calling this, as the desktop does on establishing a deck's link. A claim
+    /// written after its client lost focus, or after a newer claim from the same
+    /// client started, lands late and can take focus from the window the person
+    /// moved to. So `still_wanted` is asked **after the connection is open and
+    /// immediately before the request is written**, and a `false` returns
+    /// [`FocusReport::Superseded`] with nothing written: the connection closes
+    /// with no request on it, which the daemon's handler ends on without reading
+    /// a request or changing any state.
+    ///
+    /// **What cannot be recalled.** Once `still_wanted` has returned `true` the
+    /// request is written, and from then on the claim lands however the focus
+    /// moves: the write itself and the request's transit to the daemon are the
+    /// window that remains. For a local deck that is a socket write; for a remote
+    /// one it is also the time the request spends in the tunnel.
+    pub async fn focus_gained_while(
+        &self,
+        still_wanted: impl Fn() -> bool,
+    ) -> Result<FocusReport, ClientError> {
         let Some(client_id) = self.client_id.clone() else {
             return Err(ClientError::Malformed(
                 "focus-gained needs a client identity; build the handle with `with_client_id`"
@@ -1947,6 +1978,9 @@ impl DaemonClient {
             return Ok(FocusReport::Withheld);
         }
         let (mut rd, mut wr) = self.connect().await?;
+        if !still_wanted() {
+            return Ok(FocusReport::Superseded);
+        }
         let resp =
             issue_command(&mut rd, &mut wr, &AttachRequest::FocusGained { client_id }).await?;
         if !resp.ok {
@@ -2993,6 +3027,102 @@ mod tests {
             tui.client_id(),
             "switching back is just another claim"
         );
+    }
+
+    /// PRD #1105 — the audit's churn case, through the production handler: two
+    /// clients with measured viewers of one agent fire 200 alternating
+    /// `focus-gained` requests concurrently. The PTY is resized at most once per
+    /// started coalescing interval rather than once per flip. Two closing claims
+    /// then show that `ok` still means applied, whether the claim ran a pass at
+    /// once or waited for a deferred one.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn alternating_focus_claims_are_coalesced_by_the_daemon() {
+        use crate::agent_pty::FOCUS_REAPPLY_INTERVAL;
+        let (_dir, path, registry) = spawn_test_server().await;
+        let tui = DaemonClient::new(path.clone()).with_client_id(generate_client_id());
+        let desktop = DaemonClient::new(path).with_client_id(generate_client_id());
+        let id = tui
+            .start_agent(StartAgentOptions {
+                command: Some("/bin/cat".into()),
+                ..StartAgentOptions::default()
+            })
+            .await
+            .expect("start should succeed");
+        let _desktop_view = desktop
+            .attach_as_viewer(&id, Some((22, 153)))
+            .await
+            .expect("desktop attach");
+        let _tui_view = tui
+            .attach_as_viewer(&id, Some((42, 58)))
+            .await
+            .expect("tui attach");
+        // Learn both capability sets first, so the flood is claims and nothing
+        // else.
+        tui.capabilities().await.expect("tui handshake");
+        desktop.capabilities().await.expect("desktop handshake");
+        let before = registry.geometry_changes_of(&id).expect("agent");
+
+        let started = std::time::Instant::now();
+        let flood: Vec<_> = (0..200)
+            .map(|n| {
+                let client = if n % 2 == 0 {
+                    tui.clone()
+                } else {
+                    desktop.clone()
+                };
+                tokio::spawn(async move { client.focus_gained().await })
+            })
+            .collect();
+        for claim in flood {
+            assert_eq!(
+                claim.await.expect("claim task").expect("claim"),
+                FocusReport::Recorded
+            );
+        }
+        let elapsed = started.elapsed();
+        let changes = registry.geometry_changes_of(&id).expect("agent") - before;
+
+        // Two closing claims, with the flood's interval waited out first so the
+        // order is known rather than the scheduler's: the TUI's opens a new
+        // interval and is applied at once, and the desktop's lands inside that
+        // interval and is deferred. Both must be in force by the time their `ok`
+        // arrives, which is what `resize/policy/001`–`/011` rely on.
+        tokio::time::sleep(crate::agent_pty::FOCUS_REAPPLY_INTERVAL).await;
+        assert_eq!(
+            tui.focus_gained().await.expect("the TUI's closing claim"),
+            FocusReport::Recorded
+        );
+        assert_eq!(
+            registry.focused_client().as_deref(),
+            tui.client_id(),
+            "a claim arriving after a quiet interval is applied before its `ok`"
+        );
+        assert_eq!(
+            desktop
+                .focus_gained()
+                .await
+                .expect("the desktop's closing claim"),
+            FocusReport::Recorded
+        );
+        assert_eq!(
+            registry.focused_client().as_deref(),
+            desktop.client_id(),
+            "the claim accepted last is the one recorded, deferred or not"
+        );
+        assert_eq!(
+            registry.pty_size_for_agent(&id),
+            Some((22, 153)),
+            "and its viewer's size is in force by the time `ok` arrives"
+        );
+        let bound = (elapsed.as_nanos() / FOCUS_REAPPLY_INTERVAL.as_nanos()) as u64 + 1;
+        assert!(
+            changes <= bound,
+            "200 alternating claims over {elapsed:?} resized the PTY {changes} times — one \
+             ioctl, one scrollback clear and one geometry push each; at most {bound} focus \
+             passes can have run"
+        );
+        registry.shutdown_all();
     }
 
     /// PRD #1105 — an attach that registers a viewer records which client it

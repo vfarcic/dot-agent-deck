@@ -5471,11 +5471,17 @@ mod tests {
         /// A daemon that answers `hello` with `advertised` as its capability
         /// list and records every other request it is sent: `focus-gained`
         /// claims by the `client_id` they name, anything else by its op.
+        ///
+        /// It serves one connection at a time, and it can hold its `hello`
+        /// replies until [`Self::release_hello`], which keeps a claim waiting on
+        /// its capability handshake — unsent — for as long as a test needs.
         struct ScriptedDaemon {
             _dir: tempfile::TempDir,
             path: PathBuf,
             claims: Arc<Mutex<Vec<String>>>,
             other_ops: Arc<Mutex<Vec<String>>>,
+            hellos: Arc<std::sync::atomic::AtomicUsize>,
+            hello_gate: tokio::sync::watch::Sender<bool>,
             server: tokio::task::JoinHandle<()>,
         }
 
@@ -5484,10 +5490,31 @@ mod tests {
                 runtime: &tokio::runtime::Runtime,
                 advertised: Option<Vec<&'static str>>,
             ) -> Self {
+                Self::start_gated(runtime, advertised, true)
+            }
+
+            /// [`Self::start`], with every `hello` reply held until
+            /// [`Self::release_hello`].
+            fn start_holding_hello(
+                runtime: &tokio::runtime::Runtime,
+                advertised: Option<Vec<&'static str>>,
+            ) -> Self {
+                Self::start_gated(runtime, advertised, false)
+            }
+
+            fn start_gated(
+                runtime: &tokio::runtime::Runtime,
+                advertised: Option<Vec<&'static str>>,
+                hello_open: bool,
+            ) -> Self {
                 let (dir, path, listener) = bind(runtime, "focus-scripted");
                 let claims = Arc::new(Mutex::new(Vec::new()));
                 let other_ops = Arc::new(Mutex::new(Vec::new()));
+                let hellos = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let hello_gate = tokio::sync::watch::Sender::new(hello_open);
                 let (server_claims, server_other) = (Arc::clone(&claims), Arc::clone(&other_ops));
+                let server_hellos = Arc::clone(&hellos);
+                let mut gate = hello_gate.subscribe();
                 let server = runtime.spawn(async move {
                     while let Ok(mut stream) = listener.accept().await {
                         let Ok(Some((KIND_REQ, payload))) = read_frame(&mut stream).await else {
@@ -5496,6 +5523,10 @@ mod tests {
                         let request: serde_json::Value =
                             serde_json::from_slice(&payload).expect("decode the request");
                         let op = request["op"].as_str().unwrap_or_default().to_string();
+                        if op == "hello" {
+                            server_hellos.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            let _ = gate.wait_for(|open| *open).await;
+                        }
                         let response = match op.as_str() {
                             "hello" => AttachResponse {
                                 capabilities: advertised
@@ -5530,12 +5561,23 @@ mod tests {
                     path,
                     claims,
                     other_ops,
+                    hellos,
+                    hello_gate,
                     server,
                 }
             }
 
             fn claims(&self) -> Vec<String> {
                 self.claims.lock().unwrap().clone()
+            }
+
+            /// How many `hello` requests have arrived, answered or held.
+            fn hellos(&self) -> usize {
+                self.hellos.load(std::sync::atomic::Ordering::SeqCst)
+            }
+
+            fn release_hello(&self) {
+                self.hello_gate.send_replace(true);
             }
         }
 
@@ -5648,19 +5690,86 @@ mod tests {
                     .is_none(),
                 "bare pointer motion is not input, even with the window long closed"
             );
-            let mut started: Vec<_> = controller
+            // Each claim is finished before the next event, because a newer
+            // claim drops one still unsent — that is
+            // `a_claim_still_unsent_when_a_newer_event_arrives_is_never_sent`'s
+            // subject, and this test is about what the throttle admits.
+            let started: Vec<_> = controller
                 .report_focus(&key('x'), t0 + INPUT_CLAIM_INTERVAL)
                 .into_iter()
                 .collect();
-            started.extend(controller.report_focus(
-                &Event::FocusGained,
-                t0 + INPUT_CLAIM_INTERVAL + Duration::from_millis(1),
-            ));
+            assert_eq!(started.len(), 1, "the window's end admits the next input");
+            finish(&runtime, started);
+            let started: Vec<_> = controller
+                .report_focus(
+                    &Event::FocusGained,
+                    t0 + INPUT_CLAIM_INTERVAL + Duration::from_millis(1),
+                )
+                .into_iter()
+                .collect();
             finish(&runtime, started);
             assert_eq!(
                 daemon.claims(),
                 vec![tui.clone(), tui.clone(), tui],
                 "the window's end admits the next input, and focus-in is never throttled"
+            );
+            assert!(daemon.other_ops.lock().unwrap().is_empty());
+        }
+
+        /// Scenario: a focus-in starts a claim, and the daemon holds the claim's
+        /// capability handshake so it cannot be sent yet. The terminal then
+        /// reports focus-out, the handshake is released, and the daemon never
+        /// receives the claim. Then, against a fresh daemon, a second focus-in
+        /// arrives while the first claim is held the same way: after the release
+        /// the daemon receives exactly one claim, not the stale one as well.
+        #[test]
+        fn a_claim_still_unsent_when_a_newer_event_arrives_is_never_sent() {
+            let runtime = runtime();
+            let t0 = Instant::now();
+
+            let daemon =
+                ScriptedDaemon::start_holding_hello(&runtime, Some(vec![CAP_FOCUS_GAINED]));
+            let controller =
+                EmbeddedPaneController::new(daemon.path.clone(), runtime.handle().clone());
+            let claim = controller
+                .report_focus(&Event::FocusGained, t0)
+                .expect("focus-in starts a claim");
+            wait_until("the claim waits on its handshake", || daemon.hellos() == 1);
+            assert!(
+                controller
+                    .report_focus(&Event::FocusLost, t0 + Duration::from_millis(10))
+                    .is_none(),
+                "focus-out starts no claim of its own"
+            );
+            daemon.release_hello();
+            finish(&runtime, vec![claim]);
+            assert!(
+                daemon.claims().is_empty(),
+                "a claim still unsent when the terminal reported focus-out must be dropped, \
+                 not sent late: {:?}",
+                daemon.claims()
+            );
+
+            let daemon =
+                ScriptedDaemon::start_holding_hello(&runtime, Some(vec![CAP_FOCUS_GAINED]));
+            let controller =
+                EmbeddedPaneController::new(daemon.path.clone(), runtime.handle().clone());
+            let tui = controller.client_id().expect("identity").to_string();
+            let stale = controller
+                .report_focus(&Event::FocusGained, t0)
+                .expect("focus-in starts a claim");
+            wait_until("the first claim waits on its handshake", || {
+                daemon.hellos() == 1
+            });
+            let newer = controller
+                .report_focus(&Event::FocusGained, t0 + Duration::from_millis(10))
+                .expect("a second focus-in starts a claim");
+            daemon.release_hello();
+            finish(&runtime, vec![stale, newer]);
+            assert_eq!(
+                daemon.claims(),
+                vec![tui],
+                "the newer claim is sent and the one it superseded is not"
             );
             assert!(daemon.other_ops.lock().unwrap().is_empty());
         }

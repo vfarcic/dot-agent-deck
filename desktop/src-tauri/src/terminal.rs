@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use dot_agent_deck::daemon_client::{Endpoint, EndpointIdentity, FocusReport};
@@ -258,14 +258,48 @@ pub(crate) struct DesktopState {
     /// what carries the signal is that it moved.
     pub(crate) selection: tokio::sync::watch::Sender<u64>,
     /// PRD #1105 M11 step 4: whether the app window holds focus, as Tauri last
-    /// reported it through [`window_focus_changed`].
+    /// reported it through [`window_focus_changed`], and the generation of that
+    /// report.
     ///
     /// Read by [`establish`], so a terminal opened while the window is focused
     /// claims focus on its deck at once. Without that, focusing the app first
     /// and opening an agent's pane second — the ordinary order — would claim
     /// nothing on that deck until the window next lost and regained focus,
     /// leaving the new pane sized by whichever client claimed last.
-    window_focused: AtomicBool,
+    ///
+    /// Every claim carries the generation it was started under
+    /// ([`FocusTicket`]) and is written only while that is still the current
+    /// one, so a focus-out or a newer focus-in drops a claim not yet sent. An
+    /// `Arc` because the claim tasks read it after this call has returned.
+    window_focus: Arc<Mutex<WindowFocus>>,
+}
+
+/// PRD #1105 M11: the window's focus as Tauri last reported it.
+#[derive(Debug, Default)]
+struct WindowFocus {
+    focused: bool,
+    /// Advanced by every report in [`window_focus_changed`], in either
+    /// direction; seeding at startup does not advance it.
+    generation: u64,
+}
+
+/// PRD #1105 M11: the focus report a claim was started under.
+#[derive(Clone)]
+struct FocusTicket {
+    focus: Arc<Mutex<WindowFocus>>,
+    generation: u64,
+}
+
+impl FocusTicket {
+    /// Whether no focus report has arrived since this claim was started — the
+    /// condition for writing it.
+    fn still_current(&self) -> bool {
+        self.focus
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .generation
+            == self.generation
+    }
 }
 
 impl Default for DesktopState {
@@ -285,7 +319,7 @@ impl Default for DesktopState {
             daemon: Arc::clone(&daemon),
             tunnels: daemon.tunnels(),
             selection: tokio::sync::watch::Sender::new(0),
-            window_focused: AtomicBool::new(false),
+            window_focus: Arc::new(Mutex::new(WindowFocus::default())),
         }
     }
 }
@@ -301,7 +335,24 @@ impl DesktopState {
     /// seeding the state at startup, before any terminal is attached. A focus
     /// change goes through [`window_focus_changed`], which also claims.
     pub(crate) fn set_window_focused(&self, focused: bool) {
-        self.window_focused.store(focused, Ordering::Relaxed);
+        self.window_focus().focused = focused;
+    }
+
+    fn window_focus(&self) -> MutexGuard<'_, WindowFocus> {
+        self.window_focus
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// PRD #1105 M11: a ticket for a claim started now, if the window is
+    /// focused. Both read under one lock, so a focus-out cannot land between
+    /// "the window is focused" and the generation the claim then carries.
+    fn focused_ticket(&self) -> Option<FocusTicket> {
+        let focus = self.window_focus();
+        focus.focused.then(|| FocusTicket {
+            focus: Arc::clone(&self.window_focus),
+            generation: focus.generation,
+        })
     }
 
     /// PRD #1105 M11: every deck this app holds at least one **viewer** on, once
@@ -691,11 +742,13 @@ async fn establish(
     // its deck, because the claim the window made when it gained focus covered
     // only the decks it had a viewer on then. After the attach rather than
     // before it, so a refused attach claims nothing. Spawned, so the attach does
-    // not wait on a second round trip.
-    let focus_claim = state.window_focused.load(Ordering::Relaxed).then(|| {
+    // not wait on a second round trip. Under the focus report current now, so a
+    // focus change before the claim is written drops it.
+    let focus_claim = state.focused_ticket().map(|ticket| {
         tauri::async_runtime::spawn(claim_focus_on(
             Arc::clone(&state.daemon),
             scope.endpoint().clone(),
+            ticket,
         ))
     });
 
@@ -731,15 +784,55 @@ const FOCUS_CLAIM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 /// the daemon does not advertise `focus-gained` — the check is
 /// `DaemonClient::focus_gained`'s, answered from the capability set the link
 /// captured at its own handshake, so an older daemon is never sent the claim.
+///
+/// [`FocusReport::Superseded`], with nothing written, when a focus report
+/// arrived after `ticket`'s — see [`window_focus_changed`]. The ticket is checked
+/// by `DaemonClient::focus_gained_while` after the claim's connection is open
+/// and immediately before its request is written, which is after the longest
+/// waits a claim has: establishing the deck's link, and opening the connection.
 async fn claim_focus_on(
     links: Arc<DaemonLinks>,
     endpoint: Endpoint,
+    ticket: FocusTicket,
 ) -> Result<FocusReport, String> {
     let daemon = links.trusted(&endpoint).await?;
     daemon.require_compatible()?;
-    match tokio::time::timeout(FOCUS_CLAIM_TIMEOUT, daemon.client.focus_gained()).await {
+    let claim = daemon.client.focus_gained_while(|| ticket.still_current());
+    match tokio::time::timeout(FOCUS_CLAIM_TIMEOUT, claim).await {
         Ok(claimed) => claimed.map_err(|error| safe_message(error.to_string())),
         Err(_) => Err("focus claim timed out".to_string()),
+    }
+}
+
+/// PRD #1105 M11 — the claims one focus report started, one per deck.
+///
+/// Production drops this, which leaves every claim running; it is returned so a
+/// test can wait for the outcomes rather than poll the daemons.
+#[must_use = "dropping the claims leaves them running; bind it to `_` to say so"]
+pub(crate) struct FocusClaims(
+    Vec<(
+        EndpointIdentity,
+        tauri::async_runtime::JoinHandle<Result<FocusReport, String>>,
+    )>,
+);
+
+impl FocusClaims {
+    /// Each deck's outcome, once every claim has finished.
+    #[cfg_attr(not(all(test, unix)), allow(dead_code))]
+    pub(crate) async fn outcomes(self) -> Vec<(EndpointIdentity, Result<FocusReport, String>)> {
+        let mut outcomes = Vec::with_capacity(self.0.len());
+        for (deck, claim) in self.0 {
+            let outcome = claim
+                .await
+                .unwrap_or_else(|error| Err(safe_message(error.to_string())));
+            outcomes.push((deck, outcome));
+        }
+        outcomes
+    }
+
+    #[cfg_attr(not(all(test, unix)), allow(dead_code))]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.0.is_empty()
     }
 }
 
@@ -750,6 +843,30 @@ async fn claim_focus_on(
 /// slow remote deck does not delay a local one. Losing focus claims nothing:
 /// the contract has no focus-lost message, because under "last focused wins"
 /// leaving the app for a browser must reflow nothing.
+///
+/// **Synchronous, and called from the window-event handler itself.** Tauri
+/// delivers a window's focus events in order on its event loop; recording the
+/// state there, rather than in a task spawned per event, keeps them in that
+/// order. Two spawned handlers could run in either order, and a focus-in handled
+/// after the focus-out that followed it would claim for a window that is no
+/// longer focused.
+///
+/// **Every report drops the claims still unsent from the report before it.**
+/// Each report advances a generation, and a claim is written only if the
+/// generation it was started under is still current (`claim_focus_on`). So:
+///
+/// - **a focus-out** drops a focus-in claim still waiting — on a slow remote
+///   link, say — which would otherwise land after the person moved to a TUI and
+///   that TUI claimed, and resize everything back to this window while they are
+///   looking at the TUI;
+/// - **a newer focus-in** drops the older one's claims, and starts its own.
+///
+/// **What remains** is a claim whose request was already written when the report
+/// arrived. It cannot be recalled: it reaches the daemon after the time it
+/// spends in transit — a local socket write, or that plus the ssh tunnel for a
+/// remote deck — and the daemon applies whichever claim it accepts last. If the
+/// person has moved to a TUI on the same deck by then and the TUI's claim is
+/// accepted first, this window's claim wins until the TUI claims again.
 ///
 /// **Why those decks.** Since the cross-deck attach the app views agents on
 /// several decks at once, and each daemon keeps its own last-focused client, so
@@ -776,34 +893,34 @@ async fn claim_focus_on(
 /// signal: `TerminalViewport` forwards everything xterm.js's `onData` emits,
 /// which includes xterm.js's own replies to an agent's terminal queries, and
 /// those would claim focus while the person is looking at another client.
-///
-/// Returns each deck's outcome, for tests; production discards it.
-pub(crate) async fn window_focus_changed(
-    state: &DesktopState,
-    focused: bool,
-) -> Vec<(EndpointIdentity, Result<FocusReport, String>)> {
-    state.window_focused.store(focused, Ordering::Relaxed);
+pub(crate) fn window_focus_changed(state: &DesktopState, focused: bool) -> FocusClaims {
+    let ticket = {
+        let mut focus = state.window_focus();
+        focus.focused = focused;
+        focus.generation += 1;
+        FocusTicket {
+            focus: Arc::clone(&state.window_focus),
+            generation: focus.generation,
+        }
+    };
     if !focused {
-        return Vec::new();
+        return FocusClaims(Vec::new());
     }
-    let claims: Vec<_> = state
-        .viewed_decks()
-        .into_iter()
-        .map(|endpoint| {
-            let deck = endpoint.identity();
-            let claim =
-                tauri::async_runtime::spawn(claim_focus_on(Arc::clone(&state.daemon), endpoint));
-            (deck, claim)
-        })
-        .collect();
-    let mut outcomes = Vec::with_capacity(claims.len());
-    for (deck, claim) in claims {
-        let outcome = claim
-            .await
-            .unwrap_or_else(|error| Err(safe_message(error.to_string())));
-        outcomes.push((deck, outcome));
-    }
-    outcomes
+    FocusClaims(
+        state
+            .viewed_decks()
+            .into_iter()
+            .map(|endpoint| {
+                let deck = endpoint.identity();
+                let claim = tauri::async_runtime::spawn(claim_focus_on(
+                    Arc::clone(&state.daemon),
+                    endpoint,
+                    ticket.clone(),
+                ));
+                (deck, claim)
+            })
+            .collect(),
+    )
 }
 
 pub(crate) async fn attach(
@@ -2186,29 +2303,55 @@ mod tests {
         }
     }
 
-    /// A daemon predating `focus-gained`: it classifies as `Connected`,
-    /// advertises `advertised`, and records the op of every request it is sent.
+    /// A scripted daemon: it classifies as `Connected`, advertises
+    /// `advertised`, and records the op of every request it is sent, one
+    /// connection at a time. It answers `focus-gained` with `ok` only when it
+    /// advertises the verb, and refuses it as unknown otherwise, as a daemon
+    /// predating the verb does; every other request is refused as unknown.
+    ///
+    /// [`Self::start_holding_hello`] holds its `hello` replies until
+    /// [`Self::release_hello`], which keeps a claim waiting on the deck's link
+    /// handshake — unsent — for as long as a test needs.
     #[cfg(unix)]
     struct OlderDeck {
         _dir: tempfile::TempDir,
         endpoint: Endpoint,
         ops: Arc<Mutex<Vec<String>>>,
+        hellos: Arc<AtomicU64>,
+        hello_gate: tokio::sync::watch::Sender<bool>,
         server: tokio::task::JoinHandle<()>,
     }
 
     #[cfg(unix)]
     impl OlderDeck {
         fn start(tag: &str, advertised: Option<Vec<&'static str>>) -> Self {
+            Self::start_gated(tag, advertised, true)
+        }
+
+        fn start_holding_hello(tag: &str, advertised: Option<Vec<&'static str>>) -> Self {
+            Self::start_gated(tag, advertised, false)
+        }
+
+        fn start_gated(tag: &str, advertised: Option<Vec<&'static str>>, hello_open: bool) -> Self {
             use dot_agent_deck::daemon_client::LocalEndpoint;
-            use dot_agent_deck::daemon_protocol::{AttachResponse, KIND_REQ, KIND_RESP};
+            use dot_agent_deck::daemon_protocol::{
+                AttachResponse, CAP_FOCUS_GAINED, KIND_REQ, KIND_RESP,
+            };
             use std::os::unix::fs::PermissionsExt;
             let (dir, socket) = scratch_socket(tag);
             let listener = tokio::net::UnixListener::bind(&socket).expect("bind the older deck");
             std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))
                 .expect("restate 0o600 on the socket inode");
             let ops = Arc::new(Mutex::new(Vec::new()));
+            let hellos = Arc::new(AtomicU64::new(0));
+            let hello_gate = tokio::sync::watch::Sender::new(hello_open);
+            let answers_focus = advertised
+                .as_ref()
+                .is_some_and(|caps| caps.contains(&CAP_FOCUS_GAINED));
             let server = {
                 let ops = Arc::clone(&ops);
+                let hellos = Arc::clone(&hellos);
+                let mut gate = hello_gate.subscribe();
                 tokio::spawn(async move {
                     while let Ok((stream, _)) = listener.accept().await {
                         let (reader, writer) = stream.into_split();
@@ -2223,11 +2366,15 @@ mod tests {
                         let op = request["op"].as_str().unwrap_or_default().to_string();
                         ops.lock().unwrap().push(op.clone());
                         let reply = if op == "hello" {
+                            hellos.fetch_add(1, Ordering::SeqCst);
+                            let _ = gate.wait_for(|open| *open).await;
                             let mut hello = matching_hello();
                             hello.capabilities = advertised
                                 .clone()
                                 .map(|caps| caps.into_iter().map(String::from).collect());
                             hello
+                        } else if op == "focus-gained" && answers_focus {
+                            AttachResponse::ok()
                         } else {
                             AttachResponse::err(format!(
                                 "malformed request: unknown variant `{op}`"
@@ -2242,8 +2389,35 @@ mod tests {
                 _dir: dir,
                 endpoint: Endpoint::Local(LocalEndpoint::at(&socket)),
                 ops,
+                hellos,
+                hello_gate,
                 server,
             }
+        }
+
+        fn release_hello(&self) {
+            self.hello_gate.send_replace(true);
+        }
+
+        /// Wait until `count` `hello` requests have arrived, answered or held.
+        async fn wait_for_hellos(&self, count: u64) {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            while self.hellos.load(Ordering::SeqCst) < count {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "timed out waiting for {count} hello request(s)"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }
+
+        fn ops_named(&self, op: &str) -> usize {
+            self.ops
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|seen| *seen == op)
+                .count()
         }
     }
 
@@ -2387,7 +2561,7 @@ mod tests {
             state.insert_unique_session(id.into(), session).unwrap();
         }
 
-        let outcomes = window_focus_changed(&state, true).await;
+        let outcomes = window_focus_changed(&state, true).outcomes().await;
         assert_eq!(
             outcomes.len(),
             2,
@@ -2412,7 +2586,7 @@ mod tests {
             .await
             .expect("another client claims deck A");
         assert!(
-            window_focus_changed(&state, false).await.is_empty(),
+            window_focus_changed(&state, false).is_empty(),
             "losing focus claims nothing"
         );
         assert_eq!(
@@ -2450,6 +2624,7 @@ mod tests {
                 .unwrap();
 
             let outcomes: HashMap<_, _> = window_focus_changed(&state, true)
+                .outcomes()
                 .await
                 .into_iter()
                 .collect();
@@ -2469,6 +2644,71 @@ mod tests {
                 "advertised {advertised:?}: the older deck is sent the handshake and nothing else"
             );
         }
+    }
+
+    /// Scenario: the desktop holds a viewer on a deck whose link handshake the
+    /// test holds, so the claim the window's focus-in starts cannot be sent yet.
+    /// The window loses focus, the handshake is released, and the deck never
+    /// receives `focus-gained`. On a second such deck the window gains focus
+    /// twice while the first claim is held: the deck receives exactly one claim,
+    /// and the first reports it was superseded.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_claim_still_unsent_when_the_window_focus_changes_is_never_sent() {
+        use dot_agent_deck::daemon_protocol::CAP_FOCUS_GAINED;
+        let lease = fixture_lease().await;
+
+        let deck = OlderDeck::start_holding_hello("dad-focus-out", Some(vec![CAP_FOCUS_GAINED]));
+        let state = DesktopState::default();
+        state
+            .insert_unique_session(
+                "t-held".into(),
+                viewer_session_on(&deck.endpoint, "1", 1, Arc::clone(&lease)),
+            )
+            .unwrap();
+        let held = window_focus_changed(&state, true);
+        deck.wait_for_hellos(1).await;
+        assert!(window_focus_changed(&state, false).is_empty());
+        deck.release_hello();
+        assert_eq!(
+            held.outcomes().await,
+            vec![(deck.endpoint.identity(), Ok(FocusReport::Superseded))],
+            "a focus-in claim still unsent when the window lost focus is dropped"
+        );
+        assert_eq!(
+            deck.ops_named("focus-gained"),
+            0,
+            "and never reaches the deck: {:?}",
+            deck.ops.lock().unwrap()
+        );
+
+        let deck = OlderDeck::start_holding_hello("dad-focus-twice", Some(vec![CAP_FOCUS_GAINED]));
+        let state = DesktopState::default();
+        state
+            .insert_unique_session(
+                "t-held".into(),
+                viewer_session_on(&deck.endpoint, "1", 1, Arc::clone(&lease)),
+            )
+            .unwrap();
+        let stale = window_focus_changed(&state, true);
+        deck.wait_for_hellos(1).await;
+        let newer = window_focus_changed(&state, true);
+        deck.release_hello();
+        assert_eq!(
+            stale.outcomes().await,
+            vec![(deck.endpoint.identity(), Ok(FocusReport::Superseded))],
+            "a newer focus-in drops the older one's unsent claim"
+        );
+        assert_eq!(
+            newer.outcomes().await,
+            vec![(deck.endpoint.identity(), Ok(FocusReport::Recorded))]
+        );
+        assert_eq!(
+            deck.ops_named("focus-gained"),
+            1,
+            "only the newer claim reaches the deck: {:?}",
+            deck.ops.lock().unwrap()
+        );
     }
 
     /// Scenario: with the window unfocused, opening a pane claims nothing. The
@@ -2495,7 +2735,7 @@ mod tests {
         assert!(detach(&state, &unfocused.result.session_id).await.unwrap());
 
         assert!(
-            window_focus_changed(&state, true).await.is_empty(),
+            window_focus_changed(&state, true).is_empty(),
             "fixture: no viewer anywhere, so focus-in itself claims nothing"
         );
         assert_eq!(deck.registry.focused_client(), None);

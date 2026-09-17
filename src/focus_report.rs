@@ -18,11 +18,21 @@
 //!   since otherwise every keystroke would open a connection to repeat a claim
 //!   that is almost always a no-op.
 //!
+//! **A claim that has gone out of date is dropped, not sent late.** A claim is
+//! a spawned task that can wait — on its first capability handshake, and on
+//! opening a connection — so a newer claim or the terminal reporting focus-out
+//! can arrive while it is still unsent. Sending it then would land after the
+//! event that superseded it, and against another client's claim that can take
+//! focus from the window the person is now looking at. See
+//! [`FocusReporter::observe`] for the rule and the window that remains.
+//!
 //! What is *not* here, deliberately: a focus-lost message (the contract has
 //! none — losing focus changes nothing under "last focused"), and any decision
 //! about sizing, which is the daemon's.
 
+use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use crossterm::event::{Event, KeyEventKind, MouseEventKind};
@@ -142,6 +152,10 @@ pub struct FocusReporter {
     client: DaemonClient,
     runtime: tokio::runtime::Handle,
     throttle: Mutex<ClaimThrottle>,
+    /// Advanced by every event that makes an unsent claim out of date: a newer
+    /// admitted claim, and focus-out. A claim carries the value it was started
+    /// at and is written only if that is still the current one.
+    generation: Arc<AtomicU64>,
 }
 
 impl FocusReporter {
@@ -150,6 +164,7 @@ impl FocusReporter {
             client,
             runtime,
             throttle: Mutex::new(ClaimThrottle::default()),
+            generation: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -164,7 +179,27 @@ impl FocusReporter {
     /// [`DaemonClient::focus_gained`]'s check, not this one's, so an older daemon
     /// is never sent the claim — and after the first `Hello` that check is a
     /// cache read, so a throttled claim against an older daemon costs no socket.
+    ///
+    /// **Out-of-date claims are dropped.** Two events make a claim that has not
+    /// been written yet out of date, and each drops it:
+    ///
+    /// - **a newer admitted claim** — the newer one is the claim to send, and the
+    ///   older one reaching the daemon after it would only repeat it late;
+    /// - **[`Event::FocusLost`]** — the person has left this TUI, and a claim
+    ///   written now would say the opposite.
+    ///
+    /// Input the throttle suppresses drops nothing: the person is still here,
+    /// and the claim already started says so. The check is
+    /// [`DaemonClient::focus_gained_while`]'s, made after the claim's connection
+    /// is open and immediately before its request is written. **What remains** is
+    /// a claim whose request was already written when the newer event arrived:
+    /// it lands, and if the event was a focus-out, another client's claim that
+    /// the daemon accepts after it is still what decides.
     pub fn observe(&self, event: &Event, now: Instant) -> Option<tokio::task::JoinHandle<()>> {
+        if matches!(event, Event::FocusLost) {
+            self.generation.fetch_add(1, Ordering::SeqCst);
+            return None;
+        }
         let signal = focus_signal(event)?;
         if !self
             .throttle
@@ -174,15 +209,22 @@ impl FocusReporter {
         {
             return None;
         }
+        let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
+        let current = Arc::clone(&self.generation);
         let client = self.client.clone();
         Some(self.runtime.spawn(async move {
-            match tokio::time::timeout(CLAIM_TIMEOUT, client.focus_gained()).await {
+            let still_wanted = || current.load(Ordering::SeqCst) == generation;
+            match tokio::time::timeout(CLAIM_TIMEOUT, client.focus_gained_while(still_wanted)).await
+            {
                 Ok(Ok(FocusReport::Recorded)) => tracing::trace!(?signal, "focus claimed"),
                 Ok(Ok(FocusReport::Withheld)) => {
                     tracing::trace!(
                         ?signal,
                         "focus claim withheld: daemon predates focus-gained"
                     )
+                }
+                Ok(Ok(FocusReport::Superseded)) => {
+                    tracing::trace!(?signal, "focus claim dropped: a newer event superseded it")
                 }
                 Ok(Err(error)) => tracing::debug!(%error, "focus claim failed"),
                 Err(_) => tracing::debug!(

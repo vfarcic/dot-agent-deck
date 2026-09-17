@@ -2317,6 +2317,14 @@ pub struct RunningAgent {
     /// predates this cannot be sent a frame kind it does not know (see
     /// `KIND_GEOMETRY` in `crate::daemon_protocol`).
     pub geometry_tx: broadcast::Sender<(u16, u16)>,
+    /// PRD #1105 — how many times [`AgentPtyRegistry::apply_dims_locked`] has
+    /// actually moved this PTY. Each count is one resize ioctl (so one SIGWINCH
+    /// to the child), one scrollback-ring clear and one geometry push; the
+    /// no-change guard returns before the count, so a re-apply that settles on
+    /// the size already in force is not one. Read through
+    /// [`AgentPtyRegistry::geometry_changes_of`], for tests and diagnostics —
+    /// it is how the focus-claim coalescing's bound on that work is observed.
+    pub geometry_changes: u64,
     /// PRD #93 round-2 reviewer REV-3: set to `true` by the reader thread
     /// once the PTY returns EOF (the child died or was killed). The daemon's
     /// idle monitor consults this via [`AgentPtyRegistry::live_count`] so an
@@ -3333,6 +3341,76 @@ pub struct AgentPtyRegistry {
     /// this shape of per-pane bookkeeping (delegations, silence watches,
     /// commissions), and it is the one thing both ends are handed.
     dispatch_returns: Mutex<crate::dispatch_return::DispatchReturns>,
+    /// PRD #1105 — the coalescing gate every `focus-gained` request passes
+    /// through before [`Self::record_focus`]; see [`Self::accept_focus_claim`].
+    /// Its own lock, never held across a re-apply, so accepting a claim does
+    /// not wait on the registry lock.
+    focus_claims: Mutex<FocusClaims>,
+    /// PRD #1105 — serialises focus passes ([`Self::run_focus_pass`]), so the
+    /// claims they take are recorded in the order they were taken. Without it a
+    /// pass that took an older claim could be descheduled and record it after a
+    /// later pass recorded a newer one, and the older claim would win.
+    focus_pass: Mutex<()>,
+    /// PRD #1105 — the sequence number of the newest claim a completed focus
+    /// pass covered. A `focus-gained` handler waits here for its own claim's
+    /// number before answering `ok`.
+    focus_applied: tokio::sync::watch::Sender<u64>,
+}
+
+/// PRD #1105 — the shortest gap between two focus passes, and so the bound on
+/// how often focus claims can re-apply sizes.
+///
+/// **Why a bound at all.** A claim from a client other than the recorded one
+/// re-applies every agent that client or the previous one views, and each real
+/// size change is a resize ioctl (a SIGWINCH the agent redraws for), a cleared
+/// scrollback ring and a geometry push to every viewer. Nothing else limits how
+/// often that happens: two clients alternating claims — a peer doing it on
+/// purpose, or a desktop's delayed claim racing a TUI's — would turn each short
+/// request into work across the registry and clear replay history on every
+/// flip. With the gate, each agent is re-applied by focus at most once per
+/// interval, however many claims arrive.
+///
+/// **Why 250 ms.** It is the longest a claim's *application* is deferred, and
+/// only when another pass ran less than an interval earlier: a person switching
+/// between two windows once, or back after a pause, is applied at once. Four
+/// flips a second is already faster than anyone reads a reflowed pane, and a
+/// quarter of a second is short enough that a switch landing inside the window
+/// does not read as the switch being ignored.
+pub const FOCUS_REAPPLY_INTERVAL: Duration = Duration::from_millis(250);
+
+/// PRD #1105 — the state of [`AgentPtyRegistry::accept_focus_claim`]'s gate.
+#[derive(Debug, Default)]
+struct FocusClaims {
+    /// Sequence number of the newest accepted claim; 0 before any.
+    accepted: u64,
+    /// The client the newest accepted claim named.
+    newest: Option<String>,
+    /// Whether `newest` was accepted after the last pass took a claim, so a
+    /// pass still has to record it.
+    untaken: bool,
+    /// When the last focus pass started, or was committed to starting.
+    last_pass: Option<Instant>,
+    /// Whether a deferred pass is scheduled and has not started yet.
+    pass_scheduled: bool,
+}
+
+/// PRD #1105 — a `focus-gained` claim the registry has accepted; see
+/// [`AgentPtyRegistry::accept_focus_claim`].
+#[must_use = "a claim is answered only once `applied` resolves"]
+pub struct FocusClaim {
+    seq: u64,
+    applied: tokio::sync::watch::Receiver<u64>,
+}
+
+impl FocusClaim {
+    /// Resolves once a focus pass has recorded this claim **or a newer one** and
+    /// re-applied every agent it moves. From then on the sizes in force are the
+    /// ones the newest recorded claim decides.
+    pub async fn applied(mut self) {
+        let seq = self.seq;
+        // The sender lives as long as the registry, which the caller holds.
+        let _ = self.applied.wait_for(|applied| *applied >= seq).await;
+    }
 }
 
 /// PRD #126: the outstanding-delegation side state — records plus the
@@ -3749,6 +3827,18 @@ struct RegistryInner {
     /// holds no viewer, so the fallback applies to every agent, and if the same
     /// process attaches again it is still the last client that was focused. A
     /// daemon restart loses it, which is also the fallback.
+    ///
+    /// **Invariant this rests on:** a stale id here is inert only because
+    /// [`AgentPtyRegistry::effective_dims`] lets the focused client decide an
+    /// agent's size solely through a viewer of that agent that has *reported a
+    /// geometry*. A change that let a focused client with no measured viewer
+    /// affect sizing would turn this never-cleared id into a bug.
+    ///
+    /// Written by [`AgentPtyRegistry::record_focus`], which the claim
+    /// coalescing ([`AgentPtyRegistry::accept_focus_claim`]) calls at most once
+    /// per [`FOCUS_REAPPLY_INTERVAL`] — so this is the newest claim a focus
+    /// pass has *recorded*, which can trail the newest one accepted by up to
+    /// that interval.
     focused_client: Option<String>,
     /// PRD #882 — monotonic source of viewer tokens, kept separate from
     /// `next_id` so the two sequences cannot entangle.
@@ -4090,6 +4180,9 @@ impl AgentPtyRegistry {
             delegations: Mutex::new(DelegationTracker::default()),
             delegation_seq: AtomicU64::new(1),
             dispatch_returns: Mutex::new(crate::dispatch_return::DispatchReturns::default()),
+            focus_claims: Mutex::new(FocusClaims::default()),
+            focus_pass: Mutex::new(()),
+            focus_applied: tokio::sync::watch::Sender::new(0),
         }
     }
 
@@ -6143,6 +6236,7 @@ impl AgentPtyRegistry {
             // viewers (`effective_dims` returns `None` for the empty set).
             viewers: HashMap::new(),
             geometry_tx: broadcast::channel(GEOMETRY_BROADCAST_CAPACITY).0,
+            geometry_changes: 0,
             exited,
             // Issue #454: a fresh generation has not been handed over yet. It
             // is the one doing the taking-over, a few lines above.
@@ -7156,6 +7250,7 @@ impl AgentPtyRegistry {
             // still held against the old agent, which is the correct signal:
             // that agent's geometry is not a thing any more.
             geometry_tx: _,
+            geometry_changes: _,
             exited: _,
             // Issue #454: the OLD record is being removed outright, so its
             // handover flag has nothing left to disown. The fresh generation
@@ -7694,9 +7789,140 @@ impl AgentPtyRegistry {
         }
     }
 
+    /// PRD #1105 — accept a `focus-gained` claim for `client_id`: the daemon's
+    /// handling of the request. The handler validates the id first, then awaits
+    /// [`FocusClaim::applied`] before answering `ok`.
+    ///
+    /// **Claims are coalesced, and the newest accepted one always wins.** A claim
+    /// is not recorded here; it becomes the gate's newest, and a **focus pass**
+    /// ([`Self::run_focus_pass`]) records whichever claim is newest when it runs,
+    /// through [`Self::record_focus`]. Passes start at least
+    /// [`FOCUS_REAPPLY_INTERVAL`] apart:
+    ///
+    /// - a claim arriving an interval or more after the last pass starts one at
+    ///   once, on the caller's thread, so an isolated claim is applied before its
+    ///   handler answers, exactly as before coalescing;
+    /// - a claim arriving sooner schedules one pass for when the interval ends,
+    ///   or joins the pass already scheduled. Every claim accepted before that
+    ///   pass takes the newest is covered by it, and only the newest is recorded.
+    ///
+    /// So each agent is re-applied by focus at most once per interval, however
+    /// many claims arrive or how they alternate, and the last claim of a burst is
+    /// the one in force afterwards. Skipping the claims in between is exact
+    /// rather than approximate: a claim that was never recorded never decided any
+    /// agent's size, so there is nothing of it to undo — the recorded claim
+    /// before it and the one after it are the only two whose agents can move.
+    ///
+    /// **A claim naming the newest client again is free.** When the newest
+    /// accepted claim already names `client_id` and a pass has taken it, nothing
+    /// new is accepted and no pass is spent: the handle resolves once that pass
+    /// has finished. That keeps a TUI's steady input claims from delaying a
+    /// real switch by using up the interval.
+    ///
+    /// **Why the handler waits.** Before coalescing, `record_focus` re-applied
+    /// before the answer, so `ok` meant "the sizes this claim decides are in
+    /// force". Waiting for the covering pass keeps that meaning — now "this claim
+    /// or a newer one" — at a cost of at most one interval on a claim that landed
+    /// inside one. Nothing a client does waits on the answer except a test.
+    ///
+    /// **The deferred pass does not depend on the connection.** It runs on a
+    /// spawned task, so a client that disconnects while waiting — or whose
+    /// handler is dropped — still has its claim applied. With no Tokio runtime
+    /// to spawn on, the pass runs inline instead, which is correct and merely
+    /// unbounded; every production caller is inside the daemon's runtime.
+    pub fn accept_focus_claim(self: &Arc<Self>, client_id: &str) -> FocusClaim {
+        enum Pass {
+            Joined,
+            Now,
+            At(Instant),
+        }
+        let now = Instant::now();
+        let applied = self.focus_applied.subscribe();
+        let mut claims = self
+            .focus_claims
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if claims.newest.as_deref() == Some(client_id) && !claims.untaken {
+            // Already the newest, and already taken by a pass — done or in
+            // flight. Nothing to accept; wait for that pass.
+            return FocusClaim {
+                seq: claims.accepted,
+                applied,
+            };
+        }
+        claims.accepted += 1;
+        claims.newest = Some(client_id.to_string());
+        claims.untaken = true;
+        let seq = claims.accepted;
+        let pass = if claims.pass_scheduled {
+            Pass::Joined
+        } else {
+            match claims.last_pass {
+                Some(last) if now < last + FOCUS_REAPPLY_INTERVAL => {
+                    claims.pass_scheduled = true;
+                    Pass::At(last + FOCUS_REAPPLY_INTERVAL)
+                }
+                // Committed under the gate lock, so a claim racing this one
+                // sees the interval as started and schedules instead of running
+                // a second pass now.
+                _ => {
+                    claims.last_pass = Some(now);
+                    Pass::Now
+                }
+            }
+        };
+        drop(claims);
+        match pass {
+            Pass::Joined => {}
+            Pass::Now => self.run_focus_pass(false),
+            Pass::At(at) => match tokio::runtime::Handle::try_current() {
+                Ok(runtime) => {
+                    let registry = Arc::clone(self);
+                    runtime.spawn(async move {
+                        tokio::time::sleep_until(tokio::time::Instant::from_std(at)).await;
+                        registry.run_focus_pass(true);
+                    });
+                }
+                Err(_) => self.run_focus_pass(true),
+            },
+        }
+        FocusClaim { seq, applied }
+    }
+
+    /// PRD #1105 — one focus pass: record the newest accepted claim, if no pass
+    /// has taken it yet, then publish that every claim accepted so far is
+    /// covered. `deferred` is a pass that was scheduled rather than started by
+    /// the claim that triggered it; it opens a new interval when it starts.
+    fn run_focus_pass(&self, deferred: bool) {
+        let _serial = self
+            .focus_pass
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (covered, client) = {
+            let mut claims = self
+                .focus_claims
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if deferred {
+                claims.pass_scheduled = false;
+                claims.last_pass = Some(Instant::now());
+            }
+            let client = std::mem::take(&mut claims.untaken)
+                .then(|| claims.newest.clone())
+                .flatten();
+            (claims.accepted, client)
+        };
+        if let Some(client) = client {
+            self.record_focus(&client);
+        }
+        self.focus_applied
+            .send_modify(|applied| *applied = (*applied).max(covered));
+    }
+
     /// PRD #1105 — record `client_id` as the last-focused client, replacing any
     /// earlier one, and re-apply the size policy to every agent the claim moves.
-    /// The daemon's handling of a `focus-gained` request.
+    /// Called by a focus pass ([`Self::accept_focus_claim`]), which is the only
+    /// production path to it; calling it directly bypasses the coalescing.
     ///
     /// The re-apply is needed here because a claim changes
     /// [`Self::effective_dims`]'s answer without any viewer changing. It runs
@@ -7713,26 +7939,56 @@ impl AgentPtyRegistry {
     /// the PTY, clears the scrollback ring and pushes the new geometry to every
     /// participating viewer, exactly as a viewer's own resize does.
     ///
+    /// **The registry lock is held one agent at a time.** The set of agents to
+    /// move is chosen under one acquisition, which is an in-memory scan with no
+    /// system call; each agent is then re-applied under an acquisition of its
+    /// own, reading the focused client afresh. So the longest the lock is held
+    /// for a claim is one agent's ioctl, not the whole registry's, and an attach,
+    /// resize or snapshot on another agent can proceed between two re-applies.
+    /// Reading the focused client per agent keeps that correct if it moves
+    /// meanwhile: each agent is sized by whichever client is recorded when its
+    /// turn comes, and the newer claim re-applies its own set.
+    ///
     /// Takes the id as given; the protocol handler validates it first.
-    pub fn record_focus(&self, client_id: &str) {
-        let mut guard = self.inner.lock().unwrap();
-        let inner = &mut *guard;
-        if inner.focused_client.as_deref() == Some(client_id) {
-            return;
-        }
-        let previous = inner.focused_client.replace(client_id.to_string());
-        for (id, agent) in inner.agents.iter_mut() {
-            let moved = [previous.as_deref(), Some(client_id)]
-                .into_iter()
-                .flatten()
-                .any(|client| Self::client_geometries(agent, client).next().is_some());
-            if !moved {
-                continue;
+    fn record_focus(&self, client_id: &str) {
+        let moved: Vec<String> = {
+            let mut guard = self.inner.lock().unwrap();
+            let inner = &mut *guard;
+            if inner.focused_client.as_deref() == Some(client_id) {
+                return;
             }
-            if let Err(e) = Self::apply_effective_locked(agent, Some(client_id)) {
+            let previous = inner.focused_client.replace(client_id.to_string());
+            inner
+                .agents
+                .iter()
+                .filter(|(_, agent)| {
+                    [previous.as_deref(), Some(client_id)]
+                        .into_iter()
+                        .flatten()
+                        .any(|client| Self::client_geometries(agent, client).next().is_some())
+                })
+                .map(|(id, _)| id.clone())
+                .collect()
+        };
+        for id in moved {
+            let mut guard = self.inner.lock().unwrap();
+            let inner = &mut *guard;
+            let focused = inner.focused_client.as_deref();
+            // Gone since the scan: its viewers went with it.
+            let Some(agent) = inner.agents.get_mut(&id) else {
+                continue;
+            };
+            if let Err(e) = Self::apply_effective_locked(agent, focused) {
                 tracing::debug!(agent_id = %id, error = %e, "a focus claim could not re-apply the effective geometry");
             }
         }
+    }
+
+    /// PRD #1105 — how many times agent `id`'s PTY has actually been resized;
+    /// `None` for an unknown agent. See [`RunningAgent::geometry_changes`].
+    pub fn geometry_changes_of(&self, id: &str) -> Option<u64> {
+        let inner = self.inner.lock().unwrap();
+        inner.agents.get(id).map(|agent| agent.geometry_changes)
     }
 
     /// PRD #1105 — the last-focused client recorded by [`Self::record_focus`],
@@ -7877,6 +8133,7 @@ impl AgentPtyRegistry {
             .map_err(|e| AgentPtyError::Resize(e.to_string()))?;
         agent.pty_rows = rows;
         agent.pty_cols = cols;
+        agent.geometry_changes += 1;
         // PRD #104 M3: drop the scrollback ring so a snapshot returned to a
         // fresh subscriber covers a single dimension epoch. See the long note
         // in `resize` for the residual best-effort gap and why it is
@@ -8613,6 +8870,7 @@ impl AgentPtyRegistry {
             RunningAgent {
                 viewers: HashMap::new(),
                 geometry_tx: broadcast::channel(GEOMETRY_BROADCAST_CAPACITY).0,
+                geometry_changes: 0,
                 child,
                 // `adopt(None)` is the portable "there is no group to hold"
                 // constructor: a no-op ZST on Unix, and an unassigned (jobless)
@@ -13240,6 +13498,135 @@ mod spawn_tests {
             registry.pty_size_for_agent(&focused),
             Some((44, 144)),
             "a repeated claim by the recorded client re-applies nothing"
+        );
+
+        registry.shutdown_all();
+    }
+
+    /// PRD #1105 — the most real PTY resizes `claims` alternating claims can
+    /// cause over `elapsed` on one agent: one pass per started
+    /// [`FOCUS_REAPPLY_INTERVAL`], each moving the agent at most once. Each of
+    /// those resizes is also one scrollback-ring clear and one geometry push, all
+    /// counted by [`RunningAgent::geometry_changes`].
+    fn focus_pass_bound(elapsed: Duration) -> u64 {
+        (elapsed.as_nanos() / FOCUS_REAPPLY_INTERVAL.as_nanos()) as u64 + 1
+    }
+
+    /// PRD #1105 — two clients with measured viewers of one agent claim focus
+    /// alternately: 200 claims back to back, then two more inside the interval
+    /// that opened, then 200 claims 5 ms apart. The agent is resized at most once
+    /// per started interval rather than once per claim, and the final claim of
+    /// each run is the one recorded and in force when its handle resolves.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn alternating_focus_claims_resize_at_most_once_per_interval_and_the_last_wins() {
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let id = spawn_focus_agent(&registry);
+        let _desktop = attach_for(&registry, &id, Some((22, 153)), Some("desktop"));
+        let _tui = attach_for(&registry, &id, Some((42, 58)), Some("tui"));
+        let size = |client: &str| {
+            if client == "desktop" {
+                (22, 153)
+            } else {
+                (42, 58)
+            }
+        };
+        assert_eq!(
+            registry.pty_size_for_agent(&id),
+            Some((22, 58)),
+            "fixture: no claim yet, the per-axis minimum"
+        );
+
+        // Back to back: every claim after the first lands inside the interval
+        // the first one's pass opened.
+        let before = registry.geometry_changes_of(&id).expect("agent");
+        let started = Instant::now();
+        let clients = ["desktop", "tui"];
+        let mut last = None;
+        for n in 0..200 {
+            last = Some(registry.accept_focus_claim(clients[n % 2]));
+        }
+        last.expect("claims were made").applied().await;
+        let elapsed = started.elapsed();
+        let changes = registry.geometry_changes_of(&id).expect("agent") - before;
+        assert_eq!(
+            registry.focused_client().as_deref(),
+            Some("tui"),
+            "the burst's last claim is the one recorded"
+        );
+        assert_eq!(
+            registry.pty_size_for_agent(&id),
+            Some(size("tui")),
+            "and the size in force is the one it decides"
+        );
+        assert!(
+            changes <= focus_pass_bound(elapsed),
+            "200 alternating claims in {elapsed:?} resized the PTY {changes} times; at most \
+             {} passes can have run",
+            focus_pass_bound(elapsed)
+        );
+
+        // Two claims inside the interval that burst's pass just opened: the
+        // deferred pass must record the newer of them, not the first it finds.
+        let _first = registry.accept_focus_claim("desktop");
+        registry.accept_focus_claim("tui").applied().await;
+        assert_eq!(
+            registry.focused_client().as_deref(),
+            Some("tui"),
+            "of two claims waiting on one pass, the newer is recorded"
+        );
+        assert_eq!(registry.pty_size_for_agent(&id), Some(size("tui")));
+
+        // Sustained: a claim every 5 ms for about a second, alternating, so many
+        // intervals open and close while claims keep arriving.
+        let before = registry.geometry_changes_of(&id).expect("agent");
+        let started = Instant::now();
+        let mut last = None;
+        for n in 0..200 {
+            last = Some(registry.accept_focus_claim(clients[(n + 1) % 2]));
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        last.expect("claims were made").applied().await;
+        let elapsed = started.elapsed();
+        let changes = registry.geometry_changes_of(&id).expect("agent") - before;
+        assert_eq!(
+            registry.focused_client().as_deref(),
+            Some("desktop"),
+            "the stream's last claim is the one recorded"
+        );
+        assert_eq!(registry.pty_size_for_agent(&id), Some(size("desktop")));
+        assert!(
+            changes <= focus_pass_bound(elapsed),
+            "200 alternating claims over {elapsed:?} resized the PTY {changes} times; at most \
+             {} passes can have run",
+            focus_pass_bound(elapsed)
+        );
+
+        registry.shutdown_all();
+    }
+
+    /// PRD #1105 — a claim naming the client that is already newest spends no
+    /// pass: a real switch right after it is applied at once, not deferred to
+    /// the end of an interval the repeat would otherwise have opened.
+    #[tokio::test]
+    async fn a_repeated_claim_does_not_delay_the_next_switch() {
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let id = spawn_focus_agent(&registry);
+        let _desktop = attach_for(&registry, &id, Some((22, 153)), Some("desktop"));
+        let _tui = attach_for(&registry, &id, Some((42, 58)), Some("tui"));
+
+        registry.accept_focus_claim("tui").applied().await;
+        // Wait out the interval the first claim's pass opened.
+        tokio::time::sleep(FOCUS_REAPPLY_INTERVAL).await;
+        for _ in 0..5 {
+            registry.accept_focus_claim("tui").applied().await;
+        }
+        // Not awaited: the switch must be in force as soon as it is accepted.
+        let _switch = registry.accept_focus_claim("desktop");
+        assert_eq!(
+            registry.pty_size_for_agent(&id),
+            Some((22, 153)),
+            "repeating the recorded client's claim must not open an interval that defers \
+             the next client's"
         );
 
         registry.shutdown_all();

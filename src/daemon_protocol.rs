@@ -1192,6 +1192,14 @@ pub enum AttachRequest {
     /// changes nothing. See the PRD #1105 Work Log entry of 2026-09-17 for the
     /// sizing rule this feeds and its fallback.
     ///
+    /// **Claims are coalesced, and the last one accepted still wins.** The
+    /// daemon re-applies sizes for claims at most once per
+    /// [`crate::agent_pty::FOCUS_REAPPLY_INTERVAL`]; claims that arrive inside
+    /// that window are applied together when it ends, and only the newest of
+    /// them is recorded. The answer comes once this claim or a newer one has been
+    /// applied, so it can take up to that interval. A client must not read the
+    /// delay, or the claim in between never being recorded, as a failure.
+    ///
     /// **There is deliberately no "focus lost" message.** The rule is that the
     /// *last*-focused client wins, not the currently-focused one, so losing focus
     /// changes nothing by itself: leaving both clients for a browser must reflow
@@ -3193,11 +3201,16 @@ async fn handle_connection(
             Err(e) => write_resp(&mut stream, &AttachResponse::err(e.to_string())).await?,
         },
         AttachRequest::FocusGained { client_id } => {
-            // PRD #1105: record the claim. `record_focus` re-applies the size
-            // policy to every agent the claim moves before this answers, so a
-            // client that reads `ok` knows the resize has already happened.
+            // PRD #1105: accept the claim through the registry's coalescing
+            // gate, which bounds how often claims re-apply sizes, and answer
+            // once a focus pass has recorded it or a newer claim and re-applied
+            // every agent that moves. So a client that reads `ok` knows the
+            // sizes the newest claim decides are in force. The wait is at most
+            // `FOCUS_REAPPLY_INTERVAL`, and only for a claim that landed within
+            // one of the previous pass; the pass itself does not depend on this
+            // connection staying open.
             if is_valid_client_id(&client_id) {
-                registry.record_focus(&client_id);
+                registry.accept_focus_claim(&client_id).applied().await;
                 write_resp(&mut stream, &AttachResponse::ok()).await?
             } else {
                 write_resp(
