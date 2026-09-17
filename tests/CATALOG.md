@@ -2042,6 +2042,65 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** production daemon/RPC latency; the synthetic delays isolate fan-out semantics.
 - **Platform coverage:** mac+linux.
 
+#### lifecycle/wire-stop
+
+##### lifecycle/wire-stop/001 — `StopDaemon` REFUSES over the wire while orchestration roles are live, and carries the panes, the roles and both renderings back (issue #1049).
+- **Layer:** L1/synthetic (a real attach socket served by the production `serve_attach_with_counter` over a caller-owned `AppState`, with real stand-in children under `AgentPtyRegistry`).
+- **Agent:** none (two `sleep 30` stand-ins occupying the role panes).
+- **Asserts:** the reply is `ok = false` carrying a structured `stop_refusal`; its `reason` is `live-orchestrations`; both live roles cross with the orchestrator flagged and a stable order; the managed agent ids cross too; the multi-line `message` names the panes, says the loss is PERMANENT rather than a termination, points at `--force` and ends in a newline; the one-line `summary` is newline-free, still points at `--force`, and is byte-identical to `error` so a client reading only `error` sees the same sentence. Then the safety property itself: the registry is UNDRAINED afterwards and the daemon still serves, refusing the same way on a second ask — a reply that says no is worth nothing if the daemon tore itself down while saying it.
+- **Does not assert:** the `--force` override (`lifecycle/wire-stop/004`); that the refusal policy matches the CLI's (`daemon_stop::tests::wire_stop_refusal_agrees_with_the_cli_refusal`, which drives the force matrix without a socket); anything about the unguarded `KIND_SHUTDOWN` frame, whose narrowing is issue #1109's open question.
+- **Platform coverage:** linux+mac (`#![cfg(unix)]` — the attach socket is Unix-domain; Windows port tracked by #164).
+
+##### lifecycle/wire-stop/002 — With no roles registered, `StopDaemon` refuses as the managed-AGENTS guard and does not claim an orchestration is at stake (issue #1049).
+- **Layer:** L1/synthetic (real attach socket, real stand-in child, empty `AppState`).
+- **Agent:** none (one `sleep 30` stand-in on a plain TUI-numbered pane).
+- **Asserts:** `reason` is `live-agents`; `roles` is empty; the one agent id crosses; the message keeps the pre-existing agents wording (`managed agent(s) running`) rather than the orchestration one; the registry is undrained.
+- **Does not assert:** the ordering when both guards apply (`daemon_stop::tests::wire_stop_refusal_agrees_with_the_cli_refusal`); the PID path's own agents guard (`lifecycle/stop/002`).
+- **Platform coverage:** linux+mac (`#![cfg(unix)]`).
+
+##### lifecycle/wire-stop/003 — The refusal survives a byte-forwarding relay, so the verb needs only a path that carries frames — no pid, no peer credential (issue #1049).
+- **Layer:** L1/synthetic (real attach socket behind an in-process Unix-socket relay that copies bytes both ways and understands no frames; driven through the real `daemon_stop::run_daemon_stop_over_wire`).
+- **Agent:** none (two `sleep 30` stand-ins).
+- **Asserts:** `run_daemon_stop_over_wire` pointed at the RELAY's address returns `StopError::Refused` carrying the same structured refusal, with the panes and the permanence intact across both hops — this is the only view of that pane list a remote caller ever has. The registry is undrained. This is the property `run_daemon_stop` lacks and the reason PRD #741 M2 made it `LocalEndpoint`-only.
+- **Does not assert:** that `SO_PEERCRED` at the daemon's end would name the relay rather than the daemon. It would over a real tunnel, but both ends here live in the test process so the pid coincides and the substitution is not observable; that half is a property of the transport, exercised by the issue #1049 cross-version run against a real daemon.
+- **Platform coverage:** linux+mac (`#![cfg(unix)]`).
+
+##### lifecycle/wire-stop/004 — `StopDaemon { force: true }` clears the refusal and drains the registry through the same graceful path `KIND_SHUTDOWN` uses (issue #1049).
+- **Layer:** L1/synthetic (real attach socket, real stand-in children, `AppState` holding live roles).
+- **Agent:** none (two `sleep 30` stand-ins).
+- **Asserts:** the reply is `ok = true` with no `stop_refusal` even though both guards would otherwise apply; the registry is drained. Driven at the protocol level rather than through `run_daemon_stop_over_wire` deliberately — this harness wires no shutdown `Notify`, so the server keeps accepting and the confirmation poll would spend its whole budget before reporting `AcceptedNotConfirmed`; the drain is the observable that actually proves the accept.
+- **Does not assert:** the confirmation poll's own outcomes; that the daemon process exits, which needs the production hook loop.
+- **Platform coverage:** linux+mac (`#![cfg(unix)]`).
+
+##### lifecycle/wire-stop/005 — A wire stop against a path nothing is listening on is idempotent, not an error (issue #1049).
+- **Layer:** L1 (no socket — a path in a scratch dir).
+- **Agent:** none.
+- **Asserts:** `run_daemon_stop_over_wire` returns `WireStopOutcome::NoDaemonRunning`, the same contract the PID path's `StopOutcome::NoDaemonRunning` gives (`lifecycle/stop/004`).
+- **Does not assert:** the ECONNREFUSED-against-a-stale-inode half of that contract.
+- **Platform coverage:** linux+mac (`#![cfg(unix)]`).
+
+##### lifecycle/wire-stop/006 — The daemon advertises `stop-daemon` on `Hello`, because a remote client that misses it has no fallback (issue #1049).
+- **Layer:** L1/synthetic (real attach socket, real `Hello` round trip).
+- **Agent:** none.
+- **Asserts:** the `Hello` reply's `capabilities` contains `CAP_STOP_DAEMON`. The consequence of getting this wrong is specific: the PID stop needs a `LocalEndpoint`, so a remote client finding no capability has no second path and must say the deck is too old rather than send a frame that returns `unknown variant`.
+- **Does not assert:** the conservative reading of an absent set (`daemon_stop::tests::wire_stop_capability_is_read_conservatively`); `PROTOCOL_VERSION` negotiation, which the desktop's `classify_handshake` owns.
+- **Platform coverage:** linux+mac (`#![cfg(unix)]`).
+
+##### lifecycle/wire-stop/007 — A peer that accepts and stays silent times out instead of hanging the caller forever (issue #1049, Greptile P1 on PR #1113).
+- **Layer:** L1/synthetic (a Unix socket that accepts connections and then never writes and never closes).
+- **Agent:** none.
+- **Asserts:** `run_daemon_stop_over_wire_with` returns on its own budget rather than blocking, surfaces `StopError::WireTimedOut`, and says in its message that the outcome is UNKNOWN and a retry is safe — this side cannot tell whether the daemon saw the request. `issue_command` carries no timeout of its own, and over `ssh -L` a stalled upstream yields a connection that is open and permanently silent, so without this bound the call never returns and the confirmation budget is never reached.
+- **Does not assert:** the production 10 s budget itself (the test passes a short one through the budget-explicit entry point); the confirmation half (`lifecycle/wire-stop/008`).
+- **Platform coverage:** linux+mac (`#![cfg(unix)]`).
+
+##### lifecycle/wire-stop/008 — An accepted stop whose confirmation probes HANG is reported as unconfirmed, never as stopped (issue #1049, Greptile P1 on PR #1113).
+- **Layer:** L1/synthetic (a socket that answers the first request `ok` and then holds every later connection open and silent — an accepted stop behind a wedged forward).
+- **Agent:** none.
+- **Asserts:** the outcome is `WireStopOutcome::AcceptedNotConfirmed`, not `Stopped`. A daemon that exits CLOSES its socket, so its peer sees EOF; silence is a stalled peer and proves nothing, which is why a stalled probe resets the consecutive-unreachable count rather than advancing it. Reporting success for a daemon the caller cannot see is the precise defect #1049 was filed about — over `ssh -L` the PID path printed "Daemon stopped gracefully (pid N)" having killed the tunnel.
+- **Does not assert:** the three-probe confirmation threshold in isolation; the request-timeout half (`lifecycle/wire-stop/007`).
+- **Platform coverage:** linux+mac (`#![cfg(unix)]`).
+
+
 #### lifecycle/restart
 
 ##### lifecycle/restart/001 — `daemon restart` reuses the next-launch lazy-spawn — a subsequent `dot-agent-deck` launch comes up against a fresh daemon process.
