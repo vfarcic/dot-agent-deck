@@ -54,7 +54,7 @@ import { agentKey } from "./lib/agentKey";
 import { unreachableDeckTerminalState } from "./lib/terminalInput";
 import { applyAppearance } from "./lib/appearance";
 import { desktopWorkflowPlatformIssue } from "./lib/platform";
-import type { DeckAction, DeckRuntimeState, DeckView, EvidenceItem, PanelTab, WorkflowLaunchConfig } from "./types";
+import type { AgentSession, DeckAction, DeckRuntimeState, DeckSnapshot, DeckView, EvidenceItem, PanelTab, WorkflowLaunchConfig } from "./types";
 import { modeScopedKey } from "./lib/bridge";
 
 const WORKFLOW_STORAGE_KEY = modeScopedKey("dot-agent-deck.desktop.workflow-preview.v1");
@@ -219,6 +219,21 @@ export function DeckShell({ runtime, workflowPlatformIssue, initialView = { kind
    */
   const paneDeckAttachable = paneDeck?.connection.status === "connected";
   /**
+   * The agent the open pane is FOR, resolved by the composite identity against
+   * the fleet entry named by the view — never by bare id against the selected
+   * deck's snapshot, which is where a bare-id lookup would find a *different*
+   * agent wearing the same per-daemon monotonic id (PRD #1105 M6).
+   *
+   * Resolved HERE rather than inside {@link OverviewAgentPane}, and for the same
+   * reason `paneDeckAttachable` is one expression: three things read it — the
+   * shown declaration below, the retirement close further down, and the pane
+   * itself, which takes it as a prop. Two copies of this `find` is how those
+   * would drift, and the drift the PR review found was exactly that shape: the
+   * pane resolved the agent and rendered nothing when it failed, while the
+   * declaration never asked and went on naming it.
+   */
+  const paneAgent = agentView && paneDeck ? paneDeck.agents.find((candidate) => candidate.id === agentView.agentId) : undefined;
+  /**
    * PRD #1105 M4 — the shown set for the OVERVIEW tree, declared here because
    * this is the only component that can see the overview and the pane over it
    * in one commit. `undefined` on the deck path hands ownership to
@@ -227,9 +242,22 @@ export function DeckShell({ runtime, workflowPlatformIssue, initialView = { kind
    * The declaration names the pane's OWN deck, never the selected one, so a
    * selection move neither retargets it nor tears it down: the joined key is
    * unchanged, so no call is made at all.
+   *
+   * **It names an agent that still RESOLVES, which is the PR review's P1.** The
+   * declaration used to gate on the deck alone, so an agent the daemon ended
+   * under an open pane stayed declared — and the standing declaration is not
+   * inert. `useShownTerminals` keys its effect on the joined `(deckId,
+   * agentId)` string, which an agent leaving the fleet does not change, so
+   * nothing re-fired to withdraw it; meanwhile the bridge re-runs
+   * `attachAgents` over the whole shown set on **every** `desktop://snapshot`
+   * (`bridge.ts`'s `subscribe`), and the daemon's `end` event for that agent has
+   * already removed it from `attached` — so it cleared `attachAgents`' filter
+   * afresh on each snapshot, took the process-wide attach gate and opened a
+   * socket for an agent that no longer exists, serialising against the attaches
+   * of panes that do.
    */
   const overviewShown = base === "overview"
-    ? (agentView && paneDeckAttachable ? [{ deckId: agentView.deckId, agentId: agentView.agentId }] : [])
+    ? (agentView && paneAgent && paneDeckAttachable ? [{ deckId: agentView.deckId, agentId: agentView.agentId }] : [])
     : undefined;
   useShownTerminals(runtime.setShownTerminals, overviewShown);
   /**
@@ -270,6 +298,62 @@ export function DeckShell({ runtime, workflowPlatformIssue, initialView = { kind
   useEffect(() => {
     if (deckPaneRetargeted) closeAgent();
   }, [deckPaneRetargeted, closeAgent]);
+  /**
+   * PRD #1105 open question 3, answered — **the view does not outlive its
+   * subject.** The daemon can end an agent while it is overlaid, and before this
+   * the app simply stayed in `view.kind === "agent"`: the pane's own lookup
+   * failed, it returned `null`, and what was left was a view with nothing
+   * rendering it, no Close control, and (on the overview path) a shown
+   * declaration still naming the agent.
+   *
+   * Closing is chosen over an explicit ended state for three reasons, the first
+   * of which is decisive. **Everything the pane renders is a property of the
+   * agent RECORD** — heading, role, status, prompt, tool, the five panel tabs —
+   * and that record is what has gone; an ended state would have to be built
+   * from the view, which carries two ids and a `from`. Second, it is the answer
+   * already given one condition above for the same shape of problem:
+   * `deckPaneRetargeted` closes rather than suspends because *"a suspended pane
+   * still has to say whose agent it is showing, and the honest answer is
+   * 'nobody's'"*. Third, `closeAgent` lands on `view.from` — for an
+   * overview-origin pane, the screen that lists what does exist, which is where
+   * the absence explains itself. The PRD records the *visual* treatment as
+   * undecided, and closing is the option that decides nothing on the owner's
+   * behalf: it adds no surface, and an ended state can still replace it later.
+   *
+   * # `paneDeckAttachable` is load-bearing, and closing without it is worse than
+   * the defect
+   *
+   * A deck that is not answering reports **no agents at all** — both empty
+   * agent lists in the crate are on that path, `disconnected_snapshot` and
+   * `snapshot_with`'s non-connected early return — and `mapDesktopSnapshot`
+   * carries none over from the previous snapshot. So "the agent does not
+   * resolve" is ALSO what a remote deck blinking, a failed reconnect, or a deck
+   * that has not yet reported looks like, and closing on that alone would throw
+   * a healthy pane away on each of them. It would also contradict this PRD's own
+   * decision that such a deck *"replaces its terminal with a sentence rather
+   * than closing the pane"*.
+   *
+   * A CONNECTED deck's list is an answer rather than a silence:
+   * `connected_snapshot` is the only producer of a connected snapshot and it
+   * maps a `ListAgents` reply every time — fresh, or the agent view's cached
+   * records — and a `ListAgents` that fails becomes a `disconnected_snapshot`
+   * instead. So an absence there is a real absence, and that is the whole of
+   * why this reads `paneDeckAttachable`, the expression that already means
+   * "this deck has a live link", rather than testing `paneAgent` alone.
+   *
+   * # Both origins, one condition
+   *
+   * The deck path's shown declaration was never at risk — {@link DeckSurface}
+   * derives it from `snapshot.agents`, so a retired agent shrinks the set and
+   * the joined key changes on its own — and its render self-heals, because
+   * `paneAgentId` resolves to `undefined` and promotes no tile. What it shared
+   * with the overview was precisely this stale view, so the condition is written
+   * for `agentView` rather than for `base === "overview"`.
+   */
+  const paneAgentRetired = agentView !== undefined && paneDeckAttachable && paneAgent === undefined;
+  useEffect(() => {
+    if (paneAgentRetired) closeAgent();
+  }, [paneAgentRetired, closeAgent]);
   if (base === "overview") {
     return (
       <>
@@ -281,7 +365,7 @@ export function DeckShell({ runtime, workflowPlatformIssue, initialView = { kind
           one live `TerminalViewport` for the agent, which is the property M3
           actually requires.
         */}
-        {agentView && <OverviewAgentPane runtime={runtime} view={agentView} attached={paneDeckAttachable} onClose={closeAgent} />}
+        {agentView && paneDeck && paneAgent && <OverviewAgentPane runtime={runtime} view={agentView} deck={paneDeck} agent={paneAgent} attached={paneDeckAttachable} onClose={closeAgent} />}
       </>
     );
   }
@@ -295,25 +379,29 @@ export function DeckShell({ runtime, workflowPlatformIssue, initialView = { kind
  * The pane over the OVERVIEW, with the tile state the deck would otherwise
  * have owned. Its terminal is live whichever deck the agent is on.
  *
- * Split out for the hook, not for the rendering: the panel tab is component
- * state and the agent lookup can fail, so the two cannot live in
- * {@link DeckShell}'s body without either a conditional hook or a `tabs` map
- * kept for a screen that has no tiles.
+ * Split out for the hook and nothing else: the panel tab is component state,
+ * and a `tabs` map kept in {@link DeckShell} for a screen that has no tiles is
+ * the alternative.
  *
- * An agent that is not in the fleet renders nothing — the deck can retire a
- * pane while its overlay is open, and PRD #1105 records what that should LOOK
- * like as an open question. `Escape` still closes the view, because that
- * listener is {@link DeckShell}'s and not this component's.
+ * # It takes its deck and its agent, and resolves neither
  *
- * # The lookup is by the COMPOSITE identity, not by the bare id
+ * Both are resolved by {@link DeckShell} — `paneDeck` and `paneAgent` — and
+ * handed down, so this component has no lookup that can fail and no `null`
+ * branch. That is the PR review's P1 fixed at the structure rather than at the
+ * symptom: the early return this used to open with was a **silent** answer to
+ * "the agent is gone", and the parent that owns the view and the shown
+ * declaration never learnt of it. The parent now decides — closing the view
+ * when the pane's deck is answering and does not list the agent, and holding it
+ * when the deck is simply not answering — and this pane is rendered only where
+ * there is something to render.
  *
- * PRD #1105 M6. This screen merges every observed deck and every agent it lists
- * is openable, so this pane can be for an agent on a deck that is not the
- * selected one — and the selected deck's snapshot is exactly where a bare-id
- * lookup would find a *different* agent wearing the same per-daemon monotonic
- * id. Resolving against the fleet entry named by `view.deckId` is what the
- * variant carries a `deckId` for, and it is what keeps the pane on the agent
- * the user opened when the selection moves under it.
+ * The identity behind that lookup is the COMPOSITE one (PRD #1105 M6): this
+ * screen merges every observed deck and every agent it lists is openable, so
+ * the pane can be for an agent on a deck that is not the selected one — and the
+ * selected deck's snapshot is exactly where a bare-id lookup would find a
+ * *different* agent wearing the same per-daemon monotonic id. `Escape` closes
+ * the view from here as from anywhere, because that listener is
+ * {@link DeckShell}'s and not this component's.
  *
  * # `attached` is the pane's whole deck story, and it is a state rather than a
  * refusal
@@ -328,17 +416,25 @@ export function DeckShell({ runtime, workflowPlatformIssue, initialView = { kind
  * what is wrong with it instead of a `TerminalViewport` that would receive no
  * bytes.
  *
+ * **That "opens either way" is narrower in production than it reads, and the
+ * gap is not yet filed.** It needs an agent record, and a deck with no live
+ * link reports **no agents** —
+ * `disconnected_snapshot` and `snapshot_with`'s non-connected early return both
+ * carry `agents: Vec::new()`, and `mapDesktopSnapshot` carries none over from
+ * the previous snapshot. So the pane this state was built for is not rendered at
+ * all on a deck that stops answering; what is guaranteed is only that the view
+ * is KEPT (see `paneAgentRetired`), so the pane returns intact when the deck
+ * does. Making the state itself reachable means holding the last known record
+ * for an open pane, which is its own product call and is not taken here.
+ *
  * **Nothing here moves the selection.** Switching the selected deck on open was
  * built and withdrawn under this PRD (decision 5) because it wrote
  * `desktop.toml` on a navigation and left state created under one deck
  * attributed to another. The pane reaching its own deck is what made that
  * unnecessary rather than merely unwise.
  */
-function OverviewAgentPane({ runtime, view, attached, onClose }: { runtime: DeckRuntimeState; view: Extract<DeckView, { kind: "agent" }>; attached: boolean; onClose: () => void }) {
+function OverviewAgentPane({ runtime, view, deck, agent, attached, onClose }: { runtime: DeckRuntimeState; view: Extract<DeckView, { kind: "agent" }>; deck: DeckSnapshot; agent: AgentSession; attached: boolean; onClose: () => void }) {
   const [tab, setTab] = useState<PanelTab>("terminal");
-  const deck = runtime.fleet.find((entry) => entry.connection.deckId === view.deckId);
-  const agent = deck?.agents.find((candidate) => candidate.id === view.agentId);
-  if (!deck || !agent) return null;
   return (
     <AgentPaneFrame
       open
