@@ -10440,6 +10440,38 @@ pub async fn spawn_inprocess_daemon() -> InProcDaemon {
         "in-process daemon hook socket was not accepting connections within 5s"
     );
 
+    // Issue #954: and the ATTACH socket too, because this function hands one
+    // out. `run_daemon_with` binds the hook endpoint near its top and the attach
+    // listener some way further down — after a `state` write, a synchronous
+    // `LoadedSchedules::load()` and three `tokio::spawn`s — so the hook
+    // handshake above says nothing about whether `attach_path` is connectable
+    // yet. Returning while it is not hands the caller an address whose failure
+    // mode is an instant `ENOENT` from `DaemonClient::connect`, which surfaces
+    // wherever that client's error happens to be read rather than here.
+    //
+    // Measured on a 16-core box at `/proc/pressure/io full avg60 = 51`, over 12
+    // cold processes: the attach socket was already accepting every time, within
+    // 60-175 us of this readiness loop's first successful hook connect — so this
+    // is not the cause of #954's reported failures and is not offered as one.
+    // It is the same *shape* as the cause, and closing it is what stops a
+    // harness-sized version of that bug being written next. `daemon_status.rs`
+    // had already hand-rolled this wait for its own calls; the other consumer,
+    // `delegate_respawn_recovery.rs`, had not, and nothing said it had to.
+    let attach_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut attach_ready = false;
+    while tokio::time::Instant::now() < attach_deadline {
+        if tokio::net::UnixStream::connect(&attach_path).await.is_ok() {
+            attach_ready = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        attach_ready,
+        "in-process daemon attach socket {} was not accepting connections within 5s",
+        attach_path.display()
+    );
+
     InProcDaemon {
         _dir: dir,
         state,
