@@ -2478,7 +2478,7 @@ export class TauriDeckBridge implements DeckBridge {
       // used to look the agent up by bare id and notify with the current
       // `selectedDeckId`, so a late frame from the deck the user had just left
       // recorded that machine's dimensions as the new deck's — and the next
-      // attach submitted them to it, which the daemon's smallest-viewer policy
+      // attach submitted them to it, which the daemon's viewer size policy
       // turns into a real reflow of that PTY and of every other client watching
       // it.
       const key = this.sessionKeys.get(event.payload.sessionId);

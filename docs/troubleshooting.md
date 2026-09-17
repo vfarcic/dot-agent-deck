@@ -236,15 +236,19 @@ It runs a fixed ordered list of read-only checks — ssh reachability and auth, 
 
 It earns its keep on one case in particular. `AllowTcpForwarding no` on the remote and a port collision produce **byte-identical** errors from ssh, so no client-side message can separate them; the doctor reads the remote's own sshd policy and tells you which one you have. See [Reverse tunnels › Troubleshooting with `remote doctor`](remote-recipes.md#troubleshooting-with-remote-doctor) for annotated output of every case.
 
-## A pane does not fill its box while another app is open on the same agent
+## A pane does not fill its box, or is cut off, while another app is open on the same agent
 
 This is expected, and it is what makes two clients able to watch one agent at all.
 
 A terminal program is drawn onto a pseudo-terminal, and **a pseudo-terminal has exactly one size**. The agent asks the operating system how big its screen is, lays its interface out for that answer, and then draws by moving the cursor to absolute positions on that grid. There is no way to hand two clients different sizes of the same live screen — the bytes the agent emits only mean anything at the size it drew them for.
 
-So the daemon picks one size per agent: **the smallest pane among every client currently attached to it.** If your terminal is showing an agent at 200 columns while the desktop app is showing the same agent in a 90-column tile, the agent runs at 90 columns and your terminal pane leaves the remaining 110 blank. The alternative is worse: at any larger size, the smaller client would be showing you a cropped corner of the agent's screen with its status line off the edge and no way to scroll to it.
+So the daemon picks one size per agent, and **the app you used last picks it.** Switching to the desktop app's window, or clicking, scrolling or typing in a `dot-agent-deck` TUI, tells the daemon that app has focus, and every agent it is showing takes the size of its pane there. If you are working in the desktop app's full-window pane at 150 columns while a TUI shows the same agent in a 60-column tile, the agent runs at 150 columns: the desktop pane fills its box, and the TUI's tile shows only the left-hand 60 columns of the agent's screen. Click or type in the TUI and it switches back — the agent redraws at 60 columns, the TUI fits, and the desktop pane leaves the rest of its box blank. Switching to anything else, such as a browser, changes nothing: the last of the two you used keeps deciding.
 
-**It resolves itself when the smaller view goes away.** Close the other client, or scroll the tile out of view in the desktop app — the desktop attaches only to the terminals actually on screen — and the agent grows back to fit whoever is left, within a frame. Nothing needs restarting, and you do not need to resize anything by hand.
+A terminal can only report that it gained focus if it supports focus reporting — tmux does only with `set -g focus-events on` — so in one that does not, the TUI takes over on your first key press or click rather than the moment you switch to it.
+
+**Until an app claims focus, or when the app that did is not showing this agent, the smallest pane wins** — the smallest rows and the smallest columns among every client attached to the agent, so every client can draw the whole screen and the larger ones leave the remainder blank. That resolves itself when the smaller view goes away: close the other client, or scroll the tile out of view in the desktop app — the desktop attaches only to the terminals actually on screen — and the agent grows back to fit whoever is left, within a frame. Nothing needs restarting, and you do not need to resize anything by hand.
+
+**A TUI from an older release cannot take focus back.** It never tells the daemon it has focus, so while a current desktop app holds focus on an agent they both show, the older TUI shows that agent at the desktop's size and cuts it off wherever its own pane is smaller. Upgrading the TUI restores switching.
 
 If a pane stays short of its box with *no* other client open, that is not this: check whether a `dot-agent-deck` TUI is still running in another terminal or tmux window, since it counts as an attached client for as long as it is open.
 
@@ -254,7 +258,7 @@ Also expected, and narrower than it looks.
 
 When an agent's size changes, the daemon drops the copy of that agent's output it keeps for **replay**. It has to: those bytes were drawn for the old grid, and replaying them into a differently-sized screen is what produces overlapping text and stray vertical strips down the right-hand edge. Keeping them would trade a missing history for a scrambled one.
 
-What this costs is precise: a client that attaches **afterwards** gets a correct live screen with no history behind it. A client that was already attached keeps its own scrollback and can still scroll it — the loss is not retroactive. In practice you meet this by bringing a desktop tile back on screen after the agent's size changed, since showing a tile is what attaches it.
+What this costs is precise: a client that attaches **afterwards** gets a correct live screen with no history behind it. A client that was already attached keeps its own scrollback and can still scroll it — the loss is not retroactive. In practice you meet this by bringing a desktop tile back on screen after the agent's size changed, since showing a tile is what attaches it. Switching between the desktop app and a TUI that show the same agent changes its size too, when their panes differ, so each switch drops the replay copy again.
 
 The agent's own output fills the history back in as it keeps working.
 

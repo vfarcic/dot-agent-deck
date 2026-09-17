@@ -213,10 +213,12 @@ export function TerminalViewport({
     // PRD #882 — `fit()` PROPOSES a size; the daemon disposes.
     //
     // A PTY has exactly one window size, so every client attached to an agent
-    // sees the same grid. The daemon sizes each agent to the smallest viewport
-    // among its attached viewers, which means the grid this tile should render
-    // is not necessarily the one that fits its box: with a smaller client
-    // attached it is smaller, and the remainder of the box is unused.
+    // sees the same grid. The daemon sizes each agent to the last-focused
+    // client's viewer size, or to the smallest viewport among its attached
+    // viewers when no client claimed focus (PRD #1105), which means the grid
+    // this tile should render is not necessarily the one that fits its box:
+    // with a smaller client deciding it is smaller and the remainder of the box
+    // is unused, and with a larger focused client it is larger and clips.
     //
     // So this measures the tile, reports it as a REQUEST, and then puts the
     // grid back to whatever the daemon last applied. Letting `fitAddon.fit()`

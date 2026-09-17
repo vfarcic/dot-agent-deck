@@ -2275,11 +2275,12 @@ pub struct RunningAgent {
     pub pty_rows: u16,
     pub pty_cols: u16,
     /// PRD #882 — the geometry each attached VIEWER has asked for, keyed by the
-    /// viewer token minted at attach. The daemon sizes the PTY to the smallest
-    /// of these on each axis (see [`AgentPtyRegistry::effective_dims`]), which
-    /// is what makes every viewer able to draw the agent's whole screen: the
-    /// PTY is never larger than anyone's pane, so every client is on the safe
-    /// pad-the-remainder side of a size mismatch rather than the truncating one.
+    /// viewer token minted at attach. The daemon sizes the PTY from these (see
+    /// [`AgentPtyRegistry::effective_dims`]): from the last-focused client's
+    /// viewers when it has a measured one here (PRD #1105), and otherwise to the
+    /// smallest of all of them on each axis, which keeps every viewer on the
+    /// pad-the-remainder side of a size mismatch. Under focus a viewer of
+    /// another client can be handed a grid larger than its pane and clips.
     ///
     /// Keyed **per attach**, deliberately not per client process. One process
     /// can hold two views of the same agent (two desktop tiles, or a tile plus
@@ -3742,9 +3743,6 @@ struct RegistryInner {
     /// and a client views many agents. Held under this lock so that
     /// [`AgentPtyRegistry::effective_dims`]'s callers — every one of which
     /// already holds it — can read it beside the agent they are sizing.
-    ///
-    /// **Recorded, not yet consulted.** Sizing is still PRD #882's per-axis
-    /// minimum; the step that makes the last-focused client win reads this.
     ///
     /// Never cleared except by a newer claim. A focused client that detaches
     /// everything leaves its id here, and that is correct rather than a leak: it
@@ -7497,12 +7495,13 @@ impl AgentPtyRegistry {
     /// PRD #1105 — [`Self::subscribe_with_viewport`], recording which client the
     /// attach belongs to on the viewer it registers.
     ///
-    /// `client_id` is stored on the [`Viewer`] entry and is otherwise inert: it
-    /// does not change what is registered, what geometry is applied, or what the
-    /// handle carries. An attach that registers no viewer has nowhere to record
-    /// it, so it is dropped there. The caller validates it; the attach handler
-    /// refuses an id that fails `daemon_protocol::is_valid_client_id` before
-    /// reaching this.
+    /// `client_id` is stored on the [`Viewer`] entry. It does not change what is
+    /// registered or what the handle carries; it changes the geometry applied
+    /// only when it names the last-focused client, which is
+    /// [`Self::effective_dims`]'s rule. An attach that registers no viewer has
+    /// nowhere to record it, so it is dropped there. The caller validates it;
+    /// the attach handler refuses an id that fails
+    /// `daemon_protocol::is_valid_client_id` before reaching this.
     pub fn subscribe_with_viewport_for_client(
         &self,
         id: &str,
@@ -7517,8 +7516,12 @@ impl AgentPtyRegistry {
                 "viewer rows and cols must be > 0 (got {rows}x{cols})"
             )));
         }
-        let mut inner = self.inner.lock().unwrap();
+        let mut guard = self.inner.lock().unwrap();
+        // Reborrowed so the agent can be borrowed mutably beside the focus
+        // record, which the sizing rule reads.
+        let inner = &mut *guard;
         let seq = inner.next_viewer_id;
+        let focused = inner.focused_client.as_deref();
         let agent = inner
             .agents
             .get_mut(id)
@@ -7544,7 +7547,7 @@ impl AgentPtyRegistry {
                 // "the pane will not open at all" — strictly worse for the user
                 // and for diagnosing it. The viewer stays registered, so the
                 // next change re-attempts the apply.
-                if let Err(e) = Self::apply_effective_locked(agent) {
+                if let Err(e) = Self::apply_effective_locked(agent, focused) {
                     tracing::warn!(
                         agent_id = %id,
                         viewport = ?seeded,
@@ -7579,29 +7582,85 @@ impl AgentPtyRegistry {
         Ok(handle)
     }
 
-    /// PRD #882 — the geometry the policy says this agent's PTY should have:
-    /// the smallest each axis over every registered viewer.
+    /// PRD #882 / PRD #1105 — the geometry the policy says this agent's PTY
+    /// should have, given `focused_client`, the registry's last-focused client.
     ///
-    /// `None` when no viewer is registered, which means "leave the size alone"
-    /// rather than "resize to nothing". Two cases reach it and both want the
-    /// current size kept: an agent spawned before any client attached, and an
-    /// agent whose only client is a legacy one that never registers a viewport.
+    /// **Focused.** When `focused_client` has at least one viewer of this agent
+    /// that has reported a geometry, the agent takes the smallest rows and the
+    /// smallest columns over **that client's** measured viewers only, and every
+    /// other viewer is ignored. With one such viewer — the ordinary case: the
+    /// desktop holds one session per agent per deck, and a TUI one attach per
+    /// pane — that is exactly its geometry.
     ///
-    /// The two axes are minimised **independently**, matching tmux's
-    /// `window-size smallest`. A viewer that is short and wide therefore
+    /// **Fallback**, PRD #882's rule unchanged: when no client has claimed
+    /// focus, or the focused client has no measured viewer here, the smallest
+    /// rows and the smallest columns over every viewer that has reported one.
+    /// A viewer with no `client_id` (a client that predates focus) never
+    /// matches, so it takes part only through this branch.
+    ///
+    /// `None` when no viewer has reported a geometry, which means "leave the
+    /// size alone" rather than "resize to nothing". Two cases reach it and both
+    /// want the current size kept: an agent spawned before any client attached,
+    /// and an agent whose only client is a legacy one that never registers a
+    /// viewport.
+    ///
+    /// The two axes are minimised **independently** in both branches, matching
+    /// tmux's `window-size smallest`. A viewer that is short and wide
     /// constrains only the rows, and one that is tall and narrow only the
-    /// columns — the alternative (picking one viewer's pair wholesale) would
-    /// hand some other viewer a dimension larger than its pane, which is the
-    /// truncating direction this policy exists to avoid.
-    fn effective_dims(agent: &RunningAgent) -> Option<(u16, u16)> {
+    /// columns — picking one viewer's pair wholesale would hand another viewer
+    /// in the same set a dimension larger than its pane.
+    ///
+    /// **Why a client with several viewers of one agent takes their minimum**
+    /// rather than, say, its most recently resized one. The case is a client
+    /// showing the same agent twice — two TUI panes, or two desktop views —
+    /// and both of them are in front of the person who just focused that
+    /// client. The minimum is the largest size at which every one of them can
+    /// draw the agent whole; anything larger on an axis hands one of the panes
+    /// being looked at a grid larger than itself. It also needs no state beyond
+    /// the viewer map, where "most recent" would need an ordering the daemon
+    /// does not keep, and would flip the size whenever either pane re-sent an
+    /// unchanged geometry.
+    ///
+    /// **The accepted cost, and what changed from PRD #882.** The fallback
+    /// exists to keep clients off the truncating side of a size mismatch: no
+    /// viewer that has reported a geometry is handed a grid larger than it. The
+    /// focused branch gives that up on purpose for every viewer that does not
+    /// belong to the focused client. Where its geometry is smaller than the
+    /// focused client's on an axis, it is handed the larger grid and clips. That
+    /// is the client the person did not use last, so the trade is accepted —
+    /// including for a client that predates focus, which can never claim focus
+    /// back.
+    fn effective_dims(agent: &RunningAgent, focused_client: Option<&str>) -> Option<(u16, u16)> {
         // Only viewers that have actually told us a geometry constrain anything.
         // A viewer registered but not yet measured is deliberately inert rather
         // than defaulted: a guessed value under a smallest-wins policy would
-        // shrink the agent for every other client.
-        let geometries = || agent.viewers.values().filter_map(|viewer| viewer.geometry);
-        let rows = geometries().map(|(r, _)| r).min()?;
-        let cols = geometries().map(|(_, c)| c).min()?;
-        Some((rows, cols))
+        // shrink the agent for every other client, and under focus an
+        // unmeasured focused viewer must fall back rather than pin a guess.
+        focused_client
+            .and_then(|client| Self::smallest_per_axis(Self::client_geometries(agent, client)))
+            .or_else(|| {
+                Self::smallest_per_axis(agent.viewers.values().filter_map(|viewer| viewer.geometry))
+            })
+    }
+
+    /// PRD #1105 — the reported geometries of `client`'s viewers of `agent`.
+    /// Empty when the client has no viewer here or none has measured itself,
+    /// which is exactly when [`Self::effective_dims`] falls back.
+    fn client_geometries<'a>(
+        agent: &'a RunningAgent,
+        client: &'a str,
+    ) -> impl Iterator<Item = (u16, u16)> + 'a {
+        agent
+            .viewers
+            .values()
+            .filter(move |viewer| viewer.client_id.as_deref() == Some(client))
+            .filter_map(|viewer| viewer.geometry)
+    }
+
+    /// The smallest rows and the smallest columns over `geometries`, each axis
+    /// independently; `None` for an empty set.
+    fn smallest_per_axis(geometries: impl Iterator<Item = (u16, u16)>) -> Option<(u16, u16)> {
+        geometries.reduce(|(rows, cols), (r, c)| (rows.min(r), cols.min(c)))
     }
 
     /// PRD #882 — drop a viewer's constraint when its attach ends, and let the
@@ -7613,36 +7672,66 @@ impl AgentPtyRegistry {
     /// hand) and "a small client constrains the agent while it is looking at
     /// it". Hide the desktop tile and the agent grows back.
     ///
+    /// PRD #1105: the same recompute is what hands an agent back to the
+    /// fallback when the last-focused client's last measured viewer of it
+    /// leaves. Focus itself is not cleared — see `RegistryInner::focused_client`.
+    ///
     /// Silent about an unknown agent or token: a viewer is released on the
     /// teardown path, where the agent may already be gone, and a teardown that
     /// errors on a race it cannot prevent is noise rather than information.
     pub fn release_viewer(&self, id: &str, token: &str) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut guard = self.inner.lock().unwrap();
+        let inner = &mut *guard;
+        let focused = inner.focused_client.as_deref();
         let Some(agent) = inner.agents.get_mut(id) else {
             return;
         };
         if agent.viewers.remove(token).is_none() {
             return;
         }
-        if let Err(e) = Self::apply_effective_locked(agent) {
+        if let Err(e) = Self::apply_effective_locked(agent, focused) {
             tracing::debug!(agent_id = %id, error = %e, "releasing a viewer could not re-apply the effective geometry");
         }
     }
 
     /// PRD #1105 — record `client_id` as the last-focused client, replacing any
-    /// earlier one. The daemon's handling of a `focus-gained` request.
+    /// earlier one, and re-apply the size policy to every agent the claim moves.
+    /// The daemon's handling of a `focus-gained` request.
     ///
-    /// **This step records and does not resize.** No agent's geometry moves and
-    /// no viewer is told anything; [`Self::effective_dims`] does not read the
-    /// value yet. The step that makes the last-focused client win has to add the
-    /// re-apply here, because a claim changes the answer for every agent the
-    /// newly focused client views without any of those agents' viewers changing.
+    /// The re-apply is needed here because a claim changes
+    /// [`Self::effective_dims`]'s answer without any viewer changing. It runs
+    /// for exactly the agents on which the **new** or the **previous** focused
+    /// client has a measured viewer: the new client's agents move to its size,
+    /// and the previous client's agents that the new one does not view fall
+    /// back to the per-axis minimum. On every other agent the answer is the
+    /// fallback before and after, so they are left alone — re-applying there
+    /// would change nothing except to undo a direct, unattributed resize (see
+    /// [`Self::resize_for_viewer`]) that the claim has no business touching.
+    ///
+    /// A claim by the client already recorded changes nothing and re-applies
+    /// nothing. Where the answer does change, [`Self::apply_dims_locked`] moves
+    /// the PTY, clears the scrollback ring and pushes the new geometry to every
+    /// participating viewer, exactly as a viewer's own resize does.
     ///
     /// Takes the id as given; the protocol handler validates it first.
     pub fn record_focus(&self, client_id: &str) {
-        let mut inner = self.inner.lock().unwrap();
-        if inner.focused_client.as_deref() != Some(client_id) {
-            inner.focused_client = Some(client_id.to_string());
+        let mut guard = self.inner.lock().unwrap();
+        let inner = &mut *guard;
+        if inner.focused_client.as_deref() == Some(client_id) {
+            return;
+        }
+        let previous = inner.focused_client.replace(client_id.to_string());
+        for (id, agent) in inner.agents.iter_mut() {
+            let moved = [previous.as_deref(), Some(client_id)]
+                .into_iter()
+                .flatten()
+                .any(|client| Self::client_geometries(agent, client).next().is_some());
+            if !moved {
+                continue;
+            }
+            if let Err(e) = Self::apply_effective_locked(agent, Some(client_id)) {
+                tracing::debug!(agent_id = %id, error = %e, "a focus claim could not re-apply the effective geometry");
+            }
         }
     }
 
@@ -7672,7 +7761,7 @@ impl AgentPtyRegistry {
     /// it was before this PRD, and does not join the per-viewer minimum. That
     /// keeps an older client working exactly as it did rather than leaving it
     /// unable to size its own pane, and it is self-correcting: the next request
-    /// from any registered viewer recomputes the minimum and overrides it.
+    /// from any registered viewer recomputes the policy and overrides it.
     ///
     /// Returns the geometry the daemon **actually applied**, which is not
     /// necessarily the one asked for — that is the semantic change this PRD
@@ -7693,14 +7782,20 @@ impl AgentPtyRegistry {
             )));
         }
         let (rows, cols) = clamp_pty_dims_reporting(id, rows, cols);
-        let mut inner = self.inner.lock().unwrap();
+        let mut guard = self.inner.lock().unwrap();
+        let inner = &mut *guard;
+        let focused = inner.focused_client.as_deref();
         let agent = inner
             .agents
             .get_mut(id)
             .ok_or_else(|| AgentPtyError::NotFound(id.to_string()))?;
         match viewer {
-            // A registered viewer: update its constraint, then take the minimum
-            // over all of them. `entry`-free on purpose — a token the registry
+            // A registered viewer: update its constraint, then re-resolve the
+            // policy — the focused client's viewers if it has a measured one
+            // here, otherwise the minimum over all of them (PRD #1105). This is
+            // the one path for a focused viewer's resize, an unfocused viewer's
+            // resize, and a resize on an agent the focused client does not view;
+            // `effective_dims` tells them apart. `entry`-free on purpose — a token the registry
             // does not know (a stale one from a previous attach, or a forged
             // one) must NOT create a phantom viewer that nothing will ever
             // prune, so it falls through to the unattributed path instead.
@@ -7713,7 +7808,7 @@ impl AgentPtyRegistry {
                 if let Some(entry) = agent.viewers.get_mut(token) {
                     entry.geometry = Some((rows, cols));
                 }
-                Self::apply_effective_locked(agent)
+                Self::apply_effective_locked(agent, focused)
             }
             // A token that was minted and has since been released — its attach
             // ended while this resize was in flight, which is ordinary since the
@@ -7738,8 +7833,13 @@ impl AgentPtyRegistry {
     ///
     /// With no registered viewers the current size stands, so this is safe to
     /// call from every mutation path without special-casing the empty set.
-    fn apply_effective_locked(agent: &mut RunningAgent) -> Result<(u16, u16), AgentPtyError> {
-        if let Some((rows, cols)) = Self::effective_dims(agent) {
+    /// `focused_client` is the registry's last-focused client, read by the
+    /// caller under the same lock (PRD #1105).
+    fn apply_effective_locked(
+        agent: &mut RunningAgent,
+        focused_client: Option<&str>,
+    ) -> Result<(u16, u16), AgentPtyError> {
+        if let Some((rows, cols)) = Self::effective_dims(agent, focused_client) {
             Self::apply_dims_locked(agent, rows, cols)?;
         }
         Ok((agent.pty_rows, agent.pty_cols))
@@ -12895,6 +12995,251 @@ mod spawn_tests {
         assert!(
             !registry.snapshot(&id).unwrap().is_empty(),
             "attaching a larger viewer must not resize, and so must not clear the ring"
+        );
+
+        registry.shutdown_all();
+    }
+
+    /// Spawn a `/bin/cat` agent at 24x80 for the PRD #1105 focus tests.
+    fn spawn_focus_agent(registry: &Arc<AgentPtyRegistry>) -> String {
+        registry
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/cat"),
+                rows: 24,
+                cols: 80,
+                ..SpawnOptions::default()
+            })
+            .expect("spawn should succeed")
+    }
+
+    /// Attach a measured viewer belonging to `client` (`None`: a client that
+    /// predates focus).
+    fn attach_for(
+        registry: &AgentPtyRegistry,
+        id: &str,
+        geometry: Option<(u16, u16)>,
+        client: Option<&str>,
+    ) -> AttachHandle {
+        registry
+            .subscribe_with_viewport_for_client(id, geometry, true, client)
+            .expect("attach as a viewer")
+    }
+
+    /// PRD #1105 — the last-focused client's viewer decides both axes, a later
+    /// claim switches it, and an unfocused client's resize changes nothing.
+    #[test]
+    fn the_last_focused_clients_viewer_decides_both_axes() {
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let id = spawn_focus_agent(&registry);
+        let tui = attach_for(&registry, &id, Some((42, 58)), Some("tui"));
+        let mut desktop = attach_for(&registry, &id, Some((22, 153)), Some("desktop"));
+        assert_eq!(
+            registry.pty_size_for_agent(&id),
+            Some((22, 58)),
+            "no claim yet: the per-axis minimum"
+        );
+
+        registry.record_focus("desktop");
+        assert_eq!(
+            registry.pty_size_for_agent(&id),
+            Some((22, 153)),
+            "the focused desktop's viewer takes both axes"
+        );
+        // The claim moved the PTY without any viewer asking, so the viewers are
+        // told through the geometry push, not through a resize answer.
+        let rx = desktop.geometry_rx.as_mut().expect("a viewer subscribes");
+        assert_eq!(
+            rx.try_recv().ok(),
+            Some((22, 153)),
+            "a claim that moves the PTY pushes the new geometry to viewers"
+        );
+
+        let applied = registry
+            .resize_for_viewer(&id, 10, 200, tui.viewer.as_deref())
+            .expect("an unfocused resize succeeds");
+        assert_eq!(
+            applied,
+            (22, 153),
+            "an unfocused client's resize does not take sizing from the focused one"
+        );
+
+        registry.record_focus("tui");
+        assert_eq!(
+            registry.pty_size_for_agent(&id),
+            Some((10, 200)),
+            "a later claim hands the agent to that client's current viewer geometry"
+        );
+
+        registry.shutdown_all();
+    }
+
+    /// PRD #1105 — a focused client with several viewers of one agent takes the
+    /// smallest rows and the smallest columns over those viewers only. Both are
+    /// in front of the person who focused the client, so every one of them must
+    /// be able to draw the agent whole; the other client's smaller viewer is
+    /// still ignored.
+    #[test]
+    fn a_focused_client_with_several_viewers_takes_their_per_axis_minimum() {
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let id = spawn_focus_agent(&registry);
+        let _other = attach_for(&registry, &id, Some((10, 60)), Some("other"));
+        let _short_wide = attach_for(&registry, &id, Some((30, 200)), Some("desktop"));
+        let tall_narrow = attach_for(&registry, &id, Some((40, 120)), Some("desktop"));
+
+        registry.record_focus("desktop");
+        assert_eq!(
+            registry.pty_size_for_agent(&id),
+            Some((30, 120)),
+            "rows from the focused client's shorter viewer, cols from its narrower one, \
+             and nothing from the other client's smaller viewer"
+        );
+
+        // Releasing one of the focused client's viewers leaves the other in charge.
+        registry.release_viewer(&id, tall_narrow.viewer.as_deref().expect("token"));
+        assert_eq!(
+            registry.pty_size_for_agent(&id),
+            Some((30, 200)),
+            "with one focused viewer left, the agent takes exactly its geometry"
+        );
+
+        registry.shutdown_all();
+    }
+
+    /// PRD #1105 — when the focused client's last measured viewer of an agent
+    /// detaches, that agent falls back to the per-axis minimum over the rest,
+    /// while focus itself stays recorded.
+    #[test]
+    fn the_focused_clients_viewer_detaching_falls_back_to_the_minimum() {
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let id = spawn_focus_agent(&registry);
+        let _legacy = attach_for(&registry, &id, Some((42, 58)), None);
+        let _other = attach_for(&registry, &id, Some((30, 100)), Some("other"));
+        let desktop = attach_for(&registry, &id, Some((22, 153)), Some("desktop"));
+        registry.record_focus("desktop");
+        assert_eq!(registry.pty_size_for_agent(&id), Some((22, 153)));
+
+        registry.release_viewer(&id, desktop.viewer.as_deref().expect("token"));
+        assert_eq!(
+            registry.pty_size_for_agent(&id),
+            Some((30, 58)),
+            "the focused client's viewer gone: the minimum over the remaining viewers"
+        );
+        assert_eq!(
+            registry.focused_client().as_deref(),
+            Some("desktop"),
+            "detaching does not clear focus"
+        );
+
+        // The same client attaching again is still the last-focused one.
+        let _back = attach_for(&registry, &id, Some((35, 120)), Some("desktop"));
+        assert_eq!(
+            registry.pty_size_for_agent(&id),
+            Some((35, 120)),
+            "a returning focused client takes the agent back on attach"
+        );
+
+        registry.shutdown_all();
+    }
+
+    /// PRD #1105 — a claim re-applies the agents of the PREVIOUS focused client
+    /// too: one the new client does not view falls back to the minimum.
+    #[test]
+    fn a_claim_hands_the_previous_clients_agents_back_to_the_fallback() {
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let shared = spawn_focus_agent(&registry);
+        let only_tui = spawn_focus_agent(&registry);
+        let _desktop = attach_for(&registry, &shared, Some((22, 153)), Some("desktop"));
+        let _legacy = attach_for(&registry, &shared, Some((42, 58)), None);
+        let _tui = attach_for(&registry, &only_tui, Some((35, 120)), Some("tui"));
+        let _other = attach_for(&registry, &only_tui, Some((20, 60)), Some("other"));
+
+        registry.record_focus("desktop");
+        assert_eq!(registry.pty_size_for_agent(&shared), Some((22, 153)));
+        assert_eq!(
+            registry.pty_size_for_agent(&only_tui),
+            Some((20, 60)),
+            "the desktop views nothing here, so the fallback holds"
+        );
+
+        registry.record_focus("tui");
+        assert_eq!(
+            registry.pty_size_for_agent(&shared),
+            Some((22, 58)),
+            "the previous client's agent, which the new client does not view, falls back"
+        );
+        assert_eq!(
+            registry.pty_size_for_agent(&only_tui),
+            Some((35, 120)),
+            "the new client's agent takes its viewer geometry"
+        );
+
+        registry.shutdown_all();
+    }
+
+    /// PRD #1105 — an unmeasured viewer of the focused client does not win; the
+    /// agent falls back until that viewer reports, then follows it.
+    #[test]
+    fn an_unmeasured_focused_viewer_falls_back_until_it_reports() {
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let id = spawn_focus_agent(&registry);
+        let _tui = attach_for(&registry, &id, Some((42, 58)), Some("tui"));
+        let other = attach_for(&registry, &id, Some((22, 153)), Some("other"));
+        let pending = attach_for(&registry, &id, None, Some("desktop"));
+
+        registry.record_focus("desktop");
+        assert_eq!(
+            registry.pty_size_for_agent(&id),
+            Some((22, 58)),
+            "the focused client has no measured viewer yet: the fallback"
+        );
+        // An unfocused viewer's resize is still arbitrated by the fallback here,
+        // rather than ignored, because focus has nothing to offer this agent.
+        let applied = registry
+            .resize_for_viewer(&id, 20, 150, other.viewer.as_deref())
+            .expect("an unfocused resize");
+        assert_eq!(
+            applied,
+            (20, 58),
+            "with no measured focused viewer, another viewer's resize moves the minimum"
+        );
+
+        let applied = registry
+            .resize_for_viewer(&id, 35, 120, pending.viewer.as_deref())
+            .expect("first measurement");
+        assert_eq!(applied, (35, 120), "its first measured geometry takes over");
+
+        registry.shutdown_all();
+    }
+
+    /// PRD #1105 — a claim touches only agents the new or previous focused
+    /// client views, and a repeated claim touches nothing. Observed through a
+    /// direct unattributed resize, which a needless re-apply would undo.
+    #[test]
+    fn a_claim_leaves_agents_it_does_not_move_alone() {
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let unrelated = spawn_focus_agent(&registry);
+        let focused = spawn_focus_agent(&registry);
+        let _viewer = attach_for(&registry, &unrelated, Some((30, 100)), Some("other"));
+        let _desktop = attach_for(&registry, &focused, Some((22, 153)), Some("desktop"));
+
+        registry
+            .resize_for_viewer(&unrelated, 44, 144, None)
+            .expect("unattributed resize");
+        registry.record_focus("desktop");
+        assert_eq!(
+            registry.pty_size_for_agent(&unrelated),
+            Some((44, 144)),
+            "an agent neither client views is not re-applied by the claim"
+        );
+
+        registry
+            .resize_for_viewer(&focused, 44, 144, None)
+            .expect("unattributed resize");
+        registry.record_focus("desktop");
+        assert_eq!(
+            registry.pty_size_for_agent(&focused),
+            Some((44, 144)),
+            "a repeated claim by the recorded client re-applies nothing"
         );
 
         registry.shutdown_all();

@@ -870,7 +870,8 @@ pub enum AttachRequest {
         /// participates in the size policy.
         ///
         /// Present means "register me as a viewer": the daemon sizes the agent
-        /// to the smallest viewport among attached viewers, answers with the
+        /// by its viewer policy (the last-focused client's viewer size, else
+        /// the smallest viewport among attached viewers), answers with the
         /// applied geometry and a viewer token, and pushes later changes as
         /// [`KIND_GEOMETRY`] frames. Absent — the pre-#882 shape, and what a
         /// non-rendering observer should send — means the client neither
@@ -3192,9 +3193,9 @@ async fn handle_connection(
             Err(e) => write_resp(&mut stream, &AttachResponse::err(e.to_string())).await?,
         },
         AttachRequest::FocusGained { client_id } => {
-            // PRD #1105: record the claim and nothing else. Sizing does not read
-            // it yet — this step lands the contract, and `effective_dims` keeps
-            // PRD #882's per-axis minimum until the step that changes it.
+            // PRD #1105: record the claim. `record_focus` re-applies the size
+            // policy to every agent the claim moves before this answers, so a
+            // client that reads `ok` knows the resize has already happened.
             if is_valid_client_id(&client_id) {
                 registry.record_focus(&client_id);
                 write_resp(&mut stream, &AttachResponse::ok()).await?

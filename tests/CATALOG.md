@@ -2237,8 +2237,8 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 ##### resize/policy/001 — A smaller second client attached to the same agent shrinks that agent for every client as the focusless fallback (PRD #882).
 - **Layer:** L2 (PTY-attached: the real binary in a vt100 harness, plus a SECOND client opened directly against the deck's own attach socket).
 - **Agent:** none (the pane runs `/bin/sh`; `stty size` is the user-level probe of what the child PTY itself sees).
-- **Asserts:** the wide-viewer-alone control detaches an oversized real TUI before a desktop stand-in attaches at the measured 46x13 Runs-tile geometry and takes the production viewer-token resize path to the enlarged overlay's 153x22 proposal; the shell itself reports 22x153. In the owner's `task run-all` shape, a REAL narrow, tall TUI dashboard tile sits beside the same desktop attach-and-resize sequence; because neither client can claim focus yet, the fallback chooses each axis independently and the shell reports the desktop's 22 rows with the TUI's 58 columns, exactly 22x58. A zoom control records today's related behavior: `[Z]` appears in a real 160-column TUI while another viewer holds the shell at 22x40, and the shell remains 22x40; focus-driven sizing is expected to change that result once keyboard input makes the TUI last-focused.
-- **Does not assert:** last-focused-client selection or its wire protocol; what the deck's pane *renders* in the columns beyond the child PTY (the blank remainder is `TerminalWidget`'s `min(area, screen)` draw, covered deterministically by `render/widget/002` and `render/widget/003`); three-or-more-viewer permutations; anything about a real agent's reflow.
+- **Asserts:** the wide-viewer-alone control detaches an oversized real TUI before a desktop stand-in attaches at the measured 46x13 Runs-tile geometry and takes the production viewer-token resize path to the enlarged overlay's 153x22 proposal; the shell itself reports 22x153. In the owner's `task run-all` shape, a REAL narrow, tall TUI dashboard tile sits beside the same desktop attach-and-resize sequence; because the real TUI receives no input and the desktop stand-in carries no client id, nobody claims focus, the fallback chooses each axis independently, and the shell reports the desktop's 22 rows with the TUI's 58 columns, exactly 22x58. A zoom case exercises the one end-to-end focus path from a real terminal event (PRD #1105 M11): another viewer with no client id holds the shell at 22x40, the real 160-column TUI receives Ctrl+D and Ctrl+Z and shows `[Z]`, its keyboard input claims focus, and the shell grows past 22 rows and 40 columns to exactly the size it keeps once that other viewer detaches — the zoomed TUI's own geometry. Until M11 this case asserted the shell stayed at 22x40.
+- **Does not assert:** the zoomed pane's layout arithmetic; the focus claim's wire frames or throttle (unit-tested in `crate::focus_report` and `embedded_pane`); what the deck's pane *renders* in the columns beyond the child PTY (the blank remainder is `TerminalWidget`'s `min(area, screen)` draw, covered deterministically by `render/widget/002` and `render/widget/003`); three-or-more-viewer permutations; anything about a real agent's reflow.
 - **Platform coverage:** mac+linux (the second client attaches over a Unix domain socket).
 
 ##### resize/policy/002 — Releasing the smaller client gives the constraint back and the agent grows again (PRD #882).
@@ -2254,6 +2254,62 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Asserts:** with a real Claude UI rendered in a 160-column deck, a second client attaches to the same agent declaring 24x60 — shrinking the agent for everyone — and the live agent then answers a directive by naming the uniquely-named sentinel file `sizepolicy_r7k2q.txt`, which paints inside the resized pane. Only reachable if the real agent survived being resized by a client it knows nothing about, redrew at the imposed geometry, and kept working. The sentinel does not appear in the directive that asks for it, so an echo of the user's own typing cannot satisfy the assertion.
 - **Why a real agent:** the deterministic siblings run `/bin/sh`, which can report the kernel PTY size but cannot reproduce a full-screen agent's SIGWINCH redraw. That redraw is what makes a letterboxed pane look correct rather than looking like PRD #104's corruption, and a shell probe cannot show it.
 - **Does not assert:** anything when skipped — where credentials are absent this test executes nothing, so `resize/policy/001` and `/002` carry the CI-visible coverage; the exact reflowed line breaks (LLM- and terminal-dependent); release-on-detach (that is `resize/policy/002`).
+- **Platform coverage:** mac+linux.
+
+##### resize/policy/004 — The last-focused desktop viewer supplies both axes for the agent it shows (PRD #1105 M11).
+- **Layer:** L2 (real daemon and shell PTY, with deterministic client-library stand-ins attached after the bootstrap TUI detaches).
+- **Agent:** none (`/bin/sh`, queried through `stty size`).
+- **Asserts:** a focus-capable TUI stand-in reports the owner's narrow, tall 42x58 tile while a distinct focus-capable desktop stand-in follows the real tile-to-overlay path from 13x46 to 22x153 through its viewer token. After the desktop sends `focus-gained`, the shell itself reports 22 rows and all 153 desktop columns, one axis at a time, rather than the focusless 22x58 per-axis minimum.
+- **Does not assert:** that the production TUI or desktop sends a focus claim — M11 steps 3 and 4 own those event sources; any browser geometry; rendered clipping in the unfocused client.
+- **Platform coverage:** mac+linux.
+
+##### resize/policy/005 — A later TUI focus claim switches the shared agent back to the TUI viewer's size (PRD #1105 M11).
+- **Layer:** L2 (same real-daemon and stand-in-client shape as `resize/policy/004`).
+- **Agent:** none (`/bin/sh`, queried through `stty size`).
+- **Asserts:** distinct identity-bearing TUI and desktop stand-ins attach at 42x58 and 22x153; the desktop claims focus first and the TUI claims it afterwards. The shell then reports the complete 42x58 TUI geometry, proving claim order — not attach order or the minimum — selects the size.
+- **Does not assert:** production focus-event cadence or throttling; switching away from both clients, which deliberately sends no `focus-lost` message and changes nothing.
+- **Platform coverage:** mac+linux.
+
+##### resize/policy/006 — An unfocused client's later resize does not steal sizing from the last-focused client (PRD #1105 M11).
+- **Layer:** L2 (same real-daemon and stand-in-client shape as `resize/policy/004`).
+- **Agent:** none (`/bin/sh`, queried through `stty size`).
+- **Asserts:** after the desktop stand-in claims focus at 22x153, the unfocused TUI stand-in resizes its own viewer to 10x200 without making a claim. The shell remains exactly 22x153, proving last-focused sticks until another accepted claim rather than following the most recently resized viewer.
+- **Does not assert:** a production client resize trigger; what the unfocused TUI renders while it clips the focused grid.
+- **Platform coverage:** mac+linux.
+
+##### resize/policy/007 — An agent the last-focused client does not view keeps the per-axis fallback (PRD #1105 M11).
+- **Layer:** L2 (one real daemon with two `/bin/sh` agents and four identity-bearing client-library stand-ins).
+- **Agent:** none (both agents run `/bin/sh` and report their kernel PTY sizes through `stty size`).
+- **Asserts:** the desktop stand-in that claims focus has a viewer only on the second agent. The first agent, viewed by separate 42x58 and 22x153 stand-ins, therefore remains at the 22x58 per-axis minimum, while the second agent follows the focused stand-in's 35x120 viewer instead of its competing viewer's 20x60 minimum; the second assertion makes focus selection load-bearing while the first pins the per-agent fallback.
+- **Does not assert:** a client with an unmeasured viewer (the sibling no-viewer and no-reported-geometry branches are daemon-unit concerns); production multi-agent UI rendering.
+- **Platform coverage:** mac+linux.
+
+##### resize/policy/008 — A focused current client overrides an older identity-less viewer (PRD #1105 M11).
+- **Layer:** L2 (real daemon and shell PTY, one #882-era client-library stand-in and one current focus-capable stand-in).
+- **Agent:** none (`/bin/sh`, queried through `stty size` from the older client's attach).
+- **Asserts:** an older stand-in attaches at 42x58 without any `client_id`; a current desktop stand-in attaches and resizes to 22x153, then claims focus. The shell output read through the older attach reports 22x153, including a 153-column grid larger than the 58 columns that older client said it could draw.
+- **Does not assert:** cross-version frame decoding against an actual `v0.40.2` binary; rendered clipping in that older client; the final M11 manual compatibility check.
+- **Platform coverage:** mac+linux.
+
+##### resize/policy/009 — A focused TUI viewer can resize from tile to zoom geometry past another client (PRD #1105 M11).
+- **Layer:** L2 (real daemon and shell PTY, with identity-bearing TUI and desktop client-library stand-ins).
+- **Agent:** none (`/bin/sh`, queried through `stty size`).
+- **Asserts:** the TUI stand-in claims focus while attached at 22x40, then models `[Z]` by resizing that same viewer token to 40x140 while a desktop stand-in remains at 30x80. The shell follows the focused TUI's complete 40x140 zoom geometry rather than the focusless 30x80 minimum.
+- **Does not assert:** that the real TUI's keyboard handler emits the claim — `resize/policy/001`'s zoom case drives that through a real TUI; exact live TUI zoom layout arithmetic.
+- **Platform coverage:** mac+linux.
+
+##### resize/policy/010 — A focused client with two viewers of one agent takes their per-axis minimum (PRD #1105 M11).
+- **Layer:** L2 (real daemon and shell PTY, with two identity-bearing client-library stand-ins attached after the bootstrap TUI detaches).
+- **Agent:** none (`/bin/sh`, queried through `stty size`).
+- **Asserts:** one desktop stand-in holds two viewers of the shell, at 30x200 and 40x120, beside another client's 10x60 viewer. After the desktop claims focus the shell reports exactly 30x120 — rows from the focused client's shorter view and columns from its narrower one — so neither of the focused client's views is handed a grid larger than itself, and the unfocused client's smaller viewer is ignored.
+- **Does not assert:** that a production client opens two views of one agent; the unfocused client's clipping; release of one of the two views (a daemon unit test in `src/agent_pty.rs` covers it).
+- **Platform coverage:** mac+linux.
+
+##### resize/policy/011 — The focused client's viewer detaching hands the agent back to the per-axis fallback (PRD #1105 M11).
+- **Layer:** L2 (real daemon and shell PTY, with two identity-bearing stand-ins and one #882-era stand-in with no client id).
+- **Agent:** none (`/bin/sh`, queried through `stty size` from the TUI stand-in's attach).
+- **Asserts:** a desktop stand-in at 22x153 claims focus beside a TUI stand-in at 42x58 and an older client at 30x100, and the shell reports 22x153. The desktop's attach then ends; the daemon releases its viewer while focus stays recorded for a client with no viewer here, and the shell reports exactly 30x58 — the older client's rows and the TUI's columns.
+- **Does not assert:** that focus is still recorded (a daemon unit test covers it, and a returning client retaking the agent on attach); a production client's detach path, which `resize/policy/002` drives through the real TUI.
 - **Platform coverage:** mac+linux.
 
 #### resize/render

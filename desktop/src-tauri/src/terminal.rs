@@ -1016,7 +1016,7 @@ pub(crate) async fn write(
 /// issue #1116's pattern left in the crate: a resize carries a session id, so
 /// the deck it belongs to is knowable exactly, and reading the current
 /// selection instead sent this pane's measured grid to another machine's
-/// same-id agent. Under the daemon's smallest-viewer policy that is not a
+/// same-id agent. Under the daemon's viewer size policy that is not a
 /// display blemish — it reflows that agent's PTY and every other client
 /// watching it.
 ///
@@ -1627,7 +1627,7 @@ mod tests {
     /// deck is a remote row. Under `trusted_daemon` the refusal named the
     /// remote deck, which is the whole defect — this client's measured grid
     /// went to another machine's same-id agent, and under the daemon's
-    /// smallest-viewer policy that reflows its PTY and every other client
+    /// viewer size policy that reflows its PTY and every other client
     /// watching it.
     #[cfg(unix)]
     #[tokio::test]

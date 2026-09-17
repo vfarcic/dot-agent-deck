@@ -3215,12 +3215,14 @@ async fn resize_worker(
         .await
         {
             // PRD #882: the daemon answers with what it ACTUALLY applied, which
-            // is smaller than the request whenever another client's pane is
-            // smaller. Size the parser from the answer — sizing it from the
-            // request is what would leave this pane parsing at a geometry the
-            // PTY does not have, which is PRD #104's mis-parse arriving by a new
-            // route. A daemon predating the policy echoes nothing (`None`) and
-            // has no policy to disagree with us, so the request stands.
+            // differs from the request whenever another client decides the size
+            // — a smaller pane under the fallback, or the last-focused client's
+            // pane under PRD #1105, which can be larger. Size the parser from the
+            // answer — sizing it from the request is what would leave this pane
+            // parsing at a geometry the PTY does not have, which is PRD #104's
+            // mis-parse arriving by a new route. A daemon predating the policy
+            // echoes nothing (`None`) and has no policy to disagree with us, so
+            // the request stands.
             Ok(Ok(applied)) => {
                 let (rows, cols) = applied.unwrap_or((rows, cols));
                 set_parser_size_if_changed(&parser, rows, cols);

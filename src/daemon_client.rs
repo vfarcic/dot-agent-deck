@@ -1877,8 +1877,10 @@ impl DaemonClient {
     /// it actually applied.
     ///
     /// `viewer` is the token this client received when it attached. With it, the
-    /// request updates that viewer's constraint and the daemon applies the
-    /// smallest viewport among everyone attached; without it the request is
+    /// request updates that viewer's constraint and the daemon re-applies its
+    /// viewer policy — the last-focused client's viewer size where that client
+    /// views the agent (PRD #1105), otherwise the smallest viewport among
+    /// everyone attached; without it the request is
     /// applied directly and joins no minimum (the pre-#882 behaviour, kept for
     /// callers that are not rendering viewers).
     ///
@@ -2107,7 +2109,8 @@ impl DaemonClient {
     /// the agent at.
     ///
     /// Passing a viewport opts into the size policy in both directions: the
-    /// agent is sized to the smallest viewport among attached viewers, and this
+    /// agent is sized by the viewer policy (the last-focused client's viewer
+    /// size, else the smallest viewport among attached viewers), and this
     /// connection is told (via `KIND_GEOMETRY`) whenever that changes. Passing
     /// `None` is the pre-#882 behaviour — no constraint contributed, no
     /// geometry frames delivered — and is what a non-rendering observer wants.
@@ -2115,8 +2118,7 @@ impl DaemonClient {
     /// The returned connection carries the viewer token and the geometry in
     /// force at attach time. **Size the parser from `applied`, not from the
     /// viewport asked for**: the replayed scrollback was written at the applied
-    /// geometry, and the two differ whenever a smaller viewer is already
-    /// attached.
+    /// geometry, and the two can differ whenever another viewer is attached.
     pub async fn attach_as_viewer(
         &self,
         id: &str,

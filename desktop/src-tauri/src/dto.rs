@@ -590,8 +590,9 @@ pub struct TerminalAttachResult {
     pub generation: u64,
     pub reused: bool,
     /// PRD #882 — the geometry the daemon has APPLIED for this agent, which is
-    /// the smallest viewport among every client attached to it and so is not
-    /// necessarily the size this tile asked for.
+    /// decided by its viewer policy (the last-focused client's viewer size, else
+    /// the smallest viewport among every client attached to it, PRD #1105) and
+    /// so is not necessarily the size this tile asked for.
     ///
     /// The frontend sizes its xterm grid from this rather than from
     /// `FitAddon.fit()`. Absent only when talking to a daemon that predates the
