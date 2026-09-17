@@ -1073,6 +1073,20 @@ async fn hello_exchange(
     Ok((info, response))
 }
 
+/// PRD #1105 M11 step 4 — this desktop process's client identity on every deck.
+///
+/// Generated **once per process** and handed to every link [`establish`] builds,
+/// so every terminal attach — on any deck, and across the link re-establishment
+/// that happens every [`HANDSHAKE_REVALIDATE_INTERVAL`] — names the same client,
+/// and so does every focus claim. Per process rather than per link or per deck
+/// because focus belongs to what a person is looking at, which is this app, and
+/// each daemon only ever sees its own attaches. A restarted app is a new client,
+/// which is why this is random rather than derived from anything durable.
+pub(crate) fn desktop_client_id() -> &'static str {
+    static CLIENT_ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    CLIENT_ID.get_or_init(dot_agent_deck::daemon_client::generate_client_id)
+}
+
 /// Take one handshake against `endpoint` and build the link behind it.
 ///
 /// PRD #741 M4(a): this is the **establishment** path, reached once per
@@ -1125,7 +1139,15 @@ async fn establish(
     // what a `stat` of that address is allowed to mean. `DaemonClient::new`
     // would stamp a tunnel's own socket `LocalInode` and put `exists()`-as-health
     // back on exactly the inode M3's `Elsewhere` protects.
-    let client = transport.client().map_err(safe_message)?;
+    //
+    // PRD #1105 M11: and under this process's one client identity, so every
+    // attach made through the link names the desktop. No capability check is
+    // needed for that: an older daemon's `AttachRequest` does not deny unknown
+    // fields, so it decodes the attach and ignores `client_id`.
+    let client = transport
+        .client()
+        .map_err(safe_message)?
+        .with_client_id(desktop_client_id());
     // PRD #819 M5/M6: capture the advertised set from THIS reply.
     //
     // Its invalidation rule used to be satisfied structurally by accident —

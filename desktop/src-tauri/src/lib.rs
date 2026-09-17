@@ -2099,6 +2099,15 @@ async fn desktop_run_action(
     })
 }
 
+/// PRD #1105 M11 step 4: the focus state a window event reports, if it reports
+/// one. Only `Focused` does; every other window event says nothing about focus.
+fn window_focus(event: &tauri::WindowEvent) -> Option<bool> {
+    match event {
+        tauri::WindowEvent::Focused(focused) => Some(*focused),
+        _ => None,
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let app = tauri::Builder::default()
@@ -2140,8 +2149,29 @@ pub fn run() {
             crate::dto::apply_settings_selection(&stored);
             if let Some(window) = app.get_webview_window("main") {
                 apply_zoom(window.as_ref(), stored.zoom.level);
+                // PRD #1105 M11: seed the focus state, in case the window came up
+                // focused before a `Focused` event could be delivered. Nothing is
+                // attached yet, so there is nothing to claim — this only decides
+                // whether the first pane opened claims on its deck.
+                if let Ok(focused) = window.is_focused() {
+                    app.state::<DesktopState>().set_window_focused(focused);
+                }
             }
             Ok(())
+        })
+        // PRD #1105 M11 step 4: the window's focus changes are the desktop's
+        // focus signal — see `terminal::window_focus_changed` for why this event
+        // rather than the webview's own, which decks it claims on, and why typing
+        // does not also claim. Spawned: the handler runs on the event loop, and a
+        // claim is a round trip per deck.
+        .on_window_event(|window, event| {
+            if let Some(focused) = window_focus(event) {
+                let app = window.app_handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    let state = app.state::<DesktopState>();
+                    terminal::window_focus_changed(&state, focused).await;
+                });
+            }
         })
         .invoke_handler(tauri::generate_handler![
             desktop_get_snapshot,
@@ -2184,6 +2214,18 @@ mod tests {
     use std::collections::VecDeque;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// PRD #1105 M11 step 4: only a window's `Focused` event carries its focus
+    /// state, in both directions; any other window event is not a focus change.
+    #[test]
+    fn only_a_focused_window_event_reports_focus() {
+        assert_eq!(window_focus(&tauri::WindowEvent::Focused(true)), Some(true));
+        assert_eq!(
+            window_focus(&tauri::WindowEvent::Focused(false)),
+            Some(false)
+        );
+        assert_eq!(window_focus(&tauri::WindowEvent::Destroyed), None);
+    }
 
     /// A settings save that changed no deck must NOT take the switch path
     /// (PRD #741 M9).

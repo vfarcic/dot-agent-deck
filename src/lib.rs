@@ -24,6 +24,9 @@ pub mod embedded_pane;
 pub mod error;
 pub mod event;
 pub mod features;
+// PRD #1105 M11: when the TUI claims focus on its daemon (terminal focus-in and
+// throttled input).
+pub mod focus_report;
 pub mod hook;
 pub mod hooks_manage;
 pub mod hyperlink;

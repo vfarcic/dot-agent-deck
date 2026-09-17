@@ -12119,16 +12119,23 @@ pub fn run_tui(
             std::io::stdout(),
             crossterm::event::DisableMouseCapture,
             crossterm::event::DisableBracketedPaste,
+            crossterm::event::DisableFocusChange,
         );
         ratatui::restore();
         original_hook(info);
     }));
 
     // Enable mouse capture and bracketed paste so events reach our event loop.
+    //
+    // PRD #1105 M11: and focus-change reporting (`?1004h`), so a terminal that
+    // supports it tells us when the person switches back to this window — the
+    // signal the focus claim in `crate::focus_report` is built on. Where the
+    // terminal does not report focus, input stands in.
     crossterm::execute!(
         std::io::stdout(),
         crossterm::event::EnableMouseCapture,
         crossterm::event::EnableBracketedPaste,
+        crossterm::event::EnableFocusChange,
     )?;
 
     let mut terminal = ratatui::init();
@@ -14144,6 +14151,16 @@ pub fn run_tui(
 
             let ev = event::read()?;
 
+            // PRD #1105 M11: every event that reaches the loop is offered to the
+            // focus reporter FIRST, before any branch below can `break` or
+            // `continue` past it. It claims focus on the daemon for a terminal
+            // focus-in and (throttled) for input; everything else it ignores.
+            // Non-consuming and non-blocking — the claim is spawned — so the
+            // event is handled below exactly as it was before.
+            if let Some(embedded) = pane.as_any().downcast_ref::<EmbeddedPaneController>() {
+                embedded.report_focus(&ev, std::time::Instant::now());
+            }
+
             // PRD #84 M4 (invariant 4): a terminal resize is now just a
             // re-render trigger. The pre-draw `resize_panes_to_layout` at the
             // top of the next loop iteration recomputes the layout and commits
@@ -15090,6 +15107,7 @@ pub fn run_tui(
         std::io::stdout(),
         crossterm::event::DisableMouseCapture,
         crossterm::event::DisableBracketedPaste,
+        crossterm::event::DisableFocusChange,
     );
     ratatui::restore();
 

@@ -1,9 +1,9 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use dot_agent_deck::daemon_client::{Endpoint, EndpointIdentity};
+use dot_agent_deck::daemon_client::{Endpoint, EndpointIdentity, FocusReport};
 use dot_agent_deck::daemon_protocol::{
     KIND_DETACH, KIND_GEOMETRY, KIND_STREAM_END, KIND_STREAM_IN, KIND_STREAM_OUT,
     KIND_STREAM_REJECT, parse_geometry_frame, read_frame, write_frame,
@@ -257,6 +257,15 @@ pub(crate) struct DesktopState {
     /// wait instead of being lost. The value is a counter and nobody reads it;
     /// what carries the signal is that it moved.
     pub(crate) selection: tokio::sync::watch::Sender<u64>,
+    /// PRD #1105 M11 step 4: whether the app window holds focus, as Tauri last
+    /// reported it through [`window_focus_changed`].
+    ///
+    /// Read by [`establish`], so a terminal opened while the window is focused
+    /// claims focus on its deck at once. Without that, focusing the app first
+    /// and opening an agent's pane second — the ordinary order — would claim
+    /// nothing on that deck until the window next lost and regained focus,
+    /// leaving the new pane sized by whichever client claimed last.
+    window_focused: AtomicBool,
 }
 
 impl Default for DesktopState {
@@ -276,6 +285,7 @@ impl Default for DesktopState {
             daemon: Arc::clone(&daemon),
             tunnels: daemon.tunnels(),
             selection: tokio::sync::watch::Sender::new(0),
+            window_focused: AtomicBool::new(false),
         }
     }
 }
@@ -285,6 +295,29 @@ impl DesktopState {
         self.sessions
             .lock()
             .map_err(|_| "desktop terminal session registry lock was poisoned".to_string())
+    }
+
+    /// PRD #1105 M11: record the window's focus without claiming anything — for
+    /// seeding the state at startup, before any terminal is attached. A focus
+    /// change goes through [`window_focus_changed`], which also claims.
+    pub(crate) fn set_window_focused(&self, focused: bool) {
+        self.window_focused.store(focused, Ordering::Relaxed);
+    }
+
+    /// PRD #1105 M11: every deck this app holds at least one **viewer** on, once
+    /// each. A session with no viewer token registered nothing the daemon sizes
+    /// by, so it is not a reason to claim focus there.
+    fn viewed_decks(&self) -> Vec<Endpoint> {
+        let Ok(sessions) = self.sessions() else {
+            return Vec::new();
+        };
+        let mut seen = HashSet::new();
+        sessions
+            .values()
+            .filter(|session| session.viewer.is_some())
+            .filter(|session| seen.insert(session.endpoint.identity()))
+            .map(|session| session.endpoint.clone())
+            .collect()
     }
 
     /// The watcher registry, poison-tolerant.
@@ -528,6 +561,11 @@ fn rejection_notice(reason: &[u8]) -> Vec<u8> {
 struct Established {
     result: TerminalAttachResult,
     stream: Option<dot_agent_deck::platform::transport::TransportReadHalf>,
+    /// PRD #1105 M11: the focus claim this attach started, if the window was
+    /// focused. Production lets it run; it is carried out only so a test can
+    /// wait for it rather than poll the daemon. Those tests are Unix-only.
+    #[cfg_attr(not(all(test, unix)), allow(dead_code))]
+    focus_claim: Option<tauri::async_runtime::JoinHandle<Result<FocusReport, String>>>,
 }
 
 /// Everything [`attach`] does except emitting and spawning — which is to say,
@@ -588,6 +626,7 @@ async fn establish(
                 applied_cols: None,
             },
             stream: None,
+            focus_claim: None,
         });
     }
     // This deck's earlier session for this agent, never another deck's.
@@ -648,7 +687,20 @@ async fn establish(
         }
     }
 
+    // PRD #1105 M11: a pane opened while the window is focused claims focus on
+    // its deck, because the claim the window made when it gained focus covered
+    // only the decks it had a viewer on then. After the attach rather than
+    // before it, so a refused attach claims nothing. Spawned, so the attach does
+    // not wait on a second round trip.
+    let focus_claim = state.window_focused.load(Ordering::Relaxed).then(|| {
+        tauri::async_runtime::spawn(claim_focus_on(
+            Arc::clone(&state.daemon),
+            scope.endpoint().clone(),
+        ))
+    });
+
     Ok(Established {
+        focus_claim,
         result: TerminalAttachResult {
             session_id,
             agent_id,
@@ -667,6 +719,93 @@ async fn establish(
     })
 }
 
+/// PRD #1105 M11 step 4 — the bound on one focus claim once the deck's link is
+/// held. The link's own establishment has its own bounds; this covers only the
+/// claim's request and reply, so a wedged daemon cannot hold the task open.
+const FOCUS_CLAIM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// PRD #1105 M11 step 4 — claim focus on one deck as this app's client.
+///
+/// Through the deck's held link, whose client carries
+/// [`crate::daemon_bridge::desktop_client_id`]. [`FocusReport::Withheld`] when
+/// the daemon does not advertise `focus-gained` — the check is
+/// `DaemonClient::focus_gained`'s, answered from the capability set the link
+/// captured at its own handshake, so an older daemon is never sent the claim.
+async fn claim_focus_on(
+    links: Arc<DaemonLinks>,
+    endpoint: Endpoint,
+) -> Result<FocusReport, String> {
+    let daemon = links.trusted(&endpoint).await?;
+    daemon.require_compatible()?;
+    match tokio::time::timeout(FOCUS_CLAIM_TIMEOUT, daemon.client.focus_gained()).await {
+        Ok(claimed) => claimed.map_err(|error| safe_message(error.to_string())),
+        Err(_) => Err("focus claim timed out".to_string()),
+    }
+}
+
+/// PRD #1105 M11 step 4 — the app window gained or lost focus.
+///
+/// Records the state for [`establish`], and on **gaining** focus claims it on
+/// every deck this app holds a viewer on, one claim per deck, concurrently so a
+/// slow remote deck does not delay a local one. Losing focus claims nothing:
+/// the contract has no focus-lost message, because under "last focused wins"
+/// leaving the app for a browser must reflow nothing.
+///
+/// **Why those decks.** Since the cross-deck attach the app views agents on
+/// several decks at once, and each daemon keeps its own last-focused client, so
+/// a claim has to be made per deck. A deck where this app holds a viewer is
+/// exactly a deck where the claim can change an agent's size: under the rule, a
+/// focused client with no viewer of an agent falls through to the fallback for
+/// it. Claiming on the other observed decks would change nothing there, and
+/// would spend a handshake on each — an `ssh` round trip for a remote deck,
+/// or a reconnect attempt against one that is down — every time the window is
+/// focused. The deck a pane is opened on *after* focus-in is covered by the
+/// claim in [`establish`].
+///
+/// **Why the Tauri window event, and not the webview's.** Tauri's runtime
+/// produces `WindowEvent::Focused` per platform — from GTK's `focus-in-event` on
+/// Linux and `windowDidBecomeKey` on macOS, and on Windows it synthesizes the
+/// event from WebView2's `GotFocus`/`LostFocus` — so one Rust-side handler
+/// covers all three. The DOM `focus` event gets no such treatment from Tauri,
+/// and handling it would also route a Rust-side decision through the webview
+/// and back.
+///
+/// **No input trigger.** Typing into a terminal does not claim. Keystrokes go
+/// to the focused window, so they reach a terminal only after the window gained
+/// focus and claimed. The bytes that reach [`write`] would also be the wrong
+/// signal: `TerminalViewport` forwards everything xterm.js's `onData` emits,
+/// which includes xterm.js's own replies to an agent's terminal queries, and
+/// those would claim focus while the person is looking at another client.
+///
+/// Returns each deck's outcome, for tests; production discards it.
+pub(crate) async fn window_focus_changed(
+    state: &DesktopState,
+    focused: bool,
+) -> Vec<(EndpointIdentity, Result<FocusReport, String>)> {
+    state.window_focused.store(focused, Ordering::Relaxed);
+    if !focused {
+        return Vec::new();
+    }
+    let claims: Vec<_> = state
+        .viewed_decks()
+        .into_iter()
+        .map(|endpoint| {
+            let deck = endpoint.identity();
+            let claim =
+                tauri::async_runtime::spawn(claim_focus_on(Arc::clone(&state.daemon), endpoint));
+            (deck, claim)
+        })
+        .collect();
+    let mut outcomes = Vec::with_capacity(claims.len());
+    for (deck, claim) in claims {
+        let outcome = claim
+            .await
+            .unwrap_or_else(|error| Err(safe_message(error.to_string())));
+        outcomes.push((deck, outcome));
+    }
+    outcomes
+}
+
 pub(crate) async fn attach(
     app: &AppHandle,
     state: &DesktopState,
@@ -682,7 +821,7 @@ pub(crate) async fn attach(
     // watching it and tells this tile whenever that changes.
     viewport: Option<(u16, u16)>,
 ) -> Result<TerminalAttachResult, String> {
-    let Established { result, stream } =
+    let Established { result, stream, .. } =
         establish(state, deck_id, agent_id, &on_output, viewport).await?;
     let Some(mut reader) = stream else {
         // A reused session: the caller already has a live stream task and an
@@ -1972,5 +2111,402 @@ mod tests {
              to a host the user has removed"
         );
         assert!(state.sessions().unwrap().is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // PRD #1105 M11 step 4 — the desktop identifies itself and claims focus.
+    //
+    // Against the PRODUCTION attach server wherever the assertion is about what
+    // a daemon recorded (its registry's `focused_client` and each viewer's
+    // `client_id`), and against a scripted older daemon where it is about what
+    // was never sent.
+    // -----------------------------------------------------------------------
+
+    /// One real daemon over a scratch socket, bound by production code.
+    #[cfg(unix)]
+    struct FocusDeck {
+        _dir: tempfile::TempDir,
+        socket: std::path::PathBuf,
+        endpoint: Endpoint,
+        registry: Arc<dot_agent_deck::agent_pty::AgentPtyRegistry>,
+        server: tokio::task::JoinHandle<()>,
+    }
+
+    #[cfg(unix)]
+    impl FocusDeck {
+        fn start(tag: &str) -> Self {
+            use dot_agent_deck::daemon_client::LocalEndpoint;
+            use dot_agent_deck::daemon_protocol::{bind_attach_listener, serve_attach};
+            let (dir, socket) = scratch_socket(tag);
+            let registry = Arc::new(dot_agent_deck::agent_pty::AgentPtyRegistry::new());
+            let listener = bind_attach_listener(&socket).expect("bind the real attach socket");
+            let server = {
+                let registry = Arc::clone(&registry);
+                tokio::spawn(async move {
+                    let (events, _) = tokio::sync::broadcast::channel(16);
+                    let _ = serve_attach(listener, registry, events).await;
+                })
+            };
+            Self {
+                _dir: dir,
+                endpoint: Endpoint::Local(LocalEndpoint::at(&socket)),
+                socket,
+                registry,
+                server,
+            }
+        }
+
+        /// A `cat` under this daemon, which emits nothing and stays alive.
+        fn spawn_agent(&self, pane_id: &str) -> String {
+            use dot_agent_deck::agent_pty::{DOT_AGENT_DECK_PANE_ID, SpawnOptions};
+            self.registry
+                .spawn_agent(SpawnOptions {
+                    command: Some("cat"),
+                    env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane_id.to_string())],
+                    ..SpawnOptions::default()
+                })
+                .expect("spawn a real PTY agent")
+        }
+
+        /// The client each of `agent_id`'s viewers attached as.
+        fn viewer_clients(&self, agent_id: &str) -> Vec<Option<String>> {
+            self.registry
+                .viewers_of(agent_id)
+                .into_values()
+                .map(|viewer| viewer.client_id)
+                .collect()
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for FocusDeck {
+        fn drop(&mut self) {
+            self.server.abort();
+            self.registry.shutdown_all();
+        }
+    }
+
+    /// A daemon predating `focus-gained`: it classifies as `Connected`,
+    /// advertises `advertised`, and records the op of every request it is sent.
+    #[cfg(unix)]
+    struct OlderDeck {
+        _dir: tempfile::TempDir,
+        endpoint: Endpoint,
+        ops: Arc<Mutex<Vec<String>>>,
+        server: tokio::task::JoinHandle<()>,
+    }
+
+    #[cfg(unix)]
+    impl OlderDeck {
+        fn start(tag: &str, advertised: Option<Vec<&'static str>>) -> Self {
+            use dot_agent_deck::daemon_client::LocalEndpoint;
+            use dot_agent_deck::daemon_protocol::{AttachResponse, KIND_REQ, KIND_RESP};
+            use std::os::unix::fs::PermissionsExt;
+            let (dir, socket) = scratch_socket(tag);
+            let listener = tokio::net::UnixListener::bind(&socket).expect("bind the older deck");
+            std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))
+                .expect("restate 0o600 on the socket inode");
+            let ops = Arc::new(Mutex::new(Vec::new()));
+            let server = {
+                let ops = Arc::clone(&ops);
+                tokio::spawn(async move {
+                    while let Ok((stream, _)) = listener.accept().await {
+                        let (reader, writer) = stream.into_split();
+                        let mut reader =
+                            dot_agent_deck::platform::transport::TransportReadHalf::new(reader);
+                        let mut writer = TransportWriteHalf::new(writer);
+                        let Ok(Some((KIND_REQ, payload))) = read_frame(&mut reader).await else {
+                            continue;
+                        };
+                        let request: serde_json::Value =
+                            serde_json::from_slice(&payload).expect("decode the request");
+                        let op = request["op"].as_str().unwrap_or_default().to_string();
+                        ops.lock().unwrap().push(op.clone());
+                        let reply = if op == "hello" {
+                            let mut hello = matching_hello();
+                            hello.capabilities = advertised
+                                .clone()
+                                .map(|caps| caps.into_iter().map(String::from).collect());
+                            hello
+                        } else {
+                            AttachResponse::err(format!(
+                                "malformed request: unknown variant `{op}`"
+                            ))
+                        };
+                        let encoded = serde_json::to_vec(&reply).expect("serialize the reply");
+                        let _ = write_frame(&mut writer, KIND_RESP, &encoded).await;
+                    }
+                })
+            };
+            Self {
+                _dir: dir,
+                endpoint: Endpoint::Local(LocalEndpoint::at(&socket)),
+                ops,
+                server,
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for OlderDeck {
+        fn drop(&mut self) {
+            self.server.abort();
+        }
+    }
+
+    /// A session on `deck` that registered a viewer, as a desktop attach does
+    /// against a daemon with the PRD #882 size policy.
+    #[cfg(unix)]
+    fn viewer_session_on(
+        deck: &Endpoint,
+        agent_id: &str,
+        generation: u64,
+        lease: Arc<crate::endpoint_tunnels::TunnelLease>,
+    ) -> TerminalSession {
+        let mut session = fixture_session_on(deck.clone(), agent_id, generation, lease);
+        session.viewer = Some(format!("viewer-{generation}"));
+        session
+    }
+
+    /// Point the selected deck at `deck`'s socket, so [`establish`] with no
+    /// deck id attaches there — the production path a pane takes.
+    #[cfg(unix)]
+    fn select_local_deck(deck: &FocusDeck) {
+        // SAFETY: under nextest this test owns its process, so no other thread
+        // is reading the environment here. See `bind_local_deck`.
+        unsafe { std::env::set_var("DOT_AGENT_DECK_ATTACH_SOCKET", &deck.socket) };
+        crate::dto::apply_settings_selection(&crate::settings::DesktopSettings::default());
+        assert_eq!(
+            crate::dto::selected_endpoint().identity(),
+            deck.endpoint.identity(),
+            "fixture: the selected deck is the real daemon under test"
+        );
+    }
+
+    /// Scenario: the desktop attaches a pane on deck A through the production
+    /// attach, a second agent's terminal on deck B through B's link, and a
+    /// third after every link was dropped and re-established. All three
+    /// viewers carry the one client id this process generated, and asking for
+    /// that id again returns the same one.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn every_attach_on_every_deck_names_the_one_desktop_client() {
+        let desktop = crate::daemon_bridge::desktop_client_id();
+        assert_eq!(desktop, crate::daemon_bridge::desktop_client_id());
+        assert!(dot_agent_deck::daemon_protocol::is_valid_client_id(desktop));
+
+        let deck_a = FocusDeck::start("dad-focus-id-a");
+        let deck_b = FocusDeck::start("dad-focus-id-b");
+        let (agent_a, agent_b) = (deck_a.spawn_agent("pane-a"), deck_b.spawn_agent("pane-b"));
+        select_local_deck(&deck_a);
+        let state = DesktopState::default();
+
+        let channel = fixture_channel();
+        establish(&state, None, agent_a.clone(), &channel, Some((22, 153)))
+            .await
+            .expect("attach a pane on deck A");
+        let link_b = state
+            .daemon
+            .trusted(&deck_b.endpoint)
+            .await
+            .expect("link B");
+        let _on_b = link_b
+            .client
+            .attach_as_viewer(&agent_b, Some((30, 100)))
+            .await
+            .expect("attach on deck B");
+
+        let link_a = state
+            .daemon
+            .trusted(&deck_a.endpoint)
+            .await
+            .expect("link A");
+        state.daemon.invalidate_all().await;
+        let relinked = state
+            .daemon
+            .trusted(&deck_a.endpoint)
+            .await
+            .expect("relink A");
+        assert!(
+            !Arc::ptr_eq(&relinked, &link_a),
+            "fixture: a fresh link, so a fresh client handle"
+        );
+        let _again = relinked
+            .client
+            .attach_as_viewer(&agent_a, Some((40, 120)))
+            .await
+            .expect("attach again on deck A");
+
+        let mut clients = deck_a.viewer_clients(&agent_a);
+        clients.extend(deck_b.viewer_clients(&agent_b));
+        assert_eq!(clients.len(), 3, "one viewer per attach: {clients:?}");
+        assert!(
+            clients
+                .iter()
+                .all(|client| client.as_deref() == Some(desktop)),
+            "every attach, on every deck and across a re-established link, names the \
+             process's one client: {clients:?}"
+        );
+    }
+
+    /// Scenario: the desktop holds viewers on decks A (two panes) and B, and a
+    /// session with no viewer on deck C. The window gains focus: A and B each
+    /// record the desktop as their last-focused client, once each, and C is
+    /// sent nothing. Another client then claims A, and the window LOSING focus
+    /// claims nothing back.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn gaining_window_focus_claims_focus_on_every_deck_with_a_viewer() {
+        use dot_agent_deck::daemon_client::{DaemonClient, generate_client_id};
+        let desktop = crate::daemon_bridge::desktop_client_id();
+        let (deck_a, deck_b, deck_c) = (
+            FocusDeck::start("dad-focus-a"),
+            FocusDeck::start("dad-focus-b"),
+            FocusDeck::start("dad-focus-c"),
+        );
+        let lease = fixture_lease().await;
+        let state = DesktopState::default();
+        for (id, session) in [
+            (
+                "t-a1",
+                viewer_session_on(&deck_a.endpoint, "1", 1, Arc::clone(&lease)),
+            ),
+            (
+                "t-a2",
+                viewer_session_on(&deck_a.endpoint, "2", 2, Arc::clone(&lease)),
+            ),
+            (
+                "t-b",
+                viewer_session_on(&deck_b.endpoint, "1", 3, Arc::clone(&lease)),
+            ),
+            (
+                "t-c",
+                fixture_session_on(deck_c.endpoint.clone(), "1", 4, Arc::clone(&lease)),
+            ),
+        ] {
+            state.insert_unique_session(id.into(), session).unwrap();
+        }
+
+        let outcomes = window_focus_changed(&state, true).await;
+        assert_eq!(
+            outcomes.len(),
+            2,
+            "one claim per deck with a viewer, however many panes it has: {outcomes:?}"
+        );
+        let outcomes: HashMap<_, _> = outcomes.into_iter().collect();
+        for deck in [&deck_a, &deck_b] {
+            assert_eq!(
+                outcomes.get(&deck.endpoint.identity()),
+                Some(&Ok(FocusReport::Recorded))
+            );
+            assert_eq!(deck.registry.focused_client().as_deref(), Some(desktop));
+        }
+        assert_eq!(
+            deck_c.registry.focused_client(),
+            None,
+            "a deck the desktop has no viewer on is not claimed"
+        );
+
+        let tui = DaemonClient::new(deck_a.socket.clone()).with_client_id(generate_client_id());
+        tui.focus_gained()
+            .await
+            .expect("another client claims deck A");
+        assert!(
+            window_focus_changed(&state, false).await.is_empty(),
+            "losing focus claims nothing"
+        );
+        assert_eq!(
+            deck_a.registry.focused_client().as_deref(),
+            tui.client_id(),
+            "and moves nothing"
+        );
+    }
+
+    /// Scenario: the desktop holds viewers on a current deck and on an older
+    /// one — first one advertising no capabilities, then one advertising only
+    /// PRD #819's verbs, as every release through v0.40.2 does. The window
+    /// gains focus: the current deck records the claim, and the older deck is
+    /// sent nothing but the link's handshake.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_deck_that_does_not_advertise_focus_gained_is_never_sent_the_claim() {
+        use dot_agent_deck::daemon_protocol::CAP_LIST_PROJECTS;
+        let current = FocusDeck::start("dad-focus-cur");
+        let lease = fixture_lease().await;
+        for advertised in [None, Some(vec![CAP_LIST_PROJECTS])] {
+            let older = OlderDeck::start("dad-focus-old", advertised.clone());
+            let state = DesktopState::default();
+            state
+                .insert_unique_session(
+                    "t-current".into(),
+                    viewer_session_on(&current.endpoint, "1", 1, Arc::clone(&lease)),
+                )
+                .unwrap();
+            state
+                .insert_unique_session(
+                    "t-older".into(),
+                    viewer_session_on(&older.endpoint, "1", 2, Arc::clone(&lease)),
+                )
+                .unwrap();
+
+            let outcomes: HashMap<_, _> = window_focus_changed(&state, true)
+                .await
+                .into_iter()
+                .collect();
+            assert_eq!(
+                outcomes.get(&current.endpoint.identity()),
+                Some(&Ok(FocusReport::Recorded)),
+                "advertised {advertised:?}: {outcomes:?}"
+            );
+            assert_eq!(
+                outcomes.get(&older.endpoint.identity()),
+                Some(&Ok(FocusReport::Withheld)),
+                "advertised {advertised:?}: {outcomes:?}"
+            );
+            assert_eq!(
+                *older.ops.lock().unwrap(),
+                vec!["hello".to_string()],
+                "advertised {advertised:?}: the older deck is sent the handshake and nothing else"
+            );
+        }
+    }
+
+    /// Scenario: with the window unfocused, opening a pane claims nothing. The
+    /// pane is closed, the window gains focus with no viewer anywhere (so there
+    /// is nothing to claim), and the pane is opened again: that attach claims
+    /// focus on its deck.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_pane_opened_while_the_window_is_focused_claims_focus_on_its_deck() {
+        let desktop = crate::daemon_bridge::desktop_client_id();
+        let deck = FocusDeck::start("dad-focus-open");
+        let agent = deck.spawn_agent("pane-open");
+        select_local_deck(&deck);
+        let state = DesktopState::default();
+        let channel = fixture_channel();
+
+        let unfocused = establish(&state, None, agent.clone(), &channel, Some((22, 153)))
+            .await
+            .expect("attach while unfocused");
+        assert!(
+            unfocused.focus_claim.is_none(),
+            "an unfocused window claims nothing"
+        );
+        assert!(detach(&state, &unfocused.result.session_id).await.unwrap());
+
+        assert!(
+            window_focus_changed(&state, true).await.is_empty(),
+            "fixture: no viewer anywhere, so focus-in itself claims nothing"
+        );
+        assert_eq!(deck.registry.focused_client(), None);
+
+        let focused = establish(&state, None, agent, &channel, Some((22, 153)))
+            .await
+            .expect("attach while focused");
+        let claim = focused
+            .focus_claim
+            .expect("a pane opened in a focused window claims focus on its deck");
+        assert_eq!(claim.await.expect("claim task"), Ok(FocusReport::Recorded));
+        assert_eq!(deck.registry.focused_client().as_deref(), Some(desktop));
     }
 }
