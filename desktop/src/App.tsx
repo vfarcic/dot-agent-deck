@@ -416,8 +416,8 @@ export function DeckShell({ runtime, workflowPlatformIssue, initialView = { kind
  * what is wrong with it instead of a `TerminalViewport` that would receive no
  * bytes.
  *
- * **That "opens either way" is narrower in production than it reads, and the
- * gap is not yet filed.** It needs an agent record, and a deck with no live
+ * **That "opens either way" is narrower in production than it reads; the gap is
+ * issue #1143.** It needs an agent record, and a deck with no live
  * link reports **no agents** —
  * `disconnected_snapshot` and `snapshot_with`'s non-connected early return both
  * carry `agents: Vec::new()`, and `mapDesktopSnapshot` carries none over from
