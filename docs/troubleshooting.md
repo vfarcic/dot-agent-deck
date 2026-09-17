@@ -258,7 +258,9 @@ Also expected, and narrower than it looks.
 
 When an agent's size changes, the daemon drops the copy of that agent's output it keeps for **replay**. It has to: those bytes were drawn for the old grid, and replaying them into a differently-sized screen is what produces overlapping text and stray vertical strips down the right-hand edge. Keeping them would trade a missing history for a scrambled one.
 
-What this costs is precise: a client that attaches **afterwards** gets a correct live screen with no history behind it. A client that was already attached keeps its own scrollback and can still scroll it — the loss is not retroactive. In practice you meet this by bringing a desktop tile back on screen after the agent's size changed, since showing a tile is what attaches it. Switching between the desktop app and a TUI that show the same agent changes its size too, when their panes differ, so each switch drops the replay copy again.
+What this costs is precise, and **only a client that attaches or re-attaches after the size changed is affected**: it gets a correct live screen with no history behind it. A client that was already attached keeps its own scrollback and can still scroll it — the loss is not retroactive, so nothing disappears from a pane you are looking at. In practice you meet it by bringing a desktop tile back on screen after the agent's size changed, since showing a tile is what attaches it; a pane that respawns and a client that reconnects after a dropped link are in the same position, because both attach afresh.
+
+Switching between the desktop app and a TUI that show the same agent changes its size too, when their panes differ, so switching drops the replay copy again. Switches that land within about a quarter of a second of each other are applied as a single size change rather than one each, so flipping back and forth quickly costs no more than a single switch does.
 
 The agent's own output fills the history back in as it keeps working.
 

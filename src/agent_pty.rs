@@ -3376,6 +3376,15 @@ pub struct AgentPtyRegistry {
 /// flips a second is already faster than anyone reads a reflowed pane, and a
 /// quarter of a second is short enough that a switch landing inside the window
 /// does not read as the switch being ignored.
+///
+/// **This is a product-visible number, not an implementation detail — change it
+/// only as a deliberate product decision.** Stated in what a person sees: it is
+/// the longest a switch between two apps can take to reflow the agent's pane,
+/// for a switch that lands inside another claim's window. They move to the other
+/// app, and the terminal redraws at the new size up to a quarter of a second
+/// later; that delay is the whole of what this constant buys the bound above.
+/// 250 ms was put to the product owner for PRD #1105 M11 and kept (Work Log,
+/// 2026-09-17).
 pub const FOCUS_REAPPLY_INTERVAL: Duration = Duration::from_millis(250);
 
 /// PRD #1105 — the state of [`AgentPtyRegistry::accept_focus_claim`]'s gate.

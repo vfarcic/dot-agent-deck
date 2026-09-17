@@ -330,12 +330,20 @@ pub fn parse_geometry_frame(bytes: &[u8]) -> Option<(u16, u16)> {
 /// remote decks the user cannot upgrade, and it would buy no structural safety
 /// the capability does not already provide. Two limits, stated so this is not
 /// read as a general licence either. It covers only a variant whose every
-/// sender checks the capability first — [`crate::daemon_client::DaemonClient::focus_gained`]
-/// does, and a raw sender that skips it gets the older daemon's
+/// sender checks the capability first — both public entry points do, because
+/// [`crate::daemon_client::DaemonClient::focus_gained`] delegates to
+/// [`crate::daemon_client::DaemonClient::focus_gained_while`], which holds the
+/// one check — and a raw sender that skips it gets the older daemon's
 /// `malformed request` refusal and no state change. And it says nothing about
 /// *semantic* breaks: focus-driven sizing changes what an older, #882-era viewer
 /// can be handed, which is a `changelog.d/*.breaking.md` question and is
 /// answered in the PRD #1105 Work Log (2026-09-17).
+///
+/// The general form of this exception — the same rule, stated for any gated
+/// variant rather than for this one — is written up in
+/// `docs/develop/versioning.md`, under "How a break is detected and marked"
+/// item 1, which names `focus-gained` as its worked example. The two are meant
+/// to say the same thing; if you change one, change the other.
 ///
 /// # Where this constant is enforced
 ///
@@ -371,10 +379,12 @@ pub fn parse_geometry_frame(bytes: &[u8]) -> Option<(u16, u16)> {
 /// pairing skews the same way and is the one that *does* read this constant,
 /// per the paragraph above.
 ///
-/// Keep bumping this on every wire-shape break regardless. The bump is what
-/// makes a skew *nameable* — it is the number the handshake reports, what
-/// `daemon hello` prints, and the input any future compatibility gate will
-/// read; #405 is what will make it *refused*.
+/// Keep bumping this on every wire-shape break regardless — "break" in the
+/// sense of this module's bump list at the top, which a capability-gated
+/// variant is deliberately not on. The bump is what makes a skew *nameable* —
+/// it is the number the handshake reports, what `daemon hello` prints, and the
+/// input any future compatibility gate will read; #405 is what will make it
+/// *refused*.
 pub const PROTOCOL_VERSION: u32 = 9;
 
 /// Hard cap on a single frame's payload length. Defends against a malicious
