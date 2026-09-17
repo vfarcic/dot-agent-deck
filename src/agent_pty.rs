@@ -1025,12 +1025,132 @@ const _: () = assert!(
     "the wrapper must escalate to SIGKILL strictly before the deck kills the wrapper"
 );
 
+/// Poll cadence of [`AgentPtyRegistry::force_kill_and_reap_all`]'s reap pass.
+/// Matches [`AgentPtyRegistry::shutdown_all_graceful`]'s own grace poll and the
+/// wrapper's reap loop (the "finding #12" comment in [`crate::wrap`]), and
+/// costs at most one tick on a shutdown whose agents already exited.
+const FORCE_REAP_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// The tighter of the two windows a stop client allows the daemon between
+/// asking it to stop and concluding it did not.
+///
+/// [`crate::build_version_handshake::terminate_daemon_graceful`] has exactly two
+/// callers and each passes one of these: `daemon stop`
+/// ([`crate::daemon_stop::STOP_GRACE_TIMEOUT`]) and the build-mismatch prompt
+/// ([`crate::build_version_handshake::TERMINATE_POLL_TIMEOUT`]). Both are 5 s
+/// today; taking the smaller keeps [`FORCE_REAP_DEADLINE`] derived from whichever
+/// is tighter if they ever diverge.
+const DAEMON_STOP_POLL_BUDGET: Duration = {
+    let stop = crate::daemon_stop::STOP_GRACE_TIMEOUT;
+    let prompt = crate::build_version_handshake::TERMINATE_POLL_TIMEOUT;
+    if stop.as_millis() < prompt.as_millis() {
+        stop
+    } else {
+        prompt
+    }
+};
+
+/// Divisor giving [`FORCE_REAP_DEADLINE`] from what [`DAEMON_STOP_POLL_BUDGET`]
+/// leaves after [`AGENT_TERMINATE_GRACE`]. See that constant for why the reap
+/// gets a fraction of the remainder rather than all of it.
+const FORCE_REAP_DEADLINE_DIVISOR: u64 = 2;
+
+/// How long [`AgentPtyRegistry::force_kill_and_reap_all`]'s reap pass polls a
+/// SIGKILLed child before giving up on it (issue #1118). Twenty ticks of
+/// [`FORCE_REAP_POLL_INTERVAL`] as the three inputs stand today.
+///
+/// **Derived from the budget the daemon's stop clients allow it, not picked
+/// round.** Each of those clients (see [`DAEMON_STOP_POLL_BUDGET`]) asks the
+/// daemon to stop and then polls that long for its listener to go away, before
+/// either escalating — `daemon stop --force` SIGKILLs the daemon — or reporting
+/// a timeout. Of that window the daemon's own teardown can already spend
+/// [`AGENT_TERMINATE_GRACE`] in `shutdown_all_graceful`'s SIGTERM phase, and the
+/// two costs co-occur in precisely the interesting case: a child that did not
+/// exit on SIGTERM is the child phase 3 then has to SIGKILL and reap. What is
+/// left is the reap's share.
+///
+/// **A fraction of that remainder, not all of it** — the same reasoning as
+/// [`WRAP_TERMINATE_GRACE`], and for the same reason it is not a thin
+/// subtraction. Past the give-up the daemon still has to notify its hook loop,
+/// unwind, drop the registry and exit before the listener closes, and the client
+/// samples only every 100 ms; spending the whole remainder here would put the
+/// give-up and the client's escalation at the same instant. Half leaves the
+/// other half as headroom, and the assertions below pin the relationship instead
+/// of leaving it to this comment.
+///
+/// **So the bound does not give up a reap that waiting would have won.** Past
+/// the outer window the reap is abandoned either way — `daemon stop --force`
+/// SIGKILLs the daemon mid-teardown, and plain `daemon stop` reports `TimedOut`
+/// while the daemon stays parked in the loop. What the bound changes is which
+/// layer gives up: this one knows *which* children it could not reap and says
+/// so, the outer one knows neither.
+pub(crate) const FORCE_REAP_DEADLINE: Duration = Duration::from_millis(
+    (DAEMON_STOP_POLL_BUDGET.as_millis() as u64 - AGENT_TERMINATE_GRACE.as_millis() as u64)
+        / FORCE_REAP_DEADLINE_DIVISOR,
+);
+
+// Both pinned at compile time rather than left to the prose above, the same way
+// the wrapper's grace ordering is: the arithmetic is only sound while a stop
+// client waits longer than the SIGTERM grace it is waiting through, and the
+// reap's give-up is only useful while it lands strictly before that client
+// escalates.
+const _: () = assert!(
+    DAEMON_STOP_POLL_BUDGET.as_millis() > AGENT_TERMINATE_GRACE.as_millis(),
+    "a stop client must allow the daemon longer than its own SIGTERM grace, or the reap has no \
+     budget left to be derived from"
+);
+const _: () = assert!(
+    AGENT_TERMINATE_GRACE.as_millis() + FORCE_REAP_DEADLINE.as_millis()
+        < DAEMON_STOP_POLL_BUDGET.as_millis(),
+    "`shutdown_all_graceful` must finish strictly inside the window its stop clients poll for, or \
+     the daemon is SIGKILLed mid-teardown by its own `daemon stop --force`"
+);
+const _: () = assert!(
+    FORCE_REAP_DEADLINE.as_millis() >= FORCE_REAP_POLL_INTERVAL.as_millis(),
+    "the reap deadline must leave room for more than the one `try_wait` pass that happens before \
+     it is first checked"
+);
+
 // PRD #42 M1: the process-group teardown helpers (`pid_to_pgid`,
 // `signal_child_pgroup_or_fallback`, `force_kill_child_and_wait`,
 // `terminate_child_with_grace_and_wait`) moved to `crate::platform::proc`,
 // where the Unix `killpg`/SIGTERM→SIGKILL logic lives behind the platform seam
 // and a Windows Job-Object backend lands in PRD #163. Call sites below use
 // `crate::platform::proc::*`.
+
+/// One agent's identity for [`AgentPtyRegistry::force_kill_and_reap_all`]'s
+/// give-up warning. Pid first: it is what an operator hands to `ps` to see what
+/// state the child is actually stuck in, which is how issue #959 established
+/// that a stalled reap was waiting on `?Es` rather than on anything the deck
+/// could still influence. `?` where the field is absent — a pid is `None` once
+/// the backend has let go of the child, and `pane_id_env` is `None` for any
+/// agent spawned without `DOT_AGENT_DECK_PANE_ID`.
+///
+/// `kill=` carries what pass 1's force-kill reported for this agent (issue
+/// #1118, Greptile P1), and it is the field that separates the two very
+/// different reasons a child can still be here. `kill=ok` means nothing reported
+/// a failure, which is most likely a child the kernel has not finished tearing
+/// down — the `?Es` case, which resolves itself — but is NOT a delivery receipt:
+/// Unix's pid-unavailable branch returns `true` having discarded its own
+/// `child.kill()` result. `kill=FAILED` means the
+/// force-kill's own mechanism reported an error
+/// ([`crate::platform::proc::force_kill_child_group`] has the per-platform
+/// meaning), so this child was very likely never signalled and may still be
+/// running after the daemon exits. Without the distinction both read as "left
+/// un-reaped", and only one of them is somebody's problem.
+///
+/// Takes the three fields rather than a `&RunningAgent` so both arms are
+/// unit-testable on every platform. That is not cosmetic: a synthetic test agent
+/// holds `AgentProcessGroup::adopt(None)`, which reports `ok` on Unix (the
+/// `killpg` fallback) and `FAILED` on Windows (no job object), so a test that
+/// went through a registry could only ever assert one arm, and a different one
+/// per platform.
+fn describe_unreaped_agent(pid: Option<u32>, pane: Option<&str>, kill_reported_ok: bool) -> String {
+    let pid = pid.map_or_else(|| "?".to_string(), |p| p.to_string());
+    let pane = pane.unwrap_or("?");
+    let kill = if kill_reported_ok { "ok" } else { "FAILED" };
+    format!("pid={pid} pane={pane} kill={kill}")
+}
 
 fn force_kill_and_wait(pty: &mut AgentPty) {
     crate::platform::proc::force_kill_child_and_wait(&mut pty.child, &pty.process_group);
@@ -8588,6 +8708,21 @@ impl AgentPtyRegistry {
         &self,
         child: Box<dyn portable_pty::Child + Send + Sync>,
     ) -> String {
+        self.insert_test_agent_for_pane(child, None)
+    }
+
+    /// [`Self::insert_test_agent`] with a `pane_id_env`, so a test can assert on
+    /// how the teardown paths NAME an agent rather than only on what they do to
+    /// it — issue #1118's give-up warning identifies each un-reaped child by pid
+    /// and pane, and a synthetic agent has no pid worth asserting on (its
+    /// `WedgedChild` reports whatever the test handed it, and a real pid there
+    /// would put a real process group under the production `killpg`).
+    #[cfg(test)]
+    pub(crate) fn insert_test_agent_for_pane(
+        &self,
+        child: Box<dyn portable_pty::Child + Send + Sync>,
+        pane_id_env: Option<&str>,
+    ) -> String {
         let pair = NativePtySystem::default()
             .openpty(PtySize {
                 rows: 24,
@@ -8621,7 +8756,7 @@ impl AgentPtyRegistry {
                     self.pane_input.clone(),
                 ))),
                 bus: Arc::new(AgentBus::new()),
-                pane_id_env: None,
+                pane_id_env: pane_id_env.map(str::to_string),
                 display_name: None,
                 cwd: None,
                 tab_membership: None,
@@ -8633,8 +8768,9 @@ impl AgentPtyRegistry {
                 exited: Arc::new(AtomicBool::new(false)),
                 // Issue #454: `false` is the birth value — the flag latches to
                 // `true` only when a *successor* takes this record's pane, and
-                // this synthetic agent holds no pane at all (`pane_id_env:
-                // None`), so nothing can ever hand one over.
+                // nothing here spawns one: this seam inserts a record directly
+                // rather than going through `spawn_agent`, which is where a
+                // hand-over would be observed.
                 pane_handed_over: false,
                 pending_seed: None,
                 seed_delivered_native: false,
@@ -9073,38 +9209,157 @@ impl AgentPtyRegistry {
     /// `wait()`, so one wedged agent cannot hold its siblings' *reaps* hostage
     /// either — the same shape as `shutdown_all_graceful`'s own grace poll and
     /// as the wrapper's reap loop (see the "finding #12" comment in
-    /// [`crate::wrap`]). The 50 ms cadence matches both, and costs at most one
-    /// tick: a shutdown whose agents already exited during the grace window
-    /// clears the whole vector on the first `try_wait` pass and never sleeps.
+    /// [`crate::wrap`]). [`FORCE_REAP_POLL_INTERVAL`] matches both, and costs at
+    /// most one tick: a shutdown whose agents already exited during the grace
+    /// window clears the whole vector on the first `try_wait` pass and never
+    /// sleeps.
     ///
-    /// **The reap is never dropped.** An agent leaves the vector only once its
-    /// `try_wait` reported an exit status, or reported an error (meaning there
-    /// is no status left to collect) — so this cannot trade the leaked-process
-    /// bug for a leaked-zombie one. A genuinely wedged child therefore still
-    /// holds this function until the kernel lets its `wait` complete, exactly as
-    /// before; what changed is that it no longer takes its siblings with it.
-    fn force_kill_and_reap_all(mut agents: Vec<RunningAgent>) {
-        // Pass 1: signal only.
-        for agent in &mut agents {
-            crate::platform::proc::force_kill_child_group(&mut agent.child, &agent.process_group);
+    /// **The reap is bounded, and CAN be given up** (issue #1118). An agent
+    /// leaves the vector once its `try_wait` reported an exit status, or reported
+    /// an error (meaning there is no status left to collect); whatever is still
+    /// there after [`FORCE_REAP_DEADLINE`] is abandoned, with a `warn!` naming
+    /// each one. That is a deliberate trade of a zombie for a bounded shutdown,
+    /// on three grounds:
+    ///
+    /// * **Waiting buys nothing.** Pass 1 has already ISSUED the force-kill (not
+    ///   necessarily landed it — see below), so nothing this function can still
+    ///   do makes the child exit sooner. A child the kernel has not finished
+    ///   tearing down — macOS `ps` state `?Es`, "trying to exit", measured 18
+    ///   times in 4500 executions in issue #959 — answers `Ok(None)` for exactly
+    ///   as long as it stays in that state, which is not a duration this process
+    ///   controls or can observe an end to.
+    /// * **Nothing downstream reads the statuses.** Both callers only
+    ///   `change_notify.notify_one()` afterwards, and the `RunningAgent`s are
+    ///   dropped when this function returns whichever way it left the loop.
+    /// * **Every PRODUCTION caller is on a teardown path.** Enumerated rather
+    ///   than asserted, because it is the load-bearing half of this argument:
+    ///   under `src/`, outside a `#[cfg(test)]` module, the callers are `Drop for
+    ///   AgentPtyRegistry`, the daemon's termination-signal handler
+    ///   (`daemon.rs`), and `daemon_protocol`'s `KIND_SHUTDOWN` handler. The
+    ///   remaining call sites in the tree are `tests/`, `#[cfg(test)]` modules
+    ///   and `examples/perf_baseline_probe.rs` — each tearing down a registry it
+    ///   owns, at the end of its own run. So an abandoned Unix child is
+    ///   re-parented — to init, or to the nearest subreaper — as soon as this
+    ///   process exits, which is the next thing each of those paths does, and
+    ///   reaped there; on Windows dropping the `Child` closes the handle and the
+    ///   kernel releases the process object when it finally exits. The give-up
+    ///   therefore costs one process-table entry for the remainder of this
+    ///   process's life, not a permanent leak.
+    ///
+    /// **The give-up abandons the status collection and never the kill — but
+    /// "the kill was issued" is not "the kill landed"** (issue #1118, Greptile
+    /// P1). Pass 1 asks for every agent before pass 2 waits for any, so no agent
+    /// can have its kill *withheld* by this deadline. What the deadline cannot
+    /// do is make a kill that FAILED succeed:
+    /// [`crate::platform::proc::force_kill_child_group`] returns `false` when
+    /// its own mechanism reported an error (a non-`ESRCH` `killpg`; a
+    /// `TerminateJobObject` that did not fire), and such a child may well still
+    /// be running when this returns. That is why each agent's kill outcome is
+    /// carried through pass 2 and reported in the give-up warning rather than
+    /// being swallowed.
+    ///
+    /// It is not a reason to keep waiting, though, and that is the one thing
+    /// worth being explicit about: a child that was never signalled is *less*
+    /// likely to exit on its own than one the kernel is already tearing down, so
+    /// waiting on it is strictly worse than waiting on the `?Es` case this
+    /// deadline exists for. Nor is there an escalation left to try — `SIGKILL`
+    /// is the strongest signal there is, and the realistic non-`ESRCH` failure
+    /// (`EPERM`) returns `EPERM` again on a retry. Reporting it is the remedy
+    /// actually available. Before the deadline the same failed kill produced a
+    /// loop that never returned, which left the child running too and said
+    /// nothing at all.
+    fn force_kill_and_reap_all(agents: Vec<RunningAgent>) {
+        if agents.is_empty() {
+            return;
         }
+        let total = agents.len();
+
+        // Pass 1: signal only. Each agent is paired with what its force-kill
+        // REPORTED, which pass 2 carries so the give-up below can tell a child
+        // the kernel is still tearing down from one that was never signalled.
+        let mut agents: Vec<(RunningAgent, bool)> = agents
+            .into_iter()
+            .map(|mut agent| {
+                let kill_reported_ok = crate::platform::proc::force_kill_child_group(
+                    &mut agent.child,
+                    &agent.process_group,
+                );
+                (agent, kill_reported_ok)
+            })
+            .collect();
 
         // Pass 2: reap, dropping each agent as its status is collected.
         //
-        // Termination depends on `try_wait` staying `Some` once it has reported
-        // an exit: phase 2 above may already have collected a child's status, and
-        // this loop asks again. Both backends hold that — Unix `Child` is
-        // `std::process::Child`, which caches the status and short-circuits, and
-        // `WinChild::try_wait` re-reads `GetExitCodeProcess` on a handle it still
-        // owns. A `Child` impl that answered `None` after reporting an exit would
-        // pin its agent here forever.
-        while !agents.is_empty() {
-            agents.retain_mut(|agent| matches!(agent.child.try_wait(), Ok(None)));
-            if agents.is_empty() {
+        // Clearing the vector depends on `try_wait` staying `Some` once it has
+        // reported an exit: phase 2 above may already have collected a child's
+        // status, and this loop asks again. Both backends hold that — Unix
+        // `Child` is `std::process::Child`, which caches the status and
+        // short-circuits, and `WinChild::try_wait` re-reads `GetExitCodeProcess`
+        // on a handle it still owns. TERMINATION, though, no longer depends on
+        // any of that: a `Child` impl that answered `None` after reporting an
+        // exit, or a real child stuck part-way through exiting, leaves the loop
+        // at the deadline instead of pinning it.
+        let started = Instant::now();
+        let deadline = started + FORCE_REAP_DEADLINE;
+        // Distinguishes "cleared on the first pass", which is the ordinary
+        // shutdown and would be noise at `info`, from "waited and then cleared",
+        // which is the near-miss of the give-up below and worth seeing.
+        let mut waited = false;
+        loop {
+            agents.retain_mut(|(agent, _)| matches!(agent.child.try_wait(), Ok(None)));
+            if agents.is_empty() || Instant::now() >= deadline {
                 break;
             }
-            std::thread::sleep(Duration::from_millis(50));
+            waited = true;
+            std::thread::sleep(FORCE_REAP_POLL_INTERVAL);
         }
+
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        if agents.is_empty() {
+            if waited {
+                tracing::info!(
+                    agents = total,
+                    elapsed_ms,
+                    "force-kill reap collected every agent's exit status, after waiting for one \
+                     or more of them"
+                );
+            } else {
+                tracing::debug!(
+                    agents = total,
+                    elapsed_ms,
+                    "force-kill reap collected every agent's exit status on the first pass"
+                );
+            }
+            return;
+        }
+
+        // The give-up. `?` on the list rather than a joined string so a pane id
+        // carrying control bytes is escaped by `str`'s `Debug` rather than
+        // forging log structure.
+        let unreaped: Vec<String> = agents
+            .iter()
+            .map(|(agent, kill_reported_ok)| {
+                describe_unreaped_agent(
+                    agent.child.process_id(),
+                    agent.pane_id_env.as_deref(),
+                    *kill_reported_ok,
+                )
+            })
+            .collect();
+        let kill_failed = agents.iter().filter(|(_, ok)| !ok).count();
+        tracing::warn!(
+            agents = total,
+            unreaped = unreaped.len(),
+            kill_failed,
+            unreaped_agents = ?unreaped,
+            deadline_ms = FORCE_REAP_DEADLINE.as_millis() as u64,
+            elapsed_ms,
+            "force-kill reap gave up: these agents never reported an exit status within the \
+             deadline and are left un-reaped. `kill=ok` means NO force-kill failure was reported \
+             — most likely a child the kernel has not finished tearing down, though it does not \
+             establish that the signal was delivered; `kill=FAILED` means the force-kill itself \
+             reported an error and that child may still be running"
+        );
     }
 
     /// SIGKILL every agent and drain the registry. Idempotent.
@@ -15092,6 +15347,200 @@ mod spawn_tests {
         assert!(
             reaped.iter().all(|r| r.load(Ordering::SeqCst)),
             "every agent must still be reaped, not merely signalled"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // Issue #1118 — the reap pass has a deadline, and says so when it expires.
+    // ---------------------------------------------------------------------
+
+    /// Issue #1118 (regression): a child that NEVER reports an exit must not pin
+    /// the whole shutdown.
+    ///
+    /// The wedged agent's gate is never released, so its `try_wait` answers
+    /// `Ok(None)` for as long as it is asked — the shape issue #959 measured on
+    /// `macos-latest`, where 18 of 4500 executions parked here with the child in
+    /// `ps` state `?Es` and nextest killed the test at 180 s. On the pre-fix code
+    /// this test does not fail, it HANGS, which is why the shutdown runs on a
+    /// thread that is deliberately never joined: the flag below turns "parked
+    /// forever" into a named assertion failure inside
+    /// [`WEDGE_TEST_BUDGET`] instead of a mystery kill.
+    ///
+    /// Three properties, and the lower bound is as load-bearing as the upper
+    /// one: a `force_kill_and_reap_all` that returned immediately would satisfy
+    /// "it terminated" while abandoning every child that merely needed a poll
+    /// cycle or two, so the test also requires that it actually spent the
+    /// deadline. The sibling proves the give-up is per-agent — one child that
+    /// cannot be reaped must not cost a reapable one its status — and the log
+    /// assertion is the whole point of #1118's second half, since a bounded wait
+    /// that gave up silently would leave the next operator exactly where #959
+    /// started, needing phase markers to find out what happened.
+    #[test]
+    fn force_kill_reap_gives_up_on_a_child_that_never_reports_an_exit() {
+        const WEDGED_PANE: &str = "pane-whose-child-never-finishes-exiting";
+
+        let registry = Arc::new(AgentPtyRegistry::new());
+
+        // The wedged one: its gate is never released, so `try_wait` is `Ok(None)`
+        // every time it is asked, forever.
+        let wedged = WedgedChild::new(None, Arc::new(WedgeGate::default()));
+        let wedged_kills = wedged.kills.clone();
+        let wedged_reaped = wedged.reaped.clone();
+        registry.insert_test_agent_for_pane(Box::new(wedged), Some(WEDGED_PANE));
+
+        // The sibling: reapable on the first pass.
+        let open_gate = Arc::new(WedgeGate::default());
+        open_gate.release();
+        let sibling = WedgedChild::new(None, open_gate);
+        let sibling_reaped = sibling.reaped.clone();
+        registry.insert_test_agent(Box::new(sibling));
+
+        let captured = CapturedLog::default();
+        let finished = Arc::new(AtomicBool::new(false));
+        let shutting_down = registry.clone();
+        let done = finished.clone();
+        let log_sink = captured.clone();
+        let started = Instant::now();
+        // Never joined, for the reason in the doc comment above. The subscriber
+        // is installed INSIDE the thread because `set_default` is thread-local
+        // and the warning is emitted on whichever thread runs the shutdown.
+        std::thread::spawn(move || {
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(log_sink)
+                .with_max_level(tracing_subscriber::filter::LevelFilter::WARN)
+                .with_ansi(false)
+                .finish();
+            let _subscriber_guard = tracing::subscriber::set_default(subscriber);
+            shutting_down.shutdown_all_graceful(Duration::from_millis(0));
+            done.store(true, Ordering::SeqCst);
+        });
+
+        let returned = holds_within(FORCE_REAP_DEADLINE + WEDGE_TEST_BUDGET, || {
+            finished.load(Ordering::SeqCst)
+        });
+        let elapsed = started.elapsed();
+
+        assert!(
+            returned,
+            "the shutdown never returned — a child that never reports an exit still pins \
+             `force_kill_and_reap_all`, which is exactly issue #1118"
+        );
+        assert!(
+            elapsed >= FORCE_REAP_DEADLINE,
+            "the reap gave up after {elapsed:?}, before its own {FORCE_REAP_DEADLINE:?} deadline \
+             — a child that merely needs a poll cycle or two would be abandoned too"
+        );
+        assert!(
+            wedged_kills.load(Ordering::SeqCst) > PHASE_ONE_FALLBACK_KILLS,
+            "giving up on the REAP must not give up on the KILL — pass 1 delivers it before the \
+             deadline can expire"
+        );
+        assert!(
+            !wedged_reaped.load(Ordering::SeqCst),
+            "the fixture is only meaningful while the wedged child is genuinely unreapable"
+        );
+        assert!(
+            sibling_reaped.load(Ordering::SeqCst),
+            "the give-up is per-agent: a reapable sibling must still have its status collected"
+        );
+
+        let log = String::from_utf8_lossy(&captured.0.lock().unwrap().clone()).into_owned();
+        assert!(
+            log.contains("force-kill reap gave up"),
+            "the give-up must be logged — a bounded wait that gives up silently leaves the next \
+             operator where #959 started. Captured WARN output was: {log}"
+        );
+        assert!(
+            log.contains(WEDGED_PANE),
+            "the warning must NAME the agent it could not reap, not just count it. Captured WARN \
+             output was: {log}"
+        );
+        assert!(
+            log.contains("unreaped=1"),
+            "…and must count only the agent it actually gave up on, not the reaped sibling. \
+             Captured WARN output was: {log}"
+        );
+        // Deliberately not asserting WHICH kill outcome: a synthetic agent holds
+        // `AgentProcessGroup::adopt(None)`, which reports `ok` on Unix and
+        // `FAILED` on Windows. That the two render distinguishably is
+        // `describe_unreaped_agent_separates_a_stuck_exit_from_a_failed_kill`'s
+        // job; what matters here is that the outcome is carried through pass 2
+        // at all rather than being swallowed by the `retain_mut`.
+        assert!(
+            log.contains(&format!("pane={WEDGED_PANE} kill=")),
+            "the warning must carry the agent's kill outcome beside its identity. Captured WARN \
+             output was: {log}"
+        );
+    }
+
+    /// Issue #1118 (Greptile P1): the give-up report must separate a child the
+    /// kernel has not finished tearing down from one that was never signalled.
+    ///
+    /// Both leave an agent un-reaped and both used to read identically, but only
+    /// the second may still be RUNNING after the daemon exits — so "left
+    /// un-reaped" alone tells an operator nothing about whether they have a
+    /// problem. `FAILED` is deliberately the shouty one: it is the arm worth
+    /// grepping for.
+    #[test]
+    fn describe_unreaped_agent_separates_a_stuck_exit_from_a_failed_kill() {
+        assert_eq!(
+            describe_unreaped_agent(Some(4321), Some("orch-1"), true),
+            "pid=4321 pane=orch-1 kill=ok",
+            "a kill that reported no failure, on a child that is merely slow to finish exiting"
+        );
+        assert_eq!(
+            describe_unreaped_agent(Some(4321), Some("orch-1"), false),
+            "pid=4321 pane=orch-1 kill=FAILED",
+            "a kill whose own mechanism reported an error — this child may still be running"
+        );
+        assert_eq!(
+            describe_unreaped_agent(None, None, true),
+            "pid=? pane=? kill=ok",
+            "both identity fields are legitimately absent (a backend that let go of the pid, an \
+             agent spawned without DOT_AGENT_DECK_PANE_ID) and must not be rendered as empty"
+        );
+    }
+
+    /// Control for the test above: the ordinary shutdown — every child reapable —
+    /// returns nowhere near the deadline and logs no give-up.
+    ///
+    /// Without it, "the shutdown returned" proves nothing about the deadline
+    /// being a BOUND rather than a floor: a reap that always slept out its full
+    /// window would pass the wedged test and make every clean daemon stop a
+    /// second slower.
+    #[test]
+    fn force_kill_reap_returns_at_once_when_every_child_is_reapable() {
+        let registry = AgentPtyRegistry::new();
+        for _ in 0..2 {
+            let gate = Arc::new(WedgeGate::default());
+            gate.release();
+            registry.insert_test_agent(Box::new(WedgedChild::new(None, gate)));
+        }
+
+        let captured = CapturedLog::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(captured.clone())
+            .with_max_level(tracing_subscriber::filter::LevelFilter::WARN)
+            .with_ansi(false)
+            .finish();
+        let started = Instant::now();
+        {
+            let _subscriber_guard = tracing::subscriber::set_default(subscriber);
+            registry.shutdown_all_graceful(Duration::from_millis(0));
+        }
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < FORCE_REAP_DEADLINE,
+            "a shutdown with nothing to wait for must clear on the first `try_wait` pass, not \
+             spend the reap deadline; it took {elapsed:?} against a {FORCE_REAP_DEADLINE:?} \
+             deadline"
+        );
+        let log = String::from_utf8_lossy(&captured.0.lock().unwrap().clone()).into_owned();
+        assert!(
+            !log.contains("force-kill reap gave up"),
+            "nothing was given up on, so nothing may be reported as given up on. Captured WARN \
+             output was: {log}"
         );
     }
 
