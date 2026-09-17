@@ -4145,8 +4145,8 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 ##### pane/drift/001 — A role grown into an already-open orchestration tab via `pane spawn` survives the next session snapshot flush (issue #868).
 - **Layer:** L2 (PTY-attached, real `dot-agent-deck` binary via `TuiDeck`, `DOT_AGENT_DECK_SESSION` redirected to a test-owned path — the `e2e` tier). Extends `pane/spawn/005`'s own setup.
 - **Agent:** none (`cat` role stand-ins).
-- **Asserts:** the leading-edge snapshot write already captures both fixture roles in `[panes.orchestration]`; after growing the tab with `reviewer` via the real `pane spawn` CLI (mirroring `pane/spawn/005`) and forcing one more coalesced flush (spawning an unrelated plain dashboard pane, since the growth branch alone does not always mark the session dirty), the re-flushed `[panes.orchestration]` role list includes `reviewer` — proving the snapshot writer reads the tab's live, grown role list rather than a copy frozen at tab-open time.
-- **Does not assert:** the restore-side drift guard itself (`resolve_orchestration_for_restore`) — only that the snapshot WRITE side stays in sync with a live-grown tab, which is the precondition for that guard not false-positiving.
+- **Asserts:** the leading-edge snapshot write already captures both fixture roles in `[panes.orchestration]`; after growing the tab with `reviewer` — INSERTED between `orchestrator` and `coder`, issue #1096's shape — via the real `pane spawn` CLI (mirroring `pane/spawn/005`) and forcing one more coalesced flush (spawning an unrelated plain dashboard pane, since the growth branch alone does not always mark the session dirty), the re-flushed `[panes.orchestration]` role list includes `reviewer` AND, parsed as TOML rather than substring-matched, lists exactly `[orchestrator, reviewer, coder]` in the on-disk config's order — proving the snapshot writer rebuilds from the tab's live, grown role list rather than from a copy frozen at tab-open time or by appending onto it (issue #1096: the restore drift guard is an element-by-element sequence comparison, so a snapshot carrying `reviewer` in the wrong slot is rejected exactly like one that never captured it).
+- **Does not assert:** the restore-side drift guard itself (`resolve_orchestration_for_restore`) — only that the snapshot WRITE side stays in sync with a live-grown tab, which is the precondition for that guard not false-positiving; the `TabManager`-level placement rule that produces the order (`pane/spawn/014`-`016` pin that).
 - **Platform coverage:** mac+linux (unix-only — spawns a real daemon/TUI subprocess).
 
 #### pane/restart
@@ -4261,7 +4261,7 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 ##### pane/spawn/005 — Spawning a role into an orchestration that already has an ATTACHED tab open makes the new role's card join that SAME tab, not a duplicate second tab (issue #868).
 - **Layer:** L2 (PTY-attached, real `dot-agent-deck` binary via `TuiDeck` — the `e2e` tier). Uses the `pane-spawn-live` fixture (`orchestrator` [start] + `coder`).
 - **Agent:** none (`cat` role stand-ins; the real binary and daemon are what's under test).
-- **Asserts:** after opening the orchestration tab (both configured roles visible, exactly Dashboard + 1 orchestration tab), rewriting the running orchestration's own `.dot-agent-deck.toml` to add a `reviewer` role and invoking the real `dot-agent-deck pane spawn reviewer` CLI subprocess, reviewer's card joins the SAME already-open tab (visible without any tab switch), the tab bar still shows exactly 2 tabs (not a duplicate orchestration tab), and reviewer renders as its own bordered role pane box.
+- **Asserts:** after opening the orchestration tab (both configured roles visible, exactly Dashboard + 1 orchestration tab), rewriting the running orchestration's own `.dot-agent-deck.toml` to INSERT a `reviewer` role between `orchestrator` and `coder` (issue #1096's shape — the fixture used to append it) and invoking the real `dot-agent-deck pane spawn reviewer` CLI subprocess, reviewer's card joins the SAME already-open tab (visible without any tab switch), the tab bar still shows exactly 2 tabs (not a duplicate orchestration tab), and reviewer renders as its own bordered role pane box.
 - **Does not assert:** the daemon-side handler contract itself (`pane/spawn/001`-`004`/`007`/`008`/`011` pin that at the L1 level).
 - **Platform coverage:** mac+linux (unix-only — spawns a real daemon/TUI subprocess).
 
@@ -4283,7 +4283,7 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 - **Layer:** L1/fast (`TabManager`-only — a `TabManager` with a trivial no-op `PaneController`, no daemon, no PTY, no `ui.rs`/`EmbeddedPaneController` involved; mirrors `tests/pane_close.rs`'s own `DelayedCloseController` isolation technique).
 - **Agent:** none.
 - **Asserts:** growing an orchestration tab that already has a dead slot (`None` pane) for `reviewer` with a freshly-spawned `reviewer` pane replaces that slot rather than appending a second `reviewer` role config entry — the role count stays at 2, the dead slot's pane id and status (`Failed` → `Working`) are updated in place, the replaced slot's config reflects the FRESH role config (not the tab's stale copy), and the returned `was_new` flag reports `false`.
-- **Does not assert:** a role inserted in the MIDDLE of the config, shifting existing role indices (a known out-of-scope edge case for M4).
+- **Does not assert:** a role inserted in the MIDDLE of the config, shifting existing role indices — `pane/spawn/014` pins that since issue #1096 closed it.
 - **Platform coverage:** mac+linux (unix-only).
 
 ##### pane/spawn/010 — Two orchestration tabs sharing the same `(cwd, name)` do not cross-wire on growth (issue #868 — the most significant fix-round finding: `orchestration_tab_index_for` must key on the PRD #140 per-tab `Instance` token, not the bare tuple).
@@ -4312,6 +4312,27 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 - **Agent:** none.
 - **Asserts:** the real CLI exits non-zero and prints a stderr line containing, case-insensitively, "unexpected" — this test file's own deliberately chosen needle.
 - **Does not assert:** exact byte-for-byte stderr wording beyond that needle; the silent-close case (`pane/spawn/012` owns that).
+- **Platform coverage:** mac+linux (unix-only).
+
+##### pane/spawn/014 — A role INSERTED in the middle of `.dot-agent-deck.toml` lands at its configured index in the already-open tab instead of being appended (issue #1096).
+- **Layer:** L1/fast (same `TabManager`-only technique as `pane/spawn/009` — a `TabManager` with a no-op `PaneController`, no daemon, no PTY, no `ui.rs`).
+- **Agent:** none.
+- **Asserts:** with a tab open on `[orchestrator, coder]` and the current config now reading `[orchestrator, reviewer, coder]`, growing the tab with `reviewer` places it at index 1 — `config.roles`, `role_pane_ids` and `role_statuses` all read `[orchestrator, reviewer, coder]` in lockstep, the returned role index is 1 (the index the daemon stamps on `TabMembership` from the same config, not the append index 2), the new slot carries its own `Working` status, `was_new` is `true`, and `start_role_index` is unmoved by an insert that lands after it.
+- **Does not assert:** the session-snapshot half (`pane/drift/001` pins that the flushed `[panes.orchestration]` list carries the same order); roles REMOVED, REORDERED or RENAMED in the config since the tab opened — deliberately out of scope, since none is expressible as a `pane spawn` of one role and each would mean deleting or moving slots whose panes are live.
+- **Platform coverage:** mac+linux (unix-only).
+
+##### pane/spawn/015 — A role added at the END of the config still appends, and a role the current config does not list at all still appends rather than guessing a slot (issue #1096 — the control for `pane/spawn/014`).
+- **Layer:** L1/fast (same `TabManager`-only technique as `pane/spawn/009`).
+- **Agent:** none.
+- **Asserts:** two legs on the same fixture tab shape (`[orchestrator, coder]`). Leg 1 — with the current config reading `[orchestrator, coder, reviewer]`, growing with `reviewer` still lands it last (returned index 2, vectors `[orchestrator, coder, reviewer]`, `start_role_index` unmoved): the case that was accidentally correct before placement existed must stay correct. Leg 2 — with a current config that does not mention `reviewer` at all, the growth still succeeds and appends (returned index 2), so placement degrades to the pre-#1096 behaviour rather than panicking or picking an arbitrary slot.
+- **Does not assert:** the mid-insert case (`pane/spawn/014` owns it); what the RESTORE path then does with a tab whose config dropped a live role — that drift is unrepairable by placement and still falls back to a plain pane.
+- **Platform coverage:** mac+linux (unix-only).
+
+##### pane/spawn/016 — A role inserted BEFORE the start role carries `start_role_index` along with it (issue #1096).
+- **Layer:** L1/fast (same `TabManager`-only technique as `pane/spawn/009`).
+- **Agent:** none.
+- **Asserts:** with a tab open on `[coder, orchestrator]` — start role second, index 1 — and the config now reading `[reviewer, coder, orchestrator]`, growing with `reviewer` places it at index 0 and moves `start_role_index` from 1 to 2, so `role_pane_ids[start_role_index]` still names the orchestrator's pane. That pane id is the `ui.pane_metadata` key the orchestration snapshot is stored under and the pane the orchestrator prompt is delivered to, so a stale cursor would silently repoint both at whichever role took index 1.
+- **Does not assert:** the delivery path itself, or the snapshot write (`pane/drift/001`); a config that makes the inserted role itself the `start` role — the tab keeps the start role it opened with.
 - **Platform coverage:** mac+linux (unix-only).
 
 #### pi/live
