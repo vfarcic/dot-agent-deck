@@ -531,6 +531,29 @@ pub const CONTRACT_BREAKS: &[&str] = &[
     // moved is who gets refused, which is a semantic break by
     // `docs/develop/versioning.md`'s definition.
     "617-pane-write-agent-binding",
+    // Issue #1049, the 9 -> 10 bump: the attach protocol gains `stop-daemon`,
+    // the first wire verb that stops a deck, so a daemon speaking 9 fails the
+    // frame decode on a variant it does not have.
+    //
+    // Listed even though PROTOCOL_VERSION already separates every build on
+    // either side of it, which is NOT the treatment PRD #882 and PRD #819 get
+    // above. The difference is the fragment: `changelog.d/1049.breaking.md`
+    // exists, and the `contract_breaks` rule is one-directional -- it fails on
+    // a fragment with no entry and says nothing about an entry with no
+    // fragment. An entry the version floor makes redundant costs nothing, since
+    // two builds that differ on it already differ on PROTOCOL_VERSION and the
+    // refusal is the same one either way; suppressing it would instead mean
+    // teaching the rule which breaks moved the version, which it cannot see
+    // from the tree.
+    "1049-stop-daemon-verb",
+    // Issue #1077, which landed at 10 without moving it -- the same shape as
+    // #617 above, and the case this list exists for. Hook-socket messages must
+    // now present the per-spawn capability token their pane was issued, and the
+    // daemon refuses one that arrives without it or carries a token issued for
+    // a different pane. `token` is an optional field, so nothing on the wire
+    // moved and an older daemon ignores it; what moved is which messages a
+    // NEWER daemon refuses, which a version number cannot express.
+    "1077-hook-capability-token",
 ];
 
 /// What comparing this build's [`CONTRACT_BREAKS`] against a peer's found.
@@ -4664,12 +4687,20 @@ mod tests {
                 peer_lacks,
                 this_build_lacks,
             } => {
+                // Compared as a SET, because `compare_contract_breaks` builds
+                // its answer from a `BTreeSet` difference and so returns the
+                // names sorted, while `CONTRACT_BREAKS` is in declaration
+                // order. Those coincided while the list held one entry and
+                // stopped coinciding at the second — asserting the sequence
+                // would be pinning an ordering nothing promises.
+                let expected: std::collections::BTreeSet<String> =
+                    CONTRACT_BREAKS.iter().map(|b| (*b).to_string()).collect();
                 assert_eq!(
-                    peer_lacks,
-                    CONTRACT_BREAKS
+                    peer_lacks
                         .iter()
-                        .map(|b| (*b).to_string())
-                        .collect::<Vec<_>>()
+                        .cloned()
+                        .collect::<std::collections::BTreeSet<_>>(),
+                    expected
                 );
                 assert!(this_build_lacks.is_empty());
             }

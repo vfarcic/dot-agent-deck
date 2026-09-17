@@ -1485,9 +1485,18 @@ mod tests {
         assert_eq!(info.status, ConnectionStatus::Incompatible);
         let error = info.error.expect("a refusal says why");
         assert!(error.contains("contract mismatch"), "{error}");
+        // `last()`, not `[0]`: `hello_from_a_deck_one_declared_break_behind`
+        // makes its older deck by `pop()`ing the tail, so the break it withholds
+        // is the LAST declared one. Those were the same element while
+        // `CONTRACT_BREAKS` held a single entry, and stopped being the same at
+        // the second — asserting on `[0]` was reading the fixture's intent off a
+        // coincidence.
+        let withheld = dot_agent_deck::daemon_protocol::CONTRACT_BREAKS
+            .last()
+            .expect("the fixture withholds a declared break, so there is one");
         assert!(
-            error.contains(dot_agent_deck::daemon_protocol::CONTRACT_BREAKS[0]),
-            "the sentence names the break: {error}"
+            error.contains(withheld),
+            "the sentence names the withheld break {withheld}: {error}"
         );
         assert!(
             info.build_stamp_mismatch_only,
@@ -1561,22 +1570,35 @@ mod tests {
     /// about a build this repo can no longer produce: it reports
     /// `server_version: 9` and carries no `contract_breaks` key at all.
     ///
-    /// Two things it pins. That the reply still DESERIALIZES — a field added to
-    /// `AttachResponse` must stay additive — and that it CONNECTS, because
-    /// refusing every released daemon for omitting a field it was built before
-    /// would relocate issue #801's false positive rather than remove it.
+    /// What it pins is that the reply still DESERIALIZES — a field added to
+    /// `AttachResponse` must stay additive — and that the refusal it now earns
+    /// comes from the PROTOCOL FLOOR rather than from this classifier.
     ///
-    /// The stamps are a minor-and-a-patch apart from anything this branch builds
-    /// (`0.40.2` against `0.40.1-…`, since `v0.40.2` is not reachable from this
-    /// branch's HEAD — the tag-timing shape the issue is about, live), and that
-    /// no longer has any bearing on the verdict.
+    /// **It used to assert that the capture CONNECTS, and that assertion was
+    /// correct until issue #1049 took `PROTOCOL_VERSION` from 9 to 10.** The
+    /// capture reports 9, so every released daemon through `0.40.2` is now
+    /// refused before the contract lists are ever compared. That is the version
+    /// floor doing its job, not issue #801's false positive returning — and the
+    /// distinction is the whole point of keeping this capture: the error must
+    /// say `protocol mismatch`, because a `contract mismatch` here would mean
+    /// the classifier had reached a peer it should never have got to.
+    ///
+    /// The property the old assertion protected — that omitting the field is
+    /// not itself a refusal — moved to
+    /// [`a_same_protocol_peer_that_omits_the_contract_list_connects`], which is
+    /// where it can still be shown. Do not fold the two back together: this one
+    /// is evidence about a build that exists, and that one is about a code path.
     #[test]
-    fn the_real_v0_40_2_daemon_hello_deserializes_and_connects() {
+    fn the_real_v0_40_2_daemon_hello_is_refused_by_the_protocol_floor() {
         let _guard = AllowanceGuard::acquire();
         let captured = r#"{"ok":true,"server_version":9,"build_version":"0.40.2-g7e87d7f","daemon_version":"0.40.2"}"#;
         let response: AttachResponse =
             serde_json::from_str(captured).expect("a released daemon's reply must still decode");
-        assert_eq!(response.server_version, Some(PROTOCOL_VERSION));
+        // The captured literal, NOT `PROTOCOL_VERSION`: pinning it to the
+        // constant is what made this test fail the moment #1049 moved it, and
+        // the capture's value is a fact about a released build that no later
+        // bump can change.
+        assert_eq!(response.server_version, Some(9));
         assert!(
             response.contract_breaks.is_none(),
             "the capture is only evidence while it predates the field"
@@ -1587,14 +1609,49 @@ mod tests {
             "0.40.1-ga41acea6-dirty",
             BuildMismatchAllowance::Refuse,
         );
+        assert_eq!(info.status, ConnectionStatus::Incompatible);
+        let error = info.error.expect("a protocol mismatch must be reported");
+        assert!(
+            error.contains("protocol mismatch"),
+            "the floor must refuse this, not the contract classifier: {error}"
+        );
+        assert!(
+            !error.contains("contract mismatch"),
+            "the contract lists must never be compared across a protocol gap: {error}"
+        );
+    }
+
+    /// Omitting `contract_breaks` is not itself a refusal.
+    ///
+    /// This is the half of the old capture test that survived issue #1049's
+    /// `PROTOCOL_VERSION` bump, and it matters because
+    /// [`ContractComparison::Unknown`] reads an absent list as "connect" — an
+    /// assumption its own doc flags as an assumption. Every other fixture here
+    /// goes through `AttachResponse::hello`, which POPULATES the list, so
+    /// without this test nothing at the handshake layer exercises the absent
+    /// case at all.
+    ///
+    /// Constructed rather than captured, deliberately: a real build old enough
+    /// to omit the field is also old enough to fail the protocol floor, so the
+    /// two properties can no longer be shown by the same peer.
+    #[test]
+    fn a_same_protocol_peer_that_omits_the_contract_list_connects() {
+        let _guard = AllowanceGuard::acquire();
+        let mut response = hello_with_build(Some("0.40.1-gdeadbee"));
+        response.contract_breaks = None;
+
+        let info = classify_handshake(
+            &response,
+            "0.40.1-ga41acea6-dirty",
+            BuildMismatchAllowance::Refuse,
+        );
         assert_eq!(
             info.status,
             ConnectionStatus::Connected,
-            "a released daemon must not be refused for omitting a field it predates: {:?}",
+            "a peer that declares nothing must not be refused for the silence: {:?}",
             info.error
         );
         assert!(info.error.is_none(), "{:?}", info.error);
-        assert!(!info.build_stamp_mismatch_only);
     }
 
     /// A hostile deck cannot write whatever it likes into the connection banner.
