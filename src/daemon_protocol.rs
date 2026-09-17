@@ -5888,6 +5888,41 @@ mod tests {
         use crate::agent_pty::{AgentPtyRegistry, AgentRecord, SpawnOptions};
         use portable_pty::{CommandBuilder, PtySize, PtySystem};
 
+        // Issue #959: this test was killed once by nextest's default 3 x 60s
+        // window on `build-macos`, at `time="180.616"`, against 0.194s for the
+        // same test on the same runner image in the same run's passing
+        // re-attempt — 931x. Where it stalled was unknown at the time, because
+        // the test printed nothing and a kill leaves no assertion behind:
+        // nextest's JUnit records a timeout as `<failure type="test timeout"/>`
+        // with no message of its own, so the artifact said only that 180.6
+        // seconds had gone somewhere.
+        //
+        // These markers are what answered it, and they are why the fix below is
+        // one line rather than a guess. nextest stores a FAILED or TIMED-OUT
+        // test's stdout and stderr and drops a passing one's
+        // (`store-success-output` is at its default of false — see
+        // `.config/nextest.toml`), so they cost nothing on the green path and
+        // name the last phase entered on the red one, in the JUnit artifact CI
+        // uploads per attempt as well as in the terminal. Stressed on a real
+        // `macos-latest` runner, 18 of 4500 executions stalled and all 18 named
+        // the same phase.
+        //
+        // One marker per UNBOUNDED wait, which is what each phase below
+        // contains — that is also why no `slow-timeout` carve-out would have
+        // helped, and `.config/nextest.toml` carries a tombstone saying so.
+        // `spawn_agent` blocks inside `Command::spawn` until the forked child
+        // clears portable-pty's `pre_exec` hook, with no timeout anywhere on
+        // that path: measured directly, a `pre_exec` that sleeps 3000 ms makes
+        // the parent's `spawn()` return in 3000.8 ms, and a hook that never
+        // returns is never given up on. `shutdown_all` polls `try_wait` in a
+        // loop that has no deadline either — which is the one that hung. Keep
+        // the markers: they are the only thing that would name a NEW stall
+        // site, and neither wait has grown a bound since.
+        let started = std::time::Instant::now();
+        let phase = |name: &str| {
+            eprintln!("live_014 phase: {name} (t+{:?})", started.elapsed());
+        };
+
         // (a) RECORDED, and recorded as an OBSERVATION of our own fork.
         //
         // This is the property that made a duration shippable where the PRD had
@@ -5898,6 +5933,7 @@ mod tests {
         // A spawn is something the daemon DID, so it needs no signal and no
         // inference. Bracketing the spawn is what would fail if anyone ever
         // "helpfully" stamped this at snapshot time instead.
+        phase("spawn_agent");
         let before = chrono::Utc::now().timestamp_millis();
         let registry = Arc::new(AgentPtyRegistry::new());
         let id = registry
@@ -5935,12 +5971,14 @@ mod tests {
         let json = serde_json::to_string(rec).expect("AgentRecord serializes");
         let back: AgentRecord = serde_json::from_str(&json).expect("deserializes");
         assert_eq!(back.spawned_at_ms, Some(spawned_at_ms));
+        phase("shutdown_all (spawned agent)");
         registry.shutdown_all();
 
         // (b) ABSENT when this registry did not do the spawning, and omitted
         // from the wire entirely rather than sent as a null. There is no
         // `Utc::now()` fallback anywhere on this path — an invented value is
         // exactly the failure the PRD's original duration rejection was about.
+        phase("openpty + spawn_command (adopted child)");
         let adopted = Arc::new(AgentPtyRegistry::new());
         let pair = portable_pty::NativePtySystem::default()
             .openpty(PtySize {
@@ -5954,6 +5992,40 @@ mod tests {
             .slave
             .spawn_command(CommandBuilder::new("sleep"))
             .expect("spawn a child the registry did not fork");
+        // Issue #959: drop BOTH ends of this PTY the moment the child owns its
+        // own copies, and do it here rather than at the end of the test.
+        //
+        // This is what the production spawn path does — `agent_pty::spawn`
+        // drops the slave as soon as `spawn_command` returns, and `spawn_agent`
+        // starts a `pump_reader` thread that drains the master for the agent's
+        // whole life. Nothing needs either handle here: `insert_test_agent`
+        // opens a PTY of its OWN for the synthetic `RunningAgent`, so this pair
+        // exists only to give the child a terminal to be born on.
+        //
+        // Holding them and reading neither is what wedged this test. The child
+        // is a bare `sleep`, which writes a usage line to this slave and exits;
+        // on macOS it then got stuck in the kernel's exit path (`ps` state
+        // `?<Es`, "trying to exit") often enough to matter, and
+        // `shutdown_all` -> `force_kill_and_reap_all` polls `try_wait` in a loop
+        // with no deadline, so the test sat there until nextest killed it at
+        // 180 seconds. It was NOT slow and it was NOT the spawn: measured on
+        // `macos-latest`, 18 of 4500 executions stalled, every one of them in
+        // this phase and with the child in that state, against 0 of 4500 on
+        // `ubuntu-latest`. With this `drop`, the same 4500-execution stress on
+        // the same runner type stalled 0 times.
+        //
+        // The shape needs four things at once, isolated on `macos-latest` by
+        // varying one at a time: the child WRITES to the PTY, NOBODY drains it,
+        // BOTH ends are still open, and the child is EXITING of its own accord
+        // when the kill lands. A standalone reproduction of all four stalls 40
+        // of 40 times; swap the child for `/usr/bin/true`, drop either end, add
+        // a draining thread, or use a `sleep 300` that is still running when
+        // killed, and each is 0 of 800. The last of those is also why the real
+        // test stalled on only 0.4% of executions: the markers above put ~1.3 ms
+        // between this spawn and the kill, so the SIGKILL usually wins the race
+        // and the child never reaches the exit path it gets stuck in.
+        // `.config/nextest.toml`'s #959 tombstone has the table.
+        drop(pair);
         let adopted_id = adopted.insert_test_agent(child);
         let adopted_records = adopted.agent_records();
         let adopted_rec = adopted_records
@@ -5970,6 +6042,7 @@ mod tests {
             value.get("spawned_at_ms").is_none(),
             "an absent spawn time must have no key at all; got {json}"
         );
+        phase("shutdown_all (adopted agent)");
         adopted.shutdown_all();
 
         // (c) FORWARD-COMPATIBLE with an older peer, which is the entire basis
@@ -6002,6 +6075,7 @@ mod tests {
             serde_json::from_str(newer).expect("a newer peer's record must decode");
         assert_eq!(forward.spawned_at_ms, Some(1_756_684_800_123));
         assert_eq!(forward.pane_id_env.as_deref(), Some("pane-4"));
+        phase("done");
     }
 
     /// Issue #856: `AgentRecord.cli_name` is additive and optional in BOTH
