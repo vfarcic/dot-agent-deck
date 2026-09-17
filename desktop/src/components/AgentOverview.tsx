@@ -1,4 +1,4 @@
-import { createContext, useCallback, useContext, useEffect, useId, useMemo, useRef, useState, type CSSProperties, type ReactNode } from "react";
+import { createContext, useCallback, useContext, useEffect, useId, useMemo, useRef, useState, type CSSProperties, type MouseEvent, type ReactNode } from "react";
 import { Blocks, Boxes, Columns3, LayoutList, Layers, Maximize2, Network, RefreshCw, RotateCcw, ShieldAlert, Sparkles, SquareTerminal, Wrench } from "lucide-react";
 import type { AgentSession, AgentStatus, ConnectionView, DeckRuntimeState, DeckView } from "../types";
 import { modeScopedKey } from "../lib/bridge";
@@ -1476,8 +1476,9 @@ function OverviewRow({ agent, hoistedCwd, now, columns }: { agent: OverviewAgent
   /*
     PRD #1105 M5 — the only thing this milestone adds to a card, and the limit
     is deliberate: #745's commitment is that these rows stay terminal-free, so
-    the row gains a control that NAVIGATES and gains nothing that renders
-    output. Its accessible name is built from `name` rather than from
+    the row gains a way to NAVIGATE — this control, and a click anywhere else
+    on the row (see `openFromRow`) — and gains nothing that renders output.
+    Its accessible name is built from `name` rather than from
     `agent.displayName`, so the sanitised, clamped copy is what a screen reader
     announces and a hostile display name cannot spell a different button.
 
@@ -1651,11 +1652,73 @@ function OverviewRow({ agent, hoistedCwd, now, columns }: { agent: OverviewAgent
       }
     }
   };
+  /*
+    The whole row is the pointer target for opening the pane, and the control
+    above stays as the keyboard and screen-reader route. A click handler on the
+    `<tr>` rather than a `<button>` around it, which would be invalid HTML with
+    the control inside and would announce the entire row as one button name. It
+    is also a click handler rather than a stretched link: a transparent layer
+    stretched over the row would sit on top of every cell, so the working
+    directory and prompt could no longer be selected, and each cell's `title`
+    (the full path, the full prompt, the exact instants) would never show on
+    hover. The row stays out of the tab order because the control is already
+    in it, and a second stop per agent would only repeat it.
+  */
+  const openFromRow = openAgent && ((event: MouseEvent<HTMLTableRowElement>) => {
+    if (clickLandedOnRowControl(event) || clickFinishedSelection(event.currentTarget)) return;
+    openAgent(agent);
+  });
   return (
-    <tr className="overview-row" role="row" data-testid={`overview-agent-${agentDomKey(agent)}`} data-status={agent.status}>
+    <tr
+      className={openAgent ? "overview-row is-openable" : "overview-row"}
+      role="row"
+      data-testid={`overview-agent-${agentDomKey(agent)}`}
+      data-status={agent.status}
+      onClick={openFromRow}
+    >
       {columns.map(cell)}
     </tr>
   );
+}
+
+/**
+ * Everything inside a row that can do a job of its own, so a click on it is
+ * left to that job. Today the open control is the only match in a row, and it
+ * opens the pane itself, so letting the click reach the row as well would open
+ * it twice. The selector is wider than that one control on purpose: a control
+ * added to a row later gets its own click without having to remember
+ * `stopPropagation`.
+ */
+const ROW_CONTROL_SELECTOR = "a[href], button, input, select, textarea, label, summary, [contenteditable], [tabindex], [role='button'], [role='link']";
+
+function clickLandedOnRowControl(event: MouseEvent<HTMLTableRowElement>): boolean {
+  if (!(event.target instanceof Element)) return false;
+  const control = event.target.closest(ROW_CONTROL_SELECTOR);
+  return control !== null && control !== event.currentTarget && event.currentTarget.contains(control);
+}
+
+/**
+ * Whether this click is the mouse-up that finished a text selection in the row.
+ * A drag across a working directory or a prompt still ends in a `click` on the
+ * row, and someone copying a path is not asking to open a pane.
+ *
+ * It reads the selection rather than measuring the drag: the selection is the
+ * thing that must survive, and a drag distance is only a guess at it, one that
+ * misses a short selection and flags a long drag that selected nothing. A plain
+ * click leaves a collapsed caret, which this does not count. The check is
+ * scoped to ranges touching THIS row, so a selection somewhere else on the
+ * screen cannot make a row refuse to open.
+ *
+ * Selecting by double-click is not covered: its first click is an ordinary
+ * click and opens the pane before the second one arrives.
+ */
+function clickFinishedSelection(row: HTMLTableRowElement): boolean {
+  const selection = window.getSelection();
+  if (!selection || selection.isCollapsed) return false;
+  for (let index = 0; index < selection.rangeCount; index += 1) {
+    if (selection.getRangeAt(index).intersectsNode(row)) return true;
+  }
+  return false;
 }
 
 function OverviewNote({ className, testId, icon, title, children }: { className?: string; testId: string; icon: ReactNode; title: string; children: ReactNode }) {

@@ -1248,4 +1248,10 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
    name cell rather than beside the name, so a long display name is still
    clamped by its own `text-overflow` and the control never moves. */
 .overview-open-agent { flex: 0 0 auto; margin-left: auto; width: 20px; height: 20px; display: grid; place-items: center; border: 1px solid transparent; border-radius: 4px; color: var(--faint); background: transparent; cursor: pointer; }
-.overview-open-agent:hover, .overview-open-agent:focus-visible { color: var(--teal); border-color: var(--teal-focus); background: var(--teal-soft); }
+.overview-open-agent:hover, .overview-open-agent:focus-visible, .overview-row.is-openable:hover .overview-open-agent { color: var(--teal); border-color: var(--teal-focus); background: var(--teal-soft); }
+/* A click anywhere on the row opens the pane too, so the row reads as one
+   target: a pointer over all of it, and while it is hovered the control lights
+   exactly as it does under the pointer itself. The control is what carries the
+   hover here rather than the row's background, because a failed row's red
+   background already wins over `.overview-row:hover` and would show nothing. */
+.overview-row.is-openable { cursor: pointer; }
