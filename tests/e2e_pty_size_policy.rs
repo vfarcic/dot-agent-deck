@@ -412,6 +412,7 @@ fn policy_001_a_smaller_second_client_shrinks_the_agent_for_everyone() {
 
     let (runtime, mut desktop) = attach_enlarged_desktop(&socket);
     let seen = agent_visible_stty_size(&runtime, &mut desktop, "DAD_OWNER_BOTH=");
+    // Holds only while this TUI claims no focus (no input, no harness `FocusGained`); a claim gives it the TUI's rows.
     assert_eq!(
         seen.0, DESKTOP_OVERLAY.0,
         "owner configuration: the shell must see the desktop overlay's 22 rows even while \
