@@ -3031,10 +3031,10 @@ mod tests {
 
     /// PRD #1105 — the audit's churn case, through the production handler: two
     /// clients with measured viewers of one agent fire 200 alternating
-    /// `focus-gained` requests concurrently. The PTY is resized at most once per
-    /// started coalescing interval rather than once per flip. Two closing claims
-    /// then show that `ok` still means applied, whether the claim ran a pass at
-    /// once or waited for a deferred one.
+    /// `focus-gained` requests, 16 in flight at a time. The PTY is resized at
+    /// most once per started coalescing interval rather than once per flip. Two
+    /// closing claims then show that `ok` still means applied, whether the claim
+    /// ran a pass at once or waited for a deferred one.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn alternating_focus_claims_are_coalesced_by_the_daemon() {
@@ -3063,6 +3063,30 @@ mod tests {
         desktop.capabilities().await.expect("desktop handshake");
         let before = registry.geometry_changes_of(&id).expect("agent");
 
+        // Bounded in flight, because every claim opens its own connection and a
+        // listener's accept backlog is finite. mio asks for `listen(fd, -1)`,
+        // which each kernel clamps to its own `somaxconn`: 4096 on this Linux,
+        // 128 on macOS. Once that queue is full the platforms diverge in exactly
+        // the way `platform::ipc::unix`'s `QueueFull` already records — a BSD
+        // `sonewconn` refuses outright with `ECONNREFUSED`, which is the errno 61
+        // `build-macos` failed this test with while `build` passed it on the same
+        // commit. Measured here by forcing the backlog to 128 on Linux and
+        // re-running this flood unchanged: 71 of the 200 claims failed (with
+        // Linux's non-blocking spelling of the same condition, `EAGAIN`); at 4096,
+        // none did. 16 keeps every one of the 200 claims and keeps them arriving
+        // inside a small number of intervals, while staying an order of
+        // magnitude under the smallest platform backlog. NOT a retry on
+        // `ConnectionRefused` (which would hide the condition and buy
+        // flakiness), and not a smaller claim count (which would quietly weaken
+        // the property). The bound asserted below is computed from the MEASURED
+        // elapsed time, so a slower flood stays correct by construction rather
+        // than by a tuned constant — and it IS slower, because each wave of 16
+        // waits out the interval its claims were deferred into: measured here,
+        // 200 claims over 3.0s producing 8 resizes against a bound of 13, where
+        // unbounded they all joined one pass. Removing the coalescing gate
+        // re-measured at 99 resizes over 5.4 ms against a bound of 1, so the
+        // margin that catches that mutation is untouched.
+        let in_flight = Arc::new(tokio::sync::Semaphore::new(16));
         let started = std::time::Instant::now();
         let flood: Vec<_> = (0..200)
             .map(|n| {
@@ -3071,7 +3095,14 @@ mod tests {
                 } else {
                     desktop.clone()
                 };
-                tokio::spawn(async move { client.focus_gained().await })
+                let gate = in_flight.clone();
+                tokio::spawn(async move {
+                    let _permit = gate
+                        .acquire_owned()
+                        .await
+                        .expect("the flood gate is never closed");
+                    client.focus_gained().await
+                })
             })
             .collect();
         for claim in flood {
