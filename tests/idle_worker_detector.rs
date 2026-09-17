@@ -332,6 +332,7 @@ impl IdleHarness {
             task: "Perform the delegated test task.".to_string(),
             to: roles.iter().map(|role| (*role).to_string()).collect(),
             timestamp: chrono::Utc::now(),
+            token: None,
         };
         self.state
             .read()
@@ -350,6 +351,7 @@ impl IdleHarness {
                     task: "The delegated test task is complete.".to_string(),
                     done: false,
                     timestamp: chrono::Utc::now(),
+                    token: None,
                 },
                 &self.registry,
             )

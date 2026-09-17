@@ -207,6 +207,7 @@ fn run_pane_spawn_reviewer(deck: &TuiDeck, orchestrator_pane_id: &str) {
 #[test]
 fn spawn_005_pane_spawn_joins_the_already_open_orchestration_tab() {
     let deck = TuiDeck::builder()
+        .impersonating_pane_signals()
         .with_pty_size(120, 40)
         .launch_with_fixture("pane-spawn-live");
     deck.wait_for_string("No active sessions");
@@ -314,6 +315,7 @@ fn drift_001_role_grown_via_pane_spawn_survives_session_capture() {
     let session_file = session_dir.path().join("session.toml");
 
     let deck = TuiDeck::builder()
+        .impersonating_pane_signals()
         .with_pty_size(120, 40)
         .with_env(
             "DOT_AGENT_DECK_SESSION",

@@ -1,0 +1,36 @@
+# Fixture for `orchestration/provenance/001` (issue #1077).
+#
+# Two roles, both stand-ins, and the ONLY fixture whose worker issues its own
+# `work-done` from inside its pane. That is the whole point of it: every other
+# work-done e2e runs the CLI from the test process with just a pane id, which
+# is exactly the forgery the provenance gate now refuses, so none of them can
+# prove that a LEGITIMATE signal still gets through. This one can, because the
+# daemon spawns the worker's command and therefore gives that command the
+# per-spawn hook capability token in its environment — the same way it gives a
+# real agent one.
+#
+# `$DAD_TEST_BIN` is the branch's own binary, passed in by the test through the
+# deck's env so the pane cannot silently pick up an unrelated `dot-agent-deck`
+# from `PATH` — on a developer box that is usually an INSTALLED release.
+#
+# TWO signals, each gated on its own trigger file, because the test has to
+# prove an ABSENCE and a fixed sleep proves nothing. The order it drives is:
+# release signal 1 and wait for it (the legitimate path is live and the daemon's
+# role maps are populated — without that first wait a forgery dropped as
+# "unknown pane" is indistinguishable from a forgery refused for want of
+# provenance, which is how the first cut of this test passed with the gate
+# disabled); send the forgery; release signal 2 and wait for it, which is a
+# LATER message completing the whole round trip on the same path; only then
+# assert the forged report never appeared. `exec cat` keeps the pane alive for
+# the rest of the run, like every other stand-in role here.
+[[orchestrations]]
+name = "demo-orch"
+
+[[orchestrations.roles]]
+name = "orchestrator"
+command = "cat"
+start = true
+
+[[orchestrations.roles]]
+name = "worker"
+command = "while [ ! -f ./provenance-go-1 ]; do sleep 0.1; done; \"$DAD_TEST_BIN\" work-done --task \"$DAD_PROVENANCE_SENTINEL_1\"; while [ ! -f ./provenance-go-2 ]; do sleep 0.1; done; \"$DAD_TEST_BIN\" work-done --task \"$DAD_PROVENANCE_SENTINEL_2\"; exec cat"

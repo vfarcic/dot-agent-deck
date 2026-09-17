@@ -320,6 +320,34 @@ impl TuiDeckBuilder {
         self
     }
 
+    /// Issue #1077: ask this deck's daemon for the pre-provenance hook-socket
+    /// policy, because this test stands in for a pane's agent.
+    ///
+    /// The daemon now mints a per-spawn hook capability token, injects it into
+    /// each pane's own environment, and requires every `DaemonMessage` naming
+    /// that pane to present it. The long-standing harness pattern — running the
+    /// real `dot-agent-deck` CLI **from the test process** with only
+    /// `DOT_AGENT_DECK_PANE_ID` and the socket path — is, by construction,
+    /// exactly the forgery the gate refuses: the test process is not the pane
+    /// and has no way to read the token the daemon put in the pane's
+    /// environment. That is the mechanism working, not a bug in it.
+    ///
+    /// So a test that impersonates a pane says so here, in one place, rather
+    /// than faking a provenance it does not have. The two things this costs are
+    /// covered elsewhere and deliberately: the gate's decision matrix by
+    /// `crate::hook_provenance`'s unit tests, its wiring by
+    /// `crate::daemon`'s `hook_provenance_*` tests over a real socket and a real
+    /// registry, and the whole chain — daemon injects the token, the real CLI
+    /// forwards it out of its own environment, the daemon attests it — by
+    /// `orchestration/provenance/001`, which runs under the DEFAULT policy and
+    /// issues its legitimate signal from inside a real pane.
+    pub fn impersonating_pane_signals(self) -> Self {
+        self.with_env(
+            dot_agent_deck::hook_provenance::DOT_AGENT_DECK_HOOK_PROVENANCE,
+            "warn",
+        )
+    }
+
     /// Launch the deck from `subdir` *inside* the fixture instead of at the
     /// fixture root, creating it if absent. The fixture still lands at the
     /// tempdir root, so the project's `.dot-agent-deck.toml` sits one or more
@@ -6909,13 +6937,20 @@ use std::sync::OnceLock;
 #[allow(dead_code)]
 static LOCK_DIR: OnceLock<PathBuf> = OnceLock::new();
 
-/// Endpoint env vars that point a process at a *specific* deck's daemon.
+/// Env vars that tie a process to a *specific* deck — its daemon's endpoints,
+/// and the pane identity and capability that daemon issued.
+///
+/// `DOT_AGENT_DECK_PANE_CAPABILITY` (issue #1077) is here for the reason
+/// `src/test_isolation.rs` gives at length: inherited from a live pane, it is
+/// forwarded by any CLI a test launches and refused by the test's own daemon as a
+/// token it never minted — a refusal the `warn` policy does not relax.
 #[allow(dead_code)]
-const DECK_ENDPOINT_VARS: [&str; 4] = [
+const DECK_ENDPOINT_VARS: [&str; 5] = [
     "DOT_AGENT_DECK_SOCKET",
     "DOT_AGENT_DECK_ATTACH_SOCKET",
     "DOT_AGENT_DECK_PANE_ID",
     "DOT_AGENT_DECK_AGENT_ID",
+    "DOT_AGENT_DECK_PANE_CAPABILITY",
 ];
 
 /// Detach this test process from any real deck before it can spawn anything.
