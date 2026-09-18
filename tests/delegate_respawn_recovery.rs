@@ -221,10 +221,24 @@ async fn wait_for_pane_record_to_clear(
 /// on every turn as well, so it can never draw a conclusion from a window that
 /// has since shut; that, too, is an inconclusive attempt rather than a verdict.
 ///
-/// Bounded by [`common::child_boot_budget`] for the same reason the boot waits
-/// are: the quantity being waited on is a freshly scheduled task getting its
-/// turn, so the ceiling has to follow how contended the machine is. It returns
-/// the instant the window opens, so an idle box pays nothing for the headroom.
+/// Bounded by [`common::daemon_task_start_budget`], because the quantity being
+/// waited on is a freshly scheduled task getting its turn, so the ceiling has to
+/// follow how contended the machine is. It returns the instant the window opens,
+/// so an idle box pays nothing for the headroom. (Issue #1148 renamed this from
+/// [`common::child_boot_budget`], which this wait had borrowed while naming the
+/// right quantity in this very sentence. Same 8 s base and the same load
+/// scaling, so nothing here changed behaviour — but `delegate/034` bounded a
+/// dispatch task's start on that constant and nobody questioned the size,
+/// because the name said it was about a child.)
+///
+/// **The ~3 s this relies on is a property of `close_agent` specifically, not of
+/// the stand-in alone** (issue #1148). The close terminates the child while
+/// still holding its whole `RunningAgent` — PTY master included — so a
+/// `trap '' TERM` worker really does survive to the SIGKILL backstop here. The
+/// RESPAWN leg drops the master BEFORE terminating, which hands the same worker
+/// EOF on stdin and ends it in milliseconds; that asymmetry is what
+/// `delegate/034` was wrecked by, and it is why its stand-in reads nothing at
+/// all while `/022`'s is a `cat`.
 async fn close_pane_into_its_grace_window(
     registry: &AgentPtyRegistry,
     attach_path: &std::path::Path,
@@ -262,10 +276,10 @@ async fn close_pane_into_its_grace_window(
         let client = dot_agent_deck::daemon_client::DaemonClient::new(attach_path.to_path_buf());
         let closing_id = agent_id.to_string();
         let mut request = tokio::spawn(async move { client.stop_agent(&closing_id).await });
-        // Captured, not re-read in the panic below: `child_boot_budget` samples
-        // the machine's load each call, so reporting a second sample would name
-        // a duration this attempt never actually waited.
-        let ceiling = common::child_boot_budget();
+        // Captured, not re-read in the panic below: `daemon_task_start_budget`
+        // samples the machine's load each call, so reporting a second sample
+        // would name a duration this attempt never actually waited.
+        let ceiling = common::daemon_task_start_budget();
         let budget = tokio::time::sleep(ceiling);
         tokio::pin!(budget);
         tokio::select! {
@@ -1020,6 +1034,116 @@ async fn delegate_033_a_close_that_outruns_the_settle_timeout_still_brings_the_r
     );
 }
 
+/// Issue #1148: what a `trap '' TERM HUP` stand-in that reads NOTHING prints
+/// once it is armed — `delegate/034`'s worker.
+///
+/// A separate marker from [`STUBBORN_WORKER_ARMED`] so the two stand-ins cannot
+/// be confused in a snapshot dump, and because they are armed against different
+/// things: `delegate/022`'s ignores SIGTERM and still reads its PTY, which is
+/// all `close_agent` needs; this one must additionally survive having its PTY
+/// taken away. See [`delegate_034_a_hold_taken_after_the_record_was_lifted_still_brings_the_role_back`].
+const UNKILLABLE_WORKER_ARMED: &[u8] = b"UNKILLABLE-WORKER-ARMED";
+
+/// Issue #1148: what `delegate/034`'s precondition found when it looked for the
+/// respawn's gap.
+#[derive(Debug)]
+enum RespawnGap {
+    /// The pane has no record: the respawn has lifted it out and has not yet
+    /// published a replacement. This is the state the hold must be taken in.
+    Entered,
+    /// The pane has a record again, under an agent id that is not the one the
+    /// respawn lifted out. So the respawn DID run — it ran to completion,
+    /// gap included, before this poll could observe the gap at all.
+    ///
+    /// A verdict, not an inconclusive attempt: the gap is supposed to be
+    /// `AGENT_TERMINATE_GRACE` wide (~3 s) and a 5 ms poll cannot step over
+    /// something that lasts 3 s. Seeing a successor therefore means the
+    /// premise the whole scenario rests on has stopped holding, and retrying
+    /// would only find the same collapsed gap again.
+    Collapsed { successor: String },
+    /// The budget ran out with the pane still on the agent id the delegate was
+    /// aimed at, so nothing lifted anything: the dispatch task never got as far
+    /// as the respawn.
+    ///
+    /// `waited` is the ceiling this attempt ACTUALLY used, carried out rather
+    /// than re-sampled by the panic (PR #1149 review, Greptile P2).
+    /// [`common::daemon_task_start_budget`] reads `/proc/loadavg` on every
+    /// call, so a second call names a duration nobody waited — and misstating
+    /// the budget in a failure about the budget is the same class of defect as
+    /// the message this whole helper replaces. [`close_pane_into_its_grace_window`]
+    /// already captures its ceiling for exactly this reason.
+    NeverStarted { waited: Duration },
+}
+
+/// Issue #1148: wait for the respawn to lift `pane_id`'s record out, and say
+/// WHICH of the three things happened rather than only whether the record is
+/// gone.
+///
+/// **The three-way answer is the fix, not a nicety.** Its predecessor was a
+/// `while pane_current_agent_id(..).is_some()` poll whose failure message read
+/// "the respawn never lifted the pane's record out" — and in every failure
+/// measured for issue #1148 that sentence was FALSE. The respawn had lifted the
+/// record and published a replacement 2.57 ms later, and the poll, having
+/// missed a window that narrow, spent the rest of its budget looking at the
+/// SUCCESSOR's record and reporting it as the original's. A wrong diagnosis is
+/// worse than a bare failure: #1148 records a bisect built on that sentence
+/// which produced a nonsense culprit. `Collapsed` is the arm that says so, and
+/// it says it in milliseconds instead of burning the budget first.
+///
+/// **Polling is sound here, given a gap that is genuinely
+/// `AGENT_TERMINATE_GRACE` wide** — and the fixture is what makes it so; see
+/// the stand-in in
+/// [`delegate_034_a_hold_taken_after_the_record_was_lifted_still_brings_the_role_back`].
+/// Two properties, both needed. "No record for this pane" is MONOTONIC for the
+/// rest of the gap: the respawn is parked in
+/// `terminate_child_with_grace_and_wait` and is the only thing that can publish
+/// onto the pane, so once true the state cannot be left until the respawn
+/// itself leaves it — the same argument [`wait_for_pane_record_to_clear`]
+/// makes for the close window. And it lasts ~3 s against a 5 ms poll, so a
+/// poller gets ~600 looks at it. A poll cannot miss a state that cannot be left
+/// and that outlasts its own cadence by three orders of magnitude.
+///
+/// **Which is why this does NOT take a registry signal for the lift edge, and
+/// that was a real choice rather than an omission** (issue #1148). A signal
+/// would make the edge unmissable, and unmissable is not what this test needs:
+/// it needs to *be inside* the gap when it places the hold, not to learn
+/// afterwards that the gap happened. Against the 2.57 ms gap that failed, a
+/// signal-woken test would still have lost the race — it would simply have
+/// failed somewhere else. The only signal that would fix it is one that HOLDS
+/// the respawn between the lift and the spawn, i.e. a test-only barrier in a
+/// hot product path, which is a large cost to pay for a premise the fixture can
+/// restore on its own. The width of the gap was the defect; the sampling was
+/// only how it surfaced.
+///
+/// Bounded by [`common::daemon_task_start_budget`] rather than
+/// [`common::child_boot_budget`]: what is waited on is a freshly
+/// `tokio::spawn`ed dispatch task getting its turn and reaching a synchronous
+/// record removal, which is not a child producing its first byte. Both are
+/// load-scaled and both are 8 s, so this is a naming fix and not a behaviour
+/// change — but the old name is how the mis-sized wait went unquestioned in the
+/// first place.
+async fn wait_for_respawn_to_lift_the_record(
+    registry: &AgentPtyRegistry,
+    pane_id: &str,
+    delegated_agent_id: &str,
+) -> RespawnGap {
+    let ceiling = common::daemon_task_start_budget();
+    let deadline = tokio::time::Instant::now() + ceiling;
+    loop {
+        match registry.pane_current_agent_id(pane_id) {
+            None => return RespawnGap::Entered,
+            Some(id) if id != delegated_agent_id => {
+                return RespawnGap::Collapsed { successor: id };
+            }
+            Some(_) => {}
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return RespawnGap::NeverStarted { waited: ceiling };
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
 /// Issue #1114 (Greptile P1 on PR #1119): how long `delegate/034` keeps the
 /// cleanup hold up once it has taken it — a `StopAgent` whose remaining steps
 /// are starved, modelled the same way `delegate/033` models a starved close
@@ -1034,49 +1158,79 @@ async fn delegate_033_a_close_that_outruns_the_settle_timeout_still_brings_the_r
 /// which a FIXED build would fail too.
 const STARVED_STOPAGENT_HOLD: Duration = Duration::from_secs(5);
 
-/// Scenario: delegate to a `clear = true` role whose worker IGNORES SIGTERM, so
-/// the respawn spends its full three-second termination grace between lifting
-/// the pane's record out and spawning the replacement. Take the pane's cleanup
-/// hold inside that gap — a `StopAgent` that read its record a moment before the
-/// respawn removed it, and whose own remaining steps are then starved — and keep
-/// it up past the grace, so the replacement spawn is refused. The role must
-/// still come back once the hold goes down.
+/// Scenario: delegate to a `clear = true` role whose worker survives being
+/// terminated, so the respawn spends its full three-second termination grace
+/// between lifting the pane's record out and spawning the replacement. Take the
+/// pane's cleanup hold inside that gap — a `StopAgent` that read its record a
+/// moment before the respawn removed it, and whose own remaining steps are then
+/// starved — and keep it up past the grace, so the replacement spawn is
+/// refused. The role must still come back once the hold goes down.
 #[tokio::test(flavor = "multi_thread")]
 #[spec("orchestration/delegate/034")]
 async fn delegate_034_a_hold_taken_after_the_record_was_lifted_still_brings_the_role_back() {
     use std::os::unix::fs::PermissionsExt;
 
-    // Same stand-in `delegate/022` uses, and for the same reason: `close_agent`
-    // and the respawn's terminate both spend the full `AGENT_TERMINATE_GRACE`
-    // only while the child is still running. A plain `cat` dies on the first
-    // signal, the gap this test aims at is a few milliseconds wide, and the hold
-    // below could not be placed inside it.
+    // Issue #1148: NOT `delegate/022`'s stand-in, and the difference is the
+    // whole of why that one could not hold this gap open.
+    //
+    // `/022`'s worker is `trap '' TERM` + `exec cat`, and against `close_agent`
+    // that is exactly right: the close terminates the child while still HOLDING
+    // its `RunningAgent`, PTY master included, so a SIGTERM-ignoring `cat` has
+    // nothing to end it and the close spends the full `AGENT_TERMINATE_GRACE`.
+    //
+    // The RESPAWN leg is not shaped like that. `respawn_agent_for_pane_declared`
+    // deliberately `drop`s the writer and the master BEFORE it terminates — so
+    // that any I/O blocked on the PTY unblocks first — and closing the master
+    // hands the child EOF on its stdin. A `cat` then exits **0**, of its own
+    // accord, with the SIGTERM it is ignoring never mattering at all. Measured:
+    // the old child's exit status on this path is `(success, 0)`, never a
+    // signal, and the terminate returns after ONE 50 ms `try_wait` tick rather
+    // than after 3 s. That made this test's gap ~50 ms instead of ~3 s, and
+    // when the child's exit happened to land before the terminate helper's
+    // immediate FIRST `try_wait` — a sub-millisecond scheduling race, which is
+    // why the failure was load-sensitive — the gap collapsed to **2.57 ms** and
+    // the 5 ms poll below stepped straight over it. That is issue #1148.
+    //
+    // So this worker reads nothing at all: it ignores TERM and HUP (a `trap ''`
+    // disposition is `SIG_IGN`, which `execve` preserves, so the `sleep` that
+    // replaces the shell inherits both) and then sleeps. Losing the PTY is not
+    // an event for it, no signal the grace phase sends can end it, and it
+    // survives to the SIGKILL backstop — which is what makes the gap
+    // `AGENT_TERMINATE_GRACE` wide BY CONSTRUCTION rather than by luck.
+    //
+    // `sleep 300` rather than an unbounded sleep or a busy `while :` loop: it is
+    // one process with no CPU cost, 50x the worst case this test can take, and a
+    // bounded leak if the SIGKILL ever failed to land. Nothing here needs the
+    // pane to echo — unlike `/022`, this test asserts no pointer delivery, only
+    // that a LIVE replacement takes the pane and the role still routes — so the
+    // `cat` that `/022` needs buys this test nothing and costs it the gap.
     let fx = fixture(|dir| {
-        let script = dir.join("stubborn-worker.sh");
-        let marker = String::from_utf8_lossy(STUBBORN_WORKER_ARMED).into_owned();
+        let script = dir.join("unkillable-worker.sh");
+        let marker = String::from_utf8_lossy(UNKILLABLE_WORKER_ARMED).into_owned();
         std::fs::write(
             &script,
-            format!("#!/bin/sh\ntrap '' TERM\nprintf '{marker}'\nexec cat\n"),
+            format!("#!/bin/sh\ntrap '' TERM HUP\nprintf '{marker}'\nexec sleep 300\n"),
         )
-        .expect("write SIGTERM-ignoring worker stand-in");
+        .expect("write signal-ignoring, PTY-ignoring worker stand-in");
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
-            .expect("chmod SIGTERM-ignoring worker stand-in");
+            .expect("chmod signal-ignoring, PTY-ignoring worker stand-in");
         script.to_string_lossy().into_owned()
     })
     .await;
 
-    // The marker proves the `trap '' TERM` is already installed, so the grace
-    // below is a fact rather than a hope — issue #709's fix, borrowed.
+    // The marker is printed AFTER the trap and BEFORE the exec, so seeing it is
+    // proof the dispositions are already `SIG_IGN` — the one fact this scenario
+    // cannot proceed without. Issue #709's fix, borrowed.
     let armed = common::wait_for_child_first_output(
         &fx.daemon.registry,
         &fx.worker_agent_id,
-        STUBBORN_WORKER_ARMED,
+        UNKILLABLE_WORKER_ARMED,
     )
     .await;
     assert!(
-        snapshot_contains(&armed, STUBBORN_WORKER_ARMED),
-        "precondition: the worker stand-in never got as far as installing its `trap '' TERM`, so \
-         the respawn below would terminate it instantly and leave no gap to place the hold in; \
+        snapshot_contains(&armed, UNKILLABLE_WORKER_ARMED),
+        "precondition: the worker stand-in never got as far as installing its `trap '' TERM HUP`, \
+         so the respawn below would terminate it promptly and leave no gap to place the hold in; \
          snapshot = {:?}",
         String::from_utf8_lossy(&armed)
     );
@@ -1090,29 +1244,39 @@ async fn delegate_034_a_hold_taken_after_the_record_was_lifted_still_brings_the_
     delegate(&fx, "list the files in this directory").await;
 
     // The gap: the respawn has lifted the record out and is now inside
-    // `terminate_child_with_grace_and_wait`, which the stand-in will make spend
-    // the full three seconds. "The record has gone" is the observable edge of
-    // it, so the hold lands inside the gap by construction rather than by
-    // arithmetic.
-    let removed_by_deadline = tokio::time::Instant::now() + common::child_boot_budget();
-    while fx
-        .daemon
-        .registry
-        .pane_current_agent_id(WORKER_PANE)
-        .is_some()
-        && tokio::time::Instant::now() < removed_by_deadline
+    // `terminate_child_with_grace_and_wait`, which the stand-in makes spend the
+    // full three seconds. "The record has gone" is the observable edge of it, so
+    // the hold lands inside the gap by construction rather than by arithmetic.
+    //
+    // Issue #1148: the two ways this can fail are now told apart, because the
+    // predecessor merged them and named the wrong one. See
+    // [`wait_for_respawn_to_lift_the_record`].
+    match wait_for_respawn_to_lift_the_record(&fx.daemon.registry, WORKER_PANE, &fx.worker_agent_id)
+        .await
     {
-        tokio::time::sleep(Duration::from_millis(5)).await;
+        RespawnGap::Entered => {}
+        RespawnGap::Collapsed { successor } => panic!(
+            "precondition: the respawn lifted the pane's record out AND published a replacement \
+             ({successor}, where the delegate was aimed at {delegated}) before this poll could \
+             see the gap — so the gap is no longer the ~3 s of `AGENT_TERMINATE_GRACE` this \
+             scenario needs, and the hold below would be taken after the spawn it is supposed to \
+             refuse. The stand-in has stopped surviving the respawn's terminate: see the fixture \
+             above, and note that the respawn drops the PTY master before terminating, so a \
+             worker that READS its PTY exits on EOF at once however many signals it traps \
+             (issue #1148). records = {records:?}",
+            delegated = fx.worker_agent_id,
+            records = fx.daemon.registry.agent_records()
+        ),
+        RespawnGap::NeverStarted { waited } => panic!(
+            "precondition: the pane is still on the agent id the delegate was aimed at \
+             ({delegated}) after {waited:?}, so nothing lifted its record and the respawn never \
+             got going at all — there is no gap to take the hold in and the assertion below \
+             would pass for the wrong reason. Unlike the collapsed case above, this one says the \
+             dispatch task never reached the respawn. records = {records:?}",
+            delegated = fx.worker_agent_id,
+            records = fx.daemon.registry.agent_records()
+        ),
     }
-    assert!(
-        fx.daemon
-            .registry
-            .pane_current_agent_id(WORKER_PANE)
-            .is_none(),
-        "precondition: the respawn never lifted the pane's record out, so there is no gap to take \
-         the hold in and the assertion below would pass for the wrong reason; records = {:?}",
-        fx.daemon.registry.agent_records()
-    );
 
     // The `StopAgent` that lost this race: it read the worker's record just
     // before the respawn removed it, so `pane_claimed_by_other` sees nothing and
