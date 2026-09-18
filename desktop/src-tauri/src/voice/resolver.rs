@@ -5,11 +5,12 @@
 //! situation, not a sentence** — the app renders every word the user reads,
 //! from the table, in [`super::outcome`].
 //!
-//! M5 puts the real backends behind this trait: an agent-CLI one that needs no
-//! key and no download, and a keyed remote one for the latency. Neither exists
-//! here. What does is the shape they have to fit and a deterministic stub, so
-//! everything downstream — validation, param resolution, the rendered sentences
-//! — is exercised without a model.
+//! M5 put the real backends behind this trait: [`super::agent_cli`], which
+//! needs no key and no download, and [`super::remote`], which is keyed and
+//! fast. [`resolver_for`] is where the settings choose. [`StubResolver`] stays,
+//! and is what every test of everything downstream — validation, param
+//! resolution, the rendered sentences — still drives, so none of them needs a
+//! model, a credential or a network hop.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -120,6 +121,41 @@ pub type ResolveFuture<'a> =
 /// A backend that turns an utterance into a structured answer.
 pub trait IntentResolver: Send + Sync {
     fn resolve<'a>(&'a self, request: IntentRequest<'a>) -> ResolveFuture<'a>;
+
+    /// Which backend this is, for the surface to name.
+    ///
+    /// One of `claude`, `opencode`, `remote`, `stub`. It travels on every
+    /// [`super::VoiceResult`] beside the latency, because the two are only
+    /// useful together: *4.2 s* on its own is a complaint, and *claude, 4.2 s*
+    /// is a reason to try the keyed backend. It is a `&'static str` and not the
+    /// settings enum so a backend a later milestone adds can name itself
+    /// without the settings token and the surface's vocabulary having to move
+    /// in lockstep.
+    fn backend_name(&self) -> &'static str;
+}
+
+/// Build the backend the settings name.
+///
+/// The one place `IntentBackend` becomes an implementation, and the reason the
+/// trait is object-safe: M1 built the `dyn` seam for exactly this, and the
+/// choice is made at call time rather than at startup so a user who changes the
+/// setting does not restart the app to use it.
+///
+/// `secrets` is taken for every variant even though only
+/// [`IntentBackend::Remote`] reads one. Passing the store rather than a
+/// credential is what keeps the value Rust-side: the resolver asks the keychain
+/// itself, at the moment it needs one, and nothing hands a secret around in the
+/// hope that whoever holds it will not serialize it.
+pub fn resolver_for(
+    backend: crate::settings::IntentBackend,
+    secrets: std::sync::Arc<dyn crate::secrets::SecretStore>,
+) -> Box<dyn IntentResolver> {
+    use crate::settings::IntentBackend;
+    match backend {
+        IntentBackend::Claude => Box::new(super::agent_cli::AgentCliResolver::claude()),
+        IntentBackend::Opencode => Box::new(super::agent_cli::AgentCliResolver::opencode()),
+        IntentBackend::Remote => Box::new(super::remote::RemoteResolver::new(secrets)),
+    }
 }
 
 /// A deterministic stand-in for a model.
@@ -166,6 +202,10 @@ impl IntentResolver for StubResolver {
                 .unwrap_or_else(IntentAnswer::none)),
         };
         Box::pin(async move { outcome })
+    }
+
+    fn backend_name(&self) -> &'static str {
+        "stub"
     }
 }
 
@@ -247,6 +287,55 @@ mod tests {
             .await
             .expect("answers");
         assert_eq!(answer.action, "open_overview");
+    }
+
+    #[test]
+    fn voice_resolver_selects_the_backend_the_settings_name() {
+        use crate::secrets::MemorySecretStore;
+        use crate::settings::IntentBackend;
+        let store = || std::sync::Arc::new(MemorySecretStore::new()) as std::sync::Arc<_>;
+        // Named by `backend_name`, which is what the surface renders — so this
+        // asserts the thing a user would see rather than a type the compiler
+        // already knows.
+        assert_eq!(
+            resolver_for(IntentBackend::Claude, store()).backend_name(),
+            "claude"
+        );
+        assert_eq!(
+            resolver_for(IntentBackend::Opencode, store()).backend_name(),
+            "opencode"
+        );
+        assert_eq!(
+            resolver_for(IntentBackend::Remote, store()).backend_name(),
+            "remote"
+        );
+    }
+
+    #[test]
+    fn voice_resolver_selection_is_total_over_the_settings_enum() {
+        // A variant added to `IntentBackend` without an adapter would be a
+        // settings value the app cannot honour, which `VoiceSettings`' own docs
+        // call a lie in a file the user can read. The `match` in `resolver_for`
+        // is exhaustive, so the compiler catches it — this asserts the set is
+        // the one that was mapped, which the compiler cannot.
+        use crate::settings::IntentBackend;
+        let names: Vec<&str> = [
+            IntentBackend::Claude,
+            IntentBackend::Opencode,
+            IntentBackend::Remote,
+        ]
+        .into_iter()
+        .map(|backend| {
+            resolver_for(
+                backend,
+                std::sync::Arc::new(crate::secrets::MemorySecretStore::new()),
+            )
+            .backend_name()
+        })
+        .collect();
+        assert_eq!(names, vec!["claude", "opencode", "remote"]);
+        // Every token the settings can hold has an adapter above.
+        assert_eq!(names.len(), 3);
     }
 
     #[test]

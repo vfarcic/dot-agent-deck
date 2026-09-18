@@ -4,9 +4,16 @@
 //! report. This module owns the middle: it takes a [`Transcript`] plus the live
 //! state the app already has, asks an [`IntentResolver`] what the user meant,
 //! refuses anything the table does not sanction, and returns one
-//! [`VoiceOutcome`] carrying the sentence to show. It captures nothing, calls
-//! no model, and renders no UI — M5 brings the real resolvers, M6 the surface,
-//! M7 the microphone.
+//! [`VoiceOutcome`] carrying the sentence to show. It captures nothing and
+//! renders no UI — M6 brings the surface and M7 the microphone.
+//!
+//! **M5 brought the real backends.** [`agent_cli`] spawns the pre-authenticated
+//! CLI the user already has — no key of the app's own, no download, and slow;
+//! [`remote`] makes one keyed HTTPS request with a constrained enum, and is
+//! roughly four times faster. [`resolver_for`] is where `VoiceSettings.intent`
+//! picks one. Every [`VoiceResult`] carries the latency it cost, because PRD
+//! #802's mitigation for *slow enough to feel broken* is to show the number
+//! rather than hide it.
 //!
 //! **Voice gets no execution path of its own.** A [`VoiceOutcome::Dispatch`]
 //! names an `invoke` target in the frontend action registry (M2) and the
@@ -17,7 +24,10 @@
 //! it yet: M6 owns the IPC seam and will decide its shape, and until then a
 //! private module of unreferenced items is dead code.
 
+pub mod agent_cli;
 pub mod outcome;
+pub mod prompt;
+pub mod remote;
 pub mod resolver;
 pub mod schema;
 pub mod table;
@@ -34,9 +44,15 @@ use serde::{Deserialize, Serialize};
 /// there" with nothing keeping the two in step.
 pub use crate::dto::DesktopAgent;
 
-pub use outcome::{ResolvedParam, VoiceOutcome, handle_utterance};
-pub use resolver::{IntentAnswer, IntentError, IntentRequest, IntentResolver, StubResolver};
-pub use schema::{AnnotatedCommand, AnnotatedParam, TOOL_NAME, annotate, tool_schema};
+pub use agent_cli::{AGENT_CLI_TIMEOUT, AgentCli, AgentCliResolver};
+pub use outcome::{ResolvedParam, VoiceOutcome, VoiceResult, handle_utterance};
+pub use remote::{REMOTE_TIMEOUT, RemoteResolver};
+pub use resolver::{
+    IntentAnswer, IntentError, IntentRequest, IntentResolver, StubResolver, resolver_for,
+};
+pub use schema::{
+    AnnotatedCommand, AnnotatedParam, TOOL_INSTRUCTIONS, TOOL_NAME, annotate, tool_schema,
+};
 pub use table::{CommandRow, CommandTable, NO_MATCH_ACTION, ParamKind, ParamSpec, Screen, table};
 
 /// What the user said, as text — from the microphone through the `Transcriber`
@@ -108,6 +124,57 @@ impl From<&str> for Transcript {
 impl From<String> for Transcript {
     fn from(value: String) -> Self {
         Self::new(value)
+    }
+}
+
+/// Snapshot-agent fixtures, shared by every test module under `voice`.
+///
+/// One construction site for [`DesktopAgent`]'s fifteen fields rather than one
+/// per module: `outcome`, `prompt` and `remote` all need agents to resolve a
+/// spoken reference against, and three literals would be three things to edit
+/// when the DTO gains a field.
+#[cfg(test)]
+pub(crate) mod fixtures {
+    use super::DesktopAgent;
+    use crate::dto::DesktopTab;
+
+    /// A snapshot agent. Only the fields a spoken reference can reach are
+    /// interesting; the rest are what the daemon would have reported.
+    pub(crate) fn agent(id: &str, display_name: Option<&str>, agent_type: &str) -> DesktopAgent {
+        DesktopAgent {
+            id: id.to_string(),
+            pane_id: None,
+            display_name: display_name.map(str::to_string),
+            cwd: None,
+            rows: 24,
+            cols: 80,
+            agent_type: agent_type.to_string(),
+            cli_name: None,
+            status: "running".to_string(),
+            active_tool: None,
+            tool_count: 0,
+            last_user_prompt: None,
+            write_lease: None,
+            last_activity_ms: None,
+            spawned_at_ms: None,
+            tab: DesktopTab::Dashboard,
+        }
+    }
+
+    /// An agent the deck names by its orchestration ROLE, which is how a user
+    /// refers to one out loud.
+    pub(crate) fn role_agent(id: &str, role: &str) -> DesktopAgent {
+        let mut agent = agent(id, None, "claude_code");
+        agent.tab = DesktopTab::Orchestration {
+            name: "build".to_string(),
+            role_index: 0,
+            role_name: role.to_string(),
+            is_start_role: false,
+            cwd: None,
+            display_title: None,
+            orchestration_id: None,
+        };
+        agent
     }
 }
 

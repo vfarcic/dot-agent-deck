@@ -38,7 +38,47 @@ tauri = { version = "2", features = [] }
 # comments, inline-array/inline-table spelling, key order and blank-line
 # grouping survive a write. `toml::Table` models DATA, so it could not.
 toml_edit = { version = "0.25", features = ["serde"] }
-tokio = { version = "1", features = ["sync", "time"] }
+# PRD #802 M5 added `process` and `rt` to what was `["sync", "time"]`.
+#
+# `process` is the agent-CLI intent backend spawning `claude`/`opencode`
+# (`voice/agent_cli.rs`). It has to be the ASYNC Command: the resolver runs on
+# the Tauri runtime, and a `std::process` wait of 3-5s there is an app that
+# stops repainting for the length of every utterance. `kill_on_drop` is also
+# what makes "the child is killed before returning" a property of the mechanism
+# rather than of a line that a later edit could skip.
+#
+# `rt` is `spawn_blocking`, and it has exactly one caller: the lazy
+# login-shell PATH capture, which runs an interactive login shell and is
+# bounded by a 10s `CAPTURE_TIMEOUT`. That is blocking by nature and must not
+# be on a runtime thread.
+#
+# Neither adds a dependency or a line of new code to the workspace build: the
+# root package already declares `tokio` with `full`, so both were reachable
+# here by feature unification. Declaring them is the same discipline the
+# dev-dependency block below states — a change over there cannot silently take
+# this crate's backends out.
+tokio = { version = "1", features = ["process", "rt", "sync", "time"] }
+# PRD #802 M5: the keyed remote intent backend's one HTTPS request
+# (`voice/remote.rs`). The CSP leaves no alternative to making it here —
+# `tauri.conf.json`'s `connect-src` names `ipc:` and `http://ipc.localhost` and
+# nothing else, so the webview cannot reach a network origin and read the reply
+# — and the credential is already Rust-side anyway.
+#
+# NOT A NEW DEPENDENCY, in the sense that costs anything: the root package
+# declares reqwest 0.13 with this exact spec, this crate already links the root
+# package, and the lockfile carries exactly one `reqwest`. The version, the
+# `default-features = false` and the two features are copied verbatim from
+# there so cargo resolves one build of it rather than two feature sets of one.
+#
+# `rustls` rather than a native-TLS feature, and no roots feature named, for the
+# root package's stated reason: 0.13 renamed 0.12's `rustls-tls` and brought its
+# own root-certificate source, and 0.13.4 removed the `webpki-roots` /
+# `rustls-native-certs` names 0.13.1 offered — so pinning one breaks on the next
+# patch bump. `rustls` is the one name stable across 0.13.
+reqwest = { version = "0.13", default-features = false, features = [
+  "rustls",
+  "json",
+] }
 # PRD #802 M4: the OS keychain behind `secrets.rs`'s `SecretStore`, which is the
 # seam PRD #803 M5 named and deliberately did not build. Genuinely new — no
 # crate here declares `keyring`, `secret-service`, `security-framework` or

@@ -121,6 +121,27 @@ const ALLOWED_ROOT_MODULES: &[&str] = &[
     "daemon_protocol",
     "daemon_stop",
     "event",
+    // PRD #802 M5, argued rather than added quietly. The agent-CLI intent
+    // backend spawns `claude`/`opencode` by bare name, so on a Finder or
+    // desktop-launcher start — where PATH is minimal — it has to be able to
+    // find them; `login_shell::capture_login_shell_path` is the mechanism that
+    // already exists for exactly that problem on the daemon's spawn path, and
+    // re-implementing "run the user's interactive login shell and read $PATH
+    // out of its noisy stdout" here would be a second copy of a function whose
+    // whole substance is marker tokens, a pipe-drain thread and a control-byte
+    // refusal.
+    //
+    // It crosses none of the four things this rule looks for, checked rather
+    // than assumed: it resolves no project, reads no project state file (its
+    // production paths touch the filesystem not at all — `std::env::var`, a
+    // subprocess, and a string scan), names no FORBIDDEN_SYMBOL, and contains
+    // zero occurrences of `current_dir`. What it returns is a PATH, which the
+    // desktop puts on one child `Command`'s environment.
+    //
+    // Note which half is reached: `capture_login_shell_path`, never
+    // `apply_login_shell_path`. The latter calls `std::env::set_var` and is
+    // sound only in a single-threaded startup window the desktop does not have.
+    "login_shell",
     "platform",
     "prompt_delivery",
     // PRD #741 M6, argued rather than added quietly. The desktop's settings

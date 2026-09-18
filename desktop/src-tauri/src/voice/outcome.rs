@@ -214,6 +214,46 @@ impl VoiceOutcome {
     }
 }
 
+/// One utterance's outcome, plus what it cost to get it.
+///
+/// **The latency is produced here rather than left for M6 to invent**, which is
+/// PRD #802's mitigation for its own risk entry: measured through this very
+/// function, the default backend took **4.30 s and 6.30 s** — *"slow enough to
+/// feel broken"* for a supervisor who just pressed a button — against the keyed
+/// backend's 0.62–1.03 s. The answer the PRD chose is to surface the number
+/// rather than hide it. A surface that had to guess would guess wrong, and a
+/// surface handed the real number can say *claude, 6.3 s* and let the user
+/// decide whether to switch — which is the whole reason the seam is not
+/// optional.
+///
+/// Measured around [`IntentResolver::resolve`], so it is the wall clock the
+/// user actually waited for — including a lazy PATH capture or a one-time
+/// strict-schema compile, which are real waits that belong in the number rather
+/// than being excused out of it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VoiceResult {
+    pub outcome: VoiceOutcome,
+    /// Milliseconds spent in the backend, or `None` when none was called.
+    ///
+    /// `None` is a real answer and not a missing one: silence short-circuits
+    /// before any backend call, and rendering `0 ms` for it would claim a
+    /// measurement that was never taken.
+    pub resolve_ms: Option<u32>,
+    /// Which backend answered — `claude`, `opencode`, `remote`, `stub`.
+    ///
+    /// Present even when no call was made, because it names what *would* have
+    /// answered, which is what a settings-facing sentence is about.
+    pub backend: &'static str,
+}
+
+impl VoiceResult {
+    /// The sentence to show the user.
+    pub fn sentence(&self) -> &str {
+        self.outcome.sentence()
+    }
+}
+
 /// Take one utterance from a transcript to an outcome.
 ///
 /// The whole middle of the pipeline: annotate the table for the current screen,
@@ -230,37 +270,56 @@ pub async fn handle_utterance(
     screen: Screen,
     agents: &[DesktopAgent],
     transcript: Transcript,
-) -> VoiceOutcome {
+) -> VoiceResult {
+    let backend = resolver.backend_name();
+    let finish = |outcome, resolve_ms| VoiceResult {
+        outcome,
+        resolve_ms,
+        backend,
+    };
+
     // Silence is a no-match without a backend call. The default intent backend
-    // measured 4.5 s and costs money per utterance, and neither is worth
-    // spending on an empty string.
+    // measured 4.3-6.3 s through here and costs money per utterance, and
+    // neither is worth spending on an empty string.
     if transcript.is_empty() {
-        return VoiceOutcome::no_match(transcript);
+        return finish(VoiceOutcome::no_match(transcript), None);
     }
 
     let commands = annotate(table, screen);
-    let answer = match resolver
+    let started = std::time::Instant::now();
+    let answered = resolver
         .resolve(IntentRequest {
             transcript: &transcript,
             commands: &commands,
             agents,
         })
-        .await
-    {
+        .await;
+    // Taken before anything is rendered: what the user waited for is the
+    // backend, and the table lookups after it are microseconds this must not
+    // fold in.
+    let resolve_ms = Some(millis(started.elapsed()));
+    let finish = move |outcome| finish(outcome, resolve_ms);
+
+    let answer = match answered {
         Ok(answer) => answer,
-        Err(error) => return VoiceOutcome::resolution_failed(transcript, &error),
+        Err(error) => return finish(VoiceOutcome::resolution_failed(transcript, &error)),
     };
 
     if answer.is_no_match() {
-        return VoiceOutcome::no_match(transcript);
+        return finish(VoiceOutcome::no_match(transcript));
     }
 
+    // The case PRD #802's four-outcome list could not express: a backend that
+    // named an action outside the table. Impossible under grammar-constrained
+    // decoding, refused by the schema under the keyed backend's `strict: true`,
+    // and merely unlikely under a print-mode agent CLI — so it is refused HERE,
+    // once, for every backend, rather than trusted to any of them.
     let Some(row) = table.row(&answer.action) else {
-        return VoiceOutcome::unknown_action(transcript, answer.action);
+        return finish(VoiceOutcome::unknown_action(transcript, answer.action));
     };
 
     if !row.callable_on(screen) {
-        return VoiceOutcome::unavailable(transcript, row);
+        return finish(VoiceOutcome::unavailable(transcript, row));
     }
 
     // Driven by the ROW's declared params, not by what the model sent, so a
@@ -277,12 +336,12 @@ pub async fn handle_utterance(
             .map(|value| value.trim())
             .filter(|value| !value.is_empty())
         else {
-            return VoiceOutcome::ParamMissing {
+            return finish(VoiceOutcome::ParamMissing {
                 sentence: heard(&transcript, spec.kind.missing_phrase()),
                 transcript,
                 action: row.id.clone(),
                 param: spec.name.clone(),
-            };
+            });
         };
         match spec.kind {
             ParamKind::AgentRef => match resolve_agent_ref(spoken, agents) {
@@ -294,35 +353,45 @@ pub async fn handle_utterance(
                     label,
                 }),
                 AgentRefMatch::None => {
-                    return VoiceOutcome::ParamUnresolved {
+                    return finish(VoiceOutcome::ParamUnresolved {
                         sentence: heard(&transcript, &spec.kind.unresolved_phrase(spoken)),
                         transcript,
                         action: row.id.clone(),
                         param: spec.name.clone(),
                         spoken: spoken.to_string(),
-                    };
+                    });
                 }
                 AgentRefMatch::Ambiguous(labels) => {
-                    return VoiceOutcome::ParamAmbiguous {
+                    return finish(VoiceOutcome::ParamAmbiguous {
                         sentence: heard(&transcript, &spec.kind.ambiguous_phrase(spoken, &labels)),
                         transcript,
                         action: row.id.clone(),
                         param: spec.name.clone(),
                         spoken: spoken.to_string(),
                         matches: labels,
-                    };
+                    });
                 }
             },
         }
     }
 
-    VoiceOutcome::Dispatch {
+    finish(VoiceOutcome::Dispatch {
         sentence: report(row, &resolved),
         transcript,
         action: row.id.clone(),
         invoke: row.invoke.clone(),
         params: resolved,
-    }
+    })
+}
+
+/// Whole milliseconds, saturating.
+///
+/// `u32` rather than `u128`: it is a number a surface renders, and 49 days of
+/// milliseconds is well past any wait this build permits — both backends are
+/// bounded by their own timeout, in seconds. Saturating rather than wrapping so
+/// a clock anomaly reads as "very slow" rather than as "instant".
+fn millis(elapsed: std::time::Duration) -> u32 {
+    u32::try_from(elapsed.as_millis()).unwrap_or(u32::MAX)
 }
 
 /// `Heard: “<transcript>” — <situation>.`
@@ -512,7 +581,7 @@ fn role_name(agent: &DesktopAgent) -> Option<String> {
 /// `bridge.ts`'s `agentFromDto` is `agent.displayName || role`, with
 /// `Agent <n>` when neither is there — the position in the snapshot, the same
 /// number the webview uses.
-fn display_label(agent: &DesktopAgent, agents: &[DesktopAgent]) -> String {
+pub(super) fn display_label(agent: &DesktopAgent, agents: &[DesktopAgent]) -> String {
     if let Some(display_name) = agent
         .display_name
         .as_ref()
@@ -564,42 +633,7 @@ mod tests {
     use crate::voice::resolver::{IntentAnswer, StubResolver};
     use crate::voice::table::table;
 
-    /// A snapshot agent. Only the fields a spoken reference can reach are
-    /// interesting; the rest are what the daemon would have reported.
-    fn agent(id: &str, display_name: Option<&str>, agent_type: &str) -> DesktopAgent {
-        DesktopAgent {
-            id: id.to_string(),
-            pane_id: None,
-            display_name: display_name.map(str::to_string),
-            cwd: None,
-            rows: 24,
-            cols: 80,
-            agent_type: agent_type.to_string(),
-            cli_name: None,
-            status: "running".to_string(),
-            active_tool: None,
-            tool_count: 0,
-            last_user_prompt: None,
-            write_lease: None,
-            last_activity_ms: None,
-            spawned_at_ms: None,
-            tab: DesktopTab::Dashboard,
-        }
-    }
-
-    fn role_agent(id: &str, role: &str) -> DesktopAgent {
-        let mut agent = agent(id, None, "claude_code");
-        agent.tab = DesktopTab::Orchestration {
-            name: "build".to_string(),
-            role_index: 0,
-            role_name: role.to_string(),
-            is_start_role: false,
-            cwd: None,
-            display_title: None,
-            orchestration_id: None,
-        };
-        agent
-    }
+    use crate::voice::fixtures::{agent, role_agent};
 
     fn fleet() -> Vec<DesktopAgent> {
         vec![role_agent("1", "tester"), role_agent("2", "orchestrator")]
@@ -611,6 +645,16 @@ mod tests {
         agents: &[DesktopAgent],
         said: &str,
     ) -> VoiceOutcome {
+        result(resolver, screen, agents, said).await.outcome
+    }
+
+    /// The same call, keeping the timing M6 consumes.
+    async fn result(
+        resolver: &StubResolver,
+        screen: Screen,
+        agents: &[DesktopAgent],
+        said: &str,
+    ) -> VoiceResult {
         handle_utterance(resolver, table(), screen, agents, Transcript::new(said)).await
     }
 
@@ -1222,5 +1266,135 @@ mod tests {
         assert_eq!(normalize("claude-code"), "claude code");
         assert_eq!(normalize("  CLAUDE   code "), "claude code");
         assert_eq!(normalize(" _- "), "");
+    }
+
+    // -- what M6 consumes (PRD #802 M5) ------------------------------------
+
+    #[tokio::test]
+    async fn voice_outcome_carries_the_latency_the_backend_cost() {
+        // PRD #802's mitigation for "slow enough to feel broken" is that the
+        // number is produced here rather than invented by the surface. Asserted
+        // against a resolver that takes a known, visible amount of time, so
+        // this proves the clock is around the BACKEND rather than around
+        // nothing.
+        struct Slow;
+        impl IntentResolver for Slow {
+            fn resolve<'a>(
+                &'a self,
+                _request: IntentRequest<'a>,
+            ) -> crate::voice::resolver::ResolveFuture<'a> {
+                Box::pin(async {
+                    tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+                    Ok(IntentAnswer::new("open_overview"))
+                })
+            }
+            fn backend_name(&self) -> &'static str {
+                "slow"
+            }
+        }
+        let result = handle_utterance(
+            &Slow,
+            table(),
+            Screen::Deck,
+            &fleet(),
+            "show everything".into(),
+        )
+        .await;
+        assert!(result.outcome.is_dispatch(), "{:?}", result.outcome);
+        let measured = result.resolve_ms.expect("a backend was called");
+        assert!(measured >= 40, "measured {measured}ms for a 40ms backend");
+        assert_eq!(result.backend, "slow");
+        assert_eq!(result.sentence(), result.outcome.sentence());
+    }
+
+    #[tokio::test]
+    async fn voice_outcome_reports_no_latency_when_no_backend_was_called() {
+        // `None` is a real answer: silence short-circuits, and rendering `0 ms`
+        // would claim a measurement never taken. The backend is still named,
+        // because that names what WOULD have answered.
+        let resolver = StubResolver::failing(IntentError::Backend("never called".into()));
+        let result = result(&resolver, Screen::Deck, &fleet(), "   ").await;
+        assert!(matches!(result.outcome, VoiceOutcome::NoMatch { .. }));
+        assert_eq!(result.resolve_ms, None);
+        assert_eq!(result.backend, "stub");
+    }
+
+    #[tokio::test]
+    async fn voice_outcome_times_a_failing_backend_too() {
+        // The failure path is where the number matters most: a user who waited
+        // four seconds for "I could not work out what to do" should be able to
+        // see that they waited four seconds.
+        let resolver = StubResolver::failing(IntentError::Backend("boom".into()));
+        let result = result(&resolver, Screen::Deck, &fleet(), "show me the tester").await;
+        assert!(matches!(
+            result.outcome,
+            VoiceOutcome::ResolutionFailed { .. }
+        ));
+        assert!(result.resolve_ms.is_some());
+    }
+
+    #[tokio::test]
+    async fn voice_outcome_result_serializes_for_the_webview() {
+        let resolver =
+            StubResolver::new().answering("go to the overview", IntentAnswer::new("open_overview"));
+        let result = result(&resolver, Screen::Deck, &fleet(), "go to the overview").await;
+        let json = serde_json::to_value(&result).expect("serializes");
+        assert_eq!(json["outcome"]["kind"], "dispatch");
+        assert_eq!(json["outcome"]["invoke"], "openOverview");
+        assert_eq!(json["backend"], "stub");
+        assert!(json["resolveMs"].is_number(), "{json}");
+    }
+
+    /// An action outside the table, from a REAL backend, becomes
+    /// [`VoiceOutcome::UnknownAction`] rather than dispatching.
+    ///
+    /// The sibling above drives a stub, which proves the branch. This drives
+    /// the agent-CLI backend against a script that answers `launch_missiles` —
+    /// so the whole chain is exercised: a child process, the fence-tolerant
+    /// read, the answer crossing the seam, and the refusal here. It is the case
+    /// PRD #802's original four-outcome list could not express, and the one
+    /// this pipeline's safety rests on when the backend is a print-mode CLI
+    /// that constrains nothing.
+    #[tokio::test]
+    #[cfg_attr(not(unix), ignore = "the stub is a /bin/sh script")]
+    async fn voice_outcome_an_agent_cli_action_outside_the_table_never_dispatches() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let script = dir.path().join("rogue-cli");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nprintf '```json\\n{\"action\":\"launch_missiles\",\"params\":{\"agent\":\"tester\"}}\\n```'\n",
+        )
+        .expect("write");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod");
+        }
+        let resolver = crate::voice::AgentCliResolver::claude().with_program(&script);
+
+        let result = handle_utterance(
+            &resolver,
+            table(),
+            Screen::Deck,
+            &fleet(),
+            "open the tester".into(),
+        )
+        .await;
+
+        assert!(
+            !result.outcome.is_dispatch(),
+            "an action outside the table dispatched: {:?}",
+            result.outcome
+        );
+        let VoiceOutcome::UnknownAction { action, .. } = &result.outcome else {
+            panic!("expected UnknownAction, got {:?}", result.outcome);
+        };
+        assert_eq!(action, "launch_missiles");
+        assert_eq!(result.backend, "claude");
+        assert_eq!(
+            result.sentence(),
+            "Heard: \u{201c}open the tester\u{201d} — no matching action."
+        );
     }
 }

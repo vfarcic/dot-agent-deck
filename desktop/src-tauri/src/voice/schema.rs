@@ -21,6 +21,27 @@ use super::table::{CommandTable, NO_MATCH_ACTION, ParamKind, Screen};
 /// The one tool the model is given.
 pub const TOOL_NAME: &str = "run_deck_action";
 
+/// What the model is told to do, in one paragraph.
+///
+/// **A prompt, reviewed as an interface.** It is a `const` rather than a
+/// literal inside [`tool_schema`] because M5 gave it a second consumer: the
+/// keyed remote backend sends it as the tool's `description` and the agent-CLI
+/// backend, which has no tool-use envelope to put it in, sends the same words
+/// in its prompt. One wording, two backends — a copy in each would let the two
+/// drift, and PRD #802's phrase fixtures are authoritative against one backend
+/// only, so nothing would catch the drift.
+///
+/// Written as a `\`-continued literal, which rustfmt indents; the continuation
+/// strips the newline **and** the leading whitespace, so the text is one
+/// paragraph. `voice_schema_tool_description_reads_as_prose` asserts that
+/// rather than trusting it.
+pub const TOOL_INSTRUCTIONS: &str = "Pick the deck action the user asked for. Pick exactly one. \
+    Every action is listed whether or not it can run right now: `callable: false` \
+    means it exists but the current screen cannot run it, and picking it is the \
+    right answer when that is what the user asked for. Answer `none` when the \
+    request does not match any action listed — do not force a pick. Write no prose; \
+    the app writes what the user reads.";
+
 /// One row as the model sees it, with its availability on the screen the
 /// request was built for.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -90,12 +111,7 @@ pub fn tool_schema(table: &CommandTable, screen: Screen) -> Value {
     let commands = annotate(table, screen);
     json!({
         "name": TOOL_NAME,
-        "description": "Pick the deck action the user asked for. Pick exactly one. \
-    Every action is listed whether or not it can run right now: `callable: false` \
-    means it exists but the current screen cannot run it, and picking it is the \
-    right answer when that is what the user asked for. Answer `none` when the \
-    request does not match any action listed — do not force a pick. Write no prose; \
-    the app writes what the user reads.",
+        "description": TOOL_INSTRUCTIONS,
         "input_schema": {
             "type": "object",
             "properties": {

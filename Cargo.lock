@@ -1310,6 +1310,7 @@ dependencies = [
  "dot-agent-deck",
  "keyring",
  "libc",
+ "reqwest",
  "serde",
  "serde_json",
  "tauri",

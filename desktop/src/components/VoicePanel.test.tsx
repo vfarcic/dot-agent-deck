@@ -64,14 +64,44 @@ describe("VoicePanel", () => {
     );
     expect(screen.getByLabelText("Commands")).toHaveValue("claude");
     expect(screen.getByLabelText("Speech")).toHaveValue("off");
-    expect(screen.getByLabelText("Activation")).toHaveValue("toggle");
     // The lists are the closed sets, so a token the Rust side would fold away
     // cannot be offered here.
     expect(screen.getByLabelText("Commands").querySelectorAll("option")).toHaveLength(
       VOICE_INTENT_BACKENDS.length,
     );
-    expect(screen.getByLabelText("Activation").querySelectorAll("option")).toHaveLength(
-      VOICE_ACTIVATION_MODES.length,
+  });
+
+  /**
+   * Activation is STATED, not offered (PRD #802 M5). There is one mode, and a
+   * `<select>` with one option implies a choice the user does not have — it
+   * opens, shows one item, and closing it changes nothing.
+   */
+  it("states the activation mode rather than offering it as a choice", () => {
+    renderPanel();
+    const row = screen.getByTestId("voice-activation");
+    expect(row).toHaveTextContent("Press to start, press to stop");
+    expect(row.tagName).not.toBe("SELECT");
+    expect(row.querySelector("select")).toBeNull();
+    expect(screen.getByTestId("voice-body").querySelectorAll("select")).toHaveLength(2);
+    // Still named, so a screen reader gets the same row structure as the
+    // chosen ones.
+    expect(row).toHaveAccessibleName("Activation");
+    // The list it will render from once D4 adds the other two modes.
+    expect(VOICE_ACTIVATION_MODES).toEqual(["toggle"]);
+  });
+
+  /**
+   * A document written by a newer build can name a mode this one has never
+   * heard of. The Rust side folds it to the default on read; this is the same
+   * tolerance at the render seam, where a stale in-memory value could still
+   * arrive.
+   */
+  it("states this build's default for an activation mode it does not know", () => {
+    renderPanel({
+      voice: { ...DEFAULT_VOICE_SETTINGS, activation: "hold-to-talk" },
+    });
+    expect(screen.getByTestId("voice-activation")).toHaveTextContent(
+      "Press to start, press to stop",
     );
   });
 

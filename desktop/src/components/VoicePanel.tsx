@@ -3,7 +3,8 @@
  *
  * It implements `SettingsPanelProps` and nothing else — the sheet does not know
  * this is about voice, and this file does not know how the document is stored.
- * Three rows of choices, plus an API-key row for each backend that needs one.
+ * Two rows of choices, one stated row, plus an API-key row for each backend
+ * that needs one.
  *
  * # The key row is the reason this panel exists at all in M4
  *
@@ -36,26 +37,31 @@
  * without retyping it. The outcome PRD #802 M4 is written against is *a user
  * who thinks their key is stored and finds voice broken tomorrow*.
  *
- * # Why a select for every choice
+ * # Why a select for both choices
  *
  * `docs/develop/desktop-gui.md` picks the control by cardinality: a switch for
  * a boolean, a segmented control for up to about four exclusive options, a
- * select beyond that. Two of these three are inside the segmented range today
- * and are selects anyway, because they will grow — the transcription list gains
- * local whisper at D1, the intent list gains a local model at D2, the
- * activation list gains two modes at D4 — and a panel whose controls change
- * shape as its options arrive reads as three conventions rather than one.
+ * select beyond that. Both of these are inside the segmented range today and
+ * are selects anyway, because they will grow — the transcription list gains
+ * local whisper at D1 and the intent list gains a local model at D2 — and a
+ * panel whose controls change shape as its options arrive reads as two
+ * conventions rather than one.
  *
- * The Activation row has exactly one option today. It renders rather than
- * hiding, for `ZoomPanel`'s reason: **the app has no other surface that says
- * what the activation mode is.** Telling the reader what it is, is information
- * even when there is nothing to change.
+ * The Activation row has exactly one mode today, so it is **stated rather than
+ * offered** — a line of text naming the mode, not a `<select>` with one option.
+ * It renders at all for `ZoomPanel`'s reason: the app has no other surface that
+ * says what the activation mode is, and telling the reader what it is is
+ * information even when there is nothing to change. But a control implies a
+ * choice, and a one-option select is a control that lies about having one — it
+ * opens, it shows a single item, and closing it changes nothing. D4 adds
+ * hold-to-talk and always-on-with-VAD; that is when this becomes the select
+ * beside the other two, and `VOICE_ACTIVATION_MODES` is already the list it
+ * will render from.
  */
 import { useCallback, useEffect, useState } from "react";
 import { AlertTriangle } from "lucide-react";
 import {
   DEFAULT_VOICE_SETTINGS,
-  VOICE_ACTIVATION_MODES,
   VOICE_INTENT_BACKENDS,
   VOICE_TRANSCRIPTION_BACKENDS,
   type SecretStatusDto,
@@ -77,6 +83,17 @@ const INTENT_LABELS: Record<string, string> = {
   remote: "Remote API",
 };
 
+/**
+ * The activation modes, for the line that STATES the current one.
+ *
+ * Still a map keyed by token rather than a single string: the token is what the
+ * document holds and what a future build may widen, so a document written by a
+ * newer build naming a mode this one has never heard of renders this build's
+ * default rather than an empty line. The Rust side folds an unknown token to
+ * the default on read anyway (`VoiceToken::from_str_lossy`); this is the same
+ * tolerance at the render seam, where a stale in-memory value could still
+ * arrive.
+ */
 const ACTIVATION_LABELS: Record<string, string> = {
   toggle: "Press to start, press to stop",
 };
@@ -134,17 +151,12 @@ export function VoicePanel({ settings, onSave, saveError }: SettingsPanelProps) 
         </select>
       </div>
 
+      {/* Stated, not chosen. See the note above the ACTIVATION_LABELS map. */}
       <div className="settings-row">
-        <label htmlFor="voice-activation">Activation</label>
-        <select
-          id="voice-activation"
-          value={voice.activation}
-          onChange={(event) => saveVoice({ activation: event.target.value })}
-        >
-          {VOICE_ACTIVATION_MODES.map((token) => (
-            <option key={token} value={token}>{ACTIVATION_LABELS[token]}</option>
-          ))}
-        </select>
+        <span className="settings-row-label" id="voice-activation-label">Activation</span>
+        <p className="settings-value" data-testid="voice-activation" aria-labelledby="voice-activation-label">
+          {ACTIVATION_LABELS[voice.activation] ?? ACTIVATION_LABELS[DEFAULT_VOICE_SETTINGS.activation]}
+        </p>
       </div>
 
       {/* One key row per backend that authenticates with a key of the app's

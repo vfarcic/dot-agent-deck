@@ -782,6 +782,13 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
    the reason the rule above gives: it lays out identically in both engines and
    keeps the group's accessible name. */
 .settings-row > .settings-row-label { color: var(--ink); font-size: 13px; font-weight: 650; }
+/* A row that STATES a value instead of offering one (PRD #802 M5). Used where
+   a setting has exactly one legal value today and a `<select>` with one option
+   would imply a choice the user does not have. Sized like a select's own text
+   so a stated row and a chosen row sit on the same baseline, and rendered in
+   `--ink` rather than `--muted` because it is the value, not a hint about one.
+   When the setting gains its other values it becomes an ordinary select row. */
+.settings-value { margin: 0; color: var(--ink); font-size: 10px; }
 .settings-row select { min-width: 96px; height: 28px; padding: 0 7px; border: 1px solid var(--line-strong); border-radius: 5px; color: var(--ink); background: var(--paper); font-size: 10px; }
 .settings-row select:disabled { color: var(--faint); background: var(--paper-sunken); cursor: not-allowed; }
 
