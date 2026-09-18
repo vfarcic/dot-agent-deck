@@ -340,26 +340,41 @@ export const audience = {
     'If you run one agent, in one window, and that is working fine — this is not for you yet. Come back when the second one starts drifting.',
 };
 
+/**
+ * The four story rows. Each step names the `screenshots` entry it carries, so
+ * the page joins copy to frame BY NAME -- `step.shot` -- rather than by lining
+ * two arrays up positionally. Reordering the steps or inserting one therefore
+ * carries each row's image, alt text and caption with it; the positional form
+ * mispaired them silently, which is what `bc6f0abe` had to repair by hand.
+ * `screenshots` is declared above, so a typo here is `undefined` and the first
+ * property read fails the build rather than rendering the wrong frame.
+ *
+ * Which frame each row carries, and why, is recorded on `screenshots` above.
+ */
 export const workflow = [
   {
     step: '01',
     title: 'Open a pane',
     body: 'Ctrl+n, pick a directory, name it, and give it the command that launches your agent. It runs in an embedded PTY — no multiplexer involved.',
+    shot: screenshots.newPane,
   },
   {
     step: '02',
     title: 'Watch every one of them',
     body: 'Each pane gets a card: status, the tool it is running right now, its working directory, its last prompt. Updated live, from hooks installed for you.',
+    shot: screenshots.card,
   },
   {
     step: '03',
     title: 'Let one agent run the others',
     body: 'Define roles in per-project TOML — orchestrator, coder, reviewer. The orchestrator delegates, and you watch the work land in the other panes.',
+    shot: screenshots.parallel,
   },
   {
     step: '04',
     title: 'Walk away',
     body: 'The agents belong to a daemon, not to your terminal. Detach the deck, come back later, reattach — they kept working.',
+    shot: screenshots.reattach,
   },
 ];
 

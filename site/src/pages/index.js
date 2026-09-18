@@ -39,19 +39,6 @@ import styles from './index.module.css';
  * that changes what a frame shows is a one-file correction.
  */
 
-/**
- * One screenshot per workflow step, in step order. Each row carries the frame
- * its own copy describes -- 01 is the form `Ctrl+n` opens, 04 is the
- * before/after detach pair -- and `landing-content.js` records why the two
- * images these displaced left the page rather than moving elsewhere.
- */
-const storyShots = [
-  screenshots.newPane,
-  screenshots.card,
-  screenshots.parallel,
-  screenshots.reattach,
-];
-
 /** The pages the closing panel hands the visitor, in the order to read them. */
 const doorPages = [
   {
@@ -191,8 +178,8 @@ export default function Home() {
                   <p>{step.body}</p>
                 </div>
                 <figure className={styles.storyFigure}>
-                  <img src={storyShots[i].src} alt={storyShots[i].alt} loading="lazy" />
-                  <figcaption>{storyShots[i].caption}</figcaption>
+                  <img src={step.shot.src} alt={step.shot.alt} loading="lazy" />
+                  <figcaption>{step.shot.caption}</figcaption>
                 </figure>
               </div>
             ))}
