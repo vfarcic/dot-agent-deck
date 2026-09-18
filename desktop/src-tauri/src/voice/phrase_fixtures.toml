@@ -117,6 +117,51 @@ screen = "deck"
 action = "close_agent_view"
 outcome = "unavailable"
 
+# PRD #802 M8 — pending expectations for the `open_settings` command-table
+# row. These intentionally become runnable only after that one row exists.
+
+[[fixtures]]
+name = "open-settings-direct"
+utterance = "open settings"
+screen = "deck"
+action = "open_settings"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "open-settings-preferences"
+utterance = "change my preferences"
+screen = "overview"
+action = "open_settings"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "open-settings-api-key"
+utterance = "where do I set my API key?"
+screen = "deck"
+action = "open_settings"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "open-settings-overview-collision"
+utterance = "show me all the settings"
+screen = "overview"
+action = "open_settings"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "open-settings-deck-collision"
+utterance = "go back to settings"
+screen = "overview"
+action = "open_settings"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "open-settings-unavailable"
+utterance = "open settings"
+screen = "agent"
+action = "open_settings"
+outcome = "unavailable"
+
 [[fixtures]]
 name = "no-match-clock"
 utterance = "what time is it?"
