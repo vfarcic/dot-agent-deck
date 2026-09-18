@@ -132,6 +132,53 @@ reqwest = { version = "0.13", default-features = false, features = [
 # secret-service backends, so no `openssl` and no `vendored` C build enters the
 # graph.
 keyring = "4"
+# PRD #802 M7: microphone capture (`voice/capture.rs`). THE one native
+# dependency this PRD takes, and the accounting is the PRD's own.
+#
+# WHY RUST-SIDE AT ALL. The webview cannot do it on the platforms this app
+# ships to. Read from `wry` 0.55.1: WKWebView grants capture unconditionally,
+# WebView2's permission handler is wired only for the clipboard, and the
+# WebKitGTK backend connects no `permission-request` signal and never sets
+# `enable-media-stream` — so a `getUserMedia` path would ship a macOS-only
+# feature. Capturing here also removes the AudioWorklet, the CSP question and
+# the three-engine matrix at once, and the audio has to reach this process
+# anyway because the CSP forces every network hop Rust-side.
+#
+# WHY NOT BEHIND A CARGO FEATURE, which is the tempting way to keep it out of
+# the workspace gate: that reproduces the hole class this repo has closed three
+# times (#407, #436, #502) — code behind a feature nobody's gate enables is
+# type-checked by nothing and lints clean by compiling nothing. Rule 2's clippy
+# command names `e2e,e2e-live` for exactly that reason.
+#
+# DEFAULT FEATURES, which is `default = []` — cpal declares no default feature
+# content at all, so `jack` and `asio` (the two that would drag in a system
+# library or a vendored SDK) stay off. What it resolves to per platform:
+# `alsa` + `libc` + `dasp_sample` on Linux, the `objc2-*`/`coreaudio-rs`
+# CoreAudio tree on Apple, `windows`/`windows-core` on Windows.
+#
+# WHAT IT COSTS ON LINUX, and this is the whole reason M7 is last: `alsa-sys`
+# resolves `alsa` through pkg-config, so the dev headers have to be declared
+# everywhere this repo declares system dependencies — `tauri-deps/flake.nix`
+# (which is what a `devbox shell` reads), both `apt-get` blocks in
+# `.github/workflows/ci.yml`, and the bundle job's block in `release.yml`.
+# macOS needs nothing for CoreAudio and Windows nothing for WASAPI, so the edit
+# is Linux-shaped. No CMake, no bundled C++ tree, no model and no new build
+# toolchain — a Rust binding to a library the platform already has, which is
+# why this dependency is acceptable where an inference engine is not.
+cpal = "0.18"
+# PRD #802 M7: the multipart boundary for one transcription upload
+# (`voice/transcribe.rs`). NOT a new dependency in any sense that costs
+# anything — the root package declares `getrandom = "0.3"` for the hook
+# capability token, this crate already links the root package, and the lockfile
+# carries exactly one of it. Declaring it is the discipline the `tokio` entry
+# above states: a change over there cannot silently take this crate's uploads
+# out.
+#
+# Randomness rather than a counter because the boundary has to be a byte
+# sequence the BODY cannot contain, and the body is a WAV whose samples are
+# arbitrary. Deliberately `getrandom` and not `rand`, for the root package's
+# reason: the whole requirement is "N bytes from the operating system".
+getrandom = "0.3"
 
 [dev-dependencies]
 # The `#[tokio::test]` attribute needs `macros` + `rt`, and the scripted-socket

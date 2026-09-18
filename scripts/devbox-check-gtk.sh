@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 #
-# Assert that Tauri's GTK/WebKit stack resolves through pkg-config to Nix's
-# copy — not the host distribution's — inside a devbox environment on Linux.
+# Assert that the desktop crate's system libraries — Tauri's GTK/WebKit stack,
+# plus ALSA since PRD #802 M7 — resolve through pkg-config to Nix's copy, not
+# the host distribution's, inside a devbox environment on Linux.
 #
 # Usage: devbox run -- bash scripts/devbox-check-gtk.sh
 #        (scripts/devbox-smoke.sh calls it; CI's `devbox` job runs that.)
@@ -36,8 +37,9 @@
 # It also catches the case that actually bit: a STALE devbox environment. See
 # the remedy printed on failure below.
 #
-# Linux only. macOS builds Tauri against the system WebKit, so the flake yields
-# an empty output there and none of these modules exists.
+# Linux only. macOS builds Tauri against the system WebKit and cpal against
+# CoreAudio, so the flake yields an empty output there and none of these
+# modules exists.
 
 set -euo pipefail
 
@@ -48,11 +50,18 @@ fi
 
 # The same set `ci.yml`'s `build` job installs with apt, and the set
 # `tauri-deps/flake.nix` freezes. Keep the two in step.
+#
+# `alsa` is PRD #802 M7's and is not Tauri's: the desktop crate declares `cpal`
+# for microphone capture, whose `alsa-sys` build script resolves this module
+# through pkg-config. It belongs in this list for the same reason as the
+# others — a `/usr/lib` answer links the crate against a library the Nix loader
+# cannot find, which is #815's silent failure arriving through a second crate.
 MODULES=(
   glib-2.0 gobject-2.0 gio-2.0
   gtk+-3.0 gdk-3.0 gdk-x11-3.0
   webkit2gtk-4.1 javascriptcoregtk-4.1 libsoup-3.0
   ayatana-appindicator3-0.1 dbus-1 librsvg-2.0 libxdo
+  alsa
 )
 
 resolved_pkg_config="$(command -v pkg-config || true)"
@@ -70,7 +79,7 @@ for mod in "${MODULES[@]}"; do
     failures+=("$mod: not found by pkg-config at all")
     continue
   fi
-  # `libdir` rather than `prefix`: every one of these 13 defines it, `libxdo`
+  # `libdir` rather than `prefix`: every module above defines it, `libxdo`
   # reports an EMPTY prefix, and libdir is the value that becomes the linker's
   # -L flag and therefore the binary's RUNPATH.
   libdir="$(pkg-config --variable=libdir "$mod" 2>/dev/null || true)"
@@ -87,7 +96,8 @@ done
 if [ "${#failures[@]}" -ne 0 ]; then
   {
     echo
-    echo "FAIL: pkg-config resolved Tauri's GTK stack OUTSIDE /nix/store."
+    echo "FAIL: pkg-config resolved the desktop crate's system libraries"
+    echo "      OUTSIDE /nix/store."
     echo
     for f in ${failures[@]+"${failures[@]}"}; do
       echo "  - $f"

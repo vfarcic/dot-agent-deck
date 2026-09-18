@@ -571,8 +571,16 @@ mod tests {
 
     // -- the bounded wait --------------------------------------------------
 
+    // `#[cfg(unix)]` and NOT the `cfg_attr(..., ignore)` its siblings carry, and
+    // the difference is a compile error rather than a style choice: an `ignore`
+    // skips a test at RUN time and still compiles its body, and this body names
+    // `wait_for_exit`, which is `#[cfg(unix)]` because it reads `/proc`. Under
+    // `scripts/windows-cross-check.sh` that was an E0425 in the lib test target
+    // — which `build-windows` builds, since it runs `cargo nextest run
+    // --workspace`. Caught by PRD #802 M7's own run of that script, whose
+    // header says only errors matter; this was one.
+    #[cfg(unix)]
     #[tokio::test]
-    #[cfg_attr(not(unix), ignore = "the stub is a /bin/sh script")]
     async fn voice_agent_cli_times_out_and_leaves_no_child_behind() {
         // The stub writes its own pid, then sleeps far past the timeout. After
         // the Err, that pid must be gone: `kill_on_drop` fires when `timeout`

@@ -22,12 +22,12 @@ mod secrets;
 mod selection_capture;
 mod settings;
 mod terminal;
-// PRD #802 M1 — the voice command table and its Rust-side consumers.
+// PRD #802 — the voice command table, its Rust-side consumers, the microphone
+// and the transcription seam.
 //
-// `pub` rather than private: nothing in this crate reads it yet, because M6
-// owns the IPC seam and decides its shape. A private module of unreferenced
-// items is dead code, and the alternative — registering a command M6 would then
-// have to redesign — is worse than a module that is public for a milestone.
+// `pub` rather than private because most of it still has no in-crate consumer:
+// M6 owns the surface. M7 gave part of it one — the four `desktop_voice_*`
+// commands below are the IPC seam the panel will drive.
 pub mod voice;
 
 use std::collections::{HashMap, HashSet};
@@ -1590,6 +1590,194 @@ fn report_secret_error(error: SecretError) -> String {
     safe_message(error.public())
 }
 
+/// PRD #802 M7: the microphone, and the four commands the panel drives it with.
+///
+/// # What M6 calls, and in what order
+///
+/// `desktop_voice_status` to decide whether to offer a microphone at all;
+/// `desktop_voice_start` on the first press; `desktop_voice_stop` on the
+/// second, which closes the device, transcribes and answers with the
+/// transcript; `desktop_voice_cancel` when the panel closes or the user escapes.
+/// Between a start and a stop, `desktop_voice_status` is how the surface learns
+/// that the length cap ended the recording on its own — from the user's side the
+/// microphone simply stopped, and a panel that did not know why would go on
+/// rendering *listening…* over a closed device.
+///
+/// # Stop transcribes; it does not hand back a buffer
+///
+/// The alternative shape — a third command that takes the audio and returns
+/// text — would put a `Pcm16` on the IPC boundary, which is a base64 copy of up
+/// to 960 KB of the user's voice crossing into the webview for no reason. PRD
+/// #802's Open Question 5 says no part of an utterance is persisted; keeping
+/// the audio inside this process is the same rule applied one seam earlier. The
+/// webview receives a transcript, which it has to render anyway, and nothing
+/// else.
+///
+/// # There is no `desktop_voice_transcribe` taking a credential either
+///
+/// The key is read Rust-side from the keychain at call time, exactly as PRD
+/// #802 M4 and M5 established. `desktop_secret_status`, `…_store` and
+/// `…_forget` remain the whole credential surface, and `load` is still
+/// deliberately absent.
+pub(crate) struct VoiceState {
+    /// One session per process: one microphone, one utterance at a time.
+    ///
+    /// An `Arc` because the cap timer is a spawned task that outlives the
+    /// command that started it, and because `AudioSource::start` blocks and so
+    /// runs on a blocking thread.
+    session: Arc<voice::CaptureSession>,
+}
+
+impl Default for VoiceState {
+    fn default() -> Self {
+        Self {
+            // Constructs no host and opens no device — `cpal` is not touched
+            // until a `start`. An app on a machine with no audio server starts
+            // normally and finds out at the first press, which is where the
+            // sentence for it already is.
+            session: Arc::new(voice::CaptureSession::new(Arc::new(
+                voice::CpalSource::new(),
+            ))),
+        }
+    }
+}
+
+/// What the webview is told about the microphone.
+///
+/// [`voice::CaptureStatus`]'s four fields, flattened, plus the two that come
+/// from the settings document rather than from the session — which is why this
+/// lives here and not in `voice::capture`, a module that deliberately reads no
+/// settings.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VoiceStatus {
+    #[serde(flatten)]
+    pub capture: voice::CaptureStatus,
+    /// Whether a microphone path is offered at all.
+    ///
+    /// False when `[voice] transcription` is `off`, which is the default and is
+    /// a product statement rather than a degraded mode: the panel works from
+    /// typed input and says what to add. The surface reads this to decide
+    /// whether to render the button, and `desktop_voice_start` refuses anyway —
+    /// a user can change the setting between the two calls.
+    pub available: bool,
+    /// Which transcriber would answer — `off` or `remote`.
+    pub backend: &'static str,
+}
+
+/// The transcription backend the settings document currently names.
+///
+/// Read per call rather than cached, for `voice::resolver_for`'s reason: a user
+/// who changes the setting uses it on the next utterance instead of after a
+/// restart. It costs one small TOML read per button press, which is what
+/// `desktop_get_settings` already costs per settings render.
+fn voice_transcription_backend() -> crate::settings::TranscriptionBackend {
+    crate::settings::load_snapshot()
+        .settings
+        .voice
+        .unwrap_or_default()
+        .transcription
+}
+
+fn voice_status(session: &voice::CaptureSession) -> VoiceStatus {
+    let backend = voice_transcription_backend();
+    VoiceStatus {
+        capture: session.status(),
+        available: backend != crate::settings::TranscriptionBackend::Off,
+        backend: backend.as_token(),
+    }
+}
+
+/// A refused or failed capture, split the way a failed credential operation is:
+/// the detail belongs in the app's own log and the webview gets the sentence.
+///
+/// Nothing here prints a transcript or a sample — a capture error names the
+/// device or the state machine and never what was said, which is the rule PRD
+/// #802's Open Question 5 sets and this is the one place it could be broken by
+/// accident.
+fn report_capture_error(error: voice::CaptureError) -> String {
+    safe_message(error.detail())
+}
+
+/// Open the microphone. Idle, done or failed → recording.
+#[tauri::command]
+async fn desktop_voice_start(
+    webview: Webview,
+    voice_state: State<'_, VoiceState>,
+) -> Result<VoiceStatus, String> {
+    ensure_main_webview(&webview)?;
+    if voice_transcription_backend() == crate::settings::TranscriptionBackend::Off {
+        return Err(voice::transcribe::NOT_CONFIGURED.to_string());
+    }
+    let session = Arc::clone(&voice_state.session);
+
+    // Opening an audio device is a round trip to the OS and can prompt, so it
+    // goes through `spawn_blocking` rather than sitting on the async runtime
+    // every other command shares — the same treatment a keychain call gets.
+    let started = {
+        let session = Arc::clone(&session);
+        tauri::async_runtime::spawn_blocking(move || session.start())
+            .await
+            .map_err(|error| safe_message(format!("the microphone call failed: {error}")))?
+    };
+    let (_, ticket) = started.map_err(report_capture_error)?;
+
+    // The other half of the length cap. `voice::PcmSink` already refuses to
+    // grow past `MAX_UTTERANCE`, which bounds the allocation; this is what
+    // releases the DEVICE, so a forgotten toggle does not leave a microphone
+    // open for the life of the app. The ticket is what stops a timer outliving
+    // its own utterance and closing the next one.
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(voice::MAX_UTTERANCE).await;
+        session.cap_reached(ticket);
+    });
+
+    Ok(voice_status(&voice_state.session))
+}
+
+/// Close the microphone and transcribe what it heard. Recording →
+/// transcribing → done or failed.
+#[tauri::command]
+async fn desktop_voice_stop(
+    webview: Webview,
+    voice_state: State<'_, VoiceState>,
+) -> Result<voice::VoiceTranscription, String> {
+    ensure_main_webview(&webview)?;
+    let audio = voice_state.session.stop().map_err(report_capture_error)?;
+    let transcriber = voice::transcriber_for(
+        voice_transcription_backend(),
+        Arc::new(KeychainSecretStore::new()),
+    );
+    let result = voice::handle_audio(transcriber.as_ref(), &audio).await;
+    voice_state.session.settle(result.outcome.is_heard());
+    Ok(result)
+}
+
+/// What the microphone is doing right now, and whether one is offered at all.
+#[tauri::command]
+async fn desktop_voice_status(
+    webview: Webview,
+    voice_state: State<'_, VoiceState>,
+) -> Result<VoiceStatus, String> {
+    ensure_main_webview(&webview)?;
+    Ok(voice_status(&voice_state.session))
+}
+
+/// Abandon the recording without transcribing it — a closed panel, an escape
+/// key, a user who changed their mind.
+///
+/// Idempotent and never refused, because each of those can arrive in any state
+/// and a caller that has to know which one it is in would get it wrong.
+#[tauri::command]
+async fn desktop_voice_cancel(
+    webview: Webview,
+    voice_state: State<'_, VoiceState>,
+) -> Result<VoiceStatus, String> {
+    ensure_main_webview(&webview)?;
+    voice_state.session.cancel();
+    Ok(voice_status(&voice_state.session))
+}
+
 /// Put a saved document's deck selection into force (PRD #741 M7, completed at
 /// M9).
 ///
@@ -2238,6 +2426,8 @@ fn window_focus(event: &tauri::WindowEvent) -> Option<bool> {
 pub fn run() {
     let app = tauri::Builder::default()
         .manage(DesktopState::default())
+        // PRD #802 M7: the capture session. Opens no device until a `start`.
+        .manage(VoiceState::default())
         // Issue #845: the stored Light/Dark choice reaches the document root
         // before the webview parses the document, so the first painted frame is
         // already the one the user chose. Registered before `build()`, which is
@@ -2314,6 +2504,10 @@ pub fn run() {
             desktop_secret_status,
             desktop_store_secret,
             desktop_forget_secret,
+            desktop_voice_start,
+            desktop_voice_stop,
+            desktop_voice_status,
+            desktop_voice_cancel,
         ])
         .build(tauri::generate_context!())
         .expect("failed to build dot-agent-deck desktop application");

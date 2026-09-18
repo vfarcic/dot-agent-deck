@@ -7,6 +7,13 @@
 //! [`VoiceOutcome`] carrying the sentence to show. It captures nothing and
 //! renders no UI — M6 brings the surface and M7 the microphone.
 //!
+//! **M7 brought the microphone.** [`capture`] owns the device — Rust-side,
+//! because `wry` grants webview capture on one of the three platforms this app
+//! ships to — and [`transcribe`] owns the seam that turns its PCM into a
+//! [`Transcript`]. `off` is the default there and is a product statement, not a
+//! degraded mode: with it, the panel works from typed input through the
+//! identical path below.
+//!
 //! **M5 brought the real backends.** [`agent_cli`] spawns the pre-authenticated
 //! CLI the user already has — no key of the app's own, no download, and slow;
 //! [`remote`] makes one keyed HTTPS request with a constrained enum, and is
@@ -20,17 +27,20 @@
 //! frontend dispatches it where a click dispatches one. Nothing here runs an
 //! action.
 //!
-//! The module is `pub` because the crate's lib target has no other consumer for
-//! it yet: M6 owns the IPC seam and will decide its shape, and until then a
-//! private module of unreferenced items is dead code.
+//! The module is `pub` because most of it has no in-crate consumer yet: M6 owns
+//! the surface, and until then a private module of unreferenced items is dead
+//! code. M7 gave part of it one — `lib.rs`'s four `desktop_voice_*` commands
+//! are what the panel will call.
 
 pub mod agent_cli;
+pub mod capture;
 pub mod outcome;
 pub mod prompt;
 pub mod remote;
 pub mod resolver;
 pub mod schema;
 pub mod table;
+pub mod transcribe;
 
 use std::fmt;
 
@@ -45,6 +55,11 @@ use serde::{Deserialize, Serialize};
 pub use crate::dto::DesktopAgent;
 
 pub use agent_cli::{AGENT_CLI_TIMEOUT, AgentCli, AgentCliResolver};
+pub use capture::{
+    AudioFormat, AudioSource, AudioStream, Capture, CaptureError, CaptureSession, CaptureState,
+    CaptureStatus, CaptureTicket, CpalSource, MAX_UTTERANCE, Pcm16, PcmSink, StubSource,
+    TARGET_SAMPLE_RATE,
+};
 pub use outcome::{ResolvedParam, VoiceOutcome, VoiceResult, handle_utterance};
 pub use remote::{REMOTE_TIMEOUT, RemoteResolver};
 pub use resolver::{
@@ -54,6 +69,10 @@ pub use schema::{
     AnnotatedCommand, AnnotatedParam, TOOL_INSTRUCTIONS, TOOL_NAME, annotate, tool_schema,
 };
 pub use table::{CommandRow, CommandTable, NO_MATCH_ACTION, ParamKind, ParamSpec, Screen, table};
+pub use transcribe::{
+    OffTranscriber, RemoteTranscriber, StubTranscriber, TRANSCRIBE_TIMEOUT, Transcriber,
+    TranscriptionError, TranscriptionOutcome, VoiceTranscription, handle_audio, transcriber_for,
+};
 
 /// What the user said, as text — from the microphone through the `Transcriber`
 /// seam (M7), or typed into the same box.

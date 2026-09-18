@@ -27,8 +27,10 @@ This is not optional reading on Linux, because `desktop/src-tauri` is a **worksp
 
 ```sh
 sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev \
-  libayatana-appindicator3-dev librsvg2-dev libxdo-dev
+  libayatana-appindicator3-dev librsvg2-dev libxdo-dev libasound2-dev
 ```
+
+The last one is not Tauri's. PRD #802 M7 declares `cpal` in this crate for microphone capture, and on Linux its `alsa-sys` build script resolves `alsa` through pkg-config — so without `libasound2-dev` the crate does not build at all, which is issue #771's failure arriving through a different dependency. macOS needs nothing for CoreAudio and Windows nothing for WASAPI, so the edit is Linux-shaped. Four places declare this set and they are meant to stay in step: `tauri-deps/flake.nix` (the devbox shell), both `apt-get` blocks in `.github/workflows/ci.yml` (`build` and `e2e-deterministic`), and the bundle job's block in `.github/workflows/release.yml`.
 
 **Do not mix the two.** `apt-get install` inside a `devbox shell` looks like it should work and does not, which is what made issue #771 expensive rather than merely annoying:
 
@@ -47,7 +49,7 @@ What makes it expensive is that the degraded state reports success everywhere. T
 
 The remedy is to leave every nested devbox shell until `DEVBOX_PATH_STACK` is unset, then `devbox install` and re-enter.
 
-`scripts/devbox-check-gtk.sh` catches it at the point the wrong answer is given: for each of the 13 modules it asserts the resolved **`libdir` is under `/nix/store`**, not merely that the module exists. `libdir` rather than `prefix` because every one of the 13 defines it, `libxdo` reports an empty `prefix`, and `libdir` is the value that becomes the linker's `-L` flag. `scripts/devbox-smoke.sh` invokes it and CI's `devbox` job runs that — the only job that can see this regress, since every other one installs the compile set with apt and would stay green with `devbox.json` empty of GTK. `xtask/linkage-check/src/devbox_gtk_origin.rs` drives the script under a stubbed `pkg-config` in the fast tier, so weakening the assertion back to a presence check goes red on the per-task gate; that matters because a presence check is precisely what was there when #815 shipped.
+`scripts/devbox-check-gtk.sh` catches it at the point the wrong answer is given: for each of the 14 modules it asserts the resolved **`libdir` is under `/nix/store`**, not merely that the module exists. `libdir` rather than `prefix` because every one of the 14 defines it, `libxdo` reports an empty `prefix`, and `libdir` is the value that becomes the linker's `-L` flag. `scripts/devbox-smoke.sh` invokes it and CI's `devbox` job runs that — the only job that can see this regress, since every other one installs the compile set with apt and would stay green with `devbox.json` empty of GTK. `xtask/linkage-check/src/devbox_gtk_origin.rs` drives the script under a stubbed `pkg-config` in the fast tier, so weakening the assertion back to a presence check goes red on the per-task gate; that matters because a presence check is precisely what was there when #815 shipped.
 
 Bundling a `.deb` locally needs more than the compile set — `patchelf`, `fakeroot`, `file` and `desktop-file-utils` — which nothing in this repository's gates exercises, so they are deliberately not in `devbox.json`. Install them yourself before `pnpm tauri build`.
 
