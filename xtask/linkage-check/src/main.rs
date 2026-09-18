@@ -95,6 +95,11 @@
 #[cfg(all(test, unix))]
 mod build_gate;
 mod clean_tmp;
+/// Issue #801: a `changelog.d/<issue>.breaking.md` fragment and the
+/// `CONTRACT_BREAKS` entry the desktop handshake classifies from must move
+/// together. Tests only; the rule reads two files and shells out to nothing.
+#[cfg(test)]
+mod contract_breaks;
 /// PRD #743: no hard-coded colour under `desktop/src` outside the `:root`
 /// palette, so the desktop app's light/dark appearance cannot rot by attrition.
 /// Tests only — the rule and its scanner both live in the module, and nothing
