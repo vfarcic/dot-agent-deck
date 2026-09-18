@@ -17,6 +17,13 @@ mod generation;
 mod selection_capture;
 mod settings;
 mod terminal;
+// PRD #802 M1 — the voice command table and its Rust-side consumers.
+//
+// `pub` rather than private: nothing in this crate reads it yet, because M6
+// owns the IPC seam and decides its shape. A private module of unreferenced
+// items is dead code, and the alternative — registering a command M6 would then
+// have to redesign — is worse than a module that is public for a milestone.
+pub mod voice;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;

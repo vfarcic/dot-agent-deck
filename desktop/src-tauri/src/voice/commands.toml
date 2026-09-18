@@ -1,0 +1,80 @@
+# PRD #802 — the voice command table.
+#
+# ONE file, embedded with `include_str!` (see `table.rs`), read by three
+# consumers: schema generation, validation, and dispatch. A row does NOT define
+# behaviour — it EXPOSES behaviour that already exists, so `invoke` names an
+# entry in the frontend action registry (`desktop/src/lib/voiceActions.ts`,
+# M2) and never a second implementation.
+#
+# Columns:
+#
+#   id               the action the model answers with. Must not be `none`,
+#                    which is reserved for "none of these".
+#   description      a PROMPT, not documentation. The model picks on it, so it
+#                    is written for a model and reviewed as an interface.
+#   invoke           the registry entry to dispatch. M3's guard resolves it.
+#   screens          where the command can run: `deck`, `overview`, `agent` —
+#                    the three `DeckView` kinds (`desktop/src/types.ts`).
+#                    Absent or empty means available everywhere.
+#   unavailable_hint names the PREREQUISITE, for the sentence the app renders
+#                    when the model picks a command the current screen cannot
+#                    run. No leading capital and no trailing period: it is
+#                    rendered into a sentence, not as one.
+#   confirmation     the user-facing sentence for a successful dispatch. A
+#                    `{param}` placeholder is replaced with what the param
+#                    resolved to; `table.rs` refuses a placeholder that names
+#                    no declared param.
+#   [[commands.params]]  name + kind, `kind` from the closed resolver set.
+#
+# This slice is NAVIGATION ONLY (PRD #802 Scope). No row here starts an agent,
+# stops one, or answers a permission prompt, which is why none of them needs a
+# confirmation step. `close_agent_view` closes a VIEW rather than a pane — see
+# the comment above that row, because the two are one word apart in speech.
+
+[[commands]]
+id          = "open_agent"
+description = """Open one agent's pane over the current screen, so the user can watch that one
+agent's terminal. Use when the user asks to focus on, enlarge, zoom, open, show or look at ONE
+named agent. The agent is named the way the deck shows it — a role like "tester" or
+"orchestrator", or a name the user gave it."""
+invoke      = "openAgent"
+screens     = ["deck", "overview"]
+unavailable_hint = "opening an agent works from the deck or the agent overview"
+confirmation = "Opening {agent}."
+
+  [[commands.params]]
+  name = "agent"
+  kind = "agent_ref"
+
+[[commands]]
+id          = "open_overview"
+description = """Leave the deck and show the agent overview: every agent across every connected
+deck in one list, with each one's status and activity. Use when the user asks to see everything,
+all the agents, the whole fleet, or asks which agents are running or what needs attention."""
+invoke      = "openOverview"
+screens     = ["deck"]
+unavailable_hint = "the agent overview opens from the deck"
+confirmation = "Opening the agent overview."
+
+[[commands]]
+id          = "open_deck"
+description = """Leave the agent overview and go back to the deck, the screen with the terminals
+on it. Use when the user asks to go back, return to the deck, or see the terminals again."""
+invoke      = "openDeck"
+screens     = ["overview"]
+unavailable_hint = "returning to the deck works from the agent overview"
+confirmation = "Back to the deck."
+
+# NOT the destructive "close a pane" the PRD puts out of scope. This closes the
+# VIEW — `closeAgent` in `desktop/src/App.tsx`, which is `setView({ kind: from })`
+# and nothing else. The agent keeps running, its terminal pane is untouched, and
+# the description says so because the two are one word apart in speech.
+[[commands]]
+id          = "close_agent_view"
+description = """Close the agent view that is open and return to the screen it was opened from.
+Use when the user asks to go back, close this, leave this agent, or stop looking at one agent.
+This only closes the view — it does NOT stop the agent and does NOT close its terminal pane."""
+invoke      = "closeAgentView"
+screens     = ["agent"]
+unavailable_hint = "closing an agent view needs one open"
+confirmation = "Closing the agent view."
