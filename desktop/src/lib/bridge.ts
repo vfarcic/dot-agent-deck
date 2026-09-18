@@ -598,7 +598,7 @@ export type EndpointTestState =
   | "deck_not_answering"
   | "handshake_refused"
   | "protocol_refused"
-  | "build_stamp_differs"
+  | "contract_differs"
   | "reachable";
 
 /** What `desktop_test_endpoint` reports. Every text field is already scrubbed. */
