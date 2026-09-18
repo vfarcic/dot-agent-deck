@@ -165,7 +165,16 @@ export default function Home() {
             </div>
           </section>
 
-          <section className={styles.story}>
+          <section className={styles.story} aria-labelledby="story-title">
+            {/*
+              * The four steps are <h3>s, so the section needs an <h2> above
+              * them or the document outline jumps a level. The design has no
+              * room for a visible one between the pull quote and the first
+              * row, so it is visually hidden rather than dropped.
+              */}
+            <h2 id="story-title" className={styles.visuallyHidden}>
+              How it works
+            </h2>
             {workflow.map((step, i) => (
               <div
                 key={step.step}
@@ -233,6 +242,9 @@ export default function Home() {
               </p>
               <p className={styles.desktopProvenance}>{desktop.provenanceNote}</p>
               <InstallPill command={desktop.provenanceCommand} />
+              <p className={styles.desktopProvenanceScope}>
+                {desktop.provenanceScope}
+              </p>
               <p className={styles.desktopLink}>
                 <Link href={product.releases}>Get it from the latest release →</Link>
               </p>
@@ -293,7 +305,9 @@ export default function Home() {
 
           <section className={styles.close}>
             <div className={styles.closeInner}>
-              <h2 className={styles.closeTitle}>One command, then five agents.</h2>
+              <h2 className={styles.closeTitle}>
+                One command to install. One dashboard for every agent you run.
+              </h2>
               <InstallPill command={installCommand} />
               <div className={styles.ctaRow}>
                 <Link className={styles.ctaPrimary} to={docLinks.gettingStarted}>

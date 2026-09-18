@@ -7,9 +7,10 @@
  * are gone and direction C is now `/`, so the exports that only served the
  * losing directions went with them.
  *
- * The prose is lifted from the previous homepage, with four corrections it
- * never had. Each one was checked against the repository rather than against
- * the issue text, because the issue text was wrong about two of them:
+ * The prose is lifted from the previous homepage, with seven corrections it
+ * never had, every one checked against the repository rather than reasoned
+ * about. The first four are the ones the page shipped with; the issue text was
+ * wrong about two of them:
  *
  * 1. The desktop GUI. Issue #1021 calls the artifacts "signed and notarized".
  *    They are neither. `.github/workflows/release.yml:523` introduces the
@@ -20,8 +21,8 @@
  *    two desktop assets, both named `...-desktop-alpha-...`. There is also no
  *    Windows bundle: release.yml says "Windows is deliberately absent", because
  *    a Tauri bundle carries the daemon as a sidecar and no Windows daemon
- *    binary is published. What the assets DO carry is build provenance, from
- *    the credential-free `attest` job.
+ *    binary is published. What the binaries and packages DO carry is build
+ *    provenance, from the credential-free `attest` job.
  * 2. The agent list. `src/event.rs`'s `AgentType` and `src/agent_registry.rs`
  *    ship five agents, not the two the page named and not the four the issue
  *    names: Claude Code, OpenCode, Pi, Codex and Devin. `docs/getting-started.md`
@@ -33,6 +34,39 @@
  *    generated formula in `Taskfile.yml` carries a full `on_linux` block for
  *    both amd64 and arm64, and `docs/installation.md` heads the section
  *    "Homebrew (macOS / Linux)". It is a supported path, so say so.
+ *
+ * A security audit of the published page then corrected three more, each
+ * measured against `release.yml` and the live v0.41.0 release rather than
+ * reasoned about:
+ *
+ * 5. "Every published asset carries build provenance" was false. A full
+ *    release publishes EIGHT assets -- four CLI binaries, two desktop
+ *    packages, and two checksum manifests -- and the subject collection at
+ *    `release.yml:855-885` matches only `dot-agent-deck-*` and
+ *    `dot-agent-deck-desktop-alpha-*`, so `checksums.txt` and
+ *    `checksums-desktop-alpha.txt` are attested by nothing. Measured:
+ *    `gh attestation verify` exits 0 on the `.dmg` and on a CLI binary, and
+ *    returns an attestation API 404 on both checksum manifests. Widening the
+ *    attestation subjects is the better long-term fix, but that is a
+ *    release-workflow change and belongs in its own PR; the page narrows its
+ *    claim instead.
+ * 6. The provenance command was weaker than the sentence above it. `--repo`
+ *    alone pins the repository, not the workflow that produced the file.
+ *    `--signer-workflow vfarcic/dot-agent-deck/.github/workflows/release.yml`
+ *    was verified against real v0.41.0 assets (exit 0 on both the `.dmg` and
+ *    a CLI binary) and verified to REJECT a wrong workflow path -- `ci.yml`
+ *    gives `Error: verifying with issuer "sigstore.dev"`, exit 1 -- so the
+ *    page hands out the form that actually enforces what the prose claims.
+ * 7. "Every release also publishes a desktop build" was a false absolute
+ *    (CLAUDE.md rule 17). A manual dispatch can set `skip_desktop`
+ *    (`release.yml:11`, gating both desktop jobs at `:546` and `:705`), and
+ *    the bundle matrix is `fail-fast: false` with an explicit path where "the
+ *    CLI release itself is unaffected and complete" when every leg fails.
+ *
+ * Ordering, not just wording, is corrected too: the unsigned-macOS caveat now
+ * says to verify provenance BEFORE following the release notes past Gatekeeper.
+ * The exact OS steps stay centralized in the release notes rather than being
+ * duplicated here.
  */
 
 export const product = {
@@ -186,7 +220,7 @@ export const installRoutes = [
 export const desktop = {
   heading: 'There is a desktop app too. It is an alpha.',
   intro:
-    'Every release also publishes a desktop build: a native window onto the same daemon the terminal deck talks to, and — unlike the TUI, which attaches to one — it can hold several decks at once.',
+    'Where the terminal deck attaches to one daemon at a time, the desktop app is a native window that holds several at once — the agents on your laptop and the ones on a remote box, side by side in the same window. It rides along with a release rather than gating it, so check the assets on the release you open: the CLI ships even when a desktop bundle does not.',
   artifacts: [
     {
       platform: 'macOS',
@@ -206,7 +240,7 @@ export const desktop = {
     },
     {
       title: 'Unsigned, so macOS will stop you',
-      body: 'There is no Developer ID certificate and no notarization, so the first launch hits a security dialog. The release notes carry the exact route past it.',
+      body: 'There is no Developer ID certificate and no notarization, so the first launch hits a security dialog. Verify the download with the provenance command below first, then follow the release notes for the exact route past the dialog — in that order, because getting past the warning is the step you want to take only once you know what you have.',
     },
     {
       title: 'No Windows bundle',
@@ -214,14 +248,26 @@ export const desktop = {
     },
   ],
   provenanceNote:
-    'What every published asset does carry is build provenance: proof that this exact file came out of this repository’s release workflow, from a named commit.',
+    'The binaries and the desktop packages carry build provenance: proof that this exact file came out of this repository’s release workflow, and a record of the commit it was built from. Run it on what you downloaded before you open it.',
   provenanceCommand:
-    'gh attestation verify <file> --repo vfarcic/dot-agent-deck',
+    'gh attestation verify <file> --repo vfarcic/dot-agent-deck --signer-workflow vfarcic/dot-agent-deck/.github/workflows/release.yml',
+  provenanceScope:
+    'It does not cover the two checksums manifests published beside them: those carry no attestation, so running the command on one returns a 404 rather than a verdict.',
 };
 
 /**
  * The screenshot catalogue. Paths are the existing ones on purpose -- the
  * image refresh keeps the filenames, so a refreshed image lands here for free.
+ *
+ * Every entry here is rendered. `orchestration` (orchestration-start.png) sat
+ * here unreferenced and is gone. The reviewer's alternative -- re-pair it onto
+ * story row 01, "Open a pane" -- is declined: it is an ORCHESTRATION frame,
+ * tab bar and all, and row 01 is two steps before orchestration is introduced
+ * at row 03, so it trades a mild mismatch for a louder one. Taking it would
+ * also have to displace one of the two images already earning their rows. The
+ * image itself stays in `docs/img/`, where `getting-started.md` and
+ * `orchestration.md` both use it. Row 01's real fix is a capture that does not
+ * exist yet: the new-pane dialog `Ctrl+n` opens.
  */
 export const screenshots = {
   hero: {
@@ -235,12 +281,6 @@ export const screenshots = {
     alt: 'Five agents running in parallel — cards switch to Compact density to fit them all without scrolling',
     caption:
       'Five agents in parallel. The cards drop to Compact density on their own so they all fit without scrolling.',
-  },
-  orchestration: {
-    src: '/img/orchestration-start.png',
-    alt: 'Orchestration tab on launch — five role cards in the sidebar, orchestrator pane active on the right',
-    caption:
-      'An orchestration on launch: five role panes — orchestrator, coder, reviewer, auditor, release.',
   },
   parallel: {
     src: '/img/orchestration-delegation-parallel.png',
@@ -303,6 +343,5 @@ export const docLinks = {
   configuration: '/docs/configuration',
   keyboard: '/docs/keyboard-shortcuts',
   modes: '/docs/workspace-modes',
-  sessions: '/docs/session-management',
   remote: '/docs/remote-environments',
 };
