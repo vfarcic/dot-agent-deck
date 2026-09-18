@@ -20,16 +20,23 @@
 #                    when the model picks a command the current screen cannot
 #                    run. No leading capital and no trailing period: it is
 #                    rendered into a sentence, not as one.
-#   confirmation     the user-facing sentence for a successful dispatch. A
-#                    `{param}` placeholder is replaced with what the param
-#                    resolved to; `table.rs` refuses a placeholder that names
-#                    no declared param.
+#   report           the user-facing sentence for a successful dispatch — the
+#                    pipeline's stage 6. A `{param}` placeholder is replaced
+#                    with what that param resolved to; `table.rs` refuses a
+#                    placeholder naming no declared param.
+#                    NAMED `report` RATHER THAN `confirmation` ON PURPOSE:
+#                    PRD #802 D5 is "destructive commands behind confirmation",
+#                    so rows in this same file will later carry a genuine
+#                    confirm-before-acting flag, and the two are close to
+#                    opposite — this describes an action that HAPPENED, that
+#                    one blocks an action before it does. Do not rename it back.
 #   [[commands.params]]  name + kind, `kind` from the closed resolver set.
 #
 # This slice is NAVIGATION ONLY (PRD #802 Scope). No row here starts an agent,
 # stops one, or answers a permission prompt, which is why none of them needs a
-# confirmation step. `close_agent_view` closes a VIEW rather than a pane — see
-# the comment above that row, because the two are one word apart in speech.
+# confirm-before-acting step. `close_agent_view` closes a VIEW rather than a
+# terminal pane — see the comment above that row, because the two are one word
+# apart in speech.
 
 [[commands]]
 id          = "open_agent"
@@ -40,7 +47,7 @@ named agent. The agent is named the way the deck shows it — a role like "teste
 invoke      = "openAgent"
 screens     = ["deck", "overview"]
 unavailable_hint = "opening an agent works from the deck or the agent overview"
-confirmation = "Opening {agent}."
+report      = "Opening {agent}."
 
   [[commands.params]]
   name = "agent"
@@ -54,7 +61,7 @@ all the agents, the whole fleet, or asks which agents are running or what needs 
 invoke      = "openOverview"
 screens     = ["deck"]
 unavailable_hint = "the agent overview opens from the deck"
-confirmation = "Opening the agent overview."
+report      = "Opening the agent overview."
 
 [[commands]]
 id          = "open_deck"
@@ -63,7 +70,7 @@ on it. Use when the user asks to go back, return to the deck, or see the termina
 invoke      = "openDeck"
 screens     = ["overview"]
 unavailable_hint = "returning to the deck works from the agent overview"
-confirmation = "Back to the deck."
+report      = "Back to the deck."
 
 # NOT the destructive "close a pane" the PRD puts out of scope. This closes the
 # VIEW — `closeAgent` in `desktop/src/App.tsx`, which is `setView({ kind: from })`
@@ -77,4 +84,4 @@ This only closes the view — it does NOT stop the agent and does NOT close its 
 invoke      = "closeAgentView"
 screens     = ["agent"]
 unavailable_hint = "closing an agent view needs one open"
-confirmation = "Closing the agent view."
+report      = "Closing the agent view."

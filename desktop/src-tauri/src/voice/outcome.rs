@@ -5,12 +5,25 @@
 //! of varying per utterance; a fixture test can assert a sentence, whereas
 //! asserting on free-form prose is miserable; and the model cannot invent a
 //! plausible-sounding but wrong reason for why something is unavailable,
-//! because `screens` already knows. Every sentence below is rendered here, in
-//! Rust, from the table. The model writes no user-facing PROSE at any point —
-//! the narrower claim, and the true one, because a model-supplied param DOES
-//! reach a sentence: the refusals quote it back (`no agent here matches
-//! “deployer”`) so the user can see what it thought they said. It is quoted
-//! as a reference, never as wording of the app's own.
+//! because `screens` already knows.
+//!
+//! **Every sentence below is rendered here, in Rust — but not all of it comes
+//! from the table, and the wider version of that sentence was written here
+//! first.** The table supplies two pieces of wording and only two: a row's
+//! `report` for a successful dispatch, and its `unavailable_hint` for the
+//! not-here refusal. Every other sentence is fixed prose in this file, which is
+//! what makes the consistency claim true — it is one file, not one column.
+//!
+//! **The model writes no user-facing PROSE at any point**, which is the
+//! narrower claim and the true one, because two model- or backend-supplied
+//! strings DO reach a sentence. A model-supplied **param** is quoted back by
+//! the refusals (`no agent here matches “deployer”`) so the user can see what
+//! it thought they said, and a backend's own **failure detail** is quoted by
+//! [`VoiceOutcome::ResolutionFailed`] and
+//! [`VoiceOutcome::TranscriptionFailed`], because "nothing is configured yet"
+//! and "the request timed out" are different things to do next. Both are
+//! quoted as references and neither is wording of the app's own; both go
+//! through [`safe_message`] first.
 //!
 //! **A failure says what it heard.** Most failures are transcription rather
 //! than intent, so the transcript goes into the sentence verbatim and turns a
@@ -44,7 +57,7 @@ pub struct ResolvedParam {
     /// What it resolved to, and what the frontend dispatches with: an agent id
     /// for [`ParamKind::AgentRef`].
     pub value: String,
-    /// The name the deck shows for it, which is what the confirmation sentence
+    /// The name the deck shows for it, which is what the report sentence
     /// says. Derived the same way the webview derives it, so the sentence names
     /// the agent the way the screen does.
     pub label: String,
@@ -304,7 +317,7 @@ pub async fn handle_utterance(
     }
 
     VoiceOutcome::Dispatch {
-        sentence: confirmation(row, &resolved),
+        sentence: report(row, &resolved),
         transcript,
         action: row.id.clone(),
         invoke: row.invoke.clone(),
@@ -324,19 +337,42 @@ fn heard(transcript: &Transcript, situation: &str) -> String {
     )
 }
 
-/// The row's `confirmation`, with each `{param}` replaced by what that param
+/// The row's `report`, with each `{param}` replaced by what that param
 /// resolved to.
 ///
-/// A placeholder naming no declared param cannot get here — the table refuses
-/// one at parse time — so an unreplaced `{…}` in a rendered sentence would mean
+/// **One pass over the template, deliberately, rather than a `replace` per
+/// param.** A label is an agent's display name, which a user chose, so it can
+/// contain a `{…}` of its own — and a second `replace` would then substitute
+/// into text this function had just inserted. One pass copies a substituted
+/// label out and never looks at it again, so what a row renders depends on the
+/// template and the labels and not on the order the params happen to be in.
+///
+/// A placeholder naming no declared param cannot reach a parsed table — that is
+/// `TableError::UnknownPlaceholder` — so an unreplaced `{…}` here would mean
 /// a param the model never supplied, which the missing-param refusal catches
-/// first.
-fn confirmation(row: &CommandRow, params: &[ResolvedParam]) -> String {
-    let mut sentence = row.confirmation.clone();
-    for param in params {
-        sentence = sentence.replace(&format!("{{{}}}", param.name), &param.label);
+/// before this is called. Anything that is not a well-formed `{name}` is copied
+/// through verbatim, which is what a hand-built [`CommandRow`] in a test gets.
+fn report(row: &CommandRow, params: &[ResolvedParam]) -> String {
+    let mut out = String::with_capacity(row.report.len());
+    let mut rest = row.report.as_str();
+    while let Some(open) = rest.find('{') {
+        let (before, after_open) = rest.split_at(open);
+        out.push_str(before);
+        let body = &after_open[1..];
+        let Some(close) = body.find('}') else {
+            // No closing brace at all: the remainder is literal text.
+            out.push_str(after_open);
+            return out;
+        };
+        let name = &body[..close];
+        match params.iter().find(|param| param.name == name) {
+            Some(param) => out.push_str(&param.label),
+            None => out.push_str(&after_open[..close + 2]),
+        }
+        rest = &body[close + 1..];
     }
-    sentence
+    out.push_str(rest);
+    out
 }
 
 impl ParamKind {
@@ -635,7 +671,7 @@ mod tests {
 
     #[tokio::test]
     async fn voice_outcome_dispatch_sentence_names_the_agent_the_deck_shows() {
-        // The confirmation interpolates the DISPLAY name, not what was said, so
+        // The report interpolates the DISPLAY name, not what was said, so
         // "the one called tester" confirms as the deck spells it.
         let mut agents = fleet();
         agents[0].display_name = Some("Release Tester".to_string());
@@ -898,6 +934,65 @@ mod tests {
         );
     }
 
+    /// The report template is rendered in ONE pass, so a label cannot be
+    /// substituted into.
+    ///
+    /// An agent's display name is whatever the user renamed it to, so a label
+    /// carrying `{…}` is reachable rather than theoretical. Under a
+    /// `replace`-per-param render the second param's pass would walk over the
+    /// first param's inserted label and rewrite it, making the rendered
+    /// sentence depend on the order the params happen to be declared in.
+    #[test]
+    fn voice_outcome_a_report_renders_in_one_pass_over_its_template() {
+        let row = CommandRow {
+            id: "two_params".to_string(),
+            description: "d".to_string(),
+            invoke: "twoParams".to_string(),
+            screens: vec![Screen::Deck],
+            unavailable_hint: "h".to_string(),
+            report: "{first} then {second}.".to_string(),
+            params: Vec::new(),
+        };
+        let param = |name: &str, label: &str| ResolvedParam {
+            name: name.to_string(),
+            kind: ParamKind::AgentRef,
+            spoken: name.to_string(),
+            value: name.to_string(),
+            label: label.to_string(),
+        };
+
+        // The hostile case: the first label names the second param.
+        assert_eq!(
+            report(
+                &row,
+                &[param("first", "{second}"), param("second", "tester")],
+            ),
+            "{second} then tester.",
+        );
+        // And the ordinary one still renders.
+        assert_eq!(
+            report(&row, &[param("first", "alpha"), param("second", "beta")]),
+            "alpha then beta.",
+        );
+
+        // A placeholder with no matching param is copied through verbatim
+        // rather than swallowed. A parsed table cannot produce one — that is
+        // `TableError::UnknownPlaceholder` — so this covers a hand-built row.
+        assert_eq!(
+            report(&row, &[param("first", "alpha")]),
+            "alpha then {second}."
+        );
+        // An unclosed brace is likewise literal text, not a panic.
+        let unclosed = CommandRow {
+            report: "Opening {agent.".to_string(),
+            ..row.clone()
+        };
+        assert_eq!(
+            report(&unclosed, &[param("agent", "tester")]),
+            "Opening {agent."
+        );
+    }
+
     #[test]
     fn voice_outcome_transcription_failure_has_its_own_sentence() {
         let outcome = VoiceOutcome::transcription_failed("no transcription backend is configured");
@@ -926,7 +1021,7 @@ mod tests {
                 transcript: transcript.clone(),
                 action: row.id.clone(),
                 invoke: row.invoke.clone(),
-                sentence: confirmation(row, std::slice::from_ref(&param)),
+                sentence: report(row, std::slice::from_ref(&param)),
                 params: vec![param],
             },
             VoiceOutcome::unavailable(transcript.clone(), row),

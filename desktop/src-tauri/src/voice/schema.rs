@@ -266,7 +266,7 @@ mod tests {
             "description = \"Works anywhere.\"",
             "invoke = \"anywhere\"",
             "unavailable_hint = \"unreachable\"",
-            "confirmation = \"Done.\"",
+            "report = \"Done.\"",
         ]
         .join("\n");
         let parsed = CommandTable::parse(&source).expect("parses");
@@ -315,15 +315,15 @@ mod tests {
     }
 
     #[test]
-    fn voice_schema_never_leaks_the_confirmation_wording_to_the_model() {
+    fn voice_schema_never_leaks_the_report_wording_to_the_model() {
         // The app renders every user-facing sentence. The model is given the
         // hint (so it can reason about availability) and nothing it could
         // parrot back as prose.
         let schema = tool_schema(table(), Screen::Deck).to_string();
         for row in table().rows() {
             assert!(
-                !schema.contains(&row.confirmation),
-                "`{}`'s confirmation reached the model",
+                !schema.contains(&row.report),
+                "`{}`'s report reached the model",
                 row.id
             );
         }

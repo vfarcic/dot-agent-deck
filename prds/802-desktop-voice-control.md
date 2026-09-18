@@ -1,6 +1,6 @@
 # PRD #802: Voice control for the desktop app
 
-**Status**: Not started — this document was written first and is what implementation is delegated against
+**Status**: In progress — this document was written first and is what implementation is delegated against
 **Priority**: Medium (its hard dependency, [PRD #803](803-desktop-settings-surface.md), has shipped; nothing is blocked on this)
 **Created**: 2026-09-18
 
@@ -60,7 +60,7 @@ Three consumers read that one file, which is what keeps it one file: **schema ge
 - **Any bundled native inference engine.** No `whisper-rs`, no `llama-cpp-2`, no model files. See [Dependency cost](#dependency-cost-and-the-one-native-dependency-this-pr-does-take) for why this is a staging decision about `desktop/src-tauri` being a workspace member rather than a change of direction.
 - **Model download management** — progress, retry, disk-usage visibility, removal. With no bundled engine in this PR, nothing downloads; this arrives with the local engines that need it.
 - **The remaining two activation modes**, hold-to-talk and always-on with voice-activity detection.
-- **Destructive commands.** Approve/deny a permission prompt, close a pane, stop an agent — none of them gets a row here.
+- **Destructive commands.** Approve/deny a permission prompt, close an agent's **terminal pane**, stop an agent — none of them gets a row here; they are D5, behind a confirmation. **"Close a pane" is one word away in speech from something that IS in scope, so name both operations rather than leaving the next reader to infer the split.** Closing an agent's *terminal pane* destroys a PTY and stops work: lifecycle, destructive, deferred. Dismissing the agent *view* — the screen overlaying the deck — is `closeAgent` in `desktop/src/App.tsx`, which is `setView({ kind: from })` and nothing else: it destroys nothing and stops nothing, so it is navigation in exactly the sense the other three rows are, and it ships here as `close_agent_view`. The hazard is real because [#1105](https://github.com/vfarcic/dot-agent-deck/issues/1105) calls the overlay "the agent pane", so the same word points at both sides of this line. Two things follow from keeping the row beyond the classification: without it the `agent` screen has **no callable command at all**, which is a functional hole rather than a coverage one, and the `callable: true` path on that screen would be exercised by nothing. Its `description` says in as many words that it does not stop the agent and does not close its terminal pane, and that sentence is doing real work on the model.
 - **Modal dictation** ("type to the tester" until "finished with that agent").
 - **Discovery** — contextual examples rendered from the table.
 - **Chaining.** The table knows a command's prerequisite, so the app can *offer* the next step; performing that chain automatically is deliberately absent, because a single utterance silently performing two operations is where a misfire gets expensive.
@@ -100,6 +100,7 @@ to focus on, enlarge, zoom, or see only one agent."""
 invoke      = "openAgent"               # an entry in VOICE_ACTIONS
 screens     = ["deck", "overview"]      # absent or empty = available everywhere
 unavailable_hint = "opening an agent works from the deck or the overview"
+report      = "Opening {agent}."        # the sentence shown on a SUCCESSFUL dispatch
 
   [[commands.params]]
   name = "agent"
@@ -108,11 +109,15 @@ unavailable_hint = "opening an agent works from the deck or the overview"
 
 **The `description` column is a prompt, not documentation.** The model picks on it, so it is written for a model and reviewed as an interface.
 
+**The `report` column is the success sentence, and without it the "the app renders every sentence" property is lost.** Every *refusal* has somewhere to get its wording — `unavailable_hint` for the not-here case, fixed prose in `outcome.rs` for the rest — and success had nowhere, so the surface would have had to invent success wording in the frontend. A `{param}` placeholder is replaced with what that param resolved to, and a placeholder naming no declared param is refused at parse time: that is the same stringly-reference discipline `invoke` gets from the guard, applied to the one column carrying a reference inside itself.
+
+**It is called `report`, not `confirmation`, and the name is load-bearing.** [D5](#milestones) is *destructive commands behind confirmation* — an actual confirm-before-acting dialog — so rows carrying a genuine confirmation flag will live in this same file. The two are close to opposite: a report describes a completed action, a confirmation blocks one before it happens. The name also matches the pipeline's own stage 6, **Report**. `commands.toml` carries a one-line comment at the column saying so, because the rename is otherwise easy to undo.
+
 The three consumers:
 
 1. **Schema generation** — `id`, `description` and `params` become the model's tool definition.
 2. **Validation** — `screens` and each param `kind` check the model's answer before anything runs.
-3. **Dispatch** — `invoke` names the action to run, and the app calls it with the resolved params.
+3. **Dispatch** — `invoke` names the action to run, and the app calls it with the resolved params; `report` is the sentence it shows afterwards.
 
 ### Dispatch: the `invoke` column names a FRONTEND action, and the issue's wording is wrong about this
 
@@ -145,7 +150,23 @@ The model returns structure — `{"action": "open_agent", "callable": false}` �
 
 **A failure must say what it heard** — "Heard: *'go beck'* — no matching action." Most failures are transcription rather than intent, and showing the transcript turns a dead end into a correction.
 
-Concretely, the Rust side returns one closed-set outcome per utterance: the transcript, plus one of *dispatch this action with these params*, *this action exists and is not callable here, here is the hint*, *no matching action*, or *transcription failed*. The frontend dispatches on the first and renders the sentence the outcome carries. Rust renders the sentences because Rust holds the table; the frontend renders no voice prose of its own.
+Concretely, the Rust side returns one closed-set outcome per utterance, each carrying its own rendered sentence. The frontend dispatches on the first and renders the sentence the outcome carries. Rust renders the sentences because Rust holds the table; the frontend renders no voice prose of its own.
+
+**There are nine of them, not four, and the four this document first listed cannot express the other five.** M1 found that out by building them: a missing param, a param that resolves to nothing, a param that resolves to more than one thing, a backend that could not answer at all, and a backend that named an action outside the table are five genuinely distinct situations, and each of the first four needs a different sentence from the user's point of view. Collapsing them into *no matching action* would tell a user "I don't know how to do that" when the truth is "I could not tell which agent you meant" or "nothing configured yet".
+
+| outcome | what happened | carries |
+| --- | --- | --- |
+| **Dispatch** | run this action with these params — the one outcome that asks for anything to run | transcript, action, `invoke`, resolved params, the row's `report` |
+| **Unavailable** | the action exists and this screen cannot run it | transcript, action, the row's `unavailable_hint` |
+| **NoMatch** | the model answered "none of these" | transcript |
+| **UnknownAction** | the model named an action that is not in the table | transcript, the action it named |
+| **ParamMissing** | the action declares a param and the model supplied none | transcript, action, param |
+| **ParamUnresolved** | a param was supplied and nothing in live state matches it | transcript, action, param, what was spoken |
+| **ParamAmbiguous** | a param was supplied and more than one thing matches it | transcript, action, param, what was spoken, the matches |
+| **ResolutionFailed** | the intent backend could not answer — unconfigured, timed out, unparseable | transcript, detail |
+| **TranscriptionFailed** | speech could not be turned into text; upstream of everything else, so the one outcome with no transcript | detail |
+
+**`UnknownAction` and `NoMatch` deliberately render the SAME sentence while staying separate variants, and that is not a redundancy to simplify away.** The *cause* differs and the *effect* does not: a model that invents an action id is a backend not honouring the enum — impossible under grammar-constrained decoding, merely unlikely under the print-mode agent CLI — while a no-match is the escape working exactly as designed. From where the user is standing both mean the app did not know how to do what they asked, so both say so. Keeping them apart is what lets a fixture, a log or a future metric tell a misbehaving backend from a genuine no-match; merging them would throw that away to save one variant.
 
 ### Screens: the smallest honest closed set is three
 
@@ -368,7 +389,7 @@ Rule 4's vocabulary is the Rust TUI's — L1 is `insta` + `TestBackend`, L2 is P
 
 **In this PR.** Each is independently deliverable and testable, and they are ordered so the riskiest platform-specific work is last rather than first.
 
-- [ ] **M1 — The table and its three consumers, Rust-side.** `commands.toml` with `include_str!`, the parse and its rejections, generated single-tool enum schema, the `callable` computation from `screens` against a given screen, validation of action and params, and resolution of `invoke` to an action id plus params. No model, no capture, no UI: the resolver seam takes a transcript and returns an outcome, and a stub resolver stands in. Rust tests for every rejection and every outcome variant.
+- [x] **M1 — The table and its three consumers, Rust-side.** `commands.toml` with `include_str!`, the parse and its rejections, generated single-tool enum schema, the `callable` computation from `screens` against a given screen, validation of action and params, and resolution of `invoke` to an action id plus params. No model, no capture, no UI: the resolver seam takes a transcript and returns an outcome, and a stub resolver stands in. Rust tests for every rejection and every outcome variant.
 - [ ] **M2 — The frontend action registry, and the palette moved into it.** `desktop/src/lib/voiceActions.ts` exporting `VOICE_ACTIONS`, with the rail buttons and the command palette's `commandItems` (`desktop/src/App.tsx:1043-1053`) dispatching through it. **This is what makes the capability definition real rather than a parallel list**, so it lands before the guard. No behaviour change visible to a user; vitest proves each moved control still does what it did.
 - [ ] **M3 — The guard.** `linkage-check` numbered rule **13** plus a `#[cfg(test)]` module holding the scanner's own tests, including planted-bad-input tests for each assertion so "no findings" is meaningful. Covers `invoke` ↔ registry, `screens` ↔ `DeckView`'s `kind` literals, param `kind` ↔ the closed set, and every registry entry classified by a row or a `no_voice` marker.
 - [ ] **M4 — The `[voice]` settings section and the `SecretStore`.** The section struct with all-allowlisted types, closed enums for the backend and mode choices, the panel component, one `SETTINGS_SECTIONS` row, the `PINNED_TS_FIELDS` and `normalizeDesktopSettings` extensions, and the `SecretStore` #803 M5 named — store/load/delete over the OS keychain, with a documented non-silent failure path where no Secret Service exists. Any edit to `ALLOWED_FIELD_TYPES` arrives here with its written reason.
@@ -431,3 +452,15 @@ Written from [#802](https://github.com/vfarcic/dot-agent-deck/issues/802) read a
 **#803's credential guard will go red when this PRD adds a `String`, and its own module docs say so.** That turned the settings work from "add a section" into "add a section whose every field is a closed enum, and build the `SecretStore` #803 M5 deliberately did not build". Recorded with the guard's four checks read rather than guessed, including that `bool` is not on the fifteen-entry allowlist either, so even a plain on/off field is a deliberate edit with a written reason.
 
 Two decisions were taken before the document and are recorded rather than re-opened: **rule 9's flag question was asked of the user and answered no**, so the issue's `## Rule 9` section is superseded and this surface ships visible by default; and **the PRD is written first and implemented against**, with milestones as the unit of delegation.
+
+### 2026-09-18 — M1 shipped, and three corrections to this document
+
+**M1 landed** as `desktop/src-tauri/src/voice/` — `commands.toml` with `include_str!`, the parse and its twelve named rejections, the single-tool enum schema, the `callable` computation, validation, param resolution against the live snapshot, and the outcome-to-sentence rendering, with a `StubResolver` standing in for a model. Three things it found are corrections to this document rather than to the code, and they are recorded here so M2/M3/M6 build against the corrected shape.
+
+**The outcome set is nine, not four.** The four listed above could not express a missing param, a param that resolves to nothing, a param that resolves to more than one thing, a backend that could not answer, or a backend that named an action outside the table — and each of the first four wants a different sentence. The table above enumerates all nine. `UnknownAction` and `NoMatch` share a sentence and stay separate variants, which is written down so a later reader does not merge them.
+
+**The success-sentence column was added and is called `report`.** The example row in this document had nothing to render on success, so without the column M6 would have invented success wording in the frontend and the "the app renders every sentence" property would have gone with it. `confirmation` was the obvious name and is the wrong one: D5 is *destructive commands behind confirmation*, so a genuine confirm-before-acting flag will live in this same file, and the two are close to opposite. Renamed while M1 was its only dependent.
+
+**`close_agent_view` stays, and the Out of Scope entry now names both operations.** Closing an agent's *terminal pane* is lifecycle and destructive; dismissing the agent *view* is `setView({ kind: from })` and is navigation. #1105's vocabulary calls the overlay "the agent pane", so the distinction is written into the scope entry rather than left to be inferred. Without the row the `agent` screen has no callable command at all.
+
+Also in the same commit: a CLAUDE.md rule 17 sweep over M1's own prose. Four claims were narrowed — the transcript no-logging rule was scoped to a `tracing`/`log` call this crate does not use (it logs with `eprintln!`) and was stated as an established property rather than as the rule it is; `table()`'s "a failure can only be introduced by editing `commands.toml` or the parser" omitted a `toml_edit` bump; and `outcome.rs`'s "every sentence is rendered from the table" was one quantifier too wide, since the table supplies two pieces of wording and fixed prose in that file supplies the rest. The fourth was resolved by changing the code instead of the sentence: the report template now renders in one pass, so a user-chosen agent name containing `{…}` cannot be substituted into by a later param.

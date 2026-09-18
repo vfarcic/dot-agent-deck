@@ -106,7 +106,7 @@ pub struct ParamSpec {
 pub struct CommandRow {
     pub id: String,
     /// A prompt the model picks on, not documentation. Never shown to the user
-    /// — the user-facing wording is [`CommandRow::confirmation`] and
+    /// — the user-facing wording is [`CommandRow::report`] and
     /// [`CommandRow::unavailable_hint`].
     pub description: String,
     /// The frontend action registry entry to dispatch (M2). Stringly typed on
@@ -118,7 +118,14 @@ pub struct CommandRow {
     /// absent `screens` key parses to.
     pub screens: Vec<Screen>,
     pub unavailable_hint: String,
-    pub confirmation: String,
+    /// The sentence a successful dispatch shows — the pipeline's stage 6.
+    ///
+    /// **Named `report` rather than `confirmation` deliberately.** PRD #802's
+    /// D5 is *destructive commands behind confirmation*, so rows in this same
+    /// file will later carry a genuine confirm-before-acting flag, and the two
+    /// are close to opposite: this describes an action that happened, that one
+    /// blocks an action before it does. `commands.toml` says so at the column.
+    pub report: String,
     pub params: Vec<ParamSpec>,
 }
 
@@ -169,7 +176,7 @@ impl CommandTable {
                 .ok_or_else(|| TableError::MissingInvoke { id: id.clone() })?;
             let description = required(row.description, &id, "description")?;
             let unavailable_hint = required(row.unavailable_hint, &id, "unavailable_hint")?;
-            let confirmation = required(row.confirmation, &id, "confirmation")?;
+            let report = required(row.report, &id, "report")?;
 
             let mut screens = Vec::new();
             for screen in row.screens.unwrap_or_default() {
@@ -207,11 +214,11 @@ impl CommandTable {
                 params.push(ParamSpec { name, kind });
             }
 
-            // The confirmation is the one column with a stringly reference
-            // INSIDE it, so it gets the same treatment `invoke` gets from M3's
-            // guard: a placeholder naming no declared param is refused here
-            // rather than rendering as a literal `{agent}` to the user.
-            for placeholder in placeholders(&confirmation, &id)? {
+            // The report is the one column with a stringly reference INSIDE
+            // it, so it gets the same treatment `invoke` gets from M3's guard:
+            // a placeholder naming no declared param is refused here rather
+            // than rendering as a literal `{agent}` to the user.
+            for placeholder in placeholders(&report, &id)? {
                 if !params.iter().any(|param| param.name == placeholder) {
                     return Err(TableError::UnknownPlaceholder {
                         id: id.clone(),
@@ -226,7 +233,7 @@ impl CommandTable {
                 invoke,
                 screens,
                 unavailable_hint,
-                confirmation,
+                report,
                 params,
             });
         }
@@ -256,25 +263,23 @@ fn required(value: Option<String>, id: &str, field: &'static str) -> Result<Stri
         })
 }
 
-/// The `{name}` placeholders in a confirmation, in order.
+/// The `{name}` placeholders in a report, in order.
 ///
 /// There is no escape for a literal `{` and nothing in the table needs one; an
-/// unclosed brace is refused rather than passed through, so a confirmation that
+/// unclosed brace is refused rather than passed through, so a report that
 /// looks interpolated and is not cannot reach a user.
 fn placeholders(text: &str, id: &str) -> Result<Vec<String>, TableError> {
     let mut found = Vec::new();
     let mut rest = text;
     while let Some(open) = rest.find('{') {
         let after = &rest[open + 1..];
-        let close = after
-            .find('}')
-            .ok_or_else(|| TableError::MalformedConfirmation {
-                id: id.to_string(),
-                detail: "an opening `{` with no closing `}`".to_string(),
-            })?;
+        let close = after.find('}').ok_or_else(|| TableError::MalformedReport {
+            id: id.to_string(),
+            detail: "an opening `{` with no closing `}`".to_string(),
+        })?;
         let name = after[..close].trim().to_string();
         if name.is_empty() {
-            return Err(TableError::MalformedConfirmation {
+            return Err(TableError::MalformedReport {
                 id: id.to_string(),
                 detail: "an empty `{}` placeholder".to_string(),
             });
@@ -319,10 +324,10 @@ pub enum TableError {
     MissingParamName { id: String, index: usize },
     /// Two params of one row sharing a `name`.
     DuplicateParam { id: String, param: String },
-    /// A `confirmation` placeholder naming no declared param.
+    /// A `report` placeholder naming no declared param.
     UnknownPlaceholder { id: String, placeholder: String },
-    /// A `confirmation` whose braces do not pair up.
-    MalformedConfirmation { id: String, detail: String },
+    /// A `report` whose braces do not pair up.
+    MalformedReport { id: String, detail: String },
 }
 
 impl fmt::Display for TableError {
@@ -366,10 +371,10 @@ impl fmt::Display for TableError {
             }
             TableError::UnknownPlaceholder { id, placeholder } => write!(
                 f,
-                "command `{id}`'s confirmation names `{{{placeholder}}}`, which is not one of its params"
+                "command `{id}`'s report names `{{{placeholder}}}`, which is not one of its params"
             ),
-            TableError::MalformedConfirmation { id, detail } => {
-                write!(f, "command `{id}`'s confirmation has {detail}")
+            TableError::MalformedReport { id, detail } => {
+                write!(f, "command `{id}`'s report has {detail}")
             }
         }
     }
@@ -387,16 +392,18 @@ fn joined<'a>(values: impl Iterator<Item = &'a str>) -> String {
 /// The embedded table, parsed once at first use.
 ///
 /// `OnceLock` at first use rather than eagerly at startup, deliberately. The
-/// source is `include_str!`d, so its bytes are fixed when the binary is built:
-/// there is no runtime input here at all, and a failure can only be introduced
-/// by editing `commands.toml` or the parser above it. Either way
-/// `voice_table_embedded_table_parses` below refuses it, under `cargo test-fast
-/// --workspace` and therefore in the required `build` job. So for a build that
-/// went through that gate, being lazy defers no failure onto a user; it just
-/// means a desktop process that never speaks never parses, and voice is opt-in.
+/// source is `include_str!`d, so its bytes are fixed when the binary is built
+/// and nothing a user does at run time reaches this parse. A failure therefore
+/// arrives with a source change — `commands.toml`, the parser above it, or a
+/// `toml_edit` bump that changes what its deserializer accepts — rather than
+/// with an input, and `voice_table_embedded_table_parses` below refuses each of
+/// those under `cargo test-fast --workspace` and therefore in the required
+/// `build` job. So for a build that went through that gate, being lazy defers
+/// no failure onto a user; it just means a desktop process that never speaks
+/// never parses, and voice is opt-in.
 ///
-/// It panics rather than returning a `Result` for the same reason: there is no
-/// runtime input here for a caller to handle differently, and a `Result` every
+/// It panics rather than returning a `Result` for the same reason: there is
+/// nothing here a caller could handle differently, and a `Result` every
 /// call site has to thread would be a permanent cost paid against a case the
 /// gate above already refuses. The message names the file and the rejection, so
 /// whoever broke the table reads what they broke.
@@ -421,7 +428,7 @@ mod tests {
             "invoke = \"openAgent\"",
             "screens = [\"deck\"]",
             "unavailable_hint = \"it works from the deck\"",
-            "confirmation = \"Opening {agent}.\"",
+            "report = \"Opening {agent}.\"",
             "",
             "[[commands.params]]",
             "name = \"agent\"",
@@ -609,7 +616,7 @@ mod tests {
                 "unavailable_hint = \"it works from the deck\"\n",
                 "unavailable_hint",
             ),
-            ("confirmation = \"Opening {agent}.\"\n", "confirmation"),
+            ("report = \"Opening {agent}.\"\n", "report"),
         ] {
             let source = one_row().replace(line, "");
             let error = CommandTable::parse(&source).expect_err("refused");
@@ -698,10 +705,10 @@ mod tests {
     }
 
     #[test]
-    fn voice_table_rejects_a_confirmation_placeholder_that_names_no_param() {
+    fn voice_table_rejects_a_report_placeholder_that_names_no_param() {
         let source = one_row().replace(
-            "confirmation = \"Opening {agent}.\"",
-            "confirmation = \"Opening {pane}.\"",
+            "report = \"Opening {agent}.\"",
+            "report = \"Opening {pane}.\"",
         );
         let error = CommandTable::parse(&source).expect_err("refused");
         assert_eq!(
@@ -714,27 +721,24 @@ mod tests {
     }
 
     #[test]
-    fn voice_table_rejects_an_unclosed_confirmation_placeholder() {
+    fn voice_table_rejects_an_unclosed_report_placeholder() {
         let source = one_row().replace(
-            "confirmation = \"Opening {agent}.\"",
-            "confirmation = \"Opening {agent.\"",
+            "report = \"Opening {agent}.\"",
+            "report = \"Opening {agent.\"",
         );
         let error = CommandTable::parse(&source).expect_err("refused");
         assert!(
-            matches!(error, TableError::MalformedConfirmation { .. }),
+            matches!(error, TableError::MalformedReport { .. }),
             "got {error:?}"
         );
     }
 
     #[test]
-    fn voice_table_rejects_an_empty_confirmation_placeholder() {
-        let source = one_row().replace(
-            "confirmation = \"Opening {agent}.\"",
-            "confirmation = \"Opening {}.\"",
-        );
+    fn voice_table_rejects_an_empty_report_placeholder() {
+        let source = one_row().replace("report = \"Opening {agent}.\"", "report = \"Opening {}.\"");
         let error = CommandTable::parse(&source).expect_err("refused");
         assert!(
-            matches!(error, TableError::MalformedConfirmation { .. }),
+            matches!(error, TableError::MalformedReport { .. }),
             "got {error:?}"
         );
     }
@@ -860,7 +864,7 @@ struct RawCommand {
     invoke: Option<String>,
     screens: Option<Vec<String>>,
     unavailable_hint: Option<String>,
-    confirmation: Option<String>,
+    report: Option<String>,
     #[serde(default)]
     params: Vec<RawParam>,
 }

@@ -42,12 +42,19 @@ pub use table::{CommandRow, CommandTable, NO_MATCH_ACTION, ParamKind, ParamSpec,
 /// What the user said, as text — from the microphone through the `Transcriber`
 /// seam (M7), or typed into the same box.
 ///
-/// **The rule: nothing in this feature hands a transcript, an utterance or an
-/// audio buffer to a `tracing`/`log` call — not as a field, not inside a
-/// message, not at `debug` and not at `trace`.** (PRD #802 Open Question 5,
-/// answered: no part of an utterance is persisted or logged, anywhere, at any
-/// level.) It lives in memory for the session's UI, and the one place it is
-/// meant to appear is the no-match sentence the app renders back to the user.
+/// **The rule this feature adopts: no transcript, utterance or audio buffer is
+/// written to a log or to disk.** That covers `eprintln!`, which is how this
+/// crate logs today (`lib.rs` and `settings.rs` between them are its only log
+/// calls, and neither `tracing` nor `log` is a dependency of it), and it covers
+/// whatever replaces it. A transcript lives in memory for the session's UI, and
+/// the one place it is meant to appear is the sentence the app renders back to
+/// the user.
+///
+/// It is a **rule**, not a property M1 can assert: the code that could break it
+/// — the backends (M5), the surface (M6), the microphone (M7) — is not written
+/// yet. PRD #802's Open Question 5 asks whether any part of an utterance is
+/// persisted; this is the answer being proposed, and M6 owes it to the docs
+/// either way.
 ///
 /// [`fmt::Debug`] is written by hand and prints no content, so a DERIVED
 /// `{:?}` on a type containing a transcript prints none either. That closes the
