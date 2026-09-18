@@ -13,7 +13,7 @@
       "environment": {
         "GITHUB_PAT": "{env:GITHUB_TOKEN}"
       },
-      "enabled": true
+      "enabled": false
     }
   },
   "permission": {
