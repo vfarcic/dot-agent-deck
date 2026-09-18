@@ -1,240 +1,348 @@
-import clsx from 'clsx';
-import Link from '@docusaurus/Link';
-import useDocusaurusContext from '@docusaurus/useDocusaurusContext';
 import Layout from '@theme/Layout';
-import Tabs from '@theme/Tabs';
-import TabItem from '@theme/TabItem';
+import Link from '@docusaurus/Link';
+import {
+  agents,
+  agentsNote,
+  audience,
+  desktop,
+  docLinks,
+  installCommand,
+  installRoutes,
+  platforms,
+  principles,
+  product,
+  screenshots,
+  why,
+  workflow,
+} from '@site/src/data/landing-content';
 import styles from './index.module.css';
 
-const features = [
+/**
+ * The landing page (issue #1021).
+ *
+ * Direction C -- bold product marketing, drawing on linear.app, raycast.com
+ * and warp.dev -- promoted from `/style/c` after the four candidates were
+ * compared. It optimises for a first-time visitor who has never heard of this:
+ * the pitch lands before the specification does.
+ *
+ * The `/` <-> `/docs` relationship is SHARED CHROME, chosen rather than
+ * inherited. The page renders inside `@theme/Layout`, so the navbar and the
+ * footer are the docs' own and nothing moves when a visitor clicks through.
+ * Everything between them is this page's: full-bleed bands, its own colour and
+ * type tokens, its own background. The last band ("The door into the docs",
+ * carried over from candidate D) says the handoff out loud and hands the
+ * visitor six specific pages instead of a bare "Docs" link.
+ *
+ * All copy comes from `src/data/landing-content.js` so the corrected facts
+ * live in one place, and so do the screenshot paths, the alt text and the
+ * captions -- which are written against the frames themselves, so a recapture
+ * that changes what a frame shows is a one-file correction.
+ */
+
+/** The pages the closing panel hands the visitor, in the order to read them. */
+const doorPages = [
   {
-    title: 'Real-time Monitoring',
-    description:
-      'See status, active tool, working directory, and last prompt for every agent session — updated in real time.',
+    to: docLinks.gettingStarted,
+    title: 'Getting started',
+    body: 'Install it, open your first pane, and read the card it gives you.',
   },
   {
-    title: 'Keyboard-Driven',
-    description:
-      'Vim-style navigation with single-key actions. Create, focus, close, and rename panes without leaving the dashboard.',
+    to: docLinks.orchestration,
+    title: 'Orchestration',
+    body: 'Roles, delegation, and letting one agent run the others.',
   },
   {
-    title: 'Multi-Agent Support',
-    description:
-      'Works with Claude Code and OpenCode out of the box. Auto-installed hooks get you running in one command.',
+    to: docLinks.modes,
+    title: 'Workspace modes',
+    body: 'Pair an agent with the side panes you want beside it.',
   },
   {
-    title: 'Single Binary',
-    description:
-      'No external terminal multiplexer needed. dot-agent-deck is a single binary with native embedded terminal panes.',
+    to: docLinks.keyboard,
+    title: 'Keyboard shortcuts',
+    body: 'The full key map, and the TOML that rebinds most of it.',
+  },
+  {
+    to: docLinks.remote,
+    title: 'Remote environments',
+    body: 'Run the deck on another machine over ssh, and leave the agents there.',
+  },
+  {
+    to: docLinks.configuration,
+    title: 'Configuration',
+    body: 'Environment variables, defaults, and the .dot-agent-deck.toml a project carries.',
   },
 ];
 
-function HomepageHero() {
-  const { siteConfig } = useDocusaurusContext();
+function InstallPill({command}) {
   return (
-    <header className={clsx('hero', styles.heroBanner)}>
-      <div className="container">
-        <p className={styles.brandName}>DevOps Toolkit</p>
-        <h1 className="hero__title">{siteConfig.title}</h1>
-        <p className="hero__subtitle">{siteConfig.tagline}</p>
-        <div className={styles.buttons}>
-          <Link
-            className="button button--secondary button--lg"
-            to="/docs/getting-started"
-          >
-            Get Started
-          </Link>
-          <Link
-            className="button button--secondary button--outline button--lg"
-            href="https://github.com/vfarcic/dot-agent-deck"
-          >
-            GitHub
-          </Link>
-        </div>
-      </div>
-    </header>
-  );
-}
-
-function Feature({ title, description }) {
-  return (
-    <div className={clsx('col col--3')}>
-      <div className="text--center padding-horiz--md padding-vert--lg">
-        <h3>{title}</h3>
-        <p>{description}</p>
-      </div>
+    <div className={styles.installPill}>
+      <span className={styles.installSigil} aria-hidden="true">
+        $
+      </span>
+      <code>{command}</code>
     </div>
   );
 }
 
-function HomepageFeatures() {
-  return (
-    <section className={styles.features}>
-      <div className="container">
-        <div className="row">
-          {features.map((props, idx) => (
-            <Feature key={idx} {...props} />
-          ))}
-        </div>
-      </div>
-    </section>
-  );
-}
-
-function HomepageScreenshot() {
-  return (
-    <section className={styles.screenshot}>
-      <div className="container">
-        <img
-          src="/img/orchestration-coder.png"
-          alt="Agent Deck orchestrating multiple agents in parallel — orchestrator and coder both working"
-          className={styles.screenshotImage}
-        />
-      </div>
-    </section>
-  );
-}
-
-function HomepageWhy() {
-  return (
-    <section className={styles.why}>
-      <div className="container">
-        <div className={styles.whyContent}>
-          <h2 className="text--center">Why Agent Deck</h2>
-          <p>
-            Running one AI agent at a time, you're still a software engineer who
-            happens to use AI. Running five at once, you stop being one. You
-            become a project manager supervising a team, a tech lead unblocking
-            them, an architect designing the approach, a product manager
-            deciding what to build.
-          </p>
-          <p>
-            The agents write the code. Your job is everything around it —
-            defining the work up front, supervising it in flight, and
-            validating that the right thing got built. None of this is new.
-            It's the same craft people have practiced for decades. The team
-            just looks different.
-          </p>
-          <p>
-            Agent Deck is the tool that lets you do that without losing your
-            mind. One dashboard, every agent visible at a glance,
-            keyboard-driven, in the terminal you already use, with the agent
-            client you already know.
-          </p>
-        </div>
-      </div>
-    </section>
-  );
-}
-
-const principles = [
-  {
-    title: 'Runs in your terminal',
-    description:
-      'Ghostty, iTerm2, Alacritty, Kitty, WezTerm — whatever you already configured. Agent Deck is a guest, not a replacement.',
-  },
-  {
-    title: 'Uses your agent client',
-    description:
-      'Claude Code or OpenCode — keep the shortcuts, skills, and configs you already dialed in. No new agent client to learn.',
-  },
-  {
-    title: 'Focus-mode side panes',
-    description:
-      'Pair an agent with live test runs, log tails, or kubectl watches via per-project TOML config. Deep-diving on one agent doesn\u2019t mean opening a dozen extra terminals.',
-  },
-  {
-    title: 'No buttons',
-    description:
-      'Every action is one or two keystrokes away. Managing a team of agents has to fit in muscle memory \u2014 mouse-clicking breaks flow.',
-  },
-];
-
-function HomepagePrinciples() {
-  return (
-    <section className={styles.principles}>
-      <div className="container">
-        <h2 className="text--center">Design Principles</h2>
-        <div className="row">
-          {principles.map((p, idx) => (
-            <div key={idx} className="col col--3">
-              <div className="padding-horiz--md padding-vert--md">
-                <h3>{p.title}</h3>
-                <p>{p.description}</p>
-              </div>
-            </div>
-          ))}
-        </div>
-      </div>
-    </section>
-  );
-}
-
-function HomepageQuickStart() {
-  return (
-    <section className={styles.quickStart}>
-      <div className="container">
-        <h2 className="text--center">Quick Start</h2>
-        <div className={styles.tabsWrapper}>
-          <Tabs groupId="os" defaultValue="macos">
-            <TabItem value="macos" label="macOS">
-              <pre>
-                <code>
-                  {`# 1. Install via Homebrew
-brew tap vfarcic/tap && brew install dot-agent-deck
-
-# 2. Launch the dashboard
-dot-agent-deck`}
-                </code>
-              </pre>
-            </TabItem>
-            <TabItem value="linux" label="Linux">
-              <pre>
-                <code>
-                  {`# 1. Install via Homebrew (if available)
-brew tap vfarcic/tap && brew install dot-agent-deck
-
-# 2. Launch the dashboard
-dot-agent-deck`}
-                </code>
-              </pre>
-            </TabItem>
-            <TabItem value="windows" label="Windows">
-              <p className={styles.tabNote}>
-                Native Windows is{' '}
-                <Link href="https://github.com/vfarcic/dot-agent-deck/issues/42">coming soon</Link>.
-                For now, install{' '}
-                <Link href="https://learn.microsoft.com/en-us/windows/wsl/install">WSL</Link>{' '}
-                and follow the Linux instructions inside your WSL shell.
-              </p>
-            </TabItem>
-          </Tabs>
-        </div>
-        <div className={styles.installCallout}>
-          <strong>Prebuilt binaries and source builds</strong> are also
-          available for macOS and Linux.{' '}
-          <Link to="/docs/installation">See all install options &rarr;</Link>
-        </div>
-      </div>
-    </section>
-  );
-}
-
 export default function Home() {
-  const { siteConfig } = useDocusaurusContext();
   return (
     <Layout
-      title={siteConfig.title}
-      description={siteConfig.tagline}
-    >
-      <HomepageHero />
-      <main>
-        <HomepageScreenshot />
-        <HomepageWhy />
-        <HomepageFeatures />
-        <HomepagePrinciples />
-        <HomepageQuickStart />
-      </main>
+      title="Run your coding agents in parallel"
+      description={product.tagline}>
+      <div className={styles.page}>
+        <header className={styles.hero}>
+          <div className={styles.spotlight} aria-hidden="true" />
+          <div className={styles.heroInner}>
+            <p className={styles.eyebrow}>
+              <span className={styles.dot} aria-hidden="true" />
+              Open source · MIT · written in Rust
+            </p>
+            <h1 className={styles.heroTitle}>
+              Stop watching one agent.
+              <br />
+              <span className={styles.heroTitleAccent}>Run the whole team.</span>
+            </h1>
+            <p className={styles.heroLede}>{product.shortDefinition}</p>
+            <div className={styles.ctaRow}>
+              <Link className={styles.ctaPrimary} to={docLinks.gettingStarted}>
+                Get started
+              </Link>
+              <Link className={styles.ctaGhost} href={product.repo}>
+                Star on GitHub
+              </Link>
+            </div>
+            <InstallPill command={installCommand} />
+          </div>
+        </header>
+
+        <main>
+          <section className={styles.showcase}>
+            <figure className={styles.device}>
+              <div className={styles.deviceBar} aria-hidden="true">
+                <span className={styles.light} />
+                <span className={styles.light} />
+                <span className={styles.light} />
+                <span className={styles.deviceTitle}>{product.binary}</span>
+              </div>
+              <img
+                className={styles.deviceImage}
+                src={screenshots.hero.src}
+                alt={screenshots.hero.alt}
+              />
+            </figure>
+            <p className={styles.showcaseCaption}>{screenshots.hero.caption}</p>
+          </section>
+
+          <section className={styles.agentStrip}>
+            <p className={styles.agentStripLabel}>
+              Drives the client you already use
+            </p>
+            <ul className={styles.agentStripList}>
+              {agents.map((a) => (
+                <li key={a.name}>
+                  <Link href={a.href}>{a.name}</Link>
+                  <span className={styles.agentHow}>{a.integration}</span>
+                </li>
+              ))}
+            </ul>
+            <p className={styles.agentStripNote}>{agentsNote}</p>
+          </section>
+
+          <section className={styles.why}>
+            <h2 className={styles.sectionTitle}>{why.heading}</h2>
+            <p className={styles.pullQuote}>{why.paragraphs[0]}</p>
+            <div className={styles.whyRest}>
+              {why.paragraphs.slice(1).map((p, i) => (
+                <p key={i}>{p}</p>
+              ))}
+            </div>
+          </section>
+
+          <section className={styles.story} aria-labelledby="story-title">
+            {/*
+              * The four steps are <h3>s, so the section needs an <h2> above
+              * them or the document outline jumps a level. The design has no
+              * room for a visible one between the pull quote and the first
+              * row, so it is visually hidden rather than dropped.
+              */}
+            <h2 id="story-title" className={styles.visuallyHidden}>
+              How it works
+            </h2>
+            {workflow.map((step, i) => (
+              <div
+                key={step.step}
+                className={i % 2 === 0 ? styles.storyRow : styles.storyRowFlip}>
+                <div className={styles.storyText}>
+                  <span className={styles.storyStep}>{step.step}</span>
+                  <h3>{step.title}</h3>
+                  <p>{step.body}</p>
+                </div>
+                <figure className={styles.storyFigure}>
+                  <img src={step.shot.src} alt={step.shot.alt} loading="lazy" />
+                  <figcaption>{step.shot.caption}</figcaption>
+                </figure>
+              </div>
+            ))}
+          </section>
+
+          <section className={styles.audience}>
+            <div className={styles.audienceInner}>
+              <h2 className={styles.sectionTitle}>{audience.heading}</h2>
+              <ul className={styles.audienceList}>
+                {audience.forYou.map((line) => (
+                  <li key={line}>
+                    <span className={styles.check} aria-hidden="true">
+                      ✓
+                    </span>
+                    {line}
+                  </li>
+                ))}
+              </ul>
+              <p className={styles.audienceNot}>{audience.notYou}</p>
+            </div>
+          </section>
+
+          <section className={styles.principles}>
+            <h2 className={styles.sectionTitle}>Four decisions that shaped it</h2>
+            <div className={styles.principleGrid}>
+              {principles.map((p, i) => (
+                <article key={p.title} className={styles.principleCard}>
+                  <span className={styles.principleNum}>{`0${i + 1}`}</span>
+                  <h3>{p.title}</h3>
+                  <p>{p.description}</p>
+                </article>
+              ))}
+            </div>
+          </section>
+
+          <section className={styles.desktop}>
+            <div className={styles.desktopInner}>
+              <span className={styles.alphaBadge}>Alpha</span>
+              <h2 className={styles.sectionTitle}>{desktop.heading}</h2>
+              <p className={styles.desktopLede}>{desktop.intro}</p>
+              <div className={styles.desktopGrid}>
+                {desktop.caveats.map((c) => (
+                  <div key={c.title} className={styles.desktopCaveat}>
+                    <h3>{c.title}</h3>
+                    <p>{c.body}</p>
+                  </div>
+                ))}
+              </div>
+              <p className={styles.desktopFiles}>
+                {desktop.artifacts.map((a) => (
+                  <code key={a.file}>{a.file}</code>
+                ))}
+              </p>
+              <p className={styles.desktopProvenance}>{desktop.provenanceNote}</p>
+              <InstallPill command={desktop.provenanceCommand} />
+              <p className={styles.desktopProvenanceScope}>
+                {desktop.provenanceScope}
+              </p>
+              <p className={styles.desktopLink}>
+                <Link href={product.releases}>Get it from the latest release →</Link>
+              </p>
+            </div>
+          </section>
+
+          <section className={styles.install}>
+            <div className={styles.installInner}>
+              <h2 className={styles.sectionTitle}>Runs where you work</h2>
+              <div className={styles.installCols}>
+                <div className={styles.installCol}>
+                  <h3 className={styles.installHeading}>Platforms</h3>
+                  <ul className={styles.platformList}>
+                    {platforms.map((p) => (
+                      <li key={p.platform}>
+                        <span
+                          className={p.supported ? styles.markOk : styles.markNot}
+                          aria-hidden="true">
+                          {p.supported ? '✓' : '·'}
+                        </span>
+                        <span className={styles.platformName}>
+                          {p.platform}
+                          <span className={styles.platformDetail}>{p.detail}</span>
+                        </span>
+                        <span className={styles.platformStatus}>
+                          {p.href ? (
+                            <Link href={p.href}>{p.status}</Link>
+                          ) : (
+                            p.status
+                          )}
+                        </span>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+                <div className={styles.installCol}>
+                  <h3 className={styles.installHeading}>Ways in</h3>
+                  <ul className={styles.routeList}>
+                    {installRoutes.map((r) => (
+                      <li key={r.name}>
+                        <span className={styles.routeName}>{r.name}</span>
+                        <span className={styles.routeDetail}>{r.detail}</span>
+                        {r.code ? (
+                          <code className={styles.routeCode}>{r.code}</code>
+                        ) : null}
+                      </li>
+                    ))}
+                  </ul>
+                  <p className={styles.installMore}>
+                    <Link to={docLinks.installation}>
+                      Full installation guide →
+                    </Link>
+                  </p>
+                </div>
+              </div>
+            </div>
+          </section>
+
+          <section className={styles.close}>
+            <div className={styles.closeInner}>
+              <h2 className={styles.closeTitle}>
+                One command to install. One dashboard for every agent you run.
+              </h2>
+              <InstallPill command={installCommand} />
+              <div className={styles.ctaRow}>
+                <Link className={styles.ctaPrimary} to={docLinks.gettingStarted}>
+                  Read the guide
+                </Link>
+                <Link className={styles.ctaGhost} href={product.repo}>
+                  Browse the source
+                </Link>
+              </div>
+            </div>
+          </section>
+
+          <section className={styles.door} aria-labelledby="door-title">
+            <div className={styles.doorInner}>
+              <p className={styles.doorKicker}>The door into the docs</p>
+              <div className={styles.doorHead}>
+                <h2 id="door-title" className={styles.doorTitle}>
+                  The furniture stays. The job changes.
+                </h2>
+                <p className={styles.doorLede}>
+                  These links keep the navbar and the footer you are looking at
+                  now — you are not leaving the site, and nothing moves under
+                  you. What changes is the page between them: a sidebar, a table
+                  of contents, and prose written for someone who has already
+                  decided. This page was for deciding. Those are for doing.
+                </p>
+              </div>
+              <div className={styles.doorGrid}>
+                {doorPages.map((d) => (
+                  <Link key={d.to} to={d.to} className={styles.doorCard}>
+                    <span className={styles.doorCardTitle}>{d.title}</span>
+                    <span className={styles.doorCardBody}>{d.body}</span>
+                    <span className={styles.doorArrow} aria-hidden="true">
+                      →
+                    </span>
+                  </Link>
+                ))}
+              </div>
+            </div>
+          </section>
+        </main>
+      </div>
     </Layout>
   );
 }

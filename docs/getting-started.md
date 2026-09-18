@@ -81,7 +81,7 @@ Once you have a config, starting an orchestration tab is the same as opening any
 3. Cycle the **Mode** field (`Left`/`Right` or `h`/`l`) until the orchestration name appears.
 4. Press `Enter` — the deck opens a tab with a pane for every role.
 
-![Orchestration tab with all five role panes visible — orchestrator at top, coder, reviewer, auditor, and release below](./img/orchestration-start.png)
+![Orchestration tab on launch — five role cards stacked in the sidebar (orchestrator working, coder, reviewer, auditor and release idle), with the focused orchestrator pane filling the right-hand side](./img/orchestration-start.png)
 
 For the full reference, examples, and configuration options, see [Orchestration](orchestration.md).
 

@@ -1,4 +1,27 @@
+/*
+ * Link contrast (issue #1021).
+ *
+ * Infima defaults `--ifm-link-color` to `var(--ifm-color-primary)`, and
+ * `#4ecdc4` on the light background measures 1.93:1 -- a WCAG AA failure on
+ * every docs page, not only on `/`. The fix is deliberately narrow: only
+ * `--ifm-link-color` moves, so buttons, admonition accents, the active sidebar
+ * item and the navbar hover keep the current teal and no page is restyled
+ * beyond its link text.
+ *
+ * `#0a7c73` is the landing page's own light teal and measures 5.07:1 on white
+ * (4.72:1 on the `#f5f7f9` band). The existing ramp cannot do this job: even
+ * `--ifm-color-primary-darkest` `#279f95` is 3.24:1, still failing for normal
+ * text.
+ *
+ * The dark block below restates `--ifm-link-color` rather than leaving it
+ * alone. It has to: Infima declares the default on `:root` only, so a literal
+ * value set here would be inherited by the dark theme too, where `#0a7c73`
+ * measures 3.39:1 on `#1b1b1d` -- trading one failure for another. Pointing it
+ * back at `--ifm-color-primary` keeps dark links on `#4ecdc4`, which is 8.89:1
+ * there and needs no change.
+ */
 :root {
+  --ifm-link-color: #0a7c73;
   --ifm-color-primary: #4ecdc4;
   --ifm-color-primary-dark: #38c5bb;
   --ifm-color-primary-darker: #2fc0b5;
@@ -11,6 +34,7 @@
 }
 
 [data-theme='dark'] {
+  --ifm-link-color: var(--ifm-color-primary);
   --ifm-color-primary: #4ecdc4;
   --ifm-color-primary-dark: #38c5bb;
   --ifm-color-primary-darker: #2fc0b5;
