@@ -34,16 +34,22 @@ import styles from './index.module.css';
  * visitor six specific pages instead of a bare "Docs" link.
  *
  * All copy comes from `src/data/landing-content.js` so the corrected facts
- * live in one place. Screenshot paths are the existing ones on purpose: the
- * image refresh keeps the filenames, so it lands here for free.
+ * live in one place, and so do the screenshot paths, the alt text and the
+ * captions -- which are written against the frames themselves, so a recapture
+ * that changes what a frame shows is a one-file correction.
  */
 
-/** One screenshot per workflow step, in step order. */
+/**
+ * One screenshot per workflow step, in step order. Each row carries the frame
+ * its own copy describes -- 01 is the form `Ctrl+n` opens, 04 is the
+ * before/after detach pair -- and `landing-content.js` records why the two
+ * images these displaced left the page rather than moving elsewhere.
+ */
 const storyShots = [
-  screenshots.dashboard,
+  screenshots.newPane,
   screenshots.card,
   screenshots.parallel,
-  screenshots.modes,
+  screenshots.reattach,
 ];
 
 /** The pages the closing panel hands the visitor, in the order to read them. */

@@ -256,31 +256,64 @@ export const desktop = {
 };
 
 /**
- * The screenshot catalogue. Paths are the existing ones on purpose -- the
- * image refresh keeps the filenames, so a refreshed image lands here for free.
+ * The screenshot catalogue. Every entry here is rendered: `orchestration`
+ * (orchestration-start.png) once sat here unreferenced and is gone, and
+ * `dashboard` / `modes` left for the same reason in this pass.
  *
- * Every entry here is rendered. `orchestration` (orchestration-start.png) sat
- * here unreferenced and is gone. The reviewer's alternative -- re-pair it onto
- * story row 01, "Open a pane" -- is declined: it is an ORCHESTRATION frame,
- * tab bar and all, and row 01 is two steps before orchestration is introduced
- * at row 03, so it trades a mild mismatch for a louder one. Taking it would
- * also have to displace one of the two images already earning their rows. The
- * image itself stays in `docs/img/`, where `getting-started.md` and
- * `orchestration.md` both use it. Row 01's real fix is a capture that does not
- * exist yet: the new-pane dialog `Ctrl+n` opens.
+ * Each story row carries the frame its own copy describes, and each caption
+ * describes what is IN the frame rather than what the row argues. Two pairings
+ * changed once the refreshed captures landed:
+ *
+ * - Row 01 ("Open a pane. Ctrl+n, pick a directory, name it, and give it the
+ *   command that launches your agent") now carries `orchestration-new-deck.png`
+ *   -- that sentence word for word. The reviewer's earlier suggestion, re-pair
+ *   `orchestration-start.png` onto this row, was declined and stays declined:
+ *   it is an ORCHESTRATION frame, tab bar and all, two rows before
+ *   orchestration is introduced. The row's real fix was always a capture of the
+ *   form `Ctrl+n` opens, and that capture now exists. The recapture is of the
+ *   CURRENT form, which the old one predated: it always shows the Mode chips
+ *   and the Agent selector now, and the old `Tip:` row is gone. The caption
+ *   accounts for both; the row body does not, because the row is about opening
+ *   a pane and the dialog merely offers them.
+ * - Row 04 ("Walk away ... detach the deck, come back later, reattach") now
+ *   carries `reattach.png` and no longer carries `modes.png`, which showed git
+ *   status and kubectl panes and illustrated nothing the row claims.
+ *
+ * `home-hero-dashboard.jpg` and `modes.png` are both freed by those two moves,
+ * and both LEAVE the landing page rather than being re-homed. Nothing on the
+ * page wants either one without a slot being invented for it: every story row
+ * already carries the frame its own copy describes, `why` is the page's one
+ * text-only breather between two image-heavy bands, and `showcase` is a single
+ * device frame under the hero. Neither is orphaned -- the dashboard shot is
+ * `docs/session-management.md`'s Compact-density illustration, which is the
+ * exact claim its caption made here, and the modes shot is used by
+ * `docs/getting-started.md` and `docs/workspace-modes.md`. Nor does the page
+ * lose "several agents at once": the hero shows a three-card sidebar with live
+ * per-card status, and row 03 a five-card one.
+ *
+ * `orchestration-config.png` was deleted from `site/static/img/` in the same
+ * round -- it published a maintainer's home path and an unrelated project's
+ * orchestration config. Confirmed after the deletion rather than before it:
+ * `grep -rn 'orchestration-config' docs/ site/` returns nothing.
  */
 export const screenshots = {
   hero: {
     src: '/img/orchestration-coder.png',
-    alt: 'Agent Deck orchestrating multiple agents in parallel — orchestrator and coder both working',
+    alt: 'Agent Deck’s split view — a sidebar of orchestrator, coder and reviewer cards with only the coder marked Working, beside the coder’s own pane running a grep, an edit to src/email/order_confirmation.rs, and cargo test order_confirmation',
     caption:
       'A coder pane working on what the orchestrator just delegated to it.',
   },
-  dashboard: {
-    src: '/img/home-hero-dashboard.jpg',
-    alt: 'Five agents running in parallel — cards switch to Compact density to fit them all without scrolling',
+  newPane: {
+    src: '/img/orchestration-new-deck.png',
+    alt: 'The New Agent form — Dir /tmp/storefront, a Mode row offering No mode, schedule and dispatcher, Agent on auto, Name storefront, Command claude, and Submit and Cancel buttons',
     caption:
-      'Five agents in parallel. The cards drop to Compact density on their own so they all fit without scrolling.',
+      'The form Ctrl+n opens once the directory is picked: name the pane, give it a command. Mode and Agent are optional — left on auto, the client is read off the command.',
+  },
+  card: {
+    src: '/img/session-management-card.jpg',
+    alt: 'One agent card — storefront-checkout, Working — with its directory, its last prompt, three recent tool calls, and Last 3s / Tools 3 on the bottom border',
+    caption:
+      'One card: status, directory, the last prompt, the recent tool calls, and the last-activity and tool counters on the border.',
   },
   parallel: {
     src: '/img/orchestration-delegation-parallel.png',
@@ -288,17 +321,11 @@ export const screenshots = {
     caption:
       'One agent delegating to two others at once. Both cards light up together.',
   },
-  modes: {
-    src: '/img/modes.png',
-    alt: 'A mode tab in action — agent pane on the left, with live Git status, kubectl pods, and kubectl events stacked on the right',
+  reattach: {
+    src: '/img/reattach.png',
+    alt: 'Two labelled frames of one pane, storefront-release-verification — BEFORE DETACH ending at 22:23:56 with 27 integration tests passed, and AFTER REATTACH opening on that same line and running on to 22:24:12',
     caption:
-      'A mode pairs one agent with the side panes you want next to it — here git status, pods and events.',
-  },
-  card: {
-    src: '/img/session-management-card.jpg',
-    alt: 'Single agent card showing directory, last activity, tool count, recent prompt, and recent tool calls',
-    caption:
-      'One card: directory, last activity, tool count, the last prompt and the recent tool calls.',
+      'Two frames, not one view: the same pane before detaching and after reattaching. The 22:23:56 line that closes the top one opens the bottom — one session, not a restart.',
   },
 };
 
