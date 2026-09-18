@@ -200,6 +200,36 @@ pub fn child_boot_budget() -> Duration {
     load_scaled(CHILD_BOOT_BASE)
 }
 
+/// Issue #1148: the base ceiling on a wait for a freshly `tokio::spawn`ed
+/// daemon task to reach its FIRST OBSERVABLE STEP, before [`load_scaled`]
+/// widens it for a contended machine.
+///
+/// A DIFFERENT quantity from [`CHILD_BOOT_BASE`], which is why it is a separate
+/// constant rather than a second caller of that one. A child boot is a `fork` +
+/// `execve` + the child's own first write; this is a task that is already
+/// queued on the runtime getting its turn and running a few hundred
+/// microseconds of synchronous work. The two are the same order of magnitude
+/// for the same reason — under contention the dominant term in both is the
+/// scheduler, not the work — and both are load-scaled for that reason, but a
+/// wait on one is not a wait on the other and naming them alike is how
+/// `delegate/034` came to bound a dispatch task's start on a constant
+/// documented as "a freshly spawned child's first byte" (issue #1148).
+///
+/// 8 s is deliberately far more than the ~0.3 ms this is ever measured at,
+/// because the cost is paid only on the failure path and the failure this
+/// bounds is "the task never got going at all" — a verdict worth being sure of.
+/// Every caller returns the instant its condition holds, so an idle box pays
+/// nothing for the headroom.
+pub const DAEMON_TASK_START_BASE: Duration = Duration::from_secs(8);
+
+/// Issue #1148: [`load_scaled`] applied to [`DAEMON_TASK_START_BASE`] — the
+/// ceiling a fast-tier test gives a freshly `tokio::spawn`ed daemon task to
+/// reach its first observable step.
+#[allow(dead_code)]
+pub fn daemon_task_start_budget() -> Duration {
+    load_scaled(DAEMON_TASK_START_BASE)
+}
+
 /// Issue #709: how long after a child stops being live its output is still
 /// waited for, so a stand-in that printed and then died is not reported as one
 /// that printed nothing.

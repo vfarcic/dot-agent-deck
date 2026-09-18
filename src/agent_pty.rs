@@ -7627,6 +7627,21 @@ impl AgentPtyRegistry {
         // helper still escalates to SIGKILL if the child hangs on
         // slave EOF, so a buggy agent is still reaped within the
         // grace window.
+        //
+        // Issue #1148 — the CONSEQUENCE of dropping the master here, which is
+        // not a defect but is easy to be surprised by: closing the master hands
+        // the child EOF on its stdin, so a child that READS its PTY ends itself
+        // before step 2's SIGTERM grace has anything to wait for. Measured on a
+        // `trap '' TERM` + `exec cat` stand-in: it exits **0**, of its own
+        // accord, and `terminate_child_with_grace_and_wait` returns after one
+        // 50 ms `try_wait` tick — or immediately, when the exit lands before its
+        // first tick. So the grace this respawn spends is bounded by how the
+        // child reacts to losing its PTY, NOT by what signals it traps; only a
+        // child that reads nothing from the PTY spends the full
+        // `AGENT_TERMINATE_GRACE` here. `close_agent` is the other way round: it
+        // terminates while still holding the master, so a trapping child there
+        // does survive to the SIGKILL backstop. `orchestration/delegate/034`
+        // depends on this distinction and its stand-in is built for it.
         drop(writer);
         drop(master);
 
