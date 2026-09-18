@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createFixtureSnapshot } from "../data/fixture";
 import { DEFAULT_DESKTOP_SETTINGS, type DesktopSettingsDto } from "../lib/bridge";
@@ -34,8 +34,43 @@ interface VoiceResult {
   backend: VoiceBackend;
 }
 
+type VoiceCaptureState = "idle" | "recording" | "transcribing" | "done" | "failed";
+
+interface VoiceStatus {
+  state: VoiceCaptureState;
+  capturedMs: number;
+  maxMs: number;
+  capped: boolean;
+  available: boolean;
+  backend: "off" | "remote";
+}
+
+type VoiceTranscriptionOutcome =
+  | { kind: "heard"; transcript: string; sentence: string }
+  | { kind: "not_configured"; detail: string; sentence: string }
+  | { kind: "failed"; detail: string; sentence: string };
+
+interface VoiceTranscription {
+  outcome: VoiceTranscriptionOutcome;
+  transcribeMs: number | null;
+  backend: string;
+  audioMs: number;
+}
+
 type ResolveVoice = ReturnType<typeof vi.fn<(utterance: string) => Promise<VoiceResult>>>;
-type VoiceRuntime = DeckRuntimeState & { resolveVoice: ResolveVoice };
+type VoiceStatusCall = ReturnType<typeof vi.fn<() => Promise<VoiceStatus>>>;
+type VoiceStart = ReturnType<typeof vi.fn<() => Promise<VoiceStatus>>>;
+type VoiceStop = ReturnType<typeof vi.fn<() => Promise<VoiceTranscription>>>;
+type VoiceCancel = ReturnType<typeof vi.fn<() => Promise<VoiceStatus>>>;
+
+interface VoiceControls {
+  voiceStatus: VoiceStatusCall;
+  voiceStart: VoiceStart;
+  voiceStop: VoiceStop;
+  voiceCancel: VoiceCancel;
+}
+
+type VoiceRuntime = DeckRuntimeState & VoiceControls & { resolveVoice: ResolveVoice };
 
 function settingsStore() {
   let document: DesktopSettingsDto = { ...DEFAULT_DESKTOP_SETTINGS };
@@ -48,7 +83,42 @@ function settingsStore() {
   };
 }
 
-function runtime(resolveVoice: ResolveVoice): VoiceRuntime {
+function voiceStatus(overrides: Partial<VoiceStatus> = {}): VoiceStatus {
+  return {
+    state: "idle",
+    capturedMs: 0,
+    maxMs: 30_000,
+    capped: false,
+    available: false,
+    backend: "off",
+    ...overrides,
+  };
+}
+
+function transcription(outcome: VoiceTranscriptionOutcome): VoiceTranscription {
+  return {
+    outcome,
+    transcribeMs: outcome.kind === "not_configured" ? null : 183,
+    backend: outcome.kind === "not_configured" ? "off" : "remote",
+    audioMs: 1_240,
+  };
+}
+
+function voiceControls(overrides: Partial<VoiceControls> = {}): VoiceControls {
+  return {
+    voiceStatus: vi.fn(async () => voiceStatus()),
+    voiceStart: vi.fn(async () => voiceStatus({ state: "recording", available: true, backend: "remote" })),
+    voiceStop: vi.fn(async () => transcription({
+      kind: "failed",
+      detail: "the microphone returned no test transcription",
+      sentence: "Could not turn that recording into text.",
+    })),
+    voiceCancel: vi.fn(async () => voiceStatus()),
+    ...overrides,
+  };
+}
+
+function runtime(resolveVoice: ResolveVoice, voice: VoiceControls = voiceControls()): VoiceRuntime {
   const snapshot = createFixtureSnapshot("connected");
   const settings = settingsStore();
   return {
@@ -83,6 +153,7 @@ function runtime(resolveVoice: ResolveVoice): VoiceRuntime {
     getSettings: settings.getSettings,
     saveSettings: settings.saveSettings,
     resolveVoice,
+    ...voice,
   } as VoiceRuntime;
 }
 
@@ -95,7 +166,7 @@ function resolver(answer: VoiceResult): ResolveVoice {
 }
 
 function openVoicePanel() {
-  const trigger = screen.queryByRole("button", { name: "Voice", exact: true });
+  const trigger = screen.queryByRole("button", { name: "Voice" });
   if (!trigger) throw new Error("Voice control trigger is missing from the primary surface.");
   fireEvent.click(trigger);
   return screen.getByRole("dialog", { name: "Voice control" });
@@ -111,6 +182,22 @@ async function submit(panel: HTMLElement, utterance: string, resolveVoice: Resol
   });
   expect(resolveVoice).toHaveBeenCalledTimes(1);
   expect(resolveVoice.mock.calls[0][0]).toBe(utterance);
+}
+
+async function startListening(panel: HTMLElement) {
+  const control = await within(panel).findByRole("button", { name: "Start listening" });
+  await act(async () => {
+    fireEvent.click(control);
+    await Promise.resolve();
+  });
+}
+
+async function stopListening(panel: HTMLElement) {
+  const control = await within(panel).findByRole("button", { name: "Stop listening" });
+  await act(async () => {
+    fireEvent.click(control);
+    await Promise.resolve();
+  });
 }
 
 const DISPATCH = {
@@ -215,6 +302,33 @@ const OUTCOMES: Array<{ name: string; utterance: string; outcome: VoiceOutcome }
   },
 ];
 
+const TRANSCRIPTION_OUTCOMES: Array<{ name: string; outcome: VoiceTranscriptionOutcome }> = [
+  {
+    name: "heard",
+    outcome: {
+      kind: "heard",
+      transcript: "show me every agent",
+      sentence: "Heard: “show me every agent”.",
+    },
+  },
+  {
+    name: "not-configured",
+    outcome: {
+      kind: "not_configured",
+      detail: "voice transcription is off",
+      sentence: "Choose a transcription backend in Voice settings to use the microphone.",
+    },
+  },
+  {
+    name: "capture-failure",
+    outcome: {
+      kind: "failed",
+      detail: "the microphone did not produce audio",
+      sentence: "Could not turn that recording into text (the microphone did not produce audio).",
+    },
+  },
+];
+
 describe("voice control panel", () => {
   beforeEach(() => {
     window.localStorage.clear();
@@ -249,6 +363,182 @@ describe("voice control panel", () => {
     await submit(panel, "show me every agent", resolveVoice);
 
     expect(within(panel).getByText("Opening the agent overview.")).toBeVisible();
+    expect(screen.getByTestId("overview-table-region")).toBeVisible();
+  });
+
+  /**
+   * Scenario: open Voice while transcription is deliberately off. Typed input
+   * remains available, no microphone control is offered, and the panel does not
+   * describe that product choice as a failure or degraded state.
+   */
+  it("offers typed input without a broken-looking microphone when transcription is off", async () => {
+    const voice = voiceControls();
+    render(<DeckShell runtime={runtime(resolver(result(DISPATCH)), voice)} />);
+
+    const panel = openVoicePanel();
+
+    await waitFor(() => expect(voice.voiceStatus).toHaveBeenCalledWith());
+    expect(within(panel).getByRole("textbox", { name: "Command" })).toBeVisible();
+    expect(within(panel).queryByRole("button", { name: "Start listening" })).not.toBeInTheDocument();
+    expect(panel).not.toHaveTextContent(/not configured|unavailable|failed|error|broken|degraded/i);
+  });
+
+  /**
+   * Scenario: with remote transcription available, press the microphone once
+   * to begin listening and once more to stop. The control toggles state and the
+   * transcription service's complete sentence is rendered.
+   */
+  it("starts and stops listening with two presses", async () => {
+    const heard = {
+      kind: "heard" as const,
+      transcript: "show me every agent",
+      sentence: "Heard: “show me every agent”.",
+    };
+    const voice = voiceControls({
+      voiceStatus: vi.fn(async () => voiceStatus({ available: true, backend: "remote" })),
+      voiceStop: vi.fn(async () => transcription(heard)),
+    });
+    const resolveVoice = vi.fn<(utterance: string) => Promise<VoiceResult>>(() => new Promise(() => {}));
+    render(<DeckShell runtime={runtime(resolveVoice, voice)} />);
+
+    const panel = openVoicePanel();
+    await startListening(panel);
+
+    expect(voice.voiceStart).toHaveBeenCalledWith();
+    expect(within(panel).getByRole("button", { name: "Stop listening" })).toBeVisible();
+
+    await stopListening(panel);
+
+    expect(voice.voiceStop).toHaveBeenCalledWith();
+    expect(await within(panel).findByText(heard.sentence)).toBeVisible();
+  });
+
+  /**
+   * Scenario: start recording, then have a status poll report that the device
+   * reached its cap and is no longer recording. The surface observes that
+   * reply and stops presenting itself as listening without calling stop.
+   */
+  it("stops showing listening when a status poll observes the recording cap", async () => {
+    vi.useFakeTimers();
+    const voice = voiceControls({
+      voiceStatus: vi.fn()
+        .mockResolvedValueOnce(voiceStatus({ available: true, backend: "remote" }))
+        .mockResolvedValue(voiceStatus({
+          state: "done",
+          capturedMs: 30_000,
+          capped: true,
+          available: true,
+          backend: "remote",
+        })),
+    });
+    render(<DeckShell runtime={runtime(resolver(result(DISPATCH)), voice)} />);
+
+    const panel = openVoicePanel();
+    await act(async () => { await Promise.resolve(); });
+    await act(async () => {
+      fireEvent.click(within(panel).getByRole("button", { name: "Start listening" }));
+      await Promise.resolve();
+    });
+    expect(within(panel).getByRole("button", { name: "Stop listening" })).toBeVisible();
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(30_000); });
+
+    expect(voice.voiceStatus.mock.calls.length).toBeGreaterThanOrEqual(2);
+    expect(within(panel).queryByRole("button", { name: "Stop listening" })).not.toBeInTheDocument();
+    expect(within(panel).queryByText("Listening…")).not.toBeInTheDocument();
+    expect(voice.voiceStop).not.toHaveBeenCalled();
+  });
+
+  /**
+   * Scenario: begin listening and close the Voice panel before stopping. The
+   * panel cancels capture as it closes so no hidden microphone remains open.
+   */
+  it("cancels an in-progress recording when the panel closes", async () => {
+    const voice = voiceControls({
+      voiceStatus: vi.fn(async () => voiceStatus({ available: true, backend: "remote" })),
+    });
+    render(<DeckShell runtime={runtime(resolver(result(DISPATCH)), voice)} />);
+
+    const panel = openVoicePanel();
+    await startListening(panel);
+    fireEvent.click(within(panel).getByRole("button", { name: "Close voice control" }));
+
+    await waitFor(() => expect(voice.voiceCancel).toHaveBeenCalledWith());
+    expect(screen.queryByRole("dialog", { name: "Voice control" })).not.toBeInTheDocument();
+  });
+
+  /**
+   * Scenario: status offered a microphone but the setting changed before the
+   * first press, so start rejects with Rust's not-configured sentence. The
+   * panel renders that sentence and remains usable instead of crashing.
+   */
+  it("renders the not-configured sentence when starting capture is refused", async () => {
+    const sentence = "Choose a transcription backend in Voice settings to use the microphone.";
+    const voice = voiceControls({
+      voiceStatus: vi.fn(async () => voiceStatus({ available: true, backend: "remote" })),
+      // Tauri rejects a Rust `Err(String)` as the string itself, not an Error.
+      voiceStart: vi.fn(async () => { throw sentence; }),
+    });
+    render(<DeckShell runtime={runtime(resolver(result(DISPATCH)), voice)} />);
+
+    const panel = openVoicePanel();
+    await startListening(panel);
+
+    expect(await within(panel).findByText(sentence)).toBeVisible();
+    expect(within(panel).getByRole("textbox", { name: "Command" })).toBeVisible();
+    expect(within(panel).queryByRole("button", { name: "Stop listening" })).not.toBeInTheDocument();
+  });
+
+  /**
+   * Scenario: stop one recording for each closed transcription outcome. The
+   * panel renders that outcome's own complete sentence, including a capture
+   * failure distinct from the intent-resolution failure sentence.
+   */
+  it.each(TRANSCRIPTION_OUTCOMES)("renders the $name transcription outcome's sentence", async ({ outcome }) => {
+    const voice = voiceControls({
+      voiceStatus: vi.fn(async () => voiceStatus({ available: true, backend: "remote" })),
+      voiceStop: vi.fn(async () => transcription(outcome)),
+    });
+    const resolveVoice = outcome.kind === "heard"
+      ? vi.fn<(utterance: string) => Promise<VoiceResult>>(() => new Promise(() => {}))
+      : resolver(result(DISPATCH));
+    render(<DeckShell runtime={runtime(resolveVoice, voice)} />);
+
+    const panel = openVoicePanel();
+    await startListening(panel);
+    await stopListening(panel);
+
+    expect(await within(panel).findByText(outcome.sentence)).toBeVisible();
+    if (outcome.kind !== "heard") expect(resolveVoice).not.toHaveBeenCalled();
+    if (outcome.kind === "failed") {
+      expect(panel).not.toHaveTextContent("could not work out what to do");
+    }
+  });
+
+  /**
+   * Scenario: stopping capture returns a heard transcript that maps to the
+   * overview command. The transcript enters the same resolver used by typed
+   * input, and its resolved sentence and navigation are rendered.
+   */
+  it("sends a heard transcript through the shared resolve path", async () => {
+    const utterance = "show me every agent";
+    const voice = voiceControls({
+      voiceStatus: vi.fn(async () => voiceStatus({ available: true, backend: "remote" })),
+      voiceStop: vi.fn(async () => transcription({
+        kind: "heard",
+        transcript: utterance,
+        sentence: `Heard: “${utterance}”.`,
+      })),
+    });
+    const resolveVoice = resolver(result(DISPATCH));
+    render(<DeckShell runtime={runtime(resolveVoice, voice)} />);
+
+    const panel = openVoicePanel();
+    await startListening(panel);
+    await stopListening(panel);
+
+    await waitFor(() => expect(resolveVoice).toHaveBeenCalledWith(utterance));
+    expect(await within(panel).findByText(DISPATCH.sentence)).toBeVisible();
     expect(screen.getByTestId("overview-table-region")).toBeVisible();
   });
 
@@ -373,24 +663,42 @@ describe("voice control panel", () => {
   });
 
   /**
-   * Scenario: type a uniquely identifiable utterance, submit it, then close the
-   * panel after the report appears. No localStorage write or stored value
-   * contains any part of that transcript after the complete round trip.
+   * Scenario: resolve uniquely identifiable typed and spoken utterances, then
+   * close the panel after both reports appear. No localStorage write or stored
+   * value contains either transcript after the complete round trips.
    */
-  it("never persists a typed transcript", async () => {
-    const utterance = 'SENTINEL voice transcript, "Mixed CASE"?!';
-    const sentence = `Heard: “${utterance}” — no matching action.`;
+  it("never persists a typed or spoken transcript", async () => {
+    const typed = 'SENTINEL typed voice transcript, "Mixed CASE"?!';
+    const spoken = 'SENTINEL spoken voice transcript, "Other CASE"?!';
+    const sentenceFor = (utterance: string) => `Heard: “${utterance}” — no matching action.`;
     const setItem = vi.spyOn(Storage.prototype, "setItem");
-    const resolveVoice = resolver(result({ kind: "no_match", transcript: utterance, sentence }));
-    render(<DeckShell runtime={runtime(resolveVoice)} />);
+    const resolveVoice = vi.fn(async (utterance: string) => result({
+      kind: "no_match",
+      transcript: utterance,
+      sentence: sentenceFor(utterance),
+    }));
+    const voice = voiceControls({
+      voiceStatus: vi.fn(async () => voiceStatus({ available: true, backend: "remote" })),
+      voiceStop: vi.fn(async () => transcription({
+        kind: "heard",
+        transcript: spoken,
+        sentence: `Heard: “${spoken}”.`,
+      })),
+    });
+    render(<DeckShell runtime={runtime(resolveVoice, voice)} />);
 
     const panel = openVoicePanel();
-    await submit(panel, utterance, resolveVoice);
-    expect(within(panel).getByText(sentence)).toBeVisible();
+    await submit(panel, typed, resolveVoice);
+    expect(within(panel).getByText(sentenceFor(typed))).toBeVisible();
+    await startListening(panel);
+    await stopListening(panel);
+    expect(await within(panel).findByText(sentenceFor(spoken))).toBeVisible();
     fireEvent.click(within(panel).getByRole("button", { name: "Close voice control" }));
     expect(screen.queryByRole("dialog", { name: "Voice control" })).not.toBeInTheDocument();
 
-    for (const call of setItem.mock.calls) expect(String(call[1])).not.toContain(utterance);
-    expect(JSON.stringify(window.localStorage)).not.toContain(utterance);
+    for (const utterance of [typed, spoken]) {
+      for (const call of setItem.mock.calls) expect(String(call[1])).not.toContain(utterance);
+      expect(JSON.stringify(window.localStorage)).not.toContain(utterance);
+    }
   });
 });

@@ -14,6 +14,23 @@ async function submitVoice(page: Page, utterance: string) {
 
 test.describe("voice control through the browser fixture", () => {
   /**
+   * Scenario: open Voice while the browser fixture reports that transcription
+   * is off. Typed input remains visible, no microphone control is offered, and
+   * the deliberate off state is not presented as a failure.
+   */
+  test("transcription off offers typed input without a broken microphone", async ({ page }) => {
+    await page.goto("/?fixture=1&state=connected");
+    const trigger = page.getByRole("button", { name: "Voice", exact: true });
+    await expect(trigger, "Voice control trigger is missing from the primary surface").toBeVisible({ timeout: 1_000 });
+    await trigger.click();
+
+    const panel = page.getByRole("dialog", { name: "Voice control" });
+    await expect(panel.getByRole("textbox", { name: "Command" })).toBeVisible();
+    await expect(panel.getByRole("button", { name: "Start listening" })).toHaveCount(0);
+    await expect(panel).not.toContainText(/not configured|unavailable|failed|error|broken|degraded/i);
+  });
+
+  /**
    * Scenario: open Voice from the deck, type the fixture's overview utterance
    * and submit it. The Rust-shaped success sentence appears and the real app
    * navigates to the agent overview in both browser engines.
