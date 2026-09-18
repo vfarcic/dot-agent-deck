@@ -1,0 +1,125 @@
+# PRD #802 M9 — utterances the reference intent backend must keep routing.
+#
+# These are model-facing compatibility fixtures, not examples for a keyword
+# matcher. Each shipped action has deliberately different phrasings, and one
+# representative phrase is repeated on a screen where that action is not
+# callable so a typo in `commands.toml`'s `screens` column is observable.
+
+[[fixtures]]
+name = "open-agent-zoom"
+utterance = "zoom the tester"
+screen = "deck"
+action = "open_agent"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "open-agent-isolate"
+utterance = "get rid of everything except the tester"
+screen = "overview"
+action = "open_agent"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "open-agent-by-state"
+utterance = "show me the one that's stuck"
+screen = "deck"
+action = "open_agent"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "open-agent-unavailable"
+utterance = "zoom the tester"
+screen = "agent"
+action = "open_agent"
+outcome = "unavailable"
+
+[[fixtures]]
+name = "open-overview-everything"
+utterance = "show me everything"
+screen = "deck"
+action = "open_overview"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "open-overview-running"
+utterance = "which agents are running?"
+screen = "deck"
+action = "open_overview"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "open-overview-attention"
+utterance = "what needs my attention?"
+screen = "deck"
+action = "open_overview"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "open-overview-unavailable"
+utterance = "show me everything"
+screen = "overview"
+action = "open_overview"
+outcome = "unavailable"
+
+[[fixtures]]
+name = "open-deck-back"
+utterance = "go back"
+screen = "overview"
+action = "open_deck"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "open-deck-terminals"
+utterance = "take me back to the terminals"
+screen = "overview"
+action = "open_deck"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "open-deck-panes"
+utterance = "show the panes again"
+screen = "overview"
+action = "open_deck"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "open-deck-unavailable"
+utterance = "take me back to the terminals"
+screen = "deck"
+action = "open_deck"
+outcome = "unavailable"
+
+[[fixtures]]
+name = "close-agent-view-back"
+utterance = "go back"
+screen = "agent"
+action = "close_agent_view"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "close-agent-view-close"
+utterance = "close this"
+screen = "agent"
+action = "close_agent_view"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "close-agent-view-stop-looking"
+utterance = "stop looking at this agent"
+screen = "agent"
+action = "close_agent_view"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "close-agent-view-unavailable"
+utterance = "close this"
+screen = "deck"
+action = "close_agent_view"
+outcome = "unavailable"
+
+[[fixtures]]
+name = "no-match-clock"
+utterance = "what time is it?"
+screen = "deck"
+action = "none"
+outcome = "no_match"
