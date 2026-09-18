@@ -194,7 +194,7 @@
     --violet-soft: #29223a;
     /* Live status. Unchanged: these were already picked to read against the dark */
     /* instrument chrome, and every one of their call sites is on it -- the rail's */
-    /* connection lamp, the composer's caution/error lines, the check rows. */
+    /* connection lamp, the terminal input-state notices, the check rows. */
     --status-ok: #6db58b;
     --status-warn: #c69a4e;
     --status-error: #d0685f;
@@ -298,7 +298,7 @@
   --violet-soft: #29223a;
   /* Live status. Unchanged: these were already picked to read against the dark */
   /* instrument chrome, and every one of their call sites is on it -- the rail's */
-  /* connection lamp, the composer's caution/error lines, the check rows. */
+  /* connection lamp, the terminal input-state notices, the check rows. */
   --status-ok: #6db58b;
   --status-warn: #c69a4e;
   --status-error: #d0685f;
@@ -504,32 +504,31 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .agent-tabs button:hover, .agent-tabs button.is-active { color: var(--shell-ink); }
 .agent-tabs button.is-active { border-bottom-color: var(--shell-teal); }
 .agent-panel { min-height: 320px; height: 42vh; max-height: 560px; display: flex; flex-direction: column; background: var(--terminal); }
-/* The terminal fills whatever the composer leaves; min-height:0 lets it shrink
-   instead of shoving the composer past the tile's overflow:hidden edge. A
-   bounded terminal also makes FitAddon report real rows to the PTY, so the
+/* The terminal fills whatever the input-state notice leaves; min-height:0 lets
+   it shrink instead of shoving that line past the tile's overflow:hidden edge.
+   A bounded terminal also makes FitAddon report real rows to the PTY, so the
    CLI's own input line stays on screen. */
 .agent-terminal-stack { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; }
 .terminal-viewport { flex: 1 1 auto; min-height: 120px; }
 .terminal-viewport, .terminal-host { width: 100%; }
 .terminal-host { height: 100%; }
 .terminal-viewport { padding: 6px 4px 3px 8px; overflow: hidden; }
-/* Always-visible external prompt box, pinned below the terminal. */
-.agent-composer { flex: 0 0 auto; display: flex; flex-direction: column; gap: 4px; padding: 7px 9px 8px; border-top: 1px solid var(--shell-line); background: var(--paper-strong); }
-.agent-composer.is-coordinator { background: var(--shell); border-top-color: var(--shell-teal-edge); }
-.composer-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
-.composer-title { color: var(--faint); font-size: 8px; font-weight: 800; letter-spacing: .1em; text-transform: uppercase; }
-.composer-prompt-picker { display: flex; align-items: center; gap: 3px; color: var(--faint); }
-.composer-prompt-picker select { border: 1px solid var(--line-strong); border-radius: 5px; padding: 1px 4px; color: var(--ink); background: var(--paper); font-size: 9px; }
-.agent-composer textarea { width: 100%; resize: none; padding: 6px 8px; border: 1px solid var(--line-strong); border-radius: 6px; color: var(--ink); background: var(--paper); font-family: "JetBrains Mono", "SFMono-Regular", Consolas, monospace; font-size: 11.5px; line-height: 1.45; }
-.agent-composer textarea:focus { outline: none; border-color: var(--teal-focus); box-shadow: 0 0 0 1px var(--teal-focus); }
-.agent-composer textarea:disabled { opacity: .55; cursor: not-allowed; }
-.composer-actions { display: flex; align-items: center; gap: 8px; }
-.composer-spacer { flex: 1 1 auto; }
-.composer-caution { display: flex; align-items: center; gap: 4px; color: var(--status-warn); font-size: 8px; line-height: 1.3; }
-.composer-error { display: flex; align-items: center; gap: 4px; color: var(--status-error); font-size: 8.5px; }
-.composer-status { display: flex; align-items: center; gap: 4px; margin: 0; font-size: 9px; }
-.composer-status.is-delivered { color: var(--status-ok); }
-.composer-status.is-failed { color: var(--status-error); }
+/* Issue #1042 — the terminal's own delivery state, pinned under the pane it
+   describes. A blocked pane dims its terminal so the disabled input reads as
+   disabled rather than as an agent that has gone quiet. */
+.terminal-input-status { flex: 0 0 auto; margin: 0; padding: 5px 9px 6px; display: flex; align-items: flex-start; gap: 5px; border-top: 1px solid var(--shell-line); background: var(--shell); font-size: 9px; line-height: 1.35; }
+.terminal-input-status svg { flex: 0 0 auto; margin-top: 1px; }
+.terminal-input-status.is-blocked { color: var(--status-error); }
+.terminal-input-status.is-unconfirmed { color: var(--status-warn); }
+.terminal-viewport[aria-disabled="true"] { opacity: .62; }
+/* PRD #1105 — what stands where the terminal would be when this pane has none,
+   which today means an agent on a deck that is not the selected one. It reuses
+   `.panel-empty` on purpose: this IS one of that state's family, and the thing
+   it replaces is a black rectangle that reads as an agent gone quiet. Wider
+   measure than the other empty panels because it carries a sentence rather than
+   a label. */
+.terminal-absent { padding: 12px 18px; }
+.terminal-absent span { max-width: 52ch; font-size: 9px; line-height: 1.5; }
 .button.compact { padding: 3px 9px; font-size: 10px; gap: 4px; }
 
 /* ---- Output Reader: a large readable rendering of an agent's CLI output ---- */
@@ -547,9 +546,8 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .reader-tail.is-live { color: var(--shell-teal); background: var(--shell-teal-surface); }
 .reader-scroll { flex: 1 1 auto; min-height: 0; overflow: auto; overscroll-behavior: contain; padding: 18px 26px 22px; scrollbar-color: var(--shell-thumb) var(--shell-deep); scrollbar-width: thin; }
 .reader-text { margin: 0; white-space: pre-wrap; word-break: break-word; color: var(--shell-ink); font-family: "JetBrains Mono", "SFMono-Regular", Consolas, monospace; font-size: 13.5px; line-height: 1.7; user-select: text; }
-.reader-jump { position: absolute; bottom: 148px; left: 50%; transform: translateX(-50%); display: flex; align-items: center; gap: 6px; padding: 6px 14px; border: 1px solid var(--shell-teal-edge); border-radius: 16px; color: var(--shell-teal-text-strong); background: var(--shell); cursor: pointer; font-size: 10.5px; box-shadow: 0 6px 18px rgb(var(--scrim-rgb) / .4); }
+.reader-jump { position: absolute; bottom: 26px; left: 50%; transform: translateX(-50%); display: flex; align-items: center; gap: 6px; padding: 6px 14px; border: 1px solid var(--shell-teal-edge); border-radius: 16px; color: var(--shell-teal-text-strong); background: var(--shell); cursor: pointer; font-size: 10.5px; box-shadow: 0 6px 18px rgb(var(--scrim-rgb) / .4); }
 .reader-jump:hover { background: var(--shell-teal-surface); }
-.reader-panel .agent-composer { border-top: 1px solid var(--shell-line); }
 .terminal-host .xterm { height: 100%; }
 .terminal-host .xterm-viewport { scrollbar-color: var(--shell-thumb) var(--terminal); scrollbar-width: thin; }
 .text-panel { width: 100%; height: 100%; padding: 10px; overflow: auto; color: var(--shell-ink); background: var(--terminal); font-size: 9px; }
@@ -1195,3 +1193,65 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
    mystery icon in a menu of words. */
 .overview-columns-reset { margin-top: 6px; padding: 4px 5px; display: flex; align-items: center; gap: 5px; border: 0; border-top: 1px solid var(--line); border-radius: 0 0 3px 3px; background: none; color: var(--muted); font-size: 9.5px; cursor: pointer; }
 .overview-columns-reset:hover { color: var(--ink); background: var(--paper-strong); }
+
+/* ---- PRD #1105: one agent's pane, over the screen it was opened from ---- */
+/* The frame around every tile, open or not. Closed it is `display: contents`,
+   so `.agent-tile` stays the grid item it has always been and nothing about the
+   deck's layout moves — the element exists only so React has a stable position
+   to promote the tile IN, rather than unmounting it into an overlay. */
+.agent-pane-slot { display: contents; }
+/* Open, the same element is the dialog. `position: fixed` takes it out of the
+   grid's flow entirely, so the tiles behind it re-flow one cell and keep their
+   size — `.agent-grid`'s columns are a fixed template, and `ResizeObserver`
+   fires on box size rather than position, so this costs no extra geometry
+   report. `inset: 0` with no margin is what makes the box the window, which is
+   what the browser tier measures. Between `.reader-overlay` (80) and
+   `.dialog-backdrop` (100): a modal dialog still belongs on top of a pane. */
+.agent-pane-overlay { position: fixed; z-index: 90; inset: 0; margin: 0; display: flex; padding: 14px; background: rgb(var(--scrim-rgb) / .74); }
+/* Every rule below is keyed off `data-presentation`, the seam M1 put on the
+   tile, and every one of them exists to outrank something. The compound
+   `.agent-tile[data-presentation="overlay"]` is (0,2,0) rather than the (0,1,0)
+   an attribute selector alone would be, which is what it takes to beat
+   `@media (max-width: 680px)`'s `.agent-tile:not(.is-selected)` — `:not()`
+   carries its argument's specificity, so that rule is (0,2,0) too and this one
+   wins on source order, being last in the file. Media queries add no
+   specificity of their own. */
+.agent-tile[data-presentation="overlay"] { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; border-color: var(--teal-focus); box-shadow: 0 28px 70px rgb(var(--scrim-rgb) / .55); }
+/* The terminal's box, and the whole of "enlarging really enlarges": drop the
+   tile's fixed 42vh band for whatever the window leaves after the header,
+   assignment, instruments, tabs and footer. `TerminalViewport` measures its own
+   host under a `ResizeObserver`, so the bigger box reports a bigger geometry
+   through the path that already exists and no measurement code changes.
+   `display: none` here is what `@media (max-width: 680px)` would otherwise
+   leave, which is a pane with no terminal in it at all. */
+[data-presentation="overlay"] .agent-panel { min-height: 0; height: auto; max-height: none; flex: 1 1 auto; display: flex; }
+[data-presentation="overlay"] .agent-tabs { display: flex; }
+/* The tab labels. They are hidden by a `min-width: 1450px` media query, which
+   asks how wide the WINDOW is when the question is how wide this PANE is — a
+   pane-width question a media query structurally cannot answer, and the overlay
+   is the case where the two answers differ. */
+[data-presentation="overlay"] .agent-tabs button span { display: inline; }
+[data-presentation="overlay"] .agent-tabs button { min-width: 61px; }
+/* The two-line clamp exists for a half-width tile. Nothing else in the header
+   is removed or compacted: in the grid, position tells a reader which tile they
+   are looking at, and in the pane that context is gone, so identity matters
+   MORE here rather than less. */
+[data-presentation="overlay"] .agent-assignment p { display: block; -webkit-line-clamp: none; }
+
+/* The header's right-hand group: the attempt read-out and whichever of Open and
+   Close this tile was given. One `<div>` so the header's `space-between` still
+   has exactly two children and the identity block keeps the whole left side. */
+.agent-header-actions { flex: 0 0 auto; display: flex; align-items: center; gap: 2px; }
+.agent-pane-control { width: 26px; height: 26px; display: grid; place-items: center; border: 1px solid transparent; border-radius: 4px; color: var(--faint); background: transparent; cursor: pointer; }
+.agent-pane-control:hover { color: var(--teal); border-color: var(--teal-focus); background: var(--teal-soft); }
+/* The overview's entry control. `margin-left: auto` puts it at the end of the
+   name cell rather than beside the name, so a long display name is still
+   clamped by its own `text-overflow` and the control never moves. */
+.overview-open-agent { flex: 0 0 auto; margin-left: auto; width: 20px; height: 20px; display: grid; place-items: center; border: 1px solid transparent; border-radius: 4px; color: var(--faint); background: transparent; cursor: pointer; }
+.overview-open-agent:hover, .overview-open-agent:focus-visible, .overview-row.is-openable:hover .overview-open-agent { color: var(--teal); border-color: var(--teal-focus); background: var(--teal-soft); }
+/* A click anywhere on the row opens the pane too, so the row reads as one
+   target: a pointer over all of it, and while it is hovered the control lights
+   exactly as it does under the pointer itself. The control is what carries the
+   hover here rather than the row's background, because a failed row's red
+   background already wins over `.overview-row:hover` and would show nothing. */
+.overview-row.is-openable { cursor: pointer; }

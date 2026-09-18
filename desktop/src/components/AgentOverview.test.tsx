@@ -20,7 +20,7 @@ import { createFixtureFleet, createFixtureSnapshot, FIXTURE_DAEMON_ID, FIXTURE_P
 import { DEFAULT_DESKTOP_SETTINGS, type DesktopSettingsDto, PENDING_DECK_MESSAGE, pendingDeckSnapshot, unconfiguredDeckSnapshot } from "../lib/bridge";
 import { DISPLAY_LIMITS } from "../lib/displayText";
 import { UNREPORTED } from "../types";
-import type { AgentSession, DeckRuntimeState, DeckSnapshot } from "../types";
+import type { AgentSession, DeckRuntimeState, DeckSnapshot, DeckView } from "../types";
 
 /**
  * The overview's central claim is that it mounts no terminal. Spying on the
@@ -1403,6 +1403,215 @@ describe("AgentOverview", () => {
     expect(container.querySelectorAll(".terminal-viewport, .agent-panel, .agent-tile, canvas")).toHaveLength(0);
   });
 
+  /**
+   * Scenario: render the terminal-free overview and activate the Planner
+   * card's keyboard-reachable open control. It navigates with the card's
+   * composite identity and overview origin without mounting a terminal itself.
+   */
+  it("opens an overview card as an agent view without putting a terminal on the overview", () => {
+    const onNavigate = vi.fn();
+    window.localStorage.setItem(OVERVIEW_COLUMNS_STORAGE_KEY, JSON.stringify({ columns: ALL_OVERVIEW_COLUMNS }));
+    render(<AgentOverview runtime={runtime({ snapshot: createFixtureSnapshot("connected") })} onNavigate={onNavigate} />);
+
+    const card = screen.getByTestId(`overview-agent-${agentKey({ daemonId: FIXTURE_DAEMON_ID, id: "planner" })}`);
+    const open = within(card).getByRole("button", { name: "Open Plan / architecture agent" });
+    expect(open.tagName).toBe("BUTTON");
+    open.focus();
+    expect(open).toHaveFocus();
+
+    fireEvent.click(open);
+    expect(onNavigate).toHaveBeenCalledOnce();
+    expect(onNavigate).toHaveBeenCalledWith({
+      kind: "agent",
+      deckId: FIXTURE_DAEMON_ID,
+      agentId: "planner",
+      from: "overview",
+    });
+    expect(terminalMounted).not.toHaveBeenCalled();
+    expect(screen.queryAllByTestId(/^terminal-/)).toHaveLength(0);
+  });
+
+  /**
+   * Scenario: render the whole fleet and click each agent's row away from its
+   * open control — on the status, the name, the prompt, and the row's own
+   * padding. Every click opens that agent's pane with its own deck, including
+   * agents on a deck that is not selected, and the row still is not a button.
+   */
+  it("opens the pane from a click anywhere on a row, on every deck", () => {
+    const onNavigate = vi.fn();
+    const fleet = createFixtureFleet("fleet");
+    window.localStorage.setItem(OVERVIEW_COLUMNS_STORAGE_KEY, JSON.stringify({ columns: ALL_OVERVIEW_COLUMNS }));
+    render(<AgentOverview runtime={runtime({ snapshot: fleet[0], fleet })} onNavigate={onNavigate} />);
+
+    const [local, remote] = fleet;
+    // A non-selected deck's rows have to be in the loop, or "every deck" would
+    // be covering one.
+    expect(remote.agents.length).toBeGreaterThan(0);
+    expect(remote.connection.deckId).not.toBe(local.connection.deckId);
+
+    for (const agent of [...local.agents, ...remote.agents]) {
+      const row = screen.getByTestId(`overview-agent-${agentDomKey(agent)}`);
+      expect(row.tagName).toBe("TR");
+      expect(row).not.toHaveAttribute("role", "button");
+      expect(getComputedStyle(row).cursor).toBe("pointer");
+
+      const expected = { kind: "agent", deckId: agent.daemonId, agentId: agent.id, from: "overview" };
+      const targets = [
+        row.querySelector(".overview-state .status-label"),
+        row.querySelector(".overview-agent-name strong"),
+        row.querySelector(".overview-prompt"),
+        row,
+      ];
+      for (const target of targets) {
+        expect(target).not.toBeNull();
+        onNavigate.mockClear();
+        fireEvent.click(target!);
+        expect(onNavigate).toHaveBeenCalledOnce();
+        expect(onNavigate).toHaveBeenCalledWith(expected);
+      }
+    }
+    expect(terminalMounted).not.toHaveBeenCalled();
+  });
+
+  /**
+   * Scenario: click a row's own open control, then the icon glyph inside it,
+   * which is what a mouse actually lands on. Each click opens the pane exactly
+   * once, rather than once for the control and again for the row around it.
+   */
+  it("opens the pane once, not twice, when the row's own open control is clicked", () => {
+    const onNavigate = vi.fn();
+    render(<AgentOverview runtime={runtime({ snapshot: createFixtureSnapshot("connected") })} onNavigate={onNavigate} />);
+
+    const card = screen.getByTestId(`overview-agent-${agentKey({ daemonId: FIXTURE_DAEMON_ID, id: "planner" })}`);
+    const open = within(card).getByRole("button", { name: "Open Plan / architecture agent" });
+    const glyph = open.querySelector("svg");
+    expect(glyph).not.toBeNull();
+
+    for (const target of [open, glyph!]) {
+      onNavigate.mockClear();
+      fireEvent.click(target);
+      expect(onNavigate).toHaveBeenCalledOnce();
+      expect(onNavigate).toHaveBeenCalledWith({ kind: "agent", deckId: FIXTURE_DAEMON_ID, agentId: "planner", from: "overview" });
+    }
+  });
+
+  /**
+   * Scenario: select part of an agent's prompt, as a drag across it leaves the
+   * document, and click the row the way that drag's mouse-up does. Nothing
+   * opens. The same click on a plain caret opens the pane, and so does one
+   * while the only selection on screen is in a different row.
+   */
+  it("does not open the pane for a click that finishes selecting text in the row", () => {
+    const onNavigate = vi.fn();
+    const snapshot = createFixtureSnapshot("crowded");
+    window.localStorage.setItem(OVERVIEW_COLUMNS_STORAGE_KEY, JSON.stringify({ columns: ALL_OVERVIEW_COLUMNS }));
+    render(<AgentOverview runtime={runtime({ snapshot })} onNavigate={onNavigate} />);
+
+    const [agent, other] = snapshot.agents.filter((candidate) => candidate.lastUserPrompt);
+    expect(other).toBeDefined();
+    const promptText = (target: AgentSession) => {
+      const cell = screen.getByTestId(`overview-agent-${agentDomKey(target)}`).querySelector(".overview-prompt");
+      expect(cell?.firstChild?.nodeType).toBe(Node.TEXT_NODE);
+      return cell!.firstChild as Text;
+    };
+    const text = promptText(agent);
+    const selection = window.getSelection()!;
+    const selectIn = (node: Text) => {
+      const range = document.createRange();
+      range.setStart(node, 2);
+      range.setEnd(node, 12);
+      selection.removeAllRanges();
+      selection.addRange(range);
+      expect(selection.isCollapsed).toBe(false);
+    };
+
+    try {
+      selectIn(text);
+      expect(selection.toString()).toBe(text.data.slice(2, 12));
+      fireEvent.click(text.parentElement!);
+      expect(onNavigate).not.toHaveBeenCalled();
+
+      // A plain click leaves a collapsed caret where it landed, and that is an
+      // ordinary click.
+      selection.collapse(text, 4);
+      fireEvent.click(text.parentElement!);
+      expect(onNavigate).toHaveBeenCalledOnce();
+      expect(onNavigate).toHaveBeenLastCalledWith({ kind: "agent", deckId: agent.daemonId, agentId: agent.id, from: "overview" });
+
+      // A selection that is not in this row says nothing about this click.
+      selectIn(promptText(other));
+      fireEvent.click(text.parentElement!);
+      expect(onNavigate).toHaveBeenCalledTimes(2);
+    } finally {
+      selection.removeAllRanges();
+    }
+  });
+
+  /**
+   * Scenario: list every interactive element in every row of three fixtures,
+   * which is the open control and nothing else; then put one of each kind of
+   * control into a row and click it. Each control gets its own click and none
+   * of them opens the pane.
+   */
+  it("leaves a click on any control inside a row to that control", () => {
+    /*
+      Deliberately wider than the selector the row uses, so a control the row's
+      guard would miss still shows up here as an unexpected extra.
+    */
+    const INTERACTIVE = "a, area, button, input, select, textarea, label, summary, details, iframe, audio[controls], video[controls], [tabindex], [contenteditable], [draggable='true'], [role='button'], [role='link'], [role='checkbox'], [role='switch'], [role='menuitem'], [role='tab'], [role='option'], [role='textbox'], [role='combobox'], [role='slider']";
+    window.localStorage.setItem(OVERVIEW_COLUMNS_STORAGE_KEY, JSON.stringify({ columns: ALL_OVERVIEW_COLUMNS }));
+    const fleet = createFixtureFleet("fleet");
+    const cases: Partial<DeckRuntimeState>[] = [
+      { snapshot: createFixtureSnapshot("crowded") },
+      { snapshot: createFixtureSnapshot("connected") },
+      { snapshot: fleet[0], fleet },
+    ];
+    let rowsSeen = 0;
+    for (const overrides of cases) {
+      const { container, unmount } = render(<AgentOverview runtime={runtime(overrides)} onNavigate={vi.fn()} />);
+      for (const row of container.querySelectorAll(".overview-row")) {
+        const controls = [...row.querySelectorAll(INTERACTIVE)];
+        expect(controls.map((control) => control.className)).toEqual(["overview-open-agent"]);
+        rowsSeen += 1;
+      }
+      unmount();
+    }
+    expect(rowsSeen).toBeGreaterThan(15);
+
+    const onNavigate = vi.fn();
+    render(<AgentOverview runtime={runtime({ snapshot: createFixtureSnapshot("connected") })} onNavigate={onNavigate} />);
+    const cell = screen.getByTestId(`overview-agent-${agentKey({ daemonId: FIXTURE_DAEMON_ID, id: "planner" })}`).querySelector(".overview-agent-name")!;
+    const injected = [
+      '<button type="button"><span data-hit>nested</span></button>',
+      '<a href="#overview-row-control" data-hit>link</a>',
+      '<label><input type="checkbox"><span data-hit>label</span></label>',
+      '<input type="text" data-hit>',
+      '<select data-hit><option>one</option></select>',
+      '<textarea data-hit></textarea>',
+      '<span tabindex="0" data-hit>focusable</span>',
+      '<span role="button" data-hit>role</span>',
+      '<span contenteditable="true" data-hit>editable</span>',
+    ];
+    for (const markup of injected) {
+      const host = document.createElement("span");
+      host.innerHTML = markup;
+      cell.append(host);
+      const control = host.firstElementChild!;
+      const ownJob = vi.fn();
+      control.addEventListener("click", ownJob);
+
+      fireEvent.click(host.querySelector("[data-hit]")!);
+      expect(ownJob, markup).toHaveBeenCalled();
+      expect(onNavigate, markup).not.toHaveBeenCalled();
+      host.remove();
+    }
+    window.history.replaceState(null, "", window.location.pathname);
+
+    // The guard is scoped to the row: plain text in the same cell still opens.
+    fireEvent.click(cell.querySelector("strong")!);
+    expect(onNavigate).toHaveBeenCalledOnce();
+  });
+
   it("says the control channel is still opening rather than listing a fleet it has not read", () => {
     const snapshot = createFixtureSnapshot("crowded");
     snapshot.connection = { status: "loading", socketPath: FIXTURE_DAEMON_ID, message: "Connecting to the daemon" };
@@ -1642,16 +1851,24 @@ describe("AgentOverview", () => {
   });
 
   /**
-   * Scenario: render the overview against the crowded fifteen-agent fleet and
-   * watch what it tells the bridge. Its header claims "no terminals attached",
-   * and this is that claim as an instruction rather than as prose: declaring the
-   * empty shown set is what detaches whatever the deck left warm on the way here
-   * (PRD #745 M7). Rendering no terminal is NOT the same as attaching none —
-   * mounting nothing was already true before M7 and the sockets stayed open.
+   * Scenario: land on the overview against the crowded fifteen-agent fleet and
+   * watch what the app tells the bridge. Its header claims "no terminals
+   * attached", and this is that claim as an instruction rather than as prose:
+   * declaring the empty shown set is what detaches whatever the deck left warm
+   * on the way here (PRD #745 M7). Rendering no terminal is NOT the same as
+   * attaching none — mounting nothing was already true before M7 and the
+   * sockets stayed open.
+   *
+   * Driven through `DeckShell` rather than through `AgentOverview` alone
+   * because PRD #1105 M4 moved the declaration up to the one component that can
+   * see this screen and an agent pane over it together. What is asserted is
+   * unchanged and is the point of the move: exactly ONE call, carrying the
+   * empty set. The screen rendered standalone now declares nothing at all,
+   * which is a fact about a harness with no owner above it.
    */
   it("declares an empty shown set so the screen holds no PTY", () => {
     const setShownTerminals = vi.fn(async () => undefined);
-    renderOverview({ setShownTerminals });
+    render(<DeckShell runtime={runtime({ setShownTerminals })} initialView={{ kind: "overview" }} />);
 
     expect(terminalMounted).not.toHaveBeenCalled();
     expect(setShownTerminals).toHaveBeenCalledTimes(1);
@@ -1805,6 +2022,99 @@ describe("DeckShell", () => {
   });
 
   afterEach(() => vi.unstubAllGlobals());
+
+  const agentView = (from: "deck" | "overview"): DeckView => ({
+    kind: "agent",
+    deckId: FIXTURE_DAEMON_ID,
+    agentId: "planner",
+    from,
+  } as unknown as DeckView);
+
+  /**
+   * Scenario: start directly in a deck-origin agent view, with no navigation
+   * history to consult. The deck grid stays mounted below the named dialog,
+   * and its close control returns to the deck recorded in the view value.
+   */
+  it("renders a deck-origin agent view over the mounted deck and closes back to it", () => {
+    render(<DeckShell runtime={runtime({ snapshot: createFixtureSnapshot("connected") })} initialView={agentView("deck")} />);
+
+    const overlay = screen.getByTestId("agent-pane-overlay");
+    expect(overlay).toHaveAttribute("role", "dialog");
+    expect(overlay).toHaveAccessibleName("Planner agent");
+    expect(overlay).toHaveAttribute("aria-modal", "true");
+    expect(within(overlay).getByRole("heading", { name: "Planner" })).toBeVisible();
+    expect(document.querySelector(".agent-grid")).toBeInTheDocument();
+    expect(screen.getByTestId("agent-tile-builder")).toBeInTheDocument();
+    expect(screen.queryByTestId("overview-table-region")).not.toBeInTheDocument();
+
+    fireEvent.click(within(overlay).getByRole("button", { name: "Close Planner agent" }));
+    expect(screen.queryByTestId("agent-pane-overlay")).not.toBeInTheDocument();
+    expect(document.querySelector(".agent-grid")).toBeVisible();
+    expect(screen.getByTestId("agent-tile-planner")).toBeVisible();
+    expect(screen.queryByTestId("overview-table-region")).not.toBeInTheDocument();
+  });
+
+  /**
+   * Scenario: start directly in an overview-origin agent view, again without
+   * history. The terminal-free overview stays mounted below the pane, whose
+   * sole terminal disappears when Close returns to the recorded overview.
+   */
+  it("renders an overview-origin agent view over the mounted overview and closes back to it", () => {
+    render(<DeckShell runtime={runtime({ snapshot: createFixtureSnapshot("connected") })} initialView={agentView("overview")} />);
+
+    const overview = screen.getByTestId("overview-table-region");
+    const overlay = screen.getByTestId("agent-pane-overlay");
+    expect(overview).toBeInTheDocument();
+    expect(within(overview).queryAllByTestId(/^terminal-/)).toHaveLength(0);
+    expect(within(overlay).getByTestId("terminal-planner")).toBeVisible();
+    expect(terminalMounted).toHaveBeenCalledTimes(1);
+    expect(terminalMounted).toHaveBeenCalledWith("planner");
+    expect(screen.queryByTestId("agent-tile-builder")).not.toBeInTheDocument();
+
+    fireEvent.click(within(overlay).getByRole("button", { name: "Close Planner agent" }));
+    expect(screen.queryByTestId("agent-pane-overlay")).not.toBeInTheDocument();
+    expect(screen.getByTestId("overview-table-region")).toBeVisible();
+    expect(screen.getByTestId(`overview-agent-${agentKey({ daemonId: FIXTURE_DAEMON_ID, id: "planner" })}`)).toBeVisible();
+    expect(screen.queryAllByTestId(/^terminal-/)).toHaveLength(0);
+  });
+
+  /**
+   * Scenario: open the overview in the whole app and click the Planner row's
+   * status, away from its open control. The pane opens over the overview with
+   * the one terminal in the pane, and the overview underneath still has none.
+   */
+  it("opens a pane from an overview row click with its terminal in the pane and none on the overview", () => {
+    render(<DeckShell runtime={runtime({ snapshot: createFixtureSnapshot("connected") })} initialView={{ kind: "overview" }} />);
+    expect(terminalMounted).not.toHaveBeenCalled();
+
+    const row = screen.getByTestId(`overview-agent-${agentKey({ daemonId: FIXTURE_DAEMON_ID, id: "planner" })}`);
+    fireEvent.click(row.querySelector(".overview-state .status-label")!);
+
+    const overview = screen.getByTestId("overview-table-region");
+    const overlay = screen.getByTestId("agent-pane-overlay");
+    expect(overlay).toHaveAccessibleName("Planner agent");
+    expect(within(overlay).getByTestId("terminal-planner")).toBeVisible();
+    expect(within(overview).queryAllByTestId(/^terminal-/)).toHaveLength(0);
+    expect(overview.querySelectorAll(".terminal-viewport, .agent-panel, .agent-tile, canvas")).toHaveLength(0);
+    expect(terminalMounted).toHaveBeenCalledTimes(1);
+    expect(terminalMounted).toHaveBeenCalledWith("planner");
+  });
+
+  /**
+   * Scenario: start directly in an overview-origin agent view and press Escape
+   * at window. The pane closes to the origin carried by that view even though
+   * no browser history entry or prior screen transition exists.
+   */
+  it("closes an agent view on Escape to the origin recorded in the view", () => {
+    render(<DeckShell runtime={runtime({ snapshot: createFixtureSnapshot("connected") })} initialView={agentView("overview")} />);
+
+    expect(screen.getByTestId("agent-pane-overlay")).toBeVisible();
+    fireEvent.keyDown(window, { key: "Escape" });
+
+    expect(screen.queryByTestId("agent-pane-overlay")).not.toBeInTheDocument();
+    expect(screen.getByTestId("overview-table-region")).toBeVisible();
+    expect(screen.queryByTestId("agent-tile-planner")).not.toBeInTheDocument();
+  });
 
   it("opens on the deck and reaches the overview from the rail without mounting a terminal", () => {
     render(<DeckShell runtime={runtime({ snapshot: createFixtureSnapshot("connected") })} />);
@@ -2301,5 +2611,66 @@ describe("AgentOverview across a fleet (PRD #742 M4)", () => {
     // out rather than imports — `bridge.ts` imports the fixture module, so this
     // assertion is what stands in for the import that would close a cycle.
     expect(within(waiting).getByTestId("daemon-state")).toHaveTextContent(PENDING_DECK_MESSAGE);
+  });
+
+  /**
+   * Scenario: the four-deck fleet is on screen with the local deck selected.
+   * Every row on every deck carries a real open control, and pressing the one
+   * on a NON-selected deck's row navigates to that agent's pane with that
+   * agent's own deck in the view.
+   *
+   * # Why every row, including the ones this app cannot attach
+   *
+   * The overview merges every observed deck (#742) while a tile's terminal is
+   * always the *selected* deck's, so it lists agents no attach can reach. An
+   * earlier build of this milestone gated the control on that and rendered a
+   * two-word marker instead; that was reverted. If an agent is on the screen
+   * there has to be a way into its pane — a listed row with no way to open it
+   * is a dead row, and nothing on the row tells the reader which deck they are
+   * pointing at in the first place.
+   *
+   * The deck decides what the PANE can do, not whether it opens: it comes up
+   * with an explicit no-terminal state naming the deck
+   * (`desktop/src/AgentPaneDeckIdentity.test.tsx` has that half). What stays
+   * withdrawn is the deck SWITCH — this screen moves no selection, and
+   * `writes no settings document when a pane opens or closes` is its guard.
+   */
+  it("offers an open control on every row, whichever deck the agent is on", () => {
+    const onNavigate = vi.fn();
+    const fleet = createFixtureFleet("fleet");
+    window.localStorage.setItem(OVERVIEW_COLUMNS_STORAGE_KEY, JSON.stringify({ columns: ALL_OVERVIEW_COLUMNS }));
+    render(<AgentOverview runtime={runtime({ snapshot: fleet[0], fleet })} onNavigate={onNavigate} />);
+
+    const [local, remote] = fleet;
+    expect(local.connection.deckId).toBe(FIXTURE_DAEMON_ID);
+    expect(remote.connection.deckId).toBe(FIXTURE_REMOTE_DAEMON_ID);
+    // The fleet has to contain a non-selected deck with agents on it, or the
+    // loop below would pass by covering nothing.
+    expect(remote.agents.length).toBeGreaterThan(0);
+
+    for (const agent of [...local.agents, ...remote.agents]) {
+      const row = screen.getByTestId(`overview-agent-${agentDomKey(agent)}`);
+      const open = within(row).getByRole("button", { name: `Open ${agent.displayName} agent` });
+      expect(open).toBeVisible();
+      expect(open.tagName).toBe("BUTTON");
+      expect(open).not.toBeDisabled();
+    }
+
+    /*
+      And the control on a non-selected deck's row is live rather than
+      decorative, carrying that agent's OWN deck into the view — which is what
+      the pane resolves through, and what keeps it off the selected deck's
+      same-id namesake.
+    */
+    const stranger = remote.agents[0];
+    fireEvent.click(screen.getByRole("button", { name: `Open ${stranger.displayName} agent` }));
+    expect(onNavigate).toHaveBeenCalledOnce();
+    expect(onNavigate).toHaveBeenCalledWith({
+      kind: "agent",
+      deckId: FIXTURE_REMOTE_DAEMON_ID,
+      agentId: stranger.id,
+      from: "overview",
+    });
+    expect(terminalMounted).not.toHaveBeenCalled();
   });
 });

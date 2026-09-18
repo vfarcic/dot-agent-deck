@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
 import {
   Activity,
   AlertTriangle,
@@ -34,23 +34,27 @@ import {
   Zap,
 } from "lucide-react";
 import { AgentOverview } from "./components/AgentOverview";
-import { AgentTile } from "./components/AgentTile";
+import { AgentTile, type AgentTileProps } from "./components/AgentTile";
 import { ConfirmDialog, type ConfirmState } from "./components/ConfirmDialog";
 import { DeckSelector } from "./components/DeckSelector";
 import { HandoffRail } from "./components/HandoffRail";
 import { ProfilesPanel, ProjectsPanel, PromptLibraryPanel, WorkflowPanel } from "./components/ConfigurationPanels";
 import { SettingsSheet } from "./components/SettingsSheet";
 import { SettingsBridgeProvider } from "./lib/settingsBridge";
-import { DISPLAY_LIMITS, displayText } from "./lib/displayText";
+import { DISPLAY_LIMITS, deckName, displayText } from "./lib/displayText";
 import { useAgentProfiles } from "./hooks/useAgentProfiles";
 import { useDeckRuntime } from "./hooks/useDeckRuntime";
 import { useDaemonProjects } from "./hooks/useDaemonProjects";
 import { usePromptLibrary } from "./hooks/usePromptLibrary";
 import { useDesktopSettings, type DesktopSettingsState } from "./hooks/useDesktopSettings";
+import { useInertBackground } from "./hooks/useInertBackground";
+import { useShownTerminals } from "./hooks/useShownTerminals";
 import { useZoom } from "./hooks/useZoom";
+import { agentKey } from "./lib/agentKey";
+import { unreachableDeckTerminalState } from "./lib/terminalInput";
 import { applyAppearance } from "./lib/appearance";
 import { desktopWorkflowPlatformIssue } from "./lib/platform";
-import type { DeckAction, DeckActionResult, DeckRuntimeState, DeckView, EvidenceItem, PanelTab, WorkflowLaunchConfig } from "./types";
+import type { AgentSession, DeckAction, DeckRuntimeState, DeckSnapshot, DeckView, EvidenceItem, PanelTab, WorkflowLaunchConfig } from "./types";
 import { modeScopedKey } from "./lib/bridge";
 
 const WORKFLOW_STORAGE_KEY = modeScopedKey("dot-agent-deck.desktop.workflow-preview.v1");
@@ -116,6 +120,11 @@ export default function App() {
  *
  * The deck stays the default: launching the app lands exactly where it does
  * today.
+ *
+ * PRD #1105 M2 narrowed the first sentence rather than repealing it. The two
+ * SCREEN variants still replace one another; the `"agent"` variant does not —
+ * it names the screen to keep mounted underneath and renders the pane over it,
+ * which is why the switch below reads `base` rather than `view.kind`.
  */
 export function DeckShell({ runtime, workflowPlatformIssue, initialView = { kind: "deck" } }: { runtime: DeckRuntimeState; workflowPlatformIssue?: string; initialView?: DeckView }) {
   const [view, setView] = useState<DeckView>(initialView);
@@ -134,8 +143,403 @@ export function DeckShell({ runtime, workflowPlatformIssue, initialView = { kind
    */
   const settings = useDesktopSettings(runtime);
   useZoom(runtime, settings);
-  if (view.kind === "overview") return <AgentOverview runtime={runtime} settings={settings} onNavigate={setView} />;
-  return <DeckSurface runtime={runtime} settings={settings} workflowPlatformIssue={workflowPlatformIssue} onNavigate={setView} />;
+  const agentView = view.kind === "agent" ? view : undefined;
+  /**
+   * Back, and the whole of it. The destination is read off the view rather
+   * than popped from a stack, so an agent view that was never navigated TO —
+   * the app's `initialView`, a future deep link — closes to a real screen
+   * instead of to nothing.
+   */
+  const closeAgent = useCallback(() => setView((current) => (current.kind === "agent" ? { kind: current.from } : current)), []);
+  /**
+   * `Escape`, bound at `window` because the pane has no single focusable owner
+   * — focus is usually inside xterm's helper textarea, which swallows keys
+   * before React sees them.
+   *
+   * Exactly ONE `window` `keydown` listener exists for the pane, and that is a
+   * property of the pane's contents rather than of this line: `OutputReader`
+   * binds one too, `stopPropagation` does nothing between two listeners on the
+   * same target, and the order is registration order.
+   *
+   * It takes TWO gates in `AgentTile` to make that true, and the PR review
+   * found the second missing. `presentation="overlay"` renders no Reader, which
+   * covers the tile being promoted; the other tiles the pane is drawn OVER stay
+   * at `"tile"` and kept any Reader they already had, so opening the Reader on
+   * one tile and the pane on another left two listeners answering one
+   * `Escape` — closing the pane and that Reader together. `panePresent` is the
+   * screen-wide gate that closes it, and it dismisses rather than hides: a
+   * Reader restored on close would answer the next `Escape` instead of the
+   * deck.
+   */
+  useEffect(() => {
+    if (!agentView) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") closeAgent();
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [agentView, closeAgent]);
+  const base = agentView?.from ?? view.kind;
+  const selectedDeckId = runtime.snapshot.connection.deckId;
+  /** The fleet entry the open pane's agent lives on, if the app is observing it. */
+  const paneDeck = agentView ? runtime.fleet.find((entry) => entry.connection.deckId === agentView.deckId) : undefined;
+  /**
+   * PRD #1105 — whether the open pane's agent can have a terminal at all, which
+   * is the one condition two different things read.
+   *
+   * It decides whether an attach may be declared for that agent, and it decides
+   * whether the pane shows a terminal or says why it has none. Those must agree
+   * — a pane showing a terminal nothing attached to is the black rectangle this
+   * feature exists to replace, and a pane explaining itself while an attach is
+   * live would be explaining a state it is not in. One expression is how they
+   * are kept in agreement; two comparisons of the same values is how they would
+   * drift.
+   *
+   * # It used to ask whether the deck was SELECTED, and that is what changed
+   *
+   * The desktop app's reason to exist over the TUI is that it is a control
+   * plane for every deck at once (PRD #802, #742) — so an agent the overview
+   * lists and cannot open as a working pane is the feature failing on its own
+   * terms. The condition was `agentView.deckId === selectedDeckId` because
+   * `terminal::attach` resolved its daemon through the process-global
+   * `trusted_daemon()`: declaring an attach while another deck was in force
+   * attached *that* deck's agent of the same per-daemon monotonic id, on
+   * another machine, under the right name.
+   *
+   * The attach now names its deck and the crate resolves that deck's own link
+   * through `DaemonLinks`, so being selected has stopped being a precondition
+   * for having a terminal. What remains a precondition is being REACHABLE: a
+   * deck that is disconnected, still waiting to report, or configured with no
+   * address has no link to attach over, and a pane there must say so rather
+   * than mount a viewport that will receive nothing.
+   *
+   * An agent on a deck this app is not observing at all falls here too, through
+   * `paneDeck` being `undefined` — a pane cannot promise an attach against a
+   * deck it cannot name.
+   */
+  const paneDeckAttachable = paneDeck?.connection.status === "connected";
+  /**
+   * The agent the open pane is FOR, resolved by the composite identity against
+   * the fleet entry named by the view — never by bare id against the selected
+   * deck's snapshot, which is where a bare-id lookup would find a *different*
+   * agent wearing the same per-daemon monotonic id (PRD #1105 M6).
+   *
+   * Resolved HERE rather than inside {@link OverviewAgentPane}, and for the same
+   * reason `paneDeckAttachable` is one expression: three things read it — the
+   * shown declaration below, the retirement close further down, and the pane
+   * itself, which takes it as a prop. Two copies of this `find` is how those
+   * would drift, and the drift the PR review found was exactly that shape: the
+   * pane resolved the agent and rendered nothing when it failed, while the
+   * declaration never asked and went on naming it.
+   */
+  const paneAgent = agentView && paneDeck ? paneDeck.agents.find((candidate) => candidate.id === agentView.agentId) : undefined;
+  /**
+   * PRD #1105 M4 — the shown set for the OVERVIEW tree, declared here because
+   * this is the only component that can see the overview and the pane over it
+   * in one commit. `undefined` on the deck path hands ownership to
+   * {@link DeckSurface} without declaring anything; see {@link useShownTerminals}.
+   *
+   * The declaration names the pane's OWN deck, never the selected one, so a
+   * selection move neither retargets it nor tears it down: the joined key is
+   * unchanged, so no call is made at all.
+   *
+   * **It names an agent that still RESOLVES, which is the PR review's P1.** The
+   * declaration used to gate on the deck alone, so an agent the daemon ended
+   * under an open pane stayed declared — and the standing declaration is not
+   * inert. `useShownTerminals` keys its effect on the joined `(deckId,
+   * agentId)` string, which an agent leaving the fleet does not change, so
+   * nothing re-fired to withdraw it; meanwhile the bridge re-runs
+   * `attachAgents` over the whole shown set on **every** `desktop://snapshot`
+   * (`bridge.ts`'s `subscribe`), and the daemon's `end` event for that agent has
+   * already removed it from `attached` — so it cleared `attachAgents`' filter
+   * afresh on each snapshot, took the process-wide attach gate and opened a
+   * socket for an agent that no longer exists, serialising against the attaches
+   * of panes that do.
+   */
+  const overviewShown = base === "overview"
+    ? (agentView && paneAgent && paneDeckAttachable ? [{ deckId: agentView.deckId, agentId: agentView.agentId }] : [])
+    : undefined;
+  useShownTerminals(runtime.setShownTerminals, overviewShown);
+  /**
+   * PRD #1105's security audit — the deck-origin pane is FENCED on identity,
+   * and closes rather than retargets.
+   *
+   * A deck-origin pane means "this agent, on the deck you are looking at": the
+   * deck surface renders the selected deck and no other, so the pane's claim
+   * and the view's `deckId` are the same claim. When the selected deck moves
+   * out from under it — by the deck selector under an open pane, by a
+   * `selectionFallback` the crate reports, or by another window writing the
+   * settings document — that claim is no longer true of anything on screen.
+   * Holding the pane open would promote the NEW deck's agent of the same
+   * per-daemon monotonic id under the old one's name, with matching role text
+   * and no deck identity in the dialog, and would route the user's keystrokes
+   * to it.
+   *
+   * Closing is chosen over suspending because it is the only option that
+   * leaves nothing to be wrong about: a suspended pane still has to say whose
+   * agent it is showing, and the honest answer is "nobody's". The user lands on
+   * the deck they just selected, which is what they asked for.
+   *
+   * The render below does not wait for this effect. `DeckSurface` promotes a
+   * tile only on the full `(deckId, agentId)` match, so the mismatch commit
+   * shows no pane at all and this closes the view behind it — the pane's
+   * lookup, its shown declaration and its input authority never degrade to a
+   * bare id, not even for one frame.
+   *
+   * An UNKNOWN selected deck is not a mismatch, which is why this is its own
+   * comparison rather than `!paneDeckSelected` above. `reconnect`'s failure
+   * path rebuilds `connection` without a `deckId`, and a transiently
+   * unidentified deck is not evidence that the pane's deck changed — where for
+   * the attach declaration it is exactly grounds to declare nothing. The two
+   * conditions genuinely differ on that one input, and collapsing them would
+   * close a deck-origin pane every time a reconnect failed.
+   */
+  const deckPaneRetargeted = agentView?.from === "deck" && selectedDeckId !== undefined && agentView.deckId !== selectedDeckId;
+  useEffect(() => {
+    if (deckPaneRetargeted) closeAgent();
+  }, [deckPaneRetargeted, closeAgent]);
+  /**
+   * PRD #1105 open question 3, answered — **the view does not outlive its
+   * subject.** The daemon can end an agent while it is overlaid, and before this
+   * the app simply stayed in `view.kind === "agent"`: the pane's own lookup
+   * failed, it returned `null`, and what was left was a view with nothing
+   * rendering it, no Close control, and (on the overview path) a shown
+   * declaration still naming the agent.
+   *
+   * Closing is chosen over an explicit ended state for three reasons, the first
+   * of which is decisive. **Everything the pane renders is a property of the
+   * agent RECORD** — heading, role, status, prompt, tool, the five panel tabs —
+   * and that record is what has gone; an ended state would have to be built
+   * from the view, which carries two ids and a `from`. Second, it is the answer
+   * already given one condition above for the same shape of problem:
+   * `deckPaneRetargeted` closes rather than suspends because *"a suspended pane
+   * still has to say whose agent it is showing, and the honest answer is
+   * 'nobody's'"*. Third, `closeAgent` lands on `view.from` — for an
+   * overview-origin pane, the screen that lists what does exist, which is where
+   * the absence explains itself. The PRD records the *visual* treatment as
+   * undecided, and closing is the option that decides nothing on the owner's
+   * behalf: it adds no surface, and an ended state can still replace it later.
+   *
+   * # `paneDeckAttachable` is load-bearing, and closing without it is worse than
+   * the defect
+   *
+   * A deck that is not answering reports **no agents at all** — both empty
+   * agent lists in the crate are on that path, `disconnected_snapshot` and
+   * `snapshot_with`'s non-connected early return — and `mapDesktopSnapshot`
+   * carries none over from the previous snapshot. So "the agent does not
+   * resolve" is ALSO what a remote deck blinking, a failed reconnect, or a deck
+   * that has not yet reported looks like, and closing on that alone would throw
+   * a healthy pane away on each of them. It would also contradict this PRD's own
+   * decision that such a deck *"replaces its terminal with a sentence rather
+   * than closing the pane"*.
+   *
+   * A CONNECTED deck's list is an answer rather than a silence:
+   * `connected_snapshot` is the only producer of a connected snapshot and it
+   * maps a `ListAgents` reply every time — fresh, or the agent view's cached
+   * records — and a `ListAgents` that fails becomes a `disconnected_snapshot`
+   * instead. So an absence there is a real absence, and that is the whole of
+   * why this reads `paneDeckAttachable`, the expression that already means
+   * "this deck has a live link", rather than testing `paneAgent` alone.
+   *
+   * # Both origins, one condition
+   *
+   * The deck path's shown declaration was never at risk — {@link DeckSurface}
+   * derives it from `snapshot.agents`, so a retired agent shrinks the set and
+   * the joined key changes on its own — and its render self-heals, because
+   * `paneAgentId` resolves to `undefined` and promotes no tile. What it shared
+   * with the overview was precisely this stale view, so the condition is written
+   * for `agentView` rather than for `base === "overview"`.
+   */
+  const paneAgentRetired = agentView !== undefined && paneDeckAttachable && paneAgent === undefined;
+  useEffect(() => {
+    if (paneAgentRetired) closeAgent();
+  }, [paneAgentRetired, closeAgent]);
+  if (base === "overview") {
+    return (
+      <>
+        <AgentOverview runtime={runtime} settings={settings} onNavigate={setView} />
+        {/*
+          The overview mounts no terminal of its own (PRD #745's commitment), so
+          there is no tile here to promote and the pane is a sibling of the
+          screen rather than a promotion inside it. That still leaves exactly
+          one live `TerminalViewport` for the agent, which is the property M3
+          actually requires.
+        */}
+        {agentView && paneDeck && paneAgent && <OverviewAgentPane runtime={runtime} view={agentView} deck={paneDeck} agent={paneAgent} attached={paneDeckAttachable} onClose={closeAgent} />}
+      </>
+    );
+  }
+  /* The COMPOSITE identity, never the bare id. See `deckPaneRetargeted` above
+     and `DeckSurface`'s own promotion condition. */
+  const openAgent = agentView ? { deckId: agentView.deckId, agentId: agentView.agentId } : undefined;
+  return <DeckSurface runtime={runtime} settings={settings} workflowPlatformIssue={workflowPlatformIssue} onNavigate={setView} openAgent={openAgent} onCloseAgent={closeAgent} />;
+}
+
+/**
+ * The pane over the OVERVIEW, with the tile state the deck would otherwise
+ * have owned. Its terminal is live whichever deck the agent is on.
+ *
+ * Split out for the hook and nothing else: the panel tab is component state,
+ * and a `tabs` map kept in {@link DeckShell} for a screen that has no tiles is
+ * the alternative.
+ *
+ * # It takes its deck and its agent, and resolves neither
+ *
+ * Both are resolved by {@link DeckShell} — `paneDeck` and `paneAgent` — and
+ * handed down, so this component has no lookup that can fail and no `null`
+ * branch. That is the PR review's P1 fixed at the structure rather than at the
+ * symptom: the early return this used to open with was a **silent** answer to
+ * "the agent is gone", and the parent that owns the view and the shown
+ * declaration never learnt of it. The parent now decides — closing the view
+ * when the pane's deck is answering and does not list the agent, and holding it
+ * when the deck is simply not answering — and this pane is rendered only where
+ * there is something to render.
+ *
+ * The identity behind that lookup is the COMPOSITE one (PRD #1105 M6): this
+ * screen merges every observed deck and every agent it lists is openable, so
+ * the pane can be for an agent on a deck that is not the selected one — and the
+ * selected deck's snapshot is exactly where a bare-id lookup would find a
+ * *different* agent wearing the same per-daemon monotonic id. `Escape` closes
+ * the view from here as from anywhere, because that listener is
+ * {@link DeckShell}'s and not this component's.
+ *
+ * # `attached` is the pane's whole deck story, and it is a state rather than a
+ * refusal
+ *
+ * The pane attaches on its OWN deck — {@link DeckShell}'s `paneDeckAttachable`
+ * is the one condition that decides both the shown declaration and this, so the
+ * two cannot disagree. It is false only where that deck has no live link at
+ * all: disconnected, not yet reporting, or not observed. The pane opens either
+ * way — everything that is a property of the AGENT works, header, status,
+ * prompt, tool, all five panel tabs, `Esc` and the close control — and the
+ * terminal tab then renders an explicit no-terminal state naming the deck and
+ * what is wrong with it instead of a `TerminalViewport` that would receive no
+ * bytes.
+ *
+ * **That "opens either way" is narrower in production than it reads; the gap is
+ * issue #1143.** It needs an agent record, and a deck with no live
+ * link reports **no agents** —
+ * `disconnected_snapshot` and `snapshot_with`'s non-connected early return both
+ * carry `agents: Vec::new()`, and `mapDesktopSnapshot` carries none over from
+ * the previous snapshot. So the pane this state was built for is not rendered at
+ * all on a deck that stops answering; what is guaranteed is only that the view
+ * is KEPT (see `paneAgentRetired`), so the pane returns intact when the deck
+ * does. Making the state itself reachable means holding the last known record
+ * for an open pane, which is its own product call and is not taken here.
+ *
+ * **Nothing here moves the selection.** Switching the selected deck on open was
+ * built and withdrawn under this PRD (decision 5) because it wrote
+ * `desktop.toml` on a navigation and left state created under one deck
+ * attributed to another. The pane reaching its own deck is what made that
+ * unnecessary rather than merely unwise.
+ */
+function OverviewAgentPane({ runtime, view, deck, agent, attached, onClose }: { runtime: DeckRuntimeState; view: Extract<DeckView, { kind: "agent" }>; deck: DeckSnapshot; agent: AgentSession; attached: boolean; onClose: () => void }) {
+  const [tab, setTab] = useState<PanelTab>("terminal");
+  return (
+    <AgentPaneFrame
+      open
+      agent={agent}
+      mode={runtime.mode}
+      selected
+      tab={tab}
+      terminalFeed={runtime.terminalFeed}
+      /* The deck named by the fleet entry this pane resolved through — so the
+         sentence names the agent's OWN deck, not whichever one is selected, and
+         it names it with `deckName`, which is what the overview's group header
+         the user just came from calls it. Reached only where that deck has no
+         live link: a merely NON-SELECTED deck attaches like any other. */
+      noTerminal={attached ? undefined : unreachableDeckTerminalState(deckName(deck.connection), deck.connection.message)}
+      /* This deck's, for the same reason the agent above is: the bridge records
+         hook events for the selected deck alone, so a non-selected deck's entry
+         carries none rather than somebody else's. The terminal crosses decks;
+         the evidence ring does not, and PRD #742 DECISION 1 keeps it that
+         way. */
+      evidence={deck.evidence}
+      /* By the COMPOSITE key, for the same reason the agent above is resolved
+         that way: a verdict recorded against the previously selected deck's
+         `planner` would otherwise disable this pane and print that deck's
+         rejection notice under this agent's heading, and that deck's cached
+         grid would be submitted to this agent's PTY — reflowing it, and every
+         other viewer attached to it, from a viewport on another machine. */
+      inputResult={runtime.terminalInputResults?.[agentKey(view.deckId, agent.id)]}
+      onSelect={() => undefined}
+      onTabChange={setTab}
+      onTerminalInput={runtime.sendTerminalInput}
+      onTerminalResize={runtime.resizeTerminal}
+      appliedGeometry={runtime.appliedGeometry?.[agentKey(view.deckId, agent.id)]}
+      /* The evidence drawer is the deck's, and no screen is mounted here that
+         could open it — so the handoffs tab lists evidence and selecting one
+         does nothing, rather than pretending at a drawer that is not there.
+         `onRename` is absent for the sharper version of the same reason: a
+         rename reports its outcome through the deck's toast, and a rename that
+         fails silently is worse than a header without the pencil. Both are
+         capabilities this screen genuinely lacks rather than presentation
+         differences, which is why neither is expressed through
+         `presentation`. */
+      onEvidenceSelect={() => undefined}
+      onClose={onClose}
+    />
+  );
+}
+
+/**
+ * PRD #1105 M3 — the pane's WRAPPER, and the reason it is rendered whether or
+ * not the pane is open.
+ *
+ * It positions {@link AgentTile} and carries the dialog chrome AROUND it; it
+ * renders no part of the pane itself. That line is what keeps the PRD's "no
+ * `AgentTileLarge`" criterion checkable — everything inside the box is one
+ * component at two presentations, and everything outside it is position and
+ * role.
+ *
+ * **Always rendered, because promote-in-place is a property of the React
+ * tree.** React reconciles children by position, key and TYPE, so this element
+ * has to exist at the tile's position in both states: flipping `open` then
+ * changes this `div`'s attributes and the tile's `presentation`, and React
+ * keeps the same `AgentTile` fiber, the same `TerminalViewport` beneath it and
+ * therefore the same xterm instance with its scrollback, selection and cursor.
+ * Rendering the wrapper only when open would swap a `div` in where an
+ * `AgentTile` was, which is an unmount — a rebuilt xterm and a client-side
+ * transcript re-write on every open and every close.
+ *
+ * Closed, the wrapper is `display: contents`, so `.agent-tile` remains the
+ * grid item it has always been and the deck's layout is untouched.
+ */
+function AgentPaneFrame({ open, onOpen, onClose, ...tile }: Omit<AgentTileProps, "presentation"> & { open: boolean }) {
+  /*
+    The `aria-modal` below is a claim about the whole interface, and until the
+    PRD's security audit it was false: the base screen is deliberately still
+    mounted underneath, so every control on it — the rail, the other tiles, and
+    the `DeckSelector` that can retarget the app to another deck — stayed
+    keyboard-reachable behind a full-window dialog. `useInertBackground` is what
+    makes the attribute true, by marking every element that is not an ancestor
+    of this one inert and moving focus inside. See that hook for why it walks
+    siblings rather than marking one subtree.
+  */
+  const paneRef = useInertBackground<HTMLDivElement>(open);
+  return (
+    <div
+      ref={paneRef}
+      className={open ? "agent-pane-overlay" : "agent-pane-slot"}
+      data-testid={open ? "agent-pane-overlay" : undefined}
+      role={open ? "dialog" : undefined}
+      aria-modal={open ? "true" : undefined}
+      aria-label={open ? `${tile.agent.role} agent` : undefined}
+      /* Focusable only as a focus TARGET, never as a tab stop: the hook moves
+         focus here when the pane opens over a control that had it, and Tab then
+         proceeds into the pane's own controls. */
+      tabIndex={open ? -1 : undefined}
+    >
+      <AgentTile
+        {...tile}
+        presentation={open ? "overlay" : "tile"}
+        /* One control at a time, and by construction: the pane that is open
+           offers Close and the tiles behind it offer Open. */
+        onOpen={open ? undefined : onOpen}
+        onClose={open ? onClose : undefined}
+      />
+    </div>
+  );
 }
 
 /**
@@ -154,8 +558,27 @@ export function ControlDeck(props: { runtime: DeckRuntimeState; workflowPlatform
   return <DeckSurface {...props} settings={settings} />;
 }
 
-export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktopWorkflowPlatformIssue(), onNavigate }: { runtime: DeckRuntimeState; settings: DesktopSettingsState; workflowPlatformIssue?: string; onNavigate?: (view: DeckView) => void }) {
+export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktopWorkflowPlatformIssue(), onNavigate, openAgent, onCloseAgent }: { runtime: DeckRuntimeState; settings: DesktopSettingsState; workflowPlatformIssue?: string; onNavigate?: (view: DeckView) => void; openAgent?: { deckId: string; agentId: string }; onCloseAgent?: () => void }) {
   const { snapshot, mode, setShownTerminals } = runtime;
+  /**
+   * Which tile is promoted, decided on the FULL `(deckId, agentId)` identity.
+   *
+   * PRD #1105's security audit. This prop was a bare `openAgentId`, and agent
+   * ids are per-daemon monotonic — so when the selected deck moved under an
+   * open pane, the arriving deck's namesake matched and was promoted into it.
+   * Same role, same display text, no deck identity in the dialog, and
+   * `sendTerminalInput(agentId, …)` resolving the bare-id session that now
+   * belonged to the other machine. `DeckShell` closes the view when that
+   * happens; this is the render-synchronous half, so no such commit exists even
+   * before the effect runs.
+   *
+   * Every agent here carries the selected deck's `daemonId`, so this is exactly
+   * the comparison `DeckShell` makes — expressed per tile, at the seam that
+   * decides what the user sees, rather than trusted from the caller.
+   */
+  const paneAgentId = openAgent && snapshot.agents.some((agent) => agent.id === openAgent.agentId && agent.daemonId === openAgent.deckId)
+    ? openAgent.agentId
+    : undefined;
   const [selectedAgentId, setSelectedAgentId] = useState("");
   const [tabs, setTabs] = useState<Record<string, PanelTab>>({});
   const [selectedEvidenceId, setSelectedEvidenceId] = useState("");
@@ -164,7 +587,7 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
   const [profilesOpen, setProfilesOpen] = useState(false);
   const [promptsOpen, setPromptsOpen] = useState(false);
   const [selectedPromptId, setSelectedPromptId] = useState("");
-  const [composerFocus, setComposerFocus] = useState<{ agentId: string; token: number }>();
+  const [terminalFocus, setTerminalFocus] = useState<{ agentId: string; token: number }>();
   const [workflowOpen, setWorkflowOpen] = useState(false);
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [helpOpen, setHelpOpen] = useState(false);
@@ -309,37 +732,28 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
    */
   const shownTerminals = snapshot.agents
     .filter((agent) => (tabs[agent.id] ?? "terminal") === "terminal")
-    .map((agent) => agent.id);
-
-  /**
-   * The same ids joined into one dependency so the effect below fires when the
-   * SET changes rather than on every render. It is a dependency KEY and nothing
-   * else — never split back apart. Agent ids are raw daemon identities, not
-   * display strings, so an id containing a newline would come back out of a
-   * `split` as two shown agents: two attach paths from one tile, and one
-   * invalid identity turned into several valid-looking ones behind
-   * `validate_agent_id`, which rejects control characters only when it is
-   * handed the id whole.
-   */
-  const shownTerminalKey = shownTerminals.join("\n");
-  /**
-   * The array the effect actually passes on, held in a ref because the effect
-   * must key on the joined string (stable across renders that change nothing)
-   * while carrying the ids themselves (a fresh array every render).
-   */
-  const shownTerminalsRef = useRef(shownTerminals);
-  shownTerminalsRef.current = shownTerminals;
+    /* The agent's OWN deck, which on this screen is always the selected one —
+       written as the agent's rather than read off the connection so the
+       declaration cannot drift from what the tile actually mounted. */
+    .map((agent) => ({ deckId: agent.daemonId, agentId: agent.id }));
 
   /**
    * ONE call per render commit carrying ALL the shown ids, never one call per
    * tile: `setShownTerminals` is declarative, so nine tiles declaring
    * themselves one at a time would leave eight of the nine in the warm set and
-   * evict five of them. Deleting this effect does not fail a bridge test — it
+   * evict five of them. Deleting this line does not fail a bridge test — it
    * silently leaves the deck with no attached terminals at all.
+   *
+   * PRD #1105 M4 moved the mechanism into {@link useShownTerminals} without
+   * changing what the deck declares, so the deck path's most useful property
+   * survives by construction: opening the agent pane over the grid changes
+   * neither `snapshot.agents` nor `tabs`, so the set is unchanged, so **no call
+   * is made at all** on open or on close.
+   *
+   * This is the deck tree's owner. The overview tree's is `DeckShell`, and the
+   * two screens are mutually exclusive, so exactly one is ever mounted.
    */
-  useEffect(() => {
-    void setShownTerminals(shownTerminalsRef.current);
-  }, [setShownTerminals, shownTerminalKey]);
+  useShownTerminals(setShownTerminals, shownTerminals);
 
   const orderedStages = snapshot.stages;
   const selectedAgent = snapshot.agents.find((agent) => agent.id === selectedAgentId);
@@ -370,19 +784,21 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
     }
   };
 
-  // Returned to the composer rather than swallowed here: only the composer can
-  // show a per-message delivered/failed state next to the text that produced it.
-  const submitText = async (agentId: string, text: string): Promise<DeckActionResult> =>
-    runtime.runAction({ type: "submit_text", agentId, text });
-
   const renameAgent = async (agentId: string, displayName: string) => {
     await perform({ type: "rename_agent", agentId, displayName }, `Agent renamed to ${displayName}.`);
   };
 
-  const focusComposer = (agentId: string) => {
+  /**
+   * Issue #1042: the terminal IS the input path now, so the palette's
+   * "Message coordinator…" entry puts the caret where the agent's own CLI
+   * grammar lives instead of in a composer that no longer exists. It still
+   * sends nothing — it selects the agent, shows its terminal, and asks that
+   * terminal to take focus.
+   */
+  const focusTerminal = (agentId: string) => {
     setSelectedAgentId(agentId);
     setTabs((current) => ({ ...current, [agentId]: "terminal" }));
-    setComposerFocus((current) => ({ agentId, token: (current?.token ?? 0) + 1 }));
+    setTerminalFocus((current) => ({ agentId, token: (current?.token ?? 0) + 1 }));
   };
 
   useEffect(() => {
@@ -625,9 +1041,9 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
   };
 
   const commandItems = [
-    ...(coordinator ? [{ label: "Message coordinator…", hint: `Send text to ${coordinator.displayName}`, icon: Send, run: () => focusComposer(coordinator.id) }] : []),
+    ...(coordinator ? [{ label: "Message coordinator…", hint: `Focus ${coordinator.displayName}'s terminal`, icon: Send, run: () => focusTerminal(coordinator.id) }] : []),
     { label: "Manage projects", hint: "Choose repositories & workflows", icon: FolderGit2, run: () => setProjectsOpen(true) },
-    { label: "Open prompt library", hint: "Reusable launch and message prompts", icon: BookMarked, run: () => setPromptsOpen(true) },
+    { label: "Open prompt library", hint: "Reusable workflow launch prompts", icon: BookMarked, run: () => setPromptsOpen(true) },
     { label: "Open agent profiles", hint: "Configure models & permissions", icon: Bot, run: () => setProfilesOpen(true) },
     { label: "Edit workflow order", hint: "Enable, skip, or reorder roles", icon: Network, run: () => setWorkflowOpen(true) },
     { label: "Open settings", hint: "Appearance and other app preferences", icon: Settings2, run: () => setSettingsOpen(true) },
@@ -773,25 +1189,50 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
           </header>
           {snapshot.connection.status === "loading" && !snapshot.agents.length ? <LoadingDeck /> : snapshot.agents.length ? (
             <div className="agent-grid">
+              {/*
+                PRD #1105 M3. Every tile goes through {@link AgentPaneFrame},
+                including every one that is NOT open, so opening a pane is a
+                change of attributes on an element that is already there rather
+                than a different element in its place. That is what keeps the
+                xterm instance — and with it the one-viewport-per-agent rule,
+                which the module-level `terminalRegistry` needs rather than
+                merely prefers: it is keyed by bare agent id, so a second live
+                viewport would overwrite the first's registration and the
+                first's unmount would then clean up nothing.
+              */}
               {snapshot.agents.map((agent) => (
-                <AgentTile
+                <AgentPaneFrame
                   key={agent.id}
+                  open={agent.id === paneAgentId}
+                  panePresent={paneAgentId !== undefined}
                   agent={agent}
                   mode={mode}
                   selected={agent.id === selectedAgentId}
                   tab={tabs[agent.id] ?? "terminal"}
                   terminalFeed={runtime.terminalFeed}
                   evidence={snapshot.evidence}
-                  prompts={prompts}
-                  composerFocusToken={composerFocus?.agentId === agent.id ? composerFocus.token : 0}
+                  inputResult={runtime.terminalInputResults?.[agentKey(agent.daemonId, agent.id)]}
+                  terminalFocusToken={terminalFocus?.agentId === agent.id ? terminalFocus.token : 0}
                   onSelect={() => setSelectedAgentId(agent.id)}
                   onTabChange={(tab) => setTabs((current) => ({ ...current, [agent.id]: tab }))}
                   onTerminalInput={runtime.sendTerminalInput}
                   onTerminalResize={runtime.resizeTerminal}
-                  appliedGeometry={runtime.appliedGeometry?.[agent.id]}
+                  appliedGeometry={runtime.appliedGeometry?.[agentKey(agent.daemonId, agent.id)]}
                   onEvidenceSelect={(id) => { setSelectedEvidenceId(id); setEvidenceOpen(true); }}
-                  onSubmitText={submitText}
                   onRename={mode === "live" ? renameAgent : undefined}
+                  /*
+                    Opening SELECTS as well, which is the difference between the
+                    overlay's `selected` being harmlessly degenerate and being
+                    true: one pane is on screen, so it is the selected one. It
+                    also settles `@media (max-width: 680px)`'s
+                    `.agent-tile:not(.is-selected) { display: none }` for the
+                    promoted tile without relying on a specificity race.
+                  */
+                  onOpen={onNavigate && (() => {
+                    setSelectedAgentId(agent.id);
+                    onNavigate({ kind: "agent", deckId: agent.daemonId, agentId: agent.id, from: "deck" });
+                  })}
+                  onClose={onCloseAgent}
                 />
               ))}
             </div>
@@ -842,7 +1283,7 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
       {paletteOpen && <CommandPalette commands={commandItems} onClose={() => setPaletteOpen(false)} />}
       {helpOpen && <ShortcutHelp onClose={() => setHelpOpen(false)} />}
       {confirm && <ConfirmDialog state={confirm} onClose={() => setConfirm(undefined)} />}
-      {(notice || runtime.error) && <div className="toast" role="status"><AlertTriangle size={15} /><span>{notice ?? runtime.error}</span><button aria-label="Dismiss message" onClick={dismissToast}><X size={14} /></button></div>}
+      {(notice || runtime.error) && <div className="toast" data-testid="toast" role="status"><AlertTriangle size={15} /><span>{notice ?? runtime.error}</span><button aria-label="Dismiss message" onClick={dismissToast}><X size={14} /></button></div>}
     </div>
   );
 }

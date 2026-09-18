@@ -251,6 +251,7 @@ async fn connect_attach(server: &Server, id: &str) -> UnixStream {
             rows: None,
             cols: None,
             geometry_updates: false,
+            client_id: None,
         },
     )
     .await;
@@ -3842,6 +3843,7 @@ async fn attach_unknown_agent_returns_err() {
             rows: None,
             cols: None,
             geometry_updates: false,
+            client_id: None,
         },
     )
     .await;
@@ -4072,6 +4074,7 @@ async fn slow_client_dropped_within_bounded_time() {
             rows: None,
             cols: None,
             geometry_updates: false,
+            client_id: None,
         },
     )
     .await;

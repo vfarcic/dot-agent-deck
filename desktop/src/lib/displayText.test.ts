@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { clampText, CLOCK_SKEW_TOLERANCE_MS, DISPLAY_LIMITS, displayActivity, displayIdentity, displayPath, displayText, displayUptime, domIdentity, homeRelative, rendersBlank, sanitizeText } from "./displayText";
+import { clampText, CLOCK_SKEW_TOLERANCE_MS, deckName, DISPLAY_LIMITS, displayActivity, displayIdentity, displayPath, displayText, displayUptime, domIdentity, homeRelative, rendersBlank, sanitizeText } from "./displayText";
 
 /**
  * Every bidi formatting and override codepoint the Rust policy names
@@ -309,5 +309,46 @@ describe("displayUptime", () => {
 
   it("defaults `now` to the real clock, so callers need not pass one", () => {
     expect(displayUptime(Date.now())?.label).toBe("<1m");
+  });
+});
+
+/**
+ * PRD #1105 moved this off `AgentOverview` because the agent pane became its
+ * second caller: a pane for an agent on a deck this app is not attached to
+ * names that deck inside a sentence. One function, so the header and the
+ * sentence cannot spell the same deck two ways.
+ */
+describe("deckName", () => {
+  it("names a local deck by the word and a remote one by its address", () => {
+    expect(deckName({})).toBe("Local deck");
+    expect(deckName({ deckKind: "local", socketPath: "/run/user/1000/dot-agent-deck.sock" })).toBe("Local deck");
+    expect(deckName({ deckKind: "remote", socketPath: "dev@build-box" })).toBe("dev@build-box");
+    expect(deckName({ deckKind: "remote", socketPath: "ops@edge-3:2222" })).toBe("ops@edge-3:2222");
+  });
+
+  /**
+   * A remote deck with no address yet is a configured row `Test connection` has
+   * not filled in, and one whose label renders as nothing at all is the
+   * `displayIdentity` case — both read as the same honest words rather than as
+   * a blank header cell, or as a gap in the middle of the pane's sentence.
+   */
+  it("falls back to the same words for an addressless deck and an invisible label", () => {
+    expect(deckName({ deckKind: "remote" })).toBe("Remote deck");
+    expect(deckName({ deckKind: "remote", socketPath: "" })).toBe("Remote deck");
+    expect(deckName({ deckKind: "remote", socketPath: "\u200b\u200c\u200d\ufeff" })).toBe("Remote deck");
+  });
+
+  /**
+   * Bounded at the path budget plus the one character `clampText` appends as
+   * its elision marker. A remote label came through a validated ASCII charset,
+   * so this is the module's rule applied at the render seam rather than a
+   * judgement about this field — and the pane now prints it inside a sentence,
+   * which is a second reason not to let it be unbounded.
+   */
+  it("bounds a remote label the same way every other daemon-supplied path is bounded", () => {
+    const long = `dev@${"h".repeat(DISPLAY_LIMITS.path * 2)}`;
+    const named = deckName({ deckKind: "remote", socketPath: long });
+    expect(Array.from(named)).toHaveLength(DISPLAY_LIMITS.path + 1);
+    expect(named.endsWith("…")).toBe(true);
   });
 });

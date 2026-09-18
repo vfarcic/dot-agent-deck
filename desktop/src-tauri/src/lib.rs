@@ -10,6 +10,11 @@ mod endpoint_test;
 mod endpoint_field_parity;
 mod endpoint_tunnels;
 mod generation;
+// Tests only: the counted sweep that keeps `dto::DeckScope` from decaying into
+// a convention (issue #1116). No item outside `#[cfg(test)]`, so it adds
+// nothing to a normal build.
+#[cfg(test)]
+mod selection_capture;
 mod settings;
 mod terminal;
 
@@ -1322,10 +1327,26 @@ async fn desktop_bootstrap(
 }
 
 #[tauri::command]
+// Eight, and the shape is the IPC boundary's rather than a design choice: Tauri
+// deserialises a command's arguments from the webview's payload by NAME, so each
+// wire field has to be a parameter. Grouping them into a struct would change the
+// JSON the frontend sends, not the number of things being passed.
+#[allow(clippy::too_many_arguments)]
 async fn desktop_terminal_attach(
     app: AppHandle,
     webview: Webview,
     state: State<'_, DesktopState>,
+    // PRD #1105 — the deck this agent is on, so the attach resolves THAT deck's
+    // link through `DaemonLinks` instead of the process-global selected
+    // endpoint. Agent ids are per-daemon monotonic integers, so without it an
+    // attach for an agent on build-box streamed whatever `planner` the selected
+    // deck happened to be running.
+    //
+    // Optional on the wire, and `None` means the selected deck — the behaviour
+    // every caller had before this. The webview always names one; see
+    // `terminal::endpoint_for_deck` for why the value is resolved against the
+    // observed set rather than trusted as an address.
+    deck_id: Option<String>,
     agent_id: String,
     on_output: Channel<Response>,
     // PRD #882 — the geometry this tile measured, declared so the agent is sized
@@ -1342,7 +1363,7 @@ async fn desktop_terminal_attach(
         // missing axis would register a constraint nobody asked for.
         _ => None,
     };
-    terminal::attach(&app, &state, agent_id, on_output, viewport).await
+    terminal::attach(&app, &state, deck_id, agent_id, on_output, viewport).await
 }
 
 #[tauri::command]
@@ -1513,6 +1534,58 @@ async fn apply_selection(app: &AppHandle, state: &DesktopState, settings: &Deskt
     refresh_and_emit(app, &state.daemon).await;
 }
 
+/// Stop one agent on the selected deck, and tear down **that deck's** terminal
+/// session for it.
+///
+/// # ONE capture, and why this used to be two reads
+///
+/// This read `selected_endpoint()` twice: once through `trusted_daemon`, before
+/// `DaemonLinks::trusted`, and again *after* `stop_agent(…).await` returned, to
+/// decide which deck's session to detach. The first read pinned the stop to
+/// deck A correctly. The second was a fresh question about a mutable global,
+/// asked on the far side of a daemon round trip — so moving the selection while
+/// the request was in flight stopped A's `planner` and detached **B's** same-id
+/// session, closing a terminal on a machine this action never touched. Agent
+/// ids are per-daemon monotonic integers, so the collision is the ordinary case
+/// rather than a contrived one; editing the selected deck's *address* mid-stop
+/// has the same shape.
+///
+/// The comment that used to sit at the detach asserted the two reads named the
+/// same deck. They are separated by asynchronous daemon work and nothing holds
+/// the selection still, so it was simply wrong.
+///
+/// [`crate::dto::DeckScope`] is the fix and the general form of it: capture the
+/// deck once, before the first await, and let every later step — cleanup very
+/// much included — read only the captured value.
+///
+/// # Split out for the same reason [`retarget_selection`] is
+///
+/// Everything here is testable and the snapshot emit around it is not. That is
+/// what lets a test drive the *caller* against a scripted daemon with the
+/// selection moved underneath it, rather than pinning `detach_agent_on` in
+/// isolation and proving nothing about who calls it.
+async fn stop_agent_action(state: &DesktopState, agent_id: &str) -> Result<(), String> {
+    validate_agent_id(agent_id)?;
+    let scope = crate::dto::DeckScope::selected();
+    let daemon = state.daemon.trusted(scope.endpoint()).await?;
+    daemon.require_compatible()?;
+    daemon
+        .client
+        .stop_agent(agent_id)
+        .await
+        .map_err(|error| safe_message(error.to_string()))?;
+    // Preserve a working attachment when stop fails: this line is after the `?`
+    // above, so a refused stop leaves the terminal alone. Once the daemon
+    // confirms, remove the registry entry promptly; the stream reader will also
+    // observe STREAM_END and is generation-guarded against removing a newer
+    // attachment.
+    //
+    // The deck is the SCOPE's — the one this operation authenticated against
+    // and stopped the agent on — and never a fresh read of the selection.
+    terminal::detach_agent_on(state, &scope.identity(), agent_id).await;
+    Ok(())
+}
+
 /// [`apply_selection`] minus the emit, reporting whether the deck moved.
 ///
 /// Split out because everything above the emit is testable and the emit is not —
@@ -1524,12 +1597,15 @@ async fn retarget_selection(state: &DesktopState, settings: &DesktopSettings) ->
     let deck = crate::dto::apply_settings_selection(settings);
     let key = deck.endpoint.identity();
     let moved = selection_moved(&previous, &key);
-    // Before the tunnels are released, so a DETACH frame still has a transport.
-    if moved {
-        terminal::detach_all(state).await;
-    }
-    state.daemon.invalidate_all().await;
     let observed = observed_keys(settings);
+    // PRD #1105 — the sessions on decks that LEFT the observed set, and no
+    // others. This was `detach_all` gated on `moved`; see
+    // `terminal::detach_decks_outside` for why a selection move is no longer a
+    // reason to tear a terminal down, and why this one is not gated.
+    //
+    // Before the tunnels are released, so a DETACH frame still has a transport.
+    terminal::detach_decks_outside(state, &observed).await;
+    state.daemon.invalidate_all().await;
     state.tunnels.retain(&observed).await;
     // PRD #742 M3: the watcher half of the same teardown, and the natural
     // sibling of the `retain` above it — a deck that left the observed set must
@@ -1839,19 +1915,7 @@ async fn desktop_run_action(
             );
         }
         DesktopAction::StopAgent { agent_id } => {
-            validate_agent_id(&agent_id)?;
-            let daemon = trusted_daemon(&state.daemon).await?;
-            daemon.require_compatible()?;
-            daemon
-                .client
-                .stop_agent(&agent_id)
-                .await
-                .map_err(|error| safe_message(error.to_string()))?;
-            // Preserve a working attachment when stop fails. Once the daemon
-            // confirms the stop, remove any registry entry promptly; the
-            // stream reader will also observe STREAM_END and is generation-
-            // guarded against removing a newer attachment.
-            terminal::detach_agent(&state, &agent_id).await;
+            stop_agent_action(&state, &agent_id).await?;
             result_agent_id = Some(agent_id);
         }
         DesktopAction::StopDaemon { force } => {
@@ -1872,7 +1936,11 @@ async fn desktop_run_action(
             // process that is going away. Drop it here rather than waiting for
             // the watcher to notice its stream end.
             state.daemon.invalidate(&endpoint).await;
-            terminal::detach_all(&state).await;
+            // PRD #1105: this deck's sessions only. Stop is refused for
+            // anything but the local deck, so tearing down every deck's
+            // terminals would close panes on machines this action never
+            // touched.
+            terminal::detach_deck(&state, &endpoint).await;
             result_message = Some(match outcome {
                 StopOutcome::NoDaemonRunning => "No deck was running.".into(),
                 StopOutcome::Stopped { pid } => format!("Deck stopped gracefully (pid {pid})."),
@@ -1895,7 +1963,8 @@ async fn desktop_run_action(
             // terminated, and the `bootstrap` below is about to start a
             // different one at the same address.
             state.daemon.invalidate(&endpoint).await;
-            terminal::detach_all(&state).await;
+            // This deck's sessions only, for the same reason Stop's are.
+            terminal::detach_deck(&state, &endpoint).await;
             let snapshot = bootstrap(
                 &BootstrapOptions {
                     start_if_missing: true,
@@ -1973,7 +2042,11 @@ async fn desktop_run_action(
             // declarative attach path, not the tile's own), so it declares no
             // viewport and constrains nothing. The tile's first resize registers
             // its size a frame later.
-            let attached = terminal::attach(&app, &state, agent_id.clone(), channel, None).await?;
+            // No deck: this action is the legacy declarative attach path and has
+            // always meant the selected deck. The webview's own attach command
+            // names one.
+            let attached =
+                terminal::attach(&app, &state, None, agent_id.clone(), channel, None).await?;
             result_agent_id = Some(agent_id);
             result_terminal = Some(attached);
         }
@@ -2026,6 +2099,15 @@ async fn desktop_run_action(
     })
 }
 
+/// PRD #1105 M11 step 4: the focus state a window event reports, if it reports
+/// one. Only `Focused` does; every other window event says nothing about focus.
+fn window_focus(event: &tauri::WindowEvent) -> Option<bool> {
+    match event {
+        tauri::WindowEvent::Focused(focused) => Some(*focused),
+        _ => None,
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let app = tauri::Builder::default()
@@ -2067,8 +2149,27 @@ pub fn run() {
             crate::dto::apply_settings_selection(&stored);
             if let Some(window) = app.get_webview_window("main") {
                 apply_zoom(window.as_ref(), stored.zoom.level);
+                // PRD #1105 M11: seed the focus state, in case the window came up
+                // focused before a `Focused` event could be delivered. Nothing is
+                // attached yet, so there is nothing to claim — this only decides
+                // whether the first pane opened claims on its deck.
+                if let Ok(focused) = window.is_focused() {
+                    app.state::<DesktopState>().set_window_focused(focused);
+                }
             }
             Ok(())
+        })
+        // PRD #1105 M11 step 4: the window's focus changes are the desktop's
+        // focus signal — see `terminal::window_focus_changed` for why this event
+        // rather than the webview's own, which decks it claims on, and why typing
+        // does not also claim. Handled right here rather than in a task spawned
+        // per event, so reports are recorded in the order the event loop
+        // delivers them; the claims themselves are spawned inside it, and are
+        // dropped by the next report if still unsent.
+        .on_window_event(|window, event| {
+            if let Some(focused) = window_focus(event) {
+                let _ = terminal::window_focus_changed(&window.state::<DesktopState>(), focused);
+            }
         })
         .invoke_handler(tauri::generate_handler![
             desktop_get_snapshot,
@@ -2111,6 +2212,18 @@ mod tests {
     use std::collections::VecDeque;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// PRD #1105 M11 step 4: only a window's `Focused` event carries its focus
+    /// state, in both directions; any other window event is not a focus change.
+    #[test]
+    fn only_a_focused_window_event_reports_focus() {
+        assert_eq!(window_focus(&tauri::WindowEvent::Focused(true)), Some(true));
+        assert_eq!(
+            window_focus(&tauri::WindowEvent::Focused(false)),
+            Some(false)
+        );
+        assert_eq!(window_focus(&tauri::WindowEvent::Destroyed), None);
+    }
 
     /// A settings save that changed no deck must NOT take the switch path
     /// (PRD #741 M9).

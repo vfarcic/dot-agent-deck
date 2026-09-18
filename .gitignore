@@ -18,6 +18,9 @@ tmp/
 # tests + `cargo xtask docs --tests` locally.
 .dot-agent-deck/
 .claude/scheduled_tasks.lock
+# `task run` / `run-desktop` / `run-all`'s default sandbox (sockets, state,
+# logs), created in whichever directory they are invoked from.
+.dad-sandbox/
 
 # Documentation site
 site/node_modules/

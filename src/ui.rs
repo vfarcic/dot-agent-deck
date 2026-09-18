@@ -11776,6 +11776,91 @@ impl Drop for KeyboardEnhancementGuard {
     }
 }
 
+/// The three reporting modes [`run_tui`] turns on, and whether they are on now.
+///
+/// Mouse capture and bracketed paste make mouse and paste events reach the
+/// event loop; focus reporting (`?1004h`, PRD #1105 M11) makes a terminal that
+/// supports it say when the person switches to or away from this window. All
+/// three outlive the process if nothing turns them off: the shell the user
+/// returns to then receives mouse reports on every pointer move, `ESC [ I` /
+/// `ESC [ O` on every window focus change, and brackets around every paste,
+/// garbling its command line until the terminal is reset.
+///
+/// **Shared, so each teardown path turns them off exactly once.** A clone is
+/// held by the panic hook, and one by the [`TerminalModesGuard`] `run_tui`
+/// keeps for the event loop; [`Self::disable`] is a test-and-clear on the one
+/// flag they share, so the explicit teardown, the guard's `Drop` and the panic
+/// hook can all fire, in any combination, and the disable sequences are written
+/// once. Unlike the keyboard-enhancement pop a second disable would be harmless
+/// to the terminal — each mode is a flag, not a stack — so this is about not
+/// writing to a terminal that one path has already handed back, rather than
+/// about correctness of the modes themselves.
+#[derive(Clone, Default)]
+struct TerminalModes(Arc<std::sync::atomic::AtomicBool>);
+
+impl TerminalModes {
+    /// Turn the three modes on, and return the guard that turns them off.
+    ///
+    /// The flag is set **before** the enable sequences are written, so a write
+    /// that fails part-way — after mouse capture, say, but before paste — still
+    /// leaves a guard whose `Drop` writes the disables, rather than returning an
+    /// error with some modes on and nothing to turn them off.
+    fn enable<W: std::io::Write>(&self, out: W) -> std::io::Result<TerminalModesGuard<W>> {
+        self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut guard = TerminalModesGuard {
+            modes: self.clone(),
+            out,
+        };
+        // On an error the `?` drops `guard`, which writes the disables.
+        crossterm::execute!(
+            guard.out,
+            crossterm::event::EnableMouseCapture,
+            crossterm::event::EnableBracketedPaste,
+            crossterm::event::EnableFocusChange,
+        )?;
+        Ok(guard)
+    }
+
+    /// Turn the three modes off by writing their disable sequences to `out`,
+    /// unless another path already has — or they were never turned on.
+    fn disable(&self, out: &mut impl std::io::Write) {
+        if self.0.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            let _ = crossterm::execute!(
+                out,
+                crossterm::event::DisableMouseCapture,
+                crossterm::event::DisableBracketedPaste,
+                crossterm::event::DisableFocusChange,
+            );
+        }
+    }
+}
+
+/// RAII half of [`TerminalModes`], for the same reason
+/// [`KeyboardEnhancementGuard`] exists: `run_tui`'s event loop returns early
+/// with `?` on a failed `terminal.draw`, `event::poll` or `event::read`, which
+/// skips its explicit teardown. This guard's `Drop` turns the modes off on
+/// those returns, and on an unwinding panic the hook did not already cover.
+///
+/// The explicit teardown still calls [`Self::disable`] itself, because the
+/// ORDER there is deliberate — after the keyboard-enhancement pop, before
+/// `ratatui::restore()` — and once it has, the `Drop` writes nothing.
+struct TerminalModesGuard<W: std::io::Write> {
+    modes: TerminalModes,
+    out: W,
+}
+
+impl<W: std::io::Write> TerminalModesGuard<W> {
+    fn disable(&mut self) {
+        self.modes.disable(&mut self.out);
+    }
+}
+
+impl<W: std::io::Write> Drop for TerminalModesGuard<W> {
+    fn drop(&mut self) {
+        self.disable();
+    }
+}
+
 /// PRD #80 / PRD #341 — process ONE key event, start to finish: reconcile the
 /// command banner's mode edge, map this `KeyEvent` to one [`Action`], feed the
 /// banner what the key resolved to, then run the action through
@@ -12108,6 +12193,8 @@ pub fn run_tui(
     config: DashboardConfig,
     keybindings: KeybindingConfig,
 ) -> std::io::Result<()> {
+    let terminal_modes = TerminalModes::default();
+    let hook_terminal_modes = terminal_modes.clone();
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         // A panic inside a guarded vt100 feed (see
@@ -12141,21 +12228,24 @@ pub fn run_tui(
         // survives the process and corrupts key delivery in the shell the user
         // is dropped back into.
         pop_keyboard_enhancement();
-        let _ = crossterm::execute!(
-            std::io::stdout(),
-            crossterm::event::DisableMouseCapture,
-            crossterm::event::DisableBracketedPaste,
-        );
+        hook_terminal_modes.disable(&mut std::io::stdout());
         ratatui::restore();
         original_hook(info);
     }));
 
     // Enable mouse capture and bracketed paste so events reach our event loop.
-    crossterm::execute!(
-        std::io::stdout(),
-        crossterm::event::EnableMouseCapture,
-        crossterm::event::EnableBracketedPaste,
-    )?;
+    //
+    // PRD #1105 M11: and focus-change reporting (`?1004h`), so a terminal that
+    // supports it tells us when the person switches back to this window — the
+    // signal the focus claim in `crate::focus_report` is built on. Where the
+    // terminal does not report focus, input stands in.
+    //
+    // Held as an RAII guard, for the reason `_keyboard_enhancement` is below:
+    // the event loop returns early via `?` on any terminal I/O error, which
+    // would skip the explicit teardown and leave all three modes on in the
+    // user's shell. Declared before `_keyboard_enhancement`, so on those
+    // returns it drops after it — the same order as the explicit teardown.
+    let mut terminal_modes = terminal_modes.enable(std::io::stdout())?;
 
     let mut terminal = ratatui::init();
 
@@ -14170,6 +14260,16 @@ pub fn run_tui(
 
             let ev = event::read()?;
 
+            // PRD #1105 M11: every event that reaches the loop is offered to the
+            // focus reporter FIRST, before any branch below can `break` or
+            // `continue` past it. It claims focus on the daemon for a terminal
+            // focus-in and (throttled) for input; everything else it ignores.
+            // Non-consuming and non-blocking — the claim is spawned — so the
+            // event is handled below exactly as it was before.
+            if let Some(embedded) = pane.as_any().downcast_ref::<EmbeddedPaneController>() {
+                embedded.report_focus(&ev, std::time::Instant::now());
+            }
+
             // PRD #84 M4 (invariant 4): a terminal resize is now just a
             // re-render trigger. The pre-draw `resize_panes_to_layout` at the
             // top of the next loop iteration recomputes the layout and commits
@@ -15112,11 +15212,7 @@ pub fn run_tui(
     // PRD #227 M2: undo the enhanced-keyboard push (no-op if it never happened)
     // alongside the mouse-capture / bracketed-paste restores.
     pop_keyboard_enhancement();
-    let _ = crossterm::execute!(
-        std::io::stdout(),
-        crossterm::event::DisableMouseCapture,
-        crossterm::event::DisableBracketedPaste,
-    );
+    terminal_modes.disable();
     ratatui::restore();
 
     // Flush accumulated session warnings now that the terminal is restored.
@@ -31184,6 +31280,132 @@ mod tests {
         // support probe returns false and nothing is ever pushed).
         pop_keyboard_enhancement();
         assert!(!KEYBOARD_ENHANCEMENT_PUSHED.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    /// A writer every clone of which appends to one buffer, so a test can read
+    /// what a [`TerminalModesGuard`] wrote while the guard still owns a writer.
+    #[derive(Clone, Default)]
+    struct SharedTerminalOutput(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl SharedTerminalOutput {
+        fn text(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).expect("escape sequences are UTF-8")
+        }
+    }
+
+    impl std::io::Write for SharedTerminalOutput {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The bytes crossterm writes for `command`.
+    fn ansi(command: impl crossterm::Command) -> String {
+        let mut out = String::new();
+        command.write_ansi(&mut out).expect("format the command");
+        out
+    }
+
+    fn terminal_modes_on() -> String {
+        ansi(crossterm::event::EnableMouseCapture)
+            + &ansi(crossterm::event::EnableBracketedPaste)
+            + &ansi(crossterm::event::EnableFocusChange)
+    }
+
+    fn terminal_modes_off() -> String {
+        ansi(crossterm::event::DisableMouseCapture)
+            + &ansi(crossterm::event::DisableBracketedPaste)
+            + &ansi(crossterm::event::DisableFocusChange)
+    }
+
+    /// Stands in for `run_tui`: enable the modes, run an event-loop step that
+    /// may fail and is propagated with `?`, and only then reach the explicit
+    /// teardown.
+    fn run_with_terminal_modes(
+        modes: &TerminalModes,
+        out: SharedTerminalOutput,
+        event_loop_step: impl FnOnce() -> std::io::Result<()>,
+    ) -> std::io::Result<()> {
+        let mut guard = modes.enable(out)?;
+        event_loop_step()?;
+        guard.disable();
+        Ok(())
+    }
+
+    /// PRD #1105 M11 audit — the terminal I/O error returns `run_tui`'s event
+    /// loop takes with `?` skip its explicit teardown, and the guard must turn
+    /// mouse capture, bracketed paste and focus reporting off on them anyway.
+    /// Byte-level, so Unix only: on a Windows console crossterm sets mouse
+    /// capture through the console API instead of writing a sequence.
+    #[cfg(unix)]
+    #[test]
+    fn terminal_modes_are_turned_off_when_the_event_loop_returns_an_error() {
+        let modes = TerminalModes::default();
+        let out = SharedTerminalOutput::default();
+        let result = run_with_terminal_modes(&modes, out.clone(), || {
+            Err(std::io::Error::other("terminal.draw failed"))
+        });
+        assert!(result.is_err(), "fixture: the step's error propagates");
+        assert_eq!(
+            out.text(),
+            terminal_modes_on() + &terminal_modes_off(),
+            "an error return must still write every disable sequence, or the shell keeps \
+             receiving mouse reports and focus sequences (ESC [ I / ESC [ O)"
+        );
+        assert!(
+            out.text()
+                .ends_with(&ansi(crossterm::event::DisableFocusChange)),
+            "focus reporting, the mode M11 added, is among them"
+        );
+    }
+
+    /// PRD #1105 M11 audit — each teardown path writes the disables at most
+    /// once between them: the explicit teardown and then the guard's `Drop`;
+    /// the panic hook and then the `Drop`; and nothing at all from a path
+    /// reached before the modes were ever turned on.
+    #[cfg(unix)]
+    #[test]
+    fn terminal_modes_are_turned_off_once_whichever_teardown_paths_run() {
+        let on_then_off = terminal_modes_on() + &terminal_modes_off();
+
+        let modes = TerminalModes::default();
+        let out = SharedTerminalOutput::default();
+        run_with_terminal_modes(&modes, out.clone(), || Ok(())).expect("a clean run");
+        assert_eq!(
+            out.text(),
+            on_then_off,
+            "the explicit teardown writes the disables, and the guard dropping after it \
+             writes nothing more"
+        );
+
+        let modes = TerminalModes::default();
+        let out = SharedTerminalOutput::default();
+        let hook_out = SharedTerminalOutput::default();
+        let guard = modes.enable(out.clone()).expect("enable");
+        // Stands in for the panic hook's clone, which runs before the unwind
+        // drops the guard.
+        modes.clone().disable(&mut hook_out.clone());
+        drop(guard);
+        assert_eq!(hook_out.text(), terminal_modes_off());
+        assert_eq!(
+            out.text(),
+            terminal_modes_on(),
+            "after the panic hook turned the modes off, the guard's Drop writes nothing"
+        );
+
+        let never_enabled = TerminalModes::default();
+        let hook_out = SharedTerminalOutput::default();
+        never_enabled.disable(&mut hook_out.clone());
+        assert_eq!(
+            hook_out.text(),
+            "",
+            "a panic before the modes were turned on writes nothing"
+        );
     }
 
     // ---------------------------------------------------------------------------

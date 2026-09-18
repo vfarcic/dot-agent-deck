@@ -598,8 +598,9 @@ pub struct TerminalAttachResult {
     pub generation: u64,
     pub reused: bool,
     /// PRD #882 — the geometry the daemon has APPLIED for this agent, which is
-    /// the smallest viewport among every client attached to it and so is not
-    /// necessarily the size this tile asked for.
+    /// decided by its viewer policy (the last-focused client's viewer size, else
+    /// the smallest viewport among every client attached to it, PRD #1105) and
+    /// so is not necessarily the size this tile asked for.
     ///
     /// The frontend sizes its xterm grid from this rather than from
     /// `FitAddon.fit()`. Absent only when talking to a daemon that predates the
@@ -1101,6 +1102,19 @@ struct AppliedSelection {
     selected: SelectedDeck,
     /// The decks the app CONNECTS to — watchers, tunnels, handshakes.
     observed: Vec<Endpoint>,
+    /// Bumped whenever a deck LEAVES [`Self::observed`] — the epoch a
+    /// [`DeckScope`] captures and revalidates against.
+    ///
+    /// Held in here rather than in a [`crate::generation::Generation`] of its
+    /// own precisely because of what this struct is for: a scope that read the
+    /// set from one place and the epoch from another could straddle a write and
+    /// hold a pair that never coexisted. One read answers both.
+    ///
+    /// **Only departures move it**, because only a departure can make an
+    /// in-flight operation unwanted. A save that *adds* a deck leaves every
+    /// existing scope valid, which is what keeps the common settings save from
+    /// failing an unrelated attach.
+    observed_generation: u64,
     /// The decks the app SHOWS but cannot connect to (PRD #742 M12). Held
     /// beside `observed` rather than folded into it because every reader of
     /// `observed` wants the connectable set and would spin a watcher against an
@@ -1119,6 +1133,7 @@ impl Default for AppliedSelection {
             selected: SelectedDeck::default(),
             observed: vec![Endpoint::local()],
             unconfigured: Vec::new(),
+            observed_generation: 0,
         }
     }
 }
@@ -1212,14 +1227,233 @@ pub(crate) fn apply_settings_selection(
             .fallback
             .map(|fallback| safe_display_text(fallback.to_string())),
     };
+    let observed = settings.connectable_endpoints();
     if let Ok(mut slot) = APPLIED_SELECTION.write() {
+        // The previous value is read **under the write lock**, so the compare
+        // and the bump are one critical section. Reading it through
+        // `applied_selection()` first would let two concurrent saves both see
+        // epoch G and both write G+1 while describing different fleets, and a
+        // scope captured at that G+1 would then revalidate against the other
+        // save's — the one case where a monotonic counter can repeat a value
+        // that means two things.
+        let previous = slot.clone().unwrap_or_default();
+        let departed = previous.observed.iter().any(|before| {
+            let key = before.identity();
+            !observed.iter().any(|kept| kept.identity() == key)
+        });
         *slot = Some(AppliedSelection {
             selected: deck.clone(),
-            observed: settings.connectable_endpoints(),
+            observed,
             unconfigured: settings.unconfigured_decks(),
+            observed_generation: previous.observed_generation + u64::from(departed),
         });
     }
     deck
+}
+
+/// The deck **one operation** acts on, captured once before its first await.
+///
+/// # The defect class this exists to close
+///
+/// The applied selection is mutable process state, so reading it is a question
+/// about *now* — and an operation that reads it twice with an await in between
+/// asks that question twice and can get two answers. Three instances shipped,
+/// all with the same shape and none of them noticed by three security audits
+/// aimed at the subject matter rather than at the shape:
+///
+/// - `DesktopAction::StopAgent` read [`selected_endpoint`] before
+///   `DaemonLinks::trusted` and **again** after `stop_agent(…).await` returned,
+///   using the second read to pick which deck's session to detach. Move the
+///   selection while the request is in flight and the daemon stops deck A's
+///   `planner` while the cleanup detaches deck **B's** same-id session. Agent
+///   ids are per-daemon monotonic integers, so the collision is the ordinary
+///   case rather than a contrived one.
+/// - `crate::terminal::attach` validated its `deck_id` against
+///   [`observed_decks`], then waited for a process-wide gate and performed the
+///   handshake and stream attach with no further check — so an attach queued
+///   behind a slower one could publish a session for a deck the user removed
+///   while it waited.
+/// - `crate::daemon_bridge::bootstrap` read the selection three times across
+///   two awaits: once for the snapshot that decides whether to lazy-spawn, once
+///   for the address to spawn at, and once for the snapshot it answers with.
+///
+/// # The mechanism
+///
+/// An operation captures a scope **once**, before its first await, and every
+/// later step — including cleanup after an await — reads [`Self::endpoint`] or
+/// [`Self::identity`] and never the applied selection again. Where the
+/// operation also *publishes* something durable, it calls [`Self::revalidate`]
+/// at the publication point.
+///
+/// This is deliberately the same answer [`crate::generation`] gives for
+/// `DaemonLinks` and `EndpointTunnels`, one layer up: that module guards a
+/// *cache entry* against a teardown, and this guards an *operation's notion of
+/// which deck it is* against the selection moving underneath it.
+///
+/// # What it does not do
+///
+/// It cannot stop a function from capturing two scopes, and nothing here is
+/// compiler-enforced. What it buys is that the captured value and the live
+/// value are different expressions — `scope.endpoint()` versus
+/// `selected_endpoint()` — so mixing them is visible at the call site instead
+/// of reading like one idea. `crate::selection_capture` pins the count of raw
+/// reads so a new one has to be added deliberately.
+#[derive(Debug, Clone)]
+pub(crate) struct DeckScope {
+    endpoint: Endpoint,
+    /// [`AppliedSelection::observed_generation`] as it stood at capture.
+    observed_generation: u64,
+}
+
+impl DeckScope {
+    /// The selected deck, captured for this operation.
+    ///
+    /// The selected deck is **not** necessarily in the observed set — see
+    /// [`observed_fleet`], which prepends it for exactly that reason — so this
+    /// makes no membership claim. [`Self::revalidate`] is still meaningful for
+    /// it, because what that asks is whether the fleet moved, not whether this
+    /// deck was ever in it.
+    pub(crate) fn selected() -> Self {
+        let applied = applied_selection();
+        Self {
+            endpoint: applied.selected.endpoint,
+            observed_generation: applied.observed_generation,
+        }
+    }
+
+    /// The deck one wire id names, or the selected deck when the caller named
+    /// none.
+    ///
+    /// # Why this is not `trusted_daemon`
+    ///
+    /// `crate::daemon_bridge::trusted_daemon` resolves [`selected_endpoint`] —
+    /// the applied selection, read at the instant the call runs. Every terminal
+    /// verb went through it, so an attach declared for an agent on build-box
+    /// reached whatever deck happened to be selected when the command was
+    /// dispatched, and agent ids are per-daemon monotonic integers: it found a
+    /// `planner` there and streamed it. That is issue
+    /// [#1116](https://github.com/vfarcic/dot-agent-deck/issues/1116)'s whole
+    /// shape at the one layer where it decides which machine the bytes come
+    /// from.
+    ///
+    /// # The resolution is against the OBSERVED set, and that is a security
+    /// boundary rather than a lookup detail
+    ///
+    /// A deck id from the webview is untrusted input. Matching it against the
+    /// observed set means the only endpoints reachable are the ones the applied
+    /// settings document already tells this app to connect to, so a malformed
+    /// or stale id yields a refusal rather than a connection: there is no path
+    /// here by which a value from the webview becomes an address.
+    ///
+    /// `None` keeps the previous behaviour for a caller that names no deck.
+    /// No production webview path sends one — the webview's own attach always
+    /// names the deck it is attaching to — but callers in this tree do:
+    /// `DesktopAction::AttachTerminal` is the legacy declarative attach path
+    /// and passes `None`, for which it legitimately means "the selected
+    /// deck". That action is not reachable from the frontend today, which
+    /// defines the variant in its action union and dispatches it from
+    /// nowhere. `Option` is kept because the parameter is optional on the IPC
+    /// boundary, so absence must mean something defined rather than an error
+    /// the user cannot act on.
+    pub(crate) fn resolve(deck_id: Option<&str>) -> Result<Self, String> {
+        // ONE read, so the endpoint and the epoch describe the same fleet.
+        let applied = applied_selection();
+        let Some(deck_id) = deck_id else {
+            return Ok(Self {
+                endpoint: applied.selected.endpoint,
+                observed_generation: applied.observed_generation,
+            });
+        };
+        let endpoint = applied
+            .observed
+            .into_iter()
+            .find(|endpoint| deck_wire_id(endpoint) == deck_id)
+            .ok_or_else(|| {
+                format!(
+                    "that deck is not one this app is observing: {}",
+                    safe_message(deck_id)
+                )
+            })?;
+        Ok(Self {
+            endpoint,
+            observed_generation: applied.observed_generation,
+        })
+    }
+
+    /// The deck this operation acts on. Every step after the capture reads this
+    /// rather than the applied selection.
+    pub(crate) fn endpoint(&self) -> &Endpoint {
+        &self.endpoint
+    }
+
+    /// [`Self::endpoint`]'s key — what both `DaemonLinks` and `EndpointTunnels`
+    /// are indexed by, and what a session records.
+    pub(crate) fn identity(&self) -> dot_agent_deck::daemon_client::EndpointIdentity {
+        self.endpoint.identity()
+    }
+
+    /// Is this scope still the fleet's, or did a deck leave while the operation
+    /// was in flight?
+    ///
+    /// Called at the point an operation publishes something that outlives it —
+    /// a terminal session, a lease, a watcher. An operation with nothing to
+    /// publish (a one-shot daemon request whose only later step is cleanup on
+    /// its *own* captured deck) does not need it: capturing once is already
+    /// enough for that shape.
+    ///
+    /// # ONE check, and it is the epoch rather than membership
+    ///
+    /// Membership answers "is that deck there **now**", which a deck that left
+    /// and came back passes — and a returning deck's link and transport are
+    /// from a later epoch than the one this operation established against, so
+    /// publishing into it would install a session over a tunnel the teardown
+    /// already released. The epoch distinguishes the two and membership cannot,
+    /// which is why membership below only picks the wording.
+    ///
+    /// # It is conservative, and here is the cost
+    ///
+    /// The epoch does not say *which* deck departed, so removing deck E refuses
+    /// an in-flight attach on unrelated deck D. That costs one refused attach
+    /// on a settings save that happened to land inside one, which the webview
+    /// recovers from by attaching again; the precise answer would need per-deck
+    /// departure history, and a removal is a deliberate, rare user act. This is
+    /// the same trade [`crate::generation`]'s module docs take for the same
+    /// reason.
+    pub(crate) fn revalidate(&self) -> Result<(), String> {
+        let applied = applied_selection();
+        if applied.observed_generation == self.observed_generation {
+            return Ok(());
+        }
+        let key = self.endpoint.identity();
+        let still_observed = applied
+            .observed
+            .iter()
+            .any(|observed| observed.identity() == key);
+        let deck = safe_display_text(self.endpoint.describe());
+        Err(if still_observed {
+            format!(
+                "the fleet changed while this operation was in flight, so nothing was published for {deck}"
+            )
+        } else {
+            format!("that deck left the fleet while this operation was in flight: {deck}")
+        })
+    }
+
+    /// A scope over `endpoint` captured **now**, for a test pinning something
+    /// other than this boundary.
+    ///
+    /// It revalidates for as long as no deck leaves the observed set after it
+    /// is taken, which is what a test about (say) registry eviction wants: the
+    /// boundary stays armed rather than being stubbed out, and it simply has
+    /// nothing to object to. A test about the boundary itself captures one of
+    /// these and *then* moves the fleet.
+    #[cfg(test)]
+    pub(crate) fn capturing(endpoint: Endpoint) -> Self {
+        Self {
+            endpoint,
+            observed_generation: applied_selection().observed_generation,
+        }
+    }
 }
 
 /// Every deck the app CONNECTS to under the applied document (PRD #742 M3).
@@ -1232,6 +1466,10 @@ pub(crate) fn apply_settings_selection(
 /// **Not the fleet the screen shows.** A configured row with no socket path is
 /// deliberately absent here and present in [`observed_fleet`]; see
 /// [`unconfigured_decks`] for the other half and why the two are separate.
+///
+/// **Also a read of MUTABLE state.** A caller resolving one deck out of this
+/// set for an operation wants [`DeckScope::resolve`], which takes the set and
+/// the epoch in one read so the pair cannot straddle a save.
 pub(crate) fn observed_decks() -> Vec<Endpoint> {
     applied_selection().observed
 }
@@ -1268,6 +1506,11 @@ pub(crate) fn selected_deck() -> SelectedDeck {
 /// A function rather than a constant so the selection has exactly one source,
 /// and so the call sites that must refuse a remote deck — the Stop and Replace
 /// actions — are written against an [`Endpoint`] rather than against a path.
+///
+/// **This is a read of MUTABLE state, so it answers "now" and not "the deck my
+/// operation is about".** An operation that keeps using the deck after an await
+/// — cleanup included — captures a [`DeckScope`] instead; see that type for the
+/// three shipped defects that are all this function called twice.
 pub(crate) fn selected_endpoint() -> Endpoint {
     selected_deck().endpoint
 }

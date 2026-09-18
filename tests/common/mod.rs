@@ -8975,6 +8975,7 @@ impl DaemonProc {
             rows: None,
             cols: None,
             geometry_updates: false,
+            client_id: None,
         };
         let payload = serde_json::to_vec(&req).expect("serialize AttachStream");
         let mut header = [0u8; 5];
@@ -9041,6 +9042,7 @@ impl DaemonProc {
             rows: None,
             cols: None,
             geometry_updates: false,
+            client_id: None,
         };
         let payload = serde_json::to_vec(&req).expect("serialize AttachStream");
         let mut header = [0u8; 5];

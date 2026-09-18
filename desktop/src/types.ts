@@ -25,6 +25,27 @@ export type RunHealth = "healthy" | "attention" | "failed" | "idle";
 export type AgentStatus = "queued" | "running" | "waiting" | "passed" | "failed" | "stopped";
 export type StageStatus = "queued" | "active" | "passed" | "failed" | "waiting";
 export type PanelTab = "terminal" | "diff" | "checks" | "handoffs" | "artifacts";
+
+/**
+ * Which of `AgentTile`'s two presentations to render (PRD #1105 M1).
+ *
+ * The grid tile and the agent-pane overlay are the SAME component at two
+ * sizes, and this is the one prop the differences are derived from — the whole
+ * point of the milestone that introduced it is that there is no
+ * `AgentTileOverlay`. A string union rather than an `isOverlay` boolean for
+ * three reasons a boolean cannot give: a third presentation (#745's deferred
+ * group view) arrives as a member rather than as a second boolean, whose four
+ * combinations include one that means nothing; `grep -rn '"overlay"'` finds
+ * every derivation; and where a derivation is written as a total map or a
+ * checked `switch`, an added member fails to compile instead of silently
+ * taking a `false` branch.
+ *
+ * The values name WHERE the pane appears, not how big it is, because not every
+ * difference is dimensional — the Reader launcher's fate is an affordance
+ * question, not a size one.
+ */
+export type AgentPanePresentation = "tile" | "overlay";
+
 export type Verdict = "PASS" | "FIX" | "HUMAN" | "ERROR" | "INFO";
 
 export interface ConnectionView {
@@ -269,13 +290,35 @@ export interface Artifact {
 
 /**
  * Which top-level surface is mounted. A discriminated union from the start even
- * though it carries only two variants today, so PRD #745 iteration 3's group
- * and single-agent views arrive as added variants rather than as a refactor of
- * a boolean. No router library is warranted for this.
+ * though it carried only two variants for its first two PRDs, so PRD #745
+ * iteration 3's group and single-agent views arrive as added variants rather
+ * than as a refactor of a boolean. No router library is warranted for this.
  */
 export type DeckView =
   | { kind: "deck" }
-  | { kind: "overview" };
+  | { kind: "overview" }
+  /**
+   * PRD #1105 M2 — one agent's pane, OVER the screen it was opened from.
+   *
+   * The first two variants REPLACE the mounted screen, and `DeckShell` says so
+   * in its own doc comment. This one deliberately does not: an overlay that
+   * unmounted the screen beneath it would re-declare that screen's shown
+   * terminal set, and a nine-tile deck coming back costs five re-attaches and
+   * five scrollback replays. So `from` names the base screen to keep mounted
+   * underneath, and closing is `setView({ kind: from })`.
+   *
+   * `from` is also the ONLY record of where back goes. There is no history
+   * stack and none is wanted: a view reachable from two screens has to carry
+   * which one it came from anyway, and carrying it in the value makes a direct
+   * initial agent view — one with no prior navigation at all — close to the
+   * right place by construction.
+   *
+   * `deckId` is here even though nothing in M2/M3/M5 reads it, because the
+   * overview merges every observed deck's agents and an agent id is per-daemon
+   * monotonic: `agentId` alone names an agent on the selected deck and a
+   * DIFFERENT agent on any other. M6's cross-deck switch is what consumes it.
+   */
+  | { kind: "agent"; deckId: string; agentId: string; from: "deck" | "overview" };
 
 /**
  * An agent's tab membership exactly as the daemon reports it, mirroring
@@ -714,6 +757,18 @@ export interface WorkflowLaunchConfig {
 
 export interface TerminalChunk {
   agentId: string;
+  /**
+   * PRD #1105 security audit — the deck whose daemon produced these bytes, as
+   * the bridge knew it at delivery time.
+   *
+   * Stamped by the producer rather than inferred by the consumer, because the
+   * bridge learns the selected deck off `DesktopSnapshotDto.fleet[0]`
+   * synchronously while React state is a commit behind it. Optional so a
+   * producer that cannot name a deck stays valid; the runtime then falls back
+   * to the deck it currently believes is selected, which is what a bare-id
+   * producer implicitly meant.
+   */
+  deckId?: string;
   data: Uint8Array;
   stream: "output" | "end" | "error";
   operation: "append" | "replace";
@@ -727,9 +782,48 @@ export interface TerminalBuffer {
   generation?: number;
 }
 
+/**
+ * The direct PTY-byte path, addressed by the COMPOSITE `(deckId, agentId)`.
+ *
+ * PRD #1105's security audit is why the deck travels here. Buffers used to be
+ * keyed by bare agent id, and nothing cleared them when the selected deck moved
+ * — so mounting a viewport for deck B's `planner` read deck A's retained
+ * buffer and wrote up to a megabyte of another machine's output into the new
+ * xterm, under B's correctly resolved heading. See {@link agentKey}.
+ */
 export interface TerminalFeed {
-  get(agentId: string): TerminalBuffer | undefined;
-  subscribe(agentId: string, listener: (buffer: TerminalBuffer) => void): () => void;
+  get(deckId: string | undefined, agentId: string): TerminalBuffer | undefined;
+  subscribe(deckId: string | undefined, agentId: string, listener: (buffer: TerminalBuffer) => void): () => void;
+}
+
+/**
+ * One agent on one deck — the whole identity of a terminal seam, passed as a
+ * value rather than assembled from a bare id and whatever deck happens to be
+ * selected when the call lands.
+ *
+ * # Why this is a parameter and not something the bridge can look up
+ *
+ * Every terminal verb used to take a bare `agentId` and resolve the daemon
+ * through the process-global selected endpoint. Agent ids are per-daemon
+ * monotonic integers, so `"planner"` names an agent on every deck: with the
+ * agent pane able to attach a terminal on a deck that is NOT the selected one,
+ * a bare id routes this client's keystrokes to whichever machine happens to be
+ * selected at the instant the write lands. Issue
+ * [#1116](https://github.com/vfarcic/dot-agent-deck/issues/1116) is two audit
+ * rounds of that one shape — identity read from mutable current selection at
+ * use time rather than captured at creation.
+ *
+ * # It is compared BY VALUE, never by reference
+ *
+ * Nothing may key a `Map` on a `AgentTarget` object. The same target is
+ * re-allocated on every render — `{ deckId: agent.daemonId, agentId: agent.id }`
+ * is a fresh object each time — so an identity-keyed lookup passes a test that
+ * happens to reuse one object and fails in production. {@link agentKey} is the
+ * one way to turn a target into a key.
+ */
+export interface AgentTarget {
+  deckId: string;
+  agentId: string;
 }
 
 export interface DeckRuntimeState {
@@ -766,10 +860,37 @@ export interface DeckRuntimeState {
    */
   clearError: () => void;
   runAction: (action: DeckAction) => Promise<DeckActionResult>;
-  sendTerminalInput: (agentId: string, data: string) => Promise<void>;
-  resizeTerminal: (agentId: string, cols: number, rows: number) => Promise<void>;
   /**
-   * PRD #882 — the geometry the daemon has APPLIED per agent, keyed by agent id.
+   * Issue #1042 — the last NON-DELIVERED `SendResult` the guarded send verb
+   * returned, per agent id. An agent with no entry has nothing unresolved.
+   *
+   * This is the post-hoc half of the terminal's input state. `history-only` and
+   * `no-live-target` are read off `AgentSession.writeLease` and need no send;
+   * `wrong-session` is decided at write time, is carried by no snapshot field,
+   * and after a rollover the pane reads `writeLease === "write"` — it looks
+   * deliverable precisely when a send would fail. So it can only be known by
+   * trying, which makes a returned verdict the only place it can come from.
+   *
+   * Optional, and absence is a real state rather than an oversight: a runtime
+   * through which nothing has ever been submitted has no verdicts to report.
+   *
+   * **Keyed by `agentKey(deckId, agentId)` since PRD #1105's security audit**,
+   * not by the bare id. A verdict recorded for deck A's `planner` would
+   * otherwise disable deck B's pane and render A's rejection notice under B's
+   * heading — the ids collide across decks by construction.
+   */
+  terminalInputResults?: Record<string, SendResult>;
+  sendTerminalInput: (target: AgentTarget, data: string) => Promise<void>;
+  resizeTerminal: (target: AgentTarget, cols: number, rows: number) => Promise<void>;
+  /**
+   * PRD #882 — the geometry the daemon has APPLIED per agent, keyed by
+   * `agentKey(deckId, agentId)`.
+   *
+   * **The deck is part of that key since PRD #1105's security audit.** Nothing
+   * evicts an entry per agent, so a pane opened for deck B's `planner` applied
+   * deck A's grid, and an attach that won the race against the pane's first fit
+   * submitted A's cached dimensions to B — transiently reflowing B's PTY, and
+   * every other viewer attached to it, from a viewport on another machine.
    *
    * A terminal must render at this, not at the size of its own tile: a PTY has
    * one window size, so the daemon sizes each agent to the smallest pane among
@@ -784,10 +905,15 @@ export interface DeckRuntimeState {
   /**
    * States the whole set of agents whose terminal is on screen (PRD #745 M7).
    * A screen that mounts terminals calls this once per render commit with every
-   * shown id; a screen that mounts none calls it with `[]`. Attach follows this
-   * and nothing else, so a screen that renders no output opens no PTYs either.
+   * shown target; a screen that mounts none calls it with `[]`. Attach follows
+   * this and nothing else, so a screen that renders no output opens no PTYs
+   * either.
+   *
+   * A target rather than a bare id since PRD #1105's cross-deck pane: the
+   * overview can show one deck's agents while a pane holds a terminal on
+   * another, and both declarations travel in the same array.
    */
-  setShownTerminals: (agentIds: string[]) => Promise<void>;
+  setShownTerminals: (targets: AgentTarget[]) => Promise<void>;
   reconnect: () => Promise<void>;
   /**
    * PRD #819 M6: the projects the connected daemon knows about. There is no

@@ -1,11 +1,11 @@
-import { useEffect, useId, useMemo, useRef, useState, type CSSProperties, type ReactNode } from "react";
-import { Blocks, Boxes, Columns3, LayoutList, Layers, Network, RefreshCw, RotateCcw, ShieldAlert, Sparkles, SquareTerminal, Wrench } from "lucide-react";
+import { createContext, useCallback, useContext, useEffect, useId, useMemo, useRef, useState, type CSSProperties, type MouseEvent, type ReactNode } from "react";
+import { Blocks, Boxes, Columns3, LayoutList, Layers, Maximize2, Network, RefreshCw, RotateCcw, ShieldAlert, Sparkles, SquareTerminal, Wrench } from "lucide-react";
 import type { AgentSession, AgentStatus, ConnectionView, DeckRuntimeState, DeckView } from "../types";
 import { modeScopedKey } from "../lib/bridge";
 import { ConfirmDialog, type ConfirmState } from "./ConfirmDialog";
 import { DeckSelector } from "./DeckSelector";
 import type { DesktopSettingsState } from "../hooks/useDesktopSettings";
-import { DISPLAY_LIMITS, displayActivity, displayIdentity, displayPath, displayText, displayTitle, displayUptime, domIdentity, rendersBlank } from "../lib/displayText";
+import { DISPLAY_LIMITS, deckName, displayActivity, displayIdentity, displayPath, displayText, displayTitle, displayUptime, domIdentity, rendersBlank } from "../lib/displayText";
 
 /**
  * The honest subset of `AgentSession`: every field a daemon genuinely reports
@@ -563,6 +563,50 @@ const WRITE_LEASE_TITLE: Record<"read" | "write" | "none", string> = {
 };
 
 /**
+ * PRD #1105 M5 — how a row's open control reaches the navigation callback.
+ *
+ * A context rather than one more prop on each of `DeckGroup`, `DaemonBody`,
+ * `OverviewGroupCard` and `OverviewRow`, and the reason is the same one
+ * `lib/settingsBridge` gives: three of those four would only FORWARD it. They
+ * are layout components about decks, groups and columns, and a callback about
+ * views threaded through their signatures is noise every later reader has to
+ * re-derive as noise.
+ *
+ * The default is `undefined` rather than a no-op, and the row renders no
+ * control at all when it reads one: a row outside {@link AgentOverview} has no
+ * view to navigate, and a control that silently does nothing is worse than an
+ * absent one. {@link AgentOverview} is the only provider and always supplies a
+ * callback, so today that branch is a guarantee about the type rather than a
+ * state the app reaches.
+ *
+ * # Every listed agent is openable, including one on a deck that is not
+ * selected
+ *
+ * This screen merges every observed deck (PRD [#742](https://github.com/vfarcic/dot-agent-deck/issues/742))
+ * and offers **every one of its rows** the same control. If an agent is on the
+ * screen there is a way into its pane; a listed row with no way to open it is a
+ * dead row, and which deck an agent happens to be on is not something a reader
+ * can see from the row they are pointing at.
+ *
+ * The pane it opens has a LIVE terminal whichever deck the agent is on: it
+ * carries the composite `(deckId, agentId)` through attach, output, input and
+ * resize, and the crate resolves that deck's own link through `DaemonLinks`
+ * (`App.tsx`'s `OverviewAgentPane`, `lib/bridge.ts`, `src-tauri/terminal.rs`).
+ * That is the desktop app's reason to exist over the TUI — one place from which
+ * any agent on any deck can be worked with (PRD
+ * [#802](https://github.com/vfarcic/dot-agent-deck/issues/802)) — and nothing
+ * here moves the selected deck to achieve it.
+ *
+ * What the deck decides is what the PANE can do, not whether it opens. A deck
+ * with no live link — disconnected, not yet reporting, no address — has nothing
+ * to attach over, and the pane says so instead of showing a black rectangle
+ * (`unreachableDeckTerminalState` in `lib/terminalInput.ts`). That is the
+ * honest division: the overview knows nothing about attach, and the pane is
+ * where the attach either happens or is explained.
+ */
+const OpenAgentContext = createContext<((agent: OverviewAgent) => void) | undefined>(undefined);
+
+/**
  * The fleet at a glance: every agent the desktop can see, grouped the way the
  * daemon groups them, described only by things that are actually true — and
  * with no terminal anywhere on it. "Shows no output" and "opens no PTY" are
@@ -589,27 +633,29 @@ const WRITE_LEASE_TITLE: Record<"read" | "write" | "none", string> = {
  * standalone gets everything except the control that needs a document.
  */
 export function AgentOverview({ runtime, settings, onNavigate }: { runtime: DeckRuntimeState; settings?: DesktopSettingsState; onNavigate: (view: DeckView) => void }) {
-  const { fleet, snapshot, mode, setShownTerminals } = runtime;
-  /**
-   * The screen's whole claim, stated to the bridge rather than merely printed in
-   * its own header (PRD #745 M7): this screen shows no terminal, so it opens no
-   * PTY. Declaring the empty set also flushes the warm set to zero, which is
-   * what makes the claim true when you arrive here from a nine-tile deck rather
-   * than only on a cold start.
+  const { fleet, snapshot, mode } = runtime;
+  /*
+   * This screen shows no terminal and opens no PTY (PRD #745 M7), and it no
+   * longer says so to the bridge itself.
    *
-   * PRD #742 M4 did not widen it and must not: a tile's terminal is always the
-   * SELECTED deck's, so the set of shown terminals is still one deck's set and
-   * the empty declaration is still the whole claim.
+   * It used to: `setShownTerminals([])` on mount, which is also what flushes
+   * the warm set to zero and makes the claim true when you arrive here from a
+   * nine-tile deck rather than only on a cold start. PRD #1105 M4 moved that
+   * declaration UP to `DeckShell` without weakening it — the empty set is still
+   * declared for this screen, by the only component that can also see the agent
+   * pane when one is open over it.
    *
-   * What it cannot claim is that every socket a previous screen opened is
-   * already gone by the time this renders: the declaration is fire-and-forget,
-   * and an attach command still outstanding is cancelled by marking, so its
-   * daemon-side tear-down completes afterwards. The copy below says exactly
-   * that rather than the stronger thing.
+   * The move is the whole of M4 and not tidying. `setShownTerminals` must be
+   * called once per render commit with the whole shown set; an overview that
+   * declares `[]` for itself while a pane above it needs `[agentId]` is two
+   * declarations in one commit, and which one the bridge saw last decided
+   * whether that pane had a terminal. Neither outcome failed loudly.
+   *
+   * So: nothing here may declare a shown set again. A caller that renders this
+   * screen standalone — every test that does, since `DeckShell` is the only
+   * production caller — declares nothing, which is a statement about the
+   * harness rather than about the screen.
    */
-  useEffect(() => {
-    void setShownTerminals([]);
-  }, [setShownTerminals]);
   /**
    * The SELECTED deck's connection — the Deck selector's, and the rail lamp's.
    *
@@ -687,6 +733,26 @@ export function AgentOverview({ runtime, settings, onNavigate }: { runtime: Deck
   const known = aggregate.decksUp > 0;
   const countOf = (status: AgentStatus) => aggregate.counts.find((entry) => entry.status === status)?.count ?? 0;
   const openDeck = () => onNavigate({ kind: "deck" });
+  /**
+   * PRD #1105 M5 — the overview's entry point into an agent's pane.
+   *
+   * The composite `(daemonId, id)` goes into the view rather than the bare id,
+   * because this screen merges every observed deck and agent ids are per-daemon
+   * monotonic: `"1"` names one agent here and a different one on the deck
+   * beside it. Everything downstream — the pane's own lookup, its shown
+   * declaration, its terminal state — addresses that composite, so the bare id
+   * is not a shorter spelling of it.
+   *
+   * `from: "overview"` is what closing reads, and it is the whole of the back
+   * behaviour — no history, no stack.
+   *
+   * **Every agent on this screen reaches this**, whichever deck it is on. This
+   * screen makes no attach decision and asks no question about the selected
+   * deck; see {@link OpenAgentContext}.
+   */
+  const openAgent = useCallback((agent: OverviewAgent) => {
+    onNavigate({ kind: "agent", deckId: agent.daemonId, agentId: agent.id, from: "overview" });
+  }, [onNavigate]);
   const [confirm, setConfirm] = useState<ConfirmState>();
   const [overrideError, setOverrideError] = useState<string>();
   /**
@@ -722,7 +788,11 @@ export function AgentOverview({ runtime, settings, onNavigate }: { runtime: Deck
     });
   };
 
-  return (
+  /*
+    Named rather than returned directly, so the provider below can wrap it
+    without re-indenting eighty lines of screen for one line of plumbing.
+  */
+  const overviewScreen = (
     <div className="control-deck overview-screen">
       <aside className="rail" aria-label="Primary navigation">
         <div className="brand-mark" aria-label="Agent Deck"><span>AD</span><i aria-hidden="true" /></div>
@@ -807,6 +877,7 @@ export function AgentOverview({ runtime, settings, onNavigate }: { runtime: Deck
       {confirm && <ConfirmDialog state={confirm} onClose={() => setConfirm(undefined)} />}
     </div>
   );
+  return <OpenAgentContext.Provider value={openAgent}>{overviewScreen}</OpenAgentContext.Provider>;
 }
 
 /** One deck of the fleet, as {@link AgentOverview} prepares it for rendering. */
@@ -983,24 +1054,6 @@ function DeckGroup({ deck, now, columns, fleetSize, overrideError, onOpenDeck, o
 function unknownPipsTitle(connection: ConnectionView): string {
   if (connection.pending) return "Not known yet — this deck has not reported, so its agents cannot be counted.";
   return "Not known — this deck is not answering, so its agents cannot be counted.";
-}
-
-/**
- * What a deck is CALLED on screen — and it is never "daemon" (PRD #741 M9's
- * vocabulary rule, which #742 inherits).
- *
- * A local deck is "Local deck", exactly as it was when there was only one. A
- * remote one is named by its address, because that is what distinguishes it
- * from the other decks beside it and it is the same string the user typed into
- * the settings row. `Endpoint::describe()` renders a remote deck as
- * `user@host[:port]`, every byte of which came through a validated ASCII
- * charset — it goes through `displayText` anyway, because bounding a
- * daemon-supplied string at the render seam is this screen's rule and not a
- * judgement about any one field.
- */
-function deckName(connection: ConnectionView): string {
-  if (connection.deckKind !== "remote") return "Local deck";
-  return connection.socketPath ? displayText(connection.socketPath, DISPLAY_LIMITS.path) : "Remote deck";
 }
 
 function DaemonBody({ agents, groups, now, columns, connection, message, compactNote, overrideError, onOpenDeck, onReconnect, onConnectAnyway }: {
@@ -1420,6 +1473,28 @@ function OverviewRow({ agent, hoistedCwd, now, columns }: { agent: OverviewAgent
     `src/untrusted_text.rs`; it is fixed by saying something visible instead.
   */
   const name = displayIdentity(agent.displayName, DISPLAY_LIMITS.name, unnamedAgentLabel(agent));
+  /*
+    PRD #1105 M5 — the only thing this milestone adds to a card, and the limit
+    is deliberate: #745's commitment is that these rows stay terminal-free, so
+    the row gains a way to NAVIGATE — this control, and a click anywhere else
+    on the row (see `openFromRow`) — and gains nothing that renders output.
+    Its accessible name is built from `name` rather than from
+    `agent.displayName`, so the sanitised, clamped copy is what a screen reader
+    announces and a hostile display name cannot spell a different button.
+
+    **Every row gets one, whichever deck its agent is on.** This screen merges
+    every observed deck, and a tile's terminal is always the SELECTED deck's —
+    so a pane opened for a non-selected deck's agent attaches nothing. That is
+    a fact about the pane and it is the pane that states it: it opens with an
+    explicit no-terminal state naming the deck rather than with a blank
+    terminal. Gating the control here instead was tried and reverted, because a
+    listed agent with no way to open it is a dead row and nothing on the row
+    tells the reader which deck they are pointing at. The deck SWITCH is the
+    thing that stays withdrawn (see the PRD's decision 5), and attaching
+    without switching is a wire change and is
+    [#1073](https://github.com/vfarcic/dot-agent-deck/issues/1073).
+  */
+  const openAgent = useContext(OpenAgentContext);
   // ONE instant for the whole screen, ticked by `useOverviewClock` so these two
   // cells keep counting between daemon events. Passed down rather than read
   // here so every row on a repaint is relative to the same moment rather than
@@ -1464,6 +1539,14 @@ function OverviewRow({ agent, hoistedCwd, now, columns }: { agent: OverviewAgent
             */}
             {agent.writeLease && <span className={`overview-lease lease-${agent.writeLease}`} title={WRITE_LEASE_TITLE[agent.writeLease]}>{agent.writeLease}</span>}
             {roleName && !rendersBlank(roleName) && roleLabel?.toLowerCase() !== agent.displayName.toLowerCase() && <em className="overview-role-name">{roleName}</em>}
+            {openAgent && (
+              <button
+                className="overview-open-agent"
+                aria-label={`Open ${name} agent`}
+                title={`Open ${name} in a full-window pane`}
+                onClick={() => openAgent(agent)}
+              ><Maximize2 size={12} /></button>
+            )}
           </td>
         );
       case "lastActivityMs":
@@ -1569,11 +1652,73 @@ function OverviewRow({ agent, hoistedCwd, now, columns }: { agent: OverviewAgent
       }
     }
   };
+  /*
+    The whole row is the pointer target for opening the pane, and the control
+    above stays as the keyboard and screen-reader route. A click handler on the
+    `<tr>` rather than a `<button>` around it, which would be invalid HTML with
+    the control inside and would announce the entire row as one button name. It
+    is also a click handler rather than a stretched link: a transparent layer
+    stretched over the row would sit on top of every cell, so the working
+    directory and prompt could no longer be selected, and each cell's `title`
+    (the full path, the full prompt, the exact instants) would never show on
+    hover. The row stays out of the tab order because the control is already
+    in it, and a second stop per agent would only repeat it.
+  */
+  const openFromRow = openAgent && ((event: MouseEvent<HTMLTableRowElement>) => {
+    if (clickLandedOnRowControl(event) || clickFinishedSelection(event.currentTarget)) return;
+    openAgent(agent);
+  });
   return (
-    <tr className="overview-row" role="row" data-testid={`overview-agent-${agentDomKey(agent)}`} data-status={agent.status}>
+    <tr
+      className={openAgent ? "overview-row is-openable" : "overview-row"}
+      role="row"
+      data-testid={`overview-agent-${agentDomKey(agent)}`}
+      data-status={agent.status}
+      onClick={openFromRow}
+    >
       {columns.map(cell)}
     </tr>
   );
+}
+
+/**
+ * Everything inside a row that can do a job of its own, so a click on it is
+ * left to that job. Today the open control is the only match in a row, and it
+ * opens the pane itself, so letting the click reach the row as well would open
+ * it twice. The selector is wider than that one control on purpose: a control
+ * added to a row later gets its own click without having to remember
+ * `stopPropagation`.
+ */
+const ROW_CONTROL_SELECTOR = "a[href], button, input, select, textarea, label, summary, [contenteditable], [tabindex], [role='button'], [role='link']";
+
+function clickLandedOnRowControl(event: MouseEvent<HTMLTableRowElement>): boolean {
+  if (!(event.target instanceof Element)) return false;
+  const control = event.target.closest(ROW_CONTROL_SELECTOR);
+  return control !== null && control !== event.currentTarget && event.currentTarget.contains(control);
+}
+
+/**
+ * Whether this click is the mouse-up that finished a text selection in the row.
+ * A drag across a working directory or a prompt still ends in a `click` on the
+ * row, and someone copying a path is not asking to open a pane.
+ *
+ * It reads the selection rather than measuring the drag: the selection is the
+ * thing that must survive, and a drag distance is only a guess at it, one that
+ * misses a short selection and flags a long drag that selected nothing. A plain
+ * click leaves a collapsed caret, which this does not count. The check is
+ * scoped to ranges touching THIS row, so a selection somewhere else on the
+ * screen cannot make a row refuse to open.
+ *
+ * Selecting by double-click is not covered: its first click is an ordinary
+ * click and opens the pane before the second one arrives.
+ */
+function clickFinishedSelection(row: HTMLTableRowElement): boolean {
+  const selection = window.getSelection();
+  if (!selection || selection.isCollapsed) return false;
+  for (let index = 0; index < selection.rangeCount; index += 1) {
+    if (selection.getRangeAt(index).intersectsNode(row)) return true;
+  }
+  return false;
 }
 
 function OverviewNote({ className, testId, icon, title, children }: { className?: string; testId: string; icon: ReactNode; title: string; children: ReactNode }) {

@@ -59,11 +59,12 @@ const REPO_SLUG: &str = "vfarcic/dot-agent-deck";
 
 /// Read a repository file with CRLF folded to LF.
 ///
-/// The `build-windows` CI job runs this same tier, and nothing in
-/// `.gitattributes` pins the line endings of these two files — so a checkout
-/// that normalises to CRLF would otherwise defeat both the heredoc extraction
-/// and the byte-comparison against the lock, on a platform where the failure
-/// says nothing about the workflow.
+/// The `build-windows` CI job runs this same tier. The root `.gitattributes`
+/// now checks these files out with LF everywhere, but a checkout that
+/// normalises to CRLF anyway — a clone made before that attribute landed —
+/// would otherwise defeat both the heredoc extraction and the byte-comparison
+/// against the lock, on a platform where the failure says nothing about the
+/// workflow.
 fn read_lf(path: &Path) -> String {
     std::fs::read_to_string(path)
         .unwrap_or_else(|e| panic!("{}: {e}", path.display()))

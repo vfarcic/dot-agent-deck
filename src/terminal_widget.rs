@@ -291,11 +291,11 @@ impl Widget for TerminalWidget {
         // the geometry: `resize_pane_pty` set the parser synchronously, so the
         // two were the same number by construction and any difference was a bug.
         // Under PRD #882 the DAEMON owns it. The parser holds the geometry the
-        // daemon applied — the smallest viewport among everyone attached — and
-        // the inner area holds what this client would like to draw. Those two
-        // legitimately differ whenever another client's view of the agent is
-        // smaller,
-        // which is the entire point of the policy.
+        // daemon applied — the last-focused client's viewer size, or the
+        // smallest viewport among everyone attached when no client claimed
+        // focus (PRD #1105) — and the inner area holds what this client would
+        // like to draw. Those two legitimately differ whenever another client
+        // decides the size, which is the entire point of the policy.
         //
         // Nor can the guard be kept for one direction only. Every request is a
         // round trip now, so during a shrink the parser is briefly LARGER than
@@ -306,13 +306,15 @@ impl Widget for TerminalWidget {
         //
         // The invariant did not disappear; it MOVED to the side that can
         // actually state it. The daemon computes the applied geometry from the
-        // registered viewers and is where "the PTY is never larger than any
-        // viewer's pane" is enforced and tested. What remains here is the
-        // rendering rule that follows from it, and it is now the designed path
-        // rather than a defense against an upstream failure: draw the screen
-        // 1:1 from the top-left and leave anything past it blank. A pane
-        // narrower or shorter than its box is what a correctly applied policy
-        // looks like from inside a client that is not the smallest one.
+        // registered viewers and is where the policy is enforced and tested.
+        // What remains here is the rendering rule that follows from it, and it
+        // is now the designed path rather than a defense against an upstream
+        // failure: draw the screen 1:1 from the top-left and leave anything past
+        // it blank. A pane narrower or shorter than its box is what a correctly
+        // applied policy looks like from inside a client that is not the
+        // smallest one; since PRD #1105, a screen LARGER than the box, clipped
+        // at its right and bottom edges, is what it looks like from inside a
+        // client that is not the last-focused one.
         let _ = self.contract_guaranteed;
 
         // Fall back to `min(area, screen)` from the top-left so an over- or

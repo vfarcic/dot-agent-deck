@@ -9,8 +9,9 @@ use std::time::{Duration, Instant};
 use std::any::Any;
 
 use crate::agent_pty::{self, DOT_AGENT_DECK_PANE_ID, PTY_RESIZE_DIM_MAX, TabMembership};
-use crate::daemon_client::{AttachConnection, DaemonClient, StartAgentOptions};
+use crate::daemon_client::{AttachConnection, DaemonClient, StartAgentOptions, generate_client_id};
 use crate::event::AgentType;
+use crate::focus_report::FocusReporter;
 use crate::hyperlink::{HyperlinkMap, Osc8Filter, Osc8Segment};
 use crate::pane::{
     AgentSpawnOptions, PaneController, PaneDirection, PaneError, PaneInfo, RenameOutcome,
@@ -511,7 +512,18 @@ pub struct EmbeddedPaneController {
     /// controller (rather than reconstructing per call) lets the
     /// existing `block_on` paths reuse the same socket address resolution
     /// logic.
+    ///
+    /// PRD #1105 M11: built with a `client_id` ([`DaemonClient::with_client_id`])
+    /// generated once in [`Self::new`], so every attach this controller makes —
+    /// a new pane, both hydration paths, and the I/O task's re-attach after a
+    /// respawn, all of which go through clones of this handle — and every
+    /// resize connection names the same client. The TUI process builds one
+    /// controller (`main.rs`), which is what makes this one id per process.
     client: DaemonClient,
+    /// PRD #1105 M11: claims focus on the daemon under [`Self::client`]'s
+    /// identity when the terminal reports focus-in or the person gives input.
+    /// Fed by the event loop through [`Self::report_focus`].
+    focus: FocusReporter,
     /// Tokio runtime handle used to drive the blocking `block_on` calls
     /// from the TUI's blocking render thread, plus the long-lived
     /// per-pane I/O and resize worker tasks.
@@ -550,15 +562,35 @@ impl EmbeddedPaneController {
     /// actually running — `daemon_attach::ensure_external_daemon_or_die`
     /// is the canonical pre-flight from `main`.
     pub fn new(socket_path: PathBuf, runtime: tokio::runtime::Handle) -> Self {
+        let client = DaemonClient::new(socket_path).with_client_id(generate_client_id());
         Self {
             panes: Arc::new(Mutex::new(HashMap::new())),
             next_id: Arc::new(Mutex::new(1)),
-            client: DaemonClient::new(socket_path),
+            focus: FocusReporter::new(client.clone(), runtime.clone()),
+            client,
             runtime,
             stream_rejections: Arc::new(Mutex::new(Vec::new())),
             close_warnings: Arc::new(Mutex::new(Vec::new())),
             any_scroll_notice_armed: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// PRD #1105 M11: the identity every attach from this controller carries,
+    /// and the one [`Self::report_focus`] claims focus as.
+    pub fn client_id(&self) -> Option<&str> {
+        self.client.client_id()
+    }
+
+    /// PRD #1105 M11: feed one terminal event to the focus reporter, which
+    /// claims focus on the daemon when the event is a focus-in (always) or input
+    /// (throttled) — see [`crate::focus_report`]. Never blocks; the returned
+    /// handle is only for tests that need to wait for the claim.
+    pub fn report_focus(
+        &self,
+        event: &crossterm::event::Event,
+        now: Instant,
+    ) -> Option<tokio::task::JoinHandle<()>> {
+        self.focus.observe(event, now)
     }
 
     /// PRD #20 R20-007 (finding #10): drain and return the typed stream
@@ -1362,7 +1394,7 @@ impl EmbeddedPaneController {
 
         let resize_task = runtime.spawn(resize_worker(
             resize_rx,
-            daemon_path.clone(),
+            self.client.clone(),
             Arc::clone(&shared_agent_id),
             Arc::clone(&shared_viewer),
             Arc::clone(&parser),
@@ -3151,7 +3183,9 @@ async fn resolve_and_reattach(
 /// exactly when the pane is dropped.
 async fn resize_worker(
     mut rx: tokio::sync::watch::Receiver<Option<(u16, u16)>>,
-    daemon_path: PathBuf,
+    // PRD #1105 M11: the controller's own handle, so a resize connection is
+    // made under the same client identity as the attach it resizes.
+    client: DaemonClient,
     agent_id: Arc<Mutex<String>>,
     viewer: Arc<Mutex<Option<String>>>,
     parser: Arc<Mutex<vt100::Parser>>,
@@ -3174,7 +3208,6 @@ async fn resize_worker(
         // under a brief lock, never held across the await below.
         let token = viewer.lock().unwrap().clone();
 
-        let client = DaemonClient::new(daemon_path.clone());
         match tokio::time::timeout(
             RESIZE_DAEMON_TIMEOUT,
             client.resize_agent_as_viewer(&id, rows, cols, token.as_deref()),
@@ -3182,12 +3215,14 @@ async fn resize_worker(
         .await
         {
             // PRD #882: the daemon answers with what it ACTUALLY applied, which
-            // is smaller than the request whenever another client's pane is
-            // smaller. Size the parser from the answer — sizing it from the
-            // request is what would leave this pane parsing at a geometry the
-            // PTY does not have, which is PRD #104's mis-parse arriving by a new
-            // route. A daemon predating the policy echoes nothing (`None`) and
-            // has no policy to disagree with us, so the request stands.
+            // differs from the request whenever another client decides the size
+            // — a smaller pane under the fallback, or the last-focused client's
+            // pane under PRD #1105, which can be larger. Size the parser from the
+            // answer — sizing it from the request is what would leave this pane
+            // parsing at a geometry the PTY does not have, which is PRD #104's
+            // mis-parse arriving by a new route. A daemon predating the policy
+            // echoes nothing (`None`) and has no policy to disagree with us, so
+            // the request stands.
             Ok(Ok(applied)) => {
                 let (rows, cols) = applied.unwrap_or((rows, cols));
                 set_parser_size_if_changed(&parser, rows, cols);
@@ -4819,11 +4854,12 @@ mod tests {
         // Split off this very test module; parsers built inside it are fixtures
         // (`wide_char_in_one_row_pane_does_not_crash_the_tui` deliberately
         // constructs a raw 1x10 parser to prove the vt100 bug still exists).
-        // `include_str!` yields the file exactly as checked out, and Windows
-        // checks it out with CRLF endings — so every `\n`-anchored marker below
-        // (this split, and the `\n}\n` that ends the helper) silently fails to
-        // match there. Normalize once so the guard reads the same source on
-        // every platform.
+        // `include_str!` yields the file exactly as checked out, and a CRLF
+        // checkout — Windows' default before the root `.gitattributes` pinned
+        // LF, and still what a clone made before that has — makes every
+        // `\n`-anchored marker below (this split, and the `\n}\n` that ends the
+        // helper) silently fail to match. Normalize once so the guard reads the
+        // same source on every platform.
         let src = SRC.replace("\r\n", "\n");
         let (prod, _tests) = src
             .split_once("\n#[cfg(test)]\nmod tests {")
@@ -5368,5 +5404,515 @@ mod tests {
             "a sequence split across two chunks must still be seen by a caller \
              that only ever sees `process_agent_output_chunk`"
         );
+    }
+
+    /// PRD #1105 M11 step 3 — the TUI identifies itself on every attach and
+    /// claims focus from terminal events. The classification and the throttle's
+    /// arithmetic are unit-tested in `crate::focus_report`; these drive the
+    /// controller against a socket, so what they assert is what reaches the
+    /// daemon.
+    #[cfg(unix)]
+    mod focus_claims {
+        use super::*;
+        use crate::agent_pty::{AgentPtyRegistry, SpawnOptions};
+        use crate::daemon_protocol::{
+            AttachResponse, CAP_FOCUS_GAINED, CAP_LIST_PROJECTS, KIND_REQ, PROTOCOL_VERSION,
+            bind_attach_listener, read_frame, serve_attach, write_resp,
+        };
+        use crate::focus_report::INPUT_CLAIM_INTERVAL;
+        use crossterm::event::{
+            Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind,
+        };
+
+        /// `bind_attach_listener` flips the process umask around its `bind(2)`;
+        /// hold this across tempdir + bind, as `daemon_client`'s tests do.
+        static BIND_LOCK: Mutex<()> = Mutex::new(());
+
+        fn runtime() -> tokio::runtime::Runtime {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .expect("build the test runtime")
+        }
+
+        fn bind(
+            runtime: &tokio::runtime::Runtime,
+            tag: &str,
+        ) -> (
+            tempfile::TempDir,
+            PathBuf,
+            crate::platform::ipc::IpcListener,
+        ) {
+            let _guard = BIND_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+            // The listener registers with the reactor as it is built.
+            let _runtime = runtime.enter();
+            let dir = crate::test_temp::tempdir().expect("scratch dir for the socket");
+            let path = dir.path().join(format!("{tag}.sock"));
+            let listener = bind_attach_listener(&path).expect("bind the attach socket");
+            (dir, path, listener)
+        }
+
+        /// The production attach server over a real registry.
+        fn real_daemon(
+            runtime: &tokio::runtime::Runtime,
+        ) -> (tempfile::TempDir, PathBuf, Arc<AgentPtyRegistry>) {
+            crate::test_isolation::detach_from_any_live_deck();
+            let (dir, path, listener) = bind(runtime, "focus-real");
+            let registry = Arc::new(AgentPtyRegistry::new());
+            let served = Arc::clone(&registry);
+            runtime.spawn(async move {
+                let (events, _) = tokio::sync::broadcast::channel(16);
+                let _ = serve_attach(listener, served, events).await;
+            });
+            (dir, path, registry)
+        }
+
+        /// A daemon that answers `hello` with `advertised` as its capability
+        /// list and records every other request it is sent: `focus-gained`
+        /// claims by the `client_id` they name, anything else by its op.
+        ///
+        /// It serves one connection at a time, and it can hold its `hello`
+        /// replies until [`Self::release_hello`], which keeps a claim waiting on
+        /// its capability handshake — unsent — for as long as a test needs.
+        struct ScriptedDaemon {
+            _dir: tempfile::TempDir,
+            path: PathBuf,
+            claims: Arc<Mutex<Vec<String>>>,
+            other_ops: Arc<Mutex<Vec<String>>>,
+            hellos: Arc<std::sync::atomic::AtomicUsize>,
+            hello_gate: tokio::sync::watch::Sender<bool>,
+            server: tokio::task::JoinHandle<()>,
+        }
+
+        impl ScriptedDaemon {
+            fn start(
+                runtime: &tokio::runtime::Runtime,
+                advertised: Option<Vec<&'static str>>,
+            ) -> Self {
+                Self::start_gated(runtime, advertised, true)
+            }
+
+            /// [`Self::start`], with every `hello` reply held until
+            /// [`Self::release_hello`].
+            fn start_holding_hello(
+                runtime: &tokio::runtime::Runtime,
+                advertised: Option<Vec<&'static str>>,
+            ) -> Self {
+                Self::start_gated(runtime, advertised, false)
+            }
+
+            fn start_gated(
+                runtime: &tokio::runtime::Runtime,
+                advertised: Option<Vec<&'static str>>,
+                hello_open: bool,
+            ) -> Self {
+                let (dir, path, listener) = bind(runtime, "focus-scripted");
+                let claims = Arc::new(Mutex::new(Vec::new()));
+                let other_ops = Arc::new(Mutex::new(Vec::new()));
+                let hellos = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let hello_gate = tokio::sync::watch::Sender::new(hello_open);
+                let (server_claims, server_other) = (Arc::clone(&claims), Arc::clone(&other_ops));
+                let server_hellos = Arc::clone(&hellos);
+                let mut gate = hello_gate.subscribe();
+                let server = runtime.spawn(async move {
+                    while let Ok(mut stream) = listener.accept().await {
+                        let Ok(Some((KIND_REQ, payload))) = read_frame(&mut stream).await else {
+                            continue;
+                        };
+                        let request: serde_json::Value =
+                            serde_json::from_slice(&payload).expect("decode the request");
+                        let op = request["op"].as_str().unwrap_or_default().to_string();
+                        if op == "hello" {
+                            server_hellos.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            let _ = gate.wait_for(|open| *open).await;
+                        }
+                        let response = match op.as_str() {
+                            "hello" => AttachResponse {
+                                capabilities: advertised
+                                    .clone()
+                                    .map(|caps| caps.into_iter().map(String::from).collect()),
+                                ..AttachResponse::hello(PROTOCOL_VERSION)
+                            },
+                            "focus-gained" => {
+                                server_claims.lock().unwrap().push(
+                                    request["client_id"]
+                                        .as_str()
+                                        .unwrap_or_default()
+                                        .to_string(),
+                                );
+                                AttachResponse {
+                                    ok: true,
+                                    ..Default::default()
+                                }
+                            }
+                            _ => {
+                                server_other.lock().unwrap().push(op.clone());
+                                AttachResponse::err(format!(
+                                    "malformed request: unknown variant `{op}`"
+                                ))
+                            }
+                        };
+                        let _ = write_resp(&mut stream, &response).await;
+                    }
+                });
+                Self {
+                    _dir: dir,
+                    path,
+                    claims,
+                    other_ops,
+                    hellos,
+                    hello_gate,
+                    server,
+                }
+            }
+
+            fn claims(&self) -> Vec<String> {
+                self.claims.lock().unwrap().clone()
+            }
+
+            /// How many `hello` requests have arrived, answered or held.
+            fn hellos(&self) -> usize {
+                self.hellos.load(std::sync::atomic::Ordering::SeqCst)
+            }
+
+            fn release_hello(&self) {
+                self.hello_gate.send_replace(true);
+            }
+        }
+
+        impl Drop for ScriptedDaemon {
+            fn drop(&mut self) {
+                self.server.abort();
+            }
+        }
+
+        fn key(c: char) -> Event {
+            Event::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE))
+        }
+
+        fn mouse(kind: MouseEventKind) -> Event {
+            Event::Mouse(MouseEvent {
+                kind,
+                column: 1,
+                row: 1,
+                modifiers: KeyModifiers::NONE,
+            })
+        }
+
+        /// Wait for every claim the reporter started, so a count read afterwards
+        /// is final rather than a race against spawned tasks.
+        fn finish(runtime: &tokio::runtime::Runtime, started: Vec<tokio::task::JoinHandle<()>>) {
+            runtime.block_on(async {
+                for claim in started {
+                    claim.await.expect("the claim task must not panic");
+                }
+            });
+        }
+
+        /// Scenario: a TUI controller is attached to a real daemon; the terminal
+        /// reports focus-in, so the daemon records that TUI as the last-focused
+        /// client. Another client then claims focus, and a second focus-in —
+        /// well inside the input throttle's window — takes it straight back.
+        #[test]
+        fn a_terminal_focus_in_claims_focus_as_the_controllers_client() {
+            let runtime = runtime();
+            let (_dir, path, registry) = real_daemon(&runtime);
+            let controller = EmbeddedPaneController::new(path.clone(), runtime.handle().clone());
+            let tui = controller
+                .client_id()
+                .expect("a TUI controller always has an identity")
+                .to_string();
+            assert_eq!(
+                registry.focused_client(),
+                None,
+                "fixture: nobody has claimed focus"
+            );
+
+            let t0 = Instant::now();
+            let claim = controller
+                .report_focus(&Event::FocusGained, t0)
+                .expect("focus-in starts a claim");
+            finish(&runtime, vec![claim]);
+            assert_eq!(registry.focused_client().as_deref(), Some(tui.as_str()));
+
+            let desktop = DaemonClient::new(path).with_client_id(generate_client_id());
+            runtime
+                .block_on(desktop.focus_gained())
+                .expect("the other client's claim");
+            assert_eq!(registry.focused_client().as_deref(), desktop.client_id());
+
+            let claim = controller
+                .report_focus(&Event::FocusGained, t0 + Duration::from_millis(10))
+                .expect("focus-in is never throttled, however recent the last claim");
+            finish(&runtime, vec![claim]);
+            assert_eq!(
+                registry.focused_client().as_deref(),
+                Some(tui.as_str()),
+                "switching back to the TUI must take focus back at once"
+            );
+            registry.shutdown_all();
+        }
+
+        /// Scenario: a burst of keys, a paste and a wheel spin inside one
+        /// throttle window reaches the daemon as exactly one `focus-gained`
+        /// claim; pointer motion claims nothing; the first key at the window's
+        /// end claims again, and a focus-in right after that claims regardless.
+        #[test]
+        fn input_reaches_the_daemon_as_one_claim_per_window() {
+            let runtime = runtime();
+            let daemon = ScriptedDaemon::start(&runtime, Some(vec![CAP_FOCUS_GAINED]));
+            let controller =
+                EmbeddedPaneController::new(daemon.path.clone(), runtime.handle().clone());
+            let tui = controller.client_id().expect("identity").to_string();
+
+            let t0 = Instant::now();
+            let mut burst: Vec<Event> = "hello world".chars().map(key).collect();
+            burst.push(Event::Paste("pasted".into()));
+            burst.extend((0..20).map(|_| mouse(MouseEventKind::ScrollDown)));
+            let step = INPUT_CLAIM_INTERVAL / (burst.len() as u32 + 1);
+            let mut started = Vec::new();
+            for (index, event) in burst.iter().enumerate() {
+                started.extend(controller.report_focus(event, t0 + step * index as u32));
+            }
+            finish(&runtime, started);
+            assert_eq!(
+                daemon.claims(),
+                vec![tui.clone()],
+                "{} input events inside one window must reach the daemon as ONE claim",
+                burst.len()
+            );
+
+            let later = t0 + INPUT_CLAIM_INTERVAL * 3;
+            assert!(
+                controller
+                    .report_focus(&mouse(MouseEventKind::Moved), later)
+                    .is_none(),
+                "bare pointer motion is not input, even with the window long closed"
+            );
+            // Each claim is finished before the next event, because a newer
+            // claim drops one still unsent — that is
+            // `a_claim_still_unsent_when_a_newer_event_arrives_is_never_sent`'s
+            // subject, and this test is about what the throttle admits.
+            let started: Vec<_> = controller
+                .report_focus(&key('x'), t0 + INPUT_CLAIM_INTERVAL)
+                .into_iter()
+                .collect();
+            assert_eq!(started.len(), 1, "the window's end admits the next input");
+            finish(&runtime, started);
+            let started: Vec<_> = controller
+                .report_focus(
+                    &Event::FocusGained,
+                    t0 + INPUT_CLAIM_INTERVAL + Duration::from_millis(1),
+                )
+                .into_iter()
+                .collect();
+            finish(&runtime, started);
+            assert_eq!(
+                daemon.claims(),
+                vec![tui.clone(), tui.clone(), tui],
+                "the window's end admits the next input, and focus-in is never throttled"
+            );
+            assert!(daemon.other_ops.lock().unwrap().is_empty());
+        }
+
+        /// Scenario: a focus-in starts a claim, and the daemon holds the claim's
+        /// capability handshake so it cannot be sent yet. The terminal then
+        /// reports focus-out, the handshake is released, and the daemon never
+        /// receives the claim. Then, against a fresh daemon, a second focus-in
+        /// arrives while the first claim is held the same way: after the release
+        /// the daemon receives exactly one claim, not the stale one as well.
+        #[test]
+        fn a_claim_still_unsent_when_a_newer_event_arrives_is_never_sent() {
+            let runtime = runtime();
+            let t0 = Instant::now();
+
+            let daemon =
+                ScriptedDaemon::start_holding_hello(&runtime, Some(vec![CAP_FOCUS_GAINED]));
+            let controller =
+                EmbeddedPaneController::new(daemon.path.clone(), runtime.handle().clone());
+            let claim = controller
+                .report_focus(&Event::FocusGained, t0)
+                .expect("focus-in starts a claim");
+            wait_until("the claim waits on its handshake", || daemon.hellos() == 1);
+            assert!(
+                controller
+                    .report_focus(&Event::FocusLost, t0 + Duration::from_millis(10))
+                    .is_none(),
+                "focus-out starts no claim of its own"
+            );
+            daemon.release_hello();
+            finish(&runtime, vec![claim]);
+            assert!(
+                daemon.claims().is_empty(),
+                "a claim still unsent when the terminal reported focus-out must be dropped, \
+                 not sent late: {:?}",
+                daemon.claims()
+            );
+
+            let daemon =
+                ScriptedDaemon::start_holding_hello(&runtime, Some(vec![CAP_FOCUS_GAINED]));
+            let controller =
+                EmbeddedPaneController::new(daemon.path.clone(), runtime.handle().clone());
+            let tui = controller.client_id().expect("identity").to_string();
+            let stale = controller
+                .report_focus(&Event::FocusGained, t0)
+                .expect("focus-in starts a claim");
+            wait_until("the first claim waits on its handshake", || {
+                daemon.hellos() == 1
+            });
+            let newer = controller
+                .report_focus(&Event::FocusGained, t0 + Duration::from_millis(10))
+                .expect("a second focus-in starts a claim");
+            daemon.release_hello();
+            finish(&runtime, vec![stale, newer]);
+            assert_eq!(
+                daemon.claims(),
+                vec![tui],
+                "the newer claim is sent and the one it superseded is not"
+            );
+            assert!(daemon.other_ops.lock().unwrap().is_empty());
+        }
+
+        /// Scenario: the TUI runs against daemons that predate focus-driven
+        /// sizing — one advertising no capabilities at all, one advertising only
+        /// PRD #819's verbs (every release through v0.40.2). Focus-in and input
+        /// both happen, and neither daemon is sent a `focus-gained` request.
+        #[test]
+        fn nothing_is_claimed_against_a_daemon_that_does_not_advertise_focus_gained() {
+            let runtime = runtime();
+            for advertised in [None, Some(vec![CAP_LIST_PROJECTS])] {
+                let daemon = ScriptedDaemon::start(&runtime, advertised.clone());
+                let controller =
+                    EmbeddedPaneController::new(daemon.path.clone(), runtime.handle().clone());
+                let t0 = Instant::now();
+                let started: Vec<_> = [
+                    (Event::FocusGained, t0),
+                    (key('a'), t0 + INPUT_CLAIM_INTERVAL),
+                    (Event::FocusGained, t0 + INPUT_CLAIM_INTERVAL * 2),
+                ]
+                .iter()
+                .filter_map(|(event, at)| controller.report_focus(event, *at))
+                .collect();
+                assert_eq!(started.len(), 3, "fixture: every event passed the throttle");
+                finish(&runtime, started);
+                assert!(
+                    daemon.claims().is_empty(),
+                    "advertised {advertised:?}: no `focus-gained` may reach this daemon"
+                );
+                assert!(
+                    daemon.other_ops.lock().unwrap().is_empty(),
+                    "advertised {advertised:?}: nothing but the handshake may be sent"
+                );
+            }
+        }
+
+        /// Every viewer of every agent, with the client each belongs to.
+        fn all_viewer_clients(registry: &AgentPtyRegistry) -> Vec<(String, Option<String>)> {
+            registry
+                .agent_records()
+                .into_iter()
+                .flat_map(|record| {
+                    registry
+                        .viewers_of(&record.id)
+                        .into_values()
+                        .map(move |viewer| (record.id.clone(), viewer.client_id))
+                })
+                .collect()
+        }
+
+        fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
+            let deadline = Instant::now() + Duration::from_secs(15);
+            while !done() {
+                assert!(Instant::now() < deadline, "timed out waiting until {what}");
+                std::thread::sleep(Duration::from_millis(25));
+            }
+        }
+
+        /// Scenario: one TUI controller reaches agents by every attach path it
+        /// has — startup hydration, hydrating a single pane, opening a new pane,
+        /// and the automatic re-attach after an agent is replaced under its
+        /// pane — and a second controller hydrates the same daemon. Every viewer
+        /// the first controller registered carries its one client id, and the
+        /// second controller's carry a different one.
+        #[test]
+        fn every_attach_path_carries_the_controllers_one_client_id() {
+            let runtime = runtime();
+            let (_dir, path, registry) = real_daemon(&runtime);
+            let spawn = |pane: &str| {
+                registry
+                    .spawn_agent(SpawnOptions {
+                        command: Some("/bin/cat"),
+                        env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane.to_string())],
+                        ..SpawnOptions::default()
+                    })
+                    .expect("spawn a PTY agent")
+            };
+            let at_startup = spawn("focus-startup");
+            let controller = EmbeddedPaneController::new(path.clone(), runtime.handle().clone());
+            let tui = controller.client_id().expect("identity").to_string();
+
+            assert_eq!(
+                controller.hydrate_from_daemon().len(),
+                1,
+                "hydration attach"
+            );
+            let late = spawn("focus-late");
+            assert!(
+                controller.hydrate_pane("focus-late"),
+                "single-pane hydration attach"
+            );
+            controller
+                .create_pane(Some("/bin/cat"), None)
+                .expect("new-pane attach");
+            let attached = all_viewer_clients(&registry);
+            assert_eq!(
+                attached.len(),
+                3,
+                "one viewer per attach so far: {attached:?}"
+            );
+
+            // The re-attach: replace the startup agent under the same pane id,
+            // and the pane's I/O task finds and attaches to the replacement.
+            registry
+                .close_agent(&at_startup)
+                .expect("close the startup agent");
+            let replacement = spawn("focus-startup");
+            wait_until("the pane re-attached to the replacement agent", || {
+                !registry.viewers_of(&replacement).is_empty()
+            });
+
+            let viewers = all_viewer_clients(&registry);
+            assert_eq!(viewers.len(), 3, "{viewers:?}");
+            assert!(
+                viewers.iter().any(|(agent, _)| *agent == replacement)
+                    && viewers.iter().any(|(agent, _)| *agent == late),
+                "fixture: the re-attach and the single-pane hydration are both counted: \
+                 {viewers:?}"
+            );
+            for (agent, client) in &viewers {
+                assert_eq!(
+                    client.as_deref(),
+                    Some(tui.as_str()),
+                    "agent {agent}: every attach this TUI made names the same client"
+                );
+            }
+
+            let other = EmbeddedPaneController::new(path, runtime.handle().clone());
+            assert_eq!(other.hydrate_from_daemon().len(), 3);
+            let other_id = other.client_id().expect("identity").to_string();
+            assert_ne!(other_id, tui, "a second TUI is a second client");
+            let by_other = all_viewer_clients(&registry)
+                .into_iter()
+                .filter(|(_, client)| client.as_deref() == Some(other_id.as_str()))
+                .count();
+            assert_eq!(
+                by_other, 3,
+                "the second controller's attaches carry its own id"
+            );
+
+            drop((controller, other));
+            registry.shutdown_all();
+        }
     }
 }

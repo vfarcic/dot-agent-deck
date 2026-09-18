@@ -2,15 +2,57 @@ import { useEffect, useRef } from "react";
 import { FitAddon } from "@xterm/addon-fit";
 import { WebglAddon } from "@xterm/addon-webgl";
 import { Terminal } from "@xterm/xterm";
-import type { TerminalBuffer, TerminalFeed } from "../types";
+import type { SendResult, TerminalBuffer, TerminalFeed } from "../types";
 import { registerRefit, registerTerminal, unregisterRefit, unregisterTerminal } from "../lib/terminalRegistry";
 
 interface TerminalViewportProps {
   agentId: string;
+  /**
+   * PRD #1105's security audit — which deck's `agentId` this is.
+   *
+   * The feed below is addressed by the composite `(deckId, agentId)` because a
+   * bare agent id is not an identity: ids are per-daemon monotonic, and leaving
+   * a deck detaches its sessions without clearing its retained buffers. A
+   * viewport mounted for the next deck's namesake therefore read the previous
+   * deck's backlog and wrote it straight into the new xterm — up to the feed's
+   * 1 MiB retention of another machine's output, under a correctly resolved
+   * heading, and indefinitely where no replacement stream ever arrives.
+   *
+   * Supplied by `AgentTile` from `agent.daemonId`, so it is the deck of the
+   * agent being rendered rather than whichever deck happens to be selected.
+   * Optional only because a caller with no fleet at all (the standalone-render
+   * tests) has no deck to name; such a caller also supplies no feed.
+   */
+  deckId?: string;
   label: string;
   transcript: string;
   terminalFeed?: TerminalFeed;
   readOnly?: boolean;
+  /**
+   * Issue #1042 — the pane's input-acceptance state in the `SendResult`
+   * vocabulary, published as `data-input-state` on the wrapper so the state is
+   * readable from the DOM rather than inferred from a disabled cursor.
+   *
+   * Undefined when nothing about the pane is being claimed: the agent-status
+   * gate disables the input without saying anything about its lease, and an
+   * attribute asserting `applied` there would be a claim this component cannot
+   * support. The sentence that goes with either case is rendered by the tile,
+   * beside this viewport, so it survives this component being mocked.
+   *
+   * So this attribute is the pane's CLAIM, not the input's disabled-ness, and
+   * the two are different axes: `aria-disabled` on the same wrapper is the
+   * authoritative disabled signal and is emitted for every disabling reason,
+   * including the status-gate one that leaves this attribute absent. Anything
+   * reading `data-input-state` to infer enabled/disabled will misread a
+   * status-disabled pane.
+   */
+  inputState?: SendResult;
+  /**
+   * Increments when something outside asks this terminal to take focus — the
+   * command palette's "Message coordinator…" entry is the only caller today.
+   * `onFocus` reports focus outward; this is the way in.
+   */
+  focusToken?: number;
   onInput: (data: string) => void;
   onResize: (cols: number, rows: number) => void;
   /**
@@ -28,10 +70,13 @@ interface TerminalViewportProps {
 
 export function TerminalViewport({
   agentId,
+  deckId,
   label,
   transcript,
   terminalFeed,
   readOnly,
+  inputState,
+  focusToken = 0,
   onInput,
   onResize,
   applied,
@@ -54,6 +99,24 @@ export function TerminalViewport({
   // rebuilding the terminal on that would destroy scroll position and selection
   // every time somebody opened the TUI.
   const appliedRef = useRef(applied);
+  // Read through a ref for the same reason: a renamed agent must not cost the
+  // operator their scroll position and selection.
+  const labelRef = useRef(label);
+  // Issue #1042 — and read through a ref for the strongest version of that
+  // reason. `readOnly` used to be status-only, and a status is effectively
+  // monotonic (queued -> running -> passed), so rebuilding on it was rare.
+  // It is now also derived from the WRITE LEASE, which is bidirectional and
+  // flips during ordinary multi-client operation (PRD #882 hand-off): baking it
+  // into the build effect's dependencies tore the pane down and rebuilt it —
+  // losing scroll position and any in-progress selection — every time a TUI
+  // attached, and again when the lease came back.
+  //
+  // The ref is what keeps the `onData` guard below honest across that flip: it
+  // reads the CURRENT value rather than the one captured when the terminal was
+  // built, so a terminal can never announce itself disabled while still
+  // accepting keystrokes. The other two seams — `disableStdin` and the helper
+  // textarea's native `disabled` — are reconciled by the effect below.
+  const readOnlyRef = useRef(readOnly);
   // Set by the terminal effect below so the geometry effect can re-run the
   // grid reconciliation without owning the xterm instance.
   const applyGridRef = useRef<(() => void) | undefined>(undefined);
@@ -61,6 +124,8 @@ export function TerminalViewport({
   onInputRef.current = onInput;
   onResizeRef.current = onResize;
   appliedRef.current = applied;
+  labelRef.current = label;
+  readOnlyRef.current = readOnly;
 
   useEffect(() => {
     const host = hostRef.current;
@@ -69,9 +134,9 @@ export function TerminalViewport({
     const terminal = new Terminal({
       allowProposedApi: false,
       convertEol: false,
-      cursorBlink: !readOnly,
+      cursorBlink: !readOnlyRef.current,
       cursorStyle: "bar",
-      disableStdin: readOnly,
+      disableStdin: Boolean(readOnlyRef.current),
       drawBoldTextInBrightColors: false,
       fontFamily: '"JetBrains Mono", "SFMono-Regular", Consolas, monospace',
       fontSize: 13.5,
@@ -128,20 +193,32 @@ export function TerminalViewport({
       webglAddon = undefined;
     }
     terminalRef.current = terminal;
+    // xterm's own `promptLabel` is a module-level string shared by every
+    // instance, so the per-agent name has to be written onto this terminal's
+    // helper textarea directly. `disabled` goes with it: `disableStdin` only
+    // makes xterm ignore what is typed, and an input that still takes focus and
+    // a caret while swallowing every keystroke is the void #1042 is about.
+    const textarea = terminal.textarea;
+    if (textarea) {
+      textarea.setAttribute("aria-label", `${labelRef.current} terminal input`);
+      textarea.disabled = Boolean(readOnlyRef.current);
+    }
     // Expose the instance so the Reader overlay can snapshot the resolved buffer.
-    registerTerminal(agentId, terminal);
+    registerTerminal(deckId, agentId, terminal);
     terminal.write(transcriptRef.current);
 
     const inputDisposable = terminal.onData((data) => {
-      if (!readOnly) onInputRef.current(data);
+      if (!readOnlyRef.current) onInputRef.current(data);
     });
     // PRD #882 — `fit()` PROPOSES a size; the daemon disposes.
     //
     // A PTY has exactly one window size, so every client attached to an agent
-    // sees the same grid. The daemon sizes each agent to the smallest viewport
-    // among its attached viewers, which means the grid this tile should render
-    // is not necessarily the one that fits its box: with a smaller client
-    // attached it is smaller, and the remainder of the box is unused.
+    // sees the same grid. The daemon sizes each agent to the last-focused
+    // client's viewer size, or to the smallest viewport among its attached
+    // viewers when no client claimed focus (PRD #1105), which means the grid
+    // this tile should render is not necessarily the one that fits its box:
+    // with a smaller client deciding it is smaller and the remainder of the box
+    // is unused, and with a larger focused client it is larger and clips.
     //
     // So this measures the tile, reports it as a REQUEST, and then puts the
     // grid back to whatever the daemon last applied. Letting `fitAddon.fit()`
@@ -188,21 +265,78 @@ export function TerminalViewport({
     // PRD #882: `fit` reports the tile's box as a REQUEST and then restores the
     // applied grid, so a zoom-driven refit proposes a new size without ever
     // leaving xterm parsing at a geometry the PTY is not using.
-    registerRefit(agentId, fit);
+    registerRefit(deckId, agentId, fit);
 
     return () => {
       applyGridRef.current = undefined;
       window.cancelAnimationFrame(frame);
       observer.disconnect();
       inputDisposable.dispose();
-      unregisterRefit(agentId, fit);
-      unregisterTerminal(agentId, terminal);
+      unregisterRefit(deckId, agentId, fit);
+      unregisterTerminal(deckId, agentId, terminal);
       webglAddon?.dispose();
       terminal.dispose();
       terminalRef.current = undefined;
       lastStreamRef.current = undefined;
     };
-  }, [agentId, readOnly]);
+    /*
+      `deckId` is a dependency, not a passenger — issue
+      [#1116](https://github.com/vfarcic/dot-agent-deck/issues/1116)'s open item
+      3. This effect built and disposed the xterm on `agentId` alone, so moving
+      from deck A's `planner` to deck B's reused the same component, the same
+      xterm, the same helper textarea, the same focus and the same
+      `lastStreamRef` — the deck changed only which feed was subscribed to.
+      B's backlog is then correctly absent, nothing resets the bytes already
+      rendered, and the transcript effect below refuses to reset while
+      `lastStreamRef.current` still holds A's buffer: A's scrollback stays on
+      screen inside B's tile, indefinitely where B has no frame yet or its
+      attach failed.
+
+      The cost of having it here is a rebuilt terminal when the identity
+      changes, which is exactly right — it is a different agent on a different
+      machine, and carrying one pixel of the old one across is the defect.
+    */
+  }, [agentId, deckId]);
+
+  // Issue #1042 — reconcile the input gate in place when the lease flips.
+  //
+  // Three seams have to agree, and they are kept in agreement here rather than
+  // by rebuilding the terminal (see `readOnlyRef` above for why a rebuild is
+  // not acceptable on this input):
+  //
+  // 1. `options.disableStdin`, which is what makes xterm ignore keystrokes;
+  // 2. the `onData` guard in the effect above, which reads `readOnlyRef` so it
+  //    can never be one flip behind the other two;
+  // 3. the helper textarea's native `disabled`, which is what stops the input
+  //    taking focus and showing a caret it would swallow.
+  //
+  // The wrapper's `aria-disabled` is React's own render below, so it moves with
+  // this prop by construction. A seam left behind would produce the one failure
+  // worse than the rebuild it replaces: a terminal announcing itself disabled
+  // while still accepting what is typed into it.
+  useEffect(() => {
+    const terminal = terminalRef.current;
+    if (!terminal) return;
+    const blocked = Boolean(readOnly);
+    terminal.options.disableStdin = blocked;
+    terminal.options.cursorBlink = !blocked;
+    const textarea = terminal.textarea;
+    if (textarea) textarea.disabled = blocked;
+  }, [readOnly]);
+
+  // A rename changes the accessible name of the input without touching the
+  // terminal, so this reconciles the attribute the effect above wrote at
+  // construction rather than rebuilding the pane to change one string.
+  useEffect(() => {
+    const textarea = terminalRef.current?.textarea;
+    if (textarea) textarea.setAttribute("aria-label", `${label} terminal input`);
+  }, [label]);
+
+  // Issue #1042 — take focus on request. Zero is the never-asked value, so a
+  // freshly mounted deck does not steal focus into a terminal nobody named.
+  useEffect(() => {
+    if (focusToken > 0) terminalRef.current?.focus();
+  }, [focusToken]);
 
   // PRD #882: the daemon changed the applied geometry — because another client
   // attached, detached or resized this agent — so reshape the grid to match.
@@ -258,18 +392,20 @@ export function TerminalViewport({
       }
       lastStreamRef.current = buffer;
     };
-    const backlog = terminalFeed.get(agentId);
+    const backlog = terminalFeed.get(deckId, agentId);
     if (backlog) apply(backlog);
-    return terminalFeed.subscribe(agentId, apply);
-  }, [agentId, terminalFeed]);
+    return terminalFeed.subscribe(deckId, agentId, apply);
+  }, [agentId, deckId, terminalFeed]);
 
   return (
     <div
       className="terminal-viewport"
       data-testid={`terminal-${agentId}`}
+      data-input-state={inputState}
       onFocusCapture={onFocus}
       role="group"
       aria-label={`${label} terminal`}
+      aria-disabled={Boolean(readOnly)}
     >
       <div ref={hostRef} className="terminal-host" />
     </div>

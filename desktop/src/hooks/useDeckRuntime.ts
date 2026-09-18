@@ -2,9 +2,11 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createFixtureSnapshot } from "../data/fixture";
 import { createDeckBridge, selectRuntimeMode } from "../lib/bridge";
 import type { DesktopSettingsDto } from "../lib/bridge";
+import { agentKey } from "../lib/agentKey";
 import { applyTerminalChunk } from "../lib/terminalBuffer";
 const EMPTY_TERMINAL_DATA: Record<string, TerminalBuffer> = {};
-import type { DeckAction, DeckFleet, DeckRuntimeState, DeckSnapshot, RuntimeMode, TerminalBuffer } from "../types";
+import { isDelivered } from "../types";
+import type { AgentTarget, DeckAction, DeckFleet, DeckRuntimeState, DeckSnapshot, RuntimeMode, SendResult, TerminalBuffer } from "../types";
 
 /**
  * The snapshot a runtime starts with, before any deck has answered. Lifted out
@@ -63,6 +65,17 @@ export function useDeckRuntime(): DeckRuntimeState {
   const [fleet, setFleet] = useState<DeckFleet>(() => [seedSnapshot(mode)]);
   const snapshot = fleet[0];
   /**
+   * The deck every per-agent map below is keyed against when the producer of a
+   * value could not name one itself.
+   *
+   * A ref rather than a dependency: `runAction`'s verdict and the geometry
+   * subscription are both callbacks that must not be rebuilt on every snapshot,
+   * and what they need is the deck in force at the instant they fire rather
+   * than the one that was in force when they were created.
+   */
+  const selectedDeckIdRef = useRef<string | undefined>(snapshot.connection.deckId);
+  selectedDeckIdRef.current = snapshot.connection.deckId;
+  /**
    * The latest reported failure, or nothing.
    *
    * PRD #742 M8 carried a `{ message, id }` here so `App` could suppress one
@@ -77,15 +90,56 @@ export function useDeckRuntime(): DeckRuntimeState {
   // through setState re-rendered the whole deck per chunk per agent — with six
   // streaming agents the main thread spent its time reconciling instead of
   // letting xterm scroll. Buffers live in a ref; terminals subscribe directly.
+  //
+  // Both are keyed by `agentKey(deckId, agentId)` since PRD #1105's security
+  // audit. Leaving a deck detaches its sessions but clears no buffer, so a
+  // bare-id map handed the next deck's same-id agent up to a megabyte of the
+  // previous deck's output — written straight into the new xterm by
+  // `TerminalViewport`'s `!previous` branch, under a correctly resolved
+  // heading, with the live transcript empty and nothing on screen saying so.
   const terminalBuffersRef = useRef<Record<string, TerminalBuffer>>({});
   const terminalListenersRef = useRef<Map<string, Set<(buffer: TerminalBuffer) => void>>>(new Map());
 
+  /**
+   * Issue #1042 — the last non-delivered verdict per agent, which is the only
+   * route by which `wrong-session` (and its `stale`/`ambiguous`/`unknown`
+   * siblings) can reach the screen: the daemon decides them at write time and
+   * carries them in no snapshot field.
+   *
+   * Held here rather than in a tile because the send that produces one is not
+   * the tile's — the composer that used to own this is gone, and what remains
+   * are PROGRAMMATIC sends: the coordinator's seed prompt at workflow launch,
+   * and whatever else dispatches through the guarded verb.
+   *
+   * A record here is one PAST ATTEMPT, never current state, which is why
+   * {@link adoptFleet} drops it the moment a newer snapshot arrives. Without
+   * that rule a recorded `wrong-session` outranks a writable lease
+   * (`terminalInput.ts`) and holds a live pane disabled with no route back: the
+   * user's own typing goes through `sendTerminalInput`, never `submit_text`, so
+   * nothing the user can do clears it, and a write lease can return to this
+   * client with no PTY respawn to trip the generation route below.
+   */
+  const [terminalInputResults, setTerminalInputResults] = useState<Record<string, SendResult>>({});
+  const noteTerminalInputResult = useCallback((key: string, verdict: SendResult | undefined) => {
+    setTerminalInputResults((current) => {
+      if (current[key] === verdict) return current;
+      if (verdict === undefined) {
+        if (!(key in current)) return current;
+        const next = { ...current };
+        delete next[key];
+        return next;
+      }
+      return { ...current, [key]: verdict };
+    });
+  }, []);
+
   const terminalFeed = useMemo(() => ({
-    get: (agentId: string) => terminalBuffersRef.current[agentId],
-    subscribe: (agentId: string, listener: (buffer: TerminalBuffer) => void) => {
-      const listeners = terminalListenersRef.current.get(agentId) ?? new Set();
+    get: (deckId: string | undefined, agentId: string) => terminalBuffersRef.current[agentKey(deckId, agentId)],
+    subscribe: (deckId: string | undefined, agentId: string, listener: (buffer: TerminalBuffer) => void) => {
+      const key = agentKey(deckId, agentId);
+      const listeners = terminalListenersRef.current.get(key) ?? new Set();
       listeners.add(listener);
-      terminalListenersRef.current.set(agentId, listeners);
+      terminalListenersRef.current.set(key, listeners);
       return () => { listeners.delete(listener); };
     },
   }), []);
@@ -96,12 +150,29 @@ export function useDeckRuntime(): DeckRuntimeState {
       : event.message
         ? new TextEncoder().encode(`\r\n[terminal] ${event.message}\r\n`)
         : event.data;
-    const current = terminalBuffersRef.current[event.agentId];
+    // The producer names the deck; a producer that cannot falls back to the one
+    // this runtime currently believes is selected, which is what a bare-id
+    // producer implicitly meant. Never the other way round — the bridge's own
+    // notion of the selection is a snapshot ahead of React's.
+    const key = agentKey(event.deckId ?? selectedDeckIdRef.current, event.agentId);
+    const current = terminalBuffersRef.current[key];
     const next = applyTerminalChunk(current, { ...event, data });
     if (next === current) return;
-    terminalBuffersRef.current[event.agentId] = next;
-    for (const listener of terminalListenersRef.current.get(event.agentId) ?? []) listener(next);
-  }, []);
+    terminalBuffersRef.current[key] = next;
+    // A new stream generation means the PTY was respawned, so any recorded
+    // verdict describes a pane that no longer exists. Without this a
+    // `wrong-session` would disable the input forever: the condition is only
+    // knowable by SENDING, and the input it disabled is the thing that would
+    // have sent again.
+    //
+    // Reached on the `replace` a fresh attach delivers, which is how a respawn
+    // arrives. `applyTerminalChunk` DROPS an `append` whose generation does not
+    // match the buffer's — returning the buffer unchanged — so that case exits
+    // above and never reaches here, which is correct: a dropped chunk changed
+    // no state to reconcile against.
+    if (current && next.generation !== current.generation) noteTerminalInputResult(key, undefined);
+    for (const listener of terminalListenersRef.current.get(key) ?? []) listener(next);
+  }, [noteTerminalInputResult]);
 
   /**
    * Replace the SELECTED deck and leave the rest of the fleet where it is.
@@ -126,7 +197,24 @@ export function useDeckRuntime(): DeckRuntimeState {
    * actually true, and the next snapshot replaces it.
    */
   const adoptFleet = useCallback((next: DeckFleet) => {
-    if (next.length) setFleet(next);
+    if (!next.length) return;
+    setFleet(next);
+    // Issue #1042 — a snapshot supersedes every recorded verdict, because a
+    // verdict is a record of one attempt that has already happened and this is
+    // newer state about the same panes. The notice is therefore transient —
+    // shown until the next push — rather than sticky, which is the honest
+    // trade: a permanent false-disable of a pane the snapshot says is writable
+    // is the worse failure of the two.
+    //
+    // This is the whole of the "drop it on the next snapshot" rule, and a
+    // per-entry snapshot epoch would be inert beside it. The state has exactly
+    // three mutation sites — this one, and `noteTerminalInputResult` reached
+    // from `runAction`'s verdict and from `updateTerminal`'s generation clear —
+    // and neither of the other two runs inside this funnel, which every
+    // snapshot passes through synchronously. So every record that survives to
+    // here is by construction older than the snapshot arriving, and an epoch
+    // tag could never read otherwise.
+    setTerminalInputResults((current) => (Object.keys(current).length ? {} : current));
   }, []);
 
   const reconnect = useCallback(async () => {
@@ -179,14 +267,27 @@ export function useDeckRuntime(): DeckRuntimeState {
 
   const runAction = useCallback(async (action: DeckAction) => {
     setError(undefined);
+    const sentToDeckId = selectedDeckIdRef.current;
     try {
-      return await bridge.runAction(action);
+      const result = await bridge.runAction(action);
+      // The guarded verb reports a non-delivery as `ok: false` with a named
+      // verdict rather than by raising, so a caller that only awaits the promise
+      // cannot tell delivery from silent loss (`types.ts`). Recording it here is
+      // what puts that verdict on the agent's terminal.
+      if (action.type === "submit_text") {
+        // The deck the action was SENT to, read before the await settles: every
+        // action this runtime dispatches goes to the selected deck, and a
+        // verdict about it must not be filed under whichever deck happens to be
+        // selected by the time the reply lands.
+        noteTerminalInputResult(agentKey(sentToDeckId, action.agentId), isDelivered(result) ? undefined : result.sendResult);
+      }
+      return result;
     } catch (cause) {
       const message = cause instanceof Error ? cause.message : String(cause);
       setError(message);
       throw cause;
     }
-  }, [bridge]);
+  }, [bridge, noteTerminalInputResult]);
 
   /*
    * Issue #1046: the toast in `App.tsx` renders on `notice || error`, and its
@@ -215,12 +316,12 @@ export function useDeckRuntime(): DeckRuntimeState {
     [bridge],
   );
 
-  const sendTerminalInput = useCallback((agentId: string, data: string) => bridge.sendTerminalInput(agentId, data), [bridge]);
-  const resizeTerminal = useCallback((agentId: string, cols: number, rows: number) => bridge.resizeTerminal(agentId, cols, rows), [bridge]);
+  const sendTerminalInput = useCallback((target: AgentTarget, data: string) => bridge.sendTerminalInput(target, data), [bridge]);
+  const resizeTerminal = useCallback((target: AgentTarget, cols: number, rows: number) => bridge.resizeTerminal(target, cols, rows), [bridge]);
   // Stable for the lifetime of the bridge, because the screens declare their
   // shown set from an effect: an identity that changed every render would fire
   // that effect every render (PRD #745 M7).
-  const setShownTerminals = useCallback((agentIds: string[]) => bridge.setShownTerminals(agentIds), [bridge]);
+  const setShownTerminals = useCallback((targets: AgentTarget[]) => bridge.setShownTerminals(targets), [bridge]);
   // PRD #819 M6. Deliberately NOT wrapped in the `setError` bookkeeping
   // `runAction` uses: an empty listing and an unresolvable path are ordinary
   // outcomes of choosing a project, and routing them into the deck's global
@@ -234,13 +335,19 @@ export function useDeckRuntime(): DeckRuntimeState {
   // bridge-wide subscription — and because a tile has to be able to read a
   // value that was pushed before it mounted (another client can constrain an
   // agent long before anyone opens a terminal on it here).
+  //
+  // Keyed by `agentKey(deckId, agentId)` since PRD #1105's security audit: no
+  // per-agent eviction removes an entry, so a bare-id map handed the pane for
+  // deck B's `planner` deck A's grid, and an attach that beat the pane's first
+  // fit submitted A's cached dimensions to B's PTY.
   const [appliedGeometry, setAppliedGeometry] = useState<Record<string, { rows: number; cols: number }>>({});
   useEffect(() => {
-    return bridge.onTerminalGeometry((agentId, rows, cols) => {
+    return bridge.onTerminalGeometry((agentId, rows, cols, deckId) => {
+      const key = agentKey(deckId ?? selectedDeckIdRef.current, agentId);
       setAppliedGeometry((current) => {
-        const existing = current[agentId];
+        const existing = current[key];
         if (existing && existing.rows === rows && existing.cols === cols) return current;
-        return { ...current, [agentId]: { rows, cols } };
+        return { ...current, [key]: { rows, cols } };
       });
     });
   }, [bridge]);
@@ -255,6 +362,7 @@ export function useDeckRuntime(): DeckRuntimeState {
     error,
     clearError,
     runAction,
+    terminalInputResults,
     sendTerminalInput,
     resizeTerminal,
     setShownTerminals,

@@ -1,3 +1,5 @@
+import type { ConnectionView } from "../types";
+
 /**
  * Display-only sanitising and bounding for daemon-supplied text.
  *
@@ -423,4 +425,36 @@ function uptimeLabel(elapsed: number): string {
   if (elapsed < HOUR_MS) return `${Math.floor(elapsed / MINUTE_MS)}m`;
   if (elapsed < DAY_MS) return `${Math.floor(elapsed / HOUR_MS)}h`;
   return `${Math.floor(elapsed / DAY_MS)}d`;
+}
+
+/**
+ * What a deck is CALLED on screen — and it is never "daemon" (PRD #741 M9's
+ * vocabulary rule, which #742 inherits).
+ *
+ * A local deck is "Local deck", exactly as it was when there was only one. A
+ * remote one is named by its address, because that is what distinguishes it
+ * from the other decks beside it and it is the same string the user typed into
+ * the settings row. `Endpoint::describe()` renders a remote deck as
+ * `user@host[:port]`, every byte of which came through a validated ASCII
+ * charset — it goes through this module anyway, because bounding a
+ * daemon-supplied string at the render seam is the rule and not a judgement
+ * about any one field.
+ *
+ * # Why it lives here rather than in `AgentOverview`
+ *
+ * It was that screen's private helper until PRD #1105 gave the agent pane a
+ * second caller: the pane for an agent on a deck the app is not attached to
+ * says *which* deck, inside a sentence. Two spellings of a deck's name is
+ * exactly the drift this module exists to prevent, so there is one function and
+ * both call sites read it.
+ *
+ * `displayIdentity` rather than `displayText`, for the reason that function
+ * exists: a remote label made entirely of invisible characters would otherwise
+ * render as an empty header cell, and — since #1105 — as a gap in the middle of
+ * the pane's sentence. It falls back to the same words the addressless case
+ * already uses.
+ */
+export function deckName(connection: Pick<ConnectionView, "deckKind" | "socketPath">): string {
+  if (connection.deckKind !== "remote") return "Local deck";
+  return connection.socketPath ? displayIdentity(connection.socketPath, DISPLAY_LIMITS.path, "Remote deck") : "Remote deck";
 }

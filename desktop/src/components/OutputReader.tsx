@@ -1,8 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { ArrowDownToLine, BookOpenText, Copy, X } from "lucide-react";
-import type { AgentSession, DeckActionResult, DeckPrompt } from "../types";
+import type { AgentSession } from "../types";
 import { getTerminal, stripAnsi, terminalSnapshotText } from "../lib/terminalRegistry";
-import { AgentComposer } from "./AgentComposer";
 
 /** How often the reader re-snapshots the live terminal buffer while open. */
 const REFRESH_MS = 700;
@@ -11,8 +10,6 @@ const PIN_SLACK = 48;
 
 interface OutputReaderProps {
   agent: AgentSession;
-  prompts: DeckPrompt[];
-  onSubmit: (agentId: string, text: string) => Promise<DeckActionResult>;
   onClose: () => void;
 }
 
@@ -21,8 +18,16 @@ interface OutputReaderProps {
  * live xterm buffer snapshot (repaints already resolved), soft-wrapped lines
  * re-joined so the column reflows at reading width. Live-tails while pinned to
  * the bottom; scrolling up pauses the tail until "Jump to latest".
+ *
+ * Read-only, which is what its construction always said it was: a snapshot
+ * `<pre>`, "Copy all", and a live-tail pin, with no terminal of its own. It
+ * carried an `AgentComposer` until issue #1042, which was this surface's ONLY
+ * send path rather than a duplicate of one — and a second, independent input
+ * box floating in a reading overlay is exactly the parallel-input surface that
+ * issue exists to collapse. The send path is the tile's terminal, one Escape
+ * away.
  */
-export function OutputReader({ agent, prompts, onSubmit, onClose }: OutputReaderProps) {
+export function OutputReader({ agent, onClose }: OutputReaderProps) {
   const [text, setText] = useState("");
   const [pinned, setPinned] = useState(true);
   const [copied, setCopied] = useState(false);
@@ -36,13 +41,16 @@ export function OutputReader({ agent, prompts, onSubmit, onClose }: OutputReader
 
   useEffect(() => {
     const snapshot = () => {
-      const terminal = getTerminal(agent.id);
+      /* By the composite identity: two decks' same-id agents can both have a
+         live xterm since PRD #1105's cross-deck pane, and a bare-id lookup
+         would snapshot whichever mounted last under either agent's heading. */
+      const terminal = getTerminal(agent.daemonId, agent.id);
       setText(terminal ? terminalSnapshotText(terminal) : stripAnsi(transcriptRef.current));
     };
     snapshot();
     const timer = window.setInterval(snapshot, REFRESH_MS);
     return () => window.clearInterval(timer);
-  }, [agent.id]);
+  }, [agent.daemonId, agent.id]);
 
   // Follow new output only while the reader is pinned to the bottom.
   useEffect(() => {
@@ -106,8 +114,6 @@ export function OutputReader({ agent, prompts, onSubmit, onClose }: OutputReader
             <ArrowDownToLine size={13} aria-hidden="true" /> Jump to latest
           </button>
         )}
-
-        <AgentComposer agent={agent} prompts={prompts} onSubmit={onSubmit} />
       </div>
     </div>
   );

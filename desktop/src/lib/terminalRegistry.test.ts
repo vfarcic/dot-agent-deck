@@ -1,13 +1,24 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  getTerminal,
   refitAllTerminals,
   registerRefit,
+  registerTerminal,
   registeredRefitCount,
   stripAnsi,
   terminalSnapshotText,
   unregisterRefit,
+  unregisterTerminal,
   type SnapshotTerminal,
 } from "./terminalRegistry";
+
+/**
+ * One deck, for the call sites below that are about the re-fit MECHANISM rather
+ * than about which deck a pane is on. The registry is keyed by the composite
+ * `(deckId, agentId)` since PRD #1105's cross-deck pane; the two tests that are
+ * about that collision name their decks themselves.
+ */
+const DECK = "deck-000000000000dec1";
 
 function fakeTerminal(rows: { text: string; wrapped?: boolean }[]): SnapshotTerminal {
   return {
@@ -66,6 +77,36 @@ describe("stripAnsi", () => {
   });
 });
 
+describe("terminals from colliding agent ids", () => {
+  /**
+   * Scenario: a deck tile and a cross-deck overview pane both mount an xterm
+   * for an agent named `planner`. Looking either one up by its composite deck
+   * identity returns that exact instance, and unmounting one leaves the other
+   * registered.
+   */
+  it("registers concurrent same-id terminals by deck and agent", () => {
+    const first = { name: "local-planner" };
+    const second = { name: "remote-planner" };
+    const registerComposite = registerTerminal as unknown as (deckId: string, agentId: string, terminal: unknown) => void;
+    const unregisterComposite = unregisterTerminal as unknown as (deckId: string, agentId: string, terminal: unknown) => void;
+    const getComposite = getTerminal as unknown as (deckId: string, agentId: string) => unknown;
+
+    registerComposite("deck-a", "planner", first);
+    registerComposite("deck-b", "planner", second);
+    try {
+      expect(getComposite("deck-a", "planner")).toBe(first);
+      expect(getComposite("deck-b", "planner")).toBe(second);
+
+      unregisterComposite("deck-a", "planner", first);
+      expect(getComposite("deck-a", "planner")).toBeUndefined();
+      expect(getComposite("deck-b", "planner")).toBe(second);
+    } finally {
+      unregisterComposite("deck-a", "planner", first);
+      unregisterComposite("deck-b", "planner", second);
+    }
+  });
+});
+
 /**
  * The re-fit seam PRD #744 added, and the two properties it exists to hold: a
  * zoom change reaches every mounted pane, and a burst of them measures layout
@@ -82,19 +123,49 @@ describe("refitAllTerminals", () => {
     expect(registeredRefitCount()).toBe(0);
   });
 
+  /**
+   * Scenario: two decks mount same-id terminals concurrently and the window is
+   * re-fitted. Both callbacks run once, and removing deck A's callback does not
+   * remove deck B's independently keyed pane.
+   */
+  it("re-fits concurrent same-id panes independently by deck", () => {
+    const first = vi.fn();
+    const second = vi.fn();
+    const registerComposite = registerRefit as unknown as (deckId: string, agentId: string, refit: () => void) => void;
+    const unregisterComposite = unregisterRefit as unknown as (deckId: string, agentId: string, refit: () => void) => void;
+
+    registerComposite("deck-a", "planner", first);
+    registerComposite("deck-b", "planner", second);
+    try {
+      refitAllTerminals();
+      vi.advanceTimersByTime(20);
+      expect(first).toHaveBeenCalledTimes(1);
+      expect(second).toHaveBeenCalledTimes(1);
+
+      unregisterComposite("deck-a", "planner", first);
+      refitAllTerminals();
+      vi.advanceTimersByTime(20);
+      expect(first).toHaveBeenCalledTimes(1);
+      expect(second).toHaveBeenCalledTimes(2);
+    } finally {
+      unregisterComposite("deck-a", "planner", first);
+      unregisterComposite("deck-b", "planner", second);
+    }
+  });
+
   it("re-fits every registered pane once", () => {
     const first = vi.fn();
     const second = vi.fn();
-    registerRefit("a", first);
-    registerRefit("b", second);
+    registerRefit(DECK, "a", first);
+    registerRefit(DECK, "b", second);
     try {
       refitAllTerminals();
       vi.advanceTimersByTime(20);
       expect(first).toHaveBeenCalledTimes(1);
       expect(second).toHaveBeenCalledTimes(1);
     } finally {
-      unregisterRefit("a", first);
-      unregisterRefit("b", second);
+      unregisterRefit(DECK, "a", first);
+      unregisterRefit(DECK, "b", second);
     }
   });
 
@@ -102,7 +173,7 @@ describe("refitAllTerminals", () => {
   // without this a held zoom key forces one reflow per pane per key repeat.
   it("collapses many requests in one frame into a single pass", () => {
     const refit = vi.fn();
-    registerRefit("a", refit);
+    registerRefit(DECK, "a", refit);
     try {
       for (let i = 0; i < 10; i += 1) refitAllTerminals();
       vi.advanceTimersByTime(20);
@@ -114,23 +185,23 @@ describe("refitAllTerminals", () => {
       vi.advanceTimersByTime(20);
       expect(refit).toHaveBeenCalledTimes(2);
     } finally {
-      unregisterRefit("a", refit);
+      unregisterRefit(DECK, "a", refit);
     }
   });
 
   it("does not call a pane that unregistered before the frame ran", () => {
     const gone = vi.fn();
     const stays = vi.fn();
-    registerRefit("gone", gone);
-    registerRefit("stays", stays);
+    registerRefit(DECK, "gone", gone);
+    registerRefit(DECK, "stays", stays);
     try {
       refitAllTerminals();
-      unregisterRefit("gone", gone);
+      unregisterRefit(DECK, "gone", gone);
       vi.advanceTimersByTime(20);
       expect(gone).not.toHaveBeenCalled();
       expect(stays).toHaveBeenCalledTimes(1);
     } finally {
-      unregisterRefit("stays", stays);
+      unregisterRefit(DECK, "stays", stays);
     }
   });
 
@@ -140,10 +211,10 @@ describe("refitAllTerminals", () => {
   it("survives a pane unmounting a sibling from inside its own re-fit", () => {
     const victim = vi.fn();
     const survivor = vi.fn();
-    const remover = vi.fn(() => unregisterRefit("victim", victim));
-    registerRefit("remover", remover);
-    registerRefit("victim", victim);
-    registerRefit("survivor", survivor);
+    const remover = vi.fn(() => unregisterRefit(DECK, "victim", victim));
+    registerRefit(DECK, "remover", remover);
+    registerRefit(DECK, "victim", victim);
+    registerRefit(DECK, "survivor", survivor);
     try {
       refitAllTerminals();
       vi.advanceTimersByTime(20);
@@ -151,9 +222,9 @@ describe("refitAllTerminals", () => {
       expect(victim).not.toHaveBeenCalled();
       expect(survivor).toHaveBeenCalledTimes(1);
     } finally {
-      unregisterRefit("remover", remover);
-      unregisterRefit("victim", victim);
-      unregisterRefit("survivor", survivor);
+      unregisterRefit(DECK, "remover", remover);
+      unregisterRefit(DECK, "victim", victim);
+      unregisterRefit(DECK, "survivor", survivor);
     }
   });
 
@@ -162,15 +233,15 @@ describe("refitAllTerminals", () => {
   it("keeps going when one pane's re-fit throws", () => {
     const angry = vi.fn(() => { throw new Error("no measurable box"); });
     const calm = vi.fn();
-    registerRefit("angry", angry);
-    registerRefit("calm", calm);
+    registerRefit(DECK, "angry", angry);
+    registerRefit(DECK, "calm", calm);
     try {
       refitAllTerminals();
       expect(() => vi.advanceTimersByTime(20)).not.toThrow();
       expect(calm).toHaveBeenCalledTimes(1);
     } finally {
-      unregisterRefit("angry", angry);
-      unregisterRefit("calm", calm);
+      unregisterRefit(DECK, "angry", angry);
+      unregisterRefit(DECK, "calm", calm);
     }
   });
 
@@ -180,16 +251,16 @@ describe("refitAllTerminals", () => {
   it("keeps a remounted pane's re-fit when the old one unregisters", () => {
     const old = vi.fn();
     const fresh = vi.fn();
-    registerRefit("a", old);
-    registerRefit("a", fresh);
-    unregisterRefit("a", old);
+    registerRefit(DECK, "a", old);
+    registerRefit(DECK, "a", fresh);
+    unregisterRefit(DECK, "a", old);
     try {
       refitAllTerminals();
       vi.advanceTimersByTime(20);
       expect(old).not.toHaveBeenCalled();
       expect(fresh).toHaveBeenCalledTimes(1);
     } finally {
-      unregisterRefit("a", fresh);
+      unregisterRefit(DECK, "a", fresh);
     }
   });
 

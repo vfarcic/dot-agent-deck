@@ -6,6 +6,10 @@ import { DEFAULT_DESKTOP_SETTINGS, type DesktopSettingsDto } from "../lib/bridge
 import type { DesktopSettingsState } from "./useDesktopSettings";
 import type { DeckRuntimeState } from "../types";
 
+/** One deck, for call sites that are about the zoom fan-out rather than about
+ *  which deck a pane is on — the registry is keyed by `(deckId, agentId)`. */
+const DECK = "deck-000000000000dec1";
+
 /**
  * The hook is driven in isolation rather than through a mounted `ControlDeck`,
  * and that is deliberate rather than convenient.
@@ -189,9 +193,9 @@ describe("useZoom", () => {
     renderHook(() => useZoom(runtimeState(), settings));
 
     const refit = vi.fn();
-    registerRefit("agent-1", refit);
+    registerRefit(DECK, "agent-1", refit);
     const second = vi.fn();
-    registerRefit("agent-2", second);
+    registerRefit(DECK, "agent-2", second);
 
     try {
       act(() => press("="));
@@ -201,8 +205,8 @@ describe("useZoom", () => {
       expect(refit).toHaveBeenCalledTimes(1);
       expect(second).toHaveBeenCalledTimes(1);
     } finally {
-      unregisterRefit("agent-1", refit);
-      unregisterRefit("agent-2", second);
+      unregisterRefit(DECK, "agent-1", refit);
+      unregisterRefit(DECK, "agent-2", second);
     }
   });
 
@@ -211,7 +215,7 @@ describe("useZoom", () => {
     renderHook(() => useZoom(runtimeState(), settings));
 
     const refit = vi.fn();
-    registerRefit("agent-1", refit);
+    registerRefit(DECK, "agent-1", refit);
     try {
       // Five steps in one frame — what a held key produces. Every one of them
       // must reach the webview, but the layout must only be measured once.
@@ -219,7 +223,7 @@ describe("useZoom", () => {
       act(() => { vi.advanceTimersByTime(20); });
       expect(refit).toHaveBeenCalledTimes(1);
     } finally {
-      unregisterRefit("agent-1", refit);
+      unregisterRefit(DECK, "agent-1", refit);
     }
   });
 

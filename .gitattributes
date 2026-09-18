@@ -1,1 +1,11 @@
+# Check out every text file with LF, on every platform. Without this the
+# Windows runner's `core.autocrlf=true` turned `.rs` files CRLF at checkout, and
+# any test that scans a source file for a `\n`-joined literal matched nothing
+# there and nowhere else (PRD #1105's selection-capture guard, fixed in
+# 7b891592). No file in the index is stored CRLF and none needs a CRLF checkout
+# (no .bat/.cmd/.ps1), so this renormalizes nothing. `text=auto` leaves files
+# git detects as binary untouched. docs/develop/windows-cross-check.md has the
+# recurring Windows-only failure shapes this does and does not cover.
+* text=auto eol=lf
+
 .github/workflows/*.lock.yml linguist-generated=true

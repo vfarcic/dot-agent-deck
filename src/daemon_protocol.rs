@@ -7,11 +7,15 @@
 //!
 //! - **Bump:** new `KIND_*` codes, payload-schema changes that aren't
 //!   forward-compatible (renames, type changes, removed fields without a
-//!   `#[serde(default)]` shim), new [`AttachRequest`] variants.
+//!   `#[serde(default)]` shim), new [`AttachRequest`] variants that a client
+//!   may send without first checking an advertised capability.
 //! - **Do NOT bump:** additive optional fields tagged
 //!   `#[serde(default, skip_serializing_if = "Option::is_none")]` — those are
 //!   forward-compatible by design (older peer ignores the field, newer peer
-//!   tolerates its absence).
+//!   tolerates its absence). Nor a new [`AttachRequest`] variant that every
+//!   client withholds until the daemon names it in [`DAEMON_CAPABILITIES`] and
+//!   whose refusal by an older daemon fails closed. See the PRD #1105 note on
+//!   [`PROTOCOL_VERSION`] for the argument and its limits.
 //!
 //! The handshake itself ([`AttachRequest::Hello`]) is enforced by the
 //! **desktop** client, which refuses to connect unless the daemon reports
@@ -321,6 +325,59 @@ pub fn parse_geometry_frame(bytes: &[u8]) -> Option<(u16, u16)> {
 /// client should actually read — the same reason the PRD #819 verbs have
 /// capability strings.
 ///
+/// **PRD #1105 narrows the bump rule the paragraphs above restate, and
+/// contributes no bump of its own for [`AttachRequest::FocusGained`].** The 10
+/// is issue #1049's, for `StopDaemon`. `focus-gained` ships under that number
+/// without contributing to it, and the two facts are independent: #1049 bumped
+/// for its own change, and a capability-gated variant would have needed no bump
+/// whatever the number happened to be — so do not read the 10 as having been
+/// spent on focus, and do not read it as overturning this decision. Read
+/// literally, "on the bump list for the ordinary reason —
+/// an older daemon fails the frame decode on a variant it does not have" says
+/// this one needs 11. What it argues from is the first sentence of this module's
+/// versioning note — bump when a change "would cause an older or newer peer to
+/// mis-parse a frame" — and a variant every client withholds until
+/// [`CAP_FOCUS_GAINED`] is advertised sends an older daemon no such frame in the
+/// ordinary pairings: a newer client against an older daemon withholds it, an
+/// older client never sends it, and the `client_id` riding on `AttachStream` is
+/// an additive optional key. The residual is the window `StartPreparedAgent`'s
+/// docs describe — a handle whose cached capability set outlived a daemon
+/// replaced by an older build — and here it fails closed: the claim is refused
+/// and nothing changes. "Another break for every user" is true of a variant a
+/// client sends unconditionally, which is the case that paragraph was written
+/// about, and not of one gated by the mechanism PRD #819 added for exactly this:
+/// telling "speaks this number" from "answers this verb".
+///
+/// **The unreleased-number argument would also reach "no further bump", and is
+/// deliberately not what this rests on.** 10 was unreleased when `focus-gained`
+/// landed — every tag up to and including `v0.40.2` carries 9 or less — so #819's
+/// "one bump covers every wire change made before it ships" is a second route to
+/// the same answer. It is not the route taken, because it is exactly the claim
+/// the paragraph above records going stale: it expires the moment 10 ships,
+/// while the capability gate does not. Re-check the released tags with the
+/// command above rather than trusting this sentence.
+///
+/// The cost side decided it rather than the letter. A bump makes the desktop
+/// refuse every daemon at the preceding number outright (see the enforcement
+/// note below), including remote decks the user cannot upgrade, and it would buy
+/// no structural safety the capability does not already provide. Two limits,
+/// stated so this is not read as a general licence either. It covers only a
+/// variant whose every
+/// sender checks the capability first — both public entry points do, because
+/// [`crate::daemon_client::DaemonClient::focus_gained`] delegates to
+/// [`crate::daemon_client::DaemonClient::focus_gained_while`], which holds the
+/// one check — and a raw sender that skips it gets the older daemon's
+/// `malformed request` refusal and no state change. And it says nothing about
+/// *semantic* breaks: focus-driven sizing changes what an older, #882-era viewer
+/// can be handed, which is a `changelog.d/*.breaking.md` question and is
+/// answered in the PRD #1105 Work Log (2026-09-17).
+///
+/// The general form of this exception — the same rule, stated for any gated
+/// variant rather than for this one — is written up in
+/// `docs/develop/versioning.md`, under "How a break is detected and marked"
+/// item 1, which names `focus-gained` as its worked example. The two are meant
+/// to say the same thing; if you change one, change the other.
+///
 /// # Where this constant is enforced
 ///
 /// **Exactly one call site refuses on it: the desktop.**
@@ -355,10 +412,12 @@ pub fn parse_geometry_frame(bytes: &[u8]) -> Option<(u16, u16)> {
 /// pairing skews the same way and is the one that *does* read this constant,
 /// per the paragraph above.
 ///
-/// Keep bumping this on every wire-shape break regardless. The bump is what
-/// makes a skew *nameable* — it is the number the handshake reports, what
-/// `daemon hello` prints, and the input any future compatibility gate will
-/// read; #405 is what will make it *refused*.
+/// Keep bumping this on every wire-shape break regardless — "break" in the
+/// sense of this module's bump list at the top, which a capability-gated
+/// variant is deliberately not on. The bump is what makes a skew *nameable* —
+/// it is the number the handshake reports, what `daemon hello` prints, and the
+/// input any future compatibility gate will read; #405 is what will make it
+/// *refused*.
 pub const PROTOCOL_VERSION: u32 = 10;
 
 /// Hard cap on a single frame's payload length. Defends against a malicious
@@ -407,6 +466,56 @@ pub const CAP_START_PREPARED_AGENT: &str = "start-prepared-agent";
 /// attempt something that cannot work.
 pub const CAP_STOP_DAEMON: &str = "stop-daemon";
 
+/// Capability string for [`AttachRequest::FocusGained`] (PRD #1105, focus-driven
+/// sizing).
+///
+/// Same convention as the PRD #819 verbs: the string is the variant's `op`. A
+/// client sends `focus-gained` only to a daemon whose `Hello` reply names this
+/// string, and withholds it otherwise — including when the reply carries no
+/// `capabilities` at all, which is every daemon that predates PRD #819.
+///
+/// Advertised on every platform: recording which client claimed focus touches
+/// no filesystem and no platform-specific surface, so nothing here parallels the
+/// Unix-only carve-out of [`CAP_PREPARE_WORKFLOW`].
+pub const CAP_FOCUS_GAINED: &str = "focus-gained";
+
+/// The longest [`AttachRequest::FocusGained::client_id`] (and
+/// [`AttachRequest::AttachStream::client_id`]) this daemon accepts, in bytes.
+///
+/// The id is opaque to the daemon and is generated by the client
+/// ([`crate::daemon_client::generate_client_id`] produces 34 bytes), so the bound
+/// only has to be comfortably above that. It exists because the daemon keeps the
+/// value — once per registered viewer and once as the last-focused client — and a
+/// peer-chosen string with no bound is a peer-chosen allocation.
+pub const MAX_CLIENT_ID_LEN: usize = 64;
+
+/// Whether `client_id` is an acceptable client identity: 1 to
+/// [`MAX_CLIENT_ID_LEN`] bytes of ASCII letters, digits, `-` and `_`.
+///
+/// Narrow on purpose. The daemon stores the value and may log it, and an id with
+/// no control bytes, whitespace or separators needs no escaping in a log line or
+/// on a terminal. It is **not** authentication — any peer on this socket already holds
+/// the daemon user's local-exec authority (see [`AttachRequest::StartAgent`]),
+/// and a peer that presents another client's id can claim focus on its behalf.
+/// What that buys the peer is a different PTY size.
+pub fn is_valid_client_id(client_id: &str) -> bool {
+    !client_id.is_empty()
+        && client_id.len() <= MAX_CLIENT_ID_LEN
+        && client_id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+/// The refusal for a `client_id` that fails [`is_valid_client_id`], on either
+/// verb that carries one. It does not echo the value: the value is what failed
+/// validation, so it is exactly the string that should not reach a log or a
+/// terminal unescaped.
+fn invalid_client_id_message() -> String {
+    format!(
+        "invalid client_id: expected 1 to {MAX_CLIENT_ID_LEN} ASCII letters, digits, '-' or '_'"
+    )
+}
+
 /// The capability set this build advertises on the [`AttachRequest::Hello`]
 /// reply, via [`AttachResponse::with_capabilities`].
 ///
@@ -431,6 +540,11 @@ pub const CAP_STOP_DAEMON: &str = "stop-daemon";
 /// across two round trips, and a build offering the second without the first
 /// would be advertising a verb that can only ever answer
 /// [`PROJECT_ERR_STALE_TOKEN`].
+///
+/// [`CAP_STOP_DAEMON`] and [`CAP_FOCUS_GAINED`] are on both lists: neither is a
+/// project verb, and neither [`AttachRequest::StopDaemon`]'s dispatch arm nor
+/// [`AttachRequest::FocusGained`]'s is `#[cfg]`-gated, so both are answered on
+/// every platform this builds for.
 #[cfg(unix)]
 pub const DAEMON_CAPABILITIES: &[&str] = &[
     CAP_LIST_PROJECTS,
@@ -438,9 +552,15 @@ pub const DAEMON_CAPABILITIES: &[&str] = &[
     CAP_PREPARE_WORKFLOW,
     CAP_START_PREPARED_AGENT,
     CAP_STOP_DAEMON,
+    CAP_FOCUS_GAINED,
 ];
 #[cfg(not(unix))]
-pub const DAEMON_CAPABILITIES: &[&str] = &[CAP_LIST_PROJECTS, CAP_RESOLVE_PROJECT, CAP_STOP_DAEMON];
+pub const DAEMON_CAPABILITIES: &[&str] = &[
+    CAP_LIST_PROJECTS,
+    CAP_RESOLVE_PROJECT,
+    CAP_STOP_DAEMON,
+    CAP_FOCUS_GAINED,
+];
 
 // ---------------------------------------------------------------------------
 // Issue #801: the declared contract breaks, and how two builds compare them.
@@ -554,6 +674,19 @@ pub const CONTRACT_BREAKS: &[&str] = &[
     // moved and an older daemon ignores it; what moved is which messages a
     // NEWER daemon refuses, which a version number cannot express.
     "1077-hook-capability-token",
+    // PRD #1105, at 10 without moving it. The daemon used to size each agent's
+    // terminal to the SMALLEST rows and columns among its attached clients, so a
+    // client was never handed a grid larger than the pane it had reported. It now
+    // sizes to whichever client last claimed focus, and hands that size to every
+    // other client showing the same agent -- which cuts a smaller pane off at the
+    // right and bottom.
+    //
+    // Nothing on the wire moved: the client identity a current client adds to its
+    // attach is an optional field an older daemon ignores, and the focus request
+    // is sent only to a daemon that advertises the capability. What changed is
+    // what the size in an unchanged answer MEANS, which is the definition of a
+    // semantic break and precisely what a version number cannot express.
+    "1105-focused-client-terminal-size",
 ];
 
 /// What comparing this build's [`CONTRACT_BREAKS`] against a peer's found.
@@ -1000,7 +1133,8 @@ pub enum AttachRequest {
         /// participates in the size policy.
         ///
         /// Present means "register me as a viewer": the daemon sizes the agent
-        /// to the smallest viewport among attached viewers, answers with the
+        /// by its viewer policy (the last-focused client's viewer size, else
+        /// the smallest viewport among attached viewers), answers with the
         /// applied geometry and a viewer token, and pushes later changes as
         /// [`KIND_GEOMETRY`] frames. Absent — the pre-#882 shape, and what a
         /// non-rendering observer should send — means the client neither
@@ -1027,6 +1161,29 @@ pub enum AttachRequest {
         /// `next_output` would read as end-of-stream.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         geometry_updates: bool,
+        /// PRD #1105 (focus-driven sizing) — which CLIENT this attach belongs
+        /// to, so the daemon can group a client's viewers under one identity.
+        ///
+        /// Viewer tokens are minted per attach, and one client holds many
+        /// attaches: the TUI opens one connection per embedded pane and the
+        /// desktop one per terminal session. Focus belongs to the client, so
+        /// without this the daemon could not tell which viewers a
+        /// [`AttachRequest::FocusGained`] claim covers. The id is generated by
+        /// the client once per process ([`crate::daemon_client::generate_client_id`])
+        /// and repeated on every attach; the daemon records it against the
+        /// viewer token it mints here and nowhere else.
+        ///
+        /// Meaningful only on an attach that registers a viewer (`rows`/`cols`
+        /// or `geometry_updates`); ignored on one that does not, since there is
+        /// no viewer to record it against. Must satisfy [`is_valid_client_id`]
+        /// or the attach is refused.
+        ///
+        /// Additive and optional: absent is a client that predates focus, whose
+        /// viewers take part only through the per-axis-minimum fallback, and an
+        /// older daemon ignores the key (this enum does not set
+        /// `deny_unknown_fields`). Sending it needs no capability check.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        client_id: Option<String>,
     },
     Snapshot {
         id: String,
@@ -1288,6 +1445,48 @@ pub enum AttachRequest {
         agent_type: Option<AgentType>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         seed: Option<String>,
+    },
+    /// PRD #1105 (focus-driven sizing): "the client `client_id` has just gained
+    /// focus".
+    ///
+    /// The daemon records `client_id` as the **last-focused client**, replacing
+    /// whatever was recorded before, and answers `ok: true` with no payload. It
+    /// is a claim, not a toggle: a repeated claim by the client already recorded
+    /// changes nothing. See the PRD #1105 Work Log entry of 2026-09-17 for the
+    /// sizing rule this feeds and its fallback.
+    ///
+    /// **Claims are coalesced, and the last one accepted still wins.** The
+    /// daemon re-applies sizes for claims at most once per
+    /// [`crate::agent_pty::FOCUS_REAPPLY_INTERVAL`]; claims that arrive inside
+    /// that window are applied together when it ends, and only the newest of
+    /// them is recorded. The answer comes once this claim or a newer one has been
+    /// applied, so it can take up to that interval. A client must not read the
+    /// delay, or the claim in between never being recorded, as a failure.
+    ///
+    /// **There is deliberately no "focus lost" message.** The rule is that the
+    /// *last*-focused client wins, not the currently-focused one, so losing focus
+    /// changes nothing by itself: leaving both clients for a browser must reflow
+    /// nothing, and losing focus to another deck client is already said by that
+    /// client's own `FocusGained`. A lost message would therefore have no state to
+    /// change, and would add an ordering hazard — one client's "lost" and the
+    /// other's "gained" travel on separate connections and can arrive in either
+    /// order. A client that goes away entirely needs no message either: its
+    /// attaches end, its viewers are released, and the fallback applies.
+    ///
+    /// **Withheld unless the daemon advertises [`CAP_FOCUS_GAINED`].** An older
+    /// daemon has no such variant and answers with the generic
+    /// `malformed request: …` refusal from [`handle_connection`], changing no
+    /// state; that text is not a stability contract and nothing may branch on it,
+    /// which is why the capability is the gate.
+    ///
+    /// Its own short-lived connection, like [`AttachRequest::Resize`]: one
+    /// request, one response, close.
+    FocusGained {
+        /// The claiming client's identity — the same value it sends as
+        /// [`AttachRequest::AttachStream::client_id`]. Required: a focus claim
+        /// with no identity names nothing. Must satisfy [`is_valid_client_id`];
+        /// an invalid one is refused and changes no state.
+        client_id: String,
     },
     /// Issue #1049: ask the daemon to stop ITSELF, and the first wire verb that
     /// does. The rest of this enum acts on agents; the `Stop` half of the
@@ -3437,6 +3636,7 @@ async fn handle_connection(
             rows,
             cols,
             geometry_updates,
+            client_id,
         } => {
             // PRD #882: both axes or neither. A half-declared viewport is a
             // client bug, and guessing the missing axis would register a
@@ -3457,6 +3657,21 @@ async fn handle_connection(
                     return Ok(());
                 }
             };
+            // PRD #1105: refuse a malformed identity rather than dropping it.
+            // Every client that sends one generates it itself, so an invalid id
+            // is a client bug — and registering the viewer anonymously instead
+            // would hide that bug behind a sizing rule that silently never
+            // applies to this client.
+            if let Some(client_id) = client_id.as_deref()
+                && !is_valid_client_id(client_id)
+            {
+                write_resp(
+                    &mut stream,
+                    &AttachResponse::err(invalid_client_id_message()),
+                )
+                .await?;
+                return Ok(());
+            }
             handle_attach_stream(
                 stream,
                 registry,
@@ -3464,6 +3679,7 @@ async fn handle_connection(
                 state.clone(),
                 viewport,
                 geometry_updates,
+                client_id,
             )
             .await?;
         }
@@ -3485,6 +3701,26 @@ async fn handle_connection(
             }
             Err(e) => write_resp(&mut stream, &AttachResponse::err(e.to_string())).await?,
         },
+        AttachRequest::FocusGained { client_id } => {
+            // PRD #1105: accept the claim through the registry's coalescing
+            // gate, which bounds how often claims re-apply sizes, and answer
+            // once a focus pass has recorded it or a newer claim and re-applied
+            // every agent that moves. So a client that reads `ok` knows the
+            // sizes the newest claim decides are in force. The wait is at most
+            // `FOCUS_REAPPLY_INTERVAL`, and only for a claim that landed within
+            // one of the previous pass; the pass itself does not depend on this
+            // connection staying open.
+            if is_valid_client_id(&client_id) {
+                registry.accept_focus_claim(&client_id).applied().await;
+                write_resp(&mut stream, &AttachResponse::ok()).await?
+            } else {
+                write_resp(
+                    &mut stream,
+                    &AttachResponse::err(invalid_client_id_message()),
+                )
+                .await?
+            }
+        }
         AttachRequest::WriteAndSubmit { pane_id, text } => {
             // PRD #20 M3: deliver input honestly. A dashboard-visible session is
             // not necessarily a live, writable target (a wrapped Codex session
@@ -4180,8 +4416,14 @@ async fn handle_attach_stream(
     state: SharedState,
     viewport: Option<(u16, u16)>,
     geometry_updates: bool,
+    client_id: Option<String>,
 ) -> io::Result<()> {
-    let handle = match registry.subscribe_with_viewport(&id, viewport, geometry_updates) {
+    let handle = match registry.subscribe_with_viewport_for_client(
+        &id,
+        viewport,
+        geometry_updates,
+        client_id.as_deref(),
+    ) {
         Ok(h) => h,
         Err(e) => {
             let mut s = stream;
@@ -6849,8 +7091,14 @@ mod tests {
                 rows,
                 cols,
                 geometry_updates,
+                client_id,
             } => {
                 assert_eq!(id, "a1");
+                assert_eq!(
+                    client_id, None,
+                    "an attach from a client predating PRD #1105 carries no identity, and its \
+                     viewer takes part in sizing only through the per-axis-minimum fallback"
+                );
                 assert_eq!(
                     (rows, cols),
                     (None, None),
@@ -6892,13 +7140,15 @@ mod tests {
             rows: None,
             cols: None,
             geometry_updates: false,
+            client_id: None,
         })
         .unwrap();
         assert_eq!(json["op"], "attach-stream");
         assert!(
             json.get("rows").is_none()
                 && json.get("cols").is_none()
-                && json.get("geometry_updates").is_none(),
+                && json.get("geometry_updates").is_none()
+                && json.get("client_id").is_none(),
             "a non-participating attach must not appear on the wire at all, so a daemon \
              predating #882 sees byte-for-byte what it saw before"
         );
@@ -6908,6 +7158,7 @@ mod tests {
             rows: Some(30),
             cols: Some(100),
             geometry_updates: false,
+            client_id: None,
         })
         .unwrap();
         assert_eq!(json["rows"], 30);
@@ -6959,6 +7210,124 @@ mod tests {
         assert!(resp.ok);
         assert_eq!(resp.viewer, None);
         assert_eq!((resp.applied_rows, resp.applied_cols), (None, None));
+    }
+
+    /// PRD #1105 — the focus claim's wire shape, pinned because the tester's
+    /// contract names it: `{"op":"focus-gained","client_id":…}`, with the `op`
+    /// spelled exactly as the capability that gates it.
+    #[test]
+    fn focus_gained_serializes_as_its_capability_with_a_required_client_id() {
+        let json = serde_json::to_value(AttachRequest::FocusGained {
+            client_id: "c-0123".into(),
+        })
+        .unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({"op": "focus-gained", "client_id": "c-0123"}),
+            "the focus claim carries exactly its op and the claiming client's id"
+        );
+        assert_eq!(
+            json["op"], CAP_FOCUS_GAINED,
+            "the capability string is the op name, per PRD #819's convention — two spellings \
+             could drift and a client would then withhold a verb the daemon answers"
+        );
+
+        let decoded: AttachRequest =
+            serde_json::from_str(r#"{"op":"focus-gained","client_id":"c-0123"}"#)
+                .expect("the claim decodes");
+        assert!(
+            matches!(decoded, AttachRequest::FocusGained { client_id } if client_id == "c-0123")
+        );
+
+        serde_json::from_str::<AttachRequest>(r#"{"op":"focus-gained"}"#).expect_err(
+            "a focus claim with no identity names nothing, so it must not decode into a claim",
+        );
+    }
+
+    /// PRD #1105 — a daemon at this build advertises `focus-gained` on its
+    /// `Hello` reply, on every platform. A client withholds the claim without
+    /// it, so dropping the string from the list would silently turn focus-driven
+    /// sizing off for every client of this daemon.
+    #[test]
+    fn hello_advertises_focus_gained() {
+        assert!(
+            DAEMON_CAPABILITIES.contains(&CAP_FOCUS_GAINED),
+            "`focus-gained` must be in this platform's advertised set"
+        );
+        let hello = AttachResponse::hello(PROTOCOL_VERSION).with_capabilities();
+        assert!(
+            hello
+                .capabilities
+                .as_ref()
+                .is_some_and(|caps| caps.iter().any(|cap| cap == CAP_FOCUS_GAINED)),
+            "the live `Hello` reply must name `focus-gained`: {:?}",
+            hello.capabilities
+        );
+    }
+
+    /// PRD #1105 — `client_id` on `attach-stream` is an additive key: present
+    /// when a client names itself, absent (not `null`) when it does not, and
+    /// decoded back to the same value.
+    #[test]
+    fn attach_stream_carries_client_id_as_an_optional_key() {
+        let json = serde_json::to_value(AttachRequest::AttachStream {
+            id: "a1".into(),
+            rows: Some(13),
+            cols: Some(46),
+            geometry_updates: true,
+            client_id: Some("c-desktop".into()),
+        })
+        .unwrap();
+        assert_eq!(json["op"], "attach-stream");
+        assert_eq!(json["client_id"], "c-desktop");
+
+        let decoded: AttachRequest = serde_json::from_str(
+            r#"{"op":"attach-stream","id":"a1","rows":13,"cols":46,"geometry_updates":true,"client_id":"c-desktop"}"#,
+        )
+        .expect("an attach naming its client decodes");
+        match decoded {
+            AttachRequest::AttachStream { client_id, .. } => {
+                assert_eq!(client_id.as_deref(), Some("c-desktop"));
+            }
+            other => panic!("expected AttachStream, got {other:?}"),
+        }
+    }
+
+    /// PRD #1105 — the client-id grammar: 1 to `MAX_CLIENT_ID_LEN` bytes of
+    /// ASCII letters, digits, `-` and `_`, and nothing that would need escaping
+    /// where the daemon stores or logs it. The generated form must sit inside it.
+    #[test]
+    fn client_id_validation_accepts_the_generated_form_and_bounds_everything_else() {
+        let generated = crate::daemon_client::generate_client_id();
+        assert!(
+            is_valid_client_id(&generated),
+            "the id this crate generates must be one this daemon accepts: {generated:?}"
+        );
+        assert_eq!(
+            generated.len(),
+            34,
+            "`c-` plus 32 hex digits: {generated:?}"
+        );
+        assert_ne!(
+            generated,
+            crate::daemon_client::generate_client_id(),
+            "two generated ids must differ, or two clients would share one identity"
+        );
+
+        assert!(is_valid_client_id("c-A_z9"));
+        assert!(is_valid_client_id(&"a".repeat(MAX_CLIENT_ID_LEN)));
+        for bad in [
+            String::new(),
+            "a".repeat(MAX_CLIENT_ID_LEN + 1),
+            "c 1".into(),
+            "c\n1".into(),
+            "c/1".into(),
+            "c.1".into(),
+            "c-ü".into(),
+            "\u{1b}[31m".into(),
+        ] {
+            assert!(!is_valid_client_id(&bad), "{bad:?} must be refused");
+        }
     }
 
     /// PRD #882 — `KIND_GEOMETRY` payloads decode, and a malformed one is
