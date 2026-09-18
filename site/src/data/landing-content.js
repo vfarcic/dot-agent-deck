@@ -1,13 +1,15 @@
 /**
- * Shared landing-page content for the /style/* candidates (issue #1021, Task 1).
+ * Landing-page content (issue #1021).
  *
- * Every candidate route imports from here, so the four directions are compared
- * on layout and personality rather than on who wrote nicer placeholder copy.
+ * Every user-visible string on `/` comes from here, so the copy can be
+ * reviewed and corrected in one file rather than hunted through JSX. It began
+ * as the shared module the four `/style/*` candidates imported; the candidates
+ * are gone and direction C is now `/`, so the exports that only served the
+ * losing directions went with them.
  *
- * The prose is lifted from `site/src/pages/index.js`, with four corrections the
- * live page has not had yet. Each one was checked against the repository rather
- * than against the issue text, because the issue text was wrong about two of
- * them:
+ * The prose is lifted from the previous homepage, with four corrections it
+ * never had. Each one was checked against the repository rather than against
+ * the issue text, because the issue text was wrong about two of them:
  *
  * 1. The desktop GUI. Issue #1021 calls the artifacts "signed and notarized".
  *    They are neither. `.github/workflows/release.yml:523` introduces the
@@ -21,13 +23,13 @@
  *    binary is published. What the assets DO carry is build provenance, from
  *    the credential-free `attest` job.
  * 2. The agent list. `src/event.rs`'s `AgentType` and `src/agent_registry.rs`
- *    ship five agents, not the two the page names and not the four the issue
+ *    ship five agents, not the two the page named and not the four the issue
  *    names: Claude Code, OpenCode, Pi, Codex and Devin. `docs/getting-started.md`
  *    already lists all five. Gemini (#211) and Aider (#212) are open PRDs and
  *    are not promised here.
- * 3. Windows. The page links #42, closed on 2026-07-15. The open work is #164,
+ * 3. Windows. The page linked #42, closed on 2026-07-15. The open work is #164,
  *    which is what `docs/installation.md` already points at.
- * 4. Linux install. The page hedges with "Homebrew (if available)". The
+ * 4. Linux install. The page hedged with "Homebrew (if available)". The
  *    generated formula in `Taskfile.yml` carries a full `on_linux` block for
  *    both amd64 and arm64, and `docs/installation.md` heads the section
  *    "Homebrew (macOS / Linux)". It is a supported path, so say so.
@@ -39,8 +41,6 @@ export const product = {
   owner: 'DevOps Toolkit',
   tagline:
     'A terminal dashboard for running multiple AI coding agents in parallel',
-  subTagline:
-    'One dashboard, every agent visible at a glance, keyboard-driven, in the terminal you already use.',
   shortDefinition:
     'A single Rust binary that runs your AI coding agents as embedded terminal panes, tracks what each one is doing in real time, and lets one agent delegate work to the others.',
   license: 'MIT',
@@ -49,7 +49,7 @@ export const product = {
   releases: 'https://github.com/vfarcic/dot-agent-deck/releases/latest',
 };
 
-/** The "Why Agent Deck" block, verbatim from the current homepage. */
+/** The "Why Agent Deck" block, verbatim from the previous homepage. */
 export const why = {
   heading: 'Why Agent Deck',
   paragraphs: [
@@ -58,29 +58,6 @@ export const why = {
     'Agent Deck is the tool that lets you do that without losing your mind. One dashboard, every agent visible at a glance, keyboard-driven, in the terminal you already use, with the agent client you already know.',
   ],
 };
-
-export const features = [
-  {
-    title: 'Real-time monitoring',
-    description:
-      'See status, active tool, working directory, and last prompt for every agent session — updated in real time.',
-  },
-  {
-    title: 'Keyboard-driven',
-    description:
-      'Vim-style navigation with single-key actions. Create, focus, close, and rename panes without leaving the dashboard.',
-  },
-  {
-    title: 'Five agents, no configuration',
-    description:
-      'Claude Code, OpenCode, Pi, Codex and Devin are tracked out of the box. On launch the deck sets up whatever each one needs for live status — hooks, a plugin, an extension or a wrapper.',
-  },
-  {
-    title: 'Single binary',
-    description:
-      'No external terminal multiplexer needed. dot-agent-deck is one binary with native embedded terminal panes — and it is the daemon too.',
-  },
-];
 
 export const principles = [
   {
@@ -146,19 +123,6 @@ export const agents = [
 export const agentsNote =
   'Any other command still runs in a pane — it just gets no live status tracking. Adapters for Gemini CLI and Aider are designed and open, not shipped.';
 
-export const agentsPlanned = [
-  {
-    name: 'Gemini CLI',
-    href: 'https://github.com/vfarcic/dot-agent-deck/issues/211',
-    label: 'designed (#211)',
-  },
-  {
-    name: 'Aider',
-    href: 'https://github.com/vfarcic/dot-agent-deck/issues/212',
-    label: 'designed (#212)',
-  },
-];
-
 /** Mirrors the Platform Support table in `docs/installation.md`. */
 export const platforms = [
   {
@@ -189,47 +153,6 @@ export const platforms = [
 ];
 
 export const installCommand = 'brew tap vfarcic/tap && brew install dot-agent-deck';
-
-export const installTabs = [
-  {
-    value: 'macos',
-    label: 'macOS',
-    code: `# 1. Install via Homebrew
-brew tap vfarcic/tap && brew install dot-agent-deck
-
-# 2. Launch the dashboard
-dot-agent-deck`,
-    note: 'Apple Silicon and Intel. A Nix flake, a prebuilt binary and a source build all work too.',
-    links: [{text: 'All install options', to: '/docs/installation'}],
-  },
-  {
-    value: 'linux',
-    label: 'Linux',
-    code: `# 1. Install via Homebrew
-brew tap vfarcic/tap && brew install dot-agent-deck
-
-# 2. Launch the dashboard
-dot-agent-deck`,
-    note: 'Homebrew is a supported path on Linux, amd64 and arm64 — not a maybe. If you would rather not use it, there is a Nix flake (with an overlay and a home-manager module), prebuilt binaries on the releases page, and a source build.',
-    links: [{text: 'All install options', to: '/docs/installation'}],
-  },
-  {
-    value: 'windows',
-    label: 'Windows',
-    code: null,
-    note: 'Native Windows is not there yet: the daemon still reports Unsupported and no .exe ships in the release artifacts. WSL is a supported path today — install it and follow the Linux instructions inside your WSL shell, where Agent Deck runs as Linux.',
-    links: [
-      {
-        text: 'Install WSL',
-        href: 'https://learn.microsoft.com/en-us/windows/wsl/install',
-      },
-      {
-        text: 'Follow native Windows support (#164)',
-        href: 'https://github.com/vfarcic/dot-agent-deck/issues/164',
-      },
-    ],
-  },
-];
 
 export const installRoutes = [
   {
@@ -296,6 +219,10 @@ export const desktop = {
     'gh attestation verify <file> --repo vfarcic/dot-agent-deck',
 };
 
+/**
+ * The screenshot catalogue. Paths are the existing ones on purpose -- the
+ * image refresh keeps the filenames, so a refreshed image lands here for free.
+ */
 export const screenshots = {
   hero: {
     src: '/img/orchestration-coder.png',
@@ -334,46 +261,6 @@ export const screenshots = {
       'One card: directory, last activity, tool count, the last prompt and the recent tool calls.',
   },
 };
-
-/** Compact fact table for the dense candidate. */
-export const facts = [
-  {label: 'What it is', value: 'A terminal dashboard for parallel AI coding agents'},
-  {label: 'Written in', value: 'Rust — one binary, which is also the daemon'},
-  {label: 'Multiplexer', value: 'None. Terminal panes are embedded, not tmux'},
-  {
-    label: 'Agents tracked',
-    value: 'Claude Code, OpenCode, Pi, Codex, Devin',
-  },
-  {label: 'Platforms', value: 'macOS, Linux, Windows via WSL'},
-  {label: 'Install', value: 'Homebrew, Nix, prebuilt binary, source'},
-  {
-    label: 'Session lifetime',
-    value: 'Agents outlive the TUI — detach, reattach, they are still there',
-  },
-  {label: 'Remote', value: 'dot-agent-deck connect, one daemon per host'},
-  {label: 'Desktop GUI', value: 'Alpha, unsigned — macOS and Linux'},
-  {label: 'License', value: 'MIT'},
-];
-
-/** What it is / what it is not, for the candidates that want the contrast. */
-export const contrasts = [
-  {
-    is: 'A dashboard over the agent clients you already run',
-    isNot: 'A new agent client, or a new model',
-  },
-  {
-    is: 'Embedded terminal panes in one binary',
-    isNot: 'A tmux configuration, or a terminal emulator',
-  },
-  {
-    is: 'A daemon your agents outlive the TUI on',
-    isNot: 'A hosted service — the daemon is a process you run',
-  },
-  {
-    is: 'Keyboard-first, every action one or two keys',
-    isNot: 'A mouse-driven IDE panel',
-  },
-];
 
 export const audience = {
   heading: 'Who this is for',
@@ -419,64 +306,3 @@ export const docLinks = {
   sessions: '/docs/session-management',
   remote: '/docs/remote-environments',
 };
-
-/**
- * The four candidate directions (issue #1021, Task 1). Used by the scaffolding
- * banner on each route and by the /style index. Delete with the routes once a
- * direction is picked.
- */
-export const candidates = [
-  {
-    id: 'a',
-    route: '/style/a',
-    name: 'Terminal-native minimalism',
-    draws: ['charm.sh', 'ghostty.org', 'zed.dev'],
-    optimises:
-      'looking like the tool it sells — a developer should recognise what this is before reading a word',
-    chrome: 'Keeps the Docusaurus navbar and footer.',
-    summary:
-      'Monospace throughout, near-black on paper, hairline rules and whitespace instead of cards. No gradients, no shadows, nothing that reads as a SaaS grid. The page is laid out as a document with a terminal’s manners.',
-  },
-  {
-    id: 'b',
-    route: '/style/b',
-    name: 'Dense technical credibility',
-    draws: ['tailscale.com', 'fly.io', 'temporal.io'],
-    optimises:
-      'answering a sceptical engineer’s three questions — what is it, does it drive my agent, what does it cost me to try — above the fold',
-    chrome:
-      'Deliberately keeps the Docusaurus chrome. Its thesis is that / is the docs’ front porch, done properly.',
-    summary:
-      'Information-dense: a one-sentence definition, the install command, the agent matrix and the platform table before you scroll. Then a facts table, an is/is-not contrast, and screenshots inline with captions.',
-  },
-  {
-    id: 'c',
-    route: '/style/c',
-    name: 'Bold product marketing',
-    draws: ['linear.app', 'raycast.com', 'warp.dev'],
-    optimises:
-      'a first-time visitor who has never heard of this — the pitch lands before the specification does',
-    chrome: 'Keeps the Docusaurus navbar and footer.',
-    summary:
-      'Spotlight hero, oversized framed screenshot, a scroll story of alternating sections, a real colour system, an explicit who-this-is-for, and CTAs you cannot miss.',
-  },
-  {
-    id: 'd',
-    route: '/style/d',
-    name: 'Own shell, no Docusaurus theme',
-    draws: ['warp.dev', 'railway.com', 'supabase.com'],
-    optimises:
-      'making / a product site in its own right, and making the handoff into /docs a designed moment rather than an accident',
-    chrome:
-      'No @theme/Layout at all. Its own sticky header, its own footer, its own theme toggle, its own type and colour tokens.',
-    summary:
-      'A modular editorial layout — left-aligned hero with a stat strip, a bento grid of capabilities, a dedicated desktop block, and a closing panel that hands you to the docs on purpose.',
-  },
-];
-
-/**
- * These pages were built from what is known of the reference sites rather than
- * from a live fetch. Stated on the index so the attribution is honest.
- */
-export const attributionNote =
-  'The reference sites were not fetched while building these — the directions are drawn from what is known of them. The point of naming them is to make the choice discussable, not to copy a layout.';
