@@ -1,0 +1,441 @@
+/*
+ * Candidate B — dense technical credibility (issue #1021, Task 1).
+ * Temporary: deleted with the route once a direction is picked.
+ */
+
+.page {
+  --b-bg: #ffffff;
+  --b-panel: #f6f7f8;
+  --b-ink: #14181d;
+  --b-dim: #5c6773;
+  --b-line: #dfe3e8;
+  --b-accent: #0e7c72;
+  --b-warn: #8a5300;
+
+  background: var(--b-bg);
+  color: var(--b-ink);
+  font-size: 15px;
+  line-height: 1.55;
+  padding: 0 1rem 4rem;
+}
+
+[data-theme='dark'] .page {
+  --b-bg: #101418;
+  --b-panel: #171d23;
+  --b-ink: #e3e8ed;
+  --b-dim: #93a1ad;
+  --b-line: #2a333c;
+  --b-accent: #4ecdc4;
+  --b-warn: #e0a531;
+}
+
+.wrap {
+  max-width: 1120px;
+  margin: 0 auto;
+}
+
+/* ---------- above the fold ---------- */
+
+.fold {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 0.95fr);
+  gap: 2.5rem;
+  align-items: start;
+  padding: 2.75rem 0 2.25rem;
+  border-bottom: 1px solid var(--b-line);
+}
+
+.title {
+  font-size: clamp(1.9rem, 5vw, 2.5rem);
+  font-weight: 700;
+  letter-spacing: -0.025em;
+  line-height: 1.1;
+  margin: 0 0 0.75rem;
+}
+
+.definition {
+  font-size: 1.05rem;
+  color: var(--b-ink);
+  margin: 0 0 1.4rem;
+  max-width: 48ch;
+}
+
+.installBox {
+  display: flex;
+  align-items: stretch;
+  border: 1px solid var(--b-line);
+  border-radius: 4px;
+  overflow: hidden;
+  background: var(--b-panel);
+  max-width: 100%;
+}
+
+.installLabel {
+  background: var(--b-accent);
+  color: #ffffff;
+  font-size: 0.68rem;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  padding: 0.55rem 0.7rem;
+  display: flex;
+  align-items: center;
+  flex: 0 0 auto;
+}
+
+[data-theme='dark'] .installLabel {
+  color: #08201e;
+}
+
+.installCode {
+  background: transparent;
+  border: none;
+  color: var(--b-ink);
+  font-size: 0.82rem;
+  padding: 0.55rem 0.75rem;
+  overflow-x: auto;
+  white-space: pre;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.foldLinks {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.6rem 1.25rem;
+  margin: 1.25rem 0 0;
+  font-size: 0.92rem;
+}
+
+.primaryLink {
+  background: var(--b-accent);
+  color: #ffffff;
+  padding: 0.45rem 1rem;
+  border-radius: 4px;
+  font-weight: 600;
+  text-decoration: none;
+}
+
+[data-theme='dark'] .primaryLink {
+  color: #08201e;
+}
+
+.primaryLink:hover {
+  text-decoration: none;
+  filter: brightness(1.08);
+  color: #ffffff;
+}
+
+[data-theme='dark'] .primaryLink:hover {
+  color: #08201e;
+}
+
+.secondaryLink {
+  color: var(--b-accent);
+  font-weight: 600;
+}
+
+/* ---------- tables ---------- */
+
+.matrix,
+.facts {
+  width: 100%;
+  display: table;
+  border-collapse: collapse;
+  font-size: 0.85rem;
+  margin: 0 0 0.75rem;
+}
+
+.matrix caption,
+.facts caption {
+  caption-side: top;
+  text-align: left;
+  font-size: 0.68rem;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--b-dim);
+  padding-bottom: 0.4rem;
+}
+
+.matrix th,
+.matrix td,
+.facts th,
+.facts td {
+  border: none;
+  border-bottom: 1px solid var(--b-line);
+  padding: 0.42rem 0.75rem 0.42rem 0;
+  text-align: left;
+  vertical-align: top;
+  background: transparent;
+}
+
+.matrix thead th,
+.facts thead th {
+  font-size: 0.68rem;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--b-dim);
+  font-weight: 600;
+  border-bottom: 1px solid var(--b-ink);
+}
+
+.matrix code,
+.facts code {
+  background: var(--b-panel);
+  border: 1px solid var(--b-line);
+  border-radius: 3px;
+  font-size: 0.78rem;
+  padding: 0.05rem 0.3rem;
+  word-break: break-word;
+}
+
+.file {
+  word-break: break-all;
+}
+
+/*
+ * An asset filename may break anywhere; a command must not -- `gh attestation`
+ * split across lines as `gh att / estation` reads as a typo.
+ */
+.microNote .file {
+  display: inline-block;
+  max-width: 100%;
+  overflow-x: auto;
+  vertical-align: bottom;
+  white-space: pre;
+  word-break: normal;
+}
+
+.dim {
+  color: var(--b-dim);
+}
+
+.pending th,
+.pending td {
+  opacity: 0.68;
+}
+
+.statusOk {
+  color: var(--b-accent);
+  font-weight: 600;
+}
+
+.statusNo {
+  color: var(--b-warn);
+}
+
+.microNote {
+  font-size: 0.78rem;
+  color: var(--b-dim);
+  margin: 0 0 1.25rem;
+  line-height: 1.5;
+}
+
+/* ---------- section labels ---------- */
+
+.sectionLabel {
+  font-size: 0.68rem;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--b-dim);
+  margin: 0 0 0.85rem;
+  padding-bottom: 0.4rem;
+  border-bottom: 1px solid var(--b-line);
+}
+
+.h2 {
+  font-size: 1.2rem;
+  font-weight: 700;
+  margin: 0 0 0.6rem;
+  letter-spacing: -0.015em;
+}
+
+/* ---------- screenshots ---------- */
+
+.shots {
+  padding: 2rem 0 0;
+}
+
+.shotGrid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 1.25rem;
+}
+
+.shot {
+  margin: 0;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.shot img {
+  display: block;
+  width: 100%;
+  height: auto;
+  border: 1px solid var(--b-line);
+  border-radius: 3px;
+}
+
+.shot figcaption {
+  font-size: 0.78rem;
+  color: var(--b-dim);
+  margin-top: 0.45rem;
+  line-height: 1.45;
+}
+
+/* Captions line up across the row whatever each screenshot's aspect ratio. */
+.shot img + figcaption {
+  margin-top: auto;
+  padding-top: 0.45rem;
+}
+
+/* ---------- two-up ---------- */
+
+.twoUp {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 2.5rem;
+  padding: 2.5rem 0 0;
+}
+
+/* ---------- why ---------- */
+
+.why {
+  padding: 2.5rem 0 0;
+}
+
+.whyCols {
+  columns: 2;
+  column-gap: 2.5rem;
+  font-size: 0.95rem;
+}
+
+.whyCols p {
+  margin: 0 0 0.9rem;
+  break-inside: avoid;
+}
+
+/* ---------- principles ---------- */
+
+.principleGrid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0;
+  border-top: 1px solid var(--b-line);
+  border-left: 1px solid var(--b-line);
+}
+
+.principle {
+  border-right: 1px solid var(--b-line);
+  border-bottom: 1px solid var(--b-line);
+  padding: 1rem 1.15rem;
+}
+
+.principle h3 {
+  font-size: 0.92rem;
+  font-weight: 700;
+  margin: 0 0 0.3rem;
+}
+
+.principle p {
+  font-size: 0.85rem;
+  color: var(--b-dim);
+  margin: 0;
+}
+
+/* ---------- desktop ---------- */
+
+.desktop {
+  padding: 2.5rem 0 0;
+}
+
+.desktopGrid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.25fr) minmax(0, 1fr);
+  gap: 2rem;
+  align-items: start;
+}
+
+.desktopGrid p {
+  font-size: 0.92rem;
+}
+
+.caveats {
+  list-style: none;
+  margin: 0;
+  padding: 0.9rem 1.1rem;
+  background: var(--b-panel);
+  border: 1px solid var(--b-line);
+  border-left: 3px solid var(--b-warn);
+  border-radius: 3px;
+  font-size: 0.85rem;
+}
+
+.caveats li {
+  margin: 0 0 0.7rem;
+  color: var(--b-dim);
+}
+
+.caveats li:last-child {
+  margin-bottom: 0;
+}
+
+.caveats strong {
+  color: var(--b-ink);
+}
+
+/* ---------- handoff ---------- */
+
+.handoff {
+  margin-top: 2.5rem;
+  padding: 0.9rem 1.1rem;
+  border: 1px solid var(--b-line);
+  border-radius: 3px;
+  background: var(--b-panel);
+  font-size: 0.88rem;
+}
+
+.handoff p {
+  margin: 0;
+}
+
+/* ---------- narrow ---------- */
+
+@media (max-width: 996px) {
+  .fold,
+  .twoUp,
+  .desktopGrid {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 2rem;
+  }
+
+  .shotGrid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .whyCols {
+    columns: 1;
+  }
+}
+
+@media (max-width: 560px) {
+  .principleGrid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .installBox {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  /* Wrap rather than scroll sideways at phone width. */
+  .installCode {
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
+
+  .installLabel {
+    justify-content: flex-start;
+  }
+}

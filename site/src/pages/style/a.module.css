@@ -1,0 +1,421 @@
+/*
+ * Candidate A — terminal-native minimalism (issue #1021, Task 1).
+ * Temporary: deleted with the route once a direction is picked.
+ */
+
+.page {
+  --a-paper: #fbfaf7;
+  --a-ink: #16161a;
+  --a-dim: #61615e;
+  --a-line: #d8d6ce;
+  --a-accent: #12796f;
+  --a-warn: #9a5b00;
+  --a-mono: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas,
+    'Liberation Mono', monospace;
+
+  background: var(--a-paper);
+  color: var(--a-ink);
+  font-family: var(--a-mono);
+  font-size: 15px;
+  line-height: 1.65;
+  font-variant-ligatures: none;
+  padding: 0 1rem 5rem;
+}
+
+[data-theme='dark'] .page {
+  --a-paper: #0b0b0d;
+  --a-ink: #e6e5df;
+  --a-dim: #8a8a84;
+  --a-line: #2a2a2e;
+  --a-accent: #4ecdc4;
+  --a-warn: #e0a531;
+}
+
+.column {
+  max-width: 74ch;
+  margin: 0 auto;
+}
+
+/* ---------- hero ---------- */
+
+.hero {
+  padding: 3.5rem 0 2rem;
+}
+
+.prompt {
+  color: var(--a-dim);
+  margin: 0 0 1.75rem;
+  font-size: 0.9rem;
+}
+
+.promptSigil {
+  color: var(--a-accent);
+}
+
+.title {
+  font-family: var(--a-mono);
+  font-size: clamp(2rem, 9vw, 3.1rem);
+  font-weight: 700;
+  letter-spacing: -0.03em;
+  line-height: 1.05;
+  margin: 0;
+}
+
+.tagline {
+  font-size: clamp(1rem, 4vw, 1.2rem);
+  margin: 0.9rem 0 0;
+  max-width: 54ch;
+}
+
+.sub {
+  color: var(--a-dim);
+  margin: 0.6rem 0 0;
+  max-width: 60ch;
+}
+
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem 1rem;
+  margin: 2rem 0 0;
+}
+
+.action {
+  color: var(--a-accent);
+  text-decoration: none;
+  font-weight: 600;
+}
+
+.action:hover,
+.action:focus-visible {
+  color: var(--a-paper);
+  background: var(--a-accent);
+  text-decoration: none;
+}
+
+/* ---------- screenshot frame ---------- */
+
+.frame {
+  margin: 2.5rem 0 0;
+  border: 1px solid var(--a-line);
+}
+
+.frameBar {
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 0.3rem 0.6rem;
+  border-bottom: 1px solid var(--a-line);
+  color: var(--a-dim);
+  font-size: 0.78rem;
+}
+
+.frameBarKeys {
+  letter-spacing: 0.25em;
+}
+
+.frameImage {
+  display: block;
+  width: 100%;
+  height: auto;
+}
+
+.caption {
+  padding: 0.55rem 0.6rem;
+  border-top: 1px solid var(--a-line);
+  color: var(--a-dim);
+  font-size: 0.8rem;
+}
+
+/* ---------- section rules ---------- */
+
+.rule {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  margin: 3.5rem 0 1.75rem;
+}
+
+.rule::after {
+  content: '';
+  flex: 1;
+  border-top: 1px solid var(--a-line);
+}
+
+.ruleLabel {
+  color: var(--a-dim);
+  font-size: 0.75rem;
+  letter-spacing: 0.22em;
+  text-transform: uppercase;
+}
+
+.ruleLabel:empty {
+  display: none;
+}
+
+/* ---------- prose ---------- */
+
+.h2 {
+  font-family: var(--a-mono);
+  font-size: 1.25rem;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+  margin: 0 0 1rem;
+}
+
+.h3 {
+  font-family: var(--a-mono);
+  font-size: 0.9rem;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--a-dim);
+  margin: 0 0 0.6rem;
+}
+
+.prose p {
+  margin: 0 0 1.1rem;
+}
+
+.note {
+  color: var(--a-dim);
+  font-size: 0.85rem;
+  margin: 0.8rem 0 0;
+}
+
+/* ---------- agents ---------- */
+
+.agentList {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.agentRow {
+  display: flex;
+  align-items: baseline;
+  gap: 0.5rem;
+  padding: 0.45rem 0;
+  border-bottom: 1px dotted var(--a-line);
+  flex-wrap: wrap;
+}
+
+.agentName {
+  color: var(--a-ink);
+  text-decoration: none;
+  font-weight: 700;
+  border-bottom: 1px solid var(--a-accent);
+}
+
+.agentName:hover {
+  color: var(--a-accent);
+  text-decoration: none;
+}
+
+.dots {
+  flex: 1 1 2rem;
+  min-width: 1rem;
+  border-bottom: 1px dotted var(--a-line);
+  transform: translateY(-0.2em);
+}
+
+.agentCommand {
+  background: transparent;
+  border: 1px solid var(--a-line);
+  border-radius: 0;
+  color: var(--a-accent);
+  font-size: 0.82rem;
+  padding: 0 0.35rem;
+}
+
+.agentStrategy {
+  color: var(--a-dim);
+  font-size: 0.78rem;
+  min-width: 11ch;
+  text-align: right;
+}
+
+/* ---------- definition rows ---------- */
+
+.defs {
+  margin: 0;
+}
+
+.defRow {
+  display: grid;
+  grid-template-columns: 22ch 1fr;
+  gap: 0 1.5rem;
+  padding: 0.9rem 0;
+  border-top: 1px solid var(--a-line);
+}
+
+.defRow:last-child {
+  border-bottom: 1px solid var(--a-line);
+}
+
+.defTerm,
+.defTermWarn {
+  font-weight: 700;
+  margin: 0;
+}
+
+.defTermWarn {
+  color: var(--a-warn);
+}
+
+.defBody {
+  margin: 0;
+  color: var(--a-dim);
+}
+
+/* ---------- install ---------- */
+
+.installBlock {
+  margin: 0 0 2rem;
+}
+
+.pre {
+  background: transparent;
+  border: 1px solid var(--a-line);
+  border-radius: 0;
+  color: var(--a-ink);
+  font-family: var(--a-mono);
+  font-size: 0.82rem;
+  line-height: 1.7;
+  margin: 0;
+  overflow-x: auto;
+  padding: 0.9rem 1rem;
+}
+
+.linkRow {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.3rem 1.25rem;
+  margin: 0.7rem 0 0;
+  font-size: 0.85rem;
+}
+
+.inlineLink {
+  color: var(--a-accent);
+  text-decoration: none;
+  border-bottom: 1px solid currentColor;
+}
+
+.inlineLink:hover {
+  text-decoration: none;
+  opacity: 0.75;
+}
+
+/* ---------- tables ---------- */
+
+.table {
+  width: 100%;
+  border-collapse: collapse;
+  display: table;
+  margin: 2rem 0 0;
+  font-size: 0.85rem;
+}
+
+.tableCaption {
+  text-align: left;
+  color: var(--a-dim);
+  font-size: 0.75rem;
+  letter-spacing: 0.22em;
+  text-transform: uppercase;
+  padding-bottom: 0.5rem;
+}
+
+.table th,
+.table td {
+  border: none;
+  border-top: 1px solid var(--a-line);
+  padding: 0.5rem 0.75rem 0.5rem 0;
+  text-align: left;
+  vertical-align: top;
+  background: transparent;
+}
+
+.table tr:last-child td,
+.table tr:last-child th {
+  border-bottom: 1px solid var(--a-line);
+}
+
+.tableDim {
+  color: var(--a-dim);
+}
+
+.yes {
+  color: var(--a-accent);
+}
+
+.no {
+  color: var(--a-warn);
+}
+
+/* ---------- desktop ---------- */
+
+.fileList {
+  list-style: none;
+  margin: 1.25rem 0;
+  padding: 0;
+  font-size: 0.82rem;
+}
+
+.fileList li {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.25rem 0.75rem;
+  align-items: baseline;
+  padding: 0.35rem 0;
+}
+
+.fileList code {
+  background: transparent;
+  border: none;
+  padding: 0;
+  color: var(--a-ink);
+  word-break: break-all;
+}
+
+/* ---------- footer ---------- */
+
+.foot {
+  color: var(--a-dim);
+  font-size: 0.8rem;
+}
+
+.foot p {
+  margin: 0;
+}
+
+/* ---------- narrow ---------- */
+
+@media (max-width: 640px) {
+  .page {
+    font-size: 14px;
+  }
+
+  /*
+   * A command you have to drag sideways to read is worse than a wrapped one,
+   * and a terminal wraps too. Measured: these blocks are ~456px against a
+   * 360px viewport.
+   */
+  .pre {
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+  }
+
+  .defRow {
+    grid-template-columns: 1fr;
+    gap: 0.35rem;
+  }
+
+  .agentStrategy {
+    text-align: left;
+    min-width: 0;
+  }
+
+  .dots {
+    display: none;
+  }
+}

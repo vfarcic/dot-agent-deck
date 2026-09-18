@@ -1,0 +1,1075 @@
+/*
+ * Candidate D — own shell, no Docusaurus theme (issue #1021, Task 1).
+ *
+ * Deliberately defines its own tokens rather than reusing Infima's `--ifm-*`,
+ * because "does / need the docs' visual language?" is the question this
+ * candidate exists to answer. Keyed off `[data-theme]` on <html>, which
+ * theme-classic's pre-body script sets on every page — see the note in d.js.
+ *
+ * Temporary: deleted with the route once a direction is picked.
+ */
+
+.shell {
+  /* Light is the fallback: no attribute, no JS, still legible. */
+  --d-bg: #ffffff;
+  --d-surface: #f7f8fa;
+  --d-surface-2: #eef1f4;
+  --d-ink: #0d1117;
+  --d-ink-2: #4a5763;
+  --d-line: #dde3e9;
+  --d-line-strong: #c4ced8;
+  --d-accent: #0d857a;
+  --d-accent-ink: #ffffff;
+  --d-accent-soft: rgba(13, 133, 122, 0.1);
+  --d-flag: #9a5b00;
+  --d-flag-soft: rgba(224, 165, 49, 0.16);
+
+  --d-sans: system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial,
+    sans-serif;
+  --d-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono',
+    monospace;
+
+  /* Own type scale, not Infima's. */
+  --d-step--1: 0.82rem;
+  --d-step-0: 1rem;
+  --d-step-1: clamp(1.1rem, 2.4vw, 1.3rem);
+  --d-step-2: clamp(1.35rem, 3.4vw, 1.75rem);
+  --d-step-3: clamp(1.75rem, 5vw, 2.4rem);
+  --d-step-4: clamp(2.1rem, 7.5vw, 3.6rem);
+
+  --d-gutter: 1.25rem;
+  --d-max: 1200px;
+
+  background: var(--d-bg);
+  color: var(--d-ink);
+  font-family: var(--d-sans);
+  font-size: var(--d-step-0);
+  line-height: 1.6;
+  min-height: 100vh;
+  overflow-x: hidden;
+}
+
+[data-theme='dark'] .shell {
+  --d-bg: #080b0f;
+  --d-surface: #0e131a;
+  --d-surface-2: #141b24;
+  --d-ink: #e9eef3;
+  --d-ink-2: #97a4b1;
+  --d-line: #1d2630;
+  --d-line-strong: #2c3846;
+  --d-accent: #4ecdc4;
+  --d-accent-ink: #06211f;
+  --d-accent-soft: rgba(78, 205, 196, 0.12);
+  --d-flag: #e0a531;
+  --d-flag-soft: rgba(224, 165, 49, 0.12);
+}
+
+/*
+ * No-JS / no-attribute fallback: if <html> carries no explicit light choice and
+ * the OS prefers dark, use the dark tokens anyway.
+ */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme='light']) .shell {
+    --d-bg: #080b0f;
+    --d-surface: #0e131a;
+    --d-surface-2: #141b24;
+    --d-ink: #e9eef3;
+    --d-ink-2: #97a4b1;
+    --d-line: #1d2630;
+    --d-line-strong: #2c3846;
+    --d-accent: #4ecdc4;
+    --d-accent-ink: #06211f;
+    --d-accent-soft: rgba(78, 205, 196, 0.12);
+    --d-flag: #e0a531;
+    --d-flag-soft: rgba(224, 165, 49, 0.12);
+  }
+}
+
+/*
+ * `:where()` contributes zero specificity, so these are a floor that any later
+ * class rule overrides. Written as plain `.shell p` they outranked every
+ * single-class rule below and silently ate its margins.
+ */
+.shell :where(h1, h2, h3) {
+  font-family: var(--d-sans);
+  letter-spacing: -0.028em;
+  line-height: 1.15;
+  margin: 0;
+}
+
+.shell :where(p) {
+  margin: 0;
+}
+
+.fine {
+  font-size: var(--d-step--1);
+  color: var(--d-ink-2);
+  line-height: 1.55;
+}
+
+/* ---------- header ---------- */
+
+.header {
+  position: sticky;
+  top: 0;
+  z-index: 20;
+  background: color-mix(in srgb, var(--d-bg) 88%, transparent);
+  backdrop-filter: blur(10px);
+  border-bottom: 1px solid var(--d-line);
+}
+
+.headerInner {
+  max-width: var(--d-max);
+  margin: 0 auto;
+  padding: 0.7rem var(--d-gutter);
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+}
+
+.brand {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.55rem;
+  text-decoration: none;
+  color: var(--d-ink);
+  flex: 0 0 auto;
+}
+
+.brand:hover {
+  text-decoration: none;
+  color: var(--d-ink);
+}
+
+.mark {
+  display: inline-flex;
+  align-items: flex-end;
+  gap: 2px;
+  height: 1.1rem;
+}
+
+.markBar {
+  width: 4px;
+  background: var(--d-accent);
+  border-radius: 1px;
+}
+
+.markBar:nth-child(1) {
+  height: 55%;
+}
+
+.markBar:nth-child(2) {
+  height: 100%;
+}
+
+.markBar:nth-child(3) {
+  height: 75%;
+}
+
+.brandName {
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  margin: 0;
+}
+
+.nav {
+  display: flex;
+  gap: 1.25rem;
+  margin-left: auto;
+  font-size: 0.92rem;
+}
+
+.nav a {
+  color: var(--d-ink-2);
+  text-decoration: none;
+  white-space: nowrap;
+}
+
+.nav a:hover {
+  color: var(--d-ink);
+  text-decoration: none;
+}
+
+.headerActions {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  flex: 0 0 auto;
+}
+
+.toggle {
+  width: 2rem;
+  height: 2rem;
+  border: 1px solid var(--d-line-strong);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--d-ink-2);
+  cursor: pointer;
+  font-size: 0.9rem;
+  line-height: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.toggle:hover {
+  color: var(--d-ink);
+  border-color: var(--d-accent);
+}
+
+/*
+ * Which glyph shows is decided by CSS, not React state, so the server and the
+ * client always render the same markup.
+ */
+.iconDark {
+  display: none;
+}
+
+.iconLight {
+  display: inline;
+}
+
+[data-theme='dark'] .iconDark {
+  display: inline;
+}
+
+[data-theme='dark'] .iconLight {
+  display: none;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme='light']) .iconDark {
+    display: inline;
+  }
+
+  :root:not([data-theme='light']) .iconLight {
+    display: none;
+  }
+}
+
+.headerCta {
+  background: var(--d-accent);
+  color: var(--d-accent-ink);
+  font-size: 0.88rem;
+  font-weight: 650;
+  padding: 0.42rem 0.9rem;
+  border-radius: 6px;
+  text-decoration: none;
+  white-space: nowrap;
+}
+
+.headerCta:hover {
+  color: var(--d-accent-ink);
+  text-decoration: none;
+  filter: brightness(1.08);
+}
+
+/* ---------- hero ---------- */
+
+.hero {
+  max-width: var(--d-max);
+  margin: 0 auto;
+  padding: 3.5rem var(--d-gutter) 0;
+}
+
+.heroGrid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1.05fr);
+  gap: 3rem;
+  align-items: center;
+}
+
+.eyebrow {
+  font-family: var(--d-mono);
+  font-size: 0.75rem;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--d-accent);
+  margin-bottom: 1rem;
+}
+
+.heroTitle {
+  font-size: var(--d-step-4);
+  font-weight: 750;
+}
+
+.heroTitleDim {
+  color: var(--d-ink-2);
+}
+
+.heroLede {
+  font-size: var(--d-step-1);
+  color: var(--d-ink-2);
+  margin-top: 1.1rem;
+  max-width: 34rem;
+}
+
+.command {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  margin-top: 1.5rem;
+  padding: 0.6rem 0.85rem;
+  border: 1px solid var(--d-line);
+  border-radius: 8px;
+  background: var(--d-surface);
+  font-family: var(--d-mono);
+  font-size: 0.82rem;
+  overflow-x: auto;
+}
+
+.command span {
+  color: var(--d-accent);
+  font-weight: 700;
+  flex: 0 0 auto;
+}
+
+.command code {
+  background: transparent;
+  border: none;
+  padding: 0;
+  color: var(--d-ink);
+  white-space: pre;
+  font-size: inherit;
+  font-family: inherit;
+}
+
+.heroActions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.7rem;
+  margin-top: 1.5rem;
+}
+
+.btnPrimary,
+.btnQuiet {
+  display: inline-block;
+  padding: 0.62rem 1.25rem;
+  border-radius: 7px;
+  font-weight: 650;
+  font-size: 0.95rem;
+  text-decoration: none;
+}
+
+.btnPrimary {
+  background: var(--d-accent);
+  color: var(--d-accent-ink);
+}
+
+.btnPrimary:hover {
+  color: var(--d-accent-ink);
+  text-decoration: none;
+  filter: brightness(1.08);
+}
+
+.btnQuiet {
+  border: 1px solid var(--d-line-strong);
+  color: var(--d-ink);
+}
+
+.btnQuiet:hover {
+  color: var(--d-ink);
+  text-decoration: none;
+  border-color: var(--d-accent);
+}
+
+.heroShot {
+  margin: 0;
+  min-width: 0;
+}
+
+.heroShot img {
+  display: block;
+  width: 100%;
+  height: auto;
+  border: 1px solid var(--d-line);
+  border-radius: 10px;
+}
+
+.heroShot figcaption {
+  margin-top: 0.6rem;
+  font-size: var(--d-step--1);
+  color: var(--d-ink-2);
+}
+
+.stats {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 0;
+  margin: 3.5rem 0 0;
+  border-top: 1px solid var(--d-line);
+  border-bottom: 1px solid var(--d-line);
+}
+
+.stats > div {
+  padding: 1.25rem 1rem 1.25rem 0;
+  border-right: 1px solid var(--d-line);
+}
+
+.stats > div:last-child {
+  border-right: none;
+}
+
+.stats dt {
+  font-family: var(--d-mono);
+  font-size: 1.9rem;
+  font-weight: 700;
+  color: var(--d-accent);
+  line-height: 1;
+}
+
+.stats dd {
+  margin: 0.4rem 0 0;
+  font-size: var(--d-step--1);
+  color: var(--d-ink-2);
+}
+
+/* ---------- bento ---------- */
+
+.bento {
+  max-width: var(--d-max);
+  margin: 0 auto;
+  padding: 3.5rem var(--d-gutter) 0;
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 1rem;
+}
+
+.cell {
+  border: 1px solid var(--d-line);
+  border-radius: 12px;
+  background: var(--d-surface);
+  padding: 1.4rem 1.5rem;
+}
+
+.cell h2 {
+  font-size: var(--d-step-2);
+  margin-bottom: 0.9rem;
+}
+
+.cell h3 {
+  font-size: var(--d-step-1);
+  margin-bottom: 0.5rem;
+}
+
+.cell p {
+  color: var(--d-ink-2);
+  font-size: 0.93rem;
+  margin-bottom: 0.85rem;
+}
+
+.cell p:last-child {
+  margin-bottom: 0;
+}
+
+.cellWide {
+  grid-column: span 2;
+  grid-row: span 2;
+}
+
+.cellWide .lead {
+  color: var(--d-ink);
+  font-size: var(--d-step-1);
+  line-height: 1.5;
+}
+
+.cellAgents {
+  grid-column: span 4;
+}
+
+.agentGrid {
+  list-style: none;
+  margin: 0.25rem 0 1rem;
+  padding: 0;
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 0.75rem;
+}
+
+.agentGrid li {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  padding: 0.75rem 0.85rem;
+  border: 1px solid var(--d-line);
+  border-radius: 9px;
+  background: var(--d-bg);
+  min-width: 0;
+}
+
+.agentGrid a {
+  font-weight: 650;
+  color: var(--d-ink);
+  text-decoration: none;
+}
+
+.agentGrid a:hover {
+  color: var(--d-accent);
+}
+
+.agentGrid code {
+  font-family: var(--d-mono);
+  font-size: 0.74rem;
+  color: var(--d-accent);
+  background: var(--d-accent-soft);
+  border: none;
+  border-radius: 4px;
+  padding: 0.05rem 0.35rem;
+  align-self: flex-start;
+}
+
+.agentGrid span {
+  font-size: 0.72rem;
+  color: var(--d-ink-2);
+}
+
+/* ---------- flow ---------- */
+
+.flow {
+  max-width: var(--d-max);
+  margin: 0 auto;
+  padding: 4rem var(--d-gutter) 0;
+}
+
+.flowHead h2 {
+  font-size: var(--d-step-3);
+  margin-bottom: 0.6rem;
+}
+
+.flowHead p {
+  color: var(--d-ink-2);
+  max-width: 48ch;
+}
+
+.flowList {
+  list-style: none;
+  margin: 2rem 0 0;
+  padding: 0;
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 0;
+  border-top: 1px solid var(--d-line);
+}
+
+.flowList li {
+  padding: 1.4rem 1.25rem 1.4rem 0;
+  border-right: 1px solid var(--d-line);
+}
+
+.flowList li:last-child {
+  border-right: none;
+}
+
+.flowStep {
+  font-family: var(--d-mono);
+  font-size: 0.72rem;
+  letter-spacing: 0.14em;
+  color: var(--d-accent);
+}
+
+.flowList h3 {
+  font-size: 1.02rem;
+  margin: 0.5rem 0 0.4rem;
+}
+
+.flowList p {
+  font-size: 0.88rem;
+  color: var(--d-ink-2);
+}
+
+.flowShot {
+  margin: 2rem 0 0;
+}
+
+.flowShot img {
+  display: block;
+  width: 100%;
+  height: auto;
+  border: 1px solid var(--d-line);
+  border-radius: 12px;
+}
+
+.flowShot figcaption {
+  margin-top: 0.6rem;
+  font-size: var(--d-step--1);
+  color: var(--d-ink-2);
+}
+
+/* ---------- desktop ---------- */
+
+.desktop {
+  max-width: var(--d-max);
+  margin: 0 auto;
+  padding: 4rem var(--d-gutter) 0;
+}
+
+.desktopInner {
+  border: 1px solid var(--d-line);
+  border-left: 3px solid var(--d-flag);
+  border-radius: 12px;
+  background: var(--d-surface);
+  padding: 2rem;
+}
+
+.badge {
+  display: inline-block;
+  font-family: var(--d-mono);
+  font-size: 0.68rem;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--d-flag);
+  background: var(--d-flag-soft);
+  border-radius: 4px;
+  padding: 0.15rem 0.5rem;
+  margin-bottom: 0.8rem;
+}
+
+.desktopHead h2 {
+  font-size: var(--d-step-2);
+  margin-bottom: 0.7rem;
+}
+
+.desktopHead p {
+  color: var(--d-ink-2);
+  max-width: 62ch;
+}
+
+.desktopBody {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 0.9fr);
+  gap: 2rem;
+  margin-top: 1.75rem;
+}
+
+.desktopCaveats {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1.1rem;
+}
+
+.desktopCaveats h3 {
+  font-size: 0.95rem;
+  margin-bottom: 0.25rem;
+}
+
+.desktopCaveats p {
+  font-size: 0.88rem;
+  color: var(--d-ink-2);
+}
+
+.desktopFiles h3 {
+  font-size: 0.8rem;
+  font-family: var(--d-mono);
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--d-ink-2);
+  margin-bottom: 0.7rem;
+}
+
+.desktopFiles > ul {
+  list-style: none;
+  margin: 0 0 1rem;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+}
+
+.desktopFiles > ul li {
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+}
+
+.desktopFiles > ul span {
+  font-size: 0.78rem;
+  color: var(--d-ink-2);
+}
+
+.desktopFiles code {
+  font-family: var(--d-mono);
+  font-size: 0.72rem;
+  background: var(--d-bg);
+  border: 1px solid var(--d-line);
+  border-radius: 5px;
+  padding: 0.15rem 0.4rem;
+  word-break: break-all;
+}
+
+.desktopFiles p {
+  margin-bottom: 0.75rem;
+}
+
+/* ---------- install / platforms ---------- */
+
+.install {
+  max-width: var(--d-max);
+  margin: 0 auto;
+  padding: 4rem var(--d-gutter) 0;
+}
+
+.installGrid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.15fr) minmax(0, 0.85fr);
+  gap: 2.5rem;
+}
+
+.installGrid h2 {
+  font-size: var(--d-step-2);
+  margin-bottom: 1.1rem;
+}
+
+.routeList,
+.platformList {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.routeList li {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  padding: 0.9rem 0;
+  border-top: 1px solid var(--d-line);
+}
+
+.routeList li:last-child {
+  border-bottom: 1px solid var(--d-line);
+}
+
+.routeList strong {
+  margin-right: 0.6rem;
+}
+
+.routeList span {
+  color: var(--d-ink-2);
+  font-size: var(--d-step--1);
+}
+
+.routeList code {
+  font-family: var(--d-mono);
+  font-size: 0.76rem;
+  background: var(--d-surface);
+  border: 1px solid var(--d-line);
+  border-radius: 5px;
+  padding: 0.2rem 0.45rem;
+  align-self: flex-start;
+  max-width: 100%;
+  overflow-x: auto;
+}
+
+.platformList li {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 0.15rem 0.75rem;
+  padding: 0.9rem 0;
+  border-top: 1px solid var(--d-line);
+}
+
+.platformList li:last-child {
+  border-bottom: 1px solid var(--d-line);
+}
+
+.platformList span {
+  grid-column: 1;
+  font-size: var(--d-step--1);
+  color: var(--d-ink-2);
+}
+
+.platformList em,
+.platformList a {
+  grid-column: 2;
+  grid-row: 1 / span 2;
+  align-self: center;
+  font-style: normal;
+  font-size: var(--d-step--1);
+  font-weight: 650;
+  text-align: right;
+}
+
+.ok a,
+.ok em {
+  color: var(--d-accent);
+}
+
+.pending a,
+.pending em {
+  color: var(--d-flag);
+}
+
+/* ---------- handoff ---------- */
+
+.handoff {
+  margin-top: 4.5rem;
+  border-top: 1px solid var(--d-line);
+  background: var(--d-surface);
+}
+
+.handoffInner {
+  max-width: var(--d-max);
+  margin: 0 auto;
+  padding: 3.5rem var(--d-gutter);
+}
+
+.handoffKicker {
+  font-family: var(--d-mono);
+  font-size: 0.72rem;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--d-accent);
+  margin-bottom: 0.9rem;
+}
+
+.handoffHead {
+  display: grid;
+  grid-template-columns: minmax(0, 1.1fr) minmax(0, 0.9fr);
+  gap: 2.5rem;
+  align-items: end;
+}
+
+.handoffInner h2 {
+  font-size: var(--d-step-3);
+  max-width: 24ch;
+}
+
+.handoffLede {
+  color: var(--d-ink-2);
+  max-width: 48ch;
+}
+
+.handoffGrid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 1rem;
+  margin-top: 2rem;
+}
+
+.handoffCard {
+  position: relative;
+  display: block;
+  padding: 1.1rem 2.4rem 1.1rem 1.2rem;
+  border: 1px solid var(--d-line-strong);
+  border-radius: 10px;
+  background: var(--d-bg);
+  text-decoration: none;
+  color: var(--d-ink);
+}
+
+.handoffCard:hover {
+  text-decoration: none;
+  border-color: var(--d-accent);
+  color: var(--d-ink);
+}
+
+.handoffTitle {
+  display: block;
+  font-weight: 650;
+  margin-bottom: 0.25rem;
+}
+
+.handoffBody {
+  display: block;
+  font-size: var(--d-step--1);
+  color: var(--d-ink-2);
+}
+
+.handoffArrow {
+  position: absolute;
+  top: 1.1rem;
+  right: 1.1rem;
+  color: var(--d-accent);
+}
+
+/* ---------- footer ---------- */
+
+.footer {
+  border-top: 1px solid var(--d-line);
+  background: var(--d-bg);
+}
+
+.footerInner {
+  max-width: var(--d-max);
+  margin: 0 auto;
+  padding: 2.5rem var(--d-gutter) 1.5rem;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 2rem;
+  align-items: start;
+}
+
+.footerBrand {
+  display: flex;
+  gap: 0.7rem;
+  align-items: flex-start;
+}
+
+.footerBrand .brandName {
+  margin-bottom: 0.3rem;
+}
+
+.footerNav {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 1.5rem;
+}
+
+.footerNav div {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+
+.footerNav a {
+  color: var(--d-ink-2);
+  font-size: var(--d-step--1);
+  text-decoration: none;
+}
+
+.footerNav a:hover {
+  color: var(--d-accent);
+  text-decoration: none;
+}
+
+.footerHeading {
+  font-family: var(--d-mono);
+  font-size: 0.7rem;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--d-ink);
+  margin-bottom: 0.2rem;
+}
+
+.footerLegal {
+  max-width: var(--d-max);
+  margin: 0 auto;
+  padding: 0 var(--d-gutter) 2.5rem;
+  font-size: var(--d-step--1);
+  color: var(--d-ink-2);
+}
+
+/* ---------- narrow ---------- */
+
+@media (max-width: 1024px) {
+  .heroGrid,
+  .desktopBody,
+  .installGrid {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 2rem;
+  }
+
+  .bento {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .cellWide,
+  .cellAgents {
+    grid-column: span 2;
+    grid-row: auto;
+  }
+
+  .agentGrid {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
+  .flowList {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .flowList li:nth-child(2n) {
+    border-right: none;
+  }
+
+  .handoffGrid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 720px) {
+  /*
+   * Collapse the nav to its first item rather than removing it: a header with
+   * no way into the docs is not a smaller header, it is a broken one.
+   */
+  .nav {
+    gap: 0;
+  }
+
+  .nav a + a {
+    display: none;
+  }
+
+  /* Wrap rather than scroll sideways at phone width. */
+  .command {
+    align-items: flex-start;
+  }
+
+  .command code {
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
+
+  .stats {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .stats > div:nth-child(2n) {
+    border-right: none;
+  }
+
+  .stats > div:nth-child(-n + 2) {
+    border-bottom: 1px solid var(--d-line);
+  }
+
+  .bento {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .cellWide,
+  .cellAgents {
+    grid-column: span 1;
+  }
+
+  .agentGrid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .flowList {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .flowList li {
+    border-right: none;
+    border-bottom: 1px solid var(--d-line);
+    padding-right: 0;
+  }
+
+  .handoffGrid,
+  .handoffHead,
+  .footerInner,
+  .footerNav {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 1rem;
+  }
+
+  .desktopInner {
+    padding: 1.4rem 1.25rem;
+  }
+
+  .hero {
+    padding-top: 2.5rem;
+  }
+}
+
+@media (max-width: 400px) {
+  .headerCta {
+    padding: 0.42rem 0.6rem;
+    font-size: 0.8rem;
+  }
+
+  .headerInner {
+    gap: 0.6rem;
+  }
+}
