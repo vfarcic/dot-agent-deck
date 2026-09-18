@@ -322,11 +322,263 @@ pub struct ZoomSettings {
     pub level: ZoomLevel,
 }
 
+/// The `[voice]` section — PRD #802's tenant, stored here.
+///
+/// # Three choices, three closed enums, and no fourth field
+///
+/// Every field is a [`VoiceToken`] enum rather than a `String`, and that is the
+/// right type rather than a way around
+/// `xtask/linkage-check`'s `ALLOWED_FIELD_TYPES`: the app supports exactly the
+/// backends it ships an adapter for, so the set of legal values is closed and a
+/// free string would be a promise it cannot keep. The guard is what forced the
+/// conversation, which is the friction working.
+///
+/// # What is deliberately NOT here
+///
+/// **No credential, in any form** — that is PRD #803's hard rule and
+/// [`crate::secrets`] is where one goes instead. **Not even a boolean saying
+/// one is stored**, which the rule would have allowed: the panel asks
+/// [`crate::secrets::SecretStore::status`] instead, so the answer comes from
+/// the keychain itself and cannot go stale against it. That also keeps `bool`
+/// off `ALLOWED_FIELD_TYPES`, which is a small win worth having.
+///
+/// **No model identifier.** PRD #802's Open Question 4 — which model the keyed
+/// remote intent backend defaults to — is explicitly M5's to answer against a
+/// measurement, and a field added here now would be this section inventing that
+/// answer. M5 adds one if it needs one.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct VoiceSettings {
+    pub activation: ActivationMode,
+    pub intent: IntentBackend,
+    pub transcription: TranscriptionBackend,
+}
+
+/// The longest `[voice]` token this build will accept, on either side.
+///
+/// The tokens are at most eight bytes today. 64 leaves room for a backend name
+/// a future build invents while making a payload-shaped value impossible — the
+/// same number and the same reasoning as [`MAX_APPEARANCE_TOKEN_BYTES`], and
+/// the bound is what stops a compromised webview having a megabyte allocated
+/// and lowercased before anything looks at it.
+pub const MAX_VOICE_TOKEN_BYTES: usize = 64;
+
+/// A settings value stored as one lowercase token, folding an unknown token to
+/// the default.
+///
+/// [`AppearanceMode`] established this shape and spells the whole of it out by
+/// hand; three more copies of that visitor would be three more places for the
+/// length bound to be forgotten, so the `[voice]` enums share one. It is
+/// deliberately a trait rather than a macro: the guard in
+/// `xtask/linkage-check/src/desktop_settings_secrets.rs` reads this file as
+/// **text**, one field per line, and a macro that generated settings structs
+/// would be invisible to it. Nothing here generates a struct — only the
+/// serde plumbing for an enum — but keeping to what a text scan can read is a
+/// property of this file worth not spending.
+///
+/// **An unknown token is not an error**, for [`AppearanceMode::from_str_lossy`]'s
+/// reason exactly: a document written by a newer build may name a backend this
+/// one has never heard of, and losing the whole document over one unreadable
+/// field is the opposite of the unknown-key tolerance the rest of the schema is
+/// built for. An **over-length** token is a different thing — a malformed
+/// document rather than an unknown value — and is an error.
+trait VoiceToken: Copy + Default {
+    /// Every token this build knows, for the error message and for the tests.
+    const TOKENS: &'static [&'static str];
+    /// What the deserializer says it expected.
+    const LABEL: &'static str;
+
+    /// The exact token written to TOML and JSON.
+    fn as_str(self) -> &'static str;
+
+    /// Parse a stored token, falling back to the default.
+    fn from_str_lossy(raw: &str) -> Self;
+}
+
+/// [`VoiceToken`]'s visitor: length first, then the folding parse.
+///
+/// The order is the point, and it is [`AppearanceModeVisitor`]'s: `from_str_lossy`
+/// trims and lowercases, which allocates a copy of whatever it was handed, so
+/// the bound has to be judged on the borrowed input before anything allocates.
+struct VoiceTokenVisitor<T>(std::marker::PhantomData<T>);
+
+impl<T: VoiceToken> serde::de::Visitor<'_> for VoiceTokenVisitor<T> {
+    type Value = T;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} of at most {MAX_VOICE_TOKEN_BYTES} bytes, one of {}",
+            T::LABEL,
+            T::TOKENS.join(", ")
+        )
+    }
+
+    fn visit_str<E: serde::de::Error>(self, raw: &str) -> Result<T, E> {
+        if raw.len() > MAX_VOICE_TOKEN_BYTES {
+            return Err(E::custom(format!(
+                "{} is at most {MAX_VOICE_TOKEN_BYTES} bytes; got {}",
+                T::LABEL,
+                raw.len()
+            )));
+        }
+        Ok(T::from_str_lossy(raw))
+    }
+}
+
+/// Which `Transcriber` turns speech into text (PRD #802 M7).
+///
+/// **`Off` is the default and is not a degraded mode.** PRD #802 says so as a
+/// product statement: transcription is the one stage with no no-key trick, so
+/// with nothing configured the surface still works from typed input through the
+/// identical resolve → validate → execute → report path, and the panel says
+/// what to add. Local whisper is the deferred milestone (D1) that removes the
+/// requirement; it is not a variant here because this build ships no adapter
+/// for it, and a settings value the app cannot honour is a lie in a file the
+/// user can read.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum TranscriptionBackend {
+    /// No microphone path; typed input only.
+    #[default]
+    Off,
+    /// The keyed remote service M7 ships. Its credential lives in
+    /// [`crate::secrets::SecretId::VoiceTranscription`].
+    Remote,
+}
+
+impl VoiceToken for TranscriptionBackend {
+    const TOKENS: &'static [&'static str] = &["off", "remote"];
+    const LABEL: &'static str = "a transcription backend";
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Remote => "remote",
+        }
+    }
+
+    fn from_str_lossy(raw: &str) -> Self {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "remote" => Self::Remote,
+            _ => Self::default(),
+        }
+    }
+}
+
+/// Which `IntentResolver` turns a transcript into an action (PRD #802 M5).
+///
+/// **`Claude` is the default because it needs no key and no download**, which
+/// is what makes the feature try-able on the day it ships: the user already has
+/// a pre-authenticated agent CLI on the box, and a print-mode call to it
+/// resolves a closed-set pick — measured in the PRD, including the "none of
+/// these" answer that is most of the safety. It is also slow (4.5 s wall), and
+/// `Remote` is the same milestone's answer to that.
+///
+/// The two CLI variants and the remote one are one enum rather than a backend
+/// choice plus a CLI choice, because a separate `agent` field would be
+/// meaningless whenever the backend is remote. Each variant names one adapter.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum IntentBackend {
+    /// The `claude` CLI in print mode. No key of the app's own, no download.
+    #[default]
+    Claude,
+    /// The `opencode` CLI. Best-effort until someone runs it — PRD #802 says so
+    /// rather than claiming parity it has not measured.
+    Opencode,
+    /// The keyed remote API, for the latency. Its credential lives in
+    /// [`crate::secrets::SecretId::VoiceIntent`].
+    Remote,
+}
+
+impl VoiceToken for IntentBackend {
+    const TOKENS: &'static [&'static str] = &["claude", "opencode", "remote"];
+    const LABEL: &'static str = "an intent backend";
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Claude => "claude",
+            Self::Opencode => "opencode",
+            Self::Remote => "remote",
+        }
+    }
+
+    fn from_str_lossy(raw: &str) -> Self {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "opencode" => Self::Opencode,
+            "remote" => Self::Remote,
+            _ => Self::default(),
+        }
+    }
+}
+
+/// How the microphone is started and stopped (PRD #802 M7).
+///
+/// **One variant today, and that is the truthful shape rather than an
+/// oversight.** PRD #802 ships one activation mode — press once to start, press
+/// once to stop — and puts hold-to-talk and always-on-with-VAD in D4, waiting
+/// on this one being used enough to say what the other two are worth. Listing
+/// them here before an adapter exists would let a user select a mode the app
+/// cannot honour.
+///
+/// The field exists now rather than arriving with D4 because the document is
+/// where the choice belongs and adding a section is the expensive half; adding
+/// a variant to one is a line.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ActivationMode {
+    /// Press once to start listening, press once to stop.
+    #[default]
+    Toggle,
+}
+
+impl VoiceToken for ActivationMode {
+    const TOKENS: &'static [&'static str] = &["toggle"];
+    const LABEL: &'static str = "an activation mode";
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Toggle => "toggle",
+        }
+    }
+
+    fn from_str_lossy(_raw: &str) -> Self {
+        Self::default()
+    }
+}
+
+macro_rules! voice_token_serde {
+    ($($ty:ty),+ $(,)?) => {$(
+        impl $ty {
+            /// The exact token written to TOML and JSON.
+            pub fn as_token(self) -> &'static str {
+                <Self as VoiceToken>::as_str(self)
+            }
+        }
+
+        impl Serialize for $ty {
+            fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                serializer.serialize_str(self.as_token())
+            }
+        }
+
+        impl<'de> Deserialize<'de> for $ty {
+            fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+                deserializer.deserialize_str(VoiceTokenVisitor::<Self>(std::marker::PhantomData))
+            }
+        }
+    )+};
+}
+
+// Three identical serde impls, written once. The macro generates NO struct and
+// NO field — see [`VoiceToken`] for why that boundary matters to the
+// linkage-check scanner that reads this file as text.
+voice_token_serde!(ActivationMode, IntentBackend, TranscriptionBackend);
+
 /// The whole settings document.
 ///
 /// Deliberately carries only the sections that have a tenant. A container that
-/// grows opinions about its contents blocks its dependents, so #802's voice
-/// backends add their own section when they land — it is not pre-created here.
+/// grows opinions about its contents blocks its dependents, which is why
+/// #802's `[voice]` section arrived with #802's own panel rather than being
+/// pre-created here for it.
 ///
 /// **No `Eq`**, and that is [`ZoomLevel`]'s doing rather than an oversight: it
 /// wraps an `f64`, which is `PartialEq` but not `Eq` because `NaN != NaN`.
@@ -341,6 +593,27 @@ pub struct DesktopSettings {
     /// *empty* — see [`EndpointSettings`] for why that distinction is what
     /// stops a webview deleting decks it cannot render.**
     pub endpoints: Option<EndpointSettings>,
+    /// PRD #802's tenant. **An `Option`, for `endpoints`' reason rather than
+    /// for a weaker version of it.**
+    ///
+    /// `desktop_set_settings` takes the whole document from the webview, and
+    /// [`merged_document`] makes the decoded struct authoritative over the keys
+    /// it owns. So a plain `VoiceSettings` would arrive as the *default* from
+    /// any client that did not send one, and the merge would write that default
+    /// over a choice the user had made. `None` makes "I am not telling you
+    /// about this section" representable, TOML omits it, and the merge leaves
+    /// the file alone.
+    ///
+    /// The section's panel ships in the same commit, so the frontend does
+    /// round-trip it — [`normalizeDesktopSettings`] rebuilds it field by field
+    /// rather than defaulting it — and the `Option` is the belt beside that
+    /// brace. What it costs is that a reader of this type has to materialise
+    /// defaults for display, which for now is the webview's job alone: nothing
+    /// under `src/` reads this section yet, and M5's backends are what will.
+    ///
+    /// [`merged_document`]: fn@merged_document
+    /// [`normalizeDesktopSettings`]: https://github.com/vfarcic/dot-agent-deck/blob/main/desktop/src/lib/bridge.ts
+    pub voice: Option<VoiceSettings>,
     pub zoom: ZoomSettings,
 }
 
@@ -350,6 +623,7 @@ impl Default for DesktopSettings {
             version: SETTINGS_VERSION,
             appearance: AppearanceSettings::default(),
             endpoints: None,
+            voice: None,
             zoom: ZoomSettings::default(),
         }
     }
@@ -2642,6 +2916,243 @@ mod tests {
         let loaded = load_from(&path);
         assert_eq!(loaded.appearance.mode, AppearanceMode::Light);
         assert_eq!(loaded.version, 1);
+        // `[voice]` is a section this build DOES own since PRD #802 M4, and
+        // `backend` is not one of its fields — so this line is now covering
+        // "an unknown field inside a known section" rather than "an unknown
+        // section", which is the other half of the same tolerance and is worth
+        // keeping. The unknown-section half is covered by `future_toplevel`
+        // above and by `a_hand_written_comment_survives_an_app_driven_save`.
+        assert_eq!(loaded.voice, Some(VoiceSettings::default()));
+    }
+
+    /// Scenario: a document names every `[voice]` choice; it round-trips
+    /// through TOML and through the JSON the webview receives, with the same
+    /// tokens on both wires.
+    ///
+    /// The section is PRD #802's tenant and both wires are its contract: the
+    /// TOML is what a user hand-edits and the JSON is what the panel renders,
+    /// and every field name is one word so the two agree byte for byte.
+    #[test]
+    fn a_voice_section_round_trips_through_toml_and_json() {
+        let dir = tempdir();
+        let path = dir.path().join(SETTINGS_FILE_NAME);
+        std::fs::write(
+            &path,
+            "version = 1\n\n\
+             [voice]\n\
+             activation = \"toggle\"\n\
+             intent = \"opencode\"\n\
+             transcription = \"remote\"\n",
+        )
+        .unwrap();
+
+        let loaded = load_from(&path);
+        let voice = loaded.voice.clone().expect("the section is present");
+        assert_eq!(voice.activation, ActivationMode::Toggle);
+        assert_eq!(voice.intent, IntentBackend::Opencode);
+        assert_eq!(voice.transcription, TranscriptionBackend::Remote);
+
+        // The JSON the webview receives carries the same tokens, not an index
+        // or a struct — one word per field, so TOML and JSON agree.
+        assert_eq!(
+            serde_json::to_value(&voice).unwrap(),
+            serde_json::json!({
+                "activation": "toggle",
+                "intent": "opencode",
+                "transcription": "remote",
+            })
+        );
+
+        // And a save puts back exactly what was read.
+        save_to(&path, &loaded).unwrap();
+        assert_eq!(load_from(&path), loaded);
+    }
+
+    /// Scenario: a document with no `[voice]` section at all — every document
+    /// on disk today — loads, and the section reads as *unspecified* rather
+    /// than as empty.
+    ///
+    /// The distinction is [`DesktopSettings::voice`]'s whole reason for being
+    /// an `Option`, and the defaults it materialises to are the product
+    /// decision: **no transcription** (PRD #802 ships the surface working from
+    /// typed input, which is a statement rather than a degraded mode), the
+    /// **agent CLI** for intent (no key, no download, try-able on day one), and
+    /// the one **activation mode** that ships.
+    #[test]
+    fn an_absent_voice_section_reads_as_unspecified_with_this_builds_defaults() {
+        let dir = tempdir();
+        let path = dir.path().join(SETTINGS_FILE_NAME);
+        std::fs::write(&path, "version = 1\n\n[appearance]\nmode = \"dark\"\n").unwrap();
+
+        let loaded = load_from(&path);
+        assert_eq!(loaded.voice, None, "absence must survive the load");
+
+        let defaults = VoiceSettings::default();
+        assert_eq!(defaults.transcription, TranscriptionBackend::Off);
+        assert_eq!(defaults.intent, IntentBackend::Claude);
+        assert_eq!(defaults.activation, ActivationMode::Toggle);
+    }
+
+    /// Scenario: a document names a `[voice]` backend this build has never
+    /// heard of, and one that is absurdly long. The first is tolerated and the
+    /// second is refused, which are deliberately different answers.
+    ///
+    /// **An unrecognised token folds to the default** — PRD #802 asks for
+    /// exactly this, "closed enums with folding deserializers in the
+    /// `AppearanceMode` idiom" — so a document written by a newer build with
+    /// more backends still loads, and the rest of the user's settings are not
+    /// lost over one unreadable field. What it costs is stated rather than
+    /// hidden: the folded value is what the **next save writes back**, so an
+    /// older build opened against a newer build's document replaces that
+    /// choice. `AppearanceMode` makes the same trade;
+    /// [`Selection`] is the type that does not, because an unknown selection is
+    /// stored as the [`EndpointId`] it was and written back unchanged.
+    ///
+    /// **An over-length token is an error**, not the fallback: an unrecognised
+    /// token is a mode this build has not heard of and a 4 KB one is a
+    /// malformed document. On the disk path that means the whole document falls
+    /// back to defaults, which is the ordinary malformed-document behaviour;
+    /// on the IPC path it fails argument deserialisation before anything
+    /// allocates a normalised copy.
+    #[test]
+    fn an_unknown_voice_token_folds_to_the_default_and_an_over_long_one_is_refused() {
+        let dir = tempdir();
+        let path = dir.path().join(SETTINGS_FILE_NAME);
+        std::fs::write(
+            &path,
+            "version = 1\n\n\
+             [voice]\n\
+             intent = \"a-backend-from-2027\"\n\
+             transcription = \"local-whisper\"\n",
+        )
+        .unwrap();
+        let loaded = load_from(&path);
+        let voice = loaded.voice.clone().expect("the section is present");
+        assert_eq!(voice.intent, IntentBackend::Claude);
+        assert_eq!(voice.transcription, TranscriptionBackend::Off);
+
+        // The cost, pinned rather than left implicit: the next save writes the
+        // folded value, so the newer build's choice is gone.
+        save_to(&path, &loaded).unwrap();
+        let reread = std::fs::read_to_string(&path).unwrap();
+        assert!(reread.contains("intent = \"claude\""), "{reread}");
+        assert!(!reread.contains("2027"), "{reread}");
+
+        // Over-length is a different answer: the document is malformed, so the
+        // load falls back to defaults entirely rather than folding one field.
+        let long = "x".repeat(MAX_VOICE_TOKEN_BYTES + 1);
+        std::fs::write(
+            &path,
+            format!(
+                "version = 1\n\n[appearance]\nmode = \"dark\"\n\n[voice]\nintent = \"{long}\"\n"
+            ),
+        )
+        .unwrap();
+        let (settings, problem) = load_document(&path);
+        assert_eq!(settings, DesktopSettings::default());
+        assert_eq!(
+            settings.appearance.mode,
+            AppearanceMode::System,
+            "a malformed document falls back whole, taking the appearance with it"
+        );
+        let problem = problem.expect("a malformed document must report why");
+        assert!(problem.public().contains("line"), "{}", problem.public());
+    }
+
+    /// The `[voice]` tokens are duplicated in `desktop/src/lib/bridge.ts`, so
+    /// both copies are pinned value-by-value and each points at the other —
+    /// the same arrangement `zoom_ladder_matches_the_frontend_copy` makes, and
+    /// for the same reason: if they drift, the panel offers a token this side
+    /// folds away, and the user's choice silently does not stick.
+    ///
+    /// The round-trip half is the one that matters most under a **folding**
+    /// deserializer, and it is the hazard that design carries: a token listed
+    /// here but missing an arm in `from_str_lossy` would not fail to parse — it
+    /// would quietly become the default, so the panel would offer a choice that
+    /// never takes.
+    #[test]
+    fn the_voice_tokens_match_the_frontends_copy() {
+        assert_eq!(
+            <ActivationMode as VoiceToken>::TOKENS,
+            ["toggle"],
+            "keep this identical to VOICE_ACTIVATION_MODES in desktop/src/lib/bridge.ts"
+        );
+        assert_eq!(
+            <IntentBackend as VoiceToken>::TOKENS,
+            ["claude", "opencode", "remote"],
+            "keep this identical to VOICE_INTENT_BACKENDS in desktop/src/lib/bridge.ts"
+        );
+        assert_eq!(
+            <TranscriptionBackend as VoiceToken>::TOKENS,
+            ["off", "remote"],
+            "keep this identical to VOICE_TRANSCRIPTION_BACKENDS in desktop/src/lib/bridge.ts"
+        );
+
+        fn round_trips<T: VoiceToken + std::fmt::Debug + PartialEq>() {
+            for token in T::TOKENS {
+                assert_eq!(
+                    T::from_str_lossy(token).as_str(),
+                    *token,
+                    "`{token}` is offered but does not parse back to itself, so choosing \
+                     it would silently store the default"
+                );
+            }
+            assert!(
+                T::TOKENS.contains(&T::default().as_str()),
+                "the default is not one of the offered tokens"
+            );
+            // Case and surrounding whitespace are forgiven, because the
+            // document is hand-editable.
+            for token in T::TOKENS {
+                assert_eq!(T::from_str_lossy(&format!("  {token}  ")).as_str(), *token);
+                assert_eq!(T::from_str_lossy(&token.to_uppercase()).as_str(), *token);
+            }
+        }
+        round_trips::<ActivationMode>();
+        round_trips::<IntentBackend>();
+        round_trips::<TranscriptionBackend>();
+    }
+
+    /// Scenario: a document holds a `[voice]` section; a client whose UI cannot
+    /// render voice saves an appearance change over it. The section must still
+    /// be there.
+    ///
+    /// The property [`DesktopSettings::voice`] is an `Option` for, and the
+    /// twin of `a_client_that_cannot_render_endpoints_cannot_delete_them`. If
+    /// it were a plain section the webview's fixed-key-set normaliser would
+    /// send the default, and the merge would write that over the user's
+    /// choices — silently, on a save triggered by changing the theme.
+    #[test]
+    fn a_client_that_cannot_render_voice_cannot_delete_it() {
+        let dir = tempdir();
+        let path = dir.path().join(SETTINGS_FILE_NAME);
+        std::fs::write(
+            &path,
+            "version = 1\n\n\
+             [appearance]\n\
+             mode = \"light\"\n\n\
+             [voice]\n\
+             intent = \"remote\"\n\
+             transcription = \"remote\"\n",
+        )
+        .unwrap();
+
+        // A document from a build with no voice UI: `None`, not an empty
+        // section.
+        let blind = DesktopSettings {
+            appearance: AppearanceSettings {
+                mode: AppearanceMode::Dark,
+            },
+            voice: None,
+            ..DesktopSettings::default()
+        };
+        save_to(&path, &blind).unwrap();
+
+        let reloaded = load_from(&path);
+        assert_eq!(reloaded.appearance.mode, AppearanceMode::Dark);
+        let voice = reloaded.voice.expect("the section must survive");
+        assert_eq!(voice.intent, IntentBackend::Remote);
+        assert_eq!(voice.transcription, TranscriptionBackend::Remote);
     }
 
     /// The zoom ladder is duplicated in `desktop/src/lib/zoom.ts`, so both
@@ -2895,6 +3406,14 @@ mod tests {
     /// naive format-preserving merge still drops: the comment lives in the
     /// value's decor, so replacing the value takes it unless the decor is
     /// carried across (see [`replace_item`]).
+    ///
+    /// The unknown section in the fixture was `[voice]` until PRD #802 M4 took
+    /// that name, which is the mechanism this test covers demonstrating itself:
+    /// once a build owns a section the merge writes the keys the struct owns
+    /// into it, so it stopped being a stand-in for a section nobody owns. The
+    /// stand-in moved rather than the assertion being relaxed — what is being
+    /// proven is that an app-driven save leaves a section this build knows
+    /// nothing about exactly as the user wrote it.
     #[test]
     fn a_hand_written_comment_survives_an_app_driven_save() {
         let dir = tempdir();
@@ -2908,9 +3427,9 @@ mod tests {
              mode = \"light\"  # flip this to \"dark\" at night\n\n\
              [zoom]\n\
              level = 1.0\n\n\
-             # everything below is for #802, not written by the app\n\
-             [voice]\n\
-             stages = [\"stt\", \"intent\"]\n",
+             # a section no build of this app owns\n\
+             [experiments]\n\
+             flags = [\"a\", \"b\"]\n",
         )
         .unwrap();
 
@@ -2929,9 +3448,9 @@ mod tests {
              mode = \"dark\"  # flip this to \"dark\" at night\n\n\
              [zoom]\n\
              level = 1.0\n\n\
-             # everything below is for #802, not written by the app\n\
-             [voice]\n\
-             stages = [\"stt\", \"intent\"]\n",
+             # a section no build of this app owns\n\
+             [experiments]\n\
+             flags = [\"a\", \"b\"]\n",
             "a hand-written annotation did not survive the save"
         );
     }
@@ -3982,6 +4501,13 @@ mod tests {
         // endpoints unable to delete them (see `EndpointSettings`). The JSON
         // half below *does* change, to `"endpoints": null`, and that null is
         // the same statement on the IPC wire: "unspecified", not "empty".
+        //
+        // PRD #802 M4's `[voice]` is the second section to arrive this way and
+        // the reasoning is `endpoints`' rather than a weaker echo of it: a
+        // plain `VoiceSettings` would arrive as the default from any client
+        // that did not send one, and the merge would then write that default
+        // over a choice the user had made. So the TOML below is unchanged for
+        // a second time, and the JSON gains `"voice": null`.
         const FRESH: &str =
             "version = 1\n\n[appearance]\nmode = \"system\"\n\n[zoom]\nlevel = 1.0\n";
         let rendered = toml_edit::ser::to_string_pretty(&DesktopSettings::default()).unwrap();
@@ -4005,6 +4531,7 @@ mod tests {
                 "version": 1,
                 "appearance": { "mode": "system" },
                 "endpoints": null,
+                "voice": null,
                 "zoom": { "level": 1.0 },
             })
         );
@@ -4233,6 +4760,16 @@ forms it is.";
                     user: Some(SshUser::parse("dev").unwrap()),
                 }],
                 selection: Selection::One(EndpointId::parse("deck1").unwrap()),
+            }),
+            // PRD #802 M4. Present, and with a non-default value in every
+            // field: the tripwire and the sentinel sweep are both derived from
+            // a serialised document, so a section left `None` here would be a
+            // section neither of them walks — which is exactly the gap this
+            // function's own doc comment exists to close.
+            voice: Some(VoiceSettings {
+                activation: ActivationMode::Toggle,
+                intent: IntentBackend::Remote,
+                transcription: TranscriptionBackend::Remote,
             }),
             ..DesktopSettings::default()
         }
@@ -5067,10 +5604,16 @@ forms it is.";
     // PRD #741 M6 — endpoint storage
     // ---------------------------------------------------------------------
 
-    /// Scenario: serialise a document holding one fully-specified remote deck,
-    /// save it, read it back, and pin the exact bytes. This is the shape a user
-    /// hand-edits and the shape M7's panel writes, so it is pinned the way the
-    /// default document is — a diff here is the review prompt.
+    /// Scenario: serialise a document holding one fully-specified remote deck
+    /// and a `[voice]` section, save it, read it back, and pin the exact bytes.
+    /// This is the shape a user hand-edits and the shape the panels write, so
+    /// it is pinned the way the default document is — a diff here is the review
+    /// prompt.
+    ///
+    /// It is also where the `[voice]` tokens are pinned as they appear ON DISK,
+    /// which is the half a user reads and hand-edits. PRD #802 M4 added the
+    /// section; the frontend's own copy of these tokens is pinned against this
+    /// crate by `the_voice_tokens_match_the_frontends_copy`.
     #[test]
     fn a_populated_endpoint_document_is_pinned_and_round_trips() {
         const STORED: &str = "\
@@ -5090,6 +5633,11 @@ jump = \"bastion\"
 port = 2222
 socket = \"/run/user/1000/dot-agent-deck-attach.sock\"
 user = \"dev\"
+
+[voice]
+activation = \"toggle\"
+intent = \"remote\"
+transcription = \"remote\"
 
 [zoom]
 level = 1.0

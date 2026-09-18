@@ -18,13 +18,22 @@
  * key/value widgets, and a renderer built to fit both would fit neither. A
  * panel is an ordinary React component and owns its own layout.
  *
- * Secrets never travel through here. A settings document may hold a non-secret
+ * Secrets never travel through here, and since PRD #802 M4 there is somewhere
+ * else for them to go: `useSettingsBridge()`'s `storeSecret`/`forgetSecret`,
+ * which reach the OS keychain through `src-tauri/src/secrets.rs` and never put
+ * a value in the document. A settings document may hold a non-secret
  * *reference* — which backend holds the key, or a boolean saying one is stored —
- * and nothing more. The Rust-side check that pins this is a **naming tripwire,
- * not a security boundary**: it reads key names in the serialised document and
- * nothing else, so a field called `endpoint` holding a token passes it, and
- * nothing on this side of the bridge is scanned at all. Issue #827 carries the
- * checks #802 needs before it stores a real key.
+ * and nothing more.
+ *
+ * Two checks watch that and they establish different things. The Rust-side
+ * key-name check is a **naming tripwire, not a security boundary**: it reads key
+ * names in the serialised document and nothing else, so a field called
+ * `endpoint` holding a token passes it. `xtask/linkage-check`'s
+ * `desktop_settings_secrets` is the structural one — it pins the field TYPES the
+ * Rust schema may use (`String` is deliberately absent), this side's DTO names,
+ * and the `localStorage` key set. It is what went red when #802 added its
+ * section, which is how the credential ended up in the keychain rather than in
+ * the document.
  */
 import type { ComponentType } from "react";
 import type { DesktopSettingsDto } from "./bridge";

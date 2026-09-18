@@ -2263,9 +2263,20 @@ describe("desktop settings hold no credential (issue 827)", () => {
       // `Option<EndpointSettings>` reads as `None`, because `JSON.stringify`
       // drops an `undefined` value on the way to the bridge. The assertion
       // below pins that it carries no *value*.
-      expect(Object.keys(normalized).sort()).toEqual(["appearance", "endpoints", "version", "zoom"]);
+      expect(Object.keys(normalized).sort()).toEqual(["appearance", "endpoints", "version", "voice", "zoom"]);
       expect(normalized.endpoints).toBeUndefined();
       expect(JSON.parse(JSON.stringify(normalized))).not.toHaveProperty("endpoints");
+      // PRD #802 M4's `voice` takes the same shape for the same reason, and the
+      // `{ voice: { api_key, endpoint } }` payload above is the one that
+      // exercises the present case: a section that IS there is rebuilt field by
+      // field from the closed token sets, so the credential-shaped keys inside
+      // it are gone rather than carried. The sentinel assertion above is what
+      // proves the value went; this pins the key set it was rebuilt to.
+      if (normalized.voice) {
+        expect(Object.keys(normalized.voice).sort()).toEqual(["activation", "intent", "transcription"]);
+      } else {
+        expect(JSON.parse(JSON.stringify(normalized))).not.toHaveProperty("voice");
+      }
     }
     // A wrongly-typed known field falls back rather than propagating, the same
     // way `AppearanceMode::from_str_lossy` does Rust-side.

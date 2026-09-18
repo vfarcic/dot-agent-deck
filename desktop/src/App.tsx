@@ -596,7 +596,15 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
   const [confirm, setConfirm] = useState<ConfirmState>();
   // Memoised so the context value is stable across renders; `runtime.testEndpoint`
   // is itself stable for the lifetime of the bridge.
-  const settingsBridge = useMemo(() => ({ testEndpoint: runtime.testEndpoint }), [runtime.testEndpoint]);
+  const settingsBridge = useMemo(
+    () => ({
+      testEndpoint: runtime.testEndpoint,
+      secretStatus: runtime.secretStatus,
+      storeSecret: runtime.storeSecret,
+      forgetSecret: runtime.forgetSecret,
+    }),
+    [runtime.testEndpoint, runtime.secretStatus, runtime.storeSecret, runtime.forgetSecret],
+  );
   const { profiles, updateProfile, resetProfiles } = useAgentProfiles(snapshot.profiles);
   /*
    * PRD #819 M6: the projects come from the daemon and nothing is remembered.

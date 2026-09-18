@@ -10,6 +10,11 @@ mod endpoint_test;
 mod endpoint_field_parity;
 mod endpoint_tunnels;
 mod generation;
+// PRD #802 M4 — the credential seam PRD #803 M5 named, over the OS keychain.
+// Not voice-specific, so it is a module of its own rather than one under
+// `voice`: the rule it serves is #803's and any later feature needing a
+// credential uses the same store.
+mod secrets;
 // Tests only: the counted sweep that keeps `dto::DeckScope` from decaying into
 // a convention (issue #1116). No item outside `#[cfg(test)]`, so it adds
 // nothing to a normal build.
@@ -61,6 +66,9 @@ use crate::dto::{
     WorkflowRoleInput, ensure_desktop_workflow_platform_supported, map_project_listing,
     map_resolved_project, mint_desktop_pane_id, safe_message, selected_endpoint, validate_agent_id,
     validate_pasted_project_path, validate_start_fields, validate_workflow_shape,
+};
+use crate::secrets::{
+    KeychainSecretStore, Secret, SecretError, SecretId, SecretStatus, SecretStore,
 };
 use crate::settings::DesktopSettings;
 use crate::terminal::DesktopState;
@@ -1471,6 +1479,117 @@ async fn desktop_set_settings(
     Ok(settings)
 }
 
+/// The three credential commands (PRD #802 M4), and the one that is missing.
+///
+/// # There is no `desktop_load_secret`, deliberately
+///
+/// The webview may ask whether a credential is stored, replace one and forget
+/// one. It may **not** read one back, and that omission is the point of the
+/// seam rather than an oversight: PRD #803's rule is that a secret goes in
+/// neither `desktop.toml` nor `localStorage`, and a command returning a
+/// credential to the webview would put it one `JSON.stringify` away from the
+/// second half of that. `secrets::SecretStore::load` exists for the Rust side,
+/// where M5's and M7's backends make their network call — which is where the
+/// CSP already forces every network hop to happen, so nothing needs the value
+/// over there.
+///
+/// # Each one answers with the resulting status
+///
+/// So a panel needs no second round trip to know what it is now looking at, and
+/// cannot render a stale answer between the two.
+///
+/// # A failure is an `Err`, never a status saying "nothing stored"
+///
+/// The outcome PRD #802 M4 says to design against is *a user who thinks their
+/// key is stored and finds voice broken tomorrow.* A store that failed
+/// therefore rejects rather than resolving: the webview's `catch` is what shows
+/// the sentence. `secrets::SecretStatus::problem` covers the other direction —
+/// a *read* that could not find out, which is not the same as "nothing is
+/// stored" and must not render as it.
+///
+/// # Blocking
+///
+/// A keychain call is a D-Bus round trip on Linux and can prompt on every
+/// platform, so each one goes through `spawn_blocking` rather than sitting on
+/// the async runtime the other commands share.
+#[tauri::command]
+async fn desktop_secret_status(webview: Webview, id: String) -> Result<SecretStatus, String> {
+    ensure_main_webview(&webview)?;
+    let id = parse_secret_id(&id)?;
+    on_keychain(move |store| store.status(id)).await
+}
+
+#[tauri::command]
+async fn desktop_store_secret(
+    webview: Webview,
+    id: String,
+    secret: String,
+) -> Result<SecretStatus, String> {
+    ensure_main_webview(&webview)?;
+    let id = parse_secret_id(&id)?;
+    // The `Secret` is built here and moved into the closure, so the credential
+    // exists as a plain `String` for exactly as long as it takes serde to hand
+    // it over.
+    let secret = Secret::new(secret);
+    on_keychain(move |store| {
+        store.store(id, &secret)?;
+        Ok::<_, SecretError>(store.status(id))
+    })
+    .await?
+    .map_err(report_secret_error)
+}
+
+#[tauri::command]
+async fn desktop_forget_secret(webview: Webview, id: String) -> Result<SecretStatus, String> {
+    ensure_main_webview(&webview)?;
+    let id = parse_secret_id(&id)?;
+    on_keychain(move |store| {
+        store.delete(id)?;
+        Ok::<_, SecretError>(store.status(id))
+    })
+    .await?
+    .map_err(report_secret_error)
+}
+
+/// The webview names a credential by its token, and an unknown one is refused.
+///
+/// A closed set rather than a free string for `secrets::SecretId`'s reason: a
+/// caller that could pass any name could strand a key under one nothing later
+/// reads.
+fn parse_secret_id(raw: &str) -> Result<SecretId, String> {
+    SecretId::parse(raw).ok_or_else(|| {
+        format!(
+            "unknown credential id; the ids are {}",
+            SecretId::ALL
+                .iter()
+                .map(|id| id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    })
+}
+
+/// Run one blocking keychain operation off the async runtime.
+///
+/// The `Err` is the join failure — a panic inside the closure — and is separate
+/// from whatever the operation itself returned, which is why the two commands
+/// above have two `?`s.
+async fn on_keychain<T: Send + 'static>(
+    work: impl FnOnce(&KeychainSecretStore) -> T + Send + 'static,
+) -> Result<T, String> {
+    tauri::async_runtime::spawn_blocking(move || work(&KeychainSecretStore::new()))
+        .await
+        .map_err(|error| safe_message(format!("the credential store call failed: {error}")))
+}
+
+/// A failed credential operation, split the way a failed settings save is: the
+/// detail names whatever the platform said and belongs in the app's log, the
+/// webview gets the sentence.
+fn report_secret_error(error: SecretError) -> String {
+    eprintln!("{}", error.detail());
+    safe_message(error.public())
+}
+
 /// Put a saved document's deck selection into force (PRD #741 M7, completed at
 /// M9).
 ///
@@ -2192,6 +2311,9 @@ pub fn run() {
             desktop_test_endpoint,
             desktop_set_zoom,
             desktop_run_action,
+            desktop_secret_status,
+            desktop_store_secret,
+            desktop_forget_secret,
         ])
         .build(tauri::generate_context!())
         .expect("failed to build dot-agent-deck desktop application");

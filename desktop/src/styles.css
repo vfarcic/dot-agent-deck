@@ -805,6 +805,13 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 /* A port is four digits; a full-width box for it reads as a field that wants a
    sentence. */
 .settings-input.is-narrow { width: 96px; }
+
+/* A credential row's control (PRD #802 M4): the field plus its one or two
+   buttons, as ONE grid item, so the row keeps the 132px label column and two
+   children that `e2e/settings-rows.spec.ts` can measure. */
+.voice-secret { width: 100%; display: flex; align-items: center; gap: 7px; }
+.voice-secret .settings-input { flex: 1 1 auto; }
+.voice-secret .button { flex: 0 0 auto; }
 /* What is wrong with a field. Below the row it belongs to and inside the label
    column's gutter, so it reads as attached to the control rather than as a new
    setting. */

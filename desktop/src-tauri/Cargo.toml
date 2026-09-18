@@ -39,6 +39,59 @@ tauri = { version = "2", features = [] }
 # grouping survive a write. `toml::Table` models DATA, so it could not.
 toml_edit = { version = "0.25", features = ["serde"] }
 tokio = { version = "1", features = ["sync", "time"] }
+# PRD #802 M4: the OS keychain behind `secrets.rs`'s `SecretStore`, which is the
+# seam PRD #803 M5 named and deliberately did not build. Genuinely new — no
+# crate here declares `keyring`, `secret-service`, `security-framework` or
+# `stronghold`, and what exists is credential *detection* in the e2e harness,
+# which reads and never writes — so it is a cost rather than an incidental, and
+# this is the accounting.
+#
+# Narrower than PRD #802's own wording, which says those four are "at zero
+# matches workspace-wide". That holds for what a crate DECLARES and not for the
+# lockfile: `security-framework 3.7.0` is already in it, reaching the graph on
+# macOS through `reqwest` -> `rustls-platform-verifier`. It changes nothing
+# about this being a new dependency; it is worth saying because the Apple
+# backend below is a second consumer of a crate already there rather than a new
+# tree.
+#
+# WHY A DEPENDENCY AT ALL. #803's rule is that a secret never goes in
+# `desktop.toml` and never in `localStorage`, and
+# `xtask/linkage-check`'s ALLOWED_FIELD_TYPES enforces the first half by
+# refusing a `String` in the settings schema. That leaves the credential
+# somewhere else by construction, and the OS keychain is where #803 said it
+# goes. The alternative it named — an owner-only file in the config directory —
+# stays available as a fallback and is not what this PR builds.
+#
+# DEFAULT FEATURES, DELIBERATELY. `default = ["v1"]` selects one store per
+# target and none of them needs a system dev package, which is the property that
+# made this acceptable: `apple-native-keyring-store` (the Security framework) on
+# macOS, `windows-native-keyring-store` (`windows-sys`) on Windows, and
+# `zbus-secret-service-keyring-store` on Linux and the other unixes. Each is
+# target-gated in `keyring`'s own manifest, so Windows never compiles the zbus
+# tree and Linux never compiles the Apple one.
+#
+# How much of that was verified, because the three are not equal: the Linux one
+# BUILT here with nothing added, and the Windows one TYPE-CHECKED through
+# `scripts/windows-cross-check.sh`. The macOS one is read from the manifest and
+# from its dependency `security-framework`, which was already in this
+# workspace's lockfile before this change; `build-macos` is what proves it.
+#
+# The two Linux alternatives were each worse in a stated way: the
+# `dbus-secret-service` backend binds `libdbus` and would need `libdbus-1-dev`
+# in `tauri-deps/flake.nix` and both `apt-get` blocks in `ci.yml` — the
+# three-file shape M7's `alsa-lib` will take — while `linux-keyutils` needs no
+# package and keeps its keys in the kernel, where they do not survive a reboot,
+# which a user experiences as the app forgetting their key overnight.
+#
+# WHAT IT COSTS. 59 new lockfile entries, dominated by zbus and by
+# `secret-service`'s pure-Rust crypto (`aes`, `cbc`, `hkdf`, `hmac`, `sha2`,
+# `num-bigint` for the session key exchange). Measured on this branch, 16 cores:
+# building all 59 from a clean slate took 13.9s wall / 66s CPU and produced
+# 210 MiB of artifacts; warm it is a no-op, and neither `cargo test-fast` nor
+# rule 2's clippy command moved. `crypto-rust` is what `keyring` pins for both
+# secret-service backends, so no `openssl` and no `vendored` C build enters the
+# graph.
+keyring = "4"
 
 [dev-dependencies]
 # The `#[tokio::test]` attribute needs `macros` + `rt`, and the scripted-socket

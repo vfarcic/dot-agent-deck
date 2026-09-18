@@ -331,12 +331,45 @@ export interface DesktopSettingsDto {
    */
   endpoints?: EndpointSettingsDto;
   /**
+   * Which backends voice uses, and how it is activated (PRD #802 M4).
+   *
+   * **Optional for `endpoints`' reason rather than a weaker version of it.**
+   * The Rust field is an `Option<VoiceSettings>` and its `None` is what stops a
+   * build whose UI cannot render voice from resetting it: the save merges the
+   * decoded struct over the document on disk, so a section this side fabricated
+   * as `{ activation: "toggle", intent: "claude", transcription: "off" }` would
+   * write those defaults over the user's choices — on a save triggered by
+   * changing the theme. Never default it; round-trip it or omit it.
+   *
+   * No credential here, in any form. PRD #803's rule is that a secret goes in
+   * neither `desktop.toml` nor `localStorage`, and this DTO is written to
+   * `localStorage` verbatim by the fixture bridge. A key lives in the OS
+   * keychain and is reached through `secretStatus` / `storeSecret` /
+   * `forgetSecret` below, none of which can read one back.
+   */
+  voice?: VoiceSettingsDto;
+  /**
    * The window's zoom level as a scale factor, always one of `ZOOM_LEVELS`
    * (PRD #744). A scale factor rather than a percentage because that is the
    * unit `webview.set_zoom` takes, so storage, this wire, the frontend ladder
    * and the platform call are all in one unit.
    */
   zoom: { level: number };
+}
+
+/**
+ * The `[voice]` section: three closed choices and nothing else (PRD #802 M4).
+ *
+ * Every value is one of the token arrays below, which mirror the Rust enums in
+ * `src-tauri/src/settings.rs` — pinned on that side by
+ * `the_voice_tokens_match_the_frontends_copy`, because a token offered here
+ * that Rust does not recognise folds to the default and the user's choice
+ * silently does not stick.
+ */
+export interface VoiceSettingsDto {
+  activation: string;
+  intent: string;
+  transcription: string;
 }
 
 /** The `[endpoints]` section: the remote decks, and which deck is selected. */
@@ -405,6 +438,68 @@ export const ALL_ENDPOINT_SELECTION = "all";
 export const DEFAULT_SSH_PORT = 22;
 
 const APPEARANCE_MODES: readonly AppearanceMode[] = ["system", "light", "dark"];
+
+/**
+ * How the microphone is started and stopped (PRD #802 M7).
+ *
+ * One entry today, and that is the truthful shape: PRD #802 ships press-once-
+ * to-start / press-once-to-stop and defers hold-to-talk and always-on-with-VAD
+ * to D4. Keep identical to `ActivationMode::TOKENS` in
+ * `src-tauri/src/settings.rs`.
+ */
+export const VOICE_ACTIVATION_MODES = ["toggle"] as const;
+
+/**
+ * Which backend resolves an utterance into an action (PRD #802 M5).
+ *
+ * `claude` is the default because it needs no key and no download — the user
+ * already has a pre-authenticated CLI on the box. Keep identical to
+ * `IntentBackend::TOKENS` in `src-tauri/src/settings.rs`.
+ */
+export const VOICE_INTENT_BACKENDS = ["claude", "opencode", "remote"] as const;
+
+/**
+ * Which backend turns speech into text (PRD #802 M7).
+ *
+ * `off` is the default and is a product statement rather than a degraded mode:
+ * transcription is the one stage with no no-key trick, so with nothing
+ * configured the surface still works from typed input through the identical
+ * resolve → validate → execute → report path. Keep identical to
+ * `TranscriptionBackend::TOKENS` in `src-tauri/src/settings.rs`.
+ */
+export const VOICE_TRANSCRIPTION_BACKENDS = ["off", "remote"] as const;
+
+/** Mirrors `VoiceSettings::default()`; what an absent section renders as. */
+export const DEFAULT_VOICE_SETTINGS: VoiceSettingsDto = {
+  activation: "toggle",
+  intent: "claude",
+  transcription: "off",
+};
+
+/**
+ * Which credential the app is being asked about (PRD #802 M4).
+ *
+ * Keep identical to `SecretId::ALL` in `src-tauri/src/secrets.rs`: these are
+ * keychain account names, so a token this side invents names an entry nothing
+ * over there reads.
+ */
+export const VOICE_SECRET_IDS = ["voice-intent", "voice-transcription"] as const;
+
+export type VoiceSecretId = (typeof VOICE_SECRET_IDS)[number];
+
+/**
+ * What the app knows about one stored credential — a boolean, and never the
+ * value (PRD #802 M4).
+ *
+ * `problem` is `Some` when the answer is "I could not find out", which is NOT
+ * the same as "nothing is stored" and must not render as it: a panel that
+ * showed *No key stored* for an unreachable keychain would invite the user to
+ * type their key again into a store that cannot hold it.
+ */
+export interface SecretStatusDto {
+  stored: boolean;
+  problem?: string;
+}
 
 /**
  * Mirrors `DesktopSettings::default()`; used when nothing is stored yet.
@@ -486,7 +581,36 @@ export function normalizeDesktopSettings(value: unknown): DesktopSettingsDto {
     version: typeof record.version === "number" && Number.isFinite(record.version) ? record.version : DEFAULT_DESKTOP_SETTINGS.version,
     appearance: { mode },
     endpoints: normalizeEndpointSettings(record.endpoints),
+    voice: normalizeVoiceSettings(record.voice),
     zoom: { level: clampZoom(zoom.level) },
+  };
+}
+
+/**
+ * Coerce the `[voice]` section, **preserving absence** (PRD #802 M4).
+ *
+ * The same shape as `normalizeEndpointSettings` and for the same reason:
+ * `undefined` in, `undefined` out, because `normalizeDesktopSettings` builds a
+ * fresh object with a fixed key set and a section this function fabricated
+ * would be merged over the user's file by `desktop_set_settings`. A section
+ * that IS present is rebuilt field by field — no spread, which
+ * `xtask/linkage-check` refuses here for the credential reason the parent has
+ * one.
+ *
+ * An unrecognised token falls back to this build's default rather than
+ * propagating, matching the folding deserializers on the Rust side. The cost is
+ * the same one those carry and is worth knowing: a token a NEWER build wrote is
+ * replaced rather than preserved.
+ */
+function normalizeVoiceSettings(value: unknown): VoiceSettingsDto | undefined {
+  if (typeof value !== "object" || value === null) return undefined;
+  const record = value as Record<string, unknown>;
+  const pick = (raw: unknown, allowed: readonly string[], fallback: string): string =>
+    allowed.find((candidate) => candidate === raw) ?? fallback;
+  return {
+    activation: pick(record.activation, VOICE_ACTIVATION_MODES, DEFAULT_VOICE_SETTINGS.activation),
+    intent: pick(record.intent, VOICE_INTENT_BACKENDS, DEFAULT_VOICE_SETTINGS.intent),
+    transcription: pick(record.transcription, VOICE_TRANSCRIPTION_BACKENDS, DEFAULT_VOICE_SETTINGS.transcription),
   };
 }
 
@@ -796,6 +920,25 @@ export interface DeckBridge {
    * only when the call itself could not be made.
    */
   testEndpoint(settings: DesktopSettingsDto, selection: string): Promise<EndpointTestReportDto>;
+  /**
+   * Whether a credential is stored under `id`, without reading it (PRD #802 M4).
+   *
+   * Never rejects for "I could not find out": that comes back as
+   * `problem`, because it is a different answer from "nothing is stored" and a
+   * panel has to be able to tell them apart.
+   */
+  secretStatus(id: VoiceSecretId): Promise<SecretStatusDto>;
+  /**
+   * Replace the credential stored under `id`, resolving with the new status.
+   *
+   * **Rejects when the store failed.** The outcome PRD #802 designs against is a
+   * user who thinks their key is stored and finds voice broken tomorrow, so a
+   * failure is never a resolved promise carrying `stored: false` — the caller's
+   * `catch` is what shows the sentence.
+   */
+  storeSecret(id: VoiceSecretId, secret: string): Promise<SecretStatusDto>;
+  /** Forget the credential stored under `id`. Rejects when the store failed. */
+  forgetSecret(id: VoiceSecretId): Promise<SecretStatusDto>;
   /**
    * States the WHOLE set of agents whose terminal is on screen right now
    * (PRD #745 M7). Attach follows this and nothing else — not `connect()`, not
@@ -1390,6 +1533,36 @@ class FixtureDeckBridge implements DeckBridge {
       clientProtocolVersion: 0,
       clientBuildVersion: "browser-preview",
     };
+  }
+
+  /**
+   * The browser preview has no OS keychain, and it deliberately does not
+   * pretend otherwise (PRD #802 M4).
+   *
+   * There is no in-memory stand-in here, which is the whole point: a preview
+   * that "stored" a key would put a real credential somewhere — this class's
+   * only persistence is `localStorage`, which is the exact half of PRD #803's
+   * rule the settings-secret guard pins. So the preview reports the same
+   * situation a headless Linux box does, the panel renders the same sentence,
+   * and the browser tier gets to drive that state without a keychain anywhere
+   * near it.
+   */
+  async secretStatus(): Promise<SecretStatusDto> {
+    await Promise.resolve();
+    return {
+      stored: false,
+      problem: "Browser preview — it has no OS credential store, so no key can be saved here.",
+    };
+  }
+
+  async storeSecret(): Promise<SecretStatusDto> {
+    await Promise.resolve();
+    throw new Error("Browser preview — it has no OS credential store, so no key can be saved here.");
+  }
+
+  async forgetSecret(): Promise<SecretStatusDto> {
+    await Promise.resolve();
+    throw new Error("Browser preview — it has no OS credential store, so there is nothing to forget.");
   }
 
   /**
@@ -2627,6 +2800,36 @@ export class TauriDeckBridge implements DeckBridge {
   async testEndpoint(settings: DesktopSettingsDto, selection: string): Promise<EndpointTestReportDto> {
     const invoke = await this.getInvoke();
     return invoke<EndpointTestReportDto>("desktop_test_endpoint", { settings, selection });
+  }
+
+  /**
+   * The three credential commands (PRD #802 M4), and the one that is absent.
+   *
+   * There is no `loadSecret` and there must not be. The crate exposes no
+   * command that returns a stored credential to this side, because a value
+   * reaching here is one `JSON.stringify` from the `localStorage` half of PRD
+   * #803's rule. `SecretStore::load` exists Rust-side, where M5's and M7's
+   * backends make their network call — which is where the CSP already forces
+   * every network hop, so nothing over here needs the value.
+   *
+   * Nothing is normalised on the way back: `SecretStatusDto` is a boolean plus
+   * a sentence the crate has already scrubbed, and there is no field a
+   * malformed value could reach state or storage through. The panel bounds what
+   * it renders.
+   */
+  async secretStatus(id: VoiceSecretId): Promise<SecretStatusDto> {
+    const invoke = await this.getInvoke();
+    return invoke<SecretStatusDto>("desktop_secret_status", { id });
+  }
+
+  async storeSecret(id: VoiceSecretId, secret: string): Promise<SecretStatusDto> {
+    const invoke = await this.getInvoke();
+    return invoke<SecretStatusDto>("desktop_store_secret", { id, secret });
+  }
+
+  async forgetSecret(id: VoiceSecretId): Promise<SecretStatusDto> {
+    const invoke = await this.getInvoke();
+    return invoke<SecretStatusDto>("desktop_forget_secret", { id });
   }
 
   /**

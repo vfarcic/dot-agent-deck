@@ -10,11 +10,11 @@
  * lines of the same array.
  *
  * It holds a row per tenant and nothing speculative: #741's decks landed as one
- * row here plus `EndpointsPanel`, and #802's voice backends add their own when
- * they land. Pre-creating empty sections for them would be this container
- * growing opinions about its contents, which is the specific failure PRD #803
- * exists to prevent — a container with opinions blocks the dependents it was
- * built for.
+ * row here plus `EndpointsPanel`, and #802's voice backends did the same at its
+ * M4. Neither was pre-created, which is the point — pre-creating empty sections
+ * would be this container growing opinions about its contents, the specific
+ * failure PRD #803 exists to prevent, because a container with opinions blocks
+ * the dependents it was built for.
  *
  * Below two entries the sheet drops the section column and renders the one
  * panel full width. **PRD #744's Zoom row is what brought the column back**,
@@ -24,9 +24,10 @@
  * having two rows, so a later PRD removing one does not silently delete the
  * coverage.
  */
-import { Palette, Server, ZoomIn } from "lucide-react";
+import { Mic, Palette, Server, ZoomIn } from "lucide-react";
 import { AppearancePanel } from "../components/AppearancePanel";
 import { EndpointsPanel } from "../components/EndpointsPanel";
+import { VoicePanel } from "../components/VoicePanel";
 import { ZoomPanel } from "../components/ZoomPanel";
 import type { SettingsSection } from "./settingsContract";
 
@@ -36,5 +37,9 @@ export const SETTINGS_SECTIONS: SettingsSection[] = [
   // PRD #741 M7. One row and one component, which is the whole of the contract
   // this registry exists to keep true — `SettingsSheet.tsx` was not opened.
   { id: "decks", label: "Decks", icon: Server, component: EndpointsPanel },
+  // PRD #802 M4, and the tenant this registry's own doc comment named while it
+  // was still hypothetical. One row and one component again, and `SettingsSheet.tsx`
+  // was not opened.
+  { id: "voice", label: "Voice", icon: Mic, component: VoicePanel },
   { id: "zoom", label: "Zoom", icon: ZoomIn, component: ZoomPanel },
 ];

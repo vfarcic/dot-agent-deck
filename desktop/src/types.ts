@@ -944,6 +944,35 @@ export interface DeckRuntimeState {
     selection: string,
   ) => Promise<import("./lib/bridge").EndpointTestReportDto>;
   /**
+   * Whether a credential is stored, without reading it (PRD #802 M4).
+   *
+   * There is deliberately no counterpart that READS one: PRD #803's rule is
+   * that a secret goes in neither `desktop.toml` nor `localStorage`, and a
+   * value reaching this side is one `JSON.stringify` from the second half of
+   * that. The backends that need the value make their call Rust-side, which is
+   * where the CSP already forces every network hop.
+   *
+   * Never rejects for "I could not find out" — that arrives as `problem`,
+   * which is a different answer from "nothing is stored".
+   */
+  secretStatus: (
+    id: import("./lib/bridge").VoiceSecretId,
+  ) => Promise<import("./lib/bridge").SecretStatusDto>;
+  /**
+   * Replace a stored credential, resolving with the new status.
+   *
+   * **Rejects when the store failed**, so a failure can never render as a
+   * saved key — which is the outcome PRD #802 M4 is written against.
+   */
+  storeSecret: (
+    id: import("./lib/bridge").VoiceSecretId,
+    secret: string,
+  ) => Promise<import("./lib/bridge").SecretStatusDto>;
+  /** Forget a stored credential. Rejects when the store failed. */
+  forgetSecret: (
+    id: import("./lib/bridge").VoiceSecretId,
+  ) => Promise<import("./lib/bridge").SecretStatusDto>;
+  /**
    * Scale the whole window, terminals included (PRD #744).
    *
    * Applying only — the level is persisted through `saveSettings`, behind a

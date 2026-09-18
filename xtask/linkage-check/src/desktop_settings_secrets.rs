@@ -132,7 +132,7 @@ const DESKTOP_SRC: &str = "desktop/src";
 /// layer. That is why `Option<String>` and `Vec<String>` still have no way in —
 /// they resolve to `String`, which is absent — and why there is no row for each
 /// container shape.
-const ALLOWED_FIELD_TYPES: [(&str, FieldKind, &str); 15] = [
+const ALLOWED_FIELD_TYPES: [(&str, FieldKind, &str); 19] = [
     (
         "u32",
         FieldKind::Scalar,
@@ -259,6 +259,58 @@ const ALLOWED_FIELD_TYPES: [(&str, FieldKind, &str); 15] = [
         FieldKind::Section,
         "a section struct, whose own fields this check walks",
     ),
+    // PRD #802 M4: the `[voice]` section. This is the moment the module docs
+    // above predicted — "the one that will go red when PRD #802 adds a
+    // `String`" — and it went red, at all four of the fields below, which is
+    // the friction working rather than an obstacle. The resolution is the first
+    // of the two honest ones that test names: the values that could have been a
+    // `String` are closed enums instead, and the value that genuinely is a
+    // credential went behind the `SecretStore` seam
+    // (`desktop/src-tauri/src/secrets.rs`) rather than into this document.
+    //
+    // Read the three scalar reasons as the STRONG kind — no text is
+    // representable. Each is a Rust enum whose `Deserialize` folds an
+    // unrecognised token to the default and errors above MAX_VOICE_TOKEN_BYTES,
+    // so the value this crate reads out and writes back is one of the listed
+    // tokens and nothing else. That is `AppearanceMode`'s claim exactly, and it
+    // carries `AppearanceMode`'s caveat exactly: a hand-edited file can hold
+    // any string at one of these keys until the next save, which is why
+    // `settings.rs` follows a sentinel through the load as well.
+    (
+        "ActivationMode",
+        FieldKind::Scalar,
+        "a closed enum serialised as one token — `toggle` today, with \
+         hold-to-talk and always-on deferred to PRD #802 D4. Its deserializer \
+         folds anything else to the default and refuses a token over \
+         MAX_VOICE_TOKEN_BYTES, so no text is representable",
+    ),
+    (
+        "IntentBackend",
+        FieldKind::Scalar,
+        "a closed enum serialised as one token: `claude`, `opencode` or \
+         `remote` — WHICH backend resolves an utterance, never how it \
+         authenticates. The keyed `remote` one's credential lives in the OS \
+         keychain under SecretId::VoiceIntent and has no field here at all. \
+         Same folding deserializer and same MAX_VOICE_TOKEN_BYTES bound, so no \
+         text is representable",
+    ),
+    (
+        "TranscriptionBackend",
+        FieldKind::Scalar,
+        "a closed enum serialised as one token: `off` or `remote`. Same as \
+         IntentBackend — it names a backend, and the keyed one's credential is \
+         in the OS keychain under SecretId::VoiceTranscription rather than \
+         anywhere in this document. Same folding deserializer and same bound",
+    ),
+    (
+        "VoiceSettings",
+        FieldKind::Section,
+        "a section struct, whose own fields this check walks. It holds three \
+         enums and deliberately NOT a boolean saying whether a key is stored — \
+         which PRD #803's rule would have allowed: the panel asks the \
+         SecretStore itself, so the answer cannot go stale against the \
+         keychain, and `bool` stays off this list",
+    ),
 ];
 
 /// The type an allowlist lookup is really performed on: one `Option<…>` or
@@ -327,7 +379,7 @@ const KEYLESS_MEMBERS: [&str; 3] = ["clear", "key", "length"];
 /// name scan on this side would repeat the mistake #827 is about: `endpoint:
 /// string` passes any name check and is a free-text field. A diff here is the
 /// review prompt.
-const PINNED_TS_FIELDS: [(&str, &str, &str); 16] = [
+const PINNED_TS_FIELDS: [(&str, &str, &str); 20] = [
     ("DesktopSettingsDto", "version", "number"),
     (
         "DesktopSettingsDto",
@@ -340,6 +392,11 @@ const PINNED_TS_FIELDS: [(&str, &str, &str); 16] = [
     // section over a user's decks. A required field here would make the
     // normaliser fabricate one.
     ("DesktopSettingsDto", "endpoints?", "EndpointSettingsDto"),
+    // PRD #802 M4. `?` is load-bearing for the reason `endpoints?` is: the Rust
+    // field is an `Option<VoiceSettings>` whose `None` means *unspecified*, and
+    // a required field here would make the normaliser fabricate a section that
+    // the merge then writes over the user's choices.
+    ("DesktopSettingsDto", "voice?", "VoiceSettingsDto"),
     ("DesktopSettingsDto", "zoom", "{ level: number }"),
     // The two nested interfaces are scanned as well, and that is the point of
     // adding them rather than letting `EndpointSettingsDto` be an opaque name:
@@ -357,6 +414,17 @@ const PINNED_TS_FIELDS: [(&str, &str, &str); 16] = [
     ("RemoteEndpointDto", "port", "number"),
     ("RemoteEndpointDto", "socket?", "string"),
     ("RemoteEndpointDto", "user?", "string"),
+    // Scanned as its own interface rather than left an opaque name, for the
+    // reason the endpoint ones are: a credential riding in through a nested
+    // shape would otherwise be invisible to this pin. All three are tokens
+    // naming a BACKEND, and their Rust counterparts are closed enums on
+    // ALLOWED_FIELD_TYPES. The credential those backends authenticate with is
+    // in the OS keychain and has no field here — `SecretStatusDto` below is a
+    // boolean plus a sentence, and is the whole of what this side ever learns
+    // about one.
+    ("VoiceSettingsDto", "activation", "string"),
+    ("VoiceSettingsDto", "intent", "string"),
+    ("VoiceSettingsDto", "transcription", "string"),
     (
         "DesktopSettingsSnapshotDto",
         "settings",
@@ -1227,6 +1295,7 @@ pub struct VoiceSettings {
             "DesktopSettingsDto",
             "EndpointSettingsDto",
             "RemoteEndpointDto",
+            "VoiceSettingsDto",
             "DesktopSettingsSnapshotDto",
         ] {
             let body = block_after(&source, &format!("export interface {interface} "))
@@ -1273,6 +1342,12 @@ pub struct VoiceSettings {
             "export function normalizeDesktopSettings(value: unknown): DesktopSettingsDto ",
             "function normalizeEndpointSettings(value: unknown): EndpointSettingsDto | undefined ",
             "function normalizeRemoteEndpoint(value: unknown): RemoteEndpointDto | undefined ",
+            // PRD #802 M4's section normaliser. It is on this list for the same
+            // reason the endpoint ones are: a spread inside it would carry an
+            // undeclared field into the document just as surely as one in the
+            // parent, and this document is written to `localStorage` verbatim
+            // by the fixture bridge.
+            "function normalizeVoiceSettings(value: unknown): VoiceSettingsDto | undefined ",
         ] {
             let body = block_after(&source, signature)
                 .unwrap_or_else(|| panic!("no `{signature}` in {BRIDGE_TS}"));
@@ -1301,7 +1376,7 @@ pub struct VoiceSettings {
         keys.sort();
         assert_eq!(
             keys,
-            ["appearance", "endpoints", "version", "zoom"],
+            ["appearance", "endpoints", "version", "voice", "zoom"],
             "unexpected normaliser result shape:\n{returned}"
         );
     }
