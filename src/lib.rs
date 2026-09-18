@@ -28,6 +28,7 @@ pub mod features;
 // throttled input).
 pub mod focus_report;
 pub mod hook;
+pub mod hook_provenance;
 pub mod hooks_manage;
 pub mod hyperlink;
 pub mod init;

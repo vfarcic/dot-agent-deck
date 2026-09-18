@@ -18,7 +18,26 @@ serde_json = "1"
 tauri = { version = "2", features = [] }
 # PRD #803: the desktop app's own settings document is TOML, a sibling of
 # the TUI's config.toml. Same version pin as the root package.
-toml = "1.0"
+#
+# Issue #825 REPLACED `toml` with `toml_edit` here rather than adding it
+# beside, and the replacement is the point: two TOML libraries in one crate
+# means two parsers that can disagree about the same file, so `settings.rs`
+# names exactly one. `toml_edit` is a strict superset of what this crate used
+# — `de::from_str` and `ser::to_string_pretty` cover every call site, and the
+# rendering is byte-identical (pinned by `default_document_shape_is_pinned`).
+#
+# It is also not a new dependency in any sense that costs anything. The root
+# package already declares `toml_edit = "0.25"` for the same reason (a
+# format-preserving edit of the user's `~/.codex/config.toml`), this crate
+# already links the root package, and the lockfile already carries exactly one
+# `toml_edit`. Turning on its `serde` feature adds `serde_core` and
+# `serde_spanned`, both of which the graph already had; dropping `toml` takes
+# `toml_parser`/`toml_writer` nowhere, since `toml_edit` uses those too.
+#
+# What it buys: the save path merges into a format-preserving DOM, so a user's
+# comments, inline-array/inline-table spelling, key order and blank-line
+# grouping survive a write. `toml::Table` models DATA, so it could not.
+toml_edit = { version = "0.25", features = ["serde"] }
 tokio = { version = "1", features = ["sync", "time"] }
 
 [dev-dependencies]

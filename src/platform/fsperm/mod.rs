@@ -167,8 +167,8 @@ pub(crate) const SITE_AUDIT: &[PermissionSite] = &[
     },
     PermissionSite {
         function: "verify_endpoint_trusted",
-        unix: "stat: is a socket, owned by our uid, mode 0o600 — out-of-band, because the \
-               connect that follows is unguarded",
+        unix: "lstat: is a socket (never a symlink), owned by our uid, mode 0o600 — out-of-band, \
+               because the connect that follows is unguarded",
         windows: WindowsCounterpart::Enforced(
             "GetSecurityInfo on the pipe handle compares the server's owner SID with ours. Also \
              welded into BOTH client entry points (IpcStream::connect and IpcClient::connect), \

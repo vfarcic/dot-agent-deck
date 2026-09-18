@@ -578,6 +578,7 @@ fn new_pane_016_dispatcher_opens_dashboard_card_with_real_agent() {
     let config = write_default_command_config(&launcher.to_string_lossy());
 
     let deck = TuiDeck::builder()
+        .impersonating_pane_signals()
         .with_imported_claude_credentials()
         // Deliberately NO `DOT_AGENT_DECK_EXPERIMENTAL`: the dispatcher option has
         // graduated out of the flag, so reaching it from a default deck is part of
@@ -841,6 +842,7 @@ fn orchestration_dispatch_001_tab_surfaces_with_role_cards() {
     const UNIT: &str = "team-probe";
 
     let deck = TuiDeck::builder()
+        .impersonating_pane_signals()
         .with_env("PATH", path_with_binary_dir())
         .launch_with_fixture("orch-deck");
     deck.wait_for_string("No active sessions");
@@ -1185,6 +1187,7 @@ fn orchestration_dispatch_002_every_real_agent_role_comes_alive() {
     const ROLES: [&str; 3] = ["orchestrator", "coder", "reviewer"];
 
     let deck = TuiDeck::builder()
+        .impersonating_pane_signals()
         // Three live agent panes in one tab; a roomy deck keeps each role card's
         // PTY wide enough for a real claude TUI to render (and for the failure
         // diagnostics to be readable).
@@ -1556,6 +1559,7 @@ fn dispatch_return_006_real_single_agent_reports_to_the_dispatcher() {
         format!("claude --ax-screen-reader --model {HAIKU_MODEL} --allowedTools Bash Read Write");
     let config = write_default_command_config(&agent_command);
     let deck = TuiDeck::builder()
+        .impersonating_pane_signals()
         .with_pty_size(220, 60)
         .with_imported_claude_credentials()
         .with_claude_trust_workdir()
@@ -1846,6 +1850,7 @@ fn dispatch_close_001_first_confirm_removes_the_dispatched_card() {
     std::fs::write(&cfg, "default_command = \"agent-wrapper\"\n").expect("write the deck config");
 
     let deck = TuiDeck::builder()
+        .impersonating_pane_signals()
         // Roomy: at the default width a card title is ellipsized
         // (`dispatch-clo…`), so the selection check below could never match the
         // full name on the title row.
@@ -2012,6 +2017,7 @@ fn dispatch_close_002_a_kept_dirty_worktree_is_announced_before_and_after_the_cl
     std::fs::write(&cfg, "default_command = \"cat\"\n").expect("write the deck config");
 
     let deck = TuiDeck::builder()
+        .impersonating_pane_signals()
         // Roomy, so neither the card title nor the dialog's path line is
         // ellipsized by the terminal — the path IS the assertion.
         .with_pty_size(200, 50)
@@ -2169,6 +2175,7 @@ fn dispatch_close_003_a_worktree_cleaned_while_the_dialog_is_open_is_not_reporte
     std::fs::write(&cfg, "default_command = \"cat\"\n").expect("write the deck config");
 
     let deck = TuiDeck::builder()
+        .impersonating_pane_signals()
         .with_pty_size(200, 50)
         .with_env("PATH", path_with_binary_dir())
         .with_env("DOT_AGENT_DECK_CONFIG", cfg.to_string_lossy())
@@ -2283,6 +2290,7 @@ fn orchestration_dispatch_004_list_targets_marks_the_declared_default() {
     const UNIT: &str = "default-probe";
 
     let deck = TuiDeck::builder()
+        .impersonating_pane_signals()
         .with_env("PATH", path_with_binary_dir())
         .launch_with_fixture("orch-multi");
     deck.wait_for_string("No active sessions");

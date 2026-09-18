@@ -108,118 +108,224 @@ async fn wait_for_pane_needle(
     }
 }
 
-/// The `StopAgent` request's own outcome, published by its task the moment it
-/// has one.
+/// Issue #954: how many times the close is asked for before the precondition
+/// gives up and reports every attempt.
 ///
-/// It exists because the test used to throw that outcome away — `let _ =
-/// closing.await` — while the precondition below reported only
-/// `JoinHandle::is_finished()`. A request that failed and a close that ran are
-/// indistinguishable through that lens, and the difference is the entire
-/// diagnosis. See [`CloseWindow::RequestEnded`].
-type StopOutcome = Arc<std::sync::Mutex<Option<Result<(), String>>>>;
+/// More than one because a `StopAgent` that comes back WITHOUT the close ever
+/// beginning has established nothing — see
+/// [`close_pane_into_its_grace_window`]. Three rather than "until the budget
+/// runs out": each attempt re-asserts that the stand-in is still live and still
+/// owns its pane, so a genuine defect fails on the second pass rather than being
+/// retried at, and a small fixed count keeps the failure report short enough to
+/// read.
+const CLOSE_GRACE_ATTEMPTS: usize = 3;
 
-/// What [`wait_for_close_in_flight`] actually found, so a failing precondition
-/// names its cause instead of listing candidates.
-///
-/// # The cause that is NOT in here, and why it cannot be
-///
-/// A previous reading of this failure was "the window opened and shut between
-/// two 5 ms samples". That is not reachable, and the two facts that rule it out
-/// are both in `src/agent_pty.rs`:
-///
-/// - the window OPENS at `hold_pane_for_cleanup`, before `close_agent` is
-///   called at all, and stays open until the end of the `StopAgent` arm — which
-///   includes `terminate_child_with_grace_and_wait` spending up to
-///   `AGENT_TERMINATE_GRACE` (**3 seconds**) against a stand-in that traps
-///   `TERM`. A 5 ms poll cannot miss a three-second window.
-/// - `close_agent`'s **first** statement removes the agent from the registry,
-///   so `agent_is_live` is false for every instant after the close begins. Any
-///   state in which the window has already shut is a state in which the
-///   stand-in reads as dead.
-///
-/// So a failure reporting `stand-in still live = true` is a failure in which
-/// the close never began. That is [`Self::RequestEnded`], and it is the cause
-/// the old comment's two candidates ("the request failed, or the pane was never
-/// closed at all") could not tell apart because the request's result was
-/// discarded.
-enum CloseWindow {
-    /// `pane_close_in_flight` was observed true: the delegate below lands
-    /// inside the grace window, which is the scenario.
-    Entered,
-    /// The `StopAgent` request ended without the window ever opening, carrying
-    /// what it reported. Nothing was arranged, so the precondition is right to
-    /// fail — the value of this variant is that it says whose fault it was.
-    RequestEnded(String),
-    /// Neither the window nor the request resolved inside the budget.
+/// What [`wait_for_pane_record_to_clear`] established.
+enum RecordCleared {
+    /// The pane has no registry entry and its close is still in flight — a
+    /// delegate issued now reaches `respawn_or_recreate_agent_for_pane`'s
+    /// `NotFound` arm, which is #606's recovery.
+    WhileClosing,
+    /// The close completed before the entry cleared. Not a verdict: the attempt
+    /// simply did not reach the state it was aiming at.
+    WindowShutFirst,
+    /// Neither happened inside the budget.
     BudgetExpired,
 }
 
-impl CloseWindow {
-    /// What to print when the precondition fails.
-    ///
-    /// A method rather than `{:?}`, so the [`Self::RequestEnded`] payload is
-    /// genuinely read: a field reachable only through a derived `Debug` is dead
-    /// code as far as `-D warnings` is concerned, and silencing that with an
-    /// `allow` would leave the diagnosis one refactor away from being dropped
-    /// on the floor again — which is the whole thing this type exists to stop.
-    fn cause(&self) -> String {
-        match self {
-            Self::Entered => "the window was entered".to_string(),
-            Self::RequestEnded(reported) => reported.clone(),
-            Self::BudgetExpired => "the budget expired with the window never opening and the \
-                 StopAgent request still in flight"
-                .to_string(),
+/// PR #1115 review (Greptile P1): wait until `pane_id` has no registry entry,
+/// while its close is still in flight.
+///
+/// See [`close_pane_into_its_grace_window`]'s doc for why the close having
+/// BEGUN is not enough, and for why polling for this particular state is sound
+/// when polling for the window was not.
+async fn wait_for_pane_record_to_clear(
+    registry: &AgentPtyRegistry,
+    pane_id: &str,
+    budget: Duration,
+) -> RecordCleared {
+    let deadline = tokio::time::Instant::now() + budget;
+    loop {
+        // `agent_id_for_pane_any`, not `pane_current_agent_id`: the respawn's
+        // own lookup carries no `exited` filter, so an entry whose child had
+        // died would still be found by it and still route away from the
+        // recovery. (The one difference left is `pane_handed_over`, which this
+        // helper skips and the respawn does not — no handover happens in this
+        // test, and a stricter reading would only make this wait end later.)
+        if registry.agent_id_for_pane_any(pane_id).is_none() {
+            // Re-read rather than trust the earlier signal: the entry could
+            // have cleared because the whole close finished, and a delegate
+            // aimed after that is an ordinary post-close delegate.
+            return if registry.pane_close_in_flight(pane_id) {
+                RecordCleared::WhileClosing
+            } else {
+                RecordCleared::WindowShutFirst
+            };
         }
+        if !registry.pane_close_in_flight(pane_id) {
+            return RecordCleared::WindowShutFirst;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return RecordCleared::BudgetExpired;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
     }
 }
 
-/// Issue #709: wait until `pane_id`'s close has OBSERVABLY entered its grace
-/// window, so a delegate aimed at that window lands inside it rather than at a
-/// guessed offset from when the close was asked for.
+/// Issue #709/#954: put `pane_id`'s close into its grace window and hand back
+/// the still-running request, so a delegate aimed at that window lands inside it
+/// rather than at a guessed offset from when the close was asked for.
+///
+/// **The window is OBSERVED, not sampled for.** The receiver comes from
+/// [`AgentPtyRegistry::pane_close_signal`] and is taken BEFORE the request is
+/// issued, so there is no interval in which the transition can happen unwitnessed:
+/// `begin_pane_close` resolves it by dropping the sender, and a resolved
+/// `oneshot` stays resolved, so the observation does not depend on when this
+/// function happens to look. That is the whole difference from issue #954's
+/// defect. The predecessor polled `pane_close_in_flight` on a 5 ms sleep and
+/// **read a finished request as proof that there had been no window**, which is
+/// exactly what it cannot prove: an attempt that never reached the daemon is
+/// silent about whether the pane would have closed. The reported failures carried
+/// `stop_agent finished = true` together with `stand-in still live = true`, and
+/// those two are only consistent with the handler never reaching `close_agent` —
+/// its first act is removing the registry entry, so a close that had begun could
+/// not leave the stand-in live. The test then blamed the window.
+///
+/// So a request that returns before the close begins is treated as INCONCLUSIVE
+/// and retried, and only a run of [`CLOSE_GRACE_ATTEMPTS`] failed attempts is a
+/// failure — reported with each attempt's own outcome, which is the fact the old
+/// `let _ = closing.await` discarded.
+///
+/// **The close BEGINNING is not enough, and waiting only for it silently loses
+/// the coverage** (PR #1115 review, Greptile P1). `begin_pane_close` — which is
+/// what resolves the signal — runs BEFORE `close_agent`, and `close_agent` is
+/// what removes the pane's registry entry. A delegate aimed at the gap between
+/// them finds a record and takes `respawn_agent_for_pane_declared`'s ORDINARY
+/// path, not the `NotFound` recreation path that is all #606 is about. What
+/// actually happens then is worse than a silent pass: that path removes the
+/// record itself and only then calls `spawn_agent`, which REFUSES a pane still
+/// in `cleanup_holds` with `DuplicatePaneId` — an error
+/// `respawn_or_recreate_agent_for_pane` returns untouched, since only `NotFound`
+/// routes to the recovery. The delegate fails, no replacement ever appears, and
+/// the test reports #606's own symptom for a scenario it never reached. The
+/// predecessor's gap was WIDER still: it returned on `pane_close_in_flight`,
+/// true from `hold_pane_for_cleanup`, a step earlier again.
+///
+/// So the second half of the precondition waits for the pane's entry to be
+/// GONE, with the close still in flight. That wait may poll, and the difference
+/// from the defect above is not a matter of degree: "no entry for this pane" is
+/// MONOTONIC for the rest of the close, because nothing can publish onto a pane
+/// in `cleanup_holds` — `spawn_agent` refuses it — so once true it stays true
+/// until the hold lifts, which is ~3 s of `AGENT_TERMINATE_GRACE` away. A poll
+/// cannot miss a state that cannot be left. It re-reads `pane_close_in_flight`
+/// on every turn as well, so it can never draw a conclusion from a window that
+/// has since shut; that, too, is an inconclusive attempt rather than a verdict.
 ///
 /// Bounded by [`common::child_boot_budget`] for the same reason the boot waits
 /// are: the quantity being waited on is a freshly scheduled task getting its
 /// turn, so the ceiling has to follow how contended the machine is. It returns
 /// the instant the window opens, so an idle box pays nothing for the headroom.
-async fn wait_for_close_in_flight<T>(
+async fn close_pane_into_its_grace_window(
     registry: &AgentPtyRegistry,
+    attach_path: &std::path::Path,
     pane_id: &str,
-    request: &tokio::task::JoinHandle<T>,
-    outcome: &StopOutcome,
-) -> CloseWindow {
-    let deadline = tokio::time::Instant::now() + common::child_boot_budget();
-    loop {
-        if registry.pane_close_in_flight(pane_id) {
-            return CloseWindow::Entered;
-        }
-        // A finished request with no window ever observed means there is
-        // nothing left to wait for. Ending here turns that into a prompt,
-        // legible failure instead of one that spends the whole budget and then
-        // reports the wrong cause — and, since the request publishes its result
-        // into `outcome` BEFORE its task ends, the failure can now name which
-        // of the reachable causes it was rather than listing them.
-        if request.is_finished() {
-            return CloseWindow::RequestEnded(
-                match outcome.lock().ok().and_then(|slot| slot.clone()) {
-                    Some(Ok(())) => "the StopAgent request SUCCEEDED without the pane ever \
-                         entering its close window, which means the close skipped its \
-                         pane-scoped path — see `hold_pane_for_cleanup`'s two refusals"
-                        .to_string(),
-                    Some(Err(error)) => format!(
-                        "the StopAgent request FAILED, so nothing was closed and the \
-                         scenario was never set up: {error}"
+    agent_id: &str,
+) -> tokio::task::JoinHandle<Result<(), dot_agent_deck::daemon_client::ClientError>> {
+    let mut attempts: Vec<String> = Vec::new();
+    for attempt in 1..=CLOSE_GRACE_ATTEMPTS {
+        // Issue #709: the assertion below says "still alive" but only ever
+        // checked REGISTRATION, and the difference is the whole scenario.
+        // `close_agent` spends `AGENT_TERMINATE_GRACE` only while the child is
+        // still running — against an already-dead one it returns at once, the
+        // close transition opens and shuts inside a few milliseconds, and the
+        // grace window this test needs to deliver into never observably exists.
+        //
+        // Issue #954: re-checked on EVERY attempt, which is what keeps the retry
+        // below from papering over a real defect. A previous attempt that closed
+        // the pane without ever calling `begin_pane_close` leaves the stand-in
+        // dead, and that fails here — naming every attempt — instead of being
+        // asked again.
+        assert!(
+            registry.agent_is_live(agent_id)
+                && registry.pane_current_agent_id(pane_id).as_deref() == Some(agent_id),
+            "precondition: the worker stand-in must own its pane and still be running for the \
+             close to spend its termination grace (attempt {attempt} of {CLOSE_GRACE_ATTEMPTS}); \
+             earlier attempts = {attempts:?}, records = {:?}",
+            registry.agent_records()
+        );
+        // Taken BEFORE the request is issued: everything after this point is
+        // witnessed, whether the transition takes three seconds or one
+        // instruction. A pane already mid-close hands back a pre-resolved
+        // receiver, so even the register-after-`begin_pane_close` ordering is
+        // covered.
+        let close_began = registry.pane_close_signal(pane_id);
+        let client = dot_agent_deck::daemon_client::DaemonClient::new(attach_path.to_path_buf());
+        let closing_id = agent_id.to_string();
+        let mut request = tokio::spawn(async move { client.stop_agent(&closing_id).await });
+        // Captured, not re-read in the panic below: `child_boot_budget` samples
+        // the machine's load each call, so reporting a second sample would name
+        // a duration this attempt never actually waited.
+        let ceiling = common::child_boot_budget();
+        let budget = tokio::time::sleep(ceiling);
+        tokio::pin!(budget);
+        tokio::select! {
+            // `biased` so a close that begins in the same instant the request
+            // returns is read as the window it is, never as a failed attempt.
+            biased;
+            _ = close_began => {
+                // The close has begun. Now wait for the half that makes the
+                // delegate below reach #606's path at all: the pane's registry
+                // entry gone, with the window still open. The doc above has the
+                // ordering and why this poll is sound where the one it replaced
+                // was not.
+                match wait_for_pane_record_to_clear(registry, pane_id, ceiling).await {
+                    RecordCleared::WhileClosing => return request,
+                    RecordCleared::WindowShutFirst => attempts.push(format!(
+                        "attempt {attempt}: the close began and had already finished before the \
+                         pane's registry entry cleared, so the delegate could not be aimed \
+                         inside the window"
+                    )),
+                    RecordCleared::BudgetExpired => panic!(
+                        "precondition: {pane_id}'s close entered its grace window but its \
+                         registry entry was still there {ceiling:?} later, so a delegate now \
+                         would take the ordinary respawn path instead of #606's recreation \
+                         path; attempt {attempt} of {CLOSE_GRACE_ATTEMPTS}, earlier attempts \
+                         = {attempts:?}, stop_agent finished = {}, close still in flight = {}, \
+                         records = {:?}",
+                        request.is_finished(),
+                        registry.pane_close_in_flight(pane_id),
+                        registry.agent_records()
                     ),
-                    None => "the StopAgent task ended without publishing an outcome, so it \
-                         panicked or was cancelled"
-                        .to_string(),
-                },
-            );
+                }
+            }
+            outcome = &mut request => {
+                attempts.push(format!(
+                    "attempt {attempt}: stop_agent returned {outcome:?} without the close ever \
+                     beginning"
+                ));
+            }
+            _ = &mut budget => {
+                panic!(
+                    "precondition: the close never entered its grace window within {:?} and the \
+                     `StopAgent` request is still in flight, so the delegate below would race a \
+                     teardown that has not started instead of landing in #606's window; \
+                     attempt {attempt} of {CLOSE_GRACE_ATTEMPTS}, earlier attempts = {attempts:?}, \
+                     stand-in still live = {}, records = {:?}",
+                    ceiling,
+                    registry.agent_is_live(agent_id),
+                    registry.agent_records()
+                );
+            }
         }
-        if tokio::time::Instant::now() >= deadline {
-            return CloseWindow::BudgetExpired;
-        }
-        tokio::time::sleep(Duration::from_millis(5)).await;
     }
+    panic!(
+        "precondition: {CLOSE_GRACE_ATTEMPTS} `StopAgent` requests each came back without the \
+         pane's close ever beginning, so the delegate below would be an ordinary post-close \
+         delegate instead of #606's race; attempts = {attempts:?}, stand-in still live = {}, \
+         records = {:?}",
+        registry.agent_is_live(agent_id),
+        registry.agent_records()
+    );
 }
 
 /// The pane's live agent id, once it is one this test has not seen before.
@@ -336,6 +442,7 @@ async fn delegate(fx: &Fixture, task: &str) {
         task: task.to_string(),
         to: vec![WORKER_ROLE.to_string()],
         timestamp: chrono::Utc::now(),
+        token: None,
     };
     fx.daemon
         .state
@@ -386,8 +493,6 @@ async fn delegate_022_delegate_during_an_in_flight_close_brings_the_role_back() 
         script.to_string_lossy().into_owned()
     })
     .await;
-    let client = dot_agent_deck::daemon_client::DaemonClient::new(fx.daemon.attach_path.clone());
-
     // Issue #709: this was a flat 400 ms sleep, and it was the load-sensitive
     // seam of the whole test. What the scenario needs is not "400 ms have
     // passed" but "the stand-in has installed its `trap '' TERM`" — and on a
@@ -410,84 +515,29 @@ async fn delegate_022_delegate_during_an_in_flight_close_brings_the_role_back() 
          window #606 is about; snapshot = {:?}",
         String::from_utf8_lossy(&armed)
     );
-    assert_eq!(
-        fx.daemon
-            .registry
-            .pane_current_agent_id(WORKER_PANE)
-            .as_deref(),
-        Some(fx.worker_agent_id.as_str()),
-        "precondition: the worker stand-in must still own its pane before the close"
-    );
-    // Issue #709: the assertion above says "still alive" but only ever checked
-    // REGISTRATION, and the difference is the whole scenario. `close_agent`
-    // spends `AGENT_TERMINATE_GRACE` only while the child is still running —
-    // against an already-dead one it returns at once, the close transition opens
-    // and shuts inside a few milliseconds, and the grace window this test needs
-    // to deliver into never observably exists. That reads downstream as "the
-    // close was not in flight", which is true and useless. Check the fact the
-    // sentence always meant.
-    assert!(
-        fx.daemon.registry.agent_is_live(&fx.worker_agent_id),
-        "precondition: the worker stand-in is registered but no longer running, so the close \
-         below would finish instantly instead of spending its termination grace"
-    );
 
-    let closing_id = fx.worker_agent_id.clone();
-    // The request's own outcome, published into the slot BEFORE the task ends.
-    // That ordering is what lets the precondition below print a cause: by the
-    // time `JoinHandle::is_finished()` is true, the slot is populated. See
-    // [`CloseWindow`].
-    let stop_outcome: StopOutcome = Arc::new(std::sync::Mutex::new(None));
-    let closing = {
-        let sink = Arc::clone(&stop_outcome);
-        tokio::spawn(async move {
-            let result = client.stop_agent(&closing_id).await;
-            if let Ok(mut slot) = sink.lock() {
-                *slot = Some(result.as_ref().map(|_| ()).map_err(|e| e.to_string()));
-            }
-            result
-        })
-    };
-
-    // Issue #709: this was a flat `sleep(200 ms)` — the reporter's own interval
-    // — followed by the assertion below, and it was the SECOND fixed deadline in
-    // this test. The 200 ms was standing in for "the close has entered its grace
+    // Issue #709: this was a flat `sleep(200 ms)` — the reporter's own interval —
+    // followed by a bare assertion, and it was the SECOND fixed deadline in this
+    // test. The 200 ms was standing in for "the close has entered its grace
     // window", but `stop_agent` is driven by a spawned task and a socket round
-    // trip, so on a loaded box neither had necessarily reached
-    // `begin_pane_close` yet when the sleep expired. The assertion then fired
-    // saying the close was not in flight — and it was right, for the opposite of
-    // the reason it names: not "the close already finished" but "the close had
-    // not started". Measured on this branch at load 78 on 16 cores, in a
-    // full-tier run whose whole failing case took 0.98 s, so nothing had
-    // overshot anything.
+    // trip, so on a loaded box neither had necessarily reached `begin_pane_close`
+    // yet when the sleep expired. The assertion then fired saying the close was
+    // not in flight — and it was right, for the opposite of the reason it names:
+    // not "the close already finished" but "the close had not started".
     //
-    // `pane_close_in_flight` is exactly the state the 200 ms was approximating —
-    // it is true from the moment the cleanup hold and the closing mark go up,
-    // which is also the moment the pane's registry entry is gone and its role is
-    // still registered: the window a `clear = true` respawn used to fail
-    // `NotFound` in. Waiting for it puts the delegate inside that window by
-    // construction rather than by arithmetic, and it cannot report a window that
-    // has not opened as one that has closed.
-    //
-    // What the wait now reports is a CAUSE rather than a bool. This assertion
-    // was met red on `main` and mis-diagnosed as "the window opened and shut
-    // between two samples" — a cause [`CloseWindow`]'s docs show is not
-    // reachable, because the window is at least the three-second termination
-    // grace wide and `agent_is_live` goes false the instant the close begins.
-    // The occurrence that produced that reading printed `stand-in still live =
-    // true`, so the close had not started at all; the request's own result
-    // would have said why, and the test was discarding it.
-    let window =
-        wait_for_close_in_flight(&fx.daemon.registry, WORKER_PANE, &closing, &stop_outcome).await;
-    assert!(
-        matches!(window, CloseWindow::Entered),
-        "precondition: the close never entered its grace window, so the delegate below would be \
-         an ordinary post-close delegate instead of #606's race; cause = {}, \
-         stand-in still live = {}, records = {:?}",
-        window.cause(),
-        fx.daemon.registry.agent_is_live(&fx.worker_agent_id),
-        fx.daemon.registry.agent_records()
-    );
+    // Issue #954: its replacement, a 5 ms poll of `pane_close_in_flight` that
+    // bailed on `JoinHandle::is_finished`, kept the second half of that defect —
+    // it still reported a request that had failed as a window that had closed.
+    // `close_pane_into_its_grace_window` observes the transition through the
+    // registry's own close signal, taken before the request is issued, and
+    // retries an attempt that establishes nothing. Its doc carries the evidence.
+    let closing = close_pane_into_its_grace_window(
+        &fx.daemon.registry,
+        &fx.daemon.attach_path,
+        WORKER_PANE,
+        &fx.worker_agent_id,
+    )
+    .await;
     delegate(&fx, "list the files in this directory").await;
 
     let replacement = wait_for_replacement_agent(
@@ -498,10 +548,27 @@ async fn delegate_022_delegate_during_an_in_flight_close_brings_the_role_back() 
     )
     .await
     .unwrap_or_else(|| {
+        // Issue #954: the two extra values separate the verdicts this one
+        // sentence used to merge. A `clear = true` respawn that finds no record
+        // waits `PANE_CLOSE_SETTLE_TIMEOUT` (6 s, twice `AGENT_TERMINATE_GRACE`)
+        // for the pane's hold to lift and then spawns anyway — and
+        // `spawn_agent` REFUSES a pane that is still held, so a close that
+        // outruns that window leaves the pane empty for the session — issue
+        // #1114, which is a product-side residual of #606 rather than a
+        // regression in this test, and which reads identically to one because
+        // the pane is simply empty either way. `close still in flight` is what
+        // tells them apart: true means the teardown never released the pane in
+        // time (#1114), false means the recovery had its chance and did not take
+        // it, which is #606 proper. Measured by shortening that constant below
+        // the grace — deterministic — and no test-side budget recovers it: the
+        // wait above was temporarily widened to 120 s and expired with the pane
+        // still empty, so it was left at its flat 20 s.
         panic!(
             "delegating to a `clear = true` role while its pane was mid-close left the role with \
              no live agent at all — the pane is dead for the rest of the session (#606). \
-             records = {:?}",
+             close still in flight = {}, stop_agent finished = {}, records = {:?}",
+            fx.daemon.registry.pane_close_in_flight(WORKER_PANE),
+            closing.is_finished(),
             fx.daemon.registry.agent_records()
         )
     });
@@ -694,6 +761,419 @@ async fn delegate_023_a_replacement_that_dies_is_reported_to_the_orchestrator() 
     );
 }
 
+/// Issue #1114: how long `delegate/032` keeps the worker pane in the window
+/// between `begin_pane_close` and `close_agent` before finishing the close.
+///
+/// Unlike the two fixed deadlines issue #709 took out of `delegate/022`, this
+/// one cannot expire early on the thing it is waiting for: anywhere inside the
+/// 6 s window it stays under, over-holding is safe in BOTH directions. A fixed
+/// build parks in the respawn's wait for as long as the hold is up and then
+/// re-creates the pane, and a broken one has already failed by then. All the
+/// value has to be is long enough that a delegate cannot still be on its way to
+/// `spawn_agent`, and short enough to stay inside the 6 s
+/// `PANE_CLOSE_SETTLE_TIMEOUT` the daemon allows a close before it stops waiting
+/// for one. One second is ~1000x the first and 6x under the second.
+///
+/// There is deliberately no early exit on "the record has gone", tempting as it
+/// is — the record going IS the defect, so ending the hold on it hands the
+/// broken build's `spawn_agent` a pane that is no longer held and lets it
+/// succeed. Measured: with a 25 ms poll on that condition the pre-fix build came
+/// back green in 1.18 s. The hold has to outlast the failure it is provoking,
+/// not race it.
+const CLOSE_WINDOW_HOLD: Duration = Duration::from_secs(1);
+
+/// Issue #1114: how long `delegate/033` keeps the pane's cleanup hold up AFTER
+/// `close_agent` has already removed the record — the starved tail of a close,
+/// which is what outrunning `PANE_CLOSE_SETTLE_TIMEOUT` means in production.
+///
+/// It has to EXCEED that 6 s constant, or the test is `delegate/022`'s ordinary
+/// in-flight close wearing a different fixture and says nothing about the
+/// give-up this scenario is named for. Eight seconds clears it by two, and a
+/// `sleep` can only overshoot, so load moves this in the safe direction. The
+/// other end is the recovery's own ceiling — `PANE_CLOSE_RECREATE_TIMEOUT`,
+/// 30 s — which this sits comfortably under.
+const STARVED_CLOSE_TAIL: Duration = Duration::from_secs(8);
+
+/// Finish a close the way `daemon_protocol.rs`'s `StopAgent` arm finishes one:
+/// `close_agent`, then `unregister_pane` under the state write guard, then
+/// `finish_pane_close`, and only then drop the cleanup hold.
+///
+/// The two tests below are ABOUT the interior of that sequence, so a faithful
+/// reproduction has to be able to stand between its statements — which is why
+/// they assemble it here rather than driving `StopAgent` over the socket the way
+/// `delegate/022` does. Everything else about them is the production path: a
+/// real `handle_delegate_with_state`, a real registry, real PTYs.
+async fn finish_the_close(
+    registry: &Arc<AgentPtyRegistry>,
+    state: &dot_agent_deck::state::SharedState,
+    agent_id: &str,
+    hold: dot_agent_deck::agent_pty::PaneCleanupHold,
+) -> Result<(), dot_agent_deck::agent_pty::AgentPtyError> {
+    let closed = registry.close_agent(agent_id);
+    state.write().await.unregister_pane(WORKER_PANE);
+    registry.finish_pane_close(WORKER_PANE, closed.is_ok());
+    drop(hold);
+    closed
+}
+
+/// Scenario: put the worker's pane into the exact state the daemon's `StopAgent`
+/// handler is in between `begin_pane_close` and `close_agent` — cleanup hold
+/// taken, closing mark set, and the pane's registry record still there — then
+/// delegate to the `clear = true` role and let the close finish a moment later.
+/// The role must come back with a live agent that receives the task pointer, and
+/// the delegate must not have destroyed the pane's record on its way past, which
+/// the close itself reports by failing `NotFound` against an id that is gone.
+#[tokio::test(flavor = "multi_thread")]
+#[spec("orchestration/delegate/032")]
+async fn delegate_032_a_delegate_inside_the_pre_close_window_leaves_the_record_alone() {
+    let fx = fixture(|_| "cat".to_string()).await;
+
+    // The window. `begin_pane_close` runs first and `close_agent` — the step
+    // that removes the pane's entry — runs behind a `spawn_blocking` hop, so a
+    // delegate landing between them finds a RECORD and takes the ordinary
+    // respawn path instead of issue #606's recreation.
+    let hold = fx
+        .daemon
+        .registry
+        .hold_pane_for_cleanup(WORKER_PANE, &fx.worker_agent_id)
+        .expect("the stopping agent must be able to hold its own pane for cleanup");
+    fx.daemon.registry.begin_pane_close(WORKER_PANE);
+
+    assert!(
+        fx.daemon.registry.pane_close_in_flight(WORKER_PANE),
+        "precondition: the pane must read as mid-close, or the delegate below is an ordinary \
+         delegate to a healthy worker"
+    );
+    assert_eq!(
+        fx.daemon
+            .registry
+            .pane_current_agent_id(WORKER_PANE)
+            .as_deref(),
+        Some(fx.worker_agent_id.as_str()),
+        "precondition: the pane's record must still be PRESENT — a pane with no record is \
+         `delegate/022`'s window, not this one, and it reaches the recovery by a different route"
+    );
+
+    // Finish the close the way the handler does, once the hold has been up long
+    // enough that no delegate can still be on its way to `spawn_agent`. See
+    // `CLOSE_WINDOW_HOLD` for why this does not end early on the defect it is
+    // provoking.
+    let registry = Arc::clone(&fx.daemon.registry);
+    let state = fx.daemon.state.clone();
+    let closing_id = fx.worker_agent_id.clone();
+    let closing = tokio::spawn(async move {
+        tokio::time::sleep(CLOSE_WINDOW_HOLD).await;
+        finish_the_close(&registry, &state, &closing_id, hold).await
+    });
+
+    delegate(&fx, "list the files in this directory").await;
+
+    let closed = closing.await.expect("the close task must not panic");
+    assert!(
+        closed.is_ok(),
+        "the close could not find the agent it was already taking apart, so the delegate had \
+         lifted the pane's record out from under it — `respawn_agent_for_pane_declared` removes \
+         the entry and only THEN calls `spawn_agent`, which refuses a pane still held for \
+         cleanup (#1114). error = {:?}",
+        closed.unwrap_err()
+    );
+
+    let replacement = wait_for_replacement_agent(
+        &fx.daemon.registry,
+        WORKER_PANE,
+        &fx.worker_agent_id,
+        Duration::from_secs(20),
+    )
+    .await
+    .unwrap_or_else(|| {
+        panic!(
+            "delegating to a `clear = true` role in the window before its close removed the \
+             pane's record left the role with no live agent at all — the pane is dead for the \
+             rest of the session (#1114, #606). records = {:?}",
+            fx.daemon.registry.agent_records()
+        )
+    });
+
+    // A `cat` stand-in emits no readiness signal of its own, so stand in for the
+    // agent's hook exactly as the rest of the fast delegate suite does.
+    common::write_hook_line(
+        &fx.daemon.hook_path,
+        &session_start(WORKER_PANE, &replacement),
+    )
+    .expect("deliver synthetic SessionStart for the replacement worker");
+
+    let snapshot = wait_for_pane_needle(
+        &fx.daemon.registry,
+        WORKER_PANE,
+        POINTER,
+        Duration::from_secs(20),
+    )
+    .await;
+    assert!(
+        snapshot_contains(&snapshot, POINTER),
+        "the recovered worker never received the task pointer; snapshot = {:?}",
+        String::from_utf8_lossy(&snapshot)
+    );
+
+    let state = fx.daemon.state.read().await;
+    assert_eq!(
+        state.pane_role_map.get(WORKER_PANE).map(String::as_str),
+        Some(WORKER_ROLE),
+        "the role must still route after the recovery, or the NEXT delegate is rejected with \
+         `reached no worker for role(s)` — the permanent breakage #606 reports"
+    );
+}
+
+/// Scenario: close the worker's pane for real but leave the close's pane-scoped
+/// cleanup running for longer than the six seconds the respawn allows it — a
+/// starved close tail — and delegate to the `clear = true` role while it runs.
+/// The role must still come back once the close finally lets go, instead of the
+/// delegate giving up at the settle timeout and leaving the pane dead for the
+/// rest of the session.
+#[tokio::test(flavor = "multi_thread")]
+#[spec("orchestration/delegate/033")]
+async fn delegate_033_a_close_that_outruns_the_settle_timeout_still_brings_the_role_back() {
+    let fx = fixture(|_| "cat".to_string()).await;
+
+    let hold = fx
+        .daemon
+        .registry
+        .hold_pane_for_cleanup(WORKER_PANE, &fx.worker_agent_id)
+        .expect("the stopping agent must be able to hold its own pane for cleanup");
+    fx.daemon.registry.begin_pane_close(WORKER_PANE);
+    fx.daemon
+        .registry
+        .close_agent(&fx.worker_agent_id)
+        .expect("close the worker stand-in");
+
+    assert!(
+        fx.daemon
+            .registry
+            .pane_current_agent_id(WORKER_PANE)
+            .is_none(),
+        "precondition: `close_agent` must have removed the pane's record, or this is \
+         `delegate/032`'s window rather than the give-up this test is named for"
+    );
+    assert!(
+        fx.daemon.registry.pane_close_in_flight(WORKER_PANE),
+        "precondition: the close's cleanup hold must still be up — it is what `spawn_agent` \
+         refuses a fresh pane on, and without it the recovery has nothing to wait for"
+    );
+
+    // The starved tail: everything after `close_agent` in the `StopAgent` arm,
+    // stretched past `PANE_CLOSE_SETTLE_TIMEOUT`. Measured on a real box at 80
+    // concurrent copies, not invented — see issue #1114.
+    let registry = Arc::clone(&fx.daemon.registry);
+    let state = fx.daemon.state.clone();
+    let closing = tokio::spawn(async move {
+        tokio::time::sleep(STARVED_CLOSE_TAIL).await;
+        state.write().await.unregister_pane(WORKER_PANE);
+        registry.finish_pane_close(WORKER_PANE, true);
+        drop(hold);
+    });
+
+    delegate(&fx, "list the files in this directory").await;
+
+    let replacement = wait_for_replacement_agent(
+        &fx.daemon.registry,
+        WORKER_PANE,
+        &fx.worker_agent_id,
+        STARVED_CLOSE_TAIL + Duration::from_secs(20),
+    )
+    .await
+    .unwrap_or_else(|| {
+        panic!(
+            "the close outran the respawn's settle window, so the `clear = true` delegate gave \
+             up and left the role with no agent at all — the pane is dead for the rest of the \
+             session (#1114). close still in flight = {}, records = {:?}",
+            fx.daemon.registry.pane_close_in_flight(WORKER_PANE),
+            fx.daemon.registry.agent_records()
+        )
+    });
+    closing.await.expect("the close task must not panic");
+
+    common::write_hook_line(
+        &fx.daemon.hook_path,
+        &session_start(WORKER_PANE, &replacement),
+    )
+    .expect("deliver synthetic SessionStart for the replacement worker");
+
+    let snapshot = wait_for_pane_needle(
+        &fx.daemon.registry,
+        WORKER_PANE,
+        POINTER,
+        Duration::from_secs(20),
+    )
+    .await;
+    assert!(
+        snapshot_contains(&snapshot, POINTER),
+        "the recovered worker never received the task pointer; snapshot = {:?}",
+        String::from_utf8_lossy(&snapshot)
+    );
+
+    let state = fx.daemon.state.read().await;
+    assert_eq!(
+        state.pane_role_map.get(WORKER_PANE).map(String::as_str),
+        Some(WORKER_ROLE),
+        "the role must still route after the recovery, or the NEXT delegate is rejected with \
+         `reached no worker for role(s)` — the permanent breakage #606 reports"
+    );
+}
+
+/// Issue #1114 (Greptile P1 on PR #1119): how long `delegate/034` keeps the
+/// cleanup hold up once it has taken it — a `StopAgent` whose remaining steps
+/// are starved, modelled the same way `delegate/033` models a starved close
+/// tail.
+///
+/// It has to outlast the respawn's own `AGENT_TERMINATE_GRACE`, because that
+/// grace is what separates the record removal this test waits for from the
+/// `spawn_agent` the hold has to refuse. Hold for less and the spawn lands after
+/// the hold is down, succeeds, and the test proves nothing. Five seconds is 1.7x
+/// the 3 s grace, and a `sleep` can only overshoot, so load moves it in the safe
+/// direction — while staying far under the recovery's own 30 s ceiling, above
+/// which a FIXED build would fail too.
+const STARVED_STOPAGENT_HOLD: Duration = Duration::from_secs(5);
+
+/// Scenario: delegate to a `clear = true` role whose worker IGNORES SIGTERM, so
+/// the respawn spends its full three-second termination grace between lifting
+/// the pane's record out and spawning the replacement. Take the pane's cleanup
+/// hold inside that gap — a `StopAgent` that read its record a moment before the
+/// respawn removed it, and whose own remaining steps are then starved — and keep
+/// it up past the grace, so the replacement spawn is refused. The role must
+/// still come back once the hold goes down.
+#[tokio::test(flavor = "multi_thread")]
+#[spec("orchestration/delegate/034")]
+async fn delegate_034_a_hold_taken_after_the_record_was_lifted_still_brings_the_role_back() {
+    use std::os::unix::fs::PermissionsExt;
+
+    // Same stand-in `delegate/022` uses, and for the same reason: `close_agent`
+    // and the respawn's terminate both spend the full `AGENT_TERMINATE_GRACE`
+    // only while the child is still running. A plain `cat` dies on the first
+    // signal, the gap this test aims at is a few milliseconds wide, and the hold
+    // below could not be placed inside it.
+    let fx = fixture(|dir| {
+        let script = dir.join("stubborn-worker.sh");
+        let marker = String::from_utf8_lossy(STUBBORN_WORKER_ARMED).into_owned();
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\ntrap '' TERM\nprintf '{marker}'\nexec cat\n"),
+        )
+        .expect("write SIGTERM-ignoring worker stand-in");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod SIGTERM-ignoring worker stand-in");
+        script.to_string_lossy().into_owned()
+    })
+    .await;
+
+    // The marker proves the `trap '' TERM` is already installed, so the grace
+    // below is a fact rather than a hope — issue #709's fix, borrowed.
+    let armed = common::wait_for_child_first_output(
+        &fx.daemon.registry,
+        &fx.worker_agent_id,
+        STUBBORN_WORKER_ARMED,
+    )
+    .await;
+    assert!(
+        snapshot_contains(&armed, STUBBORN_WORKER_ARMED),
+        "precondition: the worker stand-in never got as far as installing its `trap '' TERM`, so \
+         the respawn below would terminate it instantly and leave no gap to place the hold in; \
+         snapshot = {:?}",
+        String::from_utf8_lossy(&armed)
+    );
+    assert!(
+        !fx.daemon.registry.pane_close_in_flight(WORKER_PANE),
+        "precondition: NOTHING is closing this pane when the delegate lands — that is what makes \
+         this the ordinary respawn leg rather than `delegate/032`'s window, and the whole point \
+         is that the ordinary leg can still meet a hold on its way to `spawn_agent`"
+    );
+
+    delegate(&fx, "list the files in this directory").await;
+
+    // The gap: the respawn has lifted the record out and is now inside
+    // `terminate_child_with_grace_and_wait`, which the stand-in will make spend
+    // the full three seconds. "The record has gone" is the observable edge of
+    // it, so the hold lands inside the gap by construction rather than by
+    // arithmetic.
+    let removed_by_deadline = tokio::time::Instant::now() + common::child_boot_budget();
+    while fx
+        .daemon
+        .registry
+        .pane_current_agent_id(WORKER_PANE)
+        .is_some()
+        && tokio::time::Instant::now() < removed_by_deadline
+    {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(
+        fx.daemon
+            .registry
+            .pane_current_agent_id(WORKER_PANE)
+            .is_none(),
+        "precondition: the respawn never lifted the pane's record out, so there is no gap to take \
+         the hold in and the assertion below would pass for the wrong reason; records = {:?}",
+        fx.daemon.registry.agent_records()
+    );
+
+    // The `StopAgent` that lost this race: it read the worker's record just
+    // before the respawn removed it, so `pane_claimed_by_other` sees nothing and
+    // the hold is granted. Its own `close_agent` then fails against an id that
+    // is gone — which is exactly what the real handler does here, and why it
+    // rolls the closing mark back rather than completing.
+    let hold = fx
+        .daemon
+        .registry
+        .hold_pane_for_cleanup(WORKER_PANE, &fx.worker_agent_id)
+        .expect("a pane nobody claims is grantable to the stopping agent");
+    fx.daemon.registry.begin_pane_close(WORKER_PANE);
+    let stale_close = fx.daemon.registry.close_agent(&fx.worker_agent_id);
+    assert!(
+        stale_close.is_err(),
+        "precondition: this models a `StopAgent` whose record the respawn already took, so its \
+         own close MUST fail — if it succeeded the respawn had not removed anything and the gap \
+         was never entered"
+    );
+
+    let registry = Arc::clone(&fx.daemon.registry);
+    let releasing = tokio::spawn(async move {
+        tokio::time::sleep(STARVED_STOPAGENT_HOLD).await;
+        registry.finish_pane_close(WORKER_PANE, false);
+        drop(hold);
+    });
+
+    let replacement = wait_for_replacement_agent(
+        &fx.daemon.registry,
+        WORKER_PANE,
+        &fx.worker_agent_id,
+        STARVED_STOPAGENT_HOLD + Duration::from_secs(20),
+    )
+    .await
+    .unwrap_or_else(|| {
+        panic!(
+            "a cleanup hold taken AFTER the respawn lifted the pane's record out left the role \
+             with no agent at all — the ordinary respawn leg had already terminated the worker, \
+             and `spawn_agent`'s `DuplicatePaneId` was returned instead of entering the recovery \
+             that knows how to wait for the hold (#1114). records = {:?}",
+            fx.daemon.registry.agent_records()
+        )
+    });
+    releasing
+        .await
+        .expect("the hold-release task must not panic");
+
+    let state = fx.daemon.state.read().await;
+    assert_eq!(
+        state.pane_role_map.get(WORKER_PANE).map(String::as_str),
+        Some(WORKER_ROLE),
+        "the role must still route afterwards, or the NEXT delegate is rejected with \
+         `reached no worker for role(s)` — the permanent breakage #606 reports"
+    );
+    assert!(
+        fx.daemon.registry.agent_is_live(&replacement),
+        "and the replacement has to be a LIVE agent rather than a record: this pane's whole \
+         history in this test is a worker that was terminated and a spawn that was refused"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // #584's control: the two spawn paths' respawns, side by side.
 // ---------------------------------------------------------------------------
@@ -836,6 +1316,7 @@ async fn dispatch_003_the_dispatch_and_startagent_paths_respawn_identically() {
         task: "list the files in this directory".to_string(),
         to: vec![WORKER_ROLE.to_string()],
         timestamp: chrono::Utc::now(),
+        token: None,
     };
     daemon
         .state

@@ -196,6 +196,7 @@ impl WorkDoneHarness {
                     task: "Perform the delegated test task.".to_string(),
                     to: vec![WORKER_ROLE.to_string()],
                     timestamp: chrono::Utc::now(),
+                    token: None,
                 },
                 &self.registry,
                 &self.event_tx,
@@ -213,6 +214,7 @@ impl WorkDoneHarness {
                     task: summary.to_string(),
                     done: false,
                     timestamp: chrono::Utc::now(),
+                    token: None,
                 },
                 &self.registry,
             )
@@ -809,6 +811,7 @@ impl DispatchReturnHarness {
                     task: report.to_string(),
                     done: true,
                     timestamp: chrono::Utc::now(),
+                    token: None,
                 },
                 &self.registry,
             )

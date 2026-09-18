@@ -114,7 +114,13 @@ fn orchestrator_pane_id_and_cwd(deck: &TuiDeck) -> (String, String) {
 /// the tab was opened from — the "operator added a role mid-session"
 /// scenario `tests/pane_spawn.rs` (M3) already exercises at the handler
 /// level.
-fn add_reviewer_role(cwd: &str) {
+///
+/// Issue #1096: `reviewer` goes in the MIDDLE, between `orchestrator` and
+/// `coder`, not at the end. That is the configuration the issue reports and
+/// the one the old append-always growth path got wrong — an end-of-list role
+/// happened to append into the right slot, so a fixture that only ever added
+/// one there could never tell placement from appending.
+fn insert_reviewer_role_mid_config(cwd: &str) {
     let config_path = std::path::Path::new(cwd).join(".dot-agent-deck.toml");
     std::fs::write(
         &config_path,
@@ -127,14 +133,36 @@ fn add_reviewer_role(cwd: &str) {
          start = true\n\
          \n\
          [[orchestrations.roles]]\n\
-         name = \"coder\"\n\
+         name = \"reviewer\"\n\
          command = \"cat\"\n\
          \n\
          [[orchestrations.roles]]\n\
-         name = \"reviewer\"\n\
+         name = \"coder\"\n\
          command = \"cat\"\n",
     )
-    .expect("add the reviewer role to the running orchestration's own config");
+    .expect("insert the reviewer role into the running orchestration's own config");
+}
+
+/// The `[panes.orchestration]` role list the session snapshot actually
+/// captured, read back by PARSING the TOML rather than substring-matching
+/// it — the assertion is about ORDER, and a substring probe cannot tell
+/// `[orchestrator, reviewer, coder]` from `[orchestrator, coder, reviewer]`.
+/// Returns an empty vector when no pane carries an orchestration snapshot.
+fn captured_orchestration_roles(session_toml: &str) -> Vec<String> {
+    let parsed: toml::Value = match toml::from_str(session_toml) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    parsed
+        .get("panes")
+        .and_then(|p| p.as_array())
+        .into_iter()
+        .flatten()
+        .find_map(|pane| pane.get("orchestration")?.get("roles")?.as_array().cloned())
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|r| r.as_str().map(str::to_string))
+        .collect()
 }
 
 /// Invoke the REAL `pane spawn reviewer` CLI subcommand exactly as a real
@@ -161,21 +189,25 @@ fn run_pane_spawn_reviewer(deck: &TuiDeck, orchestrator_pane_id: &str) {
     );
 }
 
-/// Scenario: Open a real Orchestration tab (`pane-spawn-live` fixture: one
-/// orchestration, roles `orchestrator` [start] + `coder`, both spawned the
-/// instant the tab opens) and confirm both role cards are visible together.
-/// Then mutate the RUNNING orchestration's own `.dot-agent-deck.toml` (read
-/// back from the daemon's registry) to add a THIRD role, `reviewer`, that
-/// was never part of the config this tab was opened from. Invoke the REAL
-/// `dot-agent-deck pane spawn reviewer` CLI subcommand and assert reviewer's
-/// card joins the SAME orchestration tab that is still active (this test
-/// never switches tabs) and that the tab bar still shows exactly one
-/// Dashboard tab + one orchestration tab — not two orchestration tabs for
-/// the same orchestration.
+/// Scenario: Open a real Orchestration tab (`pane-spawn-live` fixture:
+/// `orchestrator` [start] + `coder`, both spawned the instant the tab opens)
+/// and confirm both role cards are visible on it. Mutate the RUNNING
+/// orchestration's own `.dot-agent-deck.toml` to insert a third role,
+/// `reviewer`, between the two, then invoke the real `dot-agent-deck pane
+/// spawn reviewer` CLI subcommand. Reviewer's card must join the SAME
+/// orchestration tab that is still active — this test never switches tabs —
+/// as its own bordered role-pane box, with the tab bar still showing exactly
+/// one Dashboard tab plus one orchestration tab rather than a duplicate.
+// The config edit goes in the MIDDLE rather than at the end because that is
+// issue #1096's shape; an end-of-list role appends into the correct slot
+// either way, so the old fixture could not tell placement from appending.
+// This test's own pins are unaffected by which slot reviewer lands in —
+// `pane/drift/001` is the one that asserts the resulting order.
 #[spec("pane/spawn/005")]
 #[test]
 fn spawn_005_pane_spawn_joins_the_already_open_orchestration_tab() {
     let deck = TuiDeck::builder()
+        .impersonating_pane_signals()
         .with_pty_size(120, 40)
         .launch_with_fixture("pane-spawn-live");
     deck.wait_for_string("No active sessions");
@@ -211,7 +243,7 @@ fn spawn_005_pane_spawn_joins_the_already_open_orchestration_tab() {
     );
 
     let (orchestrator_pane_id, orchestration_cwd) = orchestrator_pane_id_and_cwd(&deck);
-    add_reviewer_role(&orchestration_cwd);
+    insert_reviewer_role_mid_config(&orchestration_cwd);
     run_pane_spawn_reviewer(&deck, &orchestrator_pane_id);
 
     // The pin, part 1: reviewer's card must join the SAME orchestration tab
@@ -255,26 +287,27 @@ fn spawn_005_pane_spawn_joins_the_already_open_orchestration_tab() {
 /// Scenario: Open a real orchestration tab (`pane-spawn-live` fixture:
 /// `orchestrator` [start] + `coder`) with `DOT_AGENT_DECK_SESSION` redirected
 /// to a test-owned path, confirm the leading-edge snapshot write already
-/// captures both roles in `[panes.orchestration]`, then grow the SAME
-/// already-open tab with a third role (`reviewer`) via the real `pane spawn`
-/// CLI exactly as `pane/spawn/005` does. Force one more snapshot flush
-/// (spawning an unrelated plain dashboard pane, since the growth branch
-/// itself never marks the session dirty) and assert the re-flushed
-/// `[panes.orchestration]` block's role list includes `reviewer`. This is
-/// the issue #868 save/restore config-drift question: does the snapshot
-/// writer read the role list from the tab's own live, M4-grown
-/// `config.roles`, or from a stale copy captured once at tab-open time? The
-/// only place `ui.pane_metadata`'s `OrchestrationSnapshot.roles` is written
-/// is `open_orchestration_tab`'s one-time capture at tab-open —
-/// `surface_one_orchestration`'s M4 growth branch
-/// (`add_role_to_existing_orchestration`) extends the live
-/// `Tab::Orchestration` but must ALSO push onto that snapshot, or every
-/// later snapshot flush keeps re-serializing the ORIGINAL two-role list. A
-/// restored session would then see `resolve_orchestration_for_restore`'s
-/// drift guard false-positive (`current_roles` re-read from the now-3-role
-/// `.dot-agent-deck.toml` vs. `saved_roles` frozen at 2) and fall back to a
-/// plain pane, discarding the whole orchestration tab reconstruction even
-/// though nothing on disk ever actually diverged.
+/// captured both roles, then insert `reviewer` between them in the running
+/// config and bring it up with the real `pane spawn` CLI. Force one more
+/// coalesced flush by spawning an unrelated plain dashboard pane, since the
+/// growth branch alone does not reliably mark the session dirty. The
+/// re-flushed `[panes.orchestration]` block must list exactly `[orchestrator,
+/// reviewer, coder]` — the on-disk config's order — parsed as TOML rather
+/// than substring-matched.
+// Why both halves of that last assertion matter.
+//
+// Issue #868: `ui.pane_metadata`'s `OrchestrationSnapshot.roles` is written
+// once, by `open_orchestration_tab`'s capture at tab-open.
+// `surface_one_orchestration`'s growth branch
+// (`add_role_to_existing_orchestration`) extends the live
+// `Tab::Orchestration` but must ALSO carry that into the snapshot, or every
+// later flush keeps re-serializing the ORIGINAL two-role list.
+//
+// Issue #1096 adds the ORDER half. `resolve_orchestration_for_restore`'s
+// drift guard is an element-by-element sequence comparison, so a snapshot
+// that carries `reviewer` but appended it is rejected exactly like one that
+// never captured it — and the restored session falls back to a plain pane,
+// discarding the whole orchestration tab, though nothing on disk diverged.
 #[spec("pane/drift/001")]
 #[test]
 fn drift_001_role_grown_via_pane_spawn_survives_session_capture() {
@@ -282,6 +315,7 @@ fn drift_001_role_grown_via_pane_spawn_survives_session_capture() {
     let session_file = session_dir.path().join("session.toml");
 
     let deck = TuiDeck::builder()
+        .impersonating_pane_signals()
         .with_pty_size(120, 40)
         .with_env(
             "DOT_AGENT_DECK_SESSION",
@@ -323,7 +357,7 @@ fn drift_001_role_grown_via_pane_spawn_survives_session_capture() {
 
     // Grow the already-open tab with `reviewer`, mirroring `pane/spawn/005`.
     let (orchestrator_pane_id, orchestration_cwd) = orchestrator_pane_id_and_cwd(&deck);
-    add_reviewer_role(&orchestration_cwd);
+    insert_reviewer_role_mid_config(&orchestration_cwd);
     run_pane_spawn_reviewer(&deck, &orchestrator_pane_id);
 
     assert!(
@@ -355,5 +389,25 @@ fn drift_001_role_grown_via_pane_spawn_survives_session_capture() {
          positive `resolve_orchestration_for_restore`'s drift guard (saved \
          roles != the now-3-role .dot-agent-deck.toml) and fall back to a \
          plain pane.\nFile contents:\n{toml_after}"
+    );
+
+    // Issue #1096: presence is not enough — the drift guard compares the
+    // saved sequence against the config's ORDER, element by element. The
+    // fixture inserted `reviewer` in the MIDDLE, so a snapshot listing
+    // [orchestrator, coder, reviewer] is exactly as unrestorable as one
+    // missing `reviewer` altogether.
+    assert_eq!(
+        captured_orchestration_roles(&toml_after),
+        vec![
+            "orchestrator".to_string(),
+            "reviewer".to_string(),
+            "coder".to_string(),
+        ],
+        "the captured [panes.orchestration] role list must be in the order the \
+         on-disk .dot-agent-deck.toml gives -- `reviewer` was inserted BETWEEN \
+         `orchestrator` and `coder`, so a snapshot that appended it instead \
+         fails `resolve_orchestration_for_restore`'s exact-sequence drift guard \
+         on the next restore and drops the whole orchestration tab to a plain \
+         pane (issue #1096).\nFile contents:\n{toml_after}"
     );
 }

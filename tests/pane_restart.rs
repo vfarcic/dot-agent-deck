@@ -152,6 +152,7 @@ async fn restart_role(
         role: role.to_string(),
         force,
         timestamp: chrono::Utc::now(),
+        token: None,
     };
     dot_agent_deck::state::handle_restart_role_with_state(
         signal,
@@ -446,6 +447,7 @@ async fn pane_restart_006_two_same_name_cwd_instances_do_not_cross_restart() {
         role: WORKER_ROLE.to_string(),
         force: true,
         timestamp: chrono::Utc::now(),
+        token: None,
     };
     let response = dot_agent_deck::state::handle_restart_role_with_state(
         signal,
@@ -668,6 +670,7 @@ async fn pane_restart_010_recheck_under_dispatch_lock_prevents_killing_a_concurr
         role: WORKER_ROLE.to_string(),
         force: false,
         timestamp: chrono::Utc::now(),
+        token: None,
     };
     let mut restart_future = Box::pin(dot_agent_deck::state::handle_restart_role_with_state(
         signal,
@@ -799,6 +802,7 @@ async fn pane_restart_011_force_bypasses_the_post_dispatch_lock_recheck_too() {
         role: WORKER_ROLE.to_string(),
         force: true,
         timestamp: chrono::Utc::now(),
+        token: None,
     };
     let mut restart_future = Box::pin(dot_agent_deck::state::handle_restart_role_with_state(
         signal,

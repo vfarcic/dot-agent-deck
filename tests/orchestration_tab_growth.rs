@@ -101,6 +101,17 @@ fn two_role_config(orchestration_name: &str) -> OrchestrationConfig {
     }
 }
 
+fn config_with(
+    orchestration_name: &str,
+    roles: Vec<OrchestrationRoleConfig>,
+) -> OrchestrationConfig {
+    OrchestrationConfig {
+        default: false,
+        name: orchestration_name.to_string(),
+        roles,
+    }
+}
+
 fn new_tab_manager() -> TabManager {
     TabManager::new(Arc::new(NoopPaneController))
 }
@@ -143,6 +154,9 @@ fn pane_spawn_009_growing_a_dead_slot_replaces_it_instead_of_appending_a_duplica
             tab_index,
             fresh_reviewer_config.clone(),
             "fresh-reviewer-pane".to_string(),
+            // The CURRENT config still lists the same two roles in the same
+            // order — only the reviewer's `command` was edited.
+            &[role("orchestrator", true), fresh_reviewer_config.clone()],
         )
         .expect("grow the tab with a freshly-spawned reviewer");
     assert!(
@@ -287,6 +301,12 @@ fn pane_spawn_010_two_same_name_cwd_instances_do_not_cross_wire_on_growth() {
             resolved_for_b,
             role("coder", false),
             "b-coder".to_string(),
+            // `coder` was added at the END of the config, so it appends.
+            &[
+                role("orchestrator", true),
+                role("reviewer", false),
+                role("coder", false),
+            ],
         )
         .expect("grow instance B's tab with a new coder role");
     assert_eq!(grown_role_index, 2);
@@ -344,5 +364,313 @@ fn pane_spawn_010_two_same_name_cwd_instances_do_not_cross_wire_on_growth() {
         resolved_for_legacy.is_none(),
         "a token-less lookup must not match either tokened instance's tab; got \
          {resolved_for_legacy:?} (A = {tab_a}, B = {tab_b})"
+    );
+}
+
+/// Scenario: an operator edits `.dot-agent-deck.toml` while an orchestration
+/// tab is open, INSERTING a role in the middle of the role list —
+/// `[orchestrator, coder]` becomes `[orchestrator, reviewer, coder]` — then
+/// runs `dot-agent-deck pane spawn reviewer`. The role must land in the tab
+/// at the position the CURRENT config gives it (index 1, between
+/// `orchestrator` and `coder`), with `role_pane_ids`, `role_statuses` and
+/// `config.roles` all shifted together so they stay parallel. Appending it
+/// instead leaves the tab ordered `[orchestrator, coder, reviewer]`, which
+/// no longer matches the config and makes
+/// `resolve_orchestration_for_restore`'s exact-sequence drift guard reject
+/// the next restore and fall back to a plain pane.
+#[spec("pane/spawn/014")]
+#[test]
+fn pane_spawn_014_a_role_inserted_mid_config_lands_at_its_configured_index() {
+    let mut tabs = new_tab_manager();
+    let tab_config = config_with(
+        "mid-insert-orch",
+        vec![role("orchestrator", true), role("coder", false)],
+    );
+
+    let (tab_index, _) = tabs
+        .open_orchestration_tab_with_existing_role_panes(
+            &tab_config,
+            "/work/mid-insert-cwd",
+            vec![
+                Some("orchestrator-pane".to_string()),
+                Some("coder-pane".to_string()),
+            ],
+            None,
+            None,
+        )
+        .expect("open the two-role tab the operator is looking at");
+
+    // The operator's edit: `reviewer` inserted BETWEEN the two roles the tab
+    // was opened with.
+    let current_config = config_with(
+        "mid-insert-orch",
+        vec![
+            role("orchestrator", true),
+            role("reviewer", false),
+            role("coder", false),
+        ],
+    );
+
+    let (grown_role_index, was_new) = tabs
+        .add_role_to_existing_orchestration(
+            tab_index,
+            current_config.roles[1].clone(),
+            "reviewer-pane".to_string(),
+            &current_config.roles,
+        )
+        .expect("grow the open tab with the freshly-spawned reviewer");
+    assert!(
+        was_new,
+        "a role new to this tab must report was_new == true"
+    );
+
+    let Tab::Orchestration {
+        role_pane_ids,
+        role_statuses,
+        start_role_index,
+        config: grown_config,
+        ..
+    } = &tabs.tabs()[tab_index]
+    else {
+        panic!("expected an Orchestration tab at index {tab_index}");
+    };
+
+    let grown_names: Vec<&str> = grown_config.roles.iter().map(|r| r.name.as_str()).collect();
+    assert_eq!(
+        grown_names,
+        vec!["orchestrator", "reviewer", "coder"],
+        "a role INSERTED in the middle of `.dot-agent-deck.toml` must land at its \
+         configured index, not be appended — an appended role leaves the tab ordered \
+         [orchestrator, coder, reviewer], which `resolve_orchestration_for_restore`'s \
+         exact-sequence drift guard rejects against the on-disk config"
+    );
+    assert_eq!(
+        grown_role_index, 1,
+        "the returned role index must be the role's CONFIGURED position (1), which is \
+         what the daemon stamps on `TabMembership.role_index` from the same config"
+    );
+    assert_eq!(
+        role_pane_ids,
+        &vec![
+            "orchestrator-pane".to_string(),
+            "reviewer-pane".to_string(),
+            "coder-pane".to_string(),
+        ],
+        "role_pane_ids must shift in lockstep with config.roles, or every role index \
+         past the insert names a different role's pane"
+    );
+    assert_eq!(
+        role_statuses[1],
+        OrchestrationRoleStatus::Working,
+        "the freshly-spawned role's slot carries its own Working status, not the one \
+         that belonged to whichever role used to sit at this index; role_statuses = \
+         {role_statuses:?}"
+    );
+    assert_eq!(
+        *start_role_index, 0,
+        "an insert AFTER the start role must leave the start cursor where it is"
+    );
+}
+
+/// Scenario: the control for `pane/spawn/014` — the append case, which was
+/// already correct before placement existed and must stay correct. A role
+/// added at the END of `.dot-agent-deck.toml` (`[orchestrator, coder]`
+/// becoming `[orchestrator, coder, reviewer]`) and spawned must still land
+/// at the end of the open tab. The same call with a config that does not
+/// mention the spawned role at all (the config changed again between the
+/// daemon resolving the spawn and the TUI absorbing the broadcast) must also
+/// fall back to appending rather than guessing a slot.
+#[spec("pane/spawn/015")]
+#[test]
+fn pane_spawn_015_a_role_added_at_the_end_of_the_config_still_appends() {
+    let mut tabs = new_tab_manager();
+    let tab_config = config_with(
+        "append-orch",
+        vec![role("orchestrator", true), role("coder", false)],
+    );
+    let open_two_role_tab = |tabs: &mut TabManager, cwd: &str| {
+        tabs.open_orchestration_tab_with_existing_role_panes(
+            &tab_config,
+            cwd,
+            vec![
+                Some("orchestrator-pane".to_string()),
+                Some("coder-pane".to_string()),
+            ],
+            None,
+            None,
+        )
+        .expect("open the two-role tab")
+        .0
+    };
+
+    // Leg 1: `reviewer` appended to the END of the current config.
+    let tab_index = open_two_role_tab(&mut tabs, "/work/append-cwd");
+    let current_config = config_with(
+        "append-orch",
+        vec![
+            role("orchestrator", true),
+            role("coder", false),
+            role("reviewer", false),
+        ],
+    );
+    let (grown_role_index, was_new) = tabs
+        .add_role_to_existing_orchestration(
+            tab_index,
+            current_config.roles[2].clone(),
+            "reviewer-pane".to_string(),
+            &current_config.roles,
+        )
+        .expect("grow the open tab with the freshly-spawned reviewer");
+    assert!(
+        was_new,
+        "a role new to this tab must report was_new == true"
+    );
+    assert_eq!(
+        grown_role_index, 2,
+        "a role configured LAST must still land last — placement must not disturb the \
+         append case that already worked"
+    );
+
+    let Tab::Orchestration {
+        role_pane_ids,
+        start_role_index,
+        config: grown_config,
+        ..
+    } = &tabs.tabs()[tab_index]
+    else {
+        panic!("expected an Orchestration tab at index {tab_index}");
+    };
+    assert_eq!(
+        grown_config
+            .roles
+            .iter()
+            .map(|r| r.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["orchestrator", "coder", "reviewer"],
+    );
+    assert_eq!(
+        role_pane_ids,
+        &vec![
+            "orchestrator-pane".to_string(),
+            "coder-pane".to_string(),
+            "reviewer-pane".to_string(),
+        ],
+    );
+    assert_eq!(
+        *start_role_index, 0,
+        "an append must never move the start cursor"
+    );
+
+    // Leg 2: the current config does not mention the spawned role at all.
+    // Placement has nothing to go on and must degrade to the old append,
+    // never to a panic or an arbitrary slot.
+    let orphan_tab = open_two_role_tab(&mut tabs, "/work/append-orphan-cwd");
+    let (orphan_index, orphan_was_new) = tabs
+        .add_role_to_existing_orchestration(
+            orphan_tab,
+            role("reviewer", false),
+            "orphan-reviewer-pane".to_string(),
+            &config_with("append-orch", vec![role("orchestrator", true)]).roles,
+        )
+        .expect("a role missing from the current config must still grow the tab");
+    assert!(orphan_was_new);
+    assert_eq!(
+        orphan_index, 2,
+        "a role the current config does not list gives placement no evidence, so it \
+         appends — exactly the behaviour that existed before placement did"
+    );
+}
+
+/// Scenario: a role is inserted BEFORE the start role in
+/// `.dot-agent-deck.toml` — the tab holds `[coder, orchestrator]` (the
+/// orchestrator is the start role, at index 1) and the config now reads
+/// `[reviewer, coder, orchestrator]`. Spawning `reviewer` must place it at
+/// index 0 AND carry `start_role_index` along with it, so
+/// `role_pane_ids[start_role_index]` still names the orchestrator's pane.
+/// That pane id is the key `ui.pane_metadata`'s orchestration snapshot is
+/// stored under and the pane the orchestrator prompt is delivered to, so a
+/// stale cursor would silently repoint both at whichever role the insert
+/// pushed into index 1.
+#[spec("pane/spawn/016")]
+#[test]
+fn pane_spawn_016_inserting_before_the_start_role_carries_the_start_cursor() {
+    let mut tabs = new_tab_manager();
+    let tab_config = config_with(
+        "start-shift-orch",
+        vec![role("coder", false), role("orchestrator", true)],
+    );
+
+    let (tab_index, _) = tabs
+        .open_orchestration_tab_with_existing_role_panes(
+            &tab_config,
+            "/work/start-shift-cwd",
+            vec![
+                Some("coder-pane".to_string()),
+                Some("orchestrator-pane".to_string()),
+            ],
+            None,
+            None,
+        )
+        .expect("open a tab whose start role is NOT first");
+
+    let Tab::Orchestration {
+        start_role_index, ..
+    } = &tabs.tabs()[tab_index]
+    else {
+        panic!("expected an Orchestration tab at index {tab_index}");
+    };
+    assert_eq!(
+        *start_role_index, 1,
+        "precondition: the start role must be the SECOND slot for this test to mean anything"
+    );
+
+    let current_config = config_with(
+        "start-shift-orch",
+        vec![
+            role("reviewer", false),
+            role("coder", false),
+            role("orchestrator", true),
+        ],
+    );
+    let (grown_role_index, _) = tabs
+        .add_role_to_existing_orchestration(
+            tab_index,
+            current_config.roles[0].clone(),
+            "reviewer-pane".to_string(),
+            &current_config.roles,
+        )
+        .expect("grow the open tab with a role configured ahead of every existing one");
+    assert_eq!(
+        grown_role_index, 0,
+        "a role configured FIRST must land first, ahead of both existing roles"
+    );
+
+    let Tab::Orchestration {
+        role_pane_ids,
+        start_role_index,
+        config: grown_config,
+        ..
+    } = &tabs.tabs()[tab_index]
+    else {
+        panic!("expected an Orchestration tab at index {tab_index}");
+    };
+    assert_eq!(
+        grown_config
+            .roles
+            .iter()
+            .map(|r| r.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["reviewer", "coder", "orchestrator"],
+    );
+    assert_eq!(
+        *start_role_index, 2,
+        "a slot inserted at or before the start role must carry the start cursor along \
+         with it, or the tab's orchestrator becomes whichever role took its index"
+    );
+    assert_eq!(
+        role_pane_ids[*start_role_index], "orchestrator-pane",
+        "role_pane_ids[start_role_index] must still name the ORCHESTRATOR's pane — it is \
+         the ui.pane_metadata key the session snapshot hangs off and the pane the \
+         orchestrator prompt is delivered to; role_pane_ids = {role_pane_ids:?}"
     );
 }

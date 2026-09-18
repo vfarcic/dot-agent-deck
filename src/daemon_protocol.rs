@@ -289,47 +289,80 @@ pub fn parse_geometry_frame(bytes: &[u8]) -> Option<(u16, u16)> {
 /// participation: its resizes take the unattributed path and it is not told when
 /// somebody else moves the size.
 ///
-/// **PRD #819's four new `AttachRequest` variants ride that same 9, and do not
+/// **PRD #819's four new `AttachRequest` variants rode that same 9, and did not
 /// bump again.** [`AttachRequest::ListProjects`], [`AttachRequest::ResolveProject`],
 /// [`AttachRequest::PrepareWorkflow`] and [`AttachRequest::StartPreparedAgent`]
 /// are on the bump list for the ordinary reason — an older daemon fails the
 /// frame decode on a variant it does not have — but one bump covers every wire
-/// change made before 9 ships, and 9 is unreleased: `v0.39.4` carries
-/// `PROTOCOL_VERSION = 8`, and PRD #882's change above landed after that tag.
-/// The [`AttachResponse::capabilities`] field that goes with them is additive
-/// and optional and would have needed no bump of its own; it is what lets a
-/// client tell "speaks 9" from "answers this verb", which is exactly what is
-/// needed while more than one build carries 9.
+/// change made before 9 ships, and 9 was unreleased when they landed: `v0.39.4`
+/// carried `PROTOCOL_VERSION = 8`, and PRD #882's change above landed after that
+/// tag. The [`AttachResponse::capabilities`] field that goes with them is
+/// additive and optional and would have needed no bump of its own; it is what
+/// lets a client tell "speaks 9" from "answers this verb", which is exactly what
+/// was needed while more than one build carried 9.
 ///
-/// **Do not read that as licence to keep adding variants at 9.** It holds only
-/// while 9 is unreleased: the moment a build carrying it ships, another variant
-/// is another break for every user, and this repo's bump policy makes that
-/// another minor release (`docs/develop/versioning.md`). That deadline is why
-/// `StartPreparedAgent` was taken now rather than left as the recorded next
-/// step it started as — and it now applies to PRD #882's frame kind too, since
-/// both changes are spending the same one bump.
+/// **That paragraph is in the past tense because its deadline has passed.** It
+/// used to close by saying "do not read that as licence to keep adding variants
+/// at 9 — it holds only while 9 is unreleased", and then went on asserting that
+/// 9 was unreleased long after it shipped: `v0.40.0`, `v0.40.1` and `v0.40.2`
+/// all carry 9. Issue #1049 found the claim still written here. Check the
+/// released tags before concluding a number is still free —
+/// `for t in $(git tag --sort=-v:refname | head -5); do git show
+/// "$t:src/daemon_protocol.rs" | grep -m1 PROTOCOL_VERSION; done` — rather than
+/// trusting a sentence in this comment that was true only when it was written.
 ///
-/// **PRD #1105 narrows the paragraph above, and does not bump for
-/// [`AttachRequest::FocusGained`].** 9 has shipped (`v0.40.0` through `v0.40.2`
-/// carry it), so read literally that paragraph says this variant needs 10. What
-/// it argues from is the first sentence of this module's versioning note — bump
-/// when a change "would cause an older or newer peer to mis-parse a frame" — and
-/// a variant every client withholds until [`CAP_FOCUS_GAINED`] is advertised
-/// sends an older daemon no such frame in the ordinary pairings: a newer client
-/// against an older daemon withholds it, an older client never sends it, and the
-/// `client_id` riding on `AttachStream` is an additive optional key. The residual
-/// is the window `StartPreparedAgent`'s docs describe — a handle whose cached
-/// capability set outlived a daemon replaced by an older build — and here it
-/// fails closed: the claim is refused and nothing changes. "Another break for every user" is
-/// true of a variant a client sends unconditionally, which is the case the
-/// paragraph was written about, and not of one gated by the mechanism PRD #819
-/// added for exactly this: telling "speaks 9" from "answers this verb".
+/// **9 → 10 (issue #1049).** [`AttachRequest::StopDaemon`], the first wire verb
+/// that stops the deck itself. On the bump list for the ordinary reason — an
+/// older daemon fails the frame decode on a variant it does not have — but
+/// unlike the four above this one cannot ride an unshipped number, because 9
+/// has shipped. So it is a real compatibility break, and per
+/// `docs/develop/versioning.md` the release carrying it is a **minor** bump
+/// while this project is `0.x`.
+///
+/// The reply's [`AttachResponse::stop_refusal`] field is additive and optional
+/// and would have needed no bump of its own. [`CAP_STOP_DAEMON`] is what lets a
+/// client tell "speaks 10" from "answers this verb", which is the negotiation a
+/// client should actually read — the same reason the PRD #819 verbs have
+/// capability strings.
+///
+/// **PRD #1105 narrows the bump rule the paragraphs above restate, and
+/// contributes no bump of its own for [`AttachRequest::FocusGained`].** The 10
+/// is issue #1049's, for `StopDaemon`. `focus-gained` ships under that number
+/// without contributing to it, and the two facts are independent: #1049 bumped
+/// for its own change, and a capability-gated variant would have needed no bump
+/// whatever the number happened to be — so do not read the 10 as having been
+/// spent on focus, and do not read it as overturning this decision. Read
+/// literally, "on the bump list for the ordinary reason —
+/// an older daemon fails the frame decode on a variant it does not have" says
+/// this one needs 11. What it argues from is the first sentence of this module's
+/// versioning note — bump when a change "would cause an older or newer peer to
+/// mis-parse a frame" — and a variant every client withholds until
+/// [`CAP_FOCUS_GAINED`] is advertised sends an older daemon no such frame in the
+/// ordinary pairings: a newer client against an older daemon withholds it, an
+/// older client never sends it, and the `client_id` riding on `AttachStream` is
+/// an additive optional key. The residual is the window `StartPreparedAgent`'s
+/// docs describe — a handle whose cached capability set outlived a daemon
+/// replaced by an older build — and here it fails closed: the claim is refused
+/// and nothing changes. "Another break for every user" is true of a variant a
+/// client sends unconditionally, which is the case that paragraph was written
+/// about, and not of one gated by the mechanism PRD #819 added for exactly this:
+/// telling "speaks this number" from "answers this verb".
+///
+/// **The unreleased-number argument would also reach "no further bump", and is
+/// deliberately not what this rests on.** 10 was unreleased when `focus-gained`
+/// landed — every tag up to and including `v0.40.2` carries 9 or less — so #819's
+/// "one bump covers every wire change made before it ships" is a second route to
+/// the same answer. It is not the route taken, because it is exactly the claim
+/// the paragraph above records going stale: it expires the moment 10 ships,
+/// while the capability gate does not. Re-check the released tags with the
+/// command above rather than trusting this sentence.
 ///
 /// The cost side decided it rather than the letter. A bump makes the desktop
-/// refuse every daemon at 9 outright (see the enforcement note below), including
-/// remote decks the user cannot upgrade, and it would buy no structural safety
-/// the capability does not already provide. Two limits, stated so this is not
-/// read as a general licence either. It covers only a variant whose every
+/// refuse every daemon at the preceding number outright (see the enforcement
+/// note below), including remote decks the user cannot upgrade, and it would buy
+/// no structural safety the capability does not already provide. Two limits,
+/// stated so this is not read as a general licence either. It covers only a
+/// variant whose every
 /// sender checks the capability first — both public entry points do, because
 /// [`crate::daemon_client::DaemonClient::focus_gained`] delegates to
 /// [`crate::daemon_client::DaemonClient::focus_gained_while`], which holds the
@@ -385,7 +418,7 @@ pub fn parse_geometry_frame(bytes: &[u8]) -> Option<(u16, u16)> {
 /// it is the number the handshake reports, what `daemon hello` prints, and the
 /// input any future compatibility gate will read; #405 is what will make it
 /// *refused*.
-pub const PROTOCOL_VERSION: u32 = 9;
+pub const PROTOCOL_VERSION: u32 = 10;
 
 /// Hard cap on a single frame's payload length. Defends against a malicious
 /// or buggy peer trying to allocate gigabytes off a forged length prefix.
@@ -421,6 +454,17 @@ pub const CAP_PREPARE_WORKFLOW: &str = "prepare-workflow";
 /// useful together: a build that cannot prepare a workflow can never have issued
 /// a token, so a prepared start on it has nothing to present.
 pub const CAP_START_PREPARED_AGENT: &str = "start-prepared-agent";
+
+/// Capability string for [`AttachRequest::StopDaemon`] (issue #1049).
+///
+/// Worth reading the capability rather than [`PROTOCOL_VERSION`] here, for a
+/// reason specific to this verb: the fallback when it is absent is the
+/// PID-based [`crate::daemon_stop::run_daemon_stop`], which only exists for a
+/// *local* endpoint. A client holding a remote endpoint that finds this
+/// capability missing has no second path to try, so the honest thing is to tell
+/// the user the deck is too old to be stopped over the wire rather than to
+/// attempt something that cannot work.
+pub const CAP_STOP_DAEMON: &str = "stop-daemon";
 
 /// Capability string for [`AttachRequest::FocusGained`] (PRD #1105, focus-driven
 /// sizing).
@@ -497,19 +541,26 @@ fn invalid_client_id_message() -> String {
 /// would be advertising a verb that can only ever answer
 /// [`PROJECT_ERR_STALE_TOKEN`].
 ///
-/// [`CAP_FOCUS_GAINED`] is on both lists: it is not a project verb and has no
-/// platform-specific half.
+/// [`CAP_STOP_DAEMON`] and [`CAP_FOCUS_GAINED`] are on both lists: neither is a
+/// project verb, and neither [`AttachRequest::StopDaemon`]'s dispatch arm nor
+/// [`AttachRequest::FocusGained`]'s is `#[cfg]`-gated, so both are answered on
+/// every platform this builds for.
 #[cfg(unix)]
 pub const DAEMON_CAPABILITIES: &[&str] = &[
     CAP_LIST_PROJECTS,
     CAP_RESOLVE_PROJECT,
     CAP_PREPARE_WORKFLOW,
     CAP_START_PREPARED_AGENT,
+    CAP_STOP_DAEMON,
     CAP_FOCUS_GAINED,
 ];
 #[cfg(not(unix))]
-pub const DAEMON_CAPABILITIES: &[&str] =
-    &[CAP_LIST_PROJECTS, CAP_RESOLVE_PROJECT, CAP_FOCUS_GAINED];
+pub const DAEMON_CAPABILITIES: &[&str] = &[
+    CAP_LIST_PROJECTS,
+    CAP_RESOLVE_PROJECT,
+    CAP_STOP_DAEMON,
+    CAP_FOCUS_GAINED,
+];
 
 /// PRD #819 M2: the project verbs' refusal carries a stable machine-readable
 /// code as the first token of [`AttachResponse::error`], followed by `": "` and
@@ -1235,6 +1286,54 @@ pub enum AttachRequest {
         /// an invalid one is refused and changes no state.
         client_id: String,
     },
+    /// Issue #1049: ask the daemon to stop ITSELF, and the first wire verb that
+    /// does. The rest of this enum acts on agents; the `Stop` half of the
+    /// Ctrl+C dialog reaches the deck via the header-only [`KIND_SHUTDOWN`]
+    /// frame, and `dot-agent-deck daemon stop` reaches it by finding the
+    /// daemon's PID through `SO_PEERCRED` and signalling it
+    /// ([`crate::daemon_stop::run_daemon_stop`]).
+    ///
+    /// **Why the PID path was not enough.** A peer credential names a process on
+    /// *this* machine. Over a forwarded socket `SO_PEERCRED` reports the local
+    /// `ssh` client, so the PID path would have signalled the tunnel and
+    /// reported the daemon stopped — which is why PRD #741 M2 made
+    /// `run_daemon_stop` take a [`crate::daemon_client::LocalEndpoint`] and left
+    /// remote decks with no stop at all. This verb has no such tie: the daemon
+    /// terminates itself, so it works over any transport that can carry a frame.
+    ///
+    /// **Why the `KIND_SHUTDOWN` frame was not enough, which is the sharper
+    /// half.** That frame already stops the deck from anywhere, and it carries
+    /// *no* guard: it drains every managed agent unconditionally, with no
+    /// refusal and without naming what it is about to destroy. So the gap issue
+    /// #1049 describes was never only a missing verb — a remotely reachable and
+    /// wholly unguarded stop was already on this wire. This verb is the guarded
+    /// one: it runs the same [`crate::daemon_stop::stop_refusal`] policy the CLI
+    /// runs, and answers a refusal with [`AttachResponse::stop_refusal`] so a
+    /// caller that cannot see the pane list can still present the choice.
+    /// `KIND_SHUTDOWN` is deliberately left alone (the TUI's `Stop` button is a
+    /// user who has already made this exact decision, in front of the pane list,
+    /// on the same machine); whether that path should be narrowed is issue
+    /// #1109's open question, not this verb's to answer.
+    ///
+    /// **Who may ask** is unchanged by this, and deliberately so. The attach
+    /// socket authenticates no peer: on Unix the trust story is mode `0o600`
+    /// plus same-UID, and for a remote deck it is ssh host-key and user auth.
+    /// Anyone who can already send [`Self::StartAgent`] can exec arbitrary code
+    /// as the daemon's user, and anyone who can already send `KIND_SHUTDOWN` can
+    /// stop the deck with no guard at all — so this verb adds no authority to
+    /// this wire. It adds a *guard* to authority that was already there.
+    StopDaemon {
+        /// Stop even when the refusal applies. The caller is asserting it has
+        /// seen [`AttachResponse::stop_refusal`] and accepted it, so the daemon
+        /// does not repeat the check — exactly what `--force` means on
+        /// `dot-agent-deck daemon stop`, and it abandons any orchestration the
+        /// refusal named.
+        ///
+        /// `#[serde(default)]` so the field is optional on the wire: a caller
+        /// that omits it gets the guarded behaviour, which is the safe default.
+        #[serde(default)]
+        force: bool,
+    },
 }
 
 fn default_rows() -> u16 {
@@ -1365,6 +1464,82 @@ impl RunningAgentsSummary {
             names,
         }
     }
+}
+
+/// Issue #1049: why the daemon refused an [`AttachRequest::StopDaemon`], in a
+/// shape a client that cannot see the deck's panes can act on.
+///
+/// This is the wire form of [`crate::daemon_stop::StopError::LiveOrchestrations`]
+/// / [`crate::daemon_stop::StopError::LiveAgents`], which are local-only Rust
+/// error values the CLI renders to a terminal. It is built by
+/// [`crate::daemon_stop::wire_stop_refusal`] from the same
+/// [`crate::daemon_stop::stop_refusal`] policy the CLI runs, so the two paths
+/// cannot come to different verdicts.
+///
+/// Both a rendered [`Self::message`] and the structured lists are carried, on
+/// purpose. A caller with a terminal prints the message and is done; a GUI
+/// builds its own dialog from [`Self::roles`] and [`Self::agent_ids`] and would
+/// otherwise have to parse prose to find out which panes are at stake. The
+/// whole point of the #770 refusal is that the operator is told WHAT is being
+/// destroyed, and a remote caller handed only a sentence cannot re-render that.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StopDaemonRefusal {
+    /// Which guard tripped. See [`StopRefusalReason`].
+    pub reason: StopRefusalReason,
+    /// The live orchestration role registrations at stake — empty unless
+    /// [`Self::reason`] is [`StopRefusalReason::LiveOrchestrations`].
+    #[serde(default)]
+    pub roles: Vec<crate::state::OrchestrationRoleRecord>,
+    /// The ids of the managed agents this daemon would take down with it.
+    /// Populated for both reasons: a caller presenting the orchestration
+    /// refusal still benefits from knowing how many agents go with it.
+    #[serde(default)]
+    pub agent_ids: Vec<String>,
+    /// The refusal a human reads, identical to what `dot-agent-deck daemon
+    /// stop` prints for the same daemon state — one rendering, from
+    /// [`crate::daemon_stop::format_live_orchestrations_refusal`] or
+    /// [`crate::daemon_stop::format_live_agents_refusal`]. Multi-line, and
+    /// newline-terminated so a terminal caller can `eprint!` it directly.
+    pub message: String,
+    /// The same refusal as one line, for a caller with one line to spend — a
+    /// status bar, a log, a toast. This is [`crate::daemon_stop::StopError`]'s
+    /// `Display`, which is also what the daemon puts in
+    /// [`AttachResponse::error`], so a client that only ever reads `error`
+    /// sees exactly this string.
+    ///
+    /// Carried rather than derived by truncating [`Self::message`]: the first
+    /// line of the multi-line form is a header that omits `--force`, so a
+    /// client cutting it there would show a refusal with no way out of it.
+    pub summary: String,
+}
+
+/// Which of the two `daemon stop` guards refused (issue #1049).
+///
+/// The order these are checked in is the CLI's and is load-bearing, not
+/// cosmetic: see [`crate::daemon_stop::stop_refusal`], which explains why the
+/// orchestration guard wins when both apply.
+///
+/// `#[serde(other)]` on [`Self::Unknown`] is what keeps a *newer* daemon's
+/// third reason from failing an older client's whole-response decode — the
+/// client still gets [`StopDaemonRefusal::message`] and the structured lists,
+/// which is enough to present the choice, and loses only its ability to branch
+/// on the kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum StopRefusalReason {
+    /// Issue #770: the daemon holds orchestration role registrations whose panes
+    /// still have a live agent. The consequential one — the role maps live in
+    /// this process's memory and nowhere else, so an agent that survives the
+    /// stop keeps running, keeps posting hooks, keeps looking healthy, and can
+    /// never delegate again.
+    LiveOrchestrations,
+    /// PRD #103: the daemon is hosting managed agents that would be terminated
+    /// with it. Bad, but bounded — the processes die, and nothing is left in a
+    /// state that looks healthy but is not.
+    LiveAgents,
+    /// A reason this build does not know, reported by a newer daemon.
+    #[serde(other)]
+    Unknown,
 }
 
 /// Discriminated by the populated optional fields rather than a tag, since
@@ -1563,6 +1738,18 @@ pub struct AttachResponse {
     /// between daemons.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schedule_revision: Option<u64>,
+    /// Issue #1049: why an [`AttachRequest::StopDaemon`] was refused. Set only
+    /// on that verb's refusal, alongside `ok = false` and an `error` carrying
+    /// the same refusal as one line.
+    ///
+    /// Additive and optional, so it needs no `PROTOCOL_VERSION` bump of its own
+    /// (the verb it answers is what moved the wire shape). `None` from a daemon
+    /// that answered `StopDaemon` at all cannot happen today; a client should
+    /// still treat `ok = false` with no `stop_refusal` as an ordinary error and
+    /// show `error`, because that is what a future refusal for some unrelated
+    /// reason would look like.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_refusal: Option<StopDaemonRefusal>,
 }
 
 impl AttachResponse {
@@ -2376,7 +2563,7 @@ async fn handle_connection(
         })
         .await
         .ok();
-        if let Some(s) = shutdown {
+        if let Some(s) = shutdown.as_ref() {
             s.notify_one();
         } else {
             // `serve_attach` (test/harness path) doesn't pass a shutdown
@@ -2505,6 +2692,82 @@ async fn handle_connection(
             // daemon's project list draws on. See `AttachResponse::schedule_revision`.
             resp.schedule_revision = Some(scheduler.revision());
             write_resp(&mut stream, &resp).await?;
+        }
+        // Issue #1049: the guarded wire stop. `AttachRequest::StopDaemon`'s own
+        // docs say why this exists beside BOTH the PID path and `KIND_SHUTDOWN`.
+        AttachRequest::StopDaemon { force } => {
+            // The two inputs the refusal reads, from the same sources the
+            // `ListAgents` arm above reads them from. Deliberately not a second
+            // derivation of either: if these drifted from that arm, the wire
+            // stop and the CLI stop — which reads exactly that reply — would
+            // start disagreeing about whether a deck is safe to stop, and a
+            // guard that disagrees with the guard beside it is worse than
+            // either alone.
+            let agent_ids: Vec<String> =
+                registry.agent_records().into_iter().map(|r| r.id).collect();
+            let roles = state.read().await.live_orchestration_roles(&registry);
+            if let Some(refusal) = crate::daemon_stop::wire_stop_refusal(&roles, &agent_ids, force)
+            {
+                warn!(
+                    reason = ?refusal.reason,
+                    role_count = refusal.roles.len(),
+                    agent_count = refusal.agent_ids.len(),
+                    "StopDaemon refused; daemon stays up"
+                );
+                // `ok = false` plus the one-line form in `error`, so a client
+                // that knows nothing about this field still surfaces something
+                // true; the structured refusal rides beside it for one that does.
+                let mut resp = AttachResponse::err(refusal.summary.clone());
+                resp.orchestration_roles = Some(roles);
+                resp.agents = Some(agent_ids);
+                resp.stop_refusal = Some(refusal);
+                write_resp(&mut stream, &resp).await?;
+                return Ok(());
+            }
+            info!(
+                force,
+                agent_count = agent_ids.len(),
+                role_count = roles.len(),
+                "StopDaemon accepted — acknowledging, then shutting down"
+            );
+            // Answer BEFORE tearing anything down, for the reason the
+            // `KIND_SHUTDOWN_ACK` path above documents: the drain below can take
+            // the full agent grace window, and a caller whose socket simply
+            // closes cannot tell "stopped" from "this daemon is too old to know
+            // the verb". A remote caller needs that distinction MORE, not less —
+            // over a tunnel a dropped connection has several other causes.
+            //
+            // **And the `?` here is load-bearing: a failed ack ABORTS the stop.**
+            // This deliberately differs from the `KIND_SHUTDOWN` handler above,
+            // which logs a failed ack and proceeds. That frame is a local user at
+            // the Ctrl+C dialog, on this machine, who has already decided; the
+            // worst case there is a stop they asked for happening unobserved.
+            // This verb is reachable over a tunnel, where a dropped connection is
+            // routine and has causes that have nothing to do with intent — so
+            // proceeding would let a flaky network stop somebody's deck and tell
+            // no one why. Not stopping costs a retry; stopping costs the run.
+            write_resp(&mut stream, &AttachResponse::ok()).await?;
+            // The same graceful drain, with the same grace, as the
+            // `KIND_SHUTDOWN` handler: one audited teardown path, not a second
+            // one. Idempotent via the registry's `shutting_down` latch.
+            let registry_for_shutdown = registry.clone();
+            tokio::task::spawn_blocking(move || {
+                registry_for_shutdown.shutdown_all_graceful(Duration::from_secs(3));
+            })
+            .await
+            .ok();
+            if let Some(s) = shutdown.as_ref() {
+                s.notify_one();
+            } else {
+                // Same harness case the `KIND_SHUTDOWN` arm notes: `serve_attach`
+                // wires no notify because tests do not run the production hook
+                // loop. The registry was still drained, so a test can assert on
+                // that side effect.
+                warn!(
+                    "StopDaemon handled but no daemon-shutdown notify wired (likely a test harness)"
+                );
+            }
+            return Ok(());
         }
         AttachRequest::StartAgent {
             command,
@@ -6094,6 +6357,41 @@ mod tests {
         use crate::agent_pty::{AgentPtyRegistry, AgentRecord, SpawnOptions};
         use portable_pty::{CommandBuilder, PtySize, PtySystem};
 
+        // Issue #959: this test was killed once by nextest's default 3 x 60s
+        // window on `build-macos`, at `time="180.616"`, against 0.194s for the
+        // same test on the same runner image in the same run's passing
+        // re-attempt — 931x. Where it stalled was unknown at the time, because
+        // the test printed nothing and a kill leaves no assertion behind:
+        // nextest's JUnit records a timeout as `<failure type="test timeout"/>`
+        // with no message of its own, so the artifact said only that 180.6
+        // seconds had gone somewhere.
+        //
+        // These markers are what answered it, and they are why the fix below is
+        // one line rather than a guess. nextest stores a FAILED or TIMED-OUT
+        // test's stdout and stderr and drops a passing one's
+        // (`store-success-output` is at its default of false — see
+        // `.config/nextest.toml`), so they cost nothing on the green path and
+        // name the last phase entered on the red one, in the JUnit artifact CI
+        // uploads per attempt as well as in the terminal. Stressed on a real
+        // `macos-latest` runner, 18 of 4500 executions stalled and all 18 named
+        // the same phase.
+        //
+        // One marker per UNBOUNDED wait, which is what each phase below
+        // contains — that is also why no `slow-timeout` carve-out would have
+        // helped, and `.config/nextest.toml` carries a tombstone saying so.
+        // `spawn_agent` blocks inside `Command::spawn` until the forked child
+        // clears portable-pty's `pre_exec` hook, with no timeout anywhere on
+        // that path: measured directly, a `pre_exec` that sleeps 3000 ms makes
+        // the parent's `spawn()` return in 3000.8 ms, and a hook that never
+        // returns is never given up on. `shutdown_all` polls `try_wait` in a
+        // loop that has no deadline either — which is the one that hung. Keep
+        // the markers: they are the only thing that would name a NEW stall
+        // site, and neither wait has grown a bound since.
+        let started = std::time::Instant::now();
+        let phase = |name: &str| {
+            eprintln!("live_014 phase: {name} (t+{:?})", started.elapsed());
+        };
+
         // (a) RECORDED, and recorded as an OBSERVATION of our own fork.
         //
         // This is the property that made a duration shippable where the PRD had
@@ -6104,6 +6402,7 @@ mod tests {
         // A spawn is something the daemon DID, so it needs no signal and no
         // inference. Bracketing the spawn is what would fail if anyone ever
         // "helpfully" stamped this at snapshot time instead.
+        phase("spawn_agent");
         let before = chrono::Utc::now().timestamp_millis();
         let registry = Arc::new(AgentPtyRegistry::new());
         let id = registry
@@ -6141,12 +6440,14 @@ mod tests {
         let json = serde_json::to_string(rec).expect("AgentRecord serializes");
         let back: AgentRecord = serde_json::from_str(&json).expect("deserializes");
         assert_eq!(back.spawned_at_ms, Some(spawned_at_ms));
+        phase("shutdown_all (spawned agent)");
         registry.shutdown_all();
 
         // (b) ABSENT when this registry did not do the spawning, and omitted
         // from the wire entirely rather than sent as a null. There is no
         // `Utc::now()` fallback anywhere on this path — an invented value is
         // exactly the failure the PRD's original duration rejection was about.
+        phase("openpty + spawn_command (adopted child)");
         let adopted = Arc::new(AgentPtyRegistry::new());
         let pair = portable_pty::NativePtySystem::default()
             .openpty(PtySize {
@@ -6160,6 +6461,40 @@ mod tests {
             .slave
             .spawn_command(CommandBuilder::new("sleep"))
             .expect("spawn a child the registry did not fork");
+        // Issue #959: drop BOTH ends of this PTY the moment the child owns its
+        // own copies, and do it here rather than at the end of the test.
+        //
+        // This is what the production spawn path does — `agent_pty::spawn`
+        // drops the slave as soon as `spawn_command` returns, and `spawn_agent`
+        // starts a `pump_reader` thread that drains the master for the agent's
+        // whole life. Nothing needs either handle here: `insert_test_agent`
+        // opens a PTY of its OWN for the synthetic `RunningAgent`, so this pair
+        // exists only to give the child a terminal to be born on.
+        //
+        // Holding them and reading neither is what wedged this test. The child
+        // is a bare `sleep`, which writes a usage line to this slave and exits;
+        // on macOS it then got stuck in the kernel's exit path (`ps` state
+        // `?<Es`, "trying to exit") often enough to matter, and
+        // `shutdown_all` -> `force_kill_and_reap_all` polls `try_wait` in a loop
+        // with no deadline, so the test sat there until nextest killed it at
+        // 180 seconds. It was NOT slow and it was NOT the spawn: measured on
+        // `macos-latest`, 18 of 4500 executions stalled, every one of them in
+        // this phase and with the child in that state, against 0 of 4500 on
+        // `ubuntu-latest`. With this `drop`, the same 4500-execution stress on
+        // the same runner type stalled 0 times.
+        //
+        // The shape needs four things at once, isolated on `macos-latest` by
+        // varying one at a time: the child WRITES to the PTY, NOBODY drains it,
+        // BOTH ends are still open, and the child is EXITING of its own accord
+        // when the kill lands. A standalone reproduction of all four stalls 40
+        // of 40 times; swap the child for `/usr/bin/true`, drop either end, add
+        // a draining thread, or use a `sleep 300` that is still running when
+        // killed, and each is 0 of 800. The last of those is also why the real
+        // test stalled on only 0.4% of executions: the markers above put ~1.3 ms
+        // between this spawn and the kill, so the SIGKILL usually wins the race
+        // and the child never reaches the exit path it gets stuck in.
+        // `.config/nextest.toml`'s #959 tombstone has the table.
+        drop(pair);
         let adopted_id = adopted.insert_test_agent(child);
         let adopted_records = adopted.agent_records();
         let adopted_rec = adopted_records
@@ -6176,6 +6511,7 @@ mod tests {
             value.get("spawned_at_ms").is_none(),
             "an absent spawn time must have no key at all; got {json}"
         );
+        phase("shutdown_all (adopted agent)");
         adopted.shutdown_all();
 
         // (c) FORWARD-COMPATIBLE with an older peer, which is the entire basis
@@ -6208,6 +6544,7 @@ mod tests {
             serde_json::from_str(newer).expect("a newer peer's record must decode");
         assert_eq!(forward.spawned_at_ms, Some(1_756_684_800_123));
         assert_eq!(forward.pane_id_env.as_deref(), Some("pane-4"));
+        phase("done");
     }
 
     /// Issue #856: `AgentRecord.cli_name` is additive and optional in BOTH

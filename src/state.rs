@@ -7061,9 +7061,13 @@ fn restart_refusal_for_crashed_pane(
 /// not dropped until the whole statement (including the `.await`)
 /// completes, so the guard would stay held for the ENTIRE respawn, which
 /// can spend up to `AGENT_TERMINATE_GRACE` + `PANE_CLOSE_SETTLE_TIMEOUT`
-/// (~9s) inside `respawn_or_recreate_agent_for_pane`. `tokio::sync::RwLock`
-/// is write-preferring, so that would stall every other daemon
-/// reader/writer for the duration. A short-lived READ guard resolves
+/// (~9s) inside `respawn_or_recreate_agent_for_pane` — and, since issue
+/// #1114, up to `AGENT_TERMINATE_GRACE` + `PANE_CLOSE_RECREATE_TIMEOUT`
+/// (~33s) when a close of that pane outruns its settle window, which is the
+/// case where holding a read guard would matter most: the close's own
+/// `unregister_pane` needs the WRITE guard to finish and let go.
+/// `tokio::sync::RwLock` is write-preferring, so that would stall every
+/// other daemon reader/writer for the duration. A short-lived READ guard resolves
 /// caller validation, target resolution, the crashed check, and the role
 /// config lookup, then drops BEFORE the respawn — no state-lock dependency
 /// held across it. The `recreated: true` re-registration case still needs
@@ -7613,7 +7617,16 @@ impl AppState {
         let mut commissioning_orchestrator: Option<(String, String)> = None;
         match registry.retire_outstanding_delegation(&signal.pane_id) {
             crate::agent_pty::DelegationRetirement::Nothing => {}
-            crate::agent_pty::DelegationRetirement::Retired(delegation) => {
+            // Issue #1080: the whole record goes, superseded generations
+            // included. A worker that has just answered is not silent, and any
+            // record left armed here fires later against work that is already
+            // done — see `AgentPtyRegistry::retire_outstanding_delegation` for
+            // the production trace that reversed PRD #126 M1 finding 6's
+            // oldest-first accounting, and for what that costs.
+            crate::agent_pty::DelegationRetirement::Retired {
+                delegation,
+                superseded_dropped,
+            } => {
                 commissioning_orchestrator = Some((
                     delegation.orchestrator_pane_id.clone(),
                     delegation.orchestrator_agent_id.clone(),
@@ -7621,27 +7634,9 @@ impl AppState {
                 tracing::debug!(
                     pane_id = %signal.pane_id,
                     role = %delegation.role,
+                    armed_seq = delegation.seq,
+                    superseded_dropped,
                     "work-done: retired the outstanding delegation and cancelled its idle watch"
-                );
-            }
-            // PRD #126 M1 review (finding 6): a late completion from a
-            // superseded delegation retires THAT one; the newest delegation's
-            // record and watch survive, so a re-delegated worker that then goes
-            // silent is still reported instead of never being nudged again.
-            crate::agent_pty::DelegationRetirement::RetiredSuperseded {
-                role,
-                seq,
-                remaining,
-                orchestrator_pane_id,
-                orchestrator_agent_id,
-            } => {
-                commissioning_orchestrator = Some((orchestrator_pane_id, orchestrator_agent_id));
-                tracing::debug!(
-                    pane_id = %signal.pane_id,
-                    role = %role,
-                    armed_seq = seq,
-                    remaining_superseded = remaining,
-                    "work-done: retired a superseded delegation; the newest one stays armed"
                 );
             }
         }
@@ -10657,6 +10652,7 @@ mod tests {
                     task: "probe".to_string(),
                     to: to.iter().map(|s| s.to_string()).collect(),
                     timestamp: Utc::now(),
+                    token: None,
                 },
                 &registry,
                 &event_tx,

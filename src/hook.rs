@@ -584,9 +584,10 @@ pub fn send_and_await_reply(json: &str) -> SocketReply {
 }
 
 /// Issue #868: `pane restart`'s own CLI round-trip budget —
-/// [`DELEGATE_REPLY_TIMEOUT`] (5s) is smaller than the respawn's own worst
-/// case inside the daemon (`AGENT_TERMINATE_GRACE` + `PANE_CLOSE_SETTLE_TIMEOUT`
-/// = up to 9s), and at the time this constant was written a timeout here
+/// [`DELEGATE_REPLY_TIMEOUT`] (5s) is smaller than what the respawn spends
+/// inside the daemon on a HEALTHY one (`AGENT_TERMINATE_GRACE` +
+/// `PANE_CLOSE_SETTLE_TIMEOUT` = up to 9s), and at the time this constant was
+/// written a timeout here
 /// silently mapped to `ExitCode::SUCCESS` with no output — so a `--force`
 /// restart of an agent that ignores SIGTERM, or any recreate-leg restart,
 /// would have printed nothing and exited 0 while the outcome was genuinely
@@ -595,7 +596,22 @@ pub fn send_and_await_reply(json: &str) -> SocketReply {
 /// (see the `SocketReply::NoReply` arm behind `pane restart` in `main.rs`).
 ///
 /// **This budget is DERIVED FROM THE RESPAWN ALONE, and is deliberately not
-/// the end-to-end worst case** (issue #1095).
+/// the end-to-end worst case** (issue #1095). Two terms it does not cover, each
+/// for its own reason.
+///
+/// **The issue-#606 recreate leg** (issue #1114). When the respawn finds no
+/// record and a close is still holding the pane, it waits out to
+/// [`crate::agent_pty::PANE_CLOSE_RECREATE_TIMEOUT`] (30s) rather than the 6s
+/// settle window, because giving up there costs the role for the rest of the
+/// session while waiting costs only a delayed delegate. Deriving this constant
+/// from THAT instead would put a 38s ceiling on every `pane restart`, including
+/// the overwhelming majority that never touch a closing pane, and #1114's own
+/// measurements say the long wait is reached roughly once in 120 runs at 80x
+/// over-subscription — so the ceiling would be paid always to cover a case that
+/// is nearly never hit. `PANE_CLOSE_SETTLE_TIMEOUT` remains the right term here
+/// precisely because it is what a healthy daemon spends; the residue is the
+/// `NoReply` this doc's last paragraph already describes, on a restart the
+/// daemon is still carrying out.
 /// `handle_restart_role_with_state` blocks on
 /// [`crate::agent_pty::AgentPtyRegistry::pane_dispatch_lock`] *before* it
 /// respawns, and `dispatch_one_owned` takes that same per-pane lock as its
@@ -653,8 +669,7 @@ pub fn send_and_await_restart_role_reply(json: &str) -> SocketReply {
 /// does not need [`RESTART_ROLE_REPLY_TIMEOUT`]'s full margin, though:
 /// `handle_spawn_role_with_state` does no terminate-and-respawn — it's just
 /// `spawn_agent` plus two `state.write().await` acquisitions, with none of
-/// restart's `AGENT_TERMINATE_GRACE` + `PANE_CLOSE_SETTLE_TIMEOUT` worst
-/// case. 10s gives comfortable margin over that without inheriting restart's
+/// restart's `AGENT_TERMINATE_GRACE` + `PANE_CLOSE_SETTLE_TIMEOUT` budget. 10s gives comfortable margin over that without inheriting restart's
 /// larger budget for a cheaper operation.
 pub const SPAWN_ROLE_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 

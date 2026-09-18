@@ -63,6 +63,24 @@
 //! [`merged_document`] — this is the one place where `#[serde(default)]`
 //! genuinely does not give what it looks like it gives.
 //!
+//! **And it preserves how the user wrote it** (issue #825). The merge runs on a
+//! [`toml_edit::DocumentMut`], a format-preserving DOM, and writes only the keys
+//! whose data actually changed — so comments, inline arrays, inline tables, key
+//! order and blank-line grouping survive a save, and a save with no new value to
+//! write leaves every byte alone. Before that the merge went through
+//! `toml::Table`, which models data: no unknown key was ever lost, but the
+//! document was re-rendered canonically and a hand-written annotation went with
+//! it. Since PRD #803 makes "a file a user can read, edit and delete without the
+//! app running" a success criterion, hand-annotation is a thing this file
+//! invites. [`merged_document`] states the two things that are **not**
+//! preserved — read them before repeating the sentence above anywhere.
+//!
+//! **This crate names exactly one TOML library**, and that is deliberate rather
+//! than incidental: `toml_edit` replaced `toml` here instead of joining it, so
+//! the parser that reads the document and the one that writes it cannot
+//! disagree about it. `desktop/src-tauri/Cargo.toml` carries the rest of the
+//! reasoning.
+//!
 //! # Adding a setting
 //!
 //! Add a field to your feature's section struct, or add a new section struct
@@ -422,13 +440,23 @@ impl DesktopSettings {
 /// it, and send it back. Fabricating a default `{ remote: [], selection:
 /// "local" }` there would delete every row, and it would do it silently.
 ///
-/// # Field order is alphabetical on purpose
+/// # Field order is alphabetical on purpose, and issue #825 changed what forces
+/// # it
 ///
-/// The document is written two ways — `toml::to_string_pretty` over the struct
-/// (declaration order) and over a `toml::Table` (a `BTreeMap`, so alphabetical)
-/// — and [`tests::default_document_shape_is_pinned`] asserts the two agree.
-/// Declaring alphabetically is what keeps them agreeing; `DesktopSettings`'s
-/// own fields happen to be alphabetical for the same reason.
+/// The document used to be written two ways — `toml::to_string_pretty` over the
+/// struct (declaration order) and over a `toml::Table` (a `BTreeMap`, so
+/// alphabetical) — so declaring alphabetically was what kept the merged output
+/// and the freshly-serialised one agreeing, and
+/// [`tests::default_document_shape_is_pinned`] asserted it. The merge is now a
+/// [`toml_edit::DocumentMut`] one ([`merged_document`]), which re-sorts nothing:
+/// a fresh document is written in **declaration order** and an existing one
+/// keeps whatever order it already had.
+///
+/// So this is a readability convention rather than a constraint the code will
+/// break over — but it is still the one to follow. `DesktopSettings`'s own
+/// fields are alphabetical for the same reason, and a document whose sections
+/// come out in a stable, predictable order is the point of PRD #803's
+/// hand-editable file.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct EndpointSettings {
@@ -1364,7 +1392,7 @@ const UNREADABLE_CONSEQUENCE: &str = "This session is using default settings, \
 /// # It carries a locator and never the document's bytes
 ///
 /// The rule [`invalid_document_log`] already followed (issue #827), now applying
-/// to a string that reaches a **webview** as well as a log: `toml::de::Error`'s
+/// to a string that reaches a **webview** as well as a log: `toml_edit::de::Error`'s
 /// `Display` echoes the offending value twice, so neither half is built from it.
 /// Pinned by [`tests::a_document_problem_carries_a_locator_and_never_the_documents_bytes`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1770,7 +1798,7 @@ pub fn settings_path() -> PathBuf {
 pub fn load_document(path: &Path) -> (DesktopSettings, Option<SettingsDocumentProblem>) {
     match read_document(path, ReadPurpose::Load) {
         Ok(None) => (DesktopSettings::default(), None),
-        Ok(Some(contents)) => match toml::from_str(&contents) {
+        Ok(Some(contents)) => match toml_edit::de::from_str(&contents) {
             Ok(settings) => (settings, None),
             Err(error) => (
                 DesktopSettings::default(),
@@ -1798,7 +1826,7 @@ fn log_document_problem(problem: &SettingsDocumentProblem) {
 ///
 /// # Why the toml error's own message is not logged
 ///
-/// `toml::de::Error`'s `Display` echoes the offending value **twice** — once in
+/// `toml_edit::de::Error`'s `Display` echoes the offending value **twice** — once in
 /// a rendered source line and again in serde's `invalid type: string "…"`
 /// message. Measured, not assumed; the exact shape is pinned by
 /// [`tests::a_parse_diagnostic_carries_a_locator_and_never_the_documents_bytes`].
@@ -1815,7 +1843,7 @@ fn log_document_problem(problem: &SettingsDocumentProblem) {
 ///
 /// A separate function because the content of the line is then testable at all:
 /// an `eprintln!` inside a match arm cannot be asserted on.
-fn invalid_document_log(path: &Path, contents: &str, error: &toml::de::Error) -> String {
+fn invalid_document_log(path: &Path, contents: &str, error: &toml_edit::de::Error) -> String {
     format!(
         "Invalid desktop settings at {}: {} could not be read as settings",
         path.display(),
@@ -1832,7 +1860,7 @@ fn invalid_document_log(path: &Path, contents: &str, error: &toml::de::Error) ->
 /// [`save_to`] returns. All three are a locator plus fixed prose, which is what
 /// makes the issue-#827 property — no document bytes in any sink — one check
 /// rather than three.
-fn parse_locator(contents: &str, error: &toml::de::Error) -> String {
+fn parse_locator(contents: &str, error: &toml_edit::de::Error) -> String {
     match error
         .span()
         .and_then(|span| line_and_column(contents, span.start))
@@ -1848,7 +1876,7 @@ fn parse_locator(contents: &str, error: &toml::de::Error) -> String {
 fn unreadable_document_problem(
     path: &Path,
     contents: &str,
-    error: &toml::de::Error,
+    error: &toml_edit::de::Error,
 ) -> SettingsDocumentProblem {
     SettingsDocumentProblem {
         detail: invalid_document_log(path, contents, error),
@@ -1866,7 +1894,11 @@ fn unreadable_document_problem(
 /// A `SettingsWriteError` because that is what a save returns and what the
 /// webview already renders; built through [`write_error`] so it inherits the
 /// split — the path in the log half, never in the public one.
-fn refuse_to_overwrite(path: &Path, contents: &str, error: &toml::de::Error) -> SettingsWriteError {
+fn refuse_to_overwrite(
+    path: &Path,
+    contents: &str,
+    error: &toml_edit::de::Error,
+) -> SettingsWriteError {
     write_error(
         "refusing to overwrite",
         path,
@@ -1979,20 +2011,20 @@ pub fn save_to(path: &Path, settings: &DesktopSettings) -> Result<(), SettingsWr
     // appearance, zoom, endpoints and the deck selection — and the user's own
     // document would be gone.
     //
-    // The check is `DesktopSettings` rather than `toml::Table` on purpose,
-    // because it has to catch BOTH shapes of unreadable: a TOML syntax error,
-    // and a document that is valid TOML which this build's SCHEMA rejects. Only
-    // the first fails a `Table` parse. The second is the shape the issue was
-    // filed from and the more dangerous of the two — every field newtype runs
-    // its validator inside `Deserialize`, so tightening any validator converts
-    // previously-valid documents into this case, and this codebase tightens
-    // validators routinely (`port` to a `NonZeroU16`, `EndpointId::parse`
-    // reserving `all`).
+    // The check is `DesktopSettings` rather than a bare `DocumentMut` parse on
+    // purpose, because it has to catch BOTH shapes of unreadable: a TOML syntax
+    // error, and a document that is valid TOML which this build's SCHEMA
+    // rejects. Only the first fails a document parse. The second is the shape
+    // the issue was filed from and the more dangerous of the two — every field
+    // newtype runs its validator inside `Deserialize`, so tightening any
+    // validator converts previously-valid documents into this case, and this
+    // codebase tightens validators routinely (`port` to a `NonZeroU16`,
+    // `EndpointId::parse` reserving `all`).
     //
     // Re-read at save time rather than trusted from load, so a file that became
     // unreadable while the app was running is caught too.
     if let Some(contents) = existing.as_deref()
-        && let Err(error) = toml::from_str::<DesktopSettings>(contents)
+        && let Err(error) = toml_edit::de::from_str::<DesktopSettings>(contents)
     {
         return Err(refuse_to_overwrite(path, contents, &error));
     }
@@ -2027,7 +2059,8 @@ pub fn save_to(path: &Path, settings: &DesktopSettings) -> Result<(), SettingsWr
 }
 
 /// Serialise `settings` over whatever the document at `path` already holds,
-/// preserving every table and field this build does not know about.
+/// preserving every table and field this build does not know about — **and the
+/// way the user spelled them** (issue #825).
 ///
 /// **`#[serde(default)]` without `deny_unknown_fields` means *ignore*, not
 /// *retain*.** It covers reading — an older build loads a newer build's
@@ -2044,20 +2077,66 @@ pub fn save_to(path: &Path, settings: &DesktopSettings) -> Result<(), SettingsWr
 /// cost is one small read per save, on a file the app writes only when a user
 /// changes a setting.
 ///
-/// **An unparseable document is refused, not replaced (issue #1072), and that
-/// reverses what used to be written here.** The old reasoning was that nothing
-/// can be preserved out of bytes that are not TOML, and that refusing would
-/// leave a user whose file got corrupted unable to change a setting from inside
-/// the app. The first half is true and the second was the wrong trade: the
-/// alternative to refusing is not "the user gets their settings back", it is
+/// # Formatting is preserved too, and issue #825 is where that started
+///
+/// The merge used to round-trip through `toml::Table`, which models **data**:
+/// no unknown key, value or type was ever lost, but the whole document was
+/// re-rendered canonically on the way out, so a comment vanished, an inline
+/// array came back re-flowed across lines, and key order and blank-line
+/// grouping were whatever the serializer felt like. PRD #803 makes "a file a
+/// user can read, edit and delete without the app running" a success criterion,
+/// which invites hand-annotation — and those annotations disappeared the next
+/// time the app wrote any setting.
+///
+/// So the document is now a [`toml_edit::DocumentMut`], a format-preserving
+/// DOM, and [`merge_tables`] writes only the keys whose **data** actually
+/// changed. Everything else keeps its own bytes: comments above a key or a
+/// section header, a trailing comment on a line whose value did change, inline
+/// tables, inline arrays, key order and blank lines. A save with no new value
+/// to write is byte-identical to the file it read — pinned by
+/// [`tests::a_save_that_changes_nothing_rewrites_nothing`].
+///
+/// **Two things it deliberately does not do**, because a narrower true claim
+/// beats a wide false one:
+///
+/// - a **changed array is replaced whole**, so a comment *inside* an array, or
+///   between `[[endpoints.remote]]` rows, is lost when the app rewrites that
+///   list. Merging element-wise would mean matching rows by index, and an index
+///   match cannot tell a reorder from an edit — it would also stop a row's
+///   optional field from being *removed*, which replacing the array whole is
+///   what makes work today. An **unchanged** array is left alone, which is the
+///   common case and covers the comments people actually write. Pinned by
+///   [`tests::a_comment_inside_a_list_survives_until_that_list_changes`];
+/// - a key the struct **stops** emitting is not deleted, because the merge
+///   walks `incoming` and so can only add or overwrite. That is not new, not
+///   #825's, and for the one field it reaches today it is the design rather
+///   than a gap: `DesktopSettings::endpoints` is an `Option` whose `None`
+///   serialises to nothing at all, and that omission is exactly what stops a
+///   client which cannot render endpoints from deleting them (see
+///   [`EndpointSettings`]). The same additive walk is what makes an unknown key
+///   survive at all.
+///
+/// One consequence worth stating so it is not read as a bug: "leaves every byte
+/// alone" holds for a document that already **has** every key the struct owns.
+/// A partial one — no `[zoom]` section, say — gains that section on the next
+/// save, appended after whatever is already there.
+///
+/// # An unparseable document is refused, not replaced (issue #1072)
+///
+/// **That reverses what used to be written here.** The old reasoning was that
+/// nothing can be preserved out of bytes that are not TOML, and that refusing
+/// would leave a user whose file got corrupted unable to change a setting from
+/// inside the app. The first half is true and the second was the wrong trade:
+/// the alternative to refusing is not "the user gets their settings back", it is
 /// "the user's file is silently destroyed the first time they touch anything".
 /// Being unable to change a preference is recoverable — the message names the
 /// line to open — and a replaced document is not.
 ///
 /// [`save_to`] makes that call before reaching here, against `DesktopSettings`
-/// rather than `toml::Table`, because a document that is valid TOML which this
-/// build's *schema* rejects is equally unreadable and equally destructive to
-/// merge into. By the time this function runs, `existing` has already parsed.
+/// rather than a bare document parse, because a document that is valid TOML
+/// which this build's *schema* rejects is equally unreadable and equally
+/// destructive to merge into. By the time this function runs, `existing` has
+/// already parsed.
 ///
 /// **"Unreadable" means unreadable by *this* build**, which is a wider set than
 /// "corrupt" — and under a refusal that widening is now a feature rather than a
@@ -2069,49 +2148,246 @@ fn merged_document(
     existing: Option<&str>,
     settings: &DesktopSettings,
 ) -> Result<String, SettingsWriteError> {
-    // `toml::from_str`, not `str::parse` — `Value`'s `FromStr` parses a single
-    // TOML *value* expression, so a whole document fails it on the first key.
-    //
+    // The canonical rendering of the struct: byte for byte what a fresh
+    // document looks like, and the source of every value the merge writes.
+    // `to_string_pretty` rather than `to_string` because the difference is
+    // `[appearance]` versus `appearance = { … }` for a document nobody has
+    // expressed a preference about yet — pinned by
+    // [`tests::default_document_shape_is_pinned`].
+    let canonical = toml_edit::ser::to_string_pretty(settings)
+        .map_err(|error| write_error("could not serialize", path, error))?;
+
+    // No document on disk: there is nothing to preserve, and the canonical
+    // rendering IS the answer. Also the only path that can produce a document
+    // this function did not merge into, which is why the shape pin can assert
+    // on it.
+    let Some(contents) = existing else {
+        return Ok(canonical);
+    };
+
     // Unreachable through [`save_to`], which refuses an unreadable document
     // before it reaches here (issue #1072). It is still an error rather than the
-    // `unwrap_or_default()` it used to be, because defaulting is precisely what
-    // made the data loss silent: this function would then merge the struct into
-    // an EMPTY table and publish that, which is a whole-file replacement wearing
-    // a merge's clothes.
-    let mut document = match existing {
-        None => toml::Table::new(),
-        Some(contents) => toml::from_str::<toml::Table>(contents)
-            .map_err(|error| refuse_to_overwrite(path, contents, &error))?,
-    };
-    let owned = toml::Table::try_from(settings)
+    // `unwrap_or_default()` it once was, because defaulting is precisely what
+    // made the data loss silent: the merge would then run against an EMPTY
+    // document and publish that, which is a whole-file replacement wearing a
+    // merge's clothes.
+    let mut document = contents
+        .parse::<toml_edit::DocumentMut>()
+        .map_err(|error| refuse_to_overwrite(path, contents, &error.into()))?;
+
+    // Re-parsing this build's own output, which `to_string_pretty` just
+    // produced and which is therefore valid TOML. Going through the text rather
+    // than `ser::to_document` is deliberate: it is the same bytes the no-document
+    // path returns, so the two paths cannot drift into writing different values
+    // for the same struct.
+    let incoming = canonical
+        .parse::<toml_edit::DocumentMut>()
         .map_err(|error| write_error("could not serialize", path, error))?;
-    merge_tables(&mut document, owned);
-    toml::to_string_pretty(&document)
-        .map_err(|error| write_error("could not serialize", path, error))
+
+    merge_tables(document.as_table_mut(), incoming.as_table(), false);
+    Ok(document.to_string())
 }
 
 /// Deep-merge `incoming` into `base`: two tables merge key by key, anything
-/// else replaces outright.
+/// else replaces outright — and a key whose **data** is already what `incoming`
+/// says keeps the bytes the document spelled it with.
 ///
 /// So a field the struct owns always wins over whatever the file held — the
 /// struct is the authority on its own schema — while a key only the file has is
 /// left exactly as it was, down to a field nested inside a section this build
 /// *does* know.
 ///
-/// An existing entry is edited **in place** rather than removed and
-/// re-inserted, so every key keeps its position even if some dependency turns
-/// on toml's `preserve_order` feature and the table stops being sorted.
-fn merge_tables(base: &mut toml::Table, incoming: toml::Table) {
-    for (key, value) in incoming {
-        match (base.get_mut(&key), value) {
-            (Some(toml::Value::Table(existing)), toml::Value::Table(incoming)) => {
-                merge_tables(existing, incoming);
-            }
-            (Some(existing), value) => *existing = value,
-            (None, value) => {
-                base.insert(key, value);
-            }
+/// **The unchanged-key skip is what preserves formatting for keys this build
+/// DOES own.** Without it every save would rewrite `version`, `mode`, `level`
+/// and the whole endpoint list on every write, and rewriting an
+/// `[[endpoints.remote]]` list drops the comments between its rows even when
+/// not one byte of its data moved. [`same_data`] compares data and ignores
+/// spelling, so an inline `remote = [{ … }]` and an `[[endpoints.remote]]`
+/// block holding the same rows both count as unchanged.
+///
+/// `inline` says whether `base` is an inline table (`a = { … }`) rather than a
+/// `[section]`, and it is **load-bearing rather than cosmetic**: an inline table
+/// holds values only, so a `[section]`- or `[[array]]`-shaped item put inside
+/// one is a shape it cannot render — and `toml_edit` renders it as **nothing**
+/// rather than failing. Measured, not feared: against a hand-written
+/// `endpoints = { selection = "local", remote = [] }`, adding a deck without
+/// this conversion writes `endpoints = { selection = "local"}` — still valid
+/// TOML, with the deck the user just added silently gone.
+///
+/// **The `insert` path was already safe and the `replace` path was not**, which
+/// is the distinction to keep if this is ever refactored. `TableLike::insert`
+/// converts the item itself, so a new key was never the problem; its
+/// `into_value().unwrap()` fails only on an `Item::None`, which the loop above
+/// skips. A *replacement* goes straight through `get_mut` into the table's item
+/// map with no conversion anywhere, which is where the value disappeared.
+/// Converting once, up front, covers both — and it is also the behaviour a
+/// reader wants: a document written inline stays inline.
+fn merge_tables(
+    base: &mut dyn toml_edit::TableLike,
+    incoming: &dyn toml_edit::TableLike,
+    inline: bool,
+) {
+    for (key, item) in incoming.iter() {
+        // `TableLike::iter` yields entries a table is holding a place for but
+        // has no value at. `incoming` is parsed from this build's own canonical
+        // rendering, which has no way to produce one — skipping costs nothing
+        // and means the loop below does not rest on that.
+        if item.is_none() {
+            continue;
         }
+
+        let mut item = item.clone();
+        if inline {
+            item.make_value();
+        }
+
+        if base.get(key).is_none() {
+            base.insert(key, item);
+            continue;
+        }
+        // `get` and `get_mut` answer the same question on both table
+        // spellings — a `Table` filters its no-value entries out of each, an
+        // inline table filters neither — so having just seen `Some` here
+        // cannot become `None`.
+        let existing = base.get_mut(key).expect("`get` just found this key");
+
+        if let Some(incoming_table) = item.as_table_like()
+            && existing.is_table_like()
+        {
+            // Read the base's spelling BEFORE borrowing it mutably; the
+            // recursion needs it to decide how to spell anything it inserts.
+            let nested_inline = existing.is_inline_table();
+            let existing_table = existing
+                .as_table_like_mut()
+                .expect("`is_table_like` just said so");
+            merge_tables(existing_table, incoming_table, nested_inline);
+            continue;
+        }
+
+        if !same_data(existing, &item) {
+            replace_item(existing, item);
+        }
+    }
+}
+
+/// Overwrite `existing` with `incoming`, keeping the **decor** — the whitespace
+/// and comments attached to the value — that the document had there.
+///
+/// The key's own decor needs no care: only the item is replaced, so a comment
+/// line above the key stays where it is. The value's decor is the other half,
+/// and it is the one a user notices — `mode = "light"  # my own note` keeps
+/// ` # my own note` when the mode flips to `"dark"`.
+///
+/// Only values carry decor: a `[section]` or an `[[array]]` item keeps its own,
+/// and there is nothing to copy across.
+fn replace_item(existing: &mut toml_edit::Item, incoming: toml_edit::Item) {
+    let decor = existing.as_value().map(|value| value.decor().clone());
+    *existing = incoming;
+    if let Some(decor) = decor
+        && let Some(value) = existing.as_value_mut()
+    {
+        *value.decor_mut() = decor;
+    }
+}
+
+/// Whether two items hold the same **data**, ignoring every difference in how
+/// the document spells it.
+///
+/// A `[table]` and an `a = { … }` inline table with the same pairs are the same
+/// data; so are an `[[array]]` of tables and an `a = [{ … }]` array of inline
+/// tables; so are `"x"` written with one quote style or another, and a value
+/// with a comment stuck to it. That is the whole point — [`merge_tables`] uses
+/// this to decide whether it has anything to write, and re-spelling a key whose
+/// value did not change is exactly the formatting loss issue #825 is about.
+///
+/// Types are **not** coerced across: a `1` where the struct has `1.0` is a
+/// change, and the canonical `1.0` is written. That is the right way round —
+/// the struct is the authority on its own schema, so its type wins.
+fn same_data(left: &toml_edit::Item, right: &toml_edit::Item) -> bool {
+    match (data_node(left), data_node(right)) {
+        (Some(left), Some(right)) => same_node(&left, &right),
+        // `Item::None` on either side: a table holding a place for a key it has
+        // no value at is not "the same data" as any value.
+        _ => false,
+    }
+}
+
+/// An item seen as data rather than as syntax — the view [`same_data`] compares.
+enum DataNode<'a> {
+    /// A `[table]`, an inline table, or a dotted-key group.
+    Table(&'a dyn toml_edit::TableLike),
+    /// An `[[array of tables]]` or an ordinary array, element by element.
+    Array(Vec<DataNode<'a>>),
+    /// Anything with no structure under it.
+    Scalar(&'a toml_edit::Value),
+}
+
+fn data_node(item: &toml_edit::Item) -> Option<DataNode<'_>> {
+    if let Some(table) = item.as_table_like() {
+        return Some(DataNode::Table(table));
+    }
+    if let Some(rows) = item.as_array_of_tables() {
+        return Some(DataNode::Array(
+            rows.iter()
+                .map(|row| DataNode::Table(row as &dyn toml_edit::TableLike))
+                .collect(),
+        ));
+    }
+    item.as_value().map(value_node)
+}
+
+fn value_node(value: &toml_edit::Value) -> DataNode<'_> {
+    if let Some(table) = value.as_inline_table() {
+        return DataNode::Table(table);
+    }
+    if let Some(array) = value.as_array() {
+        return DataNode::Array(array.iter().map(value_node).collect());
+    }
+    DataNode::Scalar(value)
+}
+
+fn same_node(left: &DataNode<'_>, right: &DataNode<'_>) -> bool {
+    match (left, right) {
+        (DataNode::Table(left), DataNode::Table(right)) => {
+            // Order-insensitive, because a table IS an unordered map and the
+            // document's own key order is precisely what must not count as a
+            // difference. The length check is what makes the one-sided walk
+            // below a two-sided comparison.
+            let pairs = |table: &dyn toml_edit::TableLike| {
+                table.iter().filter(|(_, at)| !at.is_none()).count()
+            };
+            pairs(*left) == pairs(*right)
+                && left
+                    .iter()
+                    .filter(|(_, at)| !at.is_none())
+                    .all(|(key, at)| right.get(key).is_some_and(|other| same_data(at, other)))
+        }
+        (DataNode::Array(left), DataNode::Array(right)) => {
+            left.len() == right.len()
+                && left
+                    .iter()
+                    .zip(right.iter())
+                    .all(|(left, right)| same_node(left, right))
+        }
+        (DataNode::Scalar(left), DataNode::Scalar(right)) => same_scalar(left, right),
+        _ => false,
+    }
+}
+
+/// Spelled out rather than derived: `toml_edit::Value` carries its decor and its
+/// original text, so `PartialEq` on it — if it had one — would answer a
+/// different question than this one.
+fn same_scalar(left: &toml_edit::Value, right: &toml_edit::Value) -> bool {
+    use toml_edit::Value;
+    match (left, right) {
+        (Value::String(left), Value::String(right)) => left.value() == right.value(),
+        (Value::Integer(left), Value::Integer(right)) => left.value() == right.value(),
+        (Value::Float(left), Value::Float(right)) => left.value() == right.value(),
+        (Value::Boolean(left), Value::Boolean(right)) => left.value() == right.value(),
+        (Value::Datetime(left), Value::Datetime(right)) => left.value() == right.value(),
+        // Different types, and the two structured arms `data_node` already
+        // peeled off. Both are a change.
+        _ => false,
     }
 }
 
@@ -2554,38 +2830,36 @@ mod tests {
         assert_eq!(load_from(&path).appearance.mode, AppearanceMode::Dark);
     }
 
-    /// The limit of "byte for byte", pinned so it is a known property rather
-    /// than a surprise.
+    /// Issue #825, and this test used to assert the **opposite**.
     ///
-    /// The merge round-trips through `toml::Table`, which models *data*, so a
-    /// save re-renders the whole document in the serializer's own canonical
-    /// form. No unknown **data** is ever lost — every key, value and type comes
-    /// back — but a comment is dropped and an inline array is re-flowed across
-    /// lines. Preserving those needs a format-preserving parser (`toml_edit`),
-    /// a dependency this does not carry.
+    /// Its old name was `an_unknown_section_keeps_its_data_but_not_its_formatting`
+    /// and it pinned the limitation: the merge round-tripped through
+    /// `toml::Table`, which models *data*, so a save re-rendered the whole
+    /// document canonically — every key, value and type came back, and the
+    /// comment and the inline array did not. The merge is a
+    /// `toml_edit::DocumentMut` one now ([`merged_document`]), so both halves
+    /// hold: the data AND the bytes it was written in.
     ///
-    /// The practical consequence is worth knowing before someone reports it as
-    /// a bug: a user who hand-annotates `desktop.toml` loses the annotations
-    /// the next time the app writes a setting.
+    /// Deliberately asserted on the **whole document** rather than on a
+    /// substring. A `contains` check would pass on a save that kept the comment
+    /// and re-flowed something else, which is the shape of a weaker property
+    /// wearing this one's name.
     #[test]
-    fn an_unknown_section_keeps_its_data_but_not_its_formatting() {
+    fn an_unknown_section_keeps_its_formatting_as_well_as_its_data() {
         let dir = tempdir();
         let path = dir.path().join(SETTINGS_FILE_NAME);
-        std::fs::write(
-            &path,
-            "version = 1\n\n\
+        let hand_written = "version = 1\n\n\
              # which speech-to-text backend #802 picked\n\
              [voice]\n\
              backend = \"whisper\"\n\
-             stages = [\"stt\", \"intent\"]\n",
-        )
-        .unwrap();
+             stages = [\"stt\", \"intent\"]\n";
+        std::fs::write(&path, hand_written).unwrap();
 
         save_to(&path, &dark()).unwrap();
         let raw = std::fs::read_to_string(&path).unwrap();
 
         // The data is all there, with its types intact.
-        let reparsed = toml::from_str::<toml::Table>(&raw).unwrap();
+        let reparsed = raw.parse::<toml_edit::DocumentMut>().unwrap();
         let voice = reparsed["voice"].as_table().unwrap();
         assert_eq!(voice["backend"].as_str(), Some("whisper"));
         assert_eq!(
@@ -2594,12 +2868,287 @@ mod tests {
             "unexpected document: {raw}"
         );
 
-        // The formatting is not: the comment is gone and the array is re-flowed.
-        assert!(!raw.contains("# which"), "comments survived: {raw}");
+        // And so is the formatting: the comment, the inline array, the key
+        // order and the blank line that grouped them.
         assert!(
-            !raw.contains("[\"stt\", \"intent\"]"),
-            "the inline array survived: {raw}"
+            raw.starts_with(hand_written),
+            "the hand-written document was re-rendered: {raw}"
         );
+
+        // The only difference is the sections the save had to add, and the
+        // setting it was asked to change is in them.
+        assert_eq!(
+            raw,
+            format!("{hand_written}\n[appearance]\nmode = \"dark\"\n\n[zoom]\nlevel = 1.0\n"),
+            "unexpected document"
+        );
+        assert_eq!(load_from(&path).appearance.mode, AppearanceMode::Dark);
+    }
+
+    /// **The user-facing property issue #825 is actually about**: someone
+    /// annotates `desktop.toml` by hand — which PRD #803's "a file a user can
+    /// read, edit and delete without the app running" invites — and then uses
+    /// the app.
+    ///
+    /// Every shape of comment TOML has is in the fixture, including one on a
+    /// line whose value the save *does* change, because that is the one a
+    /// naive format-preserving merge still drops: the comment lives in the
+    /// value's decor, so replacing the value takes it unless the decor is
+    /// carried across (see [`replace_item`]).
+    #[test]
+    fn a_hand_written_comment_survives_an_app_driven_save() {
+        let dir = tempdir();
+        let path = dir.path().join(SETTINGS_FILE_NAME);
+        std::fs::write(
+            &path,
+            "# Agent Deck desktop settings — edited by hand, 2026-09-16\n\
+             version = 1\n\n\
+             # I like it light during the day\n\
+             [appearance]\n\
+             mode = \"light\"  # flip this to \"dark\" at night\n\n\
+             [zoom]\n\
+             level = 1.0\n\n\
+             # everything below is for #802, not written by the app\n\
+             [voice]\n\
+             stages = [\"stt\", \"intent\"]\n",
+        )
+        .unwrap();
+
+        // The app writes a setting, exactly as a click on the appearance
+        // toggle would.
+        let mut loaded = load_from(&path);
+        loaded.appearance.mode = AppearanceMode::Dark;
+        save_to(&path, &loaded).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "# Agent Deck desktop settings — edited by hand, 2026-09-16\n\
+             version = 1\n\n\
+             # I like it light during the day\n\
+             [appearance]\n\
+             mode = \"dark\"  # flip this to \"dark\" at night\n\n\
+             [zoom]\n\
+             level = 1.0\n\n\
+             # everything below is for #802, not written by the app\n\
+             [voice]\n\
+             stages = [\"stt\", \"intent\"]\n",
+            "a hand-written annotation did not survive the save"
+        );
+    }
+
+    /// The strongest statement of the same property, and the cheapest to read:
+    /// a save that changes no data touches no byte.
+    ///
+    /// It covers what the comment tests do not — key order (`zoom` before
+    /// `appearance` here, the reverse of what this build writes), blank-line
+    /// grouping, a doubled blank line, a trailing comment at the end of the
+    /// file, and the inline spelling of a table this build **owns**. Every one
+    /// of those was re-rendered before issue #825.
+    #[test]
+    fn a_save_that_changes_nothing_rewrites_nothing() {
+        for original in [
+            // Sections in the reverse of this build's order, odd blank-line
+            // grouping, a leading and a trailing comment.
+            "# mine\n\nversion = 1\n\n\n[zoom]\nlevel = 1.0\n\n[appearance]\nmode = \"dark\"\n\n# end\n",
+            // The sections this build owns, spelled inline.
+            "version = 1\nappearance = { mode = \"dark\" }\nzoom = { level = 1.0 }\n",
+            // Dotted keys.
+            "version = 1\nappearance.mode = \"dark\"\nzoom.level = 1.0\n",
+        ] {
+            let dir = tempdir();
+            let path = dir.path().join(SETTINGS_FILE_NAME);
+            std::fs::write(&path, original).unwrap();
+
+            // Loading and saving straight back is the no-op: whatever the
+            // document says is what the struct holds.
+            let loaded = load_from(&path);
+            assert_eq!(loaded.appearance.mode, AppearanceMode::Dark);
+            save_to(&path, &loaded).unwrap();
+
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                original,
+                "a no-op save rewrote the document"
+            );
+        }
+    }
+
+    /// The limit of the new property, pinned so it is a known shape rather than
+    /// a surprise — the same job the inverted test above used to do for the old
+    /// one.
+    ///
+    /// A **changed array** is replaced whole, so a comment between
+    /// `[[endpoints.remote]]` rows goes with it. An **unchanged** one is left
+    /// alone, comment included, which is the common case: the app rewrites that
+    /// list only when a deck is actually added, removed or edited.
+    ///
+    /// [`merged_document`] has the reason it is not merged element-wise.
+    #[test]
+    fn a_comment_inside_a_list_survives_until_that_list_changes() {
+        let with_comment = "version = 1\n\n\
+             [appearance]\n\
+             mode = \"dark\"\n\n\
+             [zoom]\n\
+             level = 1.0\n\n\
+             [endpoints]\n\
+             selection = \"local\"\n\n\
+             # the box under my desk\n\
+             [[endpoints.remote]]\n\
+             host = \"build-box.example.com\"\n\
+             id = \"deck1\"\n\
+             port = 22\n";
+
+        // Unchanged: the comment is still there.
+        let dir = tempdir();
+        let path = dir.path().join(SETTINGS_FILE_NAME);
+        std::fs::write(&path, with_comment).unwrap();
+        let loaded = load_from(&path);
+        save_to(&path, &loaded).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            with_comment,
+            "an untouched endpoint list was rewritten"
+        );
+
+        // Changed: the row's data is written, and the comment is not kept.
+        let mut edited = loaded;
+        edited.endpoints.as_mut().unwrap().remote[0].host =
+            Hostname::parse("other-box.example.com").unwrap();
+        save_to(&path, &edited).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            raw.contains("other-box.example.com"),
+            "the edit did not reach the document: {raw}"
+        );
+        assert!(
+            !raw.contains("# the box under my desk"),
+            "this test pins the LIMIT; if the comment now survives, \
+             merged_document's written limit is stale and should be narrowed \
+             rather than this assertion loosened: {raw}"
+        );
+        // Everything outside the list it rewrote is still untouched.
+        assert!(
+            raw.starts_with(
+                "version = 1\n\n[appearance]\nmode = \"dark\"\n\n[zoom]\nlevel = 1.0\n\n\
+                 [endpoints]\nselection = \"local\"\n"
+            ),
+            "the rest of the document moved: {raw}"
+        );
+    }
+
+    /// The silent data loss [`merge_tables`]'s `inline` argument exists to
+    /// stop, and the two shapes of hand-written document that reach it.
+    ///
+    /// An inline table holds values only, so a `[[array of tables]]`-shaped
+    /// item put inside one is a shape it cannot render — and `toml_edit`
+    /// renders it as **nothing** rather than failing. Measured against the
+    /// second fixture below without the conversion: the save wrote
+    /// `endpoints = { selection = "local"}` and the deck the caller had just
+    /// added was gone, with the save reporting success. The right answer is
+    /// also the preserving one: spell the new item the way the base is spelled.
+    ///
+    /// The two arms are not the same path, which is why both are here. The
+    /// first goes through `TableLike::insert`, which converts the item itself
+    /// and was never the problem; the second is a *replacement* through
+    /// `get_mut`, which converts nothing.
+    #[test]
+    fn a_section_spelled_inline_stays_inline_when_the_app_adds_to_it() {
+        for inline_endpoints in [
+            // The key the app has to ADD is the list itself.
+            "endpoints = { selection = \"local\" }",
+            // The key is already there and EMPTY, so the app replaces it. This
+            // is the arm that needs `make_value`: a replacement is written
+            // straight into the inline table's items, without the conversion
+            // `TableLike::insert` performs on its own.
+            "endpoints = { selection = \"local\", remote = [] }",
+        ] {
+            let dir = tempdir();
+            let path = dir.path().join(SETTINGS_FILE_NAME);
+            std::fs::write(
+                &path,
+                format!(
+                    "version = 1\n\
+                     appearance = {{ mode = \"dark\" }}\n\
+                     zoom = {{ level = 1.0 }}\n\
+                     {inline_endpoints}\n"
+                ),
+            )
+            .unwrap();
+
+            let mut settings = load_from(&path);
+            settings.endpoints.as_mut().unwrap().remote = vec![RemoteEndpointSettings::new(
+                EndpointId::parse("deck1").unwrap(),
+                Hostname::parse("build-box.example.com").unwrap(),
+            )];
+            save_to(&path, &settings).unwrap();
+
+            let raw = std::fs::read_to_string(&path).unwrap();
+            assert!(
+                !raw.contains("[[endpoints.remote]]") && !raw.contains("[endpoints]"),
+                "an inline section was re-spelled as a header: {raw}"
+            );
+            // And it is still a document this build reads back to the same
+            // thing — the check that catches an item written into an inline
+            // table in a shape no inline table can hold.
+            let reloaded = load_from(&path);
+            assert_eq!(reloaded, settings, "the inline save did not round-trip");
+        }
+    }
+
+    /// The third spelling a hand-written section can have, and the same class
+    /// of bug the inline test above pins: an item written into a table in a
+    /// shape that table cannot hold.
+    ///
+    /// A dotted key (`endpoints.selection = "local"`) is a third `toml_edit`
+    /// shape beside `[section]` and `{ … }`, and the app has to be able to add
+    /// a deck to one. Asserted as a **round trip** rather than on exact bytes:
+    /// what matters is that the document this build writes is one it reads back
+    /// to the same settings, and the layout a dotted section gets when the list
+    /// inside it is rewritten falls under the changed-array limit
+    /// [`merged_document`] already states.
+    #[test]
+    fn a_section_spelled_with_dotted_keys_still_round_trips_when_the_app_adds_to_it() {
+        for dotted_endpoints in [
+            // The list is not there at all, so it is inserted.
+            "endpoints.selection = \"local\"",
+            // The list is there and empty, so it is replaced.
+            "endpoints.selection = \"local\"\nendpoints.remote = []",
+        ] {
+            let dir = tempdir();
+            let path = dir.path().join(SETTINGS_FILE_NAME);
+            std::fs::write(
+                &path,
+                format!(
+                    "version = 1\n\
+                     appearance.mode = \"dark\"\n\
+                     zoom.level = 1.0\n\
+                     {dotted_endpoints}\n"
+                ),
+            )
+            .unwrap();
+
+            let mut settings = load_from(&path);
+            settings.endpoints.as_mut().unwrap().remote = vec![RemoteEndpointSettings::new(
+                EndpointId::parse("deck1").unwrap(),
+                Hostname::parse("build-box.example.com").unwrap(),
+            )];
+            save_to(&path, &settings).unwrap();
+
+            let raw = std::fs::read_to_string(&path).unwrap();
+            assert_eq!(
+                load_from(&path),
+                settings,
+                "the dotted save did not round-trip: {raw}"
+            );
+            // The dotted keys the save had no reason to touch are untouched.
+            assert!(
+                raw.starts_with(
+                    "version = 1\nappearance.mode = \"dark\"\nzoom.level = 1.0\n\
+                     endpoints.selection = \"local\"\n"
+                ),
+                "an untouched dotted key was re-spelled: {raw}"
+            );
+        }
     }
 
     /// The same property one level down: an unknown *field* inside a section
@@ -2651,12 +3200,12 @@ mod tests {
 
     /// The two documents this build cannot read, and they fail in **different
     /// places**, which is the whole reason the guard is written against
-    /// `DesktopSettings` rather than `toml::Table`.
+    /// `DesktopSettings` rather than against a bare document parse.
     ///
     /// The first is not TOML at all. The second is valid TOML whose `host`
     /// contains a space and whose `id` is one character, so this build's *schema*
-    /// rejects it while `toml::Table` parses it happily — the case issue #1072
-    /// was filed from, and the one that was silently destructive.
+    /// rejects it while a document parse accepts it happily — the case issue
+    /// #1072 was filed from, and the one that was silently destructive.
     const UNREADABLE_DOCUMENTS: [&str; 2] = [
         "# my own settings, annotated\nthis is not [ valid toml\n",
         "version = 1\n\n[[endpoints.remote]]\nhost = \"build box\"\nid = \"d\"\n",
@@ -2902,7 +3451,7 @@ mod tests {
     fn a_document_problem_carries_a_locator_and_never_the_documents_bytes() {
         let path = Path::new("/home/dev/.config/dot-agent-deck/desktop.toml");
         let contents = format!("version = 1\n[zoom]\nlevel = \"{SENTINEL}\"\n");
-        let error = toml::from_str::<DesktopSettings>(&contents).unwrap_err();
+        let error = toml_edit::de::from_str::<DesktopSettings>(&contents).unwrap_err();
         assert!(
             error.to_string().contains(SENTINEL),
             "the toml error stopped echoing the value, so this test proves nothing: {error}"
@@ -3435,7 +3984,7 @@ mod tests {
         // the same statement on the IPC wire: "unspecified", not "empty".
         const FRESH: &str =
             "version = 1\n\n[appearance]\nmode = \"system\"\n\n[zoom]\nlevel = 1.0\n";
-        let rendered = toml::to_string_pretty(&DesktopSettings::default()).unwrap();
+        let rendered = toml_edit::ser::to_string_pretty(&DesktopSettings::default()).unwrap();
         assert_eq!(rendered, FRESH);
 
         // The same bytes must come out of `save_to`, which no longer serializes
@@ -3505,7 +4054,8 @@ mod tests {
     }
 
     impl AllowedReference {
-        /// The `toml::Value::type_str()` this shape covers, and nothing else.
+        /// The `toml_edit::Item::type_name()` this shape covers, and nothing
+        /// else.
         fn type_str(self) -> &'static str {
             match self {
                 Self::BackendName => "string",
@@ -3586,29 +4136,67 @@ forms it is.";
     /// *field* (`endpoints.remote.identity`) rather than a *row*
     /// (`endpoints.remote.0.identity`), which would exempt one list position
     /// and silently fail to cover the second.
+    ///
+    /// # Spelling is not part of a path
+    ///
+    /// Since issue #825 this walks a `toml_edit` tree, where the same data has
+    /// four shapes rather than two: a `[table]` and an `a = { … }` inline table
+    /// are both tables, and an `[[array of tables]]` and an `a = [{ … }]` array
+    /// of inline tables are both lists. All four are walked, because a document
+    /// the tripwire is run against may be hand-written in any of them and a
+    /// scan blind to one spelling is a scan that passes on a schema it has not
+    /// read — which is exactly the blind spot #741 M6 closed for list rows.
     fn key_paths<'v>(
-        value: &'v toml::Value,
+        item: &'v toml_edit::Item,
         prefix: &str,
-        into: &mut Vec<(String, &'v toml::Value)>,
+        into: &mut Vec<(String, &'v toml_edit::Item)>,
     ) {
-        match value {
-            toml::Value::Table(table) => {
-                for (key, nested) in table {
-                    let path = if prefix.is_empty() {
-                        key.clone()
-                    } else {
-                        format!("{prefix}.{key}")
-                    };
-                    into.push((path.clone(), nested));
-                    key_paths(nested, &path, into);
-                }
+        if let Some(table) = item.as_table_like() {
+            key_paths_in_table(table, prefix, into);
+        } else if let Some(rows) = item.as_array_of_tables() {
+            for row in rows.iter() {
+                key_paths_in_table(row, prefix, into);
             }
-            toml::Value::Array(items) => {
-                for item in items {
-                    key_paths(item, prefix, into);
-                }
+        } else if let Some(value) = item.as_value() {
+            key_paths_in_value(value, prefix, into);
+        }
+    }
+
+    /// [`key_paths`] for a table, by whichever of the two spellings — the only
+    /// arm that emits a path, because a list position is deliberately not one.
+    fn key_paths_in_table<'v>(
+        table: &'v dyn toml_edit::TableLike,
+        prefix: &str,
+        into: &mut Vec<(String, &'v toml_edit::Item)>,
+    ) {
+        for (key, nested) in table.iter() {
+            if nested.is_none() {
+                continue;
             }
-            _ => {}
+            let path = if prefix.is_empty() {
+                key.to_string()
+            } else {
+                format!("{prefix}.{key}")
+            };
+            into.push((path.clone(), nested));
+            key_paths(nested, &path, into);
+        }
+    }
+
+    /// [`key_paths`] for a value, which is where an *inline* list of inline
+    /// tables is reached — `toml_edit` models that as an array of values rather
+    /// than as an array of tables.
+    fn key_paths_in_value<'v>(
+        value: &'v toml_edit::Value,
+        prefix: &str,
+        into: &mut Vec<(String, &'v toml_edit::Item)>,
+    ) {
+        if let Some(table) = value.as_inline_table() {
+            key_paths_in_table(table, prefix, into);
+        } else if let Some(array) = value.as_array() {
+            for element in array.iter() {
+                key_paths_in_value(element, prefix, into);
+            }
         }
     }
 
@@ -3659,11 +4247,11 @@ forms it is.";
     /// in another section; and the type is checked because an exemption is a
     /// statement about one specific field, not about a name.
     fn secretish_offenders(
-        value: &toml::Value,
+        document: &dyn toml_edit::TableLike,
         allowed: &[(&str, AllowedReference)],
     ) -> Vec<String> {
         let mut found = Vec::new();
-        key_paths(value, "", &mut found);
+        key_paths_in_table(document, "", &mut found);
         found
             .into_iter()
             .filter_map(|(path, at)| {
@@ -3680,11 +4268,11 @@ forms it is.";
                     .find(|(exception, _)| exception.eq_ignore_ascii_case(&path))
                 {
                     None => Some(path),
-                    Some((_, shape)) if shape.type_str() == at.type_str() => None,
+                    Some((_, shape)) if shape.type_str() == at.type_name() => None,
                     Some((_, shape)) => Some(format!(
                         "{path} (exempted as a {}, found a {})",
                         shape.type_str(),
-                        at.type_str()
+                        at.type_name()
                     )),
                 }
             })
@@ -3703,8 +4291,8 @@ forms it is.";
             ("the default document", DesktopSettings::default()),
             ("a fully populated document", representative_document()),
         ] {
-            let document = toml::Value::try_from(settings).unwrap();
-            let offenders = secretish_offenders(&document, &SECRETISH_ALLOWED);
+            let document = serialised_document(&settings);
+            let offenders = secretish_offenders(document.as_table(), &SECRETISH_ALLOWED);
             assert!(
                 offenders.is_empty(),
                 "{which} has key(s) named like credentials: {}\n\n{SECRET_RULE}",
@@ -3721,7 +4309,7 @@ forms it is.";
     /// so an exemption would describe the field rather than one list position.
     #[test]
     fn the_tripwire_reaches_a_field_inside_a_list_shaped_section() {
-        let bad = toml::from_str::<toml::Value>(
+        let bad = parse_document(
             "version = 1\n\n\
              [[endpoints.remote]]\n\
              host = \"a\"\n\
@@ -3729,9 +4317,8 @@ forms it is.";
              [[endpoints.remote]]\n\
              host = \"b\"\n\
              api_key = \"sk-live-nope\"\n",
-        )
-        .unwrap();
-        let offenders = secretish_offenders(&bad, &SECRETISH_ALLOWED);
+        );
+        let offenders = secretish_offenders(bad.as_table(), &SECRETISH_ALLOWED);
         assert_eq!(
             offenders,
             ["endpoints.remote.api_key", "endpoints.remote.api_key"],
@@ -3745,7 +4332,7 @@ forms it is.";
     /// one path and not to a same-named field elsewhere.
     #[test]
     fn the_credential_tripwire_matches_by_path_and_catches_the_names_it_claims_to() {
-        let bad = toml::from_str::<toml::Value>(
+        let bad = parse_document(
             "version = 1\n\n\
              [voice]\n\
              api_key = \"sk-live-nope\"\n\
@@ -3757,9 +4344,8 @@ forms it is.";
              credential = \"nope\"\n\n\
              [voice.remote]\n\
              auth_token = \"t\"\n",
-        )
-        .unwrap();
-        let mut offenders = secretish_offenders(&bad, &SECRETISH_ALLOWED);
+        );
+        let mut offenders = secretish_offenders(bad.as_table(), &SECRETISH_ALLOWED);
         offenders.sort();
         assert_eq!(
             offenders,
@@ -3778,20 +4364,19 @@ forms it is.";
         // An exception is a path, so it exempts exactly one field. The same
         // name in another section is still caught — which is the whole reason
         // the allowlist stopped being bare names.
-        let referenced = toml::from_str::<toml::Value>(
+        let referenced = parse_document(
             "[voice]\n\
              secret_backend = \"keychain\"\n\
              has_api_key = true\n\n\
              [endpoints]\n\
              secret_backend = \"somewhere else entirely\"\n",
-        )
-        .unwrap();
+        );
         let allowed = [
             ("voice.secret_backend", AllowedReference::BackendName),
             ("voice.has_api_key", AllowedReference::StoredFlag),
         ];
         assert_eq!(
-            secretish_offenders(&referenced, &allowed),
+            secretish_offenders(referenced.as_table(), &allowed),
             ["endpoints.secret_backend"]
         );
     }
@@ -3811,27 +4396,25 @@ forms it is.";
         let allowed = [("voice.has_api_key", AllowedReference::StoredFlag)];
 
         // The shape the exemption was granted for: nothing to report.
-        let flag = toml::from_str::<toml::Value>("[voice]\nhas_api_key = true\n").unwrap();
-        assert!(secretish_offenders(&flag, &allowed).is_empty());
+        let flag = parse_document("[voice]\nhas_api_key = true\n");
+        assert!(secretish_offenders(flag.as_table(), &allowed).is_empty());
 
         // The same path, now a string. Reported, with the mismatch named so
         // the failure says what actually changed.
-        let widened =
-            toml::from_str::<toml::Value>("[voice]\nhas_api_key = \"sk-live-nope\"\n").unwrap();
+        let widened = parse_document("[voice]\nhas_api_key = \"sk-live-nope\"\n");
         assert_eq!(
-            secretish_offenders(&widened, &allowed),
+            secretish_offenders(widened.as_table(), &allowed),
             ["voice.has_api_key (exempted as a boolean, found a string)"]
         );
 
         // And in the other direction: a `BackendName` exemption is for a
         // string, so it does not cover a table that grew under that name.
-        let nested = toml::from_str::<toml::Value>(
+        let nested = parse_document(
             "[voice.secret_backend]\nname = \"keychain\"\nvalue = \"sk-live-nope\"\n",
-        )
-        .unwrap();
+        );
         assert_eq!(
             secretish_offenders(
-                &nested,
+                nested.as_table(),
                 &[("voice.secret_backend", AllowedReference::BackendName)]
             ),
             ["voice.secret_backend (exempted as a string, found a table)"]
@@ -3849,20 +4432,19 @@ forms it is.";
     fn the_credential_tripwire_is_blind_to_values_and_to_innocent_names() {
         // A token under a name that says nothing. This is the case that
         // matters: it is exactly how a credential arrives in practice.
-        let innocent = toml::from_str::<toml::Value>(
+        let innocent = parse_document(
             "[voice]\nendpoint = \"https://api.example.test?auth=sk-live-nope\"\nvalue = \"sk-live-nope\"\n",
-        )
-        .unwrap();
+        );
         assert!(
-            secretish_offenders(&innocent, &SECRETISH_ALLOWED).is_empty(),
+            secretish_offenders(innocent.as_table(), &SECRETISH_ALLOWED).is_empty(),
             "the tripwire is a NAMING check; if this starts failing, the doc \
              comments claiming otherwise need updating too"
         );
 
         // And a field name is judged on its own, never on its value.
-        let named = toml::from_str::<toml::Value>("[voice]\napi_key = false\n").unwrap();
+        let named = parse_document("[voice]\napi_key = false\n");
         assert_eq!(
-            secretish_offenders(&named, &SECRETISH_ALLOWED),
+            secretish_offenders(named.as_table(), &SECRETISH_ALLOWED),
             ["voice.api_key"]
         );
     }
@@ -3926,7 +4508,7 @@ forms it is.";
     fn assert_no_sink_carries_the_sentinel(what: &str, settings: &DesktopSettings) {
         assert_free_of_sentinel(
             &format!("{what}: the TOML re-serialisation"),
-            &toml::to_string_pretty(settings).unwrap(),
+            &toml_edit::ser::to_string_pretty(settings).unwrap(),
         );
         assert_free_of_sentinel(
             &format!("{what}: the IPC echo (`desktop_set_settings` returns its input)"),
@@ -3957,21 +4539,44 @@ forms it is.";
     }
 
     /// The leaf (non-table) key paths of a serialised document, sorted.
-    fn leaf_paths(document: &toml::Value) -> Vec<String> {
+    ///
+    /// `is_table_like` rather than `is_table`: since issue #825 an inline table
+    /// is a distinct `toml_edit` shape, and a section someone spelled inline is
+    /// still a section rather than a leaf.
+    fn leaf_paths(document: &dyn toml_edit::TableLike) -> Vec<String> {
         let mut found = Vec::new();
-        key_paths(document, "", &mut found);
+        key_paths_in_table(document, "", &mut found);
         let mut leaves: Vec<String> = found
             .into_iter()
-            .filter(|(_, at)| !at.is_table())
+            .filter(|(_, at)| !at.is_table_like())
             .map(|(path, _)| path)
             .collect();
         leaves.sort();
         leaves
     }
 
+    /// A TOML fixture as a parsed DOM, for the checks that build a document by
+    /// hand rather than from the schema.
+    fn parse_document(contents: &str) -> toml_edit::DocumentMut {
+        contents.parse().expect("the fixture is valid TOML")
+    }
+
+    /// The document this build would write for `settings`, as a parsed DOM.
+    ///
+    /// Goes through the same `ser::to_string_pretty` the save path uses rather
+    /// than through `ser::to_document`, so what the tripwire and the sentinel
+    /// sweep walk is literally the bytes that reach disk — table spellings
+    /// included.
+    fn serialised_document(settings: &DesktopSettings) -> toml_edit::DocumentMut {
+        toml_edit::ser::to_string_pretty(settings)
+            .expect("the settings struct serialises")
+            .parse()
+            .expect("this build's own output is valid TOML")
+    }
+
     /// Replace the value at a dotted `path`, panicking if it is not there — a
     /// typo in a fixture must not read as a pass.
-    fn set_at(document: &mut toml::Table, path: &str, value: toml::Value) {
+    fn set_at(document: &mut dyn toml_edit::TableLike, path: &str, value: toml_edit::Item) {
         let (head, rest) = match path.split_once('.') {
             Some((head, rest)) => (head, Some(rest)),
             None => (path, None),
@@ -3979,10 +4584,12 @@ forms it is.";
         let at = document
             .get_mut(head)
             .unwrap_or_else(|| panic!("no `{head}` in the document"));
-        match (rest, at) {
-            (None, at) => *at = value,
-            (Some(rest), toml::Value::Table(nested)) => set_at(nested, rest, value),
-            (Some(_), _) => panic!("`{head}` is not a table"),
+        match rest {
+            None => *at = value,
+            Some(rest) => match at.as_table_like_mut() {
+                Some(nested) => set_at(nested, rest, value),
+                None => panic!("`{head}` is not a table"),
+            },
         }
     }
 
@@ -4111,21 +4718,21 @@ forms it is.";
     /// behaviour change unnoticed.
     #[test]
     fn a_credential_at_a_known_schema_leaf_reaches_no_sink_beyond_the_users_own_file() {
-        let default = toml::Value::try_from(DesktopSettings::default()).unwrap();
-        let leaves = leaf_paths(&default);
+        let default = serialised_document(&DesktopSettings::default());
+        let leaves = leaf_paths(default.as_table());
         assert_eq!(leaves, ["appearance.mode", "version", "zoom.level"]);
 
         let (mut dropped, mut refused) = (0, 0);
         for leaf in leaves {
             let dir = tempdir();
             let path = dir.path().join(SETTINGS_FILE_NAME);
-            let mut document = default.clone().as_table().unwrap().clone();
+            let mut document = default.clone();
             set_at(
-                &mut document,
+                document.as_table_mut(),
                 &leaf,
-                toml::Value::String(SENTINEL.to_string()),
+                toml_edit::value(SENTINEL.to_string()),
             );
-            let raw = toml::to_string_pretty(&document).unwrap();
+            let raw = document.to_string();
             assert!(
                 raw.contains(SENTINEL),
                 "fixture for {leaf} lost the sentinel"
@@ -4313,7 +4920,7 @@ forms it is.";
     /// The log sink, and the measurement that made [`invalid_document_log`]
     /// necessary.
     ///
-    /// `toml::de::Error`'s own `Display` echoes the offending value twice — in
+    /// `toml_edit::de::Error`'s own `Display` echoes the offending value twice — in
     /// a rendered source line and in serde's `invalid type` message — so the
     /// diagnostic `load_from` used to print put a hand-edited document's bytes
     /// into this process's stderr and the deck log. Both halves are asserted:
@@ -4333,7 +4940,7 @@ forms it is.";
         ];
 
         for contents in &cases {
-            let error = toml::from_str::<DesktopSettings>(contents).unwrap_err();
+            let error = toml_edit::de::from_str::<DesktopSettings>(contents).unwrap_err();
             assert!(
                 error.to_string().contains(SENTINEL),
                 "the toml error stopped echoing the value, so `invalid_document_log` \
@@ -4357,7 +4964,7 @@ forms it is.";
         // The locator itself, on a case whose position is known by hand: the
         // offending value on line 3 starts at column 9 (`level = "`).
         let contents = format!("version = 1\n[zoom]\nlevel = \"{SENTINEL}\"\n");
-        let error = toml::from_str::<DesktopSettings>(&contents).unwrap_err();
+        let error = toml_edit::de::from_str::<DesktopSettings>(&contents).unwrap_err();
         assert!(
             invalid_document_log(path, &contents, &error).contains("line 3, column 9"),
             "unexpected locator: {}",
@@ -4673,7 +5280,7 @@ level = 1.0
     fn local_is_reserved_on_both_sides_of_the_selection() {
         for token in ["local", "LOCAL", "Local"] {
             let document = format!("version = 1\n\n[endpoints]\nselection = {token:?}\n");
-            let settings = toml::from_str::<DesktopSettings>(&document)
+            let settings = toml_edit::de::from_str::<DesktopSettings>(&document)
                 .unwrap_or_else(|error| panic!("{token} must parse: {error}"));
             assert_eq!(
                 settings
@@ -4747,7 +5354,7 @@ level = 1.0
     fn all_is_reserved_on_both_sides_of_the_selection() {
         for token in ["all", "ALL", "All"] {
             let document = format!("version = 1\n\n[endpoints]\nselection = {token:?}\n");
-            let settings = toml::from_str::<DesktopSettings>(&document)
+            let settings = toml_edit::de::from_str::<DesktopSettings>(&document)
                 .unwrap_or_else(|error| panic!("{token} must parse: {error}"));
             assert_eq!(
                 settings
@@ -4774,7 +5381,7 @@ level = 1.0
         // an ambiguous `id = "all"` refuses to load rather than becoming a row
         // no selection could name unambiguously.
         let row = "version = 1\n\n[[endpoints.remote]]\nid = \"all\"\nhost = \"build-box\"\n";
-        let refusal = toml::from_str::<DesktopSettings>(row)
+        let refusal = toml_edit::de::from_str::<DesktopSettings>(row)
             .expect_err("a row claiming the reserved id must not load");
         assert!(
             refusal.to_string().contains("reserved"),
@@ -4987,7 +5594,7 @@ level = 1.0
             let document = format!(
                 "version = 1\n\n[[endpoints.remote]]\nhost = \"h\"\nid = \"d\"\n{field} = {value:?}\n"
             );
-            let parsed = toml::from_str::<DesktopSettings>(&document);
+            let parsed = toml_edit::de::from_str::<DesktopSettings>(&document);
             assert!(
                 parsed.is_err(),
                 "{field} = {value:?} must be refused, not stored"
@@ -5015,12 +5622,12 @@ level = 1.0
         };
         for refused in ["0", "65536", "-1"] {
             assert!(
-                toml::from_str::<DesktopSettings>(&row(refused)).is_err(),
+                toml_edit::de::from_str::<DesktopSettings>(&row(refused)).is_err(),
                 "port = {refused} must be refused, not stored"
             );
         }
         for accepted in ["1", "22", "65535"] {
-            let parsed = toml::from_str::<DesktopSettings>(&row(accepted))
+            let parsed = toml_edit::de::from_str::<DesktopSettings>(&row(accepted))
                 .unwrap_or_else(|error| panic!("port = {accepted} must load: {error}"));
             assert_eq!(
                 parsed.endpoints.expect("a section").remote[0].port.get(),
@@ -5046,7 +5653,7 @@ level = 1.0
             "version = 1\n\n[[endpoints.remote]]\nhost = \"h\"\n",
         ] {
             assert!(
-                toml::from_str::<DesktopSettings>(document).is_err(),
+                toml_edit::de::from_str::<DesktopSettings>(document).is_err(),
                 "{document}"
             );
         }
@@ -5288,7 +5895,7 @@ level = 1.0
 
         // The other four field types, which DO forbid text outright and are
         // what the #827 sweep's own claim still rests on.
-        assert!(toml::from_str::<DesktopSettings>(&format!(
+        assert!(toml_edit::de::from_str::<DesktopSettings>(&format!(
             "version = 1\n\n[[endpoints.remote]]\nhost = \"h\"\nid = \"d\"\nport = {SENTINEL:?}\n"
         ))
         .is_err());
