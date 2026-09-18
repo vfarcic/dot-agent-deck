@@ -1625,7 +1625,7 @@ mod tests {
     ///
     /// This is the half of the old capture test that survived issue #1049's
     /// `PROTOCOL_VERSION` bump, and it matters because
-    /// [`ContractComparison::Unknown`] reads an absent list as "connect" — an
+    /// `ContractComparison::Undeclared` reads an absent list as "connect" — an
     /// assumption its own doc flags as an assumption. Every other fixture here
     /// goes through `AttachResponse::hello`, which POPULATES the list, so
     /// without this test nothing at the handshake layer exercises the absent

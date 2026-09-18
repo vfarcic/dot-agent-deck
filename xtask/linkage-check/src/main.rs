@@ -95,10 +95,6 @@
 #[cfg(all(test, unix))]
 mod build_gate;
 mod clean_tmp;
-/// Issue #906: `scripts/sample-attribution.sh`'s worktree-attribution rule, the
-/// prefix test that decides which worktree a toolchain process is building for.
-/// Tests only — the rule lives in the script, no CI job runs it, and both ways
-/// it has been wrong produced a plausible number rather than an error.
 /// Issue #801: a `changelog.d/<issue>.breaking.md` fragment and the
 /// `CONTRACT_BREAKS` entry the desktop handshake classifies from must move
 /// together. Tests only; the rule reads two files and shells out to nothing.
@@ -191,6 +187,10 @@ mod reap_orphans;
 #[cfg(test)]
 mod release_workflow_wiring;
 mod repo_state;
+/// Issue #906: `scripts/sample-attribution.sh`'s worktree-attribution rule, the
+/// prefix test that decides which worktree a toolchain process is building for.
+/// Tests only — the rule lives in the script, no CI job runs it, and both ways
+/// it has been wrong produced a plausible number rather than an error.
 #[cfg(test)]
 mod sample_attribution;
 /// PRD #740: `desktop/scripts/prepare-sidecar.sh`'s Windows filename rule.
