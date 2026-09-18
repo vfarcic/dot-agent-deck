@@ -320,3 +320,142 @@ command = "devbox run agent-tester-oc"
 [[orchestrations.roles]]
 name = "release"
 command = "devbox run oc-release"
+
+# ===========================================================================
+# AGENT-COST EXPERIMENT — four single-model orchestrations
+#
+# Grid for the measured comparison written up in the devops-catalog repo at
+# manuscript/observability/dash0-plan.md and dash0-setup.md. Selection rule is
+# the newest flagship from each provider, read 2026-09-18.
+#
+# Each block is `anthropic`'s shape exactly — extends = "mixed", same six roles,
+# same prompt_templates, same workflow. ONLY THE LAUNCHERS DIFFER. That is the
+# point: the topology and the instructions are held constant so the model is the
+# single variable.
+#
+# Three rules these blocks exist to enforce:
+#
+#   1. SINGLE-MODEL CELLS. Every role in a block runs the same model. Do not
+#      copy `mixed`, which deliberately runs reviewer and auditor on a different
+#      model from the implementers — that would make per-role cost attribution
+#      meaningless. It also means each model's auditor judges its own coder,
+#      which is a measured finding (self-review leniency), not a defect.
+#
+#   2. NEVER `mixed`. Issue #1024 records it drifting to all-Anthropic during a
+#      credit outage. A config that silently re-models itself is not a
+#      controlled condition.
+#
+#   3. DEDICATED LAUNCHERS, never shared with an existing orchestration — the
+#      same reasoning the `GPT` block above gives for not reusing `oc-big`. A
+#      shared launcher means a model bump in one cell silently re-models
+#      another.
+#
+# No `--variant` on any launcher: provider default for all four. models.dev
+# declares no variants for any of these models, and whether Moonshot and z.ai
+# accept a reasoning-effort parameter through OpenCode is unverified, so the
+# default is the only setting all four demonstrably share.
+#
+# PREREQUISITE: `opencode auth` for anthropic, moonshotai and zai. At the time
+# these blocks were written the box had only OpenAI (oauth) and OpenRouter, so
+# three of the four will fail until credentials are added.
+# ===========================================================================
+
+# --------------------------------------------------------------------------
+# OpenAI — openai/gpt-6-astra
+# --------------------------------------------------------------------------
+[[orchestrations]]
+name = "astra"
+extends = "mixed"
+[[orchestrations.roles]]
+name = "orchestrator"
+command = "devbox run agent-orchestrator-astra"
+[[orchestrations.roles]]
+name = "coder"
+command = "devbox run agent-coder-astra"
+[[orchestrations.roles]]
+name = "reviewer"
+command = "devbox run agent-reviewer-astra"
+[[orchestrations.roles]]
+name = "auditor"
+command = "devbox run agent-auditor-astra"
+[[orchestrations.roles]]
+name = "tester"
+command = "devbox run agent-tester-astra"
+[[orchestrations.roles]]
+name = "release"
+command = "devbox run agent-release-astra"
+
+# --------------------------------------------------------------------------
+# Anthropic — anthropic/claude-fable-5-1
+# --------------------------------------------------------------------------
+[[orchestrations]]
+name = "fable"
+extends = "mixed"
+[[orchestrations.roles]]
+name = "orchestrator"
+command = "devbox run agent-orchestrator-fable"
+[[orchestrations.roles]]
+name = "coder"
+command = "devbox run agent-coder-fable"
+[[orchestrations.roles]]
+name = "reviewer"
+command = "devbox run agent-reviewer-fable"
+[[orchestrations.roles]]
+name = "auditor"
+command = "devbox run agent-auditor-fable"
+[[orchestrations.roles]]
+name = "tester"
+command = "devbox run agent-tester-fable"
+[[orchestrations.roles]]
+name = "release"
+command = "devbox run agent-release-fable"
+
+# --------------------------------------------------------------------------
+# Moonshot — moonshotai/kimi-k3
+# --------------------------------------------------------------------------
+[[orchestrations]]
+name = "kimi"
+extends = "mixed"
+[[orchestrations.roles]]
+name = "orchestrator"
+command = "devbox run agent-orchestrator-kimi"
+[[orchestrations.roles]]
+name = "coder"
+command = "devbox run agent-coder-kimi"
+[[orchestrations.roles]]
+name = "reviewer"
+command = "devbox run agent-reviewer-kimi"
+[[orchestrations.roles]]
+name = "auditor"
+command = "devbox run agent-auditor-kimi"
+[[orchestrations.roles]]
+name = "tester"
+command = "devbox run agent-tester-kimi"
+[[orchestrations.roles]]
+name = "release"
+command = "devbox run agent-release-kimi"
+
+# --------------------------------------------------------------------------
+# z.ai — zai/glm-5.3
+# --------------------------------------------------------------------------
+[[orchestrations]]
+name = "glm"
+extends = "mixed"
+[[orchestrations.roles]]
+name = "orchestrator"
+command = "devbox run agent-orchestrator-glm"
+[[orchestrations.roles]]
+name = "coder"
+command = "devbox run agent-coder-glm"
+[[orchestrations.roles]]
+name = "reviewer"
+command = "devbox run agent-reviewer-glm"
+[[orchestrations.roles]]
+name = "auditor"
+command = "devbox run agent-auditor-glm"
+[[orchestrations.roles]]
+name = "tester"
+command = "devbox run agent-tester-glm"
+[[orchestrations.roles]]
+name = "release"
+command = "devbox run agent-release-glm"
