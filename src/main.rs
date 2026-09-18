@@ -874,6 +874,7 @@ fn main() -> ExitCode {
                 task,
                 to,
                 timestamp: chrono::Utc::now(),
+                token: dot_agent_deck::hook_provenance::token_from_env(),
             };
             let msg = dot_agent_deck::event::DaemonMessage::Delegate(signal);
             let json = match serde_json::to_string(&msg) {
@@ -958,7 +959,10 @@ fn main() -> ExitCode {
             // real dispatch and still exit 0.
             if list_targets {
                 let req = dot_agent_deck::event::DaemonMessage::ListTargets(
-                    dot_agent_deck::event::ListTargetsRequest { pane_id },
+                    dot_agent_deck::event::ListTargetsRequest {
+                        pane_id,
+                        token: dot_agent_deck::hook_provenance::token_from_env(),
+                    },
                 );
                 let json = match serde_json::to_string(&req) {
                     Ok(j) => j,
@@ -1040,6 +1044,7 @@ fn main() -> ExitCode {
                     task: Some(task_text),
                     shape,
                     timestamp: chrono::Utc::now(),
+                    token: dot_agent_deck::hook_provenance::token_from_env(),
                 };
                 let msg = dot_agent_deck::event::DaemonMessage::Dispatch(signal);
                 let json = match serde_json::to_string(&msg) {
@@ -1082,6 +1087,7 @@ fn main() -> ExitCode {
                 task,
                 done,
                 timestamp: chrono::Utc::now(),
+                token: dot_agent_deck::hook_provenance::token_from_env(),
             };
             let msg = dot_agent_deck::event::DaemonMessage::WorkDone(signal);
             let json = match serde_json::to_string(&msg) {
@@ -1197,7 +1203,11 @@ fn main() -> ExitCode {
             // still delivers (graceful cross-version degradation, no
             // PROTOCOL_VERSION dependency).
             let req = dot_agent_deck::event::DaemonMessage::GetSeed(
-                dot_agent_deck::event::GetSeedRequest { pane_id, agent_id },
+                dot_agent_deck::event::GetSeedRequest {
+                    pane_id,
+                    agent_id,
+                    token: dot_agent_deck::hook_provenance::token_from_env(),
+                },
             );
             let json = match serde_json::to_string(&req) {
                 Ok(j) => j,
@@ -1286,6 +1296,7 @@ fn main() -> ExitCode {
                     role: role.clone(),
                     force,
                     timestamp: chrono::Utc::now(),
+                    token: dot_agent_deck::hook_provenance::token_from_env(),
                 };
                 let msg = dot_agent_deck::event::DaemonMessage::RestartRole(signal);
                 let json = match serde_json::to_string(&msg) {
@@ -1367,6 +1378,7 @@ fn main() -> ExitCode {
                     pane_id,
                     role: role.clone(),
                     timestamp: chrono::Utc::now(),
+                    token: dot_agent_deck::hook_provenance::token_from_env(),
                 };
                 let msg = dot_agent_deck::event::DaemonMessage::SpawnRole(signal);
                 let json = match serde_json::to_string(&msg) {

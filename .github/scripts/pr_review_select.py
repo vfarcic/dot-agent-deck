@@ -15,7 +15,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from pr_review_common import (  # noqa: E402
     DENY_PATHS,
     bot_rejection_is_stale,
-    checks_green,
+    check_status,
     deny_sort_key,
     gh_json,
     gh_json_paginated,
@@ -130,6 +130,9 @@ def main():
     prs.sort(key=lambda p: p["author"]["login"] in DEPRIORITISED_AUTHORS)
 
     items, skipped = [], []
+    # Advisory reds, per selected pull request. Kept out of `items` on purpose:
+    # that list becomes the review job's matrix payload, and this is for the log.
+    advisories = {}
     for pr in prs:
         number, sha = pr["number"], pr["headRefOid"]
         author = pr["author"]["login"]
@@ -159,10 +162,19 @@ def main():
                 continue
             print(f"note #{number}: re-reviewing; my own rejection predates {sha[:8]}")
 
-        green, why = checks_green(repo, sha)
+        # Issue #1086: the gate is the contexts branch protection REQUIRES, read
+        # from the live ruleset. It used to be "no check on the head has failed",
+        # which made every advisory job a veto — and because this reviewer's
+        # approval is what satisfies the required-review rule, an advisory red
+        # blocked the only thing that could unblock the merge. PR #1076 lost its
+        # approval to a `devbox` job that died on a third-party CDN's 504 with all
+        # five required contexts green.
+        green, why, advisory = check_status(repo, sha)
         if not green:
             skipped.append((number, why))
             continue
+        if advisory:
+            advisories[number] = advisory
 
         open_threads = unresolved_threads(repo, number)
         if open_threads:
@@ -211,6 +223,12 @@ def main():
     for item in items:
         note = "" if item["vote_allowed"] else f"  (verdict only: {item['denied_paths'] or 'author not in VOTE_AUTHORS'})"
         print(f"review #{item['number']} @ {item['sha'][:8]}{note}")
+        # Said out loud rather than swallowed: "selected anyway" is a different
+        # statement from "nothing was red", and the reader should not have to
+        # open the pull request to tell them apart.
+        if item["number"] in advisories:
+            failures = ", ".join(advisories[item["number"]])
+            print(f"note #{item['number']}: advisory (not required, not a gate): {failures}")
     print(f"\nselected {len(items)}, live={live}")
 
     if only_pr and not items:

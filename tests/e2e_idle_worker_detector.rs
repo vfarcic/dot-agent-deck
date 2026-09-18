@@ -223,6 +223,7 @@ fn orchestration_panes(deck: &TuiDeck) -> (String, String) {
 #[test]
 fn idle_worker_011_silent_worker_prompt_is_visible_in_attached_tui() {
     let deck = TuiDeck::builder()
+        .impersonating_pane_signals()
         .with_pty_size(120, 40)
         .with_env("DOT_AGENT_DECK_WORKER_RESPONSE_TIMEOUT_MS", "1500")
         .launch_with_fixture("orch-deck");
@@ -236,6 +237,7 @@ fn idle_worker_011_silent_worker_prompt_is_visible_in_attached_tui() {
         task: "Remain silent so the idle detector can surface its prompt.".to_string(),
         to: vec!["worker".to_string()],
         timestamp: chrono::Utc::now(),
+        token: None,
     });
     let line = serde_json::to_string(&message).expect("serialize Delegate hook message");
     common::write_hook_line(deck.hook_socket_path(), &line)
@@ -304,6 +306,7 @@ fn idle_worker_012_real_orchestrator_visibly_receives_idle_nudge() {
     .expect("write real-agent orchestration session");
 
     let deck = TuiDeck::builder()
+        .impersonating_pane_signals()
         .with_pty_size(200, 50)
         .with_imported_claude_credentials()
         .with_claude_project_trust(project_str.clone())
@@ -414,6 +417,7 @@ fn delegate_024_real_orchestrator_acts_on_submitted_silence_notice() {
     .expect("write real-agent orchestration session");
 
     let deck = TuiDeck::builder()
+        .impersonating_pane_signals()
         .with_pty_size(200, 50)
         .with_imported_claude_credentials()
         .with_claude_project_trust(project_str.clone())

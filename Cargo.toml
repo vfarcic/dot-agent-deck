@@ -70,6 +70,14 @@ regex = "1"
 open = "5"
 unicode-width = "0.2"
 cron = "0.17.0"
+# Issue #1077: OS randomness for the per-spawn hook capability token
+# (`src/hook_provenance.rs`). Already in this workspace's dependency graph as a
+# transitive of `tempfile`/`rand`, so naming it directly adds no new code to the
+# build — it only makes the dependency explicit rather than incidental, which is
+# what a security-relevant use of it requires. Deliberately `getrandom` and not
+# `rand`: the whole requirement is "N bytes from the operating system", and a
+# userspace PRNG adds seeding and generator surface for nothing.
+getrandom = "0.3"
 
 # Issue #250: `build.rs` validates an injected `DAD_VERSION` with the EXACT
 # parser `src/version.rs` uses (`semver::Version::parse`), so the set of

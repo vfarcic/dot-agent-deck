@@ -2439,15 +2439,18 @@ fn arm_idle_worker_watch(
             ),
             // A partial write: some bytes reached the authorized target, so the
             // prompt is not retried into a duplicate — and, unlike `Applied`,
-            // its payload record is deliberately left standing, because those
-            // bytes may still be in the pane's input box. See
+            // the payload record it may have left is deliberately not released.
+            // Issue #876: "may have left" because the write itself now erases a
+            // drainable partial write back out of the input box and records
+            // nothing when it does; this arm is unchanged either way, and the
+            // daemon log at `agent_pty` says which happened. See
             // [`settle_one_shot_payload_record`].
             Ok(crate::agent_pty::GuardedSend::Ambiguous) => warn!(
                 pane_id = %orchestrator_pane_id,
                 role = %delegation.role,
                 "idle-worker watch: idle prompt delivery was ambiguous (partial write); not \
-                 retried, and its payload record is kept so a later identical prompt cannot \
-                 submit the leftover bytes with the user's draft"
+                 retried, and any payload record it left is kept so a later identical prompt \
+                 cannot submit leftover bytes with the user's draft"
             ),
             Ok(refused) => warn!(
                 pane_id = %orchestrator_pane_id,
@@ -3099,7 +3102,10 @@ fn arm_delegate_silence_watch(
             // A partial write: some bytes reached the authorized target, so the
             // report is not retried into a duplicate — and, unlike `Applied`,
             // its payload record is deliberately left standing, because those
-            // bytes may still be in the pane's input box. See
+            // bytes may still be in the pane's input box. Issue #876's drain does
+            // not reach THIS payload specifically: the silence report opens with
+            // a `⚠`, so an exact undo cannot be proven and the daemon declines
+            // to erase it — pinned by `scheduler/idle-worker/018`. See
             // [`settle_one_shot_payload_record`].
             Ok(crate::agent_pty::GuardedSend::Ambiguous) => warn!(
                 pane_id = %orchestrator_pane_id,
@@ -3143,25 +3149,41 @@ fn arm_delegate_silence_watch(
 ///
 /// `Some(Ambiguous)` deliberately does NOT release it, even though it is just as
 /// one-shot. It is by definition a PARTIAL write — some payload bytes reached
-/// the authorized target and the submit did not complete — so those bytes are
-/// still sitting in the input box, un-submitted, and **nothing anywhere removes
-/// them**. Clearing the record there asserts the payload settled when the whole
-/// meaning of the outcome is that we do not know whether it did, and a later
-/// identical delivery into a pane the user has typed into since would then be
-/// admitted and submit the leftover bytes together with the user's unsent draft
-/// as one unintended turn. The two costs are not symmetric: keeping the record
-/// costs a SUPPRESSED later delivery — and only into a pane the user has typed
-/// into since the write, and only until `agent_pty`'s `PAYLOAD_RECORD_TTL`
-/// elapses — while releasing it costs an INVENTED turn carrying text the user
-/// never sent. Suppressing a later delivery beats inventing input. So this is
-/// one `matches!` arm on purpose — do not fold `Ambiguous` back into it.
+/// the authorized target and the submit did not complete — so those bytes may
+/// still be sitting in the input box, un-submitted. Clearing the record there
+/// asserts the payload settled when the whole meaning of the outcome is that we
+/// do not know whether it did, and a later identical delivery into a pane the
+/// user has typed into since would then be admitted and submit the leftover
+/// bytes together with the user's unsent draft as one unintended turn. The two
+/// costs are not symmetric: keeping the record costs a SUPPRESSED later delivery
+/// — and only into a pane the user has typed into since the write, and only
+/// until `agent_pty`'s `PAYLOAD_RECORD_TTL` elapses — while releasing it costs
+/// an INVENTED turn carrying text the user never sent. Suppressing a later
+/// delivery beats inventing input. So this is one `matches!` arm on purpose — do
+/// not fold `Ambiguous` back into it.
 ///
-/// Note what this narrowing does NOT fix, so nobody reads it as more than it is:
-/// an `Ambiguous` submit still STRANDS those bytes in the input box, exactly as
-/// before. What changes is only that they are no longer silently MERGED into a
-/// later turn. Each caller records what its own suppressed delivery costs, since
-/// that differs — a diagnostic at the two report sites, a whole delegation at
-/// the task pointer.
+/// **Issue #876 changed what "may still be sitting there" is worth, and this
+/// decision deliberately did NOT change with it.** This doc used to say those
+/// bytes sat there with *nothing anywhere removing them*, which was true when it
+/// was written and is now too wide:
+/// [`crate::agent_pty::drain_stranded_payload`] erases a partial write back out
+/// of the input box wherever it can prove the undo exact (every landed byte
+/// printable ASCII, under a size cap, and the erases themselves landing), and
+/// `write_guarded` then records no payload at all — so on the drained path there
+/// is nothing for this function to release and a later identical delivery is
+/// admitted honestly rather than refused to guard a clean pane. What survives is
+/// the residual the drain cannot reach: a payload carrying a non-ASCII byte (the
+/// silence report's `⚠`) or an escape sequence, a payload over the cap, and the
+/// commonest case of all — a PTY whose slave has gone, where no erase can land
+/// either. There this arm is still the only thing between the stranded bytes and
+/// a later turn, which is why it stays exactly as it is. The pane is also
+/// reported: `write_guarded` publishes a `DeliveryNotice` naming the partial
+/// write whenever bytes are left behind, so the residual is visible to the user
+/// who is the only one who can safely clear a box holding both.
+///
+/// Each caller records what its own suppressed delivery costs, since that
+/// differs — a diagnostic at the two report sites, a whole delegation at the
+/// task pointer.
 ///
 /// Every other outcome — a refusal, or `None` for a writer error that wrote
 /// nothing at all — left no record of ours, so calling this would consume a
@@ -5636,7 +5658,7 @@ async fn dispatch_one_owned(
                 pane_id = %pane_id,
                 role = %target_role,
                 "delegate: task pointer delivery was ambiguous (partial write); not retried, and \
-                 its payload record is kept so a later identical pointer cannot submit the \
+                 any payload record it left is kept so a later identical pointer cannot submit \
                  leftover bytes with the user's draft"
             );
             true
@@ -5707,9 +5729,8 @@ async fn dispatch_one_owned(
     // `submit_outcome` rather than `delivered`. `Ambiguous` deliberately keeps
     // `delivered == true` — the bytes MAY have reached the worker, so the
     // commission stays owed and the silence watch stays armed — while leaving
-    // the payload record standing, because those same bytes may instead be
-    // sitting un-submitted in the worker's input box with nothing anywhere to
-    // remove them.
+    // any payload record standing, because those same bytes may instead be
+    // sitting un-submitted in the worker's input box.
     //
     // The cost of that is sharper here than at the two report sites, and was
     // weighed rather than swept in: refusing a repeat costs a DELEGATION —
@@ -5720,9 +5741,20 @@ async fn dispatch_one_owned(
     // `DeliveryNotice` naming exactly this cause on the worker's card, and
     // `delivered == false` there releases the commission so the orchestrator is
     // not left owing a completion. Refusing and reporting why beats submitting
-    // the leftover pointer bytes on top of the user's unsent draft, and it is
-    // bounded — the refusal needs the user to have typed since the ambiguous
-    // write and lapses with `PAYLOAD_RECORD_TTL`.
+    // the leftover pointer bytes on top of the user's unsent draft.
+    //
+    // Issue #876 made that cost mostly stop being paid, without changing a line
+    // of this decision. It used to be bounded only by `PAYLOAD_RECORD_TTL` — 60
+    // seconds of guard against bytes that persisted indefinitely, so the repeat
+    // was refused for a minute and then admitted on top of them anyway. The
+    // write now erases a drainable partial write back OUT of the worker's input
+    // box (the pointer is plain printable ASCII by construction, so it is
+    // drainable) and records no payload when it succeeds, so there is nothing
+    // here to keep and the next delegation is admitted into a clean pane. What
+    // still reaches this line is the residual the drain cannot undo — above all
+    // a PTY whose slave has gone, where no erase can land either — and there the
+    // bytes really are stranded and the refusal is still the right answer.
+    // `orchestration/delegate/031` pins both halves.
     settle_one_shot_payload_record(&registry, &pane_id, &one_liner, submit_outcome);
     // Commission audit exit 5 (issue #448 review, finding 1): the delegate never
     // reached the worker, so the orchestrator is owed no completion from it — see
@@ -7029,9 +7061,13 @@ fn restart_refusal_for_crashed_pane(
 /// not dropped until the whole statement (including the `.await`)
 /// completes, so the guard would stay held for the ENTIRE respawn, which
 /// can spend up to `AGENT_TERMINATE_GRACE` + `PANE_CLOSE_SETTLE_TIMEOUT`
-/// (~9s) inside `respawn_or_recreate_agent_for_pane`. `tokio::sync::RwLock`
-/// is write-preferring, so that would stall every other daemon
-/// reader/writer for the duration. A short-lived READ guard resolves
+/// (~9s) inside `respawn_or_recreate_agent_for_pane` — and, since issue
+/// #1114, up to `AGENT_TERMINATE_GRACE` + `PANE_CLOSE_RECREATE_TIMEOUT`
+/// (~33s) when a close of that pane outruns its settle window, which is the
+/// case where holding a read guard would matter most: the close's own
+/// `unregister_pane` needs the WRITE guard to finish and let go.
+/// `tokio::sync::RwLock` is write-preferring, so that would stall every
+/// other daemon reader/writer for the duration. A short-lived READ guard resolves
 /// caller validation, target resolution, the crashed check, and the role
 /// config lookup, then drops BEFORE the respawn — no state-lock dependency
 /// held across it. The `recreated: true` re-registration case still needs
@@ -7581,7 +7617,16 @@ impl AppState {
         let mut commissioning_orchestrator: Option<(String, String)> = None;
         match registry.retire_outstanding_delegation(&signal.pane_id) {
             crate::agent_pty::DelegationRetirement::Nothing => {}
-            crate::agent_pty::DelegationRetirement::Retired(delegation) => {
+            // Issue #1080: the whole record goes, superseded generations
+            // included. A worker that has just answered is not silent, and any
+            // record left armed here fires later against work that is already
+            // done — see `AgentPtyRegistry::retire_outstanding_delegation` for
+            // the production trace that reversed PRD #126 M1 finding 6's
+            // oldest-first accounting, and for what that costs.
+            crate::agent_pty::DelegationRetirement::Retired {
+                delegation,
+                superseded_dropped,
+            } => {
                 commissioning_orchestrator = Some((
                     delegation.orchestrator_pane_id.clone(),
                     delegation.orchestrator_agent_id.clone(),
@@ -7589,27 +7634,9 @@ impl AppState {
                 tracing::debug!(
                     pane_id = %signal.pane_id,
                     role = %delegation.role,
+                    armed_seq = delegation.seq,
+                    superseded_dropped,
                     "work-done: retired the outstanding delegation and cancelled its idle watch"
-                );
-            }
-            // PRD #126 M1 review (finding 6): a late completion from a
-            // superseded delegation retires THAT one; the newest delegation's
-            // record and watch survive, so a re-delegated worker that then goes
-            // silent is still reported instead of never being nudged again.
-            crate::agent_pty::DelegationRetirement::RetiredSuperseded {
-                role,
-                seq,
-                remaining,
-                orchestrator_pane_id,
-                orchestrator_agent_id,
-            } => {
-                commissioning_orchestrator = Some((orchestrator_pane_id, orchestrator_agent_id));
-                tracing::debug!(
-                    pane_id = %signal.pane_id,
-                    role = %role,
-                    armed_seq = seq,
-                    remaining_superseded = remaining,
-                    "work-done: retired a superseded delegation; the newest one stays armed"
                 );
             }
         }
@@ -10625,6 +10652,7 @@ mod tests {
                     task: "probe".to_string(),
                     to: to.iter().map(|s| s.to_string()).collect(),
                     timestamp: Utc::now(),
+                    token: None,
                 },
                 &registry,
                 &event_tx,
@@ -12012,13 +12040,70 @@ mod tests {
         );
     }
 
+    /// Issue #876 test helper: a `/bin/cat` stand-in bound to `pane` whose PTY
+    /// writer has been swapped for one that accepts exactly `text`'s encoded
+    /// payload and then fails the submit CR — the ambiguous shape where the
+    /// WHOLE payload is left sitting in the input box.
+    ///
+    /// `heals` decides whether the drain's erases can land: `true` is the
+    /// transient short-write, `false` a PTY whose slave has gone (the ordinary
+    /// cause of a partial write, and the case where no erase reaches anything).
+    ///
+    /// Returns the agent id, the DISPLACED writer — which the caller must hold
+    /// to the end of the test, because `portable_pty`'s master writer sends EOF
+    /// from its `Drop` and would kill the stand-in — and the byte log of
+    /// everything that reached the faulted writer.
+    async fn stand_in_with_faulted_writer(
+        registry: &Arc<AgentPtyRegistry>,
+        pane: &str,
+        text: &str,
+        heals: bool,
+    ) -> (
+        String,
+        Box<dyn std::io::Write + Send>,
+        Arc<std::sync::Mutex<Vec<u8>>>,
+    ) {
+        let agent = registry
+            .spawn_agent(crate::agent_pty::SpawnOptions {
+                command: Some("/bin/cat"),
+                env: vec![(
+                    crate::agent_pty::DOT_AGENT_DECK_PANE_ID.to_string(),
+                    pane.to_string(),
+                )],
+                ..crate::agent_pty::SpawnOptions::default()
+            })
+            .expect("spawn stand-in");
+        let budget = crate::pane_input::encode_pane_payload(text)
+            .expect("the production payload must encode")
+            .len();
+        let (writer, log) = if heals {
+            crate::agent_pty::HealingFaultyWriter::healing(budget)
+        } else {
+            crate::agent_pty::HealingFaultyWriter::never_healing(budget)
+        };
+        let displaced = registry
+            .replace_agent_writer_for_test(&agent, Box::new(writer))
+            .await;
+        (agent, displaced, log)
+    }
+
+    /// Issue #876: is this payload one the daemon can erase back out of an input
+    /// box exactly? The production condition, restated in the tests so a test
+    /// asserting which side of it a composed payload falls on says WHY in its
+    /// own terms rather than by copying a magic range around.
+    fn is_exactly_drainable(text: &str) -> bool {
+        crate::pane_input::encode_pane_payload(text)
+            .expect("encode")
+            .iter()
+            .all(|b| (0x20..=0x7e).contains(b))
+    }
+
     /// Scenario: Deliver a silence report into two orchestrator panes exactly the
-    /// way the daemon does, then run the production settle decision over each —
-    /// one pane's submit is reported `Ambiguous` (a partial write), the other's
-    /// `Applied`. The user types into both panes and a byte-identical second
-    /// report follows: the ambiguous pane must REFUSE it, because report bytes
-    /// may still be sitting un-submitted in its input box, while the applied
-    /// pane still admits it.
+    /// way the daemon does, one of them through a writer faulted so its submit is
+    /// genuinely `Ambiguous`, then run the production settle decision over each.
+    /// The user types into both panes and a byte-identical second report follows:
+    /// the ambiguous pane must REFUSE it, because report bytes really are still
+    /// sitting un-submitted in its input box, while the applied pane admits it.
     #[cfg(unix)]
     #[spec("scheduler/idle-worker/018")]
     #[tokio::test]
@@ -12030,52 +12115,70 @@ mod tests {
         // identical report be admitted into a pane the user has typed into,
         // submitting the leftovers plus the user's unsent draft as one turn.
         //
-        // The physical write is `Applied` on BOTH panes here — a real `/bin/cat`
-        // PTY writer cannot be faulted into a partial write from this seam, and
-        // `write_and_submit_guarded` classifies partiality inside the writer's
-        // critical section (`deliver_payload_and_submit`, unit-tested against a
-        // fault-injecting writer in `agent_pty`). That costs nothing here,
-        // because the registry state the decision reads is identical either way:
-        // both the `Applied` and the `Ambiguous` arm of that classification call
-        // `note_automatic_write` with the same payload, so the payload record an
-        // ambiguous write leaves IS the record an applied write leaves. What
-        // differs is only the outcome the daemon then acts on, which is exactly
-        // what varies between the two panes below.
+        // Issue #876: this report is the RESIDUAL case of the drain, and that is
+        // a property of the text rather than of the harness — the notice opens
+        // with a `⚠`, so a partial write can cut a multi-byte character in half
+        // and "one byte written" stops meaning "one erase". The daemon therefore
+        // declines to erase it, exactly as designed, and #715's payload record
+        // stays the only thing standing between those bytes and a later
+        // identical report. Its two siblings below take the other branch.
         const AMBIGUOUS_PANE: &str = "silence-report-ambiguous-orchestrator";
         const APPLIED_PANE: &str = "silence-report-applied-orchestrator";
 
         let registry = Arc::new(AgentPtyRegistry::new());
         let report = compose_delegate_silence_notice(std::time::Duration::from_millis(600), None);
+        assert!(
+            !is_exactly_drainable(&report),
+            "the premise of this whole test: the production silence report carries a non-ASCII \
+             byte, so the daemon cannot prove an exact undo and must not erase it — if this ever \
+             becomes false the report joins its siblings' drained branch and the assertions below \
+             are testing nothing"
+        );
 
-        let spawn_orchestrator = |pane: &str| {
+        let applied_agent = registry
+            .spawn_agent(crate::agent_pty::SpawnOptions {
+                command: Some("/bin/cat"),
+                env: vec![(
+                    crate::agent_pty::DOT_AGENT_DECK_PANE_ID.to_string(),
+                    APPLIED_PANE.to_string(),
+                )],
+                ..crate::agent_pty::SpawnOptions::default()
+            })
+            .expect("spawn orchestrator stand-in");
+        // The ambiguous pane's writer HEALS, so the erases could land if the
+        // daemon chose to write any. That it writes none is the assertion.
+        let (ambiguous_agent, _displaced, ambiguous_log) =
+            stand_in_with_faulted_writer(&registry, AMBIGUOUS_PANE, &report, true).await;
+
+        assert_eq!(
             registry
-                .spawn_agent(crate::agent_pty::SpawnOptions {
-                    command: Some("/bin/cat"),
-                    env: vec![(
-                        crate::agent_pty::DOT_AGENT_DECK_PANE_ID.to_string(),
-                        pane.to_string(),
-                    )],
-                    ..crate::agent_pty::SpawnOptions::default()
+                .write_and_submit_guarded(AMBIGUOUS_PANE, &report, &ambiguous_agent, || async {
+                    true
                 })
-                .expect("spawn orchestrator stand-in")
-        };
-        let ambiguous_agent = spawn_orchestrator(AMBIGUOUS_PANE);
-        let applied_agent = spawn_orchestrator(APPLIED_PANE);
+                .await
+                .expect("first silence report into the faulted pane"),
+            crate::agent_pty::GuardedSend::Ambiguous,
+            "precondition: the faulted writer must make this submit genuinely ambiguous, \
+             classified by the production path rather than supplied to it"
+        );
+        assert_eq!(
+            ambiguous_log.lock().unwrap().as_slice(),
+            crate::pane_input::encode_pane_payload(&report)
+                .expect("encode")
+                .as_slice(),
+            "not one erase byte may follow a payload whose undo cannot be proven exact: the \
+             report's bytes are still in that input box, which is precisely why the record below \
+             has to survive"
+        );
+        assert_eq!(
+            registry
+                .write_and_submit_guarded(APPLIED_PANE, &report, &applied_agent, || async { true })
+                .await
+                .expect("first silence report into the healthy pane"),
+            crate::agent_pty::GuardedSend::Applied,
+            "precondition: the first silence report must reach {APPLIED_PANE}"
+        );
 
-        // First report on both panes, delivered the production way.
-        for (pane, agent) in [
-            (AMBIGUOUS_PANE, &ambiguous_agent),
-            (APPLIED_PANE, &applied_agent),
-        ] {
-            assert_eq!(
-                registry
-                    .write_and_submit_guarded(pane, &report, agent, || async { true })
-                    .await
-                    .expect("first silence report"),
-                crate::agent_pty::GuardedSend::Applied,
-                "precondition: the first silence report must reach {pane}"
-            );
-        }
         // The production decision, fed each of the two outcomes that leave a
         // payload record behind. Nothing here reaches around it: this is the
         // same function `arm_delegate_silence_watch` calls with the outcome its
@@ -12112,10 +12215,10 @@ mod tests {
         assert_eq!(
             ambiguous_repeat,
             crate::agent_pty::GuardedSend::Stale,
-            "an AMBIGUOUS submit is a partial write, so the report bytes may still be in the \
-             orchestrator's input box: its payload record must survive and refuse a \
-             byte-identical later report rather than submit those leftovers together with the \
-             user's unsent draft"
+            "an AMBIGUOUS submit is a partial write, and this payload is one the daemon cannot \
+             erase exactly, so the report bytes ARE still in the orchestrator's input box: its \
+             payload record must survive and refuse a byte-identical later report rather than \
+             submit those leftovers together with the user's unsent draft"
         );
         assert_eq!(
             applied_repeat,
@@ -12126,13 +12229,12 @@ mod tests {
         );
     }
 
-    /// Scenario: Deliver the PRD #126 idle-worker prompt into two orchestrator
-    /// panes exactly the way the daemon does, then run the production settle
-    /// decision over each — one pane's submit is reported `Ambiguous` (a partial
-    /// write), the other's `Applied`. The user types into both panes and a
-    /// byte-identical second prompt follows: the ambiguous pane must REFUSE it,
-    /// because prompt bytes may still be sitting un-submitted in its input box,
-    /// while the applied pane still admits it.
+    /// Scenario: Deliver the PRD #126 idle-worker prompt into three orchestrator
+    /// panes exactly the way the daemon does — one `Applied`, and two faulted
+    /// into a genuine `Ambiguous`, of which one pane's writer recovers in time
+    /// for the drain's erases and one does not. The user types into all three
+    /// and a byte-identical second prompt follows: only the pane whose bytes are
+    /// still in its input box may refuse it.
     #[cfg(unix)]
     #[spec("scheduler/idle-worker/019")]
     #[tokio::test]
@@ -12151,16 +12253,16 @@ mod tests {
         // (`format_idle_elapsed`), so two prompts about the same role inside one
         // bucket compose byte for byte alike.
         //
-        // The physical write is `Applied` on BOTH panes, for the same reason
-        // `scheduler/idle-worker/018` records: a real `/bin/cat` PTY writer
-        // cannot be faulted into a partial write from this seam, and
-        // `write_and_submit_guarded` classifies partiality inside the writer's
-        // critical section. That costs nothing, because the registry state the
-        // decision reads is identical either way — both arms of that
-        // classification call `note_automatic_write` with the same payload, so
-        // the record an ambiguous write leaves IS the record an applied one
-        // leaves. What differs is only the outcome the daemon then acts on.
-        const AMBIGUOUS_PANE: &str = "idle-prompt-ambiguous-orchestrator";
+        // Issue #876 is what the third pane is for. #715's refusal was the whole
+        // answer only while nothing removed the stranded bytes; the record
+        // lapses with `PAYLOAD_RECORD_TTL` after 60 s and the bytes did not
+        // lapse at all, so at T+61 s the repeat was admitted anyway. The daemon
+        // now erases what it wrote back out of the box wherever it can prove the
+        // undo exact — this prompt is plain ASCII, so it can — and a box with
+        // nothing of ours in it must NOT refuse the next prompt. The refusal is
+        // the right answer to "are our bytes still there", and only to that.
+        const DRAINED_PANE: &str = "idle-prompt-drained-orchestrator";
+        const STRANDED_PANE: &str = "idle-prompt-stranded-orchestrator";
         const APPLIED_PANE: &str = "idle-prompt-applied-orchestrator";
 
         let registry = Arc::new(AgentPtyRegistry::new());
@@ -12173,46 +12275,81 @@ mod tests {
             "precondition for the whole hazard: the coarse elapsed bucket makes two prompts \
              about one role byte-identical, so a later repeat is ordinary rather than exotic"
         );
+        assert!(
+            is_exactly_drainable(&prompt),
+            "precondition for the drained branch: the production idle prompt is plain printable \
+             ASCII, so one byte written is provably one erase and the daemon may undo a partial \
+             write of it exactly"
+        );
 
-        let spawn_orchestrator = |pane: &str| {
-            registry
-                .spawn_agent(crate::agent_pty::SpawnOptions {
-                    command: Some("/bin/cat"),
-                    env: vec![(
-                        crate::agent_pty::DOT_AGENT_DECK_PANE_ID.to_string(),
-                        pane.to_string(),
-                    )],
-                    ..crate::agent_pty::SpawnOptions::default()
-                })
-                .expect("spawn orchestrator stand-in")
-        };
-        let ambiguous_agent = spawn_orchestrator(AMBIGUOUS_PANE);
-        let applied_agent = spawn_orchestrator(APPLIED_PANE);
+        let applied_agent = registry
+            .spawn_agent(crate::agent_pty::SpawnOptions {
+                command: Some("/bin/cat"),
+                env: vec![(
+                    crate::agent_pty::DOT_AGENT_DECK_PANE_ID.to_string(),
+                    APPLIED_PANE.to_string(),
+                )],
+                ..crate::agent_pty::SpawnOptions::default()
+            })
+            .expect("spawn orchestrator stand-in");
+        // Two genuinely ambiguous submits, differing in ONE thing: whether the
+        // writer recovers in time for the erases.
+        let (drained_agent, _drained_displaced, drained_log) =
+            stand_in_with_faulted_writer(&registry, DRAINED_PANE, &prompt, true).await;
+        let (stranded_agent, _stranded_displaced, stranded_log) =
+            stand_in_with_faulted_writer(&registry, STRANDED_PANE, &prompt, false).await;
 
-        // First idle prompt on both panes, delivered the production way.
+        let payload_len = crate::pane_input::encode_pane_payload(&prompt)
+            .expect("encode")
+            .len();
         for (pane, agent) in [
-            (AMBIGUOUS_PANE, &ambiguous_agent),
-            (APPLIED_PANE, &applied_agent),
+            (DRAINED_PANE, &drained_agent),
+            (STRANDED_PANE, &stranded_agent),
         ] {
             assert_eq!(
                 registry
                     .write_and_submit_guarded(pane, &prompt, agent, || async { true })
                     .await
-                    .expect("first idle prompt"),
-                crate::agent_pty::GuardedSend::Applied,
-                "precondition: the first idle prompt must reach {pane}"
+                    .expect("first idle prompt into a faulted pane"),
+                crate::agent_pty::GuardedSend::Ambiguous,
+                "precondition: the faulted writer must make {pane}'s submit genuinely ambiguous"
             );
         }
-        // The production decision, fed each of the two outcomes that leave a
+        assert_eq!(
+            drained_log.lock().unwrap().len(),
+            payload_len * 2,
+            "the drained pane must have taken one erase for every payload byte that landed"
+        );
+        assert_eq!(
+            stranded_log.lock().unwrap().len(),
+            payload_len,
+            "the stranded pane's writer never recovered, so not one erase reached it and every \
+             prompt byte is still in that input box"
+        );
+        assert_eq!(
+            registry
+                .write_and_submit_guarded(APPLIED_PANE, &prompt, &applied_agent, || async { true })
+                .await
+                .expect("first idle prompt into the healthy pane"),
+            crate::agent_pty::GuardedSend::Applied,
+            "precondition: the first idle prompt must reach {APPLIED_PANE}"
+        );
+
+        // The production decision, fed each of the two outcomes that can leave a
         // payload record behind. Nothing here reaches around it: this is the
         // same function `arm_idle_worker_watch` calls with the outcome its own
-        // guarded submit returned.
-        settle_one_shot_payload_record(
-            &registry,
-            AMBIGUOUS_PANE,
-            &prompt,
-            Some(crate::agent_pty::GuardedSend::Ambiguous),
-        );
+        // guarded submit returned, and it is deliberately run on the DRAINED
+        // pane too — `Ambiguous` must stay out of the release arm whether or not
+        // the drain landed, because releasing consumes a CONCURRENT delivery's
+        // record when this one left none (issue #424 S2).
+        for pane in [DRAINED_PANE, STRANDED_PANE] {
+            settle_one_shot_payload_record(
+                &registry,
+                pane,
+                &prompt,
+                Some(crate::agent_pty::GuardedSend::Ambiguous),
+            );
+        }
         settle_one_shot_payload_record(
             &registry,
             APPLIED_PANE,
@@ -12220,16 +12357,21 @@ mod tests {
             Some(crate::agent_pty::GuardedSend::Applied),
         );
 
-        // The user types into both panes. This is the clock that arms the
+        // The user types into all three panes. This is the clock that arms the
         // repeat-payload refusal: without it the guard abstains and the
-        // ambiguous assertion below would pass for the wrong reason.
-        registry.note_user_input(AMBIGUOUS_PANE);
-        registry.note_user_input(APPLIED_PANE);
+        // stranded assertion below would pass for the wrong reason.
+        for pane in [DRAINED_PANE, STRANDED_PANE, APPLIED_PANE] {
+            registry.note_user_input(pane);
+        }
 
-        let ambiguous_repeat = registry
-            .write_and_submit_guarded(AMBIGUOUS_PANE, &prompt, &ambiguous_agent, || async { true })
+        let drained_repeat = registry
+            .write_and_submit_guarded(DRAINED_PANE, &prompt, &drained_agent, || async { true })
             .await
-            .expect("second identical idle prompt after an ambiguous first");
+            .expect("second identical idle prompt after a drained ambiguous first");
+        let stranded_repeat = registry
+            .write_and_submit_guarded(STRANDED_PANE, &prompt, &stranded_agent, || async { true })
+            .await
+            .expect("second identical idle prompt after a stranded ambiguous first");
         let applied_repeat = registry
             .write_and_submit_guarded(APPLIED_PANE, &prompt, &applied_agent, || async { true })
             .await
@@ -12237,12 +12379,20 @@ mod tests {
         registry.shutdown_all();
 
         assert_eq!(
-            ambiguous_repeat,
+            stranded_repeat,
             crate::agent_pty::GuardedSend::Stale,
-            "an AMBIGUOUS submit is a partial write, so the idle prompt's bytes may still be in \
+            "an AMBIGUOUS submit whose erases could not land leaves the idle prompt's bytes in \
              the orchestrator's input box: its payload record must survive and refuse a \
              byte-identical later prompt rather than submit those leftovers together with the \
              user's unsent draft"
+        );
+        assert_eq!(
+            drained_repeat,
+            crate::agent_pty::GuardedSend::Applied,
+            "the same ambiguous outcome, but every byte came back OUT of that box: refusing here \
+             would suppress an ordinary later prompt to guard a pane that is already clean, for \
+             the 60 s the record lasts and no longer — which is issue #876's hazard traded for \
+             #424's prompt loss instead of fixed"
         );
         assert_eq!(
             applied_repeat,
@@ -12253,13 +12403,13 @@ mod tests {
         );
     }
 
-    /// Scenario: Write the delegate task pointer into two worker panes exactly
-    /// the way `dispatch_one_owned` does, then run the production settle decision
-    /// over each — one pane's submit is reported `Ambiguous` (a partial write),
-    /// the other's `Applied`. The user types into both panes and the NEXT
-    /// delegation's pointer — the same fixed one-liner, so guaranteed
-    /// byte-identical — follows: the ambiguous pane must REFUSE it rather than
-    /// submit the stranded pointer bytes together with that draft.
+    /// Scenario: Write the delegate task pointer into three worker panes exactly
+    /// the way `dispatch_one_owned` does — one `Applied`, and two faulted into a
+    /// genuine `Ambiguous`, of which one pane's writer recovers in time for the
+    /// drain's erases and one does not. The user types into all three and the
+    /// NEXT delegation's pointer — the same fixed one-liner, so guaranteed
+    /// byte-identical — follows: only the pane whose bytes are still in its
+    /// input box may refuse it.
     #[cfg(unix)]
     #[spec("orchestration/delegate/031")]
     #[tokio::test]
@@ -12273,18 +12423,16 @@ mod tests {
         // `Applied` answers yes to. The fix reads the outcome for the second
         // question and leaves `delivered` alone.
         //
-        // What the refusal below costs is a DELEGATION rather than a diagnostic —
-        // weighed in `dispatch_one_owned`'s own comment, and taken because the
-        // refusal is reported (`RefusedUserInput` publishes a `DeliveryNotice`
-        // on the worker's card) and releases the commission, whereas admitting
-        // the repeat submits text the user never sent.
-        //
-        // The physical write is `Applied` on BOTH panes, for the reason
-        // `scheduler/idle-worker/018` records: a `/bin/cat` PTY writer cannot be
-        // faulted into a partial write from this seam, and the registry state the
-        // decision reads is identical either way, since both classification arms
-        // call `note_automatic_write` with the same payload.
-        const AMBIGUOUS_PANE: &str = "task-pointer-ambiguous-worker";
+        // Issue #876 is why the third pane exists, and this is the path where it
+        // bites hardest: refusing a repeat costs a DELEGATION — work that never
+        // starts — not merely a diagnostic, and the pointer's fixed text makes
+        // the repeat GUARANTEED byte-identical rather than merely likely. #715
+        // took that cost because the alternative was submitting the leftovers on
+        // top of the user's draft. Once the bytes are actually gone from the box
+        // there is no such alternative to weigh, and the cost buys nothing: the
+        // drained pane must take the next delegation.
+        const DRAINED_PANE: &str = "task-pointer-drained-worker";
+        const STRANDED_PANE: &str = "task-pointer-stranded-worker";
         const APPLIED_PANE: &str = "task-pointer-applied-worker";
 
         let registry = Arc::new(AgentPtyRegistry::new());
@@ -12299,7 +12447,7 @@ mod tests {
                 None,
                 task,
                 "coder",
-                AMBIGUOUS_PANE,
+                DRAINED_PANE,
             ))
         };
         let one_liner = pointer_for("Implement the first thing.");
@@ -12310,54 +12458,90 @@ mod tests {
              delegation's bytes are GUARANTEED identical rather than merely likely — which is \
              what makes releasing this record on an ambiguous submit reachable in practice"
         );
+        assert!(
+            is_exactly_drainable(&one_liner),
+            "precondition for the drained branch: the pointer is plain printable ASCII by \
+             construction (`role_path_slug` sanitizes the role and the path is relative), so a \
+             partial write of it can be undone exactly"
+        );
 
-        let spawn_worker = |pane: &str| {
-            registry
-                .spawn_agent(crate::agent_pty::SpawnOptions {
-                    command: Some("/bin/cat"),
-                    env: vec![(
-                        crate::agent_pty::DOT_AGENT_DECK_PANE_ID.to_string(),
-                        pane.to_string(),
-                    )],
-                    ..crate::agent_pty::SpawnOptions::default()
-                })
-                .expect("spawn worker stand-in")
-        };
-        let ambiguous_agent = spawn_worker(AMBIGUOUS_PANE);
-        let applied_agent = spawn_worker(APPLIED_PANE);
+        let applied_agent = registry
+            .spawn_agent(crate::agent_pty::SpawnOptions {
+                command: Some("/bin/cat"),
+                env: vec![(
+                    crate::agent_pty::DOT_AGENT_DECK_PANE_ID.to_string(),
+                    APPLIED_PANE.to_string(),
+                )],
+                ..crate::agent_pty::SpawnOptions::default()
+            })
+            .expect("spawn worker stand-in");
+        let (drained_agent, _drained_displaced, drained_log) =
+            stand_in_with_faulted_writer(&registry, DRAINED_PANE, &one_liner, true).await;
+        let (stranded_agent, _stranded_displaced, stranded_log) =
+            stand_in_with_faulted_writer(&registry, STRANDED_PANE, &one_liner, false).await;
 
-        // The first delegation's pointer on both panes, delivered the production
+        let payload_len = crate::pane_input::encode_pane_payload(&one_liner)
+            .expect("encode")
+            .len();
+        // The first delegation's pointer on each pane, delivered the production
         // way — the same primitive `dispatch_one_owned` calls, in its detailed
         // form.
         for (pane, agent) in [
-            (AMBIGUOUS_PANE, &ambiguous_agent),
-            (APPLIED_PANE, &applied_agent),
+            (DRAINED_PANE, &drained_agent),
+            (STRANDED_PANE, &stranded_agent),
         ] {
             assert_eq!(
                 registry
                     .write_and_submit_guarded_detailed(pane, &one_liner, agent, || async { true })
                     .await
-                    .expect("first task pointer"),
+                    .expect("first task pointer into a faulted pane"),
                 crate::agent_pty::GuardedSendDetail::Outcome(
-                    crate::agent_pty::GuardedSend::Applied
+                    crate::agent_pty::GuardedSend::Ambiguous
                 ),
-                "precondition: the first task pointer must reach {pane}"
+                "precondition: the faulted writer must make {pane}'s submit genuinely ambiguous"
             );
         }
-        // The production decision, fed each of the two outcomes that leave a
+        assert_eq!(
+            drained_log.lock().unwrap().len(),
+            payload_len * 2,
+            "the drained pane must have taken one erase for every pointer byte that landed"
+        );
+        assert_eq!(
+            stranded_log.lock().unwrap().len(),
+            payload_len,
+            "the stranded pane's writer never recovered, so the pointer bytes are still in that \
+             worker's input box"
+        );
+        assert_eq!(
+            registry
+                .write_and_submit_guarded_detailed(
+                    APPLIED_PANE,
+                    &one_liner,
+                    &applied_agent,
+                    || async { true }
+                )
+                .await
+                .expect("first task pointer into the healthy pane"),
+            crate::agent_pty::GuardedSendDetail::Outcome(crate::agent_pty::GuardedSend::Applied),
+            "precondition: the first task pointer must reach {APPLIED_PANE}"
+        );
+
+        // The production decision, fed each of the outcomes that can leave a
         // payload record behind — flattened exactly as the call site flattens
         // its `GuardedSendDetail`.
-        settle_one_shot_payload_record(
-            &registry,
-            AMBIGUOUS_PANE,
-            &one_liner,
-            Some(
-                crate::agent_pty::GuardedSendDetail::Outcome(
-                    crate::agent_pty::GuardedSend::Ambiguous,
-                )
-                .outcome(),
-            ),
-        );
+        for pane in [DRAINED_PANE, STRANDED_PANE] {
+            settle_one_shot_payload_record(
+                &registry,
+                pane,
+                &one_liner,
+                Some(
+                    crate::agent_pty::GuardedSendDetail::Outcome(
+                        crate::agent_pty::GuardedSend::Ambiguous,
+                    )
+                    .outcome(),
+                ),
+            );
+        }
         settle_one_shot_payload_record(
             &registry,
             APPLIED_PANE,
@@ -12370,21 +12554,28 @@ mod tests {
             ),
         );
 
-        // The user types into both worker panes. This is the clock that arms the
-        // repeat-payload refusal: without it the guard abstains and the
-        // ambiguous assertion below would pass for the wrong reason.
-        registry.note_user_input(AMBIGUOUS_PANE);
-        registry.note_user_input(APPLIED_PANE);
+        // The user types into all three worker panes. This is the clock that
+        // arms the repeat-payload refusal: without it the guard abstains and the
+        // stranded assertion below would pass for the wrong reason.
+        for pane in [DRAINED_PANE, STRANDED_PANE, APPLIED_PANE] {
+            registry.note_user_input(pane);
+        }
 
-        let ambiguous_repeat = registry
+        let drained_repeat = registry
+            .write_and_submit_guarded_detailed(DRAINED_PANE, &one_liner, &drained_agent, || async {
+                true
+            })
+            .await
+            .expect("next delegation's pointer after a drained ambiguous first");
+        let stranded_repeat = registry
             .write_and_submit_guarded_detailed(
-                AMBIGUOUS_PANE,
+                STRANDED_PANE,
                 &one_liner,
-                &ambiguous_agent,
+                &stranded_agent,
                 || async { true },
             )
             .await
-            .expect("next delegation's pointer after an ambiguous first");
+            .expect("next delegation's pointer after a stranded ambiguous first");
         let applied_repeat = registry
             .write_and_submit_guarded_detailed(APPLIED_PANE, &one_liner, &applied_agent, || async {
                 true
@@ -12394,12 +12585,19 @@ mod tests {
         registry.shutdown_all();
 
         assert_eq!(
-            ambiguous_repeat,
+            stranded_repeat,
             crate::agent_pty::GuardedSendDetail::RefusedUserInput,
-            "an AMBIGUOUS submit is a partial write, so the pointer bytes may still be in the \
+            "an AMBIGUOUS submit whose erases could not land leaves the pointer bytes in the \
              worker's input box: its payload record must survive and refuse the next \
              delegation's identical pointer — reported on the card by this very outcome — rather \
              than submit those leftovers together with the user's unsent draft"
+        );
+        assert_eq!(
+            drained_repeat,
+            crate::agent_pty::GuardedSendDetail::Outcome(crate::agent_pty::GuardedSend::Applied),
+            "the same ambiguous outcome, but every pointer byte came back OUT of that box: \
+             refusing here would cost a whole delegation to guard a worker whose input box is \
+             already clean"
         );
         assert_eq!(
             applied_repeat,

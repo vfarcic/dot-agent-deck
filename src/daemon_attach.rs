@@ -93,7 +93,11 @@ pub enum AttachError {
     },
     #[error(
         "refusing to connect to daemon attach socket {path}: {reason}. \
-         Another user (or a hostile same-uid process) may have placed this file."
+         Another user (or a hostile same-uid process) may have placed this file. \
+         The deck will not remove it — it refuses rather than unlink an entry it cannot \
+         vouch for, and in a sticky directory such as /tmp it could not anyway. Set \
+         DOT_AGENT_DECK_ATTACH_SOCKET to a path only you can write, for example under \
+         $XDG_RUNTIME_DIR or your home directory."
     )]
     SocketUntrusted { path: PathBuf, reason: String },
 }
@@ -170,7 +174,7 @@ where
     // process HERE — so the presence it asks is the local one, and the third
     // answer (a deck on another machine) is unreachable rather than handled.
     if crate::platform::ipc::LOCAL_ENDPOINT_PRESENCE.is_daemon_owned_inode() {
-        if socket_path.exists() {
+        if endpoint_entry_present(socket_path) {
             verify_socket_trusted(socket_path)?;
             // Trust check only validates the inode (type, owner, mode) — it
             // doesn't know whether anyone is listening. A daemon that died
@@ -196,7 +200,7 @@ where
     let start = Instant::now();
     loop {
         if crate::platform::ipc::LOCAL_ENDPOINT_PRESENCE.is_daemon_owned_inode() {
-            if socket_path.exists() {
+            if endpoint_entry_present(socket_path) {
                 verify_socket_trusted(socket_path)?;
                 return Ok(());
             }
@@ -212,6 +216,29 @@ where
         }
         tokio::time::sleep(poll_interval).await;
     }
+}
+
+/// Is there a directory entry at `path` at all — `lstat`, not `stat`.
+///
+/// `Path::exists()` follows symlinks, so a **dangling** symlink planted at the
+/// endpoint path read as absent: lazy-spawn skipped the trust check, ran
+/// `spawn_fn`, and the daemon it started then failed its own `bind(2)` with
+/// `EADDRINUSE`, because `bind` refuses any path that already has an entry —
+/// link included. The operator got a spawn failure naming neither the squatter
+/// nor the path's real problem, and on a sticky `/tmp` no amount of retrying
+/// helps, since the deck cannot unlink an entry another uid owns.
+///
+/// With the `lstat`, every shape of planted entry — live link, dangling link,
+/// regular file, foreign socket — reaches [`verify_socket_trusted`] and comes
+/// back as one [`AttachError::SocketUntrusted`] that names the path and says
+/// what to do (issue #1020). It does not make the path *usable* again; that
+/// needs the endpoint out of the world-writable directory, which is
+/// [#1121](https://github.com/vfarcic/dot-agent-deck/issues/1121).
+///
+/// Nothing this function reports changes for a real socket, an absent path, or
+/// a regular file: `lstat` and `stat` agree on all three.
+fn endpoint_entry_present(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok()
 }
 
 /// Verify `path` is a trusted endpoint (a Unix socket owned by the current uid
@@ -374,5 +401,146 @@ mod tests {
             "poll interval {DAEMON_START_POLL_INTERVAL:?} is too coarse for a \
              {DAEMON_START_POLL_TIMEOUT:?} budget",
         );
+    }
+
+    /// Issue #1020 at the level a client actually reaches it. The unit tests on
+    /// `verify_endpoint_trusted` pin the predicate; this pins that lazy-spawn
+    /// *consults* it for each shape of planted entry, which is a separate
+    /// property — `Path::exists()` follows links, so before this a dangling one
+    /// routed around the check entirely.
+    ///
+    /// Three things are asserted per case, and the middle one is the point:
+    /// the call fails `SocketUntrusted` naming the path, **`spawn_fn` never
+    /// runs**, and the planted entry is left alone rather than unlinked. A fix
+    /// that refused but still started a daemon would leave the operator with a
+    /// process that cannot bind and an error about the wrong thing.
+    ///
+    /// `spawn_fn` is a `FnOnce`, so "did it run" is recorded through an `Arc`
+    /// rather than returned.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ensure_daemon_running_refuses_a_planted_symlink_without_spawning() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let root = tempfile::tempdir().expect("tempdir");
+        let state = root.path().join("state");
+        let real = root.path().join("real.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&real).expect("bind");
+        crate::platform::fsperm::set_endpoint_mode_owner_only(&real).expect("0o600");
+
+        for (label, target) in [
+            // The issue's own case: a link to a socket that would be trusted
+            // under its own name, which is what used to be accepted.
+            ("live", real.clone()),
+            // And the one `Path::exists()` hid: a link to nothing resolves to
+            // nothing, but `bind(2)` still sees an entry and returns EADDRINUSE.
+            ("dangling", root.path().join("nowhere")),
+        ] {
+            let planted = root.path().join(format!("{label}.sock"));
+            std::os::unix::fs::symlink(&target, &planted).expect("plant the symlink");
+
+            let spawned = Arc::new(AtomicBool::new(false));
+            let flag = Arc::clone(&spawned);
+            let err = ensure_daemon_running(
+                &LocalEndpoint::at(&planted),
+                &state,
+                move || {
+                    flag.store(true, Ordering::SeqCst);
+                    Ok(())
+                },
+                Duration::from_millis(5),
+                Duration::from_millis(50),
+            )
+            .await
+            .expect_err(&format!(
+                "a {label} symlink at the endpoint must be refused"
+            ));
+
+            assert!(
+                matches!(err, AttachError::SocketUntrusted { .. }),
+                "a {label} symlink must refuse as untrusted, not as a spawn or timeout \
+                 failure: {err}"
+            );
+            let rendered = err.to_string();
+            assert!(rendered.contains("symlink"), "{rendered}");
+            assert!(
+                rendered.contains(&planted.display().to_string()),
+                "the refusal must name the path so the operator can clear it: {rendered}"
+            );
+            assert!(
+                !spawned.load(Ordering::SeqCst),
+                "a {label} symlink must be refused BEFORE a daemon is started — the one we \
+                 spawn could not bind over it anyway"
+            );
+            assert!(
+                std::fs::symlink_metadata(&planted)
+                    .expect("lstat the planted link")
+                    .file_type()
+                    .is_symlink(),
+                "the stale-inode unlink must not reach a path we refused to vouch for"
+            );
+        }
+    }
+
+    /// The control, and the half that matters most: the shapes lazy-spawn
+    /// exists for still work. A trusted socket with a live listener short-
+    /// circuits without spawning, and an absent path spawns exactly once.
+    ///
+    /// Without this, `endpoint_entry_present` returning a constant `true` or
+    /// `false` would pass every assertion in the test above.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ensure_daemon_running_still_accepts_a_real_socket_and_spawns_for_an_absent_one() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let root = tempfile::tempdir().expect("tempdir");
+        let state = root.path().join("state");
+
+        let live = root.path().join("live.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&live).expect("bind");
+        crate::platform::fsperm::set_endpoint_mode_owner_only(&live).expect("0o600");
+
+        let spawned = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&spawned);
+        ensure_daemon_running(
+            &LocalEndpoint::at(&live),
+            &state,
+            move || {
+                flag.store(true, Ordering::SeqCst);
+                Ok(())
+            },
+            Duration::from_millis(5),
+            Duration::from_millis(50),
+        )
+        .await
+        .expect("a live 0o600 socket of ours is exactly what lazy-spawn short-circuits on");
+        assert!(
+            !spawned.load(Ordering::SeqCst),
+            "a live daemon must not be double-spawned"
+        );
+
+        // Nothing at the path: spawn, and the closure creating the socket is
+        // what the poll loop then finds.
+        let fresh = root.path().join("fresh.sock");
+        let fresh_for_spawn = fresh.clone();
+        ensure_daemon_running(
+            &LocalEndpoint::at(&fresh),
+            &state,
+            move || {
+                // Dropping the handle closes the fd but leaves the inode, which
+                // is all the post-spawn branch looks at — it re-checks presence
+                // and trust, and deliberately does not probe (a daemon that has
+                // bound but not yet accepted is still a daemon).
+                let _listener = std::os::unix::net::UnixListener::bind(&fresh_for_spawn)?;
+                crate::platform::fsperm::set_endpoint_mode_owner_only(&fresh_for_spawn)?;
+                Ok(())
+            },
+            Duration::from_millis(5),
+            Duration::from_millis(500),
+        )
+        .await
+        .expect("an absent endpoint must be spawned for, not refused");
     }
 }

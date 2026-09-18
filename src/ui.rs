@@ -5404,10 +5404,15 @@ fn surface_one_orchestration(
                 );
                 continue;
             }
-            if let Ok((_role_index, was_new)) = tab_manager.add_role_to_existing_orchestration(
+            if let Ok((placed_at, was_new)) = tab_manager.add_role_to_existing_orchestration(
                 existing_tab_index,
                 role_config.clone(),
                 role.pane_id.clone(),
+                // Issue #1096: the CURRENT config's role order, so a role
+                // the operator inserted mid-list lands at its configured
+                // index instead of being appended past roles that come
+                // after it.
+                &orch_config.roles,
             ) {
                 grew_any = true;
                 // Mirror `open_orchestration_tab`'s own live-open path
@@ -5479,29 +5484,50 @@ fn surface_one_orchestration(
                 // pre-existing gap out of scope here) and must not have one
                 // backfilled.
                 //
-                // Push the role name onto the snapshot only when
-                // `add_role_to_existing_orchestration` reports a genuine
-                // APPEND (`was_new`) — the ordinary respawn-into-existing-role
-                // path REPLACES an already-listed slot, and pushing
-                // unconditionally there duplicates the role name and
-                // permanently fails the restore drift guard.
-                // `mark_session_dirty()` stays unconditional on both
-                // outcomes: a replace still changes which pane backs the
-                // role, which is worth persisting even though the role LIST
-                // itself didn't change.
+                // Issue #1096: REBUILD the snapshot's role list from the
+                // tab rather than pushing onto it. The tab is the source of
+                // truth for display order — `OrchestrationSnapshot.roles` is
+                // documented as "the same order as the tab's
+                // `role_pane_ids`" — and since #1096 a role can be PLACED
+                // mid-list rather than appended, so a `push` would record an
+                // order the tab does not have and fail the very drift guard
+                // this block exists to keep satisfied. Rebuilding is also
+                // correct for the replace path, where it is a no-op, which
+                // is what the old `if was_new` guard bought and this does
+                // not need. `mark_session_dirty()` stays on both outcomes: a
+                // replace still changes which pane backs the role, which is
+                // worth persisting even though the role LIST didn't change.
                 if let Some(Tab::Orchestration {
                     start_role_index,
                     role_pane_ids,
+                    config: tab_config,
                     ..
                 }) = tab_manager.tabs().get(existing_tab_index)
                     && let Some(start_pane_id) = role_pane_ids.get(*start_role_index).cloned()
-                    && let Some(saved) = ui.pane_metadata.get_mut(&start_pane_id)
-                    && let Some(snapshot) = saved.orchestration.as_mut()
                 {
-                    if was_new {
-                        snapshot.roles.push(role.role_name.clone());
+                    let display_roles: Vec<String> =
+                        tab_config.roles.iter().map(|r| r.name.clone()).collect();
+                    let start_index = *start_role_index;
+                    if let Some(saved) = ui.pane_metadata.get_mut(&start_pane_id)
+                        && let Some(snapshot) = saved.orchestration.as_mut()
+                    {
+                        // `started_role_indices` indexes `roles` too, so an
+                        // insert ahead of a recorded index would silently
+                        // repoint it at a different role. It has no reader
+                        // today (it is forward-compat only), which is a
+                        // reason to keep it honest rather than a licence to
+                        // let it rot.
+                        if was_new {
+                            for started in snapshot.started_role_indices.iter_mut() {
+                                if *started >= placed_at {
+                                    *started += 1;
+                                }
+                            }
+                        }
+                        snapshot.roles = display_roles;
+                        snapshot.start_role_index = start_index;
+                        ui.mark_session_dirty();
                     }
-                    ui.mark_session_dirty();
                 }
             }
         }

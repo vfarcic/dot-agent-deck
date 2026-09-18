@@ -25,6 +25,7 @@ pub mod error;
 pub mod event;
 pub mod features;
 pub mod hook;
+pub mod hook_provenance;
 pub mod hooks_manage;
 pub mod hyperlink;
 pub mod init;

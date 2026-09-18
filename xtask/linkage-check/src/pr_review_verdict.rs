@@ -21,10 +21,14 @@
 //! boundary goes red on the per-task gate rather than after an unearned
 //! approval has landed on `main`.
 //!
-//! Scope is the two pure predicates that constitute the boundary:
+//! It started as the two pure predicates that constitute that boundary —
 //! `_is_trusted_verdict_comment` (who may speak) and `parse_verdict` (what
-//! counts as a verdict). `latest_verdict` itself shells out to `gh` and is not
-//! exercised here; the predicates are where the authorization decision lives.
+//! counts as a verdict) — and has since grown to the script's other pure
+//! decisions, each added with the section comment explaining it: the deny-path
+//! precedence, the per-head idempotence guards, and the check gate (#1086).
+//! What stays out is anything that shells out to `gh`: `latest_verdict` and
+//! `required_contexts` are not exercised here, and the classifiers they feed
+//! are.
 //!
 //! Tests only. The rule lives in the script; this is its gate.
 
@@ -59,7 +63,13 @@ fn run_py(body: &str) -> Output {
         "import sys\nsys.path.insert(0, {scripts:?})\n\
          from pr_review_common import (_is_trusted_verdict_comment, parse_verdict,\n\
         \x20    DENY_PATHS, already_reviewed_at, already_noticed_at, NO_VOTE_MARKER,\n\
-        \x20    concat_json_documents, bot_rejection_is_stale)\n\
+        \x20    concat_json_documents, bot_rejection_is_stale,\n\
+        \x20    classify_check_runs, FALLBACK_REQUIRED_CONTEXTS)\n\
+         REQ = ('build', 'build-macos', 'build-windows', 'security', 'e2e-deterministic')\n\
+         def crun(name, conclusion='success', status='completed', started_at=None, run_id=None):\n\
+        \x20   return {{'name': name, 'status': status, 'conclusion': conclusion,\n\
+        \x20           'started_at': started_at, 'id': run_id}}\n\
+         def green_five():\n    return [crun(n) for n in REQ]\n\
          SHA = '0' * 40\n\
          BLOCK = ('```json\\n{{\"schema\":\"pr-review/v1\",\"pr\":1,\"head_sha\":\"' + SHA +\n\
          '\",\"verdict\":\"APPROVE\",\"reasons\":[]}}\\n```')\n\
@@ -546,4 +556,338 @@ fn an_unrejected_pull_request_is_not_a_stale_rejection() {
          assert not bot_rejection_is_stale([], 'bbbbbbbb')\n\
          assert not bot_rejection_is_stale([ok], 'bbbbbbbb')",
     );
+}
+
+// ---------------------------------------------------------------------------
+// Issue #1086: the check gate is the REQUIRED contexts, not every check run.
+//
+// The selector used to refuse a pull request when any check on its head had
+// failed, required or not. Branch protection requires five contexts and treats
+// the rest as advisory — but this reviewer's approval is what satisfies the
+// required-review rule, so an advisory red withheld the only thing that could
+// unblock the merge. "Advisory" was therefore load-bearing through a second
+// path nobody looks at, and its failure mode is a SKIP buried in the prepare
+// job's log rather than anything visible on the pull request.
+//
+// Same argument as the verdict boundary above for why these tests live in
+// `cargo test-fast`: the decision is a runtime property of a Python script that
+// no compile step sees, and getting it wrong stops the reviewer selecting
+// anything at all — silently.
+// ---------------------------------------------------------------------------
+
+/// The regression, in the exact shape PR #1076 had: all five required contexts
+/// green, one advisory job red. `devbox` died 15–18 seconds in on a `curl: (22)
+/// ... 504` from a third-party CDN inside someone else's action, on a diff that
+/// touched no devbox or workflow file at all, and the approval never came.
+#[test]
+fn an_advisory_failure_no_longer_blocks_selection() {
+    assert_py_ok(
+        "runs = green_five() + [crun('devbox', 'failure'), crun('nix')]\n\
+         green, why, advisory = classify_check_runs(runs, REQ)\n\
+         assert green, why\n\
+         assert advisory == ['devbox=failure'], advisory",
+    );
+}
+
+/// The half that must NOT move. A required context that is red still blocks, and
+/// the reason still names it — loosening the gate is the fix, removing it is not.
+#[test]
+fn a_failing_required_context_still_blocks_selection() {
+    assert_py_ok(
+        "for name in REQ:\n\
+        \x20   runs = [crun(n, 'failure' if n == name else 'success') for n in REQ]\n\
+        \x20   green, why, _ = classify_check_runs(runs, REQ)\n\
+        \x20   assert not green, name\n\
+        \x20   assert name in why and 'failure' in why, why",
+    );
+}
+
+/// A required context that produced no check run at all is not success. That is
+/// the #416 shape — a head where CI never reported leaves the pull request
+/// unmergeable with nothing red to fix — so reviewing it spends tokens on a
+/// verdict that cannot help.
+#[test]
+fn a_required_context_that_never_reported_is_not_success() {
+    assert_py_ok(
+        "runs = [r for r in green_five() if r['name'] != 'security']\n\
+         green, why, _ = classify_check_runs(runs, REQ)\n\
+         assert not green and 'security' in why and 'not concluded' in why, why",
+    );
+}
+
+/// Nor is one still running. Selecting mid-CI would have the agent read a head
+/// whose gates have not landed yet.
+#[test]
+fn a_required_context_still_running_is_not_success() {
+    assert_py_ok(
+        "runs = green_five()\n\
+         runs[0] = crun(REQ[0], None, 'in_progress')\n\
+         green, why, _ = classify_check_runs(runs, REQ)\n\
+         assert not green and 'not concluded' in why, why",
+    );
+}
+
+/// `skipped` counts as satisfied, unchanged from before this fix: a required job
+/// may legitimately skip on a path filter, and this gate has always read that as
+/// met rather than as missing.
+#[test]
+fn a_skipped_required_context_counts_as_satisfied() {
+    assert_py_ok(
+        "runs = green_five()\n\
+         runs[0] = crun(REQ[0], 'skipped')\n\
+         green, why, _ = classify_check_runs(runs, REQ)\n\
+         assert green, why",
+    );
+}
+
+/// Every conclusion this module classes as bad is advisory on a non-required job,
+/// not just `failure` — otherwise a cancelled or timed-out CDN step would keep
+/// exactly the behaviour this issue removed. Driven off BAD_CONCLUSIONS itself, so
+/// a conclusion added to that set is covered without editing this test.
+#[test]
+fn every_bad_conclusion_on_an_advisory_job_is_still_advisory() {
+    assert_py_ok(
+        "from pr_review_common import BAD_CONCLUSIONS\n\
+         for c in sorted(BAD_CONCLUSIONS):\n\
+        \x20   green, why, advisory = classify_check_runs(\n\
+        \x20       green_five() + [crun('devbox', c)], REQ)\n\
+        \x20   assert green, (c, why)\n\
+        \x20   assert advisory == ['devbox=' + c], (c, advisory)",
+    );
+}
+
+/// The gate follows the list it is GIVEN, which is what makes deriving that list
+/// from the live ruleset the fix rather than a second hardcoded copy. A context
+/// the ruleset requires gates even when this module has never heard of it, and
+/// one it no longer requires does not.
+#[test]
+fn the_gate_follows_the_derived_list_not_a_hardcoded_one() {
+    assert_py_ok(
+        "derived = ('alpha',)\n\
+         runs = [crun('alpha', 'failure')] + green_five()\n\
+         green, why, advisory = classify_check_runs(runs, derived)\n\
+         assert not green and 'alpha' in why, why\n\
+         ok = [crun('alpha')] + [crun(n, 'failure') for n in REQ]\n\
+         green, why, advisory = classify_check_runs(ok, derived)\n\
+         assert green, why\n\
+         assert advisory == ['%s=failure' % n for n in sorted(REQ)], advisory",
+    );
+}
+
+/// The ignored red is SAID, not swallowed. The issue's second complaint is that
+/// the reason for a skip lived only in the prepare job's log; a gate that now
+/// selects anyway must not make that worse by going quiet about what is red.
+#[test]
+fn the_ignored_advisory_reds_are_named_in_the_reason() {
+    assert_py_ok(
+        "runs = green_five() + [crun('devbox', 'failure'), crun('nix', 'timed_out')]\n\
+         green, why, advisory = classify_check_runs(runs, REQ)\n\
+         assert green and 'devbox=failure' in why and 'nix=timed_out' in why, why\n\
+         assert advisory == ['devbox=failure', 'nix=timed_out'], advisory\n\
+         clean = classify_check_runs(green_five(), REQ)\n\
+         assert clean[0] and 'advisory' not in clean[1], clean",
+    );
+}
+
+/// A re-run is read at its NEWEST conclusion, and the order the endpoint happens
+/// to return is not what decides which that is.
+///
+/// PR #1097 review found this asserted and not verified, and verifying it found
+/// the assertion backwards. `GET /commits/{sha}/check-runs` returns newest FIRST
+/// — measured on `4afd7498`, whose six duplicated names each carry their later
+/// `started_at` and higher `id` at the lower index — so the loop that simply
+/// overwrote per name, under a comment claiming re-runs append, kept the OLDEST
+/// run every time. A check re-run from red to green went on reading as red; on a
+/// required context that is this issue's own symptom by another route.
+///
+/// So the fixture is in the API's real order, newest first, and it fails against
+/// a positional rule in either direction.
+#[test]
+fn a_re_run_check_is_read_at_its_newest_conclusion() {
+    assert_py_ok(
+        "newest = crun('build', 'success', started_at='2026-09-15T15:11:14Z', run_id=2)\n\
+         oldest = crun('build', 'failure', started_at='2026-09-15T15:11:12Z', run_id=1)\n\
+         rest = [r for r in green_five() if r['name'] != 'build']\n\
+         green, why, _ = classify_check_runs([newest, oldest] + rest, REQ)\n\
+         assert green, why\n\
+         green, why, _ = classify_check_runs([oldest, newest] + rest, REQ)\n\
+         assert green, why\n\
+         red = crun('build', 'failure', started_at='2026-09-15T15:11:14Z', run_id=2)\n\
+         ok = crun('build', 'success', started_at='2026-09-15T15:11:12Z', run_id=1)\n\
+         for order in ([red, ok], [ok, red]):\n\
+        \x20   green, why, _ = classify_check_runs(order + rest, REQ)\n\
+        \x20   assert not green, why",
+    );
+}
+
+/// The same for an advisory job: a `devbox` re-run to green drops out of the
+/// advisory list rather than being reported off its stale red.
+#[test]
+fn a_re_run_advisory_check_drops_out_once_it_is_green() {
+    assert_py_ok(
+        "runs = green_five() + [\n\
+        \x20   crun('devbox', 'success', started_at='2026-09-15T16:00:00Z', run_id=9),\n\
+        \x20   crun('devbox', 'failure', started_at='2026-09-15T15:00:00Z', run_id=8)]\n\
+         green, why, advisory = classify_check_runs(runs, REQ)\n\
+         assert green and advisory == [], (why, advisory)",
+    );
+}
+
+/// `id` alone decides when two runs share a `started_at`, and a record carrying
+/// neither sorts oldest — so a partial entry never displaces a real one.
+#[test]
+fn the_newest_run_is_pinned_by_id_then_by_nothing_at_all() {
+    assert_py_ok(
+        "same = '2026-09-15T15:11:12Z'\n\
+         rest = [r for r in green_five() if r['name'] != 'build']\n\
+         hi = crun('build', 'success', started_at=same, run_id=2)\n\
+         lo = crun('build', 'failure', started_at=same, run_id=1)\n\
+         for order in ([hi, lo], [lo, hi]):\n\
+        \x20   assert classify_check_runs(order + rest, REQ)[0], order\n\
+         bare = crun('build', 'failure')\n\
+         real = crun('build', 'success', started_at=same, run_id=1)\n\
+         for order in ([bare, real], [real, bare]):\n\
+        \x20   assert classify_check_runs(order + rest, REQ)[0], order",
+    );
+}
+
+/// PR #1097 review, the P1: a ruleset that requires NOTHING is taken at its
+/// word. Falling back to the hardcoded five there would reintroduce this very
+/// issue one level up — the reviewer holding out for checks GitHub no longer
+/// requires, and an advisory red again withholding the approval. The advisory
+/// list still reports what is red, and `required_contexts` emits a `::warning::`
+/// so the weakened gate is announced rather than silent.
+#[test]
+fn a_ruleset_that_requires_nothing_gates_on_nothing() {
+    assert_py_ok(
+        "runs = [crun(n, 'failure') for n in REQ] + [crun('devbox', 'failure')]\n\
+         green, why, advisory = classify_check_runs(runs, ())\n\
+         assert green, why\n\
+         assert 'devbox=failure' in advisory and len(advisory) == 6, advisory",
+    );
+}
+
+/// An empty or absent run list is not green: it is the never-reported case for
+/// all five at once, and must not read as "nothing failed".
+#[test]
+fn a_head_with_no_checks_at_all_is_not_green() {
+    assert_py_ok(
+        "for runs in ([], None):\n\
+        \x20   green, why, _ = classify_check_runs(runs, REQ)\n\
+        \x20   assert not green and 'not concluded' in why, why",
+    );
+}
+
+/// ONE policy for both jobs. The selector and the vote job must gate identically
+/// or a pull request is selected under one rule and voted on under another — the
+/// drift `pr_review_common` exists to prevent. `checks_green` keeps its two-value
+/// contract because the vote job unpacks exactly two, and it delegates to the
+/// same classifier the selector reaches through `check_status`.
+#[test]
+fn the_selector_and_the_vote_job_share_one_check_gate() {
+    assert_py_ok(
+        "import pr_review_common as common, pr_review_vote as vote\n\
+         assert vote.checks_green is common.checks_green\n\
+         seen = {}\n\
+         def fake(repo, sha):\n\
+        \x20   seen['args'] = (repo, sha)\n\
+        \x20   return (True, 'all required contexts green (ignoring advisory failure(s): devbox=failure)', ['devbox=failure'])\n\
+         common.check_status = fake\n\
+         assert common.checks_green('o/r', SHA) == (True, fake('o/r', SHA)[1])\n\
+         assert seen['args'] == ('o/r', SHA), seen\n\
+         assert 'devbox=failure' in common.checks_green('o/r', SHA)[1]",
+    );
+}
+
+/// The derivation itself, with `gh` stubbed in-process so no network is touched.
+/// `required_contexts` reads the module-level `gh`, so replacing that attribute
+/// intercepts both calls it makes — the default-branch lookup and the ruleset
+/// read.
+///
+/// Four cases, and the first is PR #1097's P1: a ruleset that requires nothing
+/// yields the empty tuple rather than the hardcoded five, and says so with a
+/// `::warning::`. The fallback is reserved for a read that FAILED, which is the
+/// case a reviewer cannot tell apart from "nothing is required" without it.
+#[test]
+fn the_required_list_comes_from_the_ruleset_and_falls_back_only_on_failure() {
+    assert_py_ok(
+        "import io, contextlib, pr_review_common as m\n\
+         def stub(rules, boom=False):\n\
+        \x20   def fake_gh(*args, check=True):\n\
+        \x20       if args[1].endswith('/rules/branches/main'):\n\
+        \x20           if boom:\n\
+        \x20               raise RuntimeError('gh api failed (1): HTTP 403')\n\
+        \x20           return rules\n\
+        \x20       return 'main\\n'\n\
+        \x20   return fake_gh\n\
+         def ask(rules, boom=False, repo='o/r'):\n\
+        \x20   m._REQUIRED_CACHE.clear()\n\
+        \x20   m.gh = stub(rules, boom)\n\
+        \x20   out = io.StringIO()\n\
+        \x20   with contextlib.redirect_stdout(out):\n\
+        \x20       got = m.required_contexts(repo)\n\
+        \x20   return got, out.getvalue()\n\
+         got, log = ask('[]')\n\
+         assert got == (), got\n\
+         assert '::warning::' in log and 'requires no status checks' in log, log\n\
+         assert 'falling back' not in log, log\n\
+         got, log = ask('[\"security\",\"build\"]')\n\
+         assert got == ('build', 'security'), got\n\
+         assert 'required contexts' in log and '::warning::' not in log, log\n\
+         got, _ = ask('[\"build\",\"security\"]\\n[\"build\",\"nix\"]')\n\
+         assert got == ('build', 'nix', 'security'), got\n\
+         got, log = ask('', boom=True)\n\
+         assert got == FALLBACK_REQUIRED_CONTEXTS, got\n\
+         assert '::warning::could not read' in log and 'falling back' in log, log",
+    );
+}
+
+/// One read per process, not one per pull request: a sweep asks about a dozen
+/// heads and the ruleset is fetched once. Cheap to pin, and the memo is the only
+/// thing standing between this and two extra API calls per pull request.
+#[test]
+fn the_ruleset_is_read_once_per_run() {
+    assert_py_ok(
+        "import pr_review_common as m\n\
+         m._REQUIRED_CACHE.clear()\n\
+         calls = []\n\
+         def fake_gh(*args, check=True):\n\
+        \x20   calls.append(args[1])\n\
+        \x20   return '[\"build\"]' if args[1].endswith('/rules/branches/main') else 'main'\n\
+         m.gh = fake_gh\n\
+         for _ in range(5):\n\
+        \x20   assert m.required_contexts('o/r') == ('build',)\n\
+         assert len(calls) == 2, calls",
+    );
+}
+
+/// The hardcoded fallback and `scripts/apply-branch-protection.sh` must agree.
+///
+/// The live ruleset is the source of truth and `required_contexts()` reads it, so
+/// neither of these is consulted on a healthy run — but the fallback IS what the
+/// reviewer gates on when that read fails, so it is pinned rather than trusted.
+/// Verified against the live `main-protected` ruleset (id 20587589) on
+/// 2026-09-15; both agreed with it.
+#[test]
+fn the_fallback_list_matches_the_branch_protection_script() {
+    let script = repo_root().join("scripts/apply-branch-protection.sh");
+    let text = std::fs::read_to_string(&script).expect("apply-branch-protection.sh should exist");
+    let marker = "REQUIRED_CHECKS=\"${REQUIRED_CHECKS-";
+    let start = text
+        .find(marker)
+        .expect("apply-branch-protection.sh should still set a REQUIRED_CHECKS default")
+        + marker.len();
+    let rest = &text[start..];
+    let end = rest
+        .find("}\"")
+        .expect("the REQUIRED_CHECKS default should close with }\"");
+    let expected: Vec<&str> = rest[..end].split_whitespace().collect();
+    assert!(
+        !expected.is_empty(),
+        "parsed an empty REQUIRED_CHECKS default; the test's parser is broken, not the list"
+    );
+    assert_py_ok(&format!(
+        "assert sorted(FALLBACK_REQUIRED_CONTEXTS) == sorted({expected:?}), \\\n\
+        \x20   (sorted(FALLBACK_REQUIRED_CONTEXTS), sorted({expected:?}))"
+    ));
 }

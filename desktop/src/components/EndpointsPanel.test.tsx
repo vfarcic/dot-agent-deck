@@ -747,10 +747,26 @@ describe("EndpointsPanel", () => {
   /**
    * Scenario: a save failed. The change is still applied for this session, and
    * the panel says what that means rather than silently reverting.
+   *
+   * The lead-in moved into `useDesktopSettings` at issue #1072, because the same
+   * prop now also carries "your settings file cannot be read" — so the panel
+   * renders whatever it is handed and this passes the composed sentence.
    */
   it("says a failed save will not survive a restart", () => {
-    renderPanel({}, { saveError: "Permission denied" });
+    renderPanel({}, { saveError: "This change is applied, but saving it failed, so it will not survive a restart. Permission denied" });
     expect(screen.getByRole("alert")).toHaveTextContent("will not survive a restart");
     expect(screen.getByRole("alert")).toHaveTextContent("Permission denied");
+  });
+
+  /**
+   * Scenario (issue #1072): the document on disk cannot be read. The deck list
+   * shown is this build's defaults, every save is refused so the user's decks
+   * survive, and the panel says exactly that with no invented preamble.
+   */
+  it("renders an unreadable-document message verbatim", () => {
+    renderPanel({}, { saveError: "The desktop settings file cannot be read: line 4, column 8 is not valid settings. This session is using default settings, and nothing will be saved over the file until it is fixed or removed." });
+    const alert = screen.getByRole("alert");
+    expect(alert).toHaveTextContent("nothing will be saved over the file");
+    expect(alert).not.toHaveTextContent("saving it failed");
   });
 });

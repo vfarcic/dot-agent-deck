@@ -692,7 +692,7 @@ pub fn list_hooks_in(home: &Path, cwd: &Path) -> std::io::Result<Vec<CodexHookEn
                 }
             }
         });
-        read_hooks_list_reply(&rx, Instant::now() + HOOKS_LIST_TIMEOUT)
+        read_hooks_list_reply(&rx, &mut stdin, Instant::now() + HOOKS_LIST_TIMEOUT)
     });
 
     drop(stdin);
@@ -733,7 +733,8 @@ fn is_hooks_list_response(value: &Value) -> bool {
         && (value.get("result").is_some() || value.get("error").is_some())
 }
 
-/// Drain `rx` until the `hooks/list` response arrives or `deadline` passes.
+/// Drain `rx` until the `hooks/list` response arrives or `deadline` passes,
+/// answering anything the server asks us on the way past.
 ///
 /// Split out of [`list_hooks_in`] so the matching can be driven from a synthetic
 /// stream with no `codex` on the box (issue #1033). Everything that is not the
@@ -741,43 +742,248 @@ fn is_hooks_list_response(value: &Value) -> bool {
 /// request, including one that happens to reuse `id: 2` — is skipped rather than
 /// returned on, so no single stray message can poison the call.
 ///
+/// **Skipping a server→client REQUEST is not enough, and that is the second half
+/// of #1033.** Ignoring a request leaves it *outstanding*: JSON-RPC gives the
+/// server no way to learn that an answer is never coming, so a server that waits
+/// on it before doing further work never answers `hooks/list` either, and the
+/// call fails on `deadline` rather than on the stray message. That is what the
+/// operator's `deck.log` shows across the first fix, measured on 2026-09-16
+/// either side of `59073b60` (merged 2026-09-13T13:26:39Z): `hooks/list reply
+/// carried no result` ran at 145–448 a day and went to **zero** the afternoon it
+/// shipped, while `hooks/list did not answer in time` went from ≤8 a day to
+/// 155–269 — the same population of spawns, failing the same way, one message
+/// later. So every request is answered here, with `-32601`, which unblocks such a
+/// server and is what a JSON-RPC client owes a peer regardless. Notifications
+/// carry no `id` and are answered by nothing, per the spec.
+///
+/// `to_server` is the child's stdin. A failed write is DISCARDED on purpose: the
+/// child may simply have exited, which the `Disconnected` arm reports on its own
+/// terms, and a reply we could not send is no reason to fail a call whose real
+/// answer may already be in the channel. Discarding it is only safe because the
+/// write cannot take the process with it: nothing under `src/` restores
+/// `SIGPIPE` to its default — [`crate::wrap`]'s handler installs on `SIGTERM`,
+/// `SIGHUP` and `SIGINT` and on nothing else — so Rust's startup `SIG_IGN`
+/// stands and writing into a dead app-server's stdin returns `EPIPE` rather
+/// than killing the wrapper. Worth stating because this write happens LATER
+/// than the request write above, at a point where the child much more plausibly
+/// has already gone.
+///
 /// **The skipping is bounded by `deadline` and nothing else**, which is what
 /// keeps `continue` from being a way to spin: `remaining` is recomputed every
 /// iteration and is both the `recv_timeout` bound and, once zero, the exit. A
 /// peer that floods messages makes the loop iterate faster, not for longer —
 /// each iteration consumes one message and the total wait is still capped at
-/// [`HOOKS_LIST_TIMEOUT`].
+/// [`HOOKS_LIST_TIMEOUT`]. What the loop *accumulates* is bounded too, which is
+/// [`SkippedLog`]'s whole job: it counts every skip and names only the first few,
+/// each field clipped to [`MAX_FIELD`] so the peer chooses neither how many
+/// descriptions we keep nor how long one is. What the loop *writes* is bounded by
+/// [`MAX_DECLINES`], which is what stops a synchronous `writeln!` onto a stdin
+/// nobody is draining from blocking past `deadline` — both bounds are Greptile
+/// P2s on PR #1124, and both were holes in the first version of this fix.
 fn read_hooks_list_reply(
     rx: &mpsc::Receiver<String>,
+    to_server: &mut dyn io::Write,
     deadline: Instant,
 ) -> std::io::Result<Vec<CodexHookEntry>> {
+    let mut skipped = SkippedLog::default();
+    let mut declines = 0_usize;
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            return Err(io::Error::new(
-                ErrorKind::TimedOut,
-                "codex app-server: hooks/list did not answer in time",
-            ));
+            return Err(skipped.timed_out());
         }
         match rx.recv_timeout(remaining) {
             Ok(line) => match serde_json::from_str::<Value>(&line) {
                 Ok(value) if is_hooks_list_response(&value) => return parse_hooks_list(&value),
-                _ => continue,
+                Ok(value) => {
+                    skipped.record(&value);
+                    if declines < MAX_DECLINES && decline_server_request(&value, to_server) {
+                        declines += 1;
+                    }
+                }
+                Err(_) => skipped.record_unparsable(),
             },
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                return Err(io::Error::new(
-                    ErrorKind::TimedOut,
-                    "codex app-server: hooks/list did not answer in time",
-                ));
-            }
+            Err(mpsc::RecvTimeoutError::Timeout) => return Err(skipped.timed_out()),
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 return Err(io::Error::new(
                     ErrorKind::UnexpectedEof,
-                    "codex app-server: exited without answering hooks/list",
+                    format!(
+                        "codex app-server: exited without answering hooks/list{}",
+                        skipped.summary()
+                    ),
                 ));
             }
         }
     }
+}
+
+/// Longest peer-supplied field this module will repeat into a log line or an
+/// outgoing reply.
+///
+/// `method` and `id` come off the wire, so anything that echoes them is as long
+/// as the peer chose to make it. Naming only eight messages bounds the COUNT and
+/// not the SIZE, which is half a bound (Greptile P2 on PR #1124).
+const MAX_FIELD: usize = 80;
+
+/// Longest `id` [`decline_server_request`] will echo back.
+///
+/// JSON-RPC says a response echoes the request's id verbatim, so this one cannot
+/// be clipped and still be correct — an absurd id is therefore not answered at
+/// all, which is exactly the pre-#1033 behaviour for that message and costs a
+/// request nobody sane sends.
+const MAX_ID_BYTES: usize = 128;
+
+/// How many requests one [`read_hooks_list_reply`] call will answer.
+///
+/// **This is what keeps a blocking write from outliving `deadline`** (Greptile
+/// P2 on PR #1124). `writeln!` onto the child's stdin is synchronous, so a peer
+/// that stops reading its own stdin could fill the pipe and block us with the
+/// deadline unchecked — and a wedged peer is precisely the case this code exists
+/// for, so that is not a hypothetical shape. With the two caps above, one reply
+/// is at most ~`MAX_ID_BYTES + MAX_FIELD` plus a fixed envelope, so this many of
+/// them is a few KB against a pipe buffer of 64 KiB on Linux: the write cannot
+/// fill it and therefore cannot block. Answering the first few is also all the
+/// fix needs — the point is to release a server WAITING on an outstanding
+/// request, and a peer that sends hundreds is not waiting on one.
+const MAX_DECLINES: usize = 8;
+
+/// Clip a peer-supplied string to [`MAX_FIELD`], on a char boundary.
+fn clip(text: &str) -> String {
+    if text.len() <= MAX_FIELD {
+        return text.to_string();
+    }
+    let mut end = MAX_FIELD;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &text[..end])
+}
+
+/// How many messages [`read_hooks_list_reply`] skipped, and what the first few
+/// were, so a failure can say what arrived *instead of* the reply.
+///
+/// Issue #1033 had to be filed with its cause labelled a hypothesis, and this is
+/// the reason: the only thing the log ever carried was `hooks/list reply carried
+/// no result`, which names the stray message's shape and never its `method` or
+/// its `id`. Thousands of occurrences bought no more information than one did.
+/// Formatting happens only on the failure paths, so a call that succeeds pays
+/// for nothing but the counting.
+///
+/// Bounded deliberately, in BOTH directions: `total` counts every skip while
+/// `named` holds at most [`SKIPPED_NAMES`] descriptions, and each description
+/// clips its peer-supplied fields to [`MAX_FIELD`]. Capping the count alone was
+/// half a bound — eight descriptions of a megabyte apiece is still a megabyte of
+/// log line, and `method` and `id` come straight off the wire.
+#[derive(Default)]
+struct SkippedLog {
+    total: usize,
+    named: Vec<String>,
+}
+
+/// How many skipped messages [`SkippedLog`] names before it merely counts.
+const SKIPPED_NAMES: usize = 8;
+
+impl SkippedLog {
+    fn record(&mut self, value: &Value) {
+        self.push(describe_message(value));
+    }
+
+    fn record_unparsable(&mut self) {
+        self.push("unparsable line".to_string());
+    }
+
+    fn push(&mut self, description: String) {
+        self.total += 1;
+        if self.named.len() < SKIPPED_NAMES {
+            self.named.push(description);
+        }
+    }
+
+    /// The parenthetical a failure message carries, or **nothing at all** when
+    /// nothing was skipped: "the server said nothing" and "the server said these
+    /// other things" are different diagnoses and must not read alike.
+    fn summary(&self) -> String {
+        if self.total == 0 {
+            return String::new();
+        }
+        let unnamed = self.total - self.named.len();
+        let tail = if unnamed > 0 {
+            format!(", and {unnamed} more")
+        } else {
+            String::new()
+        };
+        format!(
+            " (skipped {} message(s): {}{tail})",
+            self.total,
+            self.named.join("; ")
+        )
+    }
+
+    fn timed_out(&self) -> io::Error {
+        io::Error::new(
+            ErrorKind::TimedOut,
+            format!(
+                "codex app-server: hooks/list did not answer in time{}",
+                self.summary()
+            ),
+        )
+    }
+}
+
+/// Name a message the way whoever reads the log needs it: which of the three
+/// JSON-RPC kinds it is, and the fields that identify it.
+fn describe_message(value: &Value) -> String {
+    let id = value.get("id").filter(|id| !id.is_null());
+    match (value.get("method").and_then(Value::as_str), id) {
+        (Some(method), Some(id)) => {
+            format!("request {} id={}", clip(method), clip(&id.to_string()))
+        }
+        (Some(method), None) => format!("notification {}", clip(method)),
+        (None, Some(id)) => format!("response id={}", clip(&id.to_string())),
+        (None, None) => "message with neither method nor id".to_string(),
+    }
+}
+
+/// Answer a server→client request with `-32601`, so a server that is waiting on
+/// it can get on with `hooks/list` (issue #1033).
+///
+/// Only a **request** is answered. A `method` marks a request or a notification
+/// and the presence of an `id` is what tells those two apart; a notification must
+/// not be answered at all, and a response has no `method` to arrive here with.
+///
+/// `-32601` ("method not found") is the literal truth rather than a convenient
+/// code: this client implements no server-initiated method whatsoever — it sends
+/// two requests and reads their replies. Measured against codex-cli 0.149.0 that
+/// an app-server accepts such a line on stdin without complaint and still answers
+/// `initialize` and `hooks/list` normally, so answering cannot cost us the case
+/// that already works.
+fn decline_server_request(value: &Value, to_server: &mut dyn io::Write) -> bool {
+    let Some(method) = value.get("method").and_then(Value::as_str) else {
+        return false;
+    };
+    let Some(id) = value.get("id").filter(|id| !id.is_null()) else {
+        return false;
+    };
+    // An id too large to echo is left unanswered rather than answered wrongly;
+    // see `MAX_ID_BYTES`. Checked BEFORE building the reply so the oversized
+    // value is never copied into one.
+    if id.to_string().len() > MAX_ID_BYTES {
+        return false;
+    }
+    let decline = json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": {
+            "code": -32601,
+            "message": format!(
+                "dot-agent-deck implements no server-initiated method ({})",
+                clip(method)
+            ),
+        }
+    });
+    // Discarded deliberately — see `read_hooks_list_reply`.
+    let _ = writeln!(to_server, "{decline}").and_then(|()| to_server.flush());
+    true
 }
 
 /// Decode the `id: 2` `hooks/list` reply into entries, tolerating both the
@@ -1970,7 +2176,8 @@ mod tests {
         }
         drop(tx);
 
-        let entries = read_hooks_list_reply(&rx, Instant::now() + HOOKS_LIST_TIMEOUT)
+        let mut sent = Vec::new();
+        let entries = read_hooks_list_reply(&rx, &mut sent, Instant::now() + HOOKS_LIST_TIMEOUT)
             .expect("the genuine hooks/list reply sits behind the stray request and must be read");
         assert_eq!(
             entries.len(),
@@ -1979,6 +2186,14 @@ mod tests {
         );
         assert_eq!(entries[0].key, "/h/hooks.json:session_start:0:0");
         assert_eq!(entries[0].current_hash, "abc123");
+
+        // Skipping the request is only half of it: an unanswered request stays
+        // outstanding, which is the state a waiting server never leaves.
+        let sent = String::from_utf8(sent).expect("replies are utf-8");
+        assert!(
+            sent.contains("-32601") && sent.contains("account/chatgptAuthTokens/refresh"),
+            "the stray request must be answered, not merely stepped over; got {sent:?}"
+        );
     }
 
     /// The response test above must not be passing because the predicate demands
@@ -1999,12 +2214,253 @@ mod tests {
         .expect("queue a line");
         drop(tx);
 
-        let err = read_hooks_list_reply(&rx, Instant::now() + HOOKS_LIST_TIMEOUT)
+        let err = read_hooks_list_reply(&rx, &mut Vec::new(), Instant::now() + HOOKS_LIST_TIMEOUT)
             .expect_err("an error reply must fail the call");
         let message = err.to_string();
         assert!(
             message.contains("hooks/list failed"),
             "an error reply must be reported as itself, not as a timeout; got {message}"
+        );
+    }
+
+    /// A well-behaved server gets the reply read and **nothing written back**.
+    ///
+    /// The baseline for the three tests around it: issue #1033's fix adds a
+    /// writer to this loop, and the case that already worked — codex answers
+    /// `hooks/list` and asks nothing — must stay a pure read. Measured against
+    /// codex-cli 0.149.0 on an empty, a ChatGPT-authenticated and a hooks-bearing
+    /// home, and with sixteen app-servers on one home at once: every one of them
+    /// answered in under 1.2s having sent no request at all.
+    #[test]
+    fn a_plain_reply_is_read_without_writing_anything() {
+        let (tx, rx) = mpsc::channel::<String>();
+        for line in [
+            json!({"jsonrpc": "2.0", "id": 1, "result": {"userAgent": "codex"}}),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": {"data": [{"hooks": [{
+                    "key": "/h/hooks.json:session_start:0:0",
+                    "command": "/abs/dot-agent-deck hook --agent codex",
+                    "sourcePath": "/h/hooks.json",
+                    "currentHash": "abc123",
+                    "trustStatus": "untrusted"
+                }]}]}
+            }),
+        ] {
+            tx.send(line.to_string()).expect("queue a line");
+        }
+        drop(tx);
+
+        let mut sent = Vec::new();
+        let entries = read_hooks_list_reply(&rx, &mut sent, Instant::now() + HOOKS_LIST_TIMEOUT)
+            .expect("a plain reply must be read");
+        assert_eq!(entries.len(), 1);
+        assert!(
+            sent.is_empty(),
+            "a server that asks nothing must be written nothing; got {:?}",
+            String::from_utf8_lossy(&sent)
+        );
+    }
+
+    /// A NOTIFICATION must never be answered, however much it looks like a
+    /// request.
+    ///
+    /// The one thing `decline_server_request` can get wrong in the safe
+    /// direction is answering too much: JSON-RPC forbids a response to a
+    /// notification, and `codex/event` — which this server emits constantly —
+    /// is one. `method` is present on both kinds, so the `id` is the whole
+    /// discriminator and this test is what holds it in place.
+    #[test]
+    fn a_notification_is_never_answered() {
+        let (tx, rx) = mpsc::channel::<String>();
+        for line in [
+            json!({"jsonrpc": "2.0", "method": "codex/event", "params": {}}),
+            json!({"jsonrpc": "2.0", "method": "remoteControl/status/changed", "id": null}),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": {"data": [{"hooks": [{
+                    "key": "/h/hooks.json:stop:0:0",
+                    "command": "/abs/dot-agent-deck hook --agent codex",
+                    "sourcePath": "/h/hooks.json",
+                    "currentHash": "def456",
+                    "trustStatus": "untrusted"
+                }]}]}
+            }),
+        ] {
+            tx.send(line.to_string()).expect("queue a line");
+        }
+        drop(tx);
+
+        let mut sent = Vec::new();
+        read_hooks_list_reply(&rx, &mut sent, Instant::now() + HOOKS_LIST_TIMEOUT)
+            .expect("the reply behind the notifications must still be read");
+        assert!(
+            sent.is_empty(),
+            "a notification carries no id and must draw no response; got {:?}",
+            String::from_utf8_lossy(&sent)
+        );
+    }
+
+    /// A reply that never comes fails on the deadline and **names what arrived
+    /// instead** (issue #1033).
+    ///
+    /// This is the regression test for the diagnosis, not only for the
+    /// behaviour. The old message said `did not answer in time` and nothing
+    /// else, so 912 occurrences on the operator's box established no more than
+    /// one did, and the cause had to be filed as a hypothesis. The sender is
+    /// held open on purpose so the loop exits by `deadline` rather than by
+    /// disconnect — the path that fires in production.
+    #[test]
+    fn a_reply_that_never_comes_times_out_naming_what_arrived() {
+        let (tx, rx) = mpsc::channel::<String>();
+        tx.send(
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "account/chatgptAuthTokens/refresh",
+                "params": {"reason": "expired"}
+            })
+            .to_string(),
+        )
+        .expect("queue a line");
+
+        let mut sent = Vec::new();
+        let err =
+            read_hooks_list_reply(&rx, &mut sent, Instant::now() + Duration::from_millis(250))
+                .expect_err("no reply must fail the call");
+        drop(tx);
+
+        assert_eq!(err.kind(), ErrorKind::TimedOut);
+        let message = err.to_string();
+        assert!(
+            message.contains("did not answer in time")
+                && message.contains("skipped 1 message(s)")
+                && message.contains("request account/chatgptAuthTokens/refresh id=2"),
+            "the timeout must name the message that arrived instead of the reply; got {message}"
+        );
+        assert!(
+            String::from_utf8_lossy(&sent).contains("-32601"),
+            "the request must still have been answered before the wait expired"
+        );
+    }
+
+    /// A flooding peer grows neither the wait nor the message.
+    ///
+    /// `continue` is only safe because two things stay bounded, and the second
+    /// is easy to lose: the wait is capped by `deadline`, and what the loop
+    /// accumulates is capped by `SKIPPED_NAMES`. Without the second, a peer that
+    /// streams notifications turns a log line into an unbounded one. The count
+    /// stays exact — it is the summary that truncates.
+    #[test]
+    fn a_flood_of_skipped_messages_is_counted_but_not_all_named() {
+        let (tx, rx) = mpsc::channel::<String>();
+        let flood = SKIPPED_NAMES + 12;
+        for i in 0..flood {
+            tx.send(json!({"jsonrpc": "2.0", "method": format!("codex/event/{i}")}).to_string())
+                .expect("queue a line");
+        }
+
+        let err = read_hooks_list_reply(
+            &rx,
+            &mut Vec::new(),
+            Instant::now() + Duration::from_millis(250),
+        )
+        .expect_err("no reply must fail the call");
+        drop(tx);
+
+        let message = err.to_string();
+        assert!(
+            message.contains(&format!("skipped {flood} message(s)")),
+            "every skip must be counted; got {message}"
+        );
+        assert!(
+            message.contains("and 12 more"),
+            "beyond SKIPPED_NAMES the rest must be counted rather than named; got {message}"
+        );
+        assert_eq!(
+            message.matches("notification codex/event/").count(),
+            SKIPPED_NAMES,
+            "exactly SKIPPED_NAMES messages may be named; got {message}"
+        );
+    }
+
+    /// A peer cannot choose how LONG a named description is, only that there is
+    /// one (Greptile P2 on PR #1124).
+    ///
+    /// Capping the count alone left half a bound: `method` and `id` come off the
+    /// wire, so eight descriptions of a megabyte apiece is still a megabyte of
+    /// log line — written by whatever is on the other end of the pipe.
+    #[test]
+    fn a_huge_peer_field_is_clipped_out_of_the_description() {
+        let (tx, rx) = mpsc::channel::<String>();
+        let huge_method = "m".repeat(50_000);
+        let huge_id = "i".repeat(50_000);
+        tx.send(json!({"jsonrpc": "2.0", "method": huge_method, "id": huge_id}).to_string())
+            .expect("queue a line");
+
+        let err = read_hooks_list_reply(
+            &rx,
+            &mut Vec::new(),
+            Instant::now() + Duration::from_millis(250),
+        )
+        .expect_err("no reply must fail the call");
+        drop(tx);
+
+        let message = err.to_string();
+        assert!(
+            message.len() < 1_000,
+            "a 100 KB pair of peer fields must not reach the log; message was {} bytes",
+            message.len()
+        );
+        assert!(
+            message.contains('…'),
+            "the clip must be visible rather than silent; got {message}"
+        );
+    }
+
+    /// A flood of REQUESTS draws at most [`MAX_DECLINES`] replies, and an
+    /// unechoable id draws none (Greptile P2 on PR #1124).
+    ///
+    /// `writeln!` onto the child's stdin is synchronous, so a peer that stops
+    /// draining its own stdin could fill the pipe and block the loop with
+    /// `deadline` unchecked — and a wedged peer is the very case this code is
+    /// for. The cap is what keeps everything this call can write far inside a
+    /// 64 KiB pipe buffer, so the write cannot fill it and therefore cannot
+    /// block.
+    #[test]
+    fn a_flood_of_requests_draws_a_bounded_number_of_replies() {
+        let (tx, rx) = mpsc::channel::<String>();
+        for i in 0..(MAX_DECLINES + 20) {
+            tx.send(json!({"jsonrpc": "2.0", "method": "server/ask", "id": i}).to_string())
+                .expect("queue a line");
+        }
+        // An id too large to echo verbatim is not answered at all.
+        tx.send(
+            json!({"jsonrpc": "2.0", "method": "server/ask", "id": "x".repeat(4096)}).to_string(),
+        )
+        .expect("queue a line");
+
+        let mut sent = Vec::new();
+        read_hooks_list_reply(&rx, &mut sent, Instant::now() + Duration::from_millis(250))
+            .expect_err("no reply must fail the call");
+        drop(tx);
+
+        let sent = String::from_utf8(sent).expect("replies are utf-8");
+        assert_eq!(
+            sent.lines().count(),
+            MAX_DECLINES,
+            "at most MAX_DECLINES replies may be written; got {sent:?}"
+        );
+        assert!(
+            sent.len() < 4_096,
+            "everything written must stay far inside a 64 KiB pipe buffer; wrote {} bytes",
+            sent.len()
+        );
+        assert!(
+            !sent.contains(&"x".repeat(200)),
+            "an id too large to echo must draw no reply at all"
         );
     }
 }

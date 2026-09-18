@@ -178,6 +178,7 @@ fn orchestrator_pty(deck: &TuiDeck, orchestrator_agent_id: &str) -> String {
 #[test]
 fn work_done_004_unsolicited_completion_is_visibly_labelled_in_the_attached_tui() {
     let deck = TuiDeck::builder()
+        .impersonating_pane_signals()
         .with_pty_size(120, 40)
         // Both delegation watches off: this test is about what an UNDELEGATED
         // completion renders as, and a detector firing into the same pane would

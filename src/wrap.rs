@@ -776,6 +776,18 @@ fn codex_spawn_prep(
             // A zero that means "our own entry was unrecognisable" has already
             // warned from inside `trust_deck_hooks_in`; nothing here reports to a
             // user, so the count is all this path needs.
+            //
+            // A NON-zero is `info!` rather than `debug!` because the failure
+            // beside it is `warn!`, and an asymmetry there costs a diagnosis:
+            // issue #1033 had to say "zero successes cannot be proven from the
+            // log alone" about a box carrying thousands of these warnings, since
+            // the only thing that would have refuted it was logged below the
+            // level anyone runs. One line per Codex spawn, on a path that
+            // already writes one when it fails.
+            Ok(outcome) if outcome.trusted() > 0 => tracing::info!(
+                count = outcome.trusted(),
+                "codex: recorded scoped trust for deck hooks"
+            ),
             Ok(outcome) => tracing::debug!(
                 count = outcome.trusted(),
                 "codex: recorded scoped trust for deck hooks"

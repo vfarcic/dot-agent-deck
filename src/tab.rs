@@ -1328,18 +1328,44 @@ impl TabManager {
     /// snapshot — pushing unconditionally on the replace path lists the role
     /// twice and permanently fails `resolve_orchestration_for_restore`'s
     /// exact-sequence drift guard, which is the exact failure this
-    /// function's replace path exists to prevent. A role inserted in the
-    /// MIDDLE of the config, shifting existing role indices, is a known
-    /// out-of-scope edge case for M4 — not handled here.
+    /// function's replace path exists to prevent.
+    ///
+    /// **Issue #1096 — a new role is PLACED, not appended.** `config_roles`
+    /// is the role list of the CURRENT `.dot-agent-deck.toml`, in config
+    /// order — the same list the daemon stamps `TabMembership.role_index`
+    /// from — not the tab's own copy, which is frozen at whatever the config
+    /// said when the tab opened. A role the operator inserted in the MIDDLE
+    /// of that list (`[orchestrator, coder]` becoming `[orchestrator,
+    /// reviewer, coder]`) used to be appended regardless, leaving the tab
+    /// ordered `[orchestrator, coder, reviewer]`; the persisted snapshot
+    /// then no longer matched the config and
+    /// `resolve_orchestration_for_restore`'s exact-sequence drift guard
+    /// rejected the next restore, dropping the whole orchestration tab to a
+    /// plain pane. [`Self::role_placement_index`] decides the slot instead,
+    /// and `role_pane_ids` / `role_statuses` / `config.roles` shift
+    /// together so they stay parallel. `start_role_index` shifts with them,
+    /// so `role_pane_ids[start_role_index]` still names the same pane — the
+    /// key `ui.pane_metadata`'s orchestration snapshot is stored under.
+    ///
+    /// What this does NOT reconcile, deliberately: roles REMOVED, REORDERED
+    /// or RENAMED in the config since the tab opened. Those are not
+    /// expressible as a `pane spawn` of one role — they would mean deleting
+    /// or moving slots whose panes are live — and the tab keeps its existing
+    /// roles in their existing order. Where such a drift leaves the tab
+    /// unable to express the current config at all, placement degrades to
+    /// the old append (see [`Self::role_placement_index`]) and restore falls
+    /// back to a plain pane exactly as it does today.
     pub fn add_role_to_existing_orchestration(
         &mut self,
         tab_index: usize,
         role_config: OrchestrationRoleConfig,
         pane_id: String,
+        config_roles: &[OrchestrationRoleConfig],
     ) -> Result<(usize, bool), TabError> {
         let Some(Tab::Orchestration {
             role_pane_ids,
             role_statuses,
+            start_role_index,
             config,
             ..
         }) = self.tabs.get_mut(tab_index)
@@ -1368,24 +1394,78 @@ impl TabManager {
             return Ok((existing_index, false));
         }
 
-        let role_index = config.roles.len();
-        // This in-process append path enforced the role-index cap
-        // nowhere — `validate_tab_membership`/`validate_orchestration_surface`
-        // only apply at the wire boundary, never to a role appended directly
-        // here. Mirror their exact bound rather than silently clamping.
-        if role_index > crate::agent_pty::ORCHESTRATION_ROLE_INDEX_MAX {
+        // The HIGHEST index this growth produces is the old length,
+        // wherever inside the vectors the new slot actually lands — so the
+        // cap check is unchanged by issue #1096's placement. This in-process
+        // path enforced it nowhere — `validate_tab_membership` /
+        // `validate_orchestration_surface` only apply at the wire boundary,
+        // never to a role added directly here. Mirror their exact bound
+        // rather than silently clamping.
+        let highest_index_after_growth = config.roles.len();
+        if highest_index_after_growth > crate::agent_pty::ORCHESTRATION_ROLE_INDEX_MAX {
             return Err(TabError::RoleIndexCapExceeded {
                 max: crate::agent_pty::ORCHESTRATION_ROLE_INDEX_MAX,
             });
         }
-        config.roles.push(role_config);
-        role_pane_ids.push(pane_id);
+        let role_index = Self::role_placement_index(&config.roles, config_roles, &role_config.name);
+        config.roles.insert(role_index, role_config);
+        role_pane_ids.insert(role_index, pane_id);
         // A freshly-spawned role is a live agent, not a dead slot — unlike
         // `open_orchestration_tab_with_existing_role_panes`'s dead-slot
         // handling, there's no `None` case here since M3's spawn only ever
         // calls this on a real, just-spawned agent.
-        role_statuses.push(OrchestrationRoleStatus::Working);
+        role_statuses.insert(role_index, OrchestrationRoleStatus::Working);
+        // `start_role_index` indexes `role_pane_ids`, so a slot inserted at
+        // or before it moves the start role one place along. Without this
+        // the tab's orchestrator pane — and the `ui.pane_metadata` key the
+        // session snapshot hangs off — would silently become whichever role
+        // the insert pushed into that index.
+        if role_index <= *start_role_index {
+            *start_role_index += 1;
+        }
         Ok((role_index, true))
+    }
+
+    /// Issue #1096: which slot a role that is NEW to this tab belongs in,
+    /// given the tab's own (possibly stale) role list and the CURRENT
+    /// `.dot-agent-deck.toml` order.
+    ///
+    /// The rule is "insert before the first role the current config places
+    /// AFTER this one, otherwise append". Stated that way it needs nothing
+    /// from the tab's list beyond the names in it, which is what makes it
+    /// safe under the drifts this function cannot repair: a tab role the
+    /// config no longer mentions (removed or renamed) is simply not evidence
+    /// about where the new role goes, so it is skipped rather than treated
+    /// as a boundary. Two consequences worth stating rather than leaving to
+    /// be rediscovered:
+    ///
+    /// * A role absent from `config_roles` entirely — a config that changed
+    ///   again between the daemon resolving the spawn and this call, or an
+    ///   empty list — appends, which is exactly the pre-#1096 behaviour.
+    /// * Existing slots are never MOVED. If the config reordered two roles
+    ///   that both already have live panes, the tab keeps them as they are
+    ///   and the restore drift guard still rejects the snapshot — placing
+    ///   the new role correctly cannot rescue a tab that was already
+    ///   unorderable, and moving live panes under the operator to chase a
+    ///   config edit is a bigger promise than `pane spawn` makes.
+    fn role_placement_index(
+        tab_roles: &[OrchestrationRoleConfig],
+        config_roles: &[OrchestrationRoleConfig],
+        new_role_name: &str,
+    ) -> usize {
+        let Some(new_config_index) = config_roles.iter().position(|r| r.name == new_role_name)
+        else {
+            return tab_roles.len();
+        };
+        tab_roles
+            .iter()
+            .position(|tab_role| {
+                config_roles
+                    .iter()
+                    .position(|r| r.name == tab_role.name)
+                    .is_some_and(|i| i > new_config_index)
+            })
+            .unwrap_or(tab_roles.len())
     }
 
     /// Issue #868: find an already-open orchestration tab by its `(cwd,

@@ -31,14 +31,25 @@
 
 use std::sync::OnceLock;
 
-/// The four endpoint variables, in the order `tests/harness_isolation.rs` lists
+/// The deck identity variables, in the order `tests/harness_isolation.rs` lists
 /// them. Kept in step with `tests/common/mod.rs`'s `DECK_ENDPOINT_VARS`; the two
 /// cannot share a constant because the lib target does not link that file.
-pub const DECK_ENDPOINT_VARS: [&str; 4] = [
+///
+/// Issue #1077 added `DOT_AGENT_DECK_PANE_CAPABILITY`. It is not an endpoint, but it
+/// has the same failure mode as the pane and agent ids beside it, and a sharper
+/// one: a test process started from inside a live deck pane inherits that pane's
+/// real capability token, and a CLI it launches forwards it. Against the test's
+/// own daemon that token was minted by a DIFFERENT daemon, so the message is
+/// refused as `UnknownToken` — which, unlike a missing token, even
+/// `DOT_AGENT_DECK_HOOK_PROVENANCE=warn` does not admit. Every test that stands
+/// in for a pane by running the CLI would then fail only when run from a deck
+/// pane, and pass everywhere else.
+pub const DECK_ENDPOINT_VARS: [&str; 5] = [
     "DOT_AGENT_DECK_SOCKET",
     "DOT_AGENT_DECK_ATTACH_SOCKET",
     "DOT_AGENT_DECK_PANE_ID",
     "DOT_AGENT_DECK_AGENT_ID",
+    "DOT_AGENT_DECK_PANE_CAPABILITY",
 ];
 
 /// Clear every inherited deck endpoint from this test process. Idempotent, and
@@ -75,7 +86,7 @@ pub fn detach_from_any_live_deck() {
 mod tests {
     use super::*;
 
-    /// Scenario: Set all four deck endpoint variables to values that mimic a
+    /// Scenario: Set every deck identity variable to a value that mimics a
     /// live deck, call the unit-test detach hook, and assert every one of them
     /// is gone — the `src/` half of `harness_clears_inherited_deck_endpoints`.
     #[test]

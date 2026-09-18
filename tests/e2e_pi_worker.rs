@@ -373,6 +373,7 @@ async fn chain_smoke_pi_002_worker_receives_delegate_and_signals_work_done_inner
         task,
         to: vec![WORKER_ROLE.to_string()],
         timestamp: chrono::Utc::now(),
+        token: None,
     };
     daemon
         .state

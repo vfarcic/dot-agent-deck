@@ -1011,6 +1011,96 @@ pub enum DaemonMessage {
     SpawnRole(SpawnRoleSignal),
 }
 
+impl DaemonMessage {
+    /// The pane this message claims to come from.
+    ///
+    /// Every variant carries one — that is what makes the provenance gate in
+    /// `crate::daemon::run_hook_loop` a single check rather than a per-arm one,
+    /// and the exhaustive `match` here is what keeps it true: a new variant
+    /// without a pane id will not compile until someone decides what it claims.
+    pub fn claimed_pane(&self) -> &str {
+        match self {
+            DaemonMessage::Delegate(s) => &s.pane_id,
+            DaemonMessage::WorkDone(s) => &s.pane_id,
+            DaemonMessage::GetSeed(r) => &r.pane_id,
+            DaemonMessage::Dispatch(s) => &s.pane_id,
+            DaemonMessage::ListTargets(r) => &r.pane_id,
+            DaemonMessage::RestartRole(s) => &s.pane_id,
+            DaemonMessage::SpawnRole(s) => &s.pane_id,
+        }
+    }
+
+    /// The hook capability token this message presented, if any. See
+    /// [`crate::hook_provenance`].
+    pub fn presented_token(&self) -> Option<&str> {
+        match self {
+            DaemonMessage::Delegate(s) => s.token.as_deref(),
+            DaemonMessage::WorkDone(s) => s.token.as_deref(),
+            DaemonMessage::GetSeed(r) => r.token.as_deref(),
+            DaemonMessage::Dispatch(s) => s.token.as_deref(),
+            DaemonMessage::ListTargets(r) => r.token.as_deref(),
+            DaemonMessage::RestartRole(s) => s.token.as_deref(),
+            DaemonMessage::SpawnRole(s) => s.token.as_deref(),
+        }
+    }
+
+    /// The wire name of this verb, for logs. Matches the `#[serde(rename)]`
+    /// discriminator so a log line and a captured payload use one vocabulary.
+    pub fn verb(&self) -> &'static str {
+        match self {
+            DaemonMessage::Delegate(_) => "delegate",
+            DaemonMessage::WorkDone(_) => "work_done",
+            DaemonMessage::GetSeed(_) => "get_seed",
+            DaemonMessage::Dispatch(_) => "dispatch",
+            DaemonMessage::ListTargets(_) => "list_targets",
+            DaemonMessage::RestartRole(_) => "restart_role",
+            DaemonMessage::SpawnRole(_) => "spawn_role",
+        }
+    }
+
+    /// The JSON line to write back when this message is refused for want of
+    /// provenance, or `None` for a verb whose caller reads nothing.
+    ///
+    /// The verbs that answer on the same connection must answer a refusal too:
+    /// `delegate`'s whole point since PRD #466 is that a delegation which routed
+    /// nowhere is no longer invisible to the orchestrator that issued it, and a
+    /// refusal is exactly such a case. `work_done` and `dispatch` are
+    /// fire-and-forget and there is nothing to write to — their refusal is a log
+    /// line, which is the same visibility an unknown pane has always had on
+    /// those two.
+    pub fn provenance_refusal_reply(&self, message: &str) -> Option<String> {
+        let json = match self {
+            DaemonMessage::Delegate(_) => serde_json::to_string(&DelegateResponse {
+                error: Some(message.to_string()),
+                ..Default::default()
+            }),
+            DaemonMessage::RestartRole(_) => serde_json::to_string(&RestartRoleResponse {
+                error: Some(message.to_string()),
+                ..Default::default()
+            }),
+            DaemonMessage::SpawnRole(_) => serde_json::to_string(&SpawnRoleResponse {
+                error: Some(message.to_string()),
+                ..Default::default()
+            }),
+            DaemonMessage::ListTargets(_) => serde_json::to_string(&ListTargetsResponse {
+                rendered: String::new(),
+                orchestrations: Vec::new(),
+                error: Some(message.to_string()),
+            }),
+            // A refused `get-seed` answers exactly as "no seed pending" does.
+            // The extension then no-sends and the daemon's own PTY-injection
+            // safety net still delivers the seed to the pane's real occupant, so
+            // a refusal costs the legitimate pane nothing — while an `error`
+            // field the response has never carried would have to be invented,
+            // and would tell a caller that guessed a pane id that the pane
+            // exists.
+            DaemonMessage::GetSeed(_) => serde_json::to_string(&GetSeedResponse { seed: None }),
+            DaemonMessage::WorkDone(_) | DaemonMessage::Dispatch(_) => return None,
+        };
+        json.ok()
+    }
+}
+
 /// PRD #201: payload of [`DaemonMessage::GetSeed`] — the pane whose pending
 /// seed the caller wants. Sourced from `DOT_AGENT_DECK_PANE_ID` by the
 /// `get-seed` CLI (same pane-scoping the delegate / work-done / agent-event
@@ -1044,6 +1134,23 @@ pub struct GetSeedRequest {
     /// [`crate::agent_pty::AgentPtyRegistry::take_pending_seed_native_for`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_id: Option<String>,
+    /// Issue #1077: the per-spawn hook capability token from the sender's
+    /// `DOT_AGENT_DECK_PANE_CAPABILITY`, which is what ties this message to the pane
+    /// `pane_id` names. The daemon resolves **token → record → pane** and
+    /// refuses a message whose claimed pane is not the one the token was minted
+    /// for, so a caller holding a valid token of its own still cannot name a
+    /// sibling's pane. See [`crate::hook_provenance`] for the mechanism, and for
+    /// the plain statement of what it does not defend against.
+    ///
+    /// **Additive on the hook socket, so it does NOT move
+    /// [`crate::daemon_protocol::PROTOCOL_VERSION`]** — that constant versions
+    /// the ATTACH socket's framed wire, which this message never travels. An
+    /// older daemon ignores the unknown key (no `deny_unknown_fields` here) and
+    /// an older CLI omits it, which deserializes to `None`. The *meaning* of
+    /// `None` is what changed across versions, not the shape: see
+    /// `changelog.d/1077.breaking.md`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
 }
 
 /// PRD #201: the daemon's reply to a [`DaemonMessage::GetSeed`], written as a
@@ -1068,6 +1175,23 @@ pub struct GetSeedResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ListTargetsRequest {
     pub pane_id: String,
+    /// Issue #1077: the per-spawn hook capability token from the sender's
+    /// `DOT_AGENT_DECK_PANE_CAPABILITY`, which is what ties this message to the pane
+    /// `pane_id` names. The daemon resolves **token → record → pane** and
+    /// refuses a message whose claimed pane is not the one the token was minted
+    /// for, so a caller holding a valid token of its own still cannot name a
+    /// sibling's pane. See [`crate::hook_provenance`] for the mechanism, and for
+    /// the plain statement of what it does not defend against.
+    ///
+    /// **Additive on the hook socket, so it does NOT move
+    /// [`crate::daemon_protocol::PROTOCOL_VERSION`]** — that constant versions
+    /// the ATTACH socket's framed wire, which this message never travels. An
+    /// older daemon ignores the unknown key (no `deny_unknown_fields` here) and
+    /// an older CLI omits it, which deserializes to `None`. The *meaning* of
+    /// `None` is what changed across versions, not the shape: see
+    /// `changelog.d/1077.breaking.md`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
 }
 
 /// PRD #220: the daemon's reply to a [`DaemonMessage::ListTargets`], one JSON
@@ -1363,6 +1487,23 @@ pub struct DelegateSignal {
     pub task: String,
     /// Role names to delegate to (one or more).
     pub to: Vec<String>,
+    /// Issue #1077: the per-spawn hook capability token from the sender's
+    /// `DOT_AGENT_DECK_PANE_CAPABILITY`, which is what ties this message to the pane
+    /// `pane_id` names. The daemon resolves **token → record → pane** and
+    /// refuses a message whose claimed pane is not the one the token was minted
+    /// for, so a caller holding a valid token of its own still cannot name a
+    /// sibling's pane. See [`crate::hook_provenance`] for the mechanism, and for
+    /// the plain statement of what it does not defend against.
+    ///
+    /// **Additive on the hook socket, so it does NOT move
+    /// [`crate::daemon_protocol::PROTOCOL_VERSION`]** — that constant versions
+    /// the ATTACH socket's framed wire, which this message never travels. An
+    /// older daemon ignores the unknown key (no `deny_unknown_fields` here) and
+    /// an older CLI omits it, which deserializes to `None`. The *meaning* of
+    /// `None` is what changed across versions, not the shape: see
+    /// `changelog.d/1077.breaking.md`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
     pub timestamp: DateTime<Utc>,
 }
 
@@ -1377,6 +1518,23 @@ pub struct RestartRoleSignal {
     /// healthy pane is refused — the ordinary case is recovering a crashed
     /// worker, not interrupting a live one.
     pub force: bool,
+    /// Issue #1077: the per-spawn hook capability token from the sender's
+    /// `DOT_AGENT_DECK_PANE_CAPABILITY`, which is what ties this message to the pane
+    /// `pane_id` names. The daemon resolves **token → record → pane** and
+    /// refuses a message whose claimed pane is not the one the token was minted
+    /// for, so a caller holding a valid token of its own still cannot name a
+    /// sibling's pane. See [`crate::hook_provenance`] for the mechanism, and for
+    /// the plain statement of what it does not defend against.
+    ///
+    /// **Additive on the hook socket, so it does NOT move
+    /// [`crate::daemon_protocol::PROTOCOL_VERSION`]** — that constant versions
+    /// the ATTACH socket's framed wire, which this message never travels. An
+    /// older daemon ignores the unknown key (no `deny_unknown_fields` here) and
+    /// an older CLI omits it, which deserializes to `None`. The *meaning* of
+    /// `None` is what changed across versions, not the shape: see
+    /// `changelog.d/1077.breaking.md`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
     pub timestamp: DateTime<Utc>,
 }
 
@@ -1426,6 +1584,23 @@ impl RestartRoleResponse {
 pub struct SpawnRoleSignal {
     pub pane_id: String,
     pub role: String,
+    /// Issue #1077: the per-spawn hook capability token from the sender's
+    /// `DOT_AGENT_DECK_PANE_CAPABILITY`, which is what ties this message to the pane
+    /// `pane_id` names. The daemon resolves **token → record → pane** and
+    /// refuses a message whose claimed pane is not the one the token was minted
+    /// for, so a caller holding a valid token of its own still cannot name a
+    /// sibling's pane. See [`crate::hook_provenance`] for the mechanism, and for
+    /// the plain statement of what it does not defend against.
+    ///
+    /// **Additive on the hook socket, so it does NOT move
+    /// [`crate::daemon_protocol::PROTOCOL_VERSION`]** — that constant versions
+    /// the ATTACH socket's framed wire, which this message never travels. An
+    /// older daemon ignores the unknown key (no `deny_unknown_fields` here) and
+    /// an older CLI omits it, which deserializes to `None`. The *meaning* of
+    /// `None` is what changed across versions, not the shape: see
+    /// `changelog.d/1077.breaking.md`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
     pub timestamp: DateTime<Utc>,
 }
 
@@ -1632,6 +1807,23 @@ pub struct DispatchSignal {
     /// So the hook-socket shape is unchanged and `PROTOCOL_VERSION` does not move.
     #[serde(default)]
     pub shape: Option<DispatchShape>,
+    /// Issue #1077: the per-spawn hook capability token from the sender's
+    /// `DOT_AGENT_DECK_PANE_CAPABILITY`, which is what ties this message to the pane
+    /// `pane_id` names. The daemon resolves **token → record → pane** and
+    /// refuses a message whose claimed pane is not the one the token was minted
+    /// for, so a caller holding a valid token of its own still cannot name a
+    /// sibling's pane. See [`crate::hook_provenance`] for the mechanism, and for
+    /// the plain statement of what it does not defend against.
+    ///
+    /// **Additive on the hook socket, so it does NOT move
+    /// [`crate::daemon_protocol::PROTOCOL_VERSION`]** — that constant versions
+    /// the ATTACH socket's framed wire, which this message never travels. An
+    /// older daemon ignores the unknown key (no `deny_unknown_fields` here) and
+    /// an older CLI omits it, which deserializes to `None`. The *meaning* of
+    /// `None` is what changed across versions, not the shape: see
+    /// `changelog.d/1077.breaking.md`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
     pub timestamp: DateTime<Utc>,
 }
 
@@ -1660,6 +1852,23 @@ pub struct WorkDoneSignal {
     /// When true, the orchestrator signals that the entire orchestration is complete.
     #[serde(default)]
     pub done: bool,
+    /// Issue #1077: the per-spawn hook capability token from the sender's
+    /// `DOT_AGENT_DECK_PANE_CAPABILITY`, which is what ties this message to the pane
+    /// `pane_id` names. The daemon resolves **token → record → pane** and
+    /// refuses a message whose claimed pane is not the one the token was minted
+    /// for, so a caller holding a valid token of its own still cannot name a
+    /// sibling's pane. See [`crate::hook_provenance`] for the mechanism, and for
+    /// the plain statement of what it does not defend against.
+    ///
+    /// **Additive on the hook socket, so it does NOT move
+    /// [`crate::daemon_protocol::PROTOCOL_VERSION`]** — that constant versions
+    /// the ATTACH socket's framed wire, which this message never travels. An
+    /// older daemon ignores the unknown key (no `deny_unknown_fields` here) and
+    /// an older CLI omits it, which deserializes to `None`. The *meaning* of
+    /// `None` is what changed across versions, not the shape: see
+    /// `changelog.d/1077.breaking.md`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
     pub timestamp: DateTime<Utc>,
 }
 
@@ -2016,6 +2225,7 @@ mod tests {
             timestamp: chrono::DateTime::parse_from_rfc3339("2026-04-17T10:00:00Z")
                 .unwrap()
                 .with_timezone(&Utc),
+            token: None,
         };
         let msg = DaemonMessage::Delegate(signal);
         let json = serde_json::to_string(&msg).unwrap();
@@ -2039,6 +2249,7 @@ mod tests {
             timestamp: chrono::DateTime::parse_from_rfc3339("2026-04-17T10:00:00Z")
                 .unwrap()
                 .with_timezone(&Utc),
+            token: None,
         };
         let msg = DaemonMessage::WorkDone(signal);
         let json = serde_json::to_string(&msg).unwrap();
@@ -2061,6 +2272,7 @@ mod tests {
         let msg = DaemonMessage::GetSeed(GetSeedRequest {
             pane_id: "pane-7".into(),
             agent_id: Some("agent-42".into()),
+            token: None,
         });
         let json = serde_json::to_string(&msg).unwrap();
         assert!(
@@ -2094,6 +2306,7 @@ mod tests {
         let without = serde_json::to_string(&DaemonMessage::GetSeed(GetSeedRequest {
             pane_id: "pane-7".into(),
             agent_id: None,
+            token: None,
         }))
         .unwrap();
         assert!(
@@ -2123,6 +2336,51 @@ mod tests {
         {
             DaemonMessage::GetSeed(r) => assert_eq!(r.agent_id.as_deref(), Some("a1")),
             _ => panic!("expected GetSeed"),
+        }
+    }
+
+    /// Issue #1077: `token` is additive on the hook socket in both directions,
+    /// on every `DaemonMessage` that carries it, which is why it moves no
+    /// `PROTOCOL_VERSION`. What changed across versions is the MEANING of an
+    /// absent token to a daemon that mints them — see
+    /// `changelog.d/1077.breaking.md` — not the shape, and this pins the shape.
+    ///
+    /// Written as a table over the raw wire forms rather than over constructed
+    /// structs, because the compatibility claim is about bytes an older peer
+    /// actually sends and receives.
+    #[test]
+    fn hook_token_is_additive_on_every_daemon_message() {
+        let legacy = [
+            r#"{"message_type":"delegate","pane_id":"p","task":"t","to":["w"],"timestamp":"2026-09-16T00:00:00Z"}"#,
+            r#"{"message_type":"work_done","pane_id":"p","task":"t","done":false,"timestamp":"2026-09-16T00:00:00Z"}"#,
+            r#"{"message_type":"get_seed","pane_id":"p"}"#,
+            r#"{"message_type":"dispatch","pane_id":"p","name":"n","timestamp":"2026-09-16T00:00:00Z"}"#,
+            r#"{"message_type":"list_targets","pane_id":"p"}"#,
+            r#"{"message_type":"restart_role","pane_id":"p","role":"r","force":false,"timestamp":"2026-09-16T00:00:00Z"}"#,
+            r#"{"message_type":"spawn_role","pane_id":"p","role":"r","timestamp":"2026-09-16T00:00:00Z"}"#,
+        ];
+        for raw in legacy {
+            // An OLD client's payload still parses, and reads as "no token".
+            let msg: DaemonMessage = serde_json::from_str(raw)
+                .unwrap_or_else(|e| panic!("a pre-#1077 payload must parse ({e}): {raw}"));
+            assert_eq!(msg.claimed_pane(), "p", "{raw}");
+            assert_eq!(msg.presented_token(), None, "{raw}");
+
+            // A NEW client with no token emits the payload it always emitted —
+            // the key is absent, not `null`, so an older daemon sees nothing new.
+            let reencoded = serde_json::to_string(&msg).unwrap();
+            assert!(
+                !reencoded.contains("token"),
+                "an absent token must be omitted from the wire: {reencoded}"
+            );
+
+            // And a NEW client's token survives a round trip, which is the half
+            // a newer daemon relies on. An older daemon has no
+            // `deny_unknown_fields` on any of these, so it ignores the key.
+            let with_token = raw.replacen(r#""pane_id":"p""#, r#""pane_id":"p","token":"tk""#, 1);
+            let parsed: DaemonMessage = serde_json::from_str(&with_token)
+                .unwrap_or_else(|e| panic!("a tokened payload must parse ({e}): {with_token}"));
+            assert_eq!(parsed.presented_token(), Some("tk"), "{with_token}");
         }
     }
 
