@@ -322,6 +322,45 @@ fn task_precedence_notice() -> &'static str {
 /// text can never occupy it. No sidecar file, no new wire field and no new tab
 /// state — the artifact already carries an unforgeable answer, it was just being
 /// read in the wrong place.
+/// Issue #550: tell the orchestrator where durable output goes, as a literal
+/// path, when — and only when — the orchestration is running in a linked
+/// worktree.
+///
+/// A linked worktree is removed when `git worktree remove` or the deck's own
+/// reclaim takes it, so anything a worker leaves inside it goes too. The
+/// orchestrator is the agent that authors worker tasks, so it is the one that
+/// has to know this; a worker only ever sees the path its task names.
+///
+/// **Interpolated as a literal rather than named as a variable**, for the same
+/// reason `crate::dispatch`'s `report_path` is: an agent's file-writing tool
+/// does not go through a shell, so an agent told to write to
+/// `$SOME_VAR/findings.md` creates a directory called `$SOME_VAR`. A path it
+/// can neither mis-expand nor fail to look up removes the whole class.
+///
+/// Emitted only for a linked worktree ([`crate::worktree_owner::main_worktree_if_linked`]):
+/// in an ordinary checkout the main worktree is the directory the agent is
+/// already working in, so this would be prompt text every orchestration pays
+/// for and none of them needs.
+///
+/// The closing sentence is load-bearing. Without it an orchestrator that has
+/// just been told "durable things go over there" has every reason to relocate
+/// the coordination files too — and those are deliberately transient: a task
+/// file is consumed by the worker that reads it, and a `work-done` report
+/// travels back over the wire and is deleted.
+fn durable_output_section(main_worktree: &std::path::Path) -> String {
+    format!(
+        "\n## Durable output\n\n\
+         This orchestration is running in a linked git worktree, which is removed once its \
+         work lands — anything written inside it goes with it. When a task needs to leave \
+         something behind (a report, findings, a generated artifact), give the worker an \
+         absolute path under the MAIN checkout instead:\n\n\
+         {}\n\n\
+         The coordination files above are not affected: task files and work-done reports are \
+         meant to be transient and stay exactly where this document already puts them.\n",
+        main_worktree.display()
+    )
+}
+
 fn composer_tail(has_task: bool) -> String {
     let mut tail = unattended_notice(has_task);
     if has_task {
@@ -350,8 +389,12 @@ pub fn compose_orchestrator_context(
     config: &OrchestrationConfig,
     task: Option<&str>,
     attendance: Attendance,
+    main_worktree: Option<&std::path::Path>,
 ) -> String {
     let mut content = build_orchestrator_context(config);
+    if let Some(main_worktree) = main_worktree {
+        content.push_str(&durable_output_section(main_worktree));
+    }
     if attendance == Attendance::Unattended {
         content.push_str(&unattended_notice(task.is_some()));
     }
@@ -430,7 +473,13 @@ pub fn prepare_orchestrator_context(
     attendance: Attendance,
 ) -> Result<PreparedContext, ContextPublishError> {
     let task = task.map(str::trim).filter(|t| !t.is_empty());
-    let content = compose_orchestrator_context(config, task, attendance);
+    // Issue #550: resolved HERE rather than inside the composer so the composer
+    // stays pure — it is the one piece the desktop, the TUI and the daemon all
+    // share, and it must remain testable without a real git repository behind
+    // it. `None` covers both "not in a linked worktree" and "could not tell",
+    // and both mean the same thing to the reader: say nothing.
+    let main_worktree = crate::worktree_owner::main_worktree_if_linked(cwd);
+    let content = compose_orchestrator_context(config, task, attendance, main_worktree.as_deref());
     let published = publish_orchestrator_context(cwd, &content)?;
     Ok(PreparedContext {
         context_path: published.path,
@@ -2297,7 +2346,8 @@ mod tests {
     #[test]
     fn the_composed_sections_never_contain_the_task_marker_themselves() {
         for attendance in [Attendance::Attended, Attendance::Unattended] {
-            let c = compose_orchestrator_context(&config(), Some("SENTINEL-TASK"), attendance);
+            let c =
+                compose_orchestrator_context(&config(), Some("SENTINEL-TASK"), attendance, None);
             let (before, after) = c
                 .split_once(TASK_SECTION_MARKER)
                 .expect("the composer wrote a task section");
@@ -2310,6 +2360,77 @@ mod tests {
                 after.trim(),
                 "SENTINEL-TASK",
                 "{attendance:?}: the marker must split at the real task"
+            );
+        }
+    }
+
+    // --- issue #550: where durable output goes ---
+
+    /// The orchestrator authors worker tasks, so it is the one that has to know
+    /// the worktree is temporary. Asserted on the composed bytes, since that is
+    /// what gets published and read.
+    #[test]
+    fn a_linked_worktree_context_names_the_main_checkout_as_a_literal_path() {
+        let main = std::path::Path::new("/home/dev/myproject");
+        let c = compose_orchestrator_context(&config(), None, Attendance::Attended, Some(main));
+
+        assert!(
+            c.contains("## Durable output"),
+            "the section must be present for a linked worktree"
+        );
+        assert!(
+            c.contains("/home/dev/myproject"),
+            "the path must be interpolated as a LITERAL — an agent's file-writing tool does \
+             not go through a shell, so a variable name here would have it create a \
+             directory of that name"
+        );
+    }
+
+    /// In an ordinary checkout the main worktree IS the directory the agent is
+    /// working in, so the section would be prompt text every orchestration pays
+    /// for and none of them needs. `None` is what
+    /// `worktree_owner::main_worktree_if_linked` returns there.
+    #[test]
+    fn an_ordinary_checkout_context_says_nothing_about_durable_output() {
+        let c = compose_orchestrator_context(&config(), None, Attendance::Attended, None);
+        assert!(!c.contains("## Durable output"));
+    }
+
+    /// The section must not teach the orchestrator to relocate the coordination
+    /// files: a task file is consumed by the worker that reads it and a
+    /// work-done report travels back over the wire, so both are meant to be
+    /// transient. Without this sentence "durable things go over there" reads as
+    /// an instruction to move everything.
+    #[test]
+    fn the_durable_output_section_exempts_the_coordination_files() {
+        let c = compose_orchestrator_context(
+            &config(),
+            None,
+            Attendance::Attended,
+            Some(std::path::Path::new("/home/dev/myproject")),
+        );
+        assert!(
+            c.contains("task files and work-done reports are meant to be transient"),
+            "the exemption is load-bearing, not decoration:\n{c}"
+        );
+    }
+
+    /// Issue #703's attendance read-back recognises the composer-owned TAIL of
+    /// the region before the task marker. The #550 section is inserted BEFORE
+    /// that tail precisely so it cannot break that `ends_with` — asserted here
+    /// rather than left to inspection, because the failure would be silent: a
+    /// dispatched orchestration re-arming with the ATTENDED text on compaction,
+    /// which is the gate #703 added being removed.
+    #[test]
+    fn the_durable_output_section_does_not_disturb_the_attendance_read_back() {
+        let main = Some(std::path::Path::new("/home/dev/myproject"));
+        for has_task in [None, Some("do the thing")] {
+            let c = compose_orchestrator_context(&config(), has_task, Attendance::Unattended, main);
+            let before_task = c.split(TASK_SECTION_MARKER).next().unwrap();
+            assert!(
+                before_task.ends_with(&composer_tail(has_task.is_some())),
+                "the section must sit before the composer tail, not after it (has_task={})",
+                has_task.is_some()
             );
         }
     }

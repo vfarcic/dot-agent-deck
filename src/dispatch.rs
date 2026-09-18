@@ -411,7 +411,21 @@ fn next_report_nonce() -> String {
 /// worktree nobody is watching. The probability of LLM-authored task text carrying
 /// those bytes is near zero and the behaviour is deliberately unchanged; what was
 /// missing was any note that the failure is total rather than partial.
-fn dispatch_prompt(task: &str, target: &crate::spawn::SpawnTarget, report_path: &str) -> String {
+///
+/// `main_worktree` is `Some` only when the unit's own directory is a LINKED
+/// worktree (issue #550) — which for a dispatch it always is, since `dispatch`
+/// cuts one per unit. It is interpolated as a literal for exactly the reason
+/// `report_path` is: an agent's file-writing tool does not go through a shell,
+/// so naming an environment variable here would have the unit create a
+/// directory called `$THE_VARIABLE`. `None` (an unresolvable repository) omits
+/// the paragraph rather than guessing a path — a unit told the wrong durable
+/// location writes there and nobody notices.
+fn dispatch_prompt(
+    task: &str,
+    target: &crate::spawn::SpawnTarget,
+    report_path: &str,
+    main_worktree: Option<&std::path::Path>,
+) -> String {
     if matches!(target, crate::spawn::SpawnTarget::Orchestration { .. }) {
         return task.to_string();
     }
@@ -443,6 +457,21 @@ fn dispatch_prompt(task: &str, target: &crate::spawn::SpawnTarget, report_path: 
          write it for someone who cannot see this pane: what you did, what the outcome was, \
          and anything they have to act on. Run it exactly once, when you are done."
     ));
+    // Issue #550: the report above travels back over the wire and is deleted, so
+    // it needs nowhere durable. Anything BIGGER than that does — the return edge
+    // carries bounded text, not an artifact — and this directory is a worktree
+    // that goes away. Stated only when we actually resolved the main checkout.
+    if let Some(main_worktree) = main_worktree {
+        prompt.push_str(&format!(
+            "\n\nYou are working in a linked git worktree, which is removed once this work \
+             lands — anything you leave in it goes with it, including the report file above \
+             (that one is fine: its contents travel back to the caller, which is why you \
+             delete it). If you need to leave behind something the report itself cannot \
+             carry — a large artifact, a generated file someone will open later — write it \
+             under the main checkout instead: {}",
+            main_worktree.display()
+        ));
+    }
     prompt
 }
 
@@ -567,6 +596,7 @@ pub async fn handle_dispatch(
         task,
         &resolved_target,
         &dispatch_report_path(name, &next_report_nonce()),
+        crate::worktree_owner::main_worktree_if_linked(&paths.worktree_dir).as_deref(),
     );
 
     let req = SpawnRequest {
@@ -1416,6 +1446,7 @@ mod tests {
             "Verify PR #232 and report back.",
             &crate::spawn::SpawnTarget::SingleAgent { command: None },
             ".dot-agent-deck/dispatch-report-verify-pr-99990000.md",
+            None,
         );
 
         assert!(
@@ -1447,6 +1478,56 @@ mod tests {
             !prompt.contains("<slug>"),
             "no filename placeholder may survive — a slug the model invents is a slug \
              nothing validates:\n{prompt}"
+        );
+    }
+
+    /// Issue #550: a dispatched unit works in a worktree `dispatch` cut for it,
+    /// so anything it leaves there goes when the worktree does. The report
+    /// above does not care — its contents travel back over the wire and the
+    /// file is deleted — but a LARGER artifact does, and the return edge carries
+    /// bounded text rather than files.
+    ///
+    /// Asserted as a literal path, never a variable name: an agent's
+    /// file-writing tool does not go through a shell, so `$SOME_VAR/out.txt`
+    /// makes a directory called `$SOME_VAR`. That is the whole reason this is
+    /// interpolated instead of exported.
+    #[test]
+    fn a_single_dispatch_prompt_names_the_main_checkout_as_a_literal_path() {
+        let prompt = dispatch_prompt(
+            "Verify PR #232 and report back.",
+            &crate::spawn::SpawnTarget::SingleAgent { command: None },
+            ".dot-agent-deck/dispatch-report-verify-pr-99990000.md",
+            Some(std::path::Path::new("/home/dev/myproject")),
+        );
+
+        assert!(
+            prompt.contains("/home/dev/myproject"),
+            "the unit must be handed the path itself:\n{prompt}"
+        );
+        assert!(
+            prompt.contains("linked git worktree"),
+            "and told why it matters, or it has no reason to use it:\n{prompt}"
+        );
+    }
+
+    /// Fail-closed, and the reason it matters more here than most places: a
+    /// unit told the WRONG durable location writes there and nobody notices.
+    /// `None` — an unresolvable repository — omits the paragraph rather than
+    /// guessing, exactly as `worktree_owner::main_worktree_if_linked` fails
+    /// closed upstream of it.
+    #[test]
+    fn a_single_dispatch_prompt_says_nothing_when_the_checkout_is_unresolvable() {
+        let prompt = dispatch_prompt(
+            "Verify PR #232 and report back.",
+            &crate::spawn::SpawnTarget::SingleAgent { command: None },
+            ".dot-agent-deck/dispatch-report-verify-pr-99990000.md",
+            None,
+        );
+
+        assert!(!prompt.contains("linked git worktree"));
+        assert!(
+            prompt.contains("work-done --done"),
+            "the rest of the prompt is unaffected:\n{prompt}"
         );
     }
 
@@ -1542,6 +1623,7 @@ mod tests {
                 "Verify PR #232 and report back.",
                 &target,
                 ".dot-agent-deck/dispatch-report-demo-orch-99990001.md",
+                None,
             ),
             "Verify PR #232 and report back.",
             "an orchestration's task rides into the composed context verbatim"
