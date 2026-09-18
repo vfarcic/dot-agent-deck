@@ -2,6 +2,7 @@ import { createContext, useCallback, useContext, useEffect, useId, useMemo, useR
 import { Blocks, Boxes, Columns3, LayoutList, Layers, Maximize2, Network, RefreshCw, RotateCcw, ShieldAlert, Sparkles, SquareTerminal, Wrench } from "lucide-react";
 import type { AgentSession, AgentStatus, ConnectionView, DeckRuntimeState, DeckView } from "../types";
 import { modeScopedKey } from "../lib/bridge";
+import { VOICE_ACTIONS } from "../lib/voiceActions";
 import { ConfirmDialog, type ConfirmState } from "./ConfirmDialog";
 import { DeckSelector } from "./DeckSelector";
 import type { DesktopSettingsState } from "../hooks/useDesktopSettings";
@@ -732,7 +733,14 @@ export function AgentOverview({ runtime, settings, onNavigate }: { runtime: Deck
    */
   const known = aggregate.decksUp > 0;
   const countOf = (status: AgentStatus) => aggregate.counts.find((entry) => entry.status === status)?.count ?? 0;
-  const openDeck = () => onNavigate({ kind: "deck" });
+  /**
+   * PRD #802 M2 — the overview's two rail buttons, its "Open deck" controls and
+   * its row-level open all dispatch through the action registry. The context is
+   * one member wide because that is all this screen can serve: the overlays, the
+   * selection and the fixture loop belong to `DeckSurface`.
+   */
+  const voiceContext = useMemo(() => ({ navigate: onNavigate }), [onNavigate]);
+  const openDeck = () => VOICE_ACTIONS.openDeck.run(voiceContext);
   /**
    * PRD #1105 M5 — the overview's entry point into an agent's pane.
    *
@@ -751,7 +759,7 @@ export function AgentOverview({ runtime, settings, onNavigate }: { runtime: Deck
    * deck; see {@link OpenAgentContext}.
    */
   const openAgent = useCallback((agent: OverviewAgent) => {
-    onNavigate({ kind: "agent", deckId: agent.daemonId, agentId: agent.id, from: "overview" });
+    VOICE_ACTIONS.openAgent.run({ navigate: onNavigate }, { deckId: agent.daemonId, agentId: agent.id, from: "overview" });
   }, [onNavigate]);
   const [confirm, setConfirm] = useState<ConfirmState>();
   const [overrideError, setOverrideError] = useState<string>();
@@ -798,7 +806,7 @@ export function AgentOverview({ runtime, settings, onNavigate }: { runtime: Deck
         <div className="brand-mark" aria-label="Agent Deck"><span>AD</span><i aria-hidden="true" /></div>
         <nav>
           <OverviewRailButton icon={SquareTerminal} label="Deck" onClick={openDeck} testId="open-deck" />
-          <OverviewRailButton icon={LayoutList} label="Overview" active onClick={() => onNavigate({ kind: "overview" })} testId="open-overview" />
+          <OverviewRailButton icon={LayoutList} label="Overview" active onClick={() => VOICE_ACTIONS.openOverview.run(voiceContext)} testId="open-overview" />
         </nav>
         <div className="rail-bottom">
           <span className={`connection-lamp connection-${connection.status}`} title={connection.message ? displayText(connection.message, DISPLAY_LIMITS.message) : undefined} />

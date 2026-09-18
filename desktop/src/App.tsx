@@ -51,6 +51,7 @@ import { useInertBackground } from "./hooks/useInertBackground";
 import { useShownTerminals } from "./hooks/useShownTerminals";
 import { useZoom } from "./hooks/useZoom";
 import { agentKey } from "./lib/agentKey";
+import { VOICE_ACTIONS, type DeckOverlay, type VoiceActionContext } from "./lib/voiceActions";
 import { unreachableDeckTerminalState } from "./lib/terminalInput";
 import { applyAppearance } from "./lib/appearance";
 import { desktopWorkflowPlatformIssue } from "./lib/platform";
@@ -152,6 +153,21 @@ export function DeckShell({ runtime, workflowPlatformIssue, initialView = { kind
    */
   const closeAgent = useCallback(() => setView((current) => (current.kind === "agent" ? { kind: current.from } : current)), []);
   /**
+   * PRD #802 M2 — the same close, dispatched through the action registry.
+   *
+   * `closeAgent` itself stays, and the split is deliberate: the two effects
+   * below close the view because its SUBJECT has gone (the selected deck moved,
+   * the daemon ended the agent), which is an invariant the app maintains rather
+   * than an action anybody asked for. The registry is the dispatch seam for
+   * things a user — or voice — does, and closing a view nobody asked to close
+   * is not one of them.
+   *
+   * The deck's own Close button is NOT routed here: {@link DeckSurface} builds
+   * its own context and dispatches there, so routing it here as well would put
+   * two dispatches on one click.
+   */
+  const closeAgentView = useCallback(() => VOICE_ACTIONS.closeAgentView.run({ closeAgentView: closeAgent }), [closeAgent]);
+  /**
    * `Escape`, bound at `window` because the pane has no single focusable owner
    * — focus is usually inside xterm's helper textarea, which swallows keys
    * before React sees them.
@@ -174,11 +190,11 @@ export function DeckShell({ runtime, workflowPlatformIssue, initialView = { kind
   useEffect(() => {
     if (!agentView) return;
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape") closeAgent();
+      if (event.key === "Escape") closeAgentView();
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [agentView, closeAgent]);
+  }, [agentView, closeAgentView]);
   const base = agentView?.from ?? view.kind;
   const selectedDeckId = runtime.snapshot.connection.deckId;
   /** The fleet entry the open pane's agent lives on, if the app is observing it. */
@@ -365,7 +381,7 @@ export function DeckShell({ runtime, workflowPlatformIssue, initialView = { kind
           one live `TerminalViewport` for the agent, which is the property M3
           actually requires.
         */}
-        {agentView && paneDeck && paneAgent && <OverviewAgentPane runtime={runtime} view={agentView} deck={paneDeck} agent={paneAgent} attached={paneDeckAttachable} onClose={closeAgent} />}
+        {agentView && paneDeck && paneAgent && <OverviewAgentPane runtime={runtime} view={agentView} deck={paneDeck} agent={paneAgent} attached={paneDeckAttachable} onClose={closeAgentView} />}
       </>
     );
   }
@@ -809,6 +825,43 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
     setTerminalFocus((current) => ({ agentId, token: (current?.token ?? 0) + 1 }));
   };
 
+  /**
+   * PRD #802 M2 — the deck's half of the action registry's context, and the one
+   * place the rail buttons, the palette entries and the tile's open/close pair
+   * reach their state from.
+   *
+   * A `Record<DeckOverlay, …>` rather than a switch, so adding an overlay to the
+   * union is a type error here rather than a silently unreachable case. Each
+   * setter is React's own and therefore stable, which is what makes it safe for
+   * the `window` keydown effect below to close over the first render's copy.
+   */
+  const overlaySetters: Record<DeckOverlay, (open: boolean) => void> = {
+    projects: setProjectsOpen,
+    prompts: setPromptsOpen,
+    profiles: setProfilesOpen,
+    workflow: setWorkflowOpen,
+    settings: setSettingsOpen,
+  };
+  const closeOverlays = () => Object.values(overlaySetters).forEach((setOpen) => setOpen(false));
+  /**
+   * **`onNavigate` and `onCloseAgent` stay optional here rather than in the
+   * registry.** Both have been optional props since PRD #1105, so a deck
+   * mounted without them renders and its Overview button does nothing — the
+   * behaviour this move must not change. Deciding what an absent prop means is
+   * the host's job; the registry's job is that there is one dispatch site per
+   * capability.
+   */
+  const voiceContext: VoiceActionContext = {
+    navigate: (view) => onNavigate?.(view),
+    closeAgentView: () => onCloseAgent?.(),
+    openOverlay: (overlay) => overlaySetters[overlay](true),
+    closeOverlays,
+    toggleEvidence: () => setEvidenceOpen((open) => !open),
+    selectAgent: setSelectedAgentId,
+    focusTerminal,
+    advanceFixture: () => { void perform({ type: "advance_fixture" }); },
+  };
+
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") {
@@ -817,7 +870,11 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
         return;
       }
       if (event.key === "Escape") {
-        setPaletteOpen(false); setHelpOpen(false); setProjectsOpen(false); setProfilesOpen(false); setPromptsOpen(false); setWorkflowOpen(false); setSettingsOpen(false); setConfirm(undefined);
+        // Not a registry dispatch, and the distinction is worth keeping: this
+        // is a blanket DISMISSAL — palette, shortcut sheet, confirm dialog and
+        // every overlay at once — rather than the Runs control, which shows the
+        // deck. It shares `closeOverlays` so the five setters are written once.
+        setPaletteOpen(false); setHelpOpen(false); closeOverlays(); setConfirm(undefined);
         return;
       }
       // Asked here rather than at the top, because the two branches above do not
@@ -831,7 +888,12 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
       if (event.key === "?") { event.preventDefault(); setHelpOpen(true); return; }
       if (/^[1-4]$/.test(event.key)) {
         const agent = snapshot.agents[Number(event.key) - 1];
-        if (agent) setSelectedAgentId(agent.id);
+        // Through the registry, because this is the SAME capability the
+        // palette's `Focus <role>` entries dispatch and a second path to one
+        // capability is what PRD #802's first risk is about. Safe from the
+        // listener's stale `voiceContext` because `selectAgent` is React's own
+        // setter — every member this handler reaches has to stay that way.
+        if (agent) VOICE_ACTIONS.focusAgent.run(voiceContext, { agentId: agent.id });
       }
       if ((event.key === "j" || event.key === "k") && snapshot.evidence.length) {
         const current = Math.max(0, snapshot.evidence.findIndex((item) => item.id === selectedEvidenceId));
@@ -1048,16 +1110,23 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
     setNotice(undefined);
   };
 
+  /**
+   * PRD #802 M2: every entry dispatches through `VOICE_ACTIONS` rather than
+   * calling a setter of its own. The two generated groups register the KIND and
+   * not the instance — one `focusAgent` entry taking the agent as a parameter,
+   * however many agents the snapshot holds — because a guard cannot enumerate a
+   * registry key per live agent.
+   */
   const commandItems = [
-    ...(coordinator ? [{ label: "Message coordinator…", hint: `Focus ${coordinator.displayName}'s terminal`, icon: Send, run: () => focusTerminal(coordinator.id) }] : []),
-    { label: "Manage projects", hint: "Choose repositories & workflows", icon: FolderGit2, run: () => setProjectsOpen(true) },
-    { label: "Open prompt library", hint: "Reusable workflow launch prompts", icon: BookMarked, run: () => setPromptsOpen(true) },
-    { label: "Open agent profiles", hint: "Configure models & permissions", icon: Bot, run: () => setProfilesOpen(true) },
-    { label: "Edit workflow order", hint: "Enable, skip, or reorder roles", icon: Network, run: () => setWorkflowOpen(true) },
-    { label: "Open settings", hint: "Appearance and other app preferences", icon: Settings2, run: () => setSettingsOpen(true) },
-    { label: evidenceOpen ? "Hide evidence drawer" : "Show evidence drawer", hint: "Toggle transition evidence", icon: PanelRight, run: () => setEvidenceOpen((open) => !open) },
-    ...snapshot.agents.map((agent, index) => ({ label: `Focus ${agent.role}`, hint: `Shortcut ${index + 1}`, icon: SquareTerminal, run: () => setSelectedAgentId(agent.id) })),
-    ...(mode === "fixture" ? [{ label: "Advance fixture", hint: "Move the deterministic loop one node", icon: Zap, run: () => { void perform({ type: "advance_fixture" }); } }] : []),
+    ...(coordinator ? [{ label: "Message coordinator…", hint: `Focus ${coordinator.displayName}'s terminal`, icon: Send, run: () => VOICE_ACTIONS.messageCoordinator.run(voiceContext, { agentId: coordinator.id }) }] : []),
+    { label: "Manage projects", hint: "Choose repositories & workflows", icon: FolderGit2, run: () => VOICE_ACTIONS.openProjects.run(voiceContext) },
+    { label: "Open prompt library", hint: "Reusable workflow launch prompts", icon: BookMarked, run: () => VOICE_ACTIONS.openPromptLibrary.run(voiceContext) },
+    { label: "Open agent profiles", hint: "Configure models & permissions", icon: Bot, run: () => VOICE_ACTIONS.openAgentProfiles.run(voiceContext) },
+    { label: "Edit workflow order", hint: "Enable, skip, or reorder roles", icon: Network, run: () => VOICE_ACTIONS.openWorkflowOrder.run(voiceContext) },
+    { label: "Open settings", hint: "Appearance and other app preferences", icon: Settings2, run: () => VOICE_ACTIONS.openSettings.run(voiceContext) },
+    { label: evidenceOpen ? "Hide evidence drawer" : "Show evidence drawer", hint: "Toggle transition evidence", icon: PanelRight, run: () => VOICE_ACTIONS.toggleEvidenceDrawer.run(voiceContext) },
+    ...snapshot.agents.map((agent, index) => ({ label: `Focus ${agent.role}`, hint: `Shortcut ${index + 1}`, icon: SquareTerminal, run: () => VOICE_ACTIONS.focusAgent.run(voiceContext, { agentId: agent.id }) })),
+    ...(mode === "fixture" ? [{ label: "Advance fixture", hint: "Move the deterministic loop one node", icon: Zap, run: () => VOICE_ACTIONS.advanceFixture.run(voiceContext) }] : []),
   ];
 
   return (
@@ -1065,14 +1134,15 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
       <aside className="rail" aria-label="Primary navigation">
         <div className="brand-mark" aria-label="Agent Deck"><span>AD</span><i aria-hidden="true" /></div>
         <nav>
-          <RailButton icon={FolderGit2} label="Projects" active={projectsOpen} onClick={() => setProjectsOpen(true)} testId="open-projects" />
-          <RailButton icon={Activity} label="Runs" active={!projectsOpen && !workflowOpen && !profilesOpen && !promptsOpen && !settingsOpen} onClick={() => { setProjectsOpen(false); setWorkflowOpen(false); setProfilesOpen(false); setPromptsOpen(false); setSettingsOpen(false); }} />
+          {/* PRD #802 M2: every one of these dispatches through the action registry. */}
+          <RailButton icon={FolderGit2} label="Projects" active={projectsOpen} onClick={() => VOICE_ACTIONS.openProjects.run(voiceContext)} testId="open-projects" />
+          <RailButton icon={Activity} label="Runs" active={!projectsOpen && !workflowOpen && !profilesOpen && !promptsOpen && !settingsOpen} onClick={() => VOICE_ACTIONS.showRuns.run(voiceContext)} />
           {/* The one rail button that is a real view rather than an overlay toggle. */}
-          <RailButton icon={LayoutList} label="Overview" onClick={() => onNavigate?.({ kind: "overview" })} testId="open-overview" />
-          <RailButton icon={BookMarked} label="Prompts" active={promptsOpen} onClick={() => setPromptsOpen(true)} testId="open-prompts" />
-          <RailButton icon={Network} label="Workflows" active={workflowOpen} onClick={() => setWorkflowOpen(true)} />
-          <RailButton icon={Bot} label="Agent Profiles" active={profilesOpen} onClick={() => setProfilesOpen(true)} testId="open-agent-profiles" />
-          <RailButton icon={Settings2} label="Settings" active={settingsOpen} onClick={() => setSettingsOpen(true)} testId="open-settings" />
+          <RailButton icon={LayoutList} label="Overview" onClick={() => VOICE_ACTIONS.openOverview.run(voiceContext)} testId="open-overview" />
+          <RailButton icon={BookMarked} label="Prompts" active={promptsOpen} onClick={() => VOICE_ACTIONS.openPromptLibrary.run(voiceContext)} testId="open-prompts" />
+          <RailButton icon={Network} label="Workflows" active={workflowOpen} onClick={() => VOICE_ACTIONS.openWorkflowOrder.run(voiceContext)} />
+          <RailButton icon={Bot} label="Agent Profiles" active={profilesOpen} onClick={() => VOICE_ACTIONS.openAgentProfiles.run(voiceContext)} testId="open-agent-profiles" />
+          <RailButton icon={Settings2} label="Settings" active={settingsOpen} onClick={() => VOICE_ACTIONS.openSettings.run(voiceContext)} testId="open-settings" />
         </nav>
         <div className="rail-bottom">
           <button aria-label="Keyboard shortcuts" title="Keyboard shortcuts" onClick={() => setHelpOpen(true)}><Keyboard size={18} /></button>
@@ -1236,11 +1306,8 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
                     `.agent-tile:not(.is-selected) { display: none }` for the
                     promoted tile without relying on a specificity race.
                   */
-                  onOpen={onNavigate && (() => {
-                    setSelectedAgentId(agent.id);
-                    onNavigate({ kind: "agent", deckId: agent.daemonId, agentId: agent.id, from: "deck" });
-                  })}
-                  onClose={onCloseAgent}
+                  onOpen={onNavigate && (() => VOICE_ACTIONS.openAgent.run(voiceContext, { deckId: agent.daemonId, agentId: agent.id, from: "deck" }))}
+                  onClose={onCloseAgent && (() => VOICE_ACTIONS.closeAgentView.run(voiceContext))}
                 />
               ))}
             </div>
