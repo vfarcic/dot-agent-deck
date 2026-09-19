@@ -3131,6 +3131,47 @@ fn arm_delegate_silence_watch(
     });
 }
 
+/// Issue #1031 (Greptile P1 on PR #1168): may a late-readiness submit recovery be
+/// armed over the bytes this write outcome left in the worker's input box?
+///
+/// **Only `Applied`, and the distinction from `dispatch_one_owned`'s `delivered`
+/// flag is the whole content of this function.** `delivered` is `true` for
+/// `Ambiguous` too, deliberately, because it answers "may the worker have got
+/// this?" — the question the commission ledger and the silence watch ask, where a
+/// partial write has to stay owed. The recovery asks whether the COMPLETE pointer
+/// is in that box, because its whole effect is a blind CR that submits whatever
+/// is. `Ambiguous` means the payload started and the sequence did not finish, so
+/// the box may hold a prefix (`Read .dot-agent-deck/worker-ta`) and a probe would
+/// submit that as a turn.
+///
+/// The operator-input guard under the write cannot cover this — it refuses once
+/// the OPERATOR has typed since our write, and a truncated pointer is the
+/// daemon's own bytes — so the outcome has to.
+///
+/// Named and exhaustively tested rather than inlined as a `matches!`, because it
+/// is a two-value decision whose SECOND value is a security-shaped one: a future
+/// variant must be classified deliberately instead of falling into whichever side
+/// a `!=` happened to put it on.
+fn outcome_leaves_the_whole_pointer_for_a_later_submit(
+    outcome: Option<crate::agent_pty::GuardedSend>,
+) -> bool {
+    match outcome {
+        // The payload AND its submit CR were written to the authorized target.
+        // That the agent may not have INTERPRETED the CR as submit is the whole of
+        // issue #1031, and is what leaves the complete pointer recoverable.
+        Some(crate::agent_pty::GuardedSend::Applied) => true,
+        // A partial write: the box may hold a prefix of the pointer. See above.
+        Some(crate::agent_pty::GuardedSend::Ambiguous) => false,
+        // Nothing was written at all, so there is nothing to submit.
+        Some(crate::agent_pty::GuardedSend::WrongSession)
+        | Some(crate::agent_pty::GuardedSend::Stale)
+        | Some(crate::agent_pty::GuardedSend::NoLiveTarget) => false,
+        // The write itself errored, or was never attempted because no worker
+        // identity resolved. Either way the box's contents are unknown to us.
+        None => false,
+    }
+}
+
 /// Issue #1031: act on a `SessionStart` that arrives AFTER the readiness gate
 /// gave up, instead of discarding the one piece of positive evidence the daemon
 /// gets that it wrote too early.
@@ -3235,7 +3276,12 @@ fn arm_delegate_silence_watch(
 /// It is deliberately NOT cancelled by `work-done`: a completion proves the
 /// pointer landed, which means a turn began, which means the proof arm above
 /// already returned. A `work-done` from a worker that emitted nothing at all
-/// leaves a probe into an empty composer, which is not a turn.
+/// leaves a probe over a box that holds no task of ours.
+///
+/// **It is armed only over a write whose outcome was `Applied`**, never over the
+/// broader "may the worker have got this?" the commission ledger and the silence
+/// watch use — see [`outcome_leaves_the_whole_pointer_for_a_later_submit`], which
+/// is where that distinction and its cost live.
 ///
 /// **The stale-event hazard #1031 names second needs no new machinery, and
 /// claiming otherwise would be inventing work.** Attempt 2's log shows the
@@ -6267,10 +6313,29 @@ async fn dispatch_one_owned(
     // switch — the exact coupling that knob's own doc comment exists to forbid —
     // and would have left the mechanism unexercised by every e2e lane.
     //
-    // Only when something was delivered: a refused write left no bytes in the
-    // worker's box, so there is nothing a later submit could submit, and the
-    // commission has already been released above.
-    if delivered
+    // Gated on `Applied`, and NOT on `delivered` — Greptile P1 on PR #1168, and the
+    // two disagree on exactly the outcome that makes a blind CR dangerous.
+    //
+    // `delivered` is deliberately `true` for `Ambiguous` as well, because that
+    // answers "may the worker have got this?" — the question the commission and
+    // the silence watch are asking, where a partial write has to stay owed. This
+    // recovery asks a different one: "is the COMPLETE pointer sitting in that
+    // input box?", and only `Applied` answers yes. An `Ambiguous` write started
+    // the payload and did not finish the sequence, so the box may hold a PREFIX —
+    // `Read .dot-agent-deck/worker-ta` — and a probe would submit that truncated
+    // text as a turn. Issue #876's drain erases a recoverable partial write back
+    // out, which makes the box clean rather than the claim safe: what reaches here
+    // is precisely the residual it could not undo, above all a PTY whose slave has
+    // gone, and that is the case where the stranded prefix really is still there.
+    //
+    // The user-input guard cannot cover this, which is why the outcome has to: it
+    // refuses a probe once the OPERATOR has typed since our write, and these bytes
+    // are the daemon's own.
+    //
+    // A refusal (`Stale`, `WrongSession`, `NoLiveTarget`, `RefusedUserInput`) wrote
+    // nothing at all, so there is likewise nothing a later submit could submit, and
+    // the commission has already been released above.
+    if outcome_leaves_the_whole_pointer_for_a_later_submit(submit_outcome)
         && let (Some(rearm), Some(rx), Some(worker_agent_id)) = (
             late_readiness_rearm,
             late_readiness_rx,
@@ -11813,6 +11878,50 @@ mod tests {
 
     /// PRD #249 M3: with no override set, the no-event window still follows the
     /// idle detector's knob — `0` means "report nothing" — but is capped, because
+    /// Issue #1031 (Greptile P1 on PR #1168): the late-readiness submit recovery is
+    /// armed over `Applied` and over NOTHING else, enumerated so a future
+    /// [`crate::agent_pty::GuardedSend`] variant has to be classified rather than
+    /// inheriting a side.
+    ///
+    /// `Ambiguous` is the one that matters and the one an `if delivered` got wrong:
+    /// `dispatch_one_owned` deliberately counts it as delivered, because the worker
+    /// MAY have got the pointer and the commission has to stay owed — but a partial
+    /// write can leave a PREFIX in the input box, and this recovery's whole effect
+    /// is a blind CR that would submit that prefix as a turn.
+    #[test]
+    fn late_readiness_recovery_is_armed_only_over_a_complete_written_pointer() {
+        use crate::agent_pty::GuardedSend;
+
+        assert!(
+            outcome_leaves_the_whole_pointer_for_a_later_submit(Some(GuardedSend::Applied)),
+            "`Applied` wrote the payload AND its submit CR to the authorized target; that the \
+             booting agent swallowed the CR is issue #1031 itself, and it is the one outcome \
+             that leaves the complete pointer recoverable"
+        );
+        assert!(
+            !outcome_leaves_the_whole_pointer_for_a_later_submit(Some(GuardedSend::Ambiguous)),
+            "a partial write may have left only a PREFIX of the pointer in the worker's input \
+             box, and a blind CR would submit that truncated text as a turn — this is the one \
+             outcome on which the recovery's question and `delivered`'s disagree"
+        );
+        for refused in [
+            GuardedSend::WrongSession,
+            GuardedSend::Stale,
+            GuardedSend::NoLiveTarget,
+        ] {
+            assert!(
+                !outcome_leaves_the_whole_pointer_for_a_later_submit(Some(refused)),
+                "{refused:?} wrote no bytes at all, so there is nothing for a later submit to \
+                 submit"
+            );
+        }
+        assert!(
+            !outcome_leaves_the_whole_pointer_for_a_later_submit(None),
+            "the write errored or was never attempted for want of a resolved worker identity; \
+             either way the box's contents are unknown and a blind CR is not a recovery"
+        );
+    }
+
     /// "this worker has emitted nothing at all" is a diagnosis that is useless two
     /// hours late.
     #[test]
