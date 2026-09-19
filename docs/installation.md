@@ -14,12 +14,43 @@ title: Installation
 | Windows (via WSL) | Supported (runs as Linux) |
 | Windows (native) | Not yet — the daemon still reports `Unsupported` on Windows and there is no `.exe` in the release artifacts. Progress is tracked in [#164](https://github.com/vfarcic/dot-agent-deck/issues/164); comment there if you need this. |
 
+## Choose an install method
+
+| Method | Best for |
+|---|---|
+| [Homebrew](#homebrew-macos--linux) | macOS or Linux, if you already use `brew` |
+| [Download a binary](#download-binary) | anywhere, with no package manager |
+| [Nix](#nix) | Nix, NixOS and home-manager users |
+| [Build from source](#build-from-source) | contributors, or a platform with no published build |
+
+Any of them gets you the same binary; skip to whichever suits you.
+
 ## Homebrew (macOS / Linux)
 
 ```bash
 brew tap vfarcic/tap
 brew install dot-agent-deck
 ```
+
+## Download Binary
+
+The binary for your platform, straight from the [latest release](https://github.com/vfarcic/dot-agent-deck/releases/latest) — no package manager required. Assets are named `dot-agent-deck-<os>-<arch>`:
+
+| Platform | Asset |
+|---|---|
+| Linux, Intel/AMD | `dot-agent-deck-linux-amd64` |
+| Linux, ARM | `dot-agent-deck-linux-arm64` |
+| macOS, Intel | `dot-agent-deck-darwin-amd64` |
+| macOS, Apple Silicon | `dot-agent-deck-darwin-arm64` |
+
+Make it executable and put it somewhere on your `PATH`:
+
+```bash
+chmod +x dot-agent-deck-linux-amd64
+mv dot-agent-deck-linux-amd64 ~/.local/bin/dot-agent-deck
+```
+
+`~/.local/bin` is not on `PATH` on every distribution — add `export PATH="$HOME/.local/bin:$PATH"` to your shell rc if `dot-agent-deck --help` comes back "command not found". On macOS, if the binary is refused because it was downloaded from the internet, clear the quarantine flag with `xattr -d com.apple.quarantine dot-agent-deck`.
 
 ## Nix
 
@@ -119,10 +150,6 @@ dot-agent-deck hooks install
 ### Contributing?
 
 `nix develop` is a consumer-oriented shell carrying just the Rust toolchain; contributors should use devbox instead, which pins the toolchain version and ships the recording and docs tooling the test suites need.
-
-## Download Binary
-
-Download the latest binary for your platform from the [Releases](https://github.com/vfarcic/dot-agent-deck/releases/latest) page. Binaries are available for Linux (amd64, arm64) and macOS (amd64, arm64).
 
 ## Build from Source
 
