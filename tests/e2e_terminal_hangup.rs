@@ -22,6 +22,12 @@
 //! Lane 1 — no credential and no real agent: the deck is launched with no panes
 //! at all, because the hangup is a property of the event loop rather than of
 //! anything running under it.
+//!
+//! **Linux only in practice.** Nothing `cfg`s this off for macOS, but no macOS
+//! job enables the `e2e` feature — `e2e-deterministic` is a Linux job — so the
+//! real-binary path is exercised there only by a developer running it. The L1
+//! tests in `crate::terminal_hangup` are what `build-macos` runs, and they are
+//! what caught Apple's `poll` reporting no hangup for an unrequested event.
 
 mod common;
 
