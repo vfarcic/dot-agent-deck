@@ -3,11 +3,12 @@
 mod common;
 
 use std::fs;
-use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use common::TuiDeck;
+use dot_agent_deck::platform::paths::TEST_LEGACY_ENDPOINT_ROOT_ENV;
 use spec::spec;
 
 const DASHBOARD_EMPTY_STATE: &str = "No active sessions";
@@ -33,52 +34,94 @@ impl EndpointPaths {
     }
 }
 
-struct LegacyEndpointClaim {
+struct LegacyEndpointPaths {
+    root: PathBuf,
     hook: PathBuf,
     attach: PathBuf,
 }
 
-impl LegacyEndpointClaim {
-    fn take() -> Self {
+impl LegacyEndpointPaths {
+    fn under(root: &Path) -> Self {
         let uid = current_uid();
-        let claim = Self {
-            hook: PathBuf::from(format!("/tmp/dot-agent-deck-{uid}.sock")),
-            attach: PathBuf::from(format!("/tmp/dot-agent-deck-attach-{uid}.sock")),
-        };
-        for endpoint in [&claim.hook, &claim.attach] {
-            assert!(
-                matches!(
-                    fs::symlink_metadata(endpoint),
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound
-                ),
-                "legacy endpoint {} must be absent before this isolated scenario starts",
-                endpoint.display()
-            );
+        Self {
+            root: root.to_path_buf(),
+            hook: root.join(format!("dot-agent-deck-{uid}.sock")),
+            attach: root.join(format!("dot-agent-deck-attach-{uid}.sock")),
         }
-        claim
-    }
-
-    fn clear_entries(&self) -> Result<(), String> {
-        for endpoint in [&self.hook, &self.attach] {
-            match fs::remove_file(endpoint) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => {
-                    return Err(format!(
-                        "remove claimed legacy endpoint {}: {error}",
-                        endpoint.display()
-                    ));
-                }
-            }
-        }
-        Ok(())
     }
 }
 
-impl Drop for LegacyEndpointClaim {
-    fn drop(&mut self) {
-        if let Err(error) = self.clear_entries() {
-            eprintln!("[endpoint-fallback-test] {error}");
+#[derive(Debug, Eq, PartialEq)]
+enum EndpointSnapshot {
+    Missing,
+    Present {
+        device: u64,
+        inode: u64,
+        mode: u32,
+        links: u64,
+        uid: u32,
+        gid: u32,
+        rdev: u64,
+        size: u64,
+        modified_seconds: i64,
+        modified_nanoseconds: i64,
+        changed_seconds: i64,
+        changed_nanoseconds: i64,
+    },
+}
+
+impl EndpointSnapshot {
+    fn capture(path: &Path) -> Self {
+        match fs::symlink_metadata(path) {
+            Ok(metadata) => Self::Present {
+                device: metadata.dev(),
+                inode: metadata.ino(),
+                mode: metadata.mode(),
+                links: metadata.nlink(),
+                uid: metadata.uid(),
+                gid: metadata.gid(),
+                rdev: metadata.rdev(),
+                size: metadata.size(),
+                modified_seconds: metadata.mtime(),
+                modified_nanoseconds: metadata.mtime_nsec(),
+                changed_seconds: metadata.ctime(),
+                changed_nanoseconds: metadata.ctime_nsec(),
+            },
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Self::Missing,
+            Err(error) => panic!(
+                "inspect literal legacy endpoint {}: {error}",
+                path.display()
+            ),
+        }
+    }
+}
+
+struct LiteralLegacyEndpoints {
+    entries: [(PathBuf, EndpointSnapshot); 2],
+}
+
+impl LiteralLegacyEndpoints {
+    fn capture() -> Self {
+        let uid = current_uid();
+        let hook = PathBuf::from(format!("/tmp/dot-agent-deck-{uid}.sock"));
+        let attach = PathBuf::from(format!("/tmp/dot-agent-deck-attach-{uid}.sock"));
+        Self {
+            entries: [
+                (hook.clone(), EndpointSnapshot::capture(&hook)),
+                (attach.clone(), EndpointSnapshot::capture(&attach)),
+            ],
+        }
+    }
+
+    fn assert_unchanged(&self) {
+        for (path, before) in &self.entries {
+            let after = EndpointSnapshot::capture(path);
+            assert_eq!(
+                &after,
+                before,
+                "literal production endpoint {} changed during an isolated endpoint-fallback scenario",
+                path.display()
+            );
         }
     }
 }
@@ -89,10 +132,11 @@ fn current_uid() -> u32 {
     unsafe { libc::geteuid() }
 }
 
-fn launch_fallback_deck(temp_dir: &Path, log_path: &Path) -> TuiDeck {
+fn launch_fallback_deck(temp_dir: &Path, legacy: &LegacyEndpointPaths, log_path: &Path) -> TuiDeck {
     TuiDeck::builder()
         .without_endpoint_overrides()
         .with_env("TMPDIR", temp_dir.to_string_lossy())
+        .with_env(TEST_LEGACY_ENDPOINT_ROOT_ENV, legacy.root.to_string_lossy())
         .with_env("DOT_AGENT_DECK_LOG", log_path.to_string_lossy())
         .with_env("DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS", "30")
         .launch_with_fixture("minimal")
@@ -100,7 +144,7 @@ fn launch_fallback_deck(temp_dir: &Path, log_path: &Path) -> TuiDeck {
 
 fn inspect_new_endpoints(
     paths: &EndpointPaths,
-    legacy: &LegacyEndpointClaim,
+    legacy: &LegacyEndpointPaths,
     legacy_must_be_absent: bool,
 ) -> Vec<String> {
     let mut failures = Vec::new();
@@ -158,6 +202,7 @@ fn inspect_new_endpoints(
 
 fn stop_resolved_daemon(
     temp_dir: &Path,
+    legacy: &LegacyEndpointPaths,
     runtime_dir: Option<&Path>,
     home: &Path,
 ) -> Result<(), String> {
@@ -171,6 +216,7 @@ fn stop_resolved_daemon(
     command.env("HOME", home);
     command.env("TERM", "xterm-256color");
     command.env("TMPDIR", temp_dir);
+    command.env(TEST_LEGACY_ENDPOINT_ROOT_ENV, &legacy.root);
     if let Some(runtime_dir) = runtime_dir {
         command.env("XDG_RUNTIME_DIR", runtime_dir);
     }
@@ -190,20 +236,22 @@ fn stop_resolved_daemon(
     }
 }
 
-/// Scenario: Launch the real deck with an isolated `TMPDIR`, with `XDG_RUNTIME_DIR` and both endpoint overrides absent. The dashboard should render while the hook and attach sockets live inside a mode-0700 per-uid directory; a second launch with `XDG_RUNTIME_DIR` set should retain its established endpoint spellings.
+/// Scenario: Launch the real deck with isolated fallback and legacy roots, with `XDG_RUNTIME_DIR` and both endpoint overrides absent. The dashboard should render while the hook and attach sockets live inside a mode-0700 per-uid directory; a second launch with `XDG_RUNTIME_DIR` set should retain its established endpoint spellings, and neither launch should change the literal production legacy paths.
 #[spec("error/socket/009")]
 #[test]
 fn socket_009_fallback_endpoints_use_owner_only_uid_directory() {
-    let legacy = LegacyEndpointClaim::take();
+    let literal_legacy = LiteralLegacyEndpoints::capture();
     let temp = common::harness_tempdir().expect("create fallback TMPDIR");
+    let legacy_temp = common::harness_tempdir().expect("create isolated legacy endpoint root");
+    let legacy = LegacyEndpointPaths::under(legacy_temp.path());
     let paths = EndpointPaths::under(temp.path());
     let log = temp.path().join("daemon.log");
 
-    let deck = launch_fallback_deck(temp.path(), &log);
+    let deck = launch_fallback_deck(temp.path(), &legacy, &log);
     deck.wait_for_string(DASHBOARD_EMPTY_STATE);
     let mut failures = inspect_new_endpoints(&paths, &legacy, true);
     let home = deck.home_dir().to_path_buf();
-    if let Err(error) = stop_resolved_daemon(temp.path(), None, &home) {
+    if let Err(error) = stop_resolved_daemon(temp.path(), &legacy, None, &home) {
         failures.push(error);
     }
     drop(deck);
@@ -215,6 +263,7 @@ fn socket_009_fallback_endpoints_use_owner_only_uid_directory() {
     let xdg_deck = TuiDeck::builder()
         .without_endpoint_overrides()
         .with_env("TMPDIR", temp.path().to_string_lossy())
+        .with_env(TEST_LEGACY_ENDPOINT_ROOT_ENV, legacy.root.to_string_lossy())
         .with_env("XDG_RUNTIME_DIR", runtime.path().to_string_lossy())
         .with_env("DOT_AGENT_DECK_LOG", xdg_log.to_string_lossy())
         .with_env("DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS", "30")
@@ -234,11 +283,13 @@ fn socket_009_fallback_endpoints_use_owner_only_uid_directory() {
         }
     }
     let xdg_home = xdg_deck.home_dir().to_path_buf();
-    if let Err(error) = stop_resolved_daemon(temp.path(), Some(runtime.path()), &xdg_home) {
+    if let Err(error) = stop_resolved_daemon(temp.path(), &legacy, Some(runtime.path()), &xdg_home)
+    {
         failures.push(error);
     }
     drop(xdg_deck);
 
+    literal_legacy.assert_unchanged();
     assert!(
         failures.is_empty(),
         "fallback endpoints did not use the owner-only per-uid directory:\n{}",
@@ -246,17 +297,19 @@ fn socket_009_fallback_endpoints_use_owner_only_uid_directory() {
     );
 }
 
-/// Scenario: Plant a regular file at the literal legacy attach path, then launch the real deck with an isolated fallback `TMPDIR` and endpoint overrides absent. Startup should still reach the dashboard, bind both endpoints in the new per-uid directory, and leave the planted legacy file untouched.
+/// Scenario: Plant a regular file at an isolated legacy attach path, then launch the real deck with isolated fallback and legacy roots and endpoint overrides absent. Startup should still reach the dashboard, bind both endpoints in the new per-uid directory, leave the planted file untouched, and never change the literal production legacy paths.
 #[spec("error/socket/010")]
 #[test]
 fn socket_010_legacy_path_squatter_does_not_wedge_startup() {
-    let legacy = LegacyEndpointClaim::take();
+    let literal_legacy = LiteralLegacyEndpoints::capture();
+    let legacy_temp = common::harness_tempdir().expect("create isolated legacy endpoint root");
+    let legacy = LegacyEndpointPaths::under(legacy_temp.path());
     fs::write(&legacy.attach, LEGACY_SQUATTER_MARKER).expect("plant legacy attach-path file");
     let temp = common::harness_tempdir().expect("create fallback TMPDIR");
     let paths = EndpointPaths::under(temp.path());
     let log = temp.path().join("daemon.log");
 
-    let deck = launch_fallback_deck(temp.path(), &log);
+    let deck = launch_fallback_deck(temp.path(), &legacy, &log);
     deck.wait_for_string(DASHBOARD_EMPTY_STATE);
     let mut failures = inspect_new_endpoints(&paths, &legacy, false);
     match fs::read_to_string(&legacy.attach) {
@@ -270,11 +323,12 @@ fn socket_010_legacy_path_squatter_does_not_wedge_startup() {
         )),
     }
     let home = deck.home_dir().to_path_buf();
-    if let Err(error) = stop_resolved_daemon(temp.path(), None, &home) {
+    if let Err(error) = stop_resolved_daemon(temp.path(), &legacy, None, &home) {
         failures.push(error);
     }
     drop(deck);
 
+    literal_legacy.assert_unchanged();
     assert!(
         failures.is_empty(),
         "legacy-path squatter still affected fallback startup:\n{}",
@@ -282,16 +336,19 @@ fn socket_010_legacy_path_squatter_does_not_wedge_startup() {
     );
 }
 
-/// Scenario: Start the real daemon on the literal legacy hook and attach paths, then launch a fallback client with an isolated `TMPDIR` and endpoint overrides absent. The client should render through that daemon without a second lazy-spawn; after it exits, a fresh fallback launch should still bind the new primary endpoint pair.
+/// Scenario: Start the real daemon on isolated legacy hook and attach paths, then launch a fallback client with an isolated `TMPDIR` and endpoint overrides absent. The client should render through that daemon without a second lazy-spawn; after it exits, a fresh fallback launch should still bind the new primary pair, and the literal production legacy paths should remain unchanged.
 #[spec("error/socket/011")]
 #[test]
 fn socket_011_fallback_client_discovers_legacy_daemon_without_lazy_spawn() {
-    let legacy = LegacyEndpointClaim::take();
+    let literal_legacy = LiteralLegacyEndpoints::capture();
     let temp = common::harness_tempdir().expect("create fallback TMPDIR");
+    let legacy_temp = common::harness_tempdir().expect("create isolated legacy endpoint root");
+    let legacy = LegacyEndpointPaths::under(legacy_temp.path());
     let paths = EndpointPaths::under(temp.path());
     let log = temp.path().join("shared-daemon.log");
     let hook = legacy.hook.to_string_lossy().into_owned();
     let attach = legacy.attach.to_string_lossy().into_owned();
+    let legacy_root = legacy.root.to_string_lossy().into_owned();
     let log_value = log.to_string_lossy().into_owned();
     let daemon = common::spawn_daemon_serve_with_env(
         None,
@@ -299,12 +356,13 @@ fn socket_011_fallback_client_discovers_legacy_daemon_without_lazy_spawn() {
         &[
             ("DOT_AGENT_DECK_SOCKET", hook.as_str()),
             ("DOT_AGENT_DECK_ATTACH_SOCKET", attach.as_str()),
+            (TEST_LEGACY_ENDPOINT_ROOT_ENV, legacy_root.as_str()),
             ("DOT_AGENT_DECK_LOG", log_value.as_str()),
         ],
     );
     common::wait_for_file_contains(&log, "Attach protocol listening");
 
-    let deck = launch_fallback_deck(temp.path(), &log);
+    let deck = launch_fallback_deck(temp.path(), &legacy, &log);
     deck.wait_for_string(DASHBOARD_EMPTY_STATE);
     let records = common::agent_records_on(&legacy.attach);
     assert!(
@@ -326,19 +384,17 @@ fn socket_011_fallback_client_discovers_legacy_daemon_without_lazy_spawn() {
 
     drop(deck);
     drop(daemon);
-    legacy
-        .clear_entries()
-        .expect("remove stopped legacy daemon endpoints");
 
     let primary_log = temp.path().join("primary-daemon.log");
-    let primary = launch_fallback_deck(temp.path(), &primary_log);
+    let primary = launch_fallback_deck(temp.path(), &legacy, &primary_log);
     primary.wait_for_string(DASHBOARD_EMPTY_STATE);
-    let mut failures = inspect_new_endpoints(&paths, &legacy, true);
+    let mut failures = inspect_new_endpoints(&paths, &legacy, false);
     let home = primary.home_dir().to_path_buf();
-    if let Err(error) = stop_resolved_daemon(temp.path(), None, &home) {
+    if let Err(error) = stop_resolved_daemon(temp.path(), &legacy, None, &home) {
         failures.push(error);
     }
     drop(primary);
+    literal_legacy.assert_unchanged();
     assert!(
         failures.is_empty(),
         "fresh fallback launch after the legacy attach did not use the new primary endpoints:\n{}",

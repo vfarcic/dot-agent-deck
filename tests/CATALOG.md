@@ -2677,23 +2677,23 @@ without depending on the config struct API.
 ##### error/socket/009 — The fallback hook and attach endpoints live in an owner-only per-uid directory.
 - **Layer:** L2 (PTY + vt100 against the real TUI and its lazy-spawned daemon).
 - **Agent:** none.
-- **Asserts:** with an isolated `TMPDIR`, `XDG_RUNTIME_DIR` absent and both endpoint overrides absent, the dashboard renders; `<TMPDIR>/dot-agent-deck-<uid>` is a directory at mode `0o700`; `hook.sock` and `attach.sock` inside it are Unix sockets; neither the old attach spelling under that `TMPDIR` nor the literal legacy `/tmp/dot-agent-deck-attach-<uid>.sock` is created. A second real-binary launch with `XDG_RUNTIME_DIR` set asserts the established `dot-agent-deck.sock` and `dot-agent-deck-attach.sock` spellings remain Unix sockets directly under that directory.
+- **Asserts:** with isolated fallback and e2e-only legacy roots, `XDG_RUNTIME_DIR` absent and both endpoint overrides absent, the dashboard renders; `<TMPDIR>/dot-agent-deck-<uid>` is a directory at mode `0o700`; `hook.sock` and `attach.sock` inside it are Unix sockets; neither the old attach spelling under `TMPDIR` nor the redirected legacy attach spelling is created. A second real-binary launch with `XDG_RUNTIME_DIR` set asserts the established `dot-agent-deck.sock` and `dot-agent-deck-attach.sock` spellings remain Unix sockets directly under that directory. Read-only before/after metadata snapshots assert that both literal `/tmp/dot-agent-deck[-attach]-<uid>.sock` production paths remain exactly as the test found them.
 - **Does not assert:** the operator-facing error when the per-uid directory is untrusted; Windows named-pipe resolution.
 - **Platform coverage:** mac+linux (Unix-domain sockets and Unix permission bits).
 
-##### error/socket/010 — An entry squatting the literal legacy attach path no longer wedges fallback startup.
+##### error/socket/010 — An entry squatting the legacy attach path no longer wedges fallback startup.
 - **Layer:** L2 (PTY + vt100 against the real TUI and its lazy-spawned daemon).
 - **Agent:** none.
-- **Asserts:** with a regular file pre-planted at `/tmp/dot-agent-deck-attach-<uid>.sock`, an isolated `TMPDIR`, `XDG_RUNTIME_DIR` absent and both endpoint overrides absent, the dashboard renders and both sockets bind inside the new per-uid directory; the planted file remains byte-identical, proving the compatibility probe did not unlink it.
+- **Asserts:** with a regular file pre-planted at `<isolated-legacy-root>/dot-agent-deck-attach-<uid>.sock`, an isolated `TMPDIR`, `XDG_RUNTIME_DIR` absent and both endpoint overrides absent, the dashboard renders and both sockets bind inside the new per-uid directory; the planted file remains byte-identical, proving the compatibility probe did not unlink it. Read-only before/after metadata snapshots assert that both literal `/tmp/dot-agent-deck[-attach]-<uid>.sock` production paths remain exactly as the test found them.
 - **Does not assert:** the foreign-uid squatter arm, because the test has no second uid; the exact diagnostic for an untrusted new per-uid directory; Windows named-pipe behavior.
-- **Platform coverage:** mac+linux (Unix-domain sockets and the literal legacy Unix path).
+- **Platform coverage:** mac+linux (Unix-domain sockets and the e2e-only legacy-root seam).
 
-##### error/socket/011 — A daemon listening at the literal legacy path is discovered without a second lazy-spawn.
-- **Layer:** L2 (PTY + vt100 client against a real headless daemon process bound through explicit endpoint overrides at the legacy paths).
+##### error/socket/011 — A daemon listening at the legacy path is discovered without a second lazy-spawn.
+- **Layer:** L2 (PTY + vt100 client against a real headless daemon process bound through explicit endpoint overrides at isolated legacy paths).
 - **Agent:** none.
-- **Asserts:** a fallback client with an isolated `TMPDIR`, `XDG_RUNTIME_DIR` absent and both endpoint overrides absent renders the dashboard through the daemon already listening at the legacy path; a real `ListAgents` probe succeeds there; the new endpoint pair remains absent during that attach; the shared log contains one `Attach protocol listening` line. After that daemon stops, a fresh fallback launch binds the new primary endpoint pair in the owner-only per-uid directory, so the same test distinguishes legacy compatibility from continuing to use the legacy path as primary.
+- **Asserts:** a fallback client with isolated fallback and e2e-only legacy roots, `XDG_RUNTIME_DIR` absent and both endpoint overrides absent renders the dashboard through the daemon already listening at the redirected legacy path; a real `ListAgents` probe succeeds there; the new endpoint pair remains absent during that attach; the log shared by the pre-bound daemon and fallback deck contains exactly one `Attach protocol listening` line, making the no-second-spawn assertion non-vacuous. After that daemon stops, a fresh fallback launch binds the new primary endpoint pair in the owner-only per-uid directory despite the stale isolated legacy inode, so the same test distinguishes legacy compatibility from continuing to use the legacy path as primary. Read-only before/after metadata snapshots assert that both literal `/tmp/dot-agent-deck[-attach]-<uid>.sock` production paths remain exactly as the test found them.
 - **Does not assert:** behavior when live daemons answer at both the new and legacy paths; a cross-version build-id mismatch prompt; a foreign-owned legacy entry.
-- **Platform coverage:** mac+linux (Unix-domain sockets and the literal legacy Unix path).
+- **Platform coverage:** mac+linux (Unix-domain sockets and the e2e-only legacy-root seam).
 
 #### error/config
 
