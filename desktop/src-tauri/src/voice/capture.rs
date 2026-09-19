@@ -32,7 +32,12 @@
 //! # No audio is written to disk, and no log line carries a sample
 //!
 //! PRD #802's Open Question 5 is answered the same way for audio as for text:
-//! nothing persists. [`Pcm16`]'s [`fmt::Debug`] is written by hand and prints
+//! nothing persists. Audio is the one part of the pipeline where that claim
+//! needs no qualification at all — a buffer never leaves this process except as
+//! an upload to the transcription endpoint, and no child process is ever handed
+//! one. ([`super::Transcript`] carries the qualified version, which the
+//! agent-CLI intent backend's child needs.) [`Pcm16`]'s [`fmt::Debug`] is
+//! written by hand and prints
 //! a duration and no samples, so a derived `{:?}` on a type that *holds* one
 //! prints none either — the same closure [`super::Transcript`] applies to the
 //! text. That covers the careless route; the deliberate one is a rule, and the
@@ -818,9 +823,32 @@ struct SessionInner {
     state: CaptureState,
     /// Present exactly while `state` is [`CaptureState::Recording`].
     live: Option<Live>,
-    /// Bumped by every start, so a cap timer that fires after its own recording
-    /// has already been stopped ends nothing.
+    /// Bumped by every start and every cancel, so a cap timer that fires after
+    /// its own recording has already been stopped ends nothing — and so a
+    /// device that finishes opening after a cancel can tell that it did.
     generation: u64,
+    /// The generation an in-flight [`CaptureSession::start`] reserved before it
+    /// released the lock to open the device.
+    ///
+    /// **This is what makes cancellation observable across the open**, which is
+    /// the whole of PRD #802's audit blocker: `AudioSource::start` blocks on the
+    /// OS — a permission dialog, a slow audio server — and it cannot be called
+    /// under the lock without parking every status poll behind it. So the lock
+    /// is released, and a `cancel` arriving in that window used to set the
+    /// session idle and be *overwritten* when the open completed, because idle
+    /// is a state a start is allowed to begin from. The user saw a cancel
+    /// succeed and the microphone recorded on with the panel closed.
+    ///
+    /// A reservation turns that back into something the returning `start` can
+    /// check: it takes the next generation before releasing the lock, and
+    /// installs the stream only if that exact generation is still reserved when
+    /// it comes back. [`CaptureSession::cancel`] clears the reservation, so
+    /// cancellation wins the race by construction rather than by timing.
+    ///
+    /// Deliberately NOT an `Opening` variant of [`CaptureState`]: that enum is
+    /// serialised to the webview, and a state token the panel has never heard of
+    /// would arrive on any status poll made while the device is opening.
+    opening: Option<u64>,
 }
 
 struct Live {
@@ -844,6 +872,7 @@ impl CaptureSession {
                 state: CaptureState::Idle,
                 live: None,
                 generation: 0,
+                opening: None,
             }),
         }
     }
@@ -876,30 +905,57 @@ impl CaptureSession {
     /// of an async runtime and lets a test advance a paused clock instead of
     /// waiting thirty seconds.
     pub fn start(&self) -> Result<(CaptureStatus, CaptureTicket), CaptureError> {
-        {
-            let inner = self.inner();
+        // Reserved UNDER the lock, before the device is touched. See
+        // `SessionInner::opening` for why this is a reservation rather than a
+        // re-check on the way back.
+        let reserved = {
+            let mut inner = self.inner();
             if !inner.state.accepts_start() {
                 return Err(CaptureError::Refused(refusal(inner.state, "start")));
             }
-        }
+            if inner.opening.is_some() {
+                return Err(CaptureError::Refused(OPENING_REFUSAL.to_string()));
+            }
+            inner.generation += 1;
+            inner.opening = Some(inner.generation);
+            inner.generation
+        };
+
         // Opened OUTSIDE the lock: `AudioSource::start` blocks on the OS, and
         // holding the session lock across it would park the status command for
         // as long as the device takes to open.
-        let capture = self.source.start(MAX_UTTERANCE)?;
+        let capture = match self.source.start(MAX_UTTERANCE) {
+            Ok(capture) => capture,
+            Err(error) => {
+                // Release our own reservation, and only ours: a cancel that
+                // arrived while the device was failing to open already cleared
+                // it and may have handed it to a later start.
+                let mut inner = self.inner();
+                if inner.opening == Some(reserved) {
+                    inner.opening = None;
+                }
+                return Err(error);
+            }
+        };
+
         let mut inner = self.inner();
-        // Re-checked, because the lock was released: two starts racing would
-        // otherwise both open a device and the second would drop the first's
-        // stream on the floor.
-        if !inner.state.accepts_start() {
-            return Err(CaptureError::Refused(refusal(inner.state, "start")));
+        if inner.opening != Some(reserved) {
+            // Cancelled (or superseded) while the device was opening. The
+            // stream is dropped rather than installed — which closes the
+            // device, since a stream's `Drop` is what releases it — and the
+            // state the canceller left is untouched.
+            let state = inner.state;
+            drop(inner);
+            drop(capture.stream);
+            return Err(CaptureError::Refused(refusal(state, "start")));
         }
-        inner.generation += 1;
+        inner.opening = None;
         inner.state = CaptureState::Recording;
         inner.live = Some(Live {
             stream: capture.stream,
             sink: capture.sink,
         });
-        let ticket = CaptureTicket(inner.generation);
+        let ticket = CaptureTicket(reserved);
         drop(inner);
         Ok((self.status(), ticket))
     }
@@ -946,11 +1002,18 @@ impl CaptureSession {
     ///
     /// Idempotent and never refused: it is what a closed panel, an escape key
     /// and a failed start all do, and each of those can arrive in any state.
+    ///
+    /// **Clearing `opening` is the load-bearing line**, not the state reset: a
+    /// device that is still being opened has nothing to release here, and what
+    /// stops it being installed a moment later is that the reservation it is
+    /// holding is no longer the one this session recognises. Bumping the
+    /// generation as well keeps a cap timer for the abandoned utterance inert.
     pub fn cancel(&self) -> CaptureStatus {
         let mut inner = self.inner();
         inner.live = None;
         inner.state = CaptureState::Idle;
         inner.generation += 1;
+        inner.opening = None;
         drop(inner);
         self.status()
     }
@@ -984,6 +1047,14 @@ impl CaptureSession {
 struct ClosedStream;
 
 impl AudioStream for ClosedStream {}
+
+/// What a second start is told while the first is still opening the device.
+///
+/// Its own sentence rather than [`refusal`]'s, because the state machine cannot
+/// supply one: the session is still `Idle` at that moment — the reservation is
+/// what is occupied, not the state — so `refusal` would say "nothing is being
+/// recorded", which is true and useless.
+const OPENING_REFUSAL: &str = "cannot start the microphone: the device is already being opened";
 
 fn refusal(state: CaptureState, verb: &str) -> String {
     let doing = match state {
@@ -1413,6 +1484,131 @@ mod tests {
         );
         // And nothing is left to transcribe.
         assert!(session.stop().is_err());
+    }
+
+    /// A device whose `start` blocks until the test lets it through, so the
+    /// cancel/open race can be driven deterministically rather than raced.
+    ///
+    /// It also runs a callback *while* the open is in flight, which is the only
+    /// way to get code to run in the window the audit describes: between the
+    /// reservation and the stream coming back.
+    struct DeferredSource {
+        inner: StubSource,
+        during_open: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    }
+
+    impl DeferredSource {
+        fn new(inner: StubSource, during_open: impl FnOnce() + Send + 'static) -> Self {
+            Self {
+                inner,
+                during_open: Mutex::new(Some(Box::new(during_open))),
+            }
+        }
+    }
+
+    impl AudioSource for DeferredSource {
+        fn start(&self, cap: Duration) -> Result<Capture, CaptureError> {
+            if let Some(during_open) = self
+                .during_open
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take()
+            {
+                during_open();
+            }
+            self.inner.start(cap)
+        }
+    }
+
+    /// Scenario: the microphone is pressed, and the panel is closed (or Escape
+    /// pressed) while the OS permission prompt is still up. The device then
+    /// finishes opening. The returned stream must be dropped and the session
+    /// must stay idle.
+    ///
+    /// The blocker PRD #802's security audit found. Before the reservation in
+    /// `SessionInner::opening`, the returning `start` saw a state that still
+    /// accepted a start — idle does — installed the stream anyway, and the
+    /// microphone recorded with the panel closed until the thirty-second cap,
+    /// with the buffer available for transcription when the panel reopened.
+    #[test]
+    fn voice_capture_a_cancel_during_the_device_open_is_observed_not_overwritten() {
+        let inner = StubSource::tone(mono(TARGET_SAMPLE_RATE), 0.1);
+        let stopped = inner.stopped();
+        // The session has to exist before the callback can cancel it, and the
+        // source has to exist before the session — so the callback reaches it
+        // through a slot filled immediately afterwards.
+        let slot: Arc<Mutex<Option<Arc<CaptureSession>>>> = Arc::new(Mutex::new(None));
+        let cancelling = Arc::clone(&slot);
+        let source = Arc::new(DeferredSource::new(inner, move || {
+            let session = cancelling
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+                .expect("the session is installed before start is called");
+            // Exactly the window: the reservation is taken, the device is
+            // opening, and the user closes the panel.
+            assert_eq!(session.cancel().state, CaptureState::Idle);
+        }));
+        let session = Arc::new(CaptureSession::new(source));
+        *slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Arc::clone(&session));
+
+        let error = session
+            .start()
+            .expect_err("a cancelled start must not install a stream");
+        assert!(error.detail().contains("cannot start"), "{error}");
+
+        // The cancellation stands, rather than having been overwritten.
+        assert_eq!(session.status().state, CaptureState::Idle);
+        assert_eq!(session.status().captured_ms, 0);
+        // The stream that came back was dropped, which is what closes the
+        // device — the whole user-visible point of the finding.
+        assert!(
+            stopped.load(Ordering::Relaxed),
+            "the opened stream was installed rather than dropped"
+        );
+        // And nothing is left behind for a later panel opening to transcribe.
+        assert!(session.stop().is_err());
+    }
+
+    /// Scenario: a second press arrives while the first is still opening the
+    /// device. It is refused with a sentence rather than opening a second one.
+    ///
+    /// The sibling property of the reservation: `start` used to re-check the
+    /// state on the way back, which meant two racing starts both opened a
+    /// device and the loser's stream was dropped on the floor. Now the loser
+    /// never opens one.
+    #[test]
+    fn voice_capture_refuses_a_second_start_while_the_device_is_opening() {
+        let inner = StubSource::tone(mono(TARGET_SAMPLE_RATE), 0.1);
+        let slot: Arc<Mutex<Option<Arc<CaptureSession>>>> = Arc::new(Mutex::new(None));
+        let racing = Arc::clone(&slot);
+        let second: Arc<Mutex<Option<CaptureError>>> = Arc::new(Mutex::new(None));
+        let record = Arc::clone(&second);
+        let source = Arc::new(DeferredSource::new(inner, move || {
+            let session = racing
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+                .expect("the session is installed before start is called");
+            let outcome = session.start().expect_err("a second start is refused");
+            *record
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(outcome);
+        }));
+        let session = Arc::new(CaptureSession::new(source));
+        *slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Arc::clone(&session));
+
+        let (status, _) = session.start().expect("the first start wins");
+        assert_eq!(status.state, CaptureState::Recording);
+        let refused = second
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+            .expect("the second start ran");
+        assert!(
+            refused.detail().contains("already being opened"),
+            "{refused}"
+        );
     }
 
     #[test]
