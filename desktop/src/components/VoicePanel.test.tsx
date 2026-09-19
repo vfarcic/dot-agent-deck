@@ -59,7 +59,7 @@ describe("VoicePanel", () => {
 
   it("renders every choice the app actually ships an adapter for", () => {
     renderPanel();
-    expect(screen.getAllByRole("option", { name: /Off — type instead|Remote service/ })).toHaveLength(
+    expect(screen.getAllByRole("option", { name: /Off — nothing to listen with|Remote service/ })).toHaveLength(
       VOICE_TRANSCRIPTION_BACKENDS.length,
     );
     expect(screen.getByLabelText("Commands")).toHaveValue("claude");
@@ -114,7 +114,7 @@ describe("VoicePanel", () => {
     renderPanel({ voice: undefined });
     expect(screen.getByLabelText("Speech")).toHaveValue(DEFAULT_VOICE_SETTINGS.transcription);
     expect(screen.getByLabelText("Commands")).toHaveValue(DEFAULT_VOICE_SETTINGS.intent);
-    expect(screen.getByTestId("voice-typed-only")).toBeVisible();
+    expect(screen.getByTestId("voice-speech-off")).toBeVisible();
   });
 
   /**

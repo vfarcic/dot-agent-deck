@@ -73,7 +73,7 @@ import type { SettingsPanelProps } from "../lib/settingsContract";
 
 /** The visible label for each token, in the order the select offers them. */
 const TRANSCRIPTION_LABELS: Record<string, string> = {
-  off: "Off — type instead",
+  off: "Off — nothing to listen with",
   remote: "Remote service",
 };
 
@@ -129,11 +129,17 @@ export function VoicePanel({ settings, onSave, saveError }: SettingsPanelProps) 
           consequence the user has to act on". With no transcription backend the
           microphone does nothing, and a user who does not know that reads an
           unresponsive button as broken. PRD #802 makes this a product statement
-          rather than a degraded mode: the whole pipeline works from typed
-          input. */}
+          rather than a degraded mode: the Voice button still renders — neither
+          hidden nor disabled — and a press reports `VOICE_UNAVAILABLE`, which
+          sends the user here. This sentence is the other end of that
+          instruction, and it has to say the same thing in the place it points
+          at; the wording tracks `VOICE_UNAVAILABLE` and `NOT_CONFIGURED`
+          deliberately, minus the "Settings → Voice" direction nobody standing
+          in Settings → Voice needs. */}
       {voice.transcription === "off" && (
-        <p className="settings-hint" data-testid="voice-typed-only">
-          Voice commands are typed for now; pick a speech backend to talk instead.
+        <p className="settings-hint" data-testid="voice-speech-off">
+          Voice control has nothing to listen with, so pressing Voice says so
+          rather than turning on. Choose a speech backend above to talk.
         </p>
       )}
 
