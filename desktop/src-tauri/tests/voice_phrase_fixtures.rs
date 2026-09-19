@@ -23,6 +23,8 @@ use serde::Deserialize;
 
 const FIXTURES: &str = include_str!("../src/voice/phrase_fixtures.toml");
 const REQUIRE_REAL_E2E_ENV: &str = "DOT_AGENT_DECK_REQUIRE_REAL_E2E";
+const MIN_FIXTURE_COUNT: usize = 24;
+const PENDING_OPEN_SETTINGS_ACTION: &str = "open_settings";
 const PER_FIXTURE_GRACE: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Deserialize)]
@@ -41,6 +43,8 @@ struct PhraseFixture {
     outcome: OutcomeKind,
     #[serde(default)]
     resolved_agent: Option<String>,
+    #[serde(default)]
+    pending_action: bool,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
@@ -138,12 +142,18 @@ fn observed(outcome: &VoiceOutcome) -> (Option<&str>, OutcomeKind, Option<&str>)
     }
 }
 
-/// Scenario: With an explicit local real-agent opt-in, feed every checked-in
-/// phrase and a live fleet to the shipping Claude CLI resolver. Verify the full
-/// outcome, including the resolved agent id or an intentional ambiguity.
+/// Scenario: Validate every checked-in phrase and the planted fleet before any
+/// live-agent gate. Skip CI unless a real-agent run is explicitly required;
+/// with local opt-in, verify the full outcome through the shipping Claude CLI.
 #[tokio::test]
 async fn voice_phrase_fixtures_match_the_default_backend() {
     let fixtures = manifest();
+    assert!(
+        fixtures.fixtures.len() >= MIN_FIXTURE_COUNT,
+        "voice phrase fixture manifest must contain at least {MIN_FIXTURE_COUNT} fixtures, found {}",
+        fixtures.fixtures.len()
+    );
+
     let agents = vec![
         role_agent_in_state("agent-tester", "tester", "waiting_for_input"),
         with_tool(
@@ -156,9 +166,35 @@ async fn voice_phrase_fixtures_match_the_default_backend() {
             "Edit",
             Some("src/lib.rs"),
         ),
-        role_agent_in_state("agent-reviewer", "reviewer", "idle"),
+        role_agent_in_state("agent-reviewer", "reviewer", "working"),
     ];
     for fixture in &fixtures.fixtures {
+        assert!(
+            Screen::parse(&fixture.screen).is_some(),
+            "{}: fixture names unknown screen `{}`",
+            fixture.name,
+            fixture.screen
+        );
+        if fixture.pending_action {
+            assert_eq!(
+                fixture.action, PENDING_OPEN_SETTINGS_ACTION,
+                "{}: only `{PENDING_OPEN_SETTINGS_ACTION}` may be marked as a pending action",
+                fixture.name
+            );
+            assert!(
+                table().row(&fixture.action).is_none(),
+                "{}: pending action `{}` now exists in commands.toml; remove its `pending_action` marker",
+                fixture.name,
+                fixture.action
+            );
+        } else {
+            assert!(
+                fixture.action == NO_MATCH_ACTION || table().row(&fixture.action).is_some(),
+                "{}: fixture names unknown action `{}`",
+                fixture.name,
+                fixture.action
+            );
+        }
         if let Some(expected) = fixture.resolved_agent.as_deref() {
             assert!(
                 agents.iter().any(|agent| agent.id == expected),
@@ -168,11 +204,16 @@ async fn voice_phrase_fixtures_match_the_default_backend() {
         }
     }
 
+    let require_real_e2e = truthy_env(REQUIRE_REAL_E2E_ENV);
     if truthy_env("CI") {
+        assert!(
+            !require_real_e2e,
+            "{REQUIRE_REAL_E2E_ENV} is set in CI, so this real-agent test must RUN, not skip"
+        );
         skip("voice phrase fixtures never reach a real agent in CI");
         return;
     }
-    if !truthy_env(REQUIRE_REAL_E2E_ENV) {
+    if !require_real_e2e {
         skip("set DOT_AGENT_DECK_REQUIRE_REAL_E2E=1 to run the voice phrase fixtures");
         return;
     }
