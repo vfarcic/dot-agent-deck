@@ -5,7 +5,7 @@ title: Remote Environments
 
 # Remote Environments
 
-A **remote environment** is a per-project Linux host that runs the deck — both the daemon and the TUI live on the remote. Your laptop is just a terminal: `dot-agent-deck connect` is an `ssh -t` wrapper that runs the TUI on the remote, and the local terminal forwards keystrokes in and renders the bytes that come back. When the ssh session ends, the daemon and agents on the remote keep running.
+A **remote environment** is a per-project host that runs the deck — both the daemon and the TUI live on the remote. Linux is the host validated end to end; `remote add` also installs onto macOS, with the caveats in [Remote Environment Requirements](remote-requirements.md#macos-as-a-remote-host). Your laptop is just a terminal: `dot-agent-deck connect` is an `ssh -t` wrapper that runs the TUI on the remote, and the local terminal forwards keystrokes in and renders the bytes that come back. When the ssh session ends, the daemon and agents on the remote keep running.
 
 This page covers how that works in practice: the lifecycle model, the difference between "stop" and "detach", the failure modes you'll see when a connect goes wrong, and how hooks behave on the remote.
 
