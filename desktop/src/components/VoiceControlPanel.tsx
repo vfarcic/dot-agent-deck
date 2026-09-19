@@ -223,8 +223,13 @@ function VoiceDialog({ runtime, screen, onDispatch, onClose }: VoiceControlPanel
   const [undo, setUndo] = useState<{ run: () => void }>();
   /**
    * The screen is read at submit time rather than closed over, so a navigation
-   * cannot stale it — `runUtterance` is a `useCallback` and would otherwise hold
-   * whichever screen was mounted when it was built.
+   * before the submit cannot stale it — `runUtterance` is a `useCallback` and
+   * would otherwise hold whichever screen was mounted when it was built.
+   *
+   * **A navigation AFTER the submit is a different problem and this does not
+   * close it.** Reading it here fixes what the utterance is judged against; it
+   * says nothing about the user moving during the round trip, which is what
+   * {@link SCREEN_MOVED_ON} and the re-check in `runUtterance` are for.
    *
    * Written from an effect rather than during render: a ref mutated in a render
    * body is a write React is allowed to discard and re-run, and the value is
