@@ -65,9 +65,22 @@ const EXIT_FORCED_BY_SECOND_SIGNAL: i32 = 143;
 /// Logged at `warn!` (not `info!`) for the same reason the give-up warnings in
 /// `embedded_pane` are: losing the daemon terminates every managed agent, so
 /// it is a user-visible outcome that must survive a default log filter.
+///
+/// Issue #1109: the signal path stays UNGUARDED on purpose — it does not run
+/// the [`crate::daemon_stop::stop_refusal`] policy `daemon stop` and the
+/// `StopDaemon` wire verb run, and it never refuses. A SIGTERM is how a service
+/// manager, a container runtime or a session logout asks a daemon to stop, and
+/// one that argues back is escalated to SIGKILL on the sender's clock, losing
+/// both the graceful drain below and any chance to say what it lost. What it
+/// gained instead is DISCLOSURE: `state` is threaded in for
+/// [`crate::daemon_stop::log_teardown_inventory`], which names the agents and
+/// the orchestration roles at stake before the drain empties both. The full
+/// argument, including the two shapes that were rejected, is in
+/// `docs/develop/daemon-teardown-paths.md`.
 fn spawn_termination_signal_watch(
     shutdown: Arc<Notify>,
     registry: Arc<AgentPtyRegistry>,
+    state: SharedState,
 ) -> Option<tokio::task::JoinHandle<()>> {
     #[cfg(unix)]
     {
@@ -99,6 +112,12 @@ fn spawn_termination_signal_watch(
                 "daemon received termination signal; initiating graceful shutdown \
                  (every managed agent will be stopped)"
             );
+            // Issue #1109: say WHICH, before the drain below empties the
+            // registry this reads. Ordered ahead of the drain for that reason
+            // and not merely for tidiness — `agent_records` filters to live
+            // agents, so the same call after `shutdown_all_graceful` reports an
+            // empty deck no matter what was running.
+            crate::daemon_stop::log_teardown_inventory(&state, &registry, "signal").await;
 
             // Drain managed agents with the SAME grace the `KIND_SHUTDOWN`
             // handler gives them, BEFORE releasing the hook loop. Notifying
@@ -159,6 +178,9 @@ fn spawn_termination_signal_watch(
                 "daemon received termination signal; initiating graceful shutdown \
                  (every managed agent will be stopped)"
             );
+            // Issue #1109: same disclosure, same position, as the Unix arm
+            // above; see its comment for why it precedes the drain.
+            crate::daemon_stop::log_teardown_inventory(&state, &registry, "signal").await;
             // Same graceful drain as the Unix arm above; see its comment.
             let draining = registry.clone();
             let _ = tokio::task::spawn_blocking(move || {
@@ -627,7 +649,8 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
     // Production termination watch: route SIGTERM/SIGINT through the same
     // `shutdown` notify. Armed unconditionally — unlike the two backstops
     // below, this is not test-only: `daemon stop` IS a SIGTERM.
-    let signal_handle = spawn_termination_signal_watch(shutdown.clone(), pty_registry.clone());
+    let signal_handle =
+        spawn_termination_signal_watch(shutdown.clone(), pty_registry.clone(), state.clone());
 
     // Test-only orphan watchdog: when `DOT_AGENT_DECK_EXIT_WHEN_ORPHANED` is
     // truthy, gracefully shut down (via the SAME `shutdown` signal the idle
