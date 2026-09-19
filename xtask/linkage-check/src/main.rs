@@ -5,7 +5,7 @@
 //! Subcommands:
 //!
 //! - `linkage-check` (default) — first runs a repository-state preflight
-//!   (issue #557; see [`repo_state`]), then performs the twelve checks
+//!   (issue #557; see [`repo_state`]), then performs the thirteen checks
 //!   listed in Decision 7 + Decision 30:
 //!
 //!   The preflight is deliberately not one of the numbered checks: it answers
@@ -56,6 +56,14 @@
 //!      with an innocuous name bypasses it, and only issue #176
 //!      M1.1 makes the invariant compiler-checked. See
 //!      [`desktop_project_boundary`].
+//!  13. The voice command table and the frontend action registry
+//!      resolve against each other — PRD #802 M3. Every `invoke` in
+//!      `commands.toml` names a `VOICE_ACTIONS` key, every `screens`
+//!      entry is a `DeckView` `kind`, every param `kind` is a
+//!      `ParamKind`, every registry entry is classified by a row or a
+//!      written `no_voice` reason, and the registry literal stays
+//!      statically readable. It proves the registry is CONSISTENT, not
+//!      that it is COMPLETE; see [`voice_command_registry`].
 //!
 //!   The numbers are stable identifiers in the failure output, so a
 //!   new rule takes the next one rather than renumbering the others.
@@ -208,6 +216,12 @@ mod skill_frontmatter;
 /// only — there is no runtime rule here, the scripts enforce themselves.
 #[cfg(test)]
 mod verify_pr_stream;
+/// PRD #802 M3: the voice command table (`commands.toml`) against the frontend
+/// action registry (`desktop/src/lib/voiceActions.ts`), plus the two closed sets
+/// the table's columns draw from. Like `desktop_project_boundary` this one
+/// carries a live rule — check 13 below — as well as its own planted-bad-input
+/// tests.
+mod voice_command_registry;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -1031,6 +1045,16 @@ fn main() -> ExitCode {
             .map(|v| format!("[12] {v}")),
     );
 
+    // Check 13 (PRD #802 M3): the voice command table and the frontend action
+    // registry resolve against each other. Read straight off its own four files
+    // for check 12's reason — a different tree, and an input going missing must
+    // be reported rather than quietly emptying the rule.
+    failures.extend(
+        voice_command_registry::run(&root)
+            .into_iter()
+            .map(|v| format!("[13] {v}")),
+    );
+
     // Check 7 (PRD #77 Decision 30 / M4.3): every #[spec] test has
     // a `/// Scenario:` doc comment with a body AND
     // `cargo xtask docs --tests` succeeds against the current source
@@ -1045,7 +1069,7 @@ fn main() -> ExitCode {
 
     if failures.is_empty() {
         println!(
-            "linkage-check: ok ({} catalog ids, {} annotations, {} allowlisted, 12 rules)",
+            "linkage-check: ok ({} catalog ids, {} annotations, {} allowlisted, 13 rules)",
             catalog_ids.len(),
             discovered.len(),
             allowlist.len()
