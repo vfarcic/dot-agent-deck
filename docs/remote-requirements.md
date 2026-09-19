@@ -104,7 +104,7 @@ Three things are easy to get wrong here, and each costs something different:
 - **A LaunchAgent starts at GUI login, not at boot.** So an always-on Mac with nobody sitting at it needs **auto-login** enabled to come back unattended after a reboot, and auto-login interacts with FileVault: a FileVault-encrypted disk requires a password at startup before any login can happen automatically. That is a real security tradeoff, not a checkbox — decide it deliberately.
 - **launchd does not source your shell profile.** The daemon repairs its own `PATH` at startup by capturing it from an interactive login shell, so `~/.local/bin` resolves either way — but nothing else does. Anything your agents need from the environment, an `ANTHROPIC_API_KEY` for instance, has to go in an `EnvironmentVariables` dict in the plist rather than in `~/.zshrc`.
 
-Three things are still open, if you are in a position to check any of them: **reboot behaviour**, the **`$DOT_AGENT_DECK_SOCKET` override** on macOS, and **hook delivery asserted directly** rather than inferred from an agent reaching `Working`. [Report what you find](https://github.com/vfarcic/dot-agent-deck/issues).
+Three things are still open, if you are in a position to check any of them: **reboot behaviour**, the **`$DOT_AGENT_DECK_SOCKET` override** on macOS, and **hook delivery asserted directly** rather than inferred from an agent reaching `Working`. Those, and an Intel Mac, are tracked in [#1176](https://github.com/vfarcic/dot-agent-deck/issues/1176) — please [report what you find](https://github.com/vfarcic/dot-agent-deck/issues/1176).
 
 ### Hardware
 
