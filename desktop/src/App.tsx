@@ -41,7 +41,7 @@ import { HandoffRail } from "./components/HandoffRail";
 import { ProfilesPanel, ProjectsPanel, PromptLibraryPanel, WorkflowPanel } from "./components/ConfigurationPanels";
 import { SettingsSheet } from "./components/SettingsSheet";
 import { SettingsBridgeProvider } from "./lib/settingsBridge";
-import { DISPLAY_LIMITS, deckName, displayText } from "./lib/displayText";
+import { DISPLAY_LIMITS, deckName, displayActivity, displayText } from "./lib/displayText";
 import { useAgentProfiles } from "./hooks/useAgentProfiles";
 import { useDeckRuntime } from "./hooks/useDeckRuntime";
 import { useDaemonProjects } from "./hooks/useDaemonProjects";
@@ -49,6 +49,7 @@ import { usePromptLibrary } from "./hooks/usePromptLibrary";
 import { useDesktopSettings, type DesktopSettingsState } from "./hooks/useDesktopSettings";
 import { useInertBackground } from "./hooks/useInertBackground";
 import { useShownTerminals } from "./hooks/useShownTerminals";
+import { useHeldAgentRecord, type HeldAgentRecord } from "./hooks/useHeldAgentRecord";
 import { useZoom } from "./hooks/useZoom";
 import { agentKey } from "./lib/agentKey";
 import { unreachableDeckTerminalState } from "./lib/terminalInput";
@@ -234,6 +235,38 @@ export function DeckShell({ runtime, workflowPlatformIssue, initialView = { kind
    */
   const paneAgent = agentView && paneDeck ? paneDeck.agents.find((candidate) => candidate.id === agentView.agentId) : undefined;
   /**
+   * Issue #1143 — the last record this pane's deck gave, so the pane can still
+   * be a pane while that deck is not answering.
+   *
+   * **This is what makes PRD #1105's no-terminal state REACHABLE.** The PRD
+   * decided that such a deck *"replaces its terminal with a sentence rather than
+   * closing the pane"*, and only the second half was true in production:
+   * `paneAgentRetired` below kept the view, but everything the pane draws is a
+   * property of the agent RECORD, and a deck with no live link reports no
+   * agents at all — so `paneAgent` was `undefined`, the render condition failed,
+   * and the state built for exactly this case never rendered.
+   *
+   * It is read ONLY where the live lookup found nothing, so a deck that is
+   * answering is never served an older record than the one it just sent. Which
+   * is also why the two conditions under it are left reading `paneAgent`
+   * directly rather than this: `paneAgentRetired` must close on a CONNECTED
+   * deck that has stopped listing the agent, and a held record would make that
+   * absence invisible; the shown declaration must name an agent that exists
+   * now, and a held record is by definition one nothing can be attached to.
+   *
+   * **The un-observed deck stays as it was, deliberately.** `paneDeck` being
+   * `undefined` — a deck that has left the observed set entirely — still
+   * renders no pane, because the state needs the deck's own account of why it
+   * is not answering and a deck the app is no longer watching gives none.
+   * Synthesising one would be this app inventing a failure it did not observe,
+   * which is the distinction `pruneFleet` already *"refuses to cross on its
+   * own"* (`lib/bridge.ts`). That case keeps today's behaviour: the view
+   * survives and the pane returns if the deck does.
+   */
+  const heldPaneAgent = useHeldAgentRecord(agentView, paneAgent);
+  /** The record the pane RENDERS: the deck's current answer, else its last one. */
+  const paneAgentShown = paneAgent ?? heldPaneAgent?.agent;
+  /**
    * PRD #1105 M4 — the shown set for the OVERVIEW tree, declared here because
    * this is the only component that can see the overview and the pane over it
    * in one commit. `undefined` on the deck path hands ownership to
@@ -365,7 +398,7 @@ export function DeckShell({ runtime, workflowPlatformIssue, initialView = { kind
           one live `TerminalViewport` for the agent, which is the property M3
           actually requires.
         */}
-        {agentView && paneDeck && paneAgent && <OverviewAgentPane runtime={runtime} view={agentView} deck={paneDeck} agent={paneAgent} attached={paneDeckAttachable} onClose={closeAgent} />}
+        {agentView && paneDeck && paneAgentShown && <OverviewAgentPane runtime={runtime} view={agentView} deck={paneDeck} agent={paneAgentShown} held={heldPaneAgent} attached={paneDeckAttachable} onClose={closeAgent} />}
       </>
     );
   }
@@ -416,16 +449,24 @@ export function DeckShell({ runtime, workflowPlatformIssue, initialView = { kind
  * what is wrong with it instead of a `TerminalViewport` that would receive no
  * bytes.
  *
- * **That "opens either way" is narrower in production than it reads; the gap is
- * issue #1143.** It needs an agent record, and a deck with no live
- * link reports **no agents** —
+ * **"Opens either way" needed a record to open WITH, and issue #1143 is where
+ * that came from.** A deck with no live link reports **no agents** —
  * `disconnected_snapshot` and `snapshot_with`'s non-connected early return both
  * carry `agents: Vec::new()`, and `mapDesktopSnapshot` carries none over from
- * the previous snapshot. So the pane this state was built for is not rendered at
- * all on a deck that stops answering; what is guaranteed is only that the view
- * is KEPT (see `paneAgentRetired`), so the pane returns intact when the deck
- * does. Making the state itself reachable means holding the last known record
- * for an open pane, which is its own product call and is not taken here.
+ * the previous snapshot — so until #1143 the pane this state was built for was
+ * not rendered at all on a deck that stopped answering, and only the view was
+ * guaranteed to survive (see `paneAgentRetired`). {@link DeckShell} now holds
+ * the last record the pane's deck gave, for that pane's identity and nothing
+ * else, and hands it down through `held`.
+ *
+ * **A held record is rendered as a past report rather than a present one**, and
+ * that is the product call rather than a detail of it: showing a stale header
+ * with nothing saying it is stale asserts a liveness this app has no evidence
+ * for, which is worse than showing nothing. Three things say it — the status
+ * reads `last seen: running` and loses its live colour, `data-agent-record` says
+ * `held` for anything reading the DOM, and the no-terminal sentence names how
+ * old the report is with the exact instant on its hover. There is no expiry:
+ * see {@link useHeldAgentRecord} for why a timestamp was chosen over a timeout.
  *
  * **Nothing here moves the selection.** Switching the selected deck on open was
  * built and withdrawn under this PRD (decision 5) because it wrote
@@ -433,7 +474,7 @@ export function DeckShell({ runtime, workflowPlatformIssue, initialView = { kind
  * attributed to another. The pane reaching its own deck is what made that
  * unnecessary rather than merely unwise.
  */
-function OverviewAgentPane({ runtime, view, deck, agent, attached, onClose }: { runtime: DeckRuntimeState; view: Extract<DeckView, { kind: "agent" }>; deck: DeckSnapshot; agent: AgentSession; attached: boolean; onClose: () => void }) {
+function OverviewAgentPane({ runtime, view, deck, agent, held, attached, onClose }: { runtime: DeckRuntimeState; view: Extract<DeckView, { kind: "agent" }>; deck: DeckSnapshot; agent: AgentSession; held?: HeldAgentRecord; attached: boolean; onClose: () => void }) {
   const [tab, setTab] = useState<PanelTab>("terminal");
   return (
     <AgentPaneFrame
@@ -448,7 +489,11 @@ function OverviewAgentPane({ runtime, view, deck, agent, attached, onClose }: { 
          it names it with `deckName`, which is what the overview's group header
          the user just came from calls it. Reached only where that deck has no
          live link: a merely NON-SELECTED deck attaches like any other. */
-      noTerminal={attached ? undefined : unreachableDeckTerminalState(deckName(deck.connection), deck.connection.message)}
+      noTerminal={attached ? undefined : unreachableDeckTerminalState(deckName(deck.connection), deck.connection.message, displayActivity(held?.confirmedAt))}
+      /* Issue #1143 — `held` is set only where the live lookup found nothing,
+         so its presence IS the claim that what the header shows is older than
+         now. One prop, read by the two colour cues and the wording together. */
+      recordFreshness={held ? "held" : "live"}
       /* This deck's, for the same reason the agent above is: the bridge records
          hook events for the selected deck alone, so a non-selected deck's entry
          carries none rather than somebody else's. The terminal crosses decks;

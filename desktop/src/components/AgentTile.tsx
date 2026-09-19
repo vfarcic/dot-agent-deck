@@ -27,7 +27,7 @@ import type {
   SendResult,
   TerminalFeed,
 } from "../types";
-import { terminalInputState, type NoTerminalState } from "../lib/terminalInput";
+import { terminalInputState, type AgentRecordFreshness, type NoTerminalState } from "../lib/terminalInput";
 import { OutputReader } from "./OutputReader";
 import { TerminalViewport } from "./TerminalViewport";
 
@@ -128,6 +128,20 @@ export interface AgentTileProps {
    * the selected one is able to answer it.
    */
   noTerminal?: NoTerminalState;
+  /**
+   * Issue #1143 — whether {@link AgentTileProps.agent} is this deck's current
+   * answer or the last one it gave, defaulting to `"live"` because every other
+   * render site in the app builds its records from a snapshot that just
+   * arrived.
+   *
+   * `"held"` changes what the header ASSERTS, and only that. The status is the
+   * field that lies hardest — `running` beside a live dot is a claim about
+   * *now*, and the record may be arbitrarily old — so it reads `last seen:
+   * running` and drops its live colour. The heading, the role and the identity
+   * are left alone: they are what the agent IS rather than what it is doing,
+   * and they do not decay the way a status does.
+   */
+  recordFreshness?: AgentRecordFreshness;
   /** Increments when the command palette asks this tile's terminal to focus. */
   terminalFocusToken?: number;
   onSelect: () => void;
@@ -191,6 +205,7 @@ export function AgentTile({
   evidence,
   inputResult,
   noTerminal,
+  recordFreshness = "live",
   terminalFocusToken,
   onSelect,
   onTabChange,
@@ -229,6 +244,9 @@ export function AgentTile({
    * `panePresent`, folded in at `readerSuppressed` below.
    */
   const overlay = presentation === "overlay";
+  /* Issue #1143 — read once, so the header's two live-colour cues and its
+     wording cannot disagree about the same record. */
+  const held = recordFreshness === "held";
   /**
    * The Reader is suppressed at overlay presentation (M1 difference 4, above)
    * AND whenever any pane is open over this screen (see `panePresent`). The
@@ -260,6 +278,15 @@ export function AgentTile({
       className={`agent-tile ${selected ? "is-selected" : ""}`}
       data-testid={`agent-tile-${agent.role.toLowerCase().replaceAll(" ", "-")}`}
       data-status={agent.status}
+      /*
+        Issue #1143 — whether the record behind every field in this box is the
+        deck's current answer or its last one. Deliberately a SIBLING of
+        `data-status` rather than a value inside it: a `held` written into the
+        status vocabulary would have to be read by everything that keys on a
+        status, and the held record still HAS a status — it is simply one that
+        was true earlier. Two facts, two attributes.
+      */
+      data-agent-record={recordFreshness}
       /* The seam the presentation differences key off. An attribute selector
          outranks a bare class even inside a media query, so
          `[data-presentation="overlay"]` can override the tile's own responsive
@@ -269,12 +296,22 @@ export function AgentTile({
     >
       <header className="agent-header">
         <div className="agent-identity">
-          <span className={`agent-state-mark status-${agent.status}`} aria-hidden="true" />
+          <span className={`agent-state-mark status-${agent.status}${held ? " is-held" : ""}`} aria-hidden="true" />
           <div>
             <div className="agent-title-line">
               <h2>{agent.role}</h2>
               {agent.isStartRole && <span className="coordinator-badge" title="Orchestration start role">COORDINATOR</span>}
-              <span className={`status-label status-${agent.status}`}>{agent.status}</span>
+              {/*
+                Issue #1143 — a held record's status is a past reading, so it is
+                worded as one, and the live colour goes with it because a teal
+                dot says "now" louder than any label can unsay.
+
+                `last seen: <status>` rather than `last seen <status>`: the
+                label-and-value reading is grammatical for every value the field
+                takes, and half of them are not verbs — `last seen passed` and
+                `last seen queued` do not parse, where `last seen: passed` does.
+              */}
+              <span className={`status-label status-${agent.status}${held ? " is-held" : ""}`}>{held ? `last seen: ${agent.status}` : agent.status}</span>
             </div>
             {renameDraft !== undefined ? (
               <div className="agent-rename" onMouseDown={(event) => event.stopPropagation()}>
@@ -428,6 +465,11 @@ export function AgentTile({
                 className="panel-empty terminal-absent"
                 data-testid={`terminal-absent-${agent.id}`}
                 role="status"
+                /* The exact instant behind the sentence's relative age, the
+                   same pairing every other relativised instant in this app
+                   uses (`ActivityDisplay`). Absent where there is no held
+                   record to date. */
+                title={noTerminal.noticeTitle}
               >
                 <Unplug size={15} aria-hidden="true" />
                 <span>{noTerminal.notice}</span>
