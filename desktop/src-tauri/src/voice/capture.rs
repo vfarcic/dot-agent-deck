@@ -224,6 +224,148 @@ impl fmt::Debug for Pcm16 {
 /// anything a microphone actually heard sits over it.
 const SILENCE_FLOOR: u16 = 32;
 
+/// The **root-mean-square** amplitude, out of `i16::MAX`, at or above which one
+/// [`VAD_FRAME`] counts as speech rather than as the room.
+///
+/// About -35 dBFS. Near-field speech sits between -30 and -20 dBFS RMS —
+/// roughly 1 000 to 3 300 in these units — and room tone, a fan and a
+/// converter's own noise floor sit below -45, under 200. This is in the middle
+/// of a wide gap rather than at the edge of a narrow one.
+///
+/// **Erring high is deliberate, because the two directions do not cost the
+/// same.** A floor set too low never accumulates a silence run in a room with
+/// any noise in it, so no utterance ever ends, every command runs into
+/// [`MAX_UTTERANCE`], and the user loses all of them. A floor set too high can
+/// only end an utterance early — and only after [`SILENCE_HOLD`] of
+/// below-threshold audio, which is a pause somebody took rather than the gap
+/// between two words.
+///
+/// It is an order of magnitude above [`SILENCE_FLOOR`] and they answer
+/// different questions: that one asks whether a buffer is worth sending at all,
+/// this one asks whether somebody is speaking *now*.
+const SPEECH_FLOOR: u16 = 600;
+
+/// How long the quiet has to run before the utterance is over.
+///
+/// 800 ms — longer than the pauses inside a spoken phrase, where a comma is
+/// 200-400 ms, and short enough not to be what the user notices: the
+/// transcription and intent calls behind it are several seconds, and PRD #802
+/// measured 4.3-6.3 s for the zero-configuration backend.
+pub const SILENCE_HOLD: Duration = Duration::from_millis(800);
+
+/// The window one RMS is measured over, in output samples: 20 ms at
+/// [`TARGET_SAMPLE_RATE`].
+///
+/// The frame length every speech VAD uses, and the granularity of
+/// [`SILENCE_HOLD`] — a hold is counted in whole frames, so it is accurate to
+/// 20 ms, which is two orders of magnitude inside the thing it is measuring.
+const VAD_FRAME: usize = TARGET_SAMPLE_RATE as usize / 50;
+
+/// Voice-activity detection: an RMS threshold, and a quiet that has run long
+/// enough to be the end of what somebody said.
+///
+/// This is what [`Pcm16::is_silent`] explicitly is not, and the difference is
+/// the whole reason both exist. That one looks at a finished buffer and decides
+/// whether a backend call is worth making. This one runs on the data path,
+/// frame by frame, and answers a question with a **time** in it — *has the
+/// speaking stopped?* — which is what turns one open microphone into a sequence
+/// of separate utterances.
+///
+/// **It is not a speech/noise classifier and does not try to be.** A steady
+/// loud noise reads as speech here and holds the utterance open; what bounds
+/// that is [`MAX_UTTERANCE`], and PRD #802's surface discards a capped segment
+/// rather than paying to transcribe it. A more discriminating detector is a
+/// model, with a model's size, licence and failure modes, and nothing in a
+/// navigation vocabulary of one-to-four-word commands needs one.
+///
+/// Silence before the first speech is ignored, so a microphone switched on in a
+/// quiet room does not immediately "end" an utterance nobody started. That is
+/// also why an open microphone nobody speaks into ends at the cap rather than
+/// here.
+pub struct Vad {
+    /// [`SPEECH_FLOOR`] squared, so a frame costs no square root.
+    floor: f64,
+    /// [`SILENCE_HOLD`] in output samples.
+    hold: usize,
+    /// Sum of squares of the frame being filled.
+    energy: f64,
+    /// How much of that frame has arrived.
+    filled: usize,
+    /// Whether any frame has been over the floor yet.
+    heard: bool,
+    /// Output samples of below-floor audio since the last one that was not.
+    quiet: usize,
+    /// Latched: an utterance that has ended does not un-end.
+    ended: bool,
+}
+
+impl Default for Vad {
+    fn default() -> Self {
+        Self::new(SPEECH_FLOOR, SILENCE_HOLD)
+    }
+}
+
+impl Vad {
+    pub fn new(speech_floor: u16, hold: Duration) -> Self {
+        Self {
+            floor: f64::from(speech_floor) * f64::from(speech_floor),
+            hold: (hold.as_secs_f64() * f64::from(TARGET_SAMPLE_RATE)) as usize,
+            energy: 0.0,
+            filled: 0,
+            heard: false,
+            quiet: 0,
+            ended: false,
+        }
+    }
+
+    /// Accept output samples, in the order they were produced.
+    ///
+    /// Called with whatever the resampler just emitted — a few hundred samples
+    /// per device callback — rather than a fixed block, so it carries a partial
+    /// frame across calls. A trailing partial frame is not judged: at most 20 ms
+    /// of the hold is therefore uncounted, which is why the hold is counted in
+    /// samples and not in calls.
+    pub fn push(&mut self, samples: &[i16]) {
+        if self.ended {
+            return;
+        }
+        for &sample in samples {
+            let value = f64::from(sample);
+            self.energy += value * value;
+            self.filled += 1;
+            if self.filled < VAD_FRAME {
+                continue;
+            }
+            let mean_square = self.energy / VAD_FRAME as f64;
+            self.energy = 0.0;
+            self.filled = 0;
+            // Compared as mean square against the squared floor: the same
+            // comparison as RMS against the floor, without the square root.
+            if mean_square >= self.floor {
+                self.heard = true;
+                self.quiet = 0;
+            } else if self.heard {
+                self.quiet += VAD_FRAME;
+                if self.quiet >= self.hold {
+                    self.ended = true;
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Whether the utterance is over: speech was heard, and the quiet after it
+    /// has run for [`SILENCE_HOLD`].
+    pub fn ended(&self) -> bool {
+        self.ended
+    }
+
+    /// Whether anything over the floor has arrived at all.
+    pub fn heard_speech(&self) -> bool {
+        self.heard
+    }
+}
+
 /// Where a device's callback thread puts its samples.
 ///
 /// Owns the whole conversion — channel downmix, resample to
@@ -242,11 +384,17 @@ pub struct PcmSink {
     /// Output samples accumulated, mirrored out of the lock for the same
     /// reason. Monotonic until [`PcmSink::finish`].
     written: AtomicU64,
+    /// Whether [`Vad`] has ended the utterance, mirrored for the same reason
+    /// and latched for [`Vad::ended`]'s.
+    ended: AtomicBool,
 }
 
 #[derive(Default)]
 struct SinkState {
     out: Vec<i16>,
+    /// Fed every output sample as it is produced, which is what makes the
+    /// detection incremental rather than a pass over the finished buffer.
+    vad: Vad,
     /// Where the next output sample sits, as an absolute position in **input
     /// frames**. Fractional because the rates rarely divide.
     next: f64,
@@ -391,6 +539,7 @@ impl PcmSink {
             state: Mutex::new(SinkState::default()),
             full: AtomicBool::new(false),
             written: AtomicU64::new(0),
+            ended: AtomicBool::new(false),
         }
     }
 
@@ -401,6 +550,15 @@ impl PcmSink {
     /// Whether the length cap has been reached.
     pub fn is_full(&self) -> bool {
         self.full.load(Ordering::Relaxed)
+    }
+
+    /// Whether [`Vad`] has decided the speaking stopped.
+    ///
+    /// Read by [`CaptureSession::status`] while the device thread may be
+    /// holding the sink lock, which is why it is an atomic rather than a look
+    /// inside [`SinkState`]: a status poll must never queue behind a callback.
+    pub fn utterance_ended(&self) -> bool {
+        self.ended.load(Ordering::Relaxed)
     }
 
     /// How much audio has been accumulated.
@@ -451,6 +609,9 @@ impl PcmSink {
         };
         // The highest input index this callback can answer for.
         let highest = base + frames as u64 - 1;
+        // Where this callback's own output starts, so the detector below is fed
+        // exactly what was produced here and nothing twice.
+        let produced = state.out.len();
 
         while state.out.len() < self.cap {
             let floor = state.next.floor();
@@ -468,6 +629,7 @@ impl PcmSink {
 
         state.prev = Some(at(highest));
         state.base = base + frames as u64;
+        state.observe(produced);
         self.finished_pushing(&state);
     }
 
@@ -486,10 +648,12 @@ impl PcmSink {
         let ratio = f64::from(self.format.sample_rate.max(1)) / f64::from(TARGET_SAMPLE_RATE);
         let held = to_i16(state.prev.unwrap_or(0.0));
         let total = state.base as f64;
+        let produced = state.out.len();
         while state.out.len() < self.cap && state.next < total {
             state.out.push(held);
             state.next += ratio;
         }
+        state.observe(produced);
         self.finished_pushing(&state);
         Pcm16::new(std::mem::take(&mut state.out))
     }
@@ -500,6 +664,22 @@ impl PcmSink {
         if state.out.len() >= self.cap {
             self.full.store(true, Ordering::Relaxed);
         }
+        if state.vad.ended() {
+            self.ended.store(true, Ordering::Relaxed);
+        }
+    }
+}
+
+impl SinkState {
+    /// Hand the detector the output samples from `produced` onward.
+    ///
+    /// A method rather than two lines at each call site because the two fields
+    /// have to be borrowed disjointly — `self.vad` mutably and `self.out`
+    /// immutably — which is available through `&mut self` here and not through
+    /// the `MutexGuard` the callers hold.
+    fn observe(&mut self, produced: usize) {
+        let SinkState { out, vad, .. } = self;
+        vad.push(&out[produced..]);
     }
 }
 
@@ -985,12 +1165,34 @@ impl CaptureSession {
     /// What the session is doing right now.
     pub fn status(&self) -> CaptureStatus {
         let inner = self.inner();
-        let (captured, capped) = match &inner.live {
-            Some(live) => (live.sink.captured(), live.sink.is_full()),
-            None => (Duration::ZERO, false),
+        let (captured, capped, ended) = match &inner.live {
+            Some(live) => (
+                live.sink.captured(),
+                live.sink.is_full(),
+                live.sink.utterance_ended(),
+            ),
+            None => (Duration::ZERO, false, false),
         };
         CaptureStatus {
-            state: inner.state,
+            // [`Vad`] has heard the speaking stop: the recording is still open
+            // and the audio is still here, but nothing more is coming, so the
+            // surface is told the utterance is DONE and takes it with a stop.
+            //
+            // The reported state moves while `inner.state` does not, which is
+            // deliberate: `stop` is the transition, and it still refuses
+            // anything that is not `Recording`. What this reports is the
+            // utterance's state, not the session's.
+            //
+            // `Done` is the same token [`CaptureSession::settle`] leaves behind
+            // after a transcript, and on the wire the two are indistinguishable.
+            // In Rust they are not — that one has no `live` — and the surface
+            // cannot confuse them either, because it only asks between a start
+            // and a stop. The token is honest for both: the utterance is over.
+            state: if ended && inner.state == CaptureState::Recording {
+                CaptureState::Done
+            } else {
+                inner.state
+            },
             captured_ms: millis(captured),
             max_ms: millis(MAX_UTTERANCE),
             capped,
@@ -1261,6 +1463,147 @@ mod tests {
         assert!(Pcm16::new(vec![0; 64]).is_silent());
         assert!(Pcm16::new(vec![7, -11, 3]).is_silent());
         assert!(!Pcm16::new(vec![0, 0, 9_000]).is_silent());
+    }
+
+    // -- voice-activity detection ------------------------------------------
+
+    /// Output samples of speech, well over [`SPEECH_FLOOR`] at any frame
+    /// boundary: a square wave rather than a sine, so no frame can land on a
+    /// quiet part of a cycle and make a test depend on its own arithmetic.
+    fn speech(samples: usize) -> Vec<i16> {
+        (0..samples)
+            .map(|i| if i % 2 == 0 { 8_000 } else { -8_000 })
+            .collect()
+    }
+
+    /// Output samples at exactly the target rate, as a count.
+    fn out_samples(millis: u64) -> usize {
+        (TARGET_SAMPLE_RATE as usize * millis as usize) / 1_000
+    }
+
+    #[test]
+    fn voice_capture_vad_never_ends_an_utterance_nobody_started() {
+        let mut vad = Vad::default();
+        // Three seconds of a quiet room, which is nearly four holds.
+        vad.push(&vec![0; out_samples(3_000)]);
+        assert!(!vad.ended(), "silence alone ended an utterance");
+        assert!(!vad.heard_speech());
+    }
+
+    #[test]
+    fn voice_capture_vad_ends_after_the_hold_and_not_before() {
+        let mut vad = Vad::default();
+        vad.push(&speech(out_samples(500)));
+        assert!(vad.heard_speech());
+        // One frame short of the hold.
+        vad.push(&vec![0; out_samples(800) - VAD_FRAME]);
+        assert!(!vad.ended(), "ended before {SILENCE_HOLD:?} of quiet");
+        vad.push(&vec![0; VAD_FRAME]);
+        assert!(vad.ended(), "did not end after {SILENCE_HOLD:?} of quiet");
+    }
+
+    #[test]
+    fn voice_capture_vad_restarts_the_hold_at_the_next_word() {
+        let mut vad = Vad::default();
+        // Two pauses that would each end it if they were counted together.
+        vad.push(&speech(out_samples(200)));
+        vad.push(&vec![0; out_samples(600)]);
+        vad.push(&speech(out_samples(200)));
+        vad.push(&vec![0; out_samples(600)]);
+        assert!(!vad.ended(), "two pauses under the hold summed into one");
+        vad.push(&vec![0; out_samples(200)]);
+        assert!(vad.ended());
+    }
+
+    #[test]
+    fn voice_capture_vad_carries_a_partial_frame_between_pushes() {
+        // What a device actually delivers: callback-sized chunks that do not
+        // divide by the frame. A detector that dropped the remainder would
+        // never accumulate a hold at all.
+        let mut vad = Vad::default();
+        for chunk in speech(out_samples(400)).chunks(333) {
+            vad.push(chunk);
+        }
+        for chunk in vec![0i16; out_samples(1_000)].chunks(333) {
+            vad.push(chunk);
+        }
+        assert!(vad.ended());
+    }
+
+    #[test]
+    fn voice_capture_vad_measures_rms_and_not_a_peak() {
+        // One click in an otherwise quiet frame: loud enough that
+        // `Pcm16::is_silent`'s per-sample floor calls the buffer noisy, and
+        // nowhere near enough energy to be somebody speaking.
+        let mut click = vec![0i16; VAD_FRAME];
+        click[7] = 5_000;
+        assert!(!Pcm16::new(click.clone()).is_silent());
+
+        let mut vad = Vad::default();
+        vad.push(&speech(out_samples(300)));
+        for _ in 0..(out_samples(1_000) / VAD_FRAME) {
+            vad.push(&click);
+        }
+        assert!(vad.ended(), "a click held the utterance open");
+    }
+
+    #[test]
+    fn voice_capture_vad_ending_is_latched() {
+        let mut vad = Vad::default();
+        vad.push(&speech(out_samples(300)));
+        vad.push(&vec![0; out_samples(1_000)]);
+        assert!(vad.ended());
+        // A device callback that lands after the surface has been told the
+        // utterance is over must not re-open it.
+        vad.push(&speech(out_samples(300)));
+        assert!(vad.ended(), "late audio un-ended a finished utterance");
+    }
+
+    #[test]
+    fn voice_capture_sink_reports_the_utterance_ending() {
+        let format = mono(TARGET_SAMPLE_RATE);
+        let sink = PcmSink::new(format, MAX_UTTERANCE);
+        let mut samples: Vec<f32> = speech(out_samples(400))
+            .into_iter()
+            .map(|s| f32::from(s) / f32::from(i16::MAX))
+            .collect();
+        sink.push(&samples);
+        assert!(!sink.utterance_ended(), "ended while still being spoken");
+        samples = vec![0.0; out_samples(1_000)];
+        sink.push(&samples);
+        assert!(sink.utterance_ended());
+    }
+
+    #[test]
+    fn voice_capture_status_says_done_when_the_speaking_stops() {
+        let format = mono(TARGET_SAMPLE_RATE);
+        let mut samples: Vec<f32> = speech(out_samples(400))
+            .into_iter()
+            .map(|s| f32::from(s) / f32::from(i16::MAX))
+            .collect();
+        samples.extend(std::iter::repeat_n(0.0, out_samples(1_000)));
+        let session = CaptureSession::new(Arc::new(StubSource::new(format, samples)));
+        let (_, _ticket) = session.start().expect("opens");
+
+        let status = session.status();
+        assert_eq!(status.state, CaptureState::Done, "{status:?}");
+        assert!(!status.capped, "nothing reached the cap");
+        // And the audio is still there to be taken, which is the whole point of
+        // reporting it rather than tearing the recording down.
+        let audio = session.stop().expect("stops");
+        assert!(!audio.is_silent());
+    }
+
+    #[test]
+    fn voice_capture_status_stays_recording_while_speech_continues() {
+        let format = mono(TARGET_SAMPLE_RATE);
+        let samples: Vec<f32> = speech(out_samples(2_000))
+            .into_iter()
+            .map(|s| f32::from(s) / f32::from(i16::MAX))
+            .collect();
+        let session = CaptureSession::new(Arc::new(StubSource::new(format, samples)));
+        session.start().expect("opens");
+        assert_eq!(session.status().state, CaptureState::Recording);
     }
 
     #[test]

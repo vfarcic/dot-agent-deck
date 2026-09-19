@@ -58,8 +58,8 @@ pub use crate::dto::DesktopAgent;
 pub use agent_cli::{AGENT_CLI_TIMEOUT, AgentCli, AgentCliResolver};
 pub use capture::{
     AudioFormat, AudioSource, AudioStream, Capture, CaptureError, CaptureSession, CaptureState,
-    CaptureStatus, CaptureTicket, CpalSource, MAX_UTTERANCE, Pcm16, PcmSink, StubSource,
-    TARGET_SAMPLE_RATE,
+    CaptureStatus, CaptureTicket, CpalSource, MAX_UTTERANCE, Pcm16, PcmSink, SILENCE_HOLD,
+    StubSource, TARGET_SAMPLE_RATE, Vad,
 };
 pub use outcome::{ResolvedParam, VoiceOutcome, VoiceResult, handle_utterance};
 pub use remote::{REMOTE_TIMEOUT, RemoteResolver};
