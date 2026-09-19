@@ -799,6 +799,19 @@ fn line_of(masked: &[char], at: usize) -> usize {
 ///
 /// The same reasoning as `desktop_settings_secrets::mask_comments`, extended to
 /// string interiors because this rule's inputs are sentences.
+///
+/// # What it does NOT handle: regex literals
+///
+/// `/`, `//`, `/* */` and the three quote kinds are the whole state machine. A
+/// **regex literal** is none of them, so `/[},]/` in a scanned range would have
+/// its `}` and `,` read as structure, and a `/` immediately before a `*` —
+/// `/\*/` — would be read as the start of a block comment and swallow the rest
+/// of the file up to the next `*/`. There is no current impact: no regex
+/// literal and no bare division appears in a code position of either scanned
+/// file. That makes this a **documented gap rather than a checked property** —
+/// a regex literal must not appear in a scanned range, and the remedy if one
+/// ever needs to is to teach this function the state rather than to work around
+/// it at the call site. It joins the `< >` generic gap `properties` documents.
 fn mask(text: &[char]) -> Vec<char> {
     #[derive(Clone, Copy, PartialEq)]
     enum State {

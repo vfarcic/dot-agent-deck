@@ -759,8 +759,8 @@ export function AgentOverview({ runtime, settings, onNavigate }: { runtime: Deck
    * deck; see {@link OpenAgentContext}.
    */
   const openAgent = useCallback((agent: OverviewAgent) => {
-    VOICE_ACTIONS.openAgent.run({ navigate: onNavigate }, { deckId: agent.daemonId, agentId: agent.id, from: "overview" });
-  }, [onNavigate]);
+    VOICE_ACTIONS.openAgent.run(voiceContext, { deckId: agent.daemonId, agentId: agent.id, from: "overview" });
+  }, [voiceContext]);
   const [confirm, setConfirm] = useState<ConfirmState>();
   const [overrideError, setOverrideError] = useState<string>();
   /**

@@ -8,11 +8,14 @@ import type { DeckView } from "../types";
  *
  * The voice command table's `invoke` column names an entry **here**, not a
  * `#[tauri::command]`. That correction is PRD #802's most consequential one and
- * it was measured rather than assumed: none of the thirteen registered Tauri
- * commands performs a navigation, because navigation in this app is React state
- * — `setView`, a `useState` boolean, a selected agent id. Voice "produces an
+ * it was measured rather than assumed: none of the registered Tauri commands
+ * performs a navigation, because navigation in this app is React state —
+ * `setView`, a `useState` boolean, a selected agent id. Voice "produces an
  * action and dispatches it where a click dispatches one", and a click is
- * dispatched in the frontend.
+ * dispatched in the frontend. (The count that used to sit in that sentence is
+ * gone on purpose: a number in a comment is read as a property. It said
+ * *thirteen*, and `generate_handler!` had already grown past that — recount it
+ * there if you need the number, rather than trusting one written here.)
  *
  * So an entry is **not** a description of a control. It IS the control: the rail
  * buttons, the palette items, the agent tile's open/close pair and the
@@ -21,6 +24,38 @@ import type { DeckView } from "../types";
  * cannot be deleted without breaking a control, and a control reachable from the
  * rail or the palette cannot exist without an entry. A registry beside the app
  * rather than inside it would be a checked-in list under a better name.
+ *
+ * # The seam is the RAIL, the PALETTE and the four voice-reachable entries
+ *
+ * **Not "one capability, one dispatch path", which is what M2's commit body and
+ * an earlier draft of this comment said and is not true.** Five `no_voice`
+ * capabilities also have a second, in-panel `setState` path in `App.tsx`, and
+ * naming them here is the point — a rediscovered list is a finding, a written
+ * one is a known residual:
+ *
+ * - `focusAgent` — the agent tile's own `onSelect` calls `setSelectedAgentId`;
+ * - `toggleEvidenceDrawer` — the workspace header's Evidence button, and the
+ *   evidence row's select-and-open;
+ * - `openWorkflowOrder` — the run-graph "Edit loop" button (twice) and
+ *   `ProjectsPanel`'s `onConfigureWorkflow`;
+ * - `openProjects` — `WorkflowPanel`'s `onChooseProject`;
+ * - `openAgentProfiles` — `EmptyDeck`'s `onProfiles`.
+ *
+ * (`grep -n 'setSelectedAgentId\|setEvidenceOpen\|setWorkflowOpen\|setProjectsOpen\|setProfilesOpen' desktop/src/App.tsx`
+ * finds them; line numbers are deliberately not quoted, since they rot.)
+ *
+ * **The load-bearing property survives the narrowing, which is why the code was
+ * not re-routed to make the wider claim true.** None of those five is
+ * voice-reachable — each carries a `no_voice` reason — so voice has exactly one
+ * execution path, {@link dispatchVoiceAction}, and acquires no second one. What
+ * is false is only the stronger claim that every capability in this file has a
+ * single dispatch site. Re-routing eight call sites to recover it would be
+ * regression risk for no functional gain.
+ *
+ * **If a later PRD gives any of those five a table row, closing its second path
+ * is that PRD's work** — and it has to be, because the moment a capability is
+ * voice-reachable, a second path is a behaviour voice cannot see. That is the
+ * cost of leaving them, stated rather than discovered.
  *
  * # What the guard needs from this file, and what it will refuse
  *

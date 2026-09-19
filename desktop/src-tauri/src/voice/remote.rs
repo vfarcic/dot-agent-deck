@@ -269,8 +269,9 @@ pub fn tool_definition(commands: &[AnnotatedCommand]) -> Value {
                 },
                 "params": {
                     "type": "object",
-                    "description": "The params the chosen action declares, as the user referred to them. \
-    Verbatim from the utterance — the app resolves each one against live state.",
+                    "description": "The params the chosen action declares, as the user referred to them \
+    — or the agent's `label`, for a reference the user made by state. The app resolves each one \
+    against live state.",
                     "properties": properties,
                     "additionalProperties": false,
                 },

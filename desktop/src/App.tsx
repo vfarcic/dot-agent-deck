@@ -925,8 +925,10 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
    * registry.** Both have been optional props since PRD #1105, so a deck
    * mounted without them renders and its Overview button does nothing — the
    * behaviour this move must not change. Deciding what an absent prop means is
-   * the host's job; the registry's job is that there is one dispatch site per
-   * capability.
+   * the host's job; the registry's job is to be the dispatch seam for the rail,
+   * the palette and every voice-reachable capability. Five of its `no_voice`
+   * entries also have a second `setState` path in this file — `voiceActions.ts`
+   * names them, and the narrower claim is the true one.
    */
   const voiceContext: VoiceActionContext = {
     navigate: (view) => onNavigate?.(view),

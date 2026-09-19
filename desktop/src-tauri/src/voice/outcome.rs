@@ -21,9 +21,14 @@
 //! it thought they said, and a backend's own **failure detail** is quoted by
 //! [`VoiceOutcome::ResolutionFailed`] and
 //! [`VoiceOutcome::TranscriptionFailed`], because "nothing is configured yet"
-//! and "the request timed out" are different things to do next. Both are
-//! quoted as references and neither is wording of the app's own; both go
-//! through [`safe_message`] first.
+//! and "the request timed out" are different things to do next. A third
+//! arrives by a third route: the agent **labels** an ambiguity sentence lists,
+//! and the label a successful `report` interpolates, are the DAEMON's text. All
+//! of them are quoted as references, none is wording of the app's own, and
+//! every one goes through [`safe_message`] first.
+//!
+//! **The transcript is the one exception, and it is deliberate**, which is the
+//! next paragraph.
 //!
 //! **A failure says what it heard.** Most failures are transcription rather
 //! than intent, so the transcript goes into the sentence verbatim and turns a
@@ -416,11 +421,23 @@ fn heard(transcript: &Transcript, situation: &str) -> String {
 /// label out and never looks at it again, so what a row renders depends on the
 /// template and the labels and not on the order the params happen to be in.
 ///
-/// A placeholder naming no declared param cannot reach a parsed table — that is
-/// `TableError::UnknownPlaceholder` — so an unreplaced `{…}` here would mean
-/// a param the model never supplied, which the missing-param refusal catches
-/// before this is called. Anything that is not a well-formed `{name}` is copied
-/// through verbatim, which is what a hand-built [`CommandRow`] in a test gets.
+/// **The placeholder name is trimmed, because the parse scanner trims and two
+/// scanners over one syntax have to agree.** [`super::table`]'s `placeholders`
+/// trims before checking a name against the row's declared params, so a report
+/// reading `Opening { agent }.` is *accepted* by the table; a byte-exact lookup
+/// here then found no param called `" agent "` and rendered the braces to the
+/// user on an otherwise successful dispatch — param supplied, resolved,
+/// dispatch fine, placeholder unreplaced. The two drifted because no row and no
+/// test used the spaced spelling, which is what
+/// `voice_outcome_a_report_renders_a_spaced_placeholder` now fixes.
+///
+/// With them agreed, an unreplaced `{…}` cannot reach a user from a parsed
+/// table: every placeholder names a param the row declares
+/// (`TableError::UnknownPlaceholder` refuses the rest), and every declared param
+/// is in `params` by the time this is called, because the resolution loop above
+/// returns a refusal rather than falling through. Anything that is not a
+/// well-formed `{name}` is copied through verbatim, which is what a hand-built
+/// [`CommandRow`] in a test gets.
 fn report(row: &CommandRow, params: &[ResolvedParam]) -> String {
     let mut out = String::with_capacity(row.report.len());
     let mut rest = row.report.as_str();
@@ -433,9 +450,12 @@ fn report(row: &CommandRow, params: &[ResolvedParam]) -> String {
             out.push_str(after_open);
             return out;
         };
-        let name = &body[..close];
+        let name = body[..close].trim();
         match params.iter().find(|param| param.name == name) {
-            Some(param) => out.push_str(&param.label),
+            // The label is the DAEMON's text, so it is scrubbed on its way into
+            // a sentence for the same reason a refusal's is — see
+            // [`ParamKind::unresolved_phrase`].
+            Some(param) => out.push_str(&safe_message(&param.label)),
             None => out.push_str(&after_open[..close + 2]),
         }
         rest = &body[close + 1..];
@@ -454,18 +474,37 @@ impl ParamKind {
     }
 
     /// What to say when a value was supplied and nothing live matches it.
+    ///
+    /// **`spoken` is scrubbed, and the transcript beside it deliberately is
+    /// not.** This is the MODEL's string — whatever the backend put in its
+    /// params object, which is not the same thing as what the transcriber heard
+    /// — so it is a foreign string on its way into a sentence that reaches a
+    /// DOM node, exactly as a backend's failure detail is, and it gets the same
+    /// [`safe_message`]. [`heard`] quotes the transcript verbatim because
+    /// seeing exactly what was heard is what turns a mis-transcription into a
+    /// correction; that is the one exception and it is a deliberate one.
     fn unresolved_phrase(self, spoken: &str) -> String {
+        let spoken = safe_message(spoken);
         match self {
             ParamKind::AgentRef => format!("no agent here matches \u{201c}{spoken}\u{201d}"),
         }
     }
 
     /// What to say when a value was supplied and more than one thing matches.
+    ///
+    /// **Both interpolated halves are foreign and both are scrubbed.** `spoken`
+    /// is the model's, for [`ParamKind::unresolved_phrase`]'s reason; each label
+    /// is the DAEMON's, which under [#741] can be a remote one, so it is the
+    /// same class of string and gets the same treatment rather than a different
+    /// one for having arrived by a different route.
+    ///
+    /// [#741]: https://github.com/vfarcic/dot-agent-deck/issues/741
     fn ambiguous_phrase(self, spoken: &str, matches: &[String]) -> String {
+        let spoken = safe_message(spoken);
         let shown = matches
             .iter()
             .take(AMBIGUITY_NAMES_SHOWN)
-            .cloned()
+            .map(safe_message)
             .collect::<Vec<_>>()
             .join(", ");
         let rest = matches.len().saturating_sub(AMBIGUITY_NAMES_SHOWN);
@@ -586,6 +625,28 @@ pub(super) fn role_name(agent: &DesktopAgent) -> Option<String> {
 /// `bridge.ts`'s `agentFromDto` is `agent.displayName || role`, with
 /// `Agent <n>` when neither is there — the position in the snapshot, the same
 /// number the webview uses.
+///
+/// # Invariant: every label this returns is a name [`spoken_names`] answers to
+///
+/// [`super::schema::TOOL_INSTRUCTIONS`] tells the model to answer a by-state
+/// reference — *"the one that's stuck"* — with the agent's **label**. So a
+/// label that is not also a spoken name turns a model that did exactly as it
+/// was told into a [`VoiceOutcome::ParamUnresolved`] refusal, which is the
+/// worst shape of bug available here: correct behaviour punished.
+///
+/// The first two branches hold it by construction — a display name and a role
+/// are both in [`spoken_names`]. The positional fallback does **not**, and it is
+/// unreachable only because `crate::dto::map_agent` floors `agent_type` at
+/// `"none"`, which makes [`role_name`] `Some` for every agent the app actually
+/// produces. `voice_outcome_every_label_is_a_name_the_agent_answers_to` asserts
+/// the invariant over those shapes, so a change that lets `agent_type` be
+/// genuinely empty goes red there rather than in a user's refusal.
+///
+/// **Teaching [`spoken_names`] to match positionally was considered and
+/// rejected.** "Agent 3" is the agent's place in a snapshot whose order the
+/// user does not control and cannot see change, so resolving by it is a worse
+/// behaviour than the refusal it would replace. The invariant is pinned
+/// instead.
 pub(super) fn display_label(agent: &DesktopAgent, agents: &[DesktopAgent]) -> String {
     if let Some(display_name) = agent
         .display_name
@@ -976,8 +1037,10 @@ mod tests {
     #[tokio::test]
     async fn voice_outcome_scrubs_control_characters_out_of_a_backend_detail() {
         // A backend's detail is whatever a CLI wrote on stderr. It reaches a
-        // DOM node, so it gets the same scrub every other foreign string here
-        // gets; the TRANSCRIPT deliberately does not, because verbatim is the
+        // DOM node, so it gets the same scrub the other foreign strings here
+        // get — the model's param, and the daemon's labels, which
+        // `voice_outcome_scrubs_a_model_supplied_param_and_a_daemon_label`
+        // covers. The TRANSCRIPT deliberately does not, because verbatim is the
         // point of showing it.
         let resolver = StubResolver::failing(IntentError::Backend("bad\u{7}exit".into()));
         let outcome = run(&resolver, Screen::Deck, &fleet(), "open the tester").await;
@@ -991,6 +1054,106 @@ mod tests {
             "got {}",
             outcome.sentence()
         );
+    }
+
+    /// A model-supplied param and a daemon-supplied label are scrubbed too.
+    ///
+    /// Same class of string as a backend's failure detail, same destination —
+    /// a DOM node — and for a while only the detail was scrubbed, which was an
+    /// arbitrary asymmetry rather than a decision. The transcript in the same
+    /// sentence stays verbatim, which this asserts as well so a later sweep
+    /// cannot "fix" the exception away.
+    #[tokio::test]
+    async fn voice_outcome_scrubs_a_model_supplied_param_and_a_daemon_label() {
+        // Unresolved: the param is the model's, and nothing live matches it.
+        let resolver = StubResolver::new().answering(
+            "open the ghost",
+            IntentAnswer::new("open_agent").with_param("agent", "gh\u{7}ost"),
+        );
+        let outcome = run(&resolver, Screen::Deck, &fleet(), "open the ghost").await;
+        assert!(
+            !outcome.sentence().contains('\u{7}') && outcome.sentence().contains("ghost"),
+            "got {}",
+            outcome.sentence()
+        );
+
+        // Ambiguous: the param is the model's AND the listed labels are the
+        // daemon's. The control character is in the agents' own names as well,
+        // because a spoken reference has to MATCH for the ambiguity sentence to
+        // be the one that renders.
+        let agents = vec![
+            role_agent("1", "tes\u{7}ter one"),
+            role_agent("2", "tes\u{7}ter two"),
+        ];
+        let resolver = StubResolver::new().answering(
+            "open a tester",
+            IntentAnswer::new("open_agent").with_param("agent", "tes\u{7}ter"),
+        );
+        let outcome = run(&resolver, Screen::Deck, &agents, "open a tester").await;
+        assert!(
+            matches!(outcome, VoiceOutcome::ParamAmbiguous { .. }),
+            "got {outcome:?}"
+        );
+        assert!(
+            !outcome.sentence().contains('\u{7}'),
+            "got {}",
+            outcome.sentence()
+        );
+        assert!(
+            outcome.sentence().contains("tester one") && outcome.sentence().contains("tester two"),
+            "got {}",
+            outcome.sentence()
+        );
+
+        // And the transcript is still verbatim, control character and all.
+        let resolver = StubResolver::new();
+        let outcome = run(&resolver, Screen::Deck, &fleet(), "wha\u{7}t").await;
+        assert!(
+            outcome.sentence().contains('\u{7}'),
+            "the transcript was scrubbed: {}",
+            outcome.sentence()
+        );
+    }
+
+    /// Every [`display_label`] output is a name [`spoken_names`] answers to.
+    ///
+    /// The model is told to answer a by-state reference with the agent's
+    /// `label`, so a label outside `spoken_names` refuses a model that obeyed.
+    /// Asserted over the shapes `crate::dto::map_agent` actually produces —
+    /// including the `agent_type = "none"` floor, which is the single reason
+    /// the positional `Agent <n>` fallback is unreachable today.
+    #[test]
+    fn voice_outcome_every_label_is_a_name_the_agent_answers_to() {
+        let shapes = vec![
+            (
+                "a display name",
+                agent("1", Some("Deploy watcher"), "claude_code"),
+            ),
+            ("a bare agent type", agent("2", None, "claude_code")),
+            ("the map_agent floor", agent("3", None, "none")),
+            ("an orchestration role", role_agent("4", "orchestrator")),
+        ];
+        for (what, shaped) in shapes {
+            let fleet = vec![shaped.clone()];
+            let label = display_label(&shaped, &fleet);
+            assert!(
+                spoken_names(&shaped)
+                    .iter()
+                    .any(|name| same_spoken_name(name, &label)),
+                "{what}: label {label:?} is not in {:?}",
+                spoken_names(&shaped)
+            );
+            // And the user-visible half of the same property: saying the label
+            // back resolves to that agent.
+            assert_eq!(
+                resolve_agent_ref(&label, &fleet),
+                AgentRefMatch::One {
+                    id: shaped.id.clone(),
+                    label: label.clone(),
+                },
+                "{what}"
+            );
+        }
     }
 
     /// The report template is rendered in ONE pass, so a label cannot be
@@ -1050,6 +1213,79 @@ mod tests {
             report(&unclosed, &[param("agent", "tester")]),
             "Opening {agent."
         );
+    }
+
+    /// A spaced placeholder renders, because the table ACCEPTS one.
+    ///
+    /// `table::placeholders` trims the name, so `{ agent }` passes the
+    /// declared-param check at parse time; this render used to look the name up
+    /// byte-exactly and print the braces at the user on a dispatch that had
+    /// otherwise succeeded. The absence of exactly this test is why the two
+    /// scanners were allowed to drift.
+    #[test]
+    fn voice_outcome_a_report_renders_a_spaced_placeholder() {
+        let row = CommandRow {
+            id: "spaced".to_string(),
+            description: "d".to_string(),
+            invoke: "spaced".to_string(),
+            screens: vec![Screen::Deck],
+            unavailable_hint: "h".to_string(),
+            report: "Opening { agent }.".to_string(),
+            params: Vec::new(),
+        };
+        let param = ResolvedParam {
+            name: "agent".to_string(),
+            kind: ParamKind::AgentRef,
+            spoken: "tester".to_string(),
+            value: "1".to_string(),
+            label: "tester".to_string(),
+        };
+        assert_eq!(report(&row, &[param]), "Opening tester.");
+    }
+
+    /// The two scanners agree, asserted through a real table rather than a
+    /// hand-built row.
+    ///
+    /// This is the finding's own scenario end to end: a row the TABLE accepts,
+    /// resolved by the pipeline, dispatched successfully — and the sentence the
+    /// user reads has no braces left in it. A hand-built [`CommandRow`] could
+    /// not show this, because what made the bug possible was that
+    /// `CommandTable::parse` accepts the spaced spelling in the first place.
+    #[tokio::test]
+    async fn voice_outcome_a_spaced_placeholder_parses_and_renders() {
+        for spelling in ["{agent}", "{ agent}", "{agent }", "{  agent  }"] {
+            let source = format!(
+                "[[commands]]\n\
+                 id = \"open_agent\"\n\
+                 invoke = \"openAgent\"\n\
+                 description = \"Open one agent\"\n\
+                 screens = [\"deck\"]\n\
+                 unavailable_hint = \"open the deck first\"\n\
+                 report = \"Opening {spelling}.\"\n\
+                 params = [{{ name = \"agent\", kind = \"agent_ref\" }}]\n"
+            );
+            let parsed = CommandTable::parse(&source)
+                .unwrap_or_else(|error| panic!("spelling {spelling:?} was refused: {error:?}"));
+            let resolver = StubResolver::new().answering(
+                "open the tester",
+                IntentAnswer::new("open_agent").with_param("agent", "tester"),
+            );
+            let outcome = handle_utterance(
+                &resolver,
+                &parsed,
+                Screen::Deck,
+                &fleet(),
+                Transcript::new("open the tester"),
+            )
+            .await
+            .outcome;
+            assert!(outcome.is_dispatch(), "spelling {spelling:?}: {outcome:?}");
+            assert_eq!(
+                outcome.sentence(),
+                "Opening tester.",
+                "spelling {spelling:?}"
+            );
+        }
     }
 
     #[test]
