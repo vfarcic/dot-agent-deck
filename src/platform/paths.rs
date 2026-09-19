@@ -3439,42 +3439,65 @@ mod tests {
     /// [`is_untrustworthy_path_entry`]) and a `target/{debug,release}` entry
     /// (routine on a developer's `$PATH`, and the one shape this whole resolver
     /// refuses) must not.
+    ///
+    /// **Every absolute path here is built from a tempdir rather than written
+    /// as a `/opt/…` literal, and that is the fixture carrying the test rather
+    /// than a style choice.** A POSIX-looking literal is NOT absolute on
+    /// Windows — it carries no drive prefix — so [`is_untrustworthy_path_entry`]
+    /// classified all three "must match" spellings as relative entries, and the
+    /// first version of this test failed on `build-windows` while passing here.
+    /// Nothing is created on disk: this predicate compares paths and never
+    /// stats one.
     #[test]
     fn is_installed_location_matches_path_entry_spellings_and_skips_untrustworthy_ones() {
-        let home = Path::new("/home/u");
-        let exe = Path::new("/opt/deck/bin/dot-agent-deck");
+        let dir = crate::test_temp::tempdir().expect("resolver tempdir");
+        let sep = std::path::MAIN_SEPARATOR;
+        let root = dir.path().to_str().expect("tempdir path is UTF-8");
 
-        for spelling in ["/opt/deck/bin", "/opt/deck/bin/", "/opt/deck/./bin"] {
-            let value = std::env::join_paths([spelling]).expect("join synthetic PATH");
+        let home = dir.path().join("home");
+        let install_dir = format!("{root}{sep}deck{sep}bin");
+        let exe = Path::new(&install_dir).join(DEFAULT_BINARY_NAME);
+
+        for spelling in [
+            install_dir.clone(),
+            format!("{install_dir}{sep}"),
+            format!("{root}{sep}deck{sep}.{sep}bin"),
+        ] {
+            let value = std::env::join_paths([&spelling]).expect("join synthetic PATH");
             assert!(
-                is_installed_location(exe, home, Some(value.as_os_str())),
+                is_installed_location(&exe, &home, Some(value.as_os_str())),
                 "`{spelling}` names the directory {} is in",
                 exe.display()
             );
         }
 
-        for skipped in ["opt/deck/bin", ""] {
-            let value = std::env::join_paths([skipped]).expect("join synthetic PATH");
+        for skipped in [format!("deck{sep}bin"), String::new()] {
+            let value = std::env::join_paths([&skipped]).expect("join synthetic PATH");
             assert!(
-                !is_installed_location(exe, home, Some(value.as_os_str())),
+                !is_installed_location(&exe, &home, Some(value.as_os_str())),
                 "a relative or empty $PATH entry (`{skipped}`) is resolved against the \
                  consuming shell's own cwd and cannot vouch for a location"
             );
         }
 
-        let artifact_exe = Path::new("/w/target/release/dot-agent-deck");
-        let value = std::env::join_paths(["/w/target/release"]).expect("join synthetic PATH");
+        let artifact_dir = format!("{root}{sep}w{sep}target{sep}release");
+        let artifact_exe = Path::new(&artifact_dir).join(DEFAULT_BINARY_NAME);
+        let value = std::env::join_paths([&artifact_dir]).expect("join synthetic PATH");
         assert!(
-            !is_installed_location(artifact_exe, home, Some(value.as_os_str())),
+            !is_installed_location(&artifact_exe, &home, Some(value.as_os_str())),
             "a build-artifact directory on $PATH does not make the artifact installed"
         );
 
         assert!(
-            is_installed_location(Path::new("/home/u/.local/bin/dot-agent-deck"), home, None),
+            is_installed_location(
+                &home.join(".local").join("bin").join(DEFAULT_BINARY_NAME),
+                &home,
+                None
+            ),
             "the canonical install target counts with no $PATH at all"
         );
         assert!(
-            !is_installed_location(exe, home, None),
+            !is_installed_location(&exe, &home, None),
             "and nothing else does"
         );
     }
