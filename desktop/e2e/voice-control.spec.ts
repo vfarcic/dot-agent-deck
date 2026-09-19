@@ -3,8 +3,9 @@ import { expect, test, type Page } from "@playwright/test";
 /** Open the voice surface and submit one typed utterance through its real form. */
 async function submitVoice(page: Page, utterance: string) {
   const trigger = page.getByRole("button", { name: "Voice", exact: true });
-  await expect(trigger, "Voice control trigger is missing from the primary surface").toBeVisible({ timeout: 1_000 });
-  await trigger.click({ timeout: 1_000 });
+  // Keep CI contention during concurrent Rust compilation from turning this helper flaky.
+  await expect(trigger, "Voice control trigger is missing from the primary surface").toBeVisible({ timeout: 5_000 });
+  await trigger.click({ timeout: 5_000 });
   const panel = page.getByRole("dialog", { name: "Voice control" });
   await expect(panel).toBeVisible();
   await panel.getByRole("textbox", { name: "Command" }).fill(utterance);
