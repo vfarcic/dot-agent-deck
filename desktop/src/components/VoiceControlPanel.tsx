@@ -47,6 +47,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Mic, Square, Undo2, X } from "lucide-react";
 import { DISPLAY_LIMITS, displayText } from "../lib/displayText";
+import { VOICE_PEER_PROPS } from "../hooks/useInertBackground";
 import type { VoiceOutcomeDto, VoiceResultDto, VoiceScreen, VoiceStatusDto } from "../lib/bridge";
 import type { DeckRuntimeState } from "../types";
 
@@ -161,6 +162,11 @@ export function VoiceControlPanel({ runtime, screen, onDispatch }: VoiceControlP
         className="voice-trigger"
         data-testid="voice-trigger"
         title="Voice control"
+        /* A peer of the agent pane rather than background, so `useInertBackground`
+           leaves it alone while a pane is open — see that hook. Without it the
+           `agent` screen's only command, `close_agent_view`, is dispatched by a
+           control the browser will not even let the user click. */
+        {...VOICE_PEER_PROPS}
         onClick={() => setOpen(true)}
       ><Mic size={16} /><span>Voice</span></button>
       {open && <VoiceDialog runtime={runtime} screen={screen} onDispatch={onDispatch} onClose={() => setOpen(false)} />}
@@ -343,7 +349,10 @@ function VoiceDialog({ runtime, screen, onDispatch, onClose }: VoiceControlPanel
   const recording = phase === "recording";
 
   return (
-    <div className="dialog-backdrop" role="presentation" onMouseDown={close}>
+    /* Marked on the BACKDROP rather than on the panel: the backdrop is the
+       element the pane's walk meets as a sibling, and `inert` is inherited, so a
+       marked panel inside an inerted backdrop would still be dead. */
+    <div className="dialog-backdrop" role="presentation" {...VOICE_PEER_PROPS} onMouseDown={close}>
       <section
         className="voice-panel"
         role="dialog"

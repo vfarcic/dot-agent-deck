@@ -734,16 +734,21 @@ export function createFixtureSnapshot(state: FixtureState = "connected"): DeckSn
  * reachable: `Go, BACK to "Deck"?!` has to resolve to nothing, and any
  * substring rule would have it matching the deck phrases below.
  *
- * # Two commands rather than four
+ * # Three commands rather than four
  *
- * `open_overview` and `open_deck` take no params, so the fixture can answer them
- * honestly with no resolver of its own. `open_agent` would need a second
- * `agent_ref` resolver here to reach at all — the real one, and every refusal it
- * produces, is covered in `voice/outcome.rs` — and inventing a stand-in for it in
- * a browser is the drift this module's placement is about. `close_agent_view`
- * needs an open agent view, which is the one screen the voice surface cannot be
- * reached from at all today (see the residual in PRD #802's M6 entry), so a
- * fixture row for it would answer a question nothing can ask.
+ * `open_overview`, `open_deck` and `close_agent_view` take no params, so the
+ * fixture can answer them honestly with no resolver of its own. `open_agent` is
+ * the one left out: it would need a second `agent_ref` resolver here to reach at
+ * all — the real one, and every refusal it produces, is covered in
+ * `voice/outcome.rs` — and inventing a stand-in for it in a browser is the drift
+ * this module's placement is about.
+ *
+ * **`close_agent_view` was the fourth until the voice surface could be reached
+ * on the `agent` screen at all.** It was left out because that screen's whole
+ * background — the voice trigger included — was marked `inert` by the pane's
+ * modal fence, so a fixture row for it answered a question nothing could ask.
+ * `useInertBackground` now exempts the voice surface as a peer dialog, so the
+ * question is askable and the row is here to answer it.
  */
 const FIXTURE_VOICE_COMMANDS: ReadonlyArray<{
   readonly phrases: readonly string[];
@@ -768,6 +773,16 @@ const FIXTURE_VOICE_COMMANDS: ReadonlyArray<{
     screens: ["overview"],
     unavailableHint: "returning to the deck works from the agent overview",
     report: "Back to the deck.",
+  },
+  {
+    // The VIEW, never the terminal pane — the same line `commands.toml` draws at
+    // this row, because the two are one word apart in speech.
+    phrases: ["close this", "close the agent view", "stop looking at this one"],
+    action: "close_agent_view",
+    invoke: "closeAgentView",
+    screens: ["agent"],
+    unavailableHint: "closing an agent view needs one open",
+    report: "Closing the agent view.",
   },
 ];
 

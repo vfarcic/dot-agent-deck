@@ -382,7 +382,10 @@ describe("agent pane identity fence", () => {
   it("makes the base screen inert except for Voice while a pane is open, and gives it back on close", () => {
     const deck = harness(documentWithFleet(), {
       resolveVoice: vi.fn(async (utterance: string) => ({
-        outcome: { kind: "no_match", transcript: utterance, sentence: "No matching action." },
+        // `as const` and nothing else: without it `kind` widens to `string`,
+        // which is not a `VoiceOutcomeDto` discriminant, and `tsc --noEmit`
+        // refuses the whole runtime. It changes nothing this test asserts.
+        outcome: { kind: "no_match" as const, transcript: utterance, sentence: "No matching action." },
         resolveMs: null,
         backend: "stub",
       })),
