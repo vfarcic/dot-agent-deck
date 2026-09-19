@@ -1729,7 +1729,9 @@ async fn desktop_voice_start(
     // its own utterance and closing the next one.
     tauri::async_runtime::spawn(async move {
         tokio::time::sleep(voice::MAX_UTTERANCE).await;
-        session.cap_reached(ticket);
+        // Blocking for the reason the open above is: releasing the device
+        // joins its thread, which is as slow as the platform's teardown.
+        let _ = tauri::async_runtime::spawn_blocking(move || session.cap_reached(ticket)).await;
     });
 
     Ok(voice_status(&voice_state.session))
@@ -1743,7 +1745,14 @@ async fn desktop_voice_stop(
     voice_state: State<'_, VoiceState>,
 ) -> Result<voice::VoiceTranscription, String> {
     ensure_main_webview(&webview)?;
-    let audio = voice_state.session.stop().map_err(report_capture_error)?;
+    // Blocking, like the open in `desktop_voice_start`: closing the device
+    // joins its thread, and a driver that is slow to let go would otherwise
+    // park a runtime worker for as long as it takes.
+    let session = Arc::clone(&voice_state.session);
+    let audio = tauri::async_runtime::spawn_blocking(move || session.stop())
+        .await
+        .map_err(|error| safe_message(format!("the microphone call failed: {error}")))?
+        .map_err(report_capture_error)?;
     let transcriber = voice::transcriber_for(
         voice_transcription_backend(),
         Arc::new(KeychainSecretStore::new()),
@@ -1774,7 +1783,13 @@ async fn desktop_voice_cancel(
     voice_state: State<'_, VoiceState>,
 ) -> Result<VoiceStatus, String> {
     ensure_main_webview(&webview)?;
-    voice_state.session.cancel();
+    // Blocking for `desktop_voice_stop`'s reason — a cancel releases the same
+    // device, and a closing panel is exactly when several of these arrive at
+    // once.
+    let session = Arc::clone(&voice_state.session);
+    tauri::async_runtime::spawn_blocking(move || session.cancel())
+        .await
+        .map_err(|error| safe_message(format!("the microphone call failed: {error}")))?;
     Ok(voice_status(&voice_state.session))
 }
 

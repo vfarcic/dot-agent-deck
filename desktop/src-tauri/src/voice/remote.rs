@@ -79,7 +79,7 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 
-use crate::secrets::{SecretId, SecretStore};
+use crate::secrets::{SecretId, SecretStore, load_off_runtime};
 
 use super::prompt::{action_enum, param_names, state};
 use super::resolver::{IntentAnswer, IntentError, IntentRequest, IntentResolver, ResolveFuture};
@@ -156,8 +156,11 @@ impl RemoteResolver {
     }
 
     async fn run(&self, request: IntentRequest<'_>) -> Result<IntentAnswer, IntentError> {
-        // Read at call time, Rust-side, and dropped with this scope.
-        let secret = match self.secrets.load(SecretId::VoiceIntent) {
+        // Read at call time, Rust-side, and dropped with this scope — and on
+        // a blocking thread, because a keychain read is entitled to prompt and
+        // this is an async fn on a shared runtime.
+        let secret = match load_off_runtime(Arc::clone(&self.secrets), SecretId::VoiceIntent).await
+        {
             Ok(Some(secret)) => secret,
             Ok(None) => {
                 return Err(IntentError::NotConfigured(
@@ -375,7 +378,7 @@ fn transport_detail(error: &reqwest::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::secrets::{MemorySecretStore, Secret, SecretErrorKind};
+    use crate::secrets::{MemorySecretStore, Secret, SecretErrorKind, ThreadRecordingStore};
     use crate::voice::Transcript;
     use crate::voice::fixtures::role_agent as agent;
     use crate::voice::schema::annotate;
@@ -653,6 +656,39 @@ mod tests {
             "got {error:?}"
         );
         assert!(!error.detail().contains("no key is stored"), "{error}");
+    }
+
+    /// Scenario: resolve one utterance and note which thread the keychain was
+    /// read on. It is not the one the resolver is running on.
+    ///
+    /// The regression: `run` called `SecretStore::load` directly inside its
+    /// own `async fn`, so a keychain entitled to raise an unlock prompt parked
+    /// a shared runtime worker for as long as the prompt stayed on screen.
+    /// Invisible in the answer, which is why it is asserted as an identity.
+    #[tokio::test]
+    async fn voice_remote_reads_the_keychain_off_the_runtime() {
+        let store = Arc::new(ThreadRecordingStore::new());
+        let resolver = RemoteResolver::new(Arc::clone(&store) as Arc<dyn SecretStore>)
+            .with_endpoint("https://voice-intent.invalid/never");
+        let commands = commands();
+        let transcript = Transcript::new("show me the tester");
+        let error = resolver
+            .resolve(IntentRequest {
+                transcript: &transcript,
+                commands: &commands,
+                agents: &[],
+            })
+            .await
+            .expect_err("no key is stored");
+        assert!(
+            matches!(&error, IntentError::NotConfigured(detail) if detail.contains("no key is stored")),
+            "got {error:?}"
+        );
+        assert_ne!(
+            store.read_on().expect("the store was read"),
+            std::thread::current().id(),
+            "the keychain read ran on the runtime thread resolving the utterance"
+        );
     }
 
     #[test]

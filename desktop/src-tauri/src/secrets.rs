@@ -57,9 +57,14 @@
 //! D-Bus round trip to the Secret Service, which can sit for as long as an
 //! unlock prompt is on screen, and macOS and Windows can prompt too. Callers on
 //! an async runtime must hand it to `tauri::async_runtime::spawn_blocking`;
-//! `lib.rs`'s three commands do.
+//! `lib.rs`'s three commands do it directly, and the two voice backends —
+//! which read inside an `async fn` of their own rather than in a command — go
+//! through [`load_off_runtime`]. That helper exists because those two did
+//! **not**: PR #1163 found them calling [`SecretStore::load`] straight from
+//! their `run`, which parks a runtime worker behind a keychain prompt.
 
 use std::fmt;
+use std::sync::Arc;
 
 use crate::dto::safe_message;
 
@@ -342,6 +347,36 @@ pub trait SecretStore: Send + Sync {
     }
 }
 
+/// [`SecretStore::load`], off the async runtime's worker threads.
+///
+/// Every implementation of `load` is a **blocking** OS call — the real one
+/// reaches the platform credential store, and on macOS that store is entitled
+/// to put a dialog in front of the user — so calling it straight from an
+/// `async fn` parks a runtime worker for as long as the platform takes. It is
+/// the same shape as the device open in `desktop_voice_start` and the capture
+/// teardown beside it, and it gets the same treatment.
+///
+/// The `Arc` is taken by value rather than borrowed because the read happens
+/// on a thread that outlives this call's stack frame.
+pub async fn load_off_runtime(
+    store: Arc<dyn SecretStore>,
+    id: SecretId,
+) -> Result<Option<Secret>, SecretError> {
+    tauri::async_runtime::spawn_blocking(move || store.load(id))
+        .await
+        .unwrap_or_else(|error| {
+            // The blocking thread died — a panic inside `load`, or a runtime
+            // shutting down. Reported as a failed read rather than as "nothing
+            // stored", which is PRD #802 M4's rule and the reason `load`
+            // distinguishes the two in the first place.
+            Err(SecretError::new(
+                SecretErrorKind::Backend,
+                SecretOp::Load,
+                format!("the credential read did not finish ({error})"),
+            ))
+        })
+}
+
 /// What the settings panel is told about one credential.
 ///
 /// `stored` and nothing else about the value — no length, no prefix, no last
@@ -467,6 +502,56 @@ fn classify(error: &keyring::Error, op: SecretOp) -> SecretError {
 /// failure path testable at all: the situations that produce one (a headless
 /// box, a locked keychain) cannot be arranged from inside a test on a developer
 /// machine that has a working keychain.
+/// A [`SecretStore`] that records which thread its `load` ran on.
+///
+/// The property [`load_off_runtime`] exists for is *not on the caller's
+/// thread*, and it is invisible in a return value — a read that ran inline on
+/// the async worker that awaited it produces exactly the same `Ok(None)` as
+/// one that went to a blocking thread. This makes the difference observable,
+/// which is the only way the two voice backends' call sites can be pinned.
+///
+/// Answers `Ok(None)` so a caller under test takes its "nothing is stored"
+/// path and returns without a network hop.
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub struct ThreadRecordingStore {
+    read_on: std::sync::Mutex<Option<std::thread::ThreadId>>,
+}
+
+#[cfg(test)]
+impl ThreadRecordingStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The thread the last `load` ran on, or `None` if none has.
+    pub fn read_on(&self) -> Option<std::thread::ThreadId> {
+        *self
+            .read_on
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+#[cfg(test)]
+impl SecretStore for ThreadRecordingStore {
+    fn store(&self, _id: SecretId, _secret: &Secret) -> Result<(), SecretError> {
+        Ok(())
+    }
+
+    fn load(&self, _id: SecretId) -> Result<Option<Secret>, SecretError> {
+        *self
+            .read_on
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(std::thread::current().id());
+        Ok(None)
+    }
+
+    fn delete(&self, _id: SecretId) -> Result<(), SecretError> {
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 #[derive(Debug, Default)]
 pub struct MemorySecretStore {
@@ -536,6 +621,27 @@ impl SecretStore for MemorySecretStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A keychain read is a blocking OS call that is entitled to put an unlock
+    /// prompt on screen, so it must not run on the async worker that awaited
+    /// it. Observed as a thread identity, because that is the only place the
+    /// difference shows: the answer is the same either way.
+    #[tokio::test]
+    async fn secrets_load_off_runtime_reads_on_a_blocking_thread() {
+        let store = Arc::new(ThreadRecordingStore::new());
+        let answer = load_off_runtime(
+            Arc::clone(&store) as Arc<dyn SecretStore>,
+            SecretId::VoiceIntent,
+        )
+        .await;
+
+        assert_eq!(answer, Ok(None));
+        assert_ne!(
+            store.read_on().expect("the store was read"),
+            std::thread::current().id(),
+            "the keychain read ran on the thread that awaited it"
+        );
+    }
 
     /// The account names are an on-keychain identity: change one and the key a
     /// user already stored is stranded where nothing reads it and nothing

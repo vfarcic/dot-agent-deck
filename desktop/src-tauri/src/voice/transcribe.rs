@@ -54,7 +54,7 @@ use std::time::Duration;
 
 use serde_json::Value;
 
-use crate::secrets::{SecretId, SecretStore};
+use crate::secrets::{SecretId, SecretStore, load_off_runtime};
 
 use super::Transcript;
 use super::capture::Pcm16;
@@ -235,8 +235,12 @@ impl RemoteTranscriber {
             ));
         }
 
-        // Read at call time, Rust-side, and dropped with this scope.
-        let secret = match self.secrets.load(SecretId::VoiceTranscription) {
+        // Read at call time, Rust-side, and dropped with this scope — and on
+        // a blocking thread, because a keychain read is entitled to prompt and
+        // this is an async fn on a shared runtime.
+        let secret = match load_off_runtime(Arc::clone(&self.secrets), SecretId::VoiceTranscription)
+            .await
+        {
             Ok(Some(secret)) => secret,
             Ok(None) => {
                 return Err(TranscriptionError::NotConfigured(
@@ -605,7 +609,7 @@ fn millis(duration: Duration) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::secrets::{MemorySecretStore, Secret, SecretErrorKind};
+    use crate::secrets::{MemorySecretStore, Secret, SecretErrorKind, ThreadRecordingStore};
     use crate::settings::TranscriptionBackend;
     use serde_json::json;
 
@@ -1007,6 +1011,32 @@ mod tests {
             "got {error:?}"
         );
         assert!(!error.detail().contains("no key is stored"), "{error}");
+    }
+
+    /// Scenario: transcribe one buffer and note which thread the keychain was
+    /// read on. It is not the one the transcriber is running on.
+    ///
+    /// The sibling of `voice_remote_reads_the_keychain_off_the_runtime`, and
+    /// the same regression: `run` read the store inline in its own `async
+    /// fn`, so an unlock prompt parked a shared runtime worker.
+    #[tokio::test]
+    async fn voice_transcribe_reads_the_keychain_off_the_runtime() {
+        let store = Arc::new(ThreadRecordingStore::new());
+        let transcriber = RemoteTranscriber::new(Arc::clone(&store) as Arc<dyn SecretStore>)
+            .with_endpoint("https://voice-transcription.invalid/never");
+        let error = transcriber
+            .transcribe(&audio(16_000))
+            .await
+            .expect_err("no key is stored");
+        assert!(
+            matches!(&error, TranscriptionError::NotConfigured(detail) if detail.contains("no key is stored")),
+            "got {error:?}"
+        );
+        assert_ne!(
+            store.read_on().expect("the store was read"),
+            std::thread::current().id(),
+            "the keychain read ran on the runtime thread transcribing the audio"
+        );
     }
 
     #[tokio::test]
